@@ -42,6 +42,8 @@ pub enum StmtKind {
     },
     /// `function` declaration (spec 15.2).
     FunctionDecl(Function),
+    /// `class` declaration (spec 15.7) — the name is required.
+    ClassDecl(Class),
     /// `return [Expression] ;` — the expression is restricted by
     /// `[no LineTerminator here]`.
     Return(Option<Expr>),
@@ -181,6 +183,8 @@ pub enum ExprKind {
     Object(ObjectLiteral),
     /// `function` expression (spec 15.2.3).
     Function(Function),
+    /// `class` expression (spec 15.7.7) — the name is optional.
+    Class(Box<Class>),
     /// Unary operators: `delete`, `void`, `typeof`, `+`, `-`, `~`, `!`.
     Unary { op: UnaryOp, operand: Box<Expr> },
     /// Prefix/postfix `++`/`--`.
@@ -468,6 +472,57 @@ pub struct Function {
     pub body: Block,
     pub is_async: bool,
     pub is_generator: bool,
+}
+
+/// A class declaration or expression (spec 15.7).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Class {
+    pub span: Span,
+    /// `None` for anonymous class expressions.
+    pub name: Option<AtomId>,
+    /// The `extends` heritage, if any.
+    pub heritage: Option<Expr>,
+    pub elements: Vec<ClassElement>,
+}
+
+/// The name of a class element: a property name or a private identifier.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClassElementName {
+    Property(PropertyName),
+    Private(AtomId),
+}
+
+/// One element of a class body (spec 15.7.5).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClassElement {
+    /// A method: plain, `async`, generator, or `async`-generator.
+    Method {
+        is_static: bool,
+        name: ClassElementName,
+        function: Function,
+    },
+    /// `get name () { body }`.
+    Get {
+        is_static: bool,
+        name: ClassElementName,
+        body: Block,
+    },
+    /// `set name ( param ) { body }`.
+    Set {
+        is_static: bool,
+        name: ClassElementName,
+        param: BindingPattern,
+        body: Block,
+    },
+    /// A class field with an optional initializer.
+    Field {
+        is_static: bool,
+        name: ClassElementName,
+        init: Option<Expr>,
+        span: Span,
+    },
+    /// `static { … }`.
+    StaticBlock(Block),
 }
 
 /// A binding element: `BindingPattern Initializer_opt` (spec 13.2.3.3).

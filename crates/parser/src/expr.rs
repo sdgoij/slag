@@ -604,7 +604,7 @@ fn parse_update(parser: &mut Parser) -> Result<Expr, JsError> {
 
 /// `LeftHandSideExpression`: `new`, `super`, member/call chains, optional
 /// chains (spec 13.4).
-fn parse_lhs(parser: &mut Parser) -> Result<Expr, JsError> {
+pub(crate) fn parse_lhs(parser: &mut Parser) -> Result<Expr, JsError> {
     if parser.at_keyword(Keyword::New)? {
         return parse_new(parser);
     }
@@ -664,6 +664,9 @@ fn parse_new(parser: &mut Parser) -> Result<Expr, JsError> {
 
 fn parse_super(parser: &mut Parser) -> Result<Expr, JsError> {
     let start = parser.next()?.span.start; // `super`
+    if !parser.allow_super {
+        return Err(parser.error_at(start, "super is only valid inside class methods"));
+    }
     let super_expr = Expr {
         span: Span::new(start, start),
         kind: ExprKind::Super,
@@ -699,6 +702,9 @@ fn parse_super(parser: &mut Parser) -> Result<Expr, JsError> {
             })
         }
         TokenKind::LeftParen => {
+            if !parser.in_constructor {
+                return Err(parser.error_at(start, "super() is only valid inside a constructor"));
+            }
             let args = parse_arguments(parser)?;
             let end = parser.prev.as_ref().unwrap().span.end;
             Ok(Expr {
@@ -979,8 +985,12 @@ fn parse_primary(parser: &mut Parser) -> Result<Expr, JsError> {
                 }
             }
             Some(Keyword::Class) => {
-                let tok = parser.peek()?.clone();
-                Err(parser.unexpected(&tok))
+                let start = parser.next()?.span.start;
+                let class = crate::class::parse_class(parser, start, false)?;
+                Ok(Expr {
+                    span: class.span,
+                    kind: ExprKind::Class(Box::new(class)),
+                })
             }
             Some(_) => {
                 eprintln!("dbg: unexpected keyword in primary: {:?}", tok);
@@ -1501,13 +1511,13 @@ fn parse_object_literal(parser: &mut Parser) -> Result<Expr, JsError> {
             }
             continue;
         }
-        // `get name() {}` / `set name(p) {}` accessors.
+        // `get` name() {}` / `set name(p) {}` accessors.
         if parser.at_contextual("get")? && is_property_name_start(parser.peek2()?.kind.clone()) {
             parser.next()?; // `get`
             let key = parser.parse_property_name()?;
             parser.expect_punct(TokenKind::LeftParen)?;
             parser.expect_punct(TokenKind::RightParen)?;
-            let body = parse_function_body_block(parser, false, false, &[])?;
+            let body = parse_function_body_block(parser, false, false, &[], true, false)?;
             props.push(ObjectProperty::Get { key, body });
             if !parser.eat_punct(TokenKind::Comma)? {
                 break;
@@ -1520,7 +1530,7 @@ fn parse_object_literal(parser: &mut Parser) -> Result<Expr, JsError> {
             parser.expect_punct(TokenKind::LeftParen)?;
             let param = parser.parse_binding_pattern()?;
             parser.expect_punct(TokenKind::RightParen)?;
-            let body = parse_function_body_block(parser, false, false, &[])?;
+            let body = parse_function_body_block(parser, false, false, &[], true, false)?;
             props.push(ObjectProperty::Set { key, param, body });
             if !parser.eat_punct(TokenKind::Comma)? {
                 break;
@@ -1596,7 +1606,7 @@ fn parse_object_literal(parser: &mut Parser) -> Result<Expr, JsError> {
 }
 
 /// Whether a token can begin a property name in a method/accessor header.
-fn is_property_name_start(kind: TokenKind) -> bool {
+pub(crate) fn is_property_name_start(kind: TokenKind) -> bool {
     matches!(
         kind,
         TokenKind::Identifier(_)
@@ -1616,7 +1626,8 @@ fn parse_method_tail(
     parser.expect_punct(TokenKind::LeftParen)?;
     let params = parse_parameter_list(parser)?;
     check_duplicate_params(parser, &params, false)?;
-    let body = parse_function_body_block(parser, is_async, is_generator, &params)?;
+    // Methods have a [[HomeObject]], so `super` is available.
+    let body = parse_function_body_block(parser, is_async, is_generator, &params, true, false)?;
     let end = body.span.end;
     Ok(Function {
         span: Span::new(start, end),
@@ -1645,7 +1656,7 @@ pub(crate) fn parse_function_expression(
     parser.expect_punct(TokenKind::LeftParen)?;
     let params = parse_parameter_list(parser)?;
     check_duplicate_params(parser, &params, false)?;
-    let body = parse_function_body_block(parser, is_async, is_generator, &params)?;
+    let body = parse_function_body_block(parser, is_async, is_generator, &params, false, false)?;
     let end = body.span.end;
     Ok(Expr {
         span: Span::new(start, end),
@@ -1699,12 +1710,15 @@ pub(crate) fn parse_parameter_list(parser: &mut Parser) -> Result<Vec<BindingEle
 
 /// Parses `{ FunctionBody }` with the directive prologue and the function
 /// context flags. `params` are declared in the function scope and checked
-/// against the body's lexical declarations.
+/// against the body's lexical declarations. `allow_super`/`in_constructor`
+/// govern the `super` forms legal in the body.
 pub(crate) fn parse_function_body_block(
     parser: &mut Parser,
     is_async: bool,
     is_generator: bool,
     params: &[BindingElement],
+    allow_super: bool,
+    in_constructor: bool,
 ) -> Result<Block, JsError> {
     parser.expect_punct(TokenKind::LeftBrace)?;
     let body_start = parser.prev.as_ref().unwrap().span.start;
@@ -1722,6 +1736,8 @@ pub(crate) fn parse_function_body_block(
         parser.in_function,
         parser.in_generator,
         parser.in_async,
+        parser.allow_super,
+        parser.in_constructor,
         parser.loop_depth,
         parser.switch_depth,
     );
@@ -1729,6 +1745,8 @@ pub(crate) fn parse_function_body_block(
     parser.in_function = true;
     parser.in_generator = is_generator;
     parser.in_async = is_async;
+    parser.allow_super = allow_super;
+    parser.in_constructor = in_constructor;
     parser.loop_depth = 0;
     parser.switch_depth = 0;
     let saved_vars = std::mem::take(&mut parser.list_vars);
@@ -1748,6 +1766,8 @@ pub(crate) fn parse_function_body_block(
         parser.in_function,
         parser.in_generator,
         parser.in_async,
+        parser.allow_super,
+        parser.in_constructor,
         parser.loop_depth,
         parser.switch_depth,
     ) = saved;
@@ -1825,6 +1845,7 @@ pub(crate) fn scan_directive_prologue(parser: &mut Parser) -> Result<bool, JsErr
 }
 
 /// The arrow body: `=> ConciseBody` — a block or an assignment expression.
+/// Arrows capture the enclosing `super` binding.
 fn parse_arrow_body(
     parser: &mut Parser,
     is_async: bool,
@@ -1832,7 +1853,14 @@ fn parse_arrow_body(
 ) -> Result<ArrowBody, JsError> {
     // `=>` consumed by the caller.
     if parser.at_punct(TokenKind::LeftBrace)? {
-        let body = parse_function_body_block(parser, is_async, false, params)?;
+        let body = parse_function_body_block(
+            parser,
+            is_async,
+            false,
+            params,
+            parser.allow_super,
+            parser.in_constructor,
+        )?;
         Ok(ArrowBody::Block(body))
     } else {
         let expr = parse_assignment(parser, true)?;

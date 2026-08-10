@@ -59,8 +59,13 @@ fn parse_statement(parser: &mut Parser) -> Result<Stmt, JsError> {
             }
             Some(Keyword::Function) => return parse_function_declaration(parser, false),
             Some(Keyword::Class) => {
-                let tok = parser.peek()?.clone();
-                return Err(parser.unexpected(&tok));
+                let start = parser.next()?.span.start;
+                let class = crate::class::parse_class(parser, start, true)?;
+                let end = class.span.end;
+                return Ok(Stmt {
+                    span: Span::new(start, end),
+                    kind: StmtKind::ClassDecl(class),
+                });
             }
             _ if atom == intern_utf8("let")
                 && is_let_declaration_start(parser.peek2()?.kind.clone()) =>
@@ -776,7 +781,14 @@ fn parse_function_declaration(parser: &mut Parser, is_async: bool) -> Result<Stm
     parser.expect_punct(TokenKind::LeftParen)?;
     let params = crate::expr::parse_parameter_list(parser)?;
     crate::expr::check_duplicate_params(parser, &params, false)?;
-    let body = crate::expr::parse_function_body_block(parser, is_async, is_generator, &params)?;
+    let body = crate::expr::parse_function_body_block(
+        parser,
+        is_async,
+        is_generator,
+        &params,
+        false,
+        false,
+    )?;
     let end = body.span.end;
     Ok(Stmt {
         span: Span::new(start, end),

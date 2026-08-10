@@ -12,6 +12,31 @@ use syntax::{
 
 use crate::token_stream::{TokenStream, can_end_expression};
 
+/// How a private name is declared, for the getter/setter-pair rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum PrivateNameKind {
+    #[default]
+    None,
+    Getter(bool),
+    Setter(bool),
+    GetterSetter {
+        getter_static: bool,
+        setter_static: bool,
+    },
+    Other,
+}
+
+impl PrivateNameKind {
+    pub(crate) fn with_static(self, is_static: bool) -> PrivateNameKind {
+        match self {
+            PrivateNameKind::Getter(_) => PrivateNameKind::Getter(is_static),
+            PrivateNameKind::Setter(_) => PrivateNameKind::Setter(is_static),
+            PrivateNameKind::Other => PrivateNameKind::Other,
+            other => other,
+        }
+    }
+}
+
 /// A label in scope; records pending `continue label` statements that are
 /// validated once the labeled statement's shape is known.
 pub(crate) struct LabelInfo {
@@ -47,6 +72,12 @@ pub struct Parser<'s> {
     pub(crate) in_function: bool,
     pub(crate) in_generator: bool,
     pub(crate) in_async: bool,
+    /// Inside a class method/field/static-block body: `super.x` is legal.
+    pub(crate) allow_super: bool,
+    /// Inside a constructor: `super()` is legal.
+    pub(crate) in_constructor: bool,
+    /// Per-class private-name declarations, for duplicate checks.
+    pub(crate) private_names: Vec<std::collections::HashMap<AtomId, PrivateNameKind>>,
     /// Inside arrow-function parameter cover grammar; `{a = 1}` shorthand
     /// initializers are only legal here (spec 13.2.5 CoverInitializedName).
     pub(crate) in_arrow_cover: bool,
@@ -93,6 +124,9 @@ impl<'s> Parser<'s> {
             in_function: false,
             in_generator: false,
             in_async: false,
+            allow_super: false,
+            in_constructor: false,
+            private_names: Vec::new(),
             in_arrow_cover: false,
             cover_error: None,
             scopes: vec![Scope::default()],

@@ -4,6 +4,7 @@
 //! Phase 3 implements the parameterized grammar `[Yield, Await, Return, In]`
 //! and the syntax-directed operations the evaluator needs.
 
+mod class;
 mod expr;
 mod parser;
 mod stmt;
@@ -632,6 +633,102 @@ mod tests {
         ok("{ } + 1");
         // let [ is a declaration, not an expression.
         ok("let [a] = b;");
+    }
+
+    #[test]
+    fn parses_classes() {
+        // Declarations, expressions, heritage, and empty bodies.
+        assert!(matches!(stmt("class A {}").kind, StmtKind::ClassDecl(c) if c.name.is_some()));
+        assert!(matches!(
+            expr_stmt("(class A {})").kind,
+            ExprKind::Paren(inner)
+                if matches!(inner.kind, ExprKind::Class(ref c) if c.name.is_some())
+        ));
+        assert!(matches!(
+            expr_stmt("(class {})").kind,
+            ExprKind::Paren(inner)
+                if matches!(inner.kind, ExprKind::Class(ref c) if c.name.is_none())
+        ));
+        assert!(matches!(
+            stmt("class A extends B {}").kind,
+            StmtKind::ClassDecl(c) if c.heritage.is_some()
+        ));
+
+        // Methods of every kind, static variants, fields, and static blocks.
+        ok("class A { m() {} }");
+        ok("class A { static m() {} }");
+        ok("class A { get x() { return 1; } set x(v) {} }");
+        ok("class A { static get x() { return 1; } }");
+        ok("class A { *gen() {} }");
+        ok("class A { static *gen() {} }");
+        ok("class A { async m() {} }");
+        ok("class A { async *gen() {} }");
+        ok("class A { x = 1; }");
+        ok("class A { x = 1 }");
+        ok("class A { static x = 1; y = 2; }");
+        ok("class A { [expr] = 1; }");
+        ok("class A { #priv = 1; }");
+        ok("class A { static #priv; }");
+        ok("class A { static {} }");
+        ok("class A { ; }");
+        ok("class A { ; m() {} }");
+        // `static` as a field or method name.
+        ok("class A { static = 1; }");
+        ok("class A { static() {} }");
+
+        // Constructor forms.
+        ok("class A { constructor() {} }");
+        ok("class A { constructor(x) { this.x = x; } }");
+        ok("class A { constructor() {} static constructor() {} }");
+
+        // super in methods and constructors.
+        ok("class A extends B { m() { return super.x; } }");
+        ok("class A extends B { m() { return super[0]; } }");
+        ok("class A extends B { constructor() { super(); } }");
+        ok("class A extends B { x = super.y; }");
+        ok("class A extends B { static { super.z; } }");
+        // Arrows capture super.
+        ok("class A extends B { m() { return () => super.x; } }");
+        // Private methods and accessor pairs.
+        ok("class A { #m() {} }");
+        ok("class A { static #m() {} }");
+        ok("class A { get #x() {} set #x(v) {} }");
+        ok("class A { static get #x() {} static set #x(v) {} }");
+    }
+
+    #[test]
+    fn class_early_errors() {
+        // A class declaration requires a name.
+        err("class {};");
+        // Duplicate constructors and special-method constructors.
+        err("class A { constructor() {} constructor() {} }");
+        err("class A { get constructor() {} }");
+        err("class A { async constructor() {} }");
+        err("class A { *constructor() {} }");
+        // Fields named constructor / prototype.
+        err("class A { constructor = 1; }");
+        err("class A { static prototype = 1; }");
+        err("class A { static constructor = 1; }");
+        err("class A { static prototype() {} }");
+        // Private-name rules.
+        err("class A { #x; #x; }");
+        err("class A { #x() {} #x() {} }");
+        err("class A { #x; get #x() {} }");
+        err("class A { get #x() {} set #x(v) {} #x; }");
+        err("class A { #constructor; }");
+        // A getter/setter pair must share static-ness.
+        err("class A { static get #x() {} set #x(v) {} }");
+        // super outside methods.
+        err("super.x;");
+        err("class A { m() { return () => super(); } }");
+        // Class bodies are strict: with is illegal.
+        err("class A { m() { with (x) {} } }");
+        // Redeclaration rules apply to the class name.
+        err("let A; class A {};");
+        ok("class A {} let B;");
+        // Class expressions may be anonymous and named.
+        ok("const C = class {};");
+        ok("const C = class Named {};");
     }
 
     #[test]
