@@ -499,7 +499,7 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
             return Err(parser.error_at(start, "using declarations are not allowed in for-in"));
         }
         parser.next()?;
-        let left = for_binding_from_init(parser, init)?;
+        let left = for_binding_from_init(parser, init, true)?;
         let right = parse_expression(parser, true)?;
         parser.expect_punct(TokenKind::RightParen)?;
         parser.loop_depth += 1;
@@ -516,7 +516,7 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
             return Err(parser.error_at(start, "Unexpected line break after for await"));
         }
         parser.next()?;
-        let left = for_binding_from_init(parser, init)?;
+        let left = for_binding_from_init(parser, init, false)?;
         let right = parse_assignment(parser, true)?;
         parser.expect_punct(TokenKind::RightParen)?;
         parser.loop_depth += 1;
@@ -629,9 +629,12 @@ fn parse_for_declarators(
 }
 
 /// Converts a for-head init into the for-in/for-of binding.
+/// `allow_var_init` admits the Annex B.2.6 form `for (var x = init in obj)`
+/// in sloppy code; the initializer is otherwise a syntax error.
 fn for_binding_from_init(
     parser: &mut Parser,
     init: Option<ForInit>,
+    allow_var_init: bool,
 ) -> Result<ForBinding, JsError> {
     match init {
         Some(ForInit::Expr(expr)) => {
@@ -644,14 +647,21 @@ fn for_binding_from_init(
                 .next()
                 .ok_or_else(|| parser.error_at(0, "Invalid for-in/of declaration"))?;
             if decl.init.is_some() {
-                return Err(parser.error_at(
-                    decl.span.start,
-                    "Invalid initializer in for-in/of declaration",
-                ));
+                let annex_b = allow_var_init
+                    && !parser.strict
+                    && kind == VarDeclKind::Var
+                    && matches!(decl.pattern, BindingPattern::Ident(_));
+                if !annex_b {
+                    return Err(parser.error_at(
+                        decl.span.start,
+                        "Invalid initializer in for-in/of declaration",
+                    ));
+                }
             }
             Ok(ForBinding::VarDecl {
                 kind,
                 pattern: decl.pattern,
+                init: decl.init,
             })
         }
         None => Err(parser.error_at(0, "Invalid for-in/of head")),

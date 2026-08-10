@@ -249,12 +249,22 @@ fn parse_class_element(parser: &mut Parser) -> Result<Option<ClassElement>, JsEr
     // Field: `name Initializer? ;`
     declare_private_name(parser, &name, PrivateNameKind::Other, is_static)?;
     let init = if parser.eat_punct(TokenKind::Equal)? {
-        // Field initializers may use `super`.
-        let saved = (parser.allow_super, parser.in_constructor);
+        // Field initializers may use `super` and `new.target` (the latter
+        // resolves to undefined at runtime; it is not an early error).
+        let saved = (
+            parser.allow_super,
+            parser.in_constructor,
+            parser.in_field_initializer,
+        );
         parser.allow_super = true;
         parser.in_constructor = false;
+        parser.in_field_initializer = true;
         let value = parse_assignment(parser, true)?;
-        (parser.allow_super, parser.in_constructor) = saved;
+        (
+            parser.allow_super,
+            parser.in_constructor,
+            parser.in_field_initializer,
+        ) = saved;
         Some(value)
     } else {
         None

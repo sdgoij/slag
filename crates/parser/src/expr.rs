@@ -622,6 +622,11 @@ fn parse_new(parser: &mut Parser) -> Result<Expr, JsError> {
         if atom != intern_utf8("target") {
             return Err(parser.error_at(start, "Expected new.target"));
         }
+        // `new.target` is an early error outside functions (spec 13.3.4,
+        // 15.2.2) except inside class field initializers and static blocks.
+        if !parser.in_function && !parser.in_field_initializer {
+            return Err(parser.error_at(start, "new.target is not allowed here"));
+        }
         let end = parser.prev.as_ref().unwrap().span.end;
         return Ok(Expr {
             span: Span::new(start, end),
@@ -1750,6 +1755,19 @@ pub(crate) fn parse_function_body_block(
     parser.top_level_await = false;
     parser.loop_depth = 0;
     parser.switch_depth = 0;
+    if directive_strict {
+        // A `"use strict"` directive makes the already-parsed parameter
+        // list strict: `eval`/`arguments` bindings and duplicates become
+        // early errors (spec 15.2.1).
+        for name in crate::stmt::bound_names_of_elements(params) {
+            if name == intern_utf8("eval") || name == intern_utf8("arguments") {
+                return Err(
+                    parser.error_at(body_start, "Unexpected eval or arguments in strict mode")
+                );
+            }
+        }
+        check_duplicate_params(parser, params, false)?;
+    }
     let saved_vars = std::mem::take(&mut parser.list_vars);
     parser.push_scope();
     parser.scopes.last_mut().unwrap().is_function = true;

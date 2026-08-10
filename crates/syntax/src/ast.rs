@@ -237,6 +237,9 @@ pub enum ForBinding {
     VarDecl {
         kind: VarDeclKind,
         pattern: BindingPattern,
+        /// Annex B.2.6: `for (var x = init in obj)` — a var initializer in a
+        /// for-in head, evaluated per iteration (sloppy code only).
+        init: Option<Expr>,
     },
 }
 

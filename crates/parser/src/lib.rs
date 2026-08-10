@@ -334,8 +334,15 @@ mod tests {
         assert!(matches!(expr.kind, ExprKind::New(n) if n.args.len() == 1));
         let expr = expr_stmt("new Foo");
         assert!(matches!(expr.kind, ExprKind::New(n) if n.args.is_empty()));
-        // new.target
-        let expr = expr_stmt("new.target");
+        // new.target — legal only inside a function body.
+        let program = ok("function f() { new.target; }");
+        let StmtKind::FunctionDecl(f) = &program.body[0].kind else {
+            panic!("expected function");
+        };
+        let expr = match &f.body.stmts[0].kind {
+            StmtKind::Expr(e) => e.clone(),
+            other => panic!("expected expression statement, got {other:?}"),
+        };
         assert!(matches!(
             expr.kind,
             ExprKind::MetaProperty { ref meta, .. } if meta == &crux::intern_utf8("new")
@@ -632,6 +639,10 @@ mod tests {
         err("'use strict'; let eval = 1;");
         err("'use strict'; var arguments;");
         err("function f() { 'use strict'; let arguments; }");
+        // A "use strict" directive makes the parameter list strict too.
+        err("function f(eval) { 'use strict'; }");
+        err("function f(a, a) { 'use strict'; }");
+        err("(a, a) => { 'use strict'; }");
         // yield/await contexts.
         err("function* g() { let yield; }");
         // break/continue outside loops.
@@ -644,7 +655,11 @@ mod tests {
         ok("function f() {} function f() {}");
         err("'use strict'; function f() {} function f() {}");
         // for-in/of restrictions.
-        err("for (var x = 0 in obj) {}");
+        // Annex B.2.6 allows `for (var x = 0 in obj)` in sloppy code.
+        ok("for (var x = 0 in obj) {}");
+        err("'use strict'; for (var x = 0 in obj) {}");
+        err("for (let x = 0 in obj) {}");
+        err("for (var x = 0 of arr) {}");
         // for-of heads allow bindings without initializers.
         ok("for (const x of arr) {}");
         ok("for (let [a, b] of arr) {}");
@@ -1072,6 +1087,47 @@ mod tests {
         // Module span covers the whole source.
         let m = mod_ok("import d from 'm';");
         assert_eq!(m.span, crux::Span::new(0, 18));
+    }
+
+    #[test]
+    fn new_target_contexts() {
+        // new.target is an early error outside function bodies (spec 13.3.4,
+        // 15.2.2) — including inside arrows and computed class names.
+        err("new.target;");
+        err("() => new.target;");
+        err("class A { [new.target]() {} }");
+        mod_err("new.target;");
+        // ...but legal inside functions, arrows, methods, field
+        // initializers, and static blocks.
+        ok("function f() { return new.target; }");
+        ok("function f() { return () => new.target; }");
+        ok("function f() { class A { [new.target]() {} } }");
+        ok("class A { m() { return new.target; } }");
+        ok("class A { x = new.target; }");
+        ok("function f() { class A { x = new.target; } }");
+        ok("class A { static { new.target; } }");
+        ok("class A { static m() { return new.target; } }");
+    }
+
+    #[test]
+    fn parses_annex_b_forin_initializer() {
+        // Annex B.2.6: `for (var x = init in obj)` in sloppy code.
+        let s = stmt("for (var x = 0 in obj) {}");
+        assert!(matches!(
+            s.kind,
+            StmtKind::ForIn {
+                left: ForBinding::VarDecl {
+                    kind: VarDeclKind::Var,
+                    pattern: syntax::BindingPattern::Ident(_),
+                    init: Some(_),
+                },
+                ..
+            }
+        ));
+        // The initializer is parsed with `[~In]`.
+        ok("for (var x = a in obj) {}");
+        // Patterns are not Annex B forms; they stay errors.
+        err("for (var [a] = b in obj) {}");
     }
 
     #[test]

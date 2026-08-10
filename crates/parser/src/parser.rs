@@ -81,6 +81,10 @@ pub struct Parser<'s> {
     pub(crate) allow_super: bool,
     /// Inside a constructor: `super()` is legal.
     pub(crate) in_constructor: bool,
+    /// Inside a class field initializer: `new.target` is legal there even
+    /// outside functions (spec: field initializers are not contained by the
+    /// enclosing StatementList).
+    pub(crate) in_field_initializer: bool,
     /// Per-class private-name declarations, for duplicate checks.
     pub(crate) private_names: Vec<std::collections::HashMap<AtomId, PrivateNameKind>>,
     /// Inside arrow-function parameter cover grammar; `{a = 1}` shorthand
@@ -133,6 +137,7 @@ impl<'s> Parser<'s> {
             top_level_await: false,
             allow_super: false,
             in_constructor: false,
+            in_field_initializer: false,
             private_names: Vec::new(),
             in_arrow_cover: false,
             cover_error: None,
