@@ -247,6 +247,22 @@ fn not_implemented(what: &str) -> JsError {
     )
 }
 
+/// Call (spec 7.3.13): invoke a callable value with a this value and an
+/// argument list. Phase 4 function values carry no [[Call]] body, so any
+/// invocation reports the pending Phase 7 capability.
+pub(crate) fn call(callee: &Value, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    match callee {
+        Value::Function(_) => Err(JsError::new(
+            ErrorKind::TypeError,
+            "calling functions is not implemented until Phase 7".into(),
+        )),
+        _ => Err(JsError::new(
+            ErrorKind::TypeError,
+            "value is not a function".into(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

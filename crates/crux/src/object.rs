@@ -3,8 +3,10 @@
 //! Phase 4 pulls forward just enough of the object model for the global
 //! object, object environment records, and global function bindings: an
 //! ordinary object with data properties and the internal methods those
-//! algorithms call. The full property-descriptor machinery (accessors,
-//! invariants), exotics, and callable function objects join in Phase 5-7.
+//! algorithms call. Properties are keyed by `PropertyKey` (string or
+//! symbol), matching the spec's [[OwnPropertyKeys]] ordering model. The
+//! full property-descriptor machinery (accessors, invariants), exotics,
+//! and callable function objects join in Phase 5-7.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::error::{ErrorKind, JsError};
 use crate::handle::Handle;
 use crate::ops::same_value;
-use crate::property::PropertyDescriptor;
+use crate::property::{PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
 use crate::value::Value;
 
@@ -50,7 +52,7 @@ pub struct JsObject {
     pub extensible: bool,
     /// Own properties in insertion order (the [[OwnPropertyKeys]] string
     /// order for ordinary objects).
-    pub properties: RefCell<Vec<(JsString, Property)>>,
+    pub properties: RefCell<Vec<(PropertyKey, Property)>>,
 }
 
 impl PartialEq for JsObject {
@@ -74,6 +76,10 @@ impl JsObject {
     /// OrdinaryGetOwnProperty (spec 10.1.7.1): `None` when the object does
     /// not have an own property `key`.
     pub fn get_own_property(&self, key: &JsString) -> Option<Property> {
+        self.get_own_property_key(&PropertyKey::from_js_string(key))
+    }
+
+    pub fn get_own_property_key(&self, key: &PropertyKey) -> Option<Property> {
         self.properties
             .borrow()
             .iter()
@@ -83,14 +89,22 @@ impl JsObject {
 
     /// spec 7.3.12 HasOwnProperty.
     pub fn has_own_property(&self, key: &JsString) -> bool {
+        self.has_own_property_key(&PropertyKey::from_js_string(key))
+    }
+
+    pub fn has_own_property_key(&self, key: &PropertyKey) -> bool {
         self.properties.borrow().iter().any(|(name, _)| name == key)
     }
 
     /// spec 7.3.13 HasProperty: walks the prototype chain.
     pub fn has_property(&self, key: &JsString) -> bool {
+        self.has_property_key(&PropertyKey::from_js_string(key))
+    }
+
+    pub fn has_property_key(&self, key: &PropertyKey) -> bool {
         let mut current = Some(self);
         while let Some(obj) = current {
-            if obj.has_own_property(key) {
+            if obj.has_own_property_key(key) {
                 return true;
             }
             current = obj.prototype.as_deref();
@@ -101,9 +115,13 @@ impl JsObject {
     /// OrdinaryGet (spec 10.1.8.3): prototype walk returning data property
     /// values. Accessor properties arrive with Phase 5.
     pub fn get(&self, key: &JsString) -> Result<Value, JsError> {
+        self.get_key(&PropertyKey::from_js_string(key))
+    }
+
+    pub fn get_key(&self, key: &PropertyKey) -> Result<Value, JsError> {
         let mut current = Some(self);
         while let Some(obj) = current {
-            if let Some(prop) = obj.get_own_property(key) {
+            if let Some(prop) = obj.get_own_property_key(key) {
                 return Ok(prop.value);
             }
             current = obj.prototype.as_deref();
@@ -115,11 +133,15 @@ impl JsObject {
     /// Non-writable properties fail: silently when `throw` is false, with a
     /// TypeError when it is true.
     pub fn set(&self, key: &JsString, value: Value, throw: bool) -> Result<bool, JsError> {
+        self.set_key(&PropertyKey::from_js_string(key), value, throw)
+    }
+
+    pub fn set_key(&self, key: &PropertyKey, value: Value, throw: bool) -> Result<bool, JsError> {
         let mut current = Some(self);
         loop {
             let Some(obj) = current else {
                 if self.extensible {
-                    return self.define_property(
+                    return self.define_property_key(
                         key,
                         &PropertyDescriptor {
                             value: Some(value),
@@ -137,14 +159,14 @@ impl JsObject {
                 }
                 return Ok(false);
             };
-            if let Some(own) = obj.get_own_property(key) {
+            if let Some(own) = obj.get_own_property_key(key) {
                 if !own.writable {
                     if throw {
                         return Err(JsError::new(
                             ErrorKind::TypeError,
                             format!(
                                 "Cannot assign to read only property {:?}",
-                                key.to_string_lossy()
+                                key.display_string()
                             ),
                         ));
                     }
@@ -153,8 +175,8 @@ impl JsObject {
                 // Writable data property: update the receiver's own copy.
                 // An existing property keeps its attributes; a new one is
                 // created with CreateDataProperty semantics.
-                if self.has_own_property(key) {
-                    return self.define_property(
+                if self.has_own_property_key(key) {
+                    return self.define_property_key(
                         key,
                         &PropertyDescriptor {
                             value: Some(value),
@@ -164,7 +186,7 @@ impl JsObject {
                         },
                     );
                 }
-                return self.create_data_property(key, value);
+                return self.create_data_property_key(key, value);
             }
             current = obj.prototype.as_deref();
         }
@@ -177,7 +199,15 @@ impl JsObject {
         key: &JsString,
         desc: &PropertyDescriptor,
     ) -> Result<bool, JsError> {
-        match self.get_own_property(key) {
+        self.define_property_key(&PropertyKey::from_js_string(key), desc)
+    }
+
+    pub fn define_property_key(
+        &self,
+        key: &PropertyKey,
+        desc: &PropertyDescriptor,
+    ) -> Result<bool, JsError> {
+        match self.get_own_property_key(key) {
             None => {
                 if !self.extensible {
                     return Ok(false);
@@ -244,7 +274,15 @@ impl JsObject {
 
     /// spec 7.3.4 CreateDataProperty.
     pub fn create_data_property(&self, key: &JsString, value: Value) -> Result<bool, JsError> {
-        self.define_property(key, &PropertyDescriptor::data(value))
+        self.create_data_property_key(&PropertyKey::from_js_string(key), value)
+    }
+
+    pub fn create_data_property_key(
+        &self,
+        key: &PropertyKey,
+        value: Value,
+    ) -> Result<bool, JsError> {
+        self.define_property_key(key, &PropertyDescriptor::data(value))
     }
 
     /// spec 7.3.5 CreateDataPropertyOrThrow.
@@ -279,8 +317,9 @@ impl JsObject {
 
     /// OrdinaryDelete (spec 10.1.10.2).
     pub fn delete(&self, key: &JsString) -> Result<bool, JsError> {
+        let key = PropertyKey::from_js_string(key);
         let mut props = self.properties.borrow_mut();
-        if let Some(index) = props.iter().position(|(name, _)| name == key) {
+        if let Some(index) = props.iter().position(|(name, _)| *name == key) {
             if props[index].1.configurable {
                 props.remove(index);
                 return Ok(true);
@@ -415,5 +454,25 @@ mod tests {
             obj.create_data_property_or_throw(&key("x"), Value::Undefined)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn symbol_keyed_properties_are_supported() {
+        let obj = JsObject::ordinary_object_create(None);
+        let sym = crate::symbol::unscopables();
+        let key = PropertyKey::Symbol(sym.as_ref().clone());
+        obj.create_data_property_key(&key, Value::Number(9.0))
+            .unwrap();
+        assert!(obj.has_own_property_key(&key));
+        assert_eq!(obj.get_key(&key).unwrap(), Value::Number(9.0));
+        // String-keyed lookups do not see symbol properties and vice versa.
+        assert_eq!(
+            obj.get(&JsString::from_utf8("x")).unwrap(),
+            Value::Undefined
+        );
+        // The same well-known symbol reaches the property; another symbol
+        // with the same description does not.
+        let other = crate::symbol::Symbol::new(Some(JsString::from_utf8("Symbol.unscopables")));
+        assert!(!obj.has_own_property_key(&PropertyKey::Symbol(other)));
     }
 }

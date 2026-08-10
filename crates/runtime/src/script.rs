@@ -14,7 +14,8 @@ use syntax::ast::{
 };
 
 use crate::agent::Agent;
-use crate::env::EnvRef;
+use crate::context::ExecutionContext;
+use crate::env::{EnvRecord, EnvRef, new_declarative_environment};
 use crate::realm::Realm;
 
 /// A Script Record (spec 16.1.4): the realm the script runs in and its
@@ -404,6 +405,220 @@ pub fn global_declaration_instantiation(
     Ok(())
 }
 
+/// PerformEval (spec 19.2.1.1): parse `source` as a Script and evaluate it
+/// in a new execution context nested on the stack.
+///
+/// `strict_caller` is the strictness of the calling code (direct eval only);
+/// `direct` selects the direct-eval wiring: a direct eval's lexical
+/// environment extends the caller's, and its vars share the caller's
+/// variable environment (unless the eval code is strict).
+pub fn perform_eval(
+    agent: &mut Agent,
+    source: &str,
+    strict_caller: bool,
+    direct: bool,
+) -> Result<Value, JsError> {
+    let eval_realm = agent.current_realm()?;
+    // The caller-context checks of spec step 5-7 (inFunc, inMethod,
+    // inDerivedCtor, inClassFieldInitializer) are subsumed by the Script
+    // early errors the parser applies: Phase 4 code never runs inside a
+    // function, and the parser rejects new.target/super/arguments in
+    // scripts. Phase 7 wires the function-environment flags.
+
+    let program = parser::parse_script(source)?;
+    // A script with no body evaluates to undefined.
+    if program.body.is_empty() {
+        return Ok(Value::Undefined);
+    }
+    let strict_eval = strict_caller || script_is_strict(&program);
+
+    let running = agent.running_context()?;
+    let (lexical_env, variable_env, private_env) = if direct {
+        // Direct eval: a fresh lexical env over the caller's, sharing the
+        // caller's variable environment (spec 19.2.1.1 step 12).
+        let lexical_env = new_declarative_environment(Some(running.lexical_environment.clone()));
+        (
+            lexical_env,
+            running.variable_environment.clone(),
+            running.private_environment.clone(),
+        )
+    } else {
+        // Indirect eval: fresh lexical env over the global environment.
+        let global_env = eval_realm.global_env();
+        (
+            new_declarative_environment(Some(global_env.clone())),
+            global_env,
+            None,
+        )
+    };
+    // Strict eval code cannot touch the caller's variable environment.
+    let variable_env = if strict_eval {
+        lexical_env.clone()
+    } else {
+        variable_env
+    };
+
+    let script_or_module = running.script_or_module.clone();
+    let eval_context = ExecutionContext {
+        function: None,
+        realm: eval_realm,
+        script_or_module,
+        lexical_environment: lexical_env.clone(),
+        variable_environment: variable_env.clone(),
+        private_environment: private_env,
+    };
+    agent.execution_context_stack.push(eval_context);
+    let result = (|| -> Result<Value, JsError> {
+        eval_declaration_instantiation(&program, &variable_env, &lexical_env, strict_eval)?;
+        crate::eval::eval_program(agent, &program, strict_eval)
+    })();
+    agent.execution_context_stack.pop();
+    result
+}
+
+/// EvalDeclarationInstantiation (spec 19.2.1.4): instantiate the eval'd
+/// script's declarations — vars and functions in `variable_env`, lexical
+/// declarations in `lexical_env` — after validating that a sloppy eval's
+/// vars do not collide with lexical bindings.
+fn eval_declaration_instantiation(
+    program: &Program,
+    variable_env: &EnvRef,
+    lexical_env: &EnvRef,
+    strict: bool,
+) -> Result<(), JsError> {
+    let variable_names = top_level_var_declared_names(&program.body);
+    let variable_decls = top_level_var_scoped_declarations(&program.body);
+    let variable_env_is_global = matches!(&**variable_env, EnvRecord::Global(_));
+
+    if !strict {
+        if variable_env_is_global {
+            for name in &variable_names {
+                if variable_env.has_lexical_declaration(name) {
+                    return Err(duplicate_declaration_error(name));
+                }
+            }
+        }
+        // Walk from the eval's lexical env up to (but not including) the
+        // variable environment, rejecting vars that would hoist over a
+        // lexical binding (spec 19.2.1.4 steps 3-10).
+        let mut this_env = Some(lexical_env.clone());
+        while let Some(env) = this_env {
+            if Handle::ptr_eq(&env, variable_env) {
+                break;
+            }
+            if !matches!(&*env, EnvRecord::Object(_)) {
+                for name in &variable_names {
+                    if env.has_binding(name)? {
+                        return Err(duplicate_declaration_error(name));
+                    }
+                }
+            }
+            this_env = env.outer();
+        }
+    }
+
+    // Function declarations, last one wins; checked in reverse order.
+    let mut funcs_to_initialize: Vec<&syntax::ast::Function> = Vec::new();
+    let mut declared_func_names: Vec<JsString> = Vec::new();
+    for decl in variable_decls.iter().rev() {
+        let VarScopedDecl::Function(f) = decl else {
+            continue;
+        };
+        let Some(func_name) = f.name else {
+            continue;
+        };
+        let name = lookup(func_name);
+        if declared_func_names.contains(&name) {
+            continue;
+        }
+        if variable_env_is_global && !variable_env.can_declare_global_function(&name)? {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                format!("Cannot define global function {:?}", name.to_string_lossy()),
+            ));
+        }
+        declared_func_names.push(name);
+        funcs_to_initialize.insert(0, *f);
+    }
+
+    let mut declared_variable_names: Vec<JsString> = Vec::new();
+    for decl in &variable_decls {
+        let VarScopedDecl::Variable(names) = decl else {
+            continue;
+        };
+        for name in names {
+            if declared_func_names.contains(name) {
+                continue;
+            }
+            if variable_env_is_global && !variable_env.can_declare_global_var(name)? {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    format!(
+                        "Cannot declare global variable {:?}",
+                        name.to_string_lossy()
+                    ),
+                ));
+            }
+            if !declared_variable_names.contains(name) {
+                declared_variable_names.push(name.clone());
+            }
+        }
+    }
+
+    // Lexical declarations are instantiated in the eval's lexical env.
+    let lexical_decls = top_level_lexically_scoped_declarations(&program.body);
+    for decl in lexical_decls {
+        let mut names = Vec::new();
+        bound_names_of_decl(decl, &mut names);
+        for name in names {
+            if is_constant_declaration(decl) {
+                lexical_env.create_immutable_binding(&name, true)?;
+            } else {
+                lexical_env.create_mutable_binding(&name, false)?;
+            }
+        }
+    }
+
+    for f in funcs_to_initialize {
+        let Some(func_name) = f.name else {
+            continue;
+        };
+        let name = lookup(func_name);
+        let func_obj = instantiate_function_object(f);
+        if variable_env_is_global {
+            // Eval-created global functions are deletable.
+            variable_env.create_global_function_binding(&name, func_obj, true)?;
+        } else if !variable_env.has_binding(&name)? {
+            variable_env.create_mutable_binding(&name, true)?;
+            variable_env.initialize_binding(&name, func_obj)?;
+        } else {
+            variable_env.set_mutable_binding(&name, func_obj, false)?;
+        }
+    }
+
+    for name in declared_variable_names {
+        if variable_env_is_global {
+            // Eval-created global vars are deletable.
+            variable_env.create_global_var_binding(&name, true)?;
+        } else if !variable_env.has_binding(&name)? {
+            variable_env.create_mutable_binding(&name, true)?;
+            variable_env.initialize_binding(&name, Value::Undefined)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn duplicate_declaration_error(name: &JsString) -> JsError {
+    JsError::new(
+        ErrorKind::SyntaxError,
+        format!(
+            "Identifier {:?} has already been declared",
+            name.to_string_lossy()
+        ),
+    )
+}
+
 /// The BoundNames of a top-level lexical declaration.
 fn bound_names_of_decl(stmt: &Stmt, out: &mut Vec<JsString>) {
     match &stmt.kind {
@@ -500,5 +715,122 @@ mod tests {
         assert!(!is_constant_declaration(&program.body[0]));
         assert!(is_constant_declaration(&program.body[1]));
         assert!(!is_constant_declaration(&program.body[2]));
+    }
+
+    fn evaluated(source: &str) -> Result<Value, JsError> {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        perform_eval(&mut agent, source, false, true)
+    }
+
+    #[test]
+    fn empty_eval_returns_undefined() {
+        assert_eq!(evaluated("").unwrap(), Value::Undefined);
+    }
+
+    #[test]
+    fn direct_eval_binds_vars_in_the_caller_variable_environment() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let result = perform_eval(&mut agent, "var ev = 5; ev", false, true).unwrap();
+        assert_eq!(result, Value::Number(5.0));
+        // The var landed on the global object, deletable (eval-created).
+        let global = agent.running_context().unwrap().realm.global_object.clone();
+        assert_eq!(
+            global.get(&JsString::from_utf8("ev")).unwrap(),
+            Value::Number(5.0)
+        );
+        let prop = global.get_own_property(&JsString::from_utf8("ev")).unwrap();
+        assert!(prop.configurable);
+    }
+
+    #[test]
+    fn indirect_eval_uses_the_global_environment() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let result = perform_eval(&mut agent, "var gv = 7; gv", false, false).unwrap();
+        assert_eq!(result, Value::Number(7.0));
+        let global = agent.running_context().unwrap().realm.global_object.clone();
+        assert_eq!(
+            global.get(&JsString::from_utf8("gv")).unwrap(),
+            Value::Number(7.0)
+        );
+    }
+
+    #[test]
+    fn strict_eval_isolates_var_declarations() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let result = perform_eval(&mut agent, "'use strict'; var s = 1; s", false, false).unwrap();
+        assert_eq!(result, Value::Number(1.0));
+        // Strict eval's vars go to the fresh lexical env, not the global.
+        let global = agent.running_context().unwrap().realm.global_object.clone();
+        assert!(!global.has_own_property(&JsString::from_utf8("s")));
+    }
+
+    #[test]
+    fn eval_lexical_declarations_stay_local() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let result = perform_eval(&mut agent, "let lx = 3; lx", false, false).unwrap();
+        assert_eq!(result, Value::Number(3.0));
+        let realm = agent.running_context().unwrap().realm.clone();
+        assert!(
+            !realm
+                .global_env
+                .has_lexical_declaration(&JsString::from_utf8("lx"))
+        );
+    }
+
+    #[test]
+    fn sloppy_eval_var_conflicts_with_lexical_bindings() {
+        // A global lexical declaration blocks a like-named eval var.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.run_script("let x;").unwrap();
+        assert!(perform_eval(&mut agent, "var x;", false, true).is_err());
+        // And a like-named var in a *strict* eval is fine (separate env).
+        assert!(perform_eval(&mut agent, "'use strict'; var x;", false, true).is_ok());
+    }
+
+    #[test]
+    fn eval_nests_on_the_execution_context_stack() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        assert_eq!(agent.execution_context_stack.len(), 1);
+        let result = perform_eval(&mut agent, "var nested = 1; nested", false, true).unwrap();
+        assert_eq!(result, Value::Number(1.0));
+        // The eval context was pushed and popped.
+        assert_eq!(agent.execution_context_stack.len(), 1);
+    }
+
+    #[test]
+    fn eval_runs_inside_jobs() {
+        let mut agent = Agent::new();
+        let realm = agent.initialize_host_defined_realm().unwrap();
+        agent.enqueue_generic_job(Some(realm), move |agent| {
+            let result = perform_eval(agent, "var from_job = 2; from_job", false, true)?;
+            assert_eq!(result, Value::Number(2.0));
+            assert_eq!(agent.execution_context_stack.len(), 1);
+            Ok(Value::Undefined)
+        });
+        agent.run_jobs().unwrap();
+        let global = agent.running_context().unwrap().realm.global_object.clone();
+        assert_eq!(
+            global.get(&JsString::from_utf8("from_job")).unwrap(),
+            Value::Number(2.0)
+        );
+    }
+
+    #[test]
+    fn eval_function_declarations_bind_to_the_variable_environment() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        perform_eval(&mut agent, "function ef() {}", false, true).unwrap();
+        let global = agent.running_context().unwrap().realm.global_object.clone();
+        assert!(matches!(
+            global.get(&JsString::from_utf8("ef")).unwrap(),
+            Value::Function(_)
+        ));
     }
 }

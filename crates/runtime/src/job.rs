@@ -1,13 +1,14 @@
 //! Jobs (spec 9.5): Job Abstract Closures and the host hooks that enqueue
-//! them, plus the host's job-running loop.
+//! them, plus the host's job-running loop, JobCallback Records, and the
+//! JobCallback host hooks.
 //!
 //! The promise-specific job constructors (NewPromiseReactionJob,
-//! NewPromiseResolveThenableJob) and JobCallback records arrive with the
-//! Promise built-in in Phase 15; the queue machinery lives here.
+//! NewPromiseResolveThenableJob) arrive with the Promise built-in in
+//! Phase 15; the queue machinery and JobCallback hooks live here.
 
-use crux::error::JsError;
+use crux::error::{ErrorKind, JsError};
 use crux::handle::Handle;
-use crux::value::Value;
+use crux::value::{Value, is_callable};
 
 use crate::agent::Agent;
 use crate::realm::Realm;
@@ -43,6 +44,39 @@ impl std::fmt::Debug for Job {
             .field("realm", &self.realm)
             .finish_non_exhaustive()
     }
+}
+
+/// A JobCallback Record (spec 9.5.1): a function object to invoke when a
+/// Job runs, plus a host-defined slot for propagating host context.
+#[derive(Debug, Clone)]
+pub struct JobCallback {
+    pub callback: Value,
+    pub host_defined: Option<Value>,
+}
+
+/// HostMakeJobCallback (spec 9.5.2): the default implementation wraps the
+/// callback with an empty host-defined field.
+pub fn host_make_job_callback(callback: Value) -> JobCallback {
+    JobCallback {
+        callback,
+        host_defined: None,
+    }
+}
+
+/// HostCallJobCallback (spec 9.5.3): the default implementation performs
+/// Call on the callback with the given this value and argument list.
+pub fn host_call_job_callback(
+    job_callback: &JobCallback,
+    this_value: Value,
+    arg_list: &[Value],
+) -> Result<Value, JsError> {
+    if !is_callable(&job_callback.callback) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "callback is not callable".into(),
+        ));
+    }
+    crate::eval::call(&job_callback.callback, this_value, arg_list)
 }
 
 #[cfg(test)]
@@ -123,5 +157,26 @@ mod tests {
         agent.run_jobs().unwrap();
         assert_eq!(*order.borrow(), vec!["first", "second"]);
         assert!(agent.job_queues_empty());
+    }
+
+    #[test]
+    fn job_callback_records_wrap_callables() {
+        let fun = Value::Function(Handle::new(crux::Function::new(None)));
+        let record = host_make_job_callback(fun.clone());
+        assert_eq!(record.callback, fun);
+        assert!(record.host_defined.is_none());
+    }
+
+    #[test]
+    fn host_call_job_callback_requires_callables() {
+        // A non-callable callback fails the IsCallable assertion.
+        let record = host_make_job_callback(Value::Undefined);
+        assert!(host_call_job_callback(&record, Value::Undefined, &[]).is_err());
+        // A function callback is dispatched to Call, which arrives in
+        // Phase 7; until then the call reports the pending capability.
+        let record =
+            host_make_job_callback(Value::Function(Handle::new(crux::Function::new(None))));
+        let err = host_call_job_callback(&record, Value::Undefined, &[]).unwrap_err();
+        assert_eq!(err.kind, crux::ErrorKind::TypeError);
     }
 }

@@ -1,6 +1,6 @@
 //! Property keys and Property Descriptor records (spec 6.1.7).
 
-use crate::string::{AtomId, intern, intern_utf8, lookup};
+use crate::string::{AtomId, JsString, intern, intern_utf8, lookup};
 use crate::symbol::{Symbol, descriptive_string};
 use crate::value::Value;
 
@@ -18,6 +18,11 @@ impl PropertyKey {
 
     pub fn from_utf16(units: &[u16]) -> Self {
         Self::String(intern(units))
+    }
+
+    /// The key for a JsString property name.
+    pub fn from_js_string(text: &JsString) -> Self {
+        Self::String(intern(text.as_slice()))
     }
 
     /// The key's text for diagnostics and error messages.

@@ -9,7 +9,7 @@ use std::cell::{Cell, RefCell};
 use crux::error::{ErrorKind, JsError};
 use crux::handle::Handle;
 use crux::object::JsObject;
-use crux::property::PropertyDescriptor;
+use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
 use crux::value::Value;
 
@@ -459,9 +459,23 @@ impl ObjectEnv {
     }
 
     fn has_binding(&self, name: &JsString) -> Result<bool, JsError> {
-        Ok(self.binding_object.has_property(name))
-        // The `with`-statement unscopables check (spec 9.2.3.1 steps 4-9)
-        // joins with the well-known symbol table in Phase 15.
+        if !self.binding_object.has_property(name) {
+            return Ok(false);
+        }
+        if !self.is_with {
+            return Ok(true);
+        }
+        // spec 9.2.3.1 steps 4-9: `with` bindings are blocked when the
+        // binding object's %Symbol.unscopables% property maps the name to a
+        // truthy value.
+        let unscopables_key = PropertyKey::Symbol(crux::symbol::unscopables().as_ref().clone());
+        let unscopables = self.binding_object.get_key(&unscopables_key)?;
+        if let Value::Object(unscopables_obj) = unscopables
+            && crux::convert::to_boolean(&unscopables_obj.get(name)?)
+        {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     fn create_mutable_binding(&self, name: &JsString, deletable: bool) -> Result<(), JsError> {
@@ -989,6 +1003,37 @@ mod tests {
         assert_eq!(env.with_base_object(), Value::Object(obj));
         let plain = new_object_environment(JsObject::ordinary_object_create(None), false, None);
         assert_eq!(plain.with_base_object(), Value::Undefined);
+    }
+
+    #[test]
+    fn with_environment_respects_unscopables() {
+        let obj = JsObject::ordinary_object_create(None);
+        obj.create_data_property(&name("blocked"), Value::Number(1.0))
+            .unwrap();
+        obj.create_data_property(&name("visible"), Value::Number(2.0))
+            .unwrap();
+        // obj[Symbol.unscopables] = { blocked: true }.
+        let unscopables = JsObject::ordinary_object_create(None);
+        unscopables
+            .create_data_property(&name("blocked"), Value::Boolean(true))
+            .unwrap();
+        let key = PropertyKey::Symbol(crux::symbol::unscopables().as_ref().clone());
+        obj.create_data_property_key(&key, Value::Object(unscopables))
+            .unwrap();
+
+        let env = new_object_environment(obj, true, None);
+        assert!(!env.has_binding(&name("blocked")).unwrap());
+        assert!(env.has_binding(&name("visible")).unwrap());
+        // A non-`with` environment ignores unscopables entirely.
+        let plain_obj = JsObject::ordinary_object_create(None);
+        plain_obj
+            .create_data_property(&name("blocked"), Value::Number(3.0))
+            .unwrap();
+        plain_obj
+            .create_data_property_key(&key, Value::Boolean(true))
+            .unwrap();
+        let plain = new_object_environment(plain_obj, false, None);
+        assert!(plain.has_binding(&name("blocked")).unwrap());
     }
 
     #[test]

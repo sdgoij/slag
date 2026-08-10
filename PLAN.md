@@ -560,16 +560,22 @@ correctly.
 A prerequisite slice of the object model was pulled into `crux` (Phase 5's first deliverable):
 `Value::Object`/`Value::Function` plus an ordinary-object shell with data-property internal
 methods (`ordinary_object_create`, `get`, `set`, `define_property`, `delete`, `has_property`)
-— the global object and object environment records cannot exist without it. Accessors,
-descriptors, exotics, and callable function objects still land in Phase 5-7. The CLI's
-`jsrt file.js` now parses and evaluates scripts. `crates/runtime` runs 41 unit suites;
-the workspace runs 225 tests with `cargo clippy --workspace --all-targets -- -D warnings`
-clean.
+— the global object and object environment records cannot exist without it. Properties are
+keyed by `PropertyKey` (string or symbol), and the deferred Phase 1 well-known symbol table
+(13 symbols incl. `%Symbol.unscopables%`) lives in `crux::symbol`. Accessors, descriptors,
+exotics, and callable function objects still land in Phase 5-7. The CLI's `jsrt file.js` now
+parses and evaluates scripts. `crates/runtime` runs 53 unit suites; the workspace runs 239
+tests with `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
-**Remaining in Phase 4:** `JobCallback` records and `HostCallJobCallback` (they only have
-call sites once Promise jobs exist — Phase 15), the `with`-statement unscopables check in
-Object Environment Records (needs the well-known symbol table), and nested `eval` execution
-contexts (with the `eval` built-in, Phase 8).
+**Remaining in Phase 4:** the Object Environment Record `with`-unscopables check is done
+(spec 9.2.3.1, via the well-known symbol table); `JobCallback` records and
+`HostMakeJobCallback`/`HostCallJobCallback` are implemented (spec 9.5.1-3) — the actual
+function invocation they perform arrives with Phase 7, and their Promise call sites with
+Phase 15; and nested `eval` execution contexts are implemented as `perform_eval`/
+`eval_declaration_instantiation` (spec 19.2.1.1/19.2.1.4), with the `eval` *built-in
+function* still arriving in Phase 8. When functions land (Phase 7), `perform_eval` must
+wire the caller-context flags (inFunc/inMethod/…) and the parser must allow `new.target`
+in direct-eval code.
 
 ---
 
