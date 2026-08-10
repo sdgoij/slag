@@ -98,6 +98,8 @@ fn set_default_global_bindings(realm: &Handle<Realm>) -> Result<(), JsError> {
         &PropertyDescriptor {
             value: Some(Value::Object(global.clone())),
             writable: Some(true),
+            get: None,
+            set: None,
             enumerable: Some(false),
             configurable: Some(true),
         },
@@ -112,6 +114,8 @@ fn set_default_global_bindings(realm: &Handle<Realm>) -> Result<(), JsError> {
             &PropertyDescriptor {
                 value: Some(value),
                 writable: Some(false),
+                get: None,
+                set: None,
                 enumerable: Some(false),
                 configurable: Some(false),
             },
@@ -160,8 +164,10 @@ mod tests {
         );
         let infinity = global
             .get_own_property(&JsString::from_utf8("Infinity"))
+            .unwrap()
             .unwrap();
-        assert!(!infinity.writable && !infinity.enumerable && !infinity.configurable);
+        assert_eq!(infinity.writable(), Some(false));
+        assert!(!infinity.enumerable && !infinity.configurable);
         // The global environment is reachable and supplies `this`.
         assert_eq!(
             realm.global_env.get_this_binding().unwrap(),

@@ -130,7 +130,7 @@ fn eval_class_declaration(
         ));
     };
     let name = crux::lookup(name);
-    let class_value = Value::Function(Handle::new(crux::Function::new(Some(name.clone()))));
+    let class_value = Value::Function(crux::Function::new(Some(name.clone())));
     let reference = resolve_binding(agent, &name, strict)?;
     initialize_referenced_binding(&reference, class_value)?;
     Ok(Value::Undefined)
@@ -248,19 +248,10 @@ fn not_implemented(what: &str) -> JsError {
 }
 
 /// Call (spec 7.3.13): invoke a callable value with a this value and an
-/// argument list. Phase 4 function values carry no [[Call]] body, so any
-/// invocation reports the pending Phase 7 capability.
-pub(crate) fn call(callee: &Value, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
-    match callee {
-        Value::Function(_) => Err(JsError::new(
-            ErrorKind::TypeError,
-            "calling functions is not implemented until Phase 7".into(),
-        )),
-        _ => Err(JsError::new(
-            ErrorKind::TypeError,
-            "value is not a function".into(),
-        )),
-    }
+/// argument list. Native built-ins run their Rust bodies; ECMAScript
+/// function bodies join with the Phase 7 evaluator.
+pub(crate) fn call(callee: &Value, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    crux::function::call(callee, this, args)
 }
 
 #[cfg(test)]

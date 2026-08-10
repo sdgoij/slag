@@ -34,13 +34,14 @@ impl PropertyKey {
     }
 }
 
-/// A Property Descriptor record (spec 6.2.5.5). Phase 1 covers the
-/// data-property fields; the accessor fields ([[Get]]/[[Set]]) join with the
-/// object model in Phase 5.
+/// A Property Descriptor record (spec 6.2.5.5): data fields ([[Value]],
+/// [[Writable]]) plus accessor fields ([[Get]], [[Set]]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PropertyDescriptor {
     pub value: Option<Value>,
     pub writable: Option<bool>,
+    pub get: Option<Value>,
+    pub set: Option<Value>,
     pub enumerable: Option<bool>,
     pub configurable: Option<bool>,
 }
@@ -51,6 +52,8 @@ impl PropertyDescriptor {
         Self {
             value: Some(value),
             writable: Some(true),
+            get: None,
+            set: None,
             enumerable: Some(true),
             configurable: Some(true),
         }
@@ -61,8 +64,22 @@ impl PropertyDescriptor {
         Self {
             value: Some(value),
             writable: Some(false),
+            get: None,
+            set: None,
             enumerable: Some(false),
             configurable: Some(false),
+        }
+    }
+
+    /// An accessor descriptor with the given getter and setter.
+    pub fn accessor(get: Option<Value>, set: Option<Value>) -> Self {
+        Self {
+            value: None,
+            writable: None,
+            get,
+            set,
+            enumerable: Some(true),
+            configurable: Some(true),
         }
     }
 
@@ -71,16 +88,36 @@ impl PropertyDescriptor {
         self.value.is_some() || self.writable.is_some()
     }
 
-    /// spec 6.2.5.6: present if neither data nor accessor fields are present.
-    pub fn is_generic_descriptor(&self) -> bool {
-        !self.is_data_descriptor()
+    /// spec 6.2.5.6: present if [[Get]] or [[Set]] is present.
+    pub fn is_accessor_descriptor(&self) -> bool {
+        self.get.is_some() || self.set.is_some()
     }
 
-    /// spec 6.2.5.9 CompletePropertyDescriptor for data descriptors: missing
-    /// fields take their default values.
+    /// spec 6.2.5.8: present if neither data nor accessor fields are present.
+    pub fn is_generic_descriptor(&self) -> bool {
+        !self.is_data_descriptor() && !self.is_accessor_descriptor()
+    }
+
+    /// Whether the descriptor has no fields at all.
+    pub fn is_empty(&self) -> bool {
+        self.value.is_none()
+            && self.writable.is_none()
+            && self.get.is_none()
+            && self.set.is_none()
+            && self.enumerable.is_none()
+            && self.configurable.is_none()
+    }
+
+    /// spec 6.2.5.9 CompletePropertyDescriptor: missing fields take their
+    /// default values (the table-object-property-attributes defaults).
     pub fn complete(&mut self) {
-        self.value.get_or_insert(Value::Undefined);
-        self.writable.get_or_insert(false);
+        if self.is_generic_descriptor() || self.is_data_descriptor() {
+            self.value.get_or_insert(Value::Undefined);
+            self.writable.get_or_insert(false);
+        } else {
+            self.get.get_or_insert(Value::Undefined);
+            self.set.get_or_insert(Value::Undefined);
+        }
         self.enumerable.get_or_insert(false);
         self.configurable.get_or_insert(false);
     }
@@ -123,6 +160,8 @@ mod tests {
         let d = PropertyDescriptor {
             value: None,
             writable: None,
+            get: None,
+            set: None,
             enumerable: Some(true),
             configurable: None,
         };
@@ -135,6 +174,8 @@ mod tests {
         let mut d = PropertyDescriptor {
             value: None,
             writable: None,
+            get: None,
+            set: None,
             enumerable: None,
             configurable: None,
         };
@@ -143,5 +184,21 @@ mod tests {
         assert_eq!(d.writable, Some(false));
         assert_eq!(d.enumerable, Some(false));
         assert_eq!(d.configurable, Some(false));
+    }
+
+    #[test]
+    fn complete_fills_accessor_defaults() {
+        // An accessor descriptor with both fields present stays accessor; the
+        // missing enumerable/configurable fields take their default values.
+        let mut d = PropertyDescriptor::accessor(Some(Value::Undefined), Some(Value::Undefined));
+        d.enumerable = None;
+        d.configurable = None;
+        d.complete();
+        assert_eq!(d.get, Some(Value::Undefined));
+        assert_eq!(d.set, Some(Value::Undefined));
+        assert_eq!(d.enumerable, Some(false));
+        assert_eq!(d.configurable, Some(false));
+        assert!(d.is_accessor_descriptor());
+        assert!(!d.is_data_descriptor());
     }
 }

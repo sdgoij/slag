@@ -4,9 +4,7 @@ use num_bigint::BigInt as NumBigInt;
 
 use crate::bigint::{self, BigInt};
 use crate::error::{ErrorKind, JsError};
-use crate::handle::Handle;
 use crate::number;
-use crate::object::JsObject;
 use crate::property::PropertyKey;
 use crate::string::{JsString, intern};
 use crate::value::{Value, is_callable};
@@ -43,33 +41,30 @@ fn trimmed(units: &[u16]) -> &[u16] {
 /// well-known symbol table in Phase 15).
 pub fn to_primitive(value: &Value, hint: ToPrimitiveHint) -> Result<Value, JsError> {
     match value {
-        Value::Object(obj) => ordinary_to_primitive(obj, hint),
-        // Functions are objects in the spec; Phase 4 function values expose
-        // no toString/valueOf properties, so conversion always throws.
-        Value::Function(_) => Err(JsError::new(
-            ErrorKind::TypeError,
-            "Cannot convert object to primitive value".into(),
-        )),
+        Value::Object(obj) => ordinary_to_primitive(|name| obj.get(name), value.clone(), hint),
+        Value::Function(function) => {
+            ordinary_to_primitive(|name| function.get(name), value.clone(), hint)
+        }
         _ => Ok(value.clone()),
     }
 }
 
-/// OrdinaryToPrimitive (spec 7.1.1.1). Phase 4 objects have no callable
-/// methods, so conversion throws a TypeError; a callable method would be
-/// invoked once Phase 7 lands.
-fn ordinary_to_primitive(obj: &Handle<JsObject>, hint: ToPrimitiveHint) -> Result<Value, JsError> {
+/// OrdinaryToPrimitive (spec 7.1.1.1): look up `toString`/`valueOf` on the
+/// object and call the first callable one with the object as receiver.
+fn ordinary_to_primitive(
+    get: impl Fn(&JsString) -> Result<Value, JsError>,
+    receiver: Value,
+    hint: ToPrimitiveHint,
+) -> Result<Value, JsError> {
     let (first, second) = match hint {
         ToPrimitiveHint::String | ToPrimitiveHint::Default => ("toString", "valueOf"),
         ToPrimitiveHint::Number => ("valueOf", "toString"),
     };
     for name in [first, second] {
         let key = JsString::from_utf8(name);
-        let method = obj.get(&key)?;
+        let method = get(&key)?;
         if is_callable(&method) {
-            return Err(JsError::new(
-                ErrorKind::TypeError,
-                "calling functions is not implemented until Phase 7".into(),
-            ));
+            return crate::function::call(&method, receiver.clone(), &[]);
         }
     }
     Err(JsError::new(

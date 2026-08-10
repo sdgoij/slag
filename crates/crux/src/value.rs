@@ -44,14 +44,30 @@ pub fn type_of(value: &Value) -> &'static str {
 }
 
 /// `IsCallable` (spec 7.2.3): function values are callable; ordinary objects
-/// are not until Phase 5 adds callable objects.
+/// are not.
 pub fn is_callable(value: &Value) -> bool {
     matches!(value, Value::Function(_))
 }
 
-/// `IsConstructor` (spec 7.2.4): no Phase 4 value is a constructor.
-pub fn is_constructor(_value: &Value) -> bool {
-    false
+/// `IsConstructor` (spec 7.2.4): built-ins with a [[Construct]] and
+/// ECMAScript (non-arrow) functions are constructors; bound functions
+/// inherit it from their target.
+pub fn is_constructor(value: &Value) -> bool {
+    match value {
+        Value::Function(function) => function.is_constructor(),
+        _ => false,
+    }
+}
+
+impl Value {
+    /// The object handle when `self` is an Object value; `None` otherwise.
+    /// Function values wrap their object side separately and report `None`.
+    pub fn as_object(&self) -> Option<Handle<JsObject>> {
+        match self {
+            Value::Object(obj) => Some(obj.clone()),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for Value {

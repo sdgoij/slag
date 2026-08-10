@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn job_callback_records_wrap_callables() {
-        let fun = Value::Function(Handle::new(crux::Function::new(None)));
+        let fun = Value::Function(crux::Function::new(None));
         let record = host_make_job_callback(fun.clone());
         assert_eq!(record.callback, fun);
         assert!(record.host_defined.is_none());
@@ -174,8 +174,7 @@ mod tests {
         assert!(host_call_job_callback(&record, Value::Undefined, &[]).is_err());
         // A function callback is dispatched to Call, which arrives in
         // Phase 7; until then the call reports the pending capability.
-        let record =
-            host_make_job_callback(Value::Function(Handle::new(crux::Function::new(None))));
+        let record = host_make_job_callback(Value::Function(crux::Function::new(None)));
         let err = host_call_job_callback(&record, Value::Undefined, &[]).unwrap_err();
         assert_eq!(err.kind, crux::ErrorKind::TypeError);
     }

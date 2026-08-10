@@ -562,10 +562,11 @@ A prerequisite slice of the object model was pulled into `crux` (Phase 5's first
 methods (`ordinary_object_create`, `get`, `set`, `define_property`, `delete`, `has_property`)
 — the global object and object environment records cannot exist without it. Properties are
 keyed by `PropertyKey` (string or symbol), and the deferred Phase 1 well-known symbol table
-(13 symbols incl. `%Symbol.unscopables%`) lives in `crux::symbol`. Accessors, descriptors,
-exotics, and callable function objects still land in Phase 5-7. The CLI's `jsrt file.js` now
-parses and evaluates scripts. `crates/runtime` runs 53 unit suites; the workspace runs 239
-tests with `cargo clippy --workspace --all-targets -- -D warnings` clean.
+(13 symbols incl. `%Symbol.unscopables%`) lives in `crux::symbol`. The full descriptor model,
+accessor properties, and the Array/String/Arguments exotics landed in Phase 5; Proxy,
+Integer-Indexed, Module namespace, and ECMAScript function bodies land in later phases. The
+CLI's `jsrt file.js` now parses and evaluates scripts. `crates/runtime` runs 53 unit suites;
+the workspace runs 270 tests with `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 **Remaining in Phase 4:** the Object Environment Record `with`-unscopables check is done
 (spec 9.2.3.1, via the well-known symbol table); `JobCallback` records and
@@ -624,12 +625,69 @@ in direct-eval code.
 - `%ThrowTypeError%` — the single shared restricted function object.
 
 **Tests:** property-attribute matrices (define with every combination of attributes against
-existing descriptors — use the spec's decision table), prototype-chain get/set walk cases,
-array-length edge cases (setting length truncates, index assignments, non-writable length),
-proxy invariant test suite (start here; grow in Phase 16), arguments object mapping, bound
-function `length`/`name`, integer-indexed bounds.
+  existing descriptors — use the spec's decision table), prototype-chain get/set walk cases,
+  array-length edge cases (setting length truncates, index assignments, non-writable length),
+  proxy invariant test suite (start here; grow in Phase 16), arguments object mapping, bound
+  function `length`/`name`, integer-indexed bounds.
 **Exit criteria:** Phase 5 tests green; internal-method dispatch is fast enough to build the
 evaluator on top.
+
+**Status (current):** the object model is implemented in `crates/crux`, ported algorithm-by-
+algorithm from the ch. 10 spec text:
+
+- `property.rs` — `PropertyDescriptor` with data *and* accessor fields (spec 6.2.5),
+  `is_data_descriptor`/`is_accessor_descriptor`/`is_generic_descriptor`/`is_empty`/
+  `complete` (6.2.5.9); `PropertyKey` (string/symbol)
+- `object.rs` — the full property storage and every essential internal method:
+  - `Property` = `{ kind: Data | Accessor, enumerable, configurable }` with
+    `PropertyDescriptor` round-tripping
+  - `ValidateAndApplyPropertyDescriptor` (10.1.6.4) with the complete decision table incl.
+    data↔accessor conversions and the non-configurable invariants; `IsCompatiblePropertyDescriptor`
+    (10.1.6.2) via the same core
+  - Ordinary `[[GetOwnProperty]]`/`[[DefineOwnProperty]]`/`[[Get]]`/`[[Set]]`
+    (`OrdinarySetWithOwnDescriptor` with receiver propagation into inherited accessors)/
+    `[[Delete]]`/`[[OwnPropertyKeys]]` (array indices ascending → strings → symbols)/
+    `[[SetPrototypeOf]]` (cycle + non-extensible checks)/`[[PreventExtensions]]`/
+    `[[HasProperty]]`; `CreateDataProperty(OrThrow)`, `DefinePropertyOrThrow`, `GetMethod`
+  - internal-method dispatch on `ObjectKind` (Ordinary/Array/String/Arguments) with ordinary
+    fallthrough; the receiver for getter/setter invocation is recovered from a weak
+    back-reference so `this` is the real object handle
+  - **Array exotic** (10.4.2): `ArrayCreate`, `ArrayDefineOwnProperty` (index-length sync),
+    `ArraySetLength` (ToUint32 + RangeError, descending truncation with undeletable-element
+    pinning), `ArrayOwnPropertyKeys` (holes appended descending); `array_index_of` (6.1.7.1)
+  - **String exotic** (10.4.3): `StringCreate` (with non-configurable `length`),
+    `StringGetOwnProperty` (virtual code-unit properties), `StringDefineOwnProperty`
+    (IsCompatiblePropertyDescriptor), `StringOwnPropertyKeys`
+  - **Arguments exotic** (10.4.4): `CreateMappedArgumentsObject` (parameter map with
+    getter/setter factories, duplicate-name handling, `length`/`callee`/@@iterator),
+    `CreateUnmappedArgumentsObject` (throwing `callee`), and the mapped `[[GetOwnProperty]]`/
+    `[[DefineOwnProperty]]`/`[[Get]]`/`[[Set]]`/`[[Delete]]` sync algorithms
+- `function.rs` — function objects: `Function` embeds an ordinary object (own properties,
+  prototype, extensible), `FunctionKind` = `Builtin` (native Rust closures with optional
+  [[Construct]]) | `EcmaScript` (body joins Phase 7) | `Bound` (10.4.1); `CreateBuiltinFunction`
+  (10.2.3) with `length`/`name`; `Call` (7.3.13) and `Construct` (7.3.14) incl. bound-function
+  delegation and newTarget forwarding; `is_constructor`; `%ThrowTypeError%` (10.2.2)
+- `convert.rs` — `OrdinaryToPrimitive` (7.1.1.1) now invokes callable `toString`/`valueOf`
+  methods; `to_primitive` handles function values
+
+The runtime (`crates/runtime`) was adapted: `eval::call` delegates to `crux::function::call`,
+and `env.rs`/`realm.rs`/`script.rs` use the fallible internal methods (Proxy's throwing traps
+motivated `Result`-based dispatch) and the accessor-aware `Property` accessors. The workspace
+runs 270 tests (`cargo test --workspace`) with `cargo fmt --check` and
+`cargo clippy --workspace --all-targets -- -D warnings` clean.
+
+**Remaining in Phase 5:** deferred to their owning phases, with the dispatch structure ready to
+receive them: the **Proxy** exotic (all 14 traps with handler validation and invariants —
+Phase 16 per its "Reflection: Proxy and Reflect" scope; the dispatch and fallible internal
+methods are in place), the **Integer-Indexed** exotic shell (Phase 12, needs the buffer
+slots), the **Module namespace** exotic (Phase 7, needs module records), and the
+**ECMAScript function body** machinery — `OrdinaryCallBindThis`/`OrdinaryCallEvaluateBody`,
+`FunctionDeclarationInstantiation` (parameter env, var/function hoisting, arguments-object
+instantiation at call time), `length`/`name`/`prototype` creation for user functions, and
+`[[HomeObject]]`/`[[PrivateEnvironment]]` slots — which require the Phase 6/7 evaluator
+(built-in functions are already callable). `%ThrowTypeError%` is created per realm in Phase 8
+with the intrinsic bootstrap; the per-realm `[[ThrowTypeError]]` function-environment slot
+wires up with Phase 7.
 
 ---
 

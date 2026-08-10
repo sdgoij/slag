@@ -44,7 +44,7 @@ impl EnvRecord {
             EnvRecord::Declarative(e) => Ok(e.has_binding(name)),
             EnvRecord::Object(e) => e.has_binding(name),
             EnvRecord::Function(e) => Ok(e.declarative.has_binding(name)),
-            EnvRecord::Global(e) => Ok(e.has_binding(name)),
+            EnvRecord::Global(e) => e.has_binding(name),
             EnvRecord::Module(e) => Ok(e.declarative.has_binding(name)),
         }
     }
@@ -459,7 +459,7 @@ impl ObjectEnv {
     }
 
     fn has_binding(&self, name: &JsString) -> Result<bool, JsError> {
-        if !self.binding_object.has_property(name) {
+        if !self.binding_object.has_property(name)? {
             return Ok(false);
         }
         if !self.is_with {
@@ -482,6 +482,8 @@ impl ObjectEnv {
         let desc = PropertyDescriptor {
             value: Some(Value::Undefined),
             writable: Some(true),
+            get: None,
+            set: None,
             enumerable: Some(true),
             configurable: Some(deletable),
         };
@@ -506,7 +508,7 @@ impl ObjectEnv {
         value: Value,
         strict: bool,
     ) -> Result<(), JsError> {
-        if !self.binding_object.has_property(name) && strict {
+        if !self.binding_object.has_property(name)? && strict {
             return Err(JsError::new(
                 ErrorKind::ReferenceError,
                 format!("{:?} is not defined", name.to_string_lossy()),
@@ -517,7 +519,7 @@ impl ObjectEnv {
     }
 
     fn get_binding_value(&self, name: &JsString, strict: bool) -> Result<Value, JsError> {
-        if !self.binding_object.has_property(name) {
+        if !self.binding_object.has_property(name)? {
             if strict {
                 return Err(JsError::new(
                     ErrorKind::ReferenceError,
@@ -639,8 +641,8 @@ impl GlobalEnv {
         }
     }
 
-    fn has_binding(&self, name: &JsString) -> bool {
-        self.declarative.has_binding(name) || self.object.has_property(name)
+    fn has_binding(&self, name: &JsString) -> Result<bool, JsError> {
+        Ok(self.declarative.has_binding(name) || self.object.has_property(name)?)
     }
 
     fn create_mutable_binding(&self, name: &JsString, deletable: bool) -> Result<(), JsError> {
@@ -688,7 +690,7 @@ impl GlobalEnv {
         if self.declarative.has_binding(name) {
             return self.declarative.get_binding_value(name, strict);
         }
-        if !self.object.has_property(name) && strict {
+        if !self.object.has_property(name)? && strict {
             return Err(JsError::new(
                 ErrorKind::ReferenceError,
                 format!("{:?} is not defined", name.to_string_lossy()),
@@ -701,7 +703,7 @@ impl GlobalEnv {
         if self.declarative.has_binding(name) {
             return self.declarative.delete_binding(name);
         }
-        if self.object.has_own_property(name) {
+        if self.object.has_own_property(name)? {
             return self.object.delete(name);
         }
         Ok(true)
@@ -709,7 +711,7 @@ impl GlobalEnv {
 
     /// spec 9.2.6.7 HasRestrictedGlobalProperty.
     fn has_restricted_global_property(&self, name: &JsString) -> Result<bool, JsError> {
-        match self.object.get_own_property(name) {
+        match self.object.get_own_property(name)? {
             Some(prop) => Ok(!prop.configurable),
             None => Ok(false),
         }
@@ -717,23 +719,31 @@ impl GlobalEnv {
 
     /// spec 9.2.6.8 CanDeclareGlobalVar.
     fn can_declare_global_var(&self, name: &JsString) -> Result<bool, JsError> {
-        Ok(self.object.has_own_property(name) || self.object.is_extensible())
+        Ok(self.object.has_own_property(name)? || self.object.is_extensible())
     }
 
     /// spec 9.2.6.9 CanDeclareGlobalFunction.
     fn can_declare_global_function(&self, name: &JsString) -> Result<bool, JsError> {
-        match self.object.get_own_property(name) {
+        match self.object.get_own_property(name)? {
             None => Ok(self.object.is_extensible()),
-            Some(prop) => Ok(prop.configurable || (prop.writable && prop.enumerable)),
+            Some(prop) => {
+                // An existing accessor property blocks the declaration.
+                let Some(writable) = prop.writable() else {
+                    return Ok(false);
+                };
+                Ok(prop.configurable || (writable && prop.enumerable))
+            }
         }
     }
 
     /// spec 9.2.6.10 CreateGlobalVarBinding.
     fn create_global_var_binding(&self, name: &JsString, deletable: bool) -> Result<(), JsError> {
-        if !self.object.has_own_property(name) && self.object.is_extensible() {
+        if !self.object.has_own_property(name)? && self.object.is_extensible() {
             let desc = PropertyDescriptor {
                 value: Some(Value::Undefined),
                 writable: Some(true),
+                get: None,
+                set: None,
                 enumerable: Some(true),
                 configurable: Some(deletable),
             };
@@ -749,23 +759,29 @@ impl GlobalEnv {
         value: Value,
         deletable: bool,
     ) -> Result<(), JsError> {
-        let existing = self.object.get_own_property(name);
+        let existing = self.object.get_own_property(name)?;
         let desc = match existing {
             None => PropertyDescriptor {
                 value: Some(value.clone()),
                 writable: Some(true),
+                get: None,
+                set: None,
                 enumerable: Some(true),
                 configurable: Some(deletable),
             },
             Some(prop) if prop.configurable => PropertyDescriptor {
                 value: Some(value.clone()),
                 writable: Some(true),
+                get: None,
+                set: None,
                 enumerable: Some(true),
                 configurable: Some(deletable),
             },
             Some(_) => PropertyDescriptor {
                 value: Some(value.clone()),
                 writable: None,
+                get: None,
+                set: None,
                 enumerable: None,
                 configurable: None,
             },
@@ -1051,7 +1067,7 @@ mod tests {
         env.create_global_var_binding(&name("var_y"), false)
             .unwrap();
         assert!(!env.has_lexical_declaration(&name("var_y")));
-        assert!(global.has_own_property(&name("var_y")));
+        assert!(global.has_own_property(&name("var_y")).unwrap());
         assert_eq!(
             env.get_binding_value(&name("var_y"), true).unwrap(),
             Value::Undefined
@@ -1062,10 +1078,10 @@ mod tests {
     fn global_function_binding_defines_a_property() {
         let global = JsObject::ordinary_object_create(None);
         let env = new_global_environment(global.clone(), global.clone());
-        let fun = Value::Function(Handle::new(crux::Function::new(None)));
+        let fun = Value::Function(crux::Function::new(None));
         env.create_global_function_binding(&name("f"), fun.clone(), false)
             .unwrap();
-        assert!(global.has_own_property(&name("f")));
+        assert!(global.has_own_property(&name("f")).unwrap());
         assert_eq!(env.get_binding_value(&name("f"), true).unwrap(), fun);
     }
 

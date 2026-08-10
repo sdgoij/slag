@@ -279,7 +279,7 @@ pub fn top_level_var_scoped_declarations<'a>(stmts: &'a [Stmt]) -> Vec<VarScoped
 /// value carrying its name; [[Environment]]/[[ECMAScriptCode]] join in
 /// Phase 7.
 pub fn instantiate_function_object(f: &syntax::ast::Function) -> Value {
-    Value::Function(Handle::new(crux::Function::new(f.name.map(lookup))))
+    Value::Function(crux::Function::new(f.name.map(lookup)))
 }
 
 /// GlobalDeclarationInstantiation (spec 16.1.7): create the script's global
@@ -746,7 +746,10 @@ mod tests {
             global.get(&JsString::from_utf8("ev")).unwrap(),
             Value::Number(5.0)
         );
-        let prop = global.get_own_property(&JsString::from_utf8("ev")).unwrap();
+        let prop = global
+            .get_own_property(&JsString::from_utf8("ev"))
+            .unwrap()
+            .unwrap();
         assert!(prop.configurable);
     }
 
@@ -771,7 +774,7 @@ mod tests {
         assert_eq!(result, Value::Number(1.0));
         // Strict eval's vars go to the fresh lexical env, not the global.
         let global = agent.running_context().unwrap().realm.global_object.clone();
-        assert!(!global.has_own_property(&JsString::from_utf8("s")));
+        assert!(!global.has_own_property(&JsString::from_utf8("s")).unwrap());
     }
 
     #[test]
