@@ -14,6 +14,100 @@ pub struct Program {
     pub span: Span,
 }
 
+/// A Module (spec 16.2): a list of statements, import declarations, and
+/// export declarations.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Module {
+    pub body: Vec<ModuleItem>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModuleItem {
+    Stmt(Stmt),
+    Import(ImportDecl),
+    Export(ExportDecl),
+}
+
+/// An `import` declaration (spec 16.2.2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportDecl {
+    pub span: Span,
+    pub specifier: JsString,
+    pub entries: Vec<ImportEntry>,
+    pub attributes: Vec<(AttributeKey, JsString)>,
+}
+
+/// One binding of an import declaration.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImportEntry {
+    /// `import default from …`.
+    Default { local: AtomId, span: Span },
+    /// `import * as ns from …`.
+    Namespace { local: AtomId, span: Span },
+    /// `import { x as local } from …`.
+    Named {
+        imported: ExportName,
+        local: AtomId,
+        span: Span,
+    },
+}
+
+/// A module export name: an identifier name or a string literal.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExportName {
+    Ident(AtomId),
+    Str(JsString),
+}
+
+/// An `export` declaration (spec 16.2.3).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExportDecl {
+    /// `export { a, b as c };` — local names.
+    Named {
+        specifiers: Vec<ExportSpecifier>,
+        span: Span,
+    },
+    /// `export … from "mod";` — re-exports (incl. `export *`).
+    From {
+        specifiers: Vec<ExportSpecifier>,
+        /// `export * as ns from …`.
+        namespace: Option<ExportName>,
+        specifier: JsString,
+        attributes: Vec<(AttributeKey, JsString)>,
+        span: Span,
+    },
+    /// `export var …;` / `export function …` / `export class …`.
+    Declaration(Stmt),
+    /// `export default …`.
+    Default(Box<ExportDefault>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExportSpecifier {
+    /// `name` — the local and exported names coincide.
+    Same(ExportName),
+    /// `local as exported`.
+    Alias {
+        local: ExportName,
+        exported: ExportName,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExportDefault {
+    Function(Function),
+    Class(Class),
+    Expr(Expr),
+}
+
+/// An import-attribute key (import attributes / `with { … }`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AttributeKey {
+    Ident(AtomId),
+    Str(JsString),
+}
+
 /// A statement node: `span` covers the entire statement (spec ch. 14).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Stmt {

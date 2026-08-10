@@ -195,7 +195,7 @@ fn is_binding_identifier(parser: &Parser, atom: AtomId) -> bool {
     if parser.in_generator && atom == intern_utf8("yield") {
         return false;
     }
-    if parser.in_async && atom == intern_utf8("await") {
+    if (parser.in_async || parser.in_module) && atom == intern_utf8("await") {
         return false;
     }
     true
@@ -524,7 +524,7 @@ fn parse_unary(parser: &mut Parser) -> Result<Expr, JsError> {
             },
         });
     }
-    if parser.in_async && parser.at_contextual("await")? {
+    if (parser.in_async || parser.top_level_await) && parser.at_contextual("await")? {
         parser.next()?;
         let operand = parse_unary(parser)?;
         let end = operand.span.end;
@@ -1738,6 +1738,7 @@ pub(crate) fn parse_function_body_block(
         parser.in_async,
         parser.allow_super,
         parser.in_constructor,
+        parser.top_level_await,
         parser.loop_depth,
         parser.switch_depth,
     );
@@ -1747,6 +1748,7 @@ pub(crate) fn parse_function_body_block(
     parser.in_async = is_async;
     parser.allow_super = allow_super;
     parser.in_constructor = in_constructor;
+    parser.top_level_await = false;
     parser.loop_depth = 0;
     parser.switch_depth = 0;
     let saved_vars = std::mem::take(&mut parser.list_vars);
@@ -1768,6 +1770,7 @@ pub(crate) fn parse_function_body_block(
         parser.in_async,
         parser.allow_super,
         parser.in_constructor,
+        parser.top_level_await,
         parser.loop_depth,
         parser.switch_depth,
     ) = saved;

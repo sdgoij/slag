@@ -72,6 +72,11 @@ pub struct Parser<'s> {
     pub(crate) in_function: bool,
     pub(crate) in_generator: bool,
     pub(crate) in_async: bool,
+    /// Parsing a module: `await` is a reserved word, import/export only at
+    /// the top level, no Annex B HTML comments.
+    pub(crate) in_module: bool,
+    /// Module top-level: `await` may be used as an expression.
+    pub(crate) top_level_await: bool,
     /// Inside a class method/field/static-block body: `super.x` is legal.
     pub(crate) allow_super: bool,
     /// Inside a constructor: `super()` is legal.
@@ -124,6 +129,8 @@ impl<'s> Parser<'s> {
             in_function: false,
             in_generator: false,
             in_async: false,
+            in_module: false,
+            top_level_await: false,
             allow_super: false,
             in_constructor: false,
             private_names: Vec::new(),
@@ -243,6 +250,31 @@ impl<'s> Parser<'s> {
         Ok(self.peek()?.kind == TokenKind::Identifier(id))
     }
 
+    /// Consumes the current token if it is the contextual keyword `text`.
+    pub(crate) fn eat_contextual(&mut self, text: &str) -> Result<bool, JsError> {
+        if self.at_contextual(text)? {
+            self.next()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Requires the current token to be the contextual keyword `text`.
+    pub(crate) fn expect_contextual(&mut self, text: &str) -> Result<(), JsError> {
+        if self.eat_contextual(text)? {
+            Ok(())
+        } else {
+            let tok = self.peek()?.clone();
+            Err(self.unexpected(&tok))
+        }
+    }
+
+    /// Statement-parser entry point for contexts outside `stmt` (modules).
+    pub(crate) fn parse_statement_public(&mut self) -> Result<syntax::Stmt, JsError> {
+        crate::stmt::parse_statement(self)
+    }
+
     /// Whether the current token is an identifier that is not a keyword and
     /// is legal to bind in the current strictness.
     pub(crate) fn at_identifier(&mut self) -> Result<bool, JsError> {
@@ -258,7 +290,7 @@ impl<'s> Parser<'s> {
         if self.in_generator && atom == intern_utf8("yield") {
             return Ok(false);
         }
-        if self.in_async && atom == intern_utf8("await") {
+        if (self.in_async || self.in_module) && atom == intern_utf8("await") {
             return Ok(false);
         }
         Ok(true)
@@ -413,6 +445,9 @@ impl<'s> Parser<'s> {
         }
         if self.in_generator && atom == intern_utf8("yield") {
             return Err(self.error_at(tok.span.start, "Unexpected yield"));
+        }
+        if (self.in_async || self.in_module) && atom == intern_utf8("await") {
+            return Err(self.error_at(tok.span.start, "Unexpected await"));
         }
         self.next()?;
         Ok((atom, tok.span.start))

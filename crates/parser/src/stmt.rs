@@ -25,7 +25,7 @@ pub(crate) fn parse_statement_list(
     Ok(stmts)
 }
 
-fn parse_statement(parser: &mut Parser) -> Result<Stmt, JsError> {
+pub(crate) fn parse_statement(parser: &mut Parser) -> Result<Stmt, JsError> {
     let start = parser.peek()?.span.start;
     let kind = match parser.peek()?.kind.clone() {
         TokenKind::LeftBrace => {

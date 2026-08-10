@@ -6,12 +6,13 @@
 
 mod class;
 mod expr;
+mod module;
 mod parser;
 mod stmt;
 mod token_stream;
 
 use crux::JsError;
-use syntax::{Program, SourceText};
+use syntax::{Module, Program, SourceText};
 
 pub use parser::Parser;
 
@@ -32,10 +33,33 @@ pub fn parse_script(source: &str) -> Result<Program, JsError> {
     Ok(Program { body, span })
 }
 
+/// Parses a Module (spec 16.2): import/export declarations plus a strict
+/// statement list. Modules are always strict, `await` is reserved, top-level
+/// `await` is allowed, and HTML comments are rejected.
+pub fn parse_module(source: &str) -> Result<Module, JsError> {
+    let source = SourceText::from_utf8(source);
+    let mut parser = Parser::new(&source, false);
+    parser.in_module = true;
+    parser.strict = true;
+    parser.top_level_await = true;
+    let body = module::parse_module_items(&mut parser)?;
+    // The module must be fully consumed.
+    let tok = parser.peek()?.clone();
+    if tok.kind != syntax::TokenKind::Eof {
+        return Err(parser.unexpected(&tok));
+    }
+    let span = crux::Span::new(0, source.len() as u32);
+    Ok(Module { body, span })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use syntax::{BinaryOp, Expr, ExprKind, Literal, LogicalOp, StmtKind, UnaryOp};
+    use crux::JsString;
+    use syntax::{
+        AttributeKey, BinaryOp, ExportDecl, ExportName, ExportSpecifier, Expr, ExprKind,
+        ImportEntry, Literal, LogicalOp, ModuleItem, StmtKind, UnaryOp,
+    };
 
     fn ok(source: &str) -> Program {
         parse_script(source)
@@ -802,5 +826,242 @@ mod tests {
         ok("({a = 1}, b) => x");
         err("(a, (b) => c) => d");
         ok("f(({a = 1}) => a)");
+    }
+
+    // ---- modules (spec 16.2) ----
+
+    fn mod_ok(source: &str) -> Module {
+        parse_module(source)
+            .unwrap_or_else(|e| panic!("expected {source:?} to parse: {e} at {:?}", e.span))
+    }
+
+    fn mod_err(source: &str) {
+        assert!(
+            parse_module(source).is_err(),
+            "expected {source:?} to be a syntax error"
+        );
+    }
+
+    #[test]
+    fn parses_import_declarations() {
+        // Default import.
+        let m = mod_ok("import def from 'm';");
+        assert_eq!(m.body.len(), 1);
+        let ModuleItem::Import(imp) = &m.body[0] else {
+            panic!("expected an import declaration");
+        };
+        assert_eq!(imp.specifier, JsString::from_utf8("m"));
+        assert_eq!(imp.entries.len(), 1);
+        assert!(matches!(
+            &imp.entries[0],
+            ImportEntry::Default { local, .. } if *local == crux::intern_utf8("def")
+        ));
+        assert!(imp.attributes.is_empty());
+
+        // Default + named with aliases: the local and imported names differ.
+        let m = mod_ok("import d, { a, b as c } from 'm';");
+        let ModuleItem::Import(imp) = &m.body[0] else {
+            panic!("expected an import declaration");
+        };
+        assert_eq!(imp.entries.len(), 3);
+        assert!(matches!(&imp.entries[0], ImportEntry::Default { .. }));
+        assert!(matches!(
+            &imp.entries[1],
+            ImportEntry::Named { imported: ExportName::Ident(a), local, .. }
+                if *a == crux::intern_utf8("a") && *local == crux::intern_utf8("a")
+        ));
+        assert!(matches!(
+            &imp.entries[2],
+            ImportEntry::Named { imported: ExportName::Ident(b), local, .. }
+                if *b == crux::intern_utf8("b") && *local == crux::intern_utf8("c")
+        ));
+
+        // Namespace imports, alone and after a default binding.
+        let m = mod_ok("import * as ns from 'm';");
+        let ModuleItem::Import(imp) = &m.body[0] else {
+            panic!("expected an import declaration");
+        };
+        assert!(matches!(
+            &imp.entries[0],
+            ImportEntry::Namespace { local, .. } if *local == crux::intern_utf8("ns")
+        ));
+        let m = mod_ok("import d, * as ns from 'm';");
+        let ModuleItem::Import(imp) = &m.body[0] else {
+            panic!("expected an import declaration");
+        };
+        assert_eq!(imp.entries.len(), 2);
+        assert!(matches!(imp.entries[0], ImportEntry::Default { .. }));
+        assert!(matches!(imp.entries[1], ImportEntry::Namespace { .. }));
+
+        // String export names and trailing commas.
+        let m = mod_ok("import { 'str name' as local } from 'm';");
+        let ModuleItem::Import(imp) = &m.body[0] else {
+            panic!("expected an import declaration");
+        };
+        assert!(matches!(
+            &imp.entries[0],
+            ImportEntry::Named { imported: ExportName::Str(s), local, .. }
+                if s == &JsString::from_utf8("str name") && *local == crux::intern_utf8("local")
+        ));
+        mod_ok("import { a, b, } from 'm';");
+        mod_ok("import d, { a, } from 'm';");
+
+        // Reserved words are valid ModuleExportNames when aliased.
+        mod_ok("import { default as x } from 'm';");
+        mod_ok("import { if as y } from 'm';");
+        // `as` itself is a legal plain binding.
+        mod_ok("import { as } from 'm';");
+
+        // Side-effect-only imports and import attributes.
+        let m = mod_ok("import 'side-effect';");
+        let ModuleItem::Import(imp) = &m.body[0] else {
+            panic!("expected an import declaration");
+        };
+        assert!(imp.entries.is_empty());
+        assert_eq!(imp.specifier, JsString::from_utf8("side-effect"));
+        let m = mod_ok("import d from './data.json' with { type: 'json' };");
+        let ModuleItem::Import(imp) = &m.body[0] else {
+            panic!("expected an import declaration");
+        };
+        assert_eq!(imp.attributes.len(), 1);
+        assert!(matches!(
+            imp.attributes[0].0,
+            AttributeKey::Ident(k) if k == crux::intern_utf8("type")
+        ));
+        assert_eq!(imp.attributes[0].1, JsString::from_utf8("json"));
+        mod_ok("import 'm' with { type: 'json' };");
+    }
+
+    #[test]
+    fn parses_export_declarations() {
+        // Named exports of local bindings.
+        let m = mod_ok("export { a, b as c };");
+        let ModuleItem::Export(ExportDecl::Named { specifiers, .. }) = &m.body[0] else {
+            panic!("expected an export declaration");
+        };
+        assert_eq!(specifiers.len(), 2);
+        assert!(matches!(
+            &specifiers[0],
+            ExportSpecifier::Same(ExportName::Ident(a)) if *a == crux::intern_utf8("a")
+        ));
+        assert!(matches!(
+            &specifiers[1],
+            ExportSpecifier::Alias { local: ExportName::Ident(b), exported: ExportName::Ident(c) }
+                if *b == crux::intern_utf8("b") && *c == crux::intern_utf8("c")
+        ));
+
+        // Re-exports: `export … from`, star, and star-namespace.
+        let m = mod_ok("export { a, b as c } from 'm';");
+        assert!(matches!(
+            m.body[0],
+            ModuleItem::Export(ExportDecl::From { .. })
+        ));
+        let m = mod_ok("export * from 'm';");
+        let ModuleItem::Export(ExportDecl::From { namespace, .. }) = &m.body[0] else {
+            panic!("expected an export declaration");
+        };
+        assert!(namespace.is_none());
+        let m = mod_ok("export * as ns from 'm';");
+        let ModuleItem::Export(ExportDecl::From { namespace, .. }) = &m.body[0] else {
+            panic!("expected an export declaration");
+        };
+        assert!(matches!(
+            namespace,
+            Some(ExportName::Ident(ns)) if *ns == crux::intern_utf8("ns")
+        ));
+        mod_ok("export { 'str' as 'out' } from 'm';");
+        mod_ok("export { default } from 'm';");
+
+        // Declaration exports.
+        mod_ok("export var x;");
+        mod_ok("export let x;");
+        mod_ok("export const x = 1;");
+        mod_ok("export function f() {}");
+        mod_ok("export async function f() {}");
+        mod_ok("export function* g() {}");
+        mod_ok("export class A {}");
+        let m = mod_ok("export const x = 1;");
+        assert!(matches!(
+            m.body[0],
+            ModuleItem::Export(ExportDecl::Declaration(_))
+        ));
+
+        // Default exports: expressions, functions, and classes.
+        let m = mod_ok("export default 1 + 2;");
+        assert!(matches!(
+            m.body[0],
+            ModuleItem::Export(ExportDecl::Default(_))
+        ));
+        mod_ok("export default 'str';");
+        mod_ok("export default function () {}");
+        mod_ok("export default function f() {}");
+        mod_ok("export default async function () {}");
+        mod_ok("export default function* () {}");
+        mod_ok("export default class {}");
+        mod_ok("export default class A {}");
+        // A named hoistable declaration after `default` keeps its name binding.
+        let m = mod_ok("export default function f() {}");
+        assert!(matches!(
+            m.body[0],
+            ModuleItem::Export(ExportDecl::Default(_))
+        ));
+    }
+
+    #[test]
+    fn module_expression_forms() {
+        // import() and import.meta are expressions, not declarations.
+        mod_ok("import('m');");
+        mod_ok("import.meta;");
+        mod_ok("import('m', { with: { type: 'json' } });");
+        let m = mod_ok("const p = import('m');");
+        assert!(matches!(m.body[0], ModuleItem::Stmt(_)));
+
+        // Top-level await is legal in modules.
+        mod_ok("await 1;");
+        mod_ok("const p = await import('m');");
+        mod_ok("export const p = await fetch('x');");
+        // Ordinary statements still work at module top level.
+        let m = mod_ok("let x = 1;");
+        assert!(matches!(m.body[0], ModuleItem::Stmt(_)));
+    }
+
+    #[test]
+    fn module_early_errors() {
+        // Only one default export per module.
+        mod_err("export default 1; export default 2;");
+        mod_err("export default function () {} export default class {}");
+
+        // await is a reserved word in module code.
+        mod_err("import await from 'm';");
+        mod_err("var await = 1;");
+        mod_err("let await;");
+        mod_err("export function await() {}");
+        mod_err("function f() { var await; }");
+
+        // Imports and exports only appear at module top level.
+        mod_err("function f() { import x from 'm'; }");
+        mod_err("{ import x from 'm'; }");
+        mod_err("if (x) { export { y }; }");
+
+        // Malformed import/export shapes.
+        mod_err("import x;");
+        mod_err("import x from;");
+        mod_err("import x, y from 'm';");
+        mod_err("import { x as } from 'm';");
+        mod_err("export;");
+        mod_err("export { x as } from 'm';");
+        mod_err("export * from;");
+
+        // Duplicate import bindings clash with lexical declarations.
+        mod_err("import { a } from 'm'; let a;");
+        mod_err("import a from 'm'; import a from 'n';");
+
+        // HTML comments are rejected in modules (Annex B is script-only).
+        mod_err("<!-- x");
+        mod_err("--> x");
+
+        // Module span covers the whole source.
+        let m = mod_ok("import d from 'm';");
+        assert_eq!(m.span, crux::Span::new(0, 18));
     }
 }
