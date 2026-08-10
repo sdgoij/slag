@@ -4,9 +4,11 @@
 //! Phase 3 adds the AST node types with spans, interning identifiers via
 //! `crux::AtomId`.
 
+pub mod ast;
 pub mod keywords;
 pub mod source;
 pub mod token;
 
+pub use ast::*;
 pub use source::SourceText;
 pub use token::{LexGoal, NumericLiteral, Token, TokenKind};

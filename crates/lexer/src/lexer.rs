@@ -40,6 +40,13 @@ impl<'s> Lexer<'s> {
         self.pos
     }
 
+    /// Repositions the lexer; the parser uses this to re-lex a token under a
+    /// different lexical goal (e.g. the `}` closing a template substitution
+    /// as a TemplateMiddle/Tail continuation).
+    pub fn set_position(&mut self, pos: usize) {
+        self.pos = pos;
+    }
+
     pub(crate) fn peek(&self) -> Option<u16> {
         self.source.code_unit(self.pos)
     }
@@ -407,7 +414,7 @@ impl<'s> Lexer<'s> {
                 if next == Some(0x26) {
                     if next2 == Some(0x3D) {
                         self.pos += 3;
-                        TokenKind::AmpersandEqual
+                        TokenKind::AndEqual
                     } else {
                         self.pos += 2;
                         TokenKind::And
@@ -424,7 +431,7 @@ impl<'s> Lexer<'s> {
                 if next == Some(0x7C) {
                     if next2 == Some(0x3D) {
                         self.pos += 3;
-                        TokenKind::PipeEqual
+                        TokenKind::OrEqual
                     } else {
                         self.pos += 2;
                         TokenKind::Or
@@ -765,9 +772,9 @@ mod tests {
                 TokenKind::NotEqual,
                 TokenKind::StrictNotEqual,
                 TokenKind::And,
-                TokenKind::AmpersandEqual,
+                TokenKind::AndEqual,
                 TokenKind::Or,
-                TokenKind::PipeEqual,
+                TokenKind::OrEqual,
                 TokenKind::NullishCoalescing,
                 TokenKind::NullishCoalescingEqual,
                 TokenKind::QuestionDot,
