@@ -1,0 +1,9 @@
+[package]
+name = "regexp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+crux = { path = "../crux" }
+unicode = { path = "../unicode" }

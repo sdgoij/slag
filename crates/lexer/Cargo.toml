@@ -1,0 +1,10 @@
+[package]
+name = "lexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+crux = { path = "../crux" }
+syntax = { path = "../syntax" }
+unicode = { path = "../unicode" }

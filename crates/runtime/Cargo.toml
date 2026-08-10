@@ -1,0 +1,12 @@
+[package]
+name = "runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+crux = { path = "../crux" }
+parser = { path = "../parser" }
+regexp = { path = "../regexp" }
+syntax = { path = "../syntax" }
+unicode = { path = "../unicode" }

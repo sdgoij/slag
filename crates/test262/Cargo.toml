@@ -1,0 +1,9 @@
+[package]
+name = "test262"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+parser = { path = "../parser" }
+runtime = { path = "../runtime" }
