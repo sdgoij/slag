@@ -32,6 +32,11 @@ impl BigInt {
         Self(NumBigInt::ZERO)
     }
 
+    /// Parses `text` in the given radix (2-36); None on invalid input.
+    pub fn parse_str(text: &str, radix: u32) -> Option<BigInt> {
+        NumBigInt::parse_bytes(text.as_bytes(), radix).map(BigInt)
+    }
+
     pub fn is_zero(&self) -> bool {
         self.0.sign() == num_bigint::Sign::NoSign
     }
@@ -214,5 +219,16 @@ mod tests {
         assert_eq!(big(123456789).to_f64(), 123456789.0);
         assert_eq!(big(-2).to_f64(), -2.0);
         assert_eq!(BigInt::from(1u64 << 63).to_f64(), 9223372036854775808.0);
+    }
+
+    #[test]
+    fn parse_str_handles_radices_and_sign() {
+        assert_eq!(BigInt::parse_str("ff", 16).unwrap(), big(255));
+        assert_eq!(BigInt::parse_str("101", 2).unwrap(), big(5));
+        assert_eq!(BigInt::parse_str("17", 8).unwrap(), big(15));
+        assert_eq!(BigInt::parse_str("-12", 10).unwrap(), big(-12));
+        assert_eq!(BigInt::parse_str("0", 10).unwrap(), big(0));
+        assert!(BigInt::parse_str("", 10).is_none());
+        assert!(BigInt::parse_str("zz", 16).is_none());
     }
 }

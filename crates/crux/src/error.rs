@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use crate::span::Span;
+
 /// The six ECMAScript native error types (spec ch. 17, 20).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
@@ -18,11 +20,22 @@ pub enum ErrorKind {
 pub struct JsError {
     pub kind: ErrorKind,
     pub message: String,
+    /// The source span the error refers to, when known.
+    pub span: Option<Span>,
 }
 
 impl JsError {
     pub const fn new(kind: ErrorKind, message: String) -> Self {
-        Self { kind, message }
+        Self {
+            kind,
+            message,
+            span: None,
+        }
+    }
+
+    pub fn with_span(mut self, span: Span) -> Self {
+        self.span = Some(span);
+        self
     }
 }
 
@@ -49,6 +62,14 @@ mod tests {
         let err = JsError::new(ErrorKind::SyntaxError, "oops".into());
         let boxed: Box<dyn std::error::Error> = Box::new(err.clone());
         assert_eq!(boxed.to_string(), "SyntaxError: oops");
+    }
+
+    #[test]
+    fn js_error_carries_optional_span() {
+        let span = Span::new(10, 20);
+        let err = JsError::new(ErrorKind::SyntaxError, "oops".into()).with_span(span);
+        assert_eq!(err.span, Some(span));
+        assert_eq!(JsError::new(ErrorKind::SyntaxError, "x".into()).span, None);
     }
 
     #[test]
