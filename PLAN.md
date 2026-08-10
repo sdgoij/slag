@@ -573,7 +573,10 @@ tests with `cargo clippy --workspace --all-targets -- -D warnings` clean.
 function invocation they perform arrives with Phase 7, and their Promise call sites with
 Phase 15; and nested `eval` execution contexts are implemented as `perform_eval`/
 `eval_declaration_instantiation` (spec 19.2.1.1/19.2.1.4), with the `eval` *built-in
-function* still arriving in Phase 8. When functions land (Phase 7), `perform_eval` must
+function* still arriving in Phase 8. The `HostHooks` embedding seam (PLAN §8: designed in
+Phase 4) is defined in `crates/runtime/src/host.rs` with `HostEnsureCanCompileStrings`
+wired into `perform_eval`; module resolution, promise-rejection tracking, timers, and I/O
+hooks fill it out in later phases. When functions land (Phase 7), `perform_eval` must
 wire the caller-context flags (inFunc/inMethod/…) and the parser must allow `new.target`
 in direct-eval code.
 

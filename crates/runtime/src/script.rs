@@ -425,6 +425,12 @@ pub fn perform_eval(
     // function, and the parser rejects new.target/super/arguments in
     // scripts. Phase 7 wires the function-environment flags.
 
+    // HostEnsureCanCompileStrings (spec 19.2.1.1 step 4).
+    let body_string = JsString::from_utf8(source);
+    if let Some(hooks) = &agent.host_hooks {
+        hooks.ensure_can_compile_strings(&eval_realm, &[], &body_string, direct)?;
+    }
+
     let program = parser::parse_script(source)?;
     // A script with no body evaluates to undefined.
     if program.body.is_empty() {

@@ -17,6 +17,7 @@ use crux::symbol::Symbol;
 use crux::value::Value;
 
 use crate::context::ExecutionContext;
+use crate::host::HostHooks;
 use crate::job::Job;
 use crate::realm::{Realm, initialize_host_defined_realm};
 
@@ -30,6 +31,9 @@ pub struct Agent {
     pub(crate) promise_jobs: VecDeque<Job>,
     pub(crate) generic_jobs: VecDeque<Job>,
     pub(crate) timeout_jobs: VecDeque<(Instant, Job)>,
+    /// Host-defined operations (spec's host hooks); `None` uses the
+    /// spec's default implementations.
+    pub host_hooks: Option<Box<dyn HostHooks>>,
     /// [[LittleEndian]]: the host byte order used by GetValueFromBuffer.
     pub little_endian: bool,
     /// [[CanBlock]]: false for the main thread; Atomics.wait joins in
@@ -55,6 +59,7 @@ impl Agent {
             promise_jobs: VecDeque::new(),
             generic_jobs: VecDeque::new(),
             timeout_jobs: VecDeque::new(),
+            host_hooks: None,
             little_endian: cfg!(target_endian = "little"),
             can_block: false,
             signifier: NEXT_AGENT_ID.fetch_add(1, Ordering::Relaxed),
@@ -219,11 +224,14 @@ fn is_lock_free_for_size(bytes: usize) -> bool {
 }
 
 /// A helper used by tests and the CLI: create an agent, bootstrap its
-/// realm, and evaluate `source`.
+/// realm, evaluate `source`, then drain the job queues (the bootstrap
+/// pipeline's RunJobs step).
 pub fn evaluate(source: &str) -> Result<Value, JsError> {
     let mut agent = Agent::new();
     agent.initialize_host_defined_realm()?;
-    agent.run_script(source)
+    let value = agent.run_script(source)?;
+    agent.run_jobs()?;
+    Ok(value)
 }
 
 #[cfg(test)]
