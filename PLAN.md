@@ -1,0 +1,1263 @@
+# jsrt — JavaScript Runtime: Implementation Plan
+
+**Target:** a from-scratch, spec-faithful JavaScript engine in Rust that implements the complete
+ECMAScript® 2026 Language Specification (17th edition), as captured in [`spec.html`](spec.html).
+**Goal state:** a `cargo` workspace whose members live under `crates/`, able to parse and execute
+arbitrary ES2026 source, pass the vast majority of the official `test262` conformance suite, and
+expose a small embedding API plus a CLI/REPL.
+
+This plan is written chapter-by-chapter against `spec.html`. Phase numbers below are an
+engineering order, **not** the spec chapter order; each phase lists the spec sections it consumes.
+
+---
+
+## 1. Mission
+
+Build a JavaScript engine in Rust that is:
+
+1. **Complete** — covers every normative part of ES2026: lexical grammar, syntactic grammar, all
+   early errors, all runtime semantics, all standard built-in objects, proxies, modules, async
+   control flow, and (eventually) the shared-memory model.
+2. **Spec-faithful** — implementation follows the spec's abstract operations and algorithms
+   closely (same names, same ordering, same edge cases), so conformance bugs are easy to find by
+   diffing against `spec.html`.
+3. **Tested** — every phase ships with unit tests, and the project tracks `test262` pass rates as
+   its primary correctness metric.
+4. **Usable** — a `jsrt` CLI (script runner + REPL) and a `jsrt::Context` embedding API.
+
+## 2. Scope and non-goals
+
+**In scope**
+
+- All of ECMA-262 (2026): chapters 1–28 of `spec.html`, including Annex B legacy behaviors,
+  explicit resource management (`using` / `await using`, `DisposableStack`, `AsyncDisposableStack`,
+  `SuppressedError`), the full standard library (including ES2026 additions: `Math.sumPrecise`,
+  `Iterator.concat`, `Array.fromAsync`, `Error.isError`, `Map`/`WeakMap` `getOrInsert(Computed)`,
+  `Uint8Array` hex/base64 methods, `JSON.parse` reviver contexts, `JSON.rawJSON`/`JSON.isRawJSON`,
+  `RegExp.escape`, RegExp modifiers, `Promise.try`, `Float16Array`, resizable/transferable buffers,
+  `Atomics.waitAsync`, etc.).
+
+**Non-goals (explicitly deferred or out of scope)**
+
+- **ECMA-402 (Intl)** — not part of `spec.html`. Locale-sensitive methods (`toLocaleString`,
+  `toLocaleLowerCase`, `localeCompare`, …) are implemented per the "no Intl" behavior the spec
+  permits (usually identity with their non-locale counterparts). A later `jsrt-intl` crate could
+  add Intl on top.
+- **Host environments** — no DOM, no Node APIs. Host facilities (`console`, timers, file I/O,
+  `import()` resolution, `import.meta`) arrive through a `HostCallbacks`/`HostHooks` embedding API.
+- **JIT compilation** — a JIT is a possible long-term performance milestone but is explicitly out
+  of scope for correctness work.
+- **Multi-agent execution** — a single-threaded agent (one Realm, one job queue) is the default;
+  the ch. 27 memory model is implemented as a scoped milestone (Phase 17) behind a worker/thread
+  API.
+
+## 3. Workspace and crate layout
+
+Everything lives under `crates/`. Dependency direction is strictly downward; there are no cycles.
+
+```mermaid
+graph TD
+    U[unicode<br/>Unicode data + helpers]
+    C[crux<br/>Value, String, PropertyKey,<br/>Descriptor, Completion, Error, GC]
+    S[syntax<br/>SourceText, Span, Token, AST]
+    L[lexer<br/>lexical grammar]
+    P[parser<br/>syntactic grammar + early errors + ASI]
+    RE[regexp<br/>RegExp pattern parser + matcher]
+    RT[runtime<br/>realms, environments, evaluator,<br/>all built-ins]
+    CLI[cli<br/>runner + REPL]
+    T[test262<br/>test262 harness adapter]
+    U --> C
+    U --> RE
+    C --> S
+    S --> L
+    S --> P
+    C --> L
+    C --> P
+    C --> RE
+    L --> P
+    RE --> P
+    P --> RT
+    S --> RT
+    C --> RT
+    RE --> RT
+    U --> RT
+    RT --> CLI
+    RT --> T
+```
+
+| Crate | Responsibility | Spec chapters |
+|---|---|---|
+| `unicode` | Code-point tables and helpers: WhiteSpace, LineTerminator, ID_Start/ID_Continue, case conversion (Default Case Conversion), normalization data, code-point properties for `\p{…}` escapes | ch. 11–12, 21–22 |
+| `crux` | `Value`, `JsString`, `PropertyKey`, `Symbol`, `BigInt`, `PropertyDescriptor`, `Completion`, error types, GC handles/heap, number-to-string/string-to-number | ch. 6, 7 (shared ops) |
+| `syntax` | `SourceText` (UTF-16), `Span`, `Token`, the full AST (parse nodes with spans) | ch. 12–16 syntax |
+| `lexer` | Tokenizer: all lexical goals, comments, literals, ASI input handling | ch. 11–12 |
+| `parser` | Recursive-descent parser, cover-grammar desugaring, all early errors, ASI | ch. 13–17 |
+| `regexp` | RegExp pattern parser (per `u`/`v` flags) + backtracking matcher; used both for literal early errors and at runtime | ch. 21 (RegExp), 12 |
+| `runtime` | Realms, environment records, execution contexts, job queue, evaluator (tree-walker → bytecode), module linking, all built-ins (ch. 18–26), Annex B | ch. 9–10, 13–26 |
+| `cli` | `jsrt file.js`, REPL, flags (`--dump-ast`, `--dump-tokens`, `--stack-size`, …) | — |
+| `test262` | test262 runner + harness files | — |
+
+## 4. Core design decisions
+
+These decisions are fixed up front because they ripple through every crate. Alternatives are noted
+where a later change is planned.
+
+### 4.1 Value representation
+
+```rust
+pub enum Value {
+    Undefined,
+    Null,
+    Boolean(bool),
+    Number(f64),                       // IEEE-754 binary64, incl. -0.0 and NaN
+    BigInt(Handle<BigInt>),            // arbitrary precision (num-bigint)
+    String(Handle<JsString>),          // UTF-16 code-unit sequence
+    Symbol(Handle<Symbol>),            // unique or registered
+    Object(Handle<JsObject>),          // all object types
+}
+```
+
+- `Number` is `f64` and must preserve `-0.0` and NaN (Rust does). NaN payload is not observable per
+  spec, so no care is needed beyond not normalizing.
+- **Milestone:** NaN-boxing `Value` as a `u64` is a pure representation change behind the same
+  public API; planned in the performance workstream (Phase 18), never before correctness is locked.
+
+### 4.2 Strings and property keys
+
+- `JsString` is a flat `Box<[u16]>` (JS strings are sequences of 16-bit code units). A Latin-1 fast
+  path (`repr` enum) is a later optimization; correctness work always operates on code units and
+  handles lone surrogates explicitly.
+- A global string interner in `crux` hash-conses strings; `AtomId(u32)` is used for
+  identifiers, property names, and keywords so equality is O(1) and hashing is cheap.
+- `PropertyKey` is either an interned string or a `Symbol` handle:
+
+  ```rust
+  pub enum PropertyKey { String(AtomId), Symbol(Handle<Symbol>) }
+  ```
+
+- All string algorithms from ch. 6 (`StringValueOf`, `CodePointAt`, `StringToCodePoints`,
+  `CodePointsToString`, `UTF16SurrogatePairToCodePoint`, …) live on `JsString`/`crux` helpers.
+
+### 4.3 Objects and GC
+
+- One `JsObject` struct for ordinary objects (property map, internal slots) with an `ExoticKind`
+  enum for the exotic behaviors (Array, String, Arguments, IntegerIndexed, BoundFunction, Proxy,
+  ModuleNamespace):
+
+  ```rust
+  pub struct JsObject {
+      pub kind: ObjectKind,              // Ordinary | Array | Proxy | ... 
+      pub prototype: Option<Handle<JsObject>>,
+      pub extensible: bool,
+      pub properties: PropertyMap,       // insertion-ordered; integer-index fast path
+      pub internal_slots: Slots,         // boxed map of spec [[Slots]]
+  }
+  ```
+
+  Internal methods are implemented as free functions (`ordinary_get`, `ordinary_set`, …) plus a
+  `dispatch` layer that routes to exotic implementations, mirroring the spec's "delegate to
+  similarly named abstract operation" pattern. Insertion order is required by the spec
+  (`[[OwnPropertyKeys]]` ordering), so `PropertyMap` is `IndexMap`-like with an integer-index fast
+  path.
+
+- **GC strategy (phased):**
+  1. **Phase 1–early:** `Handle<T> = Rc<T>` and interior mutability via `RefCell`. Object cycles
+     leak; this is acceptable while correctness work is happening, and is *documented* as a
+     known limitation (WeakMap/WeakSet/FinalizationRegistry semantics will be incomplete).
+  2. **GC milestone (Phase 18 workstream):** replace `Rc` with an arena heap (`Vec<ObjectCell>` +
+     free list) and a mark-sweep collector tracing roots: the execution context stack, Realm,
+     global environment, job queue, module records, and pending Promise reactions. This unlocks
+     faithful `WeakRef`, `FinalizationRegistry`, `WeakMap`/`WeakSet` (ephemerons), and bounded
+     memory. The `Handle<T>` API is kept so the swap is mostly internal.
+  3. When network access is available, evaluate existing crates (`gc`, `broom`) before committing
+     to a custom collector; the arena design above works with or without them.
+
+### 4.4 Completion / abrupt-completion model
+
+The spec's *Completion* concept maps to two Rust result types:
+
+```rust
+// Expression evaluation: only normal values or thrown errors.
+type EvalResult = Result<Value, JsError>;
+
+// Statement evaluation: also return / break / continue.
+pub enum Flow {
+    Normal,
+    Break(Option<AtomId>),
+    Continue(Option<AtomId>),
+    Return(Value),
+}
+type StmtResult = Result<Flow, JsError>;
+```
+
+- `JsError` carries the error kind (`SyntaxError`, `TypeError`, `RangeError`, …), message, cause,
+  and stack capture. All built-in constructors produce `JsError` values that are ordinary objects
+  when thrown into JS.
+- Spec convention mapping: `? Op()` → `op()?`; `! Op()` → `op().expect("cannot fail per spec")`
+  with a `panic!` only where the spec asserts impossibility; "Return ? X" → `return x;`.
+- Generators/async introduce a third dimension (suspension). See 4.5 — the resumable-function IR
+  subsumes `Flow` for function bodies.
+
+### 4.5 Interpreter strategy
+
+- **Correctness phase (Phases 6–8): tree-walking evaluator.** Each AST node implements
+  `eval`/`eval_stmt` following the corresponding *Runtime Semantics: Evaluation* algorithm
+  verbatim. This keeps the first working engine small and diffable against the spec.
+- **Resumable functions (Phase 7):** generator and async function bodies are compiled into a
+  linear `Vec<Step>` IR (a minimal bytecode: evaluate expr, store, branch, yield/await, resume
+  point) with an explicit instruction pointer, so `yield`/`await` suspend and resume exactly like
+  the spec's generator resume algorithm. This IR is the seed of the later bytecode VM.
+- **Performance milestone (Phase 18):** extend the IR into a full stack-based bytecode VM
+  (compiled closures with captured environments, inline caches for property access, monomorphic
+  call stubs). All built-ins remain implemented in Rust as `NativeFunction`s regardless of VM.
+
+### 4.6 Realms, agents, and the job queue
+
+- `Realm` holds `[[Intrinsics]]` (a registry keyed by spec intrinsic names — `%Object.prototype%`,
+  `%ThrowTypeError%`, …), `[[GlobalObject]]`, `[[GlobalEnv]]`, `[[TemplateMap]]`,
+  `[[LoadedModules]]`.
+- Environment records are an enum per the hierarchy in ch. 9:
+
+  ```rust
+  pub enum EnvRecord {
+      Declarative(DeclarativeEnv),      // incl. FunctionEnv, ModuleEnv fields
+      Object(ObjectEnv),
+      Global(GlobalEnv),                // object env + declarative env pair
+      With(WithEnv),
+  }
+  ```
+
+  with the ch. 9 abstract methods (`HasBinding`, `CreateMutableBinding`, `SetMutableBinding`,
+  `GetBindingValue`, `DeleteBinding`, `HasThisBinding`, `GetThisBinding`, `WithBaseObject`, …).
+- The **job queue** is a `VecDeque<Job>`; `EnqueueJob` pushes, `RunJobs` drains. Promise jobs are
+  the only jobs in the base engine (hosts may add more). A single surrounding agent owns the queue.
+- Module, script, function and eval evaluation all funnel through the same execution-context stack
+  machinery (`PushExecutionContext`/`PopExecutionContext`, `VariableEnvironment`,
+  `LexicalEnvironment`, `PrivateEnvironment`, `ThisMode`, `ScriptOrModule`).
+
+### 4.7 Modules
+
+Follow ch. 16 exactly: Source Text Module Records with `[[RequestedModules]]`,
+`[[ImportEntries]]`, `[[LocalExportEntries]]`, `[[IndirectExportEntries]]`,
+`[[StarExportEntries]]`, and the linking algorithm (`InnerModuleLinking`, `InnerModuleEvaluation`,
+`ExecuteAsyncModule`, DFS for cycles, `[[PendingAsyncDependencies]]`, top-level await). Host
+resolution (`HostResolveImportedModule`, `HostGetImportMetaProperties`,
+`HostFinalizeImportMeta`) goes through `HostHooks`, so `jsrt` itself stays embeddable. JSON
+modules and import attributes (`with { type: "json" }`) are part of the base engine.
+
+### 4.8 Errors
+
+- Parse-time failures are **early errors** (`SyntaxError`) reported by the parser with spans.
+- Runtime failures throw `JsError`s whose prototypes are the standard error objects.
+- Stack traces: capture on throw (spec leaves stack host-defined; we mimic V8's format for tooling
+  compat) and attach `cause` where the spec does (`Error(message, {cause})`,
+  `AggregateError`, `SuppressedError`).
+- `Error.isError` and `Object.prototype.toString` dispatch rely on the `[[ErrorData]]` slot —
+  implement the slot and use it exactly as the spec does.
+
+### 4.9 RegExp
+
+- A purpose-built backtracking matcher is required: ECMAScript regex semantics (backreferences,
+  lookahead/lookbehind, named groups, `u`/`v` modes, character-class set operations, class
+  escapes, legacy Annex B escapes) cannot be expressed with the `regex` crate.
+- Pattern parsing respects the flag-dependent grammar (`/u`, `/v` change what is legal); literals
+  are validated at parse time (lexer→parser calls `regexp` for early errors), while
+  `RegExp` constructor and `compile`-time parsing happen at runtime.
+- Unicode property escapes (`\p{…}`) consume `unicode` tables; `/i` uses the spec's
+  canonicalize operation (simple case folding under `u`/`v`).
+
+### 4.10 Third-party crates
+
+| Crate | Use | Notes |
+|---|---|---|
+| `num-bigint` | BigInt | sign+magnitude; spec arithmetic ops implemented on top |
+| `ryu` | `Number::toString` shortest round-trip | verify against spec's `Number::toString(𝔽(x))` incl. exponent formatting; custom wrapper for radix 2–36 |
+| `half` | binary16 (`Float16Array`, `Math.f16round`, `getFloat16`/`setFloat16`) | spec itself recommends this crate |
+| `unicode-normalization` | `String.prototype.normalize` | NFC/NFD/NFKC/NFKD |
+| `unicode-case-mapping` (or generated UCD tables) | `toUpperCase`/`toLowerCase` Default Case Conversion | must be *default* case conversion (can expand, e.g. `ß`→`"SS"`) |
+| `unicode-ident` (or generated tables) | `ID_Start`/`ID_Continue` | only if it matches the spec's Unicode version; otherwise generate from UCD |
+| `proptest` | property tests | dev-dependency |
+| `unicode-properties` (or `regex-syntax` tables) | `\p{…}` property data | cross-check the spec's property set |
+
+All deps are optional except the core correctness ones; `unicode` is the only place allowed
+to depend on Unicode data crates, so their Unicode versions can be validated in one spot.
+
+---
+
+## 5. Testing strategy
+
+**Non-negotiable rule — inline unit tests for every public function.**
+
+Every `pub` item (function, method, associated function, trait method, and any `pub` type that
+encodes logic) exported from a crate MUST be covered by an inline unit test: a
+`#[cfg(test)] mod tests` block in the **same source file** as the code it tests, per standard
+Rust convention. A public function with no inline test is a merge-blocking defect. Requirements:
+
+- "Covered" means the test asserts observable behavior — normal returns, error paths, and edge
+  cases (e.g. `-0`, `NaN`, empty input, boundary values) — never merely that the code compiles or
+  does not panic.
+- Applies to every crate in the workspace (`unicode`, `crux`, `syntax`, `lexer`, `parser`,
+  `regexp`, `runtime`, `cli`, `test262`), including the abstract-operation free functions that are
+  the main `pub` API of `crux`/`runtime` — they mirror spec algorithms and are the highest-value
+  inline-test targets.
+- Private helpers need inline tests only when they encode non-trivial spec logic; the `pub` rule
+  is unconditional.
+- Enforcement: (1) CI runs `cargo test --workspace`, which executes every inline test; (2) code
+  review rejects `pub` items lacking inline tests; (3) a coverage gate (`cargo llvm-cov`, or
+  `cargo-tarpaulin`) is added to CI once network access allows installing the tool, gating on 100%
+  of `pub` items being exercised by at least one test; (4) each phase's exit criteria include "all
+  `pub` items introduced by this phase have inline unit tests".
+
+1. **Inline unit tests (mandatory, per the rule above)** — every crate tests its algorithms
+   (conversions, number formatting, lexing, parsing, matcher, each built-in). Use the spec's own
+   examples from `spec.html` as test vectors.
+2. **test262** (the north star) — vendor the official suite (git clone `tc39/test262`) once
+   network access is available; commit a pinned revision under `test262/` (or use a git submodule).
+   `test262`:
+   - Runs each test as Script or Module (per `flags` metadata), loads `harness/*.js` files named in
+     `includes`, and validates `negative` phases and `esid` metadata.
+   - Reports per-directory pass/fail with a total percentage; a `--filter` flag drives iterative
+     work ("run only `built-ins/Promise`"). CI keeps a golden summary.
+   - `test262` is not fetched now (no network in this environment) — the harness crate and CI job
+     are built first; cloning the suite is a documented one-time setup step.
+3. **Property tests** — proptest invariants on hot algorithms: `ToNumber(ToString(n)) == n`,
+   UTF-16 round trips, parser "never panics" fuzzing on arbitrary byte/token streams, matcher
+   determinism, date round trips.
+4. **Integration tests** — end-to-end `.js` fixtures per feature area with expected stdout/stderr;
+   REPL golden tests.
+5. **Differential tests (optional, when Node is available on the host)** — sample behaviors
+   (`--compare node`) to catch spec misreads early.
+
+Each phase below lists its concrete test targets; exit criteria are explicit so a phase is only
+"done" when its tests are green.
+
+---
+
+## 6. Implementation phases
+
+### Phase 0 — Workspace scaffolding
+
+**Goal:** a compiling workspace with CI-shaped habits.
+
+- Root `Cargo.toml` (workspace) with members under `crates/`; `.gitignore`; `rustfmt`/`clippy`
+  config; GitHub Actions workflow (fmt + clippy + test; nightly not required — stable Rust).
+- Skeleton crates with `lib.rs` and empty tests: `unicode`, `crux`, `syntax`,
+  `lexer`, `parser`, `regexp`, `runtime`, `cli`, `test262`.
+- `crux`: `Span`/`SourceLocation`, basic `JsError` enum + constructors, workspace-wide
+  `Error` conversions.
+- `cli`: `jsrt --version` and `jsrt file.js` stub that reports "not implemented".
+
+**Exit criteria:** `cargo build`/`test`/`clippy` clean across the workspace; the inline-unit-test
+convention from §5 is established (every skeleton crate ships a `#[cfg(test)]` module that runs via
+`cargo test --workspace`); `jsrt` binary runs.
+
+---
+
+### Phase 1 — Values and core abstract operations
+
+**Spec:** ch. 6 (ECMAScript Data Types and Values), ch. 7 (Abstract Operations — the shared ones),
+plus the type-conversion operations used everywhere.
+
+**Deliverables (`crux`):**
+
+- `Value` enum, `Handle<T>` (`Rc` initially), `JsString` (UTF-16), string interner, `AtomId`,
+  `PropertyKey`, `Symbol` (`SymbolDescriptiveString`, well-known symbol table), `BigInt` wrapper.
+- `PropertyDescriptor` (data/accessor, attributes) + `ToPropertyDescriptor`/`FromPropertyDescriptor`.
+- Abstract operations (spec names kept verbatim):
+  - Identity/type: `Type()`, `SameValue`, `SameValueZero`, `IsStrictlyEqual`,
+    `IsLooselyEqual` (== with all cross-type branches), `IsIntegralNumber`, `IsCallable`,
+    `IsConstructor`, `IsExtensible` (later), `LengthOfArrayLike`.
+  - Conversion: `ToPrimitive` (with `OrdinaryToPrimitive` and hint wiring), `ToBoolean`,
+    `ToNumber` (incl. `StringNumericLiteral`, Annex B variants), `ToNumeric`, `ToBigInt`,
+    `ToBigInt64`/`ToBigUint64`, `ToString` (`Number::toString` — shortest round-trip via `ryu`
+    wrapper, radix 2–36 integer formatting), `ToObject`, `ToPropertyKey`, `ToLength`,
+    `ToIntegerOrInfinity`, `ToIndex`, `ToUint8Clamp` (per `Uint8ClampedArray` semantics),
+    `ToUint32`/`ToInt32` (modulo-2³² with wraparound), `RequireObjectCoercible`.
+  - Arithmetic entry points used by the evaluator: `Number::add/subtract/multiply/divide/
+    remainder/exponentiate/leftShift/signedRightShift/unsignedRightShift/bitwiseAND/bitwiseOR/
+    bitwiseXOR/unaryMinus/bitwiseNOT`, `BigInt::…` equivalents, `String::indexOf` etc. as needed.
+  - Property helpers (used by ch. 10 and built-ins): `CreateDataProperty(OrThrow)`,
+    `DefinePropertyOrThrow`, `HasProperty`, `Get`, `Set`, `DeletePropertyOrThrow`,
+    `GetMethod`, `GetV`, `Call`, `Construct`, `CreateArrayFromList`, `CreateListFromArrayLike`,
+    `EnumerableOwnProperties`, `GetOwnPropertyKeys`-style ordering helpers.
+- Number formatting/parsing with the spec's `Number::toString`/`parseFloat`/`parseInt` algorithms
+  (parseInt: radix handling, sign, whitespace, "garbage tail" rules).
+
+**Tests:** exhaustive unit vectors per operation (spec examples + edge cases: `-0`, `NaN`, `1e-7`
+exponent thresholds, `2^53`, `0x7fffffffffffffff` parseInt radix quirks, `ToUint8Clamp` boundary
+table, `IsLooselyEqual` cross-type matrix incl. `Symbol` throwing). Proptest round trips.
+**Exit criteria:** all Phase 1 tests green; `Value` API stable enough that later phases do not
+churn it.
+
+---
+
+### Phase 2 — Source text and lexer
+
+**Spec:** ch. 11 (Source Text), ch. 12 (Lexical Grammar), incl. all lexical goals and ASI input
+rules.
+
+**Deliverables (`unicode`, `syntax`, `lexer`):**
+
+- `unicode`: WhiteSpace table (incl. U+FEFF), LineTerminator set, `ID_Start`/`ID_Continue`
+  (Unicode version-matched), code-point classification for regexp `\d \s \w` under `u`/`v`.
+- `syntax`: `SourceText` (UTF-16 `Vec<u16>` from `&str` or bytes), `TokenKind`, `Span`,
+  `UnicodeEscapeSequence` helpers (`\uXXXX`, `\u{…}`), keyword tables, punctuator list.
+- `lexer`:
+  - Lexical goals: `InputElementDiv`, `InputElementRegExp`, `InputElementRegExpOrTemplateTail`,
+    `InputElementTemplateTail`, `InputElementHashbangOrRegExp` — the parser drives which goal is
+    active (division vs regexp vs template-tail contexts).
+  - Comments: `//`, `/* … */` (incl. unterminated → early error), hashbang `#!` (script start
+    only, not modules).
+  - Identifiers + keywords (incl. contextual `await`/`yield`, reserved words), identifier
+    escapes, Unicode identifiers.
+  - Literals: all NumericLiteral forms (Decimal, Hex, Octal, Binary, BigInt suffixes, legacy
+    octal `0755`, non-octal decimal integer `089`); StringLiteral (all escape sequences, line
+    continuations, legacy octal escapes, `\u{…}`); Template (NoSubstitution, Head, Middle, Tail)
+    with **cooked** values computed here (invalid escapes → `undefined` cooked + flag for tagged
+    templates, per `NotEscapeSequence`); RegularExpressionLiteral (defer validation to
+    `regexp` via a callback, but lex the body/flags tokens).
+  - Punctuators incl. `??`, `??=`, `?.`, `**`, `**=`, `&&=`, `||=`, `>>>`, `>>>=`, `...`, etc.
+  - ASI: expose the three triggering rules (line terminator, `}` , end of input; restricted
+    productions `[no LineTerminator here]`) as parser-facing signals, and mark token positions
+    where `\n` intervenes.
+- Annex B lexical bits: HTML comments (`<!--`, `-->`) in script (non-module) contexts.
+
+**Tests:** golden token streams for each literal class; Unicode identifier cases; every escape
+sequence; template cooked/raw pairs; comment termination; division-vs-regexp goal switching;
+ASI edge cases (`a = b\n/c/g` staying one expression, `return\nx`, `break label\nx`, `++\n++x`,
+`?.[` vs `?.\n[`); hashbang. Fuzz: arbitrary bytes must produce tokens or a clean early error —
+never panic.
+**Exit criteria:** lexer passes all Phase 2 tests; the parser (Phase 3) can consume the token
+stream.
+
+---
+
+### Phase 3 — Parser and early errors
+
+**Spec:** ch. 13 (Expressions), 14 (Statements and Declarations), 15 (Functions and Classes),
+16 (Scripts and Modules) — grammar only; ch. 17 (early errors); plus regexp literal early errors
+from ch. 12 (via `regexp`).
+
+**Deliverables (`parser` + AST in `syntax`):**
+
+- Full recursive-descent parser implementing the parameterized grammar
+  (`[Yield]`, `[Await]`, `[Return]`, `[In]` parameters) with an AST variant per production
+  alternative. Node types carry `Span`s (needed for stack traces and for
+  `Function.prototype.toString`, which must return exact original source).
+- **Cover grammar** desugared at parse time (store the parse, disambiguate later):
+  `CoverParenthesizedExpressionAndArrowParameterList`,
+  `CoverCallExpressionAndAsyncArrowHead`, `CoverInitializedName`.
+- Expressions: all precedence levels, optional chaining (`?.` incl. short-circuiting semantics at
+  eval time), tagged templates, `new`/`new.target`/`import()` meta properties, `super`,
+  destructuring in params/assignments, arrow functions, `yield`/`await` in context.
+- Statements: block, var/let/const (declaration instancing order), empty, expression, if,
+  do/while, for, for-in, for-of, for-await-of, labeled, break/continue, return, with, switch,
+  throw, try/catch/finally (optional catch binding, catch destructuring), debugger, and the
+  **`using`/`await using` declarations** (explicit resource management).
+- Declarations: function (declaration/expression; async/generator/async-generator variants),
+  classes (declaration/expression; extends, constructor, public/private fields, private
+  methods/accessors, static blocks, computed names, `static` fields), lexical declarations.
+- Modules: import declarations (default/named/namespace, import attributes
+  `with { "type": "json" }`), export declarations (`export {…}`, `export … from`,
+  `export * from`, `export * as ns from`, `export default`), `import()` expressions, `import.meta`.
+- **Early errors** — a dedicated pass that implements every *Static Semantics: Early Errors*
+  section: duplicate declarations (lexical/let/const/class in same scope), `var`/`let` shadowing
+  rules, invalid assignment targets (incl. `++`/`--` targets, `for-in` LHS), strict-mode
+  restrictions (`delete` identifier, octal literals/escapes, `with`, binding `eval`/`arguments`,
+  duplicate params), class restrictions (private-name rules, `constructor` restrictions, no
+  `super` outside methods), function/arrow parameter rules, regexp literal errors
+  (invalid escapes per flags, invalid `u`/`v` constructs), module-only restrictions (top-level
+  `await` legality, `import`/`export` only at top level), directive prologue processing
+  (`"use strict"` detection, `"use asm"` ignored).
+- **ASI** integration: insert semicolons per ch. 12 rules at the right grammar points.
+- AST traversal utilities used by evaluation: `VarDeclaredNames`, `VarScopedDeclarations`,
+  `LexicallyDeclaredNames`, `LexicallyScopedDeclarations`, `Contains`/`ContainsArguments`,
+  `IsSimpleParameterList`, `HasDirectSuper`, `FunctionBodyContainsUseStrict`, etc.
+  (syntax-directed ops from ch. 8 are implemented as AST methods as the evaluator needs them).
+
+**Tests:** a vendored parser corpus (e.g., acorn/espree test cases once network is available, or a
+hand-built corpus before that); per-early-error fixtures with expected error spans; AST
+snapshots; arrow/async/cover-grammar disambiguation cases; strict-mode matrix
+(sloppy × strict × module × class-body); fuzz: random token/byte streams never panic and every
+error has a span.
+**Exit criteria:** parser handles the full grammar, all early errors fire with correct spans, and
+`cargo test` in `parser` is green.
+
+---
+
+### Phase 4 — Execution model
+
+**Spec:** ch. 9 (Executable Code and Execution Contexts), plus the parts of ch. 8 (Evaluation SDOs
+plumbing) needed to run.
+
+**Deliverables (`runtime`):**
+
+- `Realm` + intrinsic registry; `Intrinsics` table built lazily/declaratively (`define_intrinsic!`
+  style) so each built-in phase registers new intrinsics in spec bootstrap order.
+- Environment records (declarative/object/global/function/module) with all ch. 9 abstract methods;
+  `WithEnvironment`, `ThisBinding` for `FunctionEnv`/`ModuleEnv`, `PrivateEnvironment` slots.
+- Execution context stack; `VariableEnvironment`/`LexicalEnvironment`/`PrivateEnvironment`
+  management; `ScriptOrModule` tracking for `import.meta`/stack traces.
+- Job queue (`VecDeque<Job>`), `EnqueueJob`, `RunJobs`; the **Promise job** kind (created via
+  `NewPromiseReactionJob`/`NewPromiseResolveThenableJob` — see Phase 15 for the Promise built-in,
+  but the *queue machinery* and `HostCallJobCallback` live here).
+- Agent record + surrounding agent (single-threaded), `AgentCanSuspend`/`CanBlock` = false for the
+  main thread (relevant to `Atomics.wait` in Phase 17).
+- `Script` record: `ParseScript`, `ScriptEvaluation`, `GlobalDeclarationInstantiation`
+  (global var/function/lexical binding creation order).
+- Bootstrap pipeline: `CreateRealm` → `SetRealmGlobalObject` → `SetDefaultGlobalBindings`
+  (grows per built-in phase) → `RunJobs`.
+
+**Tests:** binding semantics (hoisting, TDZ, redeclaration errors, global binding interactions,
+`var` vs `let` at global scope, function declarations at global scope), execution-context
+nesting via nested `eval` (once eval lands), job ordering with hand-written fake jobs, strict
+mode propagation.
+**Exit criteria:** `runtime` can evaluate a trivial hardcoded AST to a value; job queue drains
+correctly.
+
+---
+
+### Phase 5 — Ordinary and exotic objects
+
+**Spec:** ch. 10 (Ordinary and Exotic Objects Behaviours).
+
+**Deliverables (`crux` + `runtime`):**
+
+- Property model: descriptors, attributes, `PropertyMap` with the spec's
+  `[[OwnPropertyKeys]]` ordering (integer indices ascending → strings in insertion order →
+  symbols), `OrdinaryGetOwnProperty`, `OrdinaryDefineOwnProperty` (the full
+  validate-and-convert algorithm from the ch. 10 tables), `OrdinarySet`/`OrdinarySetWithOwnDescriptor`
+  (prototype-walk with writable checks), `OrdinaryDelete`, `OrdinaryPreventExtensions`,
+  `OrdinarySetPrototypeOf`, `OrdinaryGetPrototypeOf`, `OrdinaryHasInstance` (later).
+- Internal-method dispatch (`GetPrototypeOf`, `SetPrototypeOf`, `IsExtensible`,
+  `PreventExtensions`, `GetOwnProperty`, `DefineOwnProperty`, `HasProperty`, `Get`, `Set`,
+  `Delete`, `OwnPropertyKeys`, `Call`, `Construct`) with exotic overrides and the *invariant*
+  checks (ch. 10's "Invariants of the Essential Internal Methods" table).
+- Exotic objects:
+  - **Array** — `length` invariants, index → length synchronization, `[[DefineOwnProperty]]`
+    special cases, deletion behavior.
+  - **String exotic** — integer-indexed character access via code units.
+  - **Arguments exotic** — mapped arguments (`[[MappedArguments]]`), `callee`/`length` in sloppy
+    mode.
+  - **Integer-Indexed exotic** — TypedArray element access with bounds and canonical numeric
+    strings (full implementation with Phase 12, but the object shell here).
+  - **Bound function** — `[[BoundTargetFunction]]`, `[[BoundThis]]`, `[[BoundArguments]]`,
+    `length`/`name` computation, `[[Call]]`/`[[Construct]]` delegation.
+  - **Proxy** — all 14 traps with handler validation and invariants (full trap dispatch here;
+    `Reflect` built-in in Phase 16).
+  - **Module namespace exotic** — `[[Module]]`, `[[Exports]]`, `[[Prototype]] = null`,
+    immutable bindings (full activation with Phase 7 modules).
+- Function objects: ordinary `ECMAScriptFunctionObject` (all slots: `[[Environment]]`,
+  `[[FormalParameters]]`, `[[ECMAScriptCode]]`, `[[ThisMode]]`, `[[HomeObject]]`, `[[Fields]]`,
+  `[[PrivateEnvironment]]`, `[[Realm]]`, `[[ScriptOrModule]]`, `[[ParameterMap]]`…), `[[Call]]`
+  via `OrdinaryCallBindThis`/`OrdinaryCallEvaluateBody`, `[[Construct]]` via
+  `OrdinaryCreateFromConstructor`/`InitializeBoundName`, `length`/`name`/`prototype` property
+  creation, `FunctionDeclarationInstantiation` (parameter environment, var/function hoisting,
+  arguments object incl. mapped/unmapped).
+- `ObjectCreate`/`OrdinaryObjectCreate`, `CreateBuiltinFunction`, `CreateAsyncFromSyncIterator`
+  (deferred), `CreateMethodProperty`/`CreateDataPropertyOrThrow` usage discipline.
+- `%ThrowTypeError%` — the single shared restricted function object.
+
+**Tests:** property-attribute matrices (define with every combination of attributes against
+existing descriptors — use the spec's decision table), prototype-chain get/set walk cases,
+array-length edge cases (setting length truncates, index assignments, non-writable length),
+proxy invariant test suite (start here; grow in Phase 16), arguments object mapping, bound
+function `length`/`name`, integer-indexed bounds.
+**Exit criteria:** Phase 5 tests green; internal-method dispatch is fast enough to build the
+evaluator on top.
+
+---
+
+### Phase 6 — Evaluation: expressions and statements
+
+**Spec:** ch. 13 (Expressions) and ch. 14 (Statements and Declarations) runtime semantics; ch. 8
+(Evaluation SDOs).
+
+**Deliverables (`runtime`):**
+
+- Reference model: `ReferenceRecord` (base: value/environment-record, referenced name, strict
+  flag), `GetValue`, `PutValue`, `DeletePropertyOrThrow`, `GetThisValue`/`SuperBase`/
+  `GetSuperConstructor`, `MakePrivateReference`.
+- Identifier resolution through environment records; `this` binding resolution (`ResolveThisBinding`
+  honoring `ThisMode`), `new.target`/`super` bindings.
+- Every expression's Evaluation:
+  - Literals (incl. BigInt from text, regexp literal → `RegExp` object creation, template
+    literal evaluation with cooked values).
+  - Array/object initializers (holes, spread, computed keys, getters/setters, `__proto__`
+    special case per Annex B, method shorthand), `this`, identifiers.
+  - Function/class expressions (delegated to Phase 7 machinery but wired here).
+  - Member/optional-chain (`?.[]`, `?.()`, `?.`), calls (argument evaluation order, spread,
+    `IsSimpleParameterList`-driven param environments), `new`/`new.target`/`import()`,
+    tagged templates, `super` property access and `super()` calls.
+  - Update (`++`/`--` with `ToNumeric`), unary (`delete` incl. ReferenceRecord errors, `typeof`
+    on unresolvable references, `void`, `+`/`-`, `~`, `!`), `**` (right assoc, exponent
+    restrictions), multiplicative/additive/shift, relational (`in`, `instanceof` incl.
+    `Symbol.hasInstance`), equality (loose/strict), bitwise, logical (`&&`/`||`/`??` with
+    short-circuit), conditional, assignment (incl. compound `ToNumeric` semantics, destructuring
+    `DestructuringAssignmentEvaluation`, default values, rest), comma, `yield`/`await`
+    (Phase 7 wiring), arrow functions.
+  - **Destructuring**: `ObjectBindingPattern`/`ArrayBindingPattern` and assignment patterns,
+    with `IteratorClose` on failure, `GetIterator`/`IteratorStep`/`IteratorValue` usage, property
+    access order, `ToObject` of RHS.
+- Every statement's Evaluation with the `Flow` completion model:
+  - Block (lexical scope instantiation), var/let/const (TDZ, redeclaration), expression,
+    empty, if, do/while, for (bare/with `let`/`const`), **for-in** (enumerate keys per
+    `[[OwnPropertyKeys]]` + prototype walk with `EnumerableOwnNames` semantics, LHS validation),
+    **for-of** (iterator protocol with `IteratorClose`, `continue`/`break` integration),
+    **for-await-of** (async iteration, Phase 7), labeled (label sets), break/continue,
+    return (strict/`Return` parameter), with (object environment + strict-mode early error),
+    switch (case evaluation order, `default`, `CaseBlockEvaluation`), throw (incl. `EvaluateBody`
+    unwinding), try/catch/finally (catch binding env, finally override semantics per spec's
+    completion-returning algorithm), debugger, `using`/`await using` (DisposableResource
+    stack + `DisposeResources` in reverse order with `SuppressedError` aggregation — the
+    `AddDisposableResource`/`DisposeResources` AOs are implemented here).
+- Script-level: `GlobalDeclarationInstantiation` + body evaluation (with Annex B block-function
+  rules), top-level `await` only in modules (error otherwise).
+
+**Tests:** end-to-end `.js` fixtures per statement/expression family; ASI × statement matrix;
+destructuring edge cases (`({a = f()} = {});` order-of-operations); `for-in`/`for-of` iterator
+close paths (throw during body → `.return()` called); switch fallthrough; try/finally override
+(return in finally wins); `using` disposal order + `SuppressedError`; `typeof` of
+`undefined` bindings; loose equality full matrix. Begin running a small `test262`
+`language/` subset.
+**Exit criteria:** `jsrt` can run non-trivial scripts end-to-end (fibonacci, closures, strings,
+arrays, objects) and prints correct output; Phase 6 test fixtures all pass.
+
+---
+
+### Phase 7 — Functions, classes, generators, async, and modules
+
+**Spec:** ch. 15 (Functions and Classes), ch. 16 (Scripts and Modules) runtime semantics;
+the Promise core is pulled in here as a hard dependency of async semantics (the rest of ch. 25
+completes in Phase 15).
+
+**Deliverables (`runtime`):**
+
+- **Functions:** `FunctionDeclaration`/`FunctionExpression` instantiation
+  (`InstantiateOrdinaryFunctionObject`), arrow functions (no `prototype`, lexical `this`/`super`
+  via `ThisMode = lexical`), default/rest/destructured parameters (param environment,
+  `arguments` object identity, `IsSimpleParameterList` fast path), `FunctionDeclarationInstantiation`
+  hoisting, `Function.prototype` `.length`/`.name`/`.prototype` properties, strict vs sloppy
+  `this` coercion (`thisArg` undefined → global in sloppy, stays undefined in strict).
+- **Generators:** generator objects with `[[GeneratorState]]` (suspended-start/…/completed),
+  `GeneratorStart`/`GeneratorResume`/`GeneratorResumeAbrupt`/`GeneratorYield`/`GeneratorValidate`,
+  `yield*` delegation (`IteratorClose`, `.return()`/`.throw()` forwarding), generator early
+  errors (`yield` in arrow/params restrictions), the **resumable-function IR** (4.5): generator
+  bodies compile to `Vec<Step>` with an IP; `next`/`return`/`throw` drive it exactly like the
+  spec's resume algorithms.
+- **Async functions:** `AsyncFunctionStart`, `Await` (via `NewPromiseResolveThenableJob` +
+  reactions), `async` function returns a Promise that reflects the body's completion; async
+  arrow functions; `await` in for-of/for-await-of; **`await using`** disposal with async
+  resources.
+- **Async generators:** `AsyncGeneratorStart`/`AsyncGeneratorResumeNext`/`AsyncGeneratorYield`
+  (queue-based), `AsyncGeneratorPrototype.next/return/throw`, async `yield*`.
+- **Classes:** declaration/expression instantiation (`ClassDefinitionEvaluation`), `extends`
+  (`GetSuperConstructor`), `constructor` with `[[Construct]]`/`super()` ordering
+  (`SuperCall` evaluation, `[[ConstructorKind]] = derived`), field declarations (public/private,
+  `DefineField` in declaration order, `InitializeInstanceElements`, `[[Fields]]`), static blocks
+  (lexical scoping rules), private names (`[[PrivateEnvironment]]`, `PrivateBrand`, `#x in obj`,
+  brand checks for private methods), computed method names, getters/setters, method `name`
+  inference, `HomeObject`-based `super` property access.
+- **Modules (ch. 16):**
+  - Parse/`ParseModule`, Source Text Module Record with all fields; `ModuleDeclarationInstantiation`
+    (link): import/export entry resolution, `ResolveExport` (incl. star-export ambiguity and
+    cycles via `[[DFSIndex]]`/`[[DFSAncestorIndex]]`), module environment with live bindings
+    (imports are getters on the module env).
+  - `ModuleEvaluation`/`InnerModuleEvaluation`, `ExecuteAsyncModule`, top-level await, cyclic
+    `evaluation` ordering.
+  - `export *` (skipping star-exported re-exports of itself), default exports, `export … from`,
+    `export * as ns`.
+  - JSON modules: `ParseJSONModule`, `JSONModuleEvaluation`, `import json from "./x.json" with
+    { type: "json" }`; import attributes (`WithClause`) validation.
+  - `import()` dynamic import: `ImportCall` evaluation, promise-based, `HostImportModuleDynamically`.
+  - `import.meta` via `HostGetImportMetaProperties`.
+  - Module namespace exotic objects (from Phase 5) activated: immutable exported bindings,
+    `Symbol.toStringTag = "Module"`, `Object.prototype.toString` behavior.
+- **Promise core (early ch. 25):** `%Promise%` constructor with executor + resolving functions,
+  `Promise.prototype.then/catch/finally`, `Promise.resolve/reject`, `Promise.all/allSettled/any/
+  race`, `Promise.withResolvers`, `Promise.try`, `NewPromiseCapability`, `PromiseReaction`,
+  `NewPromiseReactionJob`/`NewPromiseResolveThenableJob` (into Phase 4's queue), `PerformPromiseThen`,
+  `HostPromiseRejectionTracker` (unhandled-rejection hook for the CLI), `Symbol.species` support.
+
+**Tests:** closure/capture semantics; generator state machine (`return` in generator, `yield*`
+delegation incl. `throw` forwarding, early completion); async ordering (microtask sequencing,
+`await` of thenables vs promises); class: private brand checks, field init order with
+`super()`/`this` TDZ, static block ordering, `new.target` in constructors; modules: cyclic
+imports, live bindings (`import { x }` sees updates), star-export ambiguity, JSON modules +
+attributes, dynamic import, top-level await; Promise: combinator edge cases, `Promise.try`
+sync-throw capture, unhandled rejection tracking. This is the phase where `test262` usage
+becomes significant: `language/`, `built-ins/Promise`, `built-ins/Function`, `built-ins/Map`-adjacent
+async fixtures, and `test/language/module-code`.
+**Exit criteria:** full async/await/class/module test fixtures green; **test262 ≥ 20–30%** of
+runnable tests.
+
+---
+
+### Phase 8 — Global object and fundamental objects
+
+**Spec:** ch. 18 (Standard Built-in Objects intro), ch. 19 (The Global Object), ch. 20
+(Fundamental Objects).
+
+**Deliverables (`runtime` built-ins):**
+
+- Complete bootstrap in spec order: `CreateIntrinsics` (incl. `%ThrowTypeError%`), install
+  prototypes/constructors in dependency order, `SetDefaultGlobalBindings` (grows here to the full
+  global property list: value props `globalThis`/`Infinity`/`NaN`/`undefined`; function props
+  `eval` (direct + indirect eval per `PerformEval` incl. strict eval scoping, var declarations in
+  caller env), `isFinite`, `isNaN`, `parseFloat`, `parseInt`, `encodeURI`,
+  `encodeURIComponent`, `decodeURI`, `decodeURIComponent` (per the ch. 19 URI algorithms with
+  `URIError` on malformed); all constructor props per the spec list).
+- **Object:** constructor (`Object(value)` wrapping, `[[Prototype]]` assignment),
+  `Object.prototype` (accessors, `__proto__` accessor per Annex B, `constructor`), all statics and
+  prototype methods: `assign`, `create`, `defineProperties`, `defineProperty`, `entries`,
+  `fromEntries`, `freeze`, `getOwnPropertyDescriptor(s)`, `getOwnPropertyNames`,
+  `getOwnPropertySymbols`, `getPrototypeOf`, `groupBy`, `hasOwn`, `is`, `isExtensible`,
+  `isFrozen`, `isSealed`, `keys`, `preventExtensions`, `seal`, `setPrototypeOf`, `values`;
+  `Object.prototype.hasOwnProperty/isPrototypeOf/propertyIsEnumerable/toLocaleString/toString/
+  valueOf/__defineGetter__/__defineSetter__/__lookupGetter__/__lookupSetter__`.
+- **Function:** `Function` constructor (parses parameter list + body via `parser` on
+  `FunctionBody` grammar with `[[Realm]]` handling, non-constructible functions created as
+  "bound-ish" `Function` objects), `Function.prototype` (`apply`, `bind`, `call`, `toString`
+  returning original source or `"function () { [native code] }"`, `Symbol.hasInstance`),
+  `Function.prototype.constructor`.
+- **Boolean:** constructor + prototype (`toString`, `valueOf`).
+- **Symbol:** constructor (non-constructible, `Symbol()` description), `Symbol.for`/`keyFor`,
+  `description`, `toString`, `valueOf`, well-known symbols (`@@asyncDispose`, `@@asyncIterator`,
+  `@@dispose`, `@@hasInstance`, `@@isConcatSpreadable`, `@@iterator`, `@@match`, `@@matchAll`,
+  `@@replace`, `@@search`, `@@species`, `@@split`, `@@toPrimitive`, `@@toStringTag`,
+  `@@unscopables`).
+- **Error family:** `Error` (constructor with `message` + `options.cause`, `Error.prototype`
+  `message`/`name`/`cause`/`toString`), `EvalError`, `RangeError`, `ReferenceError`,
+  `SyntaxError`, `TypeError`, `URIError`, `AggregateError` (`errors` iterable + `cause`),
+  `SuppressedError` (`error`, `suppressed`, `cause`), `Error.isError`, `[[ErrorData]]` slot,
+  `%NativeError%` shared machinery, stack capture on creation (host-defined, V8-style).
+- **WeakRef / FinalizationRegistry** — implement slots and API surface; faithful collection
+  semantics arrive with the GC milestone (documented: without a real GC, `WeakRef.deref()` never
+  returns `undefined`). `FinalizationRegistry.prototype.register/unregister`,
+  `HostEnqueueFinalizationRegistryCleanupJob` wiring.
+
+**Tests:** `eval` scoping matrix (direct/indirect, strict/sloppy, var in caller scope);
+`Object.defineProperty` full matrix on exotic objects; `Symbol.for`/`keyFor` identity;
+URI encode/decode round trips + malformed `%` errors; `Error` cause chains; `AggregateError`;
+`Function.prototype.toString` exact-source round trip; `Function` constructor param parsing
+errors; global-property completeness check (compare the installed global property list against
+the spec's table).
+**Exit criteria:** global object matches the spec's property list; Phase 8 fixtures green;
+test262 climbs (this phase alone covers a large `built-ins/` fraction).
+
+---
+
+### Phase 9 — Numbers and dates
+
+**Spec:** ch. 21 (Numbers and Dates).
+
+**Deliverables (`runtime` built-ins):**
+
+- **Number:** constructor (incl. `ToNumeric`-based wrapping), statics `EPSILON`,
+  `MAX_SAFE_INTEGER`, `MAX_VALUE`, `MIN_SAFE_INTEGER`, `MIN_VALUE`, `NaN`, `NEGATIVE_INFINITY`,
+  `POSITIVE_INFINITY`, `parseFloat`, `parseInt`, `isFinite`, `isInteger`, `isNaN`, `isSafeInteger`;
+  prototype `toExponential`, `toFixed` (banker's rounding per spec's `ℝ(𝔽)` formatting rules and
+  the "n is an integer" table), `toPrecision`, `toString` (radix 2–36 algorithm), `valueOf`,
+  `toLocaleString` (no-op).
+- **BigInt:** constructor (`BigInt(value)` coercion, no implicit conversion), `asIntN`/`asUintN`,
+  `BigInt.prototype.toString` (radix, sign), `valueOf`, `toLocaleString` (no-op); arithmetic
+  operators on `BigInt` (`BigInt::add` etc. in `crux` Phase 1) wired to the evaluator's
+  numeric operators incl. mixed-type throws; `BigInt64Array`/`BigUint64Array` element conversion
+  (`ToBigInt64`/`ToBigUint64`).
+- **Math:** all statics with spec algorithms — `abs`, `acos`, `acosh`, `asin`, `asinh`, `atan`,
+  `atan2`, `atanh`, `cbrt`, `ceil`, `clz32`, `cos`, `cosh`, `exp`, `expm1`, `floor`, `fround`
+  (binary32 via `f32` cast semantics), **`f16round`** (binary16 via `half`; honor the spec's
+  double-rounding note), `hypot` (with the spec's sum-of-squares overflow algorithm), `imul`,
+  `log`, `log10`, `log1p`, `log2`, `max`, `min`, `pow` (special cases: `NaN` exponent handling,
+  `±1` cases), `random` (host PRNG), `round`, `sign`, `sin`, `cos`, `tan` + hyperbolics,
+  `sqrt`, **`sumPrecise`** (the spec's summation state machine: minus-zero tracking, increment
+  precision per `Number::add` with `Math.fround`-style widening — implement the exact
+  `MathSumPrecise` algorithm), `trunc`; constants `E`, `LN10`, `LN2`, `LOG10E`, `LOG2E`, `PI`,
+  `SQRT1_2`, `SQRT2`.
+- **Date:**
+  - Time math: `TimeClip`, `MakeDay`, `MakeTime`, `MakeDate`, `TimeWithinDay`, `DaysInYear`,
+    `InLeapYear`, `DayFromYear`, `TimeFromYear`, `YearFromTime`, `MonthFromTime`, `DayWithinYear`,
+    `DateFromTime`, `WeekDay`, `HourFromTime`, `MinFromTime`, `SecFromTime`, `msFromTime`,
+    `LocalTime`/`UTC` with host local-timezone offset.
+  - Constructor: `new Date(...)` all overloads, `Date()` (current time string), `Date.parse`
+    (full **Date Time String Format** grammar incl. `±HH:mm` offsets, expanded years `±YYYYYY`,
+    `Z`, and the spec's fallback rules; invalid → `NaN`), `Date.UTC`, `Date.now`.
+  - Prototype: `getDate/getDay/getFullYear/getHours/getMilliseconds/getMinutes/getMonth/getSeconds/
+    getTime/getTimezoneOffset` + `getUTCDate/…/getUTCMilliseconds/…`, legacy `getYear/setYear`,
+    `setDate/setFullYear/setHours/setMilliseconds/setMinutes/setMonth/setSeconds/setTime/setUTC*`,
+    `toDateString`, `toISOString` (always UTC, `RangeError` outside ±8.64e15 ms), `toJSON`,
+    `toLocaleDateString/toLocaleString/toLocaleTimeString` (no-op formats), `toString`
+    (day/month name tables from the spec), `toTimeString`, `toUTCString`/`toGMTString`,
+    `valueOf`, `Symbol.toPrimitive` (`date` hint: `toString` first).
+- `String`-sensitive format helpers: the spec's `ToDateString` day-name/month-name tables.
+
+**Tests:** number formatting round trips (proptest: `String(n) → parse → same value`),
+`toFixed` edge table (0.5, -0.5, large/small exponents), `Math.pow` special-case table,
+`Math.clz32`, `Math.imul`, `Math.fround` vs `f32`, `Math.sumPrecise` (magnitude-mixing cases),
+`Date.parse` valid/invalid matrix from the spec examples, date arithmetic round trips, leap years,
+timezone-offset consistency, `Date.prototype.toISOString` boundaries, `BigInt` arithmetic
+properties (proptest vs `num-bigint`).
+**Exit criteria:** Number/BigInt/Math/Date fixtures green; test262 `built-ins/Number`,
+`built-ins/BigInt`, `built-ins/Math`, `built-ins/Date` largely passing.
+
+---
+
+### Phase 10 — Text processing: String
+
+**Spec:** ch. 22 Text Processing — String section (String constructor and prototype; string
+iterator).
+
+**Deliverables (`runtime` + `unicode`):**
+
+- `String` constructor (`String(value)` ToString coercion), `String.raw` (cooked/raw template
+  access), `String.fromCharCode` (code-unit semantics, `ToUint16`), `String.fromCodePoint`.
+- Prototype methods (each per its exact algorithm, operating on UTF-16 code units):
+  `at`, `charAt`, `charCodeAt`, `codePointAt` (`CodePointAt`), `concat`, `endsWith`,
+  `includes`, `indexOf`, `isWellFormed` (no lone surrogates), `lastIndexOf`, `localeCompare`
+  (no-op), `match`/`matchAll` (delegating to `Symbol.match`/`Symbol.matchAll` — RegExp wiring in
+  Phase 11), `normalize` (NFC/NFD/NFKC/NFKD via `unicode-normalization`, with
+  `RangeError` on unknown forms), `padEnd`/`padStart` (code-unit truncation), `repeat`
+  (`RangeError` on negative/infinite, count math per spec), `replace`/`replaceAll` (pattern
+  `Symbol.replace` delegation; string-pattern `GetSubstitution` semantics incl. `$& $' $\``
+  `$n` `$<name>`; `replaceAll` with non-global regexp throws), `search`, `slice` (negative
+  indices), `split` (all limit/species/empty-string edge cases, `Symbol.split` delegation),
+  `startsWith`, `substring`, `toLocaleLowerCase`/`toLocaleUpperCase` (no-op), `toLowerCase`/
+  `toUpperCase` (**Default Case Conversion**, which can expand code points — via
+  `unicode-case-mapping` or generated UCD tables), `toString`, `toWellFormed` (replace lone
+  surrogates with U+FFFD), `trim`/`trimStart`/`trimEnd` (exact WhiteSpace + LineTerminator sets
+  incl. U+FEFF), `valueOf`, `Symbol.iterator`.
+- `%StringIteratorPrototype%` (`next`, `Symbol.toStringTag = "String Iterator"`) iterating code
+  points via `CodePointAt`.
+- `Symbol.species` on String? (String has no species; skip) — note: `String.prototype` has
+  `Symbol.iterator` and `Symbol.toStringTag`? (String.prototype doesn't have toStringTag; the
+  `String` constructor has none.) Keep faithful to the property tables.
+- Annex B: `String.prototype` HTML wrappers (`anchor`, `big`, `blink`, `bold`, `fixed`,
+  `fontcolor`, `fontsize`, `italics`, `link`, `small`, `strike`, `sub`, `sup`) with `ToString`
+  + attribute escaping rules.
+
+**Tests:** per-method spec examples; case-mapping expansion cases (`ß`→`"SS"`, `İ`→`"İ"`),
+surrogate pairs in `codePointAt`/`fromCodePoint`/`split`/`slice`/`trim`; `padEnd/padStart`
+truncation; `normalize` equivalence classes; `isWellFormed`/`toWellFormed`; `replace`/`replaceAll`
+substitution patterns; `split` edge cases (empty separator, limit 0, undefined separator);
+iteration order; HTML-wrapper attribute escaping (Annex B).
+**Exit criteria:** all `built-ins/String` test262 tests that don't require Intl pass.
+
+---
+
+### Phase 11 — Text processing: RegExp
+
+**Spec:** ch. 22 (RegExp section), ch. 12 (regexp literal early errors), Annex B regexp rules.
+
+**Deliverables (`regexp` + `runtime`):**
+
+- `regexp`:
+  - Pattern parser implementing the `Pattern`/`Disjunction` grammar parameterized by
+    `u`/`v` flags, producing an AST then a compiled matcher program.
+  - Flag semantics: `d` (indices), `g`, `i` (canonicalize per spec incl. `toCaseFold`-style
+    simple folding under `u`/`v`), `m`, `s`, `u`, `v`, `y`; **inline modifiers**
+    `(?ims-ims:…)` and `(?ims-ims)` scoped forms (ES2025); `flags` getter ordering
+    `"dgimsuvy"`.
+  - Constructs: literals, character classes (ranges, negated, class escapes `\d\D\s\S\w\W`,
+    `\p{…}`/`\P{…}` property escapes incl. `General_Category`, `Script`, `Script_Extensions`,
+    binary properties — via `unicode`), **`/v` set operations** (union `[a-b]`,
+    intersection `[a&&b]`, difference `[a--b]`, nested classes, `\q{…}` strings), dot (with `s`),
+    anchors `^ $ \b \B`, quantifiers (greedy/lazy, `* + ? {n} {n,} {n,m}` with legacy octal
+    ambiguity rules), groups (capturing, non-capturing, **named groups** `(?<name>…)`),
+    **backreferences** (`\1`, `\k<name>`), lookahead `(?=…)` `(?!…)`, lookbehind
+    `(?<=…)` `(?<!…)` (fixed-length), `(?:…)`, legacy Annex B escapes
+    (`\cX`, octal escapes, identity escapes) outside `u`/`v`.
+  - Matcher: backtracking VM with explicit stack; handles all constructs above; `RegExpExec`
+    captures with indices; `indices` (`d` flag) building `[[RegExpIndices]]` with named-group
+    indices; `AdvanceStringIndex` code-point vs code-unit stepping under `u`.
+- `runtime` (RegExp built-in):
+  - `RegExp` constructor: pattern/flag coercion, `RegExpInitialize`, legacy
+    `RegExp(pattern, flags)` overloading, `lastIndex` slot, `exec` (with `g`/`y` lastIndex
+    updates incl. empty-match increment), `test`, `toString` (`/source/flags` with proper
+    escaping), `compile`-like re-initialization via constructor only; prototype accessors
+    `dotAll/global/hasIndices/ignoreCase/multiline/source/sticky/unicode/unicodeSets/flags`,
+    `Symbol.match`, `Symbol.matchAll`, `Symbol.replace` (`GetSubstitution` full algorithm),
+    `Symbol.search`, `Symbol.split` (incl. species and `?` handling), `Symbol.toStringTag =
+    "RegExp"`.
+  - `RegExp.escape` (ES2025): exact escaping algorithm from the spec.
+  - `String.prototype.match/matchAll/replace/replaceAll/search/split` delegation is already
+    wired in Phase 10 — this phase makes the RegExp sides real.
+  - Literal creation from the parser: `RegExpCreate(pattern, flags)` with early-error
+    validation done at parse time via `regexp`.
+- Annex B: legacy `RegExp.prototype.compile`? (verify presence in spec; if absent skip),
+  legacy octal/identity escapes in non-`u`/`v` patterns, `\c` weirdness, `$` matching before
+  final newline (`m`-like behavior in legacy multiline).
+
+**Tests:** a dedicated regexp test corpus (port key fixtures from test262's `built-ins/RegExp`
+and `language/literals/regexp`), plus targeted: backreference ordering, lookbehind fixed-length
+only (variable-length → SyntaxError), named group + duplicate group interplay, `/v` set
+arithmetic, modifiers scoping/restart semantics, `indices` with named groups, `lastIndex`
+protocol with `exec`/`replace`/`split`/`matchAll`, unicode canonicalization in `/i`,
+`RegExp.escape` table, empty-pattern edge cases. Fuzz matcher against randomized patterns with a
+brute-force reference for the subset without backreferences.
+**Exit criteria:** `built-ins/RegExp` + regexp-heavy `language` tests pass at a high rate; matcher
+never panics under fuzzing.
+
+---
+
+### Phase 12 — Indexed collections: Array and TypedArray
+
+**Spec:** ch. 23 (Indexed Collections).
+
+**Deliverables (`runtime` built-ins):**
+
+- **Array:** `Array` constructor (length argument + `new Array(n)` semantics, species),
+  `Array.isArray`, `Array.from` (`Array.from` with mapper/thisArg, `Symbol.iterator` + array-like
+  fallback, holes), `Array.fromAsync` (ES2026: async iterables, mapper may be async, promise
+  resolution order), `Array.of`.
+  - Prototype: `at`, `concat` (`Symbol.isConcatSpreadable`), `copyWithin`, `entries`, `every`,
+    `fill`, `filter`, `find`, `findIndex`, `findLast`, `findLastIndex`, `flat` (depth coercion),
+    `flatMap`, `forEach`, `includes`, `indexOf`, `join` (separator handling), `keys`, `lastIndexOf`,
+    `map`, `pop`, `push`, `reduce`, `reduceRight`, `reverse`, `shift`, `slice`, `some`, `sort`
+    (stable, `SortCompare` with `ToString` keys, `undefined` handling, comparator not callable →
+    default), `splice`, `toLocaleString` (no-op), `toReversed`, `toSorted`, `toSpliced`, `toString`
+    (join), `unshift`, `values`, `with`, `Symbol.iterator`, `Symbol.unscopables`,
+    `Symbol.species`.
+  - Species-aware operations: `ArraySpeciesCreate`, length preservation, holes vs `undefined`.
+- **TypedArray** (all 12 kinds: Int8, Uint8, Uint8Clamped, Int16, Uint16, Int32, Uint32, Float16,
+  Float32, Float64, BigInt64, BigUint64):
+  - `%TypedArray%` intrinsic + per-kind constructors; constructor overloads (no args, length,
+    object, typed array, buffer+byteOffset+length) with `[[ViewedArrayBuffer]]`,
+    `[[TypedArrayName]]`, `[[ContentType]]`, `[[ByteLength]]`, `[[ByteOffset]]`,
+    `[[ArrayLength]]`, `[[ArrayLengthTracking]]` (resizable buffers).
+  - Integer-Indexed exotic (Phase 5 shell completed): `IsValidIntegerIndex`, canonical numeric
+    strings, `[[Get]]`/`[[Set]]`/`[[DefineOwnProperty]]`/`[[Delete]]` semantics, bounds checks,
+    detached-buffer `TypeError`s.
+  - `GetValueFromBuffer`/`SetValueInBuffer` with element sizes, byte order (native +
+    `littleEndian`), shared-buffer variants (Phase 17).
+  - Prototype methods: `at`, `copyWithin`, `entries`, `every`, `fill`, `filter`, `find`,
+    `findIndex`, `findLast`, `findLastIndex`, `forEach`, `includes`, `indexOf`, `join`, `keys`,
+    `lastIndexOf`, `map`, `reduce`, `reduceRight`, `reverse`, `set`, `slice`, `some`, `sort`,
+    `subarray`, `toLocaleString` (no-op), `toReversed`, `toSorted`, `values`, `with`,
+    `Symbol.iterator`, `Symbol.toStringTag`; accessors `buffer`/`byteLength`/`byteOffset`/`length`.
+    Statics: `%TypedArray%.from`, `%TypedArray%.of`, `Symbol.species`.
+  - **Uint8Array hex/base64 (ES2026):** `toHex`, `toBase64` (`alphabet`: `"base64"`/`"base64url"`,
+    `omitPadding`), `setFromHex` (partial fill semantics + `written`/`read` result object),
+    `setFromBase64` (`alphabet`, `lastChunkHandling`: `"loose"`/`"strict"`/`"stop-before-partial"`),
+    per the spec's `FromHex`/`FromBase64` algorithms.
+  - `Float16` element conversion via `half`.
+- Sorting shared by Array/TypedArray with per-kind comparators (`Number::lessThan`-ish
+  ordering, BigInt ordering).
+
+**Tests:** per-method edge cases (holes, sparse arrays, `length` mutation during iteration),
+species creation, `sort` stability + comparator edge cases, typed-array bounds/detach/aliasing,
+byte order, `set` overlap semantics, resizable-buffer interactions (deferred corner cases to
+Phase 14 but design tests now), base64/hex round trips + error cases, `fromAsync` ordering,
+`Symbol.isConcatSpreadable`.
+**Exit criteria:** `built-ins/Array` and `built-ins/TypedArray` (+ `%TypedArray%`) passing at high
+rate; test262 overall ≥ 50–60%.
+
+---
+
+### Phase 13 — Keyed collections: Map, Set, WeakMap, WeakSet
+
+**Spec:** ch. 24 (Keyed Collections).
+
+**Deliverables (`runtime` built-ins):**
+
+- **Map:** `Map([iterable])` (SameValueZero keying, `-0`→`+0` normalization), `Map.prototype`
+  (`clear`, `delete`, `entries`, `forEach`, `get`, `getOrInsert`, `getOrInsertComputed`, `has`,
+  `keys`, `set`, `size` getter, `values`, `Symbol.iterator`, `Symbol.toStringTag = "Map"`),
+  `Map.groupBy` (grouping by key callback), `Map.prototype[Symbol.species]`; `%MapIteratorPrototype%`
+  (`next`, `Symbol.toStringTag = "Map Iterator"`) with entries/keys/values modes and iteration
+  visiting semantics (insertion order, mutation during iteration per spec's `MapIteratorNext`).
+- **Set:** `Set([iterable])`, `Set.prototype` (`add`, `clear`, `delete`, `difference`, `entries`,
+  `forEach`, `has`, `intersection`, `isDisjointFrom`, `isSubsetOf`, `isSupersetOf`, `keys`
+  (alias of values), `symmetricDifference`, `union`, `values`, `size`, `Symbol.iterator`,
+  `Symbol.toStringTag = "Set"`), `Set.prototype[Symbol.species]`; the ES2025 set-method
+  algorithms: create-result-set via species, `GetIterator` of `other`, `SetData` traversal,
+  `SetRecord`-style access (via `GetSetRecord`-equivalent helper for array-likes), result set
+  population order; `%SetIteratorPrototype%`.
+- **WeakMap:** `WeakMap([iterable])`, key must be Object or Symbol (`TypeError` otherwise),
+  `WeakMap.prototype` (`delete`, `get`, `getOrInsert`, `getOrInsertComputed`, `has`, `set`,
+  `Symbol.toStringTag = "WeakMap"`); ephemeron semantics gated on the GC milestone (Phase 18) —
+  until then documented limitation: entries are never collected (Rc model).
+- **WeakSet:** same shape (`add`, `delete`, `has`, `Symbol.toStringTag = "WeakSet"`).
+- `SameValueZero` for keys; `Map.prototype.getOrInsertComputed`/`WeakMap.prototype.
+  getOrInsertComputed` invoke callback only on miss and store its return (exact spec steps).
+
+**Tests:** insertion order + mutation-during-iteration semantics, `-0`/`+0`/`NaN` key behavior,
+set-method result ordering and species behavior, `groupBy` callback ordering, WeakMap/WeakSet
+basic ops + key-type errors, iterator `.return()`/close paths on early exit.
+**Exit criteria:** `built-ins/Map`, `built-ins/Set`, `built-ins/WeakMap`, `built-ins/WeakSet`
+passing (except Weak*-collection-dependent tests until the GC milestone).
+
+---
+
+### Phase 14 — Structured data: ArrayBuffer, SharedArrayBuffer, DataView, Atomics, JSON
+
+**Spec:** ch. 25 (Structured Data).
+
+**Deliverables (`runtime` built-ins):**
+
+- **ArrayBuffer:** constructor (byteLength + `{ maxByteLength }` for **resizable** buffers),
+  `ArrayBuffer.prototype` (`byteLength` with length-tracking, `resize`, `slice`,
+  `transfer`, `transferToFixedLength`, `maxByteLength`, `resizable`, `Symbol.toStringTag =
+  "ArrayBuffer"`), `ArrayBuffer.isView`; slots `[[ArrayBufferData]]`, `[[ArrayBufferByteLength]]`,
+  `[[ArrayBufferMaxByteLength]]`, `[[ArrayBufferByteLengthData]]` (length-tracking for
+  shared/resizable), `IsDetachedBuffer`, `DetachArrayBuffer` (incl. deferred-untrack-data
+  semantics), `CloneArrayBuffer`, `ArrayBufferSpeciesCreate`; `GetArrayBufferMaxByteLength`.
+- **SharedArrayBuffer:** constructor (byteLength + `maxByteLength` for growable), `grow`,
+  `growable`, `maxByteLength`, `byteLength` (with length-tracking), `slice`,
+  `Symbol.toStringTag = "SharedArrayBuffer"`; shared data blocks; `IsSharedArrayBuffer`.
+- **DataView:** constructor (buffer, byteOffset, length with bounds checks), `buffer`/
+  `byteLength`/`byteOffset`, `getInt8/getUint8/getInt16/getUint16/getInt32/getUint32/
+  getBigInt64/getBigUint64/getFloat16/getFloat32/getFloat64` + `set*` (offset + `littleEndian`
+  option, `ToIndex` bounds, detached checks), element size validation, `Symbol.toStringTag =
+  "DataView"`.
+- **Atomics:** `add`, `and`, `compareExchange`, `exchange`, `isLockFree`, `load`, `or`, `store`,
+  `sub`, `xor`, `notify`, `wait` (blocking; on the main agent `[[CanBlock]] = false` → throw
+  `TypeError`), `waitAsync` (non-blocking; returns `{async: true, value: promise}` or
+  `{async: false, value: "ok"/"not-equal"/"timed-out"}`), `[Symbol.toStringTag] = "Atomics"`;
+  `ValidateAtomicAccess` (aligned accesses), `GetWaiterList`, typed-array validation (Int8/…
+  kinds only), shared-buffer requirement (non-shared → `TypeError`).
+- **JSON:**
+  - `JSON.parse(text, reviver?)`: `ParseJSON` on the JSON grammar (JSONValue, JSONObject,
+    JSONArray, JSONString with all escapes, JSONNumber with the full grammar, true/false/null),
+    **ES2026 reviver context**: reviver is called `(key, value, context)` where `context` has a
+    `source` property (raw source text of the parsed segment) and `lastIndex`-style position;
+    implement `CreateJSONParseRecord`/`InternalizeJSONProperty` with the JSON Parse Record
+    snapshot; reviver returning `undefined` deletes the property.
+  - `JSON.stringify(value, replacer?, space?)`: `SerializeJSONProperty` with `toJSON` calls,
+    replacer function/array (property whitelist), `space` (number of spaces / string), key
+    ordering (string keys in insertion order + integers), `undefined`/function/symbol omission,
+    `StringEscape` incl. lone surrogates (`\uD800`-style), `QuoteJSONString`, circular → `TypeError`.
+  - `JSON.rawJSON(text)` (ES2026): validates `text` is a JSON primitive (`StringNumericLiteral`/
+    `StringBooleanLiteral`/`StringNullLiteral`/JSONString), returns a **RawJSON object**
+    (ordinary object with `[[RawJSON]]` slot); `JSON.isRawJSON(value)`; `JSON.stringify` of a
+    RawJSON emits its raw text verbatim (no re-escapes), and `JSON.parse`-style integration:
+    `JSON.rawJSON` objects serialize only in `stringify`, and produce the parsed value when
+    re-parsed. `[Symbol.toStringTag] = "JSON"`.
+- Memory-model hooks (read/write/read-modify-write with ordering) — the sequencing machinery is
+  designed here and activated in Phase 17.
+
+**Tests:** buffer resizing/transfer semantics (detachment, `byteLength` tracking, typed-array
+views over resizable buffers, element-shifting), `DataView` bounds/endianness, `Atomics`
+operations incl. `waitAsync` state transitions, JSON parse/stringify round trips + escaping,
+reviver context `source` correctness, `rawJSON` passthrough in `stringify`, replacer whitelists,
+`space` formatting, `toJSON` interception.
+**Exit criteria:** `built-ins/ArrayBuffer`, `built-ins/SharedArrayBuffer`, `built-ins/DataView`,
+`built-ins/Atomics`, `built-ins/JSON` at high pass rates.
+
+---
+
+### Phase 15 — Control abstraction: iterators, generators, async, promises
+
+**Spec:** ch. 26 (Control Abstraction Objects). Completes the Promise surface started in Phase 7
+and adds the full iterator/async machinery.
+
+**Deliverables (`runtime` built-ins):**
+
+- **Iterator:** `Iterator` constructor + `Iterator.prototype`:
+  `constructor`, `drop`, `every`, `filter`, `find`, `flatMap`, `forEach`, `map`, `reduce`,
+  `some`, `take`, `toArray`, `toAsync`, `Symbol.iterator` (returns `this` for iterators),
+  `Symbol.toStringTag = "Iterator"`; `%WrapForValidIteratorPrototype%` (wrapping arbitrary
+  iterables; `Iterator.from` produces wrapped iterators); statics **`Iterator.concat`** (ES2026,
+  sequences iterables with `close` semantics), `Iterator.from` (`GetIteratorFlattenable`),
+  **`Iterator.zip`** and **`Iterator.zipKeyed`** (ES2026, with `{ length: "shortest" |
+  "longest" }` option and remainder handling).
+- **AsyncIterator:** prototype `map`, `filter`, `take`, `drop`, `flatMap`, `reduce`, `toArray`,
+  `forEach`, `some`, `every`, `find`, `Symbol.asyncIterator`, `Symbol.toStringTag =
+  "Async Iterator"`.
+- **Async-from-Sync iterator:** `CreateAsyncFromSyncIterator`, `AsyncFromSyncIteratorContinuation`
+  (thenable assimilation), used by `for-await-of` over sync iterables.
+- **Generator:** `GeneratorFunction` (constructor + prototype), `%GeneratorFunction.prototype%`,
+  `GeneratorPrototype` (`next`, `return`, `throw`, `Symbol.toStringTag = "Generator"`); generator
+  objects already exist from Phase 7; this phase adds the constructor surface
+  (`GeneratorFunction(p…, body)` parsing like `Function`), `instanceof` wiring, and completes
+  `yield*` + `AsyncFromSyncIterator` interplay.
+- **AsyncGenerator:** `AsyncGeneratorFunction`, `AsyncGeneratorPrototype` (`next`, `return`,
+  `throw`, `Symbol.toStringTag = "Async Generator"`), completion of the Phase 7 queue-based
+  execution (rejection/`await` propagation, `AsyncGeneratorAwaitReturn`).
+- **AsyncFunction:** `AsyncFunction` constructor + `AsyncFunction.prototype`
+  (`Symbol.toStringTag = "Async Function"`).
+- **Promise completion:** full `Promise` surface is already in place from Phase 7; fill in
+  remaining pieces: `%Promise.allSettled%` result-record shape, `Promise.prototype.finally`
+  (species-aware, `finally` thenable assimilation), `PromiseReaction` ordering guarantees,
+  `HostPromiseRejectionTracker` emission points (unhandled vs handled-after-rejection),
+  `Promise[Symbol.species]`, `%Promise.prototype%[Symbol.toStringTag] = "Promise"`.
+- **DisposableStack / AsyncDisposableStack** (explicit resource management built-ins):
+  `DisposableStack` (`adopt`, `defer`, `dispose`, `move`, `use`, `Symbol.dispose`,
+  `Symbol.toStringTag`), `AsyncDisposableStack` (`adopt`, `defer`, `disposeAsync`, `move`, `use`,
+  `Symbol.asyncDispose`, `Symbol.toStringTag`); `CreateDisposableResource`/`DisposeResources`
+  AOs already exist from Phase 7 (`using`) — these built-ins reuse them; `SuppressedError`
+  integration (already in Phase 8 error family).
+
+**Tests:** iterator-helper chains (laziness, early termination, `return` propagation,
+`Iterator.concat` closing semantics), `zip`/`zipKeyed` length modes, `toAsync` on sync
+iterators, async iterator helper ordering with promises, generator constructor, promise
+rejection tracking, `finally` species behavior, disposable stacks (disposal order, `move`,
+errors → `SuppressedError`, async disposal awaiting).
+**Exit criteria:** `built-ins/Iterator`, `built-ins/AsyncIterator`, `built-ins/Generator*`,
+`built-ins/AsyncGenerator*`, `built-ins/AsyncFunction`, `built-ins/Promise`,
+`built-ins/DisposableStack`, `built-ins/AsyncDisposableStack` at high pass rates; test262
+≥ 80–85%.
+
+---
+
+### Phase 16 — Reflection: Proxy and Reflect
+
+**Spec:** ch. 27 (Reflection).
+
+**Deliverables (`runtime` built-ins):**
+
+- **Proxy:** `Proxy(target, handler)` (non-constructible, target must be object/function;
+  `TypeError` on revoked), `Proxy.revocable` (`revoke` makes all traps throw `TypeError`),
+  `%Proxy%` internal machinery already in Phase 5 — complete all 14 traps
+  (`getPrototypeOf`, `setPrototypeOf`, `isExtensible`, `preventExtensions`,
+  `getOwnPropertyDescriptor`, `defineProperty`, `has`, `get`, `set`, `deleteProperty`,
+  `ownKeys`, `apply`, `construct`) with:
+  - Trap validation: non-callable trap → default behavior, missing trap → target behavior.
+  - **Invariants** per trap (from the ch. 10 "Proxy Object Internal Methods" algorithms):
+    e.g. non-extensible target `ownKeys` must return exactly `[[OwnPropertyKeys]]`; get of a
+    non-configurable non-writable data property must return its value; defineProperty cannot
+    change non-configurable attributes; `getPrototypeOf` must match target's non-extensible
+    prototype, etc. Each invariant failure throws `TypeError`.
+- **Reflect:** `apply`, `construct` (with `newTarget`), `defineProperty`, `deleteProperty`,
+  `get`, `getOwnPropertyDescriptor`, `getPrototypeOf`, `has`, `isExtensible`, `ownKeys`,
+  `preventExtensions`, `set`, `setPrototypeOf` — thin, non-throwing wrappers over the internal
+  methods (returning booleans where the spec says so; `Reflect.apply/construct/…` keep `?`
+  semantics).
+
+**Tests:** the test262 proxy invariants corpus is the bulk here; targeted: revoked proxy every
+trap, `ownKeys` ordering + filtering (duplicates → TypeError, symbol/string checks), trap
+invariant matrix, `Reflect.construct` with custom `newTarget`, `Reflect.apply` with `this`,
+`Reflect.ownKeys` ordering, proxies over functions/classes/module-namespaces.
+**Exit criteria:** `built-ins/Proxy` and `built-ins/Reflect` at high pass rates; test262
+≥ 90%.
+
+---
+
+### Phase 17 — Memory model and concurrency
+
+**Spec:** ch. 28 (Memory Model).
+
+**Scope decision (documented):** ES2026's memory model only becomes observable with
+multi-agent execution (workers sharing `SharedArrayBuffer`). The base engine runs one agent. This
+phase therefore delivers:
+
+1. **A design document** (`docs/memory-model.md`) that maps ch. 28 onto a future
+   thread-per-agent design: Shared Data Blocks, Agent Signifiers, read/write/read-modify-write
+   executions, synchronizes-with (via `Atomics.notify`/`wait` and `SeqCst` fencing), happens-before
+   (sequenced-before, synchronization edge, transitive), data-race definition and the
+   "no tear, no invented read" guarantees, write buffers and their flushing rules, and the
+   `HostResolveJobQueue`-level interaction with `Atomics.wait`.
+2. **An experimental multi-threaded agent mode** behind a cargo feature (`workers`): each worker
+   = OS thread with its own Realm/job queue; `SharedArrayBuffer` storage moved to `Arc<[UnsafeCell<u8>]>`
+   with `AtomicU*` access for Atomics ops; `Atomics.wait`/`notify` over a global waiter registry;
+   `waitAsync` remains promise-based on the main thread. `Worker` creation is a host hook
+   (`HostCreateWorker`), not a built-in.
+3. **Ordering correctness tests:** single-threaded `Atomics` semantics, multi-threaded stress
+   tests with `SeqCst` invariants (e.g., message-passing via shared buffer + `notify`), run under
+   `--test-threads=1`-safe harness.
+
+**Exit criteria:** single-agent behavior unchanged; feature-gated worker mode passes stress tests;
+`docs/memory-model.md` reviewed against ch. 28.
+
+---
+
+### Phase 18 — Hardening, test262, and performance
+
+**Cross-cutting final phase.**
+
+1. **Conformance hardening:**
+   - Full `test262` sweep: run everything, triage failures into categories (bug / host-dependent /
+     missing-host-hook / Intl-required). Target **≥ 95% of runnable tests**, with the remainder
+     documented in `docs/conformance.md` (expected: host-dependent, `dynamic import` with no
+     module loader, Intl).
+   - Annex B suite (`annexB/`) explicitly tracked — legacy behaviors are part of the spec.
+   - Error-message and stack-trace polish (V8-compatible formats for `message` and `stack`).
+2. **GC milestone (from 4.3):** arena heap + mark-sweep; root tracing; ephemeron-aware
+   WeakMap/WeakSet; `WeakRef`/`FinalizationRegistry` semantics activated; stress-test with
+   `--gc-stress` mode that runs a collection on every allocation; leak-detection harness.
+3. **Performance milestones** (each behind a benchmark gate, not correctness gates):
+   - NaN-boxed `Value` (u64) with tag fast paths.
+   - Bytecode VM replacing the tree-walker for hot paths: the resumable-function IR (Phase 7)
+     grows into a full instruction set (property load/store, call/construct with inline caches,
+     closures, control flow); `--dump-bytecode` flag.
+   - Object shapes / hidden classes + inline caches for property access; string rope
+     representation; parser fast paths; interned-key hashing.
+   - Micro-benchmarks: property access, calls, arithmetic, string concat, array iteration;
+     `--bench` mode in CLI; track against an early snapshot build.
+4. **Embedding API:** `jsrt::Context::new()`, `context.eval(src)`, `context.call(fn, …)`,
+   `HostCallbacks` (console, timers, module resolution, `import.meta`, random, promise rejection
+   tracking), `JsValue`/`JsObject` handle types for interop; rustdocs + examples.
+5. **CLI polish:** `jsrt file.js [args]`, REPL (line editing, multi-line input, `--harmony`-style
+   flag no-ops), `--stack-size`, `--max-old-space`-style memory cap, `--print-bytecode`,
+   `--dump-ast`, `--dump-tokens`.
+
+**Exit criteria:** conformance target met; GC stress clean; perf milestones each pass their gate
+or are explicitly deferred in `docs/perf.md`; embedding API documented with examples.
+
+---
+
+## 7. Milestone summary
+
+| Phase | Delivers | Spec coverage | test262 target (runnable tests) |
+|---|---|---|---|
+| 0 | Workspace skeleton | — | — |
+| 1 | Values + core abstract ops | ch. 6–7 | — |
+| 2 | Source text + lexer | ch. 11–12 | — |
+| 3 | Parser + early errors | ch. 13–17 (grammar) | — (syntax tests only) |
+| 4 | Realms, environments, jobs | ch. 9 | — |
+| 5 | Object model + exotic objects | ch. 10 | — |
+| 6 | Expressions + statements eval | ch. 13–14 | small `language/` subset |
+| 7 | Functions, classes, generators, async, modules, Promise core | ch. 15–16, ch. 26 (core) | 20–30% |
+| 8 | Global + fundamental objects | ch. 18–20 | 35–45% |
+| 9 | Number, BigInt, Math, Date | ch. 21 | 50% |
+| 10 | String | ch. 22 (String) | 55–60% |
+| 11 | RegExp | ch. 22 (RegExp), 12 | 65% |
+| 12 | Array, TypedArray | ch. 23 | 70–75% |
+| 13 | Map, Set, WeakMap, WeakSet | ch. 24 | 78% |
+| 14 | Buffers, Atomics, JSON | ch. 25 | 82% |
+| 15 | Iterator/async/promise/dispose | ch. 26 | 85% |
+| 16 | Proxy, Reflect | ch. 27 | 90–92% |
+| 17 | Memory model (feature-gated) | ch. 28 | unchanged |
+| 18 | Hardening, GC, perf, embedder | all | ≥ 95% |
+
+Percentages are planning estimates; the exit criteria in each phase are authoritative.
+
+---
+
+## 8. Cross-cutting workstreams
+
+- **Unicode** (`unicode`): pin one Unicode version; generate/verify tables (WhiteSpace,
+  LineTerminator, ID_Start/Continue, Default Case Conversion, normalization, properties for
+  regex). A `unicode-version.rs` constant documents the pin; spec version drift is tracked as
+  part of adopting newer specs.
+- **GC** (Phase 1 → 18): `Rc` first with documented cycle leaks; arena mark-sweep with ephemerons
+  later; `--gc-stress` in CI.
+- **Performance** (Phase 18): NaN-boxing, bytecode VM, hidden classes/ICs; each gated by
+  benchmarks with saved baselines.
+- **Embedding** (`HostHooks` trait): designed in Phase 4, filled out per phase, stabilized in 18.
+- **Docs:** `docs/` for conformance, perf, memory model; every phase updates the milestone table.
+
+## 9. Risks and mitigations
+
+| Risk | Mitigation |
+|---|---|
+| **Scope size** (a full ES2026 engine is very large) | Chapter-ordered phases with explicit exit criteria; test262 as an objective, continuously-run measure; land value early (CLI runs real scripts by Phase 6). |
+| **GC correctness / leaks blocking WeakMap etc.** | Rc model is fine for most tests; WeakMap/WeakSet/FinalizationRegistry collection-dependent tests are explicitly deferred to the GC milestone, which has its own stress gates. |
+| **Unicode version mismatches** (spec pins a UCD version; crates may drift) | Centralize all Unicode data in `unicode`; document the pin; where crates disagree, generate tables from UCD. |
+| **RegExp complexity** (lookbehind, `/v` sets, modifiers, legacy escapes) | Dedicated crate + corpus + fuzzing with brute-force reference; implement legacy (Annex B) behavior behind the flag gates exactly as the spec does. |
+| **Async/`yield` semantics** (queue ordering, rejection tracking) | Resumable IR mirrors spec states; test262 async fixtures are early (Phase 7); rejection-tracking hooks exercised by CLI. |
+| **Modules** (cycles, live bindings, TLA, JSON modules) | Implement the spec's linking algorithms verbatim; test262 `language/module-code` + `built-ins/modules`; loader is host-injected so CI can use a fixture loader. |
+| **Date/timezone correctness** | UTC math is exact per spec; local-timezone offset is the only host-dependent piece (documented); `Date.parse` grammar implemented per the spec tables. |
+| **No network in this environment** | test262 + parser corpora vendored when network is available; a one-time setup step is documented; unit/property tests cover the gap until then. |
+
+## 10. Definition of done
+
+- [ ] `cargo build --workspace` and `cargo test --workspace` green on stable Rust; clippy clean.
+- [ ] Every `pub` item in every crate has inline unit tests (§5); the coverage gate passes at 100%
+      `pub`-item coverage.
+- [ ] `jsrt file.js` and the REPL execute ES2026 scripts; `--dump-ast`/`--dump-tokens` work.
+- [ ] test262 at **≥ 95%** of runnable tests; all failures triaged in `docs/conformance.md`.
+- [ ] GC milestone active (no unbounded leaks on long-running programs; `WeakRef`/`FinalizationRegistry`
+      semantics verified).
+- [ ] Embedding API (`jsrt::Context`, host hooks) documented with working examples.
+- [ ] `docs/memory-model.md` present; worker mode feature-gated and stress-tested.
+- [ ] Every phase's exit criteria satisfied; milestone table up to date.
