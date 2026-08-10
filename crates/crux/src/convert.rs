@@ -4,10 +4,12 @@ use num_bigint::BigInt as NumBigInt;
 
 use crate::bigint::{self, BigInt};
 use crate::error::{ErrorKind, JsError};
+use crate::handle::Handle;
 use crate::number;
+use crate::object::JsObject;
 use crate::property::PropertyKey;
 use crate::string::{JsString, intern};
-use crate::value::Value;
+use crate::value::{Value, is_callable};
 use unicode::{is_line_terminator, is_white_space};
 
 /// The hint argument of `ToPrimitive` (spec 7.1.1).
@@ -36,10 +38,44 @@ fn trimmed(units: &[u16]) -> &[u16] {
     &units[start..end]
 }
 
-/// ToPrimitive (spec 7.1.1) — primitives pass through unchanged; object
-/// handling (OrdinaryToPrimitive, @@toPrimitive) joins in Phase 5.
-pub fn to_primitive(value: &Value, _hint: ToPrimitiveHint) -> Result<Value, JsError> {
-    Ok(value.clone())
+/// ToPrimitive (spec 7.1.1): primitives pass through unchanged; objects
+/// convert via OrdinaryToPrimitive (the @@toPrimitive symbol joins with the
+/// well-known symbol table in Phase 15).
+pub fn to_primitive(value: &Value, hint: ToPrimitiveHint) -> Result<Value, JsError> {
+    match value {
+        Value::Object(obj) => ordinary_to_primitive(obj, hint),
+        // Functions are objects in the spec; Phase 4 function values expose
+        // no toString/valueOf properties, so conversion always throws.
+        Value::Function(_) => Err(JsError::new(
+            ErrorKind::TypeError,
+            "Cannot convert object to primitive value".into(),
+        )),
+        _ => Ok(value.clone()),
+    }
+}
+
+/// OrdinaryToPrimitive (spec 7.1.1.1). Phase 4 objects have no callable
+/// methods, so conversion throws a TypeError; a callable method would be
+/// invoked once Phase 7 lands.
+fn ordinary_to_primitive(obj: &Handle<JsObject>, hint: ToPrimitiveHint) -> Result<Value, JsError> {
+    let (first, second) = match hint {
+        ToPrimitiveHint::String | ToPrimitiveHint::Default => ("toString", "valueOf"),
+        ToPrimitiveHint::Number => ("valueOf", "toString"),
+    };
+    for name in [first, second] {
+        let key = JsString::from_utf8(name);
+        let method = obj.get(&key)?;
+        if is_callable(&method) {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "calling functions is not implemented until Phase 7".into(),
+            ));
+        }
+    }
+    Err(JsError::new(
+        ErrorKind::TypeError,
+        "Cannot convert object to primitive value".into(),
+    ))
 }
 
 /// ToBoolean (spec 7.1.2).
@@ -51,6 +87,7 @@ pub fn to_boolean(value: &Value) -> bool {
         Value::String(s) => !s.is_empty(),
         Value::BigInt(b) => !b.is_zero(),
         Value::Symbol(_) => true,
+        Value::Object(_) | Value::Function(_) => true,
     }
 }
 
@@ -71,6 +108,10 @@ pub fn to_number(value: &Value) -> Result<f64, JsError> {
             ErrorKind::TypeError,
             "Cannot convert a Symbol value to a number".into(),
         )),
+        Value::Object(_) | Value::Function(_) => {
+            let prim = to_primitive(value, ToPrimitiveHint::Number)?;
+            to_number(&prim)
+        }
     }
 }
 
@@ -285,6 +326,10 @@ pub fn to_string(value: &Value) -> Result<JsString, JsError> {
             ErrorKind::TypeError,
             "Cannot convert a Symbol value to a string".into(),
         )),
+        Value::Object(_) | Value::Function(_) => {
+            let prim = to_primitive(value, ToPrimitiveHint::String)?;
+            to_string(&prim)
+        }
     }
 }
 
@@ -313,6 +358,11 @@ pub fn to_big_int(value: &Value) -> Result<BigInt, JsError> {
         Value::Symbol(_) => Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert a Symbol to a BigInt".into(),
+        )),
+        // to_primitive above rejects objects, but keep the match exhaustive.
+        Value::Object(_) | Value::Function(_) => Err(JsError::new(
+            ErrorKind::TypeError,
+            "Cannot convert an object to a BigInt".into(),
         )),
     }
 }

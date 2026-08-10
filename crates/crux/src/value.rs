@@ -3,15 +3,18 @@
 use std::fmt;
 
 use crate::bigint::BigInt;
+use crate::function::Function;
 use crate::handle::Handle;
+use crate::object::JsObject;
 use crate::string::JsString;
 use crate::symbol::Symbol;
 
 /// An ECMAScript language value.
 ///
-/// Phase 1 covers the seven primitive types; the Object type joins in Phase 5
-/// with the object model (ch. 10). The derived `PartialEq` is Rust structural
-/// equality; JavaScript semantics use `ops::same_value` / `ops::is_strictly_equal`.
+/// Phase 1 covers the seven primitive types; the Object and Function types
+/// join in Phase 4 with the minimal object shell (the full object model
+/// arrives in Phase 5). The derived `PartialEq` is Rust structural equality;
+/// JavaScript semantics use `ops::same_value` / `ops::is_strictly_equal`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Undefined,
@@ -21,9 +24,11 @@ pub enum Value {
     BigInt(Handle<BigInt>),
     String(Handle<JsString>),
     Symbol(Handle<Symbol>),
+    Object(Handle<JsObject>),
+    Function(Handle<Function>),
 }
 
-/// The `Type` abstract operation (spec 7.2.1) for the Phase 1 value set.
+/// The `Type` abstract operation (spec 7.2.1).
 pub fn type_of(value: &Value) -> &'static str {
     match value {
         Value::Undefined => "undefined",
@@ -33,16 +38,18 @@ pub fn type_of(value: &Value) -> &'static str {
         Value::BigInt(_) => "bigint",
         Value::String(_) => "string",
         Value::Symbol(_) => "symbol",
+        Value::Object(_) => "object",
+        Value::Function(_) => "function",
     }
 }
 
-/// `IsCallable` (spec 7.2.3): no primitive is callable. Object support joins
-/// in Phase 5.
-pub fn is_callable(_value: &Value) -> bool {
-    false
+/// `IsCallable` (spec 7.2.3): function values are callable; ordinary objects
+/// are not until Phase 5 adds callable objects.
+pub fn is_callable(value: &Value) -> bool {
+    matches!(value, Value::Function(_))
 }
 
-/// `IsConstructor` (spec 7.2.4): no primitive is a constructor.
+/// `IsConstructor` (spec 7.2.4): no Phase 4 value is a constructor.
 pub fn is_constructor(_value: &Value) -> bool {
     false
 }
@@ -59,6 +66,11 @@ impl fmt::Display for Value {
             Value::BigInt(b) => write!(f, "{}", b.0),
             Value::String(s) => write!(f, "{s}"),
             Value::Symbol(s) => write!(f, "{}", crate::symbol::descriptive_string(s)),
+            Value::Object(_) => f.write_str("[object Object]"),
+            Value::Function(fun) => match &fun.name {
+                Some(name) => write!(f, "function {name}"),
+                None => f.write_str("function"),
+            },
         }
     }
 }

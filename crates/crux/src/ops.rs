@@ -3,7 +3,7 @@
 use num_bigint::BigInt as NumBigInt;
 
 use crate::bigint::BigInt;
-use crate::convert::{string_to_big_int, to_number};
+use crate::convert::{ToPrimitiveHint, string_to_big_int, to_number, to_primitive};
 use crate::error::JsError;
 use crate::handle::Handle;
 use crate::value::Value;
@@ -20,6 +20,10 @@ pub fn same_value(x: &Value, y: &Value) -> bool {
                 a == b
             }
         }
+        // Objects and functions are identical only when they are the same
+        // heap allocation (spec 7.2.12 step 7).
+        (Value::Object(a), Value::Object(b)) => Handle::ptr_eq(a, b),
+        (Value::Function(a), Value::Function(b)) => Handle::ptr_eq(a, b),
         _ => x == y,
     }
 }
@@ -46,13 +50,27 @@ pub fn is_integral_number(number: f64) -> bool {
     !number.is_nan() && !number.is_infinite() && number.trunc() == number
 }
 
-/// IsLooselyEqual (spec 7.2.15) for primitive operands. The object branches
-/// (steps 1, 2, 11) join in Phase 5 with the object model.
+/// IsLooselyEqual (spec 7.2.15). Object operands convert via ToPrimitive
+/// (spec steps 1-2, 11); bare Phase 4 objects throw a TypeError, which is
+/// OrdinaryToPrimitive's result for an object with no callable methods.
 pub fn is_loosely_equal(x: &Value, y: &Value) -> Result<bool, JsError> {
     if matches!(x, Value::Null) && matches!(y, Value::Undefined)
         || matches!(x, Value::Undefined) && matches!(y, Value::Null)
     {
         return Ok(true);
+    }
+    let x_is_object = matches!(x, Value::Object(_) | Value::Function(_));
+    let y_is_object = matches!(y, Value::Object(_) | Value::Function(_));
+    if x_is_object && !y_is_object {
+        let x = to_primitive(x, ToPrimitiveHint::Default)?;
+        return is_loosely_equal(&x, y);
+    }
+    if y_is_object && !x_is_object {
+        let y = to_primitive(y, ToPrimitiveHint::Default)?;
+        return is_loosely_equal(x, &y);
+    }
+    if x_is_object && y_is_object {
+        return Ok(same_value(x, y));
     }
     if matches!(x, Value::Number(_)) && matches!(y, Value::String(_)) {
         return is_loosely_equal(x, &Value::Number(to_number(y)?));

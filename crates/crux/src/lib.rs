@@ -6,8 +6,10 @@
 pub mod bigint;
 pub mod convert;
 pub mod error;
+pub mod function;
 pub mod handle;
 pub mod number;
+pub mod object;
 pub mod ops;
 pub mod property;
 pub mod span;
@@ -17,7 +19,9 @@ pub mod value;
 
 pub use bigint::BigInt;
 pub use error::{ErrorKind, JsError};
+pub use function::Function;
 pub use handle::Handle;
+pub use object::{JsObject, Property};
 pub use property::{PropertyDescriptor, PropertyKey};
 pub use span::{SourceLocation, Span};
 pub use string::{AtomId, JsString, intern, intern_utf8, lookup};

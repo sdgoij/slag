@@ -1,7 +1,7 @@
 //! `jsrt` command-line runner and REPL.
 //!
-//! Phase 0: argument handling and version reporting. Script evaluation and the
-//! REPL arrive with the runtime (Phase 4+).
+//! Phase 4: script evaluation via the runtime's execution model; the REPL
+//! and `--dump-ast`/`--dump-tokens` arrive in later phases.
 
 use std::process::ExitCode;
 
@@ -36,13 +36,29 @@ fn run(args: &[String]) -> Result<(), u8> {
             println!("jsrt {VERSION}");
             Ok(())
         }
-        Command::Run(path) => {
-            eprintln!("jsrt: {path}: script execution not yet implemented (Phase 4+)");
-            Err(1)
-        }
+        Command::Run(path) => run_file(&path),
         Command::Help => {
             eprintln!("jsrt: usage: jsrt [--version] <file.js>");
             Err(2)
+        }
+    }
+}
+
+/// Parse and evaluate a script file (spec 16.1: ParseScript +
+/// ScriptEvaluation in a fresh realm).
+fn run_file(path: &str) -> Result<(), u8> {
+    let source = std::fs::read_to_string(path).map_err(|e| {
+        eprintln!("jsrt: {path}: {e}");
+        1
+    })?;
+    match runtime::evaluate(&source) {
+        Ok(value) => {
+            println!("{value}");
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!("jsrt: {error}");
+            Err(1)
         }
     }
 }
@@ -71,5 +87,20 @@ mod tests {
     #[test]
     fn single_non_flag_arg_is_a_script_path() {
         assert_eq!(parse(&["--bogus".into()]), Command::Run("--bogus".into()));
+    }
+
+    #[test]
+    fn runs_a_simple_script_file() {
+        let path = std::env::temp_dir().join(format!("jsrt_cli_test_{}.js", std::process::id()));
+        std::fs::write(&path, "42;").unwrap();
+        let result = run_file(path.to_str().unwrap());
+        std::fs::remove_file(&path).ok();
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn missing_script_file_reports_an_error() {
+        let result = run_file("definitely-not-a-real-file.js");
+        assert_eq!(result, Err(1));
     }
 }

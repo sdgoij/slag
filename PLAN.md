@@ -533,6 +533,44 @@ mode propagation.
 **Exit criteria:** `runtime` can evaluate a trivial hardcoded AST to a value; job queue drains
 correctly.
 
+**Status (current):** the execution model is implemented in `crates/runtime`:
+
+- `agent.rs` — the surrounding agent: the execution context stack, the three job queues, and
+  the Agent Record fields (spec 9.7); `InitializeHostDefinedRealm`, `RunJobs`
+- `realm.rs` — Realm Records, the `%…%` intrinsic registry (empty until the built-in phases
+  populate it), and `SetDefaultGlobalBindings` (globalThis/Infinity/NaN/undefined)
+- `env.rs` — all five environment record types with every abstract method of the ch. 9 tables
+  (declarative, object, function, global, module), plus `NewDeclarativeEnvironment`,
+  `NewObjectEnvironment`, `NewFunctionEnvironment`, `NewGlobalEnvironment`, `NewModuleEnvironment`
+- `context.rs` — execution contexts (Function/Realm/ScriptOrModule/LexicalEnvironment/
+  VariableEnvironment/PrivateEnvironment), Reference Records, `ResolveBinding`,
+  `GetIdentifierReference`, `GetThisEnvironment`, `ResolveThisBinding`, `GetNewTarget`,
+  `GetGlobalObject`, private-environment records
+- `job.rs` — Job abstract closures and the host hooks `HostEnqueueGenericJob`/
+  `HostEnqueuePromiseJob`/`HostEnqueueTimeoutJob`; `RunJobs` drains promise jobs (FIFO) before
+  due timeouts before generic jobs
+- `script.rs` — Script Records, `ParseScript`, `ScriptEvaluation`, and
+  `GlobalDeclarationInstantiation` with its declaration SDOs (TopLevelLexicallyDeclaredNames,
+  TopLevelVarDeclaredNames, TopLevelVarScopedDeclarations, BoundNames, IsConstantDeclaration,
+  ScriptIsStrict)
+- `eval.rs` — the minimal evaluator satisfying the exit criteria: literals, identifiers,
+  identifier assignment, expression statements, `var`/`let`/`const`/`using` declarations,
+  function/class declarations, and blocks (full evaluation is Phase 6)
+
+A prerequisite slice of the object model was pulled into `crux` (Phase 5's first deliverable):
+`Value::Object`/`Value::Function` plus an ordinary-object shell with data-property internal
+methods (`ordinary_object_create`, `get`, `set`, `define_property`, `delete`, `has_property`)
+— the global object and object environment records cannot exist without it. Accessors,
+descriptors, exotics, and callable function objects still land in Phase 5-7. The CLI's
+`jsrt file.js` now parses and evaluates scripts. `crates/runtime` runs 41 unit suites;
+the workspace runs 225 tests with `cargo clippy --workspace --all-targets -- -D warnings`
+clean.
+
+**Remaining in Phase 4:** `JobCallback` records and `HostCallJobCallback` (they only have
+call sites once Promise jobs exist — Phase 15), the `with`-statement unscopables check in
+Object Environment Records (needs the well-known symbol table), and nested `eval` execution
+contexts (with the `eval` built-in, Phase 8).
+
 ---
 
 ### Phase 5 — Ordinary and exotic objects
