@@ -719,13 +719,13 @@ impl GlobalEnv {
 
     /// spec 9.2.6.8 CanDeclareGlobalVar.
     fn can_declare_global_var(&self, name: &JsString) -> Result<bool, JsError> {
-        Ok(self.object.has_own_property(name)? || self.object.is_extensible())
+        Ok(self.object.has_own_property(name)? || self.object.is_extensible()?)
     }
 
     /// spec 9.2.6.9 CanDeclareGlobalFunction.
     fn can_declare_global_function(&self, name: &JsString) -> Result<bool, JsError> {
         match self.object.get_own_property(name)? {
-            None => Ok(self.object.is_extensible()),
+            None => Ok(self.object.is_extensible()?),
             Some(prop) => {
                 // An existing accessor property blocks the declaration.
                 let Some(writable) = prop.writable() else {
@@ -738,7 +738,7 @@ impl GlobalEnv {
 
     /// spec 9.2.6.10 CreateGlobalVarBinding.
     fn create_global_var_binding(&self, name: &JsString, deletable: bool) -> Result<(), JsError> {
-        if !self.object.has_own_property(name)? && self.object.is_extensible() {
+        if !self.object.has_own_property(name)? && self.object.is_extensible()? {
             let desc = PropertyDescriptor {
                 value: Some(Value::Undefined),
                 writable: Some(true),

@@ -1,8 +1,10 @@
-//! Property keys and Property Descriptor records (spec 6.1.7).
+//! Property keys and Property Descriptor records (spec 6.1.7, 6.2.5).
 
+use crate::error::{ErrorKind, JsError};
+use crate::object::JsObject;
 use crate::string::{AtomId, JsString, intern, intern_utf8, lookup};
 use crate::symbol::{Symbol, descriptive_string};
-use crate::value::Value;
+use crate::value::{Value, is_callable};
 
 /// A property key: an interned String or a Symbol (spec 6.1.7.6).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -121,6 +123,105 @@ impl PropertyDescriptor {
         self.enumerable.get_or_insert(false);
         self.configurable.get_or_insert(false);
     }
+}
+
+/// ToPropertyDescriptor (spec 6.2.5.4): read the descriptor fields off a
+/// descriptor object. A descriptor with both data and accessor fields is an
+/// error.
+pub fn to_property_descriptor(value: &Value) -> Result<PropertyDescriptor, JsError> {
+    let Value::Object(obj) = value else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Property description must be an object".into(),
+        ));
+    };
+    let mut desc = PropertyDescriptor {
+        value: None,
+        writable: None,
+        get: None,
+        set: None,
+        enumerable: None,
+        configurable: None,
+    };
+    if obj.has_property(&JsString::from_utf8("enumerable"))? {
+        desc.enumerable = Some(crate::convert::to_boolean(
+            &obj.get(&JsString::from_utf8("enumerable"))?,
+        ));
+    }
+    if obj.has_property(&JsString::from_utf8("configurable"))? {
+        desc.configurable = Some(crate::convert::to_boolean(
+            &obj.get(&JsString::from_utf8("configurable"))?,
+        ));
+    }
+    if obj.has_property(&JsString::from_utf8("value"))? {
+        desc.value = Some(obj.get(&JsString::from_utf8("value"))?);
+    }
+    if obj.has_property(&JsString::from_utf8("writable"))? {
+        desc.writable = Some(crate::convert::to_boolean(
+            &obj.get(&JsString::from_utf8("writable"))?,
+        ));
+    }
+    for name in ["get", "set"] {
+        let key = JsString::from_utf8(name);
+        if obj.has_property(&key)? {
+            let method = obj.get(&key)?;
+            if !matches!(method, Value::Undefined) && !is_callable(&method) {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    format!("{name} must be a function or undefined"),
+                ));
+            }
+            if name == "get" {
+                desc.get = Some(method);
+            } else {
+                desc.set = Some(method);
+            }
+        }
+    }
+    // spec step 9: accessor fields conflict with data fields.
+    if (desc.get.is_some() || desc.set.is_some())
+        && (desc.value.is_some() || desc.writable.is_some())
+    {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Invalid property descriptor: cannot both specify accessors and a value or writable attribute".into(),
+        ));
+    }
+    Ok(desc)
+}
+
+/// FromPropertyDescriptor (spec 6.2.5.5): build the descriptor object from a
+/// Property Descriptor, copying only the present fields.
+pub fn from_property_descriptor(desc: &PropertyDescriptor) -> Result<Value, JsError> {
+    let obj = JsObject::ordinary_object_create(None);
+    if let Some(value) = &desc.value {
+        obj.create_data_property_or_throw(&JsString::from_utf8("value"), value.clone())?;
+    }
+    if let Some(writable) = desc.writable {
+        obj.create_data_property_or_throw(
+            &JsString::from_utf8("writable"),
+            Value::Boolean(writable),
+        )?;
+    }
+    if let Some(get) = &desc.get {
+        obj.create_data_property_or_throw(&JsString::from_utf8("get"), get.clone())?;
+    }
+    if let Some(set) = &desc.set {
+        obj.create_data_property_or_throw(&JsString::from_utf8("set"), set.clone())?;
+    }
+    if let Some(enumerable) = desc.enumerable {
+        obj.create_data_property_or_throw(
+            &JsString::from_utf8("enumerable"),
+            Value::Boolean(enumerable),
+        )?;
+    }
+    if let Some(configurable) = desc.configurable {
+        obj.create_data_property_or_throw(
+            &JsString::from_utf8("configurable"),
+            Value::Boolean(configurable),
+        )?;
+    }
+    Ok(Value::Object(obj))
 }
 
 #[cfg(test)]

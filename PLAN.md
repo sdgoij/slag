@@ -649,9 +649,9 @@ algorithm from the ch. 10 spec text:
     `[[Delete]]`/`[[OwnPropertyKeys]]` (array indices ascending → strings → symbols)/
     `[[SetPrototypeOf]]` (cycle + non-extensible checks)/`[[PreventExtensions]]`/
     `[[HasProperty]]`; `CreateDataProperty(OrThrow)`, `DefinePropertyOrThrow`, `GetMethod`
-  - internal-method dispatch on `ObjectKind` (Ordinary/Array/String/Arguments) with ordinary
-    fallthrough; the receiver for getter/setter invocation is recovered from a weak
-    back-reference so `this` is the real object handle
+  - internal-method dispatch on `ObjectKind` (Ordinary/Array/String/Arguments/Proxy/
+    IntegerIndexed/ModuleNamespace) with ordinary fallthrough; the receiver for getter/setter
+    invocation is recovered from a weak back-reference so `this` is the real object handle
   - **Array exotic** (10.4.2): `ArrayCreate`, `ArrayDefineOwnProperty` (index-length sync),
     `ArraySetLength` (ToUint32 + RangeError, descending truncation with undeletable-element
     pinning), `ArrayOwnPropertyKeys` (holes appended descending); `array_index_of` (6.1.7.1)
@@ -662,6 +662,22 @@ algorithm from the ch. 10 spec text:
     getter/setter factories, duplicate-name handling, `length`/`callee`/@@iterator),
     `CreateUnmappedArgumentsObject` (throwing `callee`), and the mapped `[[GetOwnProperty]]`/
     `[[DefineOwnProperty]]`/`[[Get]]`/`[[Set]]`/`[[Delete]]` sync algorithms
+  - **Proxy exotic** (10.5, `proxy.rs`): `ProxyCreate`, `ValidateNonRevokedProxy`, revocation,
+    and all 14 internal-method traps — getPrototypeOf/setPrototypeOf/isExtensible/
+    preventExtensions/getOwnPropertyDescriptor/defineProperty/has/get/set/deleteProperty/
+    ownKeys/apply/construct — with the invariant table enforced after every trap
+    (`IsCompatiblePropertyDescriptor` on the reported descriptors, non-configurable/non-writable
+    value checks, ownKeys completeness). Proxies over callable/constructible targets are
+    callable/constructible (`is_callable`/`is_constructor`/`type_of`/`call`/`construct` all
+    dispatch through the proxy), and revoked proxies throw on every operation.
+    `ToPropertyDescriptor`/`FromPropertyDescriptor` (6.2.5.4-5), `CreateListFromArrayLike`
+    (7.3.18, property-key kind), and `CreateArrayFromList` (7.3.17) back the traps
+  - **TypedArray (Integer-Indexed) exotic shell** (10.4.5, `TypedArraySlots`): spec-shaped
+    routing of canonical numeric index keys — virtual own keys/has/delete/bounds checks work
+    without a buffer; element reads/writes report the Phase 12 capability gap
+  - **Module namespace exotic** (10.4.6, `ModuleNamespaceSlots`): non-extensible object with
+    *null* prototype; defines/sets/deletes return *false*, prototype is fixed, and the empty
+    export list yields no own properties (exports populate with Phase 7)
 - `function.rs` — function objects: `Function` embeds an ordinary object (own properties,
   prototype, extensible), `FunctionKind` = `Builtin` (native Rust closures with optional
   [[Construct]]) | `EcmaScript` (body joins Phase 7) | `Bound` (10.4.1); `CreateBuiltinFunction`
@@ -673,21 +689,20 @@ algorithm from the ch. 10 spec text:
 The runtime (`crates/runtime`) was adapted: `eval::call` delegates to `crux::function::call`,
 and `env.rs`/`realm.rs`/`script.rs` use the fallible internal methods (Proxy's throwing traps
 motivated `Result`-based dispatch) and the accessor-aware `Property` accessors. The workspace
-runs 270 tests (`cargo test --workspace`) with `cargo fmt --check` and
+runs 286 tests (`cargo test --workspace`) with `cargo fmt --check` and
 `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
-**Remaining in Phase 5:** deferred to their owning phases, with the dispatch structure ready to
-receive them: the **Proxy** exotic (all 14 traps with handler validation and invariants —
-Phase 16 per its "Reflection: Proxy and Reflect" scope; the dispatch and fallible internal
-methods are in place), the **Integer-Indexed** exotic shell (Phase 12, needs the buffer
-slots), the **Module namespace** exotic (Phase 7, needs module records), and the
-**ECMAScript function body** machinery — `OrdinaryCallBindThis`/`OrdinaryCallEvaluateBody`,
-`FunctionDeclarationInstantiation` (parameter env, var/function hoisting, arguments-object
-instantiation at call time), `length`/`name`/`prototype` creation for user functions, and
-`[[HomeObject]]`/`[[PrivateEnvironment]]` slots — which require the Phase 6/7 evaluator
-(built-in functions are already callable). `%ThrowTypeError%` is created per realm in Phase 8
-with the intrinsic bootstrap; the per-realm `[[ThrowTypeError]]` function-environment slot
-wires up with Phase 7.
+**Remaining in Phase 5:** the **ECMAScript function body** machinery —
+`OrdinaryCallBindThis`/`OrdinaryCallEvaluateBody`, `FunctionDeclarationInstantiation`
+(parameter env, var/function hoisting, arguments-object instantiation at call time),
+`length`/`name`/`prototype` creation for user functions, and
+`[[HomeObject]]`/`[[PrivateEnvironment]]` slots — requires the Phase 6/7 evaluator (built-in
+functions are already callable). The remaining exotic gaps are explicitly owned by their
+phases: TypedArray element reads/writes need the Phase 12 buffers, module namespace exports
+populate with Phase 7 modules, and `Proxy.revocable`/the `Proxy` constructor + `Reflect`
+built-ins land in Phase 16. `%ThrowTypeError%` is created per realm in Phase 8 with the
+intrinsic bootstrap; the per-realm `[[ThrowTypeError]]` function-environment slot wires up
+with Phase 7.
 
 ---
 

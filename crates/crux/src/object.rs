@@ -173,6 +173,12 @@ pub enum ObjectKind {
     String(Handle<JsString>),
     /// Arguments exotic (spec 10.4.4): mapped parameter bindings.
     Arguments(Handle<ArgumentsSlots>),
+    /// Proxy exotic (spec 10.5): every internal method is a handler trap.
+    Proxy(Handle<crate::proxy::ProxySlots>),
+    /// TypedArray (Integer-Indexed) exotic shell (spec 10.4.5).
+    IntegerIndexed(Handle<TypedArraySlots>),
+    /// Module namespace exotic (spec 10.4.6).
+    ModuleNamespace(Handle<ModuleNamespaceSlots>),
 }
 
 /// The [[ParameterMap]] of an arguments exotic object (spec 10.4.4): an
@@ -183,6 +189,24 @@ pub struct ArgumentsSlots {
     pub parameter_map: Option<Handle<JsObject>>,
 }
 
+/// The TypedArray (Integer-Indexed) exotic slots (spec 10.4.5). Phase 5
+/// carries the element count so the index routing is spec-shaped; the buffer
+/// access ([[ViewedArrayBuffer]], element type, byte offsets) joins with
+/// Phase 12.
+#[derive(Debug, Clone)]
+pub struct TypedArraySlots {
+    /// [[ArrayLength]]: the number of elements.
+    pub array_length: usize,
+}
+
+/// The [[Exports]] of a module namespace exotic object (spec 10.4.6). Phase
+/// 7 populates it from the module's export list; until then a namespace
+/// exposes no properties and rejects every mutation.
+#[derive(Debug, Clone, Default)]
+pub struct ModuleNamespaceSlots {
+    pub exports: Vec<PropertyKey>,
+}
+
 impl ObjectKind {
     pub fn name(&self) -> &'static str {
         match self {
@@ -190,6 +214,9 @@ impl ObjectKind {
             ObjectKind::Array => "Array",
             ObjectKind::String(_) => "String",
             ObjectKind::Arguments(_) => "Arguments",
+            ObjectKind::Proxy(_) => "Proxy",
+            ObjectKind::IntegerIndexed(_) => "TypedArray",
+            ObjectKind::ModuleNamespace(_) => "Module",
         }
     }
 }
@@ -322,6 +349,56 @@ impl JsObject {
         };
         string.ordinary_define_own_property(&PropertyKey::from_utf8("length"), &length_desc)?;
         Ok(string)
+    }
+
+    /// The object half of ProxyCreate (spec 10.5.14): the proxy's own slots
+    /// are set up by `crate::proxy::proxy_create`.
+    pub fn proxy_object_create(slots: crate::proxy::ProxySlots) -> Handle<JsObject> {
+        let proxy = Handle::new(Self {
+            id: NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
+            kind: ObjectKind::Proxy(Handle::new(slots)),
+            prototype: RefCell::new(None),
+            extensible: Cell::new(true),
+            properties: RefCell::new(Vec::new()),
+            self_handle: RefCell::new(None),
+        });
+        Self::link_self_handle(&proxy);
+        proxy
+    }
+
+    /// The TypedArray (Integer-Indexed) exotic shell (spec 10.4.5.2); the
+    /// element storage joins with the Phase 12 buffers.
+    pub fn integer_indexed_object_create(
+        array_length: usize,
+        prototype: Option<Handle<JsObject>>,
+    ) -> Result<Handle<JsObject>, JsError> {
+        let object = Handle::new(Self {
+            id: NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
+            kind: ObjectKind::IntegerIndexed(Handle::new(TypedArraySlots { array_length })),
+            prototype: RefCell::new(prototype),
+            extensible: Cell::new(true),
+            properties: RefCell::new(Vec::new()),
+            self_handle: RefCell::new(None),
+        });
+        Self::link_self_handle(&object);
+        Ok(object)
+    }
+
+    /// ModuleNamespaceObjectCreate (spec 10.4.6.2): a non-extensible object
+    /// with *null* prototype exposing only the (Phase 7) exports.
+    pub fn module_namespace_object_create(
+        exports: Vec<PropertyKey>,
+    ) -> Result<Handle<JsObject>, JsError> {
+        let object = Handle::new(Self {
+            id: NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
+            kind: ObjectKind::ModuleNamespace(Handle::new(ModuleNamespaceSlots { exports })),
+            prototype: RefCell::new(None),
+            extensible: Cell::new(false),
+            properties: RefCell::new(Vec::new()),
+            self_handle: RefCell::new(None),
+        });
+        Self::link_self_handle(&object);
+        Ok(object)
     }
 
     /// CreateMappedArgumentsObject (spec 10.4.4.2). `make_getter`/`make_setter`
@@ -462,25 +539,45 @@ impl JsObject {
     }
 
     /// spec 7.3.10 IsExtensible.
-    pub fn is_extensible(&self) -> bool {
-        self.extensible.get()
+    pub fn is_extensible(&self) -> Result<bool, JsError> {
+        match &self.kind {
+            ObjectKind::Proxy(slots) => crate::proxy::is_extensible(slots),
+            ObjectKind::ModuleNamespace(_) => Ok(false),
+            _ => Ok(self.extensible.get()),
+        }
     }
 
-    /// OrdinaryPreventExtensions (spec 10.1.5.2).
+    /// OrdinaryPreventExtensions (spec 10.1.5.2) with the proxy trap.
     pub fn prevent_extensions(&self) -> Result<bool, JsError> {
+        match &self.kind {
+            ObjectKind::Proxy(slots) => return crate::proxy::prevent_extensions(slots),
+            // TypedArrays are fixed-length here (the resizable-buffer check
+            // joins with Phase 12): OrdinaryPreventExtensions applies.
+            ObjectKind::ModuleNamespace(_) => return Ok(true),
+            _ => {}
+        }
         self.extensible.set(false);
         Ok(true)
     }
 
-    /// OrdinaryGetPrototypeOf (spec 10.1.1.1).
-    pub fn get_prototype_of(&self) -> Option<Handle<JsObject>> {
-        self.prototype.borrow().clone()
+    /// OrdinaryGetPrototypeOf (spec 10.1.1.1) with the exotic overrides.
+    pub fn get_prototype_of(&self) -> Result<Option<Handle<JsObject>>, JsError> {
+        match &self.kind {
+            ObjectKind::Proxy(slots) => crate::proxy::get_prototype_of(slots),
+            ObjectKind::ModuleNamespace(_) => Ok(None),
+            _ => Ok(self.prototype.borrow().clone()),
+        }
     }
 
     /// OrdinarySetPrototypeOf (spec 10.1.2.2): no cycles, and no prototype
     /// change once non-extensible.
     pub fn set_prototype_of(&self, proto: Option<Handle<JsObject>>) -> Result<bool, JsError> {
-        let current = self.get_prototype_of();
+        match &self.kind {
+            ObjectKind::Proxy(slots) => return crate::proxy::set_prototype_of(slots, proto),
+            ObjectKind::ModuleNamespace(_) => return Ok(false),
+            _ => {}
+        }
+        let current = self.get_prototype_of()?;
         let same = match (&current, &proto) {
             (Some(a), Some(b)) => Handle::ptr_eq(a, b),
             (None, None) => true,
@@ -498,7 +595,7 @@ impl JsObject {
                 if obj.id == self.id {
                     return Ok(false);
                 }
-                ancestor = obj.get_prototype_of();
+                ancestor = obj.get_prototype_of()?;
             }
         }
         *self.prototype.borrow_mut() = proto;
@@ -513,6 +610,17 @@ impl JsObject {
 
     pub fn get_own_property_key(&self, key: &PropertyKey) -> Result<Option<Property>, JsError> {
         match &self.kind {
+            ObjectKind::Proxy(slots) => crate::proxy::get_own_property(slots, key),
+            ObjectKind::IntegerIndexed(slots) => typed_array_get_own_property(self, slots, key),
+            ObjectKind::ModuleNamespace(slots) => {
+                if slots.exports.contains(key) {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "Module namespace exports are not implemented until Phase 7".into(),
+                    ));
+                }
+                self.ordinary_get_own_property(key)
+            }
             ObjectKind::String(string) => match self.ordinary_get_own_property(key)? {
                 Some(property) => Ok(Some(property)),
                 None => Ok(string_get_own_property(string, key)),
@@ -558,6 +666,18 @@ impl JsObject {
     }
 
     pub fn has_own_property_key(&self, key: &PropertyKey) -> Result<bool, JsError> {
+        // TypedArray and module namespace elements are virtual: HasOwnProperty
+        // checks the index/export directly instead of going through
+        // [[GetOwnProperty]] (whose element access is a Phase 12 concern).
+        match &self.kind {
+            ObjectKind::IntegerIndexed(slots) => {
+                if let Some(index) = canonical_index(key) {
+                    return Ok(typed_array_valid_index(slots, index));
+                }
+            }
+            ObjectKind::ModuleNamespace(slots) => return Ok(slots.exports.contains(key)),
+            _ => {}
+        }
         Ok(self.get_own_property_key(key)?.is_some())
     }
 
@@ -567,10 +687,15 @@ impl JsObject {
     }
 
     pub fn has_property_key(&self, key: &PropertyKey) -> Result<bool, JsError> {
+        // A proxy's [[HasProperty]] is the `has` trap, not an own-property
+        // walk.
+        if let ObjectKind::Proxy(slots) = &self.kind {
+            return crate::proxy::has_property(slots, key);
+        }
         if self.has_own_property_key(key)? {
             return Ok(true);
         }
-        match self.get_prototype_of() {
+        match self.get_prototype_of()? {
             Some(proto) => proto.has_property_key(key),
             None => Ok(false),
         }
@@ -593,11 +718,28 @@ impl JsObject {
         key: &PropertyKey,
         receiver: Value,
     ) -> Result<Value, JsError> {
-        if let ObjectKind::Arguments(slots) = &self.kind
-            && let Some(map) = slots.parameter_map.as_ref()
-            && map.has_own_property_key(key)?
-        {
-            return map.get_key(key);
+        match &self.kind {
+            ObjectKind::Proxy(slots) => return crate::proxy::get(slots, key, receiver),
+            ObjectKind::IntegerIndexed(slots) => {
+                return typed_array_get(self, slots, key, receiver);
+            }
+            ObjectKind::ModuleNamespace(slots) => {
+                if slots.exports.contains(key) {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "Module namespace exports are not implemented until Phase 7".into(),
+                    ));
+                }
+                return Ok(Value::Undefined);
+            }
+            ObjectKind::Arguments(slots) => {
+                if let Some(map) = slots.parameter_map.as_ref()
+                    && map.has_own_property_key(key)?
+                {
+                    return map.get_key(key);
+                }
+            }
+            _ => {}
         }
         ordinary_get(self, key, receiver)
     }
@@ -622,12 +764,21 @@ impl JsObject {
         receiver: Value,
         throw: bool,
     ) -> Result<bool, JsError> {
-        if let ObjectKind::Arguments(slots) = &self.kind
-            && same_value(&receiver, &self.self_value())
-            && let Some(map) = slots.parameter_map.as_ref()
-            && map.has_own_property_key(key)?
-        {
-            map.set_key(key, value.clone(), false)?;
+        match &self.kind {
+            ObjectKind::Proxy(slots) => return crate::proxy::set(slots, key, value, receiver),
+            ObjectKind::IntegerIndexed(slots) => {
+                return typed_array_set(self, slots, key, value, receiver);
+            }
+            ObjectKind::ModuleNamespace(_) => return Ok(false),
+            ObjectKind::Arguments(slots) => {
+                if same_value(&receiver, &self.self_value())
+                    && let Some(map) = slots.parameter_map.as_ref()
+                    && map.has_own_property_key(key)?
+                {
+                    map.set_key(key, value.clone(), false)?;
+                }
+            }
+            _ => {}
         }
         ordinary_set(self, key, value, receiver, throw)
     }
@@ -649,7 +800,14 @@ impl JsObject {
         desc: &PropertyDescriptor,
     ) -> Result<bool, JsError> {
         match &self.kind {
-            ObjectKind::Array => array_define_own_property(self, key, desc),
+            ObjectKind::Proxy(slots) => return crate::proxy::define_own_property(slots, key, desc),
+            ObjectKind::IntegerIndexed(slots) => {
+                return typed_array_define_own_property(self, slots, key, desc);
+            }
+            // A module namespace rejects every define (its properties are
+            // non-configurable and it is not extensible).
+            ObjectKind::ModuleNamespace(_) => return Ok(false),
+            ObjectKind::Array => return array_define_own_property(self, key, desc),
             ObjectKind::String(string) => {
                 if let Some(current) = string_get_own_property(string, key) {
                     return is_compatible_property_descriptor(
@@ -658,11 +816,14 @@ impl JsObject {
                         Some(&current),
                     );
                 }
-                self.ordinary_define_own_property(key, desc)
+                return self.ordinary_define_own_property(key, desc);
             }
-            ObjectKind::Arguments(slots) => arguments_define_own_property(self, slots, key, desc),
-            _ => self.ordinary_define_own_property(key, desc),
+            ObjectKind::Arguments(slots) => {
+                return arguments_define_own_property(self, slots, key, desc);
+            }
+            _ => {}
         }
+        self.ordinary_define_own_property(key, desc)
     }
 
     /// ValidateAndApplyPropertyDescriptor with the object's [[Extensible]]
@@ -727,16 +888,42 @@ impl JsObject {
     }
 
     pub fn delete_key(&self, key: &PropertyKey) -> Result<bool, JsError> {
-        let mapped = if let ObjectKind::Arguments(slots) = &self.kind {
-            slots
-                .parameter_map
-                .as_ref()
-                .map(|map| map.has_own_property_key(key))
-                .transpose()?
-                .unwrap_or(false)
-        } else {
-            false
-        };
+        match &self.kind {
+            ObjectKind::Proxy(slots) => return crate::proxy::delete(slots, key),
+            ObjectKind::IntegerIndexed(slots) => return typed_array_delete(self, slots, key),
+            // A module namespace never deletes (its properties are
+            // non-configurable).
+            ObjectKind::ModuleNamespace(_) => return Ok(false),
+            ObjectKind::Arguments(slots) => {
+                let mapped = slots
+                    .parameter_map
+                    .as_ref()
+                    .map(|map| map.has_own_property_key(key))
+                    .transpose()?
+                    .unwrap_or(false);
+                let result = {
+                    let mut props = self.properties.borrow_mut();
+                    if let Some(index) = props.iter().position(|(name, _)| name == key) {
+                        if props[index].1.configurable {
+                            props.remove(index);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        true
+                    }
+                };
+                if result
+                    && mapped
+                    && let Some(map) = slots.parameter_map.as_ref()
+                {
+                    map.delete_key(key)?;
+                }
+                return Ok(result);
+            }
+            _ => {}
+        }
         let result = {
             let mut props = self.properties.borrow_mut();
             if let Some(index) = props.iter().position(|(name, _)| name == key) {
@@ -750,24 +937,20 @@ impl JsObject {
                 true
             }
         };
-        if result
-            && mapped
-            && let ObjectKind::Arguments(slots) = &self.kind
-            && let Some(map) = slots.parameter_map.as_ref()
-        {
-            map.delete_key(key)?;
-        }
         Ok(result)
     }
 
     /// [[OwnPropertyKeys]] (spec 10.1.12.1): array indices ascending, then
     /// strings in insertion order, then symbols.
     pub fn own_property_keys(&self) -> Result<Vec<PropertyKey>, JsError> {
-        Ok(match &self.kind {
-            ObjectKind::Array => array_own_property_keys(self),
-            ObjectKind::String(string) => string_own_property_keys(string, self),
-            _ => ordinary_own_property_keys(self),
-        })
+        match &self.kind {
+            ObjectKind::Proxy(slots) => crate::proxy::own_property_keys(slots),
+            ObjectKind::IntegerIndexed(slots) => Ok(typed_array_own_property_keys(slots, self)),
+            ObjectKind::ModuleNamespace(slots) => Ok(slots.exports.clone()),
+            ObjectKind::Array => Ok(array_own_property_keys(self)),
+            ObjectKind::String(string) => Ok(string_own_property_keys(string, self)),
+            _ => Ok(ordinary_own_property_keys(self)),
+        }
     }
 
     /// spec 7.3.11 GetMethod: `None` when the property is *undefined* or
@@ -896,7 +1079,7 @@ fn string_get_own_property(string: &JsString, key: &PropertyKey) -> Option<Prope
 
 /// ValidateAndApplyPropertyDescriptor with no object to apply to
 /// (spec 10.1.6.2 IsCompatiblePropertyDescriptor).
-fn is_compatible_property_descriptor(
+pub(crate) fn is_compatible_property_descriptor(
     extensible: bool,
     desc: &PropertyDescriptor,
     current: Option<&Property>,
@@ -1035,7 +1218,7 @@ fn ordinary_get(obj: &JsObject, key: &PropertyKey, receiver: Value) -> Result<Va
             },
         };
     }
-    match obj.get_prototype_of() {
+    match obj.get_prototype_of()? {
         Some(parent) => ordinary_get(&parent, key, receiver),
         None => Ok(Value::Undefined),
     }
@@ -1066,7 +1249,7 @@ fn ordinary_set_with_own_descriptor(
         // spec steps 1a-1c: not an own property — recurse into the parent's
         // [[Set]], or CreateDataProperty on the receiver at the end of the
         // chain.
-        if let Some(parent) = obj.get_prototype_of() {
+        if let Some(parent) = obj.get_prototype_of()? {
             return parent.set_with_receiver_key(key, value, receiver, throw);
         }
         return receiver_create_data_property(&receiver, key, value, throw);
@@ -1372,6 +1555,15 @@ fn canonical_numeric_index_string(text: &[u16]) -> Option<f64> {
     Some(value as f64)
 }
 
+/// CanonicalNumericIndexString (spec 7.1.21) for a property key: `None` for
+/// symbol keys.
+fn canonical_index(key: &PropertyKey) -> Option<f64> {
+    let PropertyKey::String(id) = key else {
+        return None;
+    };
+    canonical_numeric_index_string(lookup(*id).as_slice())
+}
+
 /// Parse a canonical non-negative decimal integer (no leading zeros).
 fn parse_canonical_u64(text: &[u16]) -> Option<u64> {
     if text.is_empty() {
@@ -1403,6 +1595,303 @@ pub fn array_index_of(key: &PropertyKey) -> Option<u64> {
         Some(value)
     } else {
         None
+    }
+}
+
+/// Whether a canonical numeric index is an in-bounds TypedArray element
+/// (spec 10.4.5.10 IsValidIntegerIndex, minus the Phase 12 buffer witness).
+fn typed_array_valid_index(slots: &TypedArraySlots, index: f64) -> bool {
+    index >= 0.0 && index.trunc() == index && (index as usize) < slots.array_length
+}
+
+fn element_access_error() -> JsError {
+    JsError::new(
+        ErrorKind::TypeError,
+        "TypedArray element access is not implemented until Phase 12".into(),
+    )
+}
+
+/// TypedArray [[GetOwnProperty]] (spec 10.4.5.3): canonical in-bounds index
+/// keys produce an element descriptor; everything else is ordinary.
+fn typed_array_get_own_property(
+    obj: &JsObject,
+    slots: &TypedArraySlots,
+    key: &PropertyKey,
+) -> Result<Option<Property>, JsError> {
+    if let Some(index) = canonical_index(key) {
+        if typed_array_valid_index(slots, index) {
+            return Err(element_access_error());
+        }
+        return Ok(None);
+    }
+    obj.ordinary_get_own_property(key)
+}
+
+/// TypedArray [[DefineOwnProperty]] (spec 10.4.5.5): element descriptors must
+/// be writable/enumerable/configurable data properties; the write itself
+/// needs the Phase 12 buffer.
+fn typed_array_define_own_property(
+    obj: &JsObject,
+    slots: &TypedArraySlots,
+    key: &PropertyKey,
+    desc: &PropertyDescriptor,
+) -> Result<bool, JsError> {
+    if let Some(index) = canonical_index(key) {
+        if !typed_array_valid_index(slots, index) {
+            return Ok(false);
+        }
+        if desc.configurable == Some(false) {
+            return Ok(false);
+        }
+        if desc.enumerable == Some(false) {
+            return Ok(false);
+        }
+        if desc.is_accessor_descriptor() {
+            return Ok(false);
+        }
+        if desc.writable == Some(false) {
+            return Ok(false);
+        }
+        if desc.value.is_some() {
+            return Err(element_access_error());
+        }
+        return Ok(true);
+    }
+    obj.ordinary_define_own_property(key, desc)
+}
+
+/// TypedArray [[Get]] (spec 10.4.5.7): in-bounds element read (Phase 12);
+/// out-of-bounds canonical indices read *undefined*.
+fn typed_array_get(
+    obj: &JsObject,
+    slots: &TypedArraySlots,
+    key: &PropertyKey,
+    receiver: Value,
+) -> Result<Value, JsError> {
+    if let Some(index) = canonical_index(key) {
+        if typed_array_valid_index(slots, index) {
+            return Err(element_access_error());
+        }
+        return Ok(Value::Undefined);
+    }
+    ordinary_get(obj, key, receiver)
+}
+
+/// TypedArray [[Set]] (spec 10.4.5.8): writing an element with the TypedArray
+/// as receiver needs the Phase 12 buffer; a different receiver skips
+/// out-of-bounds indices.
+fn typed_array_set(
+    obj: &JsObject,
+    slots: &TypedArraySlots,
+    key: &PropertyKey,
+    value: Value,
+    receiver: Value,
+) -> Result<bool, JsError> {
+    if let Some(index) = canonical_index(key) {
+        if same_value(&receiver, &obj.self_value()) {
+            return Err(element_access_error());
+        }
+        if !typed_array_valid_index(slots, index) {
+            return Ok(true);
+        }
+    }
+    ordinary_set(obj, key, value, receiver, false)
+}
+
+/// TypedArray [[Delete]] (spec 10.4.5.9): elements cannot be deleted;
+/// out-of-bounds canonical indices report success.
+fn typed_array_delete(
+    obj: &JsObject,
+    slots: &TypedArraySlots,
+    key: &PropertyKey,
+) -> Result<bool, JsError> {
+    if let Some(index) = canonical_index(key) {
+        return Ok(!typed_array_valid_index(slots, index));
+    }
+    // OrdinaryDelete over the stored properties (not the dispatching
+    // [[Delete]], which would re-enter the TypedArray branch).
+    let mut props = obj.properties.borrow_mut();
+    if let Some(position) = props.iter().position(|(name, _)| name == key) {
+        if props[position].1.configurable {
+            props.remove(position);
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// TypedArray [[OwnPropertyKeys]] (spec 10.4.5.11): element indices first,
+/// then own non-index strings and symbols.
+fn typed_array_own_property_keys(slots: &TypedArraySlots, obj: &JsObject) -> Vec<PropertyKey> {
+    let mut keys = Vec::new();
+    for index in 0..slots.array_length {
+        keys.push(PropertyKey::from_utf8(&index.to_string()));
+    }
+    for (stored_key, _) in obj.properties.borrow().iter() {
+        match stored_key {
+            PropertyKey::Symbol(_) => keys.push(stored_key.clone()),
+            PropertyKey::String(_) if array_index_of(stored_key).is_none() => {
+                keys.push(stored_key.clone())
+            }
+            _ => {}
+        }
+    }
+    keys
+}
+
+/// The internal methods of a language value (an Object or Function), used by
+/// the proxy traps to forward to the target and by the receiver operations of
+/// [[Set]].
+pub(crate) fn value_get_prototype_of(value: &Value) -> Result<Option<Handle<JsObject>>, JsError> {
+    match value {
+        Value::Object(obj) => obj.get_prototype_of(),
+        Value::Function(f) => f.object.get_prototype_of(),
+        _ => Err(JsError::new(
+            ErrorKind::TypeError,
+            "value is not an object".into(),
+        )),
+    }
+}
+
+pub(crate) fn value_set_prototype_of(
+    value: &Value,
+    proto: Option<Handle<JsObject>>,
+) -> Result<bool, JsError> {
+    match value {
+        Value::Object(obj) => obj.set_prototype_of(proto),
+        Value::Function(f) => f.object.set_prototype_of(proto),
+        _ => Err(JsError::new(
+            ErrorKind::TypeError,
+            "value is not an object".into(),
+        )),
+    }
+}
+
+pub(crate) fn value_is_extensible(value: &Value) -> Result<bool, JsError> {
+    match value {
+        Value::Object(obj) => obj.is_extensible(),
+        Value::Function(f) => f.object.is_extensible(),
+        _ => Err(JsError::new(
+            ErrorKind::TypeError,
+            "value is not an object".into(),
+        )),
+    }
+}
+
+pub(crate) fn value_prevent_extensions(value: &Value) -> Result<bool, JsError> {
+    match value {
+        Value::Object(obj) => obj.prevent_extensions(),
+        Value::Function(f) => f.object.prevent_extensions(),
+        _ => Err(JsError::new(
+            ErrorKind::TypeError,
+            "value is not an object".into(),
+        )),
+    }
+}
+
+pub(crate) fn value_get_own_property(
+    value: &Value,
+    key: &PropertyKey,
+) -> Result<Option<Property>, JsError> {
+    match value {
+        Value::Object(obj) => obj.get_own_property_key(key),
+        Value::Function(f) => f.object.get_own_property_key(key),
+        _ => Err(JsError::new(
+            ErrorKind::TypeError,
+            "value is not an object".into(),
+        )),
+    }
+}
+
+pub(crate) fn value_define_property(
+    value: &Value,
+    key: &PropertyKey,
+    desc: &PropertyDescriptor,
+) -> Result<bool, JsError> {
+    match value {
+        Value::Object(obj) => obj.define_property_key(key, desc),
+        Value::Function(f) => f.object.define_property_key(key, desc),
+        _ => Err(JsError::new(
+            ErrorKind::TypeError,
+            "value is not an object".into(),
+        )),
+    }
+}
+
+pub(crate) fn value_has_property(value: &Value, key: &PropertyKey) -> Result<bool, JsError> {
+    match value {
+        Value::Object(obj) => obj.has_property_key(key),
+        Value::Function(f) => f.object.has_property_key(key),
+        _ => Err(JsError::new(
+            ErrorKind::TypeError,
+            "value is not an object".into(),
+        )),
+    }
+}
+
+pub(crate) fn value_get(
+    value: &Value,
+    key: &PropertyKey,
+    receiver: Value,
+) -> Result<Value, JsError> {
+    match value {
+        Value::Object(obj) => obj.get_with_receiver_key(key, receiver),
+        Value::Function(f) => f.object.get_with_receiver_key(key, receiver),
+        _ => Err(JsError::new(
+            ErrorKind::TypeError,
+            "value is not an object".into(),
+        )),
+    }
+}
+
+pub(crate) fn value_set(
+    value: &Value,
+    key: &PropertyKey,
+    v: Value,
+    receiver: Value,
+    throw: bool,
+) -> Result<bool, JsError> {
+    match value {
+        Value::Object(obj) => obj.set_with_receiver_key(key, v, receiver, throw),
+        Value::Function(f) => f.object.set_with_receiver_key(key, v, receiver, throw),
+        _ => Err(JsError::new(
+            ErrorKind::TypeError,
+            "value is not an object".into(),
+        )),
+    }
+}
+
+pub(crate) fn value_delete(value: &Value, key: &PropertyKey) -> Result<bool, JsError> {
+    match value {
+        Value::Object(obj) => obj.delete_key(key),
+        Value::Function(f) => f.object.delete_key(key),
+        _ => Err(JsError::new(
+            ErrorKind::TypeError,
+            "value is not an object".into(),
+        )),
+    }
+}
+
+pub(crate) fn value_own_property_keys(value: &Value) -> Result<Vec<PropertyKey>, JsError> {
+    match value {
+        Value::Object(obj) => obj.own_property_keys(),
+        Value::Function(f) => f.object.own_property_keys(),
+        _ => Err(JsError::new(
+            ErrorKind::TypeError,
+            "value is not an object".into(),
+        )),
+    }
+}
+
+pub(crate) fn value_get_method(value: &Value, key: &JsString) -> Result<Option<Value>, JsError> {
+    match value {
+        Value::Object(obj) => obj.get_method(key),
+        Value::Function(f) => f.object.get_method(key),
+        _ => Err(JsError::new(
+            ErrorKind::TypeError,
+            "value is not an object".into(),
+        )),
     }
 }
 
@@ -2038,6 +2527,82 @@ mod tests {
         assert_eq!(args.get(&key("0")).unwrap(), Value::Number(1.0));
         assert!(args.get(&key("callee")).is_err());
         assert!(args.set(&key("callee"), Value::Undefined, false).is_err());
+    }
+
+    #[test]
+    fn integer_indexed_shell_routes_index_keys() {
+        let typed = JsObject::integer_indexed_object_create(3, None).unwrap();
+        // Element indices are virtual: own keys lists them ascending, and
+        // ordinary keys still work.
+        typed
+            .create_data_property(&key("name"), Value::String(Handle::new(key("u8"))))
+            .unwrap();
+        let names: Vec<String> = typed
+            .own_property_keys()
+            .unwrap()
+            .iter()
+            .map(|k| k.display_string())
+            .collect();
+        assert_eq!(names, ["0", "1", "2", "name"]);
+        // HasProperty / Delete behave correctly without a buffer.
+        assert!(typed.has_own_property(&key("0")).unwrap());
+        assert!(!typed.has_own_property(&key("3")).unwrap());
+        assert!(!typed.delete(&key("0")).unwrap());
+        assert!(typed.delete(&key("3")).unwrap());
+        assert!(typed.delete(&key("name")).unwrap());
+        // Out-of-bounds canonical index reads are *undefined*.
+        assert_eq!(typed.get(&key("3")).unwrap(), Value::Undefined);
+        // Descriptor checks reject incompatible defines.
+        assert!(
+            !typed
+                .define_property(
+                    &key("0"),
+                    &PropertyDescriptor::accessor(Some(Value::Undefined), None),
+                )
+                .unwrap()
+        );
+        assert!(
+            !typed
+                .define_property(
+                    &key("0"),
+                    &descriptor(Some(Value::Undefined), Some(false), None, None),
+                )
+                .unwrap()
+        );
+        // In-bounds element access itself needs the Phase 12 buffer.
+        assert!(typed.get(&key("0")).is_err());
+        assert!(typed.set(&key("0"), Value::Number(1.0), false).is_err());
+        assert!(
+            typed
+                .define_property(
+                    &key("0"),
+                    &descriptor(Some(Value::Number(1.0)), Some(true), Some(true), Some(true)),
+                )
+                .is_err()
+        );
+        // Non-canonical keys are ordinary.
+        typed
+            .create_data_property(&key("01"), Value::Number(9.0))
+            .unwrap();
+        assert_eq!(typed.get(&key("01")).unwrap(), Value::Number(9.0));
+    }
+
+    #[test]
+    fn module_namespace_shell_is_frozen_with_null_prototype() {
+        let ns = JsObject::module_namespace_object_create(Vec::new()).unwrap();
+        assert!(ns.get_prototype_of().unwrap().is_none());
+        assert!(!ns.is_extensible().unwrap());
+        assert!(ns.prevent_extensions().unwrap());
+        assert!(!ns.set_prototype_of(None).unwrap());
+        assert!(ns.own_property_keys().unwrap().is_empty());
+        assert_eq!(ns.get(&key("x")).unwrap(), Value::Undefined);
+        assert!(!ns.has_property(&key("x")).unwrap());
+        assert!(
+            !ns.define_property(&key("x"), &PropertyDescriptor::data(Value::Undefined))
+                .unwrap()
+        );
+        assert!(!ns.set(&key("x"), Value::Undefined, false).unwrap());
+        assert!(!ns.delete(&key("x")).unwrap());
     }
 
     #[test]

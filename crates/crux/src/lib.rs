@@ -12,6 +12,7 @@ pub mod number;
 pub mod object;
 pub mod ops;
 pub mod property;
+pub mod proxy;
 pub mod span;
 pub mod string;
 pub mod symbol;

@@ -28,7 +28,8 @@ pub enum Value {
     Function(Handle<Function>),
 }
 
-/// The `Type` abstract operation (spec 7.2.1).
+/// The `Type` abstract operation (spec 7.2.1). Proxies over callable
+/// functions report `function` like the spec's typeof.
 pub fn type_of(value: &Value) -> &'static str {
     match value {
         Value::Undefined => "undefined",
@@ -38,23 +39,56 @@ pub fn type_of(value: &Value) -> &'static str {
         Value::BigInt(_) => "bigint",
         Value::String(_) => "string",
         Value::Symbol(_) => "symbol",
-        Value::Object(_) => "object",
+        Value::Object(obj) => match &obj.kind {
+            crate::object::ObjectKind::Proxy(slots)
+                if slots
+                    .target
+                    .borrow()
+                    .as_ref()
+                    .map(is_callable)
+                    .unwrap_or(false) =>
+            {
+                "function"
+            }
+            _ => "object",
+        },
         Value::Function(_) => "function",
     }
 }
 
-/// `IsCallable` (spec 7.2.3): function values are callable; ordinary objects
-/// are not.
+/// `IsCallable` (spec 7.2.3): function values and proxies whose target is
+/// callable.
 pub fn is_callable(value: &Value) -> bool {
-    matches!(value, Value::Function(_))
+    match value {
+        Value::Function(_) => true,
+        Value::Object(obj) => match &obj.kind {
+            crate::object::ObjectKind::Proxy(slots) => slots
+                .target
+                .borrow()
+                .as_ref()
+                .map(is_callable)
+                .unwrap_or(false),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
-/// `IsConstructor` (spec 7.2.4): built-ins with a [[Construct]] and
-/// ECMAScript (non-arrow) functions are constructors; bound functions
-/// inherit it from their target.
+/// `IsConstructor` (spec 7.2.4): built-ins with a [[Construct]], ECMAScript
+/// (non-arrow) functions, bound functions, and proxies whose target is a
+/// constructor.
 pub fn is_constructor(value: &Value) -> bool {
     match value {
         Value::Function(function) => function.is_constructor(),
+        Value::Object(obj) => match &obj.kind {
+            crate::object::ObjectKind::Proxy(slots) => slots
+                .target
+                .borrow()
+                .as_ref()
+                .map(is_constructor)
+                .unwrap_or(false),
+            _ => false,
+        },
         _ => false,
     }
 }

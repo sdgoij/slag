@@ -222,7 +222,7 @@ impl Function {
     }
 
     /// The object side of a function value: [[GetPrototypeOf]].
-    pub fn get_prototype_of(&self) -> Option<Handle<JsObject>> {
+    pub fn get_prototype_of(&self) -> Result<Option<Handle<JsObject>>, JsError> {
         self.object.get_prototype_of()
     }
 
@@ -290,7 +290,8 @@ impl Function {
 }
 
 /// Call (spec 7.3.13): invoke a callable value with a `this` value and an
-/// argument list.
+/// argument list. Proxies over callable targets dispatch through the apply
+/// trap (spec 10.5.12).
 pub fn call(callee: &Value, this: Value, args: &[Value]) -> Result<Value, JsError> {
     match callee {
         Value::Function(function) => match &function.kind {
@@ -315,6 +316,13 @@ pub fn call(callee: &Value, this: Value, args: &[Value]) -> Result<Value, JsErro
                 call(target, bound_this.clone(), &all)
             }
         },
+        Value::Object(obj) => match &obj.kind {
+            crate::object::ObjectKind::Proxy(slots) => crate::proxy::apply(slots, this, args),
+            _ => Err(JsError::new(
+                ErrorKind::TypeError,
+                "value is not a function".into(),
+            )),
+        },
         _ => Err(JsError::new(
             ErrorKind::TypeError,
             "value is not a function".into(),
@@ -323,7 +331,8 @@ pub fn call(callee: &Value, this: Value, args: &[Value]) -> Result<Value, JsErro
 }
 
 /// Construct (spec 7.3.14): invoke a constructor with an argument list and a
-/// `newTarget` (defaulting to `callee` itself).
+/// `newTarget` (defaulting to `callee` itself). Proxies over constructible
+/// targets dispatch through the construct trap (spec 10.5.13).
 pub fn construct(callee: &Value, args: &[Value], new_target: &Value) -> Result<Value, JsError> {
     match callee {
         Value::Function(function) => match &function.kind {
@@ -351,6 +360,12 @@ pub fn construct(callee: &Value, args: &[Value], new_target: &Value) -> Result<V
                 };
                 construct(target, &all, new_target)
             }
+        },
+        Value::Object(obj) => match &obj.kind {
+            crate::object::ObjectKind::Proxy(slots) => {
+                crate::proxy::construct(slots, args, new_target)
+            }
+            _ => Err(not_constructible(callee)),
         },
         _ => Err(not_constructible(callee)),
     }
@@ -550,7 +565,7 @@ mod tests {
     fn throw_type_error_always_throws_and_is_restricted() {
         let thrower = throw_type_error().unwrap();
         assert!(call(&Value::Function(thrower.clone()), Value::Undefined, &[]).is_err());
-        assert!(!thrower.object.is_extensible());
+        assert!(!thrower.object.is_extensible().unwrap());
         for key in ["length", "name"] {
             let prop = thrower
                 .get_own_property(&JsString::from_utf8(key))
