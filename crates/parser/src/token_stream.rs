@@ -78,6 +78,22 @@ impl<'s> TokenStream<'s> {
         Ok(&self.buffer[1])
     }
 
+    /// Peeks two tokens past the current one (goal implied by the second
+    /// token). Used for the `await using` disambiguation.
+    pub fn peek3(&mut self) -> Result<&Token, JsError> {
+        self.peek2()?;
+        if self.buffer.len() < 3 {
+            let goal = if can_end_expression(&self.buffer[1].kind) {
+                LexGoal::Div
+            } else {
+                LexGoal::RegExp
+            };
+            self.lexer.set_goal(goal);
+            self.lex_one()?;
+        }
+        Ok(&self.buffer[2])
+    }
+
     pub fn next(&mut self) -> Result<Token, JsError> {
         self.peek()?;
         self.starts.pop_front();

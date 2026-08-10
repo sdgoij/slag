@@ -3,8 +3,8 @@
 use crux::{AtomId, JsError, Span, intern_utf8};
 use syntax::keywords::{Keyword, from_identifier};
 use syntax::{
-    Block, CatchClause, ForBinding, ForInit, Stmt, StmtKind, SwitchCase, Token, TokenKind,
-    VarDeclKind, VarDeclarator,
+    BindingPattern, Block, CatchClause, ForBinding, ForInit, Stmt, StmtKind, SwitchCase, Token,
+    TokenKind, VarDeclKind, VarDeclarator,
 };
 
 use crate::expr::{can_start_expression, parse_assignment, parse_expression};
@@ -72,6 +72,22 @@ pub(crate) fn parse_statement(parser: &mut Parser) -> Result<Stmt, JsError> {
             {
                 return parse_var_statement(parser, VarDeclKind::Let);
             }
+            _ if atom == intern_utf8("using")
+                && is_using_binding_start(parser.peek2()?.kind.clone())
+                && !parser.peek2()?.line_break_before =>
+            {
+                return parse_using_declaration(parser, false);
+            }
+            _ if atom == intern_utf8("await")
+                && (parser.in_async || parser.top_level_await)
+                && parser.peek2()?.kind == TokenKind::Identifier(intern_utf8("using"))
+                && !parser.peek2()?.line_break_before
+                && is_using_binding_start(parser.peek3()?.kind.clone())
+                && !parser.peek3()?.line_break_before =>
+            {
+                parser.next()?; // `await`
+                return parse_using_declaration(parser, true);
+            }
             _ if atom == intern_utf8("async")
                 && parser.peek2()?.kind == TokenKind::Identifier(intern_utf8("function"))
                 && !parser.peek2()?.line_break_before =>
@@ -101,6 +117,17 @@ fn is_let_declaration_start(kind: TokenKind) -> bool {
         kind,
         TokenKind::Identifier(_) | TokenKind::LeftBracket | TokenKind::LeftBrace
     )
+}
+
+/// A `using` token starts a declaration when followed by a non-keyword
+/// identifier on the same line. The BindingList of a `using` declaration is
+/// identifier-only (`~Pattern`), so `[`, `{`, and keywords mean the `using`
+/// token is an identifier reference (spec 15.14.1).
+fn is_using_binding_start(kind: TokenKind) -> bool {
+    match kind {
+        TokenKind::Identifier(atom) => from_identifier(atom).is_none(),
+        _ => false,
+    }
 }
 
 /// `ident :` begins a labeled statement (no line break before the colon).
@@ -194,6 +221,42 @@ fn parse_var_statement(parser: &mut Parser, kind: VarDeclKind) -> Result<Stmt, J
     })
 }
 
+/// `using x = expr, …` / `await using x = expr, …` (spec 15.14). The `using`
+/// token is already consumed; bindings are identifiers with required
+/// initializers, declared lexically.
+fn parse_using_declaration(parser: &mut Parser, is_await: bool) -> Result<Stmt, JsError> {
+    let start = parser.next()?.span.start; // `using`
+    let mut decls = Vec::new();
+    loop {
+        let decl_start = parser.peek()?.span.start;
+        let (name, name_start) = parser.parse_identifier()?;
+        if name == intern_utf8("let") {
+            return Err(parser.error_at(name_start, "let is disallowed as a lexically bound name"));
+        }
+        parser.check_binding_name(name, name_start)?;
+        parser.declare_lexical(name, name_start)?;
+        if !parser.eat_punct(TokenKind::Equal)? {
+            return Err(parser.error_at(decl_start, "Missing initializer in using declaration"));
+        }
+        let init = parse_assignment(parser, true)?;
+        let end = parser.prev.as_ref().unwrap().span.end;
+        decls.push(VarDeclarator {
+            pattern: BindingPattern::Ident(name),
+            init: Some(init),
+            span: Span::new(decl_start, end),
+        });
+        if !parser.eat_punct(TokenKind::Comma)? {
+            break;
+        }
+    }
+    parser.expect_semicolon()?;
+    let end = parser.prev.as_ref().unwrap().span.end;
+    Ok(Stmt {
+        span: Span::new(start, end),
+        kind: StmtKind::UsingDecl { is_await, decls },
+    })
+}
+
 /// Parses the comma-separated declarators of a variable declaration.
 pub(crate) fn parse_var_declarators(
     parser: &mut Parser,
@@ -208,6 +271,14 @@ pub(crate) fn parse_var_declarators(
             match kind {
                 VarDeclKind::Var => parser.declare_var(name, start)?,
                 VarDeclKind::Let | VarDeclKind::Const => parser.declare_lexical(name, start)?,
+                VarDeclKind::Using | VarDeclKind::AwaitUsing => {
+                    if name == intern_utf8("let") {
+                        return Err(
+                            parser.error_at(start, "let is disallowed as a lexically bound name")
+                        );
+                    }
+                    parser.declare_lexical(name, start)?;
+                }
             }
         }
         let init = if parser.eat_punct(TokenKind::Equal)? {
@@ -377,11 +448,56 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
             }),
             false,
         )
+    } else if parser.at_contextual("using")?
+        && is_using_binding_start(parser.peek2()?.kind.clone())
+        && !parser.peek2()?.line_break_before
+        && parser.peek2()?.kind != TokenKind::Identifier(intern_utf8("of"))
+    {
+        // `for (using x of y)` / `for (using x = 0; …)`. The `of` lookahead
+        // keeps `for (using of y)` an expression-headed for-of (spec 14.7.5).
+        let kind = VarDeclKind::Using;
+        parser.next()?;
+        (
+            Some(ForInit::VarDecl {
+                kind,
+                decls: parse_for_declarators(parser, kind)?,
+            }),
+            false,
+        )
+    } else if parser.at_contextual("await")?
+        && (parser.in_async || parser.top_level_await)
+        && parser.peek2()?.kind == TokenKind::Identifier(intern_utf8("using"))
+        && !parser.peek2()?.line_break_before
+        && is_using_binding_start(parser.peek3()?.kind.clone())
+        && !parser.peek3()?.line_break_before
+    {
+        // `for (await using x of y)` — an await-using ForDeclaration.
+        let kind = VarDeclKind::AwaitUsing;
+        parser.next()?; // `await`
+        parser.next()?; // `using`
+        (
+            Some(ForInit::VarDecl {
+                kind,
+                decls: parse_for_declarators(parser, kind)?,
+            }),
+            false,
+        )
     } else {
         (Some(ForInit::Expr(parse_expression(parser, false)?)), false)
     };
 
     if parser.at_keyword(Keyword::In)? {
+        // `for await ( … in … )` and `using` heads have no for-in form.
+        if is_await {
+            return Err(parser.error_at(start, "for await is only valid with of"));
+        }
+        if matches!(
+            &init,
+            Some(ForInit::VarDecl { kind, .. })
+                if matches!(*kind, VarDeclKind::Using | VarDeclKind::AwaitUsing)
+        ) {
+            return Err(parser.error_at(start, "using declarations are not allowed in for-in"));
+        }
         parser.next()?;
         let left = for_binding_from_init(parser, init)?;
         let right = parse_expression(parser, true)?;
@@ -428,6 +544,25 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
         }
     } else {
         parser.expect_punct(TokenKind::Semicolon)?;
+        // `const`/`using` declarators need initializers in a classic head
+        // (for-in/of heads forbid them instead).
+        if let Some(ForInit::VarDecl { kind, decls }) = &init {
+            let needs_init = matches!(
+                kind,
+                VarDeclKind::Const | VarDeclKind::Using | VarDeclKind::AwaitUsing
+            );
+            if needs_init {
+                for decl in decls {
+                    if decl.init.is_none() {
+                        let message = match kind {
+                            VarDeclKind::Const => "Missing initializer in const declaration",
+                            _ => "Missing initializer in using declaration",
+                        };
+                        return Err(parser.error_at(decl.span.start, message));
+                    }
+                }
+            }
+        }
         if parser.at_punct(TokenKind::Semicolon)? {
             None
         } else {
@@ -464,12 +599,20 @@ fn parse_for_declarators(
     kind: VarDeclKind,
 ) -> Result<Vec<VarDeclarator>, JsError> {
     let start = parser.peek()?.span.start;
+    // A `using` ForBinding is identifier-only (`~Pattern`).
+    if matches!(kind, VarDeclKind::Using | VarDeclKind::AwaitUsing)
+        && !matches!(parser.peek()?.kind, TokenKind::Identifier(_))
+    {
+        let tok = parser.peek()?.clone();
+        return Err(parser.unexpected(&tok));
+    }
     let pattern = parser.parse_binding_pattern()?;
     for name in bound_names(&pattern) {
         parser.check_binding_name(name, start)?;
         match kind {
             VarDeclKind::Var => parser.declare_var(name, start)?,
             VarDeclKind::Let | VarDeclKind::Const => parser.declare_lexical(name, start)?,
+            VarDeclKind::Using | VarDeclKind::AwaitUsing => parser.declare_lexical(name, start)?,
         }
     }
     let init = if parser.eat_punct(TokenKind::Equal)? {
@@ -477,9 +620,6 @@ fn parse_for_declarators(
     } else {
         None
     };
-    if kind == VarDeclKind::Const && init.is_none() {
-        return Err(parser.error_at(start, "Missing initializer in const declaration"));
-    }
     let end = parser.prev.as_ref().unwrap().span.end;
     Ok(vec![VarDeclarator {
         pattern,

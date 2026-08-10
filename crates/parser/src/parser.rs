@@ -169,6 +169,10 @@ impl<'s> Parser<'s> {
         self.stream.peek2()
     }
 
+    pub(crate) fn peek3(&mut self) -> Result<&Token, JsError> {
+        self.stream.peek3()
+    }
+
     pub(crate) fn snapshot(&self) -> usize {
         self.stream.snapshot()
     }

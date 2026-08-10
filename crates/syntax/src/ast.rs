@@ -134,6 +134,13 @@ pub enum StmtKind {
         kind: VarDeclKind,
         decls: Vec<VarDeclarator>,
     },
+    /// `using`/`await using` declaration (spec 15.14): binds disposables
+    /// that are disposed at scope exit. Bindings are identifier-only with
+    /// required initializers.
+    UsingDecl {
+        is_await: bool,
+        decls: Vec<VarDeclarator>,
+    },
     /// `function` declaration (spec 15.2).
     FunctionDecl(Function),
     /// `class` declaration (spec 15.7) — the name is required.
@@ -191,12 +198,16 @@ pub enum StmtKind {
     With { object: Expr, body: Box<Stmt> },
 }
 
-/// `var` vs `let` vs `const`.
+/// Declaration kinds for `var` statements and `for` heads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VarDeclKind {
     Var,
     Let,
     Const,
+    /// `for (using x of …)` — resource binding, `of` only.
+    Using,
+    /// `for (await using x of …)` — async resource binding, `of` only.
+    AwaitUsing,
 }
 
 /// One declarator of a variable declaration: `BindingPattern Initializer_opt`.

@@ -58,7 +58,8 @@ mod tests {
     use crux::JsString;
     use syntax::{
         AttributeKey, BinaryOp, ExportDecl, ExportName, ExportSpecifier, Expr, ExprKind,
-        ImportEntry, Literal, LogicalOp, ModuleItem, StmtKind, UnaryOp,
+        ForBinding, ForInit, ImportEntry, Literal, LogicalOp, ModuleItem, StmtKind, UnaryOp,
+        VarDeclKind,
     };
 
     fn ok(source: &str) -> Program {
@@ -644,7 +645,9 @@ mod tests {
         err("'use strict'; function f() {} function f() {}");
         // for-in/of restrictions.
         err("for (var x = 0 in obj) {}");
-        err("for (const x of arr) {}");
+        // for-of heads allow bindings without initializers.
+        ok("for (const x of arr) {}");
+        ok("for (let [a, b] of arr) {}");
         // Missing const initializer.
         err("const x;");
         err("for (const x; ;) {}");
@@ -1060,8 +1063,122 @@ mod tests {
         mod_err("<!-- x");
         mod_err("--> x");
 
+        // using declarations cannot be exported.
+        mod_err("export using x = 1;");
+        mod_err("export await using x = 1;");
+        // ...but are fine inside exported function bodies.
+        mod_ok("export function f() { using x = 1; }");
+
         // Module span covers the whole source.
         let m = mod_ok("import d from 'm';");
         assert_eq!(m.span, crux::Span::new(0, 18));
+    }
+
+    #[test]
+    fn parses_using_declarations() {
+        // Statement forms, with required initializers.
+        assert!(matches!(
+            stmt("using x = 1;").kind,
+            StmtKind::UsingDecl {
+                is_await: false,
+                ref decls,
+            } if decls.len() == 1
+        ));
+        let s = stmt("using x = 1, y = 2;");
+        let StmtKind::UsingDecl {
+            is_await: false,
+            ref decls,
+        } = s.kind
+        else {
+            panic!("expected a using declaration");
+        };
+        assert_eq!(decls.len(), 2);
+        assert!(matches!(decls[0].pattern, syntax::BindingPattern::Ident(_)));
+        assert!(decls[0].init.is_some());
+
+        // await using in async functions and modules.
+        ok("async function f() { await using x = 1; }");
+        mod_ok("using x = 1;");
+        mod_ok("await using x = 1;");
+        mod_ok("async function f() { await using x = 1, y = 2; }");
+        ok("{ using x = 1; }");
+
+        // `using` stays an ordinary identifier everywhere else.
+        ok("using;");
+        ok("using = 5;");
+        ok("using();");
+        ok("var using = 5;");
+        ok("let using;");
+        ok("using.x;");
+        ok("using [0] = 1;");
+        ok("using in obj;");
+        ok("f(using);");
+        ok("let x = using;");
+
+        // for-of heads: `using` and `await using` bindings.
+        assert!(matches!(
+            stmt("for (using x of arr) {}").kind,
+            StmtKind::ForOf {
+                left: ForBinding::VarDecl {
+                    kind: VarDeclKind::Using,
+                    ..
+                },
+                ..
+            }
+        ));
+        ok("async function f() { for (await using x of arr) {} }");
+        ok("async function f() { for await (using x of arr) {} }");
+        ok("async function f() { for await (await using x of arr) {} }");
+        // `for (using of y)` is an expression-headed for-of.
+        assert!(matches!(
+            stmt("for (using of arr) {}").kind,
+            StmtKind::ForOf {
+                left: ForBinding::Expr(_),
+                ..
+            }
+        ));
+        // `using` in a classic for head.
+        assert!(matches!(
+            stmt("for (using x = 0; x < 3; x++) {}").kind,
+            StmtKind::For {
+                init: Some(ForInit::VarDecl {
+                    kind: VarDeclKind::Using,
+                    ..
+                }),
+                ..
+            }
+        ));
+        ok("for (using [a] = b; ;) {}");
+    }
+
+    #[test]
+    fn using_early_errors() {
+        // Initializers are required (using bindings are constant).
+        err("using x;");
+        err("using x, y = 1;");
+        err("async function f() { await using x; }");
+        err("for (using x; ;) {}");
+        // Initializers are forbidden in for-in/of heads.
+        err("for (using x = 1 of arr) {}");
+        // No destructuring in statement-level using declarations (~Pattern).
+        err("using { a } = b;");
+        // `using` has no for-in form.
+        err("for (using x in obj) {}");
+        err("async function f() { for (await using x in obj) {} }");
+        // for await needs an async context and `of`.
+        err("for await (using x of arr) {}");
+        err("for await (x in obj) {}");
+        // Duplicate and conflicting bindings.
+        err("using x = 1; using x = 2;");
+        err("using x = 1; let x;");
+        err("let x; using x = 1;");
+        // await using requires an await-legal context.
+        err("await using x = 1;");
+        err("function f() { await using x = 1; }");
+        // A line terminator after `using` triggers ASI, not a declaration.
+        ok("using\nx = 1;");
+        // Keyword bindings are rejected.
+        err("using in = 1;");
+        err("using let = 1;");
     }
 }

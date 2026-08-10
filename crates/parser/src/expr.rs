@@ -337,7 +337,6 @@ fn parse_binary(parser: &mut Parser, allow_in: bool, min_prec: u8) -> Result<Exp
     let mut left = parse_unary(parser)?;
     loop {
         let kind = parser.peek()?.kind.clone();
-        eprintln!("dbg binary: left done, peek = {:?}", kind);
         let logical = logical_kind(kind.clone());
         let prec = if let Some(lop) = logical {
             Some(match lop {
