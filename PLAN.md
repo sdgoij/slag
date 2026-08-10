@@ -483,6 +483,24 @@ error has a span.
 **Exit criteria:** parser handles the full grammar, all early errors fire with correct spans, and
 `cargo test` in `parser` is green.
 
+**Status (current):** the full syntactic grammar is implemented (expressions, statements,
+declarations incl. `using`/`await using`, classes with fields/private elements/static blocks,
+modules with import attributes, cover grammar, ASI). Early errors are split between parse-time
+checks (strict mode, binding names, assignment targets, class/function context flags, module
+restrictions) and a dedicated post-parse pass in `crates/parser/src/early_errors.rs` covering
+the genuinely cross-tree rules: label scoping (`ContainsDuplicateLabels`,
+`ContainsUndefinedBreakTarget`, `ContainsUndefinedContinueTarget`), module `ExportedNames`
+uniqueness and `ReferencedBindings` restrictions (spec 16.2.3), `arguments` in class field
+initializers (15.7.9), `arguments`/`await` in static blocks (15.7.11), and duplicate `__proto__`
+data properties (13.2.5). `crates/parser` runs 44 unit suites including early-error fixtures
+with expected pass/error outcomes; the workspace runs 173 tests with
+`cargo clippy --workspace --all-targets -- -D warnings` clean.
+
+**Remaining in Phase 3:** regexp literal early errors (invalid escapes per flags, `u`/`v`
+constructs) are deferred to Phase 11 (`regexp` crate); the evaluator-facing traversal
+utilities (`VarDeclaredNames`, `LexicallyScopedDeclarations`, …) are filled in as Phase 6
+needs them.
+
 ---
 
 ### Phase 4 — Execution model

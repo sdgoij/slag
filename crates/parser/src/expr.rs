@@ -920,6 +920,13 @@ fn parse_arguments(parser: &mut Parser) -> Result<Vec<Argument>, JsError> {
     Ok(args)
 }
 
+/// Whether a numeric literal's raw text is a legacy octal or non-octal
+/// decimal integer (`0777`, `089`) — an early error in strict mode (spec
+/// 12.9.3). `0x`, `0b`, `0o`, `0.`, and `0e` forms are unaffected.
+fn is_legacy_octal_literal(raw: Vec<u16>) -> bool {
+    raw.first() == Some(&0x30) && raw.get(1).is_some_and(|u| (0x30..=0x39).contains(u))
+}
+
 /// `PrimaryExpression` (spec 13.2).
 fn parse_primary(parser: &mut Parser) -> Result<Expr, JsError> {
     let tok = parser.peek()?.clone();
@@ -997,7 +1004,6 @@ fn parse_primary(parser: &mut Parser) -> Result<Expr, JsError> {
                 })
             }
             Some(_) => {
-                eprintln!("dbg: unexpected keyword in primary: {:?}", tok);
                 let tok = parser.peek()?.clone();
                 Err(parser.unexpected(&tok))
             }
@@ -1024,6 +1030,12 @@ fn parse_primary(parser: &mut Parser) -> Result<Expr, JsError> {
             })
         }
         TokenKind::NumericLiteral(value) => {
+            if parser.strict && is_legacy_octal_literal(parser.source_slice(tok.span)) {
+                return Err(parser.error_at(
+                    tok.span.start,
+                    "Octal literals are not allowed in strict mode",
+                ));
+            }
             parser.next()?;
             Ok(Expr {
                 span: tok.span,
@@ -1409,7 +1421,11 @@ fn expr_to_pattern(parser: &mut Parser, expr: Expr) -> Result<BindingPattern, Js
             let mut seen_rest = false;
             for prop in lit.props {
                 match prop {
-                    ObjectProperty::Init { key, value } => {
+                    ObjectProperty::Init {
+                        key,
+                        value,
+                        shorthand: _,
+                    } => {
                         if seen_rest {
                             return Err(
                                 parser.error_at(value.span.start, "Rest element must be last")
@@ -1549,7 +1565,11 @@ fn parse_object_literal(parser: &mut Parser) -> Result<Expr, JsError> {
             props.push(ObjectProperty::Method { key, function });
         } else if parser.eat_punct(TokenKind::Colon)? {
             let value = parse_assignment(parser, true)?;
-            props.push(ObjectProperty::Init { key, value });
+            props.push(ObjectProperty::Init {
+                key,
+                value,
+                shorthand: false,
+            });
         } else if parser.eat_punct(TokenKind::Equal)? {
             // CoverInitializedName: `key = value` — only legal when the
             // object is disambiguated into a pattern.
@@ -1576,6 +1596,7 @@ fn parse_object_literal(parser: &mut Parser) -> Result<Expr, JsError> {
                 props.push(ObjectProperty::Init {
                     key: PropertyName::Ident(name),
                     value: shorthand,
+                    shorthand: true,
                 });
             } else {
                 return Err(parser.error_at(prop_start, "Invalid shorthand property initializer"));
@@ -1592,6 +1613,7 @@ fn parse_object_literal(parser: &mut Parser) -> Result<Expr, JsError> {
                     span: Span::new(prop_start, end),
                     kind: ExprKind::Ident(name),
                 },
+                shorthand: true,
             });
         }
         if !parser.eat_punct(TokenKind::Comma)? {
@@ -1743,8 +1765,6 @@ pub(crate) fn parse_function_body_block(
         parser.allow_super,
         parser.in_constructor,
         parser.top_level_await,
-        parser.loop_depth,
-        parser.switch_depth,
     );
     parser.strict = strict;
     parser.in_function = true;
@@ -1753,8 +1773,6 @@ pub(crate) fn parse_function_body_block(
     parser.allow_super = allow_super;
     parser.in_constructor = in_constructor;
     parser.top_level_await = false;
-    parser.loop_depth = 0;
-    parser.switch_depth = 0;
     if directive_strict {
         // A `"use strict"` directive makes the already-parsed parameter
         // list strict: `eval`/`arguments` bindings and duplicates become
@@ -1788,8 +1806,6 @@ pub(crate) fn parse_function_body_block(
         parser.allow_super,
         parser.in_constructor,
         parser.top_level_await,
-        parser.loop_depth,
-        parser.switch_depth,
     ) = saved;
     Ok(Block {
         stmts,
@@ -1883,7 +1899,15 @@ fn parse_arrow_body(
         )?;
         Ok(ArrowBody::Block(body))
     } else {
-        let expr = parse_assignment(parser, true)?;
-        Ok(ArrowBody::Expr(Box::new(expr)))
+        // A concise body is a function body: `await`/`yield`/top-level
+        // await are governed by the arrow's own flags, not the enclosing
+        // context (spec 15.4).
+        let saved = (parser.in_async, parser.in_generator, parser.top_level_await);
+        parser.in_async = is_async;
+        parser.in_generator = false;
+        parser.top_level_await = false;
+        let expr = parse_assignment(parser, true);
+        (parser.in_async, parser.in_generator, parser.top_level_await) = saved;
+        Ok(ArrowBody::Expr(Box::new(expr?)))
     }
 }

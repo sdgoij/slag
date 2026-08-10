@@ -37,15 +37,6 @@ impl PrivateNameKind {
     }
 }
 
-/// A label in scope; records pending `continue label` statements that are
-/// validated once the labeled statement's shape is known.
-pub(crate) struct LabelInfo {
-    pub(crate) name: AtomId,
-    /// Spans of `continue label` statements that need re-validation once the
-    /// labeled statement's shape is known.
-    pub(crate) pending_continues: Vec<u32>,
-}
-
 /// One lexical scope; tracks `let`/`const`/class names, function-declared
 /// names, and parameter names for duplicate declaration early errors.
 #[derive(Default)]
@@ -99,9 +90,6 @@ pub struct Parser<'s> {
     /// `var` names declared in the current statement list (per the
     /// lexical-vs-var disjointness rule).
     pub(crate) list_vars: HashSet<AtomId>,
-    pub(crate) labels: Vec<LabelInfo>,
-    pub(crate) loop_depth: usize,
-    pub(crate) switch_depth: usize,
 }
 
 /// A parsed parenthesized list: each element is either a plain expression or
@@ -143,9 +131,6 @@ impl<'s> Parser<'s> {
             cover_error: None,
             scopes: vec![Scope::default()],
             list_vars: HashSet::new(),
-            labels: Vec::new(),
-            loop_depth: 0,
-            switch_depth: 0,
         }
     }
 
@@ -344,9 +329,9 @@ impl<'s> Parser<'s> {
         self.scopes.pop();
     }
 
-    /// Declares a `let`/`const`/`class` name: duplicates in the same scope,
-    /// clashes with `var`/function names in the same statement list, and
-    /// clashes with a formal parameter are early errors.
+    /// Declares a `let`/`const`/`class`/`using` name: duplicates in the same
+    /// scope, clashes with `var`/function names in the same statement list,
+    /// and clashes with a formal parameter are early errors.
     pub(crate) fn declare_lexical(&mut self, name: AtomId, start: u32) -> Result<(), JsError> {
         let scope = self.scopes.last_mut().unwrap();
         if scope.lexical.contains(&name)

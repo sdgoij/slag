@@ -13,37 +13,10 @@ use crate::parser::Parser;
 /// Parses the top-level item list of a module.
 pub(crate) fn parse_module_items(parser: &mut Parser) -> Result<Vec<ModuleItem>, JsError> {
     let mut items = Vec::new();
-    let mut default_exports = 0usize;
     while !matches!(parser.peek()?.kind, TokenKind::Eof) {
-        let item = parse_module_item(parser)?;
-        if let ModuleItem::Export(ExportDecl::Default(_)) = &item {
-            default_exports += 1;
-            if default_exports > 1 {
-                return Err(parser.error_at(
-                    span_of_item(&item).start,
-                    "A module may only have one default export",
-                ));
-            }
-        }
-        items.push(item);
+        items.push(parse_module_item(parser)?);
     }
     Ok(items)
-}
-
-fn span_of_item(item: &ModuleItem) -> Span {
-    match item {
-        ModuleItem::Stmt(stmt) => stmt.span,
-        ModuleItem::Import(imp) => imp.span,
-        ModuleItem::Export(exp) => match exp {
-            ExportDecl::Named { span, .. } | ExportDecl::From { span, .. } => *span,
-            ExportDecl::Declaration(stmt) => stmt.span,
-            ExportDecl::Default(inner) => match &**inner {
-                ExportDefault::Function(f) => f.span,
-                ExportDefault::Class(c) => c.span,
-                ExportDefault::Expr(e) => e.span,
-            },
-        },
-    }
 }
 
 fn parse_module_item(parser: &mut Parser) -> Result<ModuleItem, JsError> {

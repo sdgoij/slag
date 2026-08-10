@@ -5,6 +5,7 @@
 //! and the syntax-directed operations the evaluator needs.
 
 mod class;
+mod early_errors;
 mod expr;
 mod module;
 mod parser;
@@ -30,7 +31,9 @@ pub fn parse_script(source: &str) -> Result<Program, JsError> {
         return Err(parser.unexpected(&tok));
     }
     let span = crux::Span::new(0, source.len() as u32);
-    Ok(Program { body, span })
+    let program = Program { body, span };
+    early_errors::check_script(&program)?;
+    Ok(program)
 }
 
 /// Parses a Module (spec 16.2): import/export declarations plus a strict
@@ -49,7 +52,9 @@ pub fn parse_module(source: &str) -> Result<Module, JsError> {
         return Err(parser.unexpected(&tok));
     }
     let span = crux::Span::new(0, source.len() as u32);
-    Ok(Module { body, span })
+    let module = Module { body, span };
+    early_errors::check_module(&module)?;
+    Ok(module)
 }
 
 #[cfg(test)]
@@ -1110,8 +1115,136 @@ mod tests {
     }
 
     #[test]
+    fn early_error_pass_labels() {
+        // ContainsDuplicateLabels: labels thread through blocks.
+        err("a: a: 1;");
+        err("a: { a: 1; }");
+        err("a: b: { a: 1; }");
+        ok("a: b: 1;");
+        ok("a: { b: 1; }");
+        // Function bodies reset the label scope.
+        ok("a: function f() { a: 1; }");
+        err("a: function f() { continue a; }");
+        err("a: for (;;) { function f() { continue a; } }");
+        // ContainsUndefinedBreakTarget / ContainsUndefinedContinueTarget.
+        ok("a: { break a; }");
+        ok("a: b: for (;;) { continue a; break b; }");
+        ok("a: while (1) { continue a; }");
+        ok("a: switch (x) { case 1: break a; }");
+        err("a: switch (x) { case 1: continue a; }");
+        err("a: { continue a; }");
+        err("break;");
+        err("continue;");
+        err("for (;;) { continue missing; }");
+        ok("for (;;) { break; }");
+        ok("for (;;) { continue; }");
+        ok("switch (x) { case 1: break; }");
+        // continue targets the nearest enclosing label chain; a label
+        // threading through other labels to an iteration counts, but a
+        // block boundary drops it (spec sec-syntax-directed-operations-
+        // labels: labels fold into iterationSet only via BreakableStatement).
+        ok("a: for (;;) { for (;;) { continue a; } }");
+        ok("a: for (;;) { b: { continue a; } }");
+        err("a: { b: for (;;) { continue a; } }");
+        err("a: b: { for (;;) { continue a; } }");
+        err("a: for (;;) { b: { continue b; } }");
+        ok("a: b: for (;;) { continue a; continue b; }");
+    }
+
+    #[test]
+    fn early_error_pass_module_exports() {
+        // ReferencedBindings of `export { … }` must be plain identifiers.
+        mod_err("export { default };");
+        mod_err("export { \"str\" };");
+        mod_err("export { if };");
+        mod_ok("export { x as default };");
+        mod_ok("export { default } from 'm';");
+        mod_ok("export { \"str\" as x } from 'm';");
+        // ExportedNames must be unique across the module.
+        mod_err("export { a }; export { a };");
+        mod_err("export { a } from 'm'; export { a } from 'n';");
+        mod_err("export { a as default }; export default 1;");
+        mod_err("export default 1; export default 2;");
+        mod_err("export const x = 1; export { x };");
+        mod_ok("export * from 'm'; export * from 'n';");
+        mod_ok("export * as ns from 'm'; export * as ns2 from 'n';");
+        mod_err("export * as ns from 'm'; export { ns };");
+        mod_ok("export { a as b } from 'm'; export { a as c } from 'm';");
+        mod_ok("export { a }; export { a as b };");
+    }
+
+    #[test]
+    fn early_error_pass_class_bodies() {
+        // `arguments` is an early error in field initializers and static
+        // blocks, but arrows and nested functions have their own.
+        err("class A { x = arguments; }");
+        err("class A { x = arguments[0]; }");
+        ok("class A { x = () => arguments; }");
+        ok("class A { x = function () { return arguments; }; }");
+        err("class A { static { arguments; } }");
+        ok("class A { static { () => arguments; } }");
+        // `await` is an early error in static blocks.
+        err("class A { static { await 1; } }");
+        err("class A { static { await; } }");
+        ok("class A { static { (async () => await 1); } }");
+        ok("class A { static { async function f() { await 1; } } }");
+    }
+
+    #[test]
+    fn early_error_pass_duplicate_proto() {
+        err("({ __proto__: 1, __proto__: 2 });");
+        err("({ __proto__: 1, \"__proto__\": 2 });");
+        ok("({ __proto__: 1 });");
+        // Shorthand and methods are not data properties.
+        ok("({ __proto__, __proto__: 1 });");
+        ok("({ __proto__: 1, __proto__() {} });");
+        ok("({ __proto__: 1, [\"__proto__\"]: 2 });");
+        // Computed names do not count.
+        ok("({ [\"__proto__\"]: 1, [\"__proto__\"]: 2 });");
+    }
+
+    #[test]
+    fn strict_legacy_octal_literals() {
+        // Legacy octal and non-octal decimal integers are strict-mode errors.
+        err("'use strict'; 0777;");
+        err("'use strict'; 089;");
+        err("'use strict'; 00;");
+        err("function f() { 'use strict'; 0777; }");
+        err("class A { m() { 0777; } }");
+        ok("0777;");
+        ok("function f() { 0777; }");
+        // Other zero-prefixed forms are unaffected.
+        ok("'use strict'; 0x1F;");
+        ok("'use strict'; 0b101;");
+        ok("'use strict'; 0o17;");
+        ok("'use strict'; 0.5;");
+        ok("'use strict'; 0e1;");
+        ok("'use strict'; 0;");
+        ok("'use strict'; 1;");
+    }
+
+    #[test]
+    fn let_as_lexically_bound_name() {
+        // `let` is never a valid lexically bound name (spec 14.2.1).
+        err("let let = 1;");
+        err("const let = 1;");
+        err("let [let] = a;");
+        err("using let = 1;");
+        err("for (let let of x) {}");
+        err("for (const let of x) {}");
+        err("for (using let of x) {}");
+        // `var let` and class/function names are unrestricted in sloppy code.
+        ok("var let = 1;");
+        ok("for (var let of x) {}");
+        ok("class let {}");
+        ok("function let() {}");
+        // Strict mode rejects `let` as any identifier.
+        err("'use strict'; var let = 1;");
+        err("'use strict'; let;");
+    }
+
+    #[test]
     fn parses_annex_b_forin_initializer() {
-        // Annex B.2.6: `for (var x = init in obj)` in sloppy code.
         let s = stmt("for (var x = 0 in obj) {}");
         assert!(matches!(
             s.kind,

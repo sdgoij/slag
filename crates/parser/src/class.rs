@@ -301,17 +301,17 @@ fn parse_static_block(parser: &mut Parser) -> Result<Block, JsError> {
     let saved = (
         parser.strict,
         parser.in_function,
+        parser.in_generator,
+        parser.in_async,
         parser.allow_super,
         parser.in_constructor,
-        parser.loop_depth,
-        parser.switch_depth,
     );
     parser.strict = true;
     parser.in_function = true;
+    parser.in_generator = false;
+    parser.in_async = false;
     parser.allow_super = true;
     parser.in_constructor = false;
-    parser.loop_depth = 0;
-    parser.switch_depth = 0;
     let saved_vars = std::mem::take(&mut parser.list_vars);
     parser.push_scope();
     let stmts = crate::stmt::parse_statement_list(parser, TokenKind::RightBrace)?;
@@ -322,10 +322,10 @@ fn parse_static_block(parser: &mut Parser) -> Result<Block, JsError> {
     (
         parser.strict,
         parser.in_function,
+        parser.in_generator,
+        parser.in_async,
         parser.allow_super,
         parser.in_constructor,
-        parser.loop_depth,
-        parser.switch_depth,
     ) = saved;
     Ok(Block {
         stmts,

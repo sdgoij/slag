@@ -8,7 +8,7 @@ use syntax::{
 };
 
 use crate::expr::{can_start_expression, parse_assignment, parse_expression};
-use crate::parser::{LabelInfo, Parser};
+use crate::parser::Parser;
 
 /// Parses statements until the terminator token or EOF. `var` names
 /// accumulate in `parser.list_vars`; the caller decides whether they
@@ -156,25 +156,7 @@ fn parse_labeled(parser: &mut Parser) -> Result<Stmt, JsError> {
         return Err(parser.error_at(start, "Unexpected strict mode reserved word"));
     }
     parser.expect_punct(TokenKind::Colon)?;
-    parser.labels.push(LabelInfo {
-        name,
-        pending_continues: Vec::new(),
-    });
     let body = Box::new(parse_statement(parser)?);
-    let info = parser.labels.pop().unwrap();
-    let is_loop = matches!(
-        body.kind,
-        StmtKind::While { .. }
-            | StmtKind::DoWhile { .. }
-            | StmtKind::For { .. }
-            | StmtKind::ForIn { .. }
-            | StmtKind::ForOf { .. }
-    );
-    for span in info.pending_continues {
-        if !is_loop {
-            return Err(parser.error_at(span, "Illegal continue statement"));
-        }
-    }
     let end = parser.prev.as_ref().unwrap().span.end;
     Ok(Stmt {
         span: Span::new(start, end),
@@ -230,6 +212,8 @@ fn parse_using_declaration(parser: &mut Parser, is_await: bool) -> Result<Stmt, 
     loop {
         let decl_start = parser.peek()?.span.start;
         let (name, name_start) = parser.parse_identifier()?;
+        // `let` is never a valid bound name of a using declaration (spec
+        // 15.14.2 early errors).
         if name == intern_utf8("let") {
             return Err(parser.error_at(name_start, "let is disallowed as a lexically bound name"));
         }
@@ -270,14 +254,18 @@ pub(crate) fn parse_var_declarators(
             parser.check_binding_name(name, start)?;
             match kind {
                 VarDeclKind::Var => parser.declare_var(name, start)?,
-                VarDeclKind::Let | VarDeclKind::Const => parser.declare_lexical(name, start)?,
-                VarDeclKind::Using | VarDeclKind::AwaitUsing => {
+                VarDeclKind::Let | VarDeclKind::Const => {
+                    // `let` is never a valid bound name of a lexical
+                    // declaration (spec 14.2.1 early errors).
                     if name == intern_utf8("let") {
                         return Err(
                             parser.error_at(start, "let is disallowed as a lexically bound name")
                         );
                     }
                     parser.declare_lexical(name, start)?;
+                }
+                VarDeclKind::Using | VarDeclKind::AwaitUsing => {
+                    parser.declare_lexical(name, start)?
                 }
             }
         }
@@ -374,9 +362,7 @@ fn parse_while(parser: &mut Parser) -> Result<Stmt, JsError> {
     parser.expect_punct(TokenKind::LeftParen)?;
     let test = parse_expression(parser, true)?;
     parser.expect_punct(TokenKind::RightParen)?;
-    parser.loop_depth += 1;
     let body = Box::new(parse_statement(parser)?);
-    parser.loop_depth -= 1;
     let end = parser.prev.as_ref().unwrap().span.end;
     Ok(Stmt {
         span: Span::new(start, end),
@@ -386,9 +372,7 @@ fn parse_while(parser: &mut Parser) -> Result<Stmt, JsError> {
 
 fn parse_do_while(parser: &mut Parser) -> Result<Stmt, JsError> {
     let start = parser.next()?.span.start; // `do`
-    parser.loop_depth += 1;
     let body = Box::new(parse_statement(parser)?);
-    parser.loop_depth -= 1;
     parser.expect_keyword(Keyword::While)?;
     parser.expect_punct(TokenKind::LeftParen)?;
     let test = parse_expression(parser, true)?;
@@ -502,9 +486,7 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
         let left = for_binding_from_init(parser, init, true)?;
         let right = parse_expression(parser, true)?;
         parser.expect_punct(TokenKind::RightParen)?;
-        parser.loop_depth += 1;
         let body = Box::new(parse_statement(parser)?);
-        parser.loop_depth -= 1;
         let end = parser.prev.as_ref().unwrap().span.end;
         return Ok(Stmt {
             span: Span::new(start, end),
@@ -519,9 +501,7 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
         let left = for_binding_from_init(parser, init, false)?;
         let right = parse_assignment(parser, true)?;
         parser.expect_punct(TokenKind::RightParen)?;
-        parser.loop_depth += 1;
         let body = Box::new(parse_statement(parser)?);
-        parser.loop_depth -= 1;
         let end = parser.prev.as_ref().unwrap().span.end;
         return Ok(Stmt {
             span: Span::new(start, end),
@@ -576,9 +556,7 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
         Some(parse_expression(parser, true)?)
     };
     parser.expect_punct(TokenKind::RightParen)?;
-    parser.loop_depth += 1;
     let body = Box::new(parse_statement(parser)?);
-    parser.loop_depth -= 1;
     let end = parser.prev.as_ref().unwrap().span.end;
     Ok(Stmt {
         span: Span::new(start, end),
@@ -613,6 +591,11 @@ fn parse_for_declarators(
             VarDeclKind::Var => parser.declare_var(name, start)?,
             VarDeclKind::Let | VarDeclKind::Const => parser.declare_lexical(name, start)?,
             VarDeclKind::Using | VarDeclKind::AwaitUsing => parser.declare_lexical(name, start)?,
+        }
+        // `let` is never a valid bound name of a ForDeclaration (spec 14.7.5
+        // early errors); `var` heads are unrestricted.
+        if kind != VarDeclKind::Var && name == intern_utf8("let") {
+            return Err(parser.error_at(start, "let is disallowed as a lexically bound name"));
         }
     }
     let init = if parser.eat_punct(TokenKind::Equal)? {
@@ -678,28 +661,6 @@ fn parse_continue(parser: &mut Parser) -> Result<Stmt, JsError> {
         None
     };
     parser.expect_semicolon()?;
-    match label {
-        None => {
-            if parser.loop_depth == 0 {
-                return Err(parser.error_at(start, "Illegal continue statement"));
-            }
-        }
-        Some(name) => {
-            // The label must exist and, once the labeled statement is known,
-            // must target an iteration statement.
-            let mut found = false;
-            for info in parser.labels.iter_mut().rev() {
-                if info.name == name {
-                    info.pending_continues.push(start);
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                return Err(parser.error_at(start, "Undefined label"));
-            }
-        }
-    }
     let end = parser.prev.as_ref().unwrap().span.end;
     Ok(Stmt {
         span: Span::new(start, end),
@@ -717,18 +678,6 @@ fn parse_break(parser: &mut Parser) -> Result<Stmt, JsError> {
         None
     };
     parser.expect_semicolon()?;
-    match label {
-        None => {
-            if parser.loop_depth == 0 && parser.switch_depth == 0 {
-                return Err(parser.error_at(start, "Illegal break statement"));
-            }
-        }
-        Some(name) => {
-            if !parser.labels.iter().rev().any(|info| info.name == name) {
-                return Err(parser.error_at(start, "Undefined label"));
-            }
-        }
-    }
     let end = parser.prev.as_ref().unwrap().span.end;
     Ok(Stmt {
         span: Span::new(start, end),
@@ -793,7 +742,6 @@ fn parse_switch(parser: &mut Parser) -> Result<Stmt, JsError> {
     parser.expect_punct(TokenKind::LeftBrace)?;
     let mut cases: Vec<SwitchCase> = Vec::new();
     let mut saw_default = false;
-    parser.switch_depth += 1;
     parser.push_scope();
     let saved_vars = std::mem::take(&mut parser.list_vars);
     while !parser.at_punct(TokenKind::RightBrace)? {
@@ -824,7 +772,6 @@ fn parse_switch(parser: &mut Parser) -> Result<Stmt, JsError> {
     }
     parser.expect_punct(TokenKind::RightBrace)?;
     parser.pop_scope();
-    parser.switch_depth -= 1;
     parser.list_vars.extend(saved_vars);
     let end = parser.prev.as_ref().unwrap().span.end;
     Ok(Stmt {

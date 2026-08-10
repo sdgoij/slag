@@ -472,8 +472,14 @@ pub struct ObjectLiteral {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ObjectProperty {
-    /// `key : value` or `key` shorthand.
-    Init { key: PropertyName, value: Expr },
+    /// `key : value` or `key` shorthand. `shorthand` distinguishes
+    /// `{ x }` (an IdentifierReference) from `{ x: x }` for the duplicate
+    /// `__proto__` early error.
+    Init {
+        key: PropertyName,
+        value: Expr,
+        shorthand: bool,
+    },
     /// `key ( params ) { body }` incl. `async`/`*` methods.
     Method {
         key: PropertyName,
