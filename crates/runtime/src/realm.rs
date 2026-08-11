@@ -176,6 +176,10 @@ fn set_default_global_bindings(realm: &Handle<Realm>) -> Result<(), JsError> {
     crate::builtins::string::install(realm)?;
     crate::builtins::regexp::install(realm)?;
     crate::builtins::keyed::install(realm)?;
+    crate::builtins::array_buffer::install(realm)?;
+    crate::builtins::dataview::install(realm)?;
+    crate::builtins::atomics::install(realm)?;
+    crate::builtins::json::install(realm)?;
     crate::builtins::promise::install(realm)?;
     crate::generator::install(realm)?;
     crate::builtins::weakref::install(realm)?;

@@ -147,11 +147,20 @@ pub struct Agent {
             bool,
         ),
     >,
-    /// The [[ArrayBufferData]] and [[ArrayBufferByteLength]] of ArrayBuffer
-    /// objects, keyed by object identity (spec 25.1.1). Phase 12 creates
-    /// buffers as the TypedArray backing store; the full ArrayBuffer builtin
-    /// joins in Phase 14.
-    pub buffer_data: std::collections::HashMap<u64, (crux::typed_array::SharedBuffer, usize)>,
+    /// The internal state of ArrayBuffer/SharedArrayBuffer objects, keyed by
+    /// object identity (spec 25.1.1: [[ArrayBufferData]], [[ArrayBufferByteLength]],
+    /// [[ArrayBufferMaxByteLength]], and the resizable/growable + shared flags).
+    /// Phase 12 created buffers as the TypedArray backing store; Phase 14 adds
+    /// the full builtins.
+    pub buffer_data:
+        std::collections::HashMap<u64, RefCell<crate::builtins::array_buffer::BufferState>>,
+    /// The [[ViewedArrayBuffer]], [[ByteLength]], and [[ByteOffset]] of
+    /// DataView instances, keyed by object identity (spec 25.4.2).
+    pub dataview_data:
+        std::collections::HashMap<u64, RefCell<crate::builtins::dataview::DataViewState>>,
+    /// The [[RawJSON]] text of JSON.rawJSON objects, keyed by object identity
+    /// (spec 26.6.3).
+    pub raw_json_data: std::collections::HashMap<u64, JsString>,
     /// The [[MapData]] of Map instances, keyed by object identity (spec
     /// 24.1.1: a List of entries; `None` marks a deleted ~empty~ slot that
     /// suspended Map iterators skip).
@@ -218,6 +227,8 @@ impl Agent {
             array_iter_data: std::collections::HashMap::new(),
             array_from_async: std::collections::HashMap::new(),
             buffer_data: std::collections::HashMap::new(),
+            dataview_data: std::collections::HashMap::new(),
+            raw_json_data: std::collections::HashMap::new(),
             map_data: std::collections::HashMap::new(),
             set_data: std::collections::HashMap::new(),
             weak_map_data: std::collections::HashMap::new(),

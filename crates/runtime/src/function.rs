@@ -693,6 +693,26 @@ pub fn call(
                     return result;
                 }
                 if let Some(result) =
+                    crate::builtins::array_buffer::dispatch_call(agent, callee, &this, args)
+                {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::builtins::dataview::dispatch_call(agent, callee, &this, args)
+                {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::builtins::atomics::dispatch_call(agent, callee, &this, args)
+                {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::builtins::json::dispatch_call(agent, callee, &this, args)
+                {
+                    return result;
+                }
+                if let Some(result) =
                     crate::builtins::boolean::dispatch_call(agent, callee, &this, args)
                 {
                     return result;
@@ -818,6 +838,16 @@ pub fn construct(
                 }
                 if let Some(result) =
                     crate::builtins::keyed::dispatch_construct(agent, callee, args, new_target)
+                {
+                    return result;
+                }
+                if let Some(result) = crate::builtins::array_buffer::dispatch_construct(
+                    agent, callee, args, new_target,
+                ) {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::builtins::dataview::dispatch_construct(agent, callee, args, new_target)
                 {
                     return result;
                 }

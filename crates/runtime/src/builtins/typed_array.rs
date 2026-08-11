@@ -205,6 +205,12 @@ fn validate_typed_array(
             "TypedArray buffer is detached".into(),
         ));
     }
+    if crate::builtins::array_buffer::is_detached(agent, buffer_id) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "TypedArray buffer is detached".into(),
+        ));
+    }
     Ok(slots)
 }
 
@@ -290,6 +296,12 @@ fn allocate_typed_array_buffer(
     let byte_length = length
         .checked_mul(element_size)
         .ok_or_else(|| JsError::new(ErrorKind::RangeError, "TypedArray length overflow".into()))?;
+    if byte_length > crate::builtins::array_buffer::MAX_BYTE_LENGTH {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "TypedArray length exceeds the host limit".into(),
+        ));
+    }
     let buffer = SharedBuffer::new(byte_length);
     let buffer_proto = agent
         .current_realm()?
@@ -297,9 +309,13 @@ fn allocate_typed_array_buffer(
         .get("%Object.prototype%")
         .and_then(|value| as_object(&value));
     let buffer_object = JsObject::ordinary_object_create(buffer_proto);
-    agent
-        .buffer_data
-        .insert(buffer_object.id(), (buffer.clone(), byte_length));
+    agent.buffer_data.insert(
+        buffer_object.id(),
+        std::cell::RefCell::new(crate::builtins::array_buffer::BufferState::fixed(
+            buffer.clone(),
+            byte_length,
+        )),
+    );
     let slots = TypedArraySlots {
         buffer_object: Value::Object(buffer_object),
         buffer,
@@ -564,13 +580,18 @@ fn typed_array_buffer_path(
             "ArrayBuffer expected".into(),
         ));
     };
-    let Some((shared, buffer_byte_length)) = agent.buffer_data.get(&buffer_object.id()).cloned()
-    else {
+    let state = agent
+        .buffer_data
+        .get(&buffer_object.id())
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "Expected an ArrayBuffer".into()))?;
+    if state.borrow().detached {
         return Err(JsError::new(
             ErrorKind::TypeError,
-            "Expected an ArrayBuffer".into(),
+            "ArrayBuffer is detached".into(),
         ));
-    };
+    }
+    let shared = state.borrow().shared.clone();
+    let buffer_byte_length = state.borrow().byte_length;
     let element_size = element_type.size();
     let byte_offset = match args.first() {
         None | Some(Value::Undefined) => 0,

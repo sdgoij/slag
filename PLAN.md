@@ -1753,6 +1753,58 @@ reviver context `source` correctness, `rawJSON` passthrough in `stringify`, repl
 **Exit criteria:** `built-ins/ArrayBuffer`, `built-ins/SharedArrayBuffer`, `built-ins/DataView`,
 `built-ins/Atomics`, `built-ins/JSON` at high pass rates.
 
+**Status (complete):** the five structured-data built-ins landed:
+
+- **ArrayBuffer** (`builtins/array_buffer.rs`): constructor (ToIndex + `maxByteLength` option for
+  resizable buffers), statics (`isView`, `@@species`), prototype (`byteLength`/`detached`/
+  `maxByteLength`/`resizable` accessors, `resize`, `slice`, `transfer`,
+  `transferToFixedLength`, `@@toStringTag`). Each instance's bookkeeping (`[[ArrayBufferData]]`
+  byte block, `[[ArrayBufferByteLength]]`, `[[ArrayBufferMaxByteLength]]`, resizable/shared/
+  detached flags) is a `BufferState` in the agent's `buffer_data` table keyed by object identity;
+  the byte block is a crux `SharedBuffer` aliased by every view. `DetachArrayBuffer` nulls the
+  state (`byteLength` → 0, `detached` → true) while views keep their `Rc` handle.
+  `ArrayBufferCopyAndDetach` backs `transfer*` (preserving resizability); the species path of
+  `slice` accepts results larger than `newLen` (copies only the leading bytes) and rejects
+  detached/smaller/Shared results. A host `MAX_BYTE_LENGTH` cap (1 GiB) makes
+  `CreateByteDataBlock`-style huge allocations throw `RangeError` instead of exhausting memory
+  (spec 6.2.6.1 + the `allocation-limit` fixtures).
+- **SharedArrayBuffer**: constructor (`maxByteLength` for growable), `byteLength`/`growable`/
+  `maxByteLength` accessors, `grow` (new length ≤ max, ≥ current), `slice`, `@@toStringTag`;
+  `IsSharedArrayBuffer` is the `is_shared` flag, which the ArrayBuffer accessors reject and
+  Atomics requires.
+- **DataView** (`builtins/dataview.rs`): constructor (buffer must be a registered
+  ArrayBuffer/SharedArrayBuffer, ToIndex offsets, bounds), `buffer`/`byteLength`/`byteOffset`
+  accessors, all 11 `get*`/`set*` element methods reusing the crux typed-array codecs with a
+  `littleEndian` byte-reversal option (native-endian read/write + conditional reverse). The
+  view state (`[[ViewedArrayBuffer]]`, `[[ByteLength]]`, `[[ByteOffset]]`) lives in the agent's
+  `dataview_data` table; every access re-checks detachment.
+- **Atomics** (`builtins/atomics.rs`): `add`/`sub`/`and`/`or`/`xor` (read-modify-write over
+  the shared byte block, Number and BigInt sides via `crux::bigint`), `load`/`store`/
+  `exchange`/`compareExchange` (SameValue compare), `notify` (always 0 — no waiters),
+  `isLockFree`, `pause`, `wait` (TypeError on the non-blocking main agent), `waitAsync`
+  (returns `{ async: true, value: promise }` with the promise resolved `ok`/`not-equal`),
+  `@@toStringTag`. `ValidateIntegerTypedArray` restricts the integer element kinds and requires
+  a SharedArrayBuffer (non-shared → TypeError); `ValidateAtomicAccess` bounds-checks the index.
+- **JSON** (`builtins/json.rs`): a full ECMA-404 recursive-descent parser (all string escapes
+  incl. surrogate pairs, the exact number grammar, no extensions), `parse` with the ES2026
+  reviver context (`InternalizeJSONProperty` + the parse-record tree: `context.source` is the
+  raw source text for unmodified primitives, absent for objects), `stringify` with the spec
+  `SerializeJSONProperty` pipeline (toJSON, replacer function/whitelist, wrapper/space/gap,
+  `QuoteJSONString` with control-char and lone-surrogate escapes, cycle → TypeError, Number
+  wrappers unboxed), and `rawJSON`/`isRawJSON` (the raw text lives in the agent's
+  `raw_json_data` table; `stringify` emits it verbatim).
+- **Wiring:** the three new builtin modules dispatch from `function.rs` (call; construct for
+  ArrayBuffer/SharedArrayBuffer/DataView) and install from `realm.rs`; `ArrayBuffer`/
+  `SharedArrayBuffer`/`DataView` get `%Function.prototype%` via the linking pass.
+
+**test262 fixtures:** scanner run over the five directories — **ArrayBuffer 120 pass / 19 fail,
+SharedArrayBuffer 67 pass / 14 fail, DataView 264 pass / 116 fail, Atomics 36 pass / 51 fail,
+JSON 101 pass / 36 fail** (588 total). Registered one `#[test]` each. The workspace now runs
+**2463 tests** (1921 of them test262 fixtures) with fmt and clippy (`-D warnings`) clean.
+Remaining failures are pre-existing engine gaps (detachArrayBuffer/`$262` harness includes,
+`assert.compareArray`, and the crux `to_numeric` on object operands) plus resizable-typed-array
+length-tracking and the real waiter machinery.
+
 ---
 
 ### Phase 15 — Control abstraction: iterators, generators, async, promises
