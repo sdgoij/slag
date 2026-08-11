@@ -13,6 +13,8 @@ use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
 use crux::value::Value;
 
+use crate::agent::Agent;
+
 /// A shared reference to an Environment Record.
 pub type EnvRef = Handle<EnvRecord>;
 
@@ -143,9 +145,9 @@ impl EnvRecord {
     }
 
     /// spec 9.2.1.10 HasSuperBinding.
-    pub fn has_super_binding(&self) -> bool {
+    pub fn has_super_binding(&self, agent: &Agent) -> bool {
         match self {
-            EnvRecord::Function(e) => e.has_super_binding(),
+            EnvRecord::Function(e) => e.has_super_binding(agent),
             _ => false,
         }
     }
@@ -598,14 +600,21 @@ impl FunctionEnv {
         Ok(self.this_value.borrow().clone())
     }
 
-    fn has_super_binding(&self) -> bool {
+    fn has_super_binding(&self, agent: &Agent) -> bool {
         self.this_binding_status.get() != ThisBindingStatus::Lexical
-            && self.function_object_has_home_object()
+            && self.function_object_has_home_object(agent)
     }
 
-    fn function_object_has_home_object(&self) -> bool {
-        // Phase 7: `[[FunctionObject]].[[HomeObject]] is not undefined`.
-        false
+    fn function_object_has_home_object(&self, agent: &Agent) -> bool {
+        // spec 9.2.1.10: `[[FunctionObject]].[[HomeObject]]` is not
+        // *undefined* — the function was defined as a method.
+        let Value::Function(function) = &self.function_object else {
+            return false;
+        };
+        agent
+            .ecma_functions
+            .get(&function.id())
+            .is_some_and(|data| data.home_object.is_some())
     }
 
     fn bind_this_value(&self, value: Value) -> Result<(), JsError> {

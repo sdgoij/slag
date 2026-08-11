@@ -65,18 +65,7 @@ fn not_implemented(what: &str) -> JsError {
 /// FunctionBodyContainsUseStrict (spec 15.2.1): a `"use strict"` directive in
 /// the function body's directive prologue.
 pub fn function_is_strict(f: &syntax::ast::Function) -> bool {
-    for stmt in &f.body.stmts {
-        let StmtKind::Expr(expr) = &stmt.kind else {
-            return false;
-        };
-        let ExprKind::Literal(Literal::Str(value)) = &expr.kind else {
-            return false;
-        };
-        if value.to_string_lossy() == "use strict" {
-            return true;
-        }
-    }
-    false
+    body_is_strict(&f.body)
 }
 
 /// IsSimpleParameterList (spec 15.1.1): every parameter is a bare binding
@@ -148,15 +137,24 @@ pub fn is_anonymous_function_definition(expr: &syntax::ast::Expr) -> bool {
 
 /// SetFunctionName (spec 10.2.7): redefine the `name` own data property of
 /// a function value. The property is configurable, so this also replaces the
-/// empty name anonymous functions are created with.
-pub fn set_function_name(function: &Value, name: &JsString) -> Result<(), JsError> {
+/// empty name anonymous functions are created with. `prefix` ("get"/"set") is
+/// joined with a space per the spec's step 3.
+pub fn set_function_name(
+    function: &Value,
+    name: &JsString,
+    prefix: Option<&str>,
+) -> Result<(), JsError> {
     let Value::Function(function) = function else {
         return Ok(());
+    };
+    let name = match prefix {
+        Some(prefix) => JsString::from_utf8(&format!("{prefix} {}", name.to_string_lossy())),
+        None => name.clone(),
     };
     function.define_property(
         &JsString::from_utf8("name"),
         &PropertyDescriptor {
-            value: Some(Value::String(Handle::new(name.clone()))),
+            value: Some(Value::String(Handle::new(name))),
             writable: Some(false),
             get: None,
             set: None,
@@ -199,17 +197,123 @@ fn make_constructor(function: &Handle<Function>) -> Result<(), JsError> {
 /// InstantiateOrdinaryFunctionObject (spec 15.2.4): register a function
 /// declaration or expression. `strict` is the enclosing code's strictness,
 /// inherited when the body has no directive of its own.
+/// The definition kind for OrdinaryFunctionCreate (spec 10.2.1.3): whether
+/// the function is a method or accessor (no `prototype` own property) and
+/// the async/generator flags.
+#[derive(Debug, Clone, Copy)]
+pub struct DefinitionKind {
+    pub is_method: bool,
+    pub is_async: bool,
+    pub is_generator: bool,
+}
+
+impl DefinitionKind {
+    fn function(is_async: bool, is_generator: bool) -> Self {
+        Self {
+            is_method: false,
+            is_async,
+            is_generator,
+        }
+    }
+
+    fn method(is_async: bool, is_generator: bool) -> Self {
+        Self {
+            is_method: true,
+            is_async,
+            is_generator,
+        }
+    }
+}
+
 pub fn instantiate_function(
     agent: &mut Agent,
     f: &syntax::ast::Function,
     environment: EnvRef,
     enclosing_strict: bool,
 ) -> Result<Value, JsError> {
-    if f.is_async || f.is_generator {
+    register_function(
+        agent,
+        f.name.map(crux::lookup),
+        f.params.clone(),
+        f.body.clone(),
+        environment,
+        enclosing_strict,
+        DefinitionKind::function(f.is_async, f.is_generator),
+    )
+}
+
+/// Instantiate a method definition (object literal `m() {}` and class
+/// methods): an ordinary function with no `prototype` own property and no
+/// name until SetFunctionName; [[HomeObject]] is attached by `make_method`.
+pub fn instantiate_method(
+    agent: &mut Agent,
+    f: &syntax::ast::Function,
+    environment: EnvRef,
+    enclosing_strict: bool,
+) -> Result<Value, JsError> {
+    register_function(
+        agent,
+        None,
+        f.params.clone(),
+        f.body.clone(),
+        environment,
+        enclosing_strict,
+        DefinitionKind::method(f.is_async, f.is_generator),
+    )
+}
+
+/// The accessor form of OrdinaryFunctionCreate (spec 15.4.3 getters and
+/// setters): an ordinary function with no `prototype` and no name until
+/// SetFunctionName.
+pub fn instantiate_accessor(
+    agent: &mut Agent,
+    params: Vec<BindingElement>,
+    body: Block,
+    environment: EnvRef,
+    enclosing_strict: bool,
+) -> Result<Value, JsError> {
+    register_function(
+        agent,
+        None,
+        params,
+        body,
+        environment,
+        enclosing_strict,
+        DefinitionKind::method(false, false),
+    )
+}
+
+/// MakeMethod (spec 10.2.12): attach the [[HomeObject]] slot that `super`
+/// property access resolves through.
+pub fn make_method(agent: &mut Agent, function: &Value, home_object: Value) -> Result<(), JsError> {
+    let Value::Function(function) = function else {
+        return Ok(());
+    };
+    let Some(data) = agent.ecma_functions.get_mut(&function.id()) else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Cannot set a HomeObject on a non-ECMAScript function".into(),
+        ));
+    };
+    data.home_object = Some(home_object);
+    Ok(())
+}
+
+/// OrdinaryFunctionCreate (spec 10.2.1.3) minus MakeConstructor when the
+/// definition is a method or accessor.
+fn register_function(
+    agent: &mut Agent,
+    name: Option<JsString>,
+    params: Vec<BindingElement>,
+    body: Block,
+    environment: EnvRef,
+    enclosing_strict: bool,
+    kind: DefinitionKind,
+) -> Result<Value, JsError> {
+    if kind.is_async || kind.is_generator {
         return Err(not_implemented("async and generator functions"));
     }
-    let name = f.name.map(crux::lookup);
-    let strict = function_is_strict(f) || enclosing_strict;
+    let strict = body_is_strict(&body) || enclosing_strict;
     let this_mode = if strict {
         ThisMode::Strict
     } else {
@@ -218,21 +322,39 @@ pub fn instantiate_function(
     let realm = agent.current_realm()?;
     let data = EcmaFunction {
         name: name.clone(),
-        params: f.params.clone(),
-        body: f.body.clone(),
+        params: params.clone(),
+        body,
         environment,
         this_mode,
         strict,
         home_object: None,
         realm,
-        is_async: f.is_async,
-        is_generator: f.is_generator,
+        is_async: false,
+        is_generator: false,
     };
     let function = Function::new(name.clone());
     agent.ecma_functions.insert(function.id(), data);
-    set_function_properties(&function, &f.params, name.as_ref())?;
-    make_constructor(&function)?;
+    set_function_properties(&function, &params, name.as_ref())?;
+    if !kind.is_method {
+        make_constructor(&function)?;
+    }
     Ok(Value::Function(function))
+}
+
+/// FunctionBodyContainsUseStrict for a body block (spec 15.2.1).
+fn body_is_strict(body: &Block) -> bool {
+    for stmt in &body.stmts {
+        let StmtKind::Expr(expr) = &stmt.kind else {
+            return false;
+        };
+        let ExprKind::Literal(Literal::Str(value)) = &expr.kind else {
+            return false;
+        };
+        if value.to_string_lossy() == "use strict" {
+            return true;
+        }
+    }
+    false
 }
 
 /// InstantiateOrdinaryFunctionExpression (spec 15.2.5): a named function
@@ -460,6 +582,7 @@ fn ordinary_construct(
     // when it is an object; %Object.prototype% joins with the Phase 8
     // intrinsics, until then a null-prototype object.
     let prototype = crate::context::get_property(
+        agent,
         new_target,
         &JsString::from_utf8("prototype"),
         new_target.clone(),
@@ -578,33 +701,8 @@ fn function_declaration_instantiation(
         }
     }
 
-    // IteratorBindingInitialization of the formals (spec 16.1.8 step 33):
-    // positional for simple lists, full binding for non-simple ones.
-    if simple {
-        for (index, param) in data.params.iter().enumerate() {
-            let BindingPattern::Ident(name) = &param.pattern else {
-                unreachable!("simple parameter lists are identifiers")
-            };
-            let name = crux::lookup(*name);
-            let value = args.get(index).cloned().unwrap_or(Value::Undefined);
-            param_env.initialize_binding(&name, value)?;
-        }
-    } else {
-        agent.running_context_mut()?.lexical_environment = param_env.clone();
-        crate::binding::iterator_binding_initialization(
-            agent,
-            &data.params,
-            args,
-            Some(&param_env),
-            strict,
-        )?;
-        // spec 16.1.8 step 44: the VariableEnvironment switches to the body's
-        // record only after the formals bind, so a direct eval inside a
-        // default sees the callee's environment (closures created there
-        // resolve eval-introduced vars through it).
-        agent.running_context_mut()?.variable_environment = variable_env.clone();
-    }
-
+    // The arguments object (spec 16.1.8 steps 58-70) is created before the
+    // formals bind, so a default initializer can reference `arguments`.
     let mut param_bindings = param_names.clone();
     if arguments_obj_needed {
         let arguments_obj = if strict || !simple {
@@ -659,6 +757,33 @@ fn function_declaration_instantiation(
         }
         param_env.initialize_binding(&JsString::from_utf8("arguments"), arguments_obj)?;
         param_bindings.push(JsString::from_utf8("arguments"));
+    }
+
+    // IteratorBindingInitialization of the formals (spec 16.1.8 step 79):
+    // positional for simple lists, full binding for non-simple ones.
+    if simple {
+        for (index, param) in data.params.iter().enumerate() {
+            let BindingPattern::Ident(name) = &param.pattern else {
+                unreachable!("simple parameter lists are identifiers")
+            };
+            let name = crux::lookup(*name);
+            let value = args.get(index).cloned().unwrap_or(Value::Undefined);
+            param_env.initialize_binding(&name, value)?;
+        }
+    } else {
+        agent.running_context_mut()?.lexical_environment = param_env.clone();
+        crate::binding::iterator_binding_initialization(
+            agent,
+            &data.params,
+            args,
+            Some(&param_env),
+            strict,
+        )?;
+        // spec 16.1.8 step 44: the VariableEnvironment switches to the body's
+        // record only after the formals bind, so a direct eval inside a
+        // default sees the callee's environment (closures created there
+        // resolve eval-introduced vars through it).
+        agent.running_context_mut()?.variable_environment = variable_env.clone();
     }
 
     // Var bindings: created and initialized to *undefined* during
@@ -1159,6 +1284,111 @@ mod tests {
             run("function f({ x }) { return arguments[0].x; } f({ x: 5 })").unwrap(),
             number(5.0)
         );
+    }
+
+    #[test]
+    fn arguments_name_conflict_edge_cases() {
+        // A param named `arguments` suppresses the arguments object entirely.
+        assert_eq!(
+            run("function f(arguments) { return arguments; } f(5)").unwrap(),
+            number(5.0)
+        );
+        // `var arguments` shares the simple-path arguments binding: the
+        // initializer overwrites it (spec 16.1.8 steps 44-51).
+        assert_eq!(
+            run("function f() { var arguments = 3; return arguments; } f()").unwrap(),
+            number(3.0)
+        );
+        // A top-level `function arguments` suppresses the object (simple path).
+        assert_eq!(
+            run("function f() { function arguments() { return 1; } return arguments(); } f()")
+                .unwrap(),
+            number(1.0)
+        );
+        // Non-simple lists always get the arguments object, even with a
+        // function/var named `arguments` in the body.
+        assert_eq!(
+            run("function f(a = 1) { function arguments() {} return typeof arguments; } f()")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("function")))
+        );
+        // A default can reference `arguments` (created before formals bind,
+        // spec 16.1.8 steps 58-79).
+        assert_eq!(
+            run("function f(x = arguments.length) { return x; } f()").unwrap(),
+            number(0.0)
+        );
+    }
+
+    #[test]
+    fn object_literal_methods_and_accessors() {
+        // Method shorthand binds `this` to the receiver (spec 15.4.3).
+        assert_eq!(
+            run("let o = { x: 5, m() { return this.x; } }; o.m()").unwrap(),
+            number(5.0)
+        );
+        // Method names are inferred from the property key.
+        assert_eq!(
+            run("let o = { m() {} }; o.m.name").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("m")))
+        );
+        // Methods are not constructors: no own `prototype` property.
+        assert_eq!(
+            run("let o = { m() {} }; typeof o.m.prototype").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("undefined")))
+        );
+        // Getters and setters share one accessor property.
+        assert_eq!(
+            run("let o = { _v: 1, get v() { return this._v; }, set v(x) { this._v = x; } }; o.v")
+                .unwrap(),
+            number(1.0)
+        );
+        assert_eq!(
+            run("let o = { _v: 1, get v() { return this._v; }, set v(x) { this._v = x; } }; o.v = 9; o.v")
+                .unwrap(),
+            number(9.0)
+        );
+        // Getter-only accessors read; sets silently fail in sloppy mode.
+        assert_eq!(
+            run("let o = { get x() { return 3; } }; o.x").unwrap(),
+            number(3.0)
+        );
+        assert_eq!(
+            run("let o = { get x() { return 3; } }; o.x = 9; o.x").unwrap(),
+            number(3.0)
+        );
+    }
+
+    #[test]
+    fn super_property_access_uses_home_object() {
+        // `super.x` reads through the method's [[HomeObject]] prototype
+        // (spec 9.2.4.5 + 13.3.6.2).
+        assert_eq!(
+            run("let proto = { x: 42 }; let o = { __proto__: proto, m() { return super.x; } }; o.m()")
+                .unwrap(),
+            number(42.0)
+        );
+        // A method call through `super` keeps the current `this`.
+        assert_eq!(
+            run("let proto = { m() { return this.v; } }; let o = { __proto__: proto, v: 7, n() { return super.m(); } }; o.n()")
+                .unwrap(),
+            number(7.0)
+        );
+        // Computed super keys and nested super through the prototype chain.
+        assert_eq!(
+            run("let base = { a: 1 }; let mid = { __proto__: base, b: 2, m() { return super.a; } }; let o = { __proto__: mid, m() { return super.m(); } }; o.m()")
+                .unwrap(),
+            number(1.0)
+        );
+        // Arrows inside a method share the enclosing HomeObject.
+        assert_eq!(
+            run("let proto = { x: 11 }; let o = { __proto__: proto, m() { let f = () => super.x; return f(); } }; o.m()")
+                .unwrap(),
+            number(11.0)
+        );
+        // `super` outside a method is a syntax error.
+        assert!(run("super.x").is_err());
+        assert!(run("function f() { super.x; } f()").is_err());
     }
 
     #[test]

@@ -613,7 +613,10 @@ pub(crate) fn parse_lhs(parser: &mut Parser) -> Result<Expr, JsError> {
         return parse_subscripts(parser, expr, false);
     }
     if parser.at_keyword(Keyword::Super)? {
-        return parse_super(parser);
+        let expr = parse_super(parser)?;
+        // `super.m()` is a CallExpression whose callee is the super member
+        // access, so the chain continues with subscripts.
+        return parse_subscripts(parser, expr, false);
     }
     let expr = parse_primary(parser)?;
     parse_subscripts(parser, expr, false)

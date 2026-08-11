@@ -71,7 +71,7 @@ pub fn iterator_binding_initialization(
 /// InitializeBoundName (spec 13.2.3.4): fill a pre-created binding, or
 /// resolve and PutValue when the caller created no binding (var statements).
 fn initialize_bound_name(
-    agent: &Agent,
+    agent: &mut Agent,
     name: &JsString,
     value: Value,
     env: Option<&EnvRef>,
@@ -163,7 +163,7 @@ fn keyed_binding_initialization(
     env: Option<&EnvRef>,
     strict: bool,
 ) -> Result<(), JsError> {
-    let mut value = get_property_key(value, key, value.clone())?;
+    let mut value = get_property_key(agent, value, key, value.clone())?;
     if matches!(value, Value::Undefined)
         && let Some(init) = &element.init
     {

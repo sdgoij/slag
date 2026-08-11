@@ -811,16 +811,17 @@ Completion model (spec 6.2.3):
 - `job.rs` — host-call jobs delegate to `crux::function::call`.
 
 **Conformance:** `crates/test262` runs a curated subset of the pinned `tc39/test262`
-submodule (repo-root `test262/`): 31 fixtures under `test/language/statements/{if,while,
-function}` and `test/language/expressions/conditional` covering completion values (`cptn-*`),
-labeled `break`/`continue`, ASI around `let`, statement-position early errors, and the Phase 7
-function fixtures (defaults, rest, destructured params, early errors). The harness parses
+submodule (repo-root `test262/`): 35 fixtures under `test/language/statements/{if,while,
+function}` and `test/language/expressions/{conditional,object}` covering completion values
+(`cptn-*`), labeled `break`/`continue`, ASI around `let`, statement-position early errors, and
+the Phase 7 function fixtures (defaults, rest, destructured params, `arguments`-name
+conflicts, object methods). The harness parses
 fixture frontmatter (`negative:` phase/type, `flags:`, `includes:`), runs strict and sloppy
 modes, installs a minimal native `assert` helper (user functions join Phase 7), and reports
-pass/skip/fail — `31/31` pass. The subset grows with each phase's feature coverage.
+pass/skip/fail — `35/35` pass. The subset grows with each phase's feature coverage.
 
-The workspace runs **337 tests** (`cargo test --workspace`: 105 in `runtime`, 44 in `parser`,
-1 harness test covering the 31 test262 fixtures) with `cargo fmt --all --check` and
+The workspace runs **340 tests** (`cargo test --workspace`: 108 in `runtime`, 44 in `parser`,
+1 harness test covering the 35 test262 fixtures) with `cargo fmt --all --check` and
 `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 **Remaining in Phase 6:**
@@ -964,20 +965,40 @@ bound via `IteratorBindingInitialization`:
 - `syntax`/`parser`: `BindingElement` gains a `rest` flag (rest params were unmarked in the
   AST); `new MemberExpression Arguments` continues subscripts (`new C(5).x` was a parse
   error); `is_simple_params` now treats a rest parameter as non-simple, so
-  `function f(...r) { 'use strict' }` is the required early error.
+  `function f(...r) { 'use strict' }` is the required early error; `super.m()` parses as a
+  call whose callee is the super member access (`parse_lhs` continues subscripts after
+  `parse_super`).
+- **Object-literal methods and accessors** (15.4.3): `Method`/`Get`/`Set` property
+  definitions evaluate via `instantiate_method`/`instantiate_accessor` (OrdinaryFunctionCreate
+  with no `prototype` own property), `MakeMethod` (10.2.12) attaches the `[[HomeObject]]` to
+  the object, `SetFunctionName` (10.2.7) names the closure from the property key (with the
+  `get `/`set ` prefix for accessors), getters and setters merge into one accessor property,
+  and methods bind `this` to the receiver when called.
+- **`[[HomeObject]]`/`super` property access** (9.2.4.5 + 13.3.6.2): `get_super_base` walks
+  the function env's `[[HomeObject]]` prototype; `super.x`/`super[x]` produce a Reference
+  whose base is the super object and whose new `[[ThisValue]]` is the current `this`, so
+  `super.m()` calls keep the receiver; arrows inside a method share its HomeObject through
+  `get_this_environment`; `super` outside a method is a syntax error. Accessor getters/setters
+  whose bodies are ECMAScript functions dispatch through the agent (`get_value`/
+  `get_property_key`/`put_value` gained an `agent` parameter and a `find_ecma_accessor` walk),
+  since the crux [[Get]]/[[Set]] layer can only run builtin accessors.
+- `FunctionDeclarationInstantiation` also creates the `arguments` binding *before* the formals
+  bind (spec steps 58-79), so defaults can reference `arguments`; the `arguments`-name
+  conflicts (`arguments` param, `var arguments`, top-level `function arguments`) match the
+  spec's `argumentsObjNeeded` rules.
 
-Tests: 18 runtime function tests (calls, hoisting, closures/recursion, `this` modes,
-`arguments` mapping, constructors, NFE names, arrows, empty completions, defaults referencing
-earlier params/TDZ, rest params, destructured params, unmapped arguments for non-simple lists,
-destructuring declarations and `for` heads, name inference, per-iteration captures) — 105 in
-`runtime`, 44 in `parser`; 12 test262 function fixtures (8 passing `dflt-params-*`/`rest-params-*`
-plus 4 early-error/parse fixtures) — **31 fixtures total**; the rest-pattern-with-eval-var
-`scope-param-rest-elem-var-*` fixtures wait on `Array.prototype[@@iterator]` (builtins phase).
-Workspace runs **337 tests** with fmt and clippy (`-D warnings`) clean.
+Tests: 21 runtime function tests (calls, hoisting, closures/recursion, `this` modes,
+`arguments` mapping and name conflicts, constructors, NFE names, arrows, empty completions,
+defaults referencing earlier params/TDZ/`arguments`, rest params, destructured params,
+destructuring declarations and `for` heads, name inference, per-iteration captures, object
+methods/accessors, super property access) — 108 in `runtime`, 44 in `parser`; 14 function
+fixtures (8 passing `dflt-params-*`/`rest-params-*`, 4 early-error/parse, 2 `arguments`-conflict,
+plus object-method defaults/trailing-comma) — **35 fixtures total**; the
+`scope-param-rest-elem-var-*` and super fixtures wait on builtins (`Array.prototype[@@iterator]`,
+`Object.*`). Workspace runs **340 tests** with fmt and clippy (`-D warnings`) clean.
 
-**Remaining in Phase 7 (functions):** method `[[HomeObject]]`/`super`, `arguments`-name
-conflict edge cases, then the `Function.prototype` intrinsic and the constructor builtin
-(Phase 8 bootstrap); generators/async/classes/modules/promises as listed below.
+**Remaining in Phase 7 (functions):** the `Function.prototype` intrinsic and the constructor
+builtin (Phase 8 bootstrap); generators/async/classes/modules/promises as listed below.
 
 ---
 

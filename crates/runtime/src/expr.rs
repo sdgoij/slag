@@ -18,9 +18,9 @@ use crux::property::PropertyKey;
 use crux::string::JsString;
 use crux::value::{Value, is_callable, is_constructor, type_of};
 use syntax::ast::{
-    Argument, ArrayElement, AssignOp, BinaryOp, Expr, ExprKind, Literal, LogicalOp, MemberExpr,
-    MemberProperty, ObjectLiteral, ObjectProperty, PropertyName, TemplateLiteral, UnaryOp,
-    UpdateOp,
+    Argument, ArrayElement, AssignOp, BinaryOp, BindingElement, Expr, ExprKind, Literal, LogicalOp,
+    MemberExpr, MemberProperty, ObjectLiteral, ObjectProperty, PropertyName, TemplateLiteral,
+    UnaryOp, UpdateOp,
 };
 
 use crate::agent::Agent;
@@ -36,7 +36,7 @@ pub fn eval_expr(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Value, 
         ExprKind::Ident(name) => {
             let name = crux::lookup(*name);
             let reference = resolve_binding(agent, &name, strict)?;
-            get_value(&reference)
+            get_value(agent, &reference)
         }
         ExprKind::This => crate::context::resolve_this_binding(agent),
         ExprKind::Super => Err(JsError::new(
@@ -73,7 +73,7 @@ pub fn eval_expr(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Value, 
         ExprKind::Binary { op, left, right } => {
             let left = eval_expr(agent, left, strict)?;
             let right = eval_expr(agent, right, strict)?;
-            apply_binary(*op, &left, &right)
+            apply_binary(agent, *op, &left, &right)
         }
         ExprKind::Logical { op, left, right } => eval_logical(agent, *op, left, right, strict),
         ExprKind::Assign { op, target, value } => eval_assignment(agent, op, target, value, strict),
@@ -95,7 +95,7 @@ pub fn eval_expr(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Value, 
             let reference = eval_chain(agent, expr, strict)?;
             match reference {
                 None => Ok(Value::Undefined),
-                Some(ChainResult::Reference(reference)) => get_value(&reference),
+                Some(ChainResult::Reference(reference)) => get_value(agent, &reference),
                 Some(ChainResult::Value(value)) => Ok(value),
             }
         }
@@ -150,12 +150,30 @@ pub fn eval_chain(
 ) -> Result<Option<ChainResult>, JsError> {
     match &expr.kind {
         ExprKind::Member(member) => {
+            if matches!(member.object.kind, ExprKind::Super) {
+                // MakeSuperPropertyReference (spec 13.3.6.2): the base is the
+                // method's [[HomeObject]] prototype, and calls through the
+                // reference receive the current `this`.
+                let base = crate::context::get_super_base(agent)?;
+                if is_nullish(&base) {
+                    return Err(nullish_member_error(member));
+                }
+                let name = eval_member_key(agent, member, strict)?;
+                let this = crate::context::resolve_this_binding(agent)?;
+                let reference = Reference {
+                    base: ReferenceBase::Value(base),
+                    name,
+                    strict,
+                    this_value: Some(this),
+                };
+                return Ok(Some(ChainResult::Reference(reference)));
+            }
             let object = eval_chain(agent, &member.object, strict)?;
             let Some(object) = object else {
                 return Ok(None);
             };
             let object_value = match object {
-                ChainResult::Reference(reference) => get_value(&reference)?,
+                ChainResult::Reference(reference) => get_value(agent, &reference)?,
                 ChainResult::Value(value) => value,
             };
             if member.optional && is_nullish(&object_value) {
@@ -169,6 +187,7 @@ pub fn eval_chain(
                 base: ReferenceBase::Value(object_value),
                 name,
                 strict,
+                this_value: None,
             };
             Ok(Some(ChainResult::Reference(reference)))
         }
@@ -197,7 +216,7 @@ fn eval_call_chain(
     let (this, callee_value) = match callee {
         ChainResult::Reference(reference) => {
             let this = get_this_value(&reference);
-            (this, get_value(&reference)?)
+            (this, get_value(agent, &reference)?)
         }
         ChainResult::Value(value) => (Value::Undefined, value),
     };
@@ -355,7 +374,7 @@ fn eval_object_literal(
                 let value = eval_expr(agent, value_expr, strict)?;
                 if crate::function::is_anonymous_function_definition(value_expr) {
                     // spec 15.4.2 step 5: SetFunctionName from the property key.
-                    crate::function::set_function_name(&value, &name)?;
+                    crate::function::set_function_name(&value, &name, None)?;
                 }
                 let name_text = name.to_string_lossy();
                 if name_text == "__proto__" {
@@ -385,13 +404,70 @@ fn eval_object_literal(
                     object.create_data_property(&name, value)?;
                 }
             }
-            ObjectProperty::Method { .. }
-            | ObjectProperty::Get { .. }
-            | ObjectProperty::Set { .. } => {
-                return Err(JsError::new(
-                    ErrorKind::TypeError,
-                    "object literal methods and accessors are not implemented until Phase 7".into(),
-                ));
+            ObjectProperty::Method { key, function } => {
+                // MethodDefinition evaluation (spec 15.4.3): OrdinaryFunction-
+                // Create, MakeMethod, SetFunctionName, DefineMethodProperty.
+                let name = eval_property_name(agent, key, strict)?;
+                let env = agent.running_context()?.lexical_environment.clone();
+                let closure = crate::function::instantiate_method(agent, function, env, strict)?;
+                crate::function::make_method(agent, &closure, Value::Object(object.clone()))?;
+                crate::function::set_function_name(&closure, &name, None)?;
+                object.create_data_property(&name, closure)?;
+            }
+            ObjectProperty::Get { key, body } => {
+                // PropertyDefinition : get PropertyName ( ) { FunctionBody }
+                let name = eval_property_name(agent, key, strict)?;
+                let env = agent.running_context()?.lexical_environment.clone();
+                let getter = crate::function::instantiate_accessor(
+                    agent,
+                    Vec::new(),
+                    body.clone(),
+                    env,
+                    strict,
+                )?;
+                crate::function::make_method(agent, &getter, Value::Object(object.clone()))?;
+                crate::function::set_function_name(&getter, &name, Some("get"))?;
+                object.define_property_key(
+                    &crux::property::PropertyKey::from_js_string(&name),
+                    &crux::property::PropertyDescriptor {
+                        value: None,
+                        writable: None,
+                        get: Some(getter),
+                        set: None,
+                        enumerable: Some(true),
+                        configurable: Some(true),
+                    },
+                )?;
+            }
+            ObjectProperty::Set { key, param, body } => {
+                // PropertyDefinition : set PropertyName ( BindingElement ) { FunctionBody }
+                let name = eval_property_name(agent, key, strict)?;
+                let env = agent.running_context()?.lexical_environment.clone();
+                let setter = crate::function::instantiate_accessor(
+                    agent,
+                    vec![BindingElement {
+                        pattern: param.clone(),
+                        init: None,
+                        rest: false,
+                        span: body.span,
+                    }],
+                    body.clone(),
+                    env,
+                    strict,
+                )?;
+                crate::function::make_method(agent, &setter, Value::Object(object.clone()))?;
+                crate::function::set_function_name(&setter, &name, Some("set"))?;
+                object.define_property_key(
+                    &crux::property::PropertyKey::from_js_string(&name),
+                    &crux::property::PropertyDescriptor {
+                        value: None,
+                        writable: None,
+                        get: None,
+                        set: Some(setter),
+                        enumerable: Some(true),
+                        configurable: Some(true),
+                    },
+                )?;
             }
             ObjectProperty::Spread(expr) => {
                 let from = eval_expr(agent, expr, strict)?;
@@ -475,7 +551,7 @@ fn eval_unary(
                 None => Value::Undefined,
                 Some(ChainResult::Reference(reference)) => match &reference.base {
                     ReferenceBase::Unresolvable => Value::Undefined,
-                    _ => get_value(&reference)?,
+                    _ => get_value(agent, &reference)?,
                 },
                 Some(ChainResult::Value(value)) => value,
             };
@@ -521,7 +597,7 @@ fn eval_update(
     strict: bool,
 ) -> Result<Value, JsError> {
     let reference = eval_reference(agent, target, strict)?;
-    let old = get_value(&reference)?;
+    let old = get_value(agent, &reference)?;
     let old_numeric = to_numeric(&old)?;
     let new = match old_numeric {
         Value::Number(n) => {
@@ -587,13 +663,13 @@ fn eval_assignment(
             if let ExprKind::Ident(name) = &target.kind
                 && crate::function::is_anonymous_function_definition(value_expr)
             {
-                crate::function::set_function_name(&value, &crux::lookup(*name))?;
+                crate::function::set_function_name(&value, &crux::lookup(*name), None)?;
             }
             put_value(agent, &reference, value.clone())?;
             Ok(value)
         }
         AssignOp::AndAssign => {
-            let old = get_value(&reference)?;
+            let old = get_value(agent, &reference)?;
             if to_boolean(&old) {
                 let new = eval_expr(agent, value_expr, strict)?;
                 put_value(agent, &reference, new.clone())?;
@@ -603,7 +679,7 @@ fn eval_assignment(
             }
         }
         AssignOp::OrAssign => {
-            let old = get_value(&reference)?;
+            let old = get_value(agent, &reference)?;
             if to_boolean(&old) {
                 Ok(old)
             } else {
@@ -613,7 +689,7 @@ fn eval_assignment(
             }
         }
         AssignOp::NullishAssign => {
-            let old = get_value(&reference)?;
+            let old = get_value(agent, &reference)?;
             if is_nullish(&old) {
                 let new = eval_expr(agent, value_expr, strict)?;
                 put_value(agent, &reference, new.clone())?;
@@ -623,9 +699,9 @@ fn eval_assignment(
             }
         }
         _ => {
-            let old = get_value(&reference)?;
+            let old = get_value(agent, &reference)?;
             let right = eval_expr(agent, value_expr, strict)?;
-            let new = apply_compound(*op, &old, &right)?;
+            let new = apply_compound(agent, *op, &old, &right)?;
             put_value(agent, &reference, new.clone())?;
             Ok(new)
         }
@@ -653,8 +729,13 @@ fn compound_binary(op: AssignOp) -> BinaryOp {
     }
 }
 
-fn apply_compound(op: AssignOp, left: &Value, right: &Value) -> Result<Value, JsError> {
-    apply_binary(compound_binary(op), left, right)
+fn apply_compound(
+    agent: &mut Agent,
+    op: AssignOp,
+    left: &Value,
+    right: &Value,
+) -> Result<Value, JsError> {
+    apply_binary(agent, compound_binary(op), left, right)
 }
 
 fn mixed_bigint_error() -> JsError {
@@ -666,7 +747,12 @@ fn mixed_bigint_error() -> JsError {
 
 /// ApplyStringOrNumericBinaryOperator (spec 13.15.4) for the arithmetic,
 /// shift, and bitwise operators.
-fn apply_binary(op: BinaryOp, left: &Value, right: &Value) -> Result<Value, JsError> {
+fn apply_binary(
+    agent: &mut Agent,
+    op: BinaryOp,
+    left: &Value,
+    right: &Value,
+) -> Result<Value, JsError> {
     match op {
         BinaryOp::Add => {
             let left_prim = to_primitive(left, ToPrimitiveHint::Default)?;
@@ -720,14 +806,18 @@ fn apply_binary(op: BinaryOp, left: &Value, right: &Value) -> Result<Value, JsEr
                     "Right-hand side of 'instanceof' is not callable".into(),
                 ));
             }
-            ordinary_has_instance(right, left)
+            ordinary_has_instance(agent, right, left)
         }
     }
 }
 
 /// OrdinaryHasInstance (spec 7.3.19): walk the prototype chain of `value`
 /// looking for `constructor.prototype`.
-fn ordinary_has_instance(constructor: &Value, value: &Value) -> Result<Value, JsError> {
+fn ordinary_has_instance(
+    agent: &mut Agent,
+    constructor: &Value,
+    value: &Value,
+) -> Result<Value, JsError> {
     if !is_callable(constructor) {
         return Ok(Value::Boolean(false));
     }
@@ -735,6 +825,7 @@ fn ordinary_has_instance(constructor: &Value, value: &Value) -> Result<Value, Js
         return Ok(Value::Boolean(false));
     };
     let prototype = get_property(
+        agent,
         constructor,
         &JsString::from_utf8("prototype"),
         constructor.clone(),
@@ -1041,7 +1132,7 @@ pub struct IteratorRecord {
 /// GetIterator (spec 7.4.2): fetch `@@iterator`, invoke it, and extract the
 /// `next` method.
 pub fn get_iterator(agent: &mut Agent, value: &Value) -> Result<IteratorRecord, JsError> {
-    let method = get_method(value, "@@iterator")?;
+    let method = get_method(agent, value, "@@iterator")?;
     let Some(method) = method else {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -1055,7 +1146,12 @@ pub fn get_iterator(agent: &mut Agent, value: &Value) -> Result<IteratorRecord, 
             "Iterator must be an object".into(),
         ));
     }
-    let next = get_property(&iterator, &JsString::from_utf8("next"), iterator.clone())?;
+    let next = get_property(
+        agent,
+        &iterator,
+        &JsString::from_utf8("next"),
+        iterator.clone(),
+    )?;
     if !is_callable(&next) {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -1078,11 +1174,16 @@ pub fn iterator_step(
             "Iterator result is not an object".into(),
         ));
     }
-    let done = get_property(&result, &JsString::from_utf8("done"), result.clone())?;
+    let done = get_property(agent, &result, &JsString::from_utf8("done"), result.clone())?;
     if to_boolean(&done) {
         return Ok(None);
     }
-    let value = get_property(&result, &JsString::from_utf8("value"), result.clone())?;
+    let value = get_property(
+        agent,
+        &result,
+        &JsString::from_utf8("value"),
+        result.clone(),
+    )?;
     Ok(Some(value))
 }
 
@@ -1091,6 +1192,7 @@ pub fn iterator_step(
 /// in Phase 7.
 pub fn iterator_close(agent: &mut Agent, iterator: &IteratorRecord) -> Result<(), JsError> {
     let return_method = get_property(
+        agent,
         &iterator.iterator,
         &JsString::from_utf8("return"),
         iterator.iterator.clone(),
@@ -1104,7 +1206,11 @@ pub fn iterator_close(agent: &mut Agent, iterator: &IteratorRecord) -> Result<()
 
 /// GetMethod (spec 7.3.11) through a language value; the `@@iterator` key is
 /// the well-known symbol.
-pub fn get_method(value: &Value, symbol_name: &str) -> Result<Option<Value>, JsError> {
+pub fn get_method(
+    agent: &mut Agent,
+    value: &Value,
+    symbol_name: &str,
+) -> Result<Option<Value>, JsError> {
     // The `@@name` notation (spec 6.1.6.3.5) names the well-known symbol
     // `name`; the registry keys by the short name.
     let key = PropertyKey::Symbol(
@@ -1112,7 +1218,7 @@ pub fn get_method(value: &Value, symbol_name: &str) -> Result<Option<Value>, JsE
             .as_ref()
             .clone(),
     );
-    let method = get_property_key(value, &key, value.clone())?;
+    let method = get_property_key(agent, value, &key, value.clone())?;
     match method {
         Value::Undefined | Value::Null => Ok(None),
         v if is_callable(&v) => Ok(Some(v)),

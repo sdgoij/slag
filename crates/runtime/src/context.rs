@@ -97,6 +97,10 @@ pub struct Reference {
     pub base: ReferenceBase,
     pub name: crux::property::PropertyKey,
     pub strict: bool,
+    /// [[ThisValue]]: present only for `super` property references, so
+    /// method calls through `super` receive the current `this` instead of
+    /// the super base (spec 13.3.6.2).
+    pub this_value: Option<Value>,
 }
 
 /// The property key of a reference.
@@ -127,6 +131,7 @@ pub fn get_identifier_reference(
                 base: ReferenceBase::Unresolvable,
                 name: crux::property::PropertyKey::from_js_string(name),
                 strict,
+                this_value: None,
             });
         };
         if env_record.has_binding(name)? {
@@ -134,27 +139,29 @@ pub fn get_identifier_reference(
                 base: ReferenceBase::Environment(env_record),
                 name: crux::property::PropertyKey::from_js_string(name),
                 strict,
+                this_value: None,
             });
         }
         current = env_record.outer();
     }
 }
 
-/// spec 6.2.5.4 GetValue on a Reference Record.
-pub fn get_value(reference: &Reference) -> Result<Value, JsError> {
+/// spec 6.2.5.4 GetValue on a Reference Record. Accessor properties whose
+/// getter is an ECMAScript function dispatch through the agent.
+pub fn get_value(agent: &mut Agent, reference: &Reference) -> Result<Value, JsError> {
     match &reference.base {
         ReferenceBase::Environment(env) => {
             env.get_binding_value(&string_name(&reference.name), reference.strict)
         }
-        ReferenceBase::Value(base) => get_property_key(base, &reference.name, base.clone()),
+        ReferenceBase::Value(base) => get_property_key(agent, base, &reference.name, base.clone()),
         ReferenceBase::Unresolvable => Err(undefined_error(&string_name(&reference.name))),
     }
 }
 
 /// GetValue restricted to callable values (spec 7.3.12 GetValue): used by
 /// call evaluation to reject non-callable callees.
-pub fn get_value_callable(reference: &Reference) -> Result<Value, JsError> {
-    let value = get_value(reference)?;
+pub fn get_value_callable(agent: &mut Agent, reference: &Reference) -> Result<Value, JsError> {
+    let value = get_value(agent, reference)?;
     if crux::value::is_callable(&value) {
         Ok(value)
     } else {
@@ -167,11 +174,13 @@ pub fn get_value_callable(reference: &Reference) -> Result<Value, JsError> {
 
 /// `base.[[Get]](P, receiver)` through a language value.
 pub fn get_property(
+    agent: &mut Agent,
     base: &Value,
     key: &crux::string::JsString,
     receiver: Value,
 ) -> Result<Value, JsError> {
     get_property_key(
+        agent,
         base,
         &crux::property::PropertyKey::from_js_string(key),
         receiver,
@@ -180,13 +189,27 @@ pub fn get_property(
 
 /// `base.[[Get]](P, receiver)` for any property key (string or symbol).
 pub fn get_property_key(
+    agent: &mut Agent,
     base: &Value,
     key: &crux::property::PropertyKey,
     receiver: Value,
 ) -> Result<Value, JsError> {
     match base {
-        Value::Object(obj) => obj.get_with_receiver_key(key, receiver),
-        Value::Function(f) => f.object.get_with_receiver_key(key, receiver),
+        Value::Object(obj) => {
+            // Accessors whose getter is an ECMAScript function cannot be
+            // invoked by the crux layer (the body lives in the agent);
+            // dispatch them through the evaluator (spec 8.12.2 step 6.b).
+            if let Some(getter) = find_ecma_accessor(obj, key, AccessorKind::Get)? {
+                return crate::function::call(agent, &getter, receiver, &[]);
+            }
+            obj.get_with_receiver_key(key, receiver)
+        }
+        Value::Function(f) => {
+            if let Some(getter) = find_ecma_accessor(&f.object, key, AccessorKind::Get)? {
+                return crate::function::call(agent, &getter, receiver, &[]);
+            }
+            f.object.get_with_receiver_key(key, receiver)
+        }
         _ => Err(JsError::new(
             ErrorKind::TypeError,
             "value is not an object".into(),
@@ -194,9 +217,59 @@ pub fn get_property_key(
     }
 }
 
+/// Which half of an accessor property the runtime dispatches for.
+#[derive(Clone, Copy)]
+enum AccessorKind {
+    Get,
+    Set,
+}
+
+/// The first accessor on the prototype chain for `key` whose getter/setter
+/// is an ECMAScript function. `None` when the chain holds no such accessor,
+/// so the crux [[Get]]/[[Set]] handles data and builtin-accessor properties.
+fn find_ecma_accessor(
+    object: &crux::object::JsObject,
+    key: &crux::property::PropertyKey,
+    which: AccessorKind,
+) -> Result<Option<Value>, JsError> {
+    // The starting object may be an owned JsObject (a Function's object
+    // part); prototype links are Handles.
+    let mut prototype: Option<Handle<crux::object::JsObject>> = None;
+    loop {
+        let obj = match &prototype {
+            None => object,
+            Some(handle) => handle,
+        };
+        if let Some(property) = obj.get_own_property_key(key)? {
+            let crux::object::PropertyKind::Accessor { get, set } = property.kind else {
+                return Ok(None);
+            };
+            let accessor = match which {
+                AccessorKind::Get => get,
+                AccessorKind::Set => set,
+            };
+            let Some(accessor) = accessor else {
+                return Ok(None);
+            };
+            if let Value::Function(function) = &accessor
+                && matches!(&function.kind, crux::function::FunctionKind::EcmaScript)
+            {
+                return Ok(Some(accessor));
+            }
+            return Ok(None);
+        }
+        match obj.get_prototype_of()? {
+            Some(proto) => prototype = Some(proto),
+            None => return Ok(None),
+        }
+    }
+}
+
 /// spec 6.2.5.6 PutValue: strict mode throws on unresolvable references and
 /// failed object writes; sloppy mode creates a global property instead.
-pub fn put_value(agent: &Agent, reference: &Reference, value: Value) -> Result<(), JsError> {
+/// Accessor properties with ECMAScript-function setters dispatch through the
+/// evaluator.
+pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Result<(), JsError> {
     match &reference.base {
         ReferenceBase::Environment(env) => {
             env.set_mutable_binding(&string_name(&reference.name), value, reference.strict)
@@ -205,9 +278,17 @@ pub fn put_value(agent: &Agent, reference: &Reference, value: Value) -> Result<(
             let key = &reference.name;
             let result = match base {
                 Value::Object(obj) => {
+                    if let Some(setter) = find_ecma_accessor(obj, key, AccessorKind::Set)? {
+                        crate::function::call(agent, &setter, base.clone(), &[value])?;
+                        return Ok(());
+                    }
                     obj.set_with_receiver_key(key, value, base.clone(), reference.strict)
                 }
                 Value::Function(f) => {
+                    if let Some(setter) = find_ecma_accessor(&f.object, key, AccessorKind::Set)? {
+                        crate::function::call(agent, &setter, base.clone(), &[value])?;
+                        return Ok(());
+                    }
                     f.object
                         .set_with_receiver_key(key, value, base.clone(), reference.strict)
                 }
@@ -279,8 +360,12 @@ pub fn initialize_referenced_binding(reference: &Reference, value: Value) -> Res
     }
 }
 
-/// spec 6.2.5.10 GetThisValue: the base value of a property reference.
+/// spec 6.2.5.10 GetThisValue: the base value of a property reference, or
+/// the [[ThisValue]] carried by `super` references.
 pub fn get_this_value(reference: &Reference) -> Value {
+    if let Some(this) = &reference.this_value {
+        return this.clone();
+    }
     match &reference.base {
         ReferenceBase::Value(base) => base.clone(),
         _ => Value::Undefined,
@@ -345,17 +430,40 @@ pub fn get_global_object(agent: &Agent) -> Result<Handle<crux::object::JsObject>
     Ok(agent.running_context()?.realm.global_object.clone())
 }
 
-/// GetSuperBase (spec 9.2.4.5): the base for `super` property accesses.
-/// Phase 4 function values have no [[HomeObject]], so this is *undefined*.
+/// GetSuperBase (spec 9.2.4.5): the prototype of the nearest method's
+/// [[HomeObject]]. `get_this_environment` skips arrow environments, so
+/// arrows inside a method share its HomeObject.
 pub fn get_super_base(agent: &Agent) -> Result<Value, JsError> {
     let env = get_this_environment(agent)?;
-    match &*env {
-        EnvRecord::Function(_) => Ok(Value::Undefined),
-        _ => Err(JsError::new(
+    if !env.has_super_binding(agent) {
+        return Err(JsError::new(
             ErrorKind::ReferenceError,
             "super is only valid inside methods".into(),
-        )),
+        ));
     }
+    let EnvRecord::Function(function_env) = &*env else {
+        return Err(JsError::new(
+            ErrorKind::ReferenceError,
+            "super is only valid inside methods".into(),
+        ));
+    };
+    let Value::Function(function) = &function_env.function_object else {
+        return Ok(Value::Undefined);
+    };
+    let Some(home) = agent
+        .ecma_functions
+        .get(&function.id())
+        .and_then(|data| data.home_object.clone())
+    else {
+        return Ok(Value::Undefined);
+    };
+    let Value::Object(home_object) = home else {
+        return Ok(Value::Undefined);
+    };
+    Ok(home_object
+        .get_prototype_of()?
+        .map(Value::Object)
+        .unwrap_or(Value::Undefined))
 }
 
 #[cfg(test)]
@@ -371,6 +479,7 @@ mod tests {
 
     #[test]
     fn identifier_reference_walks_the_chain() {
+        let mut agent = Agent::new();
         let outer = new_declarative_environment(None);
         outer.create_mutable_binding(&name("a"), false).unwrap();
         outer
@@ -384,14 +493,14 @@ mod tests {
 
         let a = get_identifier_reference(Some(inner.clone()), &name("a"), true).unwrap();
         assert!(matches!(a.base, ReferenceBase::Environment(_)));
-        assert_eq!(get_value(&a).unwrap(), Value::Number(1.0));
+        assert_eq!(get_value(&mut agent, &a).unwrap(), Value::Number(1.0));
 
         let b = get_identifier_reference(Some(inner), &name("b"), true).unwrap();
-        assert_eq!(get_value(&b).unwrap(), Value::Number(2.0));
+        assert_eq!(get_value(&mut agent, &b).unwrap(), Value::Number(2.0));
 
         let missing = get_identifier_reference(None, &name("nope"), true).unwrap();
         assert!(matches!(missing.base, ReferenceBase::Unresolvable));
-        assert!(get_value(&missing).is_err());
+        assert!(get_value(&mut agent, &missing).is_err());
     }
 
     #[test]
@@ -401,13 +510,13 @@ mod tests {
         agent.push_bootstrap_context(realm);
 
         let sloppy = get_identifier_reference(None, &name("x"), false).unwrap();
-        put_value(&agent, &sloppy, Value::Number(5.0)).unwrap();
+        put_value(&mut agent, &sloppy, Value::Number(5.0)).unwrap();
         // The sloppy write created a property on the global object.
         let global = agent.running_context().unwrap().realm.global_object.clone();
         assert_eq!(global.get(&name("x")).unwrap(), Value::Number(5.0));
 
         let strict = get_identifier_reference(None, &name("y"), true).unwrap();
-        assert!(put_value(&agent, &strict, Value::Number(6.0)).is_err());
+        assert!(put_value(&mut agent, &strict, Value::Number(6.0)).is_err());
     }
 
     #[test]

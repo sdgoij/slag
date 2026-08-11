@@ -52,6 +52,10 @@ mod harness {
         "statements/function/rest-param-strict-body.js",
         "statements/function/rest-params-trailing-comma-early-error.js",
         "statements/function/params-dflt-args-unmapped.js",
+        "statements/function/arguments-with-arguments-fn.js",
+        "statements/function/arguments-with-arguments-lex.js",
+        "expressions/object/method-definition/meth-dflt-params-ref-prior.js",
+        "expressions/object/method-definition/meth-params-trailing-comma-single.js",
         "expressions/conditional/in-condition.js",
     ];
 

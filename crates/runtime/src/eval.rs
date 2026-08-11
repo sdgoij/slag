@@ -183,7 +183,7 @@ fn eval_var_declarations(
                 && crate::function::is_anonymous_function_definition(init)
             {
                 // spec 14.3.2 step 2.b: SetFunctionName from the identifier.
-                crate::function::set_function_name(&value, &crux::lookup(*name))?;
+                crate::function::set_function_name(&value, &crux::lookup(*name), None)?;
             }
             crate::binding::binding_initialization(agent, &decl.pattern, value, None, strict)?;
         }
@@ -211,7 +211,7 @@ fn eval_lexical_declarations(
                     && crate::function::is_anonymous_function_definition(init)
                 {
                     // spec 14.2.2 step 2.d: SetFunctionName from the binding.
-                    crate::function::set_function_name(&value, &crux::lookup(*name))?;
+                    crate::function::set_function_name(&value, &crux::lookup(*name), None)?;
                 }
                 value
             }
