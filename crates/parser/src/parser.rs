@@ -266,7 +266,7 @@ impl<'s> Parser<'s> {
 
     /// Statement-parser entry point for contexts outside `stmt` (modules).
     pub(crate) fn parse_statement_public(&mut self) -> Result<syntax::Stmt, JsError> {
-        crate::stmt::parse_statement(self)
+        crate::stmt::parse_statement(self, true)
     }
 
     /// Whether the current token is an identifier that is not a keyword and

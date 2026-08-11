@@ -73,6 +73,7 @@ pub fn remainder(a: &BigInt, b: &BigInt) -> BigInt {
     BigInt(&a.0 % &b.0)
 }
 
+/// Left shift by a non-negative count (spec 6.1.6.2.11).
 /// Exponentiation; a negative exponent is a RangeError (spec 6.1.6.2.15).
 pub fn exponentiate(base: &BigInt, exponent: &BigInt) -> Result<BigInt, JsError> {
     if exponent.0.sign() == num_bigint::Sign::Minus {

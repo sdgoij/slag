@@ -76,7 +76,7 @@ pub fn host_call_job_callback(
             "callback is not callable".into(),
         ));
     }
-    crate::eval::call(&job_callback.callback, this_value, arg_list)
+    crux::function::call(&job_callback.callback, this_value, arg_list)
 }
 
 #[cfg(test)]

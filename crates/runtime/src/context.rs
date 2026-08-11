@@ -78,20 +78,39 @@ pub fn resolve_private_identifier(
     ))
 }
 
-/// The base of a Reference Record (spec 6.2.5): an Environment Record or the
-/// unresolvable sentinel. Object bases join with member evaluation (Phase 6).
+/// The base of a Reference Record (spec 6.2.5): an Environment Record, an
+/// object value (member-expression references), or the unresolvable
+/// sentinel.
 #[derive(Debug, Clone)]
 pub enum ReferenceBase {
     Environment(EnvRef),
+    /// A property reference: the receiver of the [[Get]]/[[Set]].
+    Value(Value),
     Unresolvable,
 }
 
-/// A Reference Record (spec 6.2.5) for identifier references.
+/// A Reference Record (spec 6.2.5). The referenced name is a property key
+/// (a String for identifier bindings, a String or Symbol for member
+/// accesses).
 #[derive(Debug, Clone)]
 pub struct Reference {
     pub base: ReferenceBase,
-    pub name: JsString,
+    pub name: crux::property::PropertyKey,
     pub strict: bool,
+}
+
+/// The property key of a reference.
+pub fn reference_key(reference: &Reference) -> &crux::property::PropertyKey {
+    &reference.name
+}
+
+/// The string name of a String-keyed reference (environment bindings are
+/// always String-keyed).
+fn string_name(key: &crux::property::PropertyKey) -> JsString {
+    match key {
+        crux::property::PropertyKey::String(id) => crux::lookup(*id),
+        crux::property::PropertyKey::Symbol(_) => JsString::from_utf8(""),
+    }
 }
 
 /// GetIdentifierReference (spec 9.2.7.1): walks the environment chain from
@@ -106,14 +125,14 @@ pub fn get_identifier_reference(
         let Some(env_record) = current else {
             return Ok(Reference {
                 base: ReferenceBase::Unresolvable,
-                name: name.clone(),
+                name: crux::property::PropertyKey::from_js_string(name),
                 strict,
             });
         };
         if env_record.has_binding(name)? {
             return Ok(Reference {
                 base: ReferenceBase::Environment(env_record),
-                name: name.clone(),
+                name: crux::property::PropertyKey::from_js_string(name),
                 strict,
             });
         }
@@ -124,37 +143,147 @@ pub fn get_identifier_reference(
 /// spec 6.2.5.4 GetValue on a Reference Record.
 pub fn get_value(reference: &Reference) -> Result<Value, JsError> {
     match &reference.base {
-        ReferenceBase::Environment(env) => env.get_binding_value(&reference.name, reference.strict),
-        ReferenceBase::Unresolvable => Err(undefined_error(&reference.name)),
+        ReferenceBase::Environment(env) => {
+            env.get_binding_value(&string_name(&reference.name), reference.strict)
+        }
+        ReferenceBase::Value(base) => get_property_key(base, &reference.name, base.clone()),
+        ReferenceBase::Unresolvable => Err(undefined_error(&string_name(&reference.name))),
+    }
+}
+
+/// GetValue restricted to callable values (spec 7.3.12 GetValue): used by
+/// call evaluation to reject non-callable callees.
+pub fn get_value_callable(reference: &Reference) -> Result<Value, JsError> {
+    let value = get_value(reference)?;
+    if crux::value::is_callable(&value) {
+        Ok(value)
+    } else {
+        Err(JsError::new(
+            ErrorKind::TypeError,
+            format!("{} is not a function", crux::value::type_of(&value)),
+        ))
+    }
+}
+
+/// `base.[[Get]](P, receiver)` through a language value.
+pub fn get_property(
+    base: &Value,
+    key: &crux::string::JsString,
+    receiver: Value,
+) -> Result<Value, JsError> {
+    get_property_key(
+        base,
+        &crux::property::PropertyKey::from_js_string(key),
+        receiver,
+    )
+}
+
+/// `base.[[Get]](P, receiver)` for any property key (string or symbol).
+pub fn get_property_key(
+    base: &Value,
+    key: &crux::property::PropertyKey,
+    receiver: Value,
+) -> Result<Value, JsError> {
+    match base {
+        Value::Object(obj) => obj.get_with_receiver_key(key, receiver),
+        Value::Function(f) => f.object.get_with_receiver_key(key, receiver),
+        _ => Err(JsError::new(
+            ErrorKind::TypeError,
+            "value is not an object".into(),
+        )),
+    }
+}
+
+/// spec 6.2.5.6 PutValue: strict mode throws on unresolvable references and
+/// failed object writes; sloppy mode creates a global property instead.
+pub fn put_value(agent: &Agent, reference: &Reference, value: Value) -> Result<(), JsError> {
+    match &reference.base {
+        ReferenceBase::Environment(env) => {
+            env.set_mutable_binding(&string_name(&reference.name), value, reference.strict)
+        }
+        ReferenceBase::Value(base) => {
+            let key = &reference.name;
+            let result = match base {
+                Value::Object(obj) => {
+                    obj.set_with_receiver_key(key, value, base.clone(), reference.strict)
+                }
+                Value::Function(f) => {
+                    f.object
+                        .set_with_receiver_key(key, value, base.clone(), reference.strict)
+                }
+                _ => Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "value is not an object".into(),
+                )),
+            };
+            // spec step 5: a failed [[Set]] is a TypeError in strict mode.
+            if !result? && reference.strict {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    format!(
+                        "Cannot assign to read only property {:?}",
+                        key.display_string()
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        ReferenceBase::Unresolvable => {
+            if reference.strict {
+                return Err(undefined_error(&string_name(&reference.name)));
+            }
+            // Sloppy: Set on the global object (spec 6.2.5.6 step 3.a.ii).
+            let global_env = agent.running_context()?.realm.global_env();
+            global_env.set_mutable_binding(&string_name(&reference.name), value, false)
+        }
+    }
+}
+
+/// spec 7.3.8 DeletePropertyOrThrow.
+pub fn delete_property_or_throw(reference: &Reference) -> Result<bool, JsError> {
+    match &reference.base {
+        ReferenceBase::Environment(env) => env.delete_binding(&string_name(&reference.name)),
+        ReferenceBase::Value(base) => {
+            let key = &reference.name;
+            let deleted = match base {
+                Value::Object(obj) => obj.delete_key(key)?,
+                Value::Function(f) => f.object.delete_key(key)?,
+                _ => true,
+            };
+            if !deleted && reference.strict {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    format!("Cannot delete property {:?}", key.display_string()),
+                ));
+            }
+            Ok(deleted)
+        }
+        ReferenceBase::Unresolvable => Ok(true),
     }
 }
 
 /// spec 6.2.5.8 InitializeReferencedBinding.
 pub fn initialize_referenced_binding(reference: &Reference, value: Value) -> Result<(), JsError> {
     match &reference.base {
-        ReferenceBase::Environment(env) => env.initialize_binding(&reference.name, value),
-        ReferenceBase::Unresolvable => Err(JsError::new(
+        ReferenceBase::Environment(env) => {
+            env.initialize_binding(&string_name(&reference.name), value)
+        }
+        ReferenceBase::Value(_) => Err(JsError::new(
             ErrorKind::ReferenceError,
-            format!("{:?} is not defined", reference.name.to_string_lossy()),
+            format!(
+                "Cannot initialize property reference {:?}",
+                reference.name.display_string()
+            ),
         )),
+        ReferenceBase::Unresolvable => Err(undefined_error(&string_name(&reference.name))),
     }
 }
 
-/// spec 6.2.5.6 PutValue: strict mode throws on unresolvable references;
-/// sloppy mode creates a global property instead.
-pub fn put_value(agent: &Agent, reference: &Reference, value: Value) -> Result<(), JsError> {
+/// spec 6.2.5.10 GetThisValue: the base value of a property reference.
+pub fn get_this_value(reference: &Reference) -> Value {
     match &reference.base {
-        ReferenceBase::Environment(env) => {
-            env.set_mutable_binding(&reference.name, value, reference.strict)
-        }
-        ReferenceBase::Unresolvable => {
-            if reference.strict {
-                return Err(undefined_error(&reference.name));
-            }
-            // Sloppy: Set on the global object (spec 6.2.5.6 step 3.a.ii).
-            let global_env = agent.running_context()?.realm.global_env();
-            global_env.set_mutable_binding(&reference.name, value, false)
-        }
+        ReferenceBase::Value(base) => base.clone(),
+        _ => Value::Undefined,
     }
 }
 

@@ -5,7 +5,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use crux::error::JsError;
+use crux::error::{ErrorKind, JsError};
+use crux::function::Function;
 use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::PropertyDescriptor;
@@ -121,6 +122,35 @@ fn set_default_global_bindings(realm: &Handle<Realm>) -> Result<(), JsError> {
             },
         )?;
     }
+    // %eval% (spec 19.2.1): a global whose identity the call evaluator
+    // recognizes to perform direct and indirect eval (sec 13.3.6.1). Its
+    // native body is a placeholder; dispatch happens before it runs.
+    let eval_func = Function::create_builtin(
+        Some(JsString::from_utf8("eval")),
+        1,
+        Box::new(|_, _| {
+            Err(JsError::new(
+                ErrorKind::TypeError,
+                "eval must be called through the evaluator".into(),
+            ))
+        }),
+        None,
+        None,
+    )?;
+    realm
+        .intrinsics
+        .define("%eval%", Value::Function(eval_func.clone()));
+    global.define_property_or_throw(
+        &JsString::from_utf8("eval"),
+        &PropertyDescriptor {
+            value: Some(Value::Function(eval_func)),
+            writable: Some(true),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
+    )?;
     Ok(())
 }
 

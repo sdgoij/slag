@@ -121,7 +121,7 @@ fn bigint_number_equal(b: &BigInt, n: f64) -> bool {
 }
 
 /// Exact conversion of an integer-valued `f64` to a BigInt.
-fn f64_to_bigint_exact(n: f64) -> NumBigInt {
+pub fn f64_to_bigint_exact(n: f64) -> NumBigInt {
     debug_assert!(n.is_finite() && n.trunc() == n);
     let bits = n.to_bits();
     let sign = if bits >> 63 == 1 { -1 } else { 1 };

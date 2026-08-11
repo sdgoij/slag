@@ -190,6 +190,12 @@ pub enum Flow {
 type StmtResult = Result<Flow, JsError>;
 ```
 
+> **Implemented as of Phase 6:** statement evaluation uses a `Completion` enum with values on
+> every variant (`Normal(Value)`, `Break { target, value }`, `Continue { target, value }`,
+> `Return(Value)`, `Throw(Value)`), matching spec 6.2.3 exactly — abrupt completions carry a
+> `[[Value]]` that `UpdateEmpty` fills from the enclosing statement list or loop. `JsError`s
+> propagate separately through `Result` and become the thrown value in `catch`.
+
 - `JsError` carries the error kind (`SyntaxError`, `TypeError`, `RangeError`, …), message, cause,
   and stack capture. All built-in constructors produce `JsError` values that are ordinary objects
   when thrown into JS.
@@ -760,6 +766,78 @@ close paths (throw during body → `.return()` called); switch fallthrough; try/
 `language/` subset.
 **Exit criteria:** `jsrt` can run non-trivial scripts end-to-end (fibonacci, closures, strings,
 arrays, objects) and prints correct output; Phase 6 test fixtures all pass.
+
+**Status (current):** the statement/expression evaluator lives in `crates/runtime`, built on the
+Completion model (spec 6.2.3):
+
+- `flow.rs` — `Completion` = `Normal(value)` | `Break`/`Continue { target, value }` |
+  `Return(value)` | `Throw(value)` (spec 6.2.3) plus `completion_to_result`; `eval_program`
+  maps the final completion to a value or surfaces the abrupt error. Abrupt completions
+  carry a `[[Value]]` that `UpdateEmpty` fills from the enclosing statement list (spec
+  14.2.2 step 5) or loop; `eval_if` applies `UpdateEmpty(·, undefined)` per spec 14.10.2.
+- `expr.rs` — `eval_expr` covers ch. 13:
+  - literals (incl. BigInt), array/object initializers (elisions, spread through the iterator
+    protocol, computed keys, `__proto__` per Annex B), template literals (cooked/raw values,
+    tagged calls), `this`, identifiers
+  - unary (`typeof` on unresolvable references, `void`, `+`/`-`, `~`, `!`, `delete` on
+    references), update (`++`/`--` with ToNumeric), `**` (right-associative), arithmetic,
+    shift and bitwise (ToInt32/ToUint32 semantics, incl. `>>>`), relational via
+    `AbstractRelationalComparison` (BigInt↔Number through `ops::f64_to_bigint_exact`),
+    `in`, `instanceof` (`OrdinaryHasInstance`), loose/strict equality, logical
+    (`&&`/`||`/`??` short-circuit), conditional, assignment (simple, compound with ToNumeric,
+    `??=`/`&&=`/`||=`), comma
+  - member/optional-chain/call/new with short-circuiting and spread arguments
+  - iterator machinery: `get_iterator` (7.4.2), `iterator_step` (7.4.5-6),
+    `iterator_close` (7.4.7), `get_method` (7.3.11 — the `@@name` notation resolves to the
+    well-known symbol via `crux::symbol::well_known`)
+- `eval.rs` — `eval_statement` with the Completion model: blocks (declaration instantiation),
+  var/let/const (TDZ through uninitialized bindings, redeclaration checks), if, while,
+  do-while, for (incl. lexical heads), for-in (own + prototype enumeration, duplicate-key
+  skip), for-of (iterator protocol with `IteratorClose` on break/return/throw), labeled
+  statements (label chains attach to the loop; `break label`/`continue label` are consumed by
+  the named loop so `continue label` never re-evaluates the loop head), return, throw,
+  try/catch/finally (spec 14.15.2 — a normal finally completion is replaced by the try
+  block's), switch (case order, fallthrough), with (object environment), function/class
+  declarations. Loops track the spec's iteration result `V`: an unlabeled `break` exits as a
+  normal completion carrying `V` (spec 14.14.2 step 2), `continue`/`break` completions carry
+  their statement-list value, and labeled breaks propagate to the enclosing labelled
+  statement, which completes normally with the value.
+- `context.rs` — the Reference model: `ReferenceBase::{Environment, Value}`,
+  `Reference.name` is a `PropertyKey` (string *and* symbol, enabling computed symbol access),
+  `GetValue`, `PutValue` (failed strict writes are TypeErrors), `DeletePropertyOrThrow`,
+  `GetThisValue`, `get_value_callable`.
+- `realm.rs` — `%eval%` is installed as a global whose identity the call evaluator
+  recognizes: direct and indirect eval dispatch to `PerformEval` (spec 13.3.6.1 step 5).
+- `job.rs` — host-call jobs delegate to `crux::function::call`.
+
+**Conformance:** `crates/test262` runs a curated subset of the pinned `tc39/test262`
+submodule (repo-root `test262/`): 19 fixtures under `test/language/statements/{if,while}` and
+`test/language/expressions/conditional` covering completion values (`cptn-*`), labeled
+`break`/`continue`, ASI around `let`, and statement-position early errors. The harness parses
+fixture frontmatter (`negative:` phase/type, `flags:`, `includes:`), runs strict and sloppy
+modes, installs a minimal native `assert` helper (user functions join Phase 7), and reports
+pass/skip/fail — `19/19` pass. The subset grows with each phase's feature coverage.
+
+The workspace runs **319 tests** (`cargo test --workspace`: 87 in `runtime`, 1 harness test
+covering the 19 test262 fixtures) with `cargo fmt --all --check` and
+`cargo clippy --workspace --all-targets -- -D warnings` clean.
+
+**Remaining in Phase 6:**
+
+- Destructuring — `ObjectBindingPattern`/`ArrayBindingPattern` declarations and
+  `DestructuringAssignmentEvaluation` (defaults, rest, `IteratorClose` on failure) are
+  `not_implemented` errors.
+- Function expressions, arrow functions, and method shorthand are deferred to Phase 7's
+  function machinery; `super`/`new.target` join Phase 7.
+- `for await` (async iteration is Phase 7).
+- `catch (e)` binds the raw thrown value; real `Error` objects and the constructor stack land
+  in Phase 8.
+- Per-iteration closure captures in `for`/`for-in`/`for-of` heads (Phase 7).
+- `using`/`await using` disposal — bindings are created but the DisposableResource stack and
+  `DisposeResources` are not implemented.
+- RegExp literals report a capability gap; `RegExp` object creation needs Phase 11.
+- The global `Symbol` constructor and its well-known-symbol properties are Phase 8 builtins;
+  the `@@iterator` protocol itself already works through `crux::symbol::well_known`.
 
 ---
 

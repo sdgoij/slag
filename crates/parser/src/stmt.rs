@@ -20,12 +20,15 @@ pub(crate) fn parse_statement_list(
 ) -> Result<Vec<Stmt>, JsError> {
     let mut stmts = Vec::new();
     while !matches!(parser.peek()?.kind, TokenKind::Eof) && !parser.at_punct(terminator.clone())? {
-        stmts.push(parse_statement(parser)?);
+        stmts.push(parse_statement(parser, true)?);
     }
     Ok(stmts)
 }
 
-pub(crate) fn parse_statement(parser: &mut Parser) -> Result<Stmt, JsError> {
+pub(crate) fn parse_statement(
+    parser: &mut Parser,
+    allow_declaration: bool,
+) -> Result<Stmt, JsError> {
     let start = parser.peek()?.span.start;
     let kind = match parser.peek()?.kind.clone() {
         TokenKind::LeftBrace => {
@@ -40,7 +43,17 @@ pub(crate) fn parse_statement(parser: &mut Parser) -> Result<Stmt, JsError> {
         }
         TokenKind::Identifier(atom) => match from_identifier(atom) {
             Some(Keyword::Var) => return parse_var_statement(parser, VarDeclKind::Var),
-            Some(Keyword::Const) => return parse_var_statement(parser, VarDeclKind::Const),
+            Some(Keyword::Const) => {
+                // LexicalDeclaration is a Declaration, not a Statement; it is
+                // only allowed at StatementListItem level.
+                if !allow_declaration {
+                    return Err(parser.error_at(
+                        start,
+                        "Lexical declaration cannot appear in a single-statement context",
+                    ));
+                }
+                return parse_var_statement(parser, VarDeclKind::Const);
+            }
             Some(Keyword::If) => return parse_if(parser),
             Some(Keyword::Do) => return parse_do_while(parser),
             Some(Keyword::While) => return parse_while(parser),
@@ -59,6 +72,12 @@ pub(crate) fn parse_statement(parser: &mut Parser) -> Result<Stmt, JsError> {
             }
             Some(Keyword::Function) => return parse_function_declaration(parser, false),
             Some(Keyword::Class) => {
+                if !allow_declaration {
+                    return Err(parser.error_at(
+                        start,
+                        "Lexical declaration cannot appear in a single-statement context",
+                    ));
+                }
                 let start = parser.next()?.span.start;
                 let class = crate::class::parse_class(parser, start, true)?;
                 let end = class.span.end;
@@ -70,12 +89,33 @@ pub(crate) fn parse_statement(parser: &mut Parser) -> Result<Stmt, JsError> {
             _ if atom == intern_utf8("let")
                 && is_let_declaration_start(parser.peek2()?.kind.clone()) =>
             {
-                return parse_var_statement(parser, VarDeclKind::Let);
+                if !allow_declaration && !parser.peek2()?.line_break_before {
+                    return Err(parser.error_at(
+                        start,
+                        "Lexical declaration cannot appear in a single-statement context",
+                    ));
+                }
+                if allow_declaration {
+                    return parse_var_statement(parser, VarDeclKind::Let);
+                }
+                // Statement position with a line break before the declaration
+                // start: `let` is an expression statement (ASI), e.g.
+                // `if (x) let\n{}`.
+                if is_label_start(parser)? {
+                    return parse_labeled(parser);
+                }
+                return parse_expression_statement(parser);
             }
             _ if atom == intern_utf8("using")
                 && is_using_binding_start(parser.peek2()?.kind.clone())
                 && !parser.peek2()?.line_break_before =>
             {
+                if !allow_declaration {
+                    return Err(parser.error_at(
+                        start,
+                        "Lexical declaration cannot appear in a single-statement context",
+                    ));
+                }
                 return parse_using_declaration(parser, false);
             }
             _ if atom == intern_utf8("await")
@@ -85,6 +125,12 @@ pub(crate) fn parse_statement(parser: &mut Parser) -> Result<Stmt, JsError> {
                 && is_using_binding_start(parser.peek3()?.kind.clone())
                 && !parser.peek3()?.line_break_before =>
             {
+                if !allow_declaration {
+                    return Err(parser.error_at(
+                        start,
+                        "Lexical declaration cannot appear in a single-statement context",
+                    ));
+                }
                 parser.next()?; // `await`
                 return parse_using_declaration(parser, true);
             }
@@ -156,7 +202,7 @@ fn parse_labeled(parser: &mut Parser) -> Result<Stmt, JsError> {
         return Err(parser.error_at(start, "Unexpected strict mode reserved word"));
     }
     parser.expect_punct(TokenKind::Colon)?;
-    let body = Box::new(parse_statement(parser)?);
+    let body = Box::new(parse_statement(parser, false)?);
     let end = parser.prev.as_ref().unwrap().span.end;
     Ok(Stmt {
         span: Span::new(start, end),
@@ -340,9 +386,9 @@ fn parse_if(parser: &mut Parser) -> Result<Stmt, JsError> {
     parser.expect_punct(TokenKind::LeftParen)?;
     let test = parse_expression(parser, true)?;
     parser.expect_punct(TokenKind::RightParen)?;
-    let consequent = Box::new(parse_statement(parser)?);
+    let consequent = Box::new(parse_statement(parser, false)?);
     let alternate = if parser.eat_keyword(Keyword::Else)? {
-        Some(Box::new(parse_statement(parser)?))
+        Some(Box::new(parse_statement(parser, false)?))
     } else {
         None
     };
@@ -362,7 +408,7 @@ fn parse_while(parser: &mut Parser) -> Result<Stmt, JsError> {
     parser.expect_punct(TokenKind::LeftParen)?;
     let test = parse_expression(parser, true)?;
     parser.expect_punct(TokenKind::RightParen)?;
-    let body = Box::new(parse_statement(parser)?);
+    let body = Box::new(parse_statement(parser, false)?);
     let end = parser.prev.as_ref().unwrap().span.end;
     Ok(Stmt {
         span: Span::new(start, end),
@@ -372,7 +418,7 @@ fn parse_while(parser: &mut Parser) -> Result<Stmt, JsError> {
 
 fn parse_do_while(parser: &mut Parser) -> Result<Stmt, JsError> {
     let start = parser.next()?.span.start; // `do`
-    let body = Box::new(parse_statement(parser)?);
+    let body = Box::new(parse_statement(parser, false)?);
     parser.expect_keyword(Keyword::While)?;
     parser.expect_punct(TokenKind::LeftParen)?;
     let test = parse_expression(parser, true)?;
@@ -486,7 +532,7 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
         let left = for_binding_from_init(parser, init, true)?;
         let right = parse_expression(parser, true)?;
         parser.expect_punct(TokenKind::RightParen)?;
-        let body = Box::new(parse_statement(parser)?);
+        let body = Box::new(parse_statement(parser, false)?);
         let end = parser.prev.as_ref().unwrap().span.end;
         return Ok(Stmt {
             span: Span::new(start, end),
@@ -501,7 +547,7 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
         let left = for_binding_from_init(parser, init, false)?;
         let right = parse_assignment(parser, true)?;
         parser.expect_punct(TokenKind::RightParen)?;
-        let body = Box::new(parse_statement(parser)?);
+        let body = Box::new(parse_statement(parser, false)?);
         let end = parser.prev.as_ref().unwrap().span.end;
         return Ok(Stmt {
             span: Span::new(start, end),
@@ -556,7 +602,7 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
         Some(parse_expression(parser, true)?)
     };
     parser.expect_punct(TokenKind::RightParen)?;
-    let body = Box::new(parse_statement(parser)?);
+    let body = Box::new(parse_statement(parser, false)?);
     let end = parser.prev.as_ref().unwrap().span.end;
     Ok(Stmt {
         span: Span::new(start, end),
@@ -726,7 +772,7 @@ fn parse_with(parser: &mut Parser) -> Result<Stmt, JsError> {
     parser.expect_punct(TokenKind::LeftParen)?;
     let object = parse_expression(parser, true)?;
     parser.expect_punct(TokenKind::RightParen)?;
-    let body = Box::new(parse_statement(parser)?);
+    let body = Box::new(parse_statement(parser, false)?);
     let end = parser.prev.as_ref().unwrap().span.end;
     Ok(Stmt {
         span: Span::new(start, end),
@@ -796,7 +842,7 @@ fn parse_switch_consequents(parser: &mut Parser) -> Result<Vec<Stmt>, JsError> {
         {
             break;
         }
-        stmts.push(parse_statement(parser)?);
+        stmts.push(parse_statement(parser, true)?);
     }
     Ok(stmts)
 }
