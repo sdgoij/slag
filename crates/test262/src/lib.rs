@@ -56,6 +56,10 @@ mod harness {
         "statements/function/arguments-with-arguments-lex.js",
         "expressions/object/method-definition/meth-dflt-params-ref-prior.js",
         "expressions/object/method-definition/meth-params-trailing-comma-single.js",
+        "statements/class/method/dflt-params-ref-prior.js",
+        "statements/class/method/dflt-params-arg-val-undefined.js",
+        "statements/class/method/dflt-params-trailing-comma.js",
+        "statements/class/method/params-trailing-comma-single.js",
         "expressions/conditional/in-condition.js",
     ];
 

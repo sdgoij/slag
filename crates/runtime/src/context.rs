@@ -430,6 +430,34 @@ pub fn get_global_object(agent: &Agent) -> Result<Handle<crux::object::JsObject>
     Ok(agent.running_context()?.realm.global_object.clone())
 }
 
+/// GetSuperConstructor (spec 9.2.4.6): the heritage constructor of the
+/// current derived constructor, used by `super()` calls.
+pub fn get_super_constructor(agent: &Agent) -> Result<Value, JsError> {
+    let env = get_this_environment(agent)?;
+    let EnvRecord::Function(function_env) = &*env else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "super() is only valid inside a derived constructor".into(),
+        ));
+    };
+    let Value::Function(function) = &function_env.function_object else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "super() is only valid inside a derived constructor".into(),
+        ));
+    };
+    agent
+        .ecma_functions
+        .get(&function.id())
+        .and_then(|data| data.super_constructor.clone())
+        .ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                "super() is only valid inside a derived constructor".into(),
+            )
+        })
+}
+
 /// GetSuperBase (spec 9.2.4.5): the prototype of the nearest method's
 /// [[HomeObject]]. `get_this_environment` skips arrow environments, so
 /// arrows inside a method share its HomeObject.

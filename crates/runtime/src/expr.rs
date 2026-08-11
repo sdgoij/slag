@@ -64,10 +64,9 @@ pub fn eval_expr(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Value, 
                 strict,
             )
         }
-        ExprKind::Class(_) => Err(JsError::new(
-            ErrorKind::TypeError,
-            "class expressions are not implemented until later Phase 7 work".into(),
-        )),
+        ExprKind::Class(class) => {
+            crate::class::class_definition_evaluation(agent, class, class.name, strict)
+        }
         ExprKind::Unary { op, operand } => eval_unary(agent, op, operand, strict),
         ExprKind::Update { op, prefix, target } => eval_update(agent, op, *prefix, target, strict),
         ExprKind::Binary { op, left, right } => {
@@ -116,9 +115,9 @@ pub fn eval_expr(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Value, 
         ExprKind::MetaProperty { meta, .. } => {
             let meta = crux::lookup(*meta);
             if meta.as_slice() == "new".encode_utf16().collect::<Vec<_>>().as_slice() {
-                // new.target is *undefined* at the script level; functions
-                // bind it in Phase 7.
-                Ok(Value::Undefined)
+                // new.target (spec 13.3.5.3): the active constructor, or
+                // *undefined* at the script level.
+                crate::context::get_new_target(agent)
             } else {
                 Err(JsError::new(
                     ErrorKind::TypeError,
@@ -209,6 +208,21 @@ fn eval_call_chain(
     call: &syntax::ast::CallExpr,
     strict: bool,
 ) -> Result<Option<ChainResult>, JsError> {
+    if matches!(call.callee.kind, ExprKind::Super) {
+        // SuperCall (spec 13.3.5.1): construct the superclass with the
+        // current newTarget, bind the result as `this`, and initialize the
+        // derived class's instance fields.
+        let new_target = crate::context::get_new_target(agent)?;
+        let super_ctor = crate::context::get_super_constructor(agent)?;
+        let args = eval_arguments(agent, &call.args, strict)?;
+        let result = crate::function::construct(agent, &super_ctor, &args, &new_target)?;
+        let this_env = crate::context::get_this_environment(agent)?;
+        this_env.bind_this_value(result.clone())?;
+        if let Some(function_value) = agent.running_context()?.function.clone() {
+            crate::function::initialize_instance_elements(agent, &result, &function_value)?;
+        }
+        return Ok(Some(ChainResult::Value(result)));
+    }
     let callee = eval_chain(agent, &call.callee, strict)?;
     let Some(callee) = callee else {
         return Ok(None);

@@ -19,6 +19,7 @@ use crate::agent::Agent;
 use crate::context::ExecutionContext;
 use crate::env::{EnvRef, new_declarative_environment, new_function_environment};
 use crate::eval::eval_statement_list;
+use crate::expr::eval_expr;
 use crate::flow::Completion;
 use crate::realm::Realm;
 use crate::script::{
@@ -35,6 +36,23 @@ pub enum ThisMode {
     Sloppy,
 }
 
+/// [[ConstructorKind]] (spec 10.2.1): whether a constructor must call
+/// `super()` to create its `this`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstructorKind {
+    Base,
+    Derived,
+}
+
+/// A ClassFieldDefinition Record (spec 15.7.14): a field's property key plus
+/// the initializer expression, evaluated per instance in the class scope.
+#[derive(Debug, Clone)]
+pub struct ClassField {
+    pub name: crux::property::PropertyKey,
+    pub init: Option<syntax::ast::Expr>,
+    pub environment: EnvRef,
+}
+
 /// The spec 10.2.1 internal slots of an ordinary ECMAScript function,
 /// registered per function object.
 #[derive(Debug, Clone)]
@@ -48,8 +66,20 @@ pub struct EcmaFunction {
     /// [[Strict]]: the body's strictness (distinct from [[ThisMode]] for
     /// arrows, which are always ~lexical~).
     pub strict: bool,
-    /// [[HomeObject]]: set for methods (super property access, Phase 7).
+    /// [[HomeObject]]: set for methods (super property access).
     pub home_object: Option<Value>,
+    /// [[ConstructorKind]]: ~derived~ for classes with a heritage.
+    pub constructor_kind: ConstructorKind,
+    /// [[IsClassConstructor]]: class constructors reject bare calls.
+    pub is_class_constructor: bool,
+    /// [[Fields]]: instance fields initialized when the constructor runs.
+    pub fields: Vec<ClassField>,
+    /// The heritage constructor of a derived class (GetSuperConstructor).
+    pub super_constructor: Option<Value>,
+    /// The synthesized `constructor(...args) { super(...args); }` — its
+    /// [[Construct]] passes the arguments without the iterator protocol
+    /// (spec 15.7.14 step 23 note).
+    pub default_derived: bool,
     pub realm: Handle<Realm>,
     pub is_async: bool,
     pub is_generator: bool,
@@ -198,13 +228,14 @@ fn make_constructor(function: &Handle<Function>) -> Result<(), JsError> {
 /// declaration or expression. `strict` is the enclosing code's strictness,
 /// inherited when the body has no directive of its own.
 /// The definition kind for OrdinaryFunctionCreate (spec 10.2.1.3): whether
-/// the function is a method or accessor (no `prototype` own property) and
-/// the async/generator flags.
+/// the function is a method or accessor (no `prototype` own property), the
+/// async/generator flags, and whether it is a class constructor.
 #[derive(Debug, Clone, Copy)]
 pub struct DefinitionKind {
     pub is_method: bool,
     pub is_async: bool,
     pub is_generator: bool,
+    pub is_class_constructor: bool,
 }
 
 impl DefinitionKind {
@@ -213,6 +244,7 @@ impl DefinitionKind {
             is_method: false,
             is_async,
             is_generator,
+            is_class_constructor: false,
         }
     }
 
@@ -221,6 +253,7 @@ impl DefinitionKind {
             is_method: true,
             is_async,
             is_generator,
+            is_class_constructor: false,
         }
     }
 }
@@ -283,6 +316,70 @@ pub fn instantiate_accessor(
     )
 }
 
+/// The class constructor (ClassDefinitionEvaluation steps 8-9): an ordinary
+/// function with no `prototype` until MakeConstructor, [[IsClassConstructor]]
+/// true (bare calls throw), and the class name as its eventual name.
+pub fn instantiate_class_constructor(
+    agent: &mut Agent,
+    params: Vec<BindingElement>,
+    body: Block,
+    environment: EnvRef,
+    enclosing_strict: bool,
+) -> Result<Value, JsError> {
+    instantiate_class_constructor_with(agent, params, body, environment, enclosing_strict, false)
+}
+
+/// Like `instantiate_class_constructor`, marking the synthesized default
+/// derived constructor whose [[Construct]] bypasses the iterator protocol.
+pub fn instantiate_default_derived_constructor(
+    agent: &mut Agent,
+    environment: EnvRef,
+    enclosing_strict: bool,
+) -> Result<Value, JsError> {
+    instantiate_class_constructor_with(
+        agent,
+        Vec::new(),
+        Block {
+            stmts: Vec::new(),
+            span: crux::Span::new(0, 0),
+        },
+        environment,
+        enclosing_strict,
+        true,
+    )
+}
+
+fn instantiate_class_constructor_with(
+    agent: &mut Agent,
+    params: Vec<BindingElement>,
+    body: Block,
+    environment: EnvRef,
+    enclosing_strict: bool,
+    default_derived: bool,
+) -> Result<Value, JsError> {
+    let function = register_function(
+        agent,
+        None,
+        params,
+        body,
+        environment,
+        enclosing_strict,
+        DefinitionKind {
+            is_method: true,
+            is_async: false,
+            is_generator: false,
+            is_class_constructor: true,
+        },
+    )?;
+    if default_derived
+        && let Value::Function(function) = &function
+        && let Some(data) = agent.ecma_functions.get_mut(&function.id())
+    {
+        data.default_derived = true;
+    }
+    Ok(function)
+}
+
 /// MakeMethod (spec 10.2.12): attach the [[HomeObject]] slot that `super`
 /// property access resolves through.
 pub fn make_method(agent: &mut Agent, function: &Value, home_object: Value) -> Result<(), JsError> {
@@ -328,6 +425,11 @@ fn register_function(
         this_mode,
         strict,
         home_object: None,
+        constructor_kind: ConstructorKind::Base,
+        is_class_constructor: kind.is_class_constructor,
+        fields: Vec::new(),
+        super_constructor: None,
+        default_derived: false,
         realm,
         is_async: false,
         is_generator: false,
@@ -411,6 +513,11 @@ pub fn instantiate_arrow(
         this_mode: ThisMode::Lexical,
         strict: enclosing_strict,
         home_object: None,
+        constructor_kind: ConstructorKind::Base,
+        is_class_constructor: false,
+        fields: Vec::new(),
+        super_constructor: None,
+        default_derived: false,
         realm,
         is_async: false,
         is_generator: false,
@@ -433,7 +540,21 @@ pub fn call(
 ) -> Result<Value, JsError> {
     match callee {
         Value::Function(function) => match &function.kind {
-            crux::function::FunctionKind::EcmaScript => ordinary_call(agent, function, this, args),
+            crux::function::FunctionKind::EcmaScript => {
+                if agent
+                    .ecma_functions
+                    .get(&function.id())
+                    .is_some_and(|data| data.is_class_constructor)
+                {
+                    // spec 10.2.1: [[IsClassConstructor]] is true, so the
+                    // function must be called with `new` (step 5).
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "Class constructor cannot be invoked without 'new'".into(),
+                    ));
+                }
+                ordinary_call(agent, function, this, args)
+            }
             crux::function::FunctionKind::Bound {
                 target,
                 bound_this,
@@ -555,7 +676,9 @@ fn evaluate_body(agent: &mut Agent, data: &EcmaFunction) -> Result<Value, JsErro
 }
 
 /// The `[[Construct]]` of an ordinary function (spec 10.2.1): create `this`
-/// from the constructor's prototype, bind it, and run the body.
+/// from the constructor's prototype, bind it, and run the body. Base class
+/// constructors initialize instance fields before the body; derived
+/// constructors leave `this` uninitialized until `super()` binds it.
 fn ordinary_construct(
     agent: &mut Agent,
     function: &Handle<Function>,
@@ -578,20 +701,26 @@ fn ordinary_construct(
             format!("{} is not a constructor", type_of(&function.self_value())),
         ));
     }
-    // GetPrototypeFromConstructor (spec 10.2.4): newTarget's `prototype`
-    // when it is an object; %Object.prototype% joins with the Phase 8
-    // intrinsics, until then a null-prototype object.
-    let prototype = crate::context::get_property(
-        agent,
-        new_target,
-        &JsString::from_utf8("prototype"),
-        new_target.clone(),
-    )?;
-    let proto = match prototype {
-        Value::Object(obj) => Some(obj),
-        _ => None,
+    let derived = data.constructor_kind == ConstructorKind::Derived;
+    // Base constructors create `this` up front (spec 10.2.1 steps 2-4);
+    // derived constructors receive it from `super()`.
+    let this = if derived {
+        Value::Undefined
+    } else {
+        // OrdinaryCreateFromConstructor (spec 10.2.4): newTarget's
+        // `prototype`, or a null-prototype object until %Object.prototype%.
+        let prototype = crate::context::get_property(
+            agent,
+            new_target,
+            &JsString::from_utf8("prototype"),
+            new_target.clone(),
+        )?;
+        let proto = match prototype {
+            Value::Object(obj) => Some(obj),
+            _ => None,
+        };
+        Value::Object(JsObject::ordinary_object_create(proto))
     };
-    let this = Value::Object(JsObject::ordinary_object_create(proto));
     let function_value = function.self_value();
     let old_env = data.environment.clone();
     let function_env = new_function_environment(
@@ -601,7 +730,7 @@ fn ordinary_construct(
         false,
     );
     agent.execution_context_stack.push(ExecutionContext {
-        function: Some(function_value),
+        function: Some(function_value.clone()),
         realm: data.realm.clone(),
         script_or_module: None,
         lexical_environment: function_env.clone(),
@@ -609,22 +738,57 @@ fn ordinary_construct(
         private_environment: None,
     });
     let result = (|| -> Result<Value, JsError> {
-        function_env.bind_this_value(this.clone())?;
-        function_declaration_instantiation(
-            agent,
-            &function.self_value(),
-            &data,
-            args,
-            &function_env,
-        )?;
-        match eval_statement_list(agent, &data.body.stmts, data.strict)? {
-            // spec 10.2.1 [[Construct]]: an object return wins; base
-            // constructors fall back to `this` for any other value.
+        if data.default_derived {
+            // spec 15.7.14 step 23 (derived branch): Construct the superclass
+            // with the original arguments and the current newTarget — the
+            // arguments are passed directly, without the iterator protocol.
+            let Some(super_ctor) = data.super_constructor.clone() else {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "A class extending null cannot be constructed".into(),
+                ));
+            };
+            let this = crate::function::construct(agent, &super_ctor, args, new_target)?;
+            function_env.bind_this_value(this.clone())?;
+            initialize_instance_elements(agent, &this, &function_value)?;
+            return Ok(this);
+        }
+        if derived {
+            // `this` stays uninitialized: accessing it before `super()` is a
+            // ReferenceError (the FunctionEnv's uninitialized status).
+        } else {
+            function_env.bind_this_value(this.clone())?;
+            // spec 10.2.1 steps 8-9: instance fields initialize before the
+            // constructor body runs.
+            initialize_instance_elements(agent, &this, &function_value)?;
+        }
+        function_declaration_instantiation(agent, &function_value, &data, args, &function_env)?;
+        let completed = eval_statement_list(agent, &data.body.stmts, data.strict)?;
+        // spec 10.2.1 [[Construct]] steps 15-21: an object return wins; a base
+        // constructor falls back to `this`; a derived constructor returns the
+        // `super()`-bound `this` (or throws on any other value).
+        match completed {
             Completion::Return(value) => match value {
                 Value::Object(_) | Value::Function(_) => Ok(value),
+                _ if derived => {
+                    if matches!(value, Value::Undefined) {
+                        function_env.get_this_binding()
+                    } else {
+                        Err(JsError::new(
+                            ErrorKind::TypeError,
+                            "Derived constructors may only return object or undefined".into(),
+                        ))
+                    }
+                }
                 _ => Ok(this),
             },
-            Completion::Normal(_) | Completion::Empty => Ok(this),
+            Completion::Normal(_) | Completion::Empty => {
+                if derived {
+                    function_env.get_this_binding()
+                } else {
+                    Ok(this)
+                }
+            }
             Completion::Throw(value) => Err(JsError::new(
                 ErrorKind::TypeError,
                 format!("Uncaught {value:?}"),
@@ -637,6 +801,37 @@ fn ordinary_construct(
     })();
     agent.execution_context_stack.pop();
     result
+}
+
+/// InitializeInstanceElements (spec 7.3.27): define `ctor`'s instance
+/// fields on `obj` in order, evaluating each initializer with `this` = obj.
+pub fn initialize_instance_elements(
+    agent: &mut Agent,
+    obj: &Value,
+    ctor: &Value,
+) -> Result<(), JsError> {
+    let Value::Function(ctor) = ctor else {
+        return Ok(());
+    };
+    let fields = agent
+        .ecma_functions
+        .get(&ctor.id())
+        .map(|data| data.fields.clone())
+        .unwrap_or_default();
+    for field in &fields {
+        // DefineField (spec 7.3.23): the initializer runs in the class scope
+        // with the current `this` (the running context already chains to the
+        // class environment through the constructor's [[Environment]]).
+        let value = match &field.init {
+            Some(init) => eval_expr(agent, init, true)?,
+            None => Value::Undefined,
+        };
+        let Value::Object(obj) = obj else {
+            return Ok(());
+        };
+        obj.create_data_property_or_throw_key(&field.name, value)?;
+    }
+    Ok(())
 }
 
 /// FunctionDeclarationInstantiation (spec 16.1.8): bind the parameters,
@@ -1389,6 +1584,136 @@ mod tests {
         // `super` outside a method is a syntax error.
         assert!(run("super.x").is_err());
         assert!(run("function f() { super.x; } f()").is_err());
+    }
+
+    #[test]
+    fn class_declarations_and_constructors() {
+        // A class constructor is invoked with `new` (spec 10.2.1).
+        assert_eq!(
+            run("class C { constructor(x) { this.x = x; } } new C(5).x").unwrap(),
+            number(5.0)
+        );
+        // The default constructor creates an instance with the class
+        // prototype; `constructor` points back at the class.
+        assert_eq!(
+            run("class C {} new C().constructor === C").unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            run("class C {} typeof C.prototype.constructor").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("function")))
+        );
+        // Class constructors cannot be called without `new`.
+        assert!(run("class C {} C()").is_err());
+        // The class name and method names are inferred.
+        assert_eq!(
+            run("class C {} C.name").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("C")))
+        );
+        assert_eq!(
+            run("let D = class {}; D.name").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("D")))
+        );
+        assert_eq!(
+            run("class C { m() {} } C.prototype.m.name").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("m")))
+        );
+        // `new.target` is the active constructor.
+        assert_eq!(
+            run("class C { constructor() { this.t = new.target; } } new C().t === C").unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn class_methods_accessors_and_fields() {
+        // Instance methods bind `this` to the receiver.
+        assert_eq!(
+            run("class C { constructor() { this.v = 3; } m() { return this.v; } } new C().m()")
+                .unwrap(),
+            number(3.0)
+        );
+        // Instance fields initialize before the constructor body (spec
+        // 10.2.1 steps 8-9), in order.
+        assert_eq!(
+            run("class C { x = 5; y = this.x + 1; } new C().y").unwrap(),
+            number(6.0)
+        );
+        // Static methods, fields, and blocks target the constructor.
+        assert_eq!(
+            run("class C { static s() { return 3; } } C.s()").unwrap(),
+            number(3.0)
+        );
+        assert_eq!(run("class C { static s = 42; } C.s").unwrap(), number(42.0));
+        assert_eq!(
+            run("class C { static { this.v = 7; } } C.v").unwrap(),
+            number(7.0)
+        );
+        // Getters/setters merge into one accessor on the prototype.
+        assert_eq!(
+            run("class A { get v() { return this._v; } set v(x) { this._v = x; } } let a = new A(); a.v = 9; a.v")
+                .unwrap(),
+            number(9.0)
+        );
+        // Class expressions, including named ones visible only inside.
+        assert_eq!(
+            run("let C = class { m() { return 5; } }; new C().m()").unwrap(),
+            number(5.0)
+        );
+        assert_eq!(
+            run("let C = class N { m() { return N; } }; new C().m() === C").unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn class_inheritance_super() {
+        // The default derived constructor forwards arguments to `super`.
+        assert_eq!(
+            run("class A { constructor(x) { this.x = x; } } class B extends A {} new B(7).x")
+                .unwrap(),
+            number(7.0)
+        );
+        // `super()` binds `this` and initializes the derived fields.
+        assert_eq!(
+            run("class A { constructor() { this.y = 1; } } class B extends A { constructor() { super(); this.z = 2; } } new B().y + new B().z")
+                .unwrap(),
+            number(3.0)
+        );
+        // `this` before `super()` is a TDZ ReferenceError.
+        assert!(
+            run("class A {} class B extends A { constructor() { this.bad = 1; } } new B()")
+                .is_err()
+        );
+        // `super.m()` resolves through the prototype chain, keeping `this`.
+        assert_eq!(
+            run("class A { m() { return 1; } } class B extends A { m() { return super.m() + 1; } } new B().m()")
+                .unwrap(),
+            number(2.0)
+        );
+        assert_eq!(
+            run("class A { n() { return 10; } } class B extends A { n() { return super.n() * 2; } } class C extends B {} new C().n()")
+                .unwrap(),
+            number(20.0)
+        );
+        // `super.constructor` is the heritage constructor.
+        assert_eq!(
+            run("class A {} class B extends A { m() { return super.constructor === A; } } new B().m()")
+                .unwrap(),
+            Value::Boolean(true)
+        );
+        // A derived constructor returning an object wins; other values throw.
+        assert_eq!(
+            run("class A {} class B extends A { constructor() { super(); return { z: 9 }; } } new B().z")
+                .unwrap(),
+            number(9.0)
+        );
+        assert!(
+            run("class A {} class B extends A { constructor() { super(); return 1; } } new B()")
+                .is_err()
+        );
+        // `extends` requires a constructor or null.
+        assert!(run("class A extends 42 {}").is_err());
     }
 
     #[test]

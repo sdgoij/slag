@@ -241,9 +241,10 @@ fn eval_function_declaration(
     Ok(())
 }
 
-/// ClassDeclaration evaluation: the binding was created (uninitialized) by
-/// declaration instantiation; Phase 4 binds a function-shaped value, and
-/// Phase 7 performs ClassDefinitionEvaluation.
+/// ClassDeclaration evaluation (spec 15.7.14 BindingClassDeclarationEvaluation):
+/// ClassDefinitionEvaluation binds the class in its own scope, then the
+/// declaration's outer binding (created uninitialized by declaration
+/// instantiation) is initialized with the constructor.
 fn eval_class_declaration(
     agent: &mut Agent,
     class: &syntax::ast::Class,
@@ -255,8 +256,8 @@ fn eval_class_declaration(
             "Class declarations require a name".into(),
         ));
     };
+    let class_value = crate::class::class_definition_evaluation(agent, class, Some(name), strict)?;
     let name = crux::lookup(name);
-    let class_value = Value::Function(crux::Function::new(Some(name.clone())));
     let reference = resolve_binding(agent, &name, strict)?;
     initialize_referenced_binding(&reference, class_value)?;
     Ok(())

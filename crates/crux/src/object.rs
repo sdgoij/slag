@@ -866,6 +866,21 @@ impl JsObject {
         Ok(())
     }
 
+    /// spec 7.3.5 CreateDataPropertyOrThrow for any property key.
+    pub fn create_data_property_or_throw_key(
+        &self,
+        key: &PropertyKey,
+        value: Value,
+    ) -> Result<(), JsError> {
+        if !self.create_data_property_key(key, value)? {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "Cannot define property".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// spec 7.3.6 DefinePropertyOrThrow.
     pub fn define_property_or_throw(
         &self,

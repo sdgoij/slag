@@ -811,17 +811,17 @@ Completion model (spec 6.2.3):
 - `job.rs` — host-call jobs delegate to `crux::function::call`.
 
 **Conformance:** `crates/test262` runs a curated subset of the pinned `tc39/test262`
-submodule (repo-root `test262/`): 35 fixtures under `test/language/statements/{if,while,
-function}` and `test/language/expressions/{conditional,object}` covering completion values
-(`cptn-*`), labeled `break`/`continue`, ASI around `let`, statement-position early errors, and
-the Phase 7 function fixtures (defaults, rest, destructured params, `arguments`-name
-conflicts, object methods). The harness parses
+submodule (repo-root `test262/`): 39 fixtures under `test/language/statements/{if,while,
+function,class}` and `test/language/expressions/{conditional,object}` covering completion
+values (`cptn-*`), labeled `break`/`continue`, ASI around `let`, statement-position early
+errors, and the Phase 7 fixtures (defaults, rest, destructured params, `arguments`-name
+conflicts, object/class methods). The harness parses
 fixture frontmatter (`negative:` phase/type, `flags:`, `includes:`), runs strict and sloppy
 modes, installs a minimal native `assert` helper (user functions join Phase 7), and reports
-pass/skip/fail — `35/35` pass. The subset grows with each phase's feature coverage.
+pass/skip/fail — `39/39` pass. The subset grows with each phase's feature coverage.
 
-The workspace runs **340 tests** (`cargo test --workspace`: 108 in `runtime`, 44 in `parser`,
-1 harness test covering the 35 test262 fixtures) with `cargo fmt --all --check` and
+The workspace runs **343 tests** (`cargo test --workspace`: 111 in `runtime`, 44 in `parser`,
+1 harness test covering the 39 test262 fixtures) with `cargo fmt --all --check` and
 `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 **Remaining in Phase 6:**
@@ -986,19 +986,37 @@ bound via `IteratorBindingInitialization`:
   bind (spec steps 58-79), so defaults can reference `arguments`; the `arguments`-name
   conflicts (`arguments` param, `var arguments`, top-level `function arguments`) match the
   spec's `argumentsObjNeeded` rules.
+- **Classes** (`crates/runtime/src/class.rs`, ClassDefinitionEvaluation 15.7.14):
+  declarations and expressions bind the class name in a fresh class environment; the heritage
+  is evaluated there (`extends` requires a constructor or null; the prototype inherits
+  `superclass.prototype`); the constructor is instantiated via
+  `instantiate_class_constructor` ([[IsClassConstructor]], no `prototype` until
+  MakeConstructor), default constructors are synthesized (base `constructor() {}`; derived
+  forwards the arguments to `super` *without* the iterator protocol per spec step 23),
+  [[ConstructorKind]] is derived when a heritage is present, and the class `prototype` is
+  non-writable with a `constructor` back-reference. Instance methods/getters/setters land on
+  the prototype and static ones on the constructor (HomeObject = the container), instance
+  fields collect into [[Fields]] and initialize before the constructor body (base) or after
+  `super()` (derived), and static fields/blocks evaluate at definition time with `this` = the
+  constructor.
+- **`super()` and `new.target`** (13.3.5.1, 13.3.5.3): `get_super_constructor` resolves the
+  heritage through the active function env; a SuperCall constructs the superclass with the
+  current newTarget, binds the result as `this` (TDZ before the call), and initializes the
+  derived fields; `new.target` reads the function env's [[NewTarget]]. Base constructors
+  create `this` from `newTarget.prototype` and initialize fields before the body; derived
+  constructors reject non-object/non-undefined returns.
 
-Tests: 21 runtime function tests (calls, hoisting, closures/recursion, `this` modes,
-`arguments` mapping and name conflicts, constructors, NFE names, arrows, empty completions,
-defaults referencing earlier params/TDZ/`arguments`, rest params, destructured params,
-destructuring declarations and `for` heads, name inference, per-iteration captures, object
-methods/accessors, super property access) — 108 in `runtime`, 44 in `parser`; 14 function
-fixtures (8 passing `dflt-params-*`/`rest-params-*`, 4 early-error/parse, 2 `arguments`-conflict,
-plus object-method defaults/trailing-comma) — **35 fixtures total**; the
-`scope-param-rest-elem-var-*` and super fixtures wait on builtins (`Array.prototype[@@iterator]`,
-`Object.*`). Workspace runs **340 tests** with fmt and clippy (`-D warnings`) clean.
+Tests: 24 runtime function tests (…, object methods/accessors, super property access, class
+constructors/default constructors, class methods/accessors/fields/static blocks, inheritance
+with `super()`/`super.m()`, derived-return rules, `new.target`) — 111 in `runtime`, 44 in
+`parser`; 18 fixtures (…, object-method and class-method defaults/trailing-comma) —
+**39 fixtures total**; the `scope-param-rest-elem-var-*`, super, and class `Object.*`-based
+fixtures wait on builtins (`Array.prototype[@@iterator]`, `Object.*`, `Function.prototype`).
+Workspace runs **343 tests** with fmt and clippy (`-D warnings`) clean.
 
-**Remaining in Phase 7 (functions):** the `Function.prototype` intrinsic and the constructor
-builtin (Phase 8 bootstrap); generators/async/classes/modules/promises as listed below.
+**Remaining in Phase 7 (functions):** class private names/fields, then the `Function.prototype`
+intrinsic and the constructor builtin (Phase 8 bootstrap); generators/async/modules/promises
+as listed below.
 
 ---
 
