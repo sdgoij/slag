@@ -1655,6 +1655,47 @@ basic ops + key-type errors, iterator `.return()`/close paths on early exit.
 **Exit criteria:** `built-ins/Map`, `built-ins/Set`, `built-ins/WeakMap`, `built-ins/WeakSet`
 passing (except Weak*-collection-dependent tests until the GC milestone).
 
+**Status (complete):** the four keyed-collection built-ins landed
+(`builtins/keyed.rs`, spec ch. 24):
+
+- **Map:** constructor (NewTarget required, `AddEntriesFromIterable` with `IfAbruptCloseIterator`
+  around every Get/adder step), prototype (`clear`/`delete`/`entries`/`forEach`/`get`/
+  `getOrInsert`/`getOrInsertComputed`/`has`/`keys`/`set`/`values` + `size` getter,
+  `@@iterator` = `entries`, `@@toStringTag`), `Map.groupBy` (GroupBy with ~collection~
+  key coercion + canonicalization), `@@species`. Keys use SameValue after
+  CanonicalizeKeyedCollectionKey (-0→+0); `[[MapData]]` is a `Vec<Option<…>>` where `None`
+  is the ~empty~ deleted slot, preserved for suspended iterators.
+- **Map iterator:** `%MapIteratorPrototype%` (next + `@@toStringTag`) with key/value/
+  key+value kinds; a forward scan with the count refreshed after each yield, so deleted
+  entries are skipped and entries added during iteration are visited (spec 24.1.6).
+- **Set:** constructor, prototype (`add`/`clear`/`delete`/`entries`/`forEach`/`has`/`keys`
+  (alias of `values`)/`values` + `size`), `@@iterator` = `values`; `%SetIteratorPrototype%`.
+  The ES2025 set-methods (`union`/`intersection`/`difference`/`symmetricDifference`/
+  `isSubsetOf`/`isSupersetOf`/`isDisjointFrom`) implement GetSetRecord (`size`/`has`/`keys`,
+  NaN size → TypeError, negative → RangeError), scan the smaller side, iterate `other` via
+  GetIteratorFromMethod, and build the result via `OrdinaryObjectCreate(%Set.prototype%)`
+  with the computed `[[SetData]]` (the vendored spec's non-species result creation).
+- **WeakMap/WeakSet:** constructors + prototype ops; keys must be Object or a Symbol with
+  no global-registry entry (`CanBeHeldWeakly`: `Symbol.for` symbols are rejected).
+  `getOrInsert`/`getOrInsertComputed` run the callback only on a miss and re-scan after
+  it (the map may have changed). Entries are never collected (Rc model, Phase 18).
+- **test262 harness:** `assert` is now the callable bare function with the helper methods
+  attached (real assert.js shape), so fixtures calling `assert(x)` directly work; the
+  `assert.throws` prelude tolerates the harness's prototype-less Test262Error instances.
+- **Parser fix (engine gap):** `can_start_expression` now accepts the `true`/`false`/`null`
+  keyword tokens, so `return true` (and similar) parse in function bodies.
+
+**test262 fixtures:** scanner run over the four directories — **Map 136 pass / 6 fail,
+Set 233 pass / 9 fail, WeakMap 109 pass / 2 fail, WeakSet 63 pass / 2 fail** (541 total,
+including all six ES2025 set-methods and `Map.groupBy`). The 19 remaining failures are
+pre-existing gaps: `$262`-using realm fixtures, object literals with symbol computed keys
+(parser), and `Object.getPrototypeOf(f) === Function.prototype` (the Function/Object value
+identity). Registered one `#[test]` each. The workspace now runs **1875 tests** (1333 of them
+test262 fixtures) with fmt and clippy (`-D warnings`) clean.
+
+**Pending:** `$262`/`detachArrayBuffer` harness support, symbol-keyed object literals, the
+Function/Object identity fix, and GC-dependent Weak-* behavior (Phase 18).
+
 ---
 
 ### Phase 14 — Structured data: ArrayBuffer, SharedArrayBuffer, DataView, Atomics, JSON

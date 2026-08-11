@@ -287,6 +287,9 @@ pub(crate) fn can_start_expression(kind: TokenKind) -> bool {
                     | Keyword::Void
                     | Keyword::Typeof
                     | Keyword::Import
+                    | Keyword::True
+                    | Keyword::False
+                    | Keyword::Null
             ),
         },
         TokenKind::NullLiteral

@@ -23,6 +23,13 @@ use crate::realm::{Realm, initialize_host_defined_realm};
 
 static NEXT_AGENT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// One entry of a Map/WeakMap `[[*Data]]` List: `None` is the ~empty~
+/// (deleted) slot, `Some((key, value))` a live entry.
+pub type MapEntry = Option<(Value, Value)>;
+
+/// One element of a Set/WeakSet `[[*Data]]` List.
+pub type SetEntry = Option<Value>;
+
 /// The surrounding agent: the execution context stack, the job queues, and
 /// the Agent Record fields of spec 9.7.
 #[derive(Debug)]
@@ -145,6 +152,26 @@ pub struct Agent {
     /// buffers as the TypedArray backing store; the full ArrayBuffer builtin
     /// joins in Phase 14.
     pub buffer_data: std::collections::HashMap<u64, (crux::typed_array::SharedBuffer, usize)>,
+    /// The [[MapData]] of Map instances, keyed by object identity (spec
+    /// 24.1.1: a List of entries; `None` marks a deleted ~empty~ slot that
+    /// suspended Map iterators skip).
+    pub map_data: std::collections::HashMap<u64, RefCell<Vec<MapEntry>>>,
+    /// The [[SetData]] of Set instances, keyed by object identity (spec
+    /// 24.2.1; `None` is a deleted ~empty~ slot).
+    pub set_data: std::collections::HashMap<u64, RefCell<Vec<SetEntry>>>,
+    /// The [[WeakMapData]] of WeakMap instances, keyed by object identity
+    /// (spec 26.3.1; the Rc model never collects the keys, Phase 18).
+    pub weak_map_data: std::collections::HashMap<u64, RefCell<Vec<MapEntry>>>,
+    /// The [[WeakSetData]] of WeakSet instances, keyed by object identity
+    /// (spec 26.4.1).
+    pub weak_set_data: std::collections::HashMap<u64, RefCell<Vec<SetEntry>>>,
+    /// The [[IteratedMap]], [[MapNextIndex]], and [[MapIterationKind]] of Map
+    /// iterators, keyed by iterator-object identity (spec 24.1.6). The map
+    /// value is `None` once iteration is done.
+    pub map_iter_data: std::collections::HashMap<u64, RefCell<(Option<Value>, usize, u8)>>,
+    /// The [[IteratedSet]], [[SetNextIndex]], and [[SetIterationKind]] of Set
+    /// iterators, keyed by iterator-object identity (spec 24.2.6).
+    pub set_iter_data: std::collections::HashMap<u64, RefCell<(Option<Value>, usize, u8)>>,
 }
 
 impl Agent {
@@ -191,6 +218,12 @@ impl Agent {
             array_iter_data: std::collections::HashMap::new(),
             array_from_async: std::collections::HashMap::new(),
             buffer_data: std::collections::HashMap::new(),
+            map_data: std::collections::HashMap::new(),
+            set_data: std::collections::HashMap::new(),
+            weak_map_data: std::collections::HashMap::new(),
+            weak_set_data: std::collections::HashMap::new(),
+            map_iter_data: std::collections::HashMap::new(),
+            set_iter_data: std::collections::HashMap::new(),
         }
     }
 

@@ -11,6 +11,7 @@ pub mod date;
 pub mod error;
 pub mod function;
 pub mod global;
+pub mod keyed;
 pub mod math;
 pub mod number;
 pub mod object;
