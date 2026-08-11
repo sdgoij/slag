@@ -213,13 +213,17 @@ fn generator_resume(agent: &mut Agent, this: &Value, completion: Resume) -> Resu
             "GeneratorResume called on a non-generator".into(),
         )
     })?;
-    if state.borrow().flag == GeneratorFlag::Executing {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "Generator is already running".into(),
-        ));
-    }
-    let flag = state.borrow().flag;
+    // A re-entrant `next()` during execution borrows the state mutably; the
+    // spec's "already running" TypeError (27.4.3.2 step 4) must not panic.
+    let flag = match state.try_borrow() {
+        Ok(state) => state.flag,
+        Err(_) => {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "Generator is already running".into(),
+            ));
+        }
+    };
     match flag {
         GeneratorFlag::Completed => iterator_result(agent, Value::Undefined, true),
         GeneratorFlag::Executing => Err(JsError::new(
@@ -227,12 +231,28 @@ fn generator_resume(agent: &mut Agent, this: &Value, completion: Resume) -> Resu
             "Generator is already running".into(),
         )),
         GeneratorFlag::SuspendedStart => {
-            let mut state = state.borrow_mut();
+            let mut state = match state.try_borrow_mut() {
+                Ok(state) => state,
+                Err(_) => {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "Generator is already running".into(),
+                    ));
+                }
+            };
             state.flag = GeneratorFlag::Executing;
             start_body(agent, &mut state, completion)
         }
         GeneratorFlag::SuspendedYield => {
-            let mut state = state.borrow_mut();
+            let mut state = match state.try_borrow_mut() {
+                Ok(state) => state,
+                Err(_) => {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "Generator is already running".into(),
+                    ));
+                }
+            };
             state.flag = GeneratorFlag::Executing;
             resume_body(agent, &mut state, completion)
         }
@@ -257,7 +277,17 @@ fn generator_resume_abrupt(
             "GeneratorResumeAbrupt called on a non-generator".into(),
         )
     })?;
-    let flag = state.borrow().flag;
+    // A re-entrant `next` during execution borrows the state mutably; throw
+    // the spec's "already running" TypeError instead of panicking.
+    let flag = match state.try_borrow() {
+        Ok(state) => state.flag,
+        Err(_) => {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "Generator is already running".into(),
+            ));
+        }
+    };
     match flag {
         GeneratorFlag::Executing => Err(JsError::new(
             ErrorKind::TypeError,
@@ -267,7 +297,15 @@ fn generator_resume_abrupt(
         GeneratorFlag::SuspendedStart => {
             // The body never ran: complete immediately with the abrupt
             // completion (spec 27.4.3.4 step 5).
-            let mut state = state.borrow_mut();
+            let mut state = match state.try_borrow_mut() {
+                Ok(state) => state,
+                Err(_) => {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "Generator is already running".into(),
+                    ));
+                }
+            };
             state.flag = GeneratorFlag::Completed;
             match completion {
                 Resume::Return(value) => iterator_result(agent, value, true),
@@ -280,7 +318,15 @@ fn generator_resume_abrupt(
             }
         }
         GeneratorFlag::SuspendedYield => {
-            let mut state = state.borrow_mut();
+            let mut state = match state.try_borrow_mut() {
+                Ok(state) => state,
+                Err(_) => {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "Generator is already running".into(),
+                    ));
+                }
+            };
             state.flag = GeneratorFlag::Executing;
             resume_body(agent, &mut state, completion)
         }

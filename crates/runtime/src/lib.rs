@@ -10,6 +10,7 @@
 
 pub mod agent;
 pub mod async_await;
+pub mod async_generator;
 pub mod binding;
 pub mod builtins;
 pub mod class;

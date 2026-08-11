@@ -61,9 +61,23 @@ pub fn parse_module(source: &str) -> Result<Module, JsError> {
 /// assembles for `new Function(...)`. The expression must be fully consumed and
 /// the function's early errors apply.
 pub fn parse_function(source: &str) -> Result<syntax::ast::Function, JsError> {
+    parse_function_with_async(source, false)
+}
+
+/// Like `parse_function`, for the `async function` / `async function*` forms
+/// CreateDynamicFunction assembles for the AsyncFunction and
+/// AsyncGeneratorFunction constructors; `is_async` consumes the leading
+/// `async` keyword.
+pub fn parse_function_with_async(
+    source: &str,
+    is_async: bool,
+) -> Result<syntax::ast::Function, JsError> {
     let source = SourceText::from_utf8(source);
     let mut parser = Parser::new(&source, true);
-    let expr = expr::parse_function_expression(&mut parser, false)?;
+    if is_async {
+        parser.next()?; // `async`
+    }
+    let expr = expr::parse_function_expression(&mut parser, is_async)?;
     let tok = parser.peek()?.clone();
     if tok.kind != syntax::TokenKind::Eof {
         return Err(parser.unexpected(&tok));

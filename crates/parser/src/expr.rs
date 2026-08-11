@@ -61,7 +61,10 @@ pub(crate) fn parse_assignment(parser: &mut Parser, allow_in: bool) -> Result<Ex
         match next_kind {
             TokenKind::Identifier(atom) if from_identifier(atom) == Some(Keyword::Function) => {
                 parser.next()?; // `async`
-                return parse_function_expression(parser, true);
+                // FunctionExpression is a PrimaryExpression, so the member/
+                // call chain continues (`async function () {}.constructor`).
+                let function = parse_function_expression(parser, true)?;
+                return parse_subscripts(parser, function, false);
             }
             TokenKind::Identifier(atom) if is_binding_identifier(parser, atom) => {
                 // `async x => …`

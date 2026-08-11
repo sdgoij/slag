@@ -182,7 +182,37 @@ fn set_default_global_bindings(realm: &Handle<Realm>) -> Result<(), JsError> {
     crate::builtins::json::install(realm)?;
     crate::builtins::promise::install(realm)?;
     crate::generator::install(realm)?;
+    crate::builtins::async_iterator::install(realm)?;
+    crate::async_generator::install(realm)?;
+    crate::builtins::async_function::install(realm)?;
     crate::builtins::weakref::install(realm)?;
+    crate::builtins::iterator::install(realm)?;
+    crate::builtins::async_iterator::install(realm)?;
+    crate::builtins::disposable::install(realm)?;
+    // ES2022+: every built-in iterator prototype object inherits
+    // %Iterator.prototype%, which installs after them. Re-parent them now
+    // that the whole table is populated.
+    if let Some(iterator_proto) = realm
+        .intrinsics
+        .get("%Iterator.prototype%")
+        .and_then(|value| as_object(&value))
+    {
+        for name in [
+            "%ArrayIteratorPrototype%",
+            "%StringIteratorPrototype%",
+            "%MapIteratorPrototype%",
+            "%SetIteratorPrototype%",
+            "%RegExpStringIteratorPrototype%",
+        ] {
+            if let Some(proto) = realm
+                .intrinsics
+                .get(name)
+                .and_then(|value| as_object(&value))
+            {
+                proto.set_prototype_of(Some(iterator_proto.clone()))?;
+            }
+        }
+    }
     // spec 10.3.1: every built-in function object's [[Prototype]] is
     // %Function.prototype%. Link all intrinsic-registered functions now that
     // the table is full; %Function.prototype% itself keeps %Object.prototype%

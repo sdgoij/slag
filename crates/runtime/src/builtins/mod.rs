@@ -6,14 +6,18 @@
 
 pub mod array;
 pub mod array_buffer;
+pub mod async_function;
+pub mod async_iterator;
 pub mod atomics;
 pub mod bigint;
 pub mod boolean;
 pub mod dataview;
 pub mod date;
+pub mod disposable;
 pub mod error;
 pub mod function;
 pub mod global;
+pub mod iterator;
 pub mod json;
 pub mod keyed;
 pub mod math;

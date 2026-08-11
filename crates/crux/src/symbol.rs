@@ -34,7 +34,9 @@ impl Symbol {
 /// process-wide singletons instead, which is unobservable until the Symbol
 /// built-in lands in Phase 8.
 pub const WELL_KNOWN_SYMBOLS: &[&str] = &[
+    "asyncDispose",
     "asyncIterator",
+    "dispose",
     "hasInstance",
     "isConcatSpreadable",
     "iterator",

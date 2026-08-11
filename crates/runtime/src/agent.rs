@@ -89,6 +89,67 @@ pub struct Agent {
     /// The generator objects' states, keyed by object identity (spec 27.4.3).
     pub generators:
         std::collections::HashMap<u64, std::rc::Rc<RefCell<crate::generator::GeneratorState>>>,
+    /// The async generator objects' states, keyed by object identity (spec
+    /// 27.6.1).
+    pub async_generators: std::collections::HashMap<
+        u64,
+        std::rc::Rc<RefCell<crate::async_generator::AsyncGeneratorState>>,
+    >,
+    /// The await-resume handlers of async generator bodies, keyed by function
+    /// identity.
+    pub async_generator_awaits: std::collections::HashMap<
+        u64,
+        std::rc::Rc<crate::async_generator::AsyncGeneratorAwaitEntry>,
+    >,
+    /// The thenable-unwrap handlers of AsyncGeneratorResolve, keyed by
+    /// function identity; the bool is the `done` flag of the result.
+    pub async_generator_resolvers:
+        std::collections::HashMap<u64, (crate::promise::PromiseCapability, bool)>,
+    /// The iterator-helper objects' states, keyed by object identity (spec
+    /// 27.1.3).
+    pub iterator_helpers: std::collections::HashMap<
+        u64,
+        std::rc::Rc<RefCell<crate::builtins::iterator::HelperState>>,
+    >,
+    /// The wrapped iterators created by `Iterator.from`, keyed by object
+    /// identity (spec 27.1.3.2).
+    pub wrapped_iterators: std::collections::HashMap<
+        u64,
+        std::rc::Rc<RefCell<crate::builtins::iterator::WrappedIteratorState>>,
+    >,
+    /// The async-iterator-helper objects' states, keyed by object identity
+    /// (spec 27.1.4).
+    pub async_iterator_helpers: std::collections::HashMap<
+        u64,
+        std::rc::Rc<RefCell<crate::builtins::async_iterator::HelperState>>,
+    >,
+    /// The await continuations of async-iterator helper drivers, keyed by
+    /// function identity.
+    pub async_iterator_awaits:
+        std::collections::HashMap<u64, std::rc::Rc<crate::builtins::async_iterator::AwaitEntry>>,
+    /// The drivers of eager async-iterator helpers, keyed by driver-object
+    /// identity.
+    pub async_iterator_eager: std::collections::HashMap<
+        u64,
+        std::rc::Rc<RefCell<crate::builtins::async_iterator::EagerState>>,
+    >,
+    /// The capability of the in-flight `next()` of each lazy async-iterator
+    /// helper, keyed by helper-object identity.
+    pub async_iterator_pending: std::collections::HashMap<u64, crate::promise::PromiseCapability>,
+    /// The [[DisposableStackData]] of DisposableStack/AsyncDisposableStack
+    /// instances, keyed by object identity (spec 27.4.2).
+    pub disposable_stacks:
+        std::collections::HashMap<u64, RefCell<crate::builtins::disposable::DisposableStackData>>,
+    /// The in-flight `disposeAsync` drivers, keyed by driver-object identity.
+    pub disposable_async_drivers: std::collections::HashMap<
+        u64,
+        std::rc::Rc<RefCell<crate::builtins::disposable::AsyncDisposalDriver>>,
+    >,
+    /// The capability of each in-flight `disposeAsync`, keyed by driver
+    /// identity.
+    pub disposable_async_caps: std::collections::HashMap<u64, crate::promise::PromiseCapability>,
+    /// The `disposeAsync` continuations, keyed by function identity.
+    pub disposable_async_cont: std::collections::HashMap<u64, u64>,
     /// Host-provided module sources, keyed by specifier (HostResolveImportedModule).
     pub host_modules:
         RefCell<std::collections::HashMap<crux::string::JsString, crate::module::HostModuleSource>>,
@@ -210,6 +271,19 @@ impl Agent {
             async_resume: std::collections::HashMap::new(),
             async_from_sync: std::collections::HashMap::new(),
             generators: std::collections::HashMap::new(),
+            async_generators: std::collections::HashMap::new(),
+            async_generator_awaits: std::collections::HashMap::new(),
+            async_generator_resolvers: std::collections::HashMap::new(),
+            iterator_helpers: std::collections::HashMap::new(),
+            wrapped_iterators: std::collections::HashMap::new(),
+            async_iterator_helpers: std::collections::HashMap::new(),
+            async_iterator_awaits: std::collections::HashMap::new(),
+            async_iterator_eager: std::collections::HashMap::new(),
+            async_iterator_pending: std::collections::HashMap::new(),
+            disposable_stacks: std::collections::HashMap::new(),
+            disposable_async_drivers: std::collections::HashMap::new(),
+            disposable_async_caps: std::collections::HashMap::new(),
+            disposable_async_cont: std::collections::HashMap::new(),
             host_modules: RefCell::new(std::collections::HashMap::new()),
             module_namespaces: std::collections::HashMap::new(),
             import_namespace_resolvers: std::collections::HashMap::new(),

@@ -1901,6 +1901,64 @@ errors → `SuppressedError`, async disposal awaiting).
 `built-ins/DisposableStack`, `built-ins/AsyncDisposableStack` at high pass rates; test262
 ≥ 80–85%.
 
+**Status (complete):**
+
+- **Iterator** (`builtins/iterator.rs`): the `Iterator` ctor (call/construct throw), the
+  prototype helpers — lazy `map`/`filter`/`take`/`drop`/`flatMap`/`chunks`/`windows`
+  (iterator-helper objects on `%IteratorHelper.prototype%` with `next`/`return` closing the
+  underlying, `take` closing on limit exhaustion), eager `every`/`some`/`find`/`forEach`/
+  `reduce`/`toArray`/`includes`/`join` (iterating directly, closing on short-circuit) — plus
+  `toAsync` (AsyncFromSyncIterator), `Symbol.dispose` (IteratorClose), the `@@iterator`
+  self-return, `@@toStringTag`, and the accessor `constructor` with
+  SetterThatIgnoresPrototypeProperties. Statics: `from` (GetIteratorFlattenable with the
+  `%WrapForValidIterator%` flat-iterable wrap), `concat` (close-on-completion), `zip`/
+  `zipKeyed` (shortest/longest modes with `remainder`).
+- **AsyncIterator** (`builtins/async_iterator.rs`): `%AsyncIterator.prototype%` with
+  `@@asyncIterator`, `@@asyncDispose` (promise-returning IteratorClose), `@@toStringTag =
+  "Async Iterator"`, and the helper surface (lazy helpers return async-iterator-helper objects
+  whose `next()` returns a promise; eager helpers return promises) driven by promise
+  continuations. `%AsyncGenerator.prototype%` inherits it.
+- **Generator/AsyncFunction constructors** (`builtins/async_function.rs` + `async_generator.rs`):
+  `GeneratorFunction`/`AsyncFunction`/`AsyncGeneratorFunction` via CreateDynamicFunction
+  (assembled source + `parse_function_with_async`), with the right prototype objects
+  (`%GeneratorFunction.prototype%.prototype` = `%Generator.prototype%`, `@@toStringTag`s) and
+  `%Function%` [[Prototype]]; not global bindings. Generator/async functions are not
+  constructors ([[Construct]] throws); async functions have no `prototype`; generator
+  prototypes inherit the generator prototypes. `set_function_prototype` now picks the intrinsic
+  per kind, so `Object.getPrototypeOf(function*(){})` is `%GeneratorFunction.prototype%` etc.
+- **Async generators** (`async_generator.rs`): the request queue (`next`/`return`/`throw`),
+  `return()`-while-executing → awaiting-return, thenable-unwrapped AsyncGeneratorResolve,
+  await continuations, and context/Vm save-restore across suspensions. `call_async_generator`
+  returns the AsyncGenerator object; `%AsyncGenerator.prototype%` has `next`/`return`/`throw`,
+  `@@asyncIterator`, `@@toStringTag = "Async Generator"`.
+- **Promise completion** (`builtins/promise.rs`): `%Promise.prototype%[@@toStringTag] =
+  "Promise"` and `%Promise%[@@species]`; the combinators now attach per-element handlers via
+  `Invoke(nextPromise, "then", …)` instead of the internal PerformPromiseThen, so custom
+  constructors' thenables and overridden `then` methods behave per spec (this also fixed an
+  infinite-iterator hang when `then` throws).
+- **DisposableStack/AsyncDisposableStack** (`builtins/disposable.rs`): `adopt`/`defer`/
+  `use`/`dispose`/`disposeAsync`/`move` + the `disposed` accessor + `Symbol.dispose`/
+  `Symbol.asyncDispose` + `@@toStringTag`s. Disposal runs resources in reverse order with
+  `SuppressedError` chains for multiple failures; `disposeAsync` awaits async results through
+  promise continuations.
+- **Iterators inherit `%Iterator.prototype%`** (spec 2022+): the built-in iterator prototypes
+  (`%ArrayIteratorPrototype%` and friends) are re-parented after install, so
+  `[1,2].values().map(…)` and friends work on every built-in iterator.
+- **Fixes:** generator `next()`/`throw()`/`return()` re-entrancy now throws the spec's
+  "already running" TypeError instead of panicking on the RefCell; the parser chains member/
+  call subscripts after `async function` expressions (`async function () {}.constructor`).
+
+**test262 fixtures:** scanner run over the eleven directories — **Iterator 207 pass,
+AsyncIteratorPrototype 7, GeneratorFunction 18, AsyncGeneratorFunction 14,
+AsyncGeneratorPrototype 11, AsyncFunction 15, GeneratorPrototype 49,
+AsyncFromSyncIteratorPrototype 1, DisposableStack 79, AsyncDisposableStack 64, Promise 131**
+(596 registered). The workspace now runs **3832 tests** (3273 of them test262 fixtures) with
+fmt and clippy (`-D warnings`) clean. Most remaining failures in the async dirs are
+`flags: async` fixtures the harness skips until async fixture running lands.
+
+**Pending:** `Reflect`/`Proxy` (Phase 16), `$262.createRealm`, async-flagged fixture running,
+and the async-iterator/async-generator ordering edge cases.
+
 ---
 
 ### Phase 16 — Reflection: Proxy and Reflect

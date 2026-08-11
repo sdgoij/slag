@@ -142,6 +142,17 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     install_methods(&promise_proto)?;
     install_statics(&promise_ctor)?;
 
+    // %Promise.prototype%[@@toStringTag] = "Promise" (spec 27.2.5.5) and
+    // %Promise%[@@species] (spec 27.2.4.6).
+    promise_proto.define_property_key(
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyDescriptor::none(Value::String(Handle::new(JsString::from_utf8("Promise")))),
+    )?;
+    promise_ctor.define_property_key(
+        &PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone()),
+        &PropertyDescriptor::none(promise_ctor_value.clone()),
+    )?;
+
     realm.global_object.define_property_or_throw(
         &JsString::from_utf8("Promise"),
         &PropertyDescriptor {
@@ -540,6 +551,28 @@ fn promise_static_reject(
     Ok(capability.promise)
 }
 
+/// Invoke(nextPromise, "then", «onFulfilled, onRejected») (spec
+/// 27.2.4.x): attach the combinator's element handlers through the value's
+/// own `then` method, so custom constructors' thenables and overridden
+/// `then` methods behave per spec (PerformPromiseThen cannot reach them).
+fn invoke_then(
+    agent: &mut Agent,
+    next_promise: &Value,
+    on_fulfilled: Option<Value>,
+    on_rejected: Option<Value>,
+) -> Result<(), JsError> {
+    let then = crate::context::get_property(
+        agent,
+        next_promise,
+        &JsString::from_utf8("then"),
+        next_promise.clone(),
+    )?;
+    let fulfilled = on_fulfilled.unwrap_or(Value::Undefined);
+    let rejected = on_rejected.unwrap_or(Value::Undefined);
+    crate::function::call(agent, &then, next_promise.clone(), &[fulfilled, rejected])?;
+    Ok(())
+}
+
 /// Promise.all (spec 27.2.4.2.1).
 fn promise_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let capability = new_promise_capability(agent, this)?;
@@ -603,13 +636,17 @@ fn promise_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
                 index,
             })),
         );
-        perform_promise_then(
+        if let Err(error) = invoke_then(
             agent,
             &next_promise,
             Some(Value::Function(closure)),
             Some(capability.reject.clone()),
-            None,
-        )?;
+        ) {
+            crate::expr::iterator_close(agent, &iterator)?;
+            let rejection = error_value(agent, &error);
+            crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
+            return Ok(capability.promise);
+        }
         *remaining.borrow_mut() += 1;
         index += 1;
     }
@@ -700,6 +737,7 @@ fn promise_all_settled(agent: &mut Agent, this: &Value, args: &[Value]) -> Resul
         results.borrow_mut().push(Value::Undefined);
         let next_promise =
             crate::function::call(agent, &promise_resolve_fn, this.clone(), &[next])?;
+        let mut handlers = Vec::new();
         for fulfilled in [true, false] {
             let closure = Function::create_builtin(
                 Some(JsString::from_utf8("")),
@@ -718,12 +756,15 @@ fn promise_all_settled(agent: &mut Agent, this: &Value, args: &[Value]) -> Resul
                     index,
                 })),
             );
-            let (on_fulfilled, on_rejected) = if fulfilled {
-                (Some(Value::Function(closure)), None)
-            } else {
-                (None, Some(Value::Function(closure)))
-            };
-            perform_promise_then(agent, &next_promise, on_fulfilled, on_rejected, None)?;
+            handlers.push((fulfilled, Value::Function(closure)));
+        }
+        let on_fulfilled = handlers.iter().find(|(f, _)| *f).map(|(_, v)| v.clone());
+        let on_rejected = handlers.iter().find(|(f, _)| !*f).map(|(_, v)| v.clone());
+        if let Err(error) = invoke_then(agent, &next_promise, on_fulfilled, on_rejected) {
+            crate::expr::iterator_close(agent, &iterator)?;
+            let rejection = error_value(agent, &error);
+            crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
+            return Ok(capability.promise);
         }
         *remaining.borrow_mut() += 1;
         index += 1;
@@ -834,6 +875,7 @@ fn promise_any(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
         errors.borrow_mut().push(Value::Undefined);
         let next_promise =
             crate::function::call(agent, &promise_resolve_fn, this.clone(), &[next])?;
+        let mut handlers = Vec::new();
         for fulfilled in [true, false] {
             let closure = Function::create_builtin(
                 Some(JsString::from_utf8("")),
@@ -853,12 +895,15 @@ fn promise_any(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
                     index,
                 })),
             );
-            let (on_fulfilled, on_rejected) = if fulfilled {
-                (Some(Value::Function(closure)), None)
-            } else {
-                (None, Some(Value::Function(closure)))
-            };
-            perform_promise_then(agent, &next_promise, on_fulfilled, on_rejected, None)?;
+            handlers.push((fulfilled, Value::Function(closure)));
+        }
+        let on_fulfilled = handlers.iter().find(|(f, _)| *f).map(|(_, v)| v.clone());
+        let on_rejected = handlers.iter().find(|(f, _)| !*f).map(|(_, v)| v.clone());
+        if let Err(error) = invoke_then(agent, &next_promise, on_fulfilled, on_rejected) {
+            crate::expr::iterator_close(agent, &iterator)?;
+            let rejection = error_value(agent, &error);
+            crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
+            return Ok(capability.promise);
         }
         *remaining.borrow_mut() += 1;
         index += 1;
@@ -954,13 +999,17 @@ fn promise_race(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
         };
         let next_promise =
             crate::function::call(agent, &promise_resolve_fn, this.clone(), &[next])?;
-        perform_promise_then(
+        if let Err(error) = invoke_then(
             agent,
             &next_promise,
             Some(capability.resolve.clone()),
             Some(capability.reject.clone()),
-            None,
-        )?;
+        ) {
+            crate::expr::iterator_close(agent, &iterator)?;
+            let rejection = error_value(agent, &error);
+            crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
+            return Ok(capability.promise);
+        }
     }
 }
 

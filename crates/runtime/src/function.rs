@@ -203,9 +203,13 @@ pub fn set_function_name(
 }
 
 /// MakeConstructor (spec 10.2.5): the `prototype` property with a
-/// `constructor` back-reference. Arrows and methods skip this.
-fn make_constructor(function: &Handle<Function>) -> Result<(), JsError> {
-    let prototype = JsObject::ordinary_object_create(None);
+/// `constructor` back-reference on the supplied prototype object. Arrows and
+/// methods skip this; async functions never have a `prototype`.
+fn make_constructor(
+    function: &Handle<Function>,
+    prototype: Handle<JsObject>,
+    writable: bool,
+) -> Result<(), JsError> {
     prototype.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
@@ -221,7 +225,7 @@ fn make_constructor(function: &Handle<Function>) -> Result<(), JsError> {
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
             value: Some(Value::Object(prototype)),
-            writable: Some(false),
+            writable: Some(writable),
             get: None,
             set: None,
             enumerable: Some(false),
@@ -469,8 +473,27 @@ fn register_function(
     let function = Function::new(name.clone());
     agent.ecma_functions.insert(function.id(), data);
     set_function_properties(&function, &params, name.as_ref())?;
-    if !kind.is_method {
-        make_constructor(&function)?;
+    // Plain async functions are never constructors and have no `prototype`;
+    // generator and async-generator functions get a `prototype` that inherits
+    // %Generator.prototype% / %AsyncGenerator.prototype%, writable per
+    // MakeConstructor's default.
+    if !kind.is_method && !(kind.is_async && !kind.is_generator) {
+        let prototype = if kind.is_generator {
+            let intrinsic = if kind.is_async {
+                "%AsyncGenerator.prototype%"
+            } else {
+                "%Generator.prototype%"
+            };
+            let proto = agent
+                .current_realm()?
+                .intrinsics
+                .get(intrinsic)
+                .and_then(|value| crate::context::as_object(&value));
+            JsObject::ordinary_object_create(proto)
+        } else {
+            JsObject::ordinary_object_create(None)
+        };
+        make_constructor(&function, prototype, true)?;
     }
     set_function_prototype(agent, &function)?;
     Ok(Value::Function(function))
@@ -488,13 +511,21 @@ fn capture_source(agent: &Agent, span: crux::Span) -> Option<JsString> {
     Some(JsString::from_utf16(&source.as_slice()[start..end]))
 }
 
-/// OrdinaryFunctionCreate step: `F.[[Prototype]]` is %Function.prototype%
-/// once the Function builtins install it.
+/// OrdinaryFunctionCreate step: `F.[[Prototype]]` is the intrinsic prototype
+/// of the function's kind — %Function.prototype% for ordinary functions,
+/// %GeneratorFunction.prototype% / %AsyncFunction.prototype% /
+/// %AsyncGeneratorFunction.prototype% for the resumable kinds.
 fn set_function_prototype(agent: &Agent, function: &Handle<Function>) -> Result<(), JsError> {
+    let intrinsic = match agent.ecma_functions.get(&function.id()) {
+        Some(data) if data.is_generator && data.is_async => "%AsyncGeneratorFunction.prototype%",
+        Some(data) if data.is_generator => "%GeneratorFunction.prototype%",
+        Some(data) if data.is_async => "%AsyncFunction.prototype%",
+        _ => "%Function.prototype%",
+    };
     let proto = agent
         .current_realm()?
         .intrinsics
-        .get("%Function.prototype%")
+        .get(intrinsic)
         .and_then(|value| crate::context::as_object(&value));
     function.object.set_prototype_of(proto)?;
     Ok(())
@@ -539,7 +570,9 @@ pub fn instantiate_function_expression(
 /// ordinary sloppy function whose [[Prototype]] comes from
 /// GetPrototypeFromConstructor and whose environment is the global one.
 /// `parser::parse_function` already named it `anonymous` and checked the
-/// early errors.
+/// early errors. The async/generator flags come from the parsed form, so the
+/// GeneratorFunction/AsyncFunction/AsyncGeneratorFunction constructors reuse
+/// this path.
 pub fn instantiate_dynamic_function(
     agent: &mut Agent,
     f: &syntax::ast::Function,
@@ -553,7 +586,7 @@ pub fn instantiate_dynamic_function(
         f.body.clone(),
         environment,
         false,
-        DefinitionKind::function(false, false),
+        DefinitionKind::function(f.is_async, f.is_generator),
         None,
     )?;
     // GetPrototypeFromConstructor wins over the default %Function.prototype%.
@@ -645,6 +678,11 @@ pub fn call(
                     ));
                 }
                 let data = agent.ecma_functions.get(&function.id());
+                if data.is_some_and(|data| data.is_async && data.is_generator) {
+                    return crate::async_generator::call_async_generator(
+                        agent, function, this, args,
+                    );
+                }
                 if data.is_some_and(|data| data.is_async) {
                     return crate::async_await::call_async_function(agent, function, this, args);
                 }
@@ -778,6 +816,43 @@ pub fn call(
                 if let Some(result) = crate::generator::dispatch_call(agent, callee, &this, args) {
                     return result;
                 }
+                if let Some(result) =
+                    crate::async_generator::dispatch_call(agent, callee, &this, args)
+                {
+                    return result;
+                }
+                if let Some(result) = crate::async_generator::dispatch_await(agent, callee, args) {
+                    return result;
+                }
+                if let Some(result) = crate::async_generator::dispatch_resolver(agent, callee, args)
+                {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::builtins::async_function::dispatch_call(agent, callee, &this, args)
+                {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::builtins::iterator::dispatch_call(agent, callee, &this, args)
+                {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::builtins::async_iterator::dispatch_call(agent, callee, &this, args)
+                {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::builtins::disposable::dispatch_call(agent, callee, &this, args)
+                {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::builtins::disposable::dispatch_continuation(agent, callee, args)
+                {
+                    return result;
+                }
                 if let Some(result) = crate::module::dispatch_import_resolver(agent, callee, args) {
                     return result;
                 }
@@ -799,6 +874,18 @@ pub fn construct(
     match callee {
         Value::Function(function) => match &function.kind {
             crux::function::FunctionKind::EcmaScript => {
+                // Generator, async, and async-generator functions have no
+                // [[Construct]] (spec 27.4.2/27.5.2/27.6.2 FunctionAllocate).
+                if agent
+                    .ecma_functions
+                    .get(&function.id())
+                    .is_some_and(|data| data.is_async || data.is_generator)
+                {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "not a constructor".into(),
+                    ));
+                }
                 ordinary_construct(agent, function, args, new_target)
             }
             crux::function::FunctionKind::Bound {
@@ -898,6 +985,21 @@ pub fn construct(
                 }
                 if let Some(result) =
                     crate::builtins::promise::dispatch_construct(agent, callee, args, new_target)
+                {
+                    return result;
+                }
+                if let Some(result) = crate::builtins::async_function::dispatch_construct(
+                    agent, callee, args, new_target,
+                ) {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::builtins::iterator::dispatch_construct(agent, callee, args, new_target)
+                {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::builtins::disposable::dispatch_construct(agent, callee, args, new_target)
                 {
                     return result;
                 }
