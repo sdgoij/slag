@@ -261,26 +261,38 @@ fn object_of(agent: &mut Agent, value: &Value) -> Result<Handle<JsObject>, JsErr
 }
 
 /// Object.prototype.toString (spec 20.1.3.6): `[object Tag]` from the value's
-/// kind (the wrapper objects for primitives arrive with their phases; the tag
-/// table matches the spec regardless). The `@@toStringTag` override joins
-/// with the Symbol builtin.
+/// kind, honoring the `@@toStringTag` override (the Symbol builtin installs
+/// the well-known symbols).
 fn prototype_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     let tag = match this {
-        Value::Undefined => "Undefined",
-        Value::Null => "Null",
-        Value::Boolean(_) => "Boolean",
-        Value::Number(_) => "Number",
-        Value::String(_) => "String",
-        Value::BigInt(_) => "BigInt",
-        Value::Symbol(_) => "Symbol",
-        Value::Function(_) => "Function",
+        Value::Undefined => "Undefined".to_string(),
+        Value::Null => "Null".to_string(),
+        Value::Boolean(_) => "Boolean".to_string(),
+        Value::Number(_) => "Number".to_string(),
+        Value::String(_) => "String".to_string(),
+        Value::BigInt(_) => "BigInt".to_string(),
+        Value::Symbol(_) => "Symbol".to_string(),
+        Value::Function(_) => "Function".to_string(),
         Value::Object(obj) => {
             if agent.boolean_data.contains_key(&obj.id()) {
-                "Boolean"
+                "Boolean".to_string()
             } else if agent.error_data.contains(&obj.id()) {
-                "Error"
+                "Error".to_string()
             } else {
-                obj.kind.name()
+                // spec step 6.c: an own or inherited @@toStringTag string
+                // overrides the built-in tag.
+                let tag = crate::context::get_property_key(
+                    agent,
+                    this,
+                    &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+                    this.clone(),
+                )?;
+                match tag {
+                    Value::String(text) => {
+                        return Ok(str(&format!("[object {}]", text.to_string_lossy())));
+                    }
+                    _ => obj.kind.name().to_string(),
+                }
             }
         }
     };

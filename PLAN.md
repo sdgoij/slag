@@ -1205,6 +1205,23 @@ attribute shape; it grows as later phases add Array/String/Number/etc.
 in Phase 8: `WeakRef`/`FinalizationRegistry` (collection semantics wait on the GC
 milestone).
 
+**`WeakRef`/`FinalizationRegistry`** (`builtins/weakref.rs`): `WeakRef(target)` stores
+`[[WeakRefTarget]]` in the agent's `weak_ref_targets` table; `deref()` returns it (no GC, so
+it never dies — documented in the module, collection semantics join with the GC milestone);
+`new FinalizationRegistry(callback)` stores `[[Cells]]`/`[[CleanupCallback]]`; `register`
+(target object, `heldValue` ≠ target, optional unregister token) appends a cell and
+`unregister` removes by token identity — `HostEnqueueFinalizationRegistryCleanupJob` never
+fires without a collector. Both constructors reject bare calls and non-object targets. 4
+tests.
+
+`Object.prototype.toString` now honors the `@@toStringTag` override (spec 20.1.3.6 step
+6.c), so `[object WeakRef]`/`[object FinalizationRegistry]`/`[object Symbol]` render from
+their prototype tags.
+
+**Phase 8 complete**: Object, Function (exact-source `toString`), Boolean, Symbol, the
+Error family, the global function properties + URI handling, WeakRef/FinalizationRegistry,
+and the global-property completeness check are all landed — 210 runtime tests.
+
 ---
 
 ### Phase 9 — Numbers and dates

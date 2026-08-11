@@ -11,3 +11,4 @@ pub mod global;
 pub mod object;
 pub mod promise;
 pub mod symbol;
+pub mod weakref;

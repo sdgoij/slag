@@ -98,6 +98,16 @@ pub struct Agent {
     /// [[ErrorData]] markers of Error instances, keyed by object identity
     /// (spec 20.5.4: `Error.isError` and the `[object Error]` tag need it).
     pub error_data: std::collections::HashSet<u64>,
+    /// [[WeakRefTarget]] of WeakRef instances, keyed by object identity
+    /// (spec 26.1.1: without a GC, the target never dies, so `deref` always
+    /// returns it).
+    pub weak_ref_targets: std::collections::HashMap<u64, Value>,
+    /// [[Cells]] and [[CleanupCallback]] of FinalizationRegistry instances,
+    /// keyed by object identity (spec 26.2.1).
+    pub finalization_registries: std::collections::HashMap<
+        u64,
+        std::rc::Rc<std::cell::RefCell<crate::builtins::weakref::FinalizationData>>,
+    >,
 }
 
 impl Agent {
@@ -133,6 +143,8 @@ impl Agent {
             boolean_data: std::collections::HashMap::new(),
             symbol_data: std::collections::HashMap::new(),
             error_data: std::collections::HashSet::new(),
+            weak_ref_targets: std::collections::HashMap::new(),
+            finalization_registries: std::collections::HashMap::new(),
         }
     }
 

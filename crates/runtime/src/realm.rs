@@ -169,6 +169,7 @@ fn set_default_global_bindings(realm: &Handle<Realm>) -> Result<(), JsError> {
     crate::builtins::global::install(realm)?;
     crate::builtins::promise::install(realm)?;
     crate::generator::install(realm)?;
+    crate::builtins::weakref::install(realm)?;
     // spec 10.3.1: every built-in function object's [[Prototype]] is
     // %Function.prototype%. Link all intrinsic-registered functions now that
     // the table is full; %Function.prototype% itself keeps %Object.prototype%
