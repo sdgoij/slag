@@ -5,6 +5,7 @@ use std::cell::RefCell;
 
 use crux::error::{ErrorKind, JsError};
 use crux::handle::Handle;
+use crux::object::JsObject;
 use crux::string::JsString;
 use crux::value::Value;
 
@@ -12,6 +13,17 @@ use crate::agent::Agent;
 use crate::env::{EnvRecord, EnvRef};
 use crate::realm::Realm;
 use crate::script::ScriptRecord;
+
+/// The object side of a language value: ordinary objects directly, functions
+/// through their embedded object part (functions are values distinct from
+/// objects in this engine, but both carry a `Handle<JsObject>`).
+pub fn as_object(value: &Value) -> Option<Handle<JsObject>> {
+    match value {
+        Value::Object(obj) => Some(obj.clone()),
+        Value::Function(f) => f.object.handle(),
+        _ => None,
+    }
+}
 
 /// An execution context (spec 9.4 tables): the Function, Realm,
 /// ScriptOrModule, LexicalEnvironment, VariableEnvironment, and

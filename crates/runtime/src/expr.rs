@@ -849,6 +849,23 @@ fn apply_binary(
             }
         }
         BinaryOp::Instanceof => {
+            // InstanceofOperator (spec 7.3.20): an @@hasInstance method on the
+            // right-hand side overrides the default prototype-chain walk.
+            if !matches!(right, Value::Object(_) | Value::Function(_)) {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "Right-hand side of 'instanceof' is not an object".into(),
+                ));
+            }
+            if let Some(handler) = get_method(agent, right, "@@hasInstance")? {
+                let result = crate::function::call(
+                    agent,
+                    &handler,
+                    right.clone(),
+                    std::slice::from_ref(left),
+                )?;
+                return Ok(Value::Boolean(to_boolean(&result)));
+            }
             if !is_callable(right) {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
@@ -861,8 +878,9 @@ fn apply_binary(
 }
 
 /// OrdinaryHasInstance (spec 7.3.19): walk the prototype chain of `value`
-/// looking for `constructor.prototype`.
-fn ordinary_has_instance(
+/// looking for `constructor.prototype`. `pub` so the built-in
+/// %Function.prototype%[@@hasInstance] method can reuse it.
+pub fn ordinary_has_instance(
     agent: &mut Agent,
     constructor: &Value,
     value: &Value,
@@ -870,7 +888,7 @@ fn ordinary_has_instance(
     if !is_callable(constructor) {
         return Ok(Value::Boolean(false));
     }
-    let Value::Object(value_obj) = value else {
+    let Some(value_obj) = crate::context::as_object(value) else {
         return Ok(Value::Boolean(false));
     };
     let prototype = get_property(
@@ -879,15 +897,21 @@ fn ordinary_has_instance(
         &JsString::from_utf8("prototype"),
         constructor.clone(),
     )?;
-    if !matches!(prototype, Value::Object(_)) {
+    // Constructors hold their prototype as either an object value or (for
+    // %Function%, whose `prototype` is the callable %Function.prototype%) a
+    // function value; both carry an object handle for the walk.
+    let Some(prototype_obj) = crate::context::as_object(&prototype) else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Function has non-object prototype in instanceof check".into(),
         ));
-    }
+    };
     let mut current = value_obj.get_prototype_of()?;
     while let Some(obj) = current {
-        if same_value(&Value::Object(obj.clone()), &prototype) {
+        if same_value(
+            &Value::Object(obj.clone()),
+            &Value::Object(prototype_obj.clone()),
+        ) {
             return Ok(Value::Boolean(true));
         }
         current = obj.get_prototype_of()?;

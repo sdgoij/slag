@@ -1,0 +1,730 @@
+//! The Function constructor and %Function.prototype% (spec 20.2).
+
+use crux::convert::{to_integer_or_infinity, to_length, to_number, to_string};
+use crux::error::{ErrorKind, JsError};
+use crux::function::Function;
+use crux::handle::Handle;
+use crux::object::JsObject;
+use crux::property::{PropertyDescriptor, PropertyKey};
+use crux::string::JsString;
+use crux::value::{Value, is_callable};
+
+use crate::agent::Agent;
+use crate::context::{as_object, get_property_key};
+use crate::realm::Realm;
+
+/// Intrinsic registry keys. The methods and the constructor are
+/// agent-dependent (their crux closures cannot reach the agent), so the
+/// runtime call/construct dispatchers recognize them by these identities.
+const FUNCTION: &str = "%Function%";
+const FUNCTION_PROTO: &str = "%Function.prototype%";
+const APPLY: &str = "%Function.prototype.apply%";
+const CALL: &str = "%Function.prototype.call%";
+const BIND: &str = "%Function.prototype.bind%";
+const TO_STRING: &str = "%Function.prototype.toString%";
+const HAS_INSTANCE: &str = "%Function.prototype.@@hasInstance%";
+
+/// Install the Function intrinsics and the global `Function` binding
+/// (spec 20.2.1-20.2.3), during SetDefaultGlobalBindings.
+pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
+    // %Function.prototype% (20.2.3): a built-in function object with no
+    // [[Construct]] and no `prototype` property. Its [[Prototype]] is
+    // %Object.prototype% once the Phase 8 object intrinsics exist; null now.
+    let function_proto = Function::create_builtin(
+        Some(JsString::from_utf8("")),
+        0,
+        Box::new(|_, _| Ok(Value::Undefined)),
+        None,
+        None,
+    )?;
+    let object_proto = realm
+        .intrinsics
+        .get("%Object.prototype%")
+        .and_then(|value| as_object(&value));
+    function_proto.object.set_prototype_of(object_proto)?;
+    let function_proto_value = Value::Function(function_proto.clone());
+
+    // %Function% (20.2.1): call and construct both run CreateDynamicFunction.
+    let function_ctor = Function::create_builtin(
+        Some(JsString::from_utf8("Function")),
+        1,
+        Box::new(placeholder("Function")),
+        Some(Box::new(placeholder("Function"))),
+        None,
+    )?;
+    let function_ctor_value = Value::Function(function_ctor.clone());
+
+    realm
+        .intrinsics
+        .define(FUNCTION_PROTO, function_proto_value.clone());
+    realm
+        .intrinsics
+        .define(FUNCTION, function_ctor_value.clone());
+
+    // 20.2.2 Function.prototype: non-writable and non-configurable.
+    function_ctor.define_property(
+        &JsString::from_utf8("prototype"),
+        &PropertyDescriptor {
+            value: Some(function_proto_value.clone()),
+            writable: Some(false),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(false),
+        },
+    )?;
+    // 20.2.3.1 constructor back-reference.
+    function_proto.define_property(
+        &JsString::from_utf8("constructor"),
+        &PropertyDescriptor {
+            value: Some(function_ctor_value.clone()),
+            writable: Some(true),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
+    )?;
+    // The constructor's own [[Prototype]] is %Function.prototype%.
+    let proto_handle = function_proto.object.handle().ok_or_else(|| {
+        JsError::new(
+            ErrorKind::TypeError,
+            "%Function.prototype% has no object handle".into(),
+        )
+    })?;
+    function_ctor.object.set_prototype_of(Some(proto_handle))?;
+
+    install_methods(realm, &function_proto)?;
+
+    // The global `Function` property (20.2.1).
+    realm.global_object.define_property_or_throw(
+        &JsString::from_utf8("Function"),
+        &PropertyDescriptor {
+            value: Some(function_ctor_value),
+            writable: Some(true),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
+    )?;
+    Ok(())
+}
+
+/// The `%Function.prototype%` methods (20.2.3.2-20.2.3.7). All bodies are
+/// placeholders; `runtime::function::call` dispatches by intrinsic identity.
+fn install_methods(
+    realm: &Handle<Realm>,
+    function_proto: &Handle<Function>,
+) -> Result<(), JsError> {
+    let proto = function_proto.object.handle().ok_or_else(|| {
+        JsError::new(
+            ErrorKind::TypeError,
+            "%Function.prototype% has no object handle".into(),
+        )
+    })?;
+    let methods = [
+        (
+            APPLY,
+            "apply",
+            2,
+            PropertyDescriptor {
+                value: None,
+                writable: Some(true),
+                get: None,
+                set: None,
+                enumerable: Some(false),
+                configurable: Some(true),
+            },
+        ),
+        (
+            CALL,
+            "call",
+            1,
+            PropertyDescriptor {
+                value: None,
+                writable: Some(true),
+                get: None,
+                set: None,
+                enumerable: Some(false),
+                configurable: Some(true),
+            },
+        ),
+        (
+            BIND,
+            "bind",
+            1,
+            PropertyDescriptor {
+                value: None,
+                writable: Some(true),
+                get: None,
+                set: None,
+                enumerable: Some(false),
+                configurable: Some(true),
+            },
+        ),
+        (
+            TO_STRING,
+            "toString",
+            0,
+            PropertyDescriptor {
+                value: None,
+                writable: Some(true),
+                get: None,
+                set: None,
+                enumerable: Some(false),
+                configurable: Some(true),
+            },
+        ),
+    ];
+    for (intrinsic, name, length, mut desc) in methods {
+        let method = Function::create_builtin(
+            Some(JsString::from_utf8(name)),
+            length,
+            Box::new(placeholder(name)),
+            None,
+            Some(proto.clone()),
+        )?;
+        realm
+            .intrinsics
+            .define(intrinsic, Value::Function(method.clone()));
+        desc.value = Some(Value::Function(method));
+        function_proto.define_property(&JsString::from_utf8(name), &desc)?;
+    }
+
+    // 20.2.3.6 Function.prototype[@@hasInstance]: non-writable and
+    // non-configurable so `instanceof` stays tamper-proof.
+    let has_instance = Function::create_builtin(
+        Some(JsString::from_utf8("[Symbol.hasInstance]")),
+        1,
+        Box::new(placeholder("Function.prototype[@@hasInstance]")),
+        None,
+        Some(proto),
+    )?;
+    realm
+        .intrinsics
+        .define(HAS_INSTANCE, Value::Function(has_instance.clone()));
+    function_proto.define_property_key(
+        &PropertyKey::Symbol(crux::symbol::well_known("hasInstance").as_ref().clone()),
+        &PropertyDescriptor {
+            value: Some(Value::Function(has_instance)),
+            writable: Some(false),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(false),
+        },
+    )?;
+
+    // 20.2.3.7 Function.prototype[@@toStringTag] = "Function".
+    function_proto.define_property_key(
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyDescriptor {
+            value: Some(Value::String(Handle::new(JsString::from_utf8("Function")))),
+            writable: Some(false),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
+    )?;
+    Ok(())
+}
+
+/// A placeholder body for the agent-dispatched Function built-ins; the
+/// runtime dispatcher intercepts calls before the closure can run.
+fn placeholder(name: &str) -> crux::function::NativeFn {
+    let name = name.to_string();
+    Box::new(move |_, _| {
+        Err(JsError::new(
+            ErrorKind::TypeError,
+            format!("{name} must be dispatched by the runtime"),
+        ))
+    })
+}
+
+/// Route a call to the Function built-ins by intrinsic identity.
+pub fn dispatch_call(
+    agent: &mut Agent,
+    callee: &Value,
+    this: &Value,
+    args: &[Value],
+) -> Option<Result<Value, JsError>> {
+    let realm = agent.current_realm().ok()?;
+    let intrinsics = &realm.intrinsics;
+    if intrinsics.get(FUNCTION).as_ref() == Some(callee) {
+        let (params, body) = split_dynamic_args(args);
+        return Some(create_dynamic_function(
+            agent,
+            callee,
+            &Value::Undefined,
+            params,
+            body,
+        ));
+    }
+    if intrinsics.get(APPLY).as_ref() == Some(callee) {
+        return Some(apply(agent, this, args));
+    }
+    if intrinsics.get(CALL).as_ref() == Some(callee) {
+        return Some(call_method(agent, this, args));
+    }
+    if intrinsics.get(BIND).as_ref() == Some(callee) {
+        return Some(bind(agent, this, args));
+    }
+    if intrinsics.get(TO_STRING).as_ref() == Some(callee) {
+        return Some(function_to_string(agent, this));
+    }
+    if intrinsics.get(HAS_INSTANCE).as_ref() == Some(callee) {
+        let value = args.first().cloned().unwrap_or(Value::Undefined);
+        return Some(crate::expr::ordinary_has_instance(agent, this, &value));
+    }
+    None
+}
+
+/// Route `new` on the Function constructor to CreateDynamicFunction.
+pub fn dispatch_construct(
+    agent: &mut Agent,
+    callee: &Value,
+    args: &[Value],
+    new_target: &Value,
+) -> Option<Result<Value, JsError>> {
+    let realm = agent.current_realm().ok()?;
+    if realm.intrinsics.get(FUNCTION).as_ref() == Some(callee) {
+        let (params, body) = split_dynamic_args(args);
+        return Some(create_dynamic_function(
+            agent, callee, new_target, params, body,
+        ));
+    }
+    None
+}
+
+/// The last argument is the body, the rest are parameters.
+fn split_dynamic_args(args: &[Value]) -> (&[Value], Option<&Value>) {
+    match args.split_last() {
+        Some((body, params)) => (params, Some(body)),
+        None => (&[], None),
+    }
+}
+
+/// CreateDynamicFunction (spec 20.2.1.1), kind ~normal~: assemble the source
+/// `function anonymous(params\n) {\nbody\n}`, parse it, and instantiate an
+/// ordinary function with the GetPrototypeFromConstructor prototype.
+fn create_dynamic_function(
+    agent: &mut Agent,
+    ctor: &Value,
+    new_target: &Value,
+    param_args: &[Value],
+    body_arg: Option<&Value>,
+) -> Result<Value, JsError> {
+    let new_target = if matches!(new_target, Value::Undefined) {
+        ctor.clone()
+    } else {
+        new_target.clone()
+    };
+    let mut param_strings = Vec::new();
+    for arg in param_args {
+        param_strings.push(to_string(arg)?.to_string_lossy());
+    }
+    let body_string = match body_arg {
+        Some(arg) => to_string(arg)?.to_string_lossy(),
+        None => String::new(),
+    };
+    let param_string = param_strings.join(",");
+    let source = format!("function anonymous({param_string}\n) {{\n{body_string}\n}}");
+    let function_ast = parser::parse_function(&source)?;
+    let func_proto = get_prototype_from_constructor(agent, &new_target)?;
+    let environment = agent.current_realm()?.global_env();
+    crate::function::instantiate_dynamic_function(agent, &function_ast, environment, func_proto)
+}
+
+/// GetPrototypeFromConstructor (spec 10.2.4): `constructor.prototype` when it
+/// is an object, else the realm's %Function.prototype% (GetFunctionRealm).
+fn get_prototype_from_constructor(
+    agent: &mut Agent,
+    constructor: &Value,
+) -> Result<Handle<JsObject>, JsError> {
+    let proto = get_property_key(
+        agent,
+        constructor,
+        &PropertyKey::from_utf8("prototype"),
+        constructor.clone(),
+    )?;
+    match as_object(&proto) {
+        Some(handle) => Ok(handle),
+        None => agent
+            .current_realm()?
+            .intrinsics
+            .get(FUNCTION_PROTO)
+            .and_then(|value| as_object(&value))
+            .ok_or_else(|| {
+                JsError::new(
+                    ErrorKind::TypeError,
+                    format!("{FUNCTION_PROTO} is not defined"),
+                )
+            }),
+    }
+}
+
+/// Function.prototype.apply (spec 20.2.3.2).
+fn apply(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    let func = this.clone();
+    if !is_callable(&func) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Apply must be called on a function".into(),
+        ));
+    }
+    let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
+    let arg_array = args.get(1).cloned().unwrap_or(Value::Undefined);
+    if matches!(arg_array, Value::Undefined | Value::Null) {
+        return crate::function::call(agent, &func, this_arg, &[]);
+    }
+    let arg_list = create_list_from_array_like(agent, &arg_array)?;
+    crate::function::call(agent, &func, this_arg, &arg_list)
+}
+
+/// Function.prototype.call (spec 20.2.3.4).
+fn call_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    let func = this.clone();
+    if !is_callable(&func) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Call must be called on a function".into(),
+        ));
+    }
+    let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
+    let rest = args.get(1..).unwrap_or(&[]);
+    crate::function::call(agent, &func, this_arg, rest)
+}
+
+/// Function.prototype.bind (spec 20.2.3.3).
+fn bind(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    let target = this.clone();
+    if !is_callable(&target) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Bind must be called on a function".into(),
+        ));
+    }
+    let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
+    let bound_args = args.get(1..).unwrap_or(&[]).to_vec();
+    let proto = agent
+        .current_realm()?
+        .intrinsics
+        .get(FUNCTION_PROTO)
+        .and_then(|value| as_object(&value));
+    let bound =
+        Function::bound_function_create(target.clone(), this_arg, bound_args.clone(), proto)?;
+
+    // SetFunctionLength (spec steps 4-7): always an own `length`, computed
+    // from the target's when it is a Number.
+    let mut length = 0.0;
+    let has_length = match &target {
+        Value::Function(f) => f.has_own_property(&JsString::from_utf8("length"))?,
+        Value::Object(obj) => obj.has_own_property(&JsString::from_utf8("length"))?,
+        _ => false,
+    };
+    if has_length {
+        let target_length = get_property_key(
+            agent,
+            &target,
+            &PropertyKey::from_utf8("length"),
+            target.clone(),
+        )?;
+        if let Value::Number(number) = target_length {
+            let int = to_integer_or_infinity(number);
+            length = if int == f64::INFINITY {
+                f64::INFINITY
+            } else if int == f64::NEG_INFINITY {
+                0.0
+            } else {
+                (int - bound_args.len() as f64).max(0.0)
+            };
+        }
+    }
+    bound.define_property(
+        &JsString::from_utf8("length"),
+        &PropertyDescriptor {
+            value: Some(Value::Number(length)),
+            writable: Some(false),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
+    )?;
+
+    // SetFunctionName with the "bound " prefix (spec steps 8-10).
+    let target_name = get_property_key(
+        agent,
+        &target,
+        &PropertyKey::from_utf8("name"),
+        target.clone(),
+    )?;
+    let target_name = match target_name {
+        Value::String(text) => text.as_ref().clone(),
+        _ => JsString::from_utf8(""),
+    };
+    crate::function::set_function_name(&bound.self_value(), &target_name, Some("bound"))?;
+    Ok(bound.self_value())
+}
+
+/// Function.prototype.toString (spec 20.2.3.5): HostHasSourceTextAvailable is
+/// false in this engine, so every callable renders as a NativeFunction.
+fn function_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
+    if !is_callable(this) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Function.prototype.toString requires a callable this".into(),
+        ));
+    }
+    let name = get_property_key(agent, this, &PropertyKey::from_utf8("name"), this.clone())?;
+    let name = match name {
+        Value::String(text) => text.to_string_lossy(),
+        _ => String::new(),
+    };
+    Ok(Value::String(Handle::new(JsString::from_utf8(&format!(
+        "function {name}() {{ [native code] }}"
+    )))))
+}
+
+/// CreateListFromArrayLike (spec 7.3.19): `length` then indexed `Get`s.
+fn create_list_from_array_like(agent: &mut Agent, value: &Value) -> Result<Vec<Value>, JsError> {
+    if !matches!(value, Value::Object(_) | Value::Function(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "CreateListFromArrayLike called on non-object".into(),
+        ));
+    }
+    let length = get_property_key(
+        agent,
+        value,
+        &PropertyKey::from_utf8("length"),
+        value.clone(),
+    )?;
+    let length = to_length(to_number(&length)?);
+    let mut list = Vec::new();
+    for index in 0..length {
+        let item = get_property_key(
+            agent,
+            value,
+            &PropertyKey::from_utf8(&index.to_string()),
+            value.clone(),
+        )?;
+        list.push(item);
+    }
+    Ok(list)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn value(source: &str) -> Value {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script(source)
+            .unwrap_or_else(|e| panic!("{source}: {:?} {e}", e.kind))
+    }
+
+    fn errors(source: &str) {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        assert!(
+            agent.run_script(source).is_err(),
+            "{source} should have thrown"
+        );
+    }
+
+    #[test]
+    fn function_constructor_creates_callable_functions() {
+        assert_eq!(
+            value("Function('a', 'b', 'return a + b')(2, 3)"),
+            Value::Number(5.0)
+        );
+        assert_eq!(
+            value("new Function('return 40 + 2')()"),
+            Value::Number(42.0)
+        );
+        assert_eq!(value("Function()()"), Value::Undefined);
+        assert_eq!(
+            value("Function('x', 'return x * 2')(21)"),
+            Value::Number(42.0)
+        );
+        // Parameters and body are strings; a single argument is the body.
+        assert_eq!(
+            value("Function('return this')() === globalThis"),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn dynamic_function_bad_syntax_throws() {
+        errors("new Function('a b', 'return a')");
+        errors("Function('return 1 +')");
+        errors("Function('{')");
+    }
+
+    #[test]
+    fn apply_and_call_dispatch_this_and_arguments() {
+        assert_eq!(
+            value("(function (a, b) { return a + b; }).call(null, 2, 3)"),
+            Value::Number(5.0)
+        );
+        assert_eq!(
+            value("(function (a, b) { return a + b; }).apply(null, [4, 5])"),
+            Value::Number(9.0)
+        );
+        assert_eq!(
+            value("(function () { return this.x; }).call({ x: 7 })"),
+            Value::Number(7.0)
+        );
+        // apply with undefined/null argArray forwards no arguments.
+        let result = value("(function (a, b) { return a + b; }).apply(null, undefined)");
+        assert!(matches!(result, Value::Number(n) if n.is_nan()));
+        // apply with a non-object argArray is a TypeError.
+        errors("(function () {}).apply(null, 'x')");
+        errors("Function.prototype.call.call(1)");
+    }
+
+    #[test]
+    fn bind_fixes_this_and_prefixes_arguments() {
+        assert_eq!(
+            value("(function (a, b) { return a + b; }).bind(null, 2)(3)"),
+            Value::Number(5.0)
+        );
+        assert_eq!(
+            value("(function () { return this.x; }).bind({ x: 9 })()"),
+            Value::Number(9.0)
+        );
+        // Bound length and name follow the target (spec steps 4-10).
+        assert_eq!(
+            value("(function (a, b, c) {}).bind(null).length"),
+            Value::Number(3.0)
+        );
+        assert_eq!(
+            value("(function (a, b, c) {}).bind(null, 1, 2).length"),
+            Value::Number(1.0)
+        );
+        let bound_name = value("(function myFn() {}).bind(null).name");
+        assert!(matches!(bound_name, Value::String(s) if s.to_string_lossy() == "bound myFn"));
+        errors("Function.prototype.bind.call(1)");
+    }
+
+    #[test]
+    fn functions_inherit_from_function_prototype() {
+        assert_eq!(
+            value("(function () {}) instanceof Function"),
+            Value::Boolean(true)
+        );
+        assert_eq!(value("Function instanceof Function"), Value::Boolean(true));
+        assert_eq!(
+            value("Function.prototype instanceof Function"),
+            Value::Boolean(false)
+        );
+        assert_eq!(
+            value("(function () {}).apply instanceof Function"),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            value("new Function('return 1') instanceof Function"),
+            Value::Boolean(true)
+        );
+        assert_eq!(value("({}) instanceof Function"), Value::Boolean(false));
+    }
+
+    #[test]
+    fn custom_has_instance_overrides_instanceof() {
+        // The global `Symbol` constructor is Phase 8; install the well-known
+        // @@hasInstance property from Rust to exercise the dispatch.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.run_script("function C() {}").unwrap();
+        let ctor = match agent.run_script("C").unwrap() {
+            Value::Function(f) => f,
+            other => panic!("C should be a function, got {other:?}"),
+        };
+        let key = PropertyKey::Symbol(crux::symbol::well_known("hasInstance").as_ref().clone());
+        let override_with = |result: bool| {
+            let method = Function::create_builtin(
+                Some(JsString::from_utf8("[Symbol.hasInstance]")),
+                1,
+                Box::new(move |_, _| Ok(Value::Boolean(result))),
+                None,
+                None,
+            )
+            .unwrap();
+            ctor.define_property_key(&key, &PropertyDescriptor::data(Value::Function(method)))
+                .unwrap();
+        };
+        override_with(true);
+        assert_eq!(
+            agent.run_script("({}) instanceof C").unwrap(),
+            Value::Boolean(true)
+        );
+        override_with(false);
+        assert_eq!(
+            agent.run_script("({}) instanceof C").unwrap(),
+            Value::Boolean(false)
+        );
+        // The inherited default still walks the prototype chain.
+        assert_eq!(
+            value("function C() {} let c = new C(); c instanceof C"),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn function_prototype_is_callable_without_construct() {
+        assert_eq!(value("Function.prototype()"), Value::Undefined);
+        assert_eq!(value("Function.prototype.length"), Value::Number(0.0));
+        let name = value("Function.prototype.name");
+        assert!(matches!(name, Value::String(s) if s.to_string_lossy() == ""));
+        // Not a constructor.
+        errors("new Function.prototype()");
+    }
+
+    #[test]
+    fn function_to_string_renders_native_code() {
+        let text = value("(function named() {}).toString()");
+        assert!(
+            matches!(text, Value::String(s) if s.to_string_lossy() == "function named() { [native code] }")
+        );
+        // %Function.prototype% has an empty name.
+        let text = value("Function.prototype.toString()");
+        assert!(
+            matches!(text, Value::String(s) if s.to_string_lossy() == "function () { [native code] }")
+        );
+        errors("Function.prototype.toString.call({})");
+    }
+
+    #[test]
+    fn function_constructor_properties() {
+        assert_eq!(value("Function.length"), Value::Number(1.0));
+        assert_eq!(
+            value("Function.name"),
+            Value::String(Handle::new(JsString::from_utf8("Function")))
+        );
+        assert_eq!(
+            value("Function.prototype.constructor === Function"),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            value("typeof Function.prototype"),
+            Value::String(Handle::new(JsString::from_utf8("function")))
+        );
+    }
+
+    #[test]
+    fn dynamic_functions_capture_global_scope() {
+        assert_eq!(
+            value("var g = 10; Function('return g')()"),
+            Value::Number(10.0)
+        );
+        assert_eq!(
+            value("let g = 20; Function('return typeof g')()"),
+            Value::String(Handle::new(JsString::from_utf8("number")))
+        );
+    }
+}

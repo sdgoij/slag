@@ -68,7 +68,9 @@ pub struct Function {
     id: u64,
     pub name: Option<JsString>,
     /// The object part: [[Prototype]], [[Extensible]], and own properties.
-    pub object: JsObject,
+    /// Held as a handle so the object is also usable as a prototype link and
+    /// `JsObject::handle()` recovers it.
+    pub object: Handle<JsObject>,
     pub kind: FunctionKind,
     /// Weak back-reference to the owning handle so `this`-receiver operations
     /// (accessor invocation, own-property creation on `set`) target the real
@@ -105,7 +107,7 @@ impl Function {
         let function = Handle::new(Self {
             id: NEXT_FUNCTION_ID.fetch_add(1, Ordering::Relaxed),
             name,
-            object: JsObject::basic_object_create(None),
+            object: JsObject::ordinary_object_create(None),
             kind: FunctionKind::EcmaScript,
             self_handle: RefCell::new(None),
         });
@@ -139,7 +141,7 @@ impl Function {
         let function = Handle::new(Self {
             id: NEXT_FUNCTION_ID.fetch_add(1, Ordering::Relaxed),
             name: name.clone(),
-            object: JsObject::basic_object_create(prototype),
+            object: JsObject::ordinary_object_create(prototype),
             kind: FunctionKind::Builtin {
                 call: Some(call),
                 construct,
@@ -174,13 +176,14 @@ impl Function {
         Ok(function)
     }
 
-    /// BoundFunctionCreate (spec 10.4.1.3). The bound function's
-    /// [[Prototype]] is the target's `prototype` property when it is an
-    /// object, else *null* until the %Function.prototype% intrinsic exists.
+    /// BoundFunctionCreate (spec 10.4.1.3). The bound function's [[Prototype]]
+    /// is `%Function.prototype%` per spec step 5; the caller (the runtime
+    /// `bind` builtin) supplies it, `None` leaves the prototype null.
     pub fn bound_function_create(
         target: Value,
         bound_this: Value,
         bound_args: Vec<Value>,
+        prototype: Option<Handle<JsObject>>,
     ) -> Result<Handle<Function>, JsError> {
         if !is_callable(&target) {
             return Err(JsError::new(
@@ -188,18 +191,10 @@ impl Function {
                 "Cannot bind a non-callable value".into(),
             ));
         }
-        let prototype = match &target {
-            Value::Function(f) => f.get_key(&PropertyKey::from_utf8("prototype"))?,
-            _ => Value::Undefined,
-        };
-        let prototype = match prototype {
-            Value::Object(obj) => Some(obj),
-            _ => None,
-        };
         let function = Handle::new(Self {
             id: NEXT_FUNCTION_ID.fetch_add(1, Ordering::Relaxed),
             name: None,
-            object: JsObject::basic_object_create(prototype),
+            object: JsObject::ordinary_object_create(prototype),
             kind: FunctionKind::Bound {
                 target,
                 bound_this,
@@ -514,6 +509,7 @@ mod tests {
             Value::Function(target),
             Value::Number(7.0),
             vec![Value::Boolean(true)],
+            None,
         )
         .unwrap();
         let result = call(
@@ -534,7 +530,8 @@ mod tests {
     #[test]
     fn bound_function_requires_a_callable_target() {
         assert!(
-            Function::bound_function_create(Value::Undefined, Value::Undefined, vec![]).is_err()
+            Function::bound_function_create(Value::Undefined, Value::Undefined, vec![], None)
+                .is_err()
         );
     }
 

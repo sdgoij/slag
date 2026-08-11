@@ -10,6 +10,7 @@
 
 pub mod agent;
 pub mod binding;
+pub mod builtins;
 pub mod class;
 pub mod context;
 pub mod env;

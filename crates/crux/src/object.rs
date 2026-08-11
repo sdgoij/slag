@@ -306,6 +306,15 @@ impl JsObject {
             .unwrap_or(Value::Undefined)
     }
 
+    /// Recover the owning handle of an embedded object (a `Function`'s object
+    /// part); `None` for raw copies without a back-reference.
+    pub fn handle(&self) -> Option<Handle<JsObject>> {
+        self.self_handle
+            .borrow()
+            .as_ref()
+            .and_then(|weak| weak.upgrade())
+    }
+
     /// OrdinaryObjectCreate (spec 10.1.13).
     pub fn ordinary_object_create(prototype: Option<Handle<JsObject>>) -> Handle<JsObject> {
         let object = Handle::new(Self::basic_object_create(prototype));

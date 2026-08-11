@@ -281,7 +281,7 @@ fn check_for_binding(binding: &syntax::ForBinding, labels: &mut LabelState) -> R
 
 /// A function body starts a fresh label scope: `break`/`continue` cannot
 /// reference labels outside, and its own labels cannot clash with them.
-fn check_function(f: &syntax::Function) -> Result<(), JsError> {
+pub(crate) fn check_function(f: &syntax::Function) -> Result<(), JsError> {
     let mut fresh = LabelState::default();
     check_binding_elements(&f.params, &mut fresh)?;
     check_stmts(&f.body.stmts, &mut fresh)

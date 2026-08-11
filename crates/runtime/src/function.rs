@@ -404,8 +404,6 @@ pub fn make_method(agent: &mut Agent, function: &Value, home_object: Value) -> R
     Ok(())
 }
 
-/// OrdinaryFunctionCreate (spec 10.2.1.3) minus MakeConstructor when the
-/// definition is a method or accessor.
 fn register_function(
     agent: &mut Agent,
     name: Option<JsString>,
@@ -450,7 +448,20 @@ fn register_function(
     if !kind.is_method {
         make_constructor(&function)?;
     }
+    set_function_prototype(agent, &function)?;
     Ok(Value::Function(function))
+}
+
+/// OrdinaryFunctionCreate step: `F.[[Prototype]]` is %Function.prototype%
+/// once the Function builtins install it.
+fn set_function_prototype(agent: &Agent, function: &Handle<Function>) -> Result<(), JsError> {
+    let proto = agent
+        .current_realm()?
+        .intrinsics
+        .get("%Function.prototype%")
+        .and_then(|value| crate::context::as_object(&value));
+    function.object.set_prototype_of(proto)?;
+    Ok(())
 }
 
 /// FunctionBodyContainsUseStrict for a body block (spec 15.2.1).
@@ -485,6 +496,34 @@ pub fn instantiate_function_expression(
     let value = instantiate_function(agent, f, scope.clone(), enclosing_strict)?;
     scope.create_immutable_binding(&name, true)?;
     scope.initialize_binding(&name, value.clone())?;
+    Ok(value)
+}
+
+/// CreateDynamicFunction's OrdinaryFunctionCreate (spec 20.2.1.1 step 41): an
+/// ordinary sloppy function whose [[Prototype]] comes from
+/// GetPrototypeFromConstructor and whose environment is the global one.
+/// `parser::parse_function` already named it `anonymous` and checked the
+/// early errors.
+pub fn instantiate_dynamic_function(
+    agent: &mut Agent,
+    f: &syntax::ast::Function,
+    environment: EnvRef,
+    proto: Handle<JsObject>,
+) -> Result<Value, JsError> {
+    let value = register_function(
+        agent,
+        f.name.map(crux::lookup),
+        f.params.clone(),
+        f.body.clone(),
+        environment,
+        false,
+        DefinitionKind::function(false, false),
+    )?;
+    // GetPrototypeFromConstructor wins over the default %Function.prototype%.
+    let Value::Function(function) = &value else {
+        unreachable!("register_function returns a function");
+    };
+    function.object.set_prototype_of(Some(proto))?;
     Ok(value)
 }
 
@@ -538,6 +577,7 @@ pub fn instantiate_arrow(
     let params = data.params.clone();
     agent.ecma_functions.insert(function.id(), data);
     set_function_properties(&function, &params, None)?;
+    set_function_prototype(agent, &function)?;
     Ok(Value::Function(function))
 }
 
@@ -576,7 +616,18 @@ pub fn call(
                 all.extend_from_slice(args);
                 call(agent, target, bound_this.clone(), &all)
             }
-            _ => crux::function::call(callee, this, args),
+            _ => {
+                // Agent-dependent built-ins (the Function constructor and the
+                // %Function.prototype% methods) cannot run inside the crux
+                // closures; dispatch them here by intrinsic identity (the
+                // %eval% pattern).
+                if let Some(result) =
+                    crate::builtins::function::dispatch_call(agent, callee, &this, args)
+                {
+                    return result;
+                }
+                crux::function::call(callee, this, args)
+            }
         },
         _ => crux::function::call(callee, this, args),
     }
@@ -609,7 +660,14 @@ pub fn construct(
                     };
                 construct(agent, target, &all, new_target)
             }
-            _ => crux::function::construct(callee, args, new_target),
+            _ => {
+                if let Some(result) =
+                    crate::builtins::function::dispatch_construct(agent, callee, args, new_target)
+                {
+                    return result;
+                }
+                crux::function::construct(callee, args, new_target)
+            }
         },
         _ => crux::function::construct(callee, args, new_target),
     }

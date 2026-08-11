@@ -57,6 +57,24 @@ pub fn parse_module(source: &str) -> Result<Module, JsError> {
     Ok(module)
 }
 
+/// Parses a FunctionExpression (spec 15.2.4): the source `CreateDynamicFunction`
+/// assembles for `new Function(...)`. The expression must be fully consumed and
+/// the function's early errors apply.
+pub fn parse_function(source: &str) -> Result<syntax::ast::Function, JsError> {
+    let source = SourceText::from_utf8(source);
+    let mut parser = Parser::new(&source, true);
+    let expr = expr::parse_function_expression(&mut parser, false)?;
+    let tok = parser.peek()?.clone();
+    if tok.kind != syntax::TokenKind::Eof {
+        return Err(parser.unexpected(&tok));
+    }
+    let syntax::ExprKind::Function(function) = expr.kind else {
+        unreachable!("function expression");
+    };
+    early_errors::check_function(&function)?;
+    Ok(function)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1369,5 +1387,17 @@ mod tests {
         // Keyword bindings are rejected.
         err("using in = 1;");
         err("using let = 1;");
+    }
+
+    #[test]
+    fn parse_function_parses_function_expressions() {
+        let f = parse_function("function anonymous(a, b\n) {\nreturn a + b\n}").unwrap();
+        assert_eq!(f.name, Some(crux::intern_utf8("anonymous")));
+        assert_eq!(f.params.len(), 2);
+        // The expression must be fully consumed.
+        assert!(parse_function("function f() {} extra").is_err());
+        // Invalid bodies and parameter lists are syntax errors.
+        assert!(parse_function("function f(a b) {}").is_err());
+        assert!(parse_function("function f() { {").is_err());
     }
 }

@@ -151,6 +151,7 @@ fn set_default_global_bindings(realm: &Handle<Realm>) -> Result<(), JsError> {
             configurable: Some(true),
         },
     )?;
+    crate::builtins::function::install(realm)?;
     Ok(())
 }
 
