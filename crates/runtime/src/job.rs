@@ -79,6 +79,24 @@ pub fn host_call_job_callback(
     crux::function::call(&job_callback.callback, this_value, arg_list)
 }
 
+/// HostCallJobCallback through the runtime's agent-aware call dispatcher, so
+/// ECMAScript-function callbacks (user functions) reach their bodies. Promise
+/// reaction jobs use this.
+pub fn host_call_job_callback_agent(
+    agent: &mut crate::agent::Agent,
+    job_callback: &JobCallback,
+    this_value: Value,
+    arg_list: &[Value],
+) -> Result<Value, JsError> {
+    if !is_callable(&job_callback.callback) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "callback is not callable".into(),
+        ));
+    }
+    crate::function::call(agent, &job_callback.callback, this_value, arg_list)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -91,13 +91,9 @@ pub struct EcmaFunction {
     pub realm: Handle<Realm>,
     pub is_async: bool,
     pub is_generator: bool,
-}
-
-fn not_implemented(what: &str) -> JsError {
-    JsError::new(
-        ErrorKind::TypeError,
-        format!("{what} is not implemented until later Phase 7 work"),
-    )
+    /// The compiled resumable body (PLAN §4.5) for generator/async
+    /// functions; ordinary functions evaluate the AST directly.
+    pub ir: Option<crate::ir::CompiledBody>,
 }
 
 /// FunctionBodyContainsUseStrict (spec 15.2.1): a `"use strict"` directive in
@@ -413,9 +409,6 @@ fn register_function(
     enclosing_strict: bool,
     kind: DefinitionKind,
 ) -> Result<Value, JsError> {
-    if kind.is_async || kind.is_generator {
-        return Err(not_implemented("async and generator functions"));
-    }
     let strict = body_is_strict(&body) || enclosing_strict;
     let this_mode = if strict {
         ThisMode::Strict
@@ -423,7 +416,7 @@ fn register_function(
         ThisMode::Sloppy
     };
     let realm = agent.current_realm()?;
-    let data = EcmaFunction {
+    let mut data = EcmaFunction {
         name: name.clone(),
         params: params.clone(),
         body,
@@ -439,9 +432,15 @@ fn register_function(
         super_constructor: None,
         default_derived: false,
         realm,
-        is_async: false,
-        is_generator: false,
+        is_async: kind.is_async,
+        is_generator: kind.is_generator,
+        ir: None,
     };
+    if kind.is_generator || kind.is_async {
+        // Resumable bodies compile to the step IR; ordinary functions keep
+        // the tree-walking evaluator.
+        data.ir = Some(crate::ir::compile_body(&data)?);
+    }
     let function = Function::new(name.clone());
     agent.ecma_functions.insert(function.id(), data);
     set_function_properties(&function, &params, name.as_ref())?;
@@ -537,9 +536,6 @@ pub fn instantiate_arrow(
     environment: EnvRef,
     enclosing_strict: bool,
 ) -> Result<Value, JsError> {
-    if is_async {
-        return Err(not_implemented("async arrow functions"));
-    }
     let body = match body {
         ArrowBody::Expr(expr) => {
             let span = expr.span;
@@ -554,7 +550,7 @@ pub fn instantiate_arrow(
         ArrowBody::Block(block) => block,
     };
     let realm = agent.current_realm()?;
-    let data = EcmaFunction {
+    let mut data = EcmaFunction {
         name: None,
         params,
         body,
@@ -570,9 +566,13 @@ pub fn instantiate_arrow(
         super_constructor: None,
         default_derived: false,
         realm,
-        is_async: false,
+        is_async,
         is_generator: false,
+        ir: None,
     };
+    if is_async {
+        data.ir = Some(crate::ir::compile_body(&data)?);
+    }
     let function = Function::new(None);
     let params = data.params.clone();
     agent.ecma_functions.insert(function.id(), data);
@@ -605,6 +605,13 @@ pub fn call(
                         "Class constructor cannot be invoked without 'new'".into(),
                     ));
                 }
+                let data = agent.ecma_functions.get(&function.id());
+                if data.is_some_and(|data| data.is_async) {
+                    return crate::async_await::call_async_function(agent, function, this, args);
+                }
+                if data.is_some_and(|data| data.is_generator) {
+                    return crate::generator::call_generator(agent, function, this, args);
+                }
                 ordinary_call(agent, function, this, args)
             }
             crux::function::FunctionKind::Bound {
@@ -624,6 +631,30 @@ pub fn call(
                 if let Some(result) =
                     crate::builtins::function::dispatch_call(agent, callee, &this, args)
                 {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::builtins::object::dispatch_call(agent, callee, &this, args)
+                {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::builtins::promise::dispatch_call(agent, callee, &this, args)
+                {
+                    return result;
+                }
+                if let Some(result) = crate::async_await::dispatch_resume(agent, callee, args) {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::async_await::dispatch_async_from_sync(agent, callee, args)
+                {
+                    return result;
+                }
+                if let Some(result) = crate::generator::dispatch_call(agent, callee, &this, args) {
+                    return result;
+                }
+                if let Some(result) = crate::module::dispatch_import_resolver(agent, callee, args) {
                     return result;
                 }
                 crux::function::call(callee, this, args)
@@ -663,6 +694,16 @@ pub fn construct(
             _ => {
                 if let Some(result) =
                     crate::builtins::function::dispatch_construct(agent, callee, args, new_target)
+                {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::builtins::object::dispatch_construct(agent, callee, args, new_target)
+                {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::builtins::promise::dispatch_construct(agent, callee, args, new_target)
                 {
                     return result;
                 }
@@ -734,10 +775,9 @@ fn evaluate_body(agent: &mut Agent, data: &EcmaFunction) -> Result<Value, JsErro
     match eval_statement_list(agent, &data.body.stmts, data.strict)? {
         Completion::Return(value) => Ok(value),
         Completion::Normal(_) | Completion::Empty => Ok(Value::Undefined),
-        Completion::Throw(value) => Err(JsError::new(
-            ErrorKind::TypeError,
-            format!("Uncaught {value:?}"),
-        )),
+        Completion::Throw(value) => {
+            Err(JsError::new(ErrorKind::TypeError, format!("Uncaught {value:?}")).with_value(value))
+        }
         Completion::Break { .. } | Completion::Continue { .. } => Err(JsError::new(
             ErrorKind::SyntaxError,
             "Illegal break/continue statement".into(),
@@ -862,7 +902,8 @@ fn ordinary_construct(
             Completion::Throw(value) => Err(JsError::new(
                 ErrorKind::TypeError,
                 format!("Uncaught {value:?}"),
-            )),
+            )
+            .with_value(value)),
             Completion::Break { .. } | Completion::Continue { .. } => Err(JsError::new(
                 ErrorKind::SyntaxError,
                 "Illegal break/continue statement".into(),
@@ -922,7 +963,10 @@ pub fn initialize_instance_elements(
 /// environment for the body. Non-simple parameter lists (defaults, rest,
 /// destructuring) bind in a separate parameter environment via
 /// IteratorBindingInitialization.
-fn function_declaration_instantiation(
+/// FunctionDeclarationInstantiation (spec 16.1.8): bind formals, arguments,
+/// vars, and functions into the function environment. Shared with the
+/// async-function machinery.
+pub(crate) fn function_declaration_instantiation(
     agent: &mut Agent,
     function_value: &Value,
     data: &EcmaFunction,

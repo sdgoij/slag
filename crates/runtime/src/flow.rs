@@ -81,7 +81,8 @@ pub fn completion_to_result(completion: Completion) -> Result<Value, JsError> {
         Completion::Throw(value) => Err(crux::error::JsError::new(
             crux::error::ErrorKind::TypeError,
             format!("Uncaught {value:?}"),
-        )),
+        )
+        .with_value(value)),
         Completion::Return(_) | Completion::Break { .. } | Completion::Continue { .. } => {
             Err(JsError::new(
                 crux::error::ErrorKind::SyntaxError,

@@ -315,6 +315,12 @@ impl JsObject {
             .and_then(|weak| weak.upgrade())
     }
 
+    /// The object's unique identity ([[ObjectId]]), used by the runtime to
+    /// key per-object state (promises, generators) in agent-side tables.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     /// OrdinaryObjectCreate (spec 10.1.13).
     pub fn ordinary_object_create(prototype: Option<Handle<JsObject>>) -> Handle<JsObject> {
         let object = Handle::new(Self::basic_object_create(prototype));
@@ -652,10 +658,10 @@ impl JsObject {
             ObjectKind::IntegerIndexed(slots) => typed_array_get_own_property(self, slots, key),
             ObjectKind::ModuleNamespace(slots) => {
                 if slots.exports.contains(key) {
-                    return Err(JsError::new(
-                        ErrorKind::TypeError,
-                        "Module namespace exports are not implemented until Phase 7".into(),
-                    ));
+                    // spec 10.4.6.8: exported bindings appear as own data
+                    // properties (writable, enumerable, non-configurable);
+                    // the runtime reads the live binding value.
+                    return Ok(Some(Property::data(Value::Undefined, true, true, false)));
                 }
                 self.ordinary_get_own_property(key)
             }

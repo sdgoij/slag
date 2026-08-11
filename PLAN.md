@@ -1050,7 +1050,30 @@ and class `Object.*`-based fixtures wait on builtins (`Array.prototype[@@iterato
 `Object.*`, `Error` — `assert.throws` needs Error objects). Workspace runs **398 tests**
 (the test262 fixtures are one `#[test]` each) with fmt and clippy (`-D warnings`) clean.
 
-**Remaining in Phase 7:** generators/async/modules/promises as listed below.
+**Remaining in Phase 7:** generators, async functions, promises, and modules — all landed
+since the status text above was written:
+
+- **Promise core** (`crates/runtime/src/promise.rs` + `builtins/promise.rs`): full `%Promise%`
+  — constructor with executor and resolving functions, `then/catch/finally`, `resolve/reject`,
+  `all/allSettled/any/race`, `withResolvers`, `try`; dispatch by intrinsic identity from
+  `function.rs`. The agent gained the promise, resolver, compound, and finally tables.
+- **Resumable-function IR** (`crates/runtime/src/ir.rs`, §4.5): `Vec<Step>` compiler + VM with
+  try/catch/finally, for-in/for-of/for-await-of, `yield*`, and an environments stack;
+  suspension-free statements/expressions batch to the tree walker.
+- **Generators** (`generator.rs`): generator objects with `[[GeneratorState]]`, `next`/`return`/
+  `throw`, `yield*` delegation, `@@iterator`. 8 tests.
+- **Async functions** (`async_await.rs`): async functions/arrows/methods, `await`, for-await-of,
+  AsyncFromSyncIterator. 11 tests.
+- **Modules** (`module.rs`): Source Text Module Records with import/export entry collection,
+  `ResolveExport` (local/indirect/star with cycle and ambiguity handling), live bindings via
+  module environments, namespace exotic objects (crux `ModuleNamespace` kind + runtime
+  `resolve_export`-backed `[[Get]]`), top-level await through the async VM, dynamic `import()`
+  from both IR and tree-walker code, `import.meta`, JSON modules (`add_json_module` +
+  `with { type: "json" }`), and all export forms (`default`, `export … from`, `export *`,
+  `export * as ns`). 14 tests.
+
+**Deferred to Phase 15:** async generators (queue-based) and `await using` disposal
+(`[[DisposableResourceStack]]` exists in env records but is not yet populated).
 
 ---
 
@@ -1104,6 +1127,36 @@ errors; global-property completeness check (compare the installed global propert
 the spec's table).
 **Exit criteria:** global object matches the spec's property list; Phase 8 fixtures green;
 test262 climbs (this phase alone covers a large `built-ins/` fraction).
+
+**Status (current):** the **Object** built-in has landed (`crates/runtime/src/builtins/object.rs`),
+installed first in SetDefaultGlobalBindings so `%Object.prototype%` exists for the Function,
+Promise, and generator intrinsics and for module namespace objects:
+
+- `%Object%` (constructor, length 1, `prototype` → %Object.prototype%) wraps values via
+  `to_object` (undefined/null → a fresh object, an object passes through, primitives are boxed —
+  the Number/Boolean/BigInt/Symbol wrapper prototypes join with their phases) and installs 22
+  statics by intrinsic identity: `assign`, `create`, `defineProperties`, `defineProperty`,
+  `entries`, `freeze`, `fromEntries` (driven through the iterator protocol),
+  `getOwnPropertyDescriptor(s)`, `getOwnPropertyNames`, `getOwnPropertySymbols`,
+  `getPrototypeOf`, `hasOwn`, `is` (SameValue), `isExtensible`, `isFrozen`, `isSealed`, `keys`,
+  `preventExtensions`, `seal`, `setPrototypeOf`, `values`.
+- `%Object.prototype%` (null prototype per spec) carries `constructor`, `toString` (the full
+  `[object Tag]` table; `@@toStringTag` override waits on the Symbol builtin), `valueOf`,
+  `hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`, `toLocaleString`, and the Annex B
+  `__proto__` accessor pair.
+- Bootstrap links: `SetDefaultGlobalBindings` now finalizes `10.3.1` — every
+  intrinsic-registered built-in function's [[Prototype]] is `%Function.prototype%` — and
+  object/array literals link to `%Object.prototype%` (the IR `ObjectBegin` and the tree-walker
+  `eval_object_literal` both look it up), so `({}) instanceof Object`, `({}).toString()`, and
+  `({}).__proto__` behave. `find_ecma_accessor` now returns any callable accessor so builtin
+  getters/setters (like `__proto__`) dispatch through the agent instead of the crux closures.
+- The pre-Phase-8 `instanceof` test that asserted `Object` was undefined now asserts `({})
+  instanceof Object` is `true`.
+
+12 Object built-in tests. Still open in Phase 8: `Boolean`, `Symbol` (well-known symbols
+unblock `@@toStringTag` and the @@hasInstance path), the `Error` family (`assert.throws`
+fixtures), URI functions, `Function.prototype.toString` exact source, `WeakRef`/
+`FinalizationRegistry`, and the global-property completeness check.
 
 ---
 

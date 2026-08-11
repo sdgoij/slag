@@ -60,7 +60,13 @@ pub(crate) fn eval_statement_list(
     Ok(completion)
 }
 
-fn eval_statement(agent: &mut Agent, stmt: &Stmt, strict: bool) -> Result<Completion, JsError> {
+/// Evaluate a single statement (spec 14.x runtime semantics). Shared with the
+/// resumable-function IR, which batches suspension-free statements.
+pub(crate) fn eval_statement(
+    agent: &mut Agent,
+    stmt: &Stmt,
+    strict: bool,
+) -> Result<Completion, JsError> {
     match &stmt.kind {
         StmtKind::Empty | StmtKind::Debugger => Ok(Completion::Empty),
         StmtKind::Expr(expr) => eval_expr(agent, expr, strict).map(Completion::Normal),
@@ -282,7 +288,7 @@ fn eval_block(
 /// BlockDeclarationInstantiation (spec 14.2.4): create the block's lexical
 /// bindings uninitialized; block-level function declarations are instantiated
 /// and initialized immediately.
-fn block_declaration_instantiation(
+pub(crate) fn block_declaration_instantiation(
     agent: &mut Agent,
     stmts: &[Stmt],
     block_env: &EnvRef,
@@ -554,6 +560,46 @@ fn eval_for(
         agent.running_context_mut()?.lexical_environment = old_env;
     }
     result
+}
+
+/// ForIn/ForOfBodyEvaluation: the enumerable string keys of `rhs` and its
+/// prototype chain, in walk order (spec 14.7.5.6 steps 2-6). Shared with the
+/// resumable-function IR's `ForInBegin` step.
+pub(crate) fn for_in_keys(_agent: &mut Agent, rhs: &Value) -> Result<Vec<Value>, JsError> {
+    let mut seen: HashSet<PropertyKey> = HashSet::new();
+    let mut keys: Vec<Value> = Vec::new();
+    match rhs {
+        Value::Object(obj) => {
+            let mut current = Some(obj.clone());
+            while let Some(obj) = current {
+                for key in obj.own_property_keys()? {
+                    let PropertyKey::String(_) = key else {
+                        continue;
+                    };
+                    if !seen.insert(key.clone()) {
+                        continue;
+                    }
+                    if let Some(property) = obj.get_own_property_key(&key)?
+                        && property.enumerable
+                    {
+                        keys.push(key_value(&key));
+                    }
+                }
+                current = obj.get_prototype_of()?;
+            }
+        }
+        Value::String(text) => {
+            // ToObject of a primitive string: its own enumerable index keys.
+            for index in 0..text.len() {
+                keys.push(Value::String(Handle::new(JsString::from_utf8(
+                    &index.to_string(),
+                ))));
+            }
+        }
+        Value::Undefined | Value::Null => return Ok(Vec::new()),
+        _ => {}
+    }
+    Ok(keys)
 }
 
 /// ForInStatement evaluation (spec 14.7.5): enumerate the enumerable string
@@ -899,7 +945,9 @@ fn eval_try(
 /// The value bound to the catch parameter: the thrown language value, or the
 /// message of an internal error (Phase 8 creates real Error objects).
 fn catch_value(error: JsError) -> Value {
-    Value::String(Handle::new(JsString::from_utf8(&error.message)))
+    error
+        .value
+        .unwrap_or_else(|| Value::String(Handle::new(JsString::from_utf8(&error.message))))
 }
 
 fn run_finalizer(
@@ -1623,9 +1671,9 @@ mod tests {
 
     #[test]
     fn instanceof_and_in() {
-        // `in` works on object RHS; instanceof needs a constructor (the
-        // Phase 8 built-ins install them).
-        assert!(run("({}) instanceof Object").is_err());
+        // `in` works on object RHS; instanceof works once the Phase 8
+        // built-ins install Object and %Function.prototype%.@@hasInstance%.
+        assert_eq!(run("({}) instanceof Object").unwrap(), Value::Boolean(true));
         assert_eq!(
             run("let o = { x: 1 }; 'x' in o").unwrap(),
             Value::Boolean(true)

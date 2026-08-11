@@ -9,6 +9,7 @@
 //! full evaluation, modules, and built-ins.
 
 pub mod agent;
+pub mod async_await;
 pub mod binding;
 pub mod builtins;
 pub mod class;
@@ -18,8 +19,12 @@ pub mod eval;
 pub mod expr;
 pub mod flow;
 pub mod function;
+pub mod generator;
 pub mod host;
+pub mod ir;
 pub mod job;
+pub mod module;
+pub mod promise;
 pub mod realm;
 pub mod script;
 

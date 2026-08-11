@@ -54,6 +54,41 @@ pub struct Agent {
     /// 10.2.1 slots [[Environment]], [[FormalParameters]], [[ECMAScriptCode]],
     /// [[ThisMode]], [[HomeObject]] live here, Phase 7).
     pub ecma_functions: std::collections::HashMap<u64, crate::function::EcmaFunction>,
+    /// The Promise Records keyed by promise-object identity (spec 27.2.1).
+    pub promises: std::collections::HashMap<u64, RefCell<crate::promise::PromiseData>>,
+    /// The resolving functions created by CreateResolvingFunctions, keyed by
+    /// function identity (spec 27.2.1.3).
+    pub promise_resolvers:
+        std::collections::HashMap<u64, std::rc::Rc<RefCell<crate::promise::ResolverData>>>,
+    /// Per-element handlers created by the Promise combinators (all/
+    /// allSettled/any), keyed by function identity.
+    pub promise_compound: std::collections::HashMap<
+        u64,
+        std::rc::Rc<RefCell<crate::builtins::promise::CompoundState>>,
+    >,
+    /// The closures created by `Promise.prototype.finally`, keyed by function
+    /// identity.
+    pub promise_finally: std::collections::HashMap<
+        u64,
+        std::rc::Rc<RefCell<crate::builtins::promise::FinallyState>>,
+    >,
+    /// The await-resume handlers of running async functions, keyed by
+    /// function identity.
+    pub async_resume:
+        std::collections::HashMap<u64, std::rc::Rc<crate::async_await::ResumeHandler>>,
+    /// The AsyncFromSyncIterator methods, keyed by function identity.
+    pub async_from_sync:
+        std::collections::HashMap<u64, std::rc::Rc<crate::async_await::AsyncFromSyncEntry>>,
+    /// The generator objects' states, keyed by object identity (spec 27.4.3).
+    pub generators:
+        std::collections::HashMap<u64, std::rc::Rc<RefCell<crate::generator::GeneratorState>>>,
+    /// Host-provided module sources, keyed by specifier (HostResolveImportedModule).
+    pub host_modules:
+        RefCell<std::collections::HashMap<crux::string::JsString, crate::module::HostModuleSource>>,
+    /// The module behind each namespace object, keyed by object identity.
+    pub module_namespaces: std::collections::HashMap<u64, Handle<crate::module::SourceTextModule>>,
+    /// The dynamic-import namespace resolvers, keyed by function identity.
+    pub import_namespace_resolvers: std::collections::HashMap<u64, (Value, Value)>,
 }
 
 impl Agent {
@@ -76,6 +111,16 @@ impl Agent {
             global_symbol_registry: RefCell::new(Vec::new()),
             module_async_evaluation_count: 0,
             ecma_functions: std::collections::HashMap::new(),
+            promises: std::collections::HashMap::new(),
+            promise_resolvers: std::collections::HashMap::new(),
+            promise_compound: std::collections::HashMap::new(),
+            promise_finally: std::collections::HashMap::new(),
+            async_resume: std::collections::HashMap::new(),
+            async_from_sync: std::collections::HashMap::new(),
+            generators: std::collections::HashMap::new(),
+            host_modules: RefCell::new(std::collections::HashMap::new()),
+            module_namespaces: std::collections::HashMap::new(),
+            import_namespace_resolvers: std::collections::HashMap::new(),
         }
     }
 

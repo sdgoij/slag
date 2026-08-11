@@ -44,7 +44,7 @@ pub fn script_evaluation(
     let context = crate::context::ExecutionContext {
         function: None,
         realm: script.realm.clone(),
-        script_or_module: Some(script.clone()),
+        script_or_module: Some(crate::context::ScriptOrModule::Script(script.clone())),
         lexical_environment: global_env.clone(),
         variable_environment: global_env.clone(),
         private_environment: None,

@@ -25,14 +25,21 @@ pub fn as_object(value: &Value) -> Option<Handle<JsObject>> {
     }
 }
 
+/// The active script or module (spec 9.4.2): what the running code came from.
+#[derive(Debug, Clone)]
+pub enum ScriptOrModule {
+    Script(Handle<ScriptRecord>),
+    Module(Handle<crate::module::SourceTextModule>),
+}
+
 /// An execution context (spec 9.4 tables): the Function, Realm,
 /// ScriptOrModule, LexicalEnvironment, VariableEnvironment, and
 /// PrivateEnvironment components.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ExecutionContext {
     pub function: Option<Value>,
     pub realm: Handle<Realm>,
-    pub script_or_module: Option<Handle<ScriptRecord>>,
+    pub script_or_module: Option<ScriptOrModule>,
     pub lexical_environment: EnvRef,
     pub variable_environment: EnvRef,
     pub private_environment: Option<Handle<PrivateEnvironment>>,
@@ -228,6 +235,21 @@ pub fn get_property_key(
     key: &crux::property::PropertyKey,
     receiver: Value,
 ) -> Result<Value, JsError> {
+    // Module namespace objects read their exported bindings through the
+    // module environment (spec 10.4.6.1).
+    if let Value::Object(obj) = base
+        && matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_))
+        && let Some(module) = agent.module_namespaces.get(&obj.id()).cloned()
+    {
+        let crux::property::PropertyKey::String(id) = key else {
+            return Ok(Value::Undefined);
+        };
+        let name = crux::lookup(*id);
+        if name == JsString::from_utf8("Symbol.toStringTag") {
+            return Ok(Value::Undefined);
+        }
+        return crate::module::namespace_get(agent, &module, &name);
+    }
     match base {
         Value::Object(obj) => {
             // Accessors whose getter is an ECMAScript function cannot be
@@ -261,6 +283,11 @@ enum AccessorKind {
 /// The first accessor on the prototype chain for `key` whose getter/setter
 /// is an ECMAScript function. `None` when the chain holds no such accessor,
 /// so the crux [[Get]]/[[Set]] handles data and builtin-accessor properties.
+/// The first accessor on the prototype chain for `key` whose getter/setter
+/// is callable. `None` when the chain holds no such accessor, so the crux
+/// [[Get]]/[[Set]] handles plain data properties. Both ECMAScript accessors
+/// and agent-dispatched builtins are returned; the caller runs them through
+/// `runtime::function::call`, which handles either kind.
 fn find_ecma_accessor(
     object: &crux::object::JsObject,
     key: &crux::property::PropertyKey,
@@ -285,12 +312,7 @@ fn find_ecma_accessor(
             let Some(accessor) = accessor else {
                 return Ok(None);
             };
-            if let Value::Function(function) = &accessor
-                && matches!(&function.kind, crux::function::FunctionKind::EcmaScript)
-            {
-                return Ok(Some(accessor));
-            }
-            return Ok(None);
+            return Ok(Some(accessor));
         }
         match obj.get_prototype_of()? {
             Some(proto) => prototype = Some(proto),
@@ -421,7 +443,7 @@ fn undefined_error(name: &JsString) -> JsError {
 
 /// spec 9.4.1 GetActiveScriptOrModule: the topmost execution context whose
 /// ScriptOrModule is not null, if any.
-pub fn get_active_script_or_module(agent: &Agent) -> Option<Handle<ScriptRecord>> {
+pub fn get_active_script_or_module(agent: &Agent) -> Option<ScriptOrModule> {
     agent
         .execution_context_stack
         .iter()

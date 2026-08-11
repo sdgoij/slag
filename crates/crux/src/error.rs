@@ -16,10 +16,13 @@ pub enum ErrorKind {
 }
 
 /// An ECMAScript error before it is wrapped in a spec `Error` object.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct JsError {
     pub kind: ErrorKind,
     pub message: String,
+    /// The thrown language value, when the error came from a user `throw`
+    /// (promise rejections and `try`/`catch` of async throws need it).
+    pub value: Option<crate::value::Value>,
     /// The source span the error refers to, when known.
     pub span: Option<Span>,
 }
@@ -29,8 +32,16 @@ impl JsError {
         Self {
             kind,
             message,
+            value: None,
             span: None,
         }
+    }
+
+    /// Attach the thrown language value (a user `throw` crossing a Rust
+    /// boundary).
+    pub fn with_value(mut self, value: crate::value::Value) -> Self {
+        self.value = Some(value);
+        self
     }
 
     pub fn with_span(mut self, span: Span) -> Self {

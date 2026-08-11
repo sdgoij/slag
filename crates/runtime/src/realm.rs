@@ -24,6 +24,10 @@ pub struct Realm {
     pub intrinsics: Intrinsics,
     pub global_object: Handle<JsObject>,
     pub global_env: EnvRef,
+    /// [[LoadedModules]] (spec 9.3): the Source Text Module Records keyed by
+    /// resolved specifier.
+    pub loaded_modules:
+        RefCell<std::collections::HashMap<JsString, Handle<crate::module::SourceTextModule>>>,
 }
 
 impl Realm {
@@ -56,6 +60,11 @@ impl Intrinsics {
     pub fn is_empty(&self) -> bool {
         self.entries.borrow().is_empty()
     }
+
+    /// Every registered intrinsic value, for post-install linking.
+    pub fn entries(&self) -> Vec<Value> {
+        self.entries.borrow().values().cloned().collect()
+    }
 }
 
 fn as_object(value: &Value) -> Option<Handle<JsObject>> {
@@ -83,6 +92,7 @@ pub fn initialize_host_defined_realm(agent: &Agent) -> Result<Handle<Realm>, JsE
         intrinsics,
         global_object: global.clone(),
         global_env,
+        loaded_modules: RefCell::new(std::collections::HashMap::new()),
     });
     set_default_global_bindings(&realm)?;
     Ok(realm)
@@ -151,7 +161,28 @@ fn set_default_global_bindings(realm: &Handle<Realm>) -> Result<(), JsError> {
             configurable: Some(true),
         },
     )?;
+    crate::builtins::object::install(realm)?;
     crate::builtins::function::install(realm)?;
+    crate::builtins::promise::install(realm)?;
+    crate::generator::install(realm)?;
+    // spec 10.3.1: every built-in function object's [[Prototype]] is
+    // %Function.prototype%. Link all intrinsic-registered functions now that
+    // the table is full; %Function.prototype% itself keeps %Object.prototype%
+    // (setting its own proto would be a cycle, which set_prototype_of
+    // rejects).
+    let function_proto = match realm.intrinsics.get("%Function.prototype%") {
+        Some(Value::Function(function)) => function.object.handle(),
+        _ => None,
+    };
+    if let Some(function_proto) = function_proto {
+        for value in realm.intrinsics.entries() {
+            if let Value::Function(function) = value
+                && let Some(object) = function.object.handle()
+            {
+                object.set_prototype_of(Some(function_proto.clone()))?;
+            }
+        }
+    }
     Ok(())
 }
 

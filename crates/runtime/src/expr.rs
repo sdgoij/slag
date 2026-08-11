@@ -133,10 +133,14 @@ pub fn eval_expr(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Value, 
                 ))
             }
         }
-        ExprKind::ImportCall { .. } => Err(JsError::new(
-            ErrorKind::TypeError,
-            "dynamic import is not implemented until Phase 7".into(),
-        )),
+        ExprKind::ImportCall { specifier, options } => {
+            let specifier = eval_expr(agent, specifier, strict)?;
+            let options = match options {
+                Some(expr) => Some(eval_expr(agent, expr, strict)?),
+                None => None,
+            };
+            crate::module::dynamic_import(agent, &specifier, options.as_ref())
+        }
     }
 }
 
@@ -411,7 +415,12 @@ fn eval_object_literal(
     literal: &ObjectLiteral,
     strict: bool,
 ) -> Result<Value, JsError> {
-    let object = crux::object::JsObject::ordinary_object_create(None);
+    let proto = agent
+        .current_realm()?
+        .intrinsics
+        .get("%Object.prototype%")
+        .and_then(|value| crate::context::as_object(&value));
+    let object = crux::object::JsObject::ordinary_object_create(proto);
     for property in &literal.props {
         match property {
             ObjectProperty::Init {
@@ -529,7 +538,10 @@ fn eval_object_literal(
 
 /// CopyDataProperties (spec 14.1.16): copy the enumerable own properties of
 /// `from` onto `to`, skipping keys that already exist.
-fn copy_data_properties(to: &crux::object::JsObject, from: &Value) -> Result<(), JsError> {
+pub(crate) fn copy_data_properties(
+    to: &crux::object::JsObject,
+    from: &Value,
+) -> Result<(), JsError> {
     let Value::Object(from_obj) = from else {
         return Ok(());
     };
@@ -634,6 +646,39 @@ fn eval_unary(
             let value = eval_expr(agent, operand, strict)?;
             Ok(Value::Boolean(!to_boolean(&value)))
         }
+    }
+}
+
+/// The numeric/logical unary operators applied to an already-evaluated
+/// operand (used by the resumable-function IR's `Unary` step).
+pub(crate) fn eval_unary_value(
+    _agent: &mut Agent,
+    op: &UnaryOp,
+    value: Value,
+) -> Result<Value, JsError> {
+    match op {
+        UnaryOp::Delete | UnaryOp::Void | UnaryOp::Typeof => Err(JsError::new(
+            ErrorKind::SyntaxError,
+            "unary operator is not a value tail".into(),
+        )),
+        UnaryOp::Plus => Ok(Value::Number(to_number(&value)?)),
+        UnaryOp::Minus => {
+            let numeric = to_numeric(&value)?;
+            match numeric {
+                Value::Number(n) => Ok(Value::Number(-n)),
+                Value::BigInt(b) => Ok(Value::BigInt(Handle::new(bigint::unary_minus(&b)))),
+                _ => unreachable!(),
+            }
+        }
+        UnaryOp::BitNot => {
+            let numeric = to_numeric(&value)?;
+            match numeric {
+                Value::Number(n) => Ok(Value::Number((!(n as i32)) as f64)),
+                Value::BigInt(b) => Ok(Value::BigInt(Handle::new(bigint::bitwise_not(&b)))),
+                _ => unreachable!(),
+            }
+        }
+        UnaryOp::Not => Ok(Value::Boolean(!to_boolean(&value))),
     }
 }
 
@@ -778,7 +823,7 @@ fn compound_binary(op: AssignOp) -> BinaryOp {
     }
 }
 
-fn apply_compound(
+pub(crate) fn apply_compound(
     agent: &mut Agent,
     op: AssignOp,
     left: &Value,
@@ -796,7 +841,7 @@ fn mixed_bigint_error() -> JsError {
 
 /// ApplyStringOrNumericBinaryOperator (spec 13.15.4) for the arithmetic,
 /// shift, and bitwise operators.
-fn apply_binary(
+pub(crate) fn apply_binary(
     agent: &mut Agent,
     op: BinaryOp,
     left: &Value,
@@ -1197,6 +1242,7 @@ fn eval_tagged_template(
 }
 
 /// The Iterator Record of GetIterator (spec 7.4.2).
+#[derive(Debug, Clone)]
 pub struct IteratorRecord {
     pub iterator: Value,
     pub next: Value,
