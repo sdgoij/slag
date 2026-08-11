@@ -95,6 +95,9 @@ pub struct Agent {
     /// [[SymbolData]] of Symbol wrapper objects, keyed by object identity
     /// (spec 20.4.1: `Object(sym)` boxes the symbol).
     pub symbol_data: std::collections::HashMap<u64, crux::symbol::Symbol>,
+    /// [[ErrorData]] markers of Error instances, keyed by object identity
+    /// (spec 20.5.4: `Error.isError` and the `[object Error]` tag need it).
+    pub error_data: std::collections::HashSet<u64>,
 }
 
 impl Agent {
@@ -129,6 +132,7 @@ impl Agent {
             import_namespace_resolvers: std::collections::HashMap::new(),
             boolean_data: std::collections::HashMap::new(),
             symbol_data: std::collections::HashMap::new(),
+            error_data: std::collections::HashSet::new(),
         }
     }
 

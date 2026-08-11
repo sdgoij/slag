@@ -1014,12 +1014,8 @@ pub fn dynamic_import(
         Ok(())
     })();
     if let Err(error) = result {
-        crate::function::call(
-            agent,
-            &reject,
-            Value::Undefined,
-            &[crate::promise::error_value(&error)],
-        )?;
+        let rejection = crate::promise::error_value(agent, &error);
+        crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
     }
     Ok(capability.promise)
 }

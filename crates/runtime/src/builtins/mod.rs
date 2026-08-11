@@ -5,6 +5,7 @@
 //! pattern), because the crux-level native closures cannot reach the agent.
 
 pub mod boolean;
+pub mod error;
 pub mod function;
 pub mod object;
 pub mod promise;

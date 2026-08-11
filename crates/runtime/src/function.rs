@@ -649,6 +649,11 @@ pub fn call(
                     return result;
                 }
                 if let Some(result) =
+                    crate::builtins::error::dispatch_call(agent, callee, &this, args)
+                {
+                    return result;
+                }
+                if let Some(result) =
                     crate::builtins::promise::dispatch_call(agent, callee, &this, args)
                 {
                     return result;
@@ -719,6 +724,11 @@ pub fn construct(
                 }
                 if let Some(result) =
                     crate::builtins::symbol::dispatch_construct(agent, callee, args, new_target)
+                {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::builtins::error::dispatch_construct(agent, callee, args, new_target)
                 {
                     return result;
                 }

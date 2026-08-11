@@ -215,7 +215,10 @@ pub fn resolve_promise(
     );
     let then = match then {
         Ok(then) => then,
-        Err(error) => return reject_promise(agent, promise, error_value(&error)),
+        Err(error) => {
+            let rejection = error_value(agent, &error);
+            return reject_promise(agent, promise, rejection);
+        }
     };
     if !is_callable(&then) {
         return fulfill_promise(agent, promise, resolution);
@@ -379,21 +382,30 @@ pub fn promise_resolve(agent: &mut Agent, constructor: &Value, x: Value) -> Resu
 
 /// The value a rejected promise receives: the thrown language value, or a
 /// TypeError for an internal error (Phase 8 binds real Error objects).
-pub fn error_value(error: &JsError) -> Value {
-    error.value.clone().unwrap_or_else(|| {
-        let kind = match error.kind {
-            ErrorKind::TypeError => "TypeError",
-            ErrorKind::RangeError => "RangeError",
-            ErrorKind::ReferenceError => "ReferenceError",
-            ErrorKind::SyntaxError => "SyntaxError",
-            ErrorKind::EvalError => "EvalError",
-            ErrorKind::UriError => "URIError",
-        };
+pub fn error_value(agent: &mut Agent, error: &JsError) -> Value {
+    if let Some(value) = &error.value {
+        return value.clone();
+    }
+    // Engine errors reject with a real Error object (spec ch. 17); the
+    // message string is the fallback until the built-ins are installed.
+    crate::builtins::error::to_throwable(agent, error).unwrap_or_else(|_| {
         Value::String(Handle::new(JsString::from_utf8(&format!(
-            "{kind}: {}",
+            "{}: {}",
+            kind_name(error.kind),
             error.message
         ))))
     })
+}
+
+fn kind_name(kind: ErrorKind) -> &'static str {
+    match kind {
+        ErrorKind::TypeError => "TypeError",
+        ErrorKind::RangeError => "RangeError",
+        ErrorKind::ReferenceError => "ReferenceError",
+        ErrorKind::SyntaxError => "SyntaxError",
+        ErrorKind::EvalError => "EvalError",
+        ErrorKind::UriError => "URIError",
+    }
 }
 
 /// NewPromiseReactionJob (spec 27.2.1.6): run the reaction's handler with the
@@ -423,11 +435,12 @@ fn enqueue_reaction_job(agent: &mut Agent, reaction: PromiseReaction, argument: 
                     crate::function::call(agent, &capability.resolve, Value::Undefined, &[value])?;
                 }
                 Err(error) => {
+                    let rejection = error_value(agent, &error);
                     crate::function::call(
                         agent,
                         &capability.reject,
                         Value::Undefined,
-                        &[error_value(&error)],
+                        &[rejection],
                     )?;
                 }
             }
@@ -451,7 +464,8 @@ fn enqueue_resolve_thenable_job(
         match result {
             Ok(_) => Ok(Value::Undefined),
             Err(error) => {
-                crate::function::call(agent, &reject, Value::Undefined, &[error_value(&error)])?;
+                let rejection = error_value(agent, &error);
+                crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
                 Ok(Value::Undefined)
             }
         }

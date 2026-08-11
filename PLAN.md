@@ -1169,9 +1169,23 @@ Symbol wrappers register their wrapped value), so `true.toString()`, `Symbol('x'
 and `Symbol.prototype.toString.call(...)` work; module namespaces expose
 `Symbol.toStringTag = "Module"` (spec 28.3.1).
 
-12 Object + 4 Boolean + 5 Symbol built-in tests. Still open in Phase 8: the `Error` family
-(`assert.throws` fixtures), URI functions, `Function.prototype.toString` exact source,
-`WeakRef`/`FinalizationRegistry`, and the global-property completeness check.
+**Error family** (`builtins/error.rs`): `%Error%` + the six native error constructors
+(`TypeError`, `RangeError`, `ReferenceError`, `SyntaxError`, `EvalError`, `URIError`),
+`AggregateError` (`errors` list from CreateListFromArrayLike + `message`/`cause`), and
+`SuppressedError` (`error`/`suppressed`/`message`), sharing one constructor machinery over
+GetPrototypeFromConstructor. Instances carry non-enumerable `message`, `cause`, and a
+V8-style `stack` captured at creation; `[[ErrorData]]` lives in the agent's `error_data`
+set (`Error.isError`, `[object Error]` tag). `%Error.prototype%` provides
+`toString` (`name: message`), `name`, `message`, and `@@toStringTag`. 7 tests.
+
+Engine errors now throw **real Error objects**: `eval.rs` catch binding and promise
+rejections (`error_value`) route through `builtins::error::to_throwable`, so
+`try { null.x } catch (e) { e instanceof TypeError }` is `true` — the `assert.throws`
+fixtures unblock.
+
+12 Object + 4 Boolean + 5 Symbol + 7 Error built-in tests. Still open in Phase 8: URI
+functions, `Function.prototype.toString` exact source, `WeakRef`/`FinalizationRegistry`,
+and the global-property completeness check.
 
 ---
 

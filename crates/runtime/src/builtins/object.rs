@@ -277,6 +277,8 @@ fn prototype_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsError
         Value::Object(obj) => {
             if agent.boolean_data.contains_key(&obj.id()) {
                 "Boolean"
+            } else if agent.error_data.contains(&obj.id()) {
+                "Error"
             } else {
                 obj.kind.name()
             }

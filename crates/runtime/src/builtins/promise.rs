@@ -362,7 +362,8 @@ fn promise_constructor(
         &[resolve, reject.clone()],
     );
     if let Err(error) = result {
-        crate::function::call(agent, &reject, Value::Undefined, &[error_value(&error)])?;
+        let rejection = error_value(agent, &error);
+        crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
     }
     Ok(promise_value)
 }
@@ -554,12 +555,8 @@ fn promise_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
     let iterator = match crate::expr::get_iterator(agent, &iterable) {
         Ok(iterator) => iterator,
         Err(error) => {
-            crate::function::call(
-                agent,
-                &capability.reject,
-                Value::Undefined,
-                &[error_value(&error)],
-            )?;
+            let rejection = error_value(agent, &error);
+            crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
             return Ok(capability.promise);
         }
     };
@@ -581,7 +578,8 @@ fn promise_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
             }
             Err(error) => {
                 crate::expr::iterator_close(agent, &iterator)?;
-                crate::function::call(agent, &reject, Value::Undefined, &[error_value(&error)])?;
+                let rejection = error_value(agent, &error);
+                crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
                 return Ok(capability.promise);
             }
         };
@@ -672,12 +670,8 @@ fn promise_all_settled(agent: &mut Agent, this: &Value, args: &[Value]) -> Resul
     let iterator = match crate::expr::get_iterator(agent, &iterable) {
         Ok(iterator) => iterator,
         Err(error) => {
-            crate::function::call(
-                agent,
-                &capability.reject,
-                Value::Undefined,
-                &[error_value(&error)],
-            )?;
+            let rejection = error_value(agent, &error);
+            crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
             return Ok(capability.promise);
         }
     };
@@ -698,12 +692,8 @@ fn promise_all_settled(agent: &mut Agent, this: &Value, args: &[Value]) -> Resul
             }
             Err(error) => {
                 crate::expr::iterator_close(agent, &iterator)?;
-                crate::function::call(
-                    agent,
-                    &capability.reject,
-                    Value::Undefined,
-                    &[error_value(&error)],
-                )?;
+                let rejection = error_value(agent, &error);
+                crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
                 return Ok(capability.promise);
             }
         };
@@ -812,12 +802,8 @@ fn promise_any(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
     let iterator = match crate::expr::get_iterator(agent, &iterable) {
         Ok(iterator) => iterator,
         Err(error) => {
-            crate::function::call(
-                agent,
-                &capability.reject,
-                Value::Undefined,
-                &[error_value(&error)],
-            )?;
+            let rejection = error_value(agent, &error);
+            crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
             return Ok(capability.promise);
         }
     };
@@ -840,7 +826,8 @@ fn promise_any(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
             }
             Err(error) => {
                 crate::expr::iterator_close(agent, &iterator)?;
-                crate::function::call(agent, &reject, Value::Undefined, &[error_value(&error)])?;
+                let rejection = error_value(agent, &error);
+                crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
                 return Ok(capability.promise);
             }
         };
@@ -949,12 +936,8 @@ fn promise_race(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     let iterator = match crate::expr::get_iterator(agent, &iterable) {
         Ok(iterator) => iterator,
         Err(error) => {
-            crate::function::call(
-                agent,
-                &capability.reject,
-                Value::Undefined,
-                &[error_value(&error)],
-            )?;
+            let rejection = error_value(agent, &error);
+            crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
             return Ok(capability.promise);
         }
     };
@@ -964,12 +947,8 @@ fn promise_race(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
             Ok(None) => return Ok(capability.promise),
             Err(error) => {
                 crate::expr::iterator_close(agent, &iterator)?;
-                crate::function::call(
-                    agent,
-                    &capability.reject,
-                    Value::Undefined,
-                    &[error_value(&error)],
-                )?;
+                let rejection = error_value(agent, &error);
+                crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
                 return Ok(capability.promise);
             }
         };
@@ -1025,12 +1004,8 @@ fn promise_try(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
             crate::function::call(agent, &capability.resolve, Value::Undefined, &[value])?;
         }
         Err(error) => {
-            crate::function::call(
-                agent,
-                &capability.reject,
-                Value::Undefined,
-                &[error_value(&error)],
-            )?;
+            let rejection = error_value(agent, &error);
+            crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
         }
     }
     Ok(capability.promise)

@@ -934,20 +934,15 @@ fn eval_try(
         },
         Ok(other) => other,
         Err(error) => match handler {
-            // Phase 8 binds real Error objects; until then the message.
-            Some(handler) => eval_catch(agent, handler, catch_value(error), strict)?,
+            // Engine errors become real Error objects (spec ch. 17).
+            Some(handler) => {
+                let thrown = crate::builtins::error::to_throwable(agent, &error)?;
+                eval_catch(agent, handler, thrown, strict)?
+            }
             None => return run_finalizer(agent, finalizer, Err(error), strict),
         },
     };
     run_finalizer(agent, finalizer, Ok(handled), strict)
-}
-
-/// The value bound to the catch parameter: the thrown language value, or the
-/// message of an internal error (Phase 8 creates real Error objects).
-fn catch_value(error: JsError) -> Value {
-    error
-        .value
-        .unwrap_or_else(|| Value::String(Handle::new(JsString::from_utf8(&error.message))))
 }
 
 fn run_finalizer(
