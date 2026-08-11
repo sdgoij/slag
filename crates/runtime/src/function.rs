@@ -713,6 +713,11 @@ pub fn call(
                     return result;
                 }
                 if let Some(result) =
+                    crate::builtins::string::dispatch_call(agent, callee, &this, args)
+                {
+                    return result;
+                }
+                if let Some(result) =
                     crate::builtins::weakref::dispatch_call(agent, callee, &this, args)
                 {
                     return result;
@@ -813,6 +818,11 @@ pub fn construct(
                 }
                 if let Some(result) =
                     crate::builtins::number::dispatch_construct(agent, callee, args, new_target)
+                {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::builtins::string::dispatch_construct(agent, callee, args, new_target)
                 {
                     return result;
                 }

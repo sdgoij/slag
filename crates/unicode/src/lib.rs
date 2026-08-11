@@ -6,6 +6,8 @@
 //! are already here because phase 1 conversions (parseFloat/parseInt) need
 //! them.
 
+use unicode_normalization::UnicodeNormalization;
+
 /// `WhiteSpace` (spec 11.2): TAB, VT, FF, SP, NBSP, ZWNBSP, and the
 /// Space_Separator (Zs) category.
 pub fn is_white_space(cp: u32) -> bool {
@@ -47,6 +49,70 @@ pub fn is_unicode_id_continue(cp: u32) -> bool {
 
 fn char_of(cp: u32) -> Option<char> {
     char::from_u32(cp)
+}
+
+/// The four Unicode normalization forms (spec 22.1.3.17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::upper_case_acronyms)]
+pub enum NormalizationForm {
+    Nfc,
+    Nfd,
+    Nfkc,
+    Nfkd,
+}
+
+/// Normalize a code-point sequence into `form` (Unicode Normalization
+/// Forms); lone surrogates pass through unchanged, since they are not valid
+/// Unicode scalar values and never participate in normalization.
+///
+/// The Unicode data comes from `unicode-normalization` (Unicode 16.0); the
+/// pinned spec version drift is documented at the crate root.
+pub fn normalize_code_points(cps: &[u32], form: NormalizationForm) -> Vec<u32> {
+    let mut out = Vec::with_capacity(cps.len());
+    let mut run: Vec<char> = Vec::new();
+    for &cp in cps {
+        match char_of(cp) {
+            Some(c) => run.push(c),
+            None => {
+                flush_run(&mut run, &mut out, form);
+                out.push(cp);
+            }
+        }
+    }
+    flush_run(&mut run, &mut out, form);
+    out
+}
+
+fn flush_run(run: &mut Vec<char>, out: &mut Vec<u32>, form: NormalizationForm) {
+    if run.is_empty() {
+        return;
+    }
+    let text: String = run.drain(..).collect();
+    let normalized: String = match form {
+        NormalizationForm::Nfc => text.nfc().collect(),
+        NormalizationForm::Nfd => text.nfd().collect(),
+        NormalizationForm::Nfkc => text.nfkc().collect(),
+        NormalizationForm::Nfkd => text.nfkd().collect(),
+    };
+    out.extend(normalized.chars().map(|c| c as u32));
+}
+
+/// Default Case Conversion (spec 22.1.3.30): the locale-insensitive
+/// lowercase mapping of one code point, which may expand to several.
+pub fn to_lowercase(cp: u32) -> Vec<u32> {
+    match char_of(cp) {
+        Some(c) => c.to_lowercase().map(|c| c as u32).collect(),
+        None => vec![cp],
+    }
+}
+
+/// Default Case Conversion (spec 22.1.3.31): the uppercase mapping of one
+/// code point, which may expand to several (`ß` → `"SS"`).
+pub fn to_uppercase(cp: u32) -> Vec<u32> {
+    match char_of(cp) {
+        Some(c) => c.to_uppercase().map(|c| c as u32).collect(),
+        None => vec![cp],
+    }
 }
 
 #[cfg(test)]
@@ -114,5 +180,50 @@ mod tests {
         }
         assert!(!is_line_terminator(0x000B));
         assert!(!is_line_terminator(0x0020));
+    }
+
+    #[test]
+    fn nfd_decomposes_and_nfc_recomposes() {
+        let e_accent = vec![0x00E9]; // é
+        let nfd = normalize_code_points(&e_accent, NormalizationForm::Nfd);
+        assert_eq!(nfd, vec![0x65, 0x0301]); // e + combining acute
+        assert_eq!(
+            normalize_code_points(&nfd, NormalizationForm::Nfc),
+            e_accent
+        );
+    }
+
+    #[test]
+    fn nfkc_compatibility_decomposes() {
+        // U+FF21 FULLWIDTH LATIN CAPITAL LETTER A → "A".
+        assert_eq!(
+            normalize_code_points(&[0xFF21], NormalizationForm::Nfkc),
+            vec![0x41]
+        );
+        // NFKC keeps the ligature intact.
+        assert_eq!(
+            normalize_code_points(&[0xFB01], NormalizationForm::Nfc),
+            vec![0xFB01]
+        );
+        assert_eq!(
+            normalize_code_points(&[0xFB01], NormalizationForm::Nfkc),
+            vec![0x66, 0x69]
+        );
+    }
+
+    #[test]
+    fn normalization_passes_lone_surrogates_through() {
+        let cps = vec![0x61, 0xD800, 0x62, 0x0301];
+        let nfd = normalize_code_points(&cps, NormalizationForm::Nfd);
+        assert_eq!(nfd, vec![0x61, 0xD800, 0x62, 0x0301]);
+    }
+
+    #[test]
+    fn case_conversion_expands_code_points() {
+        assert_eq!(to_lowercase(0x41), vec![0x61]);
+        assert_eq!(to_uppercase(0x61), vec![0x41]);
+        assert_eq!(to_uppercase(0x00DF), vec![0x53, 0x53]); // ß → "SS"
+        assert_eq!(to_lowercase(0x0130), vec![0x69, 0x0307]); // İ → "i̇"
+        assert_eq!(to_lowercase(0xD800), vec![0xD800]); // lone surrogate
     }
 }

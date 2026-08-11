@@ -885,6 +885,62 @@ mod harness {
     test262_builtin_fixture!(Date_S15_9_3_1_A6_T3, "Date/S15.9.3.1_A6_T3.js");
     test262_builtin_fixture!(Date_S15_9_3_1_A6_T4, "Date/S15.9.3.1_A6_T4.js");
     test262_builtin_fixture!(Date_S15_9_3_1_A6_T5, "Date/S15.9.3.1_A6_T5.js");
+    test262_builtin_fixture!(String_15_5_5_5_2_1_1, "String/15.5.5.5.2-1-1.js");
+    test262_builtin_fixture!(String_15_5_5_5_2_1_2, "String/15.5.5.5.2-1-2.js");
+    test262_builtin_fixture!(String_15_5_5_5_2_3_1, "String/15.5.5.5.2-3-1.js");
+    test262_builtin_fixture!(String_15_5_5_5_2_3_2, "String/15.5.5.5.2-3-2.js");
+    test262_builtin_fixture!(String_15_5_5_5_2_3_3, "String/15.5.5.5.2-3-3.js");
+    test262_builtin_fixture!(String_15_5_5_5_2_3_4, "String/15.5.5.5.2-3-4.js");
+    test262_builtin_fixture!(String_15_5_5_5_2_3_5, "String/15.5.5.5.2-3-5.js");
+    test262_builtin_fixture!(String_15_5_5_5_2_3_6, "String/15.5.5.5.2-3-6.js");
+    test262_builtin_fixture!(String_15_5_5_5_2_3_7, "String/15.5.5.5.2-3-7.js");
+    test262_builtin_fixture!(String_15_5_5_5_2_3_8, "String/15.5.5.5.2-3-8.js");
+    test262_builtin_fixture!(String_15_5_5_5_2_7_1, "String/15.5.5.5.2-7-1.js");
+    test262_builtin_fixture!(String_15_5_5_5_2_7_2, "String/15.5.5.5.2-7-2.js");
+    test262_builtin_fixture!(String_15_5_5_5_2_7_3, "String/15.5.5.5.2-7-3.js");
+    test262_builtin_fixture!(String_15_5_5_5_2_7_4, "String/15.5.5.5.2-7-4.js");
+    test262_builtin_fixture!(String_S15_5_1_1_A1_T1, "String/S15.5.1.1_A1_T1.js");
+    test262_builtin_fixture!(String_S15_5_1_1_A1_T10, "String/S15.5.1.1_A1_T10.js");
+    test262_builtin_fixture!(String_S15_5_1_1_A1_T11, "String/S15.5.1.1_A1_T11.js");
+    test262_builtin_fixture!(String_S15_5_1_1_A1_T12, "String/S15.5.1.1_A1_T12.js");
+    test262_builtin_fixture!(String_S15_5_1_1_A1_T13, "String/S15.5.1.1_A1_T13.js");
+    test262_builtin_fixture!(String_S15_5_1_1_A1_T14, "String/S15.5.1.1_A1_T14.js");
+    test262_builtin_fixture!(String_S15_5_1_1_A1_T15, "String/S15.5.1.1_A1_T15.js");
+    test262_builtin_fixture!(String_S15_5_1_1_A1_T16, "String/S15.5.1.1_A1_T16.js");
+    test262_builtin_fixture!(String_S15_5_1_1_A1_T17, "String/S15.5.1.1_A1_T17.js");
+    test262_builtin_fixture!(String_S15_5_1_1_A1_T18, "String/S15.5.1.1_A1_T18.js");
+    test262_builtin_fixture!(String_S15_5_1_1_A1_T2, "String/S15.5.1.1_A1_T2.js");
+    test262_builtin_fixture!(String_S15_5_1_1_A1_T3, "String/S15.5.1.1_A1_T3.js");
+    test262_builtin_fixture!(String_S15_5_1_1_A1_T4, "String/S15.5.1.1_A1_T4.js");
+    test262_builtin_fixture!(String_S15_5_1_1_A1_T5, "String/S15.5.1.1_A1_T5.js");
+    test262_builtin_fixture!(String_S15_5_1_1_A2_T1, "String/S15.5.1.1_A2_T1.js");
+    test262_builtin_fixture!(String_S15_5_2_1_A2_T1, "String/S15.5.2.1_A2_T1.js");
+    test262_builtin_fixture!(String_S15_5_2_1_A2_T2, "String/S15.5.2.1_A2_T2.js");
+    test262_builtin_fixture!(String_S15_5_2_1_A3, "String/S15.5.2.1_A3.js");
+    test262_builtin_fixture!(String_S15_5_3_A1, "String/S15.5.3_A1.js");
+    test262_builtin_fixture!(String_S15_5_3_A2_T2, "String/S15.5.3_A2_T2.js");
+    test262_builtin_fixture!(String_S15_5_5_1_A1, "String/S15.5.5.1_A1.js");
+    test262_builtin_fixture!(String_S15_5_5_1_A2, "String/S15.5.5.1_A2.js");
+    test262_builtin_fixture!(String_S15_5_5_1_A4_T1, "String/S15.5.5.1_A4_T1.js");
+    test262_builtin_fixture!(String_S15_5_5_A1_T1, "String/S15.5.5_A1_T1.js");
+    test262_builtin_fixture!(String_S15_5_5_A1_T2, "String/S15.5.5_A1_T2.js");
+    test262_builtin_fixture!(String_S15_5_5_A2_T1, "String/S15.5.5_A2_T1.js");
+    test262_builtin_fixture!(String_S15_5_5_A2_T2, "String/S15.5.5_A2_T2.js");
+    test262_builtin_fixture!(String_S8_12_8_A1, "String/S8.12.8_A1.js");
+    test262_builtin_fixture!(String_S9_8_1_A1, "String/S9.8.1_A1.js");
+    test262_builtin_fixture!(String_S9_8_1_A10, "String/S9.8.1_A10.js");
+    test262_builtin_fixture!(String_S9_8_1_A2, "String/S9.8.1_A2.js");
+    test262_builtin_fixture!(String_S9_8_1_A3, "String/S9.8.1_A3.js");
+    test262_builtin_fixture!(String_S9_8_1_A4, "String/S9.8.1_A4.js");
+    test262_builtin_fixture!(String_S9_8_1_A6, "String/S9.8.1_A6.js");
+    test262_builtin_fixture!(String_S9_8_1_A7, "String/S9.8.1_A7.js");
+    test262_builtin_fixture!(String_S9_8_1_A8, "String/S9.8.1_A8.js");
+    test262_builtin_fixture!(String_S9_8_1_A9_T1, "String/S9.8.1_A9_T1.js");
+    test262_builtin_fixture!(String_S9_8_1_A9_T2, "String/S9.8.1_A9_T2.js");
+    test262_builtin_fixture!(String_S9_8_A1_T1, "String/S9.8_A1_T1.js");
+    test262_builtin_fixture!(String_S9_8_A2_T1, "String/S9.8_A2_T1.js");
+    test262_builtin_fixture!(String_S9_8_A3_T1, "String/S9.8_A3_T1.js");
+    test262_builtin_fixture!(String_S9_8_A4_T1, "String/S9.8_A4_T1.js");
 
     /// `crates/test262` sits one level below the repo root, where the
     /// `test262` submodule is pinned.
@@ -1287,6 +1343,7 @@ mod harness {
             "Number",
             "BigInt",
             "Date",
+            "String",
         ];
         for dir in dirs {
             let mut pass = 0;

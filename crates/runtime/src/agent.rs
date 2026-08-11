@@ -104,6 +104,9 @@ pub struct Agent {
     /// [[DateValue]] of Date instances, keyed by object identity (spec
     /// 21.4.3: ms since the epoch).
     pub date_data: std::collections::HashMap<u64, f64>,
+    /// [[IteratedString]] and [[StringIteratorNextIndex]] of String iterators,
+    /// keyed by object identity (spec 22.1.5: the iterator's internal slots).
+    pub string_iter_data: std::collections::HashMap<u64, (Option<crux::string::JsString>, u64)>,
     /// [[ErrorData]] markers of Error instances, keyed by object identity
     /// (spec 20.5.4: `Error.isError` and the `[object Error]` tag need it).
     pub error_data: std::collections::HashSet<u64>,
@@ -154,6 +157,7 @@ impl Agent {
             number_data: std::collections::HashMap::new(),
             bigint_data: std::collections::HashMap::new(),
             date_data: std::collections::HashMap::new(),
+            string_iter_data: std::collections::HashMap::new(),
             error_data: std::collections::HashSet::new(),
             weak_ref_targets: std::collections::HashMap::new(),
             finalization_registries: std::collections::HashMap::new(),

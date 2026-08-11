@@ -1366,6 +1366,51 @@ substitution patterns; `split` edge cases (empty separator, limit 0, undefined s
 iteration order; HTML-wrapper attribute escaping (Annex B).
 **Exit criteria:** all `built-ins/String` test262 tests that don't require Intl pass.
 
+**Status (complete):** the full String surface landed in `builtins/string.rs` with the exact
+spec algorithms:
+
+- **Constructor:** `String(value)` ToString coercion (call + construct); `new String(v)`
+  builds a String exotic (virtual code-unit index properties, non-configurable `length`)
+  whose `[[StringData]]` rides in the object kind — `to_object` already boxed strings this
+  way, so `"abc".length`, `"abc"[0]`, and primitive method calls link through
+  `%String.prototype%` once installed.
+- **Statics:** `String.fromCharCode` (ToUint16 per code unit), `String.fromCodePoint`
+  (integral-range check, surrogate-pair encoding), `String.raw` (array-like `raw` reads
+  interleaved with the substitutions).
+- **Prototype methods (agent-dispatched):** `at` (relative indexing), `charAt`/
+  `charCodeAt`/`codePointAt` (CodePointAt), `concat`, `endsWith`, `includes`, `indexOf`,
+  `isWellFormed`, `lastIndexOf` (ToNumber position + StringLastIndexOf), `localeCompare`
+  (lexicographic), `normalize` (NFC/NFD/NFKC/NFKD — the `unicode` crate gained
+  `normalize_code_points` backed by `unicode-normalization` 0.1.25, resolved offline from
+  the local cargo cache; lone surrogates pass through), `padStart`/`padEnd` (StringPad,
+  code-unit truncation), `repeat`, `slice` (ToClampedIndex), `split` (pure StringSplit per
+  the pinned spec — `split("")` yields code units, `advanceBy` semantics), `startsWith`,
+  `substr` (Annex B), `substring`, `toLocaleLowerCase`/`toLocaleUpperCase` (default locale
+  → same as the plain forms), `toLowerCase`/`toUpperCase` (Unicode Default Case Conversion
+  via std `char` mappings incl. expansions `ß → "SS"`, `İ → "i̇"`), `toString`/
+  `valueOf` (ThisStringValue), `toWellFormed` (lone surrogates → U+FFFD), `trim`/
+  `trimStart`/`trimEnd` (exact WhiteSpace ∪ LineTerminator), and the 13 Annex B HTML
+  wrappers via CreateHTML with `"` escaping.
+- **Replace:** `replace`/`replaceAll` implement the full GetSubstitution algorithm for
+  string patterns (`$$ $& $` `$' $n $nn $<name>`, the two-digit overflow rule), plus the
+  functional-replacement call path; `match`/`matchAll`/`search`/`replace`/`split` dispatch
+  through `@@match`/`@@matchAll`/`@@search`/`@@replace`/`@@split` via GetMethod (IsRegExp
+  checks `@@match`); the RegExpCreate fallback for `match`/`matchAll`/`search` throws
+  until `%RegExp%` lands in Phase 11.
+- **Iterator:** `String.prototype[@@iterator]` + `%StringIteratorPrototype%` (`next`,
+  `Symbol.toStringTag = "String Iterator"`), state in the agent's `string_iter_data`
+  table; `Object.prototype.toString` renders `[object String Iterator]`.
+
+**unicode crate:** `normalize_code_points` (segments valid scalar runs, lone surrogates
+pass through), `to_lowercase`/`to_uppercase` per code point; new `unicode-normalization`
+dependency (0.1.25, from the offline cargo cache). 4 crate tests.
+
+**Tests:** 20 runtime built-in tests + 4 unicode tests. The flat scanner now covers
+`built-ins/String`: **56 fixtures pass** (92 top-level files; the rest need
+`propertyHelper.js`/`isConstructor.js` or fail on gaps like `String.prototype.match`
+without `%RegExp%`). The workspace runs **971 tests** (477 of them test262) with fmt and
+clippy (`-D warnings`) clean.
+
 ---
 
 ### Phase 11 — Text processing: RegExp
