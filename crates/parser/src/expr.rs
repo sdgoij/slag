@@ -299,7 +299,8 @@ pub(crate) fn can_start_expression(kind: TokenKind) -> bool {
         | TokenKind::LeftParen
         | TokenKind::LeftBracket
         | TokenKind::LeftBrace
-        | TokenKind::Plus
+        | TokenKind::PrivateIdentifier(_) => true,
+        TokenKind::Plus
         | TokenKind::Minus
         | TokenKind::Tilde
         | TokenKind::Not
@@ -336,7 +337,29 @@ fn parse_short_circuit(parser: &mut Parser, allow_in: bool) -> Result<Expr, JsEr
 
 /// Precedence-climbing binary parser (spec 13.6-13.13).
 fn parse_binary(parser: &mut Parser, allow_in: bool, min_prec: u8) -> Result<Expr, JsError> {
-    let mut left = parse_unary(parser)?;
+    let mut left = if matches!(parser.peek()?.kind, TokenKind::PrivateIdentifier(_)) {
+        // `#name in object` (spec 13.11): a PrivateIdentifier is only valid
+        // as the left operand of `in`.
+        let start = parser.peek()?.span.start;
+        let TokenKind::PrivateIdentifier(atom) = parser.next()?.kind else {
+            unreachable!("peeked a private identifier")
+        };
+        if !allow_in || !parser.at_keyword(Keyword::In)? {
+            return Err(parser.error_at(start, "Private field access is only valid inside a class"));
+        }
+        parser.next()?; // `in`
+        let right = parse_binary(parser, allow_in, PREC_RELATIONAL + 1)?;
+        let end = right.span.end;
+        Expr {
+            span: Span::new(start, end),
+            kind: ExprKind::PrivateIn {
+                name: atom,
+                object: Box::new(right),
+            },
+        }
+    } else {
+        parse_unary(parser)?
+    };
     loop {
         let kind = parser.peek()?.kind.clone();
         let logical = logical_kind(kind.clone());

@@ -41,6 +41,16 @@ pub struct PrivateName {
     pub description: JsString,
 }
 
+static NEXT_PRIVATE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A fresh Private Name for a class body (unique per class definition).
+pub fn new_private_name(description: JsString) -> PrivateName {
+    PrivateName {
+        id: NEXT_PRIVATE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        description,
+    }
+}
+
 /// NewPrivateEnvironment (spec 9.2.1.1).
 pub fn new_private_environment(
     outer: Option<Handle<PrivateEnvironment>>,
@@ -101,6 +111,9 @@ pub struct Reference {
     /// method calls through `super` receive the current `this` instead of
     /// the super base (spec 13.3.6.2).
     pub this_value: Option<Value>,
+    /// The Private Name's id for `this.#x` references; `name` is unused
+    /// when set (private access is not a property reference).
+    pub private_name: Option<u64>,
 }
 
 /// The property key of a reference.
@@ -132,6 +145,7 @@ pub fn get_identifier_reference(
                 name: crux::property::PropertyKey::from_js_string(name),
                 strict,
                 this_value: None,
+                private_name: None,
             });
         };
         if env_record.has_binding(name)? {
@@ -140,6 +154,7 @@ pub fn get_identifier_reference(
                 name: crux::property::PropertyKey::from_js_string(name),
                 strict,
                 this_value: None,
+                private_name: None,
             });
         }
         current = env_record.outer();
@@ -147,8 +162,15 @@ pub fn get_identifier_reference(
 }
 
 /// spec 6.2.5.4 GetValue on a Reference Record. Accessor properties whose
-/// getter is an ECMAScript function dispatch through the agent.
+/// getter is an ECMAScript function dispatch through the agent, and private
+/// member references resolve through PrivateGet.
 pub fn get_value(agent: &mut Agent, reference: &Reference) -> Result<Value, JsError> {
+    if let Some(name_id) = reference.private_name {
+        let ReferenceBase::Value(base) = &reference.base else {
+            unreachable!("private references are property references")
+        };
+        return private_get(agent, base, name_id);
+    }
     match &reference.base {
         ReferenceBase::Environment(env) => {
             env.get_binding_value(&string_name(&reference.name), reference.strict)
@@ -267,9 +289,15 @@ fn find_ecma_accessor(
 
 /// spec 6.2.5.6 PutValue: strict mode throws on unresolvable references and
 /// failed object writes; sloppy mode creates a global property instead.
-/// Accessor properties with ECMAScript-function setters dispatch through the
-/// evaluator.
+/// Accessor properties with ECMAScript-function setters and private member
+/// references dispatch through the evaluator.
 pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Result<(), JsError> {
+    if let Some(name_id) = reference.private_name {
+        let ReferenceBase::Value(base) = &reference.base else {
+            unreachable!("private references are property references")
+        };
+        return private_set(agent, base, name_id, value);
+    }
     match &reference.base {
         ReferenceBase::Environment(env) => {
             env.set_mutable_binding(&string_name(&reference.name), value, reference.strict)
@@ -428,6 +456,110 @@ pub fn get_new_target(agent: &Agent) -> Result<Value, JsError> {
 /// spec 9.4.6 GetGlobalObject.
 pub fn get_global_object(agent: &Agent) -> Result<Handle<crux::object::JsObject>, JsError> {
     Ok(agent.running_context()?.realm.global_object.clone())
+}
+
+/// Resolve a `#name` in the running context's PrivateEnvironment (spec
+/// 9.2.1.2 ResolvePrivateIdentifier).
+pub fn resolve_private_name(
+    agent: &Agent,
+    atom: crux::string::AtomId,
+) -> Result<PrivateName, JsError> {
+    let private_env = agent
+        .running_context()?
+        .private_environment
+        .clone()
+        .ok_or_else(|| {
+            JsError::new(
+                ErrorKind::SyntaxError,
+                "Private field access is only valid inside a class".into(),
+            )
+        })?;
+    let description = JsString::from_utf8(&format!("#{}", crux::lookup(atom).to_string_lossy()));
+    resolve_private_identifier(&private_env, &description)
+}
+
+/// PrivateGet (spec 10.2.9): read a private field/method/accessor from an
+/// object's [[PrivateElements]].
+pub fn private_get(agent: &mut Agent, obj: &Value, name_id: u64) -> Result<Value, JsError> {
+    let Some(receiver) = private_object(obj) else {
+        return Err(private_access_error(name_id, "Cannot read private member"));
+    };
+    let Some(element) = receiver.private_element(name_id) else {
+        return Err(private_access_error(name_id, "Cannot read private member"));
+    };
+    match element.kind {
+        crux::object::PrivateElementKind::Field(value)
+        | crux::object::PrivateElementKind::Method(value) => Ok(value),
+        crux::object::PrivateElementKind::Accessor {
+            get: Some(getter), ..
+        } => crate::function::call(agent, &getter, obj.clone(), &[]),
+        crux::object::PrivateElementKind::Accessor { .. } => Ok(Value::Undefined),
+    }
+}
+
+/// PrivateSet (spec 10.2.11): write a private field, or invoke a private
+/// accessor's setter.
+pub fn private_set(
+    agent: &mut Agent,
+    obj: &Value,
+    name_id: u64,
+    value: Value,
+) -> Result<(), JsError> {
+    let Some(receiver) = private_object(obj) else {
+        return Err(private_access_error(name_id, "Cannot write private member"));
+    };
+    let Some(element) = receiver.private_element(name_id) else {
+        return Err(private_access_error(name_id, "Cannot write private member"));
+    };
+    match element.kind {
+        crux::object::PrivateElementKind::Field(_) => {
+            let mut elements = receiver.private_elements.borrow_mut();
+            if let Some(existing) = elements.iter_mut().find(|e| e.name_id == name_id) {
+                existing.kind = crux::object::PrivateElementKind::Field(value);
+            }
+            Ok(())
+        }
+        crux::object::PrivateElementKind::Method(_) => {
+            Err(private_access_error(name_id, "Cannot write private member"))
+        }
+        crux::object::PrivateElementKind::Accessor {
+            set: Some(setter), ..
+        } => {
+            crate::function::call(agent, &setter, obj.clone(), &[value])?;
+            Ok(())
+        }
+        crux::object::PrivateElementKind::Accessor { .. } => {
+            Err(private_access_error(name_id, "Cannot write private member"))
+        }
+    }
+}
+
+/// The object part holding [[PrivateElements]] of a language value.
+fn private_object(obj: &Value) -> Option<&crux::object::JsObject> {
+    match obj {
+        Value::Object(obj) => Some(obj),
+        Value::Function(function) => Some(&function.object),
+        _ => None,
+    }
+}
+
+/// PrivateIn (spec 13.11.1): whether the object carries the private brand.
+pub fn private_in(obj: &Value, name_id: u64) -> Result<bool, JsError> {
+    match obj {
+        Value::Object(obj) => Ok(obj.has_private_element(name_id)),
+        Value::Function(function) => Ok(function.object.has_private_element(name_id)),
+        _ => Ok(false),
+    }
+}
+
+fn private_access_error(name_id: u64, what: &str) -> JsError {
+    JsError::new(
+        ErrorKind::TypeError,
+        format!(
+            "{what} #{} from an object whose class did not declare it",
+            name_id
+        ),
+    )
 }
 
 /// GetSuperConstructor (spec 9.2.4.6): the heritage constructor of the

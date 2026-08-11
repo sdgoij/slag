@@ -221,6 +221,25 @@ impl ObjectKind {
     }
 }
 
+/// A PrivateElement Record (spec 10.1.4): a private field or method added
+/// to an object's [[PrivateElements]] when its class constructor runs.
+#[derive(Debug, Clone)]
+pub struct PrivateElement {
+    /// The Private Name's unique id.
+    pub name_id: u64,
+    pub kind: PrivateElementKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum PrivateElementKind {
+    Field(Value),
+    Method(Value),
+    Accessor {
+        get: Option<Value>,
+        set: Option<Value>,
+    },
+}
+
 /// An ECMAScript object. Equality is identity: each object carries a unique
 /// `id` (mirroring `Symbol`), so `Handle<JsObject>` equality and the derived
 /// `PartialEq` on `Value` are identity tests.
@@ -235,6 +254,9 @@ pub struct JsObject {
     /// Own properties in insertion order (the [[OwnPropertyKeys]] string
     /// order for ordinary objects).
     pub properties: RefCell<Vec<(PropertyKey, Property)>>,
+    /// [[PrivateElements]] (spec 10.1.4): private fields and methods added
+    /// by InitializeInstanceElements.
+    pub private_elements: RefCell<Vec<PrivateElement>>,
     /// A weak back-reference to the owning handle, so internal methods that
     /// need `this` as a language value (accessor invocation, the arguments
     /// mapping) can recover the real handle instead of a copy.
@@ -265,6 +287,7 @@ impl JsObject {
             prototype: RefCell::new(prototype),
             extensible: Cell::new(true),
             properties: RefCell::new(Vec::new()),
+            private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
         }
     }
@@ -308,6 +331,7 @@ impl JsObject {
             prototype: RefCell::new(prototype),
             extensible: Cell::new(true),
             properties: RefCell::new(Vec::new()),
+            private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
         });
         Self::link_self_handle(&array);
@@ -336,6 +360,7 @@ impl JsObject {
             prototype: RefCell::new(prototype),
             extensible: Cell::new(true),
             properties: RefCell::new(Vec::new()),
+            private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
         });
         Self::link_self_handle(&string);
@@ -360,6 +385,7 @@ impl JsObject {
             prototype: RefCell::new(None),
             extensible: Cell::new(true),
             properties: RefCell::new(Vec::new()),
+            private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
         });
         Self::link_self_handle(&proxy);
@@ -378,6 +404,7 @@ impl JsObject {
             prototype: RefCell::new(prototype),
             extensible: Cell::new(true),
             properties: RefCell::new(Vec::new()),
+            private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
         });
         Self::link_self_handle(&object);
@@ -395,6 +422,7 @@ impl JsObject {
             prototype: RefCell::new(None),
             extensible: Cell::new(false),
             properties: RefCell::new(Vec::new()),
+            private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
         });
         Self::link_self_handle(&object);
@@ -421,6 +449,7 @@ impl JsObject {
             prototype: RefCell::new(None),
             extensible: Cell::new(true),
             properties: RefCell::new(Vec::new()),
+            private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
         });
         Self::link_self_handle(&obj);
@@ -879,6 +908,42 @@ impl JsObject {
             ));
         }
         Ok(())
+    }
+
+    /// PrivateFieldAdd/PrivateMethodOrAccessorAdd storage (spec 10.2.10,
+    /// 10.2.13): append a private element, rejecting a duplicate name.
+    pub fn private_element_add(&self, element: PrivateElement) -> Result<(), JsError> {
+        let mut elements = self.private_elements.borrow_mut();
+        if elements
+            .iter()
+            .any(|existing| existing.name_id == element.name_id)
+        {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "Cannot add private member to an object that already has it".into(),
+            ));
+        }
+        elements.push(element);
+        Ok(())
+    }
+
+    /// The private element for `name_id`, if the object has been initialized
+    /// by the declaring class.
+    pub fn private_element(&self, name_id: u64) -> Option<PrivateElement> {
+        self.private_elements
+            .borrow()
+            .iter()
+            .find(|element| element.name_id == name_id)
+            .cloned()
+    }
+
+    /// Whether `name_id` is in the object's [[PrivateElements]] — the `#x in
+    /// obj` brand check (spec 13.11.1).
+    pub fn has_private_element(&self, name_id: u64) -> bool {
+        self.private_elements
+            .borrow()
+            .iter()
+            .any(|element| element.name_id == name_id)
     }
 
     /// spec 7.3.6 DefinePropertyOrThrow.

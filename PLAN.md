@@ -811,17 +811,18 @@ Completion model (spec 6.2.3):
 - `job.rs` — host-call jobs delegate to `crux::function::call`.
 
 **Conformance:** `crates/test262` runs a curated subset of the pinned `tc39/test262`
-submodule (repo-root `test262/`): 39 fixtures under `test/language/statements/{if,while,
+submodule (repo-root `test262/`): 44 fixtures under `test/language/statements/{if,while,
 function,class}` and `test/language/expressions/{conditional,object}` covering completion
 values (`cptn-*`), labeled `break`/`continue`, ASI around `let`, statement-position early
 errors, and the Phase 7 fixtures (defaults, rest, destructured params, `arguments`-name
-conflicts, object/class methods). The harness parses
-fixture frontmatter (`negative:` phase/type, `flags:`, `includes:`), runs strict and sloppy
-modes, installs a minimal native `assert` helper (user functions join Phase 7), and reports
-pass/skip/fail — `39/39` pass. The subset grows with each phase's feature coverage.
+conflicts, object/class methods, private accessor early errors, static-block private scope).
+The harness parses fixture frontmatter (`negative:` phase/type, `flags:`, `includes:`), runs
+strict and sloppy modes, installs a minimal native `assert` helper (user functions join
+Phase 7), and reports pass/skip/fail — `44/44` pass. The subset grows with each phase's
+feature coverage.
 
-The workspace runs **343 tests** (`cargo test --workspace`: 111 in `runtime`, 44 in `parser`,
-1 harness test covering the 39 test262 fixtures) with `cargo fmt --all --check` and
+The workspace runs **344 tests** (`cargo test --workspace`: 112 in `runtime`, 44 in `parser`,
+1 harness test covering the 44 test262 fixtures) with `cargo fmt --all --check` and
 `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 **Remaining in Phase 6:**
@@ -1005,18 +1006,30 @@ bound via `IteratorBindingInitialization`:
   derived fields; `new.target` reads the function env's [[NewTarget]]. Base constructors
   create `this` from `newTarget.prototype` and initialize fields before the body; derived
   constructors reject non-object/non-undefined returns.
+- **Class private names, fields, and methods** (15.7.14 private elements): ClassDefinitionEvaluation
+  creates a PrivateEnvironment per class body (fresh Private Names whose descriptions carry the
+  `#`), methods/accessors/field initializers and static blocks capture it via the function's
+  [[PrivateEnvironment]], and `crux::JsObject` gains [[PrivateElements]] storage. Instance
+  private fields are added by `PrivateFieldAdd` in InitializeInstanceElements order;
+  instance private methods/accessors via `PrivateMethodOrAccessorAdd` (the brand).
+  `this.#x` reads/writes resolve through PrivateGet/PrivateSet (accessors dispatch through
+  the agent; a method write or missing name throws TypeError), static private fields/methods
+  land on the constructor, and `#x in obj` (PrivateIn, 13.11.1) is the brand check — the
+  parser gained the `PrivateIn` relational form and `can_start_expression` accepts
+  `PrivateIdentifier`. Static fields/blocks evaluate after the class binding is initialized
+  (spec steps 36-44), so `static { C.#x }` resolves the class name.
 
-Tests: 24 runtime function tests (…, object methods/accessors, super property access, class
-constructors/default constructors, class methods/accessors/fields/static blocks, inheritance
-with `super()`/`super.m()`, derived-return rules, `new.target`) — 111 in `runtime`, 44 in
-`parser`; 18 fixtures (…, object-method and class-method defaults/trailing-comma) —
-**39 fixtures total**; the `scope-param-rest-elem-var-*`, super, and class `Object.*`-based
-fixtures wait on builtins (`Array.prototype[@@iterator]`, `Object.*`, `Function.prototype`).
-Workspace runs **343 tests** with fmt and clippy (`-D warnings`) clean.
+Tests: 25 runtime function tests (…, class constructors, methods/accessors/fields/static
+blocks, inheritance with `super()`, private fields/methods/accessors, `#x in obj` brand
+checks) — 112 in `runtime`, 44 in `parser`; 23 fixtures (…, object-method and class-method
+defaults/trailing-comma, private accessor early errors, static-block private scope) —
+**44 fixtures total**; the `scope-param-rest-elem-var-*`, super, private-`assert.throws`,
+and class `Object.*`-based fixtures wait on builtins (`Array.prototype[@@iterator]`,
+`Object.*`, `Function.prototype`). Workspace runs **344 tests** with fmt and clippy
+(`-D warnings`) clean.
 
-**Remaining in Phase 7 (functions):** class private names/fields, then the `Function.prototype`
-intrinsic and the constructor builtin (Phase 8 bootstrap); generators/async/modules/promises
-as listed below.
+**Remaining in Phase 7:** the `Function.prototype` intrinsic and the constructor builtin
+(Phase 8 bootstrap); generators/async/modules/promises as listed below.
 
 ---
 

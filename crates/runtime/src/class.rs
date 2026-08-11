@@ -16,7 +16,7 @@ use syntax::ast::{
 };
 
 use crate::agent::Agent;
-use crate::context::{ExecutionContext, get_property};
+use crate::context::{ExecutionContext, get_property, new_private_environment, new_private_name};
 use crate::env::{EnvRef, new_declarative_environment, new_function_environment};
 use crate::expr::eval_expr;
 use crate::function::{
@@ -38,6 +38,24 @@ pub fn class_definition_evaluation(
     let binding: Option<JsString> = class_binding.map(crux::lookup);
     if let Some(binding) = &binding {
         class_env.create_immutable_binding(binding, true)?;
+    }
+
+    // The class PrivateEnvironment (spec steps 4-10): a fresh Private Name
+    // per private identifier in the body, whose description is `#name`.
+    let outer_private_env = agent.running_context()?.private_environment.clone();
+    let class_private_env = new_private_environment(outer_private_env.clone());
+    {
+        let mut names = class_private_env.names.borrow_mut();
+        for element in &class.elements {
+            let Some(atom) = private_element_name(element) else {
+                continue;
+            };
+            let description =
+                JsString::from_utf8(&format!("#{}", crux::lookup(atom).to_string_lossy()));
+            if !names.iter().any(|name| name.description == description) {
+                names.push(new_private_name(description));
+            }
+        }
     }
 
     // ClassHeritage (spec steps 12-20): evaluated with the class name
@@ -101,6 +119,7 @@ pub fn class_definition_evaluation(
         )?,
         None => default_constructor(agent, super_constructor.is_some(), &class_env)?,
     };
+    set_private_environment(agent, &ctor, &class_private_env)?;
 
     // SetFunctionName(ctor, className): the empty string for anonymous
     // class expressions (the enclosing binding renames it later).
@@ -148,9 +167,13 @@ pub fn class_definition_evaluation(
 
     // The remaining class elements (spec steps 28-35): instance methods on
     // the prototype, static methods on the constructor, instance fields
-    // collected into [[Fields]], static fields/blocks evaluated now.
+    // collected into [[Fields]], static fields/blocks collected for the
+    // post-binding evaluation pass (steps 41-44).
     let mut fields = Vec::new();
+    let mut instance_private_methods = Vec::new();
+    let mut static_elements: Vec<StaticElement> = Vec::new();
     agent.running_context_mut()?.lexical_environment = class_env.clone();
+    agent.running_context_mut()?.private_environment = Some(class_private_env.clone());
     for element in &class.elements {
         if matches!(
             element,
@@ -170,24 +193,54 @@ pub fn class_definition_evaluation(
         };
         match element {
             ClassElement::Method { name, function, .. } => {
-                let key = class_element_name(agent, name, strict)?;
+                let (private_id, key) = element_key(agent, name, strict)?;
                 let closure = instantiate_method(agent, function, class_env.clone(), true)?;
+                set_private_environment(agent, &closure, &class_private_env)?;
                 make_method(agent, &closure, home.clone())?;
-                set_function_name(&closure, &key_string(&key), None)?;
-                define_method_property(&home, &key, closure)?;
+                set_function_name(&closure, &element_name_text(name), None)?;
+                if let Some(name_id) = private_id {
+                    // PrivateMethodOrAccessorAdd (spec 10.2.13).
+                    let element = crux::object::PrivateElement {
+                        name_id,
+                        kind: crux::object::PrivateElementKind::Method(closure),
+                    };
+                    if is_static {
+                        private_element_add(&home, element)?;
+                    } else {
+                        instance_private_methods.push(element);
+                    }
+                } else if let Some(key) = key {
+                    define_method_property(&home, &key, closure)?;
+                }
             }
             ClassElement::Get { name, body, .. } => {
-                let key = class_element_name(agent, name, strict)?;
+                let (private_id, key) = element_key(agent, name, strict)?;
                 let getter =
                     instantiate_accessor(agent, Vec::new(), body.clone(), class_env.clone(), true)?;
+                set_private_environment(agent, &getter, &class_private_env)?;
                 make_method(agent, &getter, home.clone())?;
-                set_function_name(&getter, &key_string(&key), Some("get"))?;
-                define_accessor_property(&home, &key, Some(getter), None)?;
+                set_function_name(&getter, &element_name_text(name), Some("get"))?;
+                if let Some(name_id) = private_id {
+                    let element = crux::object::PrivateElement {
+                        name_id,
+                        kind: crux::object::PrivateElementKind::Accessor {
+                            get: Some(getter),
+                            set: None,
+                        },
+                    };
+                    if is_static {
+                        merge_private_accessor(&home, element)?;
+                    } else {
+                        merge_instance_private_accessor(&mut instance_private_methods, element);
+                    }
+                } else if let Some(key) = key {
+                    define_accessor_property(&home, &key, Some(getter), None)?;
+                }
             }
             ClassElement::Set {
                 name, param, body, ..
             } => {
-                let key = class_element_name(agent, name, strict)?;
+                let (private_id, key) = element_key(agent, name, strict)?;
                 let setter = instantiate_accessor(
                     agent,
                     vec![BindingElement {
@@ -200,32 +253,72 @@ pub fn class_definition_evaluation(
                     class_env.clone(),
                     true,
                 )?;
+                set_private_environment(agent, &setter, &class_private_env)?;
                 make_method(agent, &setter, home.clone())?;
-                set_function_name(&setter, &key_string(&key), Some("set"))?;
-                define_accessor_property(&home, &key, None, Some(setter))?;
+                set_function_name(&setter, &element_name_text(name), Some("set"))?;
+                if let Some(name_id) = private_id {
+                    let element = crux::object::PrivateElement {
+                        name_id,
+                        kind: crux::object::PrivateElementKind::Accessor {
+                            get: None,
+                            set: Some(setter),
+                        },
+                    };
+                    if is_static {
+                        merge_private_accessor(&home, element)?;
+                    } else {
+                        merge_instance_private_accessor(&mut instance_private_methods, element);
+                    }
+                } else if let Some(key) = key {
+                    define_accessor_property(&home, &key, None, Some(setter))?;
+                }
             }
             ClassElement::Field { name, init, .. } => {
-                let key = class_element_name(agent, name, strict)?;
-                if is_static {
-                    define_field(agent, &ctor, &key, init.as_ref())?;
+                let (private_id, key) = element_key(agent, name, strict)?;
+                if let Some(name_id) = private_id {
+                    if is_static {
+                        static_elements.push(StaticElement::Field {
+                            key: None,
+                            private_name: Some(name_id),
+                            init: init.clone(),
+                        });
+                    } else {
+                        fields.push(crate::function::ClassField {
+                            name: PropertyKey::from_utf8(""),
+                            private_name: Some(name_id),
+                            init: init.clone(),
+                            environment: class_env.clone(),
+                        });
+                    }
+                } else if is_static {
+                    static_elements.push(StaticElement::Field {
+                        key: Some(key.unwrap()),
+                        private_name: None,
+                        init: init.clone(),
+                    });
                 } else {
                     fields.push(crate::function::ClassField {
-                        name: key,
+                        name: key.unwrap(),
+                        private_name: None,
                         init: init.clone(),
                         environment: class_env.clone(),
                     });
                 }
             }
             ClassElement::StaticBlock(block) => {
-                evaluate_static_block(agent, block, &ctor, &class_env)?;
+                static_elements.push(StaticElement::Block(block.clone()));
             }
         }
     }
     agent.running_context_mut()?.lexical_environment = env_record.clone();
+    agent.running_context_mut()?.private_environment = outer_private_env.clone();
 
-    // [[Fields]] (spec step 39): instance fields initialize per instance.
+    // [[Fields]], [[PrivateMethods]], and the class private environment (spec
+    // steps 38-40).
     if let Some(data) = agent.ecma_functions.get_mut(&ctor_handle.id()) {
         data.fields = fields;
+        data.private_methods = instance_private_methods;
+        data.private_environment = Some(class_private_env.clone());
     }
 
     // Initialize the class binding in the class scope (spec step 36).
@@ -233,7 +326,45 @@ pub fn class_definition_evaluation(
         class_env.initialize_binding(binding, ctor.clone())?;
     }
 
+    // Static fields and blocks evaluate after the class binding is
+    // initialized, in source order (spec steps 41-44), with the class scope
+    // and private names visible.
+    agent.running_context_mut()?.lexical_environment = class_env.clone();
+    agent.running_context_mut()?.private_environment = Some(class_private_env.clone());
+    for element in &static_elements {
+        match element {
+            StaticElement::Field {
+                key,
+                private_name,
+                init,
+            } => {
+                if let Some(name_id) = private_name {
+                    let value = field_initializer(agent, init.as_ref(), &ctor)?;
+                    private_field_add(&ctor, *name_id, value)?;
+                } else {
+                    define_field(agent, &ctor, key.as_ref().unwrap(), init.as_ref())?;
+                }
+            }
+            StaticElement::Block(block) => {
+                evaluate_static_block(agent, block, &ctor, &class_env, &class_private_env)?;
+            }
+        }
+    }
+    agent.running_context_mut()?.lexical_environment = env_record.clone();
+    agent.running_context_mut()?.private_environment = outer_private_env.clone();
+
     Ok(ctor)
+}
+
+/// A static class element awaiting evaluation after the class binding is
+/// initialized (spec 15.7.14 steps 41-44).
+enum StaticElement {
+    Field {
+        key: Option<PropertyKey>,
+        private_name: Option<u64>,
+        init: Option<Expr>,
+    },
+    Block(Block),
 }
 
 /// Whether a class element is the `constructor` method: a plain instance
@@ -281,19 +412,160 @@ fn default_constructor(
     }
 }
 
-/// The property key of a class element name, evaluating computed names
-/// (spec 15.7.5 ClassElementName).
-fn class_element_name(
+/// The private name id and property key of a class element name (spec
+/// 15.7.5): exactly one is present.
+fn element_key(
     agent: &mut Agent,
     name: &ClassElementName,
     strict: bool,
-) -> Result<PropertyKey, JsError> {
+) -> Result<(Option<u64>, Option<PropertyKey>), JsError> {
     match name {
-        ClassElementName::Property(name) => property_name_key(agent, name, strict),
-        ClassElementName::Private(_) => Err(JsError::new(
-            ErrorKind::TypeError,
-            "private class elements are not implemented yet".into(),
-        )),
+        ClassElementName::Private(atom) => {
+            let name = crate::context::resolve_private_name(agent, *atom)?;
+            Ok((Some(name.id), None))
+        }
+        ClassElementName::Property(name) => {
+            Ok((None, Some(property_name_key(agent, name, strict)?)))
+        }
+    }
+}
+
+/// The SetFunctionName string of a class element name (spec 10.2.7 step 2):
+/// the property key string, or the `#name` description of a private name.
+fn element_name_text(name: &ClassElementName) -> JsString {
+    match name {
+        ClassElementName::Private(atom) => {
+            JsString::from_utf8(&format!("#{}", crux::lookup(*atom).to_string_lossy()))
+        }
+        ClassElementName::Property(name) => match name {
+            PropertyName::Ident(id) => crux::lookup(*id),
+            PropertyName::Str(text) => text.clone(),
+            PropertyName::Number(n) => {
+                to_string(&Value::Number(*n)).unwrap_or_else(|_| JsString::from_utf8(""))
+            }
+            PropertyName::Computed(_) => JsString::from_utf8(""),
+        },
+    }
+}
+
+/// The private identifier of a class element, if its name is private.
+fn private_element_name(element: &ClassElement) -> Option<crux::string::AtomId> {
+    let name = match element {
+        ClassElement::Method { name, .. }
+        | ClassElement::Get { name, .. }
+        | ClassElement::Set { name, .. }
+        | ClassElement::Field { name, .. } => name,
+        ClassElement::StaticBlock(_) => return None,
+    };
+    match name {
+        ClassElementName::Private(atom) => Some(*atom),
+        ClassElementName::Property(_) => None,
+    }
+}
+
+/// Attach the class PrivateEnvironment to a function's record so its body
+/// can resolve `#name` (spec 10.2.1 [[PrivateEnvironment]]).
+fn set_private_environment(
+    agent: &mut Agent,
+    function: &Value,
+    private_env: &crux::handle::Handle<crate::context::PrivateEnvironment>,
+) -> Result<(), JsError> {
+    let Value::Function(function) = function else {
+        return Ok(());
+    };
+    let Some(data) = agent.ecma_functions.get_mut(&function.id()) else {
+        return Ok(());
+    };
+    data.private_environment = Some(private_env.clone());
+    Ok(())
+}
+
+/// PrivateMethodOrAccessorAdd (spec 10.2.13) on a home object or the class
+/// constructor.
+fn private_element_add(home: &Value, element: crux::object::PrivateElement) -> Result<(), JsError> {
+    let Some(obj) = home_object(home) else {
+        return Ok(());
+    };
+    obj.private_element_add(element)
+}
+
+/// Merge a private accessor element into the instance list, combining
+/// getter/setter pairs with the same name (spec 15.7.14 steps 33-37).
+fn merge_instance_private_accessor(
+    list: &mut Vec<crux::object::PrivateElement>,
+    element: crux::object::PrivateElement,
+) {
+    if let Some(existing) = list
+        .iter_mut()
+        .find(|existing| existing.name_id == element.name_id)
+        && let crux::object::PrivateElementKind::Accessor {
+            get: existing_get,
+            set: existing_set,
+        } = &mut existing.kind
+        && let crux::object::PrivateElementKind::Accessor { get, set } = element.kind
+    {
+        if get.is_some() {
+            *existing_get = get;
+        } else {
+            *existing_set = set;
+        }
+    } else {
+        list.push(element);
+    }
+}
+
+/// Merge a static private accessor into the constructor's private elements.
+fn merge_private_accessor(
+    home: &Value,
+    element: crux::object::PrivateElement,
+) -> Result<(), JsError> {
+    let Some(obj) = home_object(home) else {
+        return Ok(());
+    };
+    if let Some(existing) = obj
+        .private_elements
+        .borrow_mut()
+        .iter_mut()
+        .find(|existing| existing.name_id == element.name_id)
+        && let crux::object::PrivateElementKind::Accessor {
+            get: existing_get,
+            set: existing_set,
+        } = &mut existing.kind
+        && let crux::object::PrivateElementKind::Accessor { get, set } = element.kind
+    {
+        if get.is_some() {
+            *existing_get = get;
+        } else {
+            *existing_set = set;
+        }
+    } else {
+        obj.private_element_add(element)?;
+    }
+    Ok(())
+}
+
+/// PrivateFieldAdd (spec 10.2.10) on a receiver (object or constructor).
+fn private_field_add(receiver: &Value, name_id: u64, value: Value) -> Result<(), JsError> {
+    let Some(obj) = home_object(receiver) else {
+        return Ok(());
+    };
+    obj.private_element_add(crux::object::PrivateElement {
+        name_id,
+        kind: crux::object::PrivateElementKind::Field(value),
+    })
+}
+
+/// Evaluate a static field initializer with `this` = the constructor.
+fn field_initializer(
+    agent: &mut Agent,
+    init: Option<&Expr>,
+    receiver: &Value,
+) -> Result<Value, JsError> {
+    match init {
+        Some(init) => evaluate_with_this(agent, receiver.clone(), |agent| {
+            eval_expr(agent, init, true)
+        }),
+        None => Ok(Value::Undefined),
     }
 }
 
@@ -311,15 +583,6 @@ fn property_name_key(
             let key = eval_expr(agent, expr, strict)?;
             to_property_key(&key)
         }
-    }
-}
-
-/// The string used for SetFunctionName from a property key (spec 10.2.7
-/// step 2: a symbol's description, or the string itself).
-fn key_string(key: &PropertyKey) -> JsString {
-    match key {
-        PropertyKey::String(id) => crux::lookup(*id),
-        PropertyKey::Symbol(_) => JsString::from_utf8(""),
     }
 }
 
@@ -399,12 +662,14 @@ fn define_field(
 }
 
 /// `static { ... }`: the block runs as a strict function body called with
-/// the constructor as `this` (spec 15.7.14 step 30).
+/// the constructor as `this` (spec 15.7.14 step 30), resolving the class's
+/// private names.
 fn evaluate_static_block(
     agent: &mut Agent,
     block: &Block,
     ctor: &Value,
     class_env: &EnvRef,
+    class_private_env: &crux::handle::Handle<crate::context::PrivateEnvironment>,
 ) -> Result<(), JsError> {
     let function = FunctionAst {
         span: block.span,
@@ -415,6 +680,7 @@ fn evaluate_static_block(
         is_generator: false,
     };
     let closure = instantiate_method(agent, &function, class_env.clone(), true)?;
+    set_private_environment(agent, &closure, class_private_env)?;
     crate::function::call(agent, &closure, ctor.clone(), &[])?;
     Ok(())
 }

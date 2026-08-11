@@ -325,6 +325,8 @@ pub enum ExprKind {
         consequent: Box<Expr>,
         alternate: Box<Expr>,
     },
+    /// `#name in object` — the private brand check (spec 13.11.1).
+    PrivateIn { name: AtomId, object: Box<Expr> },
     /// `callee ( Arguments )`, incl. optional-call `callee?.(…)`.
     Call(CallExpr),
     /// `new callee ( Arguments )` and `new.target`.

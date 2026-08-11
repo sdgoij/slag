@@ -427,6 +427,7 @@ fn walk_exprs(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
         | ExprKind::Function(_)
         | ExprKind::Class(_)
         | ExprKind::Arrow { .. } => {}
+        ExprKind::PrivateIn { object, .. } => walk_exprs(object, visit),
         ExprKind::Array(array) => {
             for element in &array.elements {
                 match element {
@@ -866,6 +867,7 @@ fn check_expr(expr: &Expr, labels: &mut LabelState) -> Result<(), JsError> {
             check_expr(left, labels)?;
             check_expr(right, labels)
         }
+        ExprKind::PrivateIn { object, .. } => check_expr(object, labels),
         ExprKind::Assign { target, value, .. } => {
             check_expr(target, labels)?;
             check_expr(value, labels)

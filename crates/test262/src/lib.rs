@@ -60,6 +60,11 @@ mod harness {
         "statements/class/method/dflt-params-arg-val-undefined.js",
         "statements/class/method/dflt-params-trailing-comma.js",
         "statements/class/method/params-trailing-comma-single.js",
+        "statements/class/private-static-getter-non-static-setter-early-error.js",
+        "statements/class/private-static-setter-non-static-getter-early-error.js",
+        "statements/class/private-non-static-getter-static-setter-early-error.js",
+        "statements/class/private-non-static-setter-static-getter-early-error.js",
+        "statements/class/static-init-scope-private.js",
         "expressions/conditional/in-condition.js",
     ];
 

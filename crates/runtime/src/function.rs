@@ -16,7 +16,7 @@ use syntax::ast::{
 };
 
 use crate::agent::Agent;
-use crate::context::ExecutionContext;
+use crate::context::{ExecutionContext, PrivateEnvironment};
 use crate::env::{EnvRef, new_declarative_environment, new_function_environment};
 use crate::eval::eval_statement_list;
 use crate::expr::eval_expr;
@@ -49,6 +49,8 @@ pub enum ConstructorKind {
 #[derive(Debug, Clone)]
 pub struct ClassField {
     pub name: crux::property::PropertyKey,
+    /// Set for private fields: the Private Name's id instead of `name`.
+    pub private_name: Option<u64>,
     pub init: Option<syntax::ast::Expr>,
     pub environment: EnvRef,
 }
@@ -74,6 +76,12 @@ pub struct EcmaFunction {
     pub is_class_constructor: bool,
     /// [[Fields]]: instance fields initialized when the constructor runs.
     pub fields: Vec<ClassField>,
+    /// [[PrivateMethods]]: instance private methods/accessors added to each
+    /// instance by InitializeInstanceElements.
+    pub private_methods: Vec<crux::object::PrivateElement>,
+    /// [[PrivateEnvironment]]: the class's private names, captured so method
+    /// bodies and field initializers can resolve `#name`.
+    pub private_environment: Option<Handle<PrivateEnvironment>>,
     /// The heritage constructor of a derived class (GetSuperConstructor).
     pub super_constructor: Option<Value>,
     /// The synthesized `constructor(...args) { super(...args); }` — its
@@ -428,6 +436,8 @@ fn register_function(
         constructor_kind: ConstructorKind::Base,
         is_class_constructor: kind.is_class_constructor,
         fields: Vec::new(),
+        private_methods: Vec::new(),
+        private_environment: None,
         super_constructor: None,
         default_derived: false,
         realm,
@@ -516,6 +526,8 @@ pub fn instantiate_arrow(
         constructor_kind: ConstructorKind::Base,
         is_class_constructor: false,
         fields: Vec::new(),
+        private_methods: Vec::new(),
+        private_environment: None,
         super_constructor: None,
         default_derived: false,
         realm,
@@ -635,7 +647,7 @@ fn ordinary_call(
         script_or_module: None,
         lexical_environment: function_env.clone(),
         variable_environment: function_env.clone(),
-        private_environment: None,
+        private_environment: data.private_environment.clone(),
     });
     let result = (|| -> Result<Value, JsError> {
         // OrdinaryCallBindThis: strict keeps `this`; sloppy coerces
@@ -735,7 +747,7 @@ fn ordinary_construct(
         script_or_module: None,
         lexical_environment: function_env.clone(),
         variable_environment: function_env.clone(),
-        private_environment: None,
+        private_environment: data.private_environment.clone(),
     });
     let result = (|| -> Result<Value, JsError> {
         if data.default_derived {
@@ -804,7 +816,8 @@ fn ordinary_construct(
 }
 
 /// InitializeInstanceElements (spec 7.3.27): define `ctor`'s instance
-/// fields on `obj` in order, evaluating each initializer with `this` = obj.
+/// private methods and fields on `obj` in order, evaluating each initializer
+/// with `this` = obj.
 pub fn initialize_instance_elements(
     agent: &mut Agent,
     obj: &Value,
@@ -813,12 +826,19 @@ pub fn initialize_instance_elements(
     let Value::Function(ctor) = ctor else {
         return Ok(());
     };
-    let fields = agent
-        .ecma_functions
-        .get(&ctor.id())
-        .map(|data| data.fields.clone())
-        .unwrap_or_default();
-    for field in &fields {
+    let data = agent.ecma_functions.get(&ctor.id()).cloned();
+    let Some(data) = data else {
+        return Ok(());
+    };
+    let Value::Object(obj) = obj else {
+        return Ok(());
+    };
+    // Private methods/accessors first (spec 7.3.27 step 1).
+    for method in &data.private_methods {
+        obj.private_element_add(method.clone())?;
+    }
+    // Fields (spec 7.3.27 step 2): private fields via PrivateFieldAdd.
+    for field in &data.fields {
         // DefineField (spec 7.3.23): the initializer runs in the class scope
         // with the current `this` (the running context already chains to the
         // class environment through the constructor's [[Environment]]).
@@ -826,10 +846,14 @@ pub fn initialize_instance_elements(
             Some(init) => eval_expr(agent, init, true)?,
             None => Value::Undefined,
         };
-        let Value::Object(obj) = obj else {
-            return Ok(());
-        };
-        obj.create_data_property_or_throw_key(&field.name, value)?;
+        if let Some(name_id) = field.private_name {
+            obj.private_element_add(crux::object::PrivateElement {
+                name_id,
+                kind: crux::object::PrivateElementKind::Field(value),
+            })?;
+        } else {
+            obj.create_data_property_or_throw_key(&field.name, value)?;
+        }
     }
     Ok(())
 }
@@ -1714,6 +1738,62 @@ mod tests {
         );
         // `extends` requires a constructor or null.
         assert!(run("class A extends 42 {}").is_err());
+    }
+
+    #[test]
+    fn class_private_fields_and_methods() {
+        // Private fields read/write through `this.#x` (PrivateGet/PrivateSet).
+        assert_eq!(
+            run("class C { #x = 1; get() { return this.#x; } } new C().get()").unwrap(),
+            number(1.0)
+        );
+        assert_eq!(
+            run("class C { #x = 1; set(v) { this.#x = v; } get() { return this.#x; } } let c = new C(); c.set(9); c.get()")
+                .unwrap(),
+            number(9.0)
+        );
+        // Fields initialize in order: `#x = this.y` before `y = 2` reads
+        // undefined (spec 15.7.14 [[Fields]] order).
+        assert_eq!(
+            run("class C { #x = this.y; y = 2; get() { return this.#x; } } new C().get()").unwrap(),
+            Value::Undefined
+        );
+        // Private fields and methods are per-instance and independent.
+        assert!(run("class C { #x = 5; } let a = new C(); let b = new C(); a.#x").is_err());
+        // `#x in obj` is the brand check (spec 13.11.1).
+        assert_eq!(
+            run("class C { #x = 1; m(o) { return #x in o; } } let c = new C(); c.m(c)").unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            run("class C { #x = 1; m(o) { return #x in o; } } let c = new C(); c.m({})").unwrap(),
+            Value::Boolean(false)
+        );
+        // Private methods with brand checks, and private accessors.
+        assert_eq!(
+            run("class C { #m() { return 42; } call() { return this.#m(); } } new C().call()")
+                .unwrap(),
+            number(42.0)
+        );
+        assert_eq!(
+            run("class C { get #v() { return this._v; } set #v(x) { this._v = x; } run() { this.#v = 5; return this.#v; } } new C().run()")
+                .unwrap(),
+            number(5.0)
+        );
+        // Static private fields resolve through the constructor.
+        assert_eq!(
+            run("class C { static #s = 3; static get() { return C.#s; } } C.get()").unwrap(),
+            number(3.0)
+        );
+        // Private fields survive inheritance: the derived constructor's
+        // `super()` initializes the base class's fields.
+        assert_eq!(
+            run("class A { #v = 7; get() { return this.#v; } } class B extends A {} new B().get()")
+                .unwrap(),
+            number(7.0)
+        );
+        // Accessing a private member outside the class is an error.
+        assert!(run("class C { #x = 1; } let c = new C(); c.#x").is_err());
     }
 
     #[test]

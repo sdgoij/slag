@@ -88,6 +88,14 @@ pub fn eval_expr(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Value, 
                 eval_expr(agent, alternate, strict)
             }
         }
+        ExprKind::PrivateIn { name, object } => {
+            // PrivateIn (spec 13.11.1): the `#name in obj` brand check.
+            let name_id = crate::context::resolve_private_name(agent, *name)?.id;
+            let object = eval_expr(agent, object, strict)?;
+            Ok(Value::Boolean(crate::context::private_in(
+                &object, name_id,
+            )?))
+        }
         ExprKind::Call(call) => eval_call(agent, call, strict),
         ExprKind::New(new) => eval_new(agent, new, strict),
         ExprKind::Member(_) => {
@@ -164,6 +172,32 @@ pub fn eval_chain(
                     name,
                     strict,
                     this_value: Some(this),
+                    private_name: None,
+                };
+                return Ok(Some(ChainResult::Reference(reference)));
+            }
+            if let MemberProperty::Private(atom) = &member.property {
+                // `object.#name` — a private member reference (PrivateGet /
+                // PrivateSet at access time), resolved in the running
+                // PrivateEnvironment.
+                let name_id = crate::context::resolve_private_name(agent, *atom)?.id;
+                let object = eval_chain(agent, &member.object, strict)?;
+                let Some(object) = object else {
+                    return Ok(None);
+                };
+                let object_value = match object {
+                    ChainResult::Reference(reference) => get_value(agent, &reference)?,
+                    ChainResult::Value(value) => value,
+                };
+                if member.optional && is_nullish(&object_value) {
+                    return Ok(None);
+                }
+                let reference = Reference {
+                    base: ReferenceBase::Value(object_value),
+                    name: PropertyKey::from_utf8(""),
+                    strict,
+                    this_value: None,
+                    private_name: Some(name_id),
                 };
                 return Ok(Some(ChainResult::Reference(reference)));
             }
@@ -187,6 +221,7 @@ pub fn eval_chain(
                 name,
                 strict,
                 this_value: None,
+                private_name: None,
             };
             Ok(Some(ChainResult::Reference(reference)))
         }
