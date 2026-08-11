@@ -25,6 +25,60 @@ pub fn as_object(value: &Value) -> Option<Handle<JsObject>> {
     }
 }
 
+/// ToObject (spec 7.1.19): box a primitive; null/undefined throw. Boolean
+/// and Symbol boxes carry their wrapped value in the agent tables so
+/// `valueOf`/`toString`/`description` read it back; the Number/BigInt
+/// wrappers arrive with their phases, until then the value rides in a plain
+/// %Object.prototype% object.
+pub fn to_object(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
+    let realm = agent.current_realm()?;
+    match value {
+        Value::Object(obj) => Ok(Value::Object(obj.clone())),
+        Value::Function(function) => Ok(Value::Function(function.clone())),
+        Value::Null | Value::Undefined => Err(JsError::new(
+            ErrorKind::TypeError,
+            "Cannot convert undefined or null to object".into(),
+        )),
+        Value::String(s) => {
+            let proto = realm
+                .intrinsics
+                .get("%String.prototype%")
+                .and_then(|v| as_object(&v));
+            Ok(Value::Object(JsObject::string_create(
+                s.as_ref().clone(),
+                proto,
+            )?))
+        }
+        Value::Boolean(b) => {
+            let proto = realm
+                .intrinsics
+                .get("%Boolean.prototype%")
+                .and_then(|v| as_object(&v));
+            let object = JsObject::ordinary_object_create(proto);
+            agent.boolean_data.insert(object.id(), *b);
+            Ok(Value::Object(object))
+        }
+        Value::Symbol(symbol) => {
+            let proto = realm
+                .intrinsics
+                .get("%Symbol.prototype%")
+                .and_then(|v| as_object(&v));
+            let object = JsObject::ordinary_object_create(proto);
+            agent
+                .symbol_data
+                .insert(object.id(), symbol.as_ref().clone());
+            Ok(Value::Object(object))
+        }
+        _ => {
+            let proto = realm
+                .intrinsics
+                .get("%Object.prototype%")
+                .and_then(|v| as_object(&v));
+            Ok(Value::Object(JsObject::ordinary_object_create(proto)))
+        }
+    }
+}
+
 /// The active script or module (spec 9.4.2): what the running code came from.
 #[derive(Debug, Clone)]
 pub enum ScriptOrModule {
@@ -241,6 +295,12 @@ pub fn get_property_key(
         && matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_))
         && let Some(module) = agent.module_namespaces.get(&obj.id()).cloned()
     {
+        // Symbol.toStringTag (spec 28.3.1): a data property on the namespace.
+        if let crux::property::PropertyKey::Symbol(symbol) = key
+            && symbol.id == crux::symbol::well_known("toStringTag").id
+        {
+            return Ok(Value::String(Handle::new(JsString::from_utf8("Module"))));
+        }
         let crux::property::PropertyKey::String(id) = key else {
             return Ok(Value::Undefined);
         };
@@ -266,10 +326,12 @@ pub fn get_property_key(
             }
             f.object.get_with_receiver_key(key, receiver)
         }
-        _ => Err(JsError::new(
-            ErrorKind::TypeError,
-            "value is not an object".into(),
-        )),
+        _ => {
+            // Primitive bases are boxed for the property read (spec 7.3.2
+            // step 3): the boxed wrapper becomes the receiver.
+            let object = to_object(agent, base)?;
+            get_property_key(agent, &object, key, object.clone())
+        }
     }
 }
 
@@ -338,7 +400,15 @@ pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Resu
         }
         ReferenceBase::Value(base) => {
             let key = &reference.name;
-            let result = match base {
+            // Primitive bases are boxed (spec 7.3.4 step 5.b): the write lands
+            // on the temporary wrapper, which makes strict mode throw and
+            // sloppy mode ignore it.
+            let base = if matches!(base, Value::Object(_) | Value::Function(_)) {
+                base.clone()
+            } else {
+                to_object(agent, base)?
+            };
+            let result = match &base {
                 Value::Object(obj) => {
                     if let Some(setter) = find_ecma_accessor(obj, key, AccessorKind::Set)? {
                         crate::function::call(agent, &setter, base.clone(), &[value])?;
@@ -354,10 +424,12 @@ pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Resu
                     f.object
                         .set_with_receiver_key(key, value, base.clone(), reference.strict)
                 }
-                _ => Err(JsError::new(
-                    ErrorKind::TypeError,
-                    "value is not an object".into(),
-                )),
+                _ => {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "to_object returned a function".into(),
+                    ));
+                }
             };
             // spec step 5: a failed [[Set]] is a TypeError in strict mode.
             if !result? && reference.strict {

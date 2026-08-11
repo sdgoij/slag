@@ -15,7 +15,7 @@ use crux::string::JsString;
 use crux::value::Value;
 
 use crate::agent::Agent;
-use crate::context::as_object;
+use crate::context::{as_object, to_object};
 use crate::realm::Realm;
 
 const OBJECT: &str = "%Object%";
@@ -252,36 +252,12 @@ fn str(value: &str) -> Value {
     Value::String(Handle::new(JsString::from_utf8(value)))
 }
 
-/// ToObject (spec 7.1.19): box a primitive; null/undefined throw. The
-/// Number/Boolean/BigInt/Symbol wrapper prototypes arrive with their phases;
-/// until then the value is carried in a plain %Object.prototype% object.
-pub fn to_object(agent: &Agent, value: &Value) -> Result<Value, JsError> {
-    let realm = agent.current_realm()?;
-    match value {
-        Value::Object(obj) => Ok(Value::Object(obj.clone())),
-        Value::Function(function) => Ok(Value::Function(function.clone())),
-        Value::Null | Value::Undefined => Err(JsError::new(
-            ErrorKind::TypeError,
-            "Cannot convert undefined or null to object".into(),
-        )),
-        Value::String(s) => {
-            let proto = realm
-                .intrinsics
-                .get("%String.prototype%")
-                .and_then(|v| as_object(&v));
-            Ok(Value::Object(JsObject::string_create(
-                s.as_ref().clone(),
-                proto,
-            )?))
-        }
-        _ => {
-            let proto = realm
-                .intrinsics
-                .get(OBJECT_PROTO)
-                .and_then(|v| as_object(&v));
-            Ok(Value::Object(JsObject::ordinary_object_create(proto)))
-        }
-    }
+/// The object handle behind a (possibly boxed) value: ordinary objects
+/// directly, functions through their object part.
+fn object_of(agent: &mut Agent, value: &Value) -> Result<Handle<JsObject>, JsError> {
+    let object = to_object(agent, value)?;
+    as_object(&object)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))
 }
 
 /// Object.prototype.toString (spec 20.1.3.6): `[object Tag]` from the value's
@@ -289,7 +265,6 @@ pub fn to_object(agent: &Agent, value: &Value) -> Result<Value, JsError> {
 /// table matches the spec regardless). The `@@toStringTag` override joins
 /// with the Symbol builtin.
 fn prototype_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
-    let _ = agent;
     let tag = match this {
         Value::Undefined => "Undefined",
         Value::Null => "Null",
@@ -299,7 +274,13 @@ fn prototype_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsError
         Value::BigInt(_) => "BigInt",
         Value::Symbol(_) => "Symbol",
         Value::Function(_) => "Function",
-        Value::Object(obj) => obj.kind.name(),
+        Value::Object(obj) => {
+            if agent.boolean_data.contains_key(&obj.id()) {
+                "Boolean"
+            } else {
+                obj.kind.name()
+            }
+        }
     };
     Ok(str(&format!("[object {}]", tag)))
 }
@@ -307,12 +288,8 @@ fn prototype_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsError
 /// EnumerableOwnPropertyNames (spec 7.3.23) restricted to string keys.
 fn enumerable_string_keys(agent: &mut Agent, value: &Value) -> Result<Vec<JsString>, JsError> {
     let object = to_object(agent, value)?;
-    let Value::Object(obj) = object else {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "to_object returned a function".into(),
-        ));
-    };
+    let obj = as_object(&object)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
     let mut out = Vec::new();
     for key in obj.own_property_keys()? {
         let PropertyKey::String(id) = key else {
@@ -340,12 +317,8 @@ fn array_of(values: &[Value]) -> Result<Value, JsError> {
 /// getOwnPropertySymbols (spec 20.1.2.11.1): the own keys of one type.
 fn own_keys_of(agent: &mut Agent, value: &Value, want_symbols: bool) -> Result<Value, JsError> {
     let object = to_object(agent, value)?;
-    let Value::Object(obj) = object else {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "to_object returned a function".into(),
-        ));
-    };
+    let obj = as_object(&object)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
     let mut keys = Vec::new();
     for key in obj.own_property_keys()? {
         let matches = matches!(
@@ -369,12 +342,8 @@ fn own_keys_of(agent: &mut Agent, value: &Value, want_symbols: bool) -> Result<V
 /// SetIntegrityLevel (spec 7.3.15): freeze (writable off too) or seal.
 fn set_integrity_level(agent: &mut Agent, value: &Value, freeze: bool) -> Result<Value, JsError> {
     let object = to_object(agent, value)?;
-    let Value::Object(obj) = object.clone() else {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "to_object returned a function".into(),
-        ));
-    };
+    let obj = as_object(&object)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
     for key in obj.own_property_keys()? {
         if let Some(current) = obj.get_own_property_key(&key)?
             && current.configurable
@@ -397,8 +366,9 @@ fn set_integrity_level(agent: &mut Agent, value: &Value, freeze: bool) -> Result
 /// TestIntegrityLevel (spec 7.3.16).
 fn test_integrity_level(agent: &mut Agent, value: &Value, freeze: bool) -> Result<bool, JsError> {
     let object = to_object(agent, value)?;
-    let Value::Object(obj) = object else {
-        return Ok(false);
+    let obj = match as_object(&object) {
+        Some(obj) => obj,
+        None => return Ok(false),
     };
     if !obj.is_extensible()? {
         for key in obj.own_property_keys()? {
@@ -425,18 +395,9 @@ fn object_define_properties(
     properties: &Value,
 ) -> Result<Value, JsError> {
     let props = to_object(agent, properties)?;
-    let Value::Object(props_obj) = props.clone() else {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "to_object returned a function".into(),
-        ));
-    };
-    let Value::Object(target) = object.clone() else {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "defineProperties target is not an object".into(),
-        ));
-    };
+    let props_obj = as_object(&props)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
+    let target = object_of(agent, object)?;
     for key in props_obj.own_property_keys()? {
         let PropertyKey::String(_) = key else {
             continue;
@@ -484,12 +445,9 @@ pub fn dispatch_call(
         return Some((|| {
             let key = to_property_key(arg(args, 0))?;
             let object = to_object(agent, this)?;
-            let Value::Object(obj) = object else {
-                return Err(JsError::new(
-                    ErrorKind::TypeError,
-                    "to_object returned a function".into(),
-                ));
-            };
+            let obj = as_object(&object).ok_or_else(|| {
+                JsError::new(ErrorKind::TypeError, "value is not an object".into())
+            })?;
             Ok(Value::Boolean(obj.has_own_property_key(&key)?))
         })());
     }
@@ -517,12 +475,9 @@ pub fn dispatch_call(
         return Some((|| {
             let key = to_property_key(arg(args, 0))?;
             let object = to_object(agent, this)?;
-            let Value::Object(obj) = object else {
-                return Err(JsError::new(
-                    ErrorKind::TypeError,
-                    "to_object returned a function".into(),
-                ));
-            };
+            let obj = as_object(&object).ok_or_else(|| {
+                JsError::new(ErrorKind::TypeError, "value is not an object".into())
+            })?;
             let enumerable = obj
                 .get_own_property_key(&key)?
                 .map(|prop| prop.enumerable)
@@ -576,12 +531,9 @@ pub fn dispatch_call(
             let object = to_object(agent, arg(args, 0))?;
             let key = to_property_key(arg(args, 1))?;
             let desc = crux::property::to_property_descriptor(arg(args, 2))?;
-            let Value::Object(obj) = object.clone() else {
-                return Err(JsError::new(
-                    ErrorKind::TypeError,
-                    "to_object returned a function".into(),
-                ));
-            };
+            let obj = as_object(&object).ok_or_else(|| {
+                JsError::new(ErrorKind::TypeError, "value is not an object".into())
+            })?;
             if !obj.define_property_key(&key, &desc)? {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
@@ -644,12 +596,9 @@ pub fn dispatch_call(
         return Some((|| {
             let object = to_object(agent, arg(args, 0))?;
             let key = to_property_key(arg(args, 1))?;
-            let Value::Object(obj) = object else {
-                return Err(JsError::new(
-                    ErrorKind::TypeError,
-                    "to_object returned a function".into(),
-                ));
-            };
+            let obj = as_object(&object).ok_or_else(|| {
+                JsError::new(ErrorKind::TypeError, "value is not an object".into())
+            })?;
             let Some(prop) = obj.get_own_property_key(&key)? else {
                 return Ok(Value::Undefined);
             };
@@ -660,12 +609,9 @@ pub fn dispatch_call(
     if intrinsics.get(GET_OWN_DESCS).as_ref() == Some(callee) {
         return Some((|| {
             let object = to_object(agent, arg(args, 0))?;
-            let Value::Object(obj) = object.clone() else {
-                return Err(JsError::new(
-                    ErrorKind::TypeError,
-                    "to_object returned a function".into(),
-                ));
-            };
+            let obj = as_object(&object).ok_or_else(|| {
+                JsError::new(ErrorKind::TypeError, "value is not an object".into())
+            })?;
             let result = JsObject::ordinary_object_create(
                 realm
                     .intrinsics
@@ -694,12 +640,9 @@ pub fn dispatch_call(
         return Some((|| {
             let object = to_object(agent, arg(args, 0))?;
             let key = to_property_key(arg(args, 1))?;
-            let Value::Object(obj) = object else {
-                return Err(JsError::new(
-                    ErrorKind::TypeError,
-                    "to_object returned a function".into(),
-                ));
-            };
+            let obj = as_object(&object).ok_or_else(|| {
+                JsError::new(ErrorKind::TypeError, "value is not an object".into())
+            })?;
             Ok(Value::Boolean(obj.has_own_property_key(&key)?))
         })());
     }
@@ -709,24 +652,18 @@ pub fn dispatch_call(
     if intrinsics.get(IS_EXTENSIBLE).as_ref() == Some(callee) {
         return Some((|| {
             let object = to_object(agent, arg(args, 0))?;
-            let Value::Object(obj) = object else {
-                return Err(JsError::new(
-                    ErrorKind::TypeError,
-                    "to_object returned a function".into(),
-                ));
-            };
+            let obj = as_object(&object).ok_or_else(|| {
+                JsError::new(ErrorKind::TypeError, "value is not an object".into())
+            })?;
             Ok(Value::Boolean(obj.is_extensible()?))
         })());
     }
     if intrinsics.get(PREVENT_EXTENSIONS).as_ref() == Some(callee) {
         return Some((|| {
             let object = to_object(agent, arg(args, 0))?;
-            let Value::Object(obj) = object.clone() else {
-                return Err(JsError::new(
-                    ErrorKind::TypeError,
-                    "to_object returned a function".into(),
-                ));
-            };
+            let obj = as_object(&object).ok_or_else(|| {
+                JsError::new(ErrorKind::TypeError, "value is not an object".into())
+            })?;
             obj.prevent_extensions()?;
             Ok(object)
         })());
@@ -791,12 +728,8 @@ fn object_constructor(
 
 fn get_prototype_of(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
     let object = to_object(agent, value)?;
-    let Value::Object(obj) = object else {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "to_object returned a function".into(),
-        ));
-    };
+    let obj = as_object(&object)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
     match obj.get_prototype_of()? {
         Some(proto) => Ok(Value::Object(proto)),
         None => Ok(Value::Null),
@@ -819,12 +752,8 @@ fn set_prototype_of(
         }
     };
     let object = to_object(agent, value)?;
-    let Value::Object(obj) = object.clone() else {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "to_object returned a function".into(),
-        ));
-    };
+    let obj = as_object(&object)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
     // Setting the same prototype is a no-op (spec 20.1.2.22 step 5).
     if obj.get_prototype_of()? == proto {
         return Ok(object);

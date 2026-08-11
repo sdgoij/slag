@@ -1153,10 +1153,25 @@ Promise, and generator intrinsics and for module namespace objects:
 - The pre-Phase-8 `instanceof` test that asserted `Object` was undefined now asserts `({})
   instanceof Object` is `true`.
 
-12 Object built-in tests. Still open in Phase 8: `Boolean`, `Symbol` (well-known symbols
-unblock `@@toStringTag` and the @@hasInstance path), the `Error` family (`assert.throws`
-fixtures), URI functions, `Function.prototype.toString` exact source, `WeakRef`/
-`FinalizationRegistry`, and the global-property completeness check.
+**Boolean** (`builtins/boolean.rs`): `Boolean(value)` converts via ToBoolean; `new
+Boolean(v)` boxes the result with `[[BooleanData]]` in the agent's `boolean_data` table;
+`%Boolean.prototype%` carries `toString`/`valueOf` (ThisBooleanValue reads the table, the
+prototype itself wraps *false*). 4 tests.
+
+**Symbol** (`builtins/symbol.rs`): the non-constructible `Symbol(description)` constructor,
+the 15 well-known symbol statics (`Symbol.iterator`, `Symbol.toStringTag`, `@@hasInstance`,
+…), `Symbol.for`/`keyFor` over the agent's `[[GlobalSymbolRegistry]]`, and
+`%Symbol.prototype%` with `toString`/`valueOf`/`description`/`@@toPrimitive`/`@@toStringTag`.
+5 tests.
+
+Primitive property access now boxes through the shared `context::to_object` (Boolean and
+Symbol wrappers register their wrapped value), so `true.toString()`, `Symbol('x').description`,
+and `Symbol.prototype.toString.call(...)` work; module namespaces expose
+`Symbol.toStringTag = "Module"` (spec 28.3.1).
+
+12 Object + 4 Boolean + 5 Symbol built-in tests. Still open in Phase 8: the `Error` family
+(`assert.throws` fixtures), URI functions, `Function.prototype.toString` exact source,
+`WeakRef`/`FinalizationRegistry`, and the global-property completeness check.
 
 ---
 

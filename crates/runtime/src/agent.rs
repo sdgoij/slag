@@ -89,6 +89,12 @@ pub struct Agent {
     pub module_namespaces: std::collections::HashMap<u64, Handle<crate::module::SourceTextModule>>,
     /// The dynamic-import namespace resolvers, keyed by function identity.
     pub import_namespace_resolvers: std::collections::HashMap<u64, (Value, Value)>,
+    /// [[BooleanData]] of Boolean wrapper objects, keyed by object identity
+    /// (spec 20.3.1: `new Boolean(v)` boxes the ToBoolean result).
+    pub boolean_data: std::collections::HashMap<u64, bool>,
+    /// [[SymbolData]] of Symbol wrapper objects, keyed by object identity
+    /// (spec 20.4.1: `Object(sym)` boxes the symbol).
+    pub symbol_data: std::collections::HashMap<u64, crux::symbol::Symbol>,
 }
 
 impl Agent {
@@ -121,6 +127,8 @@ impl Agent {
             host_modules: RefCell::new(std::collections::HashMap::new()),
             module_namespaces: std::collections::HashMap::new(),
             import_namespace_resolvers: std::collections::HashMap::new(),
+            boolean_data: std::collections::HashMap::new(),
+            symbol_data: std::collections::HashMap::new(),
         }
     }
 

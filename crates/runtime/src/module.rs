@@ -1433,4 +1433,20 @@ mod tests {
             js_str("object")
         );
     }
+
+    #[test]
+    fn namespace_has_symbol_to_string_tag() {
+        // spec 28.3.1: the namespace's @@toStringTag is "Module".
+        let mut evaluated = evaluate_modules(&[("m.js", "export var x = 1;")], "m.js").unwrap();
+        let tag = crate::context::get_property_key(
+            &mut evaluated.agent,
+            &evaluated.namespace,
+            &crux::property::PropertyKey::Symbol(
+                crux::symbol::well_known("toStringTag").as_ref().clone(),
+            ),
+            evaluated.namespace.clone(),
+        )
+        .unwrap();
+        assert_eq!(tag, js_str("Module"));
+    }
 }
