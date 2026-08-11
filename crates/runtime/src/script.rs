@@ -53,7 +53,7 @@ pub fn script_evaluation(
 
     let strict = script_is_strict(&script.code);
     let result = (|| -> Result<Value, JsError> {
-        global_declaration_instantiation(&script.code, &global_env)?;
+        global_declaration_instantiation(agent, &script.code, &global_env, strict)?;
         crate::eval::eval_program(agent, &script.code, strict)
     })();
 
@@ -275,20 +275,15 @@ pub fn top_level_var_scoped_declarations<'a>(stmts: &'a [Stmt]) -> Vec<VarScoped
 
 // ---- GlobalDeclarationInstantiation (spec 16.1.7) ----
 
-/// Instantiate a top-level function declaration: Phase 4 creates a function
-/// value carrying its name; [[Environment]]/[[ECMAScriptCode]] join in
-/// Phase 7.
-pub fn instantiate_function_object(f: &syntax::ast::Function) -> Value {
-    Value::Function(crux::Function::new(f.name.map(lookup)))
-}
-
 /// GlobalDeclarationInstantiation (spec 16.1.7): create the script's global
 /// bindings — lexical declarations in the declarative record, functions and
 /// vars as properties of the global object — checking for redeclarations and
 /// restricted globals first.
 pub fn global_declaration_instantiation(
+    agent: &mut Agent,
     program: &Program,
     global_env: &EnvRef,
+    strict: bool,
 ) -> Result<(), JsError> {
     let lexical_names = top_level_lexically_declared_names(&program.body);
     let variable_names = top_level_var_declared_names(&program.body);
@@ -394,7 +389,7 @@ pub fn global_declaration_instantiation(
             continue;
         };
         let name = lookup(func_name);
-        let func_obj = instantiate_function_object(f);
+        let func_obj = crate::function::instantiate_function(agent, f, global_env.clone(), strict)?;
         global_env.create_global_function_binding(&name, func_obj, false)?;
     }
 
@@ -475,7 +470,7 @@ pub fn perform_eval(
     };
     agent.execution_context_stack.push(eval_context);
     let result = (|| -> Result<Value, JsError> {
-        eval_declaration_instantiation(&program, &variable_env, &lexical_env, strict_eval)?;
+        eval_declaration_instantiation(agent, &program, &variable_env, &lexical_env, strict_eval)?;
         crate::eval::eval_program(agent, &program, strict_eval)
     })();
     agent.execution_context_stack.pop();
@@ -487,6 +482,7 @@ pub fn perform_eval(
 /// declarations in `lexical_env` — after validating that a sloppy eval's
 /// vars do not collide with lexical bindings.
 fn eval_declaration_instantiation(
+    agent: &mut Agent,
     program: &Program,
     variable_env: &EnvRef,
     lexical_env: &EnvRef,
@@ -590,7 +586,8 @@ fn eval_declaration_instantiation(
             continue;
         };
         let name = lookup(func_name);
-        let func_obj = instantiate_function_object(f);
+        let env = agent.running_context()?.lexical_environment.clone();
+        let func_obj = crate::function::instantiate_function(agent, f, env, strict)?;
         if variable_env_is_global {
             // Eval-created global functions are deletable.
             variable_env.create_global_function_binding(&name, func_obj, true)?;
@@ -706,6 +703,7 @@ mod tests {
                 ArrayBindingElement::Element(syntax::ast::BindingElement {
                     pattern: BindingPattern::Ident(intern_utf8("y")),
                     init: None,
+                    rest: false,
                     span: crux::Span::new(0, 0),
                 }),
                 ArrayBindingElement::Hole,

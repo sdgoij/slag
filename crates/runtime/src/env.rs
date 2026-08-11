@@ -564,8 +564,13 @@ pub struct FunctionEnv {
 }
 
 impl FunctionEnv {
-    pub fn new(outer: Option<EnvRef>, function_object: Value, new_target: Value) -> Self {
-        let status = if function_object_is_lexical_this(&function_object) {
+    pub fn new(
+        outer: Option<EnvRef>,
+        function_object: Value,
+        new_target: Value,
+        lexical_this: bool,
+    ) -> Self {
+        let status = if lexical_this {
             ThisBindingStatus::Lexical
         } else {
             ThisBindingStatus::Uninitialized
@@ -615,12 +620,6 @@ impl FunctionEnv {
         self.this_binding_status.set(ThisBindingStatus::Initialized);
         Ok(())
     }
-}
-
-/// Whether the function object's [[ThisMode]] is ~lexical~ (an arrow
-/// function). Phase 4 function values are never arrows.
-fn function_object_is_lexical_this(_function: &Value) -> bool {
-    false
 }
 
 /// A Global Environment Record (spec 9.2.6): an object record over the
@@ -821,16 +820,19 @@ pub fn new_object_environment(
     Handle::new(EnvRecord::Object(ObjectEnv::new(object, is_with, outer)))
 }
 
-/// NewFunctionEnvironment (spec 9.2.4.1).
+/// NewFunctionEnvironment (spec 9.2.4.1). `lexical_this` marks arrow
+/// functions: their environment records have no `this` binding.
 pub fn new_function_environment(
     outer: Option<EnvRef>,
     function_object: Value,
     new_target: Value,
+    lexical_this: bool,
 ) -> EnvRef {
     Handle::new(EnvRecord::Function(FunctionEnv::new(
         outer,
         function_object,
         new_target,
+        lexical_this,
     )))
 }
 

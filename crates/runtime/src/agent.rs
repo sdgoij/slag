@@ -50,6 +50,10 @@ pub struct Agent {
     pub global_symbol_registry: RefCell<Vec<(JsString, Symbol)>>,
     /// [[ModuleAsyncEvaluationCount]]: module linking (Phase 7).
     pub module_async_evaluation_count: u32,
+    /// The ECMAScript-function bodies keyed by function identity (the spec
+    /// 10.2.1 slots [[Environment]], [[FormalParameters]], [[ECMAScriptCode]],
+    /// [[ThisMode]], [[HomeObject]] live here, Phase 7).
+    pub ecma_functions: std::collections::HashMap<u64, crate::function::EcmaFunction>,
 }
 
 impl Agent {
@@ -71,6 +75,7 @@ impl Agent {
             kept_alive: Vec::new(),
             global_symbol_registry: RefCell::new(Vec::new()),
             module_async_evaluation_count: 0,
+            ecma_functions: std::collections::HashMap::new(),
         }
     }
 

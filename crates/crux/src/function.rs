@@ -93,6 +93,12 @@ impl fmt::Debug for Function {
 }
 
 impl Function {
+    /// The stable identity of this function (used by the runtime to look up
+    /// the ECMAScript body, spec 10.2.1 slots).
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     /// A bare ECMAScript function value: identity and name only, used until
     /// the Phase 7 evaluator fills in the callable body.
     pub fn new(name: Option<JsString>) -> Handle<Function> {

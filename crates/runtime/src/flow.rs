@@ -12,6 +12,10 @@ use crux::value::Value;
 pub enum Completion {
     /// A normal completion; `~empty~` statements produce *undefined*.
     Normal(Value),
+    /// NormalCompletion(~empty~): a declaration, empty, or debugger
+    /// statement, whose value `UpdateEmpty` fills from the enclosing
+    /// statement list (spec 14.2.2 step 5).
+    Empty,
     /// `break label` / `continue label`: `target` is the label (or `None`),
     /// `value` is `~empty~` until `UpdateEmpty` fills it from the enclosing
     /// statement list or loop.
@@ -35,6 +39,7 @@ impl Completion {
     /// UpdateEmpty (spec 6.2.3.4): fill an `~empty~` completion value.
     pub fn update_empty(self, value: Value) -> Self {
         match self {
+            Completion::Empty => Completion::Normal(value),
             Completion::Break {
                 target,
                 value: None,
@@ -57,6 +62,7 @@ impl Completion {
     pub fn value(&self) -> Value {
         match self {
             Completion::Normal(value) => value.clone(),
+            Completion::Empty => Value::Undefined,
             Completion::Break { value, .. } | Completion::Continue { value, .. } => {
                 value.clone().unwrap_or(Value::Undefined)
             }
@@ -71,6 +77,7 @@ impl Completion {
 pub fn completion_to_result(completion: Completion) -> Result<Value, JsError> {
     match completion {
         Completion::Normal(value) => Ok(value),
+        Completion::Empty => Ok(Value::Undefined),
         Completion::Throw(value) => Err(crux::error::JsError::new(
             crux::error::ErrorKind::TypeError,
             format!("Uncaught {value:?}"),

@@ -45,9 +45,28 @@ pub fn eval_expr(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Value, 
         )),
         ExprKind::Array(literal) => eval_array_literal(agent, literal, strict),
         ExprKind::Object(literal) => eval_object_literal(agent, literal, strict),
-        ExprKind::Function(_) | ExprKind::Class(_) | ExprKind::Arrow { .. } => Err(JsError::new(
+        ExprKind::Function(f) => {
+            let env = agent.running_context()?.lexical_environment.clone();
+            crate::function::instantiate_function_expression(agent, f, env, strict)
+        }
+        ExprKind::Arrow {
+            is_async,
+            params,
+            body,
+        } => {
+            let env = agent.running_context()?.lexical_environment.clone();
+            crate::function::instantiate_arrow(
+                agent,
+                *is_async,
+                params.clone(),
+                body.clone(),
+                env,
+                strict,
+            )
+        }
+        ExprKind::Class(_) => Err(JsError::new(
             ErrorKind::TypeError,
-            "function/class expressions are not implemented until Phase 7".into(),
+            "class expressions are not implemented until later Phase 7 work".into(),
         )),
         ExprKind::Unary { op, operand } => eval_unary(agent, op, operand, strict),
         ExprKind::Update { op, prefix, target } => eval_update(agent, op, *prefix, target, strict),
@@ -210,7 +229,7 @@ fn eval_call_chain(
         let result = crate::script::perform_eval(agent, &source.to_string_lossy(), strict, direct)?;
         return Ok(Some(ChainResult::Value(result)));
     }
-    let result = crux::function::call(&callee_value, this, &args)?;
+    let result = crate::function::call(agent, &callee_value, this, &args)?;
     Ok(Some(ChainResult::Value(result)))
 }
 
@@ -301,8 +320,8 @@ fn eval_array_literal(
             }
             ArrayElement::Spread(expr) => {
                 let iterable = eval_expr(agent, expr, strict)?;
-                let iterator = get_iterator(&iterable)?;
-                while let Some(value) = iterator_step(&iterator)? {
+                let iterator = get_iterator(agent, &iterable)?;
+                while let Some(value) = iterator_step(agent, &iterator)? {
                     array.create_data_property(&JsString::from_utf8(&index.to_string()), value)?;
                     index += 1;
                 }
@@ -899,8 +918,8 @@ fn eval_arguments(
             Argument::Expr(expr) => values.push(eval_expr(agent, expr, strict)?),
             Argument::Spread(expr) => {
                 let iterable = eval_expr(agent, expr, strict)?;
-                let iterator = get_iterator(&iterable)?;
-                while let Some(value) = iterator_step(&iterator)? {
+                let iterator = get_iterator(agent, &iterable)?;
+                while let Some(value) = iterator_step(agent, &iterator)? {
                     values.push(value);
                 }
             }
@@ -933,7 +952,7 @@ fn eval_new(agent: &mut Agent, new: &syntax::ast::NewExpr, strict: bool) -> Resu
         ));
     }
     let args = eval_arguments(agent, &new.args, strict)?;
-    crux::function::construct(&constructor, &args, &constructor)
+    crate::function::construct(agent, &constructor, &args, &constructor)
 }
 
 /// TemplateLiteral evaluation (spec 13.3.7.3): concatenate the cooked quasis
@@ -995,7 +1014,7 @@ fn eval_tagged_template(
     for expr in &template.exprs {
         args.push(eval_expr(agent, expr, strict)?);
     }
-    crux::function::call(&tag_value, Value::Undefined, &args)
+    crate::function::call(agent, &tag_value, Value::Undefined, &args)
 }
 
 /// The Iterator Record of GetIterator (spec 7.4.2).
@@ -1006,7 +1025,7 @@ pub struct IteratorRecord {
 
 /// GetIterator (spec 7.4.2): fetch `@@iterator`, invoke it, and extract the
 /// `next` method.
-pub fn get_iterator(value: &Value) -> Result<IteratorRecord, JsError> {
+pub fn get_iterator(agent: &mut Agent, value: &Value) -> Result<IteratorRecord, JsError> {
     let method = get_method(value, "@@iterator")?;
     let Some(method) = method else {
         return Err(JsError::new(
@@ -1014,7 +1033,7 @@ pub fn get_iterator(value: &Value) -> Result<IteratorRecord, JsError> {
             "Value is not iterable".into(),
         ));
     };
-    let iterator = crux::function::call(&method, value.clone(), &[])?;
+    let iterator = crate::function::call(agent, &method, value.clone(), &[])?;
     if !matches!(iterator, Value::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -1033,8 +1052,11 @@ pub fn get_iterator(value: &Value) -> Result<IteratorRecord, JsError> {
 
 /// IteratorStep + IteratorValue (spec 7.4.5-7.4.6): the next value, or `None`
 /// when the iterator is done.
-pub fn iterator_step(iterator: &IteratorRecord) -> Result<Option<Value>, JsError> {
-    let result = crux::function::call(&iterator.next, iterator.iterator.clone(), &[])?;
+pub fn iterator_step(
+    agent: &mut Agent,
+    iterator: &IteratorRecord,
+) -> Result<Option<Value>, JsError> {
+    let result = crate::function::call(agent, &iterator.next, iterator.iterator.clone(), &[])?;
     if !matches!(result, Value::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -1052,7 +1074,7 @@ pub fn iterator_step(iterator: &IteratorRecord) -> Result<Option<Value>, JsError
 /// IteratorClose (spec 7.4.7): invoke the iterator's `return` method when it
 /// exists. Phase 6 propagates the close result; `throw`-completions integrate
 /// in Phase 7.
-pub fn iterator_close(iterator: &IteratorRecord) -> Result<(), JsError> {
+pub fn iterator_close(agent: &mut Agent, iterator: &IteratorRecord) -> Result<(), JsError> {
     let return_method = get_property(
         &iterator.iterator,
         &JsString::from_utf8("return"),
@@ -1061,7 +1083,7 @@ pub fn iterator_close(iterator: &IteratorRecord) -> Result<(), JsError> {
     if matches!(return_method, Value::Undefined | Value::Null) {
         return Ok(());
     }
-    crux::function::call(&return_method, iterator.iterator.clone(), &[])?;
+    crate::function::call(agent, &return_method, iterator.iterator.clone(), &[])?;
     Ok(())
 }
 

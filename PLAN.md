@@ -907,6 +907,49 @@ async fixtures, and `test/language/module-code`.
 **Exit criteria:** full async/await/class/module test fixtures green; **test262 ≥ 20–30%** of
 runnable tests.
 
+**Status (current):** ordinary function calls work end to end — the foundation the rest of the
+phase builds on:
+
+- `crates/runtime/src/function.rs` — the spec 10.2.1 slots live in the agent's `ecma_functions`
+  table keyed by function identity (`EcmaFunction`: name, params, body, `[[Environment]]`,
+  `[[ThisMode]]`, `[[Strict]]`, `[[HomeObject]]`, realm, async/generator flags).
+  `instantiate_function`/`instantiate_function_expression`/`instantiate_arrow` register the
+  body and set `length` (10.2.6) / `name` (10.2.7) / `prototype` via `make_constructor`
+  (10.2.5); named function expressions bind their name in a fresh scope.
+  `call`/`construct` dispatch ECMAScript functions to `ordinary_call`/`ordinary_construct`
+  (10.2.1: PrepareForOrdinaryCall, OrdinaryCallBindThis with sloppy `this`→global coercion,
+  GetPrototypeFromConstructor, base-constructor return rules) and unwrap bound chains so
+  bound-over-user-functions work; everything else delegates to `crux::function::call`.
+- `FunctionDeclarationInstantiation` (16.1.8), simple-parameter path: positional parameter
+  binding, the mapped (sloppy) / unmapped (strict) `arguments` object with getter/setter
+  closures over the parameter env, var bindings created and initialized to *undefined*
+  (hoisting), top-level function declarations instantiated against the lexical env and bound
+  via `SetMutableBinding`, lexical bindings instantiated uninitialized, and the sloppy
+  split of lexical vs variable environments.
+- Arrows (`instantiate_arrow`): `[[ThisMode]] = lexical` threaded into the Function
+  Environment Record (`new_function_environment` now takes the flag), concise bodies compile
+  to a synthetic `return`, no `prototype`, no `arguments`.
+- `eval.rs`/`expr.rs`: function/class declarations and function expressions register with the
+  agent; call/construct/tagged-template and the iterator helpers (`get_iterator`,
+  `iterator_step`, `iterator_close`) route through the agent-aware dispatcher so user
+  iterators work. `Completion` gains an `Empty` variant for declaration/empty statements so
+  `UpdateEmpty` fills their value from the statement list (`eval('1; function f() {}')` → 1).
+- `syntax`/`parser`: `BindingElement` gains a `rest` flag (rest params were unmarked in the
+  AST); `new MemberExpression Arguments` continues subscripts (`new C(5).x` was a parse
+  error).
+
+Tests: 9 runtime tests (calls, hoisting, closures/recursion, `this` modes, `arguments`
+mapping, constructors, NFE names, arrows, empty completions) plus 3 test262 function fixtures
+(`cptn-decl`, strict-directive and `super()` early errors) — 22 fixtures total. Workspace runs
+**328 tests** with fmt and clippy (`-D warnings`) clean.
+
+**Remaining in Phase 7 (functions):** default/rest/destructured parameter lists
+(`IteratorBindingInitialization` with the separate parameter environment — `hasParamExprs`
+path), assignment-name inference for anonymous functions (`var f = function(){}`), per-iteration
+closure captures in `for` heads, method `[[HomeObject]]`/`super`, `arguments`-name conflict
+edge cases, then the `Function.prototype` intrinsic and the constructor builtin (Phase 8
+bootstrap); generators/async/classes/modules/promises as listed below.
+
 ---
 
 ### Phase 8 — Global object and fundamental objects

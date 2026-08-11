@@ -461,6 +461,7 @@ impl<'s> Parser<'s> {
         Ok(BindingElement {
             pattern,
             init,
+            rest: false,
             span: Span::new(start, end),
         })
     }
@@ -520,6 +521,7 @@ impl<'s> Parser<'s> {
         Ok(BindingElement {
             pattern,
             init: None,
+            rest: false,
             span: Span::new(start, end),
         })
     }
@@ -560,6 +562,7 @@ impl<'s> Parser<'s> {
                     element: BindingElement {
                         pattern: BindingPattern::Ident(name),
                         init,
+                        rest: false,
                         span: Span::new(start, end),
                     },
                     span: Span::new(start, end),

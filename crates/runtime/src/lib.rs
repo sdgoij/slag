@@ -14,6 +14,7 @@ pub mod env;
 pub mod eval;
 pub mod expr;
 pub mod flow;
+pub mod function;
 pub mod host;
 pub mod job;
 pub mod realm;

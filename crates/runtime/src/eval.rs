@@ -19,7 +19,7 @@ use crate::context::{initialize_referenced_binding, put_value, resolve_binding};
 use crate::env::{EnvRef, new_declarative_environment, new_object_environment};
 use crate::expr::{eval_expr, eval_reference, get_iterator, iterator_close, iterator_step};
 use crate::flow::{Completion, completion_to_result};
-use crate::script::{bound_names, instantiate_function_object};
+use crate::script::bound_names;
 
 /// Evaluate a whole program (the Evaluation of |Script|, spec 16.1.6 step
 /// 11). The completion value is the value of the last evaluated statement.
@@ -28,7 +28,7 @@ pub fn eval_program(agent: &mut Agent, program: &Program, strict: bool) -> Resul
     completion_to_result(completion)
 }
 
-fn eval_statement_list(
+pub(crate) fn eval_statement_list(
     agent: &mut Agent,
     stmts: &[Stmt],
     strict: bool,
@@ -46,6 +46,11 @@ fn eval_statement_list(
             {
                 *value = Some(list_value.clone());
             }
+            // A declaration/empty statement has an ~empty~ value; the list
+            // fills it from the preceding statements.
+            Completion::Empty => {
+                completion = Completion::Normal(list_value.clone());
+            }
             _ => {}
         }
         if !matches!(completion, Completion::Normal(_)) {
@@ -57,7 +62,7 @@ fn eval_statement_list(
 
 fn eval_statement(agent: &mut Agent, stmt: &Stmt, strict: bool) -> Result<Completion, JsError> {
     match &stmt.kind {
-        StmtKind::Empty | StmtKind::Debugger => Ok(Completion::normal()),
+        StmtKind::Empty | StmtKind::Debugger => Ok(Completion::Empty),
         StmtKind::Expr(expr) => eval_expr(agent, expr, strict).map(Completion::Normal),
         StmtKind::VarDecl { kind, decls } => {
             match kind {
@@ -69,19 +74,19 @@ fn eval_statement(agent: &mut Agent, stmt: &Stmt, strict: bool) -> Result<Comple
                     eval_lexical_declarations(agent, decls, strict)?;
                 }
             }
-            Ok(Completion::normal())
+            Ok(Completion::Empty)
         }
         StmtKind::UsingDecl { decls, .. } => {
             eval_lexical_declarations(agent, decls, strict)?;
-            Ok(Completion::normal())
+            Ok(Completion::Empty)
         }
         StmtKind::FunctionDecl(f) => {
             eval_function_declaration(agent, f, strict)?;
-            Ok(Completion::normal())
+            Ok(Completion::Empty)
         }
         StmtKind::ClassDecl(class) => {
             eval_class_declaration(agent, class, strict)?;
-            Ok(Completion::normal())
+            Ok(Completion::Empty)
         }
         StmtKind::Block(block) => eval_block(agent, block, strict),
         StmtKind::If {
@@ -207,16 +212,18 @@ fn eval_lexical_declarations(
 }
 
 /// FunctionDeclaration evaluation (spec 15.2.6): instantiate the function
-/// object and bind it in the VariableEnvironment.
+/// object against the current lexical environment and bind it in the
+/// VariableEnvironment.
 fn eval_function_declaration(
     agent: &mut Agent,
     f: &syntax::ast::Function,
-    _strict: bool,
+    strict: bool,
 ) -> Result<(), JsError> {
     let Some(name) = f.name else {
         return Ok(());
     };
-    let func_obj = instantiate_function_object(f);
+    let env = agent.running_context()?.lexical_environment.clone();
+    let func_obj = crate::function::instantiate_function(agent, f, env, strict)?;
     let env = agent.running_context()?.variable_environment.clone();
     let name = crux::lookup(name);
     env.set_mutable_binding(&name, func_obj, false)?;
@@ -253,7 +260,7 @@ fn eval_block(
 ) -> Result<Completion, JsError> {
     let old_env = agent.running_context()?.lexical_environment.clone();
     let block_env = new_declarative_environment(Some(old_env.clone()));
-    block_declaration_instantiation(&block.stmts, &block_env)?;
+    block_declaration_instantiation(agent, &block.stmts, &block_env, strict)?;
     agent.running_context_mut()?.lexical_environment = block_env.clone();
     let result = eval_statement_list(agent, &block.stmts, strict);
     agent.running_context_mut()?.lexical_environment = old_env;
@@ -263,7 +270,12 @@ fn eval_block(
 /// BlockDeclarationInstantiation (spec 14.2.4): create the block's lexical
 /// bindings uninitialized; block-level function declarations are instantiated
 /// and initialized immediately.
-fn block_declaration_instantiation(stmts: &[Stmt], block_env: &EnvRef) -> Result<(), JsError> {
+fn block_declaration_instantiation(
+    agent: &mut Agent,
+    stmts: &[Stmt],
+    block_env: &EnvRef,
+    strict: bool,
+) -> Result<(), JsError> {
     for stmt in stmts {
         match &stmt.kind {
             StmtKind::VarDecl { kind, decls, .. } if *kind != VarDeclKind::Var => {
@@ -294,7 +306,8 @@ fn block_declaration_instantiation(stmts: &[Stmt], block_env: &EnvRef) -> Result
                 if let Some(name) = f.name {
                     let name = crux::lookup(name);
                     block_env.create_mutable_binding(&name, false)?;
-                    let func_obj = instantiate_function_object(f);
+                    let func_obj =
+                        crate::function::instantiate_function(agent, f, block_env.clone(), strict)?;
                     block_env.initialize_binding(&name, func_obj)?;
                 }
             }
@@ -319,6 +332,7 @@ fn eval_while(
         }
         match eval_statement(agent, body, strict)? {
             Completion::Normal(value) => iteration_result = value,
+            Completion::Empty => {}
             Completion::Continue { target, value }
                 if target.is_none() || target.is_some_and(|l| labels.contains(&l)) =>
             {
@@ -360,6 +374,7 @@ fn eval_do_while(
     loop {
         match eval_statement(agent, body, strict)? {
             Completion::Normal(value) => iteration_result = value,
+            Completion::Empty => {}
             Completion::Continue { target, value }
                 if target.is_none() || target.is_some_and(|l| labels.contains(&l)) =>
             {
@@ -445,6 +460,7 @@ fn eval_for(
         }
         match eval_statement(agent, body, strict)? {
             Completion::Normal(value) => iteration_result = value,
+            Completion::Empty => {}
             Completion::Continue { target, value }
                 if target.is_none() || target.is_some_and(|l| labels.contains(&l)) =>
             {
@@ -534,6 +550,7 @@ fn eval_for_in(
         }
         match result? {
             Completion::Normal(value) => iteration_result = value,
+            Completion::Empty => {}
             Completion::Continue { target, value }
                 if target.is_none() || target.is_some_and(|l| labels.contains(&l)) =>
             {
@@ -621,10 +638,10 @@ fn eval_for_of(
     labels: &[crux::string::AtomId],
 ) -> Result<Completion, JsError> {
     let rhs = eval_expr(agent, right, strict)?;
-    let iterator = get_iterator(&rhs)?;
+    let iterator = get_iterator(agent, &rhs)?;
     let mut iteration_result = Value::Undefined;
     loop {
-        let Some(value) = iterator_step(&iterator)? else {
+        let Some(value) = iterator_step(agent, &iterator)? else {
             return Ok(Completion::Normal(iteration_result));
         };
         let restore = for_binding_put(agent, left, value, strict)?;
@@ -634,6 +651,7 @@ fn eval_for_of(
         }
         match result? {
             Completion::Normal(value) => iteration_result = value,
+            Completion::Empty => {}
             Completion::Continue { target, value }
                 if target.is_none() || target.is_some_and(|l| labels.contains(&l)) =>
             {
@@ -645,21 +663,21 @@ fn eval_for_of(
                 target: None,
                 value,
             } => {
-                iterator_close(&iterator)?;
+                iterator_close(agent, &iterator)?;
                 return Ok(Completion::Normal(value.unwrap_or(iteration_result)));
             }
             Completion::Break {
                 target: Some(l),
                 value,
             } if labels.contains(&l) => {
-                iterator_close(&iterator)?;
+                iterator_close(agent, &iterator)?;
                 return Ok(Completion::Break {
                     target: Some(l),
                     value: Some(value.unwrap_or(iteration_result)),
                 });
             }
             other => {
-                iterator_close(&iterator)?;
+                iterator_close(agent, &iterator)?;
                 return Ok(other.update_empty(iteration_result.clone()));
             }
         }
@@ -778,7 +796,7 @@ fn eval_switch(
     }
     for case in &cases[start..] {
         match eval_statement_list(agent, &case.consequent, strict)? {
-            Completion::Normal(_) => {}
+            Completion::Normal(_) | Completion::Empty => {}
             // An unlabeled break exits the switch as a normal completion
             // carrying the case list's value (spec 14.14.2 step 2).
             Completion::Break {
@@ -834,7 +852,7 @@ fn run_finalizer(
         return result;
     };
     match eval_statement_list(agent, &finalizer.stmts, strict)? {
-        Completion::Normal(_) => result,
+        Completion::Normal(_) | Completion::Empty => result,
         other => Ok(other),
     }
 }

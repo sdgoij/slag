@@ -40,6 +40,9 @@ mod harness {
         "statements/while/S12.6.2_A15.js",
         "statements/while/S12.6.2_A4_T5.js",
         "statements/while/S12.6.2_A6_T1.js",
+        "statements/function/cptn-decl.js",
+        "statements/function/enable-strict-via-body.js",
+        "statements/function/early-body-super-call.js",
         "expressions/conditional/in-condition.js",
     ];
 

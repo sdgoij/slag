@@ -146,6 +146,7 @@ pub(crate) fn parse_assignment(parser: &mut Parser, allow_in: bool) -> Result<Ex
         let params = vec![BindingElement {
             pattern: BindingPattern::Ident(name),
             init: None,
+            rest: false,
             span: left.span,
         }];
         parser.next()?; // `=>`
@@ -211,6 +212,7 @@ fn parse_single_arrow_param(parser: &mut Parser) -> Result<Vec<BindingElement>, 
     Ok(vec![BindingElement {
         pattern: BindingPattern::Ident(name),
         init: None,
+        rest: false,
         span: Span::new(start, tok.span.end),
     }])
 }
@@ -605,7 +607,10 @@ fn parse_update(parser: &mut Parser) -> Result<Expr, JsError> {
 /// chains (spec 13.4).
 pub(crate) fn parse_lhs(parser: &mut Parser) -> Result<Expr, JsError> {
     if parser.at_keyword(Keyword::New)? {
-        return parse_new(parser);
+        // `new MemberExpression Arguments` is itself a MemberExpression, so
+        // the member/call chain continues after it (`new C(5).x`).
+        let expr = parse_new(parser)?;
+        return parse_subscripts(parser, expr, false);
     }
     if parser.at_keyword(Keyword::Super)? {
         return parse_super(parser);
@@ -1349,6 +1354,7 @@ fn items_to_params(
                 params.push(BindingElement {
                     pattern,
                     init: None,
+                    rest: true,
                     span,
                 });
             }
@@ -1366,6 +1372,7 @@ fn expr_to_binding_element(parser: &mut Parser, expr: Expr) -> Result<BindingEle
         ExprKind::Ident(name) => Ok(BindingElement {
             pattern: BindingPattern::Ident(name),
             init: None,
+            rest: false,
             span,
         }),
         ExprKind::Assign {
@@ -1377,6 +1384,7 @@ fn expr_to_binding_element(parser: &mut Parser, expr: Expr) -> Result<BindingEle
             Ok(BindingElement {
                 pattern,
                 init: Some(*value),
+                rest: false,
                 span,
             })
         }
@@ -1385,6 +1393,7 @@ fn expr_to_binding_element(parser: &mut Parser, expr: Expr) -> Result<BindingEle
             Ok(BindingElement {
                 pattern,
                 init: None,
+                rest: false,
                 span,
             })
         }
@@ -1409,6 +1418,7 @@ fn expr_to_pattern(parser: &mut Parser, expr: Expr) -> Result<BindingPattern, Js
                         elements.push(ArrayBindingElement::Rest(BindingElement {
                             pattern,
                             init: None,
+                            rest: false,
                             span,
                         }));
                     }
@@ -1441,6 +1451,7 @@ fn expr_to_pattern(parser: &mut Parser, expr: Expr) -> Result<BindingPattern, Js
                         props.push(ObjectBindingProperty::Rest(BindingElement {
                             pattern,
                             init: None,
+                            rest: false,
                             span,
                         }));
                         seen_rest = true;
@@ -1717,6 +1728,7 @@ pub(crate) fn parse_parameter_list(parser: &mut Parser) -> Result<Vec<BindingEle
             params.push(BindingElement {
                 pattern,
                 init: None,
+                rest: true,
                 span: Span::new(start, end),
             });
             parser.expect_punct(TokenKind::RightParen)?;

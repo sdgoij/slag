@@ -644,6 +644,8 @@ pub enum ClassElement {
 pub struct BindingElement {
     pub pattern: BindingPattern,
     pub init: Option<Expr>,
+    /// `...` rest binding (function rest parameter or pattern rest).
+    pub rest: bool,
     pub span: Span,
 }
 
@@ -765,6 +767,7 @@ mod tests {
             element: BindingElement {
                 pattern: BindingPattern::Ident(id("y")),
                 init: None,
+                rest: false,
                 span: span(),
             },
             span: span(),
@@ -781,6 +784,7 @@ mod tests {
         let rest = BindingPattern::Object(vec![ObjectBindingProperty::Rest(BindingElement {
             pattern: BindingPattern::Ident(id("r")),
             init: None,
+            rest: false,
             span: span(),
         })]);
         assert!(matches!(
@@ -794,6 +798,7 @@ mod tests {
             ArrayBindingElement::Element(BindingElement {
                 pattern: BindingPattern::Ident(id("a")),
                 init: None,
+                rest: false,
                 span: span(),
             }),
         ]);
