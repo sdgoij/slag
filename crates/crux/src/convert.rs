@@ -122,6 +122,58 @@ fn string_numeric_literal(text: &JsString) -> f64 {
         .unwrap_or(f64::NAN)
 }
 
+/// spec 7.1.18 StringToBigInt: the BigInt of a StringIntegerLiteral, or None
+/// when the string is not a valid integer literal. Whitespace-only strings are
+/// 0n.
+pub fn string_to_bigint(text: &JsString) -> Option<crate::BigInt> {
+    let body = trimmed(text.as_slice());
+    if body.is_empty() {
+        return Some(crate::BigInt::zero());
+    }
+    let (negative, rest) = match body.first() {
+        Some(&u) if u == b'-' as u16 => (true, &body[1..]),
+        Some(&u) if u == b'+' as u16 => (false, &body[1..]),
+        _ => (false, body),
+    };
+    let (radix, digits) = match rest {
+        [hi, lo, tail @ ..] if *hi == b'0' as u16 && (*lo == b'x' as u16 || *lo == b'X' as u16) => {
+            (16, tail)
+        }
+        [hi, lo, tail @ ..] if *hi == b'0' as u16 && (*lo == b'o' as u16 || *lo == b'O' as u16) => {
+            (8, tail)
+        }
+        [hi, lo, tail @ ..] if *hi == b'0' as u16 && (*lo == b'b' as u16 || *lo == b'B' as u16) => {
+            (2, tail)
+        }
+        _ => (10, rest),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut value = crate::BigInt::zero();
+    let radix = radix as i64;
+    for unit in digits {
+        let digit = match unit {
+            u if (0x30..=0x39).contains(u) => *u - 0x30,
+            u if (0x61..=0x7A).contains(u) => *u - 0x61 + 10,
+            u if (0x41..=0x5A).contains(u) => *u - 0x41 + 10,
+            _ => return None,
+        };
+        if digit >= radix as u16 {
+            return None;
+        }
+        value = crate::bigint::add(
+            &crate::bigint::multiply(&value, &crate::BigInt::from(radix)),
+            &crate::BigInt::from(digit as i64),
+        );
+    }
+    if negative {
+        Some(crate::bigint::unary_minus(&value))
+    } else {
+        Some(value)
+    }
+}
+
 /// A StrDecimalLiteral covering the whole slice, or None.
 fn decimal_literal(body: &[u16]) -> Option<f64> {
     let (value, matched) = decimal_prefix(body)?;

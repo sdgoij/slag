@@ -69,12 +69,23 @@ pub fn to_object(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
                 .insert(object.id(), symbol.as_ref().clone());
             Ok(Value::Object(object))
         }
-        _ => {
+        Value::Number(n) => {
             let proto = realm
                 .intrinsics
-                .get("%Object.prototype%")
+                .get("%Number.prototype%")
                 .and_then(|v| as_object(&v));
-            Ok(Value::Object(JsObject::ordinary_object_create(proto)))
+            let object = JsObject::ordinary_object_create(proto);
+            agent.number_data.insert(object.id(), *n);
+            Ok(Value::Object(object))
+        }
+        Value::BigInt(b) => {
+            let proto = realm
+                .intrinsics
+                .get("%BigInt.prototype%")
+                .and_then(|v| as_object(&v));
+            let object = JsObject::ordinary_object_create(proto);
+            agent.bigint_data.insert(object.id(), b.as_ref().clone());
+            Ok(Value::Object(object))
         }
     }
 }

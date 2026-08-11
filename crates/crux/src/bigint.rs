@@ -150,6 +150,34 @@ pub fn less_than(a: &BigInt, b: &BigInt) -> bool {
     a.0 < b.0
 }
 
+/// spec 21.2.2.4 BigInt.asUintN: `int mod 2^bits` as a non-negative value.
+pub fn as_uint_n(int: &BigInt, bits: u32) -> BigInt {
+    if bits == 0 || int.is_zero() {
+        return BigInt::zero();
+    }
+    let modulus = BigInt(NumBigInt::from(1u64) << bits);
+    let mut result = BigInt(&int.0 % &modulus.0);
+    if result.0.sign() == num_bigint::Sign::Minus {
+        result = BigInt(&result.0 + &modulus.0);
+    }
+    result
+}
+
+/// spec 21.2.2.3 BigInt.asIntN: the signed two's-complement truncation to
+/// `bits` bits.
+pub fn as_int_n(int: &BigInt, bits: u32) -> BigInt {
+    if bits == 0 || int.is_zero() {
+        return BigInt::zero();
+    }
+    let modulus = BigInt(NumBigInt::from(1u64) << bits);
+    let half = BigInt(NumBigInt::from(1u64) << (bits - 1));
+    let mut result = as_uint_n(int, bits);
+    if result.0 >= half.0 {
+        result = BigInt(&result.0 - &modulus.0);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

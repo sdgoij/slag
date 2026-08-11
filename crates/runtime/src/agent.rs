@@ -95,6 +95,15 @@ pub struct Agent {
     /// [[SymbolData]] of Symbol wrapper objects, keyed by object identity
     /// (spec 20.4.1: `Object(sym)` boxes the symbol).
     pub symbol_data: std::collections::HashMap<u64, crux::symbol::Symbol>,
+    /// [[NumberData]] of Number wrapper objects, keyed by object identity
+    /// (spec 21.1.1: `new Number(v)` boxes the ToNumber result).
+    pub number_data: std::collections::HashMap<u64, f64>,
+    /// [[BigIntData]] of BigInt wrapper objects, keyed by object identity
+    /// (spec 21.2.1: `Object(5n)` boxes the BigInt).
+    pub bigint_data: std::collections::HashMap<u64, crux::BigInt>,
+    /// [[DateValue]] of Date instances, keyed by object identity (spec
+    /// 21.4.3: ms since the epoch).
+    pub date_data: std::collections::HashMap<u64, f64>,
     /// [[ErrorData]] markers of Error instances, keyed by object identity
     /// (spec 20.5.4: `Error.isError` and the `[object Error]` tag need it).
     pub error_data: std::collections::HashSet<u64>,
@@ -142,6 +151,9 @@ impl Agent {
             import_namespace_resolvers: std::collections::HashMap::new(),
             boolean_data: std::collections::HashMap::new(),
             symbol_data: std::collections::HashMap::new(),
+            number_data: std::collections::HashMap::new(),
+            bigint_data: std::collections::HashMap::new(),
+            date_data: std::collections::HashMap::new(),
             error_data: std::collections::HashSet::new(),
             weak_ref_targets: std::collections::HashMap::new(),
             finalization_registries: std::collections::HashMap::new(),

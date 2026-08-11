@@ -1289,6 +1289,41 @@ properties (proptest vs `num-bigint`).
 **Exit criteria:** Number/BigInt/Math/Date fixtures green; test262 `built-ins/Number`,
 `built-ins/BigInt`, `built-ins/Math`, `built-ins/Date` largely passing.
 
+**Status (complete):** Number, BigInt, Math, and Date all landed with exact spec algorithms:
+
+- **Math** (`builtins/math.rs`): every constant and method — `Math.round` preserves −0,
+  `Math.sumPrecise` runs the exact `ExactSum` bigint accumulator (tested through native
+  iterables, since arrays aren't iterable until Phase 12), `Math.f16round` is a hand-rolled
+  binary16 conversion honoring the spec's double-rounding note (no `half` crate), `Math.hypot`
+  uses the max-magnitude rescale, plus `clz32`/`imul`/`random` (xorshift64*) and the full
+  transcendental set. `%Math.sumPrecise%` dispatches by intrinsic identity. 11 tests.
+- **Number** (`builtins/number.rs`): constructor (call + construct), statics
+  (`parseFloat`/`parseInt` shared with the globals, `isFinite`/`isInteger`/`isNaN`/
+  `isSafeInteger`), prototype `toString`/radix (crux exact digit generation with shortest
+  round-trip — exact for even/power-of-2 radixes, interval search for odd), `toFixed`/
+  `toExponential`/`toPrecision`/`valueOf`/`toLocaleString`/`@@toStringTag`; Number boxing
+  joins `context::to_object`. 7 tests.
+- **BigInt** (`builtins/bigint.rs`): non-constructible constructor with `ToBigInt` coercion,
+  `asIntN`/`asUintN` (crux modular reduction), prototype `toString`/radix/`valueOf`/
+  `toLocaleString`/`@@toStringTag`; `2n ** 100n` and mixed-type throws work. 5 tests (incl.
+  `eval::bigint_arithmetic`).
+- **crux** (`number.rs`, `bigint.rs`, `convert.rs`): the `BigU` bignum underlies exact radix
+  digit generation, shortest-round-trip `Number.prototype.toString`, `asIntN`/`asUintN`, and
+  `string_to_bigint`.
+- **Date** (`builtins/date.rs`): exact time math pinned to spec 21.4.1 (`MakeDay`/`MakeTime`/
+  `TimeClip`/`YearFromTime`/…), constructor with all overloads (incl. the 0–99 year →
+  1900+ rule), `Date.parse` (full ISO Date Time String Format + common fallback forms
+  `Mon DD YYYY`/`DD Mon YYYY` with AM/PM), `UTC`, `now`, every prototype getter/setter
+  (local + UTC + legacy `getYear`/`setYear`), and all string forms (`toISOString`, `toJSON`,
+  `toString`, `toUTCString`, `toDateString`, `toTimeString`). Local time is fixed at UTC
+  offset 0; host timezone plumbing is documented as follow-up. 8 tests (incl.
+  `eval::update_and_compound_assignment`).
+
+**test262 fixtures:** 116 more `built-ins/` fixtures pass — Math 1, Number 86 (including
+the numeric-separator literal matrix), BigInt 5, Date 24 — registered one `#[test]` each
+via the flat scanner. The workspace now runs **897 tests** (421 of them test262 fixtures)
+with fmt and clippy (`-D warnings`) clean.
+
 ---
 
 ### Phase 10 — Text processing: String

@@ -683,12 +683,32 @@ pub fn call(
                     return result;
                 }
                 if let Some(result) =
+                    crate::builtins::bigint::dispatch_call(agent, callee, &this, args)
+                {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::builtins::date::dispatch_call(agent, callee, &this, args)
+                {
+                    return result;
+                }
+                if let Some(result) =
                     crate::builtins::symbol::dispatch_call(agent, callee, &this, args)
                 {
                     return result;
                 }
                 if let Some(result) =
                     crate::builtins::error::dispatch_call(agent, callee, &this, args)
+                {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::builtins::math::dispatch_call(agent, callee, &this, args)
+                {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::builtins::number::dispatch_call(agent, callee, &this, args)
                 {
                     return result;
                 }
@@ -767,6 +787,16 @@ pub fn construct(
                     return result;
                 }
                 if let Some(result) =
+                    crate::builtins::bigint::dispatch_construct(agent, callee, args, new_target)
+                {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::builtins::date::dispatch_construct(agent, callee, args, new_target)
+                {
+                    return result;
+                }
+                if let Some(result) =
                     crate::builtins::symbol::dispatch_construct(agent, callee, args, new_target)
                 {
                     return result;
@@ -778,6 +808,11 @@ pub fn construct(
                 }
                 if let Some(result) =
                     crate::builtins::weakref::dispatch_construct(agent, callee, args, new_target)
+                {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::builtins::number::dispatch_construct(agent, callee, args, new_target)
                 {
                     return result;
                 }

@@ -1,0 +1,431 @@
+//! The `%BigInt%` intrinsic (spec 21.2): the constructor (ToBigInt coercion,
+//! no implicit Number conversion), the `asIntN`/`asUintN` statics, and
+//! `%BigInt.prototype%` (toString with radix, valueOf, toLocaleString).
+//! The arithmetic operators landed with the evaluator (Phase 6); this module
+//! adds the built-in object surface. ToBigInt's ToPrimitive on objects needs
+//! the agent, so the constructor and the statics dispatch by intrinsic
+//! identity (the %eval% pattern).
+
+use crux::convert::{to_integer_or_infinity, to_number};
+use crux::error::{ErrorKind, JsError};
+use crux::function::{Function, NativeFn};
+use crux::handle::Handle;
+use crux::object::JsObject;
+use crux::property::{PropertyDescriptor, PropertyKey};
+use crux::string::JsString;
+use crux::value::Value;
+
+use crate::agent::Agent;
+use crate::context::as_object;
+use crate::realm::Realm;
+
+const BIGINT: &str = "%BigInt%";
+const BIGINT_PROTO: &str = "%BigInt.prototype%";
+const AS_INT_N: &str = "%BigInt.asIntN%";
+const AS_UINT_N: &str = "%BigInt.asUintN%";
+const PROTO_TO_STRING: &str = "%BigInt.prototype.toString%";
+const PROTO_VALUE_OF: &str = "%BigInt.prototype.valueOf%";
+const PROTO_TO_LOCALE_STRING: &str = "%BigInt.prototype.toLocaleString%";
+
+fn placeholder(name: &'static str) -> NativeFn {
+    Box::new(move |_, _| {
+        Err(JsError::new(
+            ErrorKind::TypeError,
+            format!("{name} must be called through the agent"),
+        ))
+    })
+}
+
+/// spec 21.2.3.1 ThisBigIntValue: a BigInt or a BigInt wrapper object.
+fn this_bigint_value(agent: &Agent, this: &Value) -> Result<crux::BigInt, JsError> {
+    match this {
+        Value::BigInt(b) => Ok(b.as_ref().clone()),
+        Value::Object(obj) => match agent.bigint_data.get(&obj.id()) {
+            Some(b) => Ok(b.clone()),
+            None => Err(JsError::new(
+                ErrorKind::TypeError,
+                "BigInt.prototype method called on an incompatible receiver".into(),
+            )),
+        },
+        _ => Err(JsError::new(
+            ErrorKind::TypeError,
+            "BigInt.prototype method called on an incompatible receiver".into(),
+        )),
+    }
+}
+
+/// spec 7.1.17 ToBigInt. The agent is only needed for the ToPrimitive of
+/// object inputs.
+#[allow(clippy::only_used_in_recursion)]
+fn to_bigint(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
+    match value {
+        Value::BigInt(b) => Ok(Value::BigInt(b.clone())),
+        Value::Boolean(b) => Ok(Value::BigInt(Handle::new(crux::BigInt::from(*b as i64)))),
+        Value::String(s) => match crux::convert::string_to_bigint(s) {
+            Some(b) => Ok(Value::BigInt(Handle::new(b))),
+            None => Err(JsError::new(
+                ErrorKind::SyntaxError,
+                "Cannot convert string to a BigInt".into(),
+            )),
+        },
+        Value::Number(_) => Err(JsError::new(
+            ErrorKind::TypeError,
+            "Cannot convert a Number to a BigInt".into(),
+        )),
+        Value::Symbol(_) => Err(JsError::new(
+            ErrorKind::TypeError,
+            "Cannot convert a Symbol to a BigInt".into(),
+        )),
+        Value::Undefined | Value::Null => Err(JsError::new(
+            ErrorKind::TypeError,
+            "Cannot convert undefined or null to a BigInt".into(),
+        )),
+        Value::Object(_) | Value::Function(_) => {
+            let prim = crux::convert::to_primitive(value, crux::convert::ToPrimitiveHint::Number)?;
+            to_bigint(agent, &prim)
+        }
+    }
+}
+
+/// `BigInt(value)` (spec 21.2.1.1): ToBigInt, then recheck that the result is
+/// a BigInt (a string that parsed to a Number is impossible here; the primitive
+/// cases are exact).
+fn bigint_construct(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
+    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    to_bigint(agent, &value)
+}
+
+/// spec 7.1.5 ToIndex: ToIntegerOrInfinity, then reject negative/infinite.
+fn to_index(value: &Value) -> Result<u32, JsError> {
+    let number = to_integer_or_infinity(to_number(value)?);
+    if number < 0.0 || number == f64::INFINITY {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "Index must be a non-negative finite number".into(),
+        ));
+    }
+    Ok(number as u32)
+}
+
+/// spec 21.2.2.3 BigInt.asIntN(bits, bigint).
+fn as_int_n(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
+    let bits = to_index(args.first().unwrap_or(&Value::Undefined))?;
+    let int = to_bigint(agent, args.get(1).unwrap_or(&Value::Undefined))?;
+    let Value::BigInt(int) = int else {
+        unreachable!("ToBigInt returns a BigInt");
+    };
+    Ok(Value::BigInt(Handle::new(crux::bigint::as_int_n(
+        &int, bits,
+    ))))
+}
+
+/// spec 21.2.2.4 BigInt.asUintN(bits, bigint).
+fn as_uint_n(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
+    let bits = to_index(args.first().unwrap_or(&Value::Undefined))?;
+    let int = to_bigint(agent, args.get(1).unwrap_or(&Value::Undefined))?;
+    let Value::BigInt(int) = int else {
+        unreachable!("ToBigInt returns a BigInt");
+    };
+    Ok(Value::BigInt(Handle::new(crux::bigint::as_uint_n(
+        &int, bits,
+    ))))
+}
+
+/// spec 21.2.3.3 BigInt.prototype.toString(radix).
+fn to_string_method(agent: &Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    let value = this_bigint_value(agent, this)?;
+    let radix = args.first().cloned().unwrap_or(Value::Undefined);
+    let radix_value = if matches!(radix, Value::Undefined) {
+        10.0
+    } else {
+        to_integer_or_infinity(to_number(&radix)?)
+    };
+    if radix_value < 2.0 || radix_value > 36.0 {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "toString() radix argument must be between 2 and 36".into(),
+        ));
+    }
+    let text = crux::bigint::to_string(&value, radix_value as u32);
+    Ok(Value::String(Handle::new(JsString::from_utf8(&text))))
+}
+
+/// Install the BigInt intrinsics and the global `BigInt` binding (spec
+/// 21.2.1-21.2.3) during SetDefaultGlobalBindings.
+pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
+    let object_proto = realm
+        .intrinsics
+        .get("%Object.prototype%")
+        .and_then(|value| as_object(&value));
+    let bigint_proto = JsObject::ordinary_object_create(object_proto);
+    let bigint_proto_value = Value::Object(bigint_proto.clone());
+
+    let bigint_ctor = Function::create_builtin(
+        Some(JsString::from_utf8("BigInt")),
+        1,
+        placeholder("BigInt"),
+        Some(Box::new(placeholder("BigInt"))),
+        None,
+    )?;
+    let bigint_ctor_value = Value::Function(bigint_ctor.clone());
+
+    realm.intrinsics.define(BIGINT, bigint_ctor_value.clone());
+    realm
+        .intrinsics
+        .define(BIGINT_PROTO, bigint_proto_value.clone());
+
+    bigint_ctor.define_property(
+        &JsString::from_utf8("prototype"),
+        &PropertyDescriptor {
+            value: Some(bigint_proto_value.clone()),
+            writable: Some(false),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(false),
+        },
+    )?;
+    bigint_proto.define_property(
+        &JsString::from_utf8("constructor"),
+        &PropertyDescriptor {
+            value: Some(bigint_ctor_value.clone()),
+            writable: Some(true),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
+    )?;
+
+    // spec 21.2.2: asIntN/asUintN, W: true, E: false, C: true.
+    for (name, key, length) in [("asIntN", AS_INT_N, 2), ("asUintN", AS_UINT_N, 2)] {
+        let func = Function::create_builtin(
+            Some(JsString::from_utf8(name)),
+            length,
+            placeholder(name),
+            None,
+            None,
+        )?;
+        realm.intrinsics.define(key, Value::Function(func.clone()));
+        bigint_ctor.define_property(
+            &JsString::from_utf8(name),
+            &PropertyDescriptor {
+                value: Some(Value::Function(func)),
+                writable: Some(true),
+                get: None,
+                set: None,
+                enumerable: Some(false),
+                configurable: Some(true),
+            },
+        )?;
+    }
+
+    // spec 21.2.3: prototype methods.
+    for (name, key, length) in [
+        ("toString", PROTO_TO_STRING, 1),
+        ("valueOf", PROTO_VALUE_OF, 0),
+        ("toLocaleString", PROTO_TO_LOCALE_STRING, 0),
+    ] {
+        let func = Function::create_builtin(
+            Some(JsString::from_utf8(name)),
+            length,
+            placeholder(name),
+            None,
+            None,
+        )?;
+        realm.intrinsics.define(key, Value::Function(func.clone()));
+        bigint_proto.define_property(
+            &JsString::from_utf8(name),
+            &PropertyDescriptor {
+                value: Some(Value::Function(func)),
+                writable: Some(true),
+                get: None,
+                set: None,
+                enumerable: Some(false),
+                configurable: Some(true),
+            },
+        )?;
+    }
+
+    // spec 21.2.3: BigInt.prototype[@@toStringTag] = "BigInt".
+    bigint_proto.define_property_key(
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyDescriptor {
+            value: Some(Value::String(Handle::new(JsString::from_utf8("BigInt")))),
+            writable: Some(false),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
+    )?;
+
+    realm.global_object.define_property_or_throw(
+        &JsString::from_utf8("BigInt"),
+        &PropertyDescriptor {
+            value: Some(bigint_ctor_value),
+            writable: Some(true),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
+    )?;
+    Ok(())
+}
+
+/// The BigInt members that need the agent, dispatched by intrinsic identity
+/// from `runtime::function::call`/`construct`.
+pub fn dispatch_call(
+    agent: &mut Agent,
+    callee: &Value,
+    this: &Value,
+    args: &[Value],
+) -> Option<Result<Value, JsError>> {
+    let realm = agent.current_realm().ok()?;
+    let intrinsics = &realm.intrinsics;
+    if intrinsics.get(BIGINT).as_ref() == Some(callee) {
+        return Some(bigint_construct(agent, args));
+    }
+    if intrinsics.get(AS_INT_N).as_ref() == Some(callee) {
+        return Some(as_int_n(agent, args));
+    }
+    if intrinsics.get(AS_UINT_N).as_ref() == Some(callee) {
+        return Some(as_uint_n(agent, args));
+    }
+    if intrinsics.get(PROTO_TO_STRING).as_ref() == Some(callee) {
+        return Some(to_string_method(agent, this, args));
+    }
+    if intrinsics.get(PROTO_TO_LOCALE_STRING).as_ref() == Some(callee) {
+        return Some(to_string_method(agent, this, &[]));
+    }
+    if intrinsics.get(PROTO_VALUE_OF).as_ref() == Some(callee) {
+        return match this_bigint_value(agent, this) {
+            Ok(b) => Some(Ok(Value::BigInt(Handle::new(b)))),
+            Err(e) => Some(Err(e)),
+        };
+    }
+    None
+}
+
+pub fn dispatch_construct(
+    agent: &mut Agent,
+    callee: &Value,
+    _args: &[Value],
+    _new_target: &Value,
+) -> Option<Result<Value, JsError>> {
+    let realm = agent.current_realm().ok()?;
+    if realm.intrinsics.get(BIGINT).as_ref() == Some(callee) {
+        // BigInt is not constructible (spec 21.2.1.1: new BigInt throws).
+        return Some(Err(JsError::new(
+            ErrorKind::TypeError,
+            "BigInt is not a constructor".into(),
+        )));
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::Agent;
+
+    fn run(source: &str) -> Result<Value, JsError> {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm()?;
+        agent.run_script(source)
+    }
+
+    fn text(source: &str) -> String {
+        match run(source).unwrap() {
+            Value::String(s) => s.to_string_lossy(),
+            other => panic!("expected a string, got {other:?}"),
+        }
+    }
+
+    fn big(source: &str) -> String {
+        match run(source).unwrap() {
+            Value::BigInt(b) => b.0.to_string(),
+            other => panic!("expected a BigInt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn constructor_coercions() {
+        assert_eq!(big("BigInt('123')"), "123");
+        assert_eq!(big("BigInt('0x1F')"), "31");
+        assert_eq!(big("BigInt('  42  ')"), "42");
+        assert_eq!(big("BigInt('')"), "0");
+        assert_eq!(big("BigInt(true)"), "1");
+        assert_eq!(big("BigInt(false)"), "0");
+        assert_eq!(big("BigInt(5n)"), "5");
+        assert_eq!(big("BigInt(-3n)"), "-3");
+        assert!(matches!(
+            run("BigInt(5)"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+        assert!(matches!(
+            run("BigInt('abc')"),
+            Err(e) if e.kind == ErrorKind::SyntaxError
+        ));
+        assert!(matches!(
+            run("BigInt()"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+        assert!(matches!(
+            run("new BigInt(5n)"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+    }
+
+    #[test]
+    fn as_int_n_and_uint_n() {
+        assert_eq!(big("BigInt.asIntN(4, 0xFn)"), "-1");
+        assert_eq!(big("BigInt.asIntN(4, 7n)"), "7");
+        assert_eq!(big("BigInt.asUintN(4, 0xFn)"), "15");
+        assert_eq!(big("BigInt.asUintN(4, -1n)"), "15");
+        assert_eq!(big("BigInt.asIntN(0, 5n)"), "0");
+        assert_eq!(big("BigInt.asUintN(64, -1n)"), "18446744073709551615");
+        assert_eq!(big("BigInt.asIntN(8, 255n)"), "-1");
+        assert_eq!(big("BigInt.asIntN(8, 256n)"), "0");
+        assert!(matches!(
+            run("BigInt.asIntN(-1, 5n)"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+    }
+
+    #[test]
+    fn prototype_methods() {
+        assert_eq!(text("(255n).toString(16)"), "ff");
+        assert_eq!(text("(255n).toString(2)"), "11111111");
+        assert_eq!(text("(255n).toString()"), "255");
+        assert_eq!(text("(-15n).toString(16)"), "-f");
+        assert_eq!(text("(10n).toLocaleString()"), "10");
+        assert_eq!(big("(5n).valueOf()"), "5");
+        assert_eq!(big("BigInt.prototype.valueOf.call(42n)"), "42");
+        assert_eq!(
+            text("Object.prototype.toString.call(5n)"),
+            "[object BigInt]"
+        );
+        assert!(matches!(
+            run("(5n).toString(1)"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+        assert!(matches!(
+            run("BigInt.prototype.valueOf.call(5)"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+    }
+
+    #[test]
+    fn operators_and_boxing() {
+        assert_eq!(big("2n + 3n"), "5");
+        assert_eq!(big("2n ** 100n"), "1267650600228229401496703205376");
+        assert!(matches!(
+            run("2n + 1"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+        assert_eq!(text("typeof 5n"), "bigint");
+        assert_eq!(text("(5n).toString()"), "5");
+    }
+}

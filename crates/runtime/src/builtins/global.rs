@@ -232,7 +232,7 @@ fn digit_value(unit: u16) -> Option<u32> {
 
 /// parseInt (spec 19.2.5): optional sign and radix, with the 0x/0o/0b
 /// inference when the radix is 0 or 16.
-fn parse_int(_this: &Value, args: &[Value]) -> Result<Value, JsError> {
+pub(crate) fn parse_int(_this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let string = to_string(&arg(args, 0))?;
     let radix_value = to_number(&arg(args, 1)).unwrap_or(0.0);
     let units = string.as_slice();
@@ -302,7 +302,7 @@ fn parse_int(_this: &Value, args: &[Value]) -> Result<Value, JsError> {
 
 /// parseFloat (spec 19.2.4): the longest prefix matching the decimal-literal
 /// grammar, or NaN.
-fn parse_float(_this: &Value, args: &[Value]) -> Result<Value, JsError> {
+pub(crate) fn parse_float(_this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let string = to_string(&arg(args, 0))?;
     let units = string.as_slice();
     let mut index = 0;
