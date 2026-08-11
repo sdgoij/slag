@@ -140,6 +140,11 @@ pub struct Agent {
             bool,
         ),
     >,
+    /// The [[ArrayBufferData]] and [[ArrayBufferByteLength]] of ArrayBuffer
+    /// objects, keyed by object identity (spec 25.1.1). Phase 12 creates
+    /// buffers as the TypedArray backing store; the full ArrayBuffer builtin
+    /// joins in Phase 14.
+    pub buffer_data: std::collections::HashMap<u64, (crux::typed_array::SharedBuffer, usize)>,
 }
 
 impl Agent {
@@ -185,6 +190,7 @@ impl Agent {
             finalization_registries: std::collections::HashMap::new(),
             array_iter_data: std::collections::HashMap::new(),
             array_from_async: std::collections::HashMap::new(),
+            buffer_data: std::collections::HashMap::new(),
         }
     }
 

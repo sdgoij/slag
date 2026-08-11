@@ -18,4 +18,5 @@ pub mod promise;
 pub mod regexp;
 pub mod string;
 pub mod symbol;
+pub mod typed_array;
 pub mod weakref;

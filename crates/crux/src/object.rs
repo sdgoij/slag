@@ -189,12 +189,21 @@ pub struct ArgumentsSlots {
     pub parameter_map: Option<Handle<JsObject>>,
 }
 
-/// The TypedArray (Integer-Indexed) exotic slots (spec 10.4.5). Phase 5
-/// carries the element count so the index routing is spec-shaped; the buffer
-/// access ([[ViewedArrayBuffer]], element type, byte offsets) joins with
-/// Phase 12.
+/// The TypedArray (Integer-Indexed) exotic slots (spec 10.4.5.1): the viewed
+/// buffer, the element type, and the byte geometry. The buffer is shared
+/// with the [[ArrayBufferData]] storage.
 #[derive(Debug, Clone)]
 pub struct TypedArraySlots {
+    /// [[ViewedArrayBuffer]] as a language value (the `buffer` accessor).
+    pub buffer_object: Value,
+    /// The shared byte storage ([[ArrayBufferData]] of the viewed buffer).
+    pub buffer: crate::typed_array::SharedBuffer,
+    /// The element type (spec 25.2.1: [[TypedArrayName]] table).
+    pub element_type: crate::typed_array::ElementType,
+    /// [[ByteLength]]: the number of bytes this view covers.
+    pub byte_length: usize,
+    /// [[ByteOffset]]: the offset of the first element in the buffer.
+    pub byte_offset: usize,
     /// [[ArrayLength]]: the number of elements.
     pub array_length: usize,
 }
@@ -407,15 +416,15 @@ impl JsObject {
         proxy
     }
 
-    /// The TypedArray (Integer-Indexed) exotic shell (spec 10.4.5.2); the
-    /// element storage joins with the Phase 12 buffers.
+    /// TypedArrayCreate (spec 25.2.4.1): an Integer-Indexed exotic with the
+    /// full slot set (buffer, element type, byte geometry).
     pub fn integer_indexed_object_create(
-        array_length: usize,
+        slots: TypedArraySlots,
         prototype: Option<Handle<JsObject>>,
     ) -> Result<Handle<JsObject>, JsError> {
         let object = Handle::new(Self {
             id: NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
-            kind: ObjectKind::IntegerIndexed(Handle::new(TypedArraySlots { array_length })),
+            kind: ObjectKind::IntegerIndexed(Handle::new(slots)),
             prototype: RefCell::new(prototype),
             extensible: Cell::new(true),
             properties: RefCell::new(Vec::new()),
@@ -1699,15 +1708,25 @@ fn typed_array_valid_index(slots: &TypedArraySlots, index: f64) -> bool {
     index >= 0.0 && index.trunc() == index && (index as usize) < slots.array_length
 }
 
-fn element_access_error() -> JsError {
-    JsError::new(
-        ErrorKind::TypeError,
-        "TypedArray element access is not implemented until Phase 12".into(),
-    )
+/// The element bytes of the TypedArray at a valid canonical index.
+fn element_bytes(slots: &TypedArraySlots, index: f64) -> Result<Vec<u8>, JsError> {
+    let index = index as usize;
+    let offset = slots.byte_offset + index * slots.element_type.size();
+    let buffer = slots.buffer.0.borrow();
+    buffer
+        .get(offset..offset + slots.element_type.size())
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                "TypedArray element access out of bounds".into(),
+            )
+        })
 }
 
-/// TypedArray [[GetOwnProperty]] (spec 10.4.5.3): canonical in-bounds index
-/// keys produce an element descriptor; everything else is ordinary.
+/// TypedArray [[GetOwnProperty]] (spec 10.4.5.3): an in-bounds canonical
+/// index produces a writable/enumerable/configurable data property backed
+/// by the buffer; other canonical numeric strings produce no property.
 fn typed_array_get_own_property(
     obj: &JsObject,
     slots: &TypedArraySlots,
@@ -1715,7 +1734,9 @@ fn typed_array_get_own_property(
 ) -> Result<Option<Property>, JsError> {
     if let Some(index) = canonical_index(key) {
         if typed_array_valid_index(slots, index) {
-            return Err(element_access_error());
+            let bytes = element_bytes(slots, index)?;
+            let value = crate::typed_array::decode_element(slots.element_type, &bytes, 0)?;
+            return Ok(Some(Property::data(value, true, true, true)));
         }
         return Ok(None);
     }
@@ -1723,8 +1744,8 @@ fn typed_array_get_own_property(
 }
 
 /// TypedArray [[DefineOwnProperty]] (spec 10.4.5.5): element descriptors must
-/// be writable/enumerable/configurable data properties; the write itself
-/// needs the Phase 12 buffer.
+/// be writable/enumerable/configurable data properties; the write goes to
+/// the buffer (SetValueInBuffer).
 fn typed_array_define_own_property(
     obj: &JsObject,
     slots: &TypedArraySlots,
@@ -1747,16 +1768,31 @@ fn typed_array_define_own_property(
         if desc.writable == Some(false) {
             return Ok(false);
         }
-        if desc.value.is_some() {
-            return Err(element_access_error());
+        if let Some(value) = &desc.value {
+            let bytes = crate::typed_array::encode_element(slots.element_type, value)?;
+            write_element_bytes(slots, index, &bytes)?;
         }
         return Ok(true);
     }
     obj.ordinary_define_own_property(key, desc)
 }
 
-/// TypedArray [[Get]] (spec 10.4.5.7): in-bounds element read (Phase 12);
-/// out-of-bounds canonical indices read *undefined*.
+/// Write `bytes` to the buffer at element `index`.
+fn write_element_bytes(slots: &TypedArraySlots, index: f64, bytes: &[u8]) -> Result<(), JsError> {
+    let offset = slots.byte_offset + index as usize * slots.element_type.size();
+    let mut buffer = slots.buffer.0.borrow_mut();
+    let Some(slot) = buffer.get_mut(offset..offset + bytes.len()) else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "TypedArray element write out of bounds".into(),
+        ));
+    };
+    slot.copy_from_slice(bytes);
+    Ok(())
+}
+
+/// TypedArray [[Get]] (spec 10.4.5.7): an in-bounds element read from the
+/// buffer; out-of-bounds canonical indices read *undefined*.
 fn typed_array_get(
     obj: &JsObject,
     slots: &TypedArraySlots,
@@ -1765,7 +1801,8 @@ fn typed_array_get(
 ) -> Result<Value, JsError> {
     if let Some(index) = canonical_index(key) {
         if typed_array_valid_index(slots, index) {
-            return Err(element_access_error());
+            let bytes = element_bytes(slots, index)?;
+            return crate::typed_array::decode_element(slots.element_type, &bytes, 0);
         }
         return Ok(Value::Undefined);
     }
@@ -1773,7 +1810,7 @@ fn typed_array_get(
 }
 
 /// TypedArray [[Set]] (spec 10.4.5.8): writing an element with the TypedArray
-/// as receiver needs the Phase 12 buffer; a different receiver skips
+/// as receiver encodes into the buffer; a different receiver skips
 /// out-of-bounds indices.
 fn typed_array_set(
     obj: &JsObject,
@@ -1784,7 +1821,12 @@ fn typed_array_set(
 ) -> Result<bool, JsError> {
     if let Some(index) = canonical_index(key) {
         if same_value(&receiver, &obj.self_value()) {
-            return Err(element_access_error());
+            if !typed_array_valid_index(slots, index) {
+                return Ok(true);
+            }
+            let bytes = crate::typed_array::encode_element(slots.element_type, &value)?;
+            write_element_bytes(slots, index, &bytes)?;
+            return Ok(true);
         }
         if !typed_array_valid_index(slots, index) {
             return Ok(true);
@@ -2626,7 +2668,19 @@ mod tests {
 
     #[test]
     fn integer_indexed_shell_routes_index_keys() {
-        let typed = JsObject::integer_indexed_object_create(3, None).unwrap();
+        let buffer = crate::typed_array::SharedBuffer::new(4);
+        let typed = JsObject::integer_indexed_object_create(
+            TypedArraySlots {
+                buffer_object: Value::Undefined,
+                buffer: buffer.clone(),
+                element_type: crate::typed_array::ElementType::Uint8,
+                byte_length: 4,
+                byte_offset: 0,
+                array_length: 3,
+            },
+            None,
+        )
+        .unwrap();
         // Element indices are virtual: own keys lists them ascending, and
         // ordinary keys still work.
         typed
@@ -2664,17 +2718,25 @@ mod tests {
                 )
                 .unwrap()
         );
-        // In-bounds element access itself needs the Phase 12 buffer.
-        assert!(typed.get(&key("0")).is_err());
-        assert!(typed.set(&key("0"), Value::Number(1.0), false).is_err());
-        assert!(
-            typed
-                .define_property(
-                    &key("0"),
-                    &descriptor(Some(Value::Number(1.0)), Some(true), Some(true), Some(true)),
-                )
-                .is_err()
-        );
+        // In-bounds element access reads and writes the shared buffer.
+        typed.set(&key("0"), Value::Number(200.0), false).unwrap();
+        assert_eq!(typed.get(&key("0")).unwrap(), Value::Number(200.0));
+        assert_eq!(typed.get(&key("1")).unwrap(), Value::Number(0.0));
+        typed
+            .define_property(
+                &key("1"),
+                &descriptor(
+                    Some(Value::Number(255.0)),
+                    Some(true),
+                    Some(true),
+                    Some(true),
+                ),
+            )
+            .unwrap();
+        assert_eq!(typed.get(&key("1")).unwrap(), Value::Number(255.0));
+        // Element writes overflow into the byte type.
+        typed.set(&key("2"), Value::Number(300.0), false).unwrap();
+        assert_eq!(typed.get(&key("2")).unwrap(), Value::Number(44.0));
         // Non-canonical keys are ordinary.
         typed
             .create_data_property(&key("01"), Value::Number(9.0))

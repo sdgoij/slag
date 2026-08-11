@@ -16,6 +16,7 @@ pub mod proxy;
 pub mod span;
 pub mod string;
 pub mod symbol;
+pub mod typed_array;
 pub mod value;
 
 pub use bigint::BigInt;

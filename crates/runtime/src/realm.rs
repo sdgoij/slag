@@ -164,6 +164,7 @@ fn set_default_global_bindings(realm: &Handle<Realm>) -> Result<(), JsError> {
     crate::builtins::object::install(realm)?;
     crate::builtins::function::install(realm)?;
     crate::builtins::array::install(realm)?;
+    crate::builtins::typed_array::install(realm)?;
     crate::builtins::boolean::install(realm)?;
     crate::builtins::bigint::install(realm)?;
     crate::builtins::date::install(realm)?;
@@ -181,7 +182,8 @@ fn set_default_global_bindings(realm: &Handle<Realm>) -> Result<(), JsError> {
     // %Function.prototype%. Link all intrinsic-registered functions now that
     // the table is full; %Function.prototype% itself keeps %Object.prototype%
     // (setting its own proto would be a cycle, which set_prototype_of
-    // rejects).
+    // rejects), and installs that set a custom [[Prototype]] (the TypedArray
+    // kind constructors inherit %TypedArray%) are left alone.
     let function_proto = match realm.intrinsics.get("%Function.prototype%") {
         Some(Value::Function(function)) => function.object.handle(),
         _ => None,
@@ -190,6 +192,7 @@ fn set_default_global_bindings(realm: &Handle<Realm>) -> Result<(), JsError> {
         for value in realm.intrinsics.entries() {
             if let Value::Function(function) = value
                 && let Some(object) = function.object.handle()
+                && object.get_prototype_of()?.is_none()
             {
                 object.set_prototype_of(Some(function_proto.clone()))?;
             }

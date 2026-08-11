@@ -572,7 +572,7 @@ fn copy_within(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
 }
 
 /// spec 23.1.5.1 CreateArrayIterator.
-fn create_array_iterator(
+pub(crate) fn create_array_iterator(
     agent: &mut Agent,
     array: Value,
     kind: ArrayIterationKind,

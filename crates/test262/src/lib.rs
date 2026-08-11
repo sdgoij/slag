@@ -19,6 +19,29 @@ mod harness {
     use crux::value::Value;
     use runtime::Agent;
 
+    /// Defines `assert.throws` (the real test262 assert.js checks
+    /// `thrown.constructor === expectedErrorConstructor`); run before every
+    /// fixture because the native closures cannot invoke `func`.
+    const ASSERT_THROWS_PRELUDE: &str = r#"
+assert.throws = function (expectedErrorConstructor, func) {
+  if (typeof func !== "function") {
+    throw new Test262Error("assert.throws requires two arguments: the error constructor and a function to run");
+  }
+  try {
+    func();
+  } catch (thrown) {
+    if (typeof thrown !== "object" || thrown === null) {
+      throw new Test262Error("Thrown value was not an object!");
+    }
+    if (thrown.constructor !== expectedErrorConstructor) {
+      throw new Test262Error("Expected a " + expectedErrorConstructor.name + " but got a " + thrown.constructor.name);
+    }
+    return;
+  }
+  throw new Test262Error("Expected a " + expectedErrorConstructor.name + " to be thrown but no exception was thrown at all");
+};
+"#;
+
     /// Where a fixture lives under the pinned submodule.
     #[derive(Debug, Clone, Copy, PartialEq)]
     enum Area {
@@ -1265,6 +1288,86 @@ mod harness {
     test262_builtin_fixture!(RegExp_u180e, "RegExp/u180e.js");
     test262_builtin_fixture!(RegExp_valid_flags_y, "RegExp/valid-flags-y.js");
 
+    // Phase 12 Uint8Array hex/base64 surface (the list was produced by the
+    // scanner; the remaining fixtures need assert.compareArray/propertyHelper
+    // or detached-buffer support).
+    test262_builtin_fixture!(
+        Uint8Array_fromBase64_ignores_receiver,
+        "Uint8Array/fromBase64/ignores-receiver.js"
+    );
+    test262_builtin_fixture!(
+        Uint8Array_fromBase64_illegal_characters,
+        "Uint8Array/fromBase64/illegal-characters.js"
+    );
+    test262_builtin_fixture!(
+        Uint8Array_fromBase64_string_coercion,
+        "Uint8Array/fromBase64/string-coercion.js"
+    );
+    test262_builtin_fixture!(
+        Uint8Array_fromHex_ignores_receiver,
+        "Uint8Array/fromHex/ignores-receiver.js"
+    );
+    test262_builtin_fixture!(
+        Uint8Array_fromHex_illegal_characters,
+        "Uint8Array/fromHex/illegal-characters.js"
+    );
+    test262_builtin_fixture!(
+        Uint8Array_fromHex_odd_length_input,
+        "Uint8Array/fromHex/odd-length-input.js"
+    );
+    test262_builtin_fixture!(
+        Uint8Array_fromHex_string_coercion,
+        "Uint8Array/fromHex/string-coercion.js"
+    );
+    test262_builtin_fixture!(
+        Uint8Array_prototype_setFromBase64_illegal_characters,
+        "Uint8Array/prototype/setFromBase64/illegal-characters.js"
+    );
+    test262_builtin_fixture!(
+        Uint8Array_prototype_setFromBase64_string_coercion,
+        "Uint8Array/prototype/setFromBase64/string-coercion.js"
+    );
+    test262_builtin_fixture!(
+        Uint8Array_prototype_setFromBase64_trailing_garbage_empty,
+        "Uint8Array/prototype/setFromBase64/trailing-garbage-empty.js"
+    );
+    test262_builtin_fixture!(
+        Uint8Array_prototype_setFromBase64_trailing_garbage,
+        "Uint8Array/prototype/setFromBase64/trailing-garbage.js"
+    );
+    test262_builtin_fixture!(
+        Uint8Array_prototype_setFromHex_illegal_characters,
+        "Uint8Array/prototype/setFromHex/illegal-characters.js"
+    );
+    test262_builtin_fixture!(
+        Uint8Array_prototype_setFromHex_string_coercion,
+        "Uint8Array/prototype/setFromHex/string-coercion.js"
+    );
+    test262_builtin_fixture!(
+        Uint8Array_prototype_setFromHex_throws_when_string_length_is_odd,
+        "Uint8Array/prototype/setFromHex/throws-when-string-length-is-odd.js"
+    );
+    test262_builtin_fixture!(
+        Uint8Array_prototype_toBase64_alphabet,
+        "Uint8Array/prototype/toBase64/alphabet.js"
+    );
+    test262_builtin_fixture!(
+        Uint8Array_prototype_toBase64_omit_padding,
+        "Uint8Array/prototype/toBase64/omit-padding.js"
+    );
+    test262_builtin_fixture!(
+        Uint8Array_prototype_toBase64_option_coercion,
+        "Uint8Array/prototype/toBase64/option-coercion.js"
+    );
+    test262_builtin_fixture!(
+        Uint8Array_prototype_toBase64_results,
+        "Uint8Array/prototype/toBase64/results.js"
+    );
+    test262_builtin_fixture!(
+        Uint8Array_prototype_toHex_results,
+        "Uint8Array/prototype/toHex/results.js"
+    );
+
     /// `crates/test262` sits one level below the repo root, where the
     /// `test262` submodule is pinned.
     fn builtins_dir() -> PathBuf {
@@ -1386,6 +1489,11 @@ mod harness {
             .initialize_host_defined_realm()
             .map_err(|e| e.message)?;
         install_harness_globals(&agent)?;
+        // `assert.throws` needs to call `func` and catch its exception, which
+        // the native closures cannot (no agent access); define it as a script.
+        agent
+            .run_script(ASSERT_THROWS_PRELUDE)
+            .map_err(|e| e.message)?;
         let result = agent.run_script(&wrapped);
         agent.run_jobs().map_err(|e| e.message)?;
         match (result, fm.negative_phase.as_deref()) {
@@ -1580,6 +1688,23 @@ mod harness {
         Fail(String),
     }
 
+    /// Recursively collect the `.js` files under `dir` (the flat scanner
+    /// needs a recursive walk for the nested built-ins directories).
+    fn collect_js_files(
+        dir: &std::path::Path,
+        out: &mut Vec<std::path::PathBuf>,
+    ) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                collect_js_files(&path, out)?;
+            } else if path.extension().and_then(|e| e.to_str()) == Some("js") {
+                out.push(path);
+            }
+        }
+        Ok(())
+    }
+
     /// Run a fixture file (both modes unless `flags:` says otherwise).
     fn run_fixture(area: Area, relative: &str) -> FixtureResult {
         let path = area.root().join(relative);
@@ -1669,6 +1794,7 @@ mod harness {
             "String",
             "RegExp",
             "Array",
+            "Uint8Array",
         ];
         for dir in dirs {
             let mut pass = 0;
@@ -1676,18 +1802,12 @@ mod harness {
             let mut fail = 0;
             let mut failures = Vec::new();
             let root = builtins_dir().join(dir);
-            let entries = match std::fs::read_dir(&root) {
-                Ok(entries) => entries,
-                Err(e) => {
-                    println!("{dir}: cannot read ({e})");
-                    continue;
-                }
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("js") {
-                    continue;
-                }
+            let mut files = Vec::new();
+            if let Err(e) = collect_js_files(&root, &mut files) {
+                println!("{dir}: cannot read ({e})");
+                continue;
+            }
+            for path in files {
                 let relative = path
                     .strip_prefix(builtins_dir())
                     .unwrap()

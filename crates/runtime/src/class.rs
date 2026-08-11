@@ -151,6 +151,22 @@ pub fn class_definition_evaluation(
         data.constructor_kind = ConstructorKind::Derived;
         data.super_constructor = super_constructor.clone();
     }
+    // Set F.[[Prototype]] to superclass: static members of the superclass
+    // (and its own statics, e.g. `Uint8Array.fromBase64`) resolve on the
+    // subclass constructor (spec ClassDefinitionEvaluation step 29).
+    if let Some(super_ctor) = &super_constructor {
+        let super_object = match super_ctor {
+            Value::Object(object) => object.clone(),
+            Value::Function(function) => function.object.clone(),
+            _ => {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "Superclass constructor is not an object".into(),
+                ));
+            }
+        };
+        ctor_handle.object.set_prototype_of(Some(super_object))?;
+    }
 
     // DefineMethodProperty(proto, "constructor", ctor, false).
     proto.define_property(

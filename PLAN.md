@@ -1575,15 +1575,50 @@ rate; test262 overall ≥ 50–60%.
 
 **test262 fixtures:** `built-ins/Array` scanner run — **41 of 50 files pass** (4 skip on
 `isConstructor.js`/`propertyHelper.js` includes; 5 fail on `$262`, the Function-vs-object
-value identity, and boxed-primitive length coercion), registered one `#[test]` each. The
-workspace now runs **1303 tests** (773 of them test262 fixtures) with fmt and clippy
-(`-D warnings`) clean.
+value identity, and boxed-primitive length coercion), registered one `#[test]` each.
 
-**Pending (next session):** `%TypedArray%` + the 12 per-kind constructors, the integer-indexed
-exotic's real element storage (the Phase 5 shell still returns a TypeError on element access),
-`GetValueFromBuffer`/`SetValueInBuffer`, the TypedArray prototype surface, and
-`Uint8Array` hex/base64 (ES2026). The ArrayBuffer backing store and resizable-buffer
-corner cases are Phase 14 territory.
+**Status (TypedArray complete):** the full TypedArray surface landed
+(`builtins/typed_array.rs` + `crux/typed_array.rs`):
+
+- **Element storage:** `SharedBuffer` (`Rc<RefCell<Vec<u8>>>`) in crux, shared with the
+  buffer object's agent-side `buffer_data` entry; `encode_element`/`decode_element` per kind
+  (wrap/truncate for integers, `to_uint8_clamp`, `half::f16` for Float16, BigInt via
+  `ToPrimitive`); the integer-indexed exotic's `[[Get]]`/`[[Set]]`/`[[DefineOwnProperty]]`
+  read/write real bytes now (spec 10.4.5).
+- **Constructors:** `%TypedArray%` (non-constructible) + the 12 kind constructors
+  (overloads: no-args, length, object/iterable, typed-array copy, buffer+byteOffset+length),
+  each inheriting `%TypedArray%`; `TypedArraySpeciesCreate` defaults to the exemplar's own
+  kind; `from`/`of`; `Uint8Array.fromHex`/`fromBase64` statics (ES2026).
+- **Prototype (30 methods + 4 accessors):** `at`, `copyWithin`, `entries`, `every`, `fill`,
+  `filter`, `find`, `findIndex`, `findLast`, `findLastIndex`, `forEach`, `includes`, `indexOf`,
+  `join`, `keys`, `lastIndexOf`, `map`, `reduce`, `reduceRight`, `reverse`, `set` (same-type
+  byte copy + cross-type element copy, overlap-safe), `slice`, `some`, `sort` (numeric,
+  BigInt ordering, NaN last), `subarray` (aliases the shared buffer), `toLocaleString`,
+  `toReversed`, `toSorted`, `values`, `with`; `@@iterator` = `values`, per-kind
+  `@@toStringTag`, `@@species`; accessors `buffer`/`byteLength`/`byteOffset`/`length`.
+- **Uint8Array hex/base64 (ES2026):** `toHex`/`toBase64` (`alphabet` + `omitPadding`),
+  `setFromHex`/`setFromBase64` (`alphabet` + `lastChunkHandling`) with `{written, read}`
+  results, implemented per the spec's `FromHex`/`FromBase64` algorithms: raw String type
+  checks (TypeError, no coercion), `alphabet`/`lastChunkHandling` value validation,
+  `SkipAsciiWhitespace`, `=`-padding validation with strict extra-bit rejection, stop-when-full
+  (trailing garbage ignored once the target is full, `maxLength = 0` short-circuit), and
+  partial-writes-before-throw on invalid input. 6 tests.
+- **Class heritage fix (engine gap):** ClassDefinitionEvaluation now sets the constructor's
+  `[[Prototype]]` to the superclass (spec step 29), so subclass statics resolve
+  (`class B extends Uint8Array {}` → `B.fromBase64`); `Object.getPrototypeOf(B) === A` still
+  fails on the Function/Object value identity (tracked in the Array section above).
+- **test262 harness:** `assert.throws` is now defined as a per-fixture JS prelude (the native
+  closures lack agent access to invoke the function and catch the error).
+
+**test262 fixtures:** `built-ins/Uint8Array` scanner run — **19 of 70 files pass, 0 fail**
+(51 skip on `compareArray.js`/`propertyHelper.js`/`detachArrayBuffer.js` includes); the
+passing set (hex/base64 behavior, string coercion, illegal characters, odd length,
+trailing garbage, target size) is registered one `#[test]` each. The workspace now runs
+**1328 tests** (811 of them test262 fixtures) with fmt and clippy (`-D warnings`) clean.
+
+**Pending:** detached-buffer fixtures (`detachArrayBuffer.js`), the `compareArray.js`
+harness include, and the ArrayBuffer/DataView builtins (Phase 14); resizable-buffer
+corner cases stay deferred to Phase 14.
 
 ---
 
