@@ -14,6 +14,7 @@ pub mod math;
 pub mod number;
 pub mod object;
 pub mod promise;
+pub mod regexp;
 pub mod string;
 pub mod symbol;
 pub mod weakref;

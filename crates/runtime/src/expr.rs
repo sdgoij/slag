@@ -32,7 +32,7 @@ use crate::context::{
 /// Evaluate an expression to a value (spec 13.1.1).
 pub fn eval_expr(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Value, JsError> {
     match &expr.kind {
-        ExprKind::Literal(literal) => eval_literal(literal),
+        ExprKind::Literal(literal) => eval_literal(agent, literal),
         ExprKind::Ident(name) => {
             let name = crux::lookup(*name);
             let reference = resolve_binding(agent, &name, strict)?;
@@ -359,17 +359,26 @@ pub fn eval_reference(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Re
     }
 }
 
-fn eval_literal(literal: &Literal) -> Result<Value, JsError> {
+fn eval_literal(agent: &mut Agent, literal: &Literal) -> Result<Value, JsError> {
     match literal {
         Literal::Null => Ok(Value::Null),
         Literal::Boolean(b) => Ok(Value::Boolean(*b)),
         Literal::Number(n) => Ok(Value::Number(*n)),
         Literal::BigInt(n) => Ok(Value::BigInt(Handle::new(n.clone()))),
         Literal::Str(s) => Ok(Value::String(Handle::new(s.clone()))),
-        Literal::RegExp { .. } => Err(JsError::new(
-            ErrorKind::TypeError,
-            "Regular expression literals are not implemented until Phase 11".into(),
-        )),
+        Literal::RegExp { pattern, flags } => {
+            // RegExpCreate (spec 22.2.4.6) from a literal; the lexer already
+            // validated the pattern for early errors.
+            let realm = agent.current_realm()?;
+            let ctor = realm.intrinsics.get("%RegExp%").ok_or_else(|| {
+                JsError::new(ErrorKind::TypeError, "%RegExp% is not defined".into())
+            })?;
+            let args = vec![
+                Value::String(Handle::new(pattern.clone())),
+                Value::String(Handle::new(flags.clone())),
+            ];
+            crate::function::construct(agent, &ctor, &args, &ctor)
+        }
     }
 }
 

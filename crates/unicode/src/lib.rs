@@ -115,6 +115,164 @@ pub fn to_uppercase(cp: u32) -> Vec<u32> {
     }
 }
 
+// --- RegExp support (spec 22.2.3) ---
+
+/// Simple/common case folding, the `Canonicalize` mapping under `u`/`v` +
+/// `i` (spec 22.2.3.2.2 step 1: the CaseFolding.txt simple mapping).
+/// Approximated by `to_lowercase` when it yields a single code point, with
+/// the known multi-char-lowercase-but-single-fold divergence fixed.
+pub fn simple_case_fold(cp: u32) -> u32 {
+    if cp == 0x0130 {
+        // İ folds to i (to_lowercase yields i + combining dot above).
+        return 0x0069;
+    }
+    match char_of(cp) {
+        Some(c) => {
+            let mut it = c.to_lowercase();
+            match (it.next(), it.next()) {
+                (Some(lower), None) => lower as u32,
+                _ => cp,
+            }
+        }
+        None => cp,
+    }
+}
+
+/// `Canonicalize` for non-unicode `i` mode (spec 22.2.3.2.2 steps 3-9):
+/// toUppercase via Default Case Conversion, never mapping a non-ASCII code
+/// point into ASCII, and never expanding.
+pub fn non_unicode_canonicalize(cp: u32) -> u32 {
+    match char_of(cp) {
+        Some(c) => {
+            let mut it = c.to_uppercase();
+            match (it.next(), it.next()) {
+                (Some(upper), None) => {
+                    let upper = upper as u32;
+                    if cp >= 0x80 && upper < 0x80 {
+                        cp
+                    } else {
+                        upper
+                    }
+                }
+                _ => cp,
+            }
+        }
+        None => cp,
+    }
+}
+
+/// The basic `WordCharacters` set (spec 22.2.3.3): ASCII `[A-Za-z0-9_]`.
+/// The `u`+`i` extras (chars whose canonical form lands in this set) are
+/// folded in by the caller via `simple_case_fold`.
+pub fn is_ascii_word_char(cp: u32) -> bool {
+    matches!(cp, 0x30..=0x39 | 0x41..=0x5A | 0x61..=0x7A | 0x5F)
+}
+
+/// The two-letter `General_Category` abbreviation of `cp` (for `\p{…}`).
+pub fn general_category(cp: u32) -> &'static str {
+    use unicode_properties::UnicodeGeneralCategory;
+    match char_of(cp).map(|c| c.general_category()) {
+        Some(unicode_properties::GeneralCategory::UppercaseLetter) => "Lu",
+        Some(unicode_properties::GeneralCategory::LowercaseLetter) => "Ll",
+        Some(unicode_properties::GeneralCategory::TitlecaseLetter) => "Lt",
+        Some(unicode_properties::GeneralCategory::ModifierLetter) => "Lm",
+        Some(unicode_properties::GeneralCategory::OtherLetter) => "Lo",
+        Some(unicode_properties::GeneralCategory::NonspacingMark) => "Mn",
+        Some(unicode_properties::GeneralCategory::SpacingMark) => "Mc",
+        Some(unicode_properties::GeneralCategory::EnclosingMark) => "Me",
+        Some(unicode_properties::GeneralCategory::DecimalNumber) => "Nd",
+        Some(unicode_properties::GeneralCategory::LetterNumber) => "Nl",
+        Some(unicode_properties::GeneralCategory::OtherNumber) => "No",
+        Some(unicode_properties::GeneralCategory::ConnectorPunctuation) => "Pc",
+        Some(unicode_properties::GeneralCategory::DashPunctuation) => "Pd",
+        Some(unicode_properties::GeneralCategory::OpenPunctuation) => "Ps",
+        Some(unicode_properties::GeneralCategory::ClosePunctuation) => "Pe",
+        Some(unicode_properties::GeneralCategory::InitialPunctuation) => "Pi",
+        Some(unicode_properties::GeneralCategory::FinalPunctuation) => "Pf",
+        Some(unicode_properties::GeneralCategory::OtherPunctuation) => "Po",
+        Some(unicode_properties::GeneralCategory::MathSymbol) => "Sm",
+        Some(unicode_properties::GeneralCategory::CurrencySymbol) => "Sc",
+        Some(unicode_properties::GeneralCategory::ModifierSymbol) => "Sk",
+        Some(unicode_properties::GeneralCategory::OtherSymbol) => "So",
+        Some(unicode_properties::GeneralCategory::SpaceSeparator) => "Zs",
+        Some(unicode_properties::GeneralCategory::LineSeparator) => "Zl",
+        Some(unicode_properties::GeneralCategory::ParagraphSeparator) => "Zp",
+        Some(unicode_properties::GeneralCategory::Control) => "Cc",
+        Some(unicode_properties::GeneralCategory::Format) => "Cf",
+        Some(unicode_properties::GeneralCategory::Surrogate) => "Cs",
+        Some(unicode_properties::GeneralCategory::PrivateUse) => "Co",
+        _ => "Cn",
+    }
+}
+
+/// The script full name of `cp`, or `None` outside any script (for
+/// `\p{Script=…}`).
+pub fn script(cp: u32) -> Option<&'static str> {
+    use unicode_script::UnicodeScript;
+    let script = char_of(cp)?.script();
+    let name = script.full_name();
+    if name == "Unknown" || name == "Common" || name == "Inherited" {
+        return None;
+    }
+    Some(name)
+}
+
+/// The `Script_Extensions` of `cp` as full names (spec `\p{Script_Extensions=…}`).
+pub fn script_extensions(cp: u32) -> Vec<&'static str> {
+    use unicode_script::UnicodeScript;
+    let Some(c) = char_of(cp) else {
+        return Vec::new();
+    };
+    let ext = c.script_extension();
+    ext.iter()
+        .map(|s| s.full_name())
+        .filter(|n| *n != "Common" && *n != "Inherited" && *n != "Unknown")
+        .collect()
+}
+
+/// Canonicalize a script name (full or ISO 15924 short form) to the full
+/// name used by `script()`/`script_extensions()`; `None` for unknown names.
+pub fn canonical_script_name(name: &str) -> Option<&'static str> {
+    use unicode_script::Script;
+    Script::from_full_name(name)
+        .or_else(|| Script::from_short_name(name))
+        .map(|s| s.full_name())
+}
+
+/// The curated binary-property predicates for `\p{…}` (spec 22.2.3.13
+/// Table 65 subset): `None` for unsupported names.
+pub fn binary_property(cp: u32, name: &str) -> Option<bool> {
+    Some(match name {
+        "ASCII" => cp <= 0x7F,
+        "ASCII_Hex_Digit" => matches!(cp, 0x30..=0x39 | 0x41..=0x46 | 0x61..=0x66),
+        "Alphabetic" => char_of(cp).is_some_and(char::is_alphabetic),
+        "Any" => true,
+        "Assigned" => general_category(cp) != "Cn",
+        "ID_Continue" => char_of(cp).is_some_and(|c| {
+            use unicode_id::UnicodeID;
+            c.is_id_continue()
+        }),
+        "ID_Start" => char_of(cp).is_some_and(|c| {
+            use unicode_id::UnicodeID;
+            c.is_id_start()
+        }),
+        "Lowercase" => char_of(cp).is_some_and(char::is_lowercase),
+        "Uppercase" => char_of(cp).is_some_and(char::is_uppercase),
+        "White_Space" => is_white_space(cp) || is_line_terminator(cp),
+        // XID_Start/XID_Continue are ID_Start/ID_Continue minus a handful of
+        // code points; the ID tables are the practical approximation.
+        "XID_Continue" => char_of(cp).is_some_and(|c| {
+            use unicode_id::UnicodeID;
+            c.is_id_continue()
+        }),
+        "XID_Start" => char_of(cp).is_some_and(|c| {
+            use unicode_id::UnicodeID;
+            c.is_id_start()
+        }),
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

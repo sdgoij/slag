@@ -942,6 +942,279 @@ mod harness {
     test262_builtin_fixture!(String_S9_8_A3_T1, "String/S9.8_A3_T1.js");
     test262_builtin_fixture!(String_S9_8_A4_T1, "String/S9.8_A4_T1.js");
 
+    // Phase 11 RegExp surface (the list was produced by the scanner, so it
+    // is data, not aspiration).
+    test262_builtin_fixture!(RegExp_15_10_4_1_4, "RegExp/15.10.4.1-4.js");
+    test262_builtin_fixture!(
+        RegExp_call_with_non_regexp_same_constructor,
+        "RegExp/call_with_non_regexp_same_constructor.js"
+    );
+    test262_builtin_fixture!(
+        RegExp_call_with_regexp_not_same_constructor,
+        "RegExp/call_with_regexp_not_same_constructor.js"
+    );
+    test262_builtin_fixture!(
+        RegExp_character_class_escape_non_whitespace_u180e,
+        "RegExp/character-class-escape-non-whitespace-u180e.js"
+    );
+    test262_builtin_fixture!(
+        RegExp_from_regexp_like_flag_override,
+        "RegExp/from-regexp-like-flag-override.js"
+    );
+    test262_builtin_fixture!(
+        RegExp_from_regexp_like_short_circuit,
+        "RegExp/from-regexp-like-short-circuit.js"
+    );
+    test262_builtin_fixture!(RegExp_from_regexp_like, "RegExp/from-regexp-like.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_10_A2_1_T1, "RegExp/S15.10.2.10_A2.1_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_10_A2_1_T2, "RegExp/S15.10.2.10_A2.1_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_10_A3_1_T1, "RegExp/S15.10.2.10_A3.1_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_10_A3_1_T2, "RegExp/S15.10.2.10_A3.1_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_10_A4_1_T1, "RegExp/S15.10.2.10_A4.1_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_10_A4_1_T2, "RegExp/S15.10.2.10_A4.1_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_10_A4_1_T3, "RegExp/S15.10.2.10_A4.1_T3.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_10_A5_1_T1, "RegExp/S15.10.2.10_A5.1_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_11_A1_T1, "RegExp/S15.10.2.11_A1_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_11_A1_T4, "RegExp/S15.10.2.11_A1_T4.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_11_A1_T6, "RegExp/S15.10.2.11_A1_T6.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_11_A1_T8, "RegExp/S15.10.2.11_A1_T8.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_11_A1_T9, "RegExp/S15.10.2.11_A1_T9.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_12_A3_T5, "RegExp/S15.10.2.12_A3_T5.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_12_A4_T5, "RegExp/S15.10.2.12_A4_T5.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_13_A1_T10, "RegExp/S15.10.2.13_A1_T10.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_13_A1_T11, "RegExp/S15.10.2.13_A1_T11.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_13_A1_T12, "RegExp/S15.10.2.13_A1_T12.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_13_A1_T13, "RegExp/S15.10.2.13_A1_T13.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_13_A1_T14, "RegExp/S15.10.2.13_A1_T14.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_13_A1_T3, "RegExp/S15.10.2.13_A1_T3.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_13_A1_T4, "RegExp/S15.10.2.13_A1_T4.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_13_A1_T5, "RegExp/S15.10.2.13_A1_T5.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_13_A1_T6, "RegExp/S15.10.2.13_A1_T6.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_13_A1_T8, "RegExp/S15.10.2.13_A1_T8.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_13_A1_T9, "RegExp/S15.10.2.13_A1_T9.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_13_A2_T3, "RegExp/S15.10.2.13_A2_T3.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_13_A2_T4, "RegExp/S15.10.2.13_A2_T4.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_13_A2_T5, "RegExp/S15.10.2.13_A2_T5.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_13_A2_T7, "RegExp/S15.10.2.13_A2_T7.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_13_A3_T1, "RegExp/S15.10.2.13_A3_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_13_A3_T2, "RegExp/S15.10.2.13_A3_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_13_A3_T3, "RegExp/S15.10.2.13_A3_T3.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_13_A3_T4, "RegExp/S15.10.2.13_A3_T4.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_3_A1_T1, "RegExp/S15.10.2.3_A1_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_3_A1_T10, "RegExp/S15.10.2.3_A1_T10.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_3_A1_T11, "RegExp/S15.10.2.3_A1_T11.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_3_A1_T12, "RegExp/S15.10.2.3_A1_T12.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_3_A1_T13, "RegExp/S15.10.2.3_A1_T13.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_3_A1_T14, "RegExp/S15.10.2.3_A1_T14.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_3_A1_T15, "RegExp/S15.10.2.3_A1_T15.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_3_A1_T16, "RegExp/S15.10.2.3_A1_T16.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_3_A1_T17, "RegExp/S15.10.2.3_A1_T17.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_3_A1_T2, "RegExp/S15.10.2.3_A1_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_3_A1_T3, "RegExp/S15.10.2.3_A1_T3.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_3_A1_T4, "RegExp/S15.10.2.3_A1_T4.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_3_A1_T6, "RegExp/S15.10.2.3_A1_T6.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_3_A1_T8, "RegExp/S15.10.2.3_A1_T8.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_3_A1_T9, "RegExp/S15.10.2.3_A1_T9.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_5_A1_T1, "RegExp/S15.10.2.5_A1_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_5_A1_T2, "RegExp/S15.10.2.5_A1_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_5_A1_T3, "RegExp/S15.10.2.5_A1_T3.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_5_A1_T5, "RegExp/S15.10.2.5_A1_T5.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A1_T2, "RegExp/S15.10.2.6_A1_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A1_T3, "RegExp/S15.10.2.6_A1_T3.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A1_T4, "RegExp/S15.10.2.6_A1_T4.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A1_T5, "RegExp/S15.10.2.6_A1_T5.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A2_T10, "RegExp/S15.10.2.6_A2_T10.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A2_T2, "RegExp/S15.10.2.6_A2_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A2_T3, "RegExp/S15.10.2.6_A2_T3.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A2_T4, "RegExp/S15.10.2.6_A2_T4.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A2_T5, "RegExp/S15.10.2.6_A2_T5.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A2_T6, "RegExp/S15.10.2.6_A2_T6.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A2_T9, "RegExp/S15.10.2.6_A2_T9.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A3_T1, "RegExp/S15.10.2.6_A3_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A3_T10, "RegExp/S15.10.2.6_A3_T10.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A3_T11, "RegExp/S15.10.2.6_A3_T11.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A3_T12, "RegExp/S15.10.2.6_A3_T12.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A3_T14, "RegExp/S15.10.2.6_A3_T14.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A3_T2, "RegExp/S15.10.2.6_A3_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A3_T4, "RegExp/S15.10.2.6_A3_T4.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A3_T6, "RegExp/S15.10.2.6_A3_T6.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A3_T7, "RegExp/S15.10.2.6_A3_T7.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A3_T8, "RegExp/S15.10.2.6_A3_T8.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A4_T1, "RegExp/S15.10.2.6_A4_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A4_T2, "RegExp/S15.10.2.6_A4_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A4_T3, "RegExp/S15.10.2.6_A4_T3.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A4_T4, "RegExp/S15.10.2.6_A4_T4.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A4_T5, "RegExp/S15.10.2.6_A4_T5.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A4_T6, "RegExp/S15.10.2.6_A4_T6.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A4_T7, "RegExp/S15.10.2.6_A4_T7.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A4_T8, "RegExp/S15.10.2.6_A4_T8.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A5_T1, "RegExp/S15.10.2.6_A5_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A5_T2, "RegExp/S15.10.2.6_A5_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A6_T1, "RegExp/S15.10.2.6_A6_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A6_T2, "RegExp/S15.10.2.6_A6_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A6_T3, "RegExp/S15.10.2.6_A6_T3.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_6_A6_T4, "RegExp/S15.10.2.6_A6_T4.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A1_T1, "RegExp/S15.10.2.7_A1_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A1_T10, "RegExp/S15.10.2.7_A1_T10.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A1_T11, "RegExp/S15.10.2.7_A1_T11.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A1_T12, "RegExp/S15.10.2.7_A1_T12.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A1_T3, "RegExp/S15.10.2.7_A1_T3.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A1_T4, "RegExp/S15.10.2.7_A1_T4.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A1_T5, "RegExp/S15.10.2.7_A1_T5.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A1_T6, "RegExp/S15.10.2.7_A1_T6.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A1_T7, "RegExp/S15.10.2.7_A1_T7.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A1_T8, "RegExp/S15.10.2.7_A1_T8.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A2_T1, "RegExp/S15.10.2.7_A2_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A2_T2, "RegExp/S15.10.2.7_A2_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A2_T3, "RegExp/S15.10.2.7_A2_T3.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A3_T1, "RegExp/S15.10.2.7_A3_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A3_T11, "RegExp/S15.10.2.7_A3_T11.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A3_T12, "RegExp/S15.10.2.7_A3_T12.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A3_T13, "RegExp/S15.10.2.7_A3_T13.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A3_T14, "RegExp/S15.10.2.7_A3_T14.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A3_T2, "RegExp/S15.10.2.7_A3_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A3_T5, "RegExp/S15.10.2.7_A3_T5.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A3_T6, "RegExp/S15.10.2.7_A3_T6.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A3_T7, "RegExp/S15.10.2.7_A3_T7.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A3_T8, "RegExp/S15.10.2.7_A3_T8.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A3_T9, "RegExp/S15.10.2.7_A3_T9.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A4_T1, "RegExp/S15.10.2.7_A4_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A4_T10, "RegExp/S15.10.2.7_A4_T10.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A4_T11, "RegExp/S15.10.2.7_A4_T11.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A4_T12, "RegExp/S15.10.2.7_A4_T12.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A4_T13, "RegExp/S15.10.2.7_A4_T13.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A4_T14, "RegExp/S15.10.2.7_A4_T14.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A4_T15, "RegExp/S15.10.2.7_A4_T15.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A4_T16, "RegExp/S15.10.2.7_A4_T16.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A4_T17, "RegExp/S15.10.2.7_A4_T17.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A4_T18, "RegExp/S15.10.2.7_A4_T18.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A4_T19, "RegExp/S15.10.2.7_A4_T19.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A4_T2, "RegExp/S15.10.2.7_A4_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A4_T20, "RegExp/S15.10.2.7_A4_T20.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A4_T3, "RegExp/S15.10.2.7_A4_T3.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A4_T4, "RegExp/S15.10.2.7_A4_T4.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A4_T5, "RegExp/S15.10.2.7_A4_T5.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A4_T6, "RegExp/S15.10.2.7_A4_T6.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A4_T7, "RegExp/S15.10.2.7_A4_T7.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A4_T9, "RegExp/S15.10.2.7_A4_T9.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A5_T1, "RegExp/S15.10.2.7_A5_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A5_T10, "RegExp/S15.10.2.7_A5_T10.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A5_T11, "RegExp/S15.10.2.7_A5_T11.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A5_T12, "RegExp/S15.10.2.7_A5_T12.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A5_T2, "RegExp/S15.10.2.7_A5_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A5_T4, "RegExp/S15.10.2.7_A5_T4.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A5_T5, "RegExp/S15.10.2.7_A5_T5.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A5_T6, "RegExp/S15.10.2.7_A5_T6.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A5_T7, "RegExp/S15.10.2.7_A5_T7.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A5_T8, "RegExp/S15.10.2.7_A5_T8.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A5_T9, "RegExp/S15.10.2.7_A5_T9.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A6_T1, "RegExp/S15.10.2.7_A6_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A6_T3, "RegExp/S15.10.2.7_A6_T3.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A6_T4, "RegExp/S15.10.2.7_A6_T4.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A6_T5, "RegExp/S15.10.2.7_A6_T5.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_7_A6_T6, "RegExp/S15.10.2.7_A6_T6.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A1_T1, "RegExp/S15.10.2.8_A1_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A1_T2, "RegExp/S15.10.2.8_A1_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A1_T3, "RegExp/S15.10.2.8_A1_T3.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A1_T4, "RegExp/S15.10.2.8_A1_T4.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A2_T10, "RegExp/S15.10.2.8_A2_T10.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A2_T11, "RegExp/S15.10.2.8_A2_T11.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A2_T2, "RegExp/S15.10.2.8_A2_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A2_T5, "RegExp/S15.10.2.8_A2_T5.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A2_T6, "RegExp/S15.10.2.8_A2_T6.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A2_T7, "RegExp/S15.10.2.8_A2_T7.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A2_T9, "RegExp/S15.10.2.8_A2_T9.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T1, "RegExp/S15.10.2.8_A3_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T10, "RegExp/S15.10.2.8_A3_T10.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T11, "RegExp/S15.10.2.8_A3_T11.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T12, "RegExp/S15.10.2.8_A3_T12.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T13, "RegExp/S15.10.2.8_A3_T13.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T14, "RegExp/S15.10.2.8_A3_T14.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T16, "RegExp/S15.10.2.8_A3_T16.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T18, "RegExp/S15.10.2.8_A3_T18.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T19, "RegExp/S15.10.2.8_A3_T19.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T2, "RegExp/S15.10.2.8_A3_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T20, "RegExp/S15.10.2.8_A3_T20.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T21, "RegExp/S15.10.2.8_A3_T21.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T22, "RegExp/S15.10.2.8_A3_T22.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T23, "RegExp/S15.10.2.8_A3_T23.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T24, "RegExp/S15.10.2.8_A3_T24.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T25, "RegExp/S15.10.2.8_A3_T25.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T26, "RegExp/S15.10.2.8_A3_T26.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T27, "RegExp/S15.10.2.8_A3_T27.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T28, "RegExp/S15.10.2.8_A3_T28.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T29, "RegExp/S15.10.2.8_A3_T29.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T30, "RegExp/S15.10.2.8_A3_T30.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T31, "RegExp/S15.10.2.8_A3_T31.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T32, "RegExp/S15.10.2.8_A3_T32.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T33, "RegExp/S15.10.2.8_A3_T33.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T4, "RegExp/S15.10.2.8_A3_T4.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T5, "RegExp/S15.10.2.8_A3_T5.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T6, "RegExp/S15.10.2.8_A3_T6.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T7, "RegExp/S15.10.2.8_A3_T7.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T8, "RegExp/S15.10.2.8_A3_T8.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A3_T9, "RegExp/S15.10.2.8_A3_T9.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A4_T1, "RegExp/S15.10.2.8_A4_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A4_T2, "RegExp/S15.10.2.8_A4_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A4_T3, "RegExp/S15.10.2.8_A4_T3.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A4_T4, "RegExp/S15.10.2.8_A4_T4.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A4_T5, "RegExp/S15.10.2.8_A4_T5.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A4_T6, "RegExp/S15.10.2.8_A4_T6.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A4_T7, "RegExp/S15.10.2.8_A4_T7.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A4_T8, "RegExp/S15.10.2.8_A4_T8.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A4_T9, "RegExp/S15.10.2.8_A4_T9.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A5_T1, "RegExp/S15.10.2.8_A5_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_8_A5_T2, "RegExp/S15.10.2.8_A5_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_9_A1_T1, "RegExp/S15.10.2.9_A1_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_9_A1_T2, "RegExp/S15.10.2.9_A1_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_9_A1_T3, "RegExp/S15.10.2.9_A1_T3.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_9_A1_T5, "RegExp/S15.10.2.9_A1_T5.js");
+    test262_builtin_fixture!(RegExp_S15_10_2_A1_T1, "RegExp/S15.10.2_A1_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_3_1_A1_T1, "RegExp/S15.10.3.1_A1_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_3_1_A1_T2, "RegExp/S15.10.3.1_A1_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_3_1_A1_T3, "RegExp/S15.10.3.1_A1_T3.js");
+    test262_builtin_fixture!(RegExp_S15_10_3_1_A1_T4, "RegExp/S15.10.3.1_A1_T4.js");
+    test262_builtin_fixture!(RegExp_S15_10_3_1_A1_T5, "RegExp/S15.10.3.1_A1_T5.js");
+    test262_builtin_fixture!(RegExp_S15_10_3_1_A2_T1, "RegExp/S15.10.3.1_A2_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_3_1_A2_T2, "RegExp/S15.10.3.1_A2_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_3_1_A3_T1, "RegExp/S15.10.3.1_A3_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_4_1_A1_T1, "RegExp/S15.10.4.1_A1_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_4_1_A1_T2, "RegExp/S15.10.4.1_A1_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_4_1_A1_T3, "RegExp/S15.10.4.1_A1_T3.js");
+    test262_builtin_fixture!(RegExp_S15_10_4_1_A1_T4, "RegExp/S15.10.4.1_A1_T4.js");
+    test262_builtin_fixture!(RegExp_S15_10_4_1_A1_T5, "RegExp/S15.10.4.1_A1_T5.js");
+    test262_builtin_fixture!(RegExp_S15_10_4_1_A3_T1, "RegExp/S15.10.4.1_A3_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_4_1_A3_T2, "RegExp/S15.10.4.1_A3_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_4_1_A3_T3, "RegExp/S15.10.4.1_A3_T3.js");
+    test262_builtin_fixture!(RegExp_S15_10_4_1_A3_T4, "RegExp/S15.10.4.1_A3_T4.js");
+    test262_builtin_fixture!(RegExp_S15_10_4_1_A3_T5, "RegExp/S15.10.4.1_A3_T5.js");
+    test262_builtin_fixture!(RegExp_S15_10_4_1_A4_T1, "RegExp/S15.10.4.1_A4_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_4_1_A4_T2, "RegExp/S15.10.4.1_A4_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_4_1_A4_T3, "RegExp/S15.10.4.1_A4_T3.js");
+    test262_builtin_fixture!(RegExp_S15_10_4_1_A4_T4, "RegExp/S15.10.4.1_A4_T4.js");
+    test262_builtin_fixture!(RegExp_S15_10_4_1_A4_T5, "RegExp/S15.10.4.1_A4_T5.js");
+    test262_builtin_fixture!(RegExp_S15_10_4_1_A5_T1, "RegExp/S15.10.4.1_A5_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_4_1_A5_T3, "RegExp/S15.10.4.1_A5_T3.js");
+    test262_builtin_fixture!(RegExp_S15_10_4_1_A5_T4, "RegExp/S15.10.4.1_A5_T4.js");
+    test262_builtin_fixture!(RegExp_S15_10_4_1_A5_T6, "RegExp/S15.10.4.1_A5_T6.js");
+    test262_builtin_fixture!(RegExp_S15_10_4_1_A5_T7, "RegExp/S15.10.4.1_A5_T7.js");
+    test262_builtin_fixture!(RegExp_S15_10_4_1_A5_T8, "RegExp/S15.10.4.1_A5_T8.js");
+    test262_builtin_fixture!(RegExp_S15_10_4_1_A6_T1, "RegExp/S15.10.4.1_A6_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_4_1_A7_T1, "RegExp/S15.10.4.1_A7_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_4_1_A7_T2, "RegExp/S15.10.4.1_A7_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_4_1_A8_T1, "RegExp/S15.10.4.1_A8_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_4_1_A8_T10, "RegExp/S15.10.4.1_A8_T10.js");
+    test262_builtin_fixture!(RegExp_S15_10_5_A1, "RegExp/S15.10.5_A1.js");
+    test262_builtin_fixture!(RegExp_S15_10_5_A2_T2, "RegExp/S15.10.5_A2_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_7_A1_T1, "RegExp/S15.10.7_A1_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_7_A1_T2, "RegExp/S15.10.7_A1_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_7_A2_T1, "RegExp/S15.10.7_A2_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_7_A2_T2, "RegExp/S15.10.7_A2_T2.js");
+    test262_builtin_fixture!(RegExp_S15_10_7_A3_T1, "RegExp/S15.10.7_A3_T1.js");
+    test262_builtin_fixture!(RegExp_S15_10_7_A3_T2, "RegExp/S15.10.7_A3_T2.js");
+    test262_builtin_fixture!(RegExp_u180e, "RegExp/u180e.js");
+    test262_builtin_fixture!(RegExp_valid_flags_y, "RegExp/valid-flags-y.js");
+
     /// `crates/test262` sits one level below the repo root, where the
     /// `test262` submodule is pinned.
     fn builtins_dir() -> PathBuf {
@@ -1344,6 +1617,7 @@ mod harness {
             "BigInt",
             "Date",
             "String",
+            "RegExp",
         ];
         for dir in dirs {
             let mut pass = 0;

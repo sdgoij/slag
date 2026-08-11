@@ -1,0 +1,1392 @@
+//! The `%RegExp%` intrinsic (spec 22.2): the constructor (RegExpAlloc +
+//! RegExpInitialize), the prototype (exec/test/toString, the flag accessors,
+//! and the `@@match`/`@@matchAll`/`@@replace`/`@@search`/`@@split` methods),
+//! `RegExp.escape`, and `RegExp.prototype[Symbol.toStringTag]`. The compiled
+//! pattern lives in the agent's `regexp_data` table; `lastIndex` is an own
+//! data property on each instance.
+
+use crux::convert::{to_length, to_number, to_string, to_uint32};
+use crux::error::{ErrorKind, JsError};
+use crux::function::{Function, NativeFn};
+use crux::handle::Handle;
+use crux::object::JsObject;
+use crux::property::{PropertyDescriptor, PropertyKey};
+use crux::string::JsString;
+use crux::value::{Value, is_callable};
+
+use crate::agent::Agent;
+use crate::context::{as_object, get_property};
+use crate::realm::Realm;
+
+const REGEXP: &str = "%RegExp%";
+const REGEXP_PROTO: &str = "%RegExp.prototype%";
+const EXEC: &str = "%RegExp.prototype.exec%";
+const TEST: &str = "%RegExp.prototype.test%";
+const TO_STRING: &str = "%RegExp.prototype.toString%";
+const GET_SOURCE: &str = "%RegExp.prototype.source%";
+const GET_FLAGS: &str = "%RegExp.prototype.flags%";
+const GET_GLOBAL: &str = "%RegExp.prototype.global%";
+const GET_DOT_ALL: &str = "%RegExp.prototype.dotAll%";
+const GET_HAS_INDICES: &str = "%RegExp.prototype.hasIndices%";
+const GET_IGNORE_CASE: &str = "%RegExp.prototype.ignoreCase%";
+const GET_MULTILINE: &str = "%RegExp.prototype.multiline%";
+const GET_STICKY: &str = "%RegExp.prototype.sticky%";
+const GET_UNICODE: &str = "%RegExp.prototype.unicode%";
+const GET_UNICODE_SETS: &str = "%RegExp.prototype.unicodeSets%";
+const MATCH: &str = "%RegExp.prototype[@@match]%";
+const MATCH_ALL: &str = "%RegExp.prototype[@@matchAll]%";
+const REPLACE: &str = "%RegExp.prototype[@@replace]%";
+const SEARCH: &str = "%RegExp.prototype[@@search]%";
+const SPLIT: &str = "%RegExp.prototype[@@split]%";
+const ESCAPE: &str = "%RegExp.escape%";
+const STRING_ITERATOR: &str = "%RegExpStringIteratorPrototype%";
+const STRING_ITERATOR_NEXT: &str = "%RegExpStringIteratorPrototype.next%";
+
+/// The RegExp instance state (the spec's [[OriginalSource]],
+/// [[OriginalFlags]], [[RegExpRecord]], [[RegExpMatcher]]).
+#[derive(Debug, Clone)]
+pub struct RegExpState {
+    pub source: JsString,
+    pub flags_text: String,
+    pub flags: regexp::Flags,
+    pub compiled: regexp::Regex,
+}
+
+fn placeholder(name: &'static str) -> NativeFn {
+    Box::new(move |_, _| {
+        Err(JsError::new(
+            ErrorKind::TypeError,
+            format!("{name} must be called through the agent"),
+        ))
+    })
+}
+
+/// The RegExp state of an instance; TypeError otherwise.
+fn regexp_state(agent: &Agent, value: &Value) -> Result<RegExpState, JsError> {
+    match value {
+        Value::Object(obj) => match agent.regexp_data.get(&obj.id()) {
+            Some(state) => Ok(state.clone()),
+            None => Err(JsError::new(
+                ErrorKind::TypeError,
+                "Method called on an incompatible receiver".into(),
+            )),
+        },
+        _ => Err(JsError::new(
+            ErrorKind::TypeError,
+            "Method called on an incompatible receiver".into(),
+        )),
+    }
+}
+
+/// spec 22.2.4.2 RegExpAlloc: OrdinaryCreateFromConstructor with the four
+/// internal slots, plus the `lastIndex` own data property.
+fn regexp_alloc(agent: &mut Agent, new_target: &Value) -> Result<Handle<JsObject>, JsError> {
+    let proto = get_property(
+        agent,
+        new_target,
+        &JsString::from_utf8("prototype"),
+        new_target.clone(),
+    )?;
+    let proto = as_object(&proto).ok_or_else(|| {
+        JsError::new(
+            ErrorKind::TypeError,
+            "new.target.prototype is not an object".into(),
+        )
+    })?;
+    let object = JsObject::ordinary_object_create(Some(proto));
+    object.define_property(
+        &JsString::from_utf8("lastIndex"),
+        &PropertyDescriptor {
+            value: Some(Value::Number(0.0)),
+            writable: Some(true),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(false),
+        },
+    )?;
+    Ok(object)
+}
+
+/// spec 22.2.5 RegExpInitialize: validate the flags, parse the pattern, and
+/// reset `lastIndex`.
+pub fn regexp_initialize(
+    agent: &mut Agent,
+    object: &Handle<JsObject>,
+    pattern: &Value,
+    flags: &Value,
+) -> Result<Value, JsError> {
+    let pattern_text = if matches!(pattern, Value::Undefined) {
+        JsString::from_utf8("")
+    } else {
+        to_string(pattern)?
+    };
+    let flags_text = if matches!(flags, Value::Undefined) {
+        JsString::from_utf8("")
+    } else {
+        to_string(flags)?
+    };
+    let parsed_flags = regexp::Flags::parse(flags_text.as_slice())
+        .map_err(|e| JsError::new(ErrorKind::SyntaxError, e.message.clone()))?;
+    let compiled = regexp::compile(pattern_text.as_slice(), parsed_flags)
+        .map_err(|e| JsError::new(ErrorKind::SyntaxError, e.message.clone()))?;
+    agent.regexp_data.insert(
+        object.id(),
+        RegExpState {
+            source: pattern_text,
+            flags_text: flags_text.to_string_lossy(),
+            flags: parsed_flags,
+            compiled,
+        },
+    );
+    object.set(&JsString::from_utf8("lastIndex"), Value::Number(0.0), true)?;
+    Ok(Value::Object(object.clone()))
+}
+
+/// spec 22.2.4.1 RegExp(patternOrRegexp, flags). `new_target` is `undefined`
+/// for the call form (dispatch passes the callee's intrinsic for allocation).
+fn regexp_construct(
+    agent: &mut Agent,
+    args: &[Value],
+    new_target: &Value,
+) -> Result<Value, JsError> {
+    let pattern_or_regexp = args.first().cloned().unwrap_or(Value::Undefined);
+    let flags = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let pattern_is_regexp = crate::builtins::string::is_regexp(agent, &pattern_or_regexp)?;
+    let is_construct = !matches!(new_target, Value::Undefined);
+    let realm = agent.current_realm()?;
+    if !is_construct && pattern_is_regexp && matches!(flags, Value::Undefined) {
+        // RegExp(regexp) as a call: the active function is %RegExp%; return
+        // the same object when its constructor matches.
+        let pattern_ctor = get_property(
+            agent,
+            &pattern_or_regexp,
+            &JsString::from_utf8("constructor"),
+            pattern_or_regexp.clone(),
+        )?;
+        let active = realm.intrinsics.get(REGEXP).unwrap_or(Value::Undefined);
+        if crux::ops::same_value(&active, &pattern_ctor) {
+            return Ok(pattern_or_regexp);
+        }
+    }
+    let effective_new_target = if is_construct {
+        new_target.clone()
+    } else {
+        realm
+            .intrinsics
+            .get(REGEXP)
+            .ok_or_else(|| JsError::new(ErrorKind::TypeError, "%RegExp% is not defined".into()))?
+    };
+    let (pattern_source, effective_flags) = if let Value::Object(obj) = &pattern_or_regexp
+        && agent.regexp_data.contains_key(&obj.id())
+    {
+        let state = agent.regexp_data.get(&obj.id()).unwrap().clone();
+        let source = Value::String(Handle::new(state.source));
+        let flags_value = if matches!(flags, Value::Undefined) {
+            Value::String(Handle::new(JsString::from_utf8(&state.flags_text)))
+        } else {
+            flags
+        };
+        (source, flags_value)
+    } else if pattern_is_regexp {
+        let source = get_property(
+            agent,
+            &pattern_or_regexp,
+            &JsString::from_utf8("source"),
+            pattern_or_regexp.clone(),
+        )?;
+        let flags_value = if matches!(flags, Value::Undefined) {
+            get_property(
+                agent,
+                &pattern_or_regexp,
+                &JsString::from_utf8("flags"),
+                pattern_or_regexp.clone(),
+            )?
+        } else {
+            flags
+        };
+        (source, flags_value)
+    } else {
+        (pattern_or_regexp, flags)
+    };
+    let object = regexp_alloc(agent, &effective_new_target)?;
+    regexp_initialize(agent, &object, &pattern_source, &effective_flags)
+}
+
+/// spec 22.2.2.2 RegExpBuiltinExec: the lastIndex protocol and the match
+/// array. Returns `Ok(None)` for a failed match (null).
+fn regexp_builtin_exec(
+    agent: &mut Agent,
+    regexp: &Value,
+    string: &JsString,
+) -> Result<Option<Value>, JsError> {
+    let Value::Object(obj) = regexp else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "RegExp exec called on an incompatible receiver".into(),
+        ));
+    };
+    let Some(state) = agent.regexp_data.get(&obj.id()).cloned() else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "RegExp exec called on an incompatible receiver".into(),
+        ));
+    };
+    let length = string.len();
+    let last_index_value = get_property(
+        agent,
+        regexp,
+        &JsString::from_utf8("lastIndex"),
+        regexp.clone(),
+    )?;
+    let mut last_index = to_length(to_number(&last_index_value)?) as usize;
+    let global = state.flags.g;
+    let sticky = state.flags.y;
+    let has_indices = state.flags.d;
+    if !global && !sticky {
+        last_index = 0;
+    }
+    let match_result = loop {
+        if last_index > length {
+            if global || sticky {
+                obj.set(&JsString::from_utf8("lastIndex"), Value::Number(0.0), true)?;
+            }
+            return Ok(None);
+        }
+        if let Some(m) = state.compiled.exec_at(string.as_slice(), last_index) {
+            break m;
+        }
+        if sticky {
+            obj.set(&JsString::from_utf8("lastIndex"), Value::Number(0.0), true)?;
+            return Ok(None);
+        }
+        last_index = state
+            .compiled
+            .advance_string_index(string.as_slice(), last_index);
+    };
+    let result = match_result;
+    let end_index = result[0].map(|(_, e)| e).unwrap_or(last_index);
+    if global || sticky {
+        obj.set(
+            &JsString::from_utf8("lastIndex"),
+            Value::Number(end_index as f64),
+            true,
+        )?;
+    }
+    let capturing_groups = state.compiled.capturing_groups;
+    let array = JsObject::array_create(None, (capturing_groups + 1) as f64)?;
+    array.create_data_property(
+        &JsString::from_utf8("index"),
+        Value::Number(last_index as f64),
+    )?;
+    array.create_data_property(
+        &JsString::from_utf8("input"),
+        Value::String(Handle::new(string.clone())),
+    )?;
+    // The `groups` object (only when the pattern has any GroupName).
+    let groups = if state.compiled.has_group_names {
+        let groups_obj = JsObject::ordinary_object_create(None);
+        let named = groups_obj.clone();
+        for (name, index) in &state.compiled.named_groups {
+            let value = match result[*index] {
+                Some((s, e)) => Value::String(Handle::new(substring(string, s, e))),
+                None => Value::Undefined,
+            };
+            named.create_data_property(&JsString::from_utf16(&to_utf16(name)), value)?;
+        }
+        Value::Object(groups_obj)
+    } else {
+        Value::Undefined
+    };
+    array.create_data_property(&JsString::from_utf8("groups"), groups.clone())?;
+    // Group 0 and each capture.
+    for (i, capture) in result.iter().enumerate() {
+        let value = match capture {
+            Some((s, e)) => Value::String(Handle::new(substring(string, *s, *e))),
+            None => Value::Undefined,
+        };
+        array.create_data_property(&JsString::from_utf8(&i.to_string()), value)?;
+    }
+    // `d` flag: the indices array with named groups.
+    if has_indices {
+        let indices_obj = JsObject::array_create(None, (capturing_groups + 1) as f64)?;
+        for (i, capture) in result.iter().enumerate() {
+            let pair = match capture {
+                Some((s, e)) => pair_array(*s, *e)?,
+                None => pair_array(usize::MAX, usize::MAX)?,
+            };
+            indices_obj.create_data_property(&JsString::from_utf8(&i.to_string()), pair)?;
+        }
+        if state.compiled.has_group_names {
+            let groups_indices = JsObject::ordinary_object_create(None);
+            for (name, index) in &state.compiled.named_groups {
+                let pair = match result[*index] {
+                    Some((s, e)) => pair_array(s, e)?,
+                    None => pair_array(usize::MAX, usize::MAX)?,
+                };
+                groups_indices
+                    .create_data_property(&JsString::from_utf16(&to_utf16(name)), pair)?;
+            }
+            indices_obj.create_data_property(
+                &JsString::from_utf8("groups"),
+                Value::Object(groups_indices),
+            )?;
+        }
+        array.create_data_property(&JsString::from_utf8("indices"), Value::Object(indices_obj))?;
+    }
+    Ok(Some(Value::Object(array)))
+}
+
+fn pair_array(start: usize, end: usize) -> Result<Value, JsError> {
+    let pair = JsObject::array_create(None, 2.0)?;
+    pair.create_data_property(
+        &JsString::from_utf8("0"),
+        Value::Number(if start == usize::MAX {
+            f64::NAN
+        } else {
+            start as f64
+        }),
+    )?;
+    pair.create_data_property(
+        &JsString::from_utf8("1"),
+        Value::Number(if end == usize::MAX {
+            f64::NAN
+        } else {
+            end as f64
+        }),
+    )?;
+    Ok(Value::Object(pair))
+}
+
+fn substring(s: &JsString, from: usize, to: usize) -> JsString {
+    let len = s.len();
+    let from = from.min(len);
+    let to = to.min(len).max(from);
+    JsString::from_utf16(&s.as_slice()[from..to])
+}
+
+fn to_utf16(cps: &[u32]) -> Vec<u16> {
+    let mut out = Vec::new();
+    for &cp in cps {
+        if cp <= 0xFFFF {
+            out.push(cp as u16);
+        } else {
+            let x = cp - 0x10000;
+            out.push(0xD800 + (x >> 10) as u16);
+            out.push(0xDC00 + (x & 0x3FF) as u16);
+        }
+    }
+    out
+}
+
+/// spec 22.2.5.1 RegExp.prototype.exec(string).
+fn exec(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    let string = to_string(&args.first().cloned().unwrap_or(Value::Undefined))?;
+    match regexp_builtin_exec(agent, this, &string)? {
+        Some(array) => Ok(array),
+        None => Ok(Value::Null),
+    }
+}
+
+/// spec 22.2.5.2 RegExp.prototype.test(string).
+fn test(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    let string = to_string(&args.first().cloned().unwrap_or(Value::Undefined))?;
+    let matched = regexp_builtin_exec(agent, this, &string)?.is_some();
+    Ok(Value::Boolean(matched))
+}
+
+/// spec 22.2.5.10 RegExp.prototype.toString.
+fn to_string_method(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
+    let state = regexp_state(agent, this)?;
+    let source = escape_source(&state.source);
+    let text = format!("/{source}/{}", state.flags_text);
+    Ok(Value::String(Handle::new(JsString::from_utf8(&text))))
+}
+
+/// EscapeRegExpPattern (spec 22.2.4.4): escape `/` and line terminators so
+/// the literal round-trips; empty patterns render as `(?:)`. A slash that is
+/// already part of an escape sequence is left alone.
+fn escape_source(source: &JsString) -> String {
+    if source.is_empty() {
+        return "(?:)".to_string();
+    }
+    let units = source.as_slice();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < units.len() {
+        let u = units[i];
+        let escaped = i > 0 && units[i - 1] == b'\\' as u16;
+        match u {
+            0x2F if !escaped => out.push_str("\\/"),
+            0x0A => out.push_str("\\n"),
+            0x0D => out.push_str("\\r"),
+            0x2028 => out.push_str("\\u2028"),
+            0x2029 => out.push_str("\\u2029"),
+            _ => out.push(char::from_u32(u as u32).unwrap_or('\u{FFFD}')),
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The flag getters (spec 22.2.5.3-22.2.5.9, 22.2.5.14-15).
+fn get_flag(agent: &mut Agent, this: &Value, name: &str) -> Result<Value, JsError> {
+    let state = regexp_state(agent, this)?;
+    let value = match name {
+        "global" => state.flags.g,
+        "dotAll" => state.flags.s,
+        "hasIndices" => state.flags.d,
+        "ignoreCase" => state.flags.i,
+        "multiline" => state.flags.m,
+        "sticky" => state.flags.y,
+        "unicode" => state.flags.u,
+        "unicodeSets" => state.flags.v,
+        _ => return Ok(Value::Undefined),
+    };
+    Ok(Value::Boolean(value))
+}
+
+/// spec 22.2.5.14 RegExp.prototype.flags.
+fn get_flags(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
+    let state = regexp_state(agent, this)?;
+    Ok(Value::String(Handle::new(JsString::from_utf8(
+        &state.flags.to_string(),
+    ))))
+}
+
+/// spec 22.2.5.13 RegExp.prototype.source.
+fn get_source(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
+    let state = regexp_state(agent, this)?;
+    let text = escape_source(&state.source);
+    Ok(Value::String(Handle::new(JsString::from_utf8(&text))))
+}
+
+/// spec 22.2.7.1 RegExp.prototype[@@match](string).
+fn symbol_match(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    let string = to_string(&args.first().cloned().unwrap_or(Value::Undefined))?;
+    let state = regexp_state(agent, this)?;
+    let global = state.flags.g;
+    if !global {
+        return match regexp_builtin_exec(agent, this, &string)? {
+            Some(array) => Ok(array),
+            None => Ok(Value::Null),
+        };
+    }
+    // Global: collect all match strings (spec 22.2.7.1), advancing lastIndex
+    // past each empty match.
+    let mut result: Vec<Value> = Vec::new();
+    loop {
+        match regexp_builtin_exec(agent, this, &string)? {
+            None => break,
+            Some(array) => {
+                let matched = to_string(&get_property(
+                    agent,
+                    &array,
+                    &JsString::from_utf8("0"),
+                    array.clone(),
+                )?)?;
+                result.push(Value::String(Handle::new(matched.clone())));
+                if matched.is_empty() {
+                    let this_index = to_length(to_number(&get_property(
+                        agent,
+                        this,
+                        &JsString::from_utf8("lastIndex"),
+                        this.clone(),
+                    )?)?) as usize;
+                    let next_index = state
+                        .compiled
+                        .advance_string_index(string.as_slice(), this_index);
+                    if let Some(obj) = as_object(this) {
+                        obj.set(
+                            &JsString::from_utf8("lastIndex"),
+                            Value::Number(next_index as f64),
+                            true,
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    if result.is_empty() {
+        return Ok(Value::Null);
+    }
+    let array = JsObject::array_create(None, result.len() as f64)?;
+    for (i, value) in result.into_iter().enumerate() {
+        array.create_data_property(&JsString::from_utf8(&i.to_string()), value)?;
+    }
+    Ok(Value::Object(array))
+}
+
+/// spec 22.2.7.2 RegExp.prototype[@@matchAll](string).
+fn symbol_match_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    let string = to_string(&args.first().cloned().unwrap_or(Value::Undefined))?;
+    let state = regexp_state(agent, this)?;
+    let global = state.flags.g;
+    let full_unicode = state.flags.has_unicode();
+    let realm = agent.current_realm()?;
+    let proto = realm
+        .intrinsics
+        .get(STRING_ITERATOR)
+        .and_then(|value| as_object(&value));
+    let iterator = JsObject::ordinary_object_create(proto);
+    agent.regexp_string_iter_data.insert(
+        iterator.id(),
+        (this.clone(), string, global, full_unicode, false),
+    );
+    Ok(Value::Object(iterator))
+}
+
+/// spec 22.2.7.4 RegExp.prototype[@@search](string).
+fn symbol_search(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    let string = to_string(&args.first().cloned().unwrap_or(Value::Undefined))?;
+    let state = regexp_state(agent, this)?;
+    if state.flags.g || state.flags.y {
+        let obj = as_object(this).unwrap();
+        obj.set(&JsString::from_utf8("lastIndex"), Value::Number(0.0), true)?;
+    }
+    match regexp_builtin_exec(agent, this, &string)? {
+        Some(array) => {
+            let index = get_property(agent, &array, &JsString::from_utf8("index"), array.clone())?;
+            let index = to_number(&index)?;
+            if state.flags.g || state.flags.y {
+                let obj = as_object(this).unwrap();
+                obj.set(&JsString::from_utf8("lastIndex"), Value::Number(0.0), true)?;
+            }
+            Ok(Value::Number(index))
+        }
+        None => Ok(Value::Number(-1.0)),
+    }
+}
+
+/// spec 22.2.7.5 RegExp.prototype[@@split](string, limit).
+fn symbol_split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    if !matches!(this, Value::Object(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "RegExp.prototype[Symbol.split] called on non-object".into(),
+        ));
+    }
+    let string = to_string(&args.first().cloned().unwrap_or(Value::Undefined))?;
+    let limit = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let lim = if matches!(limit, Value::Undefined) {
+        u32::MAX
+    } else {
+        to_uint32(to_number(&limit)?)
+    };
+    // The splitter is a sticky clone of this regexp (species skipped; built
+    // directly from %RegExp%).
+    let state = regexp_state(agent, this)?;
+    let realm = agent.current_realm()?;
+    let ctor = realm
+        .intrinsics
+        .get(REGEXP)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "%RegExp% is not defined".into()))?;
+    let new_flags = format!("{}y", state.flags);
+    let splitter = crate::function::construct(
+        agent,
+        &ctor,
+        &[
+            Value::String(Handle::new(state.source.clone())),
+            Value::String(Handle::new(JsString::from_utf8(&new_flags))),
+        ],
+        &ctor,
+    )?;
+    let mut array: Vec<Value> = Vec::new();
+    let size = string.len();
+    if lim == 0 {
+        return array_from_values(&[]);
+    }
+    if string.is_empty() {
+        let match_result = regexp_builtin_exec(agent, &splitter, &string)?;
+        if match_result.is_some() {
+            return array_from_values(&[]);
+        }
+        return array_from_values(&[Value::String(Handle::new(string))]);
+    }
+    let mut last_match_end = 0usize;
+    let mut search_index = last_match_end;
+    while search_index < size {
+        if let Some(splitter_obj) = as_object(&splitter) {
+            splitter_obj.set(
+                &JsString::from_utf8("lastIndex"),
+                Value::Number(search_index as f64),
+                true,
+            )?;
+        }
+        match regexp_builtin_exec(agent, &splitter, &string)? {
+            None => {
+                search_index = state
+                    .compiled
+                    .advance_string_index(string.as_slice(), search_index);
+            }
+            Some(match_result) => {
+                let match_end_value = get_property(
+                    agent,
+                    &splitter,
+                    &JsString::from_utf8("lastIndex"),
+                    splitter.clone(),
+                )?;
+                let match_end = (to_length(to_number(&match_end_value)?) as usize).min(size);
+                if match_end == last_match_end {
+                    search_index = state
+                        .compiled
+                        .advance_string_index(string.as_slice(), search_index);
+                } else {
+                    let segment = substring(&string, last_match_end, search_index);
+                    array.push(Value::String(Handle::new(segment)));
+                    if array.len() == lim as usize {
+                        return array_from_values(&array);
+                    }
+                    last_match_end = match_end;
+                    let result_length = array_length(agent, &match_result)?;
+                    let captures_count = result_length.saturating_sub(1);
+                    for i in 1..=captures_count {
+                        let capture = get_property(
+                            agent,
+                            &match_result,
+                            &JsString::from_utf8(&i.to_string()),
+                            match_result.clone(),
+                        )?;
+                        array.push(capture);
+                        if array.len() == lim as usize {
+                            return array_from_values(&array);
+                        }
+                    }
+                    search_index = last_match_end;
+                }
+            }
+        }
+    }
+    let tail = substring(&string, last_match_end, size);
+    array.push(Value::String(Handle::new(tail)));
+    array_from_values(&array)
+}
+
+fn to_integer_or_infinity(n: f64) -> f64 {
+    if n.is_nan() || n == 0.0 {
+        0.0
+    } else if n.is_infinite() {
+        n
+    } else {
+        n.trunc()
+    }
+}
+
+fn array_from_values(values: &[Value]) -> Result<Value, JsError> {
+    let array = JsObject::array_create(None, values.len() as f64)?;
+    for (index, value) in values.iter().enumerate() {
+        array.create_data_property(&JsString::from_utf8(&index.to_string()), value.clone())?;
+    }
+    Ok(Value::Object(array))
+}
+
+/// spec 22.2.7.3 RegExp.prototype[@@replace](string, replaceValue).
+fn symbol_replace(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    if !matches!(this, Value::Object(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "RegExp.prototype[Symbol.replace] called on non-object".into(),
+        ));
+    }
+    let string = to_string(&args.first().cloned().unwrap_or(Value::Undefined))?;
+    let replace_value = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let functional = is_callable(&replace_value);
+    let replace_text = if functional {
+        None
+    } else {
+        Some(to_string(&replace_value)?)
+    };
+    let flags = to_string(&get_property(
+        agent,
+        this,
+        &JsString::from_utf8("flags"),
+        this.clone(),
+    )?)?;
+    let global = flags.as_slice().contains(&(b'g' as u16));
+    let string_length = string.len();
+    if global {
+        let obj = as_object(this).unwrap();
+        obj.set(&JsString::from_utf8("lastIndex"), Value::Number(0.0), true)?;
+    }
+    let mut results: Vec<Value> = Vec::new();
+    loop {
+        match regexp_builtin_exec(agent, this, &string)? {
+            None => break,
+            Some(array) => {
+                results.push(array.clone());
+                if !global {
+                    break;
+                }
+                let match_string = to_string(&get_property(
+                    agent,
+                    &array,
+                    &JsString::from_utf8("0"),
+                    array.clone(),
+                )?)?;
+                if match_string.is_empty() {
+                    let this_index = to_length(to_number(&get_property(
+                        agent,
+                        this,
+                        &JsString::from_utf8("lastIndex"),
+                        this.clone(),
+                    )?)?);
+                    let state = regexp_state(agent, this)?;
+                    let next_index = state
+                        .compiled
+                        .advance_string_index(string.as_slice(), this_index as usize);
+                    let obj = as_object(this).unwrap();
+                    obj.set(
+                        &JsString::from_utf8("lastIndex"),
+                        Value::Number(next_index as f64),
+                        true,
+                    )?;
+                }
+            }
+        }
+    }
+    let mut accumulated: Vec<u16> = Vec::new();
+    let mut next_source_position = 0usize;
+    for result in results {
+        let matched = to_string(&get_property(
+            agent,
+            &result,
+            &JsString::from_utf8("0"),
+            result.clone(),
+        )?)?;
+        let match_length = matched.len();
+        let position_value = to_number(&get_property(
+            agent,
+            &result,
+            &JsString::from_utf8("index"),
+            result.clone(),
+        )?)?;
+        let position = to_integer_or_infinity(position_value);
+        let position = if position.is_finite() {
+            (position as usize).clamp(0, string_length)
+        } else if position < 0.0 {
+            0
+        } else {
+            string_length
+        };
+        let mut captures: Vec<Value> = Vec::new();
+        let result_length = array_length(agent, &result)?;
+        let captures_count = result_length.saturating_sub(1);
+        for i in 1..=captures_count {
+            let capture = get_property(
+                agent,
+                &result,
+                &JsString::from_utf8(&i.to_string()),
+                result.clone(),
+            )?;
+            captures.push(capture);
+        }
+        let named_captures = get_property(
+            agent,
+            &result,
+            &JsString::from_utf8("groups"),
+            result.clone(),
+        )?;
+        let replacement_string = if functional {
+            let mut replacer_args = vec![Value::String(Handle::new(matched.clone()))];
+            replacer_args.extend(captures);
+            replacer_args.push(Value::Number(position as f64));
+            replacer_args.push(Value::String(Handle::new(string.clone())));
+            if !matches!(named_captures, Value::Undefined) {
+                replacer_args.push(named_captures.clone());
+            }
+            let called =
+                crate::function::call(agent, &replace_value, Value::Undefined, &replacer_args)?;
+            to_string(&called)?
+        } else {
+            let named = if matches!(named_captures, Value::Undefined) {
+                None
+            } else {
+                Some(crate::context::to_object(agent, &named_captures)?)
+            };
+            let text = match replace_text.as_ref() {
+                Some(text) => text,
+                None => &JsString::from_utf8(""),
+            };
+            crate::builtins::string::get_substitution_public(
+                agent, &matched, &string, position, &captures, named, text,
+            )?
+        };
+        if position >= next_source_position {
+            accumulated
+                .extend_from_slice(substring(&string, next_source_position, position).as_slice());
+            accumulated.extend_from_slice(replacement_string.as_slice());
+            next_source_position = position + match_length;
+        }
+    }
+    if next_source_position < string_length {
+        accumulated
+            .extend_from_slice(substring(&string, next_source_position, string_length).as_slice());
+    }
+    Ok(Value::String(Handle::new(JsString::from_utf16(
+        &accumulated,
+    ))))
+}
+
+fn array_length(agent: &mut Agent, value: &Value) -> Result<usize, JsError> {
+    let length = get_property(agent, value, &JsString::from_utf8("length"), value.clone())?;
+    Ok(to_length(to_number(&length)?) as usize)
+}
+
+/// spec 22.2.6.2.1 %RegExpStringIteratorPrototype%.next.
+fn string_iterator_next(
+    agent: &mut Agent,
+    this: &Value,
+    _args: &[Value],
+) -> Result<Value, JsError> {
+    let Value::Object(obj) = this else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "%RegExpStringIteratorPrototype%.next called on an incompatible receiver".into(),
+        ));
+    };
+    let Some(entry) = agent.regexp_string_iter_data.get(&obj.id()).cloned() else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "%RegExpStringIteratorPrototype%.next called on an incompatible receiver".into(),
+        ));
+    };
+    let (regexp, string, global, _unicode, done) = entry;
+    if done {
+        return iter_result(Value::Undefined, true);
+    }
+    if !global && let Some(e) = agent.regexp_string_iter_data.get_mut(&obj.id()) {
+        e.4 = true;
+    }
+    let result = regexp_builtin_exec(agent, &regexp, &string)?;
+    match result {
+        Some(array) => iter_result(array, false),
+        None => {
+            if let Some(e) = agent.regexp_string_iter_data.get_mut(&obj.id()) {
+                e.4 = true;
+            }
+            iter_result(Value::Undefined, true)
+        }
+    }
+}
+
+/// CreateIterResultObject (spec 7.4.9).
+fn iter_result(value: Value, done: bool) -> Result<Value, JsError> {
+    let object = JsObject::ordinary_object_create(None);
+    object.create_data_property(&JsString::from_utf8("value"), value)?;
+    object.create_data_property(&JsString::from_utf8("done"), Value::Boolean(done))?;
+    Ok(Value::Object(object))
+}
+
+/// spec 22.2.4.3 RegExp.escape(string).
+fn escape(_agent: &mut Agent, _this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    if !matches!(value, Value::String(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "RegExp.escape expects a string".into(),
+        ));
+    }
+    let text = to_string(&value)?;
+    let escaped = regexp::escape::escape(text.as_slice());
+    Ok(Value::String(Handle::new(JsString::from_utf8(&escaped))))
+}
+
+/// Install the RegExp intrinsics and the global `RegExp` binding.
+pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
+    let object_proto = realm
+        .intrinsics
+        .get("%Object.prototype%")
+        .and_then(|value| as_object(&value));
+    let regexp_proto = JsObject::ordinary_object_create(object_proto.clone());
+    let regexp_proto_value = Value::Object(regexp_proto.clone());
+
+    let regexp_ctor = Function::create_builtin(
+        Some(JsString::from_utf8("RegExp")),
+        2,
+        placeholder("RegExp"),
+        Some(Box::new(placeholder("RegExp"))),
+        None,
+    )?;
+    let regexp_ctor_value = Value::Function(regexp_ctor.clone());
+
+    realm.intrinsics.define(REGEXP, regexp_ctor_value.clone());
+    realm
+        .intrinsics
+        .define(REGEXP_PROTO, regexp_proto_value.clone());
+
+    regexp_ctor.define_property(
+        &JsString::from_utf8("prototype"),
+        &PropertyDescriptor {
+            value: Some(regexp_proto_value.clone()),
+            writable: Some(false),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(false),
+        },
+    )?;
+    regexp_proto.define_property(
+        &JsString::from_utf8("constructor"),
+        &PropertyDescriptor {
+            value: Some(regexp_ctor_value.clone()),
+            writable: Some(true),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
+    )?;
+
+    // RegExp.escape (spec 22.2.4.3).
+    let escape_func = Function::create_builtin(
+        Some(JsString::from_utf8("escape")),
+        1,
+        placeholder("escape"),
+        None,
+        None,
+    )?;
+    realm
+        .intrinsics
+        .define(ESCAPE, Value::Function(escape_func.clone()));
+    regexp_ctor.define_property(
+        &JsString::from_utf8("escape"),
+        &PropertyDescriptor {
+            value: Some(Value::Function(escape_func)),
+            writable: Some(true),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
+    )?;
+
+    // The prototype methods.
+    let methods: [(&str, &str, u64); 3] = [
+        ("exec", EXEC, 1),
+        ("test", TEST, 1),
+        ("toString", TO_STRING, 0),
+    ];
+    for (name, key, length) in methods {
+        let func = Function::create_builtin(
+            Some(JsString::from_utf8(name)),
+            length,
+            placeholder(name),
+            None,
+            None,
+        )?;
+        realm.intrinsics.define(key, Value::Function(func.clone()));
+        regexp_proto.define_property(
+            &JsString::from_utf8(name),
+            &PropertyDescriptor {
+                value: Some(Value::Function(func)),
+                writable: Some(true),
+                get: None,
+                set: None,
+                enumerable: Some(false),
+                configurable: Some(true),
+            },
+        )?;
+    }
+
+    // The flag accessors (data-property getters).
+    let accessors: [(&str, &str); 10] = [
+        ("source", GET_SOURCE),
+        ("flags", GET_FLAGS),
+        ("global", GET_GLOBAL),
+        ("dotAll", GET_DOT_ALL),
+        ("hasIndices", GET_HAS_INDICES),
+        ("ignoreCase", GET_IGNORE_CASE),
+        ("multiline", GET_MULTILINE),
+        ("sticky", GET_STICKY),
+        ("unicode", GET_UNICODE),
+        ("unicodeSets", GET_UNICODE_SETS),
+    ];
+    for (name, key) in accessors {
+        let getter = Function::create_builtin(
+            Some(JsString::from_utf8(&format!("get {name}"))),
+            0,
+            placeholder("get"),
+            None,
+            None,
+        )?;
+        realm
+            .intrinsics
+            .define(key, Value::Function(getter.clone()));
+        regexp_proto.define_property(
+            &JsString::from_utf8(name),
+            &PropertyDescriptor {
+                value: None,
+                writable: None,
+                get: Some(Value::Function(getter)),
+                set: None,
+                enumerable: Some(false),
+                configurable: Some(true),
+            },
+        )?;
+    }
+
+    // The symbol methods.
+    let symbol_methods: [(&str, &str, u64); 5] = [
+        ("@@match", MATCH, 1),
+        ("@@matchAll", MATCH_ALL, 1),
+        ("@@replace", REPLACE, 2),
+        ("@@search", SEARCH, 1),
+        ("@@split", SPLIT, 2),
+    ];
+    for (symbol_name, key, length) in symbol_methods {
+        let name = format!("[Symbol.{}]", symbol_name.trim_start_matches("@@"));
+        let func = Function::create_builtin(
+            Some(JsString::from_utf8(&name)),
+            length,
+            placeholder("symbol"),
+            None,
+            None,
+        )?;
+        realm.intrinsics.define(key, Value::Function(func.clone()));
+        let symbol_key = PropertyKey::Symbol(
+            crux::symbol::well_known(symbol_name.trim_start_matches("@@"))
+                .as_ref()
+                .clone(),
+        );
+        regexp_proto.define_property_key(
+            &symbol_key,
+            &PropertyDescriptor {
+                value: Some(Value::Function(func)),
+                writable: Some(true),
+                get: None,
+                set: None,
+                enumerable: Some(false),
+                configurable: Some(true),
+            },
+        )?;
+    }
+
+    // %RegExp.prototype%[@@toStringTag] = "RegExp".
+    regexp_proto.define_property_key(
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyDescriptor {
+            value: Some(Value::String(Handle::new(JsString::from_utf8("RegExp")))),
+            writable: Some(false),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
+    )?;
+
+    // %RegExpStringIteratorPrototype% (spec 22.2.6.2).
+    let iterator_proto = JsObject::ordinary_object_create(object_proto.clone());
+    let iterator_proto_value = Value::Object(iterator_proto.clone());
+    realm
+        .intrinsics
+        .define(STRING_ITERATOR, iterator_proto_value.clone());
+    let next_func = Function::create_builtin(
+        Some(JsString::from_utf8("next")),
+        0,
+        placeholder("next"),
+        None,
+        None,
+    )?;
+    realm
+        .intrinsics
+        .define(STRING_ITERATOR_NEXT, Value::Function(next_func.clone()));
+    iterator_proto.define_property(
+        &JsString::from_utf8("next"),
+        &PropertyDescriptor {
+            value: Some(Value::Function(next_func)),
+            writable: Some(true),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
+    )?;
+    iterator_proto.define_property_key(
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyDescriptor {
+            value: Some(Value::String(Handle::new(JsString::from_utf8(
+                "RegExp String Iterator",
+            )))),
+            writable: Some(false),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
+    )?;
+
+    realm.global_object.define_property_or_throw(
+        &JsString::from_utf8("RegExp"),
+        &PropertyDescriptor {
+            value: Some(regexp_ctor_value),
+            writable: Some(true),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
+    )?;
+    Ok(())
+}
+
+/// The RegExp members that need the agent, dispatched by intrinsic identity.
+pub fn dispatch_call(
+    agent: &mut Agent,
+    callee: &Value,
+    this: &Value,
+    args: &[Value],
+) -> Option<Result<Value, JsError>> {
+    let realm = agent.current_realm().ok()?;
+    let intrinsics = &realm.intrinsics;
+    // RegExp(...) called as a function: NewTarget is undefined; the
+    // constructor resolves %RegExp% for allocation.
+    if intrinsics.get(REGEXP).as_ref() == Some(callee) {
+        return Some(regexp_construct(agent, args, &Value::Undefined));
+    }
+    if intrinsics.get(EXEC).as_ref() == Some(callee) {
+        return Some(exec(agent, this, args));
+    }
+    if intrinsics.get(TEST).as_ref() == Some(callee) {
+        return Some(test(agent, this, args));
+    }
+    if intrinsics.get(TO_STRING).as_ref() == Some(callee) {
+        return Some(to_string_method(agent, this, args));
+    }
+    if intrinsics.get(GET_SOURCE).as_ref() == Some(callee) {
+        return Some(get_source(agent, this));
+    }
+    if intrinsics.get(GET_FLAGS).as_ref() == Some(callee) {
+        return Some(get_flags(agent, this));
+    }
+    for (key, name) in [
+        (GET_GLOBAL, "global"),
+        (GET_DOT_ALL, "dotAll"),
+        (GET_HAS_INDICES, "hasIndices"),
+        (GET_IGNORE_CASE, "ignoreCase"),
+        (GET_MULTILINE, "multiline"),
+        (GET_STICKY, "sticky"),
+        (GET_UNICODE, "unicode"),
+        (GET_UNICODE_SETS, "unicodeSets"),
+    ] {
+        if intrinsics.get(key).as_ref() == Some(callee) {
+            return Some(get_flag(agent, this, name));
+        }
+    }
+    if intrinsics.get(MATCH).as_ref() == Some(callee) {
+        return Some(symbol_match(agent, this, args));
+    }
+    if intrinsics.get(MATCH_ALL).as_ref() == Some(callee) {
+        return Some(symbol_match_all(agent, this, args));
+    }
+    if intrinsics.get(REPLACE).as_ref() == Some(callee) {
+        return Some(symbol_replace(agent, this, args));
+    }
+    if intrinsics.get(SEARCH).as_ref() == Some(callee) {
+        return Some(symbol_search(agent, this, args));
+    }
+    if intrinsics.get(SPLIT).as_ref() == Some(callee) {
+        return Some(symbol_split(agent, this, args));
+    }
+    if intrinsics.get(ESCAPE).as_ref() == Some(callee) {
+        return Some(escape(agent, this, args));
+    }
+    if intrinsics.get(STRING_ITERATOR_NEXT).as_ref() == Some(callee) {
+        return Some(string_iterator_next(agent, this, args));
+    }
+    None
+}
+
+pub fn dispatch_construct(
+    agent: &mut Agent,
+    callee: &Value,
+    args: &[Value],
+    new_target: &Value,
+) -> Option<Result<Value, JsError>> {
+    let realm = agent.current_realm().ok()?;
+    if realm.intrinsics.get(REGEXP).as_ref() == Some(callee) {
+        return Some(regexp_construct(agent, args, new_target));
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::Agent;
+
+    fn run(source: &str) -> Result<Value, JsError> {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm()?;
+        agent.run_script(source)
+    }
+
+    fn text(source: &str) -> String {
+        match run(source).unwrap() {
+            Value::String(s) => s.to_string_lossy(),
+            other => panic!("expected a string, got {other:?}"),
+        }
+    }
+
+    fn number(source: &str) -> f64 {
+        match run(source).unwrap() {
+            Value::Number(n) => n,
+            other => panic!("expected a number, got {other:?}"),
+        }
+    }
+
+    fn bool(source: &str) -> bool {
+        match run(source).unwrap() {
+            Value::Boolean(b) => b,
+            other => panic!("expected a boolean, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn constructor_and_literals() {
+        assert_eq!(run("typeof RegExp").unwrap().to_string(), "function");
+        assert!(bool("/ab+c/.test('abbbc')"));
+        assert!(!bool("/ab+c/.test('ac')"));
+        assert!(bool("/abc/i.test('ABC')"));
+        assert!(bool("new RegExp('a+b').test('aaab')"));
+        assert!(bool("RegExp('x').test('x')"));
+        // RegExp(regexp) returns the same object.
+        assert_eq!(
+            run("let r = /a/g; RegExp(r) === r").unwrap(),
+            Value::Boolean(true)
+        );
+        assert!(matches!(
+            run("new RegExp('(')"),
+            Err(e) if e.kind == ErrorKind::SyntaxError
+        ));
+        assert!(matches!(
+            run("new RegExp('a', 'x')"),
+            Err(e) if e.kind == ErrorKind::SyntaxError
+        ));
+        assert!(matches!(
+            run("new RegExp('a', 'gg')"),
+            Err(e) if e.kind == ErrorKind::SyntaxError
+        ));
+    }
+
+    #[test]
+    fn exec_captures_and_groups() {
+        assert_eq!(text("/(\\d+)-(\\d+)/.exec('x 12-34 y')[2]"), "34");
+        assert_eq!(number("/(\\d+)-(\\d+)/.exec('x 12-34 y').index"), 2.0);
+        assert_eq!(text("/(\\d+)-(\\d+)/.exec('x 12-34 y').input"), "x 12-34 y");
+        assert_eq!(text("/(?<y>\\d+)/.exec('x42').groups.y"), "42");
+        assert_eq!(
+            run("/(a)?b/.exec('b')[1]").unwrap().to_string(),
+            "undefined"
+        );
+        // lastIndex protocol with g.
+        assert_eq!(number("var r = /a/g; r.exec('aba'); r.lastIndex"), 1.0);
+        assert_eq!(
+            number("var r = /a/g; r.exec('aba'); r.exec('aba'); r.lastIndex"),
+            3.0
+        );
+        assert_eq!(
+            run("var r = /a/g; r.exec('aba'); r.exec('aba'); r.exec('aba')")
+                .unwrap()
+                .to_string(),
+            "null"
+        );
+    }
+
+    #[test]
+    fn sticky_and_global() {
+        assert!(bool("var r = /a/y; r.lastIndex = 1; r.test('ba')"));
+        assert!(!bool("var r = /a/y; r.lastIndex = 0; r.test('ba')"));
+        assert_eq!(number("'a1b2c3'.match(/[0-9]/g).length"), 3.0);
+        assert_eq!(text("'a1b2c3'.match(/[0-9]/g)[1]"), "2");
+        assert_eq!(text("'aaa'.match(/a*?/g).length === 4 ? 'ok' : 'no'"), "ok");
+    }
+
+    #[test]
+    fn replace_search_split() {
+        assert_eq!(text("'hello world'.replace(/o/g, '0')"), "hell0 w0rld");
+        assert_eq!(text("'hello'.replace(/l/g, 'L')"), "heLLo");
+        assert_eq!(text("'abc'.replace(/(b)/, '[$1]')"), "a[b]c");
+        assert_eq!(text("'aXbXc'.split(/X/)[1]"), "b");
+        assert_eq!(number("'abab'.split(/b/).length"), 3.0);
+        assert_eq!(number("'abc'.search(/b/)"), 1.0);
+        assert_eq!(number("'abc'.search(/x/)"), -1.0);
+        assert_eq!(text("'a1b2'.replace(/(\\d)/g, '<$1>')"), "a<1>b<2>");
+    }
+
+    #[test]
+    fn match_all_iterator() {
+        assert_eq!(number("('a1b2'[Symbol.iterator] ? 1 : 0)"), 1.0);
+        assert_eq!(
+            text("var it = 'a1b2'.matchAll(/\\d/g); it.next().value[0]"),
+            "1"
+        );
+        assert_eq!(
+            text("var it = 'a1b2'.matchAll(/\\d/g); it.next().value[0]; it.next().value[0]"),
+            "2"
+        );
+        assert_eq!(
+            text(
+                "var it = 'ab'.matchAll(/\\d/g); it.next().done === false; it.next().done === true ? 'y' : 'n'"
+            ),
+            "y"
+        );
+    }
+
+    #[test]
+    fn prototype_surface() {
+        assert_eq!(text("/foo/.source"), "foo");
+        assert_eq!(text("/foo/gi.flags"), "gi");
+        assert!(bool("/a/g.global"));
+        assert!(bool("/a/i.ignoreCase"));
+        assert!(bool("/a/m.multiline"));
+        assert!(bool("/a/s.dotAll"));
+        assert!(bool("/a/y.sticky"));
+        assert!(bool("/a/u.unicode"));
+        assert!(bool("/a/v.unicodeSets"));
+        assert!(bool("/a/d.hasIndices"));
+        assert_eq!(text("/a/.toString()"), "/a/");
+        assert_eq!(text(r"/a\/b/.toString()"), "/a\\/b/");
+        assert_eq!(text("new RegExp('').toString()"), "/(?:)/");
+        assert_eq!(text("/()/.toString()"), "/()/");
+        assert_eq!(
+            text("Object.prototype.toString.call(/a/)"),
+            "[object RegExp]"
+        );
+        assert_eq!(number("RegExp.prototype.exec.length"), 1.0);
+    }
+
+    #[test]
+    fn escape_and_d_indices() {
+        assert_eq!(text("RegExp.escape('a.b')"), "\\x61\\.b");
+        assert_eq!(text("RegExp.escape('1')"), "\\x31");
+        assert!(matches!(
+            run("RegExp.escape(5)"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+        assert_eq!(
+            text(
+                "/(a)(b)/d.exec('ab').indices[1][0] === 0 && /(a)(b)/d.exec('ab').indices[2][1] === 2 ? 'y' : 'n'"
+            ),
+            "y"
+        );
+    }
+
+    #[test]
+    fn unicode_and_backrefs() {
+        assert!(bool("/\\u{1F600}/u.test('\\u{1F600}')"));
+        assert!(bool("/(a|b)\\1/.test('aa')"));
+        assert!(!bool("/(a|b)\\1/.test('ab')"));
+        assert!(bool("/(?<w>ab)\\k<w>/.test('abab')"));
+        assert!(!bool("/(?<w>ab)\\k<w>/.test('abcd')"));
+        assert_eq!(text("/((a)|(ab))((c)|(bc))/.exec('abc')[0]"), "abc");
+        assert_eq!(
+            run("/((a)|(ab))((c)|(bc))/.exec('abc')[3]")
+                .unwrap()
+                .to_string(),
+            "undefined"
+        );
+        assert!(bool("/(?<=a)b/.test('ab')"));
+        assert!(!bool("/(?<!a)b/.test('ab')"));
+        assert_eq!(text("'aaa'.match(/a+/g).length === 1 ? 'y' : 'n'"), "y");
+    }
+}

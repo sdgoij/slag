@@ -1466,6 +1466,31 @@ brute-force reference for the subset without backreferences.
 **Exit criteria:** `built-ins/RegExp` + regexp-heavy `language` tests pass at a high rate; matcher
 never panics under fuzzing.
 
+**Status (complete):** the `regexp` crate implements the full pattern grammar — `u`/`v` set
+operations (`[a&&b]`, `[a--b]`, `\q{…}`), named groups, backreferences (`\1`, `\k<name>`),
+fixed-length lookbehind, inline modifiers `(?ims-ims:…)`, `/p` property escapes — and a
+backtracking matcher with a capture undo-log (17 crate tests). The matcher terminates on
+zero-width repeats: a quantified atom that matched the empty string used to recurse forever
+(`/(?:)*/`-style patterns overflowed the stack); a zero-progress iteration now ends the loop
+once `min` is satisfied, with a regression test covering greedy/lazy/bounded cases.
+
+- **unicode crate**: `simple_case_fold` (with `İ→i` fixup), `non_unicode_canonicalize`,
+  `general_category`/`script`/`script_extensions`/`binary_property` (via
+  `unicode-properties` 0.1.4 and `unicode-script` 0.5.8 from the offline cargo cache).
+- **runtime** (`builtins/regexp.rs`): `%RegExp%` constructor (call/construct overloading),
+  `exec` (the full lastIndex protocol incl. `advance_string_index` and `d`-flag indices
+  arrays), `test`, `toString`/`source` (escape_source), the nine flag accessors, `@@match`/
+  `@@matchAll`/`@@search`/`@@split`/`@@replace` (full GetSubstitution), the
+  `%RegExpStringIteratorPrototype%`, and `RegExp.escape`. 8 tests. `String.prototype.match`/
+  `matchAll`/`search` now construct RegExps via `%RegExp%`, and regexp literals evaluate
+  through `RegExpCreate`.
+
+**test262 fixtures:** `built-ins/RegExp` scanner run — **255 of 488 files pass** (4 skip on
+`isConstructor.js`/`propertyHelper.js`/`compareArray.js` harness includes; 229 fail on
+engine gaps like property descriptors and species), registered one `#[test]` each via the
+flat scanner. The workspace now runs **1251 tests** (732 of them test262 fixtures) with fmt
+and clippy (`-D warnings`) clean.
+
 ---
 
 ### Phase 12 — Indexed collections: Array and TypedArray

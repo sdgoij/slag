@@ -104,6 +104,14 @@ pub struct Agent {
     /// [[DateValue]] of Date instances, keyed by object identity (spec
     /// 21.4.3: ms since the epoch).
     pub date_data: std::collections::HashMap<u64, f64>,
+    /// The RegExp internal state ([[OriginalSource]], [[OriginalFlags]],
+    /// [[RegExpRecord]], [[RegExpMatcher]]) of RegExp instances, keyed by
+    /// object identity (spec 22.2.5).
+    pub regexp_data: std::collections::HashMap<u64, crate::builtins::regexp::RegExpState>,
+    /// [[IteratingRegExp]], [[IteratedString]], [[Global]], [[Unicode]], and
+    /// [[Done]] of RegExp String iterators (spec 22.2.6).
+    pub regexp_string_iter_data:
+        std::collections::HashMap<u64, (Value, crux::string::JsString, bool, bool, bool)>,
     /// [[IteratedString]] and [[StringIteratorNextIndex]] of String iterators,
     /// keyed by object identity (spec 22.1.5: the iterator's internal slots).
     pub string_iter_data: std::collections::HashMap<u64, (Option<crux::string::JsString>, u64)>,
@@ -157,6 +165,8 @@ impl Agent {
             number_data: std::collections::HashMap::new(),
             bigint_data: std::collections::HashMap::new(),
             date_data: std::collections::HashMap::new(),
+            regexp_data: std::collections::HashMap::new(),
+            regexp_string_iter_data: std::collections::HashMap::new(),
             string_iter_data: std::collections::HashMap::new(),
             error_data: std::collections::HashSet::new(),
             weak_ref_targets: std::collections::HashMap::new(),

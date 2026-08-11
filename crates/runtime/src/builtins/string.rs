@@ -473,8 +473,11 @@ fn match_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     {
         return crate::function::call(agent, &matcher, regexp, std::slice::from_ref(this));
     }
-    to_string(this)?;
-    Err(reg_exp_missing())
+    let s = to_string(this)?;
+    let rx = regexp_create(agent, &regexp, None)?;
+    let matcher = crate::expr::get_method(agent, &rx, "@@match")?
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "RegExp has no @@match".into()))?;
+    crate::function::call(agent, &matcher, rx, &[Value::String(Handle::new(s))])
 }
 
 /// spec 22.1.3.13 String.prototype.matchAll: `@@matchAll` delegation with the
@@ -503,8 +506,11 @@ fn match_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, J
             return crate::function::call(agent, &matcher, regexp, std::slice::from_ref(this));
         }
     }
-    to_string(this)?;
-    Err(reg_exp_missing())
+    let s = to_string(this)?;
+    let rx = regexp_create(agent, &regexp, Some("g"))?;
+    let matcher = crate::expr::get_method(agent, &rx, "@@matchAll")?
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "RegExp has no @@matchAll".into()))?;
+    crate::function::call(agent, &matcher, rx, &[Value::String(Handle::new(s))])
 }
 
 /// spec 22.1.3.17 String.prototype.normalize.
@@ -793,8 +799,11 @@ fn search(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
     {
         return crate::function::call(agent, &searcher, regexp, std::slice::from_ref(this));
     }
-    to_string(this)?;
-    Err(reg_exp_missing())
+    let s = to_string(this)?;
+    let rx = regexp_create(agent, &regexp, None)?;
+    let searcher = crate::expr::get_method(agent, &rx, "@@search")?
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "RegExp has no @@search".into()))?;
+    crate::function::call(agent, &searcher, rx, &[Value::String(Handle::new(s))])
 }
 
 /// spec 22.1.3.25 String.prototype.slice.
@@ -1233,9 +1242,14 @@ fn get_substitution(
     Ok(JsString::from_utf16(&result))
 }
 
-/// IsRegExp (spec 7.2.9): an object with a truthy `@@match` property; the
-/// `[[RegExpMatcher]]` slot check joins with the RegExp builtin (Phase 11).
-fn is_regexp(agent: &mut Agent, value: &Value) -> Result<bool, JsError> {
+/// IsRegExp (spec 7.2.9): an object with a [[RegExpMatcher]] slot or a
+/// truthy `@@match` property.
+pub(crate) fn is_regexp(agent: &mut Agent, value: &Value) -> Result<bool, JsError> {
+    if let Value::Object(obj) = value
+        && agent.regexp_data.contains_key(&obj.id())
+    {
+        return Ok(true);
+    }
     if !matches!(value, Value::Object(_) | Value::Function(_)) {
         return Ok(false);
     }
@@ -1247,17 +1261,66 @@ fn is_regexp(agent: &mut Agent, value: &Value) -> Result<bool, JsError> {
     Ok(crux::convert::to_boolean(&matcher))
 }
 
+/// The `GetSubstitution` variant used by `RegExp.prototype[@@replace]`: the
+/// captures are language values (converted here) and the named captures are
+/// an object or `undefined`.
+pub(crate) fn get_substitution_public(
+    agent: &mut Agent,
+    matched: &JsString,
+    string: &JsString,
+    position: usize,
+    captures: &[Value],
+    named_captures: Option<Value>,
+    template: &JsString,
+) -> Result<JsString, JsError> {
+    let capture_strings: Vec<Option<JsString>> = captures
+        .iter()
+        .map(|c| match c {
+            Value::Undefined => Ok(None),
+            other => Ok(Some(to_string(other)?)),
+        })
+        .collect::<Result<Vec<_>, JsError>>()?;
+    let named = match named_captures {
+        Some(Value::Object(obj)) => Some(obj),
+        _ => None,
+    };
+    get_substitution(
+        agent,
+        matched,
+        string,
+        position,
+        &capture_strings,
+        named.as_ref(),
+        template,
+    )
+}
+
+/// RegExpCreate (spec 22.2.4.6): construct via `%RegExp%` with the given
+/// pattern and flags.
+fn regexp_create(
+    agent: &mut Agent,
+    pattern: &Value,
+    flags: Option<&str>,
+) -> Result<Value, JsError> {
+    let realm = agent.current_realm()?;
+    let ctor = realm
+        .intrinsics
+        .get("%RegExp%")
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "%RegExp% is not defined".into()))?;
+    let args: Vec<Value> = match flags {
+        Some(flags) => vec![
+            pattern.clone(),
+            Value::String(Handle::new(JsString::from_utf8(flags))),
+        ],
+        None => vec![pattern.clone()],
+    };
+    crate::function::construct(agent, &ctor, &args, &ctor)
+}
+
 fn regexp_argument_error(method: &str) -> JsError {
     JsError::new(
         ErrorKind::TypeError,
         format!("First argument to String.prototype.{method} must not be a regular expression"),
-    )
-}
-
-fn reg_exp_missing() -> JsError {
-    JsError::new(
-        ErrorKind::TypeError,
-        "RegExp is not available yet (Phase 11)".into(),
     )
 }
 

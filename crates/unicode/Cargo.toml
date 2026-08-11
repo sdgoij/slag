@@ -7,3 +7,5 @@ license.workspace = true
 [dependencies]
 unicode-id = "0.3"
 unicode-normalization = "0.1.25"
+unicode-properties = "0.1.4"
+unicode-script = "0.5.8"
