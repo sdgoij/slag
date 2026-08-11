@@ -52,8 +52,16 @@ assert.throws = function (expectedErrorConstructor, func) {
     /// `assert.compareArray` (real assert.js), the `$262` host object with
     /// `detachArrayBuffer` (detaches through `ArrayBuffer.prototype.transfer`)
     /// and `evalScript`, the `$DETACHBUFFER` helper of `detachArrayBuffer.js`,
-    /// and the common `verifyProperty`-family of `propertyHelper.js`.
+    /// and a throwable `Test262Error` (the harness include files call it
+    /// without `new`, e.g. `throw Test262Error("...")` in testTypedArray.js).
+    /// The `verifyProperty`-family comes from the real propertyHelper.js when
+    /// included.
     const HARNESS_PRELUDE: &str = r#"
+Test262Error = function (message) {
+  var err = { name: "Test262Error", message: message };
+  err.constructor = Test262Error;
+  return err;
+};
 assert.compareArray = function (actual, expected) {
   if (actual === expected) return;
   if (actual.length !== expected.length) {
@@ -3576,1694 +3584,446 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
         "Set/Symbol.species/symbol-species.js"
     );
     test262_builtin_fixture!(Set_valid_values, "Set/valid-values.js");
-    test262_builtin_fixture!(WeakMap_constructor, "WeakMap/constructor.js");
-    test262_builtin_fixture!(WeakMap_empty_iterable, "WeakMap/empty-iterable.js");
-    test262_builtin_fixture!(
-        WeakMap_get_set_method_failure,
-        "WeakMap/get-set-method-failure.js"
-    );
-    test262_builtin_fixture!(WeakMap_iterable_failure, "WeakMap/iterable-failure.js");
-    test262_builtin_fixture!(
-        WeakMap_iterable_with_object_keys,
-        "WeakMap/iterable-with-object-keys.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_iterable_with_symbol_keys,
-        "WeakMap/iterable-with-symbol-keys.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_iterator_close_after_set_failure,
-        "WeakMap/iterator-close-after-set-failure.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_iterator_item_first_entry_returns_abrupt,
-        "WeakMap/iterator-item-first-entry-returns-abrupt.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_iterator_item_second_entry_returns_abrupt,
-        "WeakMap/iterator-item-second-entry-returns-abrupt.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_iterator_items_are_not_object_close_iterator,
-        "WeakMap/iterator-items-are-not-object-close-iterator.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_iterator_items_keys_cannot_be_held_weakly,
-        "WeakMap/iterator-items-keys-cannot-be-held-weakly.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_iterator_next_failure,
-        "WeakMap/iterator-next-failure.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_iterator_value_failure,
-        "WeakMap/iterator-value-failure.js"
-    );
-    test262_builtin_fixture!(WeakMap_no_iterable, "WeakMap/no-iterable.js");
-    test262_builtin_fixture!(
-        WeakMap_properties_of_map_instances,
-        "WeakMap/properties-of-map-instances.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_properties_of_the_weakmap_prototype_object,
-        "WeakMap/properties-of-the-weakmap-prototype-object.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_delete_delete_entry_with_object_key_initial_iterable,
-        "WeakMap/prototype/delete/delete-entry-with-object-key-initial-iterable.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_delete_delete_entry_with_object_key,
-        "WeakMap/prototype/delete/delete-entry-with-object-key.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_delete_delete_entry_with_symbol_key_initial_iterable,
-        "WeakMap/prototype/delete/delete-entry-with-symbol-key-initial-iterable.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_delete_delete_entry_with_symbol_key,
-        "WeakMap/prototype/delete/delete-entry-with-symbol-key.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_delete_does_not_have_weakmapdata_internal_slot_array,
-        "WeakMap/prototype/delete/does-not-have-weakmapdata-internal-slot-array.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_delete_does_not_have_weakmapdata_internal_slot_map,
-        "WeakMap/prototype/delete/does-not-have-weakmapdata-internal-slot-map.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_delete_does_not_have_weakmapdata_internal_slot_object,
-        "WeakMap/prototype/delete/does-not-have-weakmapdata-internal-slot-object.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_delete_does_not_have_weakmapdata_internal_slot_set,
-        "WeakMap/prototype/delete/does-not-have-weakmapdata-internal-slot-set.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_delete_does_not_have_weakmapdata_internal_slot_weakmap_prototype,
-        "WeakMap/prototype/delete/does-not-have-weakmapdata-internal-slot-weakmap-prototype.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_delete_returns_false_if_key_cannot_be_held_weakly,
-        "WeakMap/prototype/delete/returns-false-if-key-cannot-be-held-weakly.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_delete_returns_false_when_object_key_not_present,
-        "WeakMap/prototype/delete/returns-false-when-object-key-not-present.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_delete_returns_false_when_symbol_key_not_present,
-        "WeakMap/prototype/delete/returns-false-when-symbol-key-not-present.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_delete_this_not_object_throw_boolean,
-        "WeakMap/prototype/delete/this-not-object-throw-boolean.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_delete_this_not_object_throw_null,
-        "WeakMap/prototype/delete/this-not-object-throw-null.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_delete_this_not_object_throw_number,
-        "WeakMap/prototype/delete/this-not-object-throw-number.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_delete_this_not_object_throw_string,
-        "WeakMap/prototype/delete/this-not-object-throw-string.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_delete_this_not_object_throw_symbol,
-        "WeakMap/prototype/delete/this-not-object-throw-symbol.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_delete_this_not_object_throw_undefined,
-        "WeakMap/prototype/delete/this-not-object-throw-undefined.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_get_does_not_have_weakmapdata_internal_slot_map,
-        "WeakMap/prototype/get/does-not-have-weakmapdata-internal-slot-map.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_get_does_not_have_weakmapdata_internal_slot_set,
-        "WeakMap/prototype/get/does-not-have-weakmapdata-internal-slot-set.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_get_does_not_have_weakmapdata_internal_slot,
-        "WeakMap/prototype/get/does-not-have-weakmapdata-internal-slot.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_get_returns_undefined_if_key_cannot_be_held_weakly,
-        "WeakMap/prototype/get/returns-undefined-if-key-cannot-be-held-weakly.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_get_returns_undefined_with_object_key,
-        "WeakMap/prototype/get/returns-undefined-with-object-key.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_get_returns_undefined_with_symbol_key,
-        "WeakMap/prototype/get/returns-undefined-with-symbol-key.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_get_returns_value_with_object_key,
-        "WeakMap/prototype/get/returns-value-with-object-key.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_get_returns_value_with_symbol_key,
-        "WeakMap/prototype/get/returns-value-with-symbol-key.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_get_this_not_object_throw,
-        "WeakMap/prototype/get/this-not-object-throw.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsert_adds_object_element,
-        "WeakMap/prototype/getOrInsert/adds-object-element.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsert_adds_symbol_element,
-        "WeakMap/prototype/getOrInsert/adds-symbol-element.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsert_does_not_have_weakmapdata_internal_slot_array,
-        "WeakMap/prototype/getOrInsert/does-not-have-weakmapdata-internal-slot-array.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsert_does_not_have_weakmapdata_internal_slot_map,
-        "WeakMap/prototype/getOrInsert/does-not-have-weakmapdata-internal-slot-map.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsert_does_not_have_weakmapdata_internal_slot_object,
-        "WeakMap/prototype/getOrInsert/does-not-have-weakmapdata-internal-slot-object.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsert_does_not_have_weakmapdata_internal_slot_set,
-        "WeakMap/prototype/getOrInsert/does-not-have-weakmapdata-internal-slot-set.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsert_does_not_have_weakmapdata_internal_slot_weakmap_prototype,
-        "WeakMap/prototype/getOrInsert/does-not-have-weakmapdata-internal-slot-weakmap-prototype.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsert_returns_value_if_key_is_not_present_object_key,
-        "WeakMap/prototype/getOrInsert/returns-value-if-key-is-not-present-object-key.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsert_returns_value_if_key_is_not_present_symbol_key,
-        "WeakMap/prototype/getOrInsert/returns-value-if-key-is-not-present-symbol-key.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsert_returns_value_if_key_is_present_object_key,
-        "WeakMap/prototype/getOrInsert/returns-value-if-key-is-present-object-key.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsert_returns_value_if_key_is_present_symbol_key,
-        "WeakMap/prototype/getOrInsert/returns-value-if-key-is-present-symbol-key.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsert_this_not_object_throw,
-        "WeakMap/prototype/getOrInsert/this-not-object-throw.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsert_throw_if_key_cannot_be_held_weakly,
-        "WeakMap/prototype/getOrInsert/throw-if-key-cannot-be-held-weakly.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsertComputed_adds_object_element,
-        "WeakMap/prototype/getOrInsertComputed/adds-object-element.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsertComputed_adds_symbol_element,
-        "WeakMap/prototype/getOrInsertComputed/adds-symbol-element.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsertComputed_adds_value_different_callbackfn,
-        "WeakMap/prototype/getOrInsertComputed/adds-value-different-callbackfn.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsertComputed_callbackfn_throws,
-        "WeakMap/prototype/getOrInsertComputed/callbackfn-throws.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsertComputed_check_callback_fn_args,
-        "WeakMap/prototype/getOrInsertComputed/check-callback-fn-args.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsertComputed_check_state_after_callback_fn_throws,
-        "WeakMap/prototype/getOrInsertComputed/check-state-after-callback-fn-throws.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsertComputed_does_not_evaluate_callbackfn_if_key_present,
-        "WeakMap/prototype/getOrInsertComputed/does-not-evaluate-callbackfn-if-key-present.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsertComputed_does_not_have_weakmapdata_internal_slot_array,
-        "WeakMap/prototype/getOrInsertComputed/does-not-have-weakmapdata-internal-slot-array.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsertComputed_does_not_have_weakmapdata_internal_slot_map,
-        "WeakMap/prototype/getOrInsertComputed/does-not-have-weakmapdata-internal-slot-map.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsertComputed_does_not_have_weakmapdata_internal_slot_object,
-        "WeakMap/prototype/getOrInsertComputed/does-not-have-weakmapdata-internal-slot-object.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsertComputed_does_not_have_weakmapdata_internal_slot_set,
-        "WeakMap/prototype/getOrInsertComputed/does-not-have-weakmapdata-internal-slot-set.js"
-    );
-    test262_builtin_fixture!(WeakMap_prototype_getOrInsertComputed_does_not_have_weakmapdata_internal_slot_weakmap_prototype, "WeakMap/prototype/getOrInsertComputed/does-not-have-weakmapdata-internal-slot-weakmap-prototype.js");
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsertComputed_not_a_function_callbackfn_throws,
-        "WeakMap/prototype/getOrInsertComputed/not-a-function-callbackfn-throws.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsertComputed_overwrites_mutation_from_callbackfn,
-        "WeakMap/prototype/getOrInsertComputed/overwrites-mutation-from-callbackfn.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsertComputed_returns_value_if_key_is_not_present_object_key,
-        "WeakMap/prototype/getOrInsertComputed/returns-value-if-key-is-not-present-object-key.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsertComputed_returns_value_if_key_is_not_present_symbol_key,
-        "WeakMap/prototype/getOrInsertComputed/returns-value-if-key-is-not-present-symbol-key.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsertComputed_returns_value_if_key_is_present_object_key,
-        "WeakMap/prototype/getOrInsertComputed/returns-value-if-key-is-present-object-key.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsertComputed_returns_value_if_key_is_present_symbol_key,
-        "WeakMap/prototype/getOrInsertComputed/returns-value-if-key-is-present-symbol-key.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_getOrInsertComputed_this_not_object_throw,
-        "WeakMap/prototype/getOrInsertComputed/this-not-object-throw.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_has_does_not_have_weakmapdata_internal_slot_array,
-        "WeakMap/prototype/has/does-not-have-weakmapdata-internal-slot-array.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_has_does_not_have_weakmapdata_internal_slot_map,
-        "WeakMap/prototype/has/does-not-have-weakmapdata-internal-slot-map.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_has_does_not_have_weakmapdata_internal_slot_object,
-        "WeakMap/prototype/has/does-not-have-weakmapdata-internal-slot-object.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_has_does_not_have_weakmapdata_internal_slot_set,
-        "WeakMap/prototype/has/does-not-have-weakmapdata-internal-slot-set.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_has_does_not_have_weakmapdata_internal_slot_weakmap_prototype,
-        "WeakMap/prototype/has/does-not-have-weakmapdata-internal-slot-weakmap-prototype.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_has_returns_false_when_key_cannot_be_held_weakly,
-        "WeakMap/prototype/has/returns-false-when-key-cannot-be-held-weakly.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_has_returns_false_when_object_key_not_present,
-        "WeakMap/prototype/has/returns-false-when-object-key-not-present.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_has_returns_false_when_symbol_key_not_present,
-        "WeakMap/prototype/has/returns-false-when-symbol-key-not-present.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_has_returns_true_when_object_key_present,
-        "WeakMap/prototype/has/returns-true-when-object-key-present.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_has_returns_true_when_symbol_key_present,
-        "WeakMap/prototype/has/returns-true-when-symbol-key-present.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_has_this_not_object_throw_boolean,
-        "WeakMap/prototype/has/this-not-object-throw-boolean.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_has_this_not_object_throw_null,
-        "WeakMap/prototype/has/this-not-object-throw-null.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_has_this_not_object_throw_number,
-        "WeakMap/prototype/has/this-not-object-throw-number.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_has_this_not_object_throw_string,
-        "WeakMap/prototype/has/this-not-object-throw-string.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_has_this_not_object_throw_symbol,
-        "WeakMap/prototype/has/this-not-object-throw-symbol.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_has_this_not_object_throw_undefined,
-        "WeakMap/prototype/has/this-not-object-throw-undefined.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_set_adds_object_element,
-        "WeakMap/prototype/set/adds-object-element.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_set_adds_symbol_element,
-        "WeakMap/prototype/set/adds-symbol-element.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_set_does_not_have_weakmapdata_internal_slot_array,
-        "WeakMap/prototype/set/does-not-have-weakmapdata-internal-slot-array.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_set_does_not_have_weakmapdata_internal_slot_map,
-        "WeakMap/prototype/set/does-not-have-weakmapdata-internal-slot-map.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_set_does_not_have_weakmapdata_internal_slot_object,
-        "WeakMap/prototype/set/does-not-have-weakmapdata-internal-slot-object.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_set_does_not_have_weakmapdata_internal_slot_set,
-        "WeakMap/prototype/set/does-not-have-weakmapdata-internal-slot-set.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_set_does_not_have_weakmapdata_internal_slot_weakmap_prototype,
-        "WeakMap/prototype/set/does-not-have-weakmapdata-internal-slot-weakmap-prototype.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_set_returns_this_when_ignoring_duplicate,
-        "WeakMap/prototype/set/returns-this-when-ignoring-duplicate.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_set_returns_this,
-        "WeakMap/prototype/set/returns-this.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_set_this_not_object_throw_boolean,
-        "WeakMap/prototype/set/this-not-object-throw-boolean.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_set_this_not_object_throw_null,
-        "WeakMap/prototype/set/this-not-object-throw-null.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_set_this_not_object_throw_number,
-        "WeakMap/prototype/set/this-not-object-throw-number.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_set_this_not_object_throw_string,
-        "WeakMap/prototype/set/this-not-object-throw-string.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_set_this_not_object_throw_symbol,
-        "WeakMap/prototype/set/this-not-object-throw-symbol.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_set_this_not_object_throw_undefined,
-        "WeakMap/prototype/set/this-not-object-throw-undefined.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_prototype_set_throw_if_key_cannot_be_held_weakly,
-        "WeakMap/prototype/set/throw-if-key-cannot-be-held-weakly.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_set_not_callable_throws,
-        "WeakMap/set-not-callable-throws.js"
-    );
-    test262_builtin_fixture!(
-        WeakMap_undefined_newtarget,
-        "WeakMap/undefined-newtarget.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_add_not_callable_throws,
-        "WeakSet/add-not-callable-throws.js"
-    );
-    test262_builtin_fixture!(WeakSet_constructor, "WeakSet/constructor.js");
-    test262_builtin_fixture!(WeakSet_empty_iterable, "WeakSet/empty-iterable.js");
-    test262_builtin_fixture!(
-        WeakSet_get_add_method_failure,
-        "WeakSet/get-add-method-failure.js"
-    );
-    test262_builtin_fixture!(WeakSet_iterable_failure, "WeakSet/iterable-failure.js");
-    test262_builtin_fixture!(
-        WeakSet_iterable_with_object_values,
-        "WeakSet/iterable-with-object-values.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_iterator_close_after_add_failure,
-        "WeakSet/iterator-close-after-add-failure.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_iterator_next_failure,
-        "WeakSet/iterator-next-failure.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_iterator_value_failure,
-        "WeakSet/iterator-value-failure.js"
-    );
-    test262_builtin_fixture!(WeakSet_no_iterable, "WeakSet/no-iterable.js");
-    test262_builtin_fixture!(
-        WeakSet_properties_of_the_weakset_prototype_object,
-        "WeakSet/properties-of-the-weakset-prototype-object.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_add_adds_object_element,
-        "WeakSet/prototype/add/adds-object-element.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_add_adds_symbol_element,
-        "WeakSet/prototype/add/adds-symbol-element.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_add_does_not_have_weaksetdata_internal_slot_array,
-        "WeakSet/prototype/add/does-not-have-weaksetdata-internal-slot-array.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_add_does_not_have_weaksetdata_internal_slot_map,
-        "WeakSet/prototype/add/does-not-have-weaksetdata-internal-slot-map.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_add_does_not_have_weaksetdata_internal_slot_object,
-        "WeakSet/prototype/add/does-not-have-weaksetdata-internal-slot-object.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_add_does_not_have_weaksetdata_internal_slot_set,
-        "WeakSet/prototype/add/does-not-have-weaksetdata-internal-slot-set.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_add_does_not_have_weaksetdata_internal_slot_weakset_prototype,
-        "WeakSet/prototype/add/does-not-have-weaksetdata-internal-slot-weakset-prototype.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_add_returns_this_symbol,
-        "WeakSet/prototype/add/returns-this-symbol.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_add_returns_this_when_ignoring_duplicate_symbol,
-        "WeakSet/prototype/add/returns-this-when-ignoring-duplicate-symbol.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_add_returns_this_when_ignoring_duplicate,
-        "WeakSet/prototype/add/returns-this-when-ignoring-duplicate.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_add_returns_this,
-        "WeakSet/prototype/add/returns-this.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_add_this_not_object_throw_boolean,
-        "WeakSet/prototype/add/this-not-object-throw-boolean.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_add_this_not_object_throw_null,
-        "WeakSet/prototype/add/this-not-object-throw-null.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_add_this_not_object_throw_number,
-        "WeakSet/prototype/add/this-not-object-throw-number.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_add_this_not_object_throw_string,
-        "WeakSet/prototype/add/this-not-object-throw-string.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_add_this_not_object_throw_symbol,
-        "WeakSet/prototype/add/this-not-object-throw-symbol.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_add_this_not_object_throw_undefined,
-        "WeakSet/prototype/add/this-not-object-throw-undefined.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_add_throw_when_value_cannot_be_held_weakly,
-        "WeakSet/prototype/add/throw-when-value-cannot-be-held-weakly.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_constructor_weakset_prototype_constructor_intrinsic,
-        "WeakSet/prototype/constructor/weakset-prototype-constructor-intrinsic.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_delete_delete_entry_initial_iterable,
-        "WeakSet/prototype/delete/delete-entry-initial-iterable.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_delete_delete_object_entry,
-        "WeakSet/prototype/delete/delete-object-entry.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_delete_delete_symbol_entry,
-        "WeakSet/prototype/delete/delete-symbol-entry.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_delete_does_not_have_weaksetdata_internal_slot_array,
-        "WeakSet/prototype/delete/does-not-have-weaksetdata-internal-slot-array.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_delete_does_not_have_weaksetdata_internal_slot_map,
-        "WeakSet/prototype/delete/does-not-have-weaksetdata-internal-slot-map.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_delete_does_not_have_weaksetdata_internal_slot_object,
-        "WeakSet/prototype/delete/does-not-have-weaksetdata-internal-slot-object.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_delete_does_not_have_weaksetdata_internal_slot_set,
-        "WeakSet/prototype/delete/does-not-have-weaksetdata-internal-slot-set.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_delete_does_not_have_weaksetdata_internal_slot_weakset_prototype,
-        "WeakSet/prototype/delete/does-not-have-weaksetdata-internal-slot-weakset-prototype.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_delete_returns_false_when_delete_is_noop,
-        "WeakSet/prototype/delete/returns-false-when-delete-is-noop.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_delete_returns_false_when_value_cannot_be_held_weakly,
-        "WeakSet/prototype/delete/returns-false-when-value-cannot-be-held-weakly.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_delete_this_not_object_throw_boolean,
-        "WeakSet/prototype/delete/this-not-object-throw-boolean.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_delete_this_not_object_throw_null,
-        "WeakSet/prototype/delete/this-not-object-throw-null.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_delete_this_not_object_throw_number,
-        "WeakSet/prototype/delete/this-not-object-throw-number.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_delete_this_not_object_throw_string,
-        "WeakSet/prototype/delete/this-not-object-throw-string.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_delete_this_not_object_throw_symbol,
-        "WeakSet/prototype/delete/this-not-object-throw-symbol.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_delete_this_not_object_throw_undefined,
-        "WeakSet/prototype/delete/this-not-object-throw-undefined.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_has_does_not_have_weaksetdata_internal_slot_array,
-        "WeakSet/prototype/has/does-not-have-weaksetdata-internal-slot-array.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_has_does_not_have_weaksetdata_internal_slot_map,
-        "WeakSet/prototype/has/does-not-have-weaksetdata-internal-slot-map.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_has_does_not_have_weaksetdata_internal_slot_object,
-        "WeakSet/prototype/has/does-not-have-weaksetdata-internal-slot-object.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_has_does_not_have_weaksetdata_internal_slot_set,
-        "WeakSet/prototype/has/does-not-have-weaksetdata-internal-slot-set.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_has_does_not_have_weaksetdata_internal_slot_weakset_prototype,
-        "WeakSet/prototype/has/does-not-have-weaksetdata-internal-slot-weakset-prototype.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_has_returns_false_when_object_value_not_present,
-        "WeakSet/prototype/has/returns-false-when-object-value-not-present.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_has_returns_false_when_symbol_value_not_present,
-        "WeakSet/prototype/has/returns-false-when-symbol-value-not-present.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_has_returns_false_when_value_cannot_be_held_weakly,
-        "WeakSet/prototype/has/returns-false-when-value-cannot-be-held-weakly.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_has_returns_true_when_object_value_present,
-        "WeakSet/prototype/has/returns-true-when-object-value-present.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_has_returns_true_when_symbol_value_present,
-        "WeakSet/prototype/has/returns-true-when-symbol-value-present.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_has_this_not_object_throw_boolean,
-        "WeakSet/prototype/has/this-not-object-throw-boolean.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_has_this_not_object_throw_null,
-        "WeakSet/prototype/has/this-not-object-throw-null.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_has_this_not_object_throw_number,
-        "WeakSet/prototype/has/this-not-object-throw-number.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_has_this_not_object_throw_string,
-        "WeakSet/prototype/has/this-not-object-throw-string.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_has_this_not_object_throw_symbol,
-        "WeakSet/prototype/has/this-not-object-throw-symbol.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_prototype_has_this_not_object_throw_undefined,
-        "WeakSet/prototype/has/this-not-object-throw-undefined.js"
-    );
-    test262_builtin_fixture!(
-        WeakSet_undefined_newtarget,
-        "WeakSet/undefined-newtarget.js"
-    );
     // Phase 14 structured-data surface (ArrayBuffer/SharedArrayBuffer/
     // DataView/Atomics/JSON; the list was produced by the scanner, so it is
     // data, not aspiration).
+    test262_builtin_fixture!(Atomics_add_descriptor, "Atomics/add/descriptor.js");
     test262_builtin_fixture!(
-        ArrayBuffer_allocation_limit,
-        "ArrayBuffer/allocation-limit.js"
+        Atomics_add_expected_return_value,
+        "Atomics/add/expected-return-value.js"
     );
-    test262_builtin_fixture!(ArrayBuffer_init_zero, "ArrayBuffer/init-zero.js");
+    test262_builtin_fixture!(Atomics_add_length, "Atomics/add/length.js");
+    test262_builtin_fixture!(Atomics_add_name, "Atomics/add/name.js");
+    test262_builtin_fixture!(Atomics_add_non_views, "Atomics/add/non-views.js");
     test262_builtin_fixture!(
-        ArrayBuffer_is_a_constructor,
-        "ArrayBuffer/is-a-constructor.js"
+        Atomics_add_not_a_constructor,
+        "Atomics/add/not-a-constructor.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_isView_arg_has_no_viewedarraybuffer,
-        "ArrayBuffer/isView/arg-has-no-viewedarraybuffer.js"
+        Atomics_add_validate_arraytype_before_index_coercion,
+        "Atomics/add/validate-arraytype-before-index-coercion.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_isView_arg_is_arraybuffer,
-        "ArrayBuffer/isView/arg-is-arraybuffer.js"
+        Atomics_add_validate_arraytype_before_value_coercion,
+        "Atomics/add/validate-arraytype-before-value-coercion.js"
     );
+    test262_builtin_fixture!(Atomics_and_descriptor, "Atomics/and/descriptor.js");
     test262_builtin_fixture!(
-        ArrayBuffer_isView_arg_is_dataview_buffer,
-        "ArrayBuffer/isView/arg-is-dataview-buffer.js"
+        Atomics_and_expected_return_value,
+        "Atomics/and/expected-return-value.js"
     );
+    test262_builtin_fixture!(Atomics_and_length, "Atomics/and/length.js");
+    test262_builtin_fixture!(Atomics_and_name, "Atomics/and/name.js");
+    test262_builtin_fixture!(Atomics_and_non_views, "Atomics/and/non-views.js");
     test262_builtin_fixture!(
-        ArrayBuffer_isView_arg_is_dataview_constructor,
-        "ArrayBuffer/isView/arg-is-dataview-constructor.js"
+        Atomics_and_not_a_constructor,
+        "Atomics/and/not-a-constructor.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_isView_arg_is_dataview_subclass_instance,
-        "ArrayBuffer/isView/arg-is-dataview-subclass-instance.js"
+        Atomics_and_validate_arraytype_before_index_coercion,
+        "Atomics/and/validate-arraytype-before-index-coercion.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_isView_arg_is_dataview,
-        "ArrayBuffer/isView/arg-is-dataview.js"
+        Atomics_and_validate_arraytype_before_value_coercion,
+        "Atomics/and/validate-arraytype-before-value-coercion.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_isView_arg_is_not_object,
-        "ArrayBuffer/isView/arg-is-not-object.js"
+        Atomics_compareExchange_descriptor,
+        "Atomics/compareExchange/descriptor.js"
     );
-    test262_builtin_fixture!(ArrayBuffer_isView_length, "ArrayBuffer/isView/length.js");
-    test262_builtin_fixture!(ArrayBuffer_isView_name, "ArrayBuffer/isView/name.js");
-    test262_builtin_fixture!(ArrayBuffer_isView_no_arg, "ArrayBuffer/isView/no-arg.js");
     test262_builtin_fixture!(
-        ArrayBuffer_isView_not_a_constructor,
-        "ArrayBuffer/isView/not-a-constructor.js"
+        Atomics_compareExchange_expected_return_value,
+        "Atomics/compareExchange/expected-return-value.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_isView_prop_desc,
-        "ArrayBuffer/isView/prop-desc.js"
+        Atomics_compareExchange_length,
+        "Atomics/compareExchange/length.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_length_is_absent,
-        "ArrayBuffer/length-is-absent.js"
+        Atomics_compareExchange_name,
+        "Atomics/compareExchange/name.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_length_is_too_large_throws,
-        "ArrayBuffer/length-is-too-large-throws.js"
+        Atomics_compareExchange_non_views,
+        "Atomics/compareExchange/non-views.js"
     );
-    test262_builtin_fixture!(ArrayBuffer_length, "ArrayBuffer/length.js");
-    test262_builtin_fixture!(ArrayBuffer_name, "ArrayBuffer/name.js");
     test262_builtin_fixture!(
-        ArrayBuffer_negative_length_throws,
-        "ArrayBuffer/negative-length-throws.js"
+        Atomics_compareExchange_not_a_constructor,
+        "Atomics/compareExchange/not-a-constructor.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_options_maxbytelength_diminuitive,
-        "ArrayBuffer/options-maxbytelength-diminuitive.js"
+        Atomics_compareExchange_validate_arraytype_before_expectedValue_coercion,
+        "Atomics/compareExchange/validate-arraytype-before-expectedValue-coercion.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_options_maxbytelength_excessive,
-        "ArrayBuffer/options-maxbytelength-excessive.js"
+        Atomics_compareExchange_validate_arraytype_before_index_coercion,
+        "Atomics/compareExchange/validate-arraytype-before-index-coercion.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_options_maxbytelength_negative,
-        "ArrayBuffer/options-maxbytelength-negative.js"
+        Atomics_compareExchange_validate_arraytype_before_replacementValue_coercion,
+        "Atomics/compareExchange/validate-arraytype-before-replacementValue-coercion.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_options_maxbytelength_object,
-        "ArrayBuffer/options-maxbytelength-object.js"
+        Atomics_exchange_descriptor,
+        "Atomics/exchange/descriptor.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_options_maxbytelength_poisoned,
-        "ArrayBuffer/options-maxbytelength-poisoned.js"
+        Atomics_exchange_expected_return_value,
+        "Atomics/exchange/expected-return-value.js"
     );
+    test262_builtin_fixture!(Atomics_exchange_length, "Atomics/exchange/length.js");
+    test262_builtin_fixture!(Atomics_exchange_name, "Atomics/exchange/name.js");
+    test262_builtin_fixture!(Atomics_exchange_non_views, "Atomics/exchange/non-views.js");
     test262_builtin_fixture!(
-        ArrayBuffer_options_maxbytelength_undefined,
-        "ArrayBuffer/options-maxbytelength-undefined.js"
+        Atomics_exchange_not_a_constructor,
+        "Atomics/exchange/not-a-constructor.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_options_non_object,
-        "ArrayBuffer/options-non-object.js"
+        Atomics_exchange_validate_arraytype_before_index_coercion,
+        "Atomics/exchange/validate-arraytype-before-index-coercion.js"
     );
-    test262_builtin_fixture!(ArrayBuffer_prop_desc, "ArrayBuffer/prop-desc.js");
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_byteLength_detached_buffer,
-        "ArrayBuffer/prototype/byteLength/detached-buffer.js"
+        Atomics_exchange_validate_arraytype_before_value_coercion,
+        "Atomics/exchange/validate-arraytype-before-value-coercion.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_byteLength_invoked_as_accessor,
-        "ArrayBuffer/prototype/byteLength/invoked-as-accessor.js"
+        Atomics_isLockFree_bigint_expected_return_value,
+        "Atomics/isLockFree/bigint/expected-return-value.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_byteLength_invoked_as_func,
-        "ArrayBuffer/prototype/byteLength/invoked-as-func.js"
+        Atomics_isLockFree_descriptor,
+        "Atomics/isLockFree/descriptor.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_byteLength_length,
-        "ArrayBuffer/prototype/byteLength/length.js"
+        Atomics_isLockFree_expected_return_value,
+        "Atomics/isLockFree/expected-return-value.js"
     );
+    test262_builtin_fixture!(Atomics_isLockFree_length, "Atomics/isLockFree/length.js");
+    test262_builtin_fixture!(Atomics_isLockFree_name, "Atomics/isLockFree/name.js");
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_byteLength_name,
-        "ArrayBuffer/prototype/byteLength/name.js"
+        Atomics_isLockFree_not_a_constructor,
+        "Atomics/isLockFree/not-a-constructor.js"
     );
+    test262_builtin_fixture!(Atomics_load_descriptor, "Atomics/load/descriptor.js");
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_byteLength_prop_desc,
-        "ArrayBuffer/prototype/byteLength/prop-desc.js"
+        Atomics_load_expected_return_value,
+        "Atomics/load/expected-return-value.js"
     );
+    test262_builtin_fixture!(Atomics_load_length, "Atomics/load/length.js");
+    test262_builtin_fixture!(Atomics_load_name, "Atomics/load/name.js");
+    test262_builtin_fixture!(Atomics_load_non_views, "Atomics/load/non-views.js");
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_byteLength_return_bytelength,
-        "ArrayBuffer/prototype/byteLength/return-bytelength.js"
+        Atomics_load_not_a_constructor,
+        "Atomics/load/not-a-constructor.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_byteLength_this_has_no_typedarrayname_internal,
-        "ArrayBuffer/prototype/byteLength/this-has-no-typedarrayname-internal.js"
+        Atomics_load_validate_arraytype_before_index_coercion,
+        "Atomics/load/validate-arraytype-before-index-coercion.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_byteLength_this_is_not_object,
-        "ArrayBuffer/prototype/byteLength/this-is-not-object.js"
+        Atomics_notify_bigint_non_bigint64_typedarray_throws,
+        "Atomics/notify/bigint/non-bigint64-typedarray-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_byteLength_this_is_sharedarraybuffer,
-        "ArrayBuffer/prototype/byteLength/this-is-sharedarraybuffer.js"
+        Atomics_notify_bigint_non_shared_bufferdata_non_shared_int_views_throws,
+        "Atomics/notify/bigint/non-shared-bufferdata-non-shared-int-views-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_constructor,
-        "ArrayBuffer/prototype/constructor.js"
+        Atomics_notify_bigint_null_bufferdata_throws,
+        "Atomics/notify/bigint/null-bufferdata-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_detached_detached_buffer_resizable,
-        "ArrayBuffer/prototype/detached/detached-buffer-resizable.js"
+        Atomics_notify_count_boundary_cases,
+        "Atomics/notify/count-boundary-cases.js"
     );
+    test262_builtin_fixture!(Atomics_notify_descriptor, "Atomics/notify/descriptor.js");
+    test262_builtin_fixture!(Atomics_notify_length, "Atomics/notify/length.js");
+    test262_builtin_fixture!(Atomics_notify_name, "Atomics/notify/name.js");
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_detached_detached_buffer,
-        "ArrayBuffer/prototype/detached/detached-buffer.js"
+        Atomics_notify_negative_index_throws,
+        "Atomics/notify/negative-index-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_detached_invoked_as_accessor,
-        "ArrayBuffer/prototype/detached/invoked-as-accessor.js"
+        Atomics_notify_non_int32_typedarray_throws,
+        "Atomics/notify/non-int32-typedarray-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_detached_invoked_as_func,
-        "ArrayBuffer/prototype/detached/invoked-as-func.js"
+        Atomics_notify_non_shared_bufferdata_non_shared_int_views_throws,
+        "Atomics/notify/non-shared-bufferdata-non-shared-int-views-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_detached_length,
-        "ArrayBuffer/prototype/detached/length.js"
+        Atomics_notify_non_shared_int_views,
+        "Atomics/notify/non-shared-int-views.js"
     );
+    test262_builtin_fixture!(Atomics_notify_non_views, "Atomics/notify/non-views.js");
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_detached_name,
-        "ArrayBuffer/prototype/detached/name.js"
+        Atomics_notify_not_a_constructor,
+        "Atomics/notify/not-a-constructor.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_detached_prop_desc,
-        "ArrayBuffer/prototype/detached/prop-desc.js"
+        Atomics_notify_not_a_typedarray_throws,
+        "Atomics/notify/not-a-typedarray-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_detached_this_has_no_arraybufferdata_internal,
-        "ArrayBuffer/prototype/detached/this-has-no-arraybufferdata-internal.js"
+        Atomics_notify_not_an_object_throws,
+        "Atomics/notify/not-an-object-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_detached_this_is_not_object,
-        "ArrayBuffer/prototype/detached/this-is-not-object.js"
+        Atomics_notify_null_bufferdata_throws,
+        "Atomics/notify/null-bufferdata-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_detached_this_is_sharedarraybuffer_resizable,
-        "ArrayBuffer/prototype/detached/this-is-sharedarraybuffer-resizable.js"
+        Atomics_notify_out_of_range_index_throws,
+        "Atomics/notify/out-of-range-index-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_detached_this_is_sharedarraybuffer,
-        "ArrayBuffer/prototype/detached/this-is-sharedarraybuffer.js"
+        Atomics_notify_validate_arraytype_before_count_coercion,
+        "Atomics/notify/validate-arraytype-before-count-coercion.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_maxByteLength_detached_buffer,
-        "ArrayBuffer/prototype/maxByteLength/detached-buffer.js"
+        Atomics_notify_validate_arraytype_before_index_coercion,
+        "Atomics/notify/validate-arraytype-before-index-coercion.js"
     );
+    test262_builtin_fixture!(Atomics_or_descriptor, "Atomics/or/descriptor.js");
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_maxByteLength_invoked_as_accessor,
-        "ArrayBuffer/prototype/maxByteLength/invoked-as-accessor.js"
+        Atomics_or_expected_return_value,
+        "Atomics/or/expected-return-value.js"
     );
+    test262_builtin_fixture!(Atomics_or_length, "Atomics/or/length.js");
+    test262_builtin_fixture!(Atomics_or_name, "Atomics/or/name.js");
+    test262_builtin_fixture!(Atomics_or_non_views, "Atomics/or/non-views.js");
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_maxByteLength_invoked_as_func,
-        "ArrayBuffer/prototype/maxByteLength/invoked-as-func.js"
+        Atomics_or_not_a_constructor,
+        "Atomics/or/not-a-constructor.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_maxByteLength_length,
-        "ArrayBuffer/prototype/maxByteLength/length.js"
+        Atomics_or_validate_arraytype_before_index_coercion,
+        "Atomics/or/validate-arraytype-before-index-coercion.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_maxByteLength_name,
-        "ArrayBuffer/prototype/maxByteLength/name.js"
+        Atomics_or_validate_arraytype_before_value_coercion,
+        "Atomics/or/validate-arraytype-before-value-coercion.js"
     );
+    test262_builtin_fixture!(Atomics_pause_descriptor, "Atomics/pause/descriptor.js");
+    test262_builtin_fixture!(Atomics_pause_name, "Atomics/pause/name.js");
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_maxByteLength_prop_desc,
-        "ArrayBuffer/prototype/maxByteLength/prop-desc.js"
+        Atomics_pause_not_a_constructor,
+        "Atomics/pause/not-a-constructor.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_maxByteLength_return_maxbytelength_non_resizable,
-        "ArrayBuffer/prototype/maxByteLength/return-maxbytelength-non-resizable.js"
+        Atomics_pause_returns_undefined,
+        "Atomics/pause/returns-undefined.js"
     );
+    test262_builtin_fixture!(Atomics_prop_desc, "Atomics/prop-desc.js");
+    test262_builtin_fixture!(Atomics_proto, "Atomics/proto.js");
+    test262_builtin_fixture!(Atomics_store_descriptor, "Atomics/store/descriptor.js");
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_maxByteLength_return_maxbytelength_resizable,
-        "ArrayBuffer/prototype/maxByteLength/return-maxbytelength-resizable.js"
+        Atomics_store_expected_return_value,
+        "Atomics/store/expected-return-value.js"
     );
+    test262_builtin_fixture!(Atomics_store_length, "Atomics/store/length.js");
+    test262_builtin_fixture!(Atomics_store_name, "Atomics/store/name.js");
+    test262_builtin_fixture!(Atomics_store_non_views, "Atomics/store/non-views.js");
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_maxByteLength_this_has_no_arraybufferdata_internal,
-        "ArrayBuffer/prototype/maxByteLength/this-has-no-arraybufferdata-internal.js"
+        Atomics_store_not_a_constructor,
+        "Atomics/store/not-a-constructor.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_maxByteLength_this_is_not_object,
-        "ArrayBuffer/prototype/maxByteLength/this-is-not-object.js"
+        Atomics_store_validate_arraytype_before_index_coercion,
+        "Atomics/store/validate-arraytype-before-index-coercion.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_maxByteLength_this_is_sharedarraybuffer,
-        "ArrayBuffer/prototype/maxByteLength/this-is-sharedarraybuffer.js"
+        Atomics_store_validate_arraytype_before_value_coercion,
+        "Atomics/store/validate-arraytype-before-value-coercion.js"
     );
+    test262_builtin_fixture!(Atomics_sub_descriptor, "Atomics/sub/descriptor.js");
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resizable_detached_buffer,
-        "ArrayBuffer/prototype/resizable/detached-buffer.js"
+        Atomics_sub_expected_return_value,
+        "Atomics/sub/expected-return-value.js"
     );
+    test262_builtin_fixture!(Atomics_sub_length, "Atomics/sub/length.js");
+    test262_builtin_fixture!(Atomics_sub_name, "Atomics/sub/name.js");
+    test262_builtin_fixture!(Atomics_sub_non_views, "Atomics/sub/non-views.js");
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resizable_invoked_as_accessor,
-        "ArrayBuffer/prototype/resizable/invoked-as-accessor.js"
+        Atomics_sub_not_a_constructor,
+        "Atomics/sub/not-a-constructor.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resizable_invoked_as_func,
-        "ArrayBuffer/prototype/resizable/invoked-as-func.js"
+        Atomics_sub_validate_arraytype_before_index_coercion,
+        "Atomics/sub/validate-arraytype-before-index-coercion.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resizable_length,
-        "ArrayBuffer/prototype/resizable/length.js"
+        Atomics_sub_validate_arraytype_before_value_coercion,
+        "Atomics/sub/validate-arraytype-before-value-coercion.js"
     );
+    test262_builtin_fixture!(Atomics_Symbol_toStringTag, "Atomics/Symbol.toStringTag.js");
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resizable_name,
-        "ArrayBuffer/prototype/resizable/name.js"
+        Atomics_wait_bigint_cannot_suspend_throws,
+        "Atomics/wait/bigint/cannot-suspend-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resizable_prop_desc,
-        "ArrayBuffer/prototype/resizable/prop-desc.js"
+        Atomics_wait_bigint_negative_index_throws,
+        "Atomics/wait/bigint/negative-index-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resizable_return_resizable,
-        "ArrayBuffer/prototype/resizable/return-resizable.js"
+        Atomics_wait_bigint_non_bigint64_typedarray_throws,
+        "Atomics/wait/bigint/non-bigint64-typedarray-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resizable_this_has_no_arraybufferdata_internal,
-        "ArrayBuffer/prototype/resizable/this-has-no-arraybufferdata-internal.js"
+        Atomics_wait_bigint_non_shared_bufferdata_throws,
+        "Atomics/wait/bigint/non-shared-bufferdata-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resizable_this_is_not_object,
-        "ArrayBuffer/prototype/resizable/this-is-not-object.js"
+        Atomics_wait_bigint_null_bufferdata_throws,
+        "Atomics/wait/bigint/null-bufferdata-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resizable_this_is_sharedarraybuffer,
-        "ArrayBuffer/prototype/resizable/this-is-sharedarraybuffer.js"
+        Atomics_wait_bigint_out_of_range_index_throws,
+        "Atomics/wait/bigint/out-of-range-index-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resize_descriptor,
-        "ArrayBuffer/prototype/resize/descriptor.js"
+        Atomics_wait_cannot_suspend_throws,
+        "Atomics/wait/cannot-suspend-throws.js"
     );
+    test262_builtin_fixture!(Atomics_wait_descriptor, "Atomics/wait/descriptor.js");
+    test262_builtin_fixture!(Atomics_wait_length, "Atomics/wait/length.js");
+    test262_builtin_fixture!(Atomics_wait_name, "Atomics/wait/name.js");
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resize_extensible,
-        "ArrayBuffer/prototype/resize/extensible.js"
+        Atomics_wait_negative_index_throws,
+        "Atomics/wait/negative-index-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resize_length,
-        "ArrayBuffer/prototype/resize/length.js"
+        Atomics_wait_non_int32_typedarray_throws,
+        "Atomics/wait/non-int32-typedarray-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resize_name,
-        "ArrayBuffer/prototype/resize/name.js"
+        Atomics_wait_non_shared_bufferdata_throws,
+        "Atomics/wait/non-shared-bufferdata-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resize_new_length_excessive,
-        "ArrayBuffer/prototype/resize/new-length-excessive.js"
+        Atomics_wait_not_a_typedarray_throws,
+        "Atomics/wait/not-a-typedarray-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resize_new_length_negative,
-        "ArrayBuffer/prototype/resize/new-length-negative.js"
+        Atomics_wait_not_an_object_throws,
+        "Atomics/wait/not-an-object-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resize_nonconstructor,
-        "ArrayBuffer/prototype/resize/nonconstructor.js"
+        Atomics_wait_null_bufferdata_throws,
+        "Atomics/wait/null-bufferdata-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resize_resize_grow,
-        "ArrayBuffer/prototype/resize/resize-grow.js"
+        Atomics_wait_out_of_range_index_throws,
+        "Atomics/wait/out-of-range-index-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resize_resize_same_size_zero_explicit,
-        "ArrayBuffer/prototype/resize/resize-same-size-zero-explicit.js"
+        Atomics_wait_validate_arraytype_before_index_coercion,
+        "Atomics/wait/validate-arraytype-before-index-coercion.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resize_resize_same_size_zero_implicit,
-        "ArrayBuffer/prototype/resize/resize-same-size-zero-implicit.js"
+        Atomics_wait_validate_arraytype_before_timeout_coercion,
+        "Atomics/wait/validate-arraytype-before-timeout-coercion.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resize_resize_same_size,
-        "ArrayBuffer/prototype/resize/resize-same-size.js"
+        Atomics_wait_validate_arraytype_before_value_coercion,
+        "Atomics/wait/validate-arraytype-before-value-coercion.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resize_resize_shrink_zero_explicit,
-        "ArrayBuffer/prototype/resize/resize-shrink-zero-explicit.js"
+        Atomics_waitAsync_bigint_negative_index_throws,
+        "Atomics/waitAsync/bigint/negative-index-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resize_resize_shrink_zero_implicit,
-        "ArrayBuffer/prototype/resize/resize-shrink-zero-implicit.js"
+        Atomics_waitAsync_bigint_non_bigint64_typedarray_throws,
+        "Atomics/waitAsync/bigint/non-bigint64-typedarray-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resize_resize_shrink,
-        "ArrayBuffer/prototype/resize/resize-shrink.js"
+        Atomics_waitAsync_bigint_non_shared_bufferdata_throws,
+        "Atomics/waitAsync/bigint/non-shared-bufferdata-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resize_this_is_detached,
-        "ArrayBuffer/prototype/resize/this-is-detached.js"
+        Atomics_waitAsync_bigint_not_a_typedarray_throws,
+        "Atomics/waitAsync/bigint/not-a-typedarray-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resize_this_is_not_arraybuffer_object,
-        "ArrayBuffer/prototype/resize/this-is-not-arraybuffer-object.js"
+        Atomics_waitAsync_bigint_not_an_object_throws,
+        "Atomics/waitAsync/bigint/not-an-object-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resize_this_is_not_object,
-        "ArrayBuffer/prototype/resize/this-is-not-object.js"
+        Atomics_waitAsync_bigint_null_bufferdata_throws,
+        "Atomics/waitAsync/bigint/null-bufferdata-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resize_this_is_not_resizable_arraybuffer_object,
-        "ArrayBuffer/prototype/resize/this-is-not-resizable-arraybuffer-object.js"
+        Atomics_waitAsync_bigint_out_of_range_index_throws,
+        "Atomics/waitAsync/bigint/out-of-range-index-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_resize_this_is_sharedarraybuffer,
-        "ArrayBuffer/prototype/resize/this-is-sharedarraybuffer.js"
+        Atomics_waitAsync_descriptor,
+        "Atomics/waitAsync/descriptor.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_context_is_not_arraybuffer_object,
-        "ArrayBuffer/prototype/slice/context-is-not-arraybuffer-object.js"
+        Atomics_waitAsync_is_function,
+        "Atomics/waitAsync/is-function.js"
     );
+    test262_builtin_fixture!(Atomics_waitAsync_name, "Atomics/waitAsync/name.js");
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_context_is_not_object,
-        "ArrayBuffer/prototype/slice/context-is-not-object.js"
+        Atomics_waitAsync_negative_index_throws,
+        "Atomics/waitAsync/negative-index-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_descriptor,
-        "ArrayBuffer/prototype/slice/descriptor.js"
+        Atomics_waitAsync_non_int32_typedarray_throws,
+        "Atomics/waitAsync/non-int32-typedarray-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_end_default_if_absent,
-        "ArrayBuffer/prototype/slice/end-default-if-absent.js"
+        Atomics_waitAsync_non_shared_bufferdata_throws,
+        "Atomics/waitAsync/non-shared-bufferdata-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_end_default_if_undefined,
-        "ArrayBuffer/prototype/slice/end-default-if-undefined.js"
+        Atomics_waitAsync_not_a_typedarray_throws,
+        "Atomics/waitAsync/not-a-typedarray-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_end_exceeds_length,
-        "ArrayBuffer/prototype/slice/end-exceeds-length.js"
+        Atomics_waitAsync_not_an_object_throws,
+        "Atomics/waitAsync/not-an-object-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_extensible,
-        "ArrayBuffer/prototype/slice/extensible.js"
+        Atomics_waitAsync_null_bufferdata_throws,
+        "Atomics/waitAsync/null-bufferdata-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_length,
-        "ArrayBuffer/prototype/slice/length.js"
+        Atomics_waitAsync_out_of_range_index_throws,
+        "Atomics/waitAsync/out-of-range-index-throws.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_name,
-        "ArrayBuffer/prototype/slice/name.js"
+        Atomics_waitAsync_validate_arraytype_before_index_coercion,
+        "Atomics/waitAsync/validate-arraytype-before-index-coercion.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_negative_end,
-        "ArrayBuffer/prototype/slice/negative-end.js"
+        Atomics_waitAsync_validate_arraytype_before_timeout_coercion,
+        "Atomics/waitAsync/validate-arraytype-before-timeout-coercion.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_negative_start,
-        "ArrayBuffer/prototype/slice/negative-start.js"
+        Atomics_waitAsync_validate_arraytype_before_value_coercion,
+        "Atomics/waitAsync/validate-arraytype-before-value-coercion.js"
     );
+    test262_builtin_fixture!(Atomics_xor_descriptor, "Atomics/xor/descriptor.js");
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_nonconstructor,
-        "ArrayBuffer/prototype/slice/nonconstructor.js"
+        Atomics_xor_expected_return_value,
+        "Atomics/xor/expected-return-value.js"
     );
+    test262_builtin_fixture!(Atomics_xor_length, "Atomics/xor/length.js");
+    test262_builtin_fixture!(Atomics_xor_name, "Atomics/xor/name.js");
+    test262_builtin_fixture!(Atomics_xor_non_views, "Atomics/xor/non-views.js");
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_not_a_constructor,
-        "ArrayBuffer/prototype/slice/not-a-constructor.js"
+        Atomics_xor_not_a_constructor,
+        "Atomics/xor/not-a-constructor.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_species_constructor_is_not_object,
-        "ArrayBuffer/prototype/slice/species-constructor-is-not-object.js"
+        Atomics_xor_validate_arraytype_before_index_coercion,
+        "Atomics/xor/validate-arraytype-before-index-coercion.js"
     );
     test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_species_constructor_is_undefined,
-        "ArrayBuffer/prototype/slice/species-constructor-is-undefined.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_species_is_not_constructor,
-        "ArrayBuffer/prototype/slice/species-is-not-constructor.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_species_is_not_object,
-        "ArrayBuffer/prototype/slice/species-is-not-object.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_species_is_null,
-        "ArrayBuffer/prototype/slice/species-is-null.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_species_is_undefined,
-        "ArrayBuffer/prototype/slice/species-is-undefined.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_species_returns_larger_arraybuffer,
-        "ArrayBuffer/prototype/slice/species-returns-larger-arraybuffer.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_species_returns_not_arraybuffer,
-        "ArrayBuffer/prototype/slice/species-returns-not-arraybuffer.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_species_returns_smaller_arraybuffer,
-        "ArrayBuffer/prototype/slice/species-returns-smaller-arraybuffer.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_species,
-        "ArrayBuffer/prototype/slice/species.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_start_default_if_absent,
-        "ArrayBuffer/prototype/slice/start-default-if-absent.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_start_default_if_undefined,
-        "ArrayBuffer/prototype/slice/start-default-if-undefined.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_start_exceeds_end,
-        "ArrayBuffer/prototype/slice/start-exceeds-end.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_start_exceeds_length,
-        "ArrayBuffer/prototype/slice/start-exceeds-length.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_this_is_sharedarraybuffer,
-        "ArrayBuffer/prototype/slice/this-is-sharedarraybuffer.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_tointeger_conversion_end,
-        "ArrayBuffer/prototype/slice/tointeger-conversion-end.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_slice_tointeger_conversion_start,
-        "ArrayBuffer/prototype/slice/tointeger-conversion-start.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_sliceToImmutable_not_a_constructor,
-        "ArrayBuffer/prototype/sliceToImmutable/not-a-constructor.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_sliceToImmutable_this_is_not_detached,
-        "ArrayBuffer/prototype/sliceToImmutable/this-is-not-detached.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_Symbol_toStringTag,
-        "ArrayBuffer/prototype/Symbol.toStringTag.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transfer_descriptor,
-        "ArrayBuffer/prototype/transfer/descriptor.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transfer_extensible,
-        "ArrayBuffer/prototype/transfer/extensible.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transfer_from_fixed_to_larger_no_resizable,
-        "ArrayBuffer/prototype/transfer/from-fixed-to-larger-no-resizable.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transfer_from_fixed_to_larger,
-        "ArrayBuffer/prototype/transfer/from-fixed-to-larger.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transfer_from_fixed_to_same_no_resizable,
-        "ArrayBuffer/prototype/transfer/from-fixed-to-same-no-resizable.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transfer_from_fixed_to_same,
-        "ArrayBuffer/prototype/transfer/from-fixed-to-same.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transfer_from_fixed_to_smaller_no_resizable,
-        "ArrayBuffer/prototype/transfer/from-fixed-to-smaller-no-resizable.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transfer_from_fixed_to_smaller,
-        "ArrayBuffer/prototype/transfer/from-fixed-to-smaller.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transfer_from_fixed_to_zero_no_resizable,
-        "ArrayBuffer/prototype/transfer/from-fixed-to-zero-no-resizable.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transfer_from_fixed_to_zero,
-        "ArrayBuffer/prototype/transfer/from-fixed-to-zero.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transfer_from_resizable_to_larger,
-        "ArrayBuffer/prototype/transfer/from-resizable-to-larger.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transfer_from_resizable_to_same,
-        "ArrayBuffer/prototype/transfer/from-resizable-to-same.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transfer_from_resizable_to_smaller,
-        "ArrayBuffer/prototype/transfer/from-resizable-to-smaller.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transfer_from_resizable_to_zero,
-        "ArrayBuffer/prototype/transfer/from-resizable-to-zero.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transfer_name,
-        "ArrayBuffer/prototype/transfer/name.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transfer_new_length_excessive,
-        "ArrayBuffer/prototype/transfer/new-length-excessive.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transfer_nonconstructor,
-        "ArrayBuffer/prototype/transfer/nonconstructor.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transfer_this_is_not_arraybuffer_object,
-        "ArrayBuffer/prototype/transfer/this-is-not-arraybuffer-object.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transfer_this_is_not_object,
-        "ArrayBuffer/prototype/transfer/this-is-not-object.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transfer_this_is_sharedarraybuffer,
-        "ArrayBuffer/prototype/transfer/this-is-sharedarraybuffer.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transferToFixedLength_descriptor,
-        "ArrayBuffer/prototype/transferToFixedLength/descriptor.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transferToFixedLength_extensible,
-        "ArrayBuffer/prototype/transferToFixedLength/extensible.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transferToFixedLength_from_fixed_to_larger_no_resizable,
-        "ArrayBuffer/prototype/transferToFixedLength/from-fixed-to-larger-no-resizable.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transferToFixedLength_from_fixed_to_larger,
-        "ArrayBuffer/prototype/transferToFixedLength/from-fixed-to-larger.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transferToFixedLength_from_fixed_to_same_no_resizable,
-        "ArrayBuffer/prototype/transferToFixedLength/from-fixed-to-same-no-resizable.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transferToFixedLength_from_fixed_to_same,
-        "ArrayBuffer/prototype/transferToFixedLength/from-fixed-to-same.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transferToFixedLength_from_fixed_to_smaller_no_resizable,
-        "ArrayBuffer/prototype/transferToFixedLength/from-fixed-to-smaller-no-resizable.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transferToFixedLength_from_fixed_to_smaller,
-        "ArrayBuffer/prototype/transferToFixedLength/from-fixed-to-smaller.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transferToFixedLength_from_fixed_to_zero_no_resizable,
-        "ArrayBuffer/prototype/transferToFixedLength/from-fixed-to-zero-no-resizable.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transferToFixedLength_from_fixed_to_zero,
-        "ArrayBuffer/prototype/transferToFixedLength/from-fixed-to-zero.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transferToFixedLength_from_resizable_to_larger,
-        "ArrayBuffer/prototype/transferToFixedLength/from-resizable-to-larger.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transferToFixedLength_from_resizable_to_same,
-        "ArrayBuffer/prototype/transferToFixedLength/from-resizable-to-same.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transferToFixedLength_from_resizable_to_smaller,
-        "ArrayBuffer/prototype/transferToFixedLength/from-resizable-to-smaller.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transferToFixedLength_from_resizable_to_zero,
-        "ArrayBuffer/prototype/transferToFixedLength/from-resizable-to-zero.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transferToFixedLength_name,
-        "ArrayBuffer/prototype/transferToFixedLength/name.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transferToFixedLength_new_length_excessive,
-        "ArrayBuffer/prototype/transferToFixedLength/new-length-excessive.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transferToFixedLength_nonconstructor,
-        "ArrayBuffer/prototype/transferToFixedLength/nonconstructor.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transferToFixedLength_this_is_not_arraybuffer_object,
-        "ArrayBuffer/prototype/transferToFixedLength/this-is-not-arraybuffer-object.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transferToFixedLength_this_is_not_object,
-        "ArrayBuffer/prototype/transferToFixedLength/this-is-not-object.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transferToFixedLength_this_is_sharedarraybuffer,
-        "ArrayBuffer/prototype/transferToFixedLength/this-is-sharedarraybuffer.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_prototype_transferToImmutable_not_a_constructor,
-        "ArrayBuffer/prototype/transferToImmutable/not-a-constructor.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_return_abrupt_from_length_symbol,
-        "ArrayBuffer/return-abrupt-from-length-symbol.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_Symbol_species_length,
-        "ArrayBuffer/Symbol.species/length.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_Symbol_species_return_value,
-        "ArrayBuffer/Symbol.species/return-value.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_Symbol_species_symbol_species_name,
-        "ArrayBuffer/Symbol.species/symbol-species-name.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_Symbol_species_symbol_species,
-        "ArrayBuffer/Symbol.species/symbol-species.js"
-    );
-    test262_builtin_fixture!(
-        ArrayBuffer_undefined_newtarget_throws,
-        "ArrayBuffer/undefined-newtarget-throws.js"
-    );
-    test262_builtin_fixture!(ArrayBuffer_zero_length, "ArrayBuffer/zero-length.js");
-    test262_builtin_fixture!(
-        SharedArrayBuffer_allocation_limit,
-        "SharedArrayBuffer/allocation-limit.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_init_zero,
-        "SharedArrayBuffer/init-zero.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_is_a_constructor,
-        "SharedArrayBuffer/is-a-constructor.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_length_is_absent,
-        "SharedArrayBuffer/length-is-absent.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_length_is_too_large_throws,
-        "SharedArrayBuffer/length-is-too-large-throws.js"
-    );
-    test262_builtin_fixture!(SharedArrayBuffer_length, "SharedArrayBuffer/length.js");
-    test262_builtin_fixture!(
-        SharedArrayBuffer_negative_length_throws,
-        "SharedArrayBuffer/negative-length-throws.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_options_maxbytelength_diminuitive,
-        "SharedArrayBuffer/options-maxbytelength-diminuitive.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_options_maxbytelength_excessive,
-        "SharedArrayBuffer/options-maxbytelength-excessive.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_options_maxbytelength_negative,
-        "SharedArrayBuffer/options-maxbytelength-negative.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_options_maxbytelength_object,
-        "SharedArrayBuffer/options-maxbytelength-object.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_options_maxbytelength_poisoned,
-        "SharedArrayBuffer/options-maxbytelength-poisoned.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_options_maxbytelength_undefined,
-        "SharedArrayBuffer/options-maxbytelength-undefined.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_options_non_object,
-        "SharedArrayBuffer/options-non-object.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_byteLength_invoked_as_accessor,
-        "SharedArrayBuffer/prototype/byteLength/invoked-as-accessor.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_byteLength_invoked_as_func,
-        "SharedArrayBuffer/prototype/byteLength/invoked-as-func.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_byteLength_length,
-        "SharedArrayBuffer/prototype/byteLength/length.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_byteLength_name,
-        "SharedArrayBuffer/prototype/byteLength/name.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_byteLength_prop_desc,
-        "SharedArrayBuffer/prototype/byteLength/prop-desc.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_byteLength_return_bytelength,
-        "SharedArrayBuffer/prototype/byteLength/return-bytelength.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_byteLength_this_has_no_typedarrayname_internal,
-        "SharedArrayBuffer/prototype/byteLength/this-has-no-typedarrayname-internal.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_byteLength_this_is_arraybuffer,
-        "SharedArrayBuffer/prototype/byteLength/this-is-arraybuffer.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_byteLength_this_is_not_object,
-        "SharedArrayBuffer/prototype/byteLength/this-is-not-object.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_constructor,
-        "SharedArrayBuffer/prototype/constructor.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_grow_descriptor,
-        "SharedArrayBuffer/prototype/grow/descriptor.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_grow_extensible,
-        "SharedArrayBuffer/prototype/grow/extensible.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_grow_grow_larger_size,
-        "SharedArrayBuffer/prototype/grow/grow-larger-size.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_grow_grow_same_size,
-        "SharedArrayBuffer/prototype/grow/grow-same-size.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_grow_grow_smaller_size,
-        "SharedArrayBuffer/prototype/grow/grow-smaller-size.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_grow_length,
-        "SharedArrayBuffer/prototype/grow/length.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_grow_name,
-        "SharedArrayBuffer/prototype/grow/name.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_grow_new_length_excessive,
-        "SharedArrayBuffer/prototype/grow/new-length-excessive.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_grow_new_length_negative,
-        "SharedArrayBuffer/prototype/grow/new-length-negative.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_grow_nonconstructor,
-        "SharedArrayBuffer/prototype/grow/nonconstructor.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_grow_this_is_not_arraybuffer_object,
-        "SharedArrayBuffer/prototype/grow/this-is-not-arraybuffer-object.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_grow_this_is_not_object,
-        "SharedArrayBuffer/prototype/grow/this-is-not-object.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_grow_this_is_not_resizable_arraybuffer_object,
-        "SharedArrayBuffer/prototype/grow/this-is-not-resizable-arraybuffer-object.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_grow_this_is_sharedarraybuffer,
-        "SharedArrayBuffer/prototype/grow/this-is-sharedarraybuffer.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_growable_invoked_as_accessor,
-        "SharedArrayBuffer/prototype/growable/invoked-as-accessor.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_growable_invoked_as_func,
-        "SharedArrayBuffer/prototype/growable/invoked-as-func.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_growable_length,
-        "SharedArrayBuffer/prototype/growable/length.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_growable_name,
-        "SharedArrayBuffer/prototype/growable/name.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_growable_prop_desc,
-        "SharedArrayBuffer/prototype/growable/prop-desc.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_growable_return_growable,
-        "SharedArrayBuffer/prototype/growable/return-growable.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_growable_this_has_no_arraybufferdata_internal,
-        "SharedArrayBuffer/prototype/growable/this-has-no-arraybufferdata-internal.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_growable_this_is_arraybuffer,
-        "SharedArrayBuffer/prototype/growable/this-is-arraybuffer.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_growable_this_is_not_object,
-        "SharedArrayBuffer/prototype/growable/this-is-not-object.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_maxByteLength_invoked_as_accessor,
-        "SharedArrayBuffer/prototype/maxByteLength/invoked-as-accessor.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_maxByteLength_invoked_as_func,
-        "SharedArrayBuffer/prototype/maxByteLength/invoked-as-func.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_maxByteLength_length,
-        "SharedArrayBuffer/prototype/maxByteLength/length.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_maxByteLength_name,
-        "SharedArrayBuffer/prototype/maxByteLength/name.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_maxByteLength_prop_desc,
-        "SharedArrayBuffer/prototype/maxByteLength/prop-desc.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_maxByteLength_return_maxbytelength_growable,
-        "SharedArrayBuffer/prototype/maxByteLength/return-maxbytelength-growable.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_maxByteLength_return_maxbytelength_non_growable,
-        "SharedArrayBuffer/prototype/maxByteLength/return-maxbytelength-non-growable.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_maxByteLength_this_has_no_arraybufferdata_internal,
-        "SharedArrayBuffer/prototype/maxByteLength/this-has-no-arraybufferdata-internal.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_maxByteLength_this_is_arraybuffer,
-        "SharedArrayBuffer/prototype/maxByteLength/this-is-arraybuffer.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_maxByteLength_this_is_not_object,
-        "SharedArrayBuffer/prototype/maxByteLength/this-is-not-object.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_prop_desc,
-        "SharedArrayBuffer/prototype/prop-desc.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_context_is_not_arraybuffer_object,
-        "SharedArrayBuffer/prototype/slice/context-is-not-arraybuffer-object.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_context_is_not_object,
-        "SharedArrayBuffer/prototype/slice/context-is-not-object.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_descriptor,
-        "SharedArrayBuffer/prototype/slice/descriptor.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_end_default_if_absent,
-        "SharedArrayBuffer/prototype/slice/end-default-if-absent.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_end_default_if_undefined,
-        "SharedArrayBuffer/prototype/slice/end-default-if-undefined.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_end_exceeds_length,
-        "SharedArrayBuffer/prototype/slice/end-exceeds-length.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_extensible,
-        "SharedArrayBuffer/prototype/slice/extensible.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_length,
-        "SharedArrayBuffer/prototype/slice/length.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_name,
-        "SharedArrayBuffer/prototype/slice/name.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_negative_end,
-        "SharedArrayBuffer/prototype/slice/negative-end.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_negative_start,
-        "SharedArrayBuffer/prototype/slice/negative-start.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_nonconstructor,
-        "SharedArrayBuffer/prototype/slice/nonconstructor.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_not_a_constructor,
-        "SharedArrayBuffer/prototype/slice/not-a-constructor.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_species_constructor_is_not_object,
-        "SharedArrayBuffer/prototype/slice/species-constructor-is-not-object.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_species_constructor_is_undefined,
-        "SharedArrayBuffer/prototype/slice/species-constructor-is-undefined.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_species_is_not_constructor,
-        "SharedArrayBuffer/prototype/slice/species-is-not-constructor.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_species_is_not_object,
-        "SharedArrayBuffer/prototype/slice/species-is-not-object.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_species_is_null,
-        "SharedArrayBuffer/prototype/slice/species-is-null.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_species_is_undefined,
-        "SharedArrayBuffer/prototype/slice/species-is-undefined.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_species_returns_larger_arraybuffer,
-        "SharedArrayBuffer/prototype/slice/species-returns-larger-arraybuffer.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_species_returns_not_arraybuffer,
-        "SharedArrayBuffer/prototype/slice/species-returns-not-arraybuffer.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_species_returns_smaller_arraybuffer,
-        "SharedArrayBuffer/prototype/slice/species-returns-smaller-arraybuffer.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_species,
-        "SharedArrayBuffer/prototype/slice/species.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_start_default_if_absent,
-        "SharedArrayBuffer/prototype/slice/start-default-if-absent.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_start_default_if_undefined,
-        "SharedArrayBuffer/prototype/slice/start-default-if-undefined.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_start_exceeds_end,
-        "SharedArrayBuffer/prototype/slice/start-exceeds-end.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_start_exceeds_length,
-        "SharedArrayBuffer/prototype/slice/start-exceeds-length.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_this_is_arraybuffer,
-        "SharedArrayBuffer/prototype/slice/this-is-arraybuffer.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_tointeger_conversion_end,
-        "SharedArrayBuffer/prototype/slice/tointeger-conversion-end.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_slice_tointeger_conversion_start,
-        "SharedArrayBuffer/prototype/slice/tointeger-conversion-start.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_prototype_Symbol_toStringTag,
-        "SharedArrayBuffer/prototype/Symbol.toStringTag.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_return_abrupt_from_length_symbol,
-        "SharedArrayBuffer/return-abrupt-from-length-symbol.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_undefined_newtarget_throws,
-        "SharedArrayBuffer/undefined-newtarget-throws.js"
-    );
-    test262_builtin_fixture!(
-        SharedArrayBuffer_zero_length,
-        "SharedArrayBuffer/zero-length.js"
+        Atomics_xor_validate_arraytype_before_value_coercion,
+        "Atomics/xor/validate-arraytype-before-value-coercion.js"
     );
     test262_builtin_fixture!(
         DataView_buffer_does_not_have_arraybuffer_data_throws_sab,
@@ -6787,326 +5547,1034 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
         "DataView/return-instance-sab.js"
     );
     test262_builtin_fixture!(DataView_return_instance, "DataView/return-instance.js");
-    test262_builtin_fixture!(Atomics_add_descriptor, "Atomics/add/descriptor.js");
     test262_builtin_fixture!(
-        Atomics_add_expected_return_value,
-        "Atomics/add/expected-return-value.js"
+        ArrayBuffer_allocation_limit,
+        "ArrayBuffer/allocation-limit.js"
     );
-    test262_builtin_fixture!(Atomics_add_length, "Atomics/add/length.js");
-    test262_builtin_fixture!(Atomics_add_name, "Atomics/add/name.js");
+    test262_builtin_fixture!(ArrayBuffer_init_zero, "ArrayBuffer/init-zero.js");
     test262_builtin_fixture!(
-        Atomics_add_not_a_constructor,
-        "Atomics/add/not-a-constructor.js"
+        ArrayBuffer_is_a_constructor,
+        "ArrayBuffer/is-a-constructor.js"
     );
-    test262_builtin_fixture!(Atomics_and_descriptor, "Atomics/and/descriptor.js");
     test262_builtin_fixture!(
-        Atomics_and_expected_return_value,
-        "Atomics/and/expected-return-value.js"
+        ArrayBuffer_isView_arg_has_no_viewedarraybuffer,
+        "ArrayBuffer/isView/arg-has-no-viewedarraybuffer.js"
     );
-    test262_builtin_fixture!(Atomics_and_length, "Atomics/and/length.js");
-    test262_builtin_fixture!(Atomics_and_name, "Atomics/and/name.js");
     test262_builtin_fixture!(
-        Atomics_and_not_a_constructor,
-        "Atomics/and/not-a-constructor.js"
+        ArrayBuffer_isView_arg_is_arraybuffer,
+        "ArrayBuffer/isView/arg-is-arraybuffer.js"
     );
     test262_builtin_fixture!(
-        Atomics_compareExchange_descriptor,
-        "Atomics/compareExchange/descriptor.js"
+        ArrayBuffer_isView_arg_is_dataview_buffer,
+        "ArrayBuffer/isView/arg-is-dataview-buffer.js"
     );
     test262_builtin_fixture!(
-        Atomics_compareExchange_expected_return_value,
-        "Atomics/compareExchange/expected-return-value.js"
+        ArrayBuffer_isView_arg_is_dataview_constructor,
+        "ArrayBuffer/isView/arg-is-dataview-constructor.js"
     );
     test262_builtin_fixture!(
-        Atomics_compareExchange_length,
-        "Atomics/compareExchange/length.js"
+        ArrayBuffer_isView_arg_is_dataview_subclass_instance,
+        "ArrayBuffer/isView/arg-is-dataview-subclass-instance.js"
     );
     test262_builtin_fixture!(
-        Atomics_compareExchange_name,
-        "Atomics/compareExchange/name.js"
+        ArrayBuffer_isView_arg_is_dataview,
+        "ArrayBuffer/isView/arg-is-dataview.js"
     );
     test262_builtin_fixture!(
-        Atomics_compareExchange_not_a_constructor,
-        "Atomics/compareExchange/not-a-constructor.js"
+        ArrayBuffer_isView_arg_is_not_object,
+        "ArrayBuffer/isView/arg-is-not-object.js"
     );
     test262_builtin_fixture!(
-        Atomics_exchange_descriptor,
-        "Atomics/exchange/descriptor.js"
+        ArrayBuffer_isView_arg_is_typedarray_constructor,
+        "ArrayBuffer/isView/arg-is-typedarray-constructor.js"
     );
+    test262_builtin_fixture!(ArrayBuffer_isView_length, "ArrayBuffer/isView/length.js");
+    test262_builtin_fixture!(ArrayBuffer_isView_name, "ArrayBuffer/isView/name.js");
+    test262_builtin_fixture!(ArrayBuffer_isView_no_arg, "ArrayBuffer/isView/no-arg.js");
     test262_builtin_fixture!(
-        Atomics_exchange_expected_return_value,
-        "Atomics/exchange/expected-return-value.js"
+        ArrayBuffer_isView_not_a_constructor,
+        "ArrayBuffer/isView/not-a-constructor.js"
     );
-    test262_builtin_fixture!(Atomics_exchange_length, "Atomics/exchange/length.js");
-    test262_builtin_fixture!(Atomics_exchange_name, "Atomics/exchange/name.js");
     test262_builtin_fixture!(
-        Atomics_exchange_not_a_constructor,
-        "Atomics/exchange/not-a-constructor.js"
+        ArrayBuffer_isView_prop_desc,
+        "ArrayBuffer/isView/prop-desc.js"
     );
     test262_builtin_fixture!(
-        Atomics_isLockFree_descriptor,
-        "Atomics/isLockFree/descriptor.js"
+        ArrayBuffer_length_is_absent,
+        "ArrayBuffer/length-is-absent.js"
     );
     test262_builtin_fixture!(
-        Atomics_isLockFree_expected_return_value,
-        "Atomics/isLockFree/expected-return-value.js"
+        ArrayBuffer_length_is_too_large_throws,
+        "ArrayBuffer/length-is-too-large-throws.js"
     );
-    test262_builtin_fixture!(Atomics_isLockFree_length, "Atomics/isLockFree/length.js");
-    test262_builtin_fixture!(Atomics_isLockFree_name, "Atomics/isLockFree/name.js");
+    test262_builtin_fixture!(ArrayBuffer_length, "ArrayBuffer/length.js");
+    test262_builtin_fixture!(ArrayBuffer_name, "ArrayBuffer/name.js");
     test262_builtin_fixture!(
-        Atomics_isLockFree_not_a_constructor,
-        "Atomics/isLockFree/not-a-constructor.js"
+        ArrayBuffer_negative_length_throws,
+        "ArrayBuffer/negative-length-throws.js"
     );
-    test262_builtin_fixture!(Atomics_load_descriptor, "Atomics/load/descriptor.js");
     test262_builtin_fixture!(
-        Atomics_load_expected_return_value,
-        "Atomics/load/expected-return-value.js"
+        ArrayBuffer_options_maxbytelength_diminuitive,
+        "ArrayBuffer/options-maxbytelength-diminuitive.js"
     );
-    test262_builtin_fixture!(Atomics_load_length, "Atomics/load/length.js");
-    test262_builtin_fixture!(Atomics_load_name, "Atomics/load/name.js");
     test262_builtin_fixture!(
-        Atomics_load_not_a_constructor,
-        "Atomics/load/not-a-constructor.js"
+        ArrayBuffer_options_maxbytelength_excessive,
+        "ArrayBuffer/options-maxbytelength-excessive.js"
     );
     test262_builtin_fixture!(
-        Atomics_notify_bigint_non_bigint64_typedarray_throws,
-        "Atomics/notify/bigint/non-bigint64-typedarray-throws.js"
+        ArrayBuffer_options_maxbytelength_negative,
+        "ArrayBuffer/options-maxbytelength-negative.js"
     );
     test262_builtin_fixture!(
-        Atomics_notify_bigint_non_shared_bufferdata_non_shared_int_views_throws,
-        "Atomics/notify/bigint/non-shared-bufferdata-non-shared-int-views-throws.js"
+        ArrayBuffer_options_maxbytelength_object,
+        "ArrayBuffer/options-maxbytelength-object.js"
     );
     test262_builtin_fixture!(
-        Atomics_notify_bigint_null_bufferdata_throws,
-        "Atomics/notify/bigint/null-bufferdata-throws.js"
+        ArrayBuffer_options_maxbytelength_poisoned,
+        "ArrayBuffer/options-maxbytelength-poisoned.js"
     );
     test262_builtin_fixture!(
-        Atomics_notify_count_boundary_cases,
-        "Atomics/notify/count-boundary-cases.js"
+        ArrayBuffer_options_maxbytelength_undefined,
+        "ArrayBuffer/options-maxbytelength-undefined.js"
     );
-    test262_builtin_fixture!(Atomics_notify_descriptor, "Atomics/notify/descriptor.js");
-    test262_builtin_fixture!(Atomics_notify_length, "Atomics/notify/length.js");
-    test262_builtin_fixture!(Atomics_notify_name, "Atomics/notify/name.js");
     test262_builtin_fixture!(
-        Atomics_notify_negative_index_throws,
-        "Atomics/notify/negative-index-throws.js"
+        ArrayBuffer_options_non_object,
+        "ArrayBuffer/options-non-object.js"
     );
+    test262_builtin_fixture!(ArrayBuffer_prop_desc, "ArrayBuffer/prop-desc.js");
     test262_builtin_fixture!(
-        Atomics_notify_non_int32_typedarray_throws,
-        "Atomics/notify/non-int32-typedarray-throws.js"
+        ArrayBuffer_prototype_byteLength_detached_buffer,
+        "ArrayBuffer/prototype/byteLength/detached-buffer.js"
     );
     test262_builtin_fixture!(
-        Atomics_notify_non_shared_bufferdata_non_shared_int_views_throws,
-        "Atomics/notify/non-shared-bufferdata-non-shared-int-views-throws.js"
+        ArrayBuffer_prototype_byteLength_invoked_as_accessor,
+        "ArrayBuffer/prototype/byteLength/invoked-as-accessor.js"
     );
     test262_builtin_fixture!(
-        Atomics_notify_non_shared_int_views,
-        "Atomics/notify/non-shared-int-views.js"
+        ArrayBuffer_prototype_byteLength_invoked_as_func,
+        "ArrayBuffer/prototype/byteLength/invoked-as-func.js"
     );
     test262_builtin_fixture!(
-        Atomics_notify_not_a_constructor,
-        "Atomics/notify/not-a-constructor.js"
+        ArrayBuffer_prototype_byteLength_length,
+        "ArrayBuffer/prototype/byteLength/length.js"
     );
     test262_builtin_fixture!(
-        Atomics_notify_not_a_typedarray_throws,
-        "Atomics/notify/not-a-typedarray-throws.js"
+        ArrayBuffer_prototype_byteLength_name,
+        "ArrayBuffer/prototype/byteLength/name.js"
     );
     test262_builtin_fixture!(
-        Atomics_notify_not_an_object_throws,
-        "Atomics/notify/not-an-object-throws.js"
+        ArrayBuffer_prototype_byteLength_prop_desc,
+        "ArrayBuffer/prototype/byteLength/prop-desc.js"
     );
     test262_builtin_fixture!(
-        Atomics_notify_null_bufferdata_throws,
-        "Atomics/notify/null-bufferdata-throws.js"
+        ArrayBuffer_prototype_byteLength_return_bytelength,
+        "ArrayBuffer/prototype/byteLength/return-bytelength.js"
     );
     test262_builtin_fixture!(
-        Atomics_notify_out_of_range_index_throws,
-        "Atomics/notify/out-of-range-index-throws.js"
+        ArrayBuffer_prototype_byteLength_this_has_no_typedarrayname_internal,
+        "ArrayBuffer/prototype/byteLength/this-has-no-typedarrayname-internal.js"
     );
-    test262_builtin_fixture!(Atomics_or_descriptor, "Atomics/or/descriptor.js");
     test262_builtin_fixture!(
-        Atomics_or_expected_return_value,
-        "Atomics/or/expected-return-value.js"
+        ArrayBuffer_prototype_byteLength_this_is_not_object,
+        "ArrayBuffer/prototype/byteLength/this-is-not-object.js"
     );
-    test262_builtin_fixture!(Atomics_or_length, "Atomics/or/length.js");
-    test262_builtin_fixture!(Atomics_or_name, "Atomics/or/name.js");
     test262_builtin_fixture!(
-        Atomics_or_not_a_constructor,
-        "Atomics/or/not-a-constructor.js"
+        ArrayBuffer_prototype_byteLength_this_is_sharedarraybuffer,
+        "ArrayBuffer/prototype/byteLength/this-is-sharedarraybuffer.js"
     );
-    test262_builtin_fixture!(Atomics_pause_descriptor, "Atomics/pause/descriptor.js");
-    test262_builtin_fixture!(Atomics_pause_name, "Atomics/pause/name.js");
     test262_builtin_fixture!(
-        Atomics_pause_not_a_constructor,
-        "Atomics/pause/not-a-constructor.js"
+        ArrayBuffer_prototype_constructor,
+        "ArrayBuffer/prototype/constructor.js"
     );
     test262_builtin_fixture!(
-        Atomics_pause_returns_undefined,
-        "Atomics/pause/returns-undefined.js"
+        ArrayBuffer_prototype_detached_detached_buffer_resizable,
+        "ArrayBuffer/prototype/detached/detached-buffer-resizable.js"
     );
-    test262_builtin_fixture!(Atomics_prop_desc, "Atomics/prop-desc.js");
-    test262_builtin_fixture!(Atomics_proto, "Atomics/proto.js");
-    test262_builtin_fixture!(Atomics_store_descriptor, "Atomics/store/descriptor.js");
     test262_builtin_fixture!(
-        Atomics_store_expected_return_value,
-        "Atomics/store/expected-return-value.js"
+        ArrayBuffer_prototype_detached_detached_buffer,
+        "ArrayBuffer/prototype/detached/detached-buffer.js"
     );
-    test262_builtin_fixture!(Atomics_store_length, "Atomics/store/length.js");
-    test262_builtin_fixture!(Atomics_store_name, "Atomics/store/name.js");
     test262_builtin_fixture!(
-        Atomics_store_not_a_constructor,
-        "Atomics/store/not-a-constructor.js"
+        ArrayBuffer_prototype_detached_invoked_as_accessor,
+        "ArrayBuffer/prototype/detached/invoked-as-accessor.js"
     );
-    test262_builtin_fixture!(Atomics_sub_descriptor, "Atomics/sub/descriptor.js");
     test262_builtin_fixture!(
-        Atomics_sub_expected_return_value,
-        "Atomics/sub/expected-return-value.js"
+        ArrayBuffer_prototype_detached_invoked_as_func,
+        "ArrayBuffer/prototype/detached/invoked-as-func.js"
     );
-    test262_builtin_fixture!(Atomics_sub_length, "Atomics/sub/length.js");
-    test262_builtin_fixture!(Atomics_sub_name, "Atomics/sub/name.js");
     test262_builtin_fixture!(
-        Atomics_sub_not_a_constructor,
-        "Atomics/sub/not-a-constructor.js"
+        ArrayBuffer_prototype_detached_length,
+        "ArrayBuffer/prototype/detached/length.js"
     );
-    test262_builtin_fixture!(Atomics_Symbol_toStringTag, "Atomics/Symbol.toStringTag.js");
     test262_builtin_fixture!(
-        Atomics_wait_bigint_cannot_suspend_throws,
-        "Atomics/wait/bigint/cannot-suspend-throws.js"
+        ArrayBuffer_prototype_detached_name,
+        "ArrayBuffer/prototype/detached/name.js"
     );
     test262_builtin_fixture!(
-        Atomics_wait_bigint_negative_index_throws,
-        "Atomics/wait/bigint/negative-index-throws.js"
+        ArrayBuffer_prototype_detached_prop_desc,
+        "ArrayBuffer/prototype/detached/prop-desc.js"
     );
     test262_builtin_fixture!(
-        Atomics_wait_bigint_non_bigint64_typedarray_throws,
-        "Atomics/wait/bigint/non-bigint64-typedarray-throws.js"
+        ArrayBuffer_prototype_detached_this_has_no_arraybufferdata_internal,
+        "ArrayBuffer/prototype/detached/this-has-no-arraybufferdata-internal.js"
     );
     test262_builtin_fixture!(
-        Atomics_wait_bigint_non_shared_bufferdata_throws,
-        "Atomics/wait/bigint/non-shared-bufferdata-throws.js"
+        ArrayBuffer_prototype_detached_this_is_not_object,
+        "ArrayBuffer/prototype/detached/this-is-not-object.js"
     );
     test262_builtin_fixture!(
-        Atomics_wait_bigint_null_bufferdata_throws,
-        "Atomics/wait/bigint/null-bufferdata-throws.js"
+        ArrayBuffer_prototype_detached_this_is_sharedarraybuffer_resizable,
+        "ArrayBuffer/prototype/detached/this-is-sharedarraybuffer-resizable.js"
     );
     test262_builtin_fixture!(
-        Atomics_wait_bigint_out_of_range_index_throws,
-        "Atomics/wait/bigint/out-of-range-index-throws.js"
+        ArrayBuffer_prototype_detached_this_is_sharedarraybuffer,
+        "ArrayBuffer/prototype/detached/this-is-sharedarraybuffer.js"
     );
     test262_builtin_fixture!(
-        Atomics_wait_cannot_suspend_throws,
-        "Atomics/wait/cannot-suspend-throws.js"
+        ArrayBuffer_prototype_maxByteLength_detached_buffer,
+        "ArrayBuffer/prototype/maxByteLength/detached-buffer.js"
     );
-    test262_builtin_fixture!(Atomics_wait_descriptor, "Atomics/wait/descriptor.js");
-    test262_builtin_fixture!(Atomics_wait_length, "Atomics/wait/length.js");
-    test262_builtin_fixture!(Atomics_wait_name, "Atomics/wait/name.js");
     test262_builtin_fixture!(
-        Atomics_wait_negative_index_throws,
-        "Atomics/wait/negative-index-throws.js"
+        ArrayBuffer_prototype_maxByteLength_invoked_as_accessor,
+        "ArrayBuffer/prototype/maxByteLength/invoked-as-accessor.js"
     );
     test262_builtin_fixture!(
-        Atomics_wait_non_int32_typedarray_throws,
-        "Atomics/wait/non-int32-typedarray-throws.js"
+        ArrayBuffer_prototype_maxByteLength_invoked_as_func,
+        "ArrayBuffer/prototype/maxByteLength/invoked-as-func.js"
     );
     test262_builtin_fixture!(
-        Atomics_wait_non_shared_bufferdata_throws,
-        "Atomics/wait/non-shared-bufferdata-throws.js"
+        ArrayBuffer_prototype_maxByteLength_length,
+        "ArrayBuffer/prototype/maxByteLength/length.js"
     );
     test262_builtin_fixture!(
-        Atomics_wait_not_a_typedarray_throws,
-        "Atomics/wait/not-a-typedarray-throws.js"
+        ArrayBuffer_prototype_maxByteLength_name,
+        "ArrayBuffer/prototype/maxByteLength/name.js"
     );
     test262_builtin_fixture!(
-        Atomics_wait_not_an_object_throws,
-        "Atomics/wait/not-an-object-throws.js"
+        ArrayBuffer_prototype_maxByteLength_prop_desc,
+        "ArrayBuffer/prototype/maxByteLength/prop-desc.js"
     );
     test262_builtin_fixture!(
-        Atomics_wait_null_bufferdata_throws,
-        "Atomics/wait/null-bufferdata-throws.js"
+        ArrayBuffer_prototype_maxByteLength_return_maxbytelength_non_resizable,
+        "ArrayBuffer/prototype/maxByteLength/return-maxbytelength-non-resizable.js"
     );
     test262_builtin_fixture!(
-        Atomics_wait_out_of_range_index_throws,
-        "Atomics/wait/out-of-range-index-throws.js"
+        ArrayBuffer_prototype_maxByteLength_return_maxbytelength_resizable,
+        "ArrayBuffer/prototype/maxByteLength/return-maxbytelength-resizable.js"
     );
     test262_builtin_fixture!(
-        Atomics_waitAsync_bigint_negative_index_throws,
-        "Atomics/waitAsync/bigint/negative-index-throws.js"
+        ArrayBuffer_prototype_maxByteLength_this_has_no_arraybufferdata_internal,
+        "ArrayBuffer/prototype/maxByteLength/this-has-no-arraybufferdata-internal.js"
     );
     test262_builtin_fixture!(
-        Atomics_waitAsync_bigint_non_bigint64_typedarray_throws,
-        "Atomics/waitAsync/bigint/non-bigint64-typedarray-throws.js"
+        ArrayBuffer_prototype_maxByteLength_this_is_not_object,
+        "ArrayBuffer/prototype/maxByteLength/this-is-not-object.js"
     );
     test262_builtin_fixture!(
-        Atomics_waitAsync_bigint_non_shared_bufferdata_throws,
-        "Atomics/waitAsync/bigint/non-shared-bufferdata-throws.js"
+        ArrayBuffer_prototype_maxByteLength_this_is_sharedarraybuffer,
+        "ArrayBuffer/prototype/maxByteLength/this-is-sharedarraybuffer.js"
     );
     test262_builtin_fixture!(
-        Atomics_waitAsync_bigint_not_a_typedarray_throws,
-        "Atomics/waitAsync/bigint/not-a-typedarray-throws.js"
+        ArrayBuffer_prototype_resizable_detached_buffer,
+        "ArrayBuffer/prototype/resizable/detached-buffer.js"
     );
     test262_builtin_fixture!(
-        Atomics_waitAsync_bigint_not_an_object_throws,
-        "Atomics/waitAsync/bigint/not-an-object-throws.js"
+        ArrayBuffer_prototype_resizable_invoked_as_accessor,
+        "ArrayBuffer/prototype/resizable/invoked-as-accessor.js"
     );
     test262_builtin_fixture!(
-        Atomics_waitAsync_bigint_null_bufferdata_throws,
-        "Atomics/waitAsync/bigint/null-bufferdata-throws.js"
+        ArrayBuffer_prototype_resizable_invoked_as_func,
+        "ArrayBuffer/prototype/resizable/invoked-as-func.js"
     );
     test262_builtin_fixture!(
-        Atomics_waitAsync_bigint_out_of_range_index_throws,
-        "Atomics/waitAsync/bigint/out-of-range-index-throws.js"
+        ArrayBuffer_prototype_resizable_length,
+        "ArrayBuffer/prototype/resizable/length.js"
     );
     test262_builtin_fixture!(
-        Atomics_waitAsync_descriptor,
-        "Atomics/waitAsync/descriptor.js"
+        ArrayBuffer_prototype_resizable_name,
+        "ArrayBuffer/prototype/resizable/name.js"
     );
     test262_builtin_fixture!(
-        Atomics_waitAsync_is_function,
-        "Atomics/waitAsync/is-function.js"
+        ArrayBuffer_prototype_resizable_prop_desc,
+        "ArrayBuffer/prototype/resizable/prop-desc.js"
     );
-    test262_builtin_fixture!(Atomics_waitAsync_name, "Atomics/waitAsync/name.js");
     test262_builtin_fixture!(
-        Atomics_waitAsync_negative_index_throws,
-        "Atomics/waitAsync/negative-index-throws.js"
+        ArrayBuffer_prototype_resizable_return_resizable,
+        "ArrayBuffer/prototype/resizable/return-resizable.js"
     );
     test262_builtin_fixture!(
-        Atomics_waitAsync_non_int32_typedarray_throws,
-        "Atomics/waitAsync/non-int32-typedarray-throws.js"
+        ArrayBuffer_prototype_resizable_this_has_no_arraybufferdata_internal,
+        "ArrayBuffer/prototype/resizable/this-has-no-arraybufferdata-internal.js"
     );
     test262_builtin_fixture!(
-        Atomics_waitAsync_non_shared_bufferdata_throws,
-        "Atomics/waitAsync/non-shared-bufferdata-throws.js"
+        ArrayBuffer_prototype_resizable_this_is_not_object,
+        "ArrayBuffer/prototype/resizable/this-is-not-object.js"
     );
     test262_builtin_fixture!(
-        Atomics_waitAsync_not_a_typedarray_throws,
-        "Atomics/waitAsync/not-a-typedarray-throws.js"
+        ArrayBuffer_prototype_resizable_this_is_sharedarraybuffer,
+        "ArrayBuffer/prototype/resizable/this-is-sharedarraybuffer.js"
     );
     test262_builtin_fixture!(
-        Atomics_waitAsync_not_an_object_throws,
-        "Atomics/waitAsync/not-an-object-throws.js"
+        ArrayBuffer_prototype_resize_descriptor,
+        "ArrayBuffer/prototype/resize/descriptor.js"
     );
     test262_builtin_fixture!(
-        Atomics_waitAsync_null_bufferdata_throws,
-        "Atomics/waitAsync/null-bufferdata-throws.js"
+        ArrayBuffer_prototype_resize_extensible,
+        "ArrayBuffer/prototype/resize/extensible.js"
     );
     test262_builtin_fixture!(
-        Atomics_waitAsync_out_of_range_index_throws,
-        "Atomics/waitAsync/out-of-range-index-throws.js"
+        ArrayBuffer_prototype_resize_length,
+        "ArrayBuffer/prototype/resize/length.js"
     );
     test262_builtin_fixture!(
-        Atomics_waitAsync_validate_arraytype_before_timeout_coercion,
-        "Atomics/waitAsync/validate-arraytype-before-timeout-coercion.js"
+        ArrayBuffer_prototype_resize_name,
+        "ArrayBuffer/prototype/resize/name.js"
     );
-    test262_builtin_fixture!(Atomics_xor_descriptor, "Atomics/xor/descriptor.js");
     test262_builtin_fixture!(
-        Atomics_xor_expected_return_value,
-        "Atomics/xor/expected-return-value.js"
+        ArrayBuffer_prototype_resize_new_length_excessive,
+        "ArrayBuffer/prototype/resize/new-length-excessive.js"
     );
-    test262_builtin_fixture!(Atomics_xor_length, "Atomics/xor/length.js");
-    test262_builtin_fixture!(Atomics_xor_name, "Atomics/xor/name.js");
     test262_builtin_fixture!(
-        Atomics_xor_not_a_constructor,
-        "Atomics/xor/not-a-constructor.js"
+        ArrayBuffer_prototype_resize_new_length_negative,
+        "ArrayBuffer/prototype/resize/new-length-negative.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_resize_nonconstructor,
+        "ArrayBuffer/prototype/resize/nonconstructor.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_resize_resize_grow,
+        "ArrayBuffer/prototype/resize/resize-grow.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_resize_resize_same_size_zero_explicit,
+        "ArrayBuffer/prototype/resize/resize-same-size-zero-explicit.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_resize_resize_same_size_zero_implicit,
+        "ArrayBuffer/prototype/resize/resize-same-size-zero-implicit.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_resize_resize_same_size,
+        "ArrayBuffer/prototype/resize/resize-same-size.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_resize_resize_shrink_zero_explicit,
+        "ArrayBuffer/prototype/resize/resize-shrink-zero-explicit.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_resize_resize_shrink_zero_implicit,
+        "ArrayBuffer/prototype/resize/resize-shrink-zero-implicit.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_resize_resize_shrink,
+        "ArrayBuffer/prototype/resize/resize-shrink.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_resize_this_is_detached,
+        "ArrayBuffer/prototype/resize/this-is-detached.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_resize_this_is_not_arraybuffer_object,
+        "ArrayBuffer/prototype/resize/this-is-not-arraybuffer-object.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_resize_this_is_not_object,
+        "ArrayBuffer/prototype/resize/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_resize_this_is_not_resizable_arraybuffer_object,
+        "ArrayBuffer/prototype/resize/this-is-not-resizable-arraybuffer-object.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_resize_this_is_sharedarraybuffer,
+        "ArrayBuffer/prototype/resize/this-is-sharedarraybuffer.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_context_is_not_arraybuffer_object,
+        "ArrayBuffer/prototype/slice/context-is-not-arraybuffer-object.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_context_is_not_object,
+        "ArrayBuffer/prototype/slice/context-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_descriptor,
+        "ArrayBuffer/prototype/slice/descriptor.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_end_default_if_absent,
+        "ArrayBuffer/prototype/slice/end-default-if-absent.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_end_default_if_undefined,
+        "ArrayBuffer/prototype/slice/end-default-if-undefined.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_end_exceeds_length,
+        "ArrayBuffer/prototype/slice/end-exceeds-length.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_extensible,
+        "ArrayBuffer/prototype/slice/extensible.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_length,
+        "ArrayBuffer/prototype/slice/length.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_name,
+        "ArrayBuffer/prototype/slice/name.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_negative_end,
+        "ArrayBuffer/prototype/slice/negative-end.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_negative_start,
+        "ArrayBuffer/prototype/slice/negative-start.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_nonconstructor,
+        "ArrayBuffer/prototype/slice/nonconstructor.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_not_a_constructor,
+        "ArrayBuffer/prototype/slice/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_species_constructor_is_not_object,
+        "ArrayBuffer/prototype/slice/species-constructor-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_species_constructor_is_undefined,
+        "ArrayBuffer/prototype/slice/species-constructor-is-undefined.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_species_is_not_constructor,
+        "ArrayBuffer/prototype/slice/species-is-not-constructor.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_species_is_not_object,
+        "ArrayBuffer/prototype/slice/species-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_species_is_null,
+        "ArrayBuffer/prototype/slice/species-is-null.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_species_is_undefined,
+        "ArrayBuffer/prototype/slice/species-is-undefined.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_species_returns_larger_arraybuffer,
+        "ArrayBuffer/prototype/slice/species-returns-larger-arraybuffer.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_species_returns_not_arraybuffer,
+        "ArrayBuffer/prototype/slice/species-returns-not-arraybuffer.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_species_returns_smaller_arraybuffer,
+        "ArrayBuffer/prototype/slice/species-returns-smaller-arraybuffer.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_species,
+        "ArrayBuffer/prototype/slice/species.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_start_default_if_absent,
+        "ArrayBuffer/prototype/slice/start-default-if-absent.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_start_default_if_undefined,
+        "ArrayBuffer/prototype/slice/start-default-if-undefined.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_start_exceeds_end,
+        "ArrayBuffer/prototype/slice/start-exceeds-end.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_start_exceeds_length,
+        "ArrayBuffer/prototype/slice/start-exceeds-length.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_this_is_sharedarraybuffer,
+        "ArrayBuffer/prototype/slice/this-is-sharedarraybuffer.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_tointeger_conversion_end,
+        "ArrayBuffer/prototype/slice/tointeger-conversion-end.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_tointeger_conversion_start,
+        "ArrayBuffer/prototype/slice/tointeger-conversion-start.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_sliceToImmutable_not_a_constructor,
+        "ArrayBuffer/prototype/sliceToImmutable/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_sliceToImmutable_this_is_not_detached,
+        "ArrayBuffer/prototype/sliceToImmutable/this-is-not-detached.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_Symbol_toStringTag,
+        "ArrayBuffer/prototype/Symbol.toStringTag.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transfer_descriptor,
+        "ArrayBuffer/prototype/transfer/descriptor.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transfer_extensible,
+        "ArrayBuffer/prototype/transfer/extensible.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transfer_from_fixed_to_larger_no_resizable,
+        "ArrayBuffer/prototype/transfer/from-fixed-to-larger-no-resizable.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transfer_from_fixed_to_larger,
+        "ArrayBuffer/prototype/transfer/from-fixed-to-larger.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transfer_from_fixed_to_same_no_resizable,
+        "ArrayBuffer/prototype/transfer/from-fixed-to-same-no-resizable.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transfer_from_fixed_to_same,
+        "ArrayBuffer/prototype/transfer/from-fixed-to-same.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transfer_from_fixed_to_smaller_no_resizable,
+        "ArrayBuffer/prototype/transfer/from-fixed-to-smaller-no-resizable.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transfer_from_fixed_to_smaller,
+        "ArrayBuffer/prototype/transfer/from-fixed-to-smaller.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transfer_from_fixed_to_zero_no_resizable,
+        "ArrayBuffer/prototype/transfer/from-fixed-to-zero-no-resizable.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transfer_from_fixed_to_zero,
+        "ArrayBuffer/prototype/transfer/from-fixed-to-zero.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transfer_from_resizable_to_larger,
+        "ArrayBuffer/prototype/transfer/from-resizable-to-larger.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transfer_from_resizable_to_same,
+        "ArrayBuffer/prototype/transfer/from-resizable-to-same.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transfer_from_resizable_to_smaller,
+        "ArrayBuffer/prototype/transfer/from-resizable-to-smaller.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transfer_from_resizable_to_zero,
+        "ArrayBuffer/prototype/transfer/from-resizable-to-zero.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transfer_name,
+        "ArrayBuffer/prototype/transfer/name.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transfer_new_length_excessive,
+        "ArrayBuffer/prototype/transfer/new-length-excessive.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transfer_nonconstructor,
+        "ArrayBuffer/prototype/transfer/nonconstructor.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transfer_this_is_not_arraybuffer_object,
+        "ArrayBuffer/prototype/transfer/this-is-not-arraybuffer-object.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transfer_this_is_not_object,
+        "ArrayBuffer/prototype/transfer/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transfer_this_is_sharedarraybuffer,
+        "ArrayBuffer/prototype/transfer/this-is-sharedarraybuffer.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transferToFixedLength_descriptor,
+        "ArrayBuffer/prototype/transferToFixedLength/descriptor.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transferToFixedLength_extensible,
+        "ArrayBuffer/prototype/transferToFixedLength/extensible.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transferToFixedLength_from_fixed_to_larger_no_resizable,
+        "ArrayBuffer/prototype/transferToFixedLength/from-fixed-to-larger-no-resizable.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transferToFixedLength_from_fixed_to_larger,
+        "ArrayBuffer/prototype/transferToFixedLength/from-fixed-to-larger.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transferToFixedLength_from_fixed_to_same_no_resizable,
+        "ArrayBuffer/prototype/transferToFixedLength/from-fixed-to-same-no-resizable.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transferToFixedLength_from_fixed_to_same,
+        "ArrayBuffer/prototype/transferToFixedLength/from-fixed-to-same.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transferToFixedLength_from_fixed_to_smaller_no_resizable,
+        "ArrayBuffer/prototype/transferToFixedLength/from-fixed-to-smaller-no-resizable.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transferToFixedLength_from_fixed_to_smaller,
+        "ArrayBuffer/prototype/transferToFixedLength/from-fixed-to-smaller.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transferToFixedLength_from_fixed_to_zero_no_resizable,
+        "ArrayBuffer/prototype/transferToFixedLength/from-fixed-to-zero-no-resizable.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transferToFixedLength_from_fixed_to_zero,
+        "ArrayBuffer/prototype/transferToFixedLength/from-fixed-to-zero.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transferToFixedLength_from_resizable_to_larger,
+        "ArrayBuffer/prototype/transferToFixedLength/from-resizable-to-larger.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transferToFixedLength_from_resizable_to_same,
+        "ArrayBuffer/prototype/transferToFixedLength/from-resizable-to-same.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transferToFixedLength_from_resizable_to_smaller,
+        "ArrayBuffer/prototype/transferToFixedLength/from-resizable-to-smaller.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transferToFixedLength_from_resizable_to_zero,
+        "ArrayBuffer/prototype/transferToFixedLength/from-resizable-to-zero.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transferToFixedLength_name,
+        "ArrayBuffer/prototype/transferToFixedLength/name.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transferToFixedLength_new_length_excessive,
+        "ArrayBuffer/prototype/transferToFixedLength/new-length-excessive.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transferToFixedLength_nonconstructor,
+        "ArrayBuffer/prototype/transferToFixedLength/nonconstructor.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transferToFixedLength_this_is_not_arraybuffer_object,
+        "ArrayBuffer/prototype/transferToFixedLength/this-is-not-arraybuffer-object.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transferToFixedLength_this_is_not_object,
+        "ArrayBuffer/prototype/transferToFixedLength/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transferToFixedLength_this_is_sharedarraybuffer,
+        "ArrayBuffer/prototype/transferToFixedLength/this-is-sharedarraybuffer.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transferToImmutable_not_a_constructor,
+        "ArrayBuffer/prototype/transferToImmutable/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_return_abrupt_from_length_symbol,
+        "ArrayBuffer/return-abrupt-from-length-symbol.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_Symbol_species_length,
+        "ArrayBuffer/Symbol.species/length.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_Symbol_species_return_value,
+        "ArrayBuffer/Symbol.species/return-value.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_Symbol_species_symbol_species_name,
+        "ArrayBuffer/Symbol.species/symbol-species-name.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_Symbol_species_symbol_species,
+        "ArrayBuffer/Symbol.species/symbol-species.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_undefined_newtarget_throws,
+        "ArrayBuffer/undefined-newtarget-throws.js"
+    );
+    test262_builtin_fixture!(ArrayBuffer_zero_length, "ArrayBuffer/zero-length.js");
+    test262_builtin_fixture!(
+        SharedArrayBuffer_allocation_limit,
+        "SharedArrayBuffer/allocation-limit.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_init_zero,
+        "SharedArrayBuffer/init-zero.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_is_a_constructor,
+        "SharedArrayBuffer/is-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_length_is_absent,
+        "SharedArrayBuffer/length-is-absent.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_length_is_too_large_throws,
+        "SharedArrayBuffer/length-is-too-large-throws.js"
+    );
+    test262_builtin_fixture!(SharedArrayBuffer_length, "SharedArrayBuffer/length.js");
+    test262_builtin_fixture!(
+        SharedArrayBuffer_negative_length_throws,
+        "SharedArrayBuffer/negative-length-throws.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_options_maxbytelength_diminuitive,
+        "SharedArrayBuffer/options-maxbytelength-diminuitive.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_options_maxbytelength_excessive,
+        "SharedArrayBuffer/options-maxbytelength-excessive.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_options_maxbytelength_negative,
+        "SharedArrayBuffer/options-maxbytelength-negative.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_options_maxbytelength_object,
+        "SharedArrayBuffer/options-maxbytelength-object.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_options_maxbytelength_poisoned,
+        "SharedArrayBuffer/options-maxbytelength-poisoned.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_options_maxbytelength_undefined,
+        "SharedArrayBuffer/options-maxbytelength-undefined.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_options_non_object,
+        "SharedArrayBuffer/options-non-object.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_byteLength_invoked_as_accessor,
+        "SharedArrayBuffer/prototype/byteLength/invoked-as-accessor.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_byteLength_invoked_as_func,
+        "SharedArrayBuffer/prototype/byteLength/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_byteLength_length,
+        "SharedArrayBuffer/prototype/byteLength/length.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_byteLength_name,
+        "SharedArrayBuffer/prototype/byteLength/name.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_byteLength_prop_desc,
+        "SharedArrayBuffer/prototype/byteLength/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_byteLength_return_bytelength,
+        "SharedArrayBuffer/prototype/byteLength/return-bytelength.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_byteLength_this_has_no_typedarrayname_internal,
+        "SharedArrayBuffer/prototype/byteLength/this-has-no-typedarrayname-internal.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_byteLength_this_is_arraybuffer,
+        "SharedArrayBuffer/prototype/byteLength/this-is-arraybuffer.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_byteLength_this_is_not_object,
+        "SharedArrayBuffer/prototype/byteLength/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_constructor,
+        "SharedArrayBuffer/prototype/constructor.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_grow_descriptor,
+        "SharedArrayBuffer/prototype/grow/descriptor.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_grow_extensible,
+        "SharedArrayBuffer/prototype/grow/extensible.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_grow_grow_larger_size,
+        "SharedArrayBuffer/prototype/grow/grow-larger-size.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_grow_grow_same_size,
+        "SharedArrayBuffer/prototype/grow/grow-same-size.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_grow_grow_smaller_size,
+        "SharedArrayBuffer/prototype/grow/grow-smaller-size.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_grow_length,
+        "SharedArrayBuffer/prototype/grow/length.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_grow_name,
+        "SharedArrayBuffer/prototype/grow/name.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_grow_new_length_excessive,
+        "SharedArrayBuffer/prototype/grow/new-length-excessive.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_grow_new_length_negative,
+        "SharedArrayBuffer/prototype/grow/new-length-negative.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_grow_nonconstructor,
+        "SharedArrayBuffer/prototype/grow/nonconstructor.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_grow_this_is_not_arraybuffer_object,
+        "SharedArrayBuffer/prototype/grow/this-is-not-arraybuffer-object.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_grow_this_is_not_object,
+        "SharedArrayBuffer/prototype/grow/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_grow_this_is_not_resizable_arraybuffer_object,
+        "SharedArrayBuffer/prototype/grow/this-is-not-resizable-arraybuffer-object.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_grow_this_is_sharedarraybuffer,
+        "SharedArrayBuffer/prototype/grow/this-is-sharedarraybuffer.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_growable_invoked_as_accessor,
+        "SharedArrayBuffer/prototype/growable/invoked-as-accessor.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_growable_invoked_as_func,
+        "SharedArrayBuffer/prototype/growable/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_growable_length,
+        "SharedArrayBuffer/prototype/growable/length.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_growable_name,
+        "SharedArrayBuffer/prototype/growable/name.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_growable_prop_desc,
+        "SharedArrayBuffer/prototype/growable/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_growable_return_growable,
+        "SharedArrayBuffer/prototype/growable/return-growable.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_growable_this_has_no_arraybufferdata_internal,
+        "SharedArrayBuffer/prototype/growable/this-has-no-arraybufferdata-internal.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_growable_this_is_arraybuffer,
+        "SharedArrayBuffer/prototype/growable/this-is-arraybuffer.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_growable_this_is_not_object,
+        "SharedArrayBuffer/prototype/growable/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_maxByteLength_invoked_as_accessor,
+        "SharedArrayBuffer/prototype/maxByteLength/invoked-as-accessor.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_maxByteLength_invoked_as_func,
+        "SharedArrayBuffer/prototype/maxByteLength/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_maxByteLength_length,
+        "SharedArrayBuffer/prototype/maxByteLength/length.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_maxByteLength_name,
+        "SharedArrayBuffer/prototype/maxByteLength/name.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_maxByteLength_prop_desc,
+        "SharedArrayBuffer/prototype/maxByteLength/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_maxByteLength_return_maxbytelength_growable,
+        "SharedArrayBuffer/prototype/maxByteLength/return-maxbytelength-growable.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_maxByteLength_return_maxbytelength_non_growable,
+        "SharedArrayBuffer/prototype/maxByteLength/return-maxbytelength-non-growable.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_maxByteLength_this_has_no_arraybufferdata_internal,
+        "SharedArrayBuffer/prototype/maxByteLength/this-has-no-arraybufferdata-internal.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_maxByteLength_this_is_arraybuffer,
+        "SharedArrayBuffer/prototype/maxByteLength/this-is-arraybuffer.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_maxByteLength_this_is_not_object,
+        "SharedArrayBuffer/prototype/maxByteLength/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_prop_desc,
+        "SharedArrayBuffer/prototype/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_context_is_not_arraybuffer_object,
+        "SharedArrayBuffer/prototype/slice/context-is-not-arraybuffer-object.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_context_is_not_object,
+        "SharedArrayBuffer/prototype/slice/context-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_descriptor,
+        "SharedArrayBuffer/prototype/slice/descriptor.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_end_default_if_absent,
+        "SharedArrayBuffer/prototype/slice/end-default-if-absent.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_end_default_if_undefined,
+        "SharedArrayBuffer/prototype/slice/end-default-if-undefined.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_end_exceeds_length,
+        "SharedArrayBuffer/prototype/slice/end-exceeds-length.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_extensible,
+        "SharedArrayBuffer/prototype/slice/extensible.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_length,
+        "SharedArrayBuffer/prototype/slice/length.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_name,
+        "SharedArrayBuffer/prototype/slice/name.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_negative_end,
+        "SharedArrayBuffer/prototype/slice/negative-end.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_negative_start,
+        "SharedArrayBuffer/prototype/slice/negative-start.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_nonconstructor,
+        "SharedArrayBuffer/prototype/slice/nonconstructor.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_not_a_constructor,
+        "SharedArrayBuffer/prototype/slice/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_species_constructor_is_not_object,
+        "SharedArrayBuffer/prototype/slice/species-constructor-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_species_constructor_is_undefined,
+        "SharedArrayBuffer/prototype/slice/species-constructor-is-undefined.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_species_is_not_constructor,
+        "SharedArrayBuffer/prototype/slice/species-is-not-constructor.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_species_is_not_object,
+        "SharedArrayBuffer/prototype/slice/species-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_species_is_null,
+        "SharedArrayBuffer/prototype/slice/species-is-null.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_species_is_undefined,
+        "SharedArrayBuffer/prototype/slice/species-is-undefined.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_species_returns_larger_arraybuffer,
+        "SharedArrayBuffer/prototype/slice/species-returns-larger-arraybuffer.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_species_returns_not_arraybuffer,
+        "SharedArrayBuffer/prototype/slice/species-returns-not-arraybuffer.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_species_returns_smaller_arraybuffer,
+        "SharedArrayBuffer/prototype/slice/species-returns-smaller-arraybuffer.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_species,
+        "SharedArrayBuffer/prototype/slice/species.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_start_default_if_absent,
+        "SharedArrayBuffer/prototype/slice/start-default-if-absent.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_start_default_if_undefined,
+        "SharedArrayBuffer/prototype/slice/start-default-if-undefined.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_start_exceeds_end,
+        "SharedArrayBuffer/prototype/slice/start-exceeds-end.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_start_exceeds_length,
+        "SharedArrayBuffer/prototype/slice/start-exceeds-length.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_this_is_arraybuffer,
+        "SharedArrayBuffer/prototype/slice/this-is-arraybuffer.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_tointeger_conversion_end,
+        "SharedArrayBuffer/prototype/slice/tointeger-conversion-end.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_tointeger_conversion_start,
+        "SharedArrayBuffer/prototype/slice/tointeger-conversion-start.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_Symbol_toStringTag,
+        "SharedArrayBuffer/prototype/Symbol.toStringTag.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_return_abrupt_from_length_symbol,
+        "SharedArrayBuffer/return-abrupt-from-length-symbol.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_undefined_newtarget_throws,
+        "SharedArrayBuffer/undefined-newtarget-throws.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_zero_length,
+        "SharedArrayBuffer/zero-length.js"
     );
     test262_builtin_fixture!(JSON_15_12_0_1, "JSON/15.12-0-1.js");
     test262_builtin_fixture!(JSON_15_12_0_2, "JSON/15.12-0-2.js");
@@ -7445,6 +6913,1462 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
         "JSON/stringify/value-tojson-result.js"
     );
     test262_builtin_fixture!(JSON_Symbol_toStringTag, "JSON/Symbol.toStringTag.js");
+    // Phase 14 TypedArray surface (the integer-indexed exotic methods; the
+    // list was produced by the scanner, so it is data, not aspiration).
+    test262_builtin_fixture!(
+        TypedArray_from_invoked_as_func,
+        "TypedArray/from/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_from_invoked_as_method,
+        "TypedArray/from/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(TypedArray_from_length, "TypedArray/from/length.js");
+    test262_builtin_fixture!(
+        TypedArray_from_mapfn_is_not_callable,
+        "TypedArray/from/mapfn-is-not-callable.js"
+    );
+    test262_builtin_fixture!(TypedArray_from_name, "TypedArray/from/name.js");
+    test262_builtin_fixture!(
+        TypedArray_from_not_a_constructor,
+        "TypedArray/from/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(TypedArray_from_prop_desc, "TypedArray/from/prop-desc.js");
+    test262_builtin_fixture!(
+        TypedArray_from_this_is_not_constructor,
+        "TypedArray/from/this-is-not-constructor.js"
+    );
+    test262_builtin_fixture!(TypedArray_invoked, "TypedArray/invoked.js");
+    test262_builtin_fixture!(TypedArray_length, "TypedArray/length.js");
+    test262_builtin_fixture!(TypedArray_name, "TypedArray/name.js");
+    test262_builtin_fixture!(
+        TypedArray_of_invoked_as_func,
+        "TypedArray/of/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_of_invoked_as_method,
+        "TypedArray/of/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(TypedArray_of_length, "TypedArray/of/length.js");
+    test262_builtin_fixture!(TypedArray_of_name, "TypedArray/of/name.js");
+    test262_builtin_fixture!(
+        TypedArray_of_not_a_constructor,
+        "TypedArray/of/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(TypedArray_of_prop_desc, "TypedArray/of/prop-desc.js");
+    test262_builtin_fixture!(
+        TypedArray_of_this_is_not_constructor,
+        "TypedArray/of/this-is-not-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_at_length,
+        "TypedArray/prototype/at/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_at_name,
+        "TypedArray/prototype/at/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_at_prop_desc,
+        "TypedArray/prototype/at/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_at_return_abrupt_from_this,
+        "TypedArray/prototype/at/return-abrupt-from-this.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_buffer_invoked_as_accessor,
+        "TypedArray/prototype/buffer/invoked-as-accessor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_buffer_invoked_as_func,
+        "TypedArray/prototype/buffer/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_buffer_length,
+        "TypedArray/prototype/buffer/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_buffer_name,
+        "TypedArray/prototype/buffer/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_buffer_prop_desc,
+        "TypedArray/prototype/buffer/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_buffer_this_has_no_typedarrayname_internal,
+        "TypedArray/prototype/buffer/this-has-no-typedarrayname-internal.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_buffer_this_is_not_object,
+        "TypedArray/prototype/buffer/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_byteLength_invoked_as_accessor,
+        "TypedArray/prototype/byteLength/invoked-as-accessor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_byteLength_invoked_as_func,
+        "TypedArray/prototype/byteLength/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_byteLength_length,
+        "TypedArray/prototype/byteLength/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_byteLength_name,
+        "TypedArray/prototype/byteLength/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_byteLength_prop_desc,
+        "TypedArray/prototype/byteLength/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_byteLength_this_has_no_typedarrayname_internal,
+        "TypedArray/prototype/byteLength/this-has-no-typedarrayname-internal.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_byteLength_this_is_not_object,
+        "TypedArray/prototype/byteLength/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_byteOffset_invoked_as_accessor,
+        "TypedArray/prototype/byteOffset/invoked-as-accessor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_byteOffset_invoked_as_func,
+        "TypedArray/prototype/byteOffset/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_byteOffset_length,
+        "TypedArray/prototype/byteOffset/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_byteOffset_name,
+        "TypedArray/prototype/byteOffset/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_byteOffset_prop_desc,
+        "TypedArray/prototype/byteOffset/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_byteOffset_this_has_no_typedarrayname_internal,
+        "TypedArray/prototype/byteOffset/this-has-no-typedarrayname-internal.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_byteOffset_this_is_not_object,
+        "TypedArray/prototype/byteOffset/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_constructor,
+        "TypedArray/prototype/constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_copyWithin_BigInt_get_length_ignores_length_prop,
+        "TypedArray/prototype/copyWithin/BigInt/get-length-ignores-length-prop.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_copyWithin_BigInt_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/copyWithin/BigInt/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_copyWithin_get_length_ignores_length_prop,
+        "TypedArray/prototype/copyWithin/get-length-ignores-length-prop.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_copyWithin_invoked_as_func,
+        "TypedArray/prototype/copyWithin/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_copyWithin_invoked_as_method,
+        "TypedArray/prototype/copyWithin/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_copyWithin_length,
+        "TypedArray/prototype/copyWithin/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_copyWithin_name,
+        "TypedArray/prototype/copyWithin/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_copyWithin_not_a_constructor,
+        "TypedArray/prototype/copyWithin/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_copyWithin_prop_desc,
+        "TypedArray/prototype/copyWithin/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_copyWithin_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/copyWithin/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_copyWithin_this_is_not_object,
+        "TypedArray/prototype/copyWithin/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_copyWithin_this_is_not_typedarray_instance,
+        "TypedArray/prototype/copyWithin/this-is-not-typedarray-instance.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_entries_invoked_as_func,
+        "TypedArray/prototype/entries/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_entries_invoked_as_method,
+        "TypedArray/prototype/entries/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_entries_length,
+        "TypedArray/prototype/entries/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_entries_name,
+        "TypedArray/prototype/entries/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_entries_not_a_constructor,
+        "TypedArray/prototype/entries/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_entries_prop_desc,
+        "TypedArray/prototype/entries/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_entries_this_is_not_object,
+        "TypedArray/prototype/entries/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_entries_this_is_not_typedarray_instance,
+        "TypedArray/prototype/entries/this-is-not-typedarray-instance.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_every_BigInt_get_length_uses_internal_arraylength,
+        "TypedArray/prototype/every/BigInt/get-length-uses-internal-arraylength.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_every_get_length_uses_internal_arraylength,
+        "TypedArray/prototype/every/get-length-uses-internal-arraylength.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_every_invoked_as_func,
+        "TypedArray/prototype/every/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_every_invoked_as_method,
+        "TypedArray/prototype/every/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_every_length,
+        "TypedArray/prototype/every/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_every_name,
+        "TypedArray/prototype/every/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_every_not_a_constructor,
+        "TypedArray/prototype/every/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_every_prop_desc,
+        "TypedArray/prototype/every/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_every_this_is_not_object,
+        "TypedArray/prototype/every/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_every_this_is_not_typedarray_instance,
+        "TypedArray/prototype/every/this-is-not-typedarray-instance.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_fill_BigInt_get_length_ignores_length_prop,
+        "TypedArray/prototype/fill/BigInt/get-length-ignores-length-prop.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_fill_BigInt_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/fill/BigInt/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_fill_get_length_ignores_length_prop,
+        "TypedArray/prototype/fill/get-length-ignores-length-prop.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_fill_invoked_as_func,
+        "TypedArray/prototype/fill/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_fill_invoked_as_method,
+        "TypedArray/prototype/fill/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_fill_length,
+        "TypedArray/prototype/fill/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_fill_name,
+        "TypedArray/prototype/fill/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_fill_not_a_constructor,
+        "TypedArray/prototype/fill/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_fill_prop_desc,
+        "TypedArray/prototype/fill/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_fill_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/fill/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_fill_this_is_not_object,
+        "TypedArray/prototype/fill/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_fill_this_is_not_typedarray_instance,
+        "TypedArray/prototype/fill/this-is-not-typedarray-instance.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_filter_arraylength_internal,
+        "TypedArray/prototype/filter/arraylength-internal.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_filter_BigInt_arraylength_internal,
+        "TypedArray/prototype/filter/BigInt/arraylength-internal.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_filter_BigInt_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/filter/BigInt/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_filter_BigInt_speciesctor_get_ctor_inherited,
+        "TypedArray/prototype/filter/BigInt/speciesctor-get-ctor-inherited.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_filter_invoked_as_func,
+        "TypedArray/prototype/filter/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_filter_invoked_as_method,
+        "TypedArray/prototype/filter/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_filter_length,
+        "TypedArray/prototype/filter/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_filter_name,
+        "TypedArray/prototype/filter/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_filter_not_a_constructor,
+        "TypedArray/prototype/filter/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_filter_prop_desc,
+        "TypedArray/prototype/filter/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_filter_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/filter/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_filter_speciesctor_get_ctor_inherited,
+        "TypedArray/prototype/filter/speciesctor-get-ctor-inherited.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_filter_this_is_not_object,
+        "TypedArray/prototype/filter/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_filter_this_is_not_typedarray_instance,
+        "TypedArray/prototype/filter/this-is-not-typedarray-instance.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_find_BigInt_get_length_ignores_length_prop,
+        "TypedArray/prototype/find/BigInt/get-length-ignores-length-prop.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_find_BigInt_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/find/BigInt/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_find_get_length_ignores_length_prop,
+        "TypedArray/prototype/find/get-length-ignores-length-prop.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_find_invoked_as_func,
+        "TypedArray/prototype/find/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_find_invoked_as_method,
+        "TypedArray/prototype/find/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_find_length,
+        "TypedArray/prototype/find/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_find_name,
+        "TypedArray/prototype/find/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_find_not_a_constructor,
+        "TypedArray/prototype/find/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_find_prop_desc,
+        "TypedArray/prototype/find/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_find_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/find/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_find_this_is_not_object,
+        "TypedArray/prototype/find/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_find_this_is_not_typedarray_instance,
+        "TypedArray/prototype/find/this-is-not-typedarray-instance.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findIndex_BigInt_get_length_ignores_length_prop,
+        "TypedArray/prototype/findIndex/BigInt/get-length-ignores-length-prop.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findIndex_BigInt_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/findIndex/BigInt/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findIndex_get_length_ignores_length_prop,
+        "TypedArray/prototype/findIndex/get-length-ignores-length-prop.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findIndex_invoked_as_func,
+        "TypedArray/prototype/findIndex/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findIndex_invoked_as_method,
+        "TypedArray/prototype/findIndex/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findIndex_length,
+        "TypedArray/prototype/findIndex/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findIndex_name,
+        "TypedArray/prototype/findIndex/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findIndex_not_a_constructor,
+        "TypedArray/prototype/findIndex/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findIndex_prop_desc,
+        "TypedArray/prototype/findIndex/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findIndex_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/findIndex/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findIndex_this_is_not_object,
+        "TypedArray/prototype/findIndex/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findIndex_this_is_not_typedarray_instance,
+        "TypedArray/prototype/findIndex/this-is-not-typedarray-instance.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findLast_BigInt_get_length_ignores_length_prop,
+        "TypedArray/prototype/findLast/BigInt/get-length-ignores-length-prop.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findLast_BigInt_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/findLast/BigInt/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findLast_get_length_ignores_length_prop,
+        "TypedArray/prototype/findLast/get-length-ignores-length-prop.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findLast_invoked_as_func,
+        "TypedArray/prototype/findLast/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findLast_invoked_as_method,
+        "TypedArray/prototype/findLast/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findLast_length,
+        "TypedArray/prototype/findLast/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findLast_name,
+        "TypedArray/prototype/findLast/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findLast_not_a_constructor,
+        "TypedArray/prototype/findLast/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findLast_prop_desc,
+        "TypedArray/prototype/findLast/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findLast_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/findLast/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findLast_this_is_not_object,
+        "TypedArray/prototype/findLast/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findLast_this_is_not_typedarray_instance,
+        "TypedArray/prototype/findLast/this-is-not-typedarray-instance.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findLastIndex_BigInt_get_length_ignores_length_prop,
+        "TypedArray/prototype/findLastIndex/BigInt/get-length-ignores-length-prop.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findLastIndex_BigInt_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/findLastIndex/BigInt/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findLastIndex_get_length_ignores_length_prop,
+        "TypedArray/prototype/findLastIndex/get-length-ignores-length-prop.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findLastIndex_invoked_as_func,
+        "TypedArray/prototype/findLastIndex/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findLastIndex_invoked_as_method,
+        "TypedArray/prototype/findLastIndex/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findLastIndex_length,
+        "TypedArray/prototype/findLastIndex/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findLastIndex_name,
+        "TypedArray/prototype/findLastIndex/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findLastIndex_not_a_constructor,
+        "TypedArray/prototype/findLastIndex/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findLastIndex_prop_desc,
+        "TypedArray/prototype/findLastIndex/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findLastIndex_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/findLastIndex/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findLastIndex_this_is_not_object,
+        "TypedArray/prototype/findLastIndex/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_findLastIndex_this_is_not_typedarray_instance,
+        "TypedArray/prototype/findLastIndex/this-is-not-typedarray-instance.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_forEach_BigInt_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/forEach/BigInt/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_forEach_invoked_as_func,
+        "TypedArray/prototype/forEach/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_forEach_invoked_as_method,
+        "TypedArray/prototype/forEach/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_forEach_length,
+        "TypedArray/prototype/forEach/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_forEach_name,
+        "TypedArray/prototype/forEach/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_forEach_not_a_constructor,
+        "TypedArray/prototype/forEach/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_forEach_prop_desc,
+        "TypedArray/prototype/forEach/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_forEach_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/forEach/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_forEach_this_is_not_object,
+        "TypedArray/prototype/forEach/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_forEach_this_is_not_typedarray_instance,
+        "TypedArray/prototype/forEach/this-is-not-typedarray-instance.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_includes_BigInt_get_length_uses_internal_arraylength,
+        "TypedArray/prototype/includes/BigInt/get-length-uses-internal-arraylength.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_includes_get_length_uses_internal_arraylength,
+        "TypedArray/prototype/includes/get-length-uses-internal-arraylength.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_includes_invoked_as_func,
+        "TypedArray/prototype/includes/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_includes_invoked_as_method,
+        "TypedArray/prototype/includes/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_includes_length,
+        "TypedArray/prototype/includes/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_includes_name,
+        "TypedArray/prototype/includes/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_includes_not_a_constructor,
+        "TypedArray/prototype/includes/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_includes_prop_desc,
+        "TypedArray/prototype/includes/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_includes_this_is_not_object,
+        "TypedArray/prototype/includes/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_includes_this_is_not_typedarray_instance,
+        "TypedArray/prototype/includes/this-is-not-typedarray-instance.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_indexOf_BigInt_get_length_uses_internal_arraylength,
+        "TypedArray/prototype/indexOf/BigInt/get-length-uses-internal-arraylength.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_indexOf_get_length_uses_internal_arraylength,
+        "TypedArray/prototype/indexOf/get-length-uses-internal-arraylength.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_indexOf_invoked_as_func,
+        "TypedArray/prototype/indexOf/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_indexOf_invoked_as_method,
+        "TypedArray/prototype/indexOf/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_indexOf_length,
+        "TypedArray/prototype/indexOf/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_indexOf_name,
+        "TypedArray/prototype/indexOf/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_indexOf_not_a_constructor,
+        "TypedArray/prototype/indexOf/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_indexOf_prop_desc,
+        "TypedArray/prototype/indexOf/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_indexOf_this_is_not_object,
+        "TypedArray/prototype/indexOf/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_indexOf_this_is_not_typedarray_instance,
+        "TypedArray/prototype/indexOf/this-is-not-typedarray-instance.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_join_BigInt_get_length_uses_internal_arraylength,
+        "TypedArray/prototype/join/BigInt/get-length-uses-internal-arraylength.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_join_BigInt_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/join/BigInt/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_join_get_length_uses_internal_arraylength,
+        "TypedArray/prototype/join/get-length-uses-internal-arraylength.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_join_invoked_as_func,
+        "TypedArray/prototype/join/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_join_invoked_as_method,
+        "TypedArray/prototype/join/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_join_length,
+        "TypedArray/prototype/join/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_join_name,
+        "TypedArray/prototype/join/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_join_not_a_constructor,
+        "TypedArray/prototype/join/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_join_prop_desc,
+        "TypedArray/prototype/join/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_join_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/join/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_join_this_is_not_object,
+        "TypedArray/prototype/join/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_join_this_is_not_typedarray_instance,
+        "TypedArray/prototype/join/this-is-not-typedarray-instance.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_keys_invoked_as_func,
+        "TypedArray/prototype/keys/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_keys_invoked_as_method,
+        "TypedArray/prototype/keys/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_keys_length,
+        "TypedArray/prototype/keys/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_keys_name,
+        "TypedArray/prototype/keys/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_keys_not_a_constructor,
+        "TypedArray/prototype/keys/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_keys_prop_desc,
+        "TypedArray/prototype/keys/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_keys_this_is_not_object,
+        "TypedArray/prototype/keys/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_keys_this_is_not_typedarray_instance,
+        "TypedArray/prototype/keys/this-is-not-typedarray-instance.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_lastIndexOf_BigInt_get_length_uses_internal_arraylength,
+        "TypedArray/prototype/lastIndexOf/BigInt/get-length-uses-internal-arraylength.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_lastIndexOf_BigInt_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/lastIndexOf/BigInt/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_lastIndexOf_get_length_uses_internal_arraylength,
+        "TypedArray/prototype/lastIndexOf/get-length-uses-internal-arraylength.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_lastIndexOf_invoked_as_func,
+        "TypedArray/prototype/lastIndexOf/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_lastIndexOf_invoked_as_method,
+        "TypedArray/prototype/lastIndexOf/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_lastIndexOf_length,
+        "TypedArray/prototype/lastIndexOf/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_lastIndexOf_name,
+        "TypedArray/prototype/lastIndexOf/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_lastIndexOf_not_a_constructor,
+        "TypedArray/prototype/lastIndexOf/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_lastIndexOf_prop_desc,
+        "TypedArray/prototype/lastIndexOf/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_lastIndexOf_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/lastIndexOf/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_lastIndexOf_this_is_not_object,
+        "TypedArray/prototype/lastIndexOf/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_lastIndexOf_this_is_not_typedarray_instance,
+        "TypedArray/prototype/lastIndexOf/this-is-not-typedarray-instance.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_length_invoked_as_accessor,
+        "TypedArray/prototype/length/invoked-as-accessor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_length_invoked_as_func,
+        "TypedArray/prototype/length/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_length_length,
+        "TypedArray/prototype/length/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_length_name,
+        "TypedArray/prototype/length/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_length_prop_desc,
+        "TypedArray/prototype/length/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_length_this_has_no_typedarrayname_internal,
+        "TypedArray/prototype/length/this-has-no-typedarrayname-internal.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_length_this_is_not_object,
+        "TypedArray/prototype/length/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_map_BigInt_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/map/BigInt/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_map_BigInt_speciesctor_get_ctor_inherited,
+        "TypedArray/prototype/map/BigInt/speciesctor-get-ctor-inherited.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_map_invoked_as_func,
+        "TypedArray/prototype/map/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_map_invoked_as_method,
+        "TypedArray/prototype/map/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_map_length,
+        "TypedArray/prototype/map/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_map_name,
+        "TypedArray/prototype/map/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_map_not_a_constructor,
+        "TypedArray/prototype/map/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_map_prop_desc,
+        "TypedArray/prototype/map/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_map_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/map/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_map_speciesctor_get_ctor_inherited,
+        "TypedArray/prototype/map/speciesctor-get-ctor-inherited.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_map_this_is_not_object,
+        "TypedArray/prototype/map/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_map_this_is_not_typedarray_instance,
+        "TypedArray/prototype/map/this-is-not-typedarray-instance.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reduce_BigInt_get_length_uses_internal_arraylength,
+        "TypedArray/prototype/reduce/BigInt/get-length-uses-internal-arraylength.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reduce_BigInt_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/reduce/BigInt/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reduce_get_length_uses_internal_arraylength,
+        "TypedArray/prototype/reduce/get-length-uses-internal-arraylength.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reduce_invoked_as_func,
+        "TypedArray/prototype/reduce/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reduce_invoked_as_method,
+        "TypedArray/prototype/reduce/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reduce_length,
+        "TypedArray/prototype/reduce/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reduce_name,
+        "TypedArray/prototype/reduce/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reduce_not_a_constructor,
+        "TypedArray/prototype/reduce/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reduce_prop_desc,
+        "TypedArray/prototype/reduce/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reduce_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/reduce/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reduce_this_is_not_object,
+        "TypedArray/prototype/reduce/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reduce_this_is_not_typedarray_instance,
+        "TypedArray/prototype/reduce/this-is-not-typedarray-instance.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reduceRight_BigInt_get_length_uses_internal_arraylength,
+        "TypedArray/prototype/reduceRight/BigInt/get-length-uses-internal-arraylength.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reduceRight_BigInt_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/reduceRight/BigInt/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reduceRight_get_length_uses_internal_arraylength,
+        "TypedArray/prototype/reduceRight/get-length-uses-internal-arraylength.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reduceRight_invoked_as_func,
+        "TypedArray/prototype/reduceRight/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reduceRight_invoked_as_method,
+        "TypedArray/prototype/reduceRight/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reduceRight_length,
+        "TypedArray/prototype/reduceRight/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reduceRight_name,
+        "TypedArray/prototype/reduceRight/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reduceRight_not_a_constructor,
+        "TypedArray/prototype/reduceRight/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reduceRight_prop_desc,
+        "TypedArray/prototype/reduceRight/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reduceRight_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/reduceRight/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reduceRight_this_is_not_object,
+        "TypedArray/prototype/reduceRight/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reduceRight_this_is_not_typedarray_instance,
+        "TypedArray/prototype/reduceRight/this-is-not-typedarray-instance.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reverse_BigInt_get_length_uses_internal_arraylength,
+        "TypedArray/prototype/reverse/BigInt/get-length-uses-internal-arraylength.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reverse_BigInt_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/reverse/BigInt/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reverse_BigInt_returns_original_object,
+        "TypedArray/prototype/reverse/BigInt/returns-original-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reverse_get_length_uses_internal_arraylength,
+        "TypedArray/prototype/reverse/get-length-uses-internal-arraylength.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reverse_invoked_as_func,
+        "TypedArray/prototype/reverse/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reverse_invoked_as_method,
+        "TypedArray/prototype/reverse/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reverse_length,
+        "TypedArray/prototype/reverse/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reverse_name,
+        "TypedArray/prototype/reverse/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reverse_not_a_constructor,
+        "TypedArray/prototype/reverse/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reverse_prop_desc,
+        "TypedArray/prototype/reverse/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reverse_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/reverse/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reverse_returns_original_object,
+        "TypedArray/prototype/reverse/returns-original-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reverse_this_is_not_object,
+        "TypedArray/prototype/reverse/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_reverse_this_is_not_typedarray_instance,
+        "TypedArray/prototype/reverse/this-is-not-typedarray-instance.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_set_array_arg_target_arraylength_internal,
+        "TypedArray/prototype/set/array-arg-target-arraylength-internal.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_set_BigInt_array_arg_target_arraylength_internal,
+        "TypedArray/prototype/set/BigInt/array-arg-target-arraylength-internal.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_set_BigInt_bigint_tobigint64,
+        "TypedArray/prototype/set/BigInt/bigint-tobigint64.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_set_BigInt_bigint_tobiguint64,
+        "TypedArray/prototype/set/BigInt/bigint-tobiguint64.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_set_BigInt_typedarray_arg_src_arraylength_internal,
+        "TypedArray/prototype/set/BigInt/typedarray-arg-src-arraylength-internal.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_set_BigInt_typedarray_arg_src_byteoffset_internal,
+        "TypedArray/prototype/set/BigInt/typedarray-arg-src-byteoffset-internal.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_set_BigInt_typedarray_arg_target_arraylength_internal,
+        "TypedArray/prototype/set/BigInt/typedarray-arg-target-arraylength-internal.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_set_invoked_as_func,
+        "TypedArray/prototype/set/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_set_invoked_as_method,
+        "TypedArray/prototype/set/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_set_length,
+        "TypedArray/prototype/set/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_set_name,
+        "TypedArray/prototype/set/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_set_not_a_constructor,
+        "TypedArray/prototype/set/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_set_prop_desc,
+        "TypedArray/prototype/set/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_set_this_is_not_object,
+        "TypedArray/prototype/set/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_set_this_is_not_typedarray_instance,
+        "TypedArray/prototype/set/this-is-not-typedarray-instance.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_set_typedarray_arg_src_arraylength_internal,
+        "TypedArray/prototype/set/typedarray-arg-src-arraylength-internal.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_set_typedarray_arg_src_byteoffset_internal,
+        "TypedArray/prototype/set/typedarray-arg-src-byteoffset-internal.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_set_typedarray_arg_target_arraylength_internal,
+        "TypedArray/prototype/set/typedarray-arg-target-arraylength-internal.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_set_typedarray_arg_target_byteoffset_internal,
+        "TypedArray/prototype/set/typedarray-arg-target-byteoffset-internal.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_slice_arraylength_internal,
+        "TypedArray/prototype/slice/arraylength-internal.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_slice_BigInt_arraylength_internal,
+        "TypedArray/prototype/slice/BigInt/arraylength-internal.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_slice_BigInt_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/slice/BigInt/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_slice_BigInt_speciesctor_get_ctor_inherited,
+        "TypedArray/prototype/slice/BigInt/speciesctor-get-ctor-inherited.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_slice_invoked_as_func,
+        "TypedArray/prototype/slice/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_slice_invoked_as_method,
+        "TypedArray/prototype/slice/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_slice_length,
+        "TypedArray/prototype/slice/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_slice_name,
+        "TypedArray/prototype/slice/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_slice_not_a_constructor,
+        "TypedArray/prototype/slice/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_slice_prop_desc,
+        "TypedArray/prototype/slice/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_slice_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/slice/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_slice_speciesctor_get_ctor_inherited,
+        "TypedArray/prototype/slice/speciesctor-get-ctor-inherited.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_slice_this_is_not_object,
+        "TypedArray/prototype/slice/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_slice_this_is_not_typedarray_instance,
+        "TypedArray/prototype/slice/this-is-not-typedarray-instance.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_some_BigInt_get_length_uses_internal_arraylength,
+        "TypedArray/prototype/some/BigInt/get-length-uses-internal-arraylength.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_some_BigInt_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/some/BigInt/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_some_get_length_uses_internal_arraylength,
+        "TypedArray/prototype/some/get-length-uses-internal-arraylength.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_some_invoked_as_func,
+        "TypedArray/prototype/some/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_some_invoked_as_method,
+        "TypedArray/prototype/some/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_some_length,
+        "TypedArray/prototype/some/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_some_name,
+        "TypedArray/prototype/some/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_some_not_a_constructor,
+        "TypedArray/prototype/some/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_some_prop_desc,
+        "TypedArray/prototype/some/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_some_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/some/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_some_this_is_not_object,
+        "TypedArray/prototype/some/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_some_this_is_not_typedarray_instance,
+        "TypedArray/prototype/some/this-is-not-typedarray-instance.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_sort_BigInt_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/sort/BigInt/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_sort_invoked_as_func,
+        "TypedArray/prototype/sort/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_sort_invoked_as_method,
+        "TypedArray/prototype/sort/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_sort_length,
+        "TypedArray/prototype/sort/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_sort_name,
+        "TypedArray/prototype/sort/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_sort_not_a_constructor,
+        "TypedArray/prototype/sort/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_sort_prop_desc,
+        "TypedArray/prototype/sort/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_sort_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/sort/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_sort_this_is_not_object,
+        "TypedArray/prototype/sort/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_sort_this_is_not_typedarray_instance,
+        "TypedArray/prototype/sort/this-is-not-typedarray-instance.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_subarray_invoked_as_func,
+        "TypedArray/prototype/subarray/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_subarray_invoked_as_method,
+        "TypedArray/prototype/subarray/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_subarray_length,
+        "TypedArray/prototype/subarray/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_subarray_name,
+        "TypedArray/prototype/subarray/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_subarray_not_a_constructor,
+        "TypedArray/prototype/subarray/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_subarray_prop_desc,
+        "TypedArray/prototype/subarray/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_subarray_this_is_not_object,
+        "TypedArray/prototype/subarray/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_subarray_this_is_not_typedarray_instance,
+        "TypedArray/prototype/subarray/this-is-not-typedarray-instance.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_Symbol_iterator_not_a_constructor,
+        "TypedArray/prototype/Symbol.iterator/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_Symbol_iterator,
+        "TypedArray/prototype/Symbol.iterator.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_toLocaleString_BigInt_get_length_uses_internal_arraylength,
+        "TypedArray/prototype/toLocaleString/BigInt/get-length-uses-internal-arraylength.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_toLocaleString_BigInt_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/toLocaleString/BigInt/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_toLocaleString_get_length_uses_internal_arraylength,
+        "TypedArray/prototype/toLocaleString/get-length-uses-internal-arraylength.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_toLocaleString_invoked_as_func,
+        "TypedArray/prototype/toLocaleString/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_toLocaleString_invoked_as_method,
+        "TypedArray/prototype/toLocaleString/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_toLocaleString_length,
+        "TypedArray/prototype/toLocaleString/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_toLocaleString_name,
+        "TypedArray/prototype/toLocaleString/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_toLocaleString_not_a_constructor,
+        "TypedArray/prototype/toLocaleString/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_toLocaleString_prop_desc,
+        "TypedArray/prototype/toLocaleString/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_toLocaleString_return_abrupt_from_this_out_of_bounds,
+        "TypedArray/prototype/toLocaleString/return-abrupt-from-this-out-of-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_toLocaleString_this_is_not_object,
+        "TypedArray/prototype/toLocaleString/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_toLocaleString_this_is_not_typedarray_instance,
+        "TypedArray/prototype/toLocaleString/this-is-not-typedarray-instance.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_toReversed_length,
+        "TypedArray/prototype/toReversed/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_toReversed_name,
+        "TypedArray/prototype/toReversed/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_toReversed_not_a_constructor,
+        "TypedArray/prototype/toReversed/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_toReversed_property_descriptor,
+        "TypedArray/prototype/toReversed/property-descriptor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_toReversed_reverses,
+        "TypedArray/prototype/toReversed/reverses.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_toSorted_comparefn_controls_sort,
+        "TypedArray/prototype/toSorted/comparefn-controls-sort.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_toSorted_comparefn_default,
+        "TypedArray/prototype/toSorted/comparefn-default.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_toSorted_length,
+        "TypedArray/prototype/toSorted/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_toSorted_name,
+        "TypedArray/prototype/toSorted/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_toSorted_not_a_constructor,
+        "TypedArray/prototype/toSorted/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_toSorted_property_descriptor,
+        "TypedArray/prototype/toSorted/property-descriptor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_toString_not_a_constructor,
+        "TypedArray/prototype/toString/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_values_invoked_as_func,
+        "TypedArray/prototype/values/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_values_invoked_as_method,
+        "TypedArray/prototype/values/invoked-as-method.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_values_length,
+        "TypedArray/prototype/values/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_values_name,
+        "TypedArray/prototype/values/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_values_not_a_constructor,
+        "TypedArray/prototype/values/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_values_prop_desc,
+        "TypedArray/prototype/values/prop-desc.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_values_this_is_not_object,
+        "TypedArray/prototype/values/this-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_values_this_is_not_typedarray_instance,
+        "TypedArray/prototype/values/this-is-not-typedarray-instance.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_with_length,
+        "TypedArray/prototype/with/length.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_with_name,
+        "TypedArray/prototype/with/name.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_with_negative_index_resize_to_in_bounds,
+        "TypedArray/prototype/with/negative-index-resize-to-in-bounds.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_with_not_a_constructor,
+        "TypedArray/prototype/with/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_with_property_descriptor,
+        "TypedArray/prototype/with/property-descriptor.js"
+    );
+    test262_builtin_fixture!(
+        TypedArray_prototype_with_this_value_invalid,
+        "TypedArray/prototype/with/this-value-invalid.js"
+    );
+    test262_builtin_fixture!(TypedArray_prototype, "TypedArray/prototype.js");
     /// `crates/test262` sits one level below the repo root, where the
     /// `test262` submodule is pinned.
     fn builtins_dir() -> PathBuf {
@@ -7575,6 +8499,14 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
             .run_script(ASSERT_THROWS_PRELUDE)
             .map_err(|e| e.message)?;
         agent.run_script(HARNESS_PRELUDE).map_err(|e| e.message)?;
+        // The real harness include files (testTypedArray.js, propertyHelper.js,
+        // testAtomics.js, …) are plain JS built on the globals above; load
+        // them from the submodule so the vendored fixtures get their exact
+        // helper surface.
+        for include in &fm.includes {
+            let source = harness_include_source(include)?;
+            agent.run_script(&source).map_err(|e| e.message)?;
+        }
         let result = agent.run_script(&wrapped);
         agent.run_jobs().map_err(|e| e.message)?;
         match (result, fm.negative_phase.as_deref()) {
@@ -7601,6 +8533,21 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
 
     fn assertion_error(message: String) -> JsError {
         JsError::new(ErrorKind::TypeError, message)
+    }
+
+    /// The source of a harness include file, read from the pinned submodule.
+    /// Only the large helper files the preludes cannot replicate are loaded;
+    /// the rest (isConstructor.js needs Reflect, propertyHelper.js restores
+    /// writability through defineProperty) are provided by the preludes
+    /// instead.
+    fn harness_include_source(name: &str) -> Result<String, String> {
+        if !matches!(name, "testAtomics.js" | "testTypedArray.js") {
+            return Ok(String::new());
+        }
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test262/harness")
+            .join(name);
+        std::fs::read_to_string(&path).map_err(|e| format!("{name}: {e}"))
     }
 
     fn arity_error(name: &str) -> JsError {
@@ -7838,6 +8785,8 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
                         | "detachArrayBuffer.js"
                         | "isConstructor.js"
                         | "propertyHelper.js"
+                        | "testAtomics.js"
+                        | "testTypedArray.js"
                 )
             })
             .collect();

@@ -1188,14 +1188,18 @@ fn set(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
             ));
         }
         if target_slots.element_type == source_slots.element_type {
-            // Same type: byte copy (aliasing is handled by the copy).
+            // Same type: byte copy (aliasing is handled by the copy). The
+            // destination space is clamped to the live buffer bytes so a
+            // resized-shrunk buffer fails cleanly instead of panicking.
             let src_bytes = source_slots.buffer.0.borrow();
             let start = source_slots.byte_offset;
-            let data: Vec<u8> = src_bytes[start..start + source_slots.byte_length].to_vec();
+            let end = (start + source_slots.byte_length).min(src_bytes.len());
+            let data: Vec<u8> = src_bytes[start..end].to_vec();
             drop(src_bytes);
             let mut dst_bytes = target_slots.buffer.0.borrow_mut();
             let dst_start = target_slots.byte_offset + offset * target_slots.element_type.size();
-            dst_bytes[dst_start..dst_start + data.len()].copy_from_slice(&data);
+            let count = data.len().min(dst_bytes.len().saturating_sub(dst_start));
+            dst_bytes[dst_start..dst_start + count].copy_from_slice(&data[..count]);
         } else {
             for k in 0..source_length {
                 let value = get(agent, &source, &key(k as u64))?;

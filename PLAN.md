@@ -1826,14 +1826,26 @@ length-tracking and the real waiter machinery.
   and `same_value` now treats a Function value and its underlying object as the same
   allocation, so `Object.getPrototypeOf(f) === Function.prototype` holds.
 
-Re-scan after the fixes: **ArrayBuffer 171 / SharedArrayBuffer 92 / DataView 388 /
-Atomics 108 / JSON 136 / Map 203 / Set 379** (1477 passing across the seven directories;
-Map+Set grew from 369 to 582). The workspace now runs **2983 tests** (2441 of them test262
+Re-scan after the fixes: **ArrayBuffer 172 / SharedArrayBuffer 92 / DataView 388 /
+Atomics 144 / JSON 136 / Map 203 / Set 379** (1514 passing across the seven directories;
+Map+Set grew from 369 to 582). The workspace then runs **2983 tests** (2441 of them test262
 fixtures) with fmt and clippy (`-D warnings`) clean.
 
+**TypedArray harness (follow-up):** the `testTypedArray.js`/`testAtomics.js` harness files are
+now loaded verbatim from the submodule when a fixture includes them (they are plain JS built on
+the prelude globals — `testWithTypedArrayConstructors`, `testWithBigIntTypedArrayConstructors`,
+`nonClampedIntArrayConstructors`, `testWithAtomicsOutOfBoundsIndices`, …); `Test262Error` is a
+JS function whose call form returns a throwable instance (the harness files do
+`throw Test262Error(...)` without `new`). The other include files stay prelude-provided
+(isConstructor.js needs `Reflect`; propertyHelper.js restores writability through
+`defineProperty`, which the prelude versions avoid). `TypedArray.prototype.set`'s byte copy is
+clamped to the live buffer so a shrunk resizable buffer fails cleanly instead of panicking.
+The TypedArray directory scans for the first time: **TypedArray 371 pass / 966 fail**. The
+workspace now runs **3219 tests** (2677 of them test262 fixtures) with fmt and clippy
+(`-D warnings`) clean.
+
 **Pending:** `Reflect`/`Proxy` (Phase 16), `$262.createRealm`, resizable-typed-array
-length-tracking, `testTypedArray.js`/`testAtomics.js` harness files, and the real waiter
-machinery.
+length-tracking, and the real waiter machinery.
 
 ---
 
