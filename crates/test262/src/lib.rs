@@ -19,54 +19,190 @@ mod harness {
     use crux::value::Value;
     use runtime::Agent;
 
-    /// The `test/language/` fixtures this phase can execute, relative to the
-    /// submodule root. Grows as later phases add feature coverage.
-    const SUBSET: &[&str] = &[
-        "statements/if/cptn-empty-statement.js",
-        "statements/if/cptn-no-else-false.js",
-        "statements/if/cptn-no-else-true-abrupt-empty.js",
-        "statements/if/cptn-no-else-true-nrml.js",
-        "statements/if/empty-statement.js",
-        "statements/if/if-const-else-const.js",
-        "statements/if/if-let-else-let.js",
-        "statements/if/let-block-with-newline.js",
-        "statements/if/let-identifier-with-newline.js",
-        "statements/while/cptn-abrupt-empty.js",
-        "statements/while/cptn-iter.js",
-        "statements/while/cptn-no-iter.js",
-        "statements/while/decl-const.js",
-        "statements/while/decl-let.js",
-        "statements/while/let-identifier-with-newline.js",
-        "statements/while/S12.6.2_A15.js",
-        "statements/while/S12.6.2_A4_T5.js",
-        "statements/while/S12.6.2_A6_T1.js",
-        "statements/function/cptn-decl.js",
-        "statements/function/enable-strict-via-body.js",
-        "statements/function/early-body-super-call.js",
-        "statements/function/dflt-params-arg-val-undefined.js",
-        "statements/function/dflt-params-arg-val-not-undefined.js",
-        "statements/function/dflt-params-ref-prior.js",
-        "statements/function/dflt-params-trailing-comma.js",
-        "statements/function/dflt-params-duplicates.js",
-        "statements/function/dflt-params-rest.js",
-        "statements/function/rest-param-strict-body.js",
-        "statements/function/rest-params-trailing-comma-early-error.js",
-        "statements/function/params-dflt-args-unmapped.js",
-        "statements/function/arguments-with-arguments-fn.js",
-        "statements/function/arguments-with-arguments-lex.js",
-        "expressions/object/method-definition/meth-dflt-params-ref-prior.js",
-        "expressions/object/method-definition/meth-params-trailing-comma-single.js",
-        "statements/class/method/dflt-params-ref-prior.js",
-        "statements/class/method/dflt-params-arg-val-undefined.js",
-        "statements/class/method/dflt-params-trailing-comma.js",
-        "statements/class/method/params-trailing-comma-single.js",
-        "statements/class/private-static-getter-non-static-setter-early-error.js",
-        "statements/class/private-static-setter-non-static-getter-early-error.js",
-        "statements/class/private-non-static-getter-static-setter-early-error.js",
-        "statements/class/private-non-static-setter-static-getter-early-error.js",
-        "statements/class/static-init-scope-private.js",
-        "expressions/conditional/in-condition.js",
-    ];
+    /// One `#[test]` per fixture, so failures and skips are attributed to the
+    /// file, tests run in parallel, and `cargo test -p test262 <substring>`
+    /// filters to a single fixture. The ident is the path with `/`, `-`, and
+    /// `.` folded to `_`; path and ident are paired by hand so the names stay
+    /// readable.
+    macro_rules! test262_fixture {
+        ($name:ident, $path:literal) => {
+            #[test]
+            fn $name() {
+                assert_fixture($path);
+            }
+        };
+    }
+
+    test262_fixture!(
+        statements_if_cptn_empty_statement,
+        "statements/if/cptn-empty-statement.js"
+    );
+    test262_fixture!(
+        statements_if_cptn_no_else_false,
+        "statements/if/cptn-no-else-false.js"
+    );
+    test262_fixture!(
+        statements_if_cptn_no_else_true_abrupt_empty,
+        "statements/if/cptn-no-else-true-abrupt-empty.js"
+    );
+    test262_fixture!(
+        statements_if_cptn_no_else_true_nrml,
+        "statements/if/cptn-no-else-true-nrml.js"
+    );
+    test262_fixture!(
+        statements_if_empty_statement,
+        "statements/if/empty-statement.js"
+    );
+    test262_fixture!(
+        statements_if_if_const_else_const,
+        "statements/if/if-const-else-const.js"
+    );
+    test262_fixture!(
+        statements_if_if_let_else_let,
+        "statements/if/if-let-else-let.js"
+    );
+    test262_fixture!(
+        statements_if_let_block_with_newline,
+        "statements/if/let-block-with-newline.js"
+    );
+    test262_fixture!(
+        statements_if_let_identifier_with_newline,
+        "statements/if/let-identifier-with-newline.js"
+    );
+    test262_fixture!(
+        statements_while_cptn_abrupt_empty,
+        "statements/while/cptn-abrupt-empty.js"
+    );
+    test262_fixture!(statements_while_cptn_iter, "statements/while/cptn-iter.js");
+    test262_fixture!(
+        statements_while_cptn_no_iter,
+        "statements/while/cptn-no-iter.js"
+    );
+    test262_fixture!(
+        statements_while_decl_const,
+        "statements/while/decl-const.js"
+    );
+    test262_fixture!(statements_while_decl_let, "statements/while/decl-let.js");
+    test262_fixture!(
+        statements_while_let_identifier_with_newline,
+        "statements/while/let-identifier-with-newline.js"
+    );
+    test262_fixture!(
+        statements_while_s12_6_2_a15,
+        "statements/while/S12.6.2_A15.js"
+    );
+    test262_fixture!(
+        statements_while_s12_6_2_a4_t5,
+        "statements/while/S12.6.2_A4_T5.js"
+    );
+    test262_fixture!(
+        statements_while_s12_6_2_a6_t1,
+        "statements/while/S12.6.2_A6_T1.js"
+    );
+    test262_fixture!(
+        statements_function_cptn_decl,
+        "statements/function/cptn-decl.js"
+    );
+    test262_fixture!(
+        statements_function_enable_strict_via_body,
+        "statements/function/enable-strict-via-body.js"
+    );
+    test262_fixture!(
+        statements_function_early_body_super_call,
+        "statements/function/early-body-super-call.js"
+    );
+    test262_fixture!(
+        statements_function_dflt_params_arg_val_undefined,
+        "statements/function/dflt-params-arg-val-undefined.js"
+    );
+    test262_fixture!(
+        statements_function_dflt_params_arg_val_not_undefined,
+        "statements/function/dflt-params-arg-val-not-undefined.js"
+    );
+    test262_fixture!(
+        statements_function_dflt_params_ref_prior,
+        "statements/function/dflt-params-ref-prior.js"
+    );
+    test262_fixture!(
+        statements_function_dflt_params_trailing_comma,
+        "statements/function/dflt-params-trailing-comma.js"
+    );
+    test262_fixture!(
+        statements_function_dflt_params_duplicates,
+        "statements/function/dflt-params-duplicates.js"
+    );
+    test262_fixture!(
+        statements_function_dflt_params_rest,
+        "statements/function/dflt-params-rest.js"
+    );
+    test262_fixture!(
+        statements_function_rest_param_strict_body,
+        "statements/function/rest-param-strict-body.js"
+    );
+    test262_fixture!(
+        statements_function_rest_params_trailing_comma_early_error,
+        "statements/function/rest-params-trailing-comma-early-error.js"
+    );
+    test262_fixture!(
+        statements_function_params_dflt_args_unmapped,
+        "statements/function/params-dflt-args-unmapped.js"
+    );
+    test262_fixture!(
+        statements_function_arguments_with_arguments_fn,
+        "statements/function/arguments-with-arguments-fn.js"
+    );
+    test262_fixture!(
+        statements_function_arguments_with_arguments_lex,
+        "statements/function/arguments-with-arguments-lex.js"
+    );
+    test262_fixture!(
+        expressions_object_method_definition_meth_dflt_params_ref_prior,
+        "expressions/object/method-definition/meth-dflt-params-ref-prior.js"
+    );
+    test262_fixture!(
+        expressions_object_method_definition_meth_params_trailing_comma_single,
+        "expressions/object/method-definition/meth-params-trailing-comma-single.js"
+    );
+    test262_fixture!(
+        statements_class_method_dflt_params_ref_prior,
+        "statements/class/method/dflt-params-ref-prior.js"
+    );
+    test262_fixture!(
+        statements_class_method_dflt_params_arg_val_undefined,
+        "statements/class/method/dflt-params-arg-val-undefined.js"
+    );
+    test262_fixture!(
+        statements_class_method_dflt_params_trailing_comma,
+        "statements/class/method/dflt-params-trailing-comma.js"
+    );
+    test262_fixture!(
+        statements_class_method_params_trailing_comma_single,
+        "statements/class/method/params-trailing-comma-single.js"
+    );
+    test262_fixture!(
+        statements_class_private_static_getter_non_static_setter_early_error,
+        "statements/class/private-static-getter-non-static-setter-early-error.js"
+    );
+    test262_fixture!(
+        statements_class_private_static_setter_non_static_getter_early_error,
+        "statements/class/private-static-setter-non-static-getter-early-error.js"
+    );
+    test262_fixture!(
+        statements_class_private_non_static_getter_static_setter_early_error,
+        "statements/class/private-non-static-getter-static-setter-early-error.js"
+    );
+    test262_fixture!(
+        statements_class_private_non_static_setter_static_getter_early_error,
+        "statements/class/private-non-static-setter-static-getter-early-error.js"
+    );
+    test262_fixture!(
+        statements_class_static_init_scope_private,
+        "statements/class/static-init-scope-private.js"
+    );
+    test262_fixture!(
+        expressions_conditional_in_condition,
+        "expressions/conditional/in-condition.js"
+    );
 
     /// `crates/test262` sits one level below the repo root, where the
     /// `test262` submodule is pinned.
@@ -420,37 +556,20 @@ mod harness {
         FixtureResult::Pass
     }
 
-    #[test]
-    fn phase_6_language_subset() {
+    /// Run one fixture as its own test. Skips print and pass; a missing
+    /// submodule (fresh clone) makes every fixture pass vacuously.
+    fn assert_fixture(relative: &str) {
+        static NOTICE: std::sync::Once = std::sync::Once::new();
         if !language_dir().exists() {
-            eprintln!("test262 submodule not checked out; run `git submodule update --init`");
+            NOTICE.call_once(|| {
+                eprintln!("test262 submodule not checked out; run `git submodule update --init`");
+            });
             return;
         }
-        let mut passed = 0usize;
-        let mut skipped = Vec::new();
-        let mut failed = Vec::new();
-        for relative in SUBSET {
-            match run_fixture(relative) {
-                FixtureResult::Pass => passed += 1,
-                FixtureResult::Skip(reason) => skipped.push((relative, reason)),
-                FixtureResult::Fail(reason) => failed.push((relative, reason)),
-            }
+        match run_fixture(relative) {
+            FixtureResult::Pass => {}
+            FixtureResult::Skip(reason) => eprintln!("SKIP {relative}: {reason}"),
+            FixtureResult::Fail(reason) => panic!("FAIL {relative}: {reason}"),
         }
-        eprintln!(
-            "test262 subset: {passed}/{} passed, {} skipped",
-            SUBSET.len(),
-            skipped.len()
-        );
-        for (relative, reason) in &skipped {
-            eprintln!("SKIP {relative}: {reason}");
-        }
-        for (relative, reason) in &failed {
-            eprintln!("FAIL {relative}: {reason}");
-        }
-        assert!(
-            failed.is_empty(),
-            "{} test262 fixtures failed",
-            failed.len()
-        );
     }
 }
