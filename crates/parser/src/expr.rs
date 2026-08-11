@@ -1829,7 +1829,7 @@ pub(crate) fn parse_function_body_block(
 fn is_simple_params(params: &[BindingElement]) -> bool {
     params
         .iter()
-        .all(|p| p.init.is_none() && matches!(p.pattern, BindingPattern::Ident(_)))
+        .all(|p| !p.rest && p.init.is_none() && matches!(p.pattern, BindingPattern::Ident(_)))
 }
 
 /// Validates a parameter list: duplicates are an error in strict mode, for

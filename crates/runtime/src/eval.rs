@@ -176,13 +176,16 @@ fn eval_var_declarations(
 ) -> Result<(), JsError> {
     for decl in decls {
         if let Some(init) = &decl.init {
-            let BindingPattern::Ident(name) = &decl.pattern else {
-                return Err(not_implemented("destructuring variable declarations"));
-            };
             let value = eval_expr(agent, init, strict)?;
-            let name = crux::lookup(*name);
-            let reference = resolve_binding(agent, &name, strict)?;
-            put_value(agent, &reference, value)?;
+            // BindingInitialization with no environment: resolve and PutValue
+            // the hoisted var binding (spec 14.3.2 step 2.b).
+            if let BindingPattern::Ident(name) = &decl.pattern
+                && crate::function::is_anonymous_function_definition(init)
+            {
+                // spec 14.3.2 step 2.b: SetFunctionName from the identifier.
+                crate::function::set_function_name(&value, &crux::lookup(*name))?;
+            }
+            crate::binding::binding_initialization(agent, &decl.pattern, value, None, strict)?;
         }
     }
     Ok(())
@@ -196,17 +199,25 @@ fn eval_lexical_declarations(
     decls: &[syntax::ast::VarDeclarator],
     strict: bool,
 ) -> Result<(), JsError> {
+    // BindingInitialization against the running LexicalEnvironment: the
+    // bindings were created uninitialized by declaration instantiation and
+    // are filled with InitializeBinding (spec 14.2.2 step 2.c).
+    let env = agent.running_context()?.lexical_environment.clone();
     for decl in decls {
-        let BindingPattern::Ident(name) = &decl.pattern else {
-            return Err(not_implemented("destructuring lexical declarations"));
-        };
         let value = match &decl.init {
-            Some(init) => eval_expr(agent, init, strict)?,
+            Some(init) => {
+                let value = eval_expr(agent, init, strict)?;
+                if let BindingPattern::Ident(name) = &decl.pattern
+                    && crate::function::is_anonymous_function_definition(init)
+                {
+                    // spec 14.2.2 step 2.d: SetFunctionName from the binding.
+                    crate::function::set_function_name(&value, &crux::lookup(*name))?;
+                }
+                value
+            }
             None => Value::Undefined,
         };
-        let name = crux::lookup(*name);
-        let reference = resolve_binding(agent, &name, strict)?;
-        initialize_referenced_binding(&reference, value)?;
+        crate::binding::binding_initialization(agent, &decl.pattern, value, Some(&env), strict)?;
     }
     Ok(())
 }
@@ -406,8 +417,34 @@ fn eval_do_while(
     }
 }
 
+/// CreatePerIterationEnvironment (spec 14.7.4.3): a fresh declarative
+/// environment over the current one's outer, with the per-iteration bindings
+/// copied from the current environment's values. Closures created in the
+/// body capture this env, giving each iteration its own `let`/`const`
+/// bindings instead of one shared loop environment.
+fn create_per_iteration_environment(
+    agent: &mut Agent,
+    per_iteration: &[crux::string::JsString],
+) -> Result<EnvRef, JsError> {
+    let last = agent.running_context()?.lexical_environment.clone();
+    let outer = last.outer().ok_or_else(|| {
+        JsError::new(
+            ErrorKind::ReferenceError,
+            "No outer environment for per-iteration bindings".into(),
+        )
+    })?;
+    let env = new_declarative_environment(Some(outer));
+    for name in per_iteration {
+        let value = last.get_binding_value(name, false)?;
+        env.create_mutable_binding(name, false)?;
+        env.initialize_binding(name, value)?;
+    }
+    Ok(env)
+}
+
 /// ForStatement evaluation (spec 14.7.4): `let`/`const` heads bind in a
-/// fresh loop environment (per-iteration copies for closures join Phase 7).
+/// fresh loop environment; each iteration gets its own copy of the head's
+/// bindings so closures capture per-iteration values (spec 14.7.4.3).
 fn eval_for(
     agent: &mut Agent,
     init: Option<&ForInit>,
@@ -419,6 +456,7 @@ fn eval_for(
 ) -> Result<Completion, JsError> {
     let old_env = agent.running_context()?.lexical_environment.clone();
     let mut fresh_env: Option<EnvRef> = None;
+    let mut per_iteration: Vec<crux::string::JsString> = Vec::new();
     match init {
         None => {}
         Some(ForInit::Expr(expr)) => {
@@ -430,25 +468,38 @@ fn eval_for(
             } else {
                 let env = new_declarative_environment(Some(old_env.clone()));
                 for decl in decls {
-                    let BindingPattern::Ident(name) = &decl.pattern else {
-                        return Err(not_implemented("destructuring for-head declarations"));
-                    };
-                    let name = crux::lookup(*name);
-                    if *kind == VarDeclKind::Const {
-                        env.create_immutable_binding(&name, true)?;
-                    } else {
-                        env.create_mutable_binding(&name, false)?;
+                    let mut names = Vec::new();
+                    crate::script::bound_names(&decl.pattern, &mut names);
+                    for name in &names {
+                        if *kind == VarDeclKind::Const {
+                            env.create_immutable_binding(name, true)?;
+                        } else {
+                            env.create_mutable_binding(name, false)?;
+                        }
                     }
                     let value = match &decl.init {
                         Some(init) => eval_expr(agent, init, strict)?,
                         None => Value::Undefined,
                     };
-                    env.initialize_binding(&name, value)?;
+                    crate::binding::binding_initialization(
+                        agent,
+                        &decl.pattern,
+                        value,
+                        Some(&env),
+                        strict,
+                    )?;
+                    crate::script::bound_names(&decl.pattern, &mut per_iteration);
                 }
                 agent.running_context_mut()?.lexical_environment = env.clone();
                 fresh_env = Some(env);
             }
         }
+    }
+    // spec 14.7.4.2 step 2: the first per-iteration environment is created
+    // before the first test; the loop installs a fresh copy each iteration.
+    if !per_iteration.is_empty() {
+        let env = create_per_iteration_environment(agent, &per_iteration)?;
+        agent.running_context_mut()?.lexical_environment = env;
     }
     let mut iteration_result = Value::Undefined;
     let result = loop {
@@ -486,6 +537,13 @@ fn eval_for(
                 });
             }
             other => break Ok(other.update_empty(iteration_result.clone())),
+        }
+        // spec 14.7.4.2 step 5: a fresh environment is created *before* the
+        // increment runs, so closures capture the unmutated per-iteration
+        // binding and the increment targets the next iteration's copy.
+        if !per_iteration.is_empty() {
+            let env = create_per_iteration_environment(agent, &per_iteration)?;
+            agent.running_context_mut()?.lexical_environment = env;
         }
         if let Some(update) = update {
             eval_expr(agent, update, strict)?;
@@ -603,23 +661,24 @@ fn for_binding_put(
             Ok(None)
         }
         ForBinding::VarDecl { kind, pattern, .. } => {
-            let BindingPattern::Ident(name) = pattern else {
-                return Err(not_implemented("destructuring for-in/of bindings"));
-            };
-            let name = crux::lookup(*name);
             if *kind == VarDeclKind::Var {
-                let reference = resolve_binding(agent, &name, strict)?;
-                put_value(agent, &reference, value)?;
+                // BindingInitialization with no environment: the hoisted var
+                // binding is resolved and PutValue'd (spec 14.7.5.6 step 5.b).
+                crate::binding::binding_initialization(agent, pattern, value, None, strict)?;
                 Ok(None)
             } else {
                 let outer = agent.running_context()?.lexical_environment.clone();
                 let env = new_declarative_environment(Some(outer.clone()));
-                if *kind == VarDeclKind::Const {
-                    env.create_immutable_binding(&name, true)?;
-                } else {
-                    env.create_mutable_binding(&name, false)?;
+                let mut names = Vec::new();
+                crate::script::bound_names(pattern, &mut names);
+                for name in &names {
+                    if *kind == VarDeclKind::Const {
+                        env.create_immutable_binding(name, true)?;
+                    } else {
+                        env.create_mutable_binding(name, false)?;
+                    }
                 }
-                env.initialize_binding(&name, value)?;
+                crate::binding::binding_initialization(agent, pattern, value, Some(&env), strict)?;
                 agent.running_context_mut()?.lexical_environment = env;
                 Ok(Some(outer))
             }

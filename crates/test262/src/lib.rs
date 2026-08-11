@@ -43,6 +43,15 @@ mod harness {
         "statements/function/cptn-decl.js",
         "statements/function/enable-strict-via-body.js",
         "statements/function/early-body-super-call.js",
+        "statements/function/dflt-params-arg-val-undefined.js",
+        "statements/function/dflt-params-arg-val-not-undefined.js",
+        "statements/function/dflt-params-ref-prior.js",
+        "statements/function/dflt-params-trailing-comma.js",
+        "statements/function/dflt-params-duplicates.js",
+        "statements/function/dflt-params-rest.js",
+        "statements/function/rest-param-strict-body.js",
+        "statements/function/rest-params-trailing-comma-early-error.js",
+        "statements/function/params-dflt-args-unmapped.js",
         "expressions/conditional/in-condition.js",
     ];
 
@@ -233,7 +242,7 @@ mod harness {
                 let [actual, expected, ..] = args else {
                     return Err(arity_error("assert.sameValue"));
                 };
-                if crux::ops::is_strictly_equal(actual, expected) {
+                if crux::ops::same_value(actual, expected) {
                     Ok(Value::Undefined)
                 } else {
                     Err(assertion_error(format!(

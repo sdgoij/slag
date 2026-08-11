@@ -346,9 +346,17 @@ fn eval_object_literal(
     let object = crux::object::JsObject::ordinary_object_create(None);
     for property in &literal.props {
         match property {
-            ObjectProperty::Init { key, value, .. } => {
+            ObjectProperty::Init {
+                key,
+                value: value_expr,
+                ..
+            } => {
                 let name = eval_property_name(agent, key, strict)?;
-                let value = eval_expr(agent, value, strict)?;
+                let value = eval_expr(agent, value_expr, strict)?;
+                if crate::function::is_anonymous_function_definition(value_expr) {
+                    // spec 15.4.2 step 5: SetFunctionName from the property key.
+                    crate::function::set_function_name(&value, &name)?;
+                }
                 let name_text = name.to_string_lossy();
                 if name_text == "__proto__" {
                     match value {
@@ -567,20 +575,27 @@ fn eval_assignment(
     agent: &mut Agent,
     op: &AssignOp,
     target: &Expr,
-    value: &Expr,
+    value_expr: &Expr,
     strict: bool,
 ) -> Result<Value, JsError> {
     let reference = eval_reference(agent, target, strict)?;
     match op {
         AssignOp::Assign => {
-            let value = eval_expr(agent, value, strict)?;
+            let value = eval_expr(agent, value_expr, strict)?;
+            // spec 13.15.2 step 1.e: an anonymous function assigned to an
+            // identifier reference takes the identifier as its name.
+            if let ExprKind::Ident(name) = &target.kind
+                && crate::function::is_anonymous_function_definition(value_expr)
+            {
+                crate::function::set_function_name(&value, &crux::lookup(*name))?;
+            }
             put_value(agent, &reference, value.clone())?;
             Ok(value)
         }
         AssignOp::AndAssign => {
             let old = get_value(&reference)?;
             if to_boolean(&old) {
-                let new = eval_expr(agent, value, strict)?;
+                let new = eval_expr(agent, value_expr, strict)?;
                 put_value(agent, &reference, new.clone())?;
                 Ok(new)
             } else {
@@ -592,7 +607,7 @@ fn eval_assignment(
             if to_boolean(&old) {
                 Ok(old)
             } else {
-                let new = eval_expr(agent, value, strict)?;
+                let new = eval_expr(agent, value_expr, strict)?;
                 put_value(agent, &reference, new.clone())?;
                 Ok(new)
             }
@@ -600,7 +615,7 @@ fn eval_assignment(
         AssignOp::NullishAssign => {
             let old = get_value(&reference)?;
             if is_nullish(&old) {
-                let new = eval_expr(agent, value, strict)?;
+                let new = eval_expr(agent, value_expr, strict)?;
                 put_value(agent, &reference, new.clone())?;
                 Ok(new)
             } else {
@@ -609,7 +624,7 @@ fn eval_assignment(
         }
         _ => {
             let old = get_value(&reference)?;
-            let right = eval_expr(agent, value, strict)?;
+            let right = eval_expr(agent, value_expr, strict)?;
             let new = apply_compound(*op, &old, &right)?;
             put_value(agent, &reference, new.clone())?;
             Ok(new)

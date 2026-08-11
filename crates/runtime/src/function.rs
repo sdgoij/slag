@@ -133,6 +133,40 @@ fn set_function_properties(
     Ok(())
 }
 
+/// IsAnonymousFunctionDefinition (spec 14.1.9): a FunctionExpression without
+/// a name, an ArrowFunction, or a ClassExpression without a name. Such
+/// definitions receive their name from the surrounding binding or property
+/// via SetFunctionName.
+pub fn is_anonymous_function_definition(expr: &syntax::ast::Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Function(f) => f.name.is_none(),
+        ExprKind::Arrow { .. } => true,
+        ExprKind::Class(c) => c.name.is_none(),
+        _ => false,
+    }
+}
+
+/// SetFunctionName (spec 10.2.7): redefine the `name` own data property of
+/// a function value. The property is configurable, so this also replaces the
+/// empty name anonymous functions are created with.
+pub fn set_function_name(function: &Value, name: &JsString) -> Result<(), JsError> {
+    let Value::Function(function) = function else {
+        return Ok(());
+    };
+    function.define_property(
+        &JsString::from_utf8("name"),
+        &PropertyDescriptor {
+            value: Some(Value::String(Handle::new(name.clone()))),
+            writable: Some(false),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
+    )?;
+    Ok(())
+}
+
 /// MakeConstructor (spec 10.2.5): the `prototype` property with a
 /// `constructor` back-reference. Arrows and methods skip this.
 fn make_constructor(function: &Handle<Function>) -> Result<(), JsError> {
@@ -482,10 +516,12 @@ fn ordinary_construct(
     result
 }
 
-/// FunctionDeclarationInstantiation (spec 16.1.8), simple-parameter path:
-/// bind the parameters, create the `arguments` object, hoist var bindings
-/// (initialized to *undefined*) and top-level function declarations, and set
-/// up the lexical environment for the body.
+/// FunctionDeclarationInstantiation (spec 16.1.8): bind the parameters,
+/// create the `arguments` object, hoist var bindings (initialized to
+/// *undefined*) and top-level function declarations, and set up the lexical
+/// environment for the body. Non-simple parameter lists (defaults, rest,
+/// destructuring) bind in a separate parameter environment via
+/// IteratorBindingInitialization.
 fn function_declaration_instantiation(
     agent: &mut Agent,
     function_value: &Value,
@@ -500,23 +536,6 @@ fn function_declaration_instantiation(
     let mut param_names: Vec<JsString> = Vec::new();
     for param in &data.params {
         bound_names(&param.pattern, &mut param_names);
-    }
-
-    // IteratorBindingInitialization of the formals (spec 16.1.8 step 31 for
-    // the simple path): bind each parameter positionally.
-    for (index, param) in data.params.iter().enumerate() {
-        let BindingPattern::Ident(name) = &param.pattern else {
-            return Err(not_implemented("destructured and default parameters"));
-        };
-        if param.rest || param.init.is_some() {
-            return Err(not_implemented("rest and default parameters"));
-        }
-        let name = crux::lookup(*name);
-        if !function_env.has_binding(&name)? {
-            function_env.create_mutable_binding(&name, false)?;
-        }
-        let value = args.get(index).cloned().unwrap_or(Value::Undefined);
-        function_env.initialize_binding(&name, value)?;
     }
 
     // The arguments object (spec 16.1.8 steps 20-23).
@@ -535,6 +554,57 @@ fn function_declaration_instantiation(
         || (simple
             && (func_names.contains(&JsString::from_utf8("arguments"))
                 || lexical_names.contains(&JsString::from_utf8("arguments")))));
+
+    // The environment split (spec 16.1.8 steps 38-43): a non-simple
+    // parameter list binds in its own environment, and the body's vars live
+    // in a further environment so defaults cannot see them.
+    let (param_env, variable_env) = if simple {
+        (function_env.clone(), function_env.clone())
+    } else {
+        let param_env = new_declarative_environment(Some(function_env.clone()));
+        let variable_env = new_declarative_environment(Some(param_env.clone()));
+        (param_env, variable_env)
+    };
+
+    // Parameter bindings are created up front (uninitialized), so a default
+    // initializer referencing an earlier parameter hits its TDZ correctly.
+    for param in &data.params {
+        let mut names = Vec::new();
+        bound_names(&param.pattern, &mut names);
+        for name in names {
+            if !param_env.has_binding(&name)? {
+                param_env.create_mutable_binding(&name, false)?;
+            }
+        }
+    }
+
+    // IteratorBindingInitialization of the formals (spec 16.1.8 step 33):
+    // positional for simple lists, full binding for non-simple ones.
+    if simple {
+        for (index, param) in data.params.iter().enumerate() {
+            let BindingPattern::Ident(name) = &param.pattern else {
+                unreachable!("simple parameter lists are identifiers")
+            };
+            let name = crux::lookup(*name);
+            let value = args.get(index).cloned().unwrap_or(Value::Undefined);
+            param_env.initialize_binding(&name, value)?;
+        }
+    } else {
+        agent.running_context_mut()?.lexical_environment = param_env.clone();
+        crate::binding::iterator_binding_initialization(
+            agent,
+            &data.params,
+            args,
+            Some(&param_env),
+            strict,
+        )?;
+        // spec 16.1.8 step 44: the VariableEnvironment switches to the body's
+        // record only after the formals bind, so a direct eval inside a
+        // default sees the callee's environment (closures created there
+        // resolve eval-introduced vars through it).
+        agent.running_context_mut()?.variable_environment = variable_env.clone();
+    }
+
     let mut param_bindings = param_names.clone();
     if arguments_obj_needed {
         let arguments_obj = if strict || !simple {
@@ -583,37 +653,53 @@ fn function_declaration_instantiation(
             )?)
         };
         if strict {
-            function_env.create_immutable_binding(&JsString::from_utf8("arguments"), false)?;
+            param_env.create_immutable_binding(&JsString::from_utf8("arguments"), false)?;
         } else {
-            function_env.create_mutable_binding(&JsString::from_utf8("arguments"), false)?;
+            param_env.create_mutable_binding(&JsString::from_utf8("arguments"), false)?;
         }
-        function_env.initialize_binding(&JsString::from_utf8("arguments"), arguments_obj)?;
+        param_env.initialize_binding(&JsString::from_utf8("arguments"), arguments_obj)?;
         param_bindings.push(JsString::from_utf8("arguments"));
     }
 
     // Var bindings: created and initialized to *undefined* during
-    // instantiation (spec 16.1.8 steps 33-36, simple path).
-    let mut instantiated = param_bindings;
+    // instantiation (spec 16.1.8 steps 34-36 simple path). For non-simple
+    // lists a var sharing a parameter name is a separate binding that starts
+    // with the parameter's value (steps 44-51).
+    let mut instantiated: Vec<JsString> = if simple {
+        param_bindings.clone()
+    } else {
+        Vec::new()
+    };
     for decl in top_level_var_scoped_declarations(&data.body.stmts) {
         let crate::script::VarScopedDecl::Variable(names) = decl else {
             continue;
         };
         for name in names {
-            if !instantiated.contains(&name) {
-                instantiated.push(name.clone());
-                function_env.create_mutable_binding(&name, false)?;
-                function_env.initialize_binding(&name, Value::Undefined)?;
+            if instantiated.contains(&name) {
+                continue;
+            }
+            instantiated.push(name.clone());
+            variable_env.create_mutable_binding(&name, false)?;
+            if !simple {
+                let initial = if !param_bindings.contains(&name) || func_names.contains(&name) {
+                    Value::Undefined
+                } else {
+                    param_env.get_binding_value(&name, false)?
+                };
+                variable_env.initialize_binding(&name, initial)?;
+            } else {
+                variable_env.initialize_binding(&name, Value::Undefined)?;
             }
         }
     }
 
-    // The body's lexical environment: strict functions share the function
+    // The body's lexical environment: strict functions share the variable
     // env; sloppy functions get a fresh declarative record so direct eval
     // cannot see the var bindings (spec 16.1.8 steps 37-42).
     let lexical_env = if strict {
-        function_env.clone()
+        variable_env.clone()
     } else {
-        new_declarative_environment(Some(function_env.clone()))
+        new_declarative_environment(Some(variable_env.clone()))
     };
     agent.running_context_mut()?.lexical_environment = lexical_env.clone();
 
@@ -650,7 +736,7 @@ fn function_declaration_instantiation(
     for f in funcs {
         let name = crux::lookup(f.name.unwrap());
         let func_obj = instantiate_function(agent, f, lexical_env.clone(), strict)?;
-        function_env.set_mutable_binding(&name, func_obj, false)?;
+        variable_env.set_mutable_binding(&name, func_obj, false)?;
     }
     Ok(())
 }
@@ -679,7 +765,7 @@ fn type_of(value: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::evaluate;
+    use crate::agent::{Agent, evaluate};
 
     fn run(source: &str) -> Result<Value, JsError> {
         evaluate(source)
@@ -687,6 +773,87 @@ mod tests {
 
     fn number(value: f64) -> Value {
         Value::Number(value)
+    }
+
+    fn object(props: &[(&str, f64)]) -> Value {
+        let obj = crux::object::JsObject::ordinary_object_create(None);
+        for (key, value) in props {
+            obj.create_data_property(&JsString::from_utf8(key), Value::Number(*value))
+                .unwrap();
+        }
+        Value::Object(obj)
+    }
+
+    /// A native stand-in for an array: an object whose `@@iterator` method
+    /// yields the given values. The global `Array` builtin and its
+    /// `@@iterator` arrive with the builtins phase, so array-destructuring
+    /// tests iterate this until then.
+    fn iterable(values: Vec<Value>) -> Value {
+        let values_clone = values.clone();
+        let index = std::cell::Cell::new(0usize);
+        let next = crux::Function::create_builtin(
+            Some(JsString::from_utf8("next")),
+            0,
+            Box::new(move |_, _| {
+                let i = index.get();
+                let result = crux::object::JsObject::ordinary_object_create(None);
+                if i < values_clone.len() {
+                    index.set(i + 1);
+                    result.create_data_property(
+                        &JsString::from_utf8("value"),
+                        values_clone[i].clone(),
+                    )?;
+                    result.create_data_property(
+                        &JsString::from_utf8("done"),
+                        Value::Boolean(false),
+                    )?;
+                } else {
+                    result.create_data_property(&JsString::from_utf8("value"), Value::Undefined)?;
+                    result
+                        .create_data_property(&JsString::from_utf8("done"), Value::Boolean(true))?;
+                }
+                Ok(Value::Object(result))
+            }),
+            None,
+            None,
+        )
+        .unwrap();
+        let iterator = crux::object::JsObject::ordinary_object_create(None);
+        iterator
+            .create_data_property(&JsString::from_utf8("next"), Value::Function(next))
+            .unwrap();
+        let iterable = crux::object::JsObject::ordinary_object_create(None);
+        let iterator_for_method = iterator.clone();
+        iterable
+            .define_property_key(
+                &crux::property::PropertyKey::Symbol(
+                    crux::symbol::well_known("iterator").as_ref().clone(),
+                ),
+                &crux::property::PropertyDescriptor::data(Value::Function(
+                    crux::Function::create_builtin(
+                        Some(JsString::from_utf8("[Symbol.iterator]")),
+                        0,
+                        Box::new(move |_, _| Ok(Value::Object(iterator_for_method.clone()))),
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                )),
+            )
+            .unwrap();
+        Value::Object(iterable)
+    }
+
+    /// Run a script with a global `iter` holding a native iterable of the
+    /// given values.
+    fn run_with_iterable(source: &str, values: Vec<Value>) -> Result<Value, JsError> {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let global = agent.running_context().unwrap().realm.global_object.clone();
+        global
+            .create_data_property(&JsString::from_utf8("iter"), iterable(values))
+            .unwrap();
+        agent.run_script(source)
     }
 
     #[test]
@@ -745,6 +912,37 @@ mod tests {
             run("function outer(x) { return function (y) { return x + y; }; } outer(2)(3)")
                 .unwrap(),
             number(5.0)
+        );
+    }
+
+    #[test]
+    fn for_heads_capture_per_iteration_bindings() {
+        // Each iteration's closure sees its own `let` binding (spec
+        // 14.7.4.3 CreatePerIterationEnvironment).
+        assert_eq!(
+            run("let fs = []; for (let i = 0; i < 3; i++) { fs[i] = function () { return i; }; } fs[0]() + fs[1]() * 10 + fs[2]() * 100")
+                .unwrap(),
+            number(210.0)
+        );
+        assert_eq!(
+            run("let fs = []; for (let i = 0; i < 3; i++) { let f = function () { return i; }; fs[i] = f; } fs[1]()")
+                .unwrap(),
+            number(1.0)
+        );
+        // `var` heads share a single binding: all closures see the final value.
+        assert_eq!(
+            run("let fs = []; for (var i = 0; i < 3; i++) { fs[i] = function () { return i; }; } fs[0]() + fs[2]()")
+                .unwrap(),
+            number(6.0)
+        );
+        // `const` heads get fresh copies per iteration too.
+        assert_eq!(
+            run_with_iterable(
+                "let fs = []; let k = 0; for (const v of iter) { fs[k] = () => v; k++; } fs[0]() + fs[1]()",
+                vec![number(1.0), number(2.0)]
+            )
+            .unwrap(),
+            number(3.0)
         );
     }
 
@@ -851,6 +1049,228 @@ mod tests {
         assert_eq!(
             run("(() => typeof arguments)()").unwrap(),
             Value::String(Handle::new(JsString::from_utf8("undefined")))
+        );
+    }
+
+    #[test]
+    fn default_parameters_apply_when_undefined() {
+        assert_eq!(
+            run("function f(a = 10) { return a; } f()").unwrap(),
+            number(10.0)
+        );
+        assert_eq!(
+            run("function f(a = 10) { return a; } f(undefined)").unwrap(),
+            number(10.0)
+        );
+        assert_eq!(
+            run("function f(a = 10) { return a; } f(5)").unwrap(),
+            number(5.0)
+        );
+        assert_eq!(
+            run("function f(a = 10) { return a; } f(null)").unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn default_parameters_reference_earlier_parameters() {
+        // A default can read earlier parameters and previous bindings.
+        assert_eq!(
+            run("function f(a, b = a * 2) { return b; } f(3)").unwrap(),
+            number(6.0)
+        );
+        assert_eq!(
+            run("function f(a, b = a, c = b) { return c; } f(4)").unwrap(),
+            number(4.0)
+        );
+        // A default cannot see a later parameter (TDZ: uninitialized).
+        assert!(run("function f(a = b, b) { return a; } f(undefined, 2)").is_err());
+        // Defaults cannot see the body's var bindings.
+        assert!(run("function f(a = x) { var x = 1; return a; } f()").is_err());
+    }
+
+    #[test]
+    fn rest_parameters_collect_remaining_arguments() {
+        assert_eq!(
+            run("function f(a, ...rest) { return rest.length + ':' + rest[0] + rest[1]; } f(1, 2, 3)")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("2:23")))
+        );
+        assert_eq!(
+            run("function f(...r) { return r.length; } f()").unwrap(),
+            number(0.0)
+        );
+        assert_eq!(
+            run("function f(...r) { return r.length; } f(1, 2)").unwrap(),
+            number(2.0)
+        );
+        // length counts only the leading simple parameters.
+        assert_eq!(
+            run("function f(a, b = 1, ...r) {} f.length").unwrap(),
+            number(1.0)
+        );
+    }
+
+    #[test]
+    fn destructured_parameters_bind_from_objects_and_arrays() {
+        assert_eq!(
+            run("function f({ x, y }) { return x + y; } f({ x: 1, y: 2 })").unwrap(),
+            number(3.0)
+        );
+        // Array patterns consume any iterable; `Array.prototype[@@iterator]`
+        // joins the builtins phase, so a native iterable stands in.
+        assert_eq!(
+            run_with_iterable(
+                "function f([a, b]) { return a - b; } f(iter)",
+                vec![number(5.0), number(2.0)]
+            )
+            .unwrap(),
+            number(3.0)
+        );
+        assert_eq!(
+            run_with_iterable(
+                "function f({ x = 10 }, [a = 1]) { return x + a; } f({}, iter)",
+                vec![]
+            )
+            .unwrap(),
+            number(11.0)
+        );
+        // A default can destructure and reference earlier parameters.
+        assert_eq!(
+            run("function f(n, { x = n } = {}) { return x; } f(7)").unwrap(),
+            number(7.0)
+        );
+        // Destructuring null/undefined throws a TypeError.
+        assert!(run("function f({ x }) { return x; } f(null)").is_err());
+    }
+
+    #[test]
+    fn non_simple_parameter_lists_get_unmapped_arguments() {
+        // With defaults/rest/destructuring the arguments object is unmapped.
+        assert_eq!(
+            run("function f(a, b = 2) { arguments[0] = 99; return a; } f(1)").unwrap(),
+            number(1.0)
+        );
+        assert_eq!(
+            run("function f(...r) { arguments[0] = 99; return arguments[0]; } f(1)").unwrap(),
+            number(99.0)
+        );
+        assert_eq!(
+            run("function f({ x }) { return arguments[0].x; } f({ x: 5 })").unwrap(),
+            number(5.0)
+        );
+    }
+
+    #[test]
+    fn anonymous_functions_infer_names() {
+        // var/let/const declarations name an anonymous function (spec 14.3.2,
+        // 14.2.2: SetFunctionName from the binding identifier).
+        assert_eq!(
+            run("var f = function () {}; f.name").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("f")))
+        );
+        assert_eq!(
+            run("let g = () => 0; g.name").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("g")))
+        );
+        assert_eq!(
+            run("const h = function () {}; h.name").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("h")))
+        );
+        // Object properties name the function (spec 15.4.2 step 5).
+        assert_eq!(
+            run("let o = { m: function () {} }; o.m.name").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("m")))
+        );
+        assert_eq!(
+            run("let o = { m: () => 0 }; o.m.name").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("m")))
+        );
+        // Plain assignment to an identifier (spec 13.15.2 step 1.e).
+        assert_eq!(
+            run("let t; t = function () {}; t.name").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("t")))
+        );
+        // A named function expression keeps its own name.
+        assert_eq!(
+            run("var q = function inner() {}; q.name").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("inner")))
+        );
+    }
+
+    #[test]
+    fn destructuring_declarations() {
+        assert_eq!(
+            run("let { x, y } = { x: 1, y: 2 }; x + y").unwrap(),
+            number(3.0)
+        );
+        assert_eq!(
+            run_with_iterable("var [a, b] = iter; a - b", vec![number(1.0), number(2.0)]).unwrap(),
+            number(-1.0)
+        );
+        assert_eq!(run("const { x = 10 } = {}; x").unwrap(), number(10.0));
+        // Nested patterns, computed keys, and rest elements.
+        assert_eq!(
+            run("let { a: { b }, c } = { a: { b: 2 }, c: 3 }; b + c").unwrap(),
+            number(5.0)
+        );
+        assert_eq!(
+            run("let key = 'z'; let { [key]: v } = { z: 42 }; v").unwrap(),
+            number(42.0)
+        );
+        assert_eq!(
+            run_with_iterable(
+                "let [head, ...tail] = iter; tail.length + head",
+                vec![number(1.0), number(2.0), number(3.0)]
+            )
+            .unwrap(),
+            number(3.0)
+        );
+        assert_eq!(
+            run("let { a, ...rest } = { a: 1, b: 2, c: 3 }; rest.b + rest.c").unwrap(),
+            number(5.0)
+        );
+        // Destructuring null/undefined throws.
+        assert!(run("let { x } = null").is_err());
+        assert!(run("var [x] = undefined").is_err());
+    }
+
+    #[test]
+    fn destructuring_for_heads() {
+        assert_eq!(
+            run_with_iterable(
+                "let r = ''; for (let [a, b] of iter) r += a + b; r",
+                vec![
+                    iterable(vec![number(1.0), number(2.0)]),
+                    iterable(vec![number(3.0), number(4.0)]),
+                ]
+            )
+            .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("37")))
+        );
+        assert_eq!(
+            run_with_iterable(
+                "let r = ''; for (const { x } of iter) r += x; r",
+                vec![object(&[("x", 1.0)]), object(&[("x", 2.0)])]
+            )
+            .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("12")))
+        );
+        assert_eq!(
+            run_with_iterable(
+                "var r = 0; for (var [a] of iter) r += a; r",
+                vec![iterable(vec![number(1.0)]), iterable(vec![number(2.0)])]
+            )
+            .unwrap(),
+            number(3.0)
+        );
+        assert_eq!(
+            run_with_iterable(
+                "var a = 0; for (let [x] = iter; x < 3; x++) { a = x; } a",
+                vec![number(2.0)]
+            )
+            .unwrap(),
+            number(2.0)
         );
     }
 }

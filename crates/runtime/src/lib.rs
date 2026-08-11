@@ -9,6 +9,7 @@
 //! full evaluation, modules, and built-ins.
 
 pub mod agent;
+pub mod binding;
 pub mod context;
 pub mod env;
 pub mod eval;

@@ -811,22 +811,23 @@ Completion model (spec 6.2.3):
 - `job.rs` — host-call jobs delegate to `crux::function::call`.
 
 **Conformance:** `crates/test262` runs a curated subset of the pinned `tc39/test262`
-submodule (repo-root `test262/`): 19 fixtures under `test/language/statements/{if,while}` and
-`test/language/expressions/conditional` covering completion values (`cptn-*`), labeled
-`break`/`continue`, ASI around `let`, and statement-position early errors. The harness parses
+submodule (repo-root `test262/`): 31 fixtures under `test/language/statements/{if,while,
+function}` and `test/language/expressions/conditional` covering completion values (`cptn-*`),
+labeled `break`/`continue`, ASI around `let`, statement-position early errors, and the Phase 7
+function fixtures (defaults, rest, destructured params, early errors). The harness parses
 fixture frontmatter (`negative:` phase/type, `flags:`, `includes:`), runs strict and sloppy
 modes, installs a minimal native `assert` helper (user functions join Phase 7), and reports
-pass/skip/fail — `19/19` pass. The subset grows with each phase's feature coverage.
+pass/skip/fail — `31/31` pass. The subset grows with each phase's feature coverage.
 
-The workspace runs **319 tests** (`cargo test --workspace`: 87 in `runtime`, 1 harness test
-covering the 19 test262 fixtures) with `cargo fmt --all --check` and
+The workspace runs **337 tests** (`cargo test --workspace`: 105 in `runtime`, 44 in `parser`,
+1 harness test covering the 31 test262 fixtures) with `cargo fmt --all --check` and
 `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 **Remaining in Phase 6:**
 
-- Destructuring — `ObjectBindingPattern`/`ArrayBindingPattern` declarations and
-  `DestructuringAssignmentEvaluation` (defaults, rest, `IteratorClose` on failure) are
-  `not_implemented` errors.
+- Destructuring — `ObjectBindingPattern`/`ArrayBindingPattern` *declarations* now bind via
+  Phase 7's `binding_initialization` (13.2.3); only `DestructuringAssignmentEvaluation`
+  (defaults, rest, `IteratorClose` on failure) remains a `not_implemented` error.
 - Function expressions, arrow functions, and method shorthand are deferred to Phase 7's
   function machinery; `super`/`new.target` join Phase 7.
 - `for await` (async iteration is Phase 7).
@@ -908,7 +909,8 @@ async fixtures, and `test/language/module-code`.
 runnable tests.
 
 **Status (current):** ordinary function calls work end to end — the foundation the rest of the
-phase builds on:
+phase builds on — and non-simple parameter lists (defaults, rest, destructuring) are fully
+bound via `IteratorBindingInitialization`:
 
 - `crates/runtime/src/function.rs` — the spec 10.2.1 slots live in the agent's `ecma_functions`
   table keyed by function identity (`EcmaFunction`: name, params, body, `[[Environment]]`,
@@ -920,12 +922,37 @@ phase builds on:
   (10.2.1: PrepareForOrdinaryCall, OrdinaryCallBindThis with sloppy `this`→global coercion,
   GetPrototypeFromConstructor, base-constructor return rules) and unwrap bound chains so
   bound-over-user-functions work; everything else delegates to `crux::function::call`.
-- `FunctionDeclarationInstantiation` (16.1.8), simple-parameter path: positional parameter
-  binding, the mapped (sloppy) / unmapped (strict) `arguments` object with getter/setter
-  closures over the parameter env, var bindings created and initialized to *undefined*
-  (hoisting), top-level function declarations instantiated against the lexical env and bound
-  via `SetMutableBinding`, lexical bindings instantiated uninitialized, and the sloppy
-  split of lexical vs variable environments.
+- `FunctionDeclarationInstantiation` (16.1.8) now has the full environment split: simple lists
+  bind positionally in the function env; non-simple lists bind in a separate parameter
+  environment (spec steps 38-43) whose defaults see earlier parameters (TDZ for later ones)
+  but not the body's var bindings. All parameter bindings are created uninitialized up front
+  so defaults hit the TDZ correctly; the mapped (sloppy, simple) / unmapped (strict or
+  non-simple) `arguments` object lands in the parameter env; the `VariableEnvironment`
+  switches to the body's record only *after* the formals bind (spec step 44), so a direct
+  `eval` inside a default sees the callee's environment. Var bindings start with the
+  parameter's value when they share a name (steps 44-51), top-level function declarations
+  bind via `SetMutableBinding` in the variable env, and lexical bindings are instantiated
+  uninitialized in the sloppy/strict body env split.
+- `crates/runtime/src/binding.rs` — the spec 13.2.3 binding operations: `binding_initialization`
+  (Ident/Object/Array patterns; object patterns reject null/undefined with a TypeError, array
+  patterns consume any iterable with `IteratorClose` on every completion),
+  `iterator_binding_initialization` (13.2.3.5 positional binding with defaults, patterns, and
+  a final rest collecting the remaining arguments),
+  `keyed_binding_initialization`/`rest_binding_initialization` (13.2.3.6/7 with
+  `copy_data_properties_excluding`), all with an optional environment: `Some` fills a
+  pre-created binding (`InitializeBinding`), `None` resolves and `PutValue`s — the latter
+  also serves destructuring `var` declarations. The same machinery now backs `let`/`const`/`var`
+  destructuring declarations, `for`-head destructuring, and destructuring `for-in`/`for-of`
+  bindings (`eval.rs`), replacing the `not_implemented` errors from Phase 6.
+- **Name inference:** `is_anonymous_function_definition` + `set_function_name` (10.2.7) are
+  wired into `var`/`let`/`const` declarations (14.2.2/14.3.2), object-literal properties
+  (15.4.2 step 5), and identifier assignments (13.15.2 step 1.e) — `var f = function(){}`
+  gives `f.name === "f"`, `{ m: function(){} }.m.name === "m"`.
+- **Per-iteration `for` captures** (14.7.4.3 `CreatePerIterationEnvironment`): `let`/`const`
+  `for` heads copy their bindings into a fresh environment per iteration, created *before*
+  the increment runs (spec step order), so closures in the body capture unmutated values;
+  `var` heads keep the shared single binding. `for-in`/`for-of` `let`/`const` bindings were
+  already per-iteration.
 - Arrows (`instantiate_arrow`): `[[ThisMode]] = lexical` threaded into the Function
   Environment Record (`new_function_environment` now takes the flag), concise bodies compile
   to a synthetic `return`, no `prototype`, no `arguments`.
@@ -936,19 +963,21 @@ phase builds on:
   `UpdateEmpty` fills their value from the statement list (`eval('1; function f() {}')` → 1).
 - `syntax`/`parser`: `BindingElement` gains a `rest` flag (rest params were unmarked in the
   AST); `new MemberExpression Arguments` continues subscripts (`new C(5).x` was a parse
-  error).
+  error); `is_simple_params` now treats a rest parameter as non-simple, so
+  `function f(...r) { 'use strict' }` is the required early error.
 
-Tests: 9 runtime tests (calls, hoisting, closures/recursion, `this` modes, `arguments`
-mapping, constructors, NFE names, arrows, empty completions) plus 3 test262 function fixtures
-(`cptn-decl`, strict-directive and `super()` early errors) — 22 fixtures total. Workspace runs
-**328 tests** with fmt and clippy (`-D warnings`) clean.
+Tests: 18 runtime function tests (calls, hoisting, closures/recursion, `this` modes,
+`arguments` mapping, constructors, NFE names, arrows, empty completions, defaults referencing
+earlier params/TDZ, rest params, destructured params, unmapped arguments for non-simple lists,
+destructuring declarations and `for` heads, name inference, per-iteration captures) — 105 in
+`runtime`, 44 in `parser`; 12 test262 function fixtures (8 passing `dflt-params-*`/`rest-params-*`
+plus 4 early-error/parse fixtures) — **31 fixtures total**; the rest-pattern-with-eval-var
+`scope-param-rest-elem-var-*` fixtures wait on `Array.prototype[@@iterator]` (builtins phase).
+Workspace runs **337 tests** with fmt and clippy (`-D warnings`) clean.
 
-**Remaining in Phase 7 (functions):** default/rest/destructured parameter lists
-(`IteratorBindingInitialization` with the separate parameter environment — `hasParamExprs`
-path), assignment-name inference for anonymous functions (`var f = function(){}`), per-iteration
-closure captures in `for` heads, method `[[HomeObject]]`/`super`, `arguments`-name conflict
-edge cases, then the `Function.prototype` intrinsic and the constructor builtin (Phase 8
-bootstrap); generators/async/classes/modules/promises as listed below.
+**Remaining in Phase 7 (functions):** method `[[HomeObject]]`/`super`, `arguments`-name
+conflict edge cases, then the `Function.prototype` intrinsic and the constructor builtin
+(Phase 8 bootstrap); generators/async/classes/modules/promises as listed below.
 
 ---
 
