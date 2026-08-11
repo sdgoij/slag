@@ -944,6 +944,56 @@ mod harness {
 
     // Phase 11 RegExp surface (the list was produced by the scanner, so it
     // is data, not aspiration).
+
+    // Phase 12 Array surface (the list was produced by the scanner, so it
+    // is data, not aspiration).
+    test262_builtin_fixture!(Array_15_4_5_1, "Array/15.4.5-1.js");
+    test262_builtin_fixture!(Array_15_4_5_1_5_1, "Array/15.4.5.1-5-1.js");
+    test262_builtin_fixture!(Array_15_4_5_1_5_2, "Array/15.4.5.1-5-2.js");
+    test262_builtin_fixture!(Array_constructor, "Array/constructor.js");
+    test262_builtin_fixture!(
+        Array_property_cast_boolean_primitive,
+        "Array/property-cast-boolean-primitive.js"
+    );
+    test262_builtin_fixture!(
+        Array_property_cast_nan_infinity,
+        "Array/property-cast-nan-infinity.js"
+    );
+    test262_builtin_fixture!(Array_property_cast_number, "Array/property-cast-number.js");
+    test262_builtin_fixture!(Array_S15_4_1_A1_1_T1, "Array/S15.4.1_A1.1_T1.js");
+    test262_builtin_fixture!(Array_S15_4_1_A1_1_T2, "Array/S15.4.1_A1.1_T2.js");
+    test262_builtin_fixture!(Array_S15_4_1_A1_1_T3, "Array/S15.4.1_A1.1_T3.js");
+    test262_builtin_fixture!(Array_S15_4_1_A1_2_T1, "Array/S15.4.1_A1.2_T1.js");
+    test262_builtin_fixture!(Array_S15_4_1_A1_3_T1, "Array/S15.4.1_A1.3_T1.js");
+    test262_builtin_fixture!(Array_S15_4_1_A2_1_T1, "Array/S15.4.1_A2.1_T1.js");
+    test262_builtin_fixture!(Array_S15_4_1_A2_2_T1, "Array/S15.4.1_A2.2_T1.js");
+    test262_builtin_fixture!(Array_S15_4_1_A3_1_T1, "Array/S15.4.1_A3.1_T1.js");
+    test262_builtin_fixture!(Array_S15_4_2_1_A1_1_T1, "Array/S15.4.2.1_A1.1_T1.js");
+    test262_builtin_fixture!(Array_S15_4_2_1_A1_1_T2, "Array/S15.4.2.1_A1.1_T2.js");
+    test262_builtin_fixture!(Array_S15_4_2_1_A1_1_T3, "Array/S15.4.2.1_A1.1_T3.js");
+    test262_builtin_fixture!(Array_S15_4_2_1_A1_2_T1, "Array/S15.4.2.1_A1.2_T1.js");
+    test262_builtin_fixture!(Array_S15_4_2_1_A1_3_T1, "Array/S15.4.2.1_A1.3_T1.js");
+    test262_builtin_fixture!(Array_S15_4_2_1_A2_1_T1, "Array/S15.4.2.1_A2.1_T1.js");
+    test262_builtin_fixture!(Array_S15_4_2_1_A2_2_T1, "Array/S15.4.2.1_A2.2_T1.js");
+    test262_builtin_fixture!(Array_S15_4_3_A1_1_T1, "Array/S15.4.3_A1.1_T1.js");
+    test262_builtin_fixture!(Array_S15_4_3_A1_1_T2, "Array/S15.4.3_A1.1_T2.js");
+    test262_builtin_fixture!(Array_S15_4_3_A1_1_T3, "Array/S15.4.3_A1.1_T3.js");
+    test262_builtin_fixture!(Array_S15_4_5_1_A1_2_T2, "Array/S15.4.5.1_A1.2_T2.js");
+    test262_builtin_fixture!(Array_S15_4_5_1_A2_1_T1, "Array/S15.4.5.1_A2.1_T1.js");
+    test262_builtin_fixture!(Array_S15_4_5_1_A2_2_T1, "Array/S15.4.5.1_A2.2_T1.js");
+    test262_builtin_fixture!(Array_S15_4_5_1_A2_3_T1, "Array/S15.4.5.1_A2.3_T1.js");
+    test262_builtin_fixture!(Array_S15_4_5_2_A1_T1, "Array/S15.4.5.2_A1_T1.js");
+    test262_builtin_fixture!(Array_S15_4_5_2_A1_T2, "Array/S15.4.5.2_A1_T2.js");
+    test262_builtin_fixture!(Array_S15_4_5_2_A2_T1, "Array/S15.4.5.2_A2_T1.js");
+    test262_builtin_fixture!(Array_S15_4_5_2_A3_T1, "Array/S15.4.5.2_A3_T1.js");
+    test262_builtin_fixture!(Array_S15_4_5_2_A3_T3, "Array/S15.4.5.2_A3_T3.js");
+    test262_builtin_fixture!(Array_S15_4_A1_1_T10, "Array/S15.4_A1.1_T10.js");
+    test262_builtin_fixture!(Array_S15_4_A1_1_T4, "Array/S15.4_A1.1_T4.js");
+    test262_builtin_fixture!(Array_S15_4_A1_1_T5, "Array/S15.4_A1.1_T5.js");
+    test262_builtin_fixture!(Array_S15_4_A1_1_T6, "Array/S15.4_A1.1_T6.js");
+    test262_builtin_fixture!(Array_S15_4_A1_1_T7, "Array/S15.4_A1.1_T7.js");
+    test262_builtin_fixture!(Array_S15_4_A1_1_T8, "Array/S15.4_A1.1_T8.js");
+    test262_builtin_fixture!(Array_S15_4_A1_1_T9, "Array/S15.4_A1.1_T9.js");
     test262_builtin_fixture!(RegExp_15_10_4_1_4, "RegExp/15.10.4.1-4.js");
     test262_builtin_fixture!(
         RegExp_call_with_non_regexp_same_constructor,
@@ -1618,6 +1668,7 @@ mod harness {
             "Date",
             "String",
             "RegExp",
+            "Array",
         ];
         for dir in dirs {
             let mut pass = 0;

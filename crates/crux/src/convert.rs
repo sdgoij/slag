@@ -64,7 +64,12 @@ fn ordinary_to_primitive(
         let key = JsString::from_utf8(name);
         let method = get(&key)?;
         if is_callable(&method) {
-            return crate::function::call(&method, receiver.clone(), &[]);
+            // spec step 2.b.ii: a non-object result is the primitive; an
+            // object result falls through to the next method name.
+            let result = crate::function::call(&method, receiver.clone(), &[])?;
+            if !matches!(result, Value::Object(_) | Value::Function(_)) {
+                return Ok(result);
+            }
         }
     }
     Err(JsError::new(

@@ -1545,6 +1545,46 @@ Phase 14 but design tests now), base64/hex round trips + error cases, `fromAsync
 **Exit criteria:** `built-ins/Array` and `built-ins/TypedArray` (+ `%TypedArray%`) passing at high
 rate; test262 overall ≥ 50–60%.
 
+**Status (Array complete, TypedArray pending):** the full Array built-in landed
+(`builtins/array.rs`):
+
+- **Constructor and statics:** `Array(...)` (call/construct, single-number length with the
+  ToUint32 round-trip RangeError, species via `ArraySpeciesCreate`), `isArray`, `of`, `from`
+  (iterator + array-like paths, mapper/thisArg, holes read as undefined), `fromAsync`
+  (ES2026: `@@asyncIterator` with `@@iterator` fallback wrapped in an AsyncFromSyncIterator,
+  promise-returning mappers, driven through the job queue with per-await continuation state).
+- **Prototype (36 methods):** `at`, `concat` (`@@isConcatSpreadable`), `copyWithin`, `entries`,
+  `every`, `fill`, `filter`, `find`, `findIndex`, `findLast`, `findLastIndex`, `flat`/
+  `flatMap` (FlattenIntoArray), `forEach`, `includes`, `indexOf`, `join`, `keys`, `lastIndexOf`,
+  `map`, `pop`, `push`, `reduce`, `reduceRight`, `reverse`, `shift`, `slice`, `some`, `sort`
+  (stable, SortCompare with undefined-to-end), `splice`, `toLocaleString`, `toReversed`,
+  `toSorted`, `toSpliced`, `toString`, `unshift`, `values`, `with`; `@@iterator` =
+  `%Array.prototype.values%`, `@@species` accessor, `@@unscopables`; hole semantics per spec
+  (iteration methods skip holes, `find`/`includes` read them as undefined, `map` preserves
+  them). 11 tests.
+- **Array iterator:** `%ArrayIteratorPrototype%` with `next` (key+value/key/value kinds) and
+  `@@toStringTag`; `%Array.prototype%` now backs every runtime-created array (literals, spread,
+  RegExp match arrays, `Object.entries`/`values`/`fromEntries` pairs, split results, Promise
+  combinators, rest-element bindings).
+- **Conversion fixes (pre-existing engine gaps):** agent-aware `to_primitive`/`to_string`/
+  `to_number`/`to_property_key` in `crate::context` dispatch builtin `toString`/`valueOf`
+  (crux's native-closure path tripped their placeholders), with the spec's
+  "non-object result" fallthrough in OrdinaryToPrimitive (crux too); `Object.prototype
+  .isPrototypeOf` accepts Function receivers/targets (the dual Function/Object value
+  representation).
+
+**test262 fixtures:** `built-ins/Array` scanner run — **41 of 50 files pass** (4 skip on
+`isConstructor.js`/`propertyHelper.js` includes; 5 fail on `$262`, the Function-vs-object
+value identity, and boxed-primitive length coercion), registered one `#[test]` each. The
+workspace now runs **1303 tests** (773 of them test262 fixtures) with fmt and clippy
+(`-D warnings`) clean.
+
+**Pending (next session):** `%TypedArray%` + the 12 per-kind constructors, the integer-indexed
+exotic's real element storage (the Phase 5 shell still returns a TypeError on element access),
+`GetValueFromBuffer`/`SetValueInBuffer`, the TypedArray prototype surface, and
+`Uint8Array` hex/base64 (ES2026). The ArrayBuffer backing store and resizable-buffer
+corner cases are Phase 14 territory.
+
 ---
 
 ### Phase 13 — Keyed collections: Map, Set, WeakMap, WeakSet

@@ -519,7 +519,7 @@ fn list_to_array(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
     let length_value =
         crate::context::get_property(agent, value, &JsString::from_utf8("length"), value.clone())?;
     let length = to_length(to_number(&length_value)?);
-    let array = JsObject::array_create(None, length as f64)?;
+    let array = crate::builtins::array::array_create(agent, length as f64)?;
     for index in 0..length {
         let element = crate::context::get_property(
             agent,

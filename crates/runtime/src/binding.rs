@@ -59,7 +59,10 @@ pub fn iterator_binding_initialization(
 ) -> Result<(), JsError> {
     for (index, param) in params.iter().enumerate() {
         if param.rest {
-            let array = array_from_values(args.get(index..).unwrap_or_default())?;
+            let array = crate::builtins::array::array_from_values(
+                agent,
+                args.get(index..).unwrap_or_default(),
+            )?;
             return bind_rest_element(agent, param, array, env, strict);
         }
         let value = args.get(index).cloned().unwrap_or(Value::Undefined);
@@ -220,7 +223,7 @@ fn bind_array_pattern(
                     while let Some(next) = iterator_step(agent, &iterator)? {
                         collected.push(next);
                     }
-                    let array = array_from_values(&collected)?;
+                    let array = crate::builtins::array::array_from_values(agent, &collected)?;
                     return bind_rest_element(agent, element, array, env, strict);
                 }
             }
@@ -243,15 +246,6 @@ fn bind_array_pattern(
             Err(error)
         }
     }
-}
-
-/// A fresh Array of the given values (ArrayCreate + CreateDataProperty).
-fn array_from_values(values: &[Value]) -> Result<Value, JsError> {
-    let array = JsObject::array_create(None, values.len() as f64)?;
-    for (index, value) in values.iter().enumerate() {
-        array.create_data_property(&JsString::from_utf8(&index.to_string()), value.clone())?;
-    }
-    Ok(Value::Object(array))
 }
 
 /// Evaluation of a PropertyName in a binding pattern (spec 13.2.5.5).

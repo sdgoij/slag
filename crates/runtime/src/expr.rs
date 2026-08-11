@@ -8,9 +8,7 @@
 //! join with Phase 7.
 
 use crux::bigint;
-use crux::convert::{
-    ToPrimitiveHint, to_boolean, to_number, to_numeric, to_primitive, to_property_key, to_string,
-};
+use crux::convert::{ToPrimitiveHint, to_boolean, to_number, to_numeric, to_primitive, to_string};
 use crux::error::{ErrorKind, JsError};
 use crux::handle::Handle;
 use crux::ops::{is_strictly_equal, same_value};
@@ -341,7 +339,7 @@ fn eval_member_key(
         )),
         MemberProperty::Computed(expr) => {
             let key = eval_expr(agent, expr, strict)?;
-            to_property_key(&key)
+            crate::context::to_property_key(agent, &key)
         }
     }
 }
@@ -389,7 +387,7 @@ fn eval_array_literal(
     literal: &syntax::ast::ArrayLiteral,
     strict: bool,
 ) -> Result<Value, JsError> {
-    let array = crux::object::JsObject::array_create(None, 0.0)?;
+    let array = crate::builtins::array::array_create(agent, 0.0)?;
     let mut index = 0usize;
     for element in &literal.elements {
         match element {
@@ -585,7 +583,7 @@ fn eval_property_name(
         PropertyName::Number(n) => Ok(to_string(&Value::Number(*n))?),
         PropertyName::Computed(expr) => {
             let key = eval_expr(agent, expr, strict)?;
-            let key = to_property_key(&key)?;
+            let key = crate::context::to_property_key(agent, &key)?;
             match key {
                 PropertyKey::String(id) => Ok(crux::lookup(id)),
                 PropertyKey::Symbol(_) => Err(JsError::new(
@@ -858,10 +856,14 @@ pub(crate) fn apply_binary(
 ) -> Result<Value, JsError> {
     match op {
         BinaryOp::Add => {
-            let left_prim = to_primitive(left, ToPrimitiveHint::Default)?;
-            let right_prim = to_primitive(right, ToPrimitiveHint::Default)?;
+            let left_prim = crate::context::to_primitive(agent, left, ToPrimitiveHint::Default)?;
+            let right_prim = crate::context::to_primitive(agent, right, ToPrimitiveHint::Default)?;
             if matches!(left_prim, Value::String(_)) || matches!(right_prim, Value::String(_)) {
-                let text = format!("{}{}", to_string(&left_prim)?, to_string(&right_prim)?);
+                let text = format!(
+                    "{}{}",
+                    crate::context::to_string(agent, &left_prim)?,
+                    crate::context::to_string(agent, &right_prim)?
+                );
                 return Ok(Value::String(Handle::new(JsString::from_utf8(&text))));
             }
             numeric_add(&left_prim, &right_prim)
@@ -892,7 +894,7 @@ pub(crate) fn apply_binary(
         BinaryOp::StrictEqual => Ok(Value::Boolean(is_strictly_equal(left, right))),
         BinaryOp::StrictNotEqual => Ok(Value::Boolean(!is_strictly_equal(left, right))),
         BinaryOp::In => {
-            let key = to_property_key(left)?;
+            let key = crate::context::to_property_key(agent, left)?;
             match right {
                 Value::Object(obj) => Ok(Value::Boolean(obj.has_property_key(&key)?)),
                 Value::Function(f) => Ok(Value::Boolean(f.object.has_property_key(&key)?)),
@@ -1204,7 +1206,7 @@ fn eval_template(
         text.push_str(&cooked.to_string_lossy());
         if let Some(expr) = template.exprs.get(index) {
             let value = eval_expr(agent, expr, strict)?;
-            text.push_str(&to_string(&value)?.to_string_lossy());
+            text.push_str(&crate::context::to_string(agent, &value)?.to_string_lossy());
         }
     }
     Ok(Value::String(Handle::new(JsString::from_utf8(&text))))

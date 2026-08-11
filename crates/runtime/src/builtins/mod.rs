@@ -4,6 +4,7 @@
 //! intrinsic identity from `runtime::function::call`/`construct` (the %eval%
 //! pattern), because the crux-level native closures cannot reach the agent.
 
+pub mod array;
 pub mod bigint;
 pub mod boolean;
 pub mod date;

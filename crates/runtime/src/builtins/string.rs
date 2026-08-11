@@ -194,9 +194,9 @@ fn instance_proto(
     })
 }
 
-fn string_call(args: &[Value]) -> Result<Value, JsError> {
+fn string_call(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
     let text = match args.first() {
-        Some(value) => to_string(value)?,
+        Some(value) => crate::context::to_string(agent, value)?,
         None => JsString::from_utf8(""),
     };
     Ok(Value::String(Handle::new(text)))
@@ -841,10 +841,10 @@ fn split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
     };
     let separator_string = to_string(&separator)?;
     if lim == 0 {
-        return array_from_list(&[]);
+        return array_from_list(agent, &[]);
     }
     if matches!(separator, Value::Undefined) {
-        return array_from_list(&[string]);
+        return array_from_list(agent, &[string]);
     }
     let separator_len = separator_string.len();
     if separator_len == 0 {
@@ -856,10 +856,10 @@ fn split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
             .iter()
             .map(|&u| Value::String(Handle::new(JsString::from_utf16(&[u]))))
             .collect();
-        return array_from_values(&code_units);
+        return crate::builtins::array::array_from_values(agent, &code_units);
     }
     if string.is_empty() {
-        return array_from_list(&[string]);
+        return array_from_list(agent, &[string]);
     }
     let mut substrings: Vec<JsString> = Vec::new();
     let mut search_start = 0usize;
@@ -867,13 +867,13 @@ fn split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
     while let Some(match_position) = match_index {
         substrings.push(substring(&string, search_start, match_position));
         if substrings.len() == lim as usize {
-            return array_from_list(&substrings);
+            return array_from_list(agent, &substrings);
         }
         search_start = match_position + separator_len;
         match_index = string_index_of(&string, &separator_string, search_start);
     }
     substrings.push(substring(&string, search_start, string.len()));
-    array_from_list(&substrings)
+    array_from_list(agent, &substrings)
 }
 
 /// spec 22.1.3.27 String.prototype.startsWith.
@@ -1116,20 +1116,12 @@ fn iter_result(value: Value, done: bool) -> Result<Value, JsError> {
 }
 
 /// CreateArrayFromList of strings.
-fn array_from_list(items: &[JsString]) -> Result<Value, JsError> {
+fn array_from_list(agent: &mut Agent, items: &[JsString]) -> Result<Value, JsError> {
     let values: Vec<Value> = items
         .iter()
         .map(|s| Value::String(Handle::new(s.clone())))
         .collect();
-    array_from_values(&values)
-}
-
-fn array_from_values(values: &[Value]) -> Result<Value, JsError> {
-    let array = JsObject::array_create(None, values.len() as f64)?;
-    for (index, value) in values.iter().enumerate() {
-        array.create_data_property(&JsString::from_utf8(&index.to_string()), value.clone())?;
-    }
-    Ok(Value::Object(array))
+    crate::builtins::array::array_from_values(agent, &values)
 }
 
 /// spec 22.1.3.17.1 GetSubstitution: the `$`-directive replacement template
@@ -1610,7 +1602,7 @@ pub fn dispatch_call(
     let realm = agent.current_realm().ok()?;
     let intrinsics = &realm.intrinsics;
     if intrinsics.get(STRING).as_ref() == Some(callee) {
-        return Some(string_call(args));
+        return Some(string_call(agent, args));
     }
     if intrinsics.get(RAW).as_ref() == Some(callee) {
         return Some(raw(agent, this, args));

@@ -571,7 +571,7 @@ fn promise_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
             Ok(None) => {
                 *remaining.borrow_mut() -= 1;
                 if *remaining.borrow() == 0 {
-                    let array = values_array(&values)?;
+                    let array = values_array(agent, &values)?;
                     crate::function::call(agent, &resolve, Value::Undefined, &[array])?;
                 }
                 return Ok(capability.promise);
@@ -647,7 +647,7 @@ fn all_fulfilled(
     *remaining -= 1;
     if *remaining == 0 {
         drop(remaining);
-        let array = values_array(&values)?;
+        let array = values_array(agent, &values)?;
         eprintln!("DBG all: resolving with array {:?}", array);
         crate::function::call(agent, &resolve, Value::Undefined, &[array])?;
     }
@@ -685,7 +685,7 @@ fn promise_all_settled(agent: &mut Agent, this: &Value, args: &[Value]) -> Resul
             Ok(None) => {
                 *remaining.borrow_mut() -= 1;
                 if *remaining.borrow() == 0 {
-                    let array = values_array(&results)?;
+                    let array = values_array(agent, &results)?;
                     crate::function::call(agent, &resolve, Value::Undefined, &[array])?;
                 }
                 return Ok(capability.promise);
@@ -781,7 +781,7 @@ fn all_settled_handler(
     *remaining -= 1;
     if *remaining == 0 {
         drop(remaining);
-        let array = values_array(&results)?;
+        let array = values_array(agent, &results)?;
         crate::function::call(agent, &resolve, Value::Undefined, &[array])?;
     }
     Ok(Value::Undefined)
@@ -818,7 +818,7 @@ fn promise_any(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
             Ok(None) => {
                 *remaining.borrow_mut() -= 1;
                 if *remaining.borrow() == 0 {
-                    let array = values_array(&errors)?;
+                    let array = values_array(agent, &errors)?;
                     let aggregate = aggregate_error(agent, array)?;
                     crate::function::call(agent, &reject, Value::Undefined, &[aggregate])?;
                 }
@@ -914,7 +914,7 @@ fn any_rejected(
     *remaining -= 1;
     if *remaining == 0 {
         drop(remaining);
-        let array = values_array(&errors)?;
+        let array = values_array(agent, &errors)?;
         let aggregate = aggregate_error(agent, array)?;
         crate::function::call(agent, &reject, Value::Undefined, &[aggregate])?;
     }
@@ -1079,8 +1079,8 @@ fn species_constructor(agent: &mut Agent, promise: &Value) -> Result<Value, JsEr
 }
 
 /// A fresh Array from a shared values buffer.
-fn values_array(values: &Rc<RefCell<Vec<Value>>>) -> Result<Value, JsError> {
-    let array = JsObject::array_create(None, 0.0)?;
+fn values_array(agent: &mut Agent, values: &Rc<RefCell<Vec<Value>>>) -> Result<Value, JsError> {
+    let array = crate::builtins::array::array_create(agent, 0.0)?;
     let values = values.borrow();
     for (i, v) in values.iter().enumerate() {
         array.create_data_property(&JsString::from_utf8(&i.to_string()), v.clone())?;

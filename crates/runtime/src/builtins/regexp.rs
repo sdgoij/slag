@@ -274,7 +274,7 @@ fn regexp_builtin_exec(
         )?;
     }
     let capturing_groups = state.compiled.capturing_groups;
-    let array = JsObject::array_create(None, (capturing_groups + 1) as f64)?;
+    let array = crate::builtins::array::array_create(agent, (capturing_groups + 1) as f64)?;
     array.create_data_property(
         &JsString::from_utf8("index"),
         Value::Number(last_index as f64),
@@ -309,11 +309,12 @@ fn regexp_builtin_exec(
     }
     // `d` flag: the indices array with named groups.
     if has_indices {
-        let indices_obj = JsObject::array_create(None, (capturing_groups + 1) as f64)?;
+        let indices_obj =
+            crate::builtins::array::array_create(agent, (capturing_groups + 1) as f64)?;
         for (i, capture) in result.iter().enumerate() {
             let pair = match capture {
-                Some((s, e)) => pair_array(*s, *e)?,
-                None => pair_array(usize::MAX, usize::MAX)?,
+                Some((s, e)) => pair_array(agent, *s, *e)?,
+                None => pair_array(agent, usize::MAX, usize::MAX)?,
             };
             indices_obj.create_data_property(&JsString::from_utf8(&i.to_string()), pair)?;
         }
@@ -321,8 +322,8 @@ fn regexp_builtin_exec(
             let groups_indices = JsObject::ordinary_object_create(None);
             for (name, index) in &state.compiled.named_groups {
                 let pair = match result[*index] {
-                    Some((s, e)) => pair_array(s, e)?,
-                    None => pair_array(usize::MAX, usize::MAX)?,
+                    Some((s, e)) => pair_array(agent, s, e)?,
+                    None => pair_array(agent, usize::MAX, usize::MAX)?,
                 };
                 groups_indices
                     .create_data_property(&JsString::from_utf16(&to_utf16(name)), pair)?;
@@ -337,8 +338,8 @@ fn regexp_builtin_exec(
     Ok(Some(Value::Object(array)))
 }
 
-fn pair_array(start: usize, end: usize) -> Result<Value, JsError> {
-    let pair = JsObject::array_create(None, 2.0)?;
+fn pair_array(agent: &mut Agent, start: usize, end: usize) -> Result<Value, JsError> {
+    let pair = crate::builtins::array::array_create(agent, 2.0)?;
     pair.create_data_property(
         &JsString::from_utf8("0"),
         Value::Number(if start == usize::MAX {
@@ -510,7 +511,7 @@ fn symbol_match(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     if result.is_empty() {
         return Ok(Value::Null);
     }
-    let array = JsObject::array_create(None, result.len() as f64)?;
+    let array = crate::builtins::array::array_create(agent, result.len() as f64)?;
     for (i, value) in result.into_iter().enumerate() {
         array.create_data_property(&JsString::from_utf8(&i.to_string()), value)?;
     }

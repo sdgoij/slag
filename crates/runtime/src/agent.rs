@@ -128,6 +128,18 @@ pub struct Agent {
         u64,
         std::rc::Rc<std::cell::RefCell<crate::builtins::weakref::FinalizationData>>,
     >,
+    /// [[IteratedObject]], [[ArrayIteratorNextIndex]], and [[ArrayIterationKind]]
+    /// of Array iterators, keyed by object identity (spec 23.1.5).
+    pub array_iter_data: std::collections::HashMap<u64, (Value, usize, u32)>,
+    /// The `Array.fromAsync` continuation states, keyed by handler-function
+    /// identity (spec 23.1.2.4.1); the bool selects the reject handler.
+    pub array_from_async: std::collections::HashMap<
+        u64,
+        (
+            std::rc::Rc<std::cell::RefCell<crate::builtins::array::FromAsyncState>>,
+            bool,
+        ),
+    >,
 }
 
 impl Agent {
@@ -171,6 +183,8 @@ impl Agent {
             error_data: std::collections::HashSet::new(),
             weak_ref_targets: std::collections::HashMap::new(),
             finalization_registries: std::collections::HashMap::new(),
+            array_iter_data: std::collections::HashMap::new(),
+            array_from_async: std::collections::HashMap::new(),
         }
     }
 

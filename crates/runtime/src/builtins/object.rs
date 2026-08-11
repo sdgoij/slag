@@ -318,13 +318,9 @@ fn enumerable_string_keys(agent: &mut Agent, value: &Value) -> Result<Vec<JsStri
     Ok(out)
 }
 
-/// Build an Array of values (the %Array.prototype% link joins in Phase 12).
-fn array_of(values: &[Value]) -> Result<Value, JsError> {
-    let array = JsObject::array_create(None, values.len() as f64)?;
-    for (index, value) in values.iter().enumerate() {
-        array.create_data_property(&JsString::from_utf8(&index.to_string()), value.clone())?;
-    }
-    Ok(Value::Object(array))
+/// Build an Array of values linked to %Array.prototype%.
+fn array_of(agent: &mut Agent, values: &[Value]) -> Result<Value, JsError> {
+    crate::builtins::array::array_from_values(agent, values)
 }
 
 /// The GetOwnPropertyKeys machinery shared by getOwnPropertyNames and
@@ -350,7 +346,7 @@ fn own_keys_of(agent: &mut Agent, value: &Value, want_symbols: bool) -> Result<V
             keys.push(value);
         }
     }
-    array_of(&keys)
+    array_of(agent, &keys)
 }
 
 /// SetIntegrityLevel (spec 7.3.15): freeze (writable off too) or seal.
@@ -468,11 +464,11 @@ pub fn dispatch_call(
     if intrinsics.get(PROTO_IS_PROTO_OF).as_ref() == Some(callee) {
         return Some((|| {
             let candidate = arg(args, 0);
-            let Value::Object(candidate_obj) = candidate else {
+            let Some(candidate_obj) = crate::context::as_object(candidate) else {
                 return Ok(Value::Boolean(false));
             };
             let object = to_object(agent, this)?;
-            let Value::Object(this_obj) = object else {
+            let Some(this_obj) = crate::context::as_object(&object) else {
                 return Ok(Value::Boolean(false));
             };
             let mut proto = candidate_obj.get_prototype_of()?;
@@ -570,12 +566,12 @@ pub fn dispatch_call(
             let mut entries = Vec::new();
             for key in keys {
                 let value = crate::context::get_property(agent, &object, &key, object.clone())?;
-                let pair = JsObject::array_create(None, 2.0)?;
+                let pair = crate::builtins::array::array_create(agent, 2.0)?;
                 pair.create_data_property(&JsString::from_utf8("0"), str(&key.to_string_lossy()))?;
                 pair.create_data_property(&JsString::from_utf8("1"), value)?;
                 entries.push(Value::Object(pair));
             }
-            array_of(&entries)
+            array_of(agent, &entries)
         })());
     }
     if intrinsics.get(VALUES).as_ref() == Some(callee) {
@@ -587,7 +583,7 @@ pub fn dispatch_call(
                 let value = crate::context::get_property(agent, &object, &key, object.clone())?;
                 values.push(value);
             }
-            array_of(&values)
+            array_of(agent, &values)
         })());
     }
     if intrinsics.get(KEYS).as_ref() == Some(callee) {
@@ -597,7 +593,7 @@ pub fn dispatch_call(
                 .into_iter()
                 .map(|key| str(&key.to_string_lossy()))
                 .collect();
-            array_of(&values)
+            array_of(agent, &values)
         })());
     }
     if intrinsics.get(GET_OWN_NAMES).as_ref() == Some(callee) {
@@ -1081,8 +1077,6 @@ mod tests {
 
     #[test]
     fn from_entries_builds_an_object() {
-        // Arrays are not iterable until Array.prototype[@@iterator] lands
-        // (Phase 12); drive fromEntries with a hand-built iterator.
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
         let pairs = [("a", 1.0), ("b", 2.0)];

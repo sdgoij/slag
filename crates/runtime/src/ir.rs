@@ -569,7 +569,7 @@ impl Vm {
                     if is_nullish(&object) {
                         return Err(nullish_error("Cannot read properties of null"));
                     }
-                    let key = crux::convert::to_property_key(&key)?;
+                    let key = crate::context::to_property_key(agent, &key)?;
                     let value =
                         crate::context::get_property_key(agent, &object, &key, object.clone())?;
                     self.stack.push(value);
@@ -585,7 +585,7 @@ impl Vm {
                 Step::GetSuperComputed => {
                     let key = self.pop();
                     self.pop(); // base
-                    let key = crux::convert::to_property_key(&key)?;
+                    let key = crate::context::to_property_key(agent, &key)?;
                     let this = resolve_this_binding(agent)?;
                     let base = get_super_base(agent)?;
                     let value = crate::context::get_property_key(agent, &base, &key, this)?;
@@ -623,7 +623,7 @@ impl Vm {
                     if is_nullish(&object) {
                         return Err(nullish_error("Cannot set properties of null"));
                     }
-                    let key = crux::convert::to_property_key(&key)?;
+                    let key = crate::context::to_property_key(agent, &key)?;
                     self.assign_member(agent, object, PropertyKeyName::Key(key), value, op)?;
                 }
                 Step::AssignSuperName { name, op } => {
@@ -635,7 +635,7 @@ impl Vm {
                     let value = self.pop();
                     let key = self.pop();
                     self.pop(); // base
-                    let key = crux::convert::to_property_key(&key)?;
+                    let key = crate::context::to_property_key(agent, &key)?;
                     self.assign_super(agent, PropertyKeyName::Key(key), value, op)?;
                 }
                 Step::AssignPrivate { atom, op } => {
@@ -694,7 +694,7 @@ impl Vm {
                         return Err(nullish_error("Cannot set properties of null"));
                     }
                     let new = update_value(agent, &op, &old)?;
-                    let key = crux::convert::to_property_key(&key)?;
+                    let key = crate::context::to_property_key(agent, &key)?;
                     crate::context::put_value(
                         agent,
                         &member_reference(&object, &PropertyKeyName::Key(key), self.strict),
@@ -714,11 +714,8 @@ impl Vm {
                     let key = self.pop();
                     self.pop(); // base
                     let new = update_value(agent, &op, &old)?;
-                    self.put_super(
-                        agent,
-                        PropertyKeyName::Key(crux::convert::to_property_key(&key)?),
-                        new.clone(),
-                    )?;
+                    let key = crate::context::to_property_key(agent, &key)?;
+                    self.put_super(agent, PropertyKeyName::Key(key), new.clone())?;
                     self.stack.push(if prefix { new } else { old });
                 }
                 Step::UpdatePrivate { atom, op, prefix } => {
@@ -750,7 +747,7 @@ impl Vm {
                 Step::DeleteMemberComputed => {
                     let key = self.pop();
                     let object = self.pop();
-                    let key = crux::convert::to_property_key(&key)?;
+                    let key = crate::context::to_property_key(agent, &key)?;
                     let reference = crate::context::Reference {
                         base: crate::context::ReferenceBase::Value(object),
                         name: key,
@@ -808,7 +805,7 @@ impl Vm {
                     self.stack.push(value);
                 }
                 Step::ArrayBegin => {
-                    let array = crux::object::JsObject::array_create(None, 0.0)?;
+                    let array = crate::builtins::array::array_create(agent, 0.0)?;
                     self.stack.push(Value::Object(array));
                 }
                 Step::ArrayElement => {
@@ -853,7 +850,7 @@ impl Vm {
                     let value = self.pop();
                     let key = self.pop();
                     let object = self.pop();
-                    let name = property_name_from_value(key)?;
+                    let name = property_name_from_value(agent, key)?;
                     object_init(agent, &object, &name, value, set_name)?;
                     self.stack.push(object);
                 }
@@ -865,7 +862,7 @@ impl Vm {
                 Step::ObjectMethodComputed { function } => {
                     let key = self.pop();
                     let object = self.pop();
-                    let name = property_name_from_value(key)?;
+                    let name = property_name_from_value(agent, key)?;
                     object_method(agent, &object, &name, &function)?;
                     self.stack.push(object);
                 }
@@ -889,7 +886,7 @@ impl Vm {
                 Step::ObjectAccessorComputed { get, param, body } => {
                     let key = self.pop();
                     let object = self.pop();
-                    let name = property_name_from_value(key)?;
+                    let name = property_name_from_value(agent, key)?;
                     object_accessor(agent, &object, &name, get, param, &body)?;
                     self.stack.push(object);
                 }
@@ -908,7 +905,7 @@ impl Vm {
                 Step::ConcatStr => {
                     let value = self.pop();
                     let acc = self.pop();
-                    let text = crux::convert::to_string(&value)?.to_string_lossy();
+                    let text = crate::context::to_string(agent, &value)?.to_string_lossy();
                     let acc_text = string_of(&acc);
                     self.stack
                         .push(Value::String(Handle::new(JsString::from_utf8(&format!(
@@ -1908,8 +1905,8 @@ fn is_eval_function(agent: &Agent, value: &Value) -> Result<bool, JsError> {
     Ok(realm.intrinsics.get("%eval%").as_ref() == Some(value))
 }
 
-fn property_name_from_value(value: Value) -> Result<PropertyName, JsError> {
-    let key = crux::convert::to_property_key(&value)?;
+fn property_name_from_value(agent: &mut Agent, value: Value) -> Result<PropertyName, JsError> {
+    let key = crate::context::to_property_key(agent, &value)?;
     match key {
         PropertyKey::String(id) => Ok(PropertyName::Ident(id)),
         PropertyKey::Symbol(_) => Err(JsError::new(
@@ -1951,7 +1948,7 @@ fn object_init(
         PropertyName::Number(n) => crux::convert::to_string(&Value::Number(*n))?,
         PropertyName::Computed(expr) => {
             let key = crate::expr::eval_expr(agent, expr, false)?;
-            let key = crux::convert::to_property_key(&key)?;
+            let key = crate::context::to_property_key(agent, &key)?;
             return object_init_key(agent, obj, key, value, set_name);
         }
     };
@@ -2054,7 +2051,7 @@ fn object_method(
         PropertyName::Number(n) => crux::convert::to_string(&Value::Number(*n))?,
         PropertyName::Computed(expr) => {
             let key = crate::expr::eval_expr(agent, expr, false)?;
-            let key = crux::convert::to_property_key(&key)?;
+            let key = crate::context::to_property_key(agent, &key)?;
             let PropertyKey::String(id) = key else {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
@@ -2091,7 +2088,7 @@ fn object_accessor(
         PropertyName::Number(n) => crux::convert::to_string(&Value::Number(*n))?,
         PropertyName::Computed(expr) => {
             let key = crate::expr::eval_expr(agent, expr, false)?;
-            let key = crux::convert::to_property_key(&key)?;
+            let key = crate::context::to_property_key(agent, &key)?;
             let PropertyKey::String(id) = key else {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
@@ -2141,8 +2138,9 @@ fn tagged_template(
             format!("{} is not a function", crux::value::type_of(&tag)),
         ));
     }
-    let template_object = crux::object::JsObject::array_create(None, template.quasis.len() as f64)?;
-    let raw = crux::object::JsObject::array_create(None, template.quasis.len() as f64)?;
+    let template_object =
+        crate::builtins::array::array_create(agent, template.quasis.len() as f64)?;
+    let raw = crate::builtins::array::array_create(agent, template.quasis.len() as f64)?;
     for (index, quasi) in template.quasis.iter().enumerate() {
         let cooked = quasi
             .cooked

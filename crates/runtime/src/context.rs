@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use crux::error::{ErrorKind, JsError};
 use crux::handle::Handle;
 use crux::object::JsObject;
+use crux::property::PropertyKey;
 use crux::string::JsString;
 use crux::value::Value;
 
@@ -22,6 +23,73 @@ pub fn as_object(value: &Value) -> Option<Handle<JsObject>> {
         Value::Object(obj) => Some(obj.clone()),
         Value::Function(f) => f.object.handle(),
         _ => None,
+    }
+}
+
+/// ToPrimitive (spec 7.1.1) with agent dispatch: an object's builtin
+/// `toString`/`valueOf` are runtime-dispatched functions, so the crux-level
+/// ordinary conversion (which calls native closures directly) would trip
+/// their placeholders.
+pub fn to_primitive(
+    agent: &mut Agent,
+    value: &Value,
+    hint: crux::convert::ToPrimitiveHint,
+) -> Result<Value, JsError> {
+    if !matches!(value, Value::Object(_) | Value::Function(_)) {
+        return Ok(value.clone());
+    }
+    let (first, second) = match hint {
+        crux::convert::ToPrimitiveHint::String | crux::convert::ToPrimitiveHint::Default => {
+            ("toString", "valueOf")
+        }
+        crux::convert::ToPrimitiveHint::Number => ("valueOf", "toString"),
+    };
+    for name in [first, second] {
+        let method = get_property_key(agent, value, &PropertyKey::from_utf8(name), value.clone())?;
+        if crux::value::is_callable(&method) {
+            let result = crate::function::call(agent, &method, value.clone(), &[])?;
+            if !matches!(result, Value::Object(_) | Value::Function(_)) {
+                return Ok(result);
+            }
+        }
+    }
+    Err(JsError::new(
+        ErrorKind::TypeError,
+        "Cannot convert object to primitive value".into(),
+    ))
+}
+
+/// ToString (spec 7.1.17) with agent dispatch for object receivers.
+pub fn to_string(agent: &mut Agent, value: &Value) -> Result<JsString, JsError> {
+    match value {
+        Value::Object(_) | Value::Function(_) => {
+            let prim = to_primitive(agent, value, crux::convert::ToPrimitiveHint::String)?;
+            to_string(agent, &prim)
+        }
+        _ => crux::convert::to_string(value),
+    }
+}
+
+/// ToNumber (spec 7.1.4) with agent dispatch for object receivers.
+pub fn to_number(agent: &mut Agent, value: &Value) -> Result<f64, JsError> {
+    match value {
+        Value::Object(_) | Value::Function(_) => {
+            let prim = to_primitive(agent, value, crux::convert::ToPrimitiveHint::Number)?;
+            to_number(agent, &prim)
+        }
+        _ => crux::convert::to_number(value),
+    }
+}
+
+/// ToPropertyKey (spec 7.1.20) with agent dispatch for object receivers.
+pub fn to_property_key(agent: &mut Agent, value: &Value) -> Result<PropertyKey, JsError> {
+    let key = to_primitive(agent, value, crux::convert::ToPrimitiveHint::String)?;
+    match key {
+        Value::Symbol(sym) => Ok(PropertyKey::Symbol(sym.as_ref().clone())),
+        other => {
+            let text = to_string(agent, &other)?;
+            Ok(PropertyKey::String(crux::intern(text.as_slice())))
+        }
     }
 }
 
