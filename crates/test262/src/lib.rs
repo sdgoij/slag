@@ -19,6 +19,22 @@ mod harness {
     use crux::value::Value;
     use runtime::Agent;
 
+    /// Where a fixture lives under the pinned submodule.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Area {
+        Language,
+        Builtins,
+    }
+
+    impl Area {
+        fn root(self) -> PathBuf {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(match self {
+                Area::Language => "../../test262/test/language",
+                Area::Builtins => "../../test262/test/built-ins",
+            })
+        }
+    }
+
     /// One `#[test]` per fixture, so failures and skips are attributed to the
     /// file, tests run in parallel, and `cargo test -p test262 <substring>`
     /// filters to a single fixture. The ident is the path with `/`, `-`, and
@@ -28,7 +44,19 @@ mod harness {
         ($name:ident, $path:literal) => {
             #[test]
             fn $name() {
-                assert_fixture($path);
+                assert_fixture(Area::Language, $path);
+            }
+        };
+    }
+
+    /// Same, but rooted at `test/built-ins` (Phase 8+). Idents keep the
+    /// upstream file case (`S15.6.4.2_A1_T1`), which is not snake_case.
+    macro_rules! test262_builtin_fixture {
+        ($name:ident, $path:literal) => {
+            #[test]
+            #[allow(non_snake_case)]
+            fn $name() {
+                assert_fixture(Area::Builtins, $path);
             }
         };
     }
@@ -204,10 +232,434 @@ mod harness {
         "expressions/conditional/in-condition.js"
     );
 
+    // Phase 8 built-ins: every fixture below passes in both modes with the
+    // Phase 8 global surface (the list was produced by the scanner, so it is
+    // data, not aspiration).
+    test262_builtin_fixture!(global_10_2_1_1_3_4_22, "global/10.2.1.1.3-4-22.js");
+    test262_builtin_fixture!(global_S10_2_3_A1_1_T1, "global/S10.2.3_A1.1_T1.js");
+    test262_builtin_fixture!(global_S10_2_3_A1_1_T2, "global/S10.2.3_A1.1_T2.js");
+    test262_builtin_fixture!(global_S10_2_3_A1_2_T1, "global/S10.2.3_A1.2_T1.js");
+    test262_builtin_fixture!(global_S10_2_3_A1_2_T2, "global/S10.2.3_A1.2_T2.js");
+    test262_builtin_fixture!(global_S10_2_3_A1_3_T1, "global/S10.2.3_A1.3_T1.js");
+    test262_builtin_fixture!(global_S10_2_3_A1_3_T2, "global/S10.2.3_A1.3_T2.js");
+    test262_builtin_fixture!(global_S10_2_3_A2_1_T1, "global/S10.2.3_A2.1_T1.js");
+    test262_builtin_fixture!(global_S10_2_3_A2_1_T2, "global/S10.2.3_A2.1_T2.js");
+    test262_builtin_fixture!(global_S10_2_3_A2_1_T3, "global/S10.2.3_A2.1_T3.js");
+    test262_builtin_fixture!(global_S10_2_3_A2_1_T4, "global/S10.2.3_A2.1_T4.js");
+    test262_builtin_fixture!(global_S10_2_3_A2_3_T1, "global/S10.2.3_A2.3_T1.js");
+    test262_builtin_fixture!(global_S10_2_3_A2_3_T2, "global/S10.2.3_A2.3_T2.js");
+    test262_builtin_fixture!(global_S10_2_3_A2_3_T3, "global/S10.2.3_A2.3_T3.js");
+    test262_builtin_fixture!(global_S10_2_3_A2_3_T4, "global/S10.2.3_A2.3_T4.js");
+    test262_builtin_fixture!(undefined_15_1_1_3_0, "undefined/15.1.1.3-0.js");
+    test262_builtin_fixture!(undefined_15_1_1_3_1, "undefined/15.1.1.3-1.js");
+    test262_builtin_fixture!(undefined_15_1_1_3_3, "undefined/15.1.1.3-3.js");
+    test262_builtin_fixture!(undefined_S15_1_1_3_A1, "undefined/S15.1.1.3_A1.js");
+    test262_builtin_fixture!(undefined_S15_1_1_3_A3_T2, "undefined/S15.1.1.3_A3_T2.js");
+    test262_builtin_fixture!(undefined_S15_1_1_3_A4, "undefined/S15.1.1.3_A4.js");
+    test262_builtin_fixture!(NaN_15_1_1_1_0, "NaN/15.1.1.1-0.js");
+    test262_builtin_fixture!(NaN_S15_1_1_1_A2_T2, "NaN/S15.1.1.1_A2_T2.js");
+    test262_builtin_fixture!(NaN_S15_1_1_1_A3_T2, "NaN/S15.1.1.1_A3_T2.js");
+    test262_builtin_fixture!(NaN_S15_1_1_1_A4, "NaN/S15.1.1.1_A4.js");
+    test262_builtin_fixture!(Infinity_15_1_1_2_0, "Infinity/15.1.1.2-0.js");
+    test262_builtin_fixture!(Infinity_S15_1_1_2_A2_T2, "Infinity/S15.1.1.2_A2_T2.js");
+    test262_builtin_fixture!(Infinity_S15_1_1_2_A3_T2, "Infinity/S15.1.1.2_A3_T2.js");
+    test262_builtin_fixture!(Infinity_S15_1_1_2_A4, "Infinity/S15.1.1.2_A4.js");
+    test262_builtin_fixture!(eval_length_enumerable, "eval/length-enumerable.js");
+    test262_builtin_fixture!(
+        eval_length_non_configurable,
+        "eval/length-non-configurable.js"
+    );
+    test262_builtin_fixture!(eval_length_value, "eval/length-value.js");
+    test262_builtin_fixture!(eval_no_construct, "eval/no-construct.js");
+    test262_builtin_fixture!(eval_no_proto, "eval/no-proto.js");
+    test262_builtin_fixture!(
+        decodeURI_S15_1_3_1_A1_1_T1,
+        "decodeURI/S15.1.3.1_A1.1_T1.js"
+    );
+    test262_builtin_fixture!(decodeURI_S15_1_3_1_A3_T1, "decodeURI/S15.1.3.1_A3_T1.js");
+    test262_builtin_fixture!(decodeURI_S15_1_3_1_A3_T2, "decodeURI/S15.1.3.1_A3_T2.js");
+    test262_builtin_fixture!(decodeURI_S15_1_3_1_A3_T3, "decodeURI/S15.1.3.1_A3_T3.js");
+    test262_builtin_fixture!(decodeURI_S15_1_3_1_A4_T1, "decodeURI/S15.1.3.1_A4_T1.js");
+    test262_builtin_fixture!(decodeURI_S15_1_3_1_A4_T2, "decodeURI/S15.1.3.1_A4_T2.js");
+    test262_builtin_fixture!(decodeURI_S15_1_3_1_A4_T3, "decodeURI/S15.1.3.1_A4_T3.js");
+    test262_builtin_fixture!(decodeURI_S15_1_3_1_A4_T4, "decodeURI/S15.1.3.1_A4_T4.js");
+    test262_builtin_fixture!(decodeURI_S15_1_3_1_A5_4, "decodeURI/S15.1.3.1_A5.4.js");
+    test262_builtin_fixture!(decodeURI_S15_1_3_1_A5_6, "decodeURI/S15.1.3.1_A5.6.js");
+    test262_builtin_fixture!(decodeURI_S15_1_3_1_A5_7, "decodeURI/S15.1.3.1_A5.7.js");
+    test262_builtin_fixture!(
+        decodeURIComponent_S15_1_3_2_A1_1_T1,
+        "decodeURIComponent/S15.1.3.2_A1.1_T1.js"
+    );
+    test262_builtin_fixture!(
+        decodeURIComponent_S15_1_3_2_A3_T1,
+        "decodeURIComponent/S15.1.3.2_A3_T1.js"
+    );
+    test262_builtin_fixture!(
+        decodeURIComponent_S15_1_3_2_A3_T2,
+        "decodeURIComponent/S15.1.3.2_A3_T2.js"
+    );
+    test262_builtin_fixture!(
+        decodeURIComponent_S15_1_3_2_A3_T3,
+        "decodeURIComponent/S15.1.3.2_A3_T3.js"
+    );
+    test262_builtin_fixture!(
+        decodeURIComponent_S15_1_3_2_A4_T1,
+        "decodeURIComponent/S15.1.3.2_A4_T1.js"
+    );
+    test262_builtin_fixture!(
+        decodeURIComponent_S15_1_3_2_A4_T2,
+        "decodeURIComponent/S15.1.3.2_A4_T2.js"
+    );
+    test262_builtin_fixture!(
+        decodeURIComponent_S15_1_3_2_A4_T3,
+        "decodeURIComponent/S15.1.3.2_A4_T3.js"
+    );
+    test262_builtin_fixture!(
+        decodeURIComponent_S15_1_3_2_A4_T4,
+        "decodeURIComponent/S15.1.3.2_A4_T4.js"
+    );
+    test262_builtin_fixture!(
+        decodeURIComponent_S15_1_3_2_A5_4,
+        "decodeURIComponent/S15.1.3.2_A5.4.js"
+    );
+    test262_builtin_fixture!(
+        decodeURIComponent_S15_1_3_2_A5_6,
+        "decodeURIComponent/S15.1.3.2_A5.6.js"
+    );
+    test262_builtin_fixture!(
+        decodeURIComponent_S15_1_3_2_A5_7,
+        "decodeURIComponent/S15.1.3.2_A5.7.js"
+    );
+    test262_builtin_fixture!(
+        encodeURI_S15_1_3_3_A3_1_T1,
+        "encodeURI/S15.1.3.3_A3.1_T1.js"
+    );
+    test262_builtin_fixture!(
+        encodeURI_S15_1_3_3_A3_2_T1,
+        "encodeURI/S15.1.3.3_A3.2_T1.js"
+    );
+    test262_builtin_fixture!(
+        encodeURI_S15_1_3_3_A3_2_T2,
+        "encodeURI/S15.1.3.3_A3.2_T2.js"
+    );
+    test262_builtin_fixture!(
+        encodeURI_S15_1_3_3_A3_2_T3,
+        "encodeURI/S15.1.3.3_A3.2_T3.js"
+    );
+    test262_builtin_fixture!(
+        encodeURI_S15_1_3_3_A3_3_T1,
+        "encodeURI/S15.1.3.3_A3.3_T1.js"
+    );
+    test262_builtin_fixture!(encodeURI_S15_1_3_3_A4_T1, "encodeURI/S15.1.3.3_A4_T1.js");
+    test262_builtin_fixture!(encodeURI_S15_1_3_3_A4_T2, "encodeURI/S15.1.3.3_A4_T2.js");
+    test262_builtin_fixture!(encodeURI_S15_1_3_3_A4_T3, "encodeURI/S15.1.3.3_A4_T3.js");
+    test262_builtin_fixture!(encodeURI_S15_1_3_3_A4_T4, "encodeURI/S15.1.3.3_A4_T4.js");
+    test262_builtin_fixture!(encodeURI_S15_1_3_3_A5_4, "encodeURI/S15.1.3.3_A5.4.js");
+    test262_builtin_fixture!(encodeURI_S15_1_3_3_A5_6, "encodeURI/S15.1.3.3_A5.6.js");
+    test262_builtin_fixture!(encodeURI_S15_1_3_3_A5_7, "encodeURI/S15.1.3.3_A5.7.js");
+    test262_builtin_fixture!(
+        encodeURIComponent_S15_1_3_4_A3_1_T1,
+        "encodeURIComponent/S15.1.3.4_A3.1_T1.js"
+    );
+    test262_builtin_fixture!(
+        encodeURIComponent_S15_1_3_4_A3_2_T1,
+        "encodeURIComponent/S15.1.3.4_A3.2_T1.js"
+    );
+    test262_builtin_fixture!(
+        encodeURIComponent_S15_1_3_4_A3_2_T2,
+        "encodeURIComponent/S15.1.3.4_A3.2_T2.js"
+    );
+    test262_builtin_fixture!(
+        encodeURIComponent_S15_1_3_4_A3_2_T3,
+        "encodeURIComponent/S15.1.3.4_A3.2_T3.js"
+    );
+    test262_builtin_fixture!(
+        encodeURIComponent_S15_1_3_4_A3_3_T1,
+        "encodeURIComponent/S15.1.3.4_A3.3_T1.js"
+    );
+    test262_builtin_fixture!(
+        encodeURIComponent_S15_1_3_4_A4_T1,
+        "encodeURIComponent/S15.1.3.4_A4_T1.js"
+    );
+    test262_builtin_fixture!(
+        encodeURIComponent_S15_1_3_4_A4_T2,
+        "encodeURIComponent/S15.1.3.4_A4_T2.js"
+    );
+    test262_builtin_fixture!(
+        encodeURIComponent_S15_1_3_4_A4_T3,
+        "encodeURIComponent/S15.1.3.4_A4_T3.js"
+    );
+    test262_builtin_fixture!(
+        encodeURIComponent_S15_1_3_4_A4_T4,
+        "encodeURIComponent/S15.1.3.4_A4_T4.js"
+    );
+    test262_builtin_fixture!(
+        encodeURIComponent_S15_1_3_4_A5_4,
+        "encodeURIComponent/S15.1.3.4_A5.4.js"
+    );
+    test262_builtin_fixture!(
+        encodeURIComponent_S15_1_3_4_A5_6,
+        "encodeURIComponent/S15.1.3.4_A5.6.js"
+    );
+    test262_builtin_fixture!(
+        encodeURIComponent_S15_1_3_4_A5_7,
+        "encodeURIComponent/S15.1.3.4_A5.7.js"
+    );
+    test262_builtin_fixture!(
+        isFinite_return_false_on_nan_or_infinities,
+        "isFinite/return-false-on-nan-or-infinities.js"
+    );
+    test262_builtin_fixture!(isFinite_S15_1_2_5_A2_6, "isFinite/S15.1.2.5_A2.6.js");
+    test262_builtin_fixture!(isNaN_S15_1_2_4_A2_6, "isNaN/S15.1.2.4_A2.6.js");
+    test262_builtin_fixture!(parseFloat_15_1_2_3_2_1, "parseFloat/15.1.2.3-2-1.js");
+    test262_builtin_fixture!(parseFloat_S15_1_2_3_A1_T1, "parseFloat/S15.1.2.3_A1_T1.js");
+    test262_builtin_fixture!(parseFloat_S15_1_2_3_A1_T3, "parseFloat/S15.1.2.3_A1_T3.js");
+    test262_builtin_fixture!(parseFloat_S15_1_2_3_A2_T1, "parseFloat/S15.1.2.3_A2_T1.js");
+    test262_builtin_fixture!(
+        parseFloat_S15_1_2_3_A2_T10,
+        "parseFloat/S15.1.2.3_A2_T10.js"
+    );
+    test262_builtin_fixture!(
+        parseFloat_S15_1_2_3_A2_T10_U180E,
+        "parseFloat/S15.1.2.3_A2_T10_U180E.js"
+    );
+    test262_builtin_fixture!(parseFloat_S15_1_2_3_A2_T2, "parseFloat/S15.1.2.3_A2_T2.js");
+    test262_builtin_fixture!(parseFloat_S15_1_2_3_A2_T3, "parseFloat/S15.1.2.3_A2_T3.js");
+    test262_builtin_fixture!(parseFloat_S15_1_2_3_A2_T4, "parseFloat/S15.1.2.3_A2_T4.js");
+    test262_builtin_fixture!(parseFloat_S15_1_2_3_A2_T5, "parseFloat/S15.1.2.3_A2_T5.js");
+    test262_builtin_fixture!(parseFloat_S15_1_2_3_A2_T6, "parseFloat/S15.1.2.3_A2_T6.js");
+    test262_builtin_fixture!(parseFloat_S15_1_2_3_A2_T7, "parseFloat/S15.1.2.3_A2_T7.js");
+    test262_builtin_fixture!(parseFloat_S15_1_2_3_A2_T8, "parseFloat/S15.1.2.3_A2_T8.js");
+    test262_builtin_fixture!(parseFloat_S15_1_2_3_A2_T9, "parseFloat/S15.1.2.3_A2_T9.js");
+    test262_builtin_fixture!(parseFloat_S15_1_2_3_A3_T1, "parseFloat/S15.1.2.3_A3_T1.js");
+    test262_builtin_fixture!(parseFloat_S15_1_2_3_A3_T2, "parseFloat/S15.1.2.3_A3_T2.js");
+    test262_builtin_fixture!(parseFloat_S15_1_2_3_A3_T3, "parseFloat/S15.1.2.3_A3_T3.js");
+    test262_builtin_fixture!(parseFloat_S15_1_2_3_A4_T1, "parseFloat/S15.1.2.3_A4_T1.js");
+    test262_builtin_fixture!(parseFloat_S15_1_2_3_A4_T2, "parseFloat/S15.1.2.3_A4_T2.js");
+    test262_builtin_fixture!(parseFloat_S15_1_2_3_A4_T3, "parseFloat/S15.1.2.3_A4_T3.js");
+    test262_builtin_fixture!(parseFloat_S15_1_2_3_A4_T5, "parseFloat/S15.1.2.3_A4_T5.js");
+    test262_builtin_fixture!(parseFloat_S15_1_2_3_A4_T6, "parseFloat/S15.1.2.3_A4_T6.js");
+    test262_builtin_fixture!(parseFloat_S15_1_2_3_A4_T7, "parseFloat/S15.1.2.3_A4_T7.js");
+    test262_builtin_fixture!(parseFloat_S15_1_2_3_A5_T2, "parseFloat/S15.1.2.3_A5_T2.js");
+    test262_builtin_fixture!(parseFloat_S15_1_2_3_A5_T3, "parseFloat/S15.1.2.3_A5_T3.js");
+    test262_builtin_fixture!(parseFloat_S15_1_2_3_A5_T4, "parseFloat/S15.1.2.3_A5_T4.js");
+    test262_builtin_fixture!(parseFloat_S15_1_2_3_A7_6, "parseFloat/S15.1.2.3_A7.6.js");
+    test262_builtin_fixture!(parseFloat_S15_1_2_3_A7_7, "parseFloat/S15.1.2.3_A7.7.js");
+    test262_builtin_fixture!(
+        parseFloat_tonumber_numeric_separator_literal_dd_dot_dd_ep_sign_minus_dd_nsl_dd,
+        "parseFloat/tonumber-numeric-separator-literal-dd-dot-dd-ep-sign-minus-dd-nsl-dd.js"
+    );
+    test262_builtin_fixture!(
+        parseFloat_tonumber_numeric_separator_literal_dd_dot_dd_ep_sign_minus_dds_nsl_dd,
+        "parseFloat/tonumber-numeric-separator-literal-dd-dot-dd-ep-sign-minus-dds-nsl-dd.js"
+    );
+    test262_builtin_fixture!(
+        parseFloat_tonumber_numeric_separator_literal_dd_dot_dd_ep_sign_plus_dd_nsl_dd,
+        "parseFloat/tonumber-numeric-separator-literal-dd-dot-dd-ep-sign-plus-dd-nsl-dd.js"
+    );
+    test262_builtin_fixture!(
+        parseFloat_tonumber_numeric_separator_literal_dd_dot_dd_ep_sign_plus_dds_nsl_dd,
+        "parseFloat/tonumber-numeric-separator-literal-dd-dot-dd-ep-sign-plus-dds-nsl-dd.js"
+    );
+    test262_builtin_fixture!(
+        parseFloat_tonumber_numeric_separator_literal_dd_nsl_dd_one_of,
+        "parseFloat/tonumber-numeric-separator-literal-dd-nsl-dd-one-of.js"
+    );
+    test262_builtin_fixture!(
+        parseFloat_tonumber_numeric_separator_literal_dds_dot_dd_nsl_dd_ep_dd,
+        "parseFloat/tonumber-numeric-separator-literal-dds-dot-dd-nsl-dd-ep-dd.js"
+    );
+    test262_builtin_fixture!(
+        parseFloat_tonumber_numeric_separator_literal_dds_nsl_dd,
+        "parseFloat/tonumber-numeric-separator-literal-dds-nsl-dd.js"
+    );
+    test262_builtin_fixture!(
+        parseFloat_tonumber_numeric_separator_literal_dot_dd_nsl_dd_ep,
+        "parseFloat/tonumber-numeric-separator-literal-dot-dd-nsl-dd-ep.js"
+    );
+    test262_builtin_fixture!(
+        parseFloat_tonumber_numeric_separator_literal_dot_dd_nsl_dds_ep,
+        "parseFloat/tonumber-numeric-separator-literal-dot-dd-nsl-dds-ep.js"
+    );
+    test262_builtin_fixture!(
+        parseFloat_tonumber_numeric_separator_literal_dot_dds_nsl_dd_ep,
+        "parseFloat/tonumber-numeric-separator-literal-dot-dds-nsl-dd-ep.js"
+    );
+    test262_builtin_fixture!(
+        parseFloat_tonumber_numeric_separator_literal_dot_dds_nsl_dds_ep,
+        "parseFloat/tonumber-numeric-separator-literal-dot-dds-nsl-dds-ep.js"
+    );
+    test262_builtin_fixture!(
+        parseFloat_tonumber_numeric_separator_literal_nzd_nsl_dd_one_of,
+        "parseFloat/tonumber-numeric-separator-literal-nzd-nsl-dd-one-of.js"
+    );
+    test262_builtin_fixture!(
+        parseFloat_tonumber_numeric_separator_literal_nzd_nsl_dd,
+        "parseFloat/tonumber-numeric-separator-literal-nzd-nsl-dd.js"
+    );
+    test262_builtin_fixture!(
+        parseFloat_tonumber_numeric_separator_literal_nzd_nsl_dds,
+        "parseFloat/tonumber-numeric-separator-literal-nzd-nsl-dds.js"
+    );
+    test262_builtin_fixture!(
+        parseFloat_tonumber_numeric_separator_literal_sign_plus_dds_nsl_dd,
+        "parseFloat/tonumber-numeric-separator-literal-sign-plus-dds-nsl-dd.js"
+    );
+    test262_builtin_fixture!(parseInt_15_1_2_2_2_1, "parseInt/15.1.2.2-2-1.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A1_T1, "parseInt/S15.1.2.2_A1_T1.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A1_T3, "parseInt/S15.1.2.2_A1_T3.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A2_T1, "parseInt/S15.1.2.2_A2_T1.js");
+    test262_builtin_fixture!(
+        parseInt_S15_1_2_2_A2_T10_U180E,
+        "parseInt/S15.1.2.2_A2_T10_U180E.js"
+    );
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A2_T2, "parseInt/S15.1.2.2_A2_T2.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A2_T3, "parseInt/S15.1.2.2_A2_T3.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A2_T4, "parseInt/S15.1.2.2_A2_T4.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A2_T5, "parseInt/S15.1.2.2_A2_T5.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A2_T6, "parseInt/S15.1.2.2_A2_T6.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A2_T7, "parseInt/S15.1.2.2_A2_T7.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A2_T8, "parseInt/S15.1.2.2_A2_T8.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A2_T9, "parseInt/S15.1.2.2_A2_T9.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A3_1_T1, "parseInt/S15.1.2.2_A3.1_T1.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A3_1_T2, "parseInt/S15.1.2.2_A3.1_T2.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A3_1_T3, "parseInt/S15.1.2.2_A3.1_T3.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A3_2_T2, "parseInt/S15.1.2.2_A3.2_T2.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A4_1_T1, "parseInt/S15.1.2.2_A4.1_T1.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A4_1_T2, "parseInt/S15.1.2.2_A4.1_T2.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A4_2_T1, "parseInt/S15.1.2.2_A4.2_T1.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A4_2_T2, "parseInt/S15.1.2.2_A4.2_T2.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A5_1_T1, "parseInt/S15.1.2.2_A5.1_T1.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A5_2_T1, "parseInt/S15.1.2.2_A5.2_T1.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A5_2_T2, "parseInt/S15.1.2.2_A5.2_T2.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A6_1_T1, "parseInt/S15.1.2.2_A6.1_T1.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A6_1_T2, "parseInt/S15.1.2.2_A6.1_T2.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A6_1_T3, "parseInt/S15.1.2.2_A6.1_T3.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A6_1_T4, "parseInt/S15.1.2.2_A6.1_T4.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A6_1_T5, "parseInt/S15.1.2.2_A6.1_T5.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A7_1_T1, "parseInt/S15.1.2.2_A7.1_T1.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A7_1_T2, "parseInt/S15.1.2.2_A7.1_T2.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A7_2_T2, "parseInt/S15.1.2.2_A7.2_T2.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A7_2_T3, "parseInt/S15.1.2.2_A7.2_T3.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A7_3_T2, "parseInt/S15.1.2.2_A7.3_T2.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A7_3_T3, "parseInt/S15.1.2.2_A7.3_T3.js");
+    test262_builtin_fixture!(parseInt_S15_1_2_2_A9_6, "parseInt/S15.1.2.2_A9.6.js");
+    test262_builtin_fixture!(Boolean_S15_6_1_1_A1_T2, "Boolean/S15.6.1.1_A1_T2.js");
+    test262_builtin_fixture!(Boolean_S15_6_1_1_A1_T3, "Boolean/S15.6.1.1_A1_T3.js");
+    test262_builtin_fixture!(Boolean_S15_6_1_1_A1_T4, "Boolean/S15.6.1.1_A1_T4.js");
+    test262_builtin_fixture!(Boolean_S15_6_1_1_A1_T5, "Boolean/S15.6.1.1_A1_T5.js");
+    test262_builtin_fixture!(Boolean_S15_6_1_1_A2, "Boolean/S15.6.1.1_A2.js");
+    test262_builtin_fixture!(Boolean_S15_6_2_1_A1, "Boolean/S15.6.2.1_A1.js");
+    test262_builtin_fixture!(Boolean_S15_6_2_1_A3, "Boolean/S15.6.2.1_A3.js");
+    test262_builtin_fixture!(Boolean_S15_6_2_1_A4, "Boolean/S15.6.2.1_A4.js");
+    test262_builtin_fixture!(Boolean_S9_2_A1_T1, "Boolean/S9.2_A1_T1.js");
+    test262_builtin_fixture!(Boolean_S9_2_A2_T1, "Boolean/S9.2_A2_T1.js");
+    test262_builtin_fixture!(Boolean_S9_2_A3_T1, "Boolean/S9.2_A3_T1.js");
+    test262_builtin_fixture!(Boolean_S9_2_A5_T1, "Boolean/S9.2_A5_T1.js");
+    test262_builtin_fixture!(Boolean_S9_2_A5_T3, "Boolean/S9.2_A5_T3.js");
+    test262_builtin_fixture!(Boolean_symbol_coercion, "Boolean/symbol-coercion.js");
+    test262_builtin_fixture!(
+        Symbol_auto_boxing_non_strict,
+        "Symbol/auto-boxing-non-strict.js"
+    );
+    test262_builtin_fixture!(Symbol_constructor, "Symbol/constructor.js");
+    test262_builtin_fixture!(Symbol_uniqueness, "Symbol/uniqueness.js");
+    test262_builtin_fixture!(Error_length, "Error/length.js");
+    test262_builtin_fixture!(Error_name, "Error/name.js");
+    test262_builtin_fixture!(Error_tostring_1, "Error/tostring-1.js");
+    test262_builtin_fixture!(Error_tostring_2, "Error/tostring-2.js");
+    test262_builtin_fixture!(
+        AggregateError_message_undefined_no_prop,
+        "AggregateError/message-undefined-no-prop.js"
+    );
+    test262_builtin_fixture!(
+        AggregateError_newtarget_proto,
+        "AggregateError/newtarget-proto.js"
+    );
+    test262_builtin_fixture!(Function_15_3_2_1_11_1, "Function/15.3.2.1-11-1.js");
+    test262_builtin_fixture!(Function_15_3_2_1_11_2_s, "Function/15.3.2.1-11-2-s.js");
+    test262_builtin_fixture!(Function_15_3_2_1_11_3, "Function/15.3.2.1-11-3.js");
+    test262_builtin_fixture!(Function_15_3_2_1_11_4_s, "Function/15.3.2.1-11-4-s.js");
+    test262_builtin_fixture!(Function_15_3_2_1_11_5, "Function/15.3.2.1-11-5.js");
+    test262_builtin_fixture!(Function_15_3_2_1_11_6_s, "Function/15.3.2.1-11-6-s.js");
+    test262_builtin_fixture!(Function_15_3_2_1_11_7_s, "Function/15.3.2.1-11-7-s.js");
+    test262_builtin_fixture!(Function_15_3_2_1_11_8_s, "Function/15.3.2.1-11-8-s.js");
+    test262_builtin_fixture!(Function_15_3_2_1_11_9_s, "Function/15.3.2.1-11-9-s.js");
+    test262_builtin_fixture!(Function_15_3_5_4_2_12gs, "Function/15.3.5.4_2-12gs.js");
+    test262_builtin_fixture!(Function_15_3_5_4_2_14gs, "Function/15.3.5.4_2-14gs.js");
+    test262_builtin_fixture!(Function_15_3_5_4_2_75gs, "Function/15.3.5.4_2-75gs.js");
+    test262_builtin_fixture!(Function_15_3_5_4_2_76gs, "Function/15.3.5.4_2-76gs.js");
+    test262_builtin_fixture!(Function_15_3_5_4_2_77gs, "Function/15.3.5.4_2-77gs.js");
+    test262_builtin_fixture!(Function_15_3_5_4_2_78gs, "Function/15.3.5.4_2-78gs.js");
+    test262_builtin_fixture!(Function_15_3_5_4_2_79gs, "Function/15.3.5.4_2-79gs.js");
+    test262_builtin_fixture!(Function_15_3_5_4_2_80gs, "Function/15.3.5.4_2-80gs.js");
+    test262_builtin_fixture!(Function_15_3_5_4_2_81gs, "Function/15.3.5.4_2-81gs.js");
+    test262_builtin_fixture!(Function_15_3_5_4_2_82gs, "Function/15.3.5.4_2-82gs.js");
+    test262_builtin_fixture!(Function_15_3_5_4_2_83gs, "Function/15.3.5.4_2-83gs.js");
+    test262_builtin_fixture!(Function_15_3_5_4_2_84gs, "Function/15.3.5.4_2-84gs.js");
+    test262_builtin_fixture!(Function_15_3_5_4_2_85gs, "Function/15.3.5.4_2-85gs.js");
+    test262_builtin_fixture!(Function_15_3_5_4_2_86gs, "Function/15.3.5.4_2-86gs.js");
+    test262_builtin_fixture!(Function_15_3_5_4_2_87gs, "Function/15.3.5.4_2-87gs.js");
+    test262_builtin_fixture!(Function_15_3_5_4_2_88gs, "Function/15.3.5.4_2-88gs.js");
+    test262_builtin_fixture!(Function_15_3_5_4_2_89gs, "Function/15.3.5.4_2-89gs.js");
+    test262_builtin_fixture!(Function_15_3_5_4_2_90gs, "Function/15.3.5.4_2-90gs.js");
+    test262_builtin_fixture!(Function_15_3_5_4_2_91gs, "Function/15.3.5.4_2-91gs.js");
+    test262_builtin_fixture!(Function_15_3_5_4_2_92gs, "Function/15.3.5.4_2-92gs.js");
+    test262_builtin_fixture!(Function_15_3_5_4_2_93gs, "Function/15.3.5.4_2-93gs.js");
+    test262_builtin_fixture!(Function_S10_1_1_A1_T3, "Function/S10.1.1_A1_T3.js");
+    test262_builtin_fixture!(Function_S15_3_2_1_A1_T10, "Function/S15.3.2.1_A1_T10.js");
+    test262_builtin_fixture!(Function_S15_3_2_1_A1_T11, "Function/S15.3.2.1_A1_T11.js");
+    test262_builtin_fixture!(Function_S15_3_2_1_A1_T12, "Function/S15.3.2.1_A1_T12.js");
+    test262_builtin_fixture!(Function_S15_3_2_1_A1_T3, "Function/S15.3.2.1_A1_T3.js");
+    test262_builtin_fixture!(Function_S15_3_2_1_A1_T4, "Function/S15.3.2.1_A1_T4.js");
+    test262_builtin_fixture!(Function_S15_3_2_1_A3_T11, "Function/S15.3.2.1_A3_T11.js");
+    test262_builtin_fixture!(Function_S15_3_2_1_A3_T12, "Function/S15.3.2.1_A3_T12.js");
+    test262_builtin_fixture!(Function_S15_3_2_1_A3_T13, "Function/S15.3.2.1_A3_T13.js");
+    test262_builtin_fixture!(Function_S15_3_2_1_A3_T14, "Function/S15.3.2.1_A3_T14.js");
+    test262_builtin_fixture!(Function_S15_3_2_1_A3_T15, "Function/S15.3.2.1_A3_T15.js");
+    test262_builtin_fixture!(Function_S15_3_2_1_A3_T4, "Function/S15.3.2.1_A3_T4.js");
+    test262_builtin_fixture!(Function_S15_3_2_1_A3_T5, "Function/S15.3.2.1_A3_T5.js");
+    test262_builtin_fixture!(Function_S15_3_2_1_A3_T8, "Function/S15.3.2.1_A3_T8.js");
+    test262_builtin_fixture!(Function_S15_3_2_A1, "Function/S15.3.2_A1.js");
+    test262_builtin_fixture!(Function_S15_3_3_A2_T2, "Function/S15.3.3_A2_T2.js");
+    test262_builtin_fixture!(Function_S15_3_5_A1_T1, "Function/S15.3.5_A1_T1.js");
+    test262_builtin_fixture!(Function_S15_3_5_A1_T2, "Function/S15.3.5_A1_T2.js");
+    test262_builtin_fixture!(Function_S15_3_5_A2_T1, "Function/S15.3.5_A2_T1.js");
+    test262_builtin_fixture!(Function_S15_3_5_A2_T2, "Function/S15.3.5_A2_T2.js");
+    test262_builtin_fixture!(Function_S15_3_5_A3_T1, "Function/S15.3.5_A3_T1.js");
+    test262_builtin_fixture!(Function_S15_3_5_A3_T2, "Function/S15.3.5_A3_T2.js");
+    test262_builtin_fixture!(Function_S15_3_A1, "Function/S15.3_A1.js");
+    test262_builtin_fixture!(Function_S15_3_A3_T1, "Function/S15.3_A3_T1.js");
+    test262_builtin_fixture!(Function_S15_3_A3_T2, "Function/S15.3_A3_T2.js");
+    test262_builtin_fixture!(Function_S15_3_A3_T4, "Function/S15.3_A3_T4.js");
+    test262_builtin_fixture!(Function_S15_3_A3_T5, "Function/S15.3_A3_T5.js");
+    test262_builtin_fixture!(Function_S15_3_A3_T6, "Function/S15.3_A3_T6.js");
+    test262_builtin_fixture!(Object_S15_2_1_1_A1_T1, "Object/S15.2.1.1_A1_T1.js");
+    test262_builtin_fixture!(Object_S15_2_1_1_A1_T2, "Object/S15.2.1.1_A1_T2.js");
+    test262_builtin_fixture!(Object_S15_2_1_1_A1_T3, "Object/S15.2.1.1_A1_T3.js");
+    test262_builtin_fixture!(Object_S15_2_1_1_A1_T4, "Object/S15.2.1.1_A1_T4.js");
+    test262_builtin_fixture!(Object_S15_2_1_1_A1_T5, "Object/S15.2.1.1_A1_T5.js");
+    test262_builtin_fixture!(Object_S15_2_1_1_A2_T11, "Object/S15.2.1.1_A2_T11.js");
+    test262_builtin_fixture!(Object_S15_2_1_1_A2_T8, "Object/S15.2.1.1_A2_T8.js");
+    test262_builtin_fixture!(Object_S15_2_1_1_A2_T9, "Object/S15.2.1.1_A2_T9.js");
+    test262_builtin_fixture!(Object_S15_2_1_1_A3_T2, "Object/S15.2.1.1_A3_T2.js");
+    test262_builtin_fixture!(Object_S15_2_2_1_A2_T1, "Object/S15.2.2.1_A2_T1.js");
+    test262_builtin_fixture!(Object_S15_2_2_1_A2_T2, "Object/S15.2.2.1_A2_T2.js");
+    test262_builtin_fixture!(Object_S15_2_2_1_A2_T6, "Object/S15.2.2.1_A2_T6.js");
+    test262_builtin_fixture!(Object_S15_2_2_1_A2_T7, "Object/S15.2.2.1_A2_T7.js");
+    test262_builtin_fixture!(Object_S15_2_2_1_A6_T2, "Object/S15.2.2.1_A6_T2.js");
+    test262_builtin_fixture!(Object_S15_2_A1, "Object/S15.2_A1.js");
+    test262_builtin_fixture!(Object_S9_9_A3, "Object/S9.9_A3.js");
+    test262_builtin_fixture!(Object_S9_9_A6, "Object/S9.9_A6.js");
+    test262_builtin_fixture!(
+        Object_symbol_object_returns_fresh_symbol,
+        "Object/symbol_object-returns-fresh-symbol.js"
+    );
+
     /// `crates/test262` sits one level below the repo root, where the
     /// `test262` submodule is pinned.
-    fn language_dir() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test262/test/language")
+    fn builtins_dir() -> PathBuf {
+        Area::Builtins.root()
     }
 
     /// The frontmatter fields the runner needs.
@@ -520,8 +972,8 @@ mod harness {
     }
 
     /// Run a fixture file (both modes unless `flags:` says otherwise).
-    fn run_fixture(relative: &str) -> FixtureResult {
-        let path = language_dir().join(relative);
+    fn run_fixture(area: Area, relative: &str) -> FixtureResult {
+        let path = area.root().join(relative);
         let source = match std::fs::read_to_string(&path) {
             Ok(source) => source,
             Err(e) => return FixtureResult::Fail(format!("{relative}: {e}")),
@@ -558,18 +1010,99 @@ mod harness {
 
     /// Run one fixture as its own test. Skips print and pass; a missing
     /// submodule (fresh clone) makes every fixture pass vacuously.
-    fn assert_fixture(relative: &str) {
+    fn assert_fixture(area: Area, relative: &str) {
         static NOTICE: std::sync::Once = std::sync::Once::new();
-        if !language_dir().exists() {
+        if !area.root().exists() {
             NOTICE.call_once(|| {
                 eprintln!("test262 submodule not checked out; run `git submodule update --init`");
             });
             return;
         }
-        match run_fixture(relative) {
+        match run_fixture(area, relative) {
             FixtureResult::Pass => {}
             FixtureResult::Skip(reason) => eprintln!("SKIP {relative}: {reason}"),
             FixtureResult::Fail(reason) => panic!("FAIL {relative}: {reason}"),
+        }
+    }
+
+    /// Directory pass-rate scanner: `cargo test -p test262 -- --ignored
+    /// scan_builtins --nocapture` prints how much of each Phase 8 built-ins
+    /// directory already passes, so the next batch of `test262_builtin_fixture!`
+    /// entries is data-driven. Skipped for regular runs.
+    #[test]
+    #[ignore = "directory pass-rate scanner"]
+    fn scan_builtins_directories() {
+        let dirs = [
+            "global",
+            "globalThis",
+            "undefined",
+            "NaN",
+            "Infinity",
+            "eval",
+            "decodeURI",
+            "decodeURIComponent",
+            "encodeURI",
+            "encodeURIComponent",
+            "isFinite",
+            "isNaN",
+            "parseFloat",
+            "parseInt",
+            "Boolean",
+            "Symbol",
+            "Error",
+            "AggregateError",
+            "Function",
+            "Object",
+        ];
+        for dir in dirs {
+            let mut pass = 0;
+            let mut skip = 0;
+            let mut fail = 0;
+            let mut failures = Vec::new();
+            let root = builtins_dir().join(dir);
+            let entries = match std::fs::read_dir(&root) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    println!("{dir}: cannot read ({e})");
+                    continue;
+                }
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("js") {
+                    continue;
+                }
+                let relative = path
+                    .strip_prefix(builtins_dir())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                match run_fixture(Area::Builtins, &relative) {
+                    FixtureResult::Pass => {
+                        pass += 1;
+                        let ident = relative
+                            .replace(['/', '-', '.'], "_")
+                            .trim_end_matches("_js")
+                            .to_string();
+                        println!("test262_builtin_fixture!({ident}, \"{relative}\");");
+                    }
+                    FixtureResult::Skip(reason) => {
+                        skip += 1;
+                        println!("SKIP {relative}: {reason}");
+                    }
+                    FixtureResult::Fail(reason) => {
+                        fail += 1;
+                        failures.push(reason);
+                    }
+                }
+            }
+            println!(
+                "{dir}: {pass} pass, {skip} skip, {fail} fail ({} total)",
+                pass + skip + fail
+            );
+            for reason in failures.iter().take(8) {
+                println!("  FAIL {reason}");
+            }
         }
     }
 }

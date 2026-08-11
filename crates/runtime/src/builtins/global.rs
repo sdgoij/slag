@@ -419,6 +419,9 @@ mod tests {
     }
 
     #[test]
+    // parseFloat("3.14") must round-trip to the literal 3.14; clippy sees the
+    // literal as an approximation of PI and would rather we used a constant.
+    #[allow(clippy::approx_constant)]
     fn parse_float_forms() {
         assert_eq!(run("parseFloat('3.14')").unwrap(), Value::Number(3.14));
         assert_eq!(
