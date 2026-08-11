@@ -21,9 +21,19 @@ pub fn same_value(x: &Value, y: &Value) -> bool {
             }
         }
         // Objects and functions are identical only when they are the same
-        // heap allocation (spec 7.2.12 step 7).
+        // heap allocation (spec 7.2.12 step 7); a Function value and its
+        // underlying object are the same allocation, so cross-kind compares
+        // go through the function's object handle.
         (Value::Object(a), Value::Object(b)) => Handle::ptr_eq(a, b),
         (Value::Function(a), Value::Function(b)) => Handle::ptr_eq(a, b),
+        (Value::Object(a), Value::Function(b)) => b
+            .object
+            .handle()
+            .is_some_and(|object| Handle::ptr_eq(a, &object)),
+        (Value::Function(a), Value::Object(b)) => a
+            .object
+            .handle()
+            .is_some_and(|object| Handle::ptr_eq(&object, b)),
         _ => x == y,
     }
 }

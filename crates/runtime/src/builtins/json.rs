@@ -913,33 +913,55 @@ fn hex_digit(value: u16) -> u16 {
     }
 }
 
-/// JSON.rawJSON (spec 26.6.5): validate the text is a JSON primitive and
-/// return a RawJSON object holding it.
+/// JSON.rawJSON (spec 26.6.5): `ToString` the text, validate it is one JSON
+/// primitive, and return a frozen null-prototype RawJSON object whose
+/// `rawJSON` data property holds the text verbatim.
 fn raw_json(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let _ = this;
     let text_value = args.first().cloned().unwrap_or(Value::Undefined);
-    let Value::String(text) = text_value else {
+    let text = to_string_arg(agent, &text_value)?;
+    let units = text.as_slice();
+    let first = units.first().copied();
+    let last = units.last().copied();
+    let starts_ok = first.is_some_and(|unit| {
+        (0x61..=0x7A).contains(&unit)
+            || (0x30..=0x39).contains(&unit)
+            || unit == b'"' as u16
+            || unit == b'-' as u16
+    });
+    let ends_ok = last.is_some_and(|unit| {
+        (0x61..=0x7A).contains(&unit) || (0x30..=0x39).contains(&unit) || unit == b'"' as u16
+    });
+    if !starts_ok || !ends_ok {
         return Err(JsError::new(
-            ErrorKind::TypeError,
-            "JSON.rawJSON requires a String".into(),
+            ErrorKind::SyntaxError,
+            "Invalid JSON primitive".into(),
         ));
-    };
+    }
     if json_primitive_value(agent, &text)?.is_none() {
         return Err(JsError::new(
             ErrorKind::SyntaxError,
             "Invalid JSON primitive".into(),
         ));
     }
-    let object = JsObject::ordinary_object_create(
-        agent
-            .current_realm()?
-            .intrinsics
-            .get("%Object.prototype%")
-            .and_then(|value| as_object(&value)),
-    );
-    agent
-        .raw_json_data
-        .insert(object.id(), text.as_ref().clone());
+    // spec 26.6.5: a RawJSON object has a null prototype, an [[IsRawJSON]]
+    // internal slot, a `rawJSON` data property, and is frozen.
+    let object = JsObject::ordinary_object_create(None);
+    object.create_data_property_or_throw(
+        &JsString::from_utf8("rawJSON"),
+        str(&text.to_string_lossy()),
+    )?;
+    object.prevent_extensions()?;
+    let raw_json_prop = PropertyDescriptor {
+        value: Some(str(&text.to_string_lossy())),
+        writable: Some(false),
+        get: None,
+        set: None,
+        enumerable: Some(true),
+        configurable: Some(false),
+    };
+    object.define_property(&JsString::from_utf8("rawJSON"), &raw_json_prop)?;
+    agent.raw_json_data.insert(object.id(), text.clone());
     Ok(Value::Object(object))
 }
 

@@ -1441,9 +1441,10 @@ fn splice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
             delete_property_or_throw(&object, &key(k))?;
         }
     } else if item_count > actual_delete_count {
+        // spec steps 13.a-b: shift the tail up backwards (k decrements after
+        // the copy, so the last iteration moves O[actualStart + count]).
         let mut k = length - actual_delete_count;
         while k > actual_start {
-            k -= 1;
             let from_name = key(k + actual_delete_count - 1);
             let to_name = key(k + item_count - 1);
             if has_property(&object, &from_name)? {
@@ -1452,6 +1453,7 @@ fn splice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
             } else {
                 delete_property_or_throw(&object, &to_name)?;
             }
+            k -= 1;
         }
     }
     for (j, item) in args.iter().skip(2).enumerate() {

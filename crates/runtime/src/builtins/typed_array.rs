@@ -2336,6 +2336,19 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         realm
             .intrinsics
             .define(kind.proto, kind_proto_value.clone());
+        // spec 25.2.1 table: BYTES_PER_ELEMENT is a non-writable,
+        // non-enumerable, non-configurable data property of the constructor.
+        ctor.define_property(
+            &JsString::from_utf8("BYTES_PER_ELEMENT"),
+            &PropertyDescriptor {
+                value: Some(Value::Number(kind.element_type.size() as f64)),
+                writable: Some(false),
+                get: None,
+                set: None,
+                enumerable: Some(false),
+                configurable: Some(false),
+            },
+        )?;
         ctor.define_property(
             &JsString::from_utf8("prototype"),
             &PropertyDescriptor {

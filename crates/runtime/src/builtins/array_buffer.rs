@@ -133,9 +133,10 @@ fn state(agent: &Agent, id: u64) -> Option<std::cell::Ref<'_, BufferState>> {
 }
 
 /// GetArrayBufferMaxByteLengthOption (spec 25.1.2.1): the `maxByteLength`
-/// option as a ToIndex length, or `None` when the option is absent.
+/// option as a ToIndex length, or `None` when the option is absent. A
+/// non-object option (null, a primitive, or undefined) means no maximum.
 fn max_byte_length_option(agent: &mut Agent, options: &Value) -> Result<Option<usize>, JsError> {
-    if matches!(options, Value::Undefined) {
+    if !matches!(options, Value::Object(_) | Value::Function(_)) {
         return Ok(None);
     }
     let value = get_property(
@@ -147,7 +148,10 @@ fn max_byte_length_option(agent: &mut Agent, options: &Value) -> Result<Option<u
     if matches!(value, Value::Undefined) {
         return Ok(None);
     }
-    Ok(Some(to_index(&value)? as usize))
+    // ToIndex: ToPrimitive(Number) first so object values reach their
+    // valueOf/toString through the agent.
+    let prim = crate::context::to_primitive(agent, &value, crux::convert::ToPrimitiveHint::Number)?;
+    Ok(Some(to_index(&prim)? as usize))
 }
 
 /// AllocateArrayBuffer (spec 25.1.2.2): the byte block plus the agent-side

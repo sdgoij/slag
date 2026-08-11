@@ -46,6 +46,126 @@ assert.throws = function (expectedErrorConstructor, func) {
 };
 "#;
 
+    /// The harness-global helpers beyond `assert.throws` that the vendored
+    /// fixtures rely on, defined in JS because they need user-level calls
+    /// (property access, Array.isArray, eval) the native closures cannot make:
+    /// `assert.compareArray` (real assert.js), the `$262` host object with
+    /// `detachArrayBuffer` (detaches through `ArrayBuffer.prototype.transfer`)
+    /// and `evalScript`, the `$DETACHBUFFER` helper of `detachArrayBuffer.js`,
+    /// and the common `verifyProperty`-family of `propertyHelper.js`.
+    const HARNESS_PRELUDE: &str = r#"
+assert.compareArray = function (actual, expected) {
+  if (actual === expected) return;
+  if (actual.length !== expected.length) {
+    throw new Test262Error("Expected arrays to have the same length: " + actual.length + " !== " + expected.length);
+  }
+  for (var i = 0; i < actual.length; i++) {
+    var a = actual[i];
+    var b = expected[i];
+    var same = (a === b) || (typeof a === "number" && typeof b === "number" && Number.isNaN(a) && Number.isNaN(b));
+    if (!same) {
+      throw new Test262Error("Expected arrays to contain the same values at index " + i);
+    }
+  }
+};
+
+$262 = {};
+$262.global = globalThis;
+$262.detachArrayBuffer = function (buffer) {
+  if (typeof buffer !== "object" || buffer === null || typeof buffer.transfer !== "function") {
+    throw new Test262Error("No method available to detach an ArrayBuffer");
+  }
+  buffer.transfer();
+};
+$262.evalScript = function (code) {
+  return eval(code);
+};
+
+function $DETACHBUFFER(buffer) {
+  $262.detachArrayBuffer(buffer);
+}
+
+function verifyProperty(obj, name, desc, options) {
+  assert(arguments.length > 2, "verifyProperty should receive at least 3 arguments");
+  var label = (options && options.label) || (typeof name === "symbol" ? name.toString() : String(name));
+  var original = Object.getOwnPropertyDescriptor(obj, name);
+  if (desc === undefined) {
+    assert.sameValue(original, undefined, label + " descriptor should be undefined");
+    return;
+  }
+  if (original === undefined) {
+    throw new Test262Error(label + " property should exist");
+  }
+  if ("value" in desc) assert.sameValue(original.value, desc.value, label + " value");
+  if ("writable" in desc) assert.sameValue(original.writable, desc.writable, label + " writable");
+  if ("enumerable" in desc) assert.sameValue(original.enumerable, desc.enumerable, label + " enumerable");
+  if ("configurable" in desc) assert.sameValue(original.configurable, desc.configurable, label + " configurable");
+  if ("get" in desc) assert.sameValue(original.get, desc.get, label + " get");
+  if ("set" in desc) assert.sameValue(original.set, desc.set, label + " set");
+}
+function propLabel(name) {
+  return typeof name === "symbol" ? name.toString() : String(name);
+}
+function verifyNotEnumerable(obj, name) {
+  assert.sameValue(Object.getOwnPropertyDescriptor(obj, name).enumerable, false, propLabel(name) + " should not be enumerable");
+}
+function verifyEnumerable(obj, name) {
+  assert.sameValue(Object.getOwnPropertyDescriptor(obj, name).enumerable, true, propLabel(name) + " should be enumerable");
+}
+function verifyNotConfigurable(obj, name) {
+  assert.sameValue(Object.getOwnPropertyDescriptor(obj, name).configurable, false, propLabel(name) + " should not be configurable");
+}
+function verifyConfigurable(obj, name) {
+  assert.sameValue(Object.getOwnPropertyDescriptor(obj, name).configurable, true, propLabel(name) + " should be configurable");
+}
+function verifyWritable(obj, name, options) {
+  var desc = Object.getOwnPropertyDescriptor(obj, name);
+  if (desc && (desc.get || desc.set)) {
+    throw new Test262Error("Expected " + propLabel(name) + " to be writable, but it is an accessor");
+  }
+  var expected = options && options.writable !== undefined ? options.writable : true;
+  assert.sameValue(desc.writable, expected, propLabel(name) + " writable");
+}
+function verifyNotWritable(obj, name, options) {
+  var desc = Object.getOwnPropertyDescriptor(obj, name);
+  // Accessors are never writable.
+  if (desc && (desc.get || desc.set)) return;
+  var expected = options && options.writable !== undefined ? options.writable : false;
+  assert.sameValue(desc.writable, expected, propLabel(name) + " writable");
+}
+function verifyEqualTo(obj, name, value) {
+  assert.sameValue(obj[name], value, propLabel(name) + " value");
+}
+function verifyCallableProperty(obj, name, functionName, functionLength, desc, options) {
+  var label = (options && options.label) || (typeof name === "symbol" ? name.toString() : String(name));
+  var value = obj && obj[name];
+  assert.sameValue(typeof value, "function", label + " should be a function");
+  if (desc === undefined) {
+    desc = { writable: true, enumerable: false, configurable: true, value: value };
+  } else if (!("value" in desc) && !("get" in desc)) {
+    desc.value = value;
+  }
+  verifyProperty(obj, name, desc, options);
+  if (functionName === undefined) {
+    functionName = typeof name === "symbol" ? "[" + name.description + "]" : name;
+  }
+  assert.sameValue(value.name, functionName, label + " name");
+  if (functionLength !== undefined) {
+    assert.sameValue(value.length, functionLength, label + " length");
+  }
+}
+var verifyPrimordialCallableProperty = verifyCallableProperty;
+function verifyAccessorProperty(obj, name, desc, options) {
+  var label = (options && options.label) || (typeof name === "symbol" ? name.toString() : String(name));
+  var original = Object.getOwnPropertyDescriptor(obj, name);
+  if ("get" in desc) assert.sameValue(original.get, desc.get, label + " get");
+  if ("set" in desc) assert.sameValue(original.set, desc.set, label + " set");
+  if ("enumerable" in desc) assert.sameValue(original.enumerable, desc.enumerable, label + " enumerable");
+  if ("configurable" in desc) assert.sameValue(original.configurable, desc.configurable, label + " configurable");
+}
+var verifyPrimordialAccessorProperty = verifyAccessorProperty;
+"#;
+
     /// Where a fixture lives under the pinned submodule.
     #[derive(Debug, Clone, Copy, PartialEq)]
     enum Area {
@@ -1390,6 +1510,8 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Map/groupBy/callback-throws.js"
     );
     test262_builtin_fixture!(Map_groupBy_emptyList, "Map/groupBy/emptyList.js");
+    test262_builtin_fixture!(Map_groupBy_evenOdd, "Map/groupBy/evenOdd.js");
+    test262_builtin_fixture!(Map_groupBy_groupLength, "Map/groupBy/groupLength.js");
     test262_builtin_fixture!(
         Map_groupBy_invalid_callback,
         "Map/groupBy/invalid-callback.js"
@@ -1398,7 +1520,18 @@ assert.throws = function (expectedErrorConstructor, func) {
         Map_groupBy_invalid_iterable,
         "Map/groupBy/invalid-iterable.js"
     );
+    test262_builtin_fixture!(
+        Map_groupBy_iterator_next_throws,
+        "Map/groupBy/iterator-next-throws.js"
+    );
+    test262_builtin_fixture!(Map_groupBy_length, "Map/groupBy/length.js");
     test262_builtin_fixture!(Map_groupBy_map_instance, "Map/groupBy/map-instance.js");
+    test262_builtin_fixture!(Map_groupBy_name, "Map/groupBy/name.js");
+    test262_builtin_fixture!(Map_groupBy_negativeZero, "Map/groupBy/negativeZero.js");
+    test262_builtin_fixture!(Map_groupBy_string, "Map/groupBy/string.js");
+    test262_builtin_fixture!(Map_groupBy_toPropertyKey, "Map/groupBy/toPropertyKey.js");
+    test262_builtin_fixture!(Map_is_a_constructor, "Map/is-a-constructor.js");
+    test262_builtin_fixture!(Map_iterable_calls_set, "Map/iterable-calls-set.js");
     test262_builtin_fixture!(
         Map_iterator_close_after_set_failure,
         "Map/iterator-close-after-set-failure.js"
@@ -1406,6 +1539,10 @@ assert.throws = function (expectedErrorConstructor, func) {
     test262_builtin_fixture!(
         Map_iterator_close_failure_after_set_failure,
         "Map/iterator-close-failure-after-set-failure.js"
+    );
+    test262_builtin_fixture!(
+        Map_iterator_is_undefined_throws,
+        "Map/iterator-is-undefined-throws.js"
     );
     test262_builtin_fixture!(
         Map_iterator_item_first_entry_returns_abrupt,
@@ -1425,6 +1562,7 @@ assert.throws = function (expectedErrorConstructor, func) {
     );
     test262_builtin_fixture!(Map_iterator_next_failure, "Map/iterator-next-failure.js");
     test262_builtin_fixture!(Map_iterator_value_failure, "Map/iterator-value-failure.js");
+    test262_builtin_fixture!(Map_length, "Map/length.js");
     test262_builtin_fixture!(
         Map_map_iterable_empty_does_not_call_set,
         "Map/map-iterable-empty-does-not-call-set.js"
@@ -1439,6 +1577,8 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Map/map-no-iterable-does-not-call-set.js"
     );
     test262_builtin_fixture!(Map_map_no_iterable, "Map/map-no-iterable.js");
+    test262_builtin_fixture!(Map_map, "Map/map.js");
+    test262_builtin_fixture!(Map_name, "Map/name.js");
     test262_builtin_fixture!(Map_newtarget, "Map/newtarget.js");
     test262_builtin_fixture!(
         Map_properties_of_map_instances,
@@ -1452,6 +1592,7 @@ assert.throws = function (expectedErrorConstructor, func) {
         Map_prototype_clear_clear_map,
         "Map/prototype/clear/clear-map.js"
     );
+    test262_builtin_fixture!(Map_prototype_clear_clear, "Map/prototype/clear/clear.js");
     test262_builtin_fixture!(
         Map_prototype_clear_context_is_not_map_object,
         "Map/prototype/clear/context-is-not-map-object.js"
@@ -1468,14 +1609,21 @@ assert.throws = function (expectedErrorConstructor, func) {
         Map_prototype_clear_context_is_weakmap_object_throws,
         "Map/prototype/clear/context-is-weakmap-object-throws.js"
     );
+    test262_builtin_fixture!(Map_prototype_clear_length, "Map/prototype/clear/length.js");
     test262_builtin_fixture!(
         Map_prototype_clear_map_data_list_is_preserved,
         "Map/prototype/clear/map-data-list-is-preserved.js"
+    );
+    test262_builtin_fixture!(Map_prototype_clear_name, "Map/prototype/clear/name.js");
+    test262_builtin_fixture!(
+        Map_prototype_clear_not_a_constructor,
+        "Map/prototype/clear/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         Map_prototype_clear_returns_undefined,
         "Map/prototype/clear/returns-undefined.js"
     );
+    test262_builtin_fixture!(Map_prototype_constructor, "Map/prototype/constructor.js");
     test262_builtin_fixture!(
         Map_prototype_delete_context_is_not_map_object,
         "Map/prototype/delete/context-is-not-map-object.js"
@@ -1493,8 +1641,21 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Map/prototype/delete/context-is-weakmap-object-throws.js"
     );
     test262_builtin_fixture!(
+        Map_prototype_delete_delete,
+        "Map/prototype/delete/delete.js"
+    );
+    test262_builtin_fixture!(
         Map_prototype_delete_does_not_break_iterators,
         "Map/prototype/delete/does-not-break-iterators.js"
+    );
+    test262_builtin_fixture!(
+        Map_prototype_delete_length,
+        "Map/prototype/delete/length.js"
+    );
+    test262_builtin_fixture!(Map_prototype_delete_name, "Map/prototype/delete/name.js");
+    test262_builtin_fixture!(
+        Map_prototype_delete_not_a_constructor,
+        "Map/prototype/delete/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         Map_prototype_delete_returns_false,
@@ -1504,6 +1665,7 @@ assert.throws = function (expectedErrorConstructor, func) {
         Map_prototype_delete_returns_true_for_deleted_entry,
         "Map/prototype/delete/returns-true-for-deleted-entry.js"
     );
+    test262_builtin_fixture!(Map_prototype_descriptor, "Map/prototype/descriptor.js");
     test262_builtin_fixture!(
         Map_prototype_entries_does_not_have_mapdata_internal_slot_set,
         "Map/prototype/entries/does-not-have-mapdata-internal-slot-set.js"
@@ -1515,6 +1677,19 @@ assert.throws = function (expectedErrorConstructor, func) {
     test262_builtin_fixture!(
         Map_prototype_entries_does_not_have_mapdata_internal_slot,
         "Map/prototype/entries/does-not-have-mapdata-internal-slot.js"
+    );
+    test262_builtin_fixture!(
+        Map_prototype_entries_entries,
+        "Map/prototype/entries/entries.js"
+    );
+    test262_builtin_fixture!(
+        Map_prototype_entries_length,
+        "Map/prototype/entries/length.js"
+    );
+    test262_builtin_fixture!(Map_prototype_entries_name, "Map/prototype/entries/name.js");
+    test262_builtin_fixture!(
+        Map_prototype_entries_not_a_constructor,
+        "Map/prototype/entries/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         Map_prototype_entries_returns_iterator_empty,
@@ -1565,6 +1740,10 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Map/prototype/forEach/first-argument-is-not-callable.js"
     );
     test262_builtin_fixture!(
+        Map_prototype_forEach_forEach,
+        "Map/prototype/forEach/forEach.js"
+    );
+    test262_builtin_fixture!(
         Map_prototype_forEach_iterates_in_key_insertion_order,
         "Map/prototype/forEach/iterates-in-key-insertion-order.js"
     );
@@ -1575,6 +1754,15 @@ assert.throws = function (expectedErrorConstructor, func) {
     test262_builtin_fixture!(
         Map_prototype_forEach_iterates_values_deleted_then_readded,
         "Map/prototype/forEach/iterates-values-deleted-then-readded.js"
+    );
+    test262_builtin_fixture!(
+        Map_prototype_forEach_length,
+        "Map/prototype/forEach/length.js"
+    );
+    test262_builtin_fixture!(Map_prototype_forEach_name, "Map/prototype/forEach/name.js");
+    test262_builtin_fixture!(
+        Map_prototype_forEach_not_a_constructor,
+        "Map/prototype/forEach/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         Map_prototype_forEach_return_undefined,
@@ -1599,6 +1787,13 @@ assert.throws = function (expectedErrorConstructor, func) {
     test262_builtin_fixture!(
         Map_prototype_get_does_not_have_mapdata_internal_slot,
         "Map/prototype/get/does-not-have-mapdata-internal-slot.js"
+    );
+    test262_builtin_fixture!(Map_prototype_get_get, "Map/prototype/get/get.js");
+    test262_builtin_fixture!(Map_prototype_get_length, "Map/prototype/get/length.js");
+    test262_builtin_fixture!(Map_prototype_get_name, "Map/prototype/get/name.js");
+    test262_builtin_fixture!(
+        Map_prototype_get_not_a_constructor,
+        "Map/prototype/get/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         Map_prototype_get_returns_undefined,
@@ -1639,6 +1834,22 @@ assert.throws = function (expectedErrorConstructor, func) {
     test262_builtin_fixture!(
         Map_prototype_getOrInsert_does_not_have_mapdata_internal_slot,
         "Map/prototype/getOrInsert/does-not-have-mapdata-internal-slot.js"
+    );
+    test262_builtin_fixture!(
+        Map_prototype_getOrInsert_getOrInsert,
+        "Map/prototype/getOrInsert/getOrInsert.js"
+    );
+    test262_builtin_fixture!(
+        Map_prototype_getOrInsert_length,
+        "Map/prototype/getOrInsert/length.js"
+    );
+    test262_builtin_fixture!(
+        Map_prototype_getOrInsert_name,
+        "Map/prototype/getOrInsert/name.js"
+    );
+    test262_builtin_fixture!(
+        Map_prototype_getOrInsert_not_a_constructor,
+        "Map/prototype/getOrInsert/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         Map_prototype_getOrInsert_returns_value_if_key_is_not_present_different_key_types,
@@ -1701,6 +1912,14 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Map/prototype/getOrInsertComputed/does-not-have-mapdata-internal-slot-weakmap.js"
     );
     test262_builtin_fixture!(
+        Map_prototype_getOrInsertComputed_getOrInsertComputed,
+        "Map/prototype/getOrInsertComputed/getOrInsertComputed.js"
+    );
+    test262_builtin_fixture!(
+        Map_prototype_getOrInsertComputed_not_a_constructor,
+        "Map/prototype/getOrInsertComputed/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
         Map_prototype_getOrInsertComputed_not_a_function_callbackfn_throws,
         "Map/prototype/getOrInsertComputed/not-a-function-callbackfn-throws.js"
     );
@@ -1736,9 +1955,16 @@ assert.throws = function (expectedErrorConstructor, func) {
         Map_prototype_has_does_not_have_mapdata_internal_slot,
         "Map/prototype/has/does-not-have-mapdata-internal-slot.js"
     );
+    test262_builtin_fixture!(Map_prototype_has_has, "Map/prototype/has/has.js");
+    test262_builtin_fixture!(Map_prototype_has_length, "Map/prototype/has/length.js");
+    test262_builtin_fixture!(Map_prototype_has_name, "Map/prototype/has/name.js");
     test262_builtin_fixture!(
         Map_prototype_has_normalizes_zero_key,
         "Map/prototype/has/normalizes-zero-key.js"
+    );
+    test262_builtin_fixture!(
+        Map_prototype_has_not_a_constructor,
+        "Map/prototype/has/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         Map_prototype_has_return_false_different_key_types,
@@ -1763,6 +1989,13 @@ assert.throws = function (expectedErrorConstructor, func) {
     test262_builtin_fixture!(
         Map_prototype_keys_does_not_have_mapdata_internal_slot,
         "Map/prototype/keys/does-not-have-mapdata-internal-slot.js"
+    );
+    test262_builtin_fixture!(Map_prototype_keys_keys, "Map/prototype/keys/keys.js");
+    test262_builtin_fixture!(Map_prototype_keys_length, "Map/prototype/keys/length.js");
+    test262_builtin_fixture!(Map_prototype_keys_name, "Map/prototype/keys/name.js");
+    test262_builtin_fixture!(
+        Map_prototype_keys_not_a_constructor,
+        "Map/prototype/keys/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         Map_prototype_keys_returns_iterator_empty,
@@ -1800,6 +2033,12 @@ assert.throws = function (expectedErrorConstructor, func) {
         Map_prototype_set_does_not_have_mapdata_internal_slot,
         "Map/prototype/set/does-not-have-mapdata-internal-slot.js"
     );
+    test262_builtin_fixture!(Map_prototype_set_length, "Map/prototype/set/length.js");
+    test262_builtin_fixture!(Map_prototype_set_name, "Map/prototype/set/name.js");
+    test262_builtin_fixture!(
+        Map_prototype_set_not_a_constructor,
+        "Map/prototype/set/not-a-constructor.js"
+    );
     test262_builtin_fixture!(
         Map_prototype_set_replaces_a_value_normalizes_zero_key,
         "Map/prototype/set/replaces-a-value-normalizes-zero-key.js"
@@ -1812,6 +2051,7 @@ assert.throws = function (expectedErrorConstructor, func) {
         Map_prototype_set_replaces_a_value,
         "Map/prototype/set/replaces-a-value.js"
     );
+    test262_builtin_fixture!(Map_prototype_set_set, "Map/prototype/set/set.js");
     test262_builtin_fixture!(
         Map_prototype_set_this_not_object_throw,
         "Map/prototype/set/this-not-object-throw.js"
@@ -1828,6 +2068,8 @@ assert.throws = function (expectedErrorConstructor, func) {
         Map_prototype_size_does_not_have_mapdata_internal_slot,
         "Map/prototype/size/does-not-have-mapdata-internal-slot.js"
     );
+    test262_builtin_fixture!(Map_prototype_size_length, "Map/prototype/size/length.js");
+    test262_builtin_fixture!(Map_prototype_size_name, "Map/prototype/size/name.js");
     test262_builtin_fixture!(
         Map_prototype_size_returns_count_of_present_values_before_after_set_clear,
         "Map/prototype/size/returns-count-of-present-values-before-after-set-clear.js"
@@ -1844,9 +2086,22 @@ assert.throws = function (expectedErrorConstructor, func) {
         Map_prototype_size_returns_count_of_present_values_by_iterable,
         "Map/prototype/size/returns-count-of-present-values-by-iterable.js"
     );
+    test262_builtin_fixture!(Map_prototype_size_size, "Map/prototype/size/size.js");
     test262_builtin_fixture!(
         Map_prototype_size_this_not_object_throw,
         "Map/prototype/size/this-not-object-throw.js"
+    );
+    test262_builtin_fixture!(
+        Map_prototype_Symbol_iterator_not_a_constructor,
+        "Map/prototype/Symbol.iterator/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        Map_prototype_Symbol_iterator,
+        "Map/prototype/Symbol.iterator.js"
+    );
+    test262_builtin_fixture!(
+        Map_prototype_Symbol_toStringTag,
+        "Map/prototype/Symbol.toStringTag.js"
     );
     test262_builtin_fixture!(
         Map_prototype_values_does_not_have_mapdata_internal_slot_set,
@@ -1861,6 +2116,15 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Map/prototype/values/does-not-have-mapdata-internal-slot.js"
     );
     test262_builtin_fixture!(
+        Map_prototype_values_length,
+        "Map/prototype/values/length.js"
+    );
+    test262_builtin_fixture!(Map_prototype_values_name, "Map/prototype/values/name.js");
+    test262_builtin_fixture!(
+        Map_prototype_values_not_a_constructor,
+        "Map/prototype/values/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
         Map_prototype_values_returns_iterator_empty,
         "Map/prototype/values/returns-iterator-empty.js"
     );
@@ -1873,12 +2137,22 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Map/prototype/values/this-not-object-throw.js"
     );
     test262_builtin_fixture!(
+        Map_prototype_values_values,
+        "Map/prototype/values/values.js"
+    );
+    test262_builtin_fixture!(Map_prototype_of_map, "Map/prototype-of-map.js");
+    test262_builtin_fixture!(Map_Symbol_species_length, "Map/Symbol.species/length.js");
+    test262_builtin_fixture!(
         Map_Symbol_species_return_value,
         "Map/Symbol.species/return-value.js"
     );
     test262_builtin_fixture!(
         Map_Symbol_species_symbol_species_name,
         "Map/Symbol.species/symbol-species-name.js"
+    );
+    test262_builtin_fixture!(
+        Map_Symbol_species_symbol_species,
+        "Map/Symbol.species/symbol-species.js"
     );
     test262_builtin_fixture!(Map_undefined_newtarget, "Map/undefined-newtarget.js");
     test262_builtin_fixture!(Map_valid_keys, "Map/valid-keys.js");
@@ -1887,10 +2161,14 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Set/bigint-number-same-value.js"
     );
     test262_builtin_fixture!(Set_constructor, "Set/constructor.js");
+    test262_builtin_fixture!(Set_is_a_constructor, "Set/is-a-constructor.js");
+    test262_builtin_fixture!(Set_length, "Set/length.js");
+    test262_builtin_fixture!(Set_name, "Set/name.js");
     test262_builtin_fixture!(
         Set_properties_of_the_set_prototype_object,
         "Set/properties-of-the-set-prototype-object.js"
     );
+    test262_builtin_fixture!(Set_prototype_add_add, "Set/prototype/add/add.js");
     test262_builtin_fixture!(
         Set_prototype_add_does_not_have_setdata_internal_slot_array,
         "Set/prototype/add/does-not-have-setdata-internal-slot-array.js"
@@ -1910,6 +2188,12 @@ assert.throws = function (expectedErrorConstructor, func) {
     test262_builtin_fixture!(
         Set_prototype_add_does_not_have_setdata_internal_slot_weakset,
         "Set/prototype/add/does-not-have-setdata-internal-slot-weakset.js"
+    );
+    test262_builtin_fixture!(Set_prototype_add_length, "Set/prototype/add/length.js");
+    test262_builtin_fixture!(Set_prototype_add_name, "Set/prototype/add/name.js");
+    test262_builtin_fixture!(
+        Set_prototype_add_not_a_constructor,
+        "Set/prototype/add/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         Set_prototype_add_preserves_insertion_order,
@@ -1959,6 +2243,7 @@ assert.throws = function (expectedErrorConstructor, func) {
         Set_prototype_add_will_not_add_duplicate_entry,
         "Set/prototype/add/will-not-add-duplicate-entry.js"
     );
+    test262_builtin_fixture!(Set_prototype_clear_clear, "Set/prototype/clear/clear.js");
     test262_builtin_fixture!(
         Set_prototype_clear_clears_all_contents_from_iterable,
         "Set/prototype/clear/clears-all-contents-from-iterable.js"
@@ -1990,6 +2275,12 @@ assert.throws = function (expectedErrorConstructor, func) {
     test262_builtin_fixture!(
         Set_prototype_clear_does_not_have_setdata_internal_slot_weakset,
         "Set/prototype/clear/does-not-have-setdata-internal-slot-weakset.js"
+    );
+    test262_builtin_fixture!(Set_prototype_clear_length, "Set/prototype/clear/length.js");
+    test262_builtin_fixture!(Set_prototype_clear_name, "Set/prototype/clear/name.js");
+    test262_builtin_fixture!(
+        Set_prototype_clear_not_a_constructor,
+        "Set/prototype/clear/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         Set_prototype_clear_returns_undefined,
@@ -2024,6 +2315,10 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Set/prototype/constructor/set-prototype-constructor-intrinsic.js"
     );
     test262_builtin_fixture!(
+        Set_prototype_constructor_set_prototype_constructor,
+        "Set/prototype/constructor/set-prototype-constructor.js"
+    );
+    test262_builtin_fixture!(
         Set_prototype_delete_delete_entry_initial_iterable,
         "Set/prototype/delete/delete-entry-initial-iterable.js"
     );
@@ -2034,6 +2329,10 @@ assert.throws = function (expectedErrorConstructor, func) {
     test262_builtin_fixture!(
         Set_prototype_delete_delete_entry,
         "Set/prototype/delete/delete-entry.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_delete_delete,
+        "Set/prototype/delete/delete.js"
     );
     test262_builtin_fixture!(
         Set_prototype_delete_does_not_have_setdata_internal_slot_array,
@@ -2054,6 +2353,15 @@ assert.throws = function (expectedErrorConstructor, func) {
     test262_builtin_fixture!(
         Set_prototype_delete_does_not_have_setdata_internal_slot_weakset,
         "Set/prototype/delete/does-not-have-setdata-internal-slot-weakset.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_delete_length,
+        "Set/prototype/delete/length.js"
+    );
+    test262_builtin_fixture!(Set_prototype_delete_name, "Set/prototype/delete/name.js");
+    test262_builtin_fixture!(
+        Set_prototype_delete_not_a_constructor,
+        "Set/prototype/delete/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         Set_prototype_delete_returns_false_when_delete_is_noop,
@@ -2088,12 +2396,56 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Set/prototype/delete/this-not-object-throw-undefined.js"
     );
     test262_builtin_fixture!(
+        Set_prototype_difference_add_not_called,
+        "Set/prototype/difference/add-not-called.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_difference_allows_set_like_class,
+        "Set/prototype/difference/allows-set-like-class.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_difference_allows_set_like_object,
+        "Set/prototype/difference/allows-set-like-object.js"
+    );
+    test262_builtin_fixture!(
         Set_prototype_difference_array_throws,
         "Set/prototype/difference/array-throws.js"
     );
     test262_builtin_fixture!(
+        Set_prototype_difference_builtins,
+        "Set/prototype/difference/builtins.js"
+    );
+    test262_builtin_fixture!(
         Set_prototype_difference_called_with_object,
         "Set/prototype/difference/called-with-object.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_difference_combines_empty_sets,
+        "Set/prototype/difference/combines-empty-sets.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_difference_combines_itself,
+        "Set/prototype/difference/combines-itself.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_difference_combines_Map,
+        "Set/prototype/difference/combines-Map.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_difference_combines_same_sets,
+        "Set/prototype/difference/combines-same-sets.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_difference_combines_sets,
+        "Set/prototype/difference/combines-sets.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_difference_converts_negative_zero,
+        "Set/prototype/difference/converts-negative-zero.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_difference_difference,
+        "Set/prototype/difference/difference.js"
     );
     test262_builtin_fixture!(
         Set_prototype_difference_has_is_callable,
@@ -2104,6 +2456,18 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Set/prototype/difference/keys-is-callable.js"
     );
     test262_builtin_fixture!(
+        Set_prototype_difference_length,
+        "Set/prototype/difference/length.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_difference_name,
+        "Set/prototype/difference/name.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_difference_not_a_constructor,
+        "Set/prototype/difference/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
         Set_prototype_difference_receiver_not_set,
         "Set/prototype/difference/receiver-not-set.js"
     );
@@ -2112,8 +2476,36 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Set/prototype/difference/require-internal-slot.js"
     );
     test262_builtin_fixture!(
+        Set_prototype_difference_result_order,
+        "Set/prototype/difference/result-order.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_difference_set_like_array,
+        "Set/prototype/difference/set-like-array.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_difference_set_like_class_mutation,
+        "Set/prototype/difference/set-like-class-mutation.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_difference_set_like_class_order,
+        "Set/prototype/difference/set-like-class-order.js"
+    );
+    test262_builtin_fixture!(
         Set_prototype_difference_size_is_a_number,
         "Set/prototype/difference/size-is-a-number.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_difference_subclass_receiver_methods,
+        "Set/prototype/difference/subclass-receiver-methods.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_difference_subclass_symbol_species,
+        "Set/prototype/difference/subclass-symbol-species.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_difference_subclass,
+        "Set/prototype/difference/subclass.js"
     );
     test262_builtin_fixture!(
         Set_prototype_entries_does_not_have_setdata_internal_slot_array,
@@ -2134,6 +2526,19 @@ assert.throws = function (expectedErrorConstructor, func) {
     test262_builtin_fixture!(
         Set_prototype_entries_does_not_have_setdata_internal_slot_weakset,
         "Set/prototype/entries/does-not-have-setdata-internal-slot-weakset.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_entries_entries,
+        "Set/prototype/entries/entries.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_entries_length,
+        "Set/prototype/entries/length.js"
+    );
+    test262_builtin_fixture!(Set_prototype_entries_name, "Set/prototype/entries/name.js");
+    test262_builtin_fixture!(
+        Set_prototype_entries_not_a_constructor,
+        "Set/prototype/entries/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         Set_prototype_entries_returns_iterator_empty,
@@ -2212,6 +2617,10 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Set/prototype/forEach/does-not-have-setdata-internal-slot-weakset.js"
     );
     test262_builtin_fixture!(
+        Set_prototype_forEach_forEach,
+        "Set/prototype/forEach/forEach.js"
+    );
+    test262_builtin_fixture!(
         Set_prototype_forEach_iterates_in_insertion_order,
         "Set/prototype/forEach/iterates-in-insertion-order.js"
     );
@@ -2234,6 +2643,15 @@ assert.throws = function (expectedErrorConstructor, func) {
     test262_builtin_fixture!(
         Set_prototype_forEach_iterates_values_revisits_after_delete_re_add,
         "Set/prototype/forEach/iterates-values-revisits-after-delete-re-add.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_forEach_length,
+        "Set/prototype/forEach/length.js"
+    );
+    test262_builtin_fixture!(Set_prototype_forEach_name, "Set/prototype/forEach/name.js");
+    test262_builtin_fixture!(
+        Set_prototype_forEach_not_a_constructor,
+        "Set/prototype/forEach/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         Set_prototype_forEach_returns_undefined,
@@ -2302,6 +2720,13 @@ assert.throws = function (expectedErrorConstructor, func) {
     test262_builtin_fixture!(
         Set_prototype_has_does_not_have_setdata_internal_slot_weakset,
         "Set/prototype/has/does-not-have-setdata-internal-slot-weakset.js"
+    );
+    test262_builtin_fixture!(Set_prototype_has_has, "Set/prototype/has/has.js");
+    test262_builtin_fixture!(Set_prototype_has_length, "Set/prototype/has/length.js");
+    test262_builtin_fixture!(Set_prototype_has_name, "Set/prototype/has/name.js");
+    test262_builtin_fixture!(
+        Set_prototype_has_not_a_constructor,
+        "Set/prototype/has/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         Set_prototype_has_returns_false_when_undefined_added_deleted_not_present_undefined,
@@ -2388,20 +2813,76 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Set/prototype/has/this-not-object-throw-undefined.js"
     );
     test262_builtin_fixture!(
+        Set_prototype_intersection_add_not_called,
+        "Set/prototype/intersection/add-not-called.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_intersection_allows_set_like_class,
+        "Set/prototype/intersection/allows-set-like-class.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_intersection_allows_set_like_object,
+        "Set/prototype/intersection/allows-set-like-object.js"
+    );
+    test262_builtin_fixture!(
         Set_prototype_intersection_array_throws,
         "Set/prototype/intersection/array-throws.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_intersection_builtins,
+        "Set/prototype/intersection/builtins.js"
     );
     test262_builtin_fixture!(
         Set_prototype_intersection_called_with_object,
         "Set/prototype/intersection/called-with-object.js"
     );
     test262_builtin_fixture!(
+        Set_prototype_intersection_combines_empty_sets,
+        "Set/prototype/intersection/combines-empty-sets.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_intersection_combines_itself,
+        "Set/prototype/intersection/combines-itself.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_intersection_combines_Map,
+        "Set/prototype/intersection/combines-Map.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_intersection_combines_same_sets,
+        "Set/prototype/intersection/combines-same-sets.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_intersection_combines_sets,
+        "Set/prototype/intersection/combines-sets.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_intersection_converts_negative_zero,
+        "Set/prototype/intersection/converts-negative-zero.js"
+    );
+    test262_builtin_fixture!(
         Set_prototype_intersection_has_is_callable,
         "Set/prototype/intersection/has-is-callable.js"
     );
     test262_builtin_fixture!(
+        Set_prototype_intersection_intersection,
+        "Set/prototype/intersection/intersection.js"
+    );
+    test262_builtin_fixture!(
         Set_prototype_intersection_keys_is_callable,
         "Set/prototype/intersection/keys-is-callable.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_intersection_length,
+        "Set/prototype/intersection/length.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_intersection_name,
+        "Set/prototype/intersection/name.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_intersection_not_a_constructor,
+        "Set/prototype/intersection/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         Set_prototype_intersection_receiver_not_set,
@@ -2412,8 +2893,36 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Set/prototype/intersection/require-internal-slot.js"
     );
     test262_builtin_fixture!(
+        Set_prototype_intersection_result_order,
+        "Set/prototype/intersection/result-order.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_intersection_set_like_array,
+        "Set/prototype/intersection/set-like-array.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_intersection_set_like_class_mutation,
+        "Set/prototype/intersection/set-like-class-mutation.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_intersection_set_like_class_order,
+        "Set/prototype/intersection/set-like-class-order.js"
+    );
+    test262_builtin_fixture!(
         Set_prototype_intersection_size_is_a_number,
         "Set/prototype/intersection/size-is-a-number.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_intersection_subclass_receiver_methods,
+        "Set/prototype/intersection/subclass-receiver-methods.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_intersection_subclass_symbol_species,
+        "Set/prototype/intersection/subclass-symbol-species.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_intersection_subclass,
+        "Set/prototype/intersection/subclass.js"
     );
     test262_builtin_fixture!(
         Set_prototype_isDisjointFrom_allows_set_like_class,
@@ -2426,6 +2935,10 @@ assert.throws = function (expectedErrorConstructor, func) {
     test262_builtin_fixture!(
         Set_prototype_isDisjointFrom_array_throws,
         "Set/prototype/isDisjointFrom/array-throws.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_isDisjointFrom_builtins,
+        "Set/prototype/isDisjointFrom/builtins.js"
     );
     test262_builtin_fixture!(
         Set_prototype_isDisjointFrom_called_with_object,
@@ -2460,8 +2973,24 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Set/prototype/isDisjointFrom/has-is-callable.js"
     );
     test262_builtin_fixture!(
+        Set_prototype_isDisjointFrom_isDisjointFrom,
+        "Set/prototype/isDisjointFrom/isDisjointFrom.js"
+    );
+    test262_builtin_fixture!(
         Set_prototype_isDisjointFrom_keys_is_callable,
         "Set/prototype/isDisjointFrom/keys-is-callable.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_isDisjointFrom_length,
+        "Set/prototype/isDisjointFrom/length.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_isDisjointFrom_name,
+        "Set/prototype/isDisjointFrom/name.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_isDisjointFrom_not_a_constructor,
+        "Set/prototype/isDisjointFrom/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         Set_prototype_isDisjointFrom_receiver_not_set,
@@ -2474,6 +3003,10 @@ assert.throws = function (expectedErrorConstructor, func) {
     test262_builtin_fixture!(
         Set_prototype_isDisjointFrom_set_like_array,
         "Set/prototype/isDisjointFrom/set-like-array.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_isDisjointFrom_set_like_class_order,
+        "Set/prototype/isDisjointFrom/set-like-class-order.js"
     );
     test262_builtin_fixture!(
         Set_prototype_isDisjointFrom_set_like_iter_return,
@@ -2498,6 +3031,10 @@ assert.throws = function (expectedErrorConstructor, func) {
     test262_builtin_fixture!(
         Set_prototype_isSubsetOf_array_throws,
         "Set/prototype/isSubsetOf/array-throws.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_isSubsetOf_builtins,
+        "Set/prototype/isSubsetOf/builtins.js"
     );
     test262_builtin_fixture!(
         Set_prototype_isSubsetOf_called_with_object,
@@ -2528,8 +3065,24 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Set/prototype/isSubsetOf/has-is-callable.js"
     );
     test262_builtin_fixture!(
+        Set_prototype_isSubsetOf_isSubsetOf,
+        "Set/prototype/isSubsetOf/isSubsetOf.js"
+    );
+    test262_builtin_fixture!(
         Set_prototype_isSubsetOf_keys_is_callable,
         "Set/prototype/isSubsetOf/keys-is-callable.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_isSubsetOf_length,
+        "Set/prototype/isSubsetOf/length.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_isSubsetOf_name,
+        "Set/prototype/isSubsetOf/name.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_isSubsetOf_not_a_constructor,
+        "Set/prototype/isSubsetOf/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         Set_prototype_isSubsetOf_receiver_not_set,
@@ -2542,6 +3095,10 @@ assert.throws = function (expectedErrorConstructor, func) {
     test262_builtin_fixture!(
         Set_prototype_isSubsetOf_set_like_array,
         "Set/prototype/isSubsetOf/set-like-array.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_isSubsetOf_set_like_class_order,
+        "Set/prototype/isSubsetOf/set-like-class-order.js"
     );
     test262_builtin_fixture!(
         Set_prototype_isSubsetOf_size_is_a_number,
@@ -2562,6 +3119,10 @@ assert.throws = function (expectedErrorConstructor, func) {
     test262_builtin_fixture!(
         Set_prototype_isSupersetOf_array_throws,
         "Set/prototype/isSupersetOf/array-throws.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_isSupersetOf_builtins,
+        "Set/prototype/isSupersetOf/builtins.js"
     );
     test262_builtin_fixture!(
         Set_prototype_isSupersetOf_called_with_object,
@@ -2596,8 +3157,24 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Set/prototype/isSupersetOf/has-is-callable.js"
     );
     test262_builtin_fixture!(
+        Set_prototype_isSupersetOf_isSupersetOf,
+        "Set/prototype/isSupersetOf/isSupersetOf.js"
+    );
+    test262_builtin_fixture!(
         Set_prototype_isSupersetOf_keys_is_callable,
         "Set/prototype/isSupersetOf/keys-is-callable.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_isSupersetOf_length,
+        "Set/prototype/isSupersetOf/length.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_isSupersetOf_name,
+        "Set/prototype/isSupersetOf/name.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_isSupersetOf_not_a_constructor,
+        "Set/prototype/isSupersetOf/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         Set_prototype_isSupersetOf_receiver_not_set,
@@ -2612,6 +3189,14 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Set/prototype/isSupersetOf/set-like-array.js"
     );
     test262_builtin_fixture!(
+        Set_prototype_isSupersetOf_set_like_class_mutation,
+        "Set/prototype/isSupersetOf/set-like-class-mutation.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_isSupersetOf_set_like_class_order,
+        "Set/prototype/isSupersetOf/set-like-class-order.js"
+    );
+    test262_builtin_fixture!(
         Set_prototype_isSupersetOf_set_like_iter_return,
         "Set/prototype/isSupersetOf/set-like-iter-return.js"
     );
@@ -2624,6 +3209,8 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Set/prototype/isSupersetOf/subclass-receiver-methods.js"
     );
     test262_builtin_fixture!(Set_prototype_keys_keys, "Set/prototype/keys/keys.js");
+    test262_builtin_fixture!(Set_prototype_size_length, "Set/prototype/size/length.js");
+    test262_builtin_fixture!(Set_prototype_size_name, "Set/prototype/size/name.js");
     test262_builtin_fixture!(
         Set_prototype_size_returns_count_of_present_values_before_after_add_delete,
         "Set/prototype/size/returns-count-of-present-values-before-after-add-delete.js"
@@ -2636,13 +3223,70 @@ assert.throws = function (expectedErrorConstructor, func) {
         Set_prototype_size_returns_count_of_present_values_by_iterable,
         "Set/prototype/size/returns-count-of-present-values-by-iterable.js"
     );
+    test262_builtin_fixture!(Set_prototype_size_size, "Set/prototype/size/size.js");
+    test262_builtin_fixture!(
+        Set_prototype_Symbol_iterator_not_a_constructor,
+        "Set/prototype/Symbol.iterator/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_Symbol_iterator,
+        "Set/prototype/Symbol.iterator.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_Symbol_toStringTag_property_descriptor,
+        "Set/prototype/Symbol.toStringTag/property-descriptor.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_Symbol_toStringTag,
+        "Set/prototype/Symbol.toStringTag.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_symmetricDifference_add_not_called,
+        "Set/prototype/symmetricDifference/add-not-called.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_symmetricDifference_allows_set_like_class,
+        "Set/prototype/symmetricDifference/allows-set-like-class.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_symmetricDifference_allows_set_like_object,
+        "Set/prototype/symmetricDifference/allows-set-like-object.js"
+    );
     test262_builtin_fixture!(
         Set_prototype_symmetricDifference_array_throws,
         "Set/prototype/symmetricDifference/array-throws.js"
     );
     test262_builtin_fixture!(
+        Set_prototype_symmetricDifference_builtins,
+        "Set/prototype/symmetricDifference/builtins.js"
+    );
+    test262_builtin_fixture!(
         Set_prototype_symmetricDifference_called_with_object,
         "Set/prototype/symmetricDifference/called-with-object.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_symmetricDifference_combines_empty_sets,
+        "Set/prototype/symmetricDifference/combines-empty-sets.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_symmetricDifference_combines_itself,
+        "Set/prototype/symmetricDifference/combines-itself.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_symmetricDifference_combines_Map,
+        "Set/prototype/symmetricDifference/combines-Map.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_symmetricDifference_combines_same_sets,
+        "Set/prototype/symmetricDifference/combines-same-sets.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_symmetricDifference_combines_sets,
+        "Set/prototype/symmetricDifference/combines-sets.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_symmetricDifference_converts_negative_zero,
+        "Set/prototype/symmetricDifference/converts-negative-zero.js"
     );
     test262_builtin_fixture!(
         Set_prototype_symmetricDifference_has_is_callable,
@@ -2653,6 +3297,18 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Set/prototype/symmetricDifference/keys-is-callable.js"
     );
     test262_builtin_fixture!(
+        Set_prototype_symmetricDifference_length,
+        "Set/prototype/symmetricDifference/length.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_symmetricDifference_name,
+        "Set/prototype/symmetricDifference/name.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_symmetricDifference_not_a_constructor,
+        "Set/prototype/symmetricDifference/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
         Set_prototype_symmetricDifference_receiver_not_set,
         "Set/prototype/symmetricDifference/receiver-not-set.js"
     );
@@ -2661,16 +3317,88 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Set/prototype/symmetricDifference/require-internal-slot.js"
     );
     test262_builtin_fixture!(
+        Set_prototype_symmetricDifference_result_order,
+        "Set/prototype/symmetricDifference/result-order.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_symmetricDifference_set_like_array,
+        "Set/prototype/symmetricDifference/set-like-array.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_symmetricDifference_set_like_class_order,
+        "Set/prototype/symmetricDifference/set-like-class-order.js"
+    );
+    test262_builtin_fixture!(
         Set_prototype_symmetricDifference_size_is_a_number,
         "Set/prototype/symmetricDifference/size-is-a-number.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_symmetricDifference_subclass_receiver_methods,
+        "Set/prototype/symmetricDifference/subclass-receiver-methods.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_symmetricDifference_subclass_symbol_species,
+        "Set/prototype/symmetricDifference/subclass-symbol-species.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_symmetricDifference_subclass,
+        "Set/prototype/symmetricDifference/subclass.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_symmetricDifference_symmetricDifference,
+        "Set/prototype/symmetricDifference/symmetricDifference.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_union_add_not_called,
+        "Set/prototype/union/add-not-called.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_union_allows_set_like_class,
+        "Set/prototype/union/allows-set-like-class.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_union_allows_set_like_object,
+        "Set/prototype/union/allows-set-like-object.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_union_appends_new_values,
+        "Set/prototype/union/appends-new-values.js"
     );
     test262_builtin_fixture!(
         Set_prototype_union_array_throws,
         "Set/prototype/union/array-throws.js"
     );
     test262_builtin_fixture!(
+        Set_prototype_union_builtins,
+        "Set/prototype/union/builtins.js"
+    );
+    test262_builtin_fixture!(
         Set_prototype_union_called_with_object,
         "Set/prototype/union/called-with-object.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_union_combines_empty_sets,
+        "Set/prototype/union/combines-empty-sets.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_union_combines_itself,
+        "Set/prototype/union/combines-itself.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_union_combines_Map,
+        "Set/prototype/union/combines-Map.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_union_combines_same_sets,
+        "Set/prototype/union/combines-same-sets.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_union_combines_sets,
+        "Set/prototype/union/combines-sets.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_union_converts_negative_zero,
+        "Set/prototype/union/converts-negative-zero.js"
     );
     test262_builtin_fixture!(
         Set_prototype_union_has_is_callable,
@@ -2679,6 +3407,12 @@ assert.throws = function (expectedErrorConstructor, func) {
     test262_builtin_fixture!(
         Set_prototype_union_keys_is_callable,
         "Set/prototype/union/keys-is-callable.js"
+    );
+    test262_builtin_fixture!(Set_prototype_union_length, "Set/prototype/union/length.js");
+    test262_builtin_fixture!(Set_prototype_union_name, "Set/prototype/union/name.js");
+    test262_builtin_fixture!(
+        Set_prototype_union_not_a_constructor,
+        "Set/prototype/union/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         Set_prototype_union_receiver_not_set,
@@ -2689,9 +3423,38 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Set/prototype/union/require-internal-slot.js"
     );
     test262_builtin_fixture!(
+        Set_prototype_union_result_order,
+        "Set/prototype/union/result-order.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_union_set_like_array,
+        "Set/prototype/union/set-like-array.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_union_set_like_class_mutation,
+        "Set/prototype/union/set-like-class-mutation.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_union_set_like_class_order,
+        "Set/prototype/union/set-like-class-order.js"
+    );
+    test262_builtin_fixture!(
         Set_prototype_union_size_is_a_number,
         "Set/prototype/union/size-is-a-number.js"
     );
+    test262_builtin_fixture!(
+        Set_prototype_union_subclass_receiver_methods,
+        "Set/prototype/union/subclass-receiver-methods.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_union_subclass_symbol_species,
+        "Set/prototype/union/subclass-symbol-species.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_union_subclass,
+        "Set/prototype/union/subclass.js"
+    );
+    test262_builtin_fixture!(Set_prototype_union_union, "Set/prototype/union/union.js");
     test262_builtin_fixture!(
         Set_prototype_values_does_not_have_setdata_internal_slot_array,
         "Set/prototype/values/does-not-have-setdata-internal-slot-array.js"
@@ -2711,6 +3474,15 @@ assert.throws = function (expectedErrorConstructor, func) {
     test262_builtin_fixture!(
         Set_prototype_values_does_not_have_setdata_internal_slot_weakset,
         "Set/prototype/values/does-not-have-setdata-internal-slot-weakset.js"
+    );
+    test262_builtin_fixture!(
+        Set_prototype_values_length,
+        "Set/prototype/values/length.js"
+    );
+    test262_builtin_fixture!(Set_prototype_values_name, "Set/prototype/values/name.js");
+    test262_builtin_fixture!(
+        Set_prototype_values_not_a_constructor,
+        "Set/prototype/values/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         Set_prototype_values_returns_iterator_empty,
@@ -2749,6 +3521,11 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Set/prototype/values/values-iteration-mutable.js"
     );
     test262_builtin_fixture!(
+        Set_prototype_values_values,
+        "Set/prototype/values/values.js"
+    );
+    test262_builtin_fixture!(Set_prototype_of_set, "Set/prototype-of-set.js");
+    test262_builtin_fixture!(
         Set_set_does_not_throw_when_add_is_not_callable,
         "Set/set-does-not-throw-when-add-is-not-callable.js"
     );
@@ -2784,6 +3561,8 @@ assert.throws = function (expectedErrorConstructor, func) {
         Set_set_undefined_newtarget,
         "Set/set-undefined-newtarget.js"
     );
+    test262_builtin_fixture!(Set_set, "Set/set.js");
+    test262_builtin_fixture!(Set_Symbol_species_length, "Set/Symbol.species/length.js");
     test262_builtin_fixture!(
         Set_Symbol_species_return_value,
         "Set/Symbol.species/return-value.js"
@@ -2791,6 +3570,10 @@ assert.throws = function (expectedErrorConstructor, func) {
     test262_builtin_fixture!(
         Set_Symbol_species_symbol_species_name,
         "Set/Symbol.species/symbol-species-name.js"
+    );
+    test262_builtin_fixture!(
+        Set_Symbol_species_symbol_species,
+        "Set/Symbol.species/symbol-species.js"
     );
     test262_builtin_fixture!(Set_valid_values, "Set/valid-values.js");
     test262_builtin_fixture!(WeakMap_constructor, "WeakMap/constructor.js");
@@ -3463,6 +4246,10 @@ assert.throws = function (expectedErrorConstructor, func) {
     );
     test262_builtin_fixture!(ArrayBuffer_init_zero, "ArrayBuffer/init-zero.js");
     test262_builtin_fixture!(
+        ArrayBuffer_is_a_constructor,
+        "ArrayBuffer/is-a-constructor.js"
+    );
+    test262_builtin_fixture!(
         ArrayBuffer_isView_arg_has_no_viewedarraybuffer,
         "ArrayBuffer/isView/arg-has-no-viewedarraybuffer.js"
     );
@@ -3490,7 +4277,17 @@ assert.throws = function (expectedErrorConstructor, func) {
         ArrayBuffer_isView_arg_is_not_object,
         "ArrayBuffer/isView/arg-is-not-object.js"
     );
+    test262_builtin_fixture!(ArrayBuffer_isView_length, "ArrayBuffer/isView/length.js");
+    test262_builtin_fixture!(ArrayBuffer_isView_name, "ArrayBuffer/isView/name.js");
     test262_builtin_fixture!(ArrayBuffer_isView_no_arg, "ArrayBuffer/isView/no-arg.js");
+    test262_builtin_fixture!(
+        ArrayBuffer_isView_not_a_constructor,
+        "ArrayBuffer/isView/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_isView_prop_desc,
+        "ArrayBuffer/isView/prop-desc.js"
+    );
     test262_builtin_fixture!(
         ArrayBuffer_length_is_absent,
         "ArrayBuffer/length-is-absent.js"
@@ -3499,6 +4296,8 @@ assert.throws = function (expectedErrorConstructor, func) {
         ArrayBuffer_length_is_too_large_throws,
         "ArrayBuffer/length-is-too-large-throws.js"
     );
+    test262_builtin_fixture!(ArrayBuffer_length, "ArrayBuffer/length.js");
+    test262_builtin_fixture!(ArrayBuffer_name, "ArrayBuffer/name.js");
     test262_builtin_fixture!(
         ArrayBuffer_negative_length_throws,
         "ArrayBuffer/negative-length-throws.js"
@@ -3516,6 +4315,10 @@ assert.throws = function (expectedErrorConstructor, func) {
         "ArrayBuffer/options-maxbytelength-negative.js"
     );
     test262_builtin_fixture!(
+        ArrayBuffer_options_maxbytelength_object,
+        "ArrayBuffer/options-maxbytelength-object.js"
+    );
+    test262_builtin_fixture!(
         ArrayBuffer_options_maxbytelength_poisoned,
         "ArrayBuffer/options-maxbytelength-poisoned.js"
     );
@@ -3524,12 +4327,33 @@ assert.throws = function (expectedErrorConstructor, func) {
         "ArrayBuffer/options-maxbytelength-undefined.js"
     );
     test262_builtin_fixture!(
+        ArrayBuffer_options_non_object,
+        "ArrayBuffer/options-non-object.js"
+    );
+    test262_builtin_fixture!(ArrayBuffer_prop_desc, "ArrayBuffer/prop-desc.js");
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_byteLength_detached_buffer,
+        "ArrayBuffer/prototype/byteLength/detached-buffer.js"
+    );
+    test262_builtin_fixture!(
         ArrayBuffer_prototype_byteLength_invoked_as_accessor,
         "ArrayBuffer/prototype/byteLength/invoked-as-accessor.js"
     );
     test262_builtin_fixture!(
         ArrayBuffer_prototype_byteLength_invoked_as_func,
         "ArrayBuffer/prototype/byteLength/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_byteLength_length,
+        "ArrayBuffer/prototype/byteLength/length.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_byteLength_name,
+        "ArrayBuffer/prototype/byteLength/name.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_byteLength_prop_desc,
+        "ArrayBuffer/prototype/byteLength/prop-desc.js"
     );
     test262_builtin_fixture!(
         ArrayBuffer_prototype_byteLength_return_bytelength,
@@ -3548,12 +4372,36 @@ assert.throws = function (expectedErrorConstructor, func) {
         "ArrayBuffer/prototype/byteLength/this-is-sharedarraybuffer.js"
     );
     test262_builtin_fixture!(
+        ArrayBuffer_prototype_constructor,
+        "ArrayBuffer/prototype/constructor.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_detached_detached_buffer_resizable,
+        "ArrayBuffer/prototype/detached/detached-buffer-resizable.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_detached_detached_buffer,
+        "ArrayBuffer/prototype/detached/detached-buffer.js"
+    );
+    test262_builtin_fixture!(
         ArrayBuffer_prototype_detached_invoked_as_accessor,
         "ArrayBuffer/prototype/detached/invoked-as-accessor.js"
     );
     test262_builtin_fixture!(
         ArrayBuffer_prototype_detached_invoked_as_func,
         "ArrayBuffer/prototype/detached/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_detached_length,
+        "ArrayBuffer/prototype/detached/length.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_detached_name,
+        "ArrayBuffer/prototype/detached/name.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_detached_prop_desc,
+        "ArrayBuffer/prototype/detached/prop-desc.js"
     );
     test262_builtin_fixture!(
         ArrayBuffer_prototype_detached_this_has_no_arraybufferdata_internal,
@@ -3572,12 +4420,28 @@ assert.throws = function (expectedErrorConstructor, func) {
         "ArrayBuffer/prototype/detached/this-is-sharedarraybuffer.js"
     );
     test262_builtin_fixture!(
+        ArrayBuffer_prototype_maxByteLength_detached_buffer,
+        "ArrayBuffer/prototype/maxByteLength/detached-buffer.js"
+    );
+    test262_builtin_fixture!(
         ArrayBuffer_prototype_maxByteLength_invoked_as_accessor,
         "ArrayBuffer/prototype/maxByteLength/invoked-as-accessor.js"
     );
     test262_builtin_fixture!(
         ArrayBuffer_prototype_maxByteLength_invoked_as_func,
         "ArrayBuffer/prototype/maxByteLength/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_maxByteLength_length,
+        "ArrayBuffer/prototype/maxByteLength/length.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_maxByteLength_name,
+        "ArrayBuffer/prototype/maxByteLength/name.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_maxByteLength_prop_desc,
+        "ArrayBuffer/prototype/maxByteLength/prop-desc.js"
     );
     test262_builtin_fixture!(
         ArrayBuffer_prototype_maxByteLength_return_maxbytelength_non_resizable,
@@ -3600,12 +4464,28 @@ assert.throws = function (expectedErrorConstructor, func) {
         "ArrayBuffer/prototype/maxByteLength/this-is-sharedarraybuffer.js"
     );
     test262_builtin_fixture!(
+        ArrayBuffer_prototype_resizable_detached_buffer,
+        "ArrayBuffer/prototype/resizable/detached-buffer.js"
+    );
+    test262_builtin_fixture!(
         ArrayBuffer_prototype_resizable_invoked_as_accessor,
         "ArrayBuffer/prototype/resizable/invoked-as-accessor.js"
     );
     test262_builtin_fixture!(
         ArrayBuffer_prototype_resizable_invoked_as_func,
         "ArrayBuffer/prototype/resizable/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_resizable_length,
+        "ArrayBuffer/prototype/resizable/length.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_resizable_name,
+        "ArrayBuffer/prototype/resizable/name.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_resizable_prop_desc,
+        "ArrayBuffer/prototype/resizable/prop-desc.js"
     );
     test262_builtin_fixture!(
         ArrayBuffer_prototype_resizable_return_resizable,
@@ -3624,8 +4504,20 @@ assert.throws = function (expectedErrorConstructor, func) {
         "ArrayBuffer/prototype/resizable/this-is-sharedarraybuffer.js"
     );
     test262_builtin_fixture!(
+        ArrayBuffer_prototype_resize_descriptor,
+        "ArrayBuffer/prototype/resize/descriptor.js"
+    );
+    test262_builtin_fixture!(
         ArrayBuffer_prototype_resize_extensible,
         "ArrayBuffer/prototype/resize/extensible.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_resize_length,
+        "ArrayBuffer/prototype/resize/length.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_resize_name,
+        "ArrayBuffer/prototype/resize/name.js"
     );
     test262_builtin_fixture!(
         ArrayBuffer_prototype_resize_new_length_excessive,
@@ -3634,6 +4526,10 @@ assert.throws = function (expectedErrorConstructor, func) {
     test262_builtin_fixture!(
         ArrayBuffer_prototype_resize_new_length_negative,
         "ArrayBuffer/prototype/resize/new-length-negative.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_resize_nonconstructor,
+        "ArrayBuffer/prototype/resize/nonconstructor.js"
     );
     test262_builtin_fixture!(
         ArrayBuffer_prototype_resize_resize_grow,
@@ -3664,6 +4560,10 @@ assert.throws = function (expectedErrorConstructor, func) {
         "ArrayBuffer/prototype/resize/resize-shrink.js"
     );
     test262_builtin_fixture!(
+        ArrayBuffer_prototype_resize_this_is_detached,
+        "ArrayBuffer/prototype/resize/this-is-detached.js"
+    );
+    test262_builtin_fixture!(
         ArrayBuffer_prototype_resize_this_is_not_arraybuffer_object,
         "ArrayBuffer/prototype/resize/this-is-not-arraybuffer-object.js"
     );
@@ -3688,6 +4588,10 @@ assert.throws = function (expectedErrorConstructor, func) {
         "ArrayBuffer/prototype/slice/context-is-not-object.js"
     );
     test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_descriptor,
+        "ArrayBuffer/prototype/slice/descriptor.js"
+    );
+    test262_builtin_fixture!(
         ArrayBuffer_prototype_slice_end_default_if_absent,
         "ArrayBuffer/prototype/slice/end-default-if-absent.js"
     );
@@ -3704,12 +4608,28 @@ assert.throws = function (expectedErrorConstructor, func) {
         "ArrayBuffer/prototype/slice/extensible.js"
     );
     test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_length,
+        "ArrayBuffer/prototype/slice/length.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_name,
+        "ArrayBuffer/prototype/slice/name.js"
+    );
+    test262_builtin_fixture!(
         ArrayBuffer_prototype_slice_negative_end,
         "ArrayBuffer/prototype/slice/negative-end.js"
     );
     test262_builtin_fixture!(
         ArrayBuffer_prototype_slice_negative_start,
         "ArrayBuffer/prototype/slice/negative-start.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_nonconstructor,
+        "ArrayBuffer/prototype/slice/nonconstructor.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_slice_not_a_constructor,
+        "ArrayBuffer/prototype/slice/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         ArrayBuffer_prototype_slice_species_constructor_is_not_object,
@@ -3780,6 +4700,22 @@ assert.throws = function (expectedErrorConstructor, func) {
         "ArrayBuffer/prototype/slice/tointeger-conversion-start.js"
     );
     test262_builtin_fixture!(
+        ArrayBuffer_prototype_sliceToImmutable_not_a_constructor,
+        "ArrayBuffer/prototype/sliceToImmutable/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_sliceToImmutable_this_is_not_detached,
+        "ArrayBuffer/prototype/sliceToImmutable/this-is-not-detached.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_Symbol_toStringTag,
+        "ArrayBuffer/prototype/Symbol.toStringTag.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transfer_descriptor,
+        "ArrayBuffer/prototype/transfer/descriptor.js"
+    );
+    test262_builtin_fixture!(
         ArrayBuffer_prototype_transfer_extensible,
         "ArrayBuffer/prototype/transfer/extensible.js"
     );
@@ -3832,8 +4768,16 @@ assert.throws = function (expectedErrorConstructor, func) {
         "ArrayBuffer/prototype/transfer/from-resizable-to-zero.js"
     );
     test262_builtin_fixture!(
+        ArrayBuffer_prototype_transfer_name,
+        "ArrayBuffer/prototype/transfer/name.js"
+    );
+    test262_builtin_fixture!(
         ArrayBuffer_prototype_transfer_new_length_excessive,
         "ArrayBuffer/prototype/transfer/new-length-excessive.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transfer_nonconstructor,
+        "ArrayBuffer/prototype/transfer/nonconstructor.js"
     );
     test262_builtin_fixture!(
         ArrayBuffer_prototype_transfer_this_is_not_arraybuffer_object,
@@ -3846,6 +4790,10 @@ assert.throws = function (expectedErrorConstructor, func) {
     test262_builtin_fixture!(
         ArrayBuffer_prototype_transfer_this_is_sharedarraybuffer,
         "ArrayBuffer/prototype/transfer/this-is-sharedarraybuffer.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transferToFixedLength_descriptor,
+        "ArrayBuffer/prototype/transferToFixedLength/descriptor.js"
     );
     test262_builtin_fixture!(
         ArrayBuffer_prototype_transferToFixedLength_extensible,
@@ -3900,8 +4848,16 @@ assert.throws = function (expectedErrorConstructor, func) {
         "ArrayBuffer/prototype/transferToFixedLength/from-resizable-to-zero.js"
     );
     test262_builtin_fixture!(
+        ArrayBuffer_prototype_transferToFixedLength_name,
+        "ArrayBuffer/prototype/transferToFixedLength/name.js"
+    );
+    test262_builtin_fixture!(
         ArrayBuffer_prototype_transferToFixedLength_new_length_excessive,
         "ArrayBuffer/prototype/transferToFixedLength/new-length-excessive.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_prototype_transferToFixedLength_nonconstructor,
+        "ArrayBuffer/prototype/transferToFixedLength/nonconstructor.js"
     );
     test262_builtin_fixture!(
         ArrayBuffer_prototype_transferToFixedLength_this_is_not_arraybuffer_object,
@@ -3916,12 +4872,28 @@ assert.throws = function (expectedErrorConstructor, func) {
         "ArrayBuffer/prototype/transferToFixedLength/this-is-sharedarraybuffer.js"
     );
     test262_builtin_fixture!(
+        ArrayBuffer_prototype_transferToImmutable_not_a_constructor,
+        "ArrayBuffer/prototype/transferToImmutable/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
         ArrayBuffer_return_abrupt_from_length_symbol,
         "ArrayBuffer/return-abrupt-from-length-symbol.js"
     );
     test262_builtin_fixture!(
+        ArrayBuffer_Symbol_species_length,
+        "ArrayBuffer/Symbol.species/length.js"
+    );
+    test262_builtin_fixture!(
         ArrayBuffer_Symbol_species_return_value,
         "ArrayBuffer/Symbol.species/return-value.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_Symbol_species_symbol_species_name,
+        "ArrayBuffer/Symbol.species/symbol-species-name.js"
+    );
+    test262_builtin_fixture!(
+        ArrayBuffer_Symbol_species_symbol_species,
+        "ArrayBuffer/Symbol.species/symbol-species.js"
     );
     test262_builtin_fixture!(
         ArrayBuffer_undefined_newtarget_throws,
@@ -3937,6 +4909,10 @@ assert.throws = function (expectedErrorConstructor, func) {
         "SharedArrayBuffer/init-zero.js"
     );
     test262_builtin_fixture!(
+        SharedArrayBuffer_is_a_constructor,
+        "SharedArrayBuffer/is-a-constructor.js"
+    );
+    test262_builtin_fixture!(
         SharedArrayBuffer_length_is_absent,
         "SharedArrayBuffer/length-is-absent.js"
     );
@@ -3944,6 +4920,7 @@ assert.throws = function (expectedErrorConstructor, func) {
         SharedArrayBuffer_length_is_too_large_throws,
         "SharedArrayBuffer/length-is-too-large-throws.js"
     );
+    test262_builtin_fixture!(SharedArrayBuffer_length, "SharedArrayBuffer/length.js");
     test262_builtin_fixture!(
         SharedArrayBuffer_negative_length_throws,
         "SharedArrayBuffer/negative-length-throws.js"
@@ -3961,6 +4938,10 @@ assert.throws = function (expectedErrorConstructor, func) {
         "SharedArrayBuffer/options-maxbytelength-negative.js"
     );
     test262_builtin_fixture!(
+        SharedArrayBuffer_options_maxbytelength_object,
+        "SharedArrayBuffer/options-maxbytelength-object.js"
+    );
+    test262_builtin_fixture!(
         SharedArrayBuffer_options_maxbytelength_poisoned,
         "SharedArrayBuffer/options-maxbytelength-poisoned.js"
     );
@@ -3969,12 +4950,28 @@ assert.throws = function (expectedErrorConstructor, func) {
         "SharedArrayBuffer/options-maxbytelength-undefined.js"
     );
     test262_builtin_fixture!(
+        SharedArrayBuffer_options_non_object,
+        "SharedArrayBuffer/options-non-object.js"
+    );
+    test262_builtin_fixture!(
         SharedArrayBuffer_prototype_byteLength_invoked_as_accessor,
         "SharedArrayBuffer/prototype/byteLength/invoked-as-accessor.js"
     );
     test262_builtin_fixture!(
         SharedArrayBuffer_prototype_byteLength_invoked_as_func,
         "SharedArrayBuffer/prototype/byteLength/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_byteLength_length,
+        "SharedArrayBuffer/prototype/byteLength/length.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_byteLength_name,
+        "SharedArrayBuffer/prototype/byteLength/name.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_byteLength_prop_desc,
+        "SharedArrayBuffer/prototype/byteLength/prop-desc.js"
     );
     test262_builtin_fixture!(
         SharedArrayBuffer_prototype_byteLength_return_bytelength,
@@ -3993,6 +4990,14 @@ assert.throws = function (expectedErrorConstructor, func) {
         "SharedArrayBuffer/prototype/byteLength/this-is-not-object.js"
     );
     test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_constructor,
+        "SharedArrayBuffer/prototype/constructor.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_grow_descriptor,
+        "SharedArrayBuffer/prototype/grow/descriptor.js"
+    );
+    test262_builtin_fixture!(
         SharedArrayBuffer_prototype_grow_extensible,
         "SharedArrayBuffer/prototype/grow/extensible.js"
     );
@@ -4009,12 +5014,24 @@ assert.throws = function (expectedErrorConstructor, func) {
         "SharedArrayBuffer/prototype/grow/grow-smaller-size.js"
     );
     test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_grow_length,
+        "SharedArrayBuffer/prototype/grow/length.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_grow_name,
+        "SharedArrayBuffer/prototype/grow/name.js"
+    );
+    test262_builtin_fixture!(
         SharedArrayBuffer_prototype_grow_new_length_excessive,
         "SharedArrayBuffer/prototype/grow/new-length-excessive.js"
     );
     test262_builtin_fixture!(
         SharedArrayBuffer_prototype_grow_new_length_negative,
         "SharedArrayBuffer/prototype/grow/new-length-negative.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_grow_nonconstructor,
+        "SharedArrayBuffer/prototype/grow/nonconstructor.js"
     );
     test262_builtin_fixture!(
         SharedArrayBuffer_prototype_grow_this_is_not_arraybuffer_object,
@@ -4041,6 +5058,18 @@ assert.throws = function (expectedErrorConstructor, func) {
         "SharedArrayBuffer/prototype/growable/invoked-as-func.js"
     );
     test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_growable_length,
+        "SharedArrayBuffer/prototype/growable/length.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_growable_name,
+        "SharedArrayBuffer/prototype/growable/name.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_growable_prop_desc,
+        "SharedArrayBuffer/prototype/growable/prop-desc.js"
+    );
+    test262_builtin_fixture!(
         SharedArrayBuffer_prototype_growable_return_growable,
         "SharedArrayBuffer/prototype/growable/return-growable.js"
     );
@@ -4065,6 +5094,18 @@ assert.throws = function (expectedErrorConstructor, func) {
         "SharedArrayBuffer/prototype/maxByteLength/invoked-as-func.js"
     );
     test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_maxByteLength_length,
+        "SharedArrayBuffer/prototype/maxByteLength/length.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_maxByteLength_name,
+        "SharedArrayBuffer/prototype/maxByteLength/name.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_maxByteLength_prop_desc,
+        "SharedArrayBuffer/prototype/maxByteLength/prop-desc.js"
+    );
+    test262_builtin_fixture!(
         SharedArrayBuffer_prototype_maxByteLength_return_maxbytelength_growable,
         "SharedArrayBuffer/prototype/maxByteLength/return-maxbytelength-growable.js"
     );
@@ -4085,12 +5126,20 @@ assert.throws = function (expectedErrorConstructor, func) {
         "SharedArrayBuffer/prototype/maxByteLength/this-is-not-object.js"
     );
     test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_prop_desc,
+        "SharedArrayBuffer/prototype/prop-desc.js"
+    );
+    test262_builtin_fixture!(
         SharedArrayBuffer_prototype_slice_context_is_not_arraybuffer_object,
         "SharedArrayBuffer/prototype/slice/context-is-not-arraybuffer-object.js"
     );
     test262_builtin_fixture!(
         SharedArrayBuffer_prototype_slice_context_is_not_object,
         "SharedArrayBuffer/prototype/slice/context-is-not-object.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_descriptor,
+        "SharedArrayBuffer/prototype/slice/descriptor.js"
     );
     test262_builtin_fixture!(
         SharedArrayBuffer_prototype_slice_end_default_if_absent,
@@ -4109,12 +5158,28 @@ assert.throws = function (expectedErrorConstructor, func) {
         "SharedArrayBuffer/prototype/slice/extensible.js"
     );
     test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_length,
+        "SharedArrayBuffer/prototype/slice/length.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_name,
+        "SharedArrayBuffer/prototype/slice/name.js"
+    );
+    test262_builtin_fixture!(
         SharedArrayBuffer_prototype_slice_negative_end,
         "SharedArrayBuffer/prototype/slice/negative-end.js"
     );
     test262_builtin_fixture!(
         SharedArrayBuffer_prototype_slice_negative_start,
         "SharedArrayBuffer/prototype/slice/negative-start.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_nonconstructor,
+        "SharedArrayBuffer/prototype/slice/nonconstructor.js"
+    );
+    test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_slice_not_a_constructor,
+        "SharedArrayBuffer/prototype/slice/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         SharedArrayBuffer_prototype_slice_species_constructor_is_not_object,
@@ -4185,6 +5250,10 @@ assert.throws = function (expectedErrorConstructor, func) {
         "SharedArrayBuffer/prototype/slice/tointeger-conversion-start.js"
     );
     test262_builtin_fixture!(
+        SharedArrayBuffer_prototype_Symbol_toStringTag,
+        "SharedArrayBuffer/prototype/Symbol.toStringTag.js"
+    );
+    test262_builtin_fixture!(
         SharedArrayBuffer_return_abrupt_from_length_symbol,
         "SharedArrayBuffer/return-abrupt-from-length-symbol.js"
     );
@@ -4222,6 +5291,7 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/byteoffset-is-negative-throws.js"
     );
     test262_builtin_fixture!(DataView_constructor, "DataView/constructor.js");
+    test262_builtin_fixture!(DataView_dataview, "DataView/dataview.js");
     test262_builtin_fixture!(
         DataView_defined_bytelength_and_byteoffset_sab,
         "DataView/defined-bytelength-and-byteoffset-sab.js"
@@ -4264,6 +5334,17 @@ assert.throws = function (expectedErrorConstructor, func) {
     );
     test262_builtin_fixture!(DataView_extensibility, "DataView/extensibility.js");
     test262_builtin_fixture!(
+        DataView_instance_extensibility_sab,
+        "DataView/instance-extensibility-sab.js"
+    );
+    test262_builtin_fixture!(
+        DataView_instance_extensibility,
+        "DataView/instance-extensibility.js"
+    );
+    test262_builtin_fixture!(DataView_is_a_constructor, "DataView/is-a-constructor.js");
+    test262_builtin_fixture!(DataView_length, "DataView/length.js");
+    test262_builtin_fixture!(DataView_name, "DataView/name.js");
+    test262_builtin_fixture!(
         DataView_negative_bytelength_throws_sab,
         "DataView/negative-bytelength-throws-sab.js"
     );
@@ -4287,6 +5368,11 @@ assert.throws = function (expectedErrorConstructor, func) {
         DataView_newtarget_undefined_throws,
         "DataView/newtarget-undefined-throws.js"
     );
+    test262_builtin_fixture!(DataView_proto, "DataView/proto.js");
+    test262_builtin_fixture!(
+        DataView_prototype_buffer_detached_buffer,
+        "DataView/prototype/buffer/detached-buffer.js"
+    );
     test262_builtin_fixture!(
         DataView_prototype_buffer_invoked_as_accessor,
         "DataView/prototype/buffer/invoked-as-accessor.js"
@@ -4294,6 +5380,18 @@ assert.throws = function (expectedErrorConstructor, func) {
     test262_builtin_fixture!(
         DataView_prototype_buffer_invoked_as_func,
         "DataView/prototype/buffer/invoked-as-func.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_buffer_length,
+        "DataView/prototype/buffer/length.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_buffer_name,
+        "DataView/prototype/buffer/name.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_buffer_prop_desc,
+        "DataView/prototype/buffer/prop-desc.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_buffer_return_buffer_sab,
@@ -4324,6 +5422,18 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/byteLength/invoked-as-func.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_byteLength_length,
+        "DataView/prototype/byteLength/length.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_byteLength_name,
+        "DataView/prototype/byteLength/name.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_byteLength_prop_desc,
+        "DataView/prototype/byteLength/prop-desc.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_byteLength_return_bytelength_sab,
         "DataView/prototype/byteLength/return-bytelength-sab.js"
     );
@@ -4352,6 +5462,18 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/byteOffset/invoked-as-func.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_byteOffset_length,
+        "DataView/prototype/byteOffset/length.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_byteOffset_name,
+        "DataView/prototype/byteOffset/name.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_byteOffset_prop_desc,
+        "DataView/prototype/byteOffset/prop-desc.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_byteOffset_return_byteoffset_sab,
         "DataView/prototype/byteOffset/return-byteoffset-sab.js"
     );
@@ -4372,12 +5494,32 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/byteOffset/this-is-not-object.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_getBigInt64_detached_buffer_before_outofrange_byteoffset,
+        "DataView/prototype/getBigInt64/detached-buffer-before-outofrange-byteoffset.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getBigInt64_detached_buffer,
+        "DataView/prototype/getBigInt64/detached-buffer.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_getBigInt64_index_is_out_of_range,
         "DataView/prototype/getBigInt64/index-is-out-of-range.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_getBigInt64_length,
+        "DataView/prototype/getBigInt64/length.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getBigInt64_name,
+        "DataView/prototype/getBigInt64/name.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_getBigInt64_negative_byteoffset_throws,
         "DataView/prototype/getBigInt64/negative-byteoffset-throws.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getBigInt64_not_a_constructor,
+        "DataView/prototype/getBigInt64/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_getBigInt64_return_abrupt_from_tonumber_byteoffset_symbol,
@@ -4412,12 +5554,32 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/getBigInt64/toindex-byteoffset-errors.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_getBigUint64_detached_buffer_before_outofrange_byteoffset,
+        "DataView/prototype/getBigUint64/detached-buffer-before-outofrange-byteoffset.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getBigUint64_detached_buffer,
+        "DataView/prototype/getBigUint64/detached-buffer.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_getBigUint64_index_is_out_of_range,
         "DataView/prototype/getBigUint64/index-is-out-of-range.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_getBigUint64_length,
+        "DataView/prototype/getBigUint64/length.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getBigUint64_name,
+        "DataView/prototype/getBigUint64/name.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_getBigUint64_negative_byteoffset_throws,
         "DataView/prototype/getBigUint64/negative-byteoffset-throws.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getBigUint64_not_a_constructor,
+        "DataView/prototype/getBigUint64/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_getBigUint64_return_abrupt_from_tonumber_byteoffset_symbol,
@@ -4452,16 +5614,36 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/getBigUint64/toindex-byteoffset-errors.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_getFloat16_detached_buffer_before_outofrange_byteoffset,
+        "DataView/prototype/getFloat16/detached-buffer-before-outofrange-byteoffset.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getFloat16_detached_buffer,
+        "DataView/prototype/getFloat16/detached-buffer.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_getFloat16_index_is_out_of_range,
         "DataView/prototype/getFloat16/index-is-out-of-range.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getFloat16_length,
+        "DataView/prototype/getFloat16/length.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_getFloat16_minus_zero,
         "DataView/prototype/getFloat16/minus-zero.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_getFloat16_name,
+        "DataView/prototype/getFloat16/name.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_getFloat16_negative_byteoffset_throws,
         "DataView/prototype/getFloat16/negative-byteoffset-throws.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getFloat16_not_a_constructor,
+        "DataView/prototype/getFloat16/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_getFloat16_return_abrupt_from_tonumber_byteoffset_symbol,
@@ -4500,16 +5682,36 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/getFloat16/to-boolean-littleendian.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_getFloat32_detached_buffer_before_outofrange_byteoffset,
+        "DataView/prototype/getFloat32/detached-buffer-before-outofrange-byteoffset.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getFloat32_detached_buffer,
+        "DataView/prototype/getFloat32/detached-buffer.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_getFloat32_index_is_out_of_range,
         "DataView/prototype/getFloat32/index-is-out-of-range.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getFloat32_length,
+        "DataView/prototype/getFloat32/length.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_getFloat32_minus_zero,
         "DataView/prototype/getFloat32/minus-zero.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_getFloat32_name,
+        "DataView/prototype/getFloat32/name.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_getFloat32_negative_byteoffset_throws,
         "DataView/prototype/getFloat32/negative-byteoffset-throws.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getFloat32_not_a_constructor,
+        "DataView/prototype/getFloat32/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_getFloat32_return_abrupt_from_tonumber_byteoffset_symbol,
@@ -4548,16 +5750,36 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/getFloat32/to-boolean-littleendian.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_getFloat64_detached_buffer_before_outofrange_byteoffset,
+        "DataView/prototype/getFloat64/detached-buffer-before-outofrange-byteoffset.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getFloat64_detached_buffer,
+        "DataView/prototype/getFloat64/detached-buffer.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_getFloat64_index_is_out_of_range,
         "DataView/prototype/getFloat64/index-is-out-of-range.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getFloat64_length,
+        "DataView/prototype/getFloat64/length.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_getFloat64_minus_zero,
         "DataView/prototype/getFloat64/minus-zero.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_getFloat64_name,
+        "DataView/prototype/getFloat64/name.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_getFloat64_negative_byteoffset_throws,
         "DataView/prototype/getFloat64/negative-byteoffset-throws.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getFloat64_not_a_constructor,
+        "DataView/prototype/getFloat64/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_getFloat64_return_abrupt_from_tonumber_byteoffset_symbol,
@@ -4596,12 +5818,28 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/getFloat64/to-boolean-littleendian.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_getInt16_detached_buffer_before_outofrange_byteoffset,
+        "DataView/prototype/getInt16/detached-buffer-before-outofrange-byteoffset.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getInt16_detached_buffer,
+        "DataView/prototype/getInt16/detached-buffer.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_getInt16_index_is_out_of_range,
         "DataView/prototype/getInt16/index-is-out-of-range.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_getInt16_name,
+        "DataView/prototype/getInt16/name.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_getInt16_negative_byteoffset_throws,
         "DataView/prototype/getInt16/negative-byteoffset-throws.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getInt16_not_a_constructor,
+        "DataView/prototype/getInt16/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_getInt16_return_abrupt_from_tonumber_byteoffset_symbol,
@@ -4632,6 +5870,14 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/getInt16/to-boolean-littleendian.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_getInt32_detached_buffer_before_outofrange_byteoffset,
+        "DataView/prototype/getInt32/detached-buffer-before-outofrange-byteoffset.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getInt32_detached_buffer,
+        "DataView/prototype/getInt32/detached-buffer.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_getInt32_index_is_out_of_range_sab,
         "DataView/prototype/getInt32/index-is-out-of-range-sab.js"
     );
@@ -4640,12 +5886,24 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/getInt32/index-is-out-of-range.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_getInt32_length,
+        "DataView/prototype/getInt32/length.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getInt32_name,
+        "DataView/prototype/getInt32/name.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_getInt32_negative_byteoffset_throws_sab,
         "DataView/prototype/getInt32/negative-byteoffset-throws-sab.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_getInt32_negative_byteoffset_throws,
         "DataView/prototype/getInt32/negative-byteoffset-throws.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getInt32_not_a_constructor,
+        "DataView/prototype/getInt32/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_getInt32_return_abrupt_from_tonumber_byteoffset_symbol_sab,
@@ -4700,12 +5958,32 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/getInt32/to-boolean-littleendian.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_getInt8_detached_buffer_before_outofrange_byteoffset,
+        "DataView/prototype/getInt8/detached-buffer-before-outofrange-byteoffset.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getInt8_detached_buffer,
+        "DataView/prototype/getInt8/detached-buffer.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_getInt8_index_is_out_of_range,
         "DataView/prototype/getInt8/index-is-out-of-range.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_getInt8_length,
+        "DataView/prototype/getInt8/length.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getInt8_name,
+        "DataView/prototype/getInt8/name.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_getInt8_negative_byteoffset_throws,
         "DataView/prototype/getInt8/negative-byteoffset-throws.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getInt8_not_a_constructor,
+        "DataView/prototype/getInt8/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_getInt8_return_abrupt_from_tonumber_byteoffset_symbol,
@@ -4732,12 +6010,32 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/getInt8/this-is-not-object.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_getUint16_detached_buffer_before_outofrange_byteoffset,
+        "DataView/prototype/getUint16/detached-buffer-before-outofrange-byteoffset.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getUint16_detached_buffer,
+        "DataView/prototype/getUint16/detached-buffer.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_getUint16_index_is_out_of_range,
         "DataView/prototype/getUint16/index-is-out-of-range.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_getUint16_length,
+        "DataView/prototype/getUint16/length.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getUint16_name,
+        "DataView/prototype/getUint16/name.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_getUint16_negative_byteoffset_throws,
         "DataView/prototype/getUint16/negative-byteoffset-throws.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getUint16_not_a_constructor,
+        "DataView/prototype/getUint16/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_getUint16_return_abrupt_from_tonumber_byteoffset_symbol,
@@ -4768,12 +6066,32 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/getUint16/to-boolean-littleendian.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_getUint32_detached_buffer_before_outofrange_byteoffset,
+        "DataView/prototype/getUint32/detached-buffer-before-outofrange-byteoffset.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getUint32_detached_buffer,
+        "DataView/prototype/getUint32/detached-buffer.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_getUint32_index_is_out_of_range,
         "DataView/prototype/getUint32/index-is-out-of-range.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_getUint32_length,
+        "DataView/prototype/getUint32/length.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getUint32_name,
+        "DataView/prototype/getUint32/name.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_getUint32_negative_byteoffset_throws,
         "DataView/prototype/getUint32/negative-byteoffset-throws.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getUint32_not_a_constructor,
+        "DataView/prototype/getUint32/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_getUint32_return_abrupt_from_tonumber_byteoffset_symbol,
@@ -4804,12 +6122,32 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/getUint32/to-boolean-littleendian.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_getUint8_detached_buffer_before_outofrange_byteoffset,
+        "DataView/prototype/getUint8/detached-buffer-before-outofrange-byteoffset.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getUint8_detached_buffer,
+        "DataView/prototype/getUint8/detached-buffer.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_getUint8_index_is_out_of_range,
         "DataView/prototype/getUint8/index-is-out-of-range.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_getUint8_length,
+        "DataView/prototype/getUint8/length.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getUint8_name,
+        "DataView/prototype/getUint8/name.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_getUint8_negative_byteoffset_throws,
         "DataView/prototype/getUint8/negative-byteoffset-throws.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_getUint8_not_a_constructor,
+        "DataView/prototype/getUint8/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_getUint8_return_abrupt_from_tonumber_byteoffset_symbol,
@@ -4836,6 +6174,14 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/getUint8/this-is-not-object.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_setBigInt64_detached_buffer_before_outofrange_byteoffset,
+        "DataView/prototype/setBigInt64/detached-buffer-before-outofrange-byteoffset.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setBigInt64_detached_buffer,
+        "DataView/prototype/setBigInt64/detached-buffer.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_setBigInt64_index_check_before_value_conversion,
         "DataView/prototype/setBigInt64/index-check-before-value-conversion.js"
     );
@@ -4844,12 +6190,24 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/setBigInt64/index-is-out-of-range.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_setBigInt64_length,
+        "DataView/prototype/setBigInt64/length.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setBigInt64_name,
+        "DataView/prototype/setBigInt64/name.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_setBigInt64_negative_byteoffset_throws,
         "DataView/prototype/setBigInt64/negative-byteoffset-throws.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_setBigInt64_no_value_arg,
         "DataView/prototype/setBigInt64/no-value-arg.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setBigInt64_not_a_constructor,
+        "DataView/prototype/setBigInt64/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_setBigInt64_return_abrupt_from_tobigint_value_symbol,
@@ -4876,6 +6234,18 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/setBigInt64/to-boolean-littleendian.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_setBigUint64_not_a_constructor,
+        "DataView/prototype/setBigUint64/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setFloat16_detached_buffer_before_outofrange_byteoffset,
+        "DataView/prototype/setFloat16/detached-buffer-before-outofrange-byteoffset.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setFloat16_detached_buffer,
+        "DataView/prototype/setFloat16/detached-buffer.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_setFloat16_index_check_before_value_conversion,
         "DataView/prototype/setFloat16/index-check-before-value-conversion.js"
     );
@@ -4884,12 +6254,24 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/setFloat16/index-is-out-of-range.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_setFloat16_length,
+        "DataView/prototype/setFloat16/length.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setFloat16_name,
+        "DataView/prototype/setFloat16/name.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_setFloat16_negative_byteoffset_throws,
         "DataView/prototype/setFloat16/negative-byteoffset-throws.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_setFloat16_no_value_arg,
         "DataView/prototype/setFloat16/no-value-arg.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setFloat16_not_a_constructor,
+        "DataView/prototype/setFloat16/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_setFloat16_return_abrupt_from_tonumber_byteoffset_symbol,
@@ -4916,6 +6298,14 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/setFloat16/to-boolean-littleendian.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_setFloat32_detached_buffer_before_outofrange_byteoffset,
+        "DataView/prototype/setFloat32/detached-buffer-before-outofrange-byteoffset.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setFloat32_detached_buffer,
+        "DataView/prototype/setFloat32/detached-buffer.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_setFloat32_index_check_before_value_conversion,
         "DataView/prototype/setFloat32/index-check-before-value-conversion.js"
     );
@@ -4924,12 +6314,24 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/setFloat32/index-is-out-of-range.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_setFloat32_length,
+        "DataView/prototype/setFloat32/length.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setFloat32_name,
+        "DataView/prototype/setFloat32/name.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_setFloat32_negative_byteoffset_throws,
         "DataView/prototype/setFloat32/negative-byteoffset-throws.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_setFloat32_no_value_arg,
         "DataView/prototype/setFloat32/no-value-arg.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setFloat32_not_a_constructor,
+        "DataView/prototype/setFloat32/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_setFloat32_return_abrupt_from_tonumber_byteoffset_symbol,
@@ -4956,6 +6358,14 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/setFloat32/to-boolean-littleendian.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_setFloat64_detached_buffer_before_outofrange_byteoffset,
+        "DataView/prototype/setFloat64/detached-buffer-before-outofrange-byteoffset.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setFloat64_detached_buffer,
+        "DataView/prototype/setFloat64/detached-buffer.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_setFloat64_index_check_before_value_conversion,
         "DataView/prototype/setFloat64/index-check-before-value-conversion.js"
     );
@@ -4964,12 +6374,24 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/setFloat64/index-is-out-of-range.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_setFloat64_length,
+        "DataView/prototype/setFloat64/length.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setFloat64_name,
+        "DataView/prototype/setFloat64/name.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_setFloat64_negative_byteoffset_throws,
         "DataView/prototype/setFloat64/negative-byteoffset-throws.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_setFloat64_no_value_arg,
         "DataView/prototype/setFloat64/no-value-arg.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setFloat64_not_a_constructor,
+        "DataView/prototype/setFloat64/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_setFloat64_return_abrupt_from_tonumber_byteoffset_symbol,
@@ -4996,6 +6418,14 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/setFloat64/to-boolean-littleendian.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_setInt16_detached_buffer_before_outofrange_byteoffset,
+        "DataView/prototype/setInt16/detached-buffer-before-outofrange-byteoffset.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setInt16_detached_buffer,
+        "DataView/prototype/setInt16/detached-buffer.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_setInt16_index_check_before_value_conversion,
         "DataView/prototype/setInt16/index-check-before-value-conversion.js"
     );
@@ -5004,12 +6434,24 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/setInt16/index-is-out-of-range.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_setInt16_length,
+        "DataView/prototype/setInt16/length.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setInt16_name,
+        "DataView/prototype/setInt16/name.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_setInt16_negative_byteoffset_throws,
         "DataView/prototype/setInt16/negative-byteoffset-throws.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_setInt16_no_value_arg,
         "DataView/prototype/setInt16/no-value-arg.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setInt16_not_a_constructor,
+        "DataView/prototype/setInt16/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_setInt16_return_abrupt_from_tonumber_byteoffset_symbol,
@@ -5036,6 +6478,14 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/setInt16/to-boolean-littleendian.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_setInt32_detached_buffer_before_outofrange_byteoffset,
+        "DataView/prototype/setInt32/detached-buffer-before-outofrange-byteoffset.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setInt32_detached_buffer,
+        "DataView/prototype/setInt32/detached-buffer.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_setInt32_index_check_before_value_conversion,
         "DataView/prototype/setInt32/index-check-before-value-conversion.js"
     );
@@ -5044,12 +6494,24 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/setInt32/index-is-out-of-range.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_setInt32_length,
+        "DataView/prototype/setInt32/length.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setInt32_name,
+        "DataView/prototype/setInt32/name.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_setInt32_negative_byteoffset_throws,
         "DataView/prototype/setInt32/negative-byteoffset-throws.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_setInt32_no_value_arg,
         "DataView/prototype/setInt32/no-value-arg.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setInt32_not_a_constructor,
+        "DataView/prototype/setInt32/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_setInt32_return_abrupt_from_tonumber_byteoffset_symbol,
@@ -5076,6 +6538,14 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/setInt32/to-boolean-littleendian.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_setInt8_detached_buffer_before_outofrange_byteoffset,
+        "DataView/prototype/setInt8/detached-buffer-before-outofrange-byteoffset.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setInt8_detached_buffer,
+        "DataView/prototype/setInt8/detached-buffer.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_setInt8_index_check_before_value_conversion,
         "DataView/prototype/setInt8/index-check-before-value-conversion.js"
     );
@@ -5084,12 +6554,24 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/setInt8/index-is-out-of-range.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_setInt8_length,
+        "DataView/prototype/setInt8/length.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setInt8_name,
+        "DataView/prototype/setInt8/name.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_setInt8_negative_byteoffset_throws,
         "DataView/prototype/setInt8/negative-byteoffset-throws.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_setInt8_no_value_arg,
         "DataView/prototype/setInt8/no-value-arg.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setInt8_not_a_constructor,
+        "DataView/prototype/setInt8/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_setInt8_return_abrupt_from_tonumber_byteoffset_symbol,
@@ -5108,6 +6590,14 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/setInt8/this-is-not-object.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_setUint16_detached_buffer_before_outofrange_byteoffset,
+        "DataView/prototype/setUint16/detached-buffer-before-outofrange-byteoffset.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setUint16_detached_buffer,
+        "DataView/prototype/setUint16/detached-buffer.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_setUint16_index_check_before_value_conversion,
         "DataView/prototype/setUint16/index-check-before-value-conversion.js"
     );
@@ -5116,12 +6606,24 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/setUint16/index-is-out-of-range.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_setUint16_length,
+        "DataView/prototype/setUint16/length.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setUint16_name,
+        "DataView/prototype/setUint16/name.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_setUint16_negative_byteoffset_throws,
         "DataView/prototype/setUint16/negative-byteoffset-throws.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_setUint16_no_value_arg,
         "DataView/prototype/setUint16/no-value-arg.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setUint16_not_a_constructor,
+        "DataView/prototype/setUint16/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_setUint16_return_abrupt_from_tonumber_byteoffset_symbol,
@@ -5148,6 +6650,14 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/setUint16/to-boolean-littleendian.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_setUint32_detached_buffer_before_outofrange_byteoffset,
+        "DataView/prototype/setUint32/detached-buffer-before-outofrange-byteoffset.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setUint32_detached_buffer,
+        "DataView/prototype/setUint32/detached-buffer.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_setUint32_index_check_before_value_conversion,
         "DataView/prototype/setUint32/index-check-before-value-conversion.js"
     );
@@ -5156,12 +6666,24 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/setUint32/index-is-out-of-range.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_setUint32_length,
+        "DataView/prototype/setUint32/length.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setUint32_name,
+        "DataView/prototype/setUint32/name.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_setUint32_negative_byteoffset_throws,
         "DataView/prototype/setUint32/negative-byteoffset-throws.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_setUint32_no_value_arg,
         "DataView/prototype/setUint32/no-value-arg.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setUint32_not_a_constructor,
+        "DataView/prototype/setUint32/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_setUint32_return_abrupt_from_tonumber_byteoffset_symbol,
@@ -5188,6 +6710,14 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/setUint32/to-boolean-littleendian.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_setUint8_detached_buffer_before_outofrange_byteoffset,
+        "DataView/prototype/setUint8/detached-buffer-before-outofrange-byteoffset.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setUint8_detached_buffer,
+        "DataView/prototype/setUint8/detached-buffer.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_setUint8_index_check_before_value_conversion,
         "DataView/prototype/setUint8/index-check-before-value-conversion.js"
     );
@@ -5196,12 +6726,24 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/prototype/setUint8/index-is-out-of-range.js"
     );
     test262_builtin_fixture!(
+        DataView_prototype_setUint8_length,
+        "DataView/prototype/setUint8/length.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setUint8_name,
+        "DataView/prototype/setUint8/name.js"
+    );
+    test262_builtin_fixture!(
         DataView_prototype_setUint8_negative_byteoffset_throws,
         "DataView/prototype/setUint8/negative-byteoffset-throws.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_setUint8_no_value_arg,
         "DataView/prototype/setUint8/no-value-arg.js"
+    );
+    test262_builtin_fixture!(
+        DataView_prototype_setUint8_not_a_constructor,
+        "DataView/prototype/setUint8/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         DataView_prototype_setUint8_return_abrupt_from_tonumber_byteoffset_symbol,
@@ -5219,6 +6761,11 @@ assert.throws = function (expectedErrorConstructor, func) {
         DataView_prototype_setUint8_this_is_not_object,
         "DataView/prototype/setUint8/this-is-not-object.js"
     );
+    test262_builtin_fixture!(
+        DataView_prototype_Symbol_toStringTag,
+        "DataView/prototype/Symbol.toStringTag.js"
+    );
+    test262_builtin_fixture!(DataView_prototype, "DataView/prototype.js");
     test262_builtin_fixture!(
         DataView_return_abrupt_tonumber_bytelength_symbol_sab,
         "DataView/return-abrupt-tonumber-bytelength-symbol-sab.js"
@@ -5240,9 +6787,86 @@ assert.throws = function (expectedErrorConstructor, func) {
         "DataView/return-instance-sab.js"
     );
     test262_builtin_fixture!(DataView_return_instance, "DataView/return-instance.js");
+    test262_builtin_fixture!(Atomics_add_descriptor, "Atomics/add/descriptor.js");
+    test262_builtin_fixture!(
+        Atomics_add_expected_return_value,
+        "Atomics/add/expected-return-value.js"
+    );
+    test262_builtin_fixture!(Atomics_add_length, "Atomics/add/length.js");
+    test262_builtin_fixture!(Atomics_add_name, "Atomics/add/name.js");
+    test262_builtin_fixture!(
+        Atomics_add_not_a_constructor,
+        "Atomics/add/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(Atomics_and_descriptor, "Atomics/and/descriptor.js");
+    test262_builtin_fixture!(
+        Atomics_and_expected_return_value,
+        "Atomics/and/expected-return-value.js"
+    );
+    test262_builtin_fixture!(Atomics_and_length, "Atomics/and/length.js");
+    test262_builtin_fixture!(Atomics_and_name, "Atomics/and/name.js");
+    test262_builtin_fixture!(
+        Atomics_and_not_a_constructor,
+        "Atomics/and/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        Atomics_compareExchange_descriptor,
+        "Atomics/compareExchange/descriptor.js"
+    );
+    test262_builtin_fixture!(
+        Atomics_compareExchange_expected_return_value,
+        "Atomics/compareExchange/expected-return-value.js"
+    );
+    test262_builtin_fixture!(
+        Atomics_compareExchange_length,
+        "Atomics/compareExchange/length.js"
+    );
+    test262_builtin_fixture!(
+        Atomics_compareExchange_name,
+        "Atomics/compareExchange/name.js"
+    );
+    test262_builtin_fixture!(
+        Atomics_compareExchange_not_a_constructor,
+        "Atomics/compareExchange/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        Atomics_exchange_descriptor,
+        "Atomics/exchange/descriptor.js"
+    );
+    test262_builtin_fixture!(
+        Atomics_exchange_expected_return_value,
+        "Atomics/exchange/expected-return-value.js"
+    );
+    test262_builtin_fixture!(Atomics_exchange_length, "Atomics/exchange/length.js");
+    test262_builtin_fixture!(Atomics_exchange_name, "Atomics/exchange/name.js");
+    test262_builtin_fixture!(
+        Atomics_exchange_not_a_constructor,
+        "Atomics/exchange/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
+        Atomics_isLockFree_descriptor,
+        "Atomics/isLockFree/descriptor.js"
+    );
     test262_builtin_fixture!(
         Atomics_isLockFree_expected_return_value,
         "Atomics/isLockFree/expected-return-value.js"
+    );
+    test262_builtin_fixture!(Atomics_isLockFree_length, "Atomics/isLockFree/length.js");
+    test262_builtin_fixture!(Atomics_isLockFree_name, "Atomics/isLockFree/name.js");
+    test262_builtin_fixture!(
+        Atomics_isLockFree_not_a_constructor,
+        "Atomics/isLockFree/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(Atomics_load_descriptor, "Atomics/load/descriptor.js");
+    test262_builtin_fixture!(
+        Atomics_load_expected_return_value,
+        "Atomics/load/expected-return-value.js"
+    );
+    test262_builtin_fixture!(Atomics_load_length, "Atomics/load/length.js");
+    test262_builtin_fixture!(Atomics_load_name, "Atomics/load/name.js");
+    test262_builtin_fixture!(
+        Atomics_load_not_a_constructor,
+        "Atomics/load/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         Atomics_notify_bigint_non_bigint64_typedarray_throws,
@@ -5252,6 +6876,17 @@ assert.throws = function (expectedErrorConstructor, func) {
         Atomics_notify_bigint_non_shared_bufferdata_non_shared_int_views_throws,
         "Atomics/notify/bigint/non-shared-bufferdata-non-shared-int-views-throws.js"
     );
+    test262_builtin_fixture!(
+        Atomics_notify_bigint_null_bufferdata_throws,
+        "Atomics/notify/bigint/null-bufferdata-throws.js"
+    );
+    test262_builtin_fixture!(
+        Atomics_notify_count_boundary_cases,
+        "Atomics/notify/count-boundary-cases.js"
+    );
+    test262_builtin_fixture!(Atomics_notify_descriptor, "Atomics/notify/descriptor.js");
+    test262_builtin_fixture!(Atomics_notify_length, "Atomics/notify/length.js");
+    test262_builtin_fixture!(Atomics_notify_name, "Atomics/notify/name.js");
     test262_builtin_fixture!(
         Atomics_notify_negative_index_throws,
         "Atomics/notify/negative-index-throws.js"
@@ -5269,6 +6904,10 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Atomics/notify/non-shared-int-views.js"
     );
     test262_builtin_fixture!(
+        Atomics_notify_not_a_constructor,
+        "Atomics/notify/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(
         Atomics_notify_not_a_typedarray_throws,
         "Atomics/notify/not-a-typedarray-throws.js"
     );
@@ -5277,14 +6916,63 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Atomics/notify/not-an-object-throws.js"
     );
     test262_builtin_fixture!(
+        Atomics_notify_null_bufferdata_throws,
+        "Atomics/notify/null-bufferdata-throws.js"
+    );
+    test262_builtin_fixture!(
         Atomics_notify_out_of_range_index_throws,
         "Atomics/notify/out-of-range-index-throws.js"
+    );
+    test262_builtin_fixture!(Atomics_or_descriptor, "Atomics/or/descriptor.js");
+    test262_builtin_fixture!(
+        Atomics_or_expected_return_value,
+        "Atomics/or/expected-return-value.js"
+    );
+    test262_builtin_fixture!(Atomics_or_length, "Atomics/or/length.js");
+    test262_builtin_fixture!(Atomics_or_name, "Atomics/or/name.js");
+    test262_builtin_fixture!(
+        Atomics_or_not_a_constructor,
+        "Atomics/or/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(Atomics_pause_descriptor, "Atomics/pause/descriptor.js");
+    test262_builtin_fixture!(Atomics_pause_name, "Atomics/pause/name.js");
+    test262_builtin_fixture!(
+        Atomics_pause_not_a_constructor,
+        "Atomics/pause/not-a-constructor.js"
     );
     test262_builtin_fixture!(
         Atomics_pause_returns_undefined,
         "Atomics/pause/returns-undefined.js"
     );
+    test262_builtin_fixture!(Atomics_prop_desc, "Atomics/prop-desc.js");
     test262_builtin_fixture!(Atomics_proto, "Atomics/proto.js");
+    test262_builtin_fixture!(Atomics_store_descriptor, "Atomics/store/descriptor.js");
+    test262_builtin_fixture!(
+        Atomics_store_expected_return_value,
+        "Atomics/store/expected-return-value.js"
+    );
+    test262_builtin_fixture!(Atomics_store_length, "Atomics/store/length.js");
+    test262_builtin_fixture!(Atomics_store_name, "Atomics/store/name.js");
+    test262_builtin_fixture!(
+        Atomics_store_not_a_constructor,
+        "Atomics/store/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(Atomics_sub_descriptor, "Atomics/sub/descriptor.js");
+    test262_builtin_fixture!(
+        Atomics_sub_expected_return_value,
+        "Atomics/sub/expected-return-value.js"
+    );
+    test262_builtin_fixture!(Atomics_sub_length, "Atomics/sub/length.js");
+    test262_builtin_fixture!(Atomics_sub_name, "Atomics/sub/name.js");
+    test262_builtin_fixture!(
+        Atomics_sub_not_a_constructor,
+        "Atomics/sub/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(Atomics_Symbol_toStringTag, "Atomics/Symbol.toStringTag.js");
+    test262_builtin_fixture!(
+        Atomics_wait_bigint_cannot_suspend_throws,
+        "Atomics/wait/bigint/cannot-suspend-throws.js"
+    );
     test262_builtin_fixture!(
         Atomics_wait_bigint_negative_index_throws,
         "Atomics/wait/bigint/negative-index-throws.js"
@@ -5298,9 +6986,20 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Atomics/wait/bigint/non-shared-bufferdata-throws.js"
     );
     test262_builtin_fixture!(
+        Atomics_wait_bigint_null_bufferdata_throws,
+        "Atomics/wait/bigint/null-bufferdata-throws.js"
+    );
+    test262_builtin_fixture!(
         Atomics_wait_bigint_out_of_range_index_throws,
         "Atomics/wait/bigint/out-of-range-index-throws.js"
     );
+    test262_builtin_fixture!(
+        Atomics_wait_cannot_suspend_throws,
+        "Atomics/wait/cannot-suspend-throws.js"
+    );
+    test262_builtin_fixture!(Atomics_wait_descriptor, "Atomics/wait/descriptor.js");
+    test262_builtin_fixture!(Atomics_wait_length, "Atomics/wait/length.js");
+    test262_builtin_fixture!(Atomics_wait_name, "Atomics/wait/name.js");
     test262_builtin_fixture!(
         Atomics_wait_negative_index_throws,
         "Atomics/wait/negative-index-throws.js"
@@ -5320,6 +7019,10 @@ assert.throws = function (expectedErrorConstructor, func) {
     test262_builtin_fixture!(
         Atomics_wait_not_an_object_throws,
         "Atomics/wait/not-an-object-throws.js"
+    );
+    test262_builtin_fixture!(
+        Atomics_wait_null_bufferdata_throws,
+        "Atomics/wait/null-bufferdata-throws.js"
     );
     test262_builtin_fixture!(
         Atomics_wait_out_of_range_index_throws,
@@ -5346,13 +7049,22 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Atomics/waitAsync/bigint/not-an-object-throws.js"
     );
     test262_builtin_fixture!(
+        Atomics_waitAsync_bigint_null_bufferdata_throws,
+        "Atomics/waitAsync/bigint/null-bufferdata-throws.js"
+    );
+    test262_builtin_fixture!(
         Atomics_waitAsync_bigint_out_of_range_index_throws,
         "Atomics/waitAsync/bigint/out-of-range-index-throws.js"
+    );
+    test262_builtin_fixture!(
+        Atomics_waitAsync_descriptor,
+        "Atomics/waitAsync/descriptor.js"
     );
     test262_builtin_fixture!(
         Atomics_waitAsync_is_function,
         "Atomics/waitAsync/is-function.js"
     );
+    test262_builtin_fixture!(Atomics_waitAsync_name, "Atomics/waitAsync/name.js");
     test262_builtin_fixture!(
         Atomics_waitAsync_negative_index_throws,
         "Atomics/waitAsync/negative-index-throws.js"
@@ -5374,6 +7086,10 @@ assert.throws = function (expectedErrorConstructor, func) {
         "Atomics/waitAsync/not-an-object-throws.js"
     );
     test262_builtin_fixture!(
+        Atomics_waitAsync_null_bufferdata_throws,
+        "Atomics/waitAsync/null-bufferdata-throws.js"
+    );
+    test262_builtin_fixture!(
         Atomics_waitAsync_out_of_range_index_throws,
         "Atomics/waitAsync/out-of-range-index-throws.js"
     );
@@ -5381,10 +7097,30 @@ assert.throws = function (expectedErrorConstructor, func) {
         Atomics_waitAsync_validate_arraytype_before_timeout_coercion,
         "Atomics/waitAsync/validate-arraytype-before-timeout-coercion.js"
     );
+    test262_builtin_fixture!(Atomics_xor_descriptor, "Atomics/xor/descriptor.js");
+    test262_builtin_fixture!(
+        Atomics_xor_expected_return_value,
+        "Atomics/xor/expected-return-value.js"
+    );
+    test262_builtin_fixture!(Atomics_xor_length, "Atomics/xor/length.js");
+    test262_builtin_fixture!(Atomics_xor_name, "Atomics/xor/name.js");
+    test262_builtin_fixture!(
+        Atomics_xor_not_a_constructor,
+        "Atomics/xor/not-a-constructor.js"
+    );
     test262_builtin_fixture!(JSON_15_12_0_1, "JSON/15.12-0-1.js");
     test262_builtin_fixture!(JSON_15_12_0_2, "JSON/15.12-0-2.js");
     test262_builtin_fixture!(JSON_15_12_0_3, "JSON/15.12-0-3.js");
     test262_builtin_fixture!(JSON_15_12_0_4, "JSON/15.12-0-4.js");
+    test262_builtin_fixture!(JSON_isRawJSON_basic, "JSON/isRawJSON/basic.js");
+    test262_builtin_fixture!(JSON_isRawJSON_builtin, "JSON/isRawJSON/builtin.js");
+    test262_builtin_fixture!(JSON_isRawJSON_length, "JSON/isRawJSON/length.js");
+    test262_builtin_fixture!(JSON_isRawJSON_name, "JSON/isRawJSON/name.js");
+    test262_builtin_fixture!(
+        JSON_isRawJSON_not_a_constructor,
+        "JSON/isRawJSON/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(JSON_isRawJSON_prop_desc, "JSON/isRawJSON/prop-desc.js");
     test262_builtin_fixture!(JSON_parse_15_12_1_1_0_1, "JSON/parse/15.12.1.1-0-1.js");
     test262_builtin_fixture!(JSON_parse_15_12_1_1_0_2, "JSON/parse/15.12.1.1-0-2.js");
     test262_builtin_fixture!(JSON_parse_15_12_1_1_0_3, "JSON/parse/15.12.1.1-0-3.js");
@@ -5426,11 +7162,19 @@ assert.throws = function (expectedErrorConstructor, func) {
     test262_builtin_fixture!(JSON_parse_15_12_2_2_7, "JSON/parse/15.12.2-2-7.js");
     test262_builtin_fixture!(JSON_parse_15_12_2_2_8, "JSON/parse/15.12.2-2-8.js");
     test262_builtin_fixture!(JSON_parse_15_12_2_2_9, "JSON/parse/15.12.2-2-9.js");
+    test262_builtin_fixture!(JSON_parse_builtin, "JSON/parse/builtin.js");
     test262_builtin_fixture!(JSON_parse_duplicate_proto, "JSON/parse/duplicate-proto.js");
     test262_builtin_fixture!(
         JSON_parse_invalid_whitespace,
         "JSON/parse/invalid-whitespace.js"
     );
+    test262_builtin_fixture!(JSON_parse_length, "JSON/parse/length.js");
+    test262_builtin_fixture!(JSON_parse_name, "JSON/parse/name.js");
+    test262_builtin_fixture!(
+        JSON_parse_not_a_constructor,
+        "JSON/parse/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(JSON_parse_prop_desc, "JSON/parse/prop-desc.js");
     test262_builtin_fixture!(
         JSON_parse_reviver_array_get_prop_from_prototype,
         "JSON/parse/reviver-array-get-prop-from-prototype.js"
@@ -5440,8 +7184,28 @@ assert.throws = function (expectedErrorConstructor, func) {
         "JSON/parse/reviver-array-non-configurable-prop-delete.js"
     );
     test262_builtin_fixture!(
+        JSON_parse_reviver_call_args_after_forward_modification,
+        "JSON/parse/reviver-call-args-after-forward-modification.js"
+    );
+    test262_builtin_fixture!(
         JSON_parse_reviver_call_err,
         "JSON/parse/reviver-call-err.js"
+    );
+    test262_builtin_fixture!(
+        JSON_parse_reviver_call_order,
+        "JSON/parse/reviver-call-order.js"
+    );
+    test262_builtin_fixture!(
+        JSON_parse_reviver_context_source_array_literal,
+        "JSON/parse/reviver-context-source-array-literal.js"
+    );
+    test262_builtin_fixture!(
+        JSON_parse_reviver_context_source_object_literal,
+        "JSON/parse/reviver-context-source-object-literal.js"
+    );
+    test262_builtin_fixture!(
+        JSON_parse_reviver_context_source_primitive_literal,
+        "JSON/parse/reviver-context-source-primitive-literal.js"
     );
     test262_builtin_fixture!(
         JSON_parse_reviver_get_name_err,
@@ -5455,6 +7219,7 @@ assert.throws = function (expectedErrorConstructor, func) {
         JSON_parse_reviver_object_non_configurable_prop_delete,
         "JSON/parse/reviver-object-non-configurable-prop-delete.js"
     );
+    test262_builtin_fixture!(JSON_parse_reviver_wrapper, "JSON/parse/reviver-wrapper.js");
     test262_builtin_fixture!(JSON_parse_S15_12_2_A1, "JSON/parse/S15.12.2_A1.js");
     test262_builtin_fixture!(
         JSON_parse_text_negative_zero,
@@ -5469,6 +7234,36 @@ assert.throws = function (expectedErrorConstructor, func) {
         "JSON/parse/text-object-abrupt.js"
     );
     test262_builtin_fixture!(JSON_parse_text_object, "JSON/parse/text-object.js");
+    test262_builtin_fixture!(JSON_prop_desc, "JSON/prop-desc.js");
+    test262_builtin_fixture!(JSON_rawJSON_basic, "JSON/rawJSON/basic.js");
+    test262_builtin_fixture!(JSON_rawJSON_builtin, "JSON/rawJSON/builtin.js");
+    test262_builtin_fixture!(
+        JSON_rawJSON_illegal_empty_and_start_end_chars,
+        "JSON/rawJSON/illegal-empty-and-start-end-chars.js"
+    );
+    test262_builtin_fixture!(
+        JSON_rawJSON_invalid_JSON_text,
+        "JSON/rawJSON/invalid-JSON-text.js"
+    );
+    test262_builtin_fixture!(JSON_rawJSON_length, "JSON/rawJSON/length.js");
+    test262_builtin_fixture!(JSON_rawJSON_name, "JSON/rawJSON/name.js");
+    test262_builtin_fixture!(
+        JSON_rawJSON_not_a_constructor,
+        "JSON/rawJSON/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(JSON_rawJSON_prop_desc, "JSON/rawJSON/prop-desc.js");
+    test262_builtin_fixture!(
+        JSON_rawJSON_returns_expected_object,
+        "JSON/rawJSON/returns-expected-object.js"
+    );
+    test262_builtin_fixture!(JSON_stringify_builtin, "JSON/stringify/builtin.js");
+    test262_builtin_fixture!(JSON_stringify_length, "JSON/stringify/length.js");
+    test262_builtin_fixture!(JSON_stringify_name, "JSON/stringify/name.js");
+    test262_builtin_fixture!(
+        JSON_stringify_not_a_constructor,
+        "JSON/stringify/not-a-constructor.js"
+    );
+    test262_builtin_fixture!(JSON_stringify_prop_desc, "JSON/stringify/prop-desc.js");
     test262_builtin_fixture!(
         JSON_stringify_property_order,
         "JSON/stringify/property-order.js"
@@ -5506,6 +7301,10 @@ assert.throws = function (expectedErrorConstructor, func) {
         "JSON/stringify/replacer-function-abrupt.js"
     );
     test262_builtin_fixture!(
+        JSON_stringify_replacer_function_arguments,
+        "JSON/stringify/replacer-function-arguments.js"
+    );
+    test262_builtin_fixture!(
         JSON_stringify_replacer_function_array_circular,
         "JSON/stringify/replacer-function-array-circular.js"
     );
@@ -5528,6 +7327,10 @@ assert.throws = function (expectedErrorConstructor, func) {
     test262_builtin_fixture!(
         JSON_stringify_replacer_function_tojson,
         "JSON/stringify/replacer-function-tojson.js"
+    );
+    test262_builtin_fixture!(
+        JSON_stringify_replacer_function_wrapper,
+        "JSON/stringify/replacer-function-wrapper.js"
     );
     test262_builtin_fixture!(
         JSON_stringify_replacer_wrong_type,
@@ -5641,6 +7444,7 @@ assert.throws = function (expectedErrorConstructor, func) {
         JSON_stringify_value_tojson_result,
         "JSON/stringify/value-tojson-result.js"
     );
+    test262_builtin_fixture!(JSON_Symbol_toStringTag, "JSON/Symbol.toStringTag.js");
     /// `crates/test262` sits one level below the repo root, where the
     /// `test262` submodule is pinned.
     fn builtins_dir() -> PathBuf {
@@ -5762,11 +7566,15 @@ assert.throws = function (expectedErrorConstructor, func) {
             .initialize_host_defined_realm()
             .map_err(|e| e.message)?;
         install_harness_globals(&agent)?;
-        // `assert.throws` needs to call `func` and catch its exception, which
-        // the native closures cannot (no agent access); define it as a script.
+        // The preludes need to call user-level functions (assert.throws runs
+        // `func`, compareArray reads properties, $262.detachArrayBuffer calls
+        // transfer, verifyProperty calls Object.getOwnPropertyDescriptor),
+        // which the native closures cannot (no agent access); define them as
+        // scripts.
         agent
             .run_script(ASSERT_THROWS_PRELUDE)
             .map_err(|e| e.message)?;
+        agent.run_script(HARNESS_PRELUDE).map_err(|e| e.message)?;
         let result = agent.run_script(&wrapped);
         agent.run_jobs().map_err(|e| e.message)?;
         match (result, fm.negative_phase.as_deref()) {
@@ -5937,8 +7745,31 @@ assert.throws = function (expectedErrorConstructor, func) {
         )
         .map_err(|e| e.message)?;
 
+        // isConstructor (harness isConstructor.js needs Reflect.construct,
+        // which is Phase 16); the abstract op itself is crux-level, so the
+        // native closure answers it directly.
+        let is_constructor = Function::create_builtin(
+            Some(JsString::from_utf8("isConstructor")),
+            1,
+            Box::new(|_, args| {
+                let Some(value) = args.first() else {
+                    return Err(arity_error("isConstructor"));
+                };
+                Ok(Value::Boolean(crux::value::is_constructor(value)))
+            }),
+            None,
+            None,
+        )
+        .map_err(|e| e.message)?;
+
         global
             .create_data_property(&JsString::from_utf8("assert"), Value::Function(bare))
+            .map_err(|e| e.message)?;
+        global
+            .create_data_property(
+                &JsString::from_utf8("isConstructor"),
+                Value::Function(is_constructor),
+            )
             .map_err(|e| e.message)?;
         global
             .create_data_property(
@@ -5999,7 +7830,16 @@ assert.throws = function (expectedErrorConstructor, func) {
             .includes
             .iter()
             .map(String::as_str)
-            .filter(|include| *include != "assert.js")
+            .filter(|include| {
+                !matches!(
+                    *include,
+                    "assert.js"
+                        | "compareArray.js"
+                        | "detachArrayBuffer.js"
+                        | "isConstructor.js"
+                        | "propertyHelper.js"
+                )
+            })
             .collect();
         if !unsupported.is_empty() {
             return FixtureResult::Skip(format!(

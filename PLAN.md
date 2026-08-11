@@ -1805,6 +1805,36 @@ Remaining failures are pre-existing engine gaps (detachArrayBuffer/`$262` harnes
 `assert.compareArray`, and the crux `to_numeric` on object operands) plus resizable-typed-array
 length-tracking and the real waiter machinery.
 
+**Gap pass (same commit):** the harness and engine gaps above were closed:
+
+- **Harness** (`crates/test262`): `assert.compareArray` (with NaN handling), a `$262` host
+  object (`global`, `detachArrayBuffer` via `ArrayBuffer.prototype.transfer`, `evalScript`),
+  the `$DETACHBUFFER` helper, a native `isConstructor` (the harness file needs `Reflect`,
+  which is Phase 16), and the `verifyProperty` family incl. the callable/accessor/primordial
+  variants — all as preludes, with `compareArray.js`/`detachArrayBuffer.js`/`isConstructor.js`/
+  `propertyHelper.js` now accepted includes. The include allowlist predicate was also inverted
+  (only the *allowed* names were rejected, so unsupported includes ran).
+- **Engine:** the typed-array kind constructors now carry `BYTES_PER_ELEMENT` (spec 25.2.1);
+  `JSON.rawJSON` matches the ES2026 spec (`ToString`, first/last code-unit checks, null
+  prototype, `rawJSON` data property, frozen); `GetArrayBufferMaxByteLengthOption` returns
+  empty for non-object options and ToIndexes objects through the agent (valueOf/toString);
+  `Array.prototype.splice`'s grow branch decrements `k` after the copy like the spec (the
+  top-decrement underflowed for `deleteCount` 0); object operands of `*`/`/`/`%`/`**`/`<<`/`>>`/
+  `>>>`/`&`/`|`/`^`/`<`/`>`/`<=`/`>=`/unary `+ - ~`/`++`/`--` now go through
+  agent-dispatched `ToPrimitive(Number)` (crux `to_numeric` cannot reach valueOf/toString);
+  symbol-keyed object literals (`{[Symbol.iterator]: …}`) define real symbol properties;
+  and `same_value` now treats a Function value and its underlying object as the same
+  allocation, so `Object.getPrototypeOf(f) === Function.prototype` holds.
+
+Re-scan after the fixes: **ArrayBuffer 171 / SharedArrayBuffer 92 / DataView 388 /
+Atomics 108 / JSON 136 / Map 203 / Set 379** (1477 passing across the seven directories;
+Map+Set grew from 369 to 582). The workspace now runs **2983 tests** (2441 of them test262
+fixtures) with fmt and clippy (`-D warnings`) clean.
+
+**Pending:** `Reflect`/`Proxy` (Phase 16), `$262.createRealm`, resizable-typed-array
+length-tracking, `testTypedArray.js`/`testAtomics.js` harness files, and the real waiter
+machinery.
+
 ---
 
 ### Phase 15 — Control abstraction: iterators, generators, async, promises

@@ -8,7 +8,7 @@
 //! join with Phase 7.
 
 use crux::bigint;
-use crux::convert::{ToPrimitiveHint, to_boolean, to_number, to_numeric, to_primitive, to_string};
+use crux::convert::{ToPrimitiveHint, to_boolean, to_number, to_numeric, to_string};
 use crux::error::{ErrorKind, JsError};
 use crux::handle::Handle;
 use crux::ops::{is_strictly_equal, same_value};
@@ -435,14 +435,14 @@ fn eval_object_literal(
                 value: value_expr,
                 ..
             } => {
-                let name = eval_property_name(agent, key, strict)?;
+                let key = eval_property_name(agent, key, strict)?;
                 let value = eval_expr(agent, value_expr, strict)?;
                 if crate::function::is_anonymous_function_definition(value_expr) {
                     // spec 15.4.2 step 5: SetFunctionName from the property key.
-                    crate::function::set_function_name(&value, &name, None)?;
+                    crate::function::set_function_name(&value, &property_key_display(&key), None)?;
                 }
-                let name_text = name.to_string_lossy();
-                if name_text == "__proto__" {
+                let is_proto = matches!(&key, PropertyKey::String(id) if crux::lookup(*id).to_string_lossy() == "__proto__");
+                if is_proto {
                     match value {
                         Value::Object(proto) => {
                             if !object.set_prototype_of(Some(proto))? {
@@ -461,27 +461,29 @@ fn eval_object_literal(
                             }
                         }
                         _ => {
-                            object
-                                .create_data_property(&JsString::from_utf8("__proto__"), value)?;
+                            object.create_data_property_key(
+                                &PropertyKey::from_utf8("__proto__"),
+                                value,
+                            )?;
                         }
                     }
                 } else {
-                    object.create_data_property(&name, value)?;
+                    object.create_data_property_key(&key, value)?;
                 }
             }
             ObjectProperty::Method { key, function } => {
                 // MethodDefinition evaluation (spec 15.4.3): OrdinaryFunction-
                 // Create, MakeMethod, SetFunctionName, DefineMethodProperty.
-                let name = eval_property_name(agent, key, strict)?;
+                let key = eval_property_name(agent, key, strict)?;
                 let env = agent.running_context()?.lexical_environment.clone();
                 let closure = crate::function::instantiate_method(agent, function, env, strict)?;
                 crate::function::make_method(agent, &closure, Value::Object(object.clone()))?;
-                crate::function::set_function_name(&closure, &name, None)?;
-                object.create_data_property(&name, closure)?;
+                crate::function::set_function_name(&closure, &property_key_display(&key), None)?;
+                object.create_data_property_key(&key, closure)?;
             }
             ObjectProperty::Get { key, body } => {
                 // PropertyDefinition : get PropertyName ( ) { FunctionBody }
-                let name = eval_property_name(agent, key, strict)?;
+                let key = eval_property_name(agent, key, strict)?;
                 let env = agent.running_context()?.lexical_environment.clone();
                 let getter = crate::function::instantiate_accessor(
                     agent,
@@ -491,9 +493,13 @@ fn eval_object_literal(
                     strict,
                 )?;
                 crate::function::make_method(agent, &getter, Value::Object(object.clone()))?;
-                crate::function::set_function_name(&getter, &name, Some("get"))?;
+                crate::function::set_function_name(
+                    &getter,
+                    &property_key_display(&key),
+                    Some("get"),
+                )?;
                 object.define_property_key(
-                    &crux::property::PropertyKey::from_js_string(&name),
+                    &key,
                     &crux::property::PropertyDescriptor {
                         value: None,
                         writable: None,
@@ -506,7 +512,7 @@ fn eval_object_literal(
             }
             ObjectProperty::Set { key, param, body } => {
                 // PropertyDefinition : set PropertyName ( BindingElement ) { FunctionBody }
-                let name = eval_property_name(agent, key, strict)?;
+                let key = eval_property_name(agent, key, strict)?;
                 let env = agent.running_context()?.lexical_environment.clone();
                 let setter = crate::function::instantiate_accessor(
                     agent,
@@ -521,9 +527,13 @@ fn eval_object_literal(
                     strict,
                 )?;
                 crate::function::make_method(agent, &setter, Value::Object(object.clone()))?;
-                crate::function::set_function_name(&setter, &name, Some("set"))?;
+                crate::function::set_function_name(
+                    &setter,
+                    &property_key_display(&key),
+                    Some("set"),
+                )?;
                 object.define_property_key(
-                    &crux::property::PropertyKey::from_js_string(&name),
+                    &key,
                     &crux::property::PropertyDescriptor {
                         value: None,
                         writable: None,
@@ -571,27 +581,34 @@ pub(crate) fn copy_data_properties(
     Ok(())
 }
 
-/// The property name as a string, evaluating computed keys (spec 13.2.5.5).
+/// The property name, evaluating computed keys (spec 13.2.5.5).
 fn eval_property_name(
     agent: &mut Agent,
     key: &PropertyName,
     strict: bool,
-) -> Result<JsString, JsError> {
+) -> Result<PropertyKey, JsError> {
     match key {
-        PropertyName::Ident(id) => Ok(crux::lookup(*id)),
-        PropertyName::Str(text) => Ok(text.clone()),
-        PropertyName::Number(n) => Ok(to_string(&Value::Number(*n))?),
+        PropertyName::Ident(id) => Ok(PropertyKey::String(*id)),
+        PropertyName::Str(text) => Ok(PropertyKey::from_js_string(text)),
+        PropertyName::Number(n) => Ok(PropertyKey::String(crux::intern(
+            to_string(&Value::Number(*n))?.as_slice(),
+        ))),
         PropertyName::Computed(expr) => {
             let key = eval_expr(agent, expr, strict)?;
-            let key = crate::context::to_property_key(agent, &key)?;
-            match key {
-                PropertyKey::String(id) => Ok(crux::lookup(id)),
-                PropertyKey::Symbol(_) => Err(JsError::new(
-                    ErrorKind::TypeError,
-                    "symbol property keys are not supported in object literals yet".into(),
-                )),
-            }
+            crate::context::to_property_key(agent, &key)
         }
+    }
+}
+
+/// The display name SetFunctionName uses for a key: the string, or the
+/// symbol's description (empty when there is none) (spec 13.3.4).
+fn property_key_display(key: &PropertyKey) -> JsString {
+    match key {
+        PropertyKey::String(id) => crux::lookup(*id),
+        PropertyKey::Symbol(symbol) => symbol
+            .description
+            .clone()
+            .unwrap_or_else(|| JsString::from_utf8("")),
     }
 }
 
@@ -629,11 +646,11 @@ fn eval_unary(
         }
         UnaryOp::Plus => {
             let value = eval_expr(agent, operand, strict)?;
-            Ok(Value::Number(to_number(&value)?))
+            Ok(Value::Number(crate::context::to_number(agent, &value)?))
         }
         UnaryOp::Minus => {
             let value = eval_expr(agent, operand, strict)?;
-            let numeric = to_numeric(&value)?;
+            let numeric = to_numeric_operand(agent, &value)?;
             match numeric {
                 Value::Number(n) => Ok(Value::Number(-n)),
                 Value::BigInt(b) => Ok(Value::BigInt(Handle::new(bigint::unary_minus(&b)))),
@@ -642,7 +659,7 @@ fn eval_unary(
         }
         UnaryOp::BitNot => {
             let value = eval_expr(agent, operand, strict)?;
-            let numeric = to_numeric(&value)?;
+            let numeric = to_numeric_operand(agent, &value)?;
             match numeric {
                 Value::Number(n) => Ok(Value::Number((!(n as i32)) as f64)),
                 Value::BigInt(b) => Ok(Value::BigInt(Handle::new(bigint::bitwise_not(&b)))),
@@ -659,7 +676,7 @@ fn eval_unary(
 /// The numeric/logical unary operators applied to an already-evaluated
 /// operand (used by the resumable-function IR's `Unary` step).
 pub(crate) fn eval_unary_value(
-    _agent: &mut Agent,
+    agent: &mut Agent,
     op: &UnaryOp,
     value: Value,
 ) -> Result<Value, JsError> {
@@ -668,9 +685,9 @@ pub(crate) fn eval_unary_value(
             ErrorKind::SyntaxError,
             "unary operator is not a value tail".into(),
         )),
-        UnaryOp::Plus => Ok(Value::Number(to_number(&value)?)),
+        UnaryOp::Plus => Ok(Value::Number(crate::context::to_number(agent, &value)?)),
         UnaryOp::Minus => {
-            let numeric = to_numeric(&value)?;
+            let numeric = to_numeric_operand(agent, &value)?;
             match numeric {
                 Value::Number(n) => Ok(Value::Number(-n)),
                 Value::BigInt(b) => Ok(Value::BigInt(Handle::new(bigint::unary_minus(&b)))),
@@ -678,7 +695,7 @@ pub(crate) fn eval_unary_value(
             }
         }
         UnaryOp::BitNot => {
-            let numeric = to_numeric(&value)?;
+            let numeric = to_numeric_operand(agent, &value)?;
             match numeric {
                 Value::Number(n) => Ok(Value::Number((!(n as i32)) as f64)),
                 Value::BigInt(b) => Ok(Value::BigInt(Handle::new(bigint::bitwise_not(&b)))),
@@ -699,7 +716,7 @@ fn eval_update(
 ) -> Result<Value, JsError> {
     let reference = eval_reference(agent, target, strict)?;
     let old = get_value(agent, &reference)?;
-    let old_numeric = to_numeric(&old)?;
+    let old_numeric = to_numeric_operand(agent, &old)?;
     let new = match old_numeric {
         Value::Number(n) => {
             let delta = if matches!(op, UpdateOp::Increment) {
@@ -846,6 +863,17 @@ fn mixed_bigint_error() -> JsError {
     )
 }
 
+/// ToNumeric with agent-dispatched ToPrimitive for object operands (the
+/// crux `to_numeric` cannot reach the valueOf/toString builtins).
+fn to_numeric_operand(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
+    if matches!(value, Value::Object(_) | Value::Function(_)) {
+        let prim = crate::context::to_primitive(agent, value, ToPrimitiveHint::Number)?;
+        to_numeric(&prim)
+    } else {
+        to_numeric(value)
+    }
+}
+
 /// ApplyStringOrNumericBinaryOperator (spec 13.15.4) for the arithmetic,
 /// shift, and bitwise operators.
 pub(crate) fn apply_binary(
@@ -869,25 +897,25 @@ pub(crate) fn apply_binary(
             numeric_add(&left_prim, &right_prim)
         }
         BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem | BinaryOp::Exp => {
-            numeric_binary(op, left, right)
+            numeric_binary(agent, op, left, right)
         }
         BinaryOp::LeftShift
         | BinaryOp::RightShift
         | BinaryOp::UnsignedRightShift
         | BinaryOp::BitAnd
         | BinaryOp::BitXor
-        | BinaryOp::BitOr => bitwise_binary(op, left, right),
+        | BinaryOp::BitOr => bitwise_binary(agent, op, left, right),
         BinaryOp::LessThan => Ok(Value::Boolean(
-            abstract_relational(left, right)?.unwrap_or(false),
+            abstract_relational(agent, left, right)?.unwrap_or(false),
         )),
         BinaryOp::GreaterThan => Ok(Value::Boolean(
-            abstract_relational(right, left)?.unwrap_or(false),
+            abstract_relational(agent, right, left)?.unwrap_or(false),
         )),
         BinaryOp::LessEqual => Ok(Value::Boolean(
-            !abstract_relational(right, left)?.unwrap_or(false),
+            !abstract_relational(agent, right, left)?.unwrap_or(false),
         )),
         BinaryOp::GreaterEqual => Ok(Value::Boolean(
-            !abstract_relational(left, right)?.unwrap_or(false),
+            !abstract_relational(agent, left, right)?.unwrap_or(false),
         )),
         BinaryOp::Equal => Ok(Value::Boolean(crux::ops::is_loosely_equal(left, right)?)),
         BinaryOp::NotEqual => Ok(Value::Boolean(!crux::ops::is_loosely_equal(left, right)?)),
@@ -988,9 +1016,14 @@ fn numeric_add(left: &Value, right: &Value) -> Result<Value, JsError> {
 }
 
 /// spec 13.6-13.8 arithmetic with ToNumeric and same-type checks.
-fn numeric_binary(op: BinaryOp, left: &Value, right: &Value) -> Result<Value, JsError> {
-    let left = to_numeric(left)?;
-    let right = to_numeric(right)?;
+fn numeric_binary(
+    agent: &mut Agent,
+    op: BinaryOp,
+    left: &Value,
+    right: &Value,
+) -> Result<Value, JsError> {
+    let left = to_numeric_operand(agent, left)?;
+    let right = to_numeric_operand(agent, right)?;
     match (left, right) {
         (Value::BigInt(a), Value::BigInt(b)) => {
             let result = match op {
@@ -1046,9 +1079,14 @@ fn bigint_shift(count: &crux::BigInt) -> i64 {
 }
 
 /// spec 13.9 shifts and 13.11 bitwise operators.
-fn bitwise_binary(op: BinaryOp, left: &Value, right: &Value) -> Result<Value, JsError> {
-    let left = to_numeric(left)?;
-    let right = to_numeric(right)?;
+fn bitwise_binary(
+    agent: &mut Agent,
+    op: BinaryOp,
+    left: &Value,
+    right: &Value,
+) -> Result<Value, JsError> {
+    let left = to_numeric_operand(agent, left)?;
+    let right = to_numeric_operand(agent, right)?;
     match (left, right) {
         (Value::BigInt(a), Value::BigInt(b)) => {
             if matches!(op, BinaryOp::UnsignedRightShift) {
@@ -1088,9 +1126,13 @@ fn bitwise_binary(op: BinaryOp, left: &Value, right: &Value) -> Result<Value, Js
 
 /// Abstract Relational Comparison (spec 7.2.10): `None` when a NaN makes the
 /// relation undefined.
-fn abstract_relational(left: &Value, right: &Value) -> Result<Option<bool>, JsError> {
-    let left_prim = to_primitive(left, ToPrimitiveHint::Number)?;
-    let right_prim = to_primitive(right, ToPrimitiveHint::Number)?;
+fn abstract_relational(
+    agent: &mut Agent,
+    left: &Value,
+    right: &Value,
+) -> Result<Option<bool>, JsError> {
+    let left_prim = crate::context::to_primitive(agent, left, ToPrimitiveHint::Number)?;
+    let right_prim = crate::context::to_primitive(agent, right, ToPrimitiveHint::Number)?;
     if let (Value::String(a), Value::String(b)) = (&left_prim, &right_prim) {
         return Ok(Some(a.as_slice() < b.as_slice()));
     }
