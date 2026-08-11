@@ -256,4 +256,56 @@ mod tests {
             Value::Number(42.0)
         );
     }
+
+    #[test]
+    fn global_property_completeness_check() {
+        // The global property list installed so far (spec 19.1-19.3, Phase 8
+        // slice). Every entry must be present, writable, non-enumerable, and
+        // configurable (except the non-configurable value properties).
+        let agent = Agent::new();
+        let realm = initialize_host_defined_realm(&agent).unwrap();
+        let global = &realm.global_object;
+        let expected = [
+            "globalThis",
+            "Infinity",
+            "NaN",
+            "undefined",
+            "eval",
+            "isFinite",
+            "isNaN",
+            "parseFloat",
+            "parseInt",
+            "encodeURI",
+            "encodeURIComponent",
+            "decodeURI",
+            "decodeURIComponent",
+            "Object",
+            "Function",
+            "Boolean",
+            "Symbol",
+            "Error",
+            "EvalError",
+            "RangeError",
+            "ReferenceError",
+            "SyntaxError",
+            "TypeError",
+            "URIError",
+            "AggregateError",
+            "SuppressedError",
+            "Promise",
+        ];
+        for name in expected {
+            assert!(
+                global.has_own_property(&JsString::from_utf8(name)).unwrap(),
+                "missing global property {name}"
+            );
+        }
+        // Function properties are non-enumerable and configurable.
+        let descriptor = global
+            .get_own_property(&JsString::from_utf8("parseInt"))
+            .unwrap()
+            .unwrap();
+        assert!(!descriptor.enumerable && descriptor.configurable);
+        assert_eq!(descriptor.writable(), Some(true));
+    }
 }

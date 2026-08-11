@@ -699,6 +699,10 @@ fn evaluate_with_this(
     let function_env =
         new_function_environment(Some(old), function_value.clone(), Value::Undefined, false);
     function_env.bind_this_value(this_value)?;
+    let source = agent
+        .running_context()
+        .ok()
+        .and_then(|context| context.source.clone());
     agent.execution_context_stack.push(ExecutionContext {
         function: Some(function_value),
         realm,
@@ -706,6 +710,7 @@ fn evaluate_with_this(
         lexical_environment: function_env.clone(),
         variable_environment: function_env.clone(),
         private_environment: None,
+        source,
     });
     let result = f(agent);
     agent.execution_context_stack.pop();

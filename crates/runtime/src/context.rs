@@ -97,6 +97,9 @@ pub struct ExecutionContext {
     pub lexical_environment: EnvRef,
     pub variable_environment: EnvRef,
     pub private_environment: Option<Handle<PrivateEnvironment>>,
+    /// The source text of the code currently running, when known — used to
+    /// capture exact function sources for `Function.prototype.toString`.
+    pub source: Option<JsString>,
 }
 
 /// A PrivateEnvironment Record (spec 9.2.1): the Private Names declared by

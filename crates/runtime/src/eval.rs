@@ -1039,6 +1039,7 @@ mod tests {
         let script = Handle::new(crate::script::ScriptRecord {
             realm,
             code: program,
+            source: crux::string::JsString::from_utf8(""),
         });
         let value = crate::script::script_evaluation(&mut agent, &script).unwrap();
         assert_eq!(value, Value::Number(42.0));

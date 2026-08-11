@@ -91,6 +91,9 @@ pub struct EcmaFunction {
     pub realm: Handle<Realm>,
     pub is_async: bool,
     pub is_generator: bool,
+    /// The exact source text of the definition (Function.prototype.toString,
+    /// spec 20.2.3.5); `None` for synthesized/native callables.
+    pub source: Option<JsString>,
     /// The compiled resumable body (PLAN §4.5) for generator/async
     /// functions; ordinary functions evaluate the AST directly.
     pub ir: Option<crate::ir::CompiledBody>,
@@ -268,6 +271,20 @@ pub fn instantiate_function(
     environment: EnvRef,
     enclosing_strict: bool,
 ) -> Result<Value, JsError> {
+    instantiate_function_with_source(agent, f, environment, enclosing_strict, None)
+}
+
+/// Like `instantiate_function`, with an explicit source text (module
+/// declarations instantiate before the module context is pushed, so the
+/// running context cannot provide it).
+pub fn instantiate_function_with_source(
+    agent: &mut Agent,
+    f: &syntax::ast::Function,
+    environment: EnvRef,
+    enclosing_strict: bool,
+    source: Option<JsString>,
+) -> Result<Value, JsError> {
+    let source = source.or_else(|| capture_source(agent, f.span));
     register_function(
         agent,
         f.name.map(crux::lookup),
@@ -276,6 +293,7 @@ pub fn instantiate_function(
         environment,
         enclosing_strict,
         DefinitionKind::function(f.is_async, f.is_generator),
+        source,
     )
 }
 
@@ -288,6 +306,7 @@ pub fn instantiate_method(
     environment: EnvRef,
     enclosing_strict: bool,
 ) -> Result<Value, JsError> {
+    let source = capture_source(agent, f.span);
     register_function(
         agent,
         None,
@@ -296,6 +315,7 @@ pub fn instantiate_method(
         environment,
         enclosing_strict,
         DefinitionKind::method(f.is_async, f.is_generator),
+        source,
     )
 }
 
@@ -317,6 +337,7 @@ pub fn instantiate_accessor(
         environment,
         enclosing_strict,
         DefinitionKind::method(false, false),
+        None,
     )
 }
 
@@ -374,6 +395,7 @@ fn instantiate_class_constructor_with(
             is_generator: false,
             is_class_constructor: true,
         },
+        None,
     )?;
     if default_derived
         && let Value::Function(function) = &function
@@ -400,6 +422,7 @@ pub fn make_method(agent: &mut Agent, function: &Value, home_object: Value) -> R
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn register_function(
     agent: &mut Agent,
     name: Option<JsString>,
@@ -408,6 +431,7 @@ fn register_function(
     environment: EnvRef,
     enclosing_strict: bool,
     kind: DefinitionKind,
+    source: Option<JsString>,
 ) -> Result<Value, JsError> {
     let strict = body_is_strict(&body) || enclosing_strict;
     let this_mode = if strict {
@@ -434,6 +458,7 @@ fn register_function(
         realm,
         is_async: kind.is_async,
         is_generator: kind.is_generator,
+        source,
         ir: None,
     };
     if kind.is_generator || kind.is_async {
@@ -449,6 +474,18 @@ fn register_function(
     }
     set_function_prototype(agent, &function)?;
     Ok(Value::Function(function))
+}
+
+/// The exact source slice of a definition (Function.prototype.toString),
+/// cut from the running context's source text using the definition's span.
+/// Returns `None` when no source is tracked (synthesized/native callables).
+fn capture_source(agent: &Agent, span: crux::Span) -> Option<JsString> {
+    let source = agent.running_context().ok()?.source.clone()?;
+    let (start, end) = (span.start as usize, span.end as usize);
+    if start >= end || end > source.len() {
+        return None;
+    }
+    Some(JsString::from_utf16(&source.as_slice()[start..end]))
 }
 
 /// OrdinaryFunctionCreate step: `F.[[Prototype]]` is %Function.prototype%
@@ -517,6 +554,7 @@ pub fn instantiate_dynamic_function(
         environment,
         false,
         DefinitionKind::function(false, false),
+        None,
     )?;
     // GetPrototypeFromConstructor wins over the default %Function.prototype%.
     let Value::Function(function) = &value else {
@@ -568,6 +606,7 @@ pub fn instantiate_arrow(
         realm,
         is_async,
         is_generator: false,
+        source: None,
         ir: None,
     };
     if is_async {
@@ -777,6 +816,10 @@ fn ordinary_call(
         lexical_environment: function_env.clone(),
         variable_environment: function_env.clone(),
         private_environment: data.private_environment.clone(),
+        source: agent
+            .running_context()
+            .ok()
+            .and_then(|context| context.source.clone()),
     });
     let result = (|| -> Result<Value, JsError> {
         // OrdinaryCallBindThis: strict keeps `this`; sloppy coerces
@@ -876,6 +919,10 @@ fn ordinary_construct(
         lexical_environment: function_env.clone(),
         variable_environment: function_env.clone(),
         private_environment: data.private_environment.clone(),
+        source: agent
+            .running_context()
+            .ok()
+            .and_then(|context| context.source.clone()),
     });
     let result = (|| -> Result<Value, JsError> {
         if data.default_derived {

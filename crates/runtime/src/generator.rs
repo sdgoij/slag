@@ -322,6 +322,10 @@ fn start_body(
         lexical_environment: function_env.clone(),
         variable_environment: function_env.clone(),
         private_environment: data.private_environment.clone(),
+        source: agent
+            .running_context()
+            .ok()
+            .and_then(|context| context.source.clone()),
     };
     agent.execution_context_stack.push(context.clone());
     if data.this_mode != ThisMode::Lexical {

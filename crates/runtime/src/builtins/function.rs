@@ -469,14 +469,21 @@ fn bind(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     Ok(bound.self_value())
 }
 
-/// Function.prototype.toString (spec 20.2.3.5): HostHasSourceTextAvailable is
-/// false in this engine, so every callable renders as a NativeFunction.
+/// Function.prototype.toString (spec 20.2.3.5): the exact source text of an
+/// ECMAScript function, or the native form when no source is tracked
+/// (HostHasSourceTextAvailable).
 fn function_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     if !is_callable(this) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Function.prototype.toString requires a callable this".into(),
         ));
+    }
+    if let Value::Function(function) = this
+        && let Some(data) = agent.ecma_functions.get(&function.id())
+        && let Some(source) = &data.source
+    {
+        return Ok(Value::String(Handle::new(source.clone())));
     }
     let name = get_property_key(agent, this, &PropertyKey::from_utf8("name"), this.clone())?;
     let name = match name {
@@ -686,10 +693,21 @@ mod tests {
     }
 
     #[test]
-    fn function_to_string_renders_native_code() {
-        let text = value("(function named() {}).toString()");
+    fn function_to_string_renders_source_or_native() {
+        // User functions render their exact source text (spec 20.2.3.5).
+        let text = value("(function named() { return 1; }).toString()");
         assert!(
-            matches!(text, Value::String(s) if s.to_string_lossy() == "function named() { [native code] }")
+            matches!(text, Value::String(s) if s.to_string_lossy() == "function named() { return 1; }")
+        );
+        // Function expressions with whitespace round-trip exactly.
+        let text = value("var f = function (a, b) {\n  return a + b;\n}; f.toString()");
+        assert!(
+            matches!(text, Value::String(s) if s.to_string_lossy() == "function (a, b) {\n  return a + b;\n}")
+        );
+        // Arrow functions have no tracked source (native form).
+        let text = value("var g = (x) => x; g.toString()");
+        assert!(
+            matches!(text, Value::String(s) if s.to_string_lossy() == "function g() { [native code] }")
         );
         // %Function.prototype% has an empty name.
         let text = value("Function.prototype.toString()");

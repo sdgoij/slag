@@ -1189,9 +1189,21 @@ fixtures unblock.
 and invalid UTF-8). All eight run as real crux closures (pure conversions — no agent
 dispatch). 5 tests.
 
+**`Function.prototype.toString` exact source**: the source text now lives on `ScriptRecord`
+and `SourceTextModule`, is threaded through `ExecutionContext.source` (including function
+call contexts, so nested functions capture correctly), and `EcmaFunction` stores the exact
+slice cut from the definition's span. `Function.prototype.toString` returns it for user
+functions (module declarations pass the module source explicitly, since they instantiate
+before the module context is pushed); arrows/accessors/`new Function` still render native.
+Tests: function-expression round trips (incl. whitespace) and module functions.
+
+**Global-property completeness check** (`realm.rs` test): asserts the Phase 8 global list
+(value props, function props, and the installed constructors) exists with the right
+attribute shape; it grows as later phases add Array/String/Number/etc.
+
 12 Object + 4 Boolean + 5 Symbol + 7 Error + 5 global-function built-in tests. Still open
-in Phase 8: `Function.prototype.toString` exact source, `WeakRef`/`FinalizationRegistry`,
-and the global-property completeness check.
+in Phase 8: `WeakRef`/`FinalizationRegistry` (collection semantics wait on the GC
+milestone).
 
 ---
 

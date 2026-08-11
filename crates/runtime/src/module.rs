@@ -50,6 +50,8 @@ pub struct ExportEntry {
 pub struct SourceTextModule {
     pub realm: Handle<Realm>,
     pub code: Module,
+    /// The exact source text, for `Function.prototype.toString`.
+    pub source: JsString,
     pub status: RefCell<ModuleStatus>,
     pub environment: RefCell<Option<EnvRef>>,
     pub namespace: RefCell<Option<Value>>,
@@ -129,6 +131,7 @@ pub fn parse_module(
     let module = Handle::new(SourceTextModule {
         realm,
         code,
+        source: source.clone(),
         status: RefCell::new(ModuleStatus::Unlinked),
         environment: RefCell::new(None),
         namespace: RefCell::new(None),
@@ -523,7 +526,13 @@ fn instantiate_module_declarations(
             if !env.has_binding(&name)? {
                 env.create_mutable_binding(&name, false)?;
             }
-            let func = crate::function::instantiate_function(agent, function, env.clone(), true)?;
+            let func = crate::function::instantiate_function_with_source(
+                agent,
+                function,
+                env.clone(),
+                true,
+                Some(module.source.clone()),
+            )?;
             env.initialize_binding(&name, func)?;
         }
     }
@@ -705,6 +714,7 @@ pub fn module_evaluation(
         lexical_environment: env.clone(),
         variable_environment: env.clone(),
         private_environment: None,
+        source: Some(module.source.clone()),
     };
     agent.execution_context_stack.push(context.clone());
     let strict = true;
@@ -1444,5 +1454,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tag, js_str("Module"));
+    }
+
+    #[test]
+    fn module_functions_render_exact_source() {
+        // Functions instantiated during module linking still capture their
+        // source text from the module (Function.prototype.toString).
+        let mut evaluated = evaluate_modules(
+            &[(
+                "m.js",
+                "export function greet(name) { return 'hi ' + name; }",
+            )],
+            "m.js",
+        )
+        .unwrap();
+        let greet = namespace_read(&mut evaluated, "greet").unwrap();
+        let to_string = crate::context::get_property(
+            &mut evaluated.agent,
+            &greet,
+            &JsString::from_utf8("toString"),
+            greet.clone(),
+        )
+        .unwrap();
+        let rendered = crate::function::call(&mut evaluated.agent, &to_string, greet, &[]).unwrap();
+        assert_eq!(
+            rendered,
+            js_str("function greet(name) { return 'hi ' + name; }")
+        );
     }
 }

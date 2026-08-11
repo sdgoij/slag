@@ -25,13 +25,19 @@ use crate::realm::Realm;
 pub struct ScriptRecord {
     pub realm: Handle<Realm>,
     pub code: Program,
+    /// The exact source text, for `Function.prototype.toString`.
+    pub source: JsString,
 }
 
 /// ParseScript (spec 16.1.5): parse `source` as a Script and wrap it in a
 /// Script Record. Early errors surface here as a SyntaxError.
 pub fn parse_script(source: &str, realm: Handle<Realm>) -> Result<Handle<ScriptRecord>, JsError> {
     let code = parser::parse_script(source)?;
-    Ok(Handle::new(ScriptRecord { realm, code }))
+    Ok(Handle::new(ScriptRecord {
+        realm,
+        code,
+        source: JsString::from_utf8(source),
+    }))
 }
 
 /// ScriptEvaluation (spec 16.1.6): establish a script execution context,
@@ -48,6 +54,7 @@ pub fn script_evaluation(
         lexical_environment: global_env.clone(),
         variable_environment: global_env.clone(),
         private_environment: None,
+        source: Some(script.source.clone()),
     };
     agent.execution_context_stack.push(context);
 
@@ -460,6 +467,7 @@ pub fn perform_eval(
     };
 
     let script_or_module = running.script_or_module.clone();
+    let eval_source = JsString::from_utf8(source);
     let eval_context = ExecutionContext {
         function: None,
         realm: eval_realm,
@@ -467,6 +475,7 @@ pub fn perform_eval(
         lexical_environment: lexical_env.clone(),
         variable_environment: variable_env.clone(),
         private_environment: private_env,
+        source: Some(eval_source),
     };
     agent.execution_context_stack.push(eval_context);
     let result = (|| -> Result<Value, JsError> {

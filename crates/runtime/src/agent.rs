@@ -185,6 +185,7 @@ impl Agent {
             lexical_environment: global_env.clone(),
             variable_environment: global_env,
             private_environment: None,
+            source: None,
         });
     }
 
