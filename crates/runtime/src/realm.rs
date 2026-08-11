@@ -166,6 +166,7 @@ fn set_default_global_bindings(realm: &Handle<Realm>) -> Result<(), JsError> {
     crate::builtins::boolean::install(realm)?;
     crate::builtins::symbol::install(realm)?;
     crate::builtins::error::install(realm)?;
+    crate::builtins::global::install(realm)?;
     crate::builtins::promise::install(realm)?;
     crate::generator::install(realm)?;
     // spec 10.3.1: every built-in function object's [[Prototype]] is

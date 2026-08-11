@@ -1183,8 +1183,14 @@ rejections (`error_value`) route through `builtins::error::to_throwable`, so
 `try { null.x } catch (e) { e instanceof TypeError }` is `true` — the `assert.throws`
 fixtures unblock.
 
-12 Object + 4 Boolean + 5 Symbol + 7 Error built-in tests. Still open in Phase 8: URI
-functions, `Function.prototype.toString` exact source, `WeakRef`/`FinalizationRegistry`,
+**Global function properties** (`builtins/global.rs`): `isFinite`, `isNaN`, `parseFloat`,
+`parseInt` (sign + radix + 0x/0o/0b inference), and the URI functions `encodeURI[Component]` /
+`decodeURI[Component]` (Encode/Decode with `URIError` on malformed escapes, lone surrogates,
+and invalid UTF-8). All eight run as real crux closures (pure conversions — no agent
+dispatch). 5 tests.
+
+12 Object + 4 Boolean + 5 Symbol + 7 Error + 5 global-function built-in tests. Still open
+in Phase 8: `Function.prototype.toString` exact source, `WeakRef`/`FinalizationRegistry`,
 and the global-property completeness check.
 
 ---
