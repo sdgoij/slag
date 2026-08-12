@@ -7,8 +7,11 @@
 //! minimal native `assert` helper (user functions join Phase 7, so the helpers
 //! are builtins), and reports pass/skip/fail.
 
-#[cfg(test)]
-mod harness {
+/// The fixture runner: frontmatter parsing, mode selection, and per-fixture
+/// execution. Compiled in all builds so the `test262-sweep` runner binary and
+/// the vendored `#[test]` fixtures share the same code path; the fixture
+/// tests themselves are `#[test]`-gated below.
+pub mod harness {
     use std::path::{Path, PathBuf};
 
     use crux::convert::to_boolean;
@@ -176,14 +179,14 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
 
     /// Where a fixture lives under the pinned submodule.
     #[derive(Debug, Clone, Copy, PartialEq)]
-    enum Area {
+    pub enum Area {
         Language,
         Builtins,
         AnnexB,
     }
 
     impl Area {
-        fn root(self) -> PathBuf {
+        pub fn root(self) -> PathBuf {
             Path::new(env!("CARGO_MANIFEST_DIR")).join(match self {
                 Area::Language => "../../test262/test/language",
                 Area::Builtins => "../../test262/test/built-ins",
@@ -10650,6 +10653,8 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
     );
     /// `crates/test262` sits one level below the repo root, where the
     /// `test262` submodule is pinned.
+    /// The built-ins area root, for the directory scanner.
+    #[cfg(test)]
     fn builtins_dir() -> PathBuf {
         Area::Builtins.root()
     }
@@ -11012,15 +11017,17 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
         Ok(())
     }
 
-    enum FixtureResult {
+    pub enum FixtureResult {
         Pass,
         Skip(String),
         Fail(String),
     }
 
     /// Recursively collect the `.js` files under `dir` (the flat scanner
-    /// needs a recursive walk for the nested built-ins directories).
-    fn collect_js_files(
+    /// needs a recursive walk for the nested built-ins directories). Files
+    /// named `*_FIXTURE.js` are helper sources other tests include, not tests
+    /// themselves, and are skipped (upstream runner convention).
+    pub fn collect_js_files(
         dir: &std::path::Path,
         out: &mut Vec<std::path::PathBuf>,
     ) -> std::io::Result<()> {
@@ -11028,7 +11035,12 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
             let path = entry?.path();
             if path.is_dir() {
                 collect_js_files(&path, out)?;
-            } else if path.extension().and_then(|e| e.to_str()) == Some("js") {
+            } else if path.extension().and_then(|e| e.to_str()) == Some("js")
+                && !path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with("_FIXTURE.js"))
+            {
                 out.push(path);
             }
         }
@@ -11036,7 +11048,7 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
     }
 
     /// Run a fixture file (both modes unless `flags:` says otherwise).
-    fn run_fixture(area: Area, relative: &str) -> FixtureResult {
+    pub fn run_fixture(area: Area, relative: &str) -> FixtureResult {
         let path = area.root().join(relative);
         let source = match std::fs::read_to_string(&path) {
             Ok(source) => source,
@@ -11085,6 +11097,7 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
 
     /// Run one fixture as its own test. Skips print and pass; a missing
     /// submodule (fresh clone) makes every fixture pass vacuously.
+    #[cfg(test)]
     fn assert_fixture(area: Area, relative: &str) {
         static NOTICE: std::sync::Once = std::sync::Once::new();
         if !area.root().exists() {
@@ -11216,6 +11229,7 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
     /// is set, only that many fixtures per top-level directory are run (the
     /// full suite is tens of thousands of files; the sample keeps the triage
     /// shape representative without the multi-minute run).
+    #[cfg(test)]
     fn sweep_area(label: &str, area: Area) {
         let sample: Option<usize> = std::env::var("SWEEP_SAMPLE")
             .ok()

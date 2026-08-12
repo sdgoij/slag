@@ -13,19 +13,38 @@ Two harnesses live in `crates/test262`:
    the frontmatter says otherwise), with the real test262 harness helpers
    where needed (`testAtomics.js`, `testTypedArray.js`) plus native
    equivalents for `assert`, `Test262Error`, `$ERROR`, and `isConstructor`.
-2. **Full-suite sweep** (ignored test, opt-in): walks the entire pinned
-   test262 submodule (`test/language`, `test/built-ins`, `test/annexB`) and
-   triages every fixture into pass / fail / skip buckets, printing
-   per-directory statistics and failure samples. Run it with:
+   This is the regression gate.
+2. **`test262-sweep` runner** (`cargo run -p test262 --bin sweep`): runs any
+   part of the pinned submodule in small, concurrent, timeout-guarded
+   batches. A whole sweep is ~49,000 fixtures and a single hanging fixture
+   (usually an interpreter bug) can stall an in-process runner forever, so
+   each batch runs in a **child process** the parent kills when it exceeds
+   the batch deadline; un-reported fixtures are then re-run individually to
+   pinpoint the hang (`HANG`). Process death mid-fixture is reported as
+   `CRASH` (stack overflow, panics).
 
    ```
-   cargo test -p test262 --lib -- --ignored full_sweep --nocapture
+   cargo run -p test262 --bin sweep -- [area] [options]
    ```
 
-   Set `SWEEP=language|built-ins|annexB` to scan one area, and
-   `SWEEP_SAMPLE=N` to cap the run at N fixtures per top-level directory
-   (the full suite is ~49,000 files; the sample keeps the triage shape
-   representative in about a minute).
+   - `area`: `language` | `built-ins` | `annexB` | `all` (default `all`)
+   - `--jobs N` concurrent batches, `--batch N` fixtures per batch
+     (default 32), `--timeout SECS` batch deadline (default 30),
+     `--recheck-timeout SECS` per-fixture hang recheck (default 5)
+   - `--sample N` caps the run at N fixtures per top-level directory (a
+     representative ~1-minute triage), `--filter GLOB` selects by relative
+     path (`*` and `?`)
+   - `--json` emits a machine-readable report (for diffing runs); the text
+     report prints per-directory tallies, failure samples, skip reasons,
+     and the hang list
+
+   Fixtures share the same `harness::run_fixture` code path as the vendored
+   tests; `*_FIXTURE.js` helper files are excluded from collection.
+
+   An in-process whole-suite scan also exists as an ignored test
+   (`full_sweep`, with `SWEEP`/`SWEEP_SAMPLE` env knobs), but the runner is
+   the recommended tool: it parallelizes, bounds each batch, and survives
+   hangs.
 
 ## Current results
 
@@ -128,10 +147,16 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 
 ## Open items
 
-- The full ~49k-fixture sweep has not been completed in this phase (it
-  takes ~10 minutes unbounded). Run it (bounded with `SWEEP_SAMPLE`) and
-  record the per-directory triage here to certify the ≥95%-of-runnable
-  target from the plan.
+- The full ~49k-fixture sweep is now runnable and hang-safe via
+  `test262-sweep` (`--jobs` for parallelism, per-batch timeouts, hang
+  rechecks). Run each area (or a `--sample`) and record the per-directory
+  triage here to certify the ≥95%-of-runnable target from the plan.
+- Early sampled triage of `language/` shows the failure categories are
+  already triageable: real bugs (e.g. strict-mode function declarations in
+  `if`-statement position parse when they must be early errors, `arguments`
+  object strict-mode gaps), missing harness support (`_FIXTURE` helpers are
+  excluded; `tcoHelper.js` and other includes are skipped), and module tests
+  (skipped until a module loader exists).
 - `Intl` fixtures are excluded by design; anything else that fails the
   sweep should be triaged into bug / host-dependent / missing-hook
   categories and either fixed or documented here.
