@@ -218,10 +218,13 @@ fn allocate_shared_array_buffer(
 
 /// DetachArrayBuffer (spec 25.1.2.7): null the data block and reset the
 /// length. Views keep their `SharedBuffer` handles, so reads through them
-/// must be guarded by `IsDetachedBuffer`.
+/// must be guarded by `IsDetachedBuffer`; the crux `SharedBuffer` carries
+/// the same flag so Integer-Indexed access from the object model rejects
+/// views too.
 fn detach_array_buffer(agent: &mut Agent, id: u64) {
     if let Some(cell) = agent.buffer_data.get(&id) {
         let mut state = cell.borrow_mut();
+        state.shared.mark_detached();
         state.detached = true;
         state.byte_length = 0;
     }
@@ -602,7 +605,10 @@ fn transfer(
         Some(value) => to_index(value)? as usize,
     };
     if is_detached(agent, object.id()) {
-        return Ok(this.clone());
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "ArrayBuffer is detached".into(),
+        ));
     }
     array_buffer_copy_and_detach(agent, object.id(), new_length, preserve_resizability)
 }
@@ -1253,4 +1259,323 @@ pub fn dispatch_construct(
         return Some(shared_array_buffer_construct(agent, args, new_target));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::Agent;
+
+    fn run(source: &str) -> Result<Value, JsError> {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm()?;
+        agent.run_script(source)
+    }
+
+    fn text(source: &str) -> String {
+        match run(source).unwrap() {
+            Value::String(s) => s.to_string_lossy(),
+            other => panic!("expected a string, got {other:?}"),
+        }
+    }
+
+    fn number(source: &str) -> f64 {
+        match run(source).unwrap() {
+            Value::Number(n) => n,
+            other => panic!("expected a number, got {other:?}"),
+        }
+    }
+
+    fn bool(source: &str) -> bool {
+        match run(source).unwrap() {
+            Value::Boolean(b) => b,
+            other => panic!("expected a boolean, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn construct_byte_lengths() {
+        assert_eq!(number("new ArrayBuffer(8).byteLength"), 8.0);
+        assert_eq!(number("new ArrayBuffer(0).byteLength"), 0.0);
+        // A missing length is ToIndex(undefined) = 0.
+        assert_eq!(number("new ArrayBuffer().byteLength"), 0.0);
+        // ToIndex truncates fractional lengths.
+        assert_eq!(number("new ArrayBuffer(1.9).byteLength"), 1.0);
+        assert!(matches!(
+            run("new ArrayBuffer(-1)"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+        assert!(matches!(
+            run("new ArrayBuffer(Infinity)"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+        // Calling without `new` is a TypeError.
+        assert!(matches!(
+            run("ArrayBuffer(8)"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+    }
+
+    #[test]
+    fn allocation_limit_throws_range_error() {
+        // 2**31 is above the host cap (2**30); must be a RangeError, never a
+        // panic or abort.
+        assert!(matches!(
+            run("new ArrayBuffer(2 ** 31)"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+        assert!(matches!(
+            run("new ArrayBuffer(2 ** 32)"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+        assert!(matches!(
+            run("new SharedArrayBuffer(2 ** 31)"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+    }
+
+    #[test]
+    fn resizable_flags_and_max_byte_length() {
+        assert!(bool("new ArrayBuffer(4, { maxByteLength: 8 }).resizable"));
+        assert!(!bool("new ArrayBuffer(4).resizable"));
+        // A non-object options argument means no maximum.
+        assert!(!bool("new ArrayBuffer(4, null).resizable"));
+        assert_eq!(
+            number("new ArrayBuffer(4, { maxByteLength: 8 }).maxByteLength"),
+            8.0
+        );
+        // maxByteLength equal to the length is allowed.
+        assert!(bool("new ArrayBuffer(4, { maxByteLength: 4 }).resizable"));
+        assert!(matches!(
+            run("new ArrayBuffer(4, { maxByteLength: 2 })"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+    }
+
+    #[test]
+    fn resize_grows_and_zero_fills() {
+        assert_eq!(
+            number(
+                "(function(){ var b = new ArrayBuffer(4, { maxByteLength: 8 }); b.resize(6); return b.byteLength; })()"
+            ),
+            6.0
+        );
+        // The grown tail is zero-filled for fresh views.
+        assert_eq!(
+            number(
+                "(function(){ var b = new ArrayBuffer(4, { maxByteLength: 8 }); b.resize(6); return new Uint8Array(b)[4]; })()"
+            ),
+            0.0
+        );
+    }
+
+    #[test]
+    fn resize_shrinks() {
+        assert_eq!(
+            number(
+                "(function(){ var b = new ArrayBuffer(4, { maxByteLength: 8 }); b.resize(2); return b.byteLength; })()"
+            ),
+            2.0
+        );
+    }
+
+    #[test]
+    fn resize_bounds_and_errors() {
+        assert!(matches!(
+            run("(function(){ var b = new ArrayBuffer(4, { maxByteLength: 8 }); b.resize(9); })()"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+        assert!(matches!(
+            run("new ArrayBuffer(4).resize(8)"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+        // resize takes ToIndex: negatives throw, fractions truncate.
+        assert!(matches!(
+            run("(function(){ var b = new ArrayBuffer(4, { maxByteLength: 8 }); b.resize(-1); })()"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+        assert_eq!(
+            number(
+                "(function(){ var b = new ArrayBuffer(4, { maxByteLength: 8 }); b.resize(1.9); return b.byteLength; })()"
+            ),
+            1.0
+        );
+    }
+
+    #[test]
+    fn transfer_detaches_source() {
+        assert_eq!(
+            text(
+                "(function(){ var b = new ArrayBuffer(4); var t = b.transfer(); return b.detached + ':' + t.detached + ':' + t.byteLength; })()"
+            ),
+            "true:false:4"
+        );
+        // A detached buffer reports byteLength (and maxByteLength) 0.
+        assert_eq!(
+            number(
+                "(function(){ var b = new ArrayBuffer(4); b.transfer(); return b.byteLength; })()"
+            ),
+            0.0
+        );
+        assert_eq!(
+            number(
+                "(function(){ var b = new ArrayBuffer(4); b.transfer(); return b.maxByteLength; })()"
+            ),
+            0.0
+        );
+    }
+
+    #[test]
+    fn transfer_on_an_already_detached_buffer_throws() {
+        // spec 25.1.3.3 ArrayBufferCopyAndDetach: transfer/transferToFixedLength
+        // on a detached buffer is a TypeError.
+        assert!(
+            run("(function(){ var b = new ArrayBuffer(1); b.transfer(); b.transfer(); })()")
+                .is_err()
+        );
+        assert!(run(
+            "(function(){ var b = new ArrayBuffer(1); b.transfer(); b.transferToFixedLength(); })()"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn transfer_copies_bytes() {
+        assert_eq!(
+            number(
+                "(function(){ var b = new ArrayBuffer(4); var u = new Uint8Array(b); u[0] = 42; var t = b.transfer(); return new Uint8Array(t)[0]; })()"
+            ),
+            42.0
+        );
+    }
+
+    #[test]
+    fn transfer_with_explicit_length() {
+        assert_eq!(number("new ArrayBuffer(8).transfer(4).byteLength"), 4.0);
+        // Growing transfer zero-fills the tail beyond the source bytes.
+        assert_eq!(
+            text(
+                "(function(){ var t = new ArrayBuffer(2).transfer(4); return t.byteLength + ':' + new Uint8Array(t)[2]; })()"
+            ),
+            "4:0"
+        );
+        // transfer preserves resizability and the max.
+        assert_eq!(
+            text(
+                "(function(){ var t = new ArrayBuffer(4, { maxByteLength: 8 }).transfer(6); return t.resizable + ':' + t.maxByteLength + ':' + t.byteLength; })()"
+            ),
+            "true:8:6"
+        );
+        assert!(matches!(
+            run("new ArrayBuffer(4, { maxByteLength: 8 }).transfer(9)"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+    }
+
+    #[test]
+    fn transfer_to_fixed_length_loses_resizability() {
+        assert_eq!(
+            text(
+                "(function(){ var b = new ArrayBuffer(4, { maxByteLength: 8 }); var t = b.transferToFixedLength(); return t.resizable + ':' + t.maxByteLength; })()"
+            ),
+            "false:4"
+        );
+    }
+
+    #[test]
+    fn slice_bounds() {
+        assert_eq!(number("new ArrayBuffer(4).slice(1, 3).byteLength"), 2.0);
+        assert_eq!(number("new ArrayBuffer(4).slice(-2).byteLength"), 2.0);
+        assert_eq!(number("new ArrayBuffer(4).slice(10).byteLength"), 0.0);
+    }
+
+    #[test]
+    fn slice_copies_bytes() {
+        assert_eq!(
+            text(
+                "(function(){ var b = new ArrayBuffer(4); var u = new Uint8Array(b); u[0] = 1; u[1] = 2; u[2] = 3; u[3] = 4; return new Uint8Array(b.slice(1, 3)).join(','); })()"
+            ),
+            "2,3"
+        );
+    }
+
+    #[test]
+    fn detached_buffer_operations_throw() {
+        assert!(matches!(
+            run("(function(){ var b = new ArrayBuffer(4); b.transfer(); b.slice(0, 1); })()"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+        assert!(matches!(
+            run("(function(){ var b = new ArrayBuffer(4); b.transfer(); new Uint8Array(b); })()"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+        // A detached resizable buffer cannot be resized.
+        assert!(matches!(
+            run("(function(){ var b = new ArrayBuffer(4, { maxByteLength: 8 }); b.transfer(); b.resize(4); })()"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+    }
+
+    #[test]
+    fn shared_array_buffer_construction() {
+        assert_eq!(number("new SharedArrayBuffer(8).byteLength"), 8.0);
+        assert_eq!(number("new SharedArrayBuffer(0).byteLength"), 0.0);
+        assert!(matches!(
+            run("new SharedArrayBuffer(-1)"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+        assert!(matches!(
+            run("SharedArrayBuffer(8)"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+    }
+
+    #[test]
+    fn shared_array_buffer_growable() {
+        assert!(bool(
+            "new SharedArrayBuffer(4, { maxByteLength: 8 }).growable"
+        ));
+        assert!(!bool("new SharedArrayBuffer(4).growable"));
+        assert_eq!(
+            number("new SharedArrayBuffer(4, { maxByteLength: 8 }).maxByteLength"),
+            8.0
+        );
+        assert_eq!(
+            number(
+                "(function(){ var s = new SharedArrayBuffer(4, { maxByteLength: 8 }); s.grow(6); return s.byteLength; })()"
+            ),
+            6.0
+        );
+        assert!(matches!(
+            run("(function(){ var s = new SharedArrayBuffer(4, { maxByteLength: 8 }); s.grow(9); })()"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+        // grow cannot shrink below the current length.
+        assert!(matches!(
+            run("(function(){ var s = new SharedArrayBuffer(4, { maxByteLength: 8 }); s.grow(2); })()"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+        assert!(matches!(
+            run("new SharedArrayBuffer(4).grow(8)"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+    }
+
+    #[test]
+    fn shared_array_buffer_slice_and_cross_type_methods() {
+        assert_eq!(
+            number("new SharedArrayBuffer(4).slice(1, 2).byteLength"),
+            1.0
+        );
+        assert_eq!(text("typeof SharedArrayBuffer.prototype.grow"), "function");
+        // resize is ArrayBuffer-only; grow is SharedArrayBuffer-only.
+        assert!(matches!(
+            run("ArrayBuffer.prototype.resize.call(new SharedArrayBuffer(4), 8)"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+        assert!(matches!(
+            run("SharedArrayBuffer.prototype.grow.call(new ArrayBuffer(4), 8)"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+    }
 }

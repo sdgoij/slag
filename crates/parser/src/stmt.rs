@@ -879,13 +879,28 @@ fn parse_try(parser: &mut Parser) -> Result<Stmt, JsError> {
             None
         };
         parser.push_scope();
+        parser.scopes.last_mut().unwrap().is_catch = true;
         if let Some(pattern) = &param {
             for name in bound_names(pattern) {
-                parser.declare_lexical(name, catch_start)?;
+                parser.declare_catch_param(name, catch_start)?;
             }
         }
         let body = parse_block(parser)?;
         parser.pop_scope();
+        // spec 15.1.8: CatchParameter bound names must not occur in the
+        // block's LexicallyDeclaredNames (this also covers `let`/`class`/
+        // `function` declarations anywhere inside the block).
+        if let Some(pattern) = &param {
+            let mut declared = Vec::new();
+            lexically_declared_names(&body.stmts, &mut declared);
+            for name in bound_names(pattern) {
+                if declared.contains(&name) {
+                    return Err(
+                        parser.error_at(catch_start, "Identifier has already been declared")
+                    );
+                }
+            }
+        }
         handler = Some(CatchClause {
             param,
             body: body.clone(),
@@ -907,6 +922,90 @@ fn parse_try(parser: &mut Parser) -> Result<Stmt, JsError> {
             finalizer,
         },
     })
+}
+
+/// LexicallyDeclaredNames of a statement list (spec 15.2.1): `let`/`const`/
+/// `class`/`using` declarations and function declarations, recursively
+/// through nested statement lists. Used by the catch-parameter early error.
+fn lexically_declared_names(stmts: &[Stmt], out: &mut Vec<AtomId>) {
+    for stmt in stmts {
+        match &stmt.kind {
+            StmtKind::VarDecl { kind, decls, .. } if *kind != VarDeclKind::Var => {
+                for decl in decls {
+                    out.extend(bound_names(&decl.pattern));
+                }
+            }
+            StmtKind::UsingDecl { decls, .. } => {
+                for decl in decls {
+                    out.extend(bound_names(&decl.pattern));
+                }
+            }
+            StmtKind::FunctionDecl(function) => {
+                if let Some(name) = function.name {
+                    out.push(name);
+                }
+            }
+            StmtKind::ClassDecl(class) => {
+                if let Some(name) = class.name {
+                    out.push(name);
+                }
+            }
+            StmtKind::Block(block) => lexically_declared_names(&block.stmts, out),
+            StmtKind::If {
+                consequent,
+                alternate,
+                ..
+            } => {
+                lexically_declared_names(std::slice::from_ref(consequent), out);
+                if let Some(alternate) = alternate {
+                    lexically_declared_names(std::slice::from_ref(alternate), out);
+                }
+            }
+            StmtKind::While { body, .. }
+            | StmtKind::DoWhile { body, .. }
+            | StmtKind::Labeled { body, .. }
+            | StmtKind::With { body, .. } => {
+                lexically_declared_names(std::slice::from_ref(body), out);
+            }
+            StmtKind::For { init, body, .. } => {
+                if let Some(ForInit::VarDecl { kind, decls, .. }) = init
+                    && *kind != VarDeclKind::Var
+                {
+                    for decl in decls {
+                        out.extend(bound_names(&decl.pattern));
+                    }
+                }
+                lexically_declared_names(std::slice::from_ref(body), out);
+            }
+            StmtKind::ForIn { left, body, .. } | StmtKind::ForOf { left, body, .. } => {
+                if let ForBinding::VarDecl { kind, pattern, .. } = left
+                    && *kind != VarDeclKind::Var
+                {
+                    out.extend(bound_names(pattern));
+                }
+                lexically_declared_names(std::slice::from_ref(body), out);
+            }
+            StmtKind::Try {
+                block,
+                handler,
+                finalizer,
+            } => {
+                lexically_declared_names(&block.stmts, out);
+                if let Some(catch) = handler {
+                    lexically_declared_names(&catch.body.stmts, out);
+                }
+                if let Some(finalizer) = finalizer {
+                    lexically_declared_names(&finalizer.stmts, out);
+                }
+            }
+            StmtKind::Switch { cases, .. } => {
+                for case in cases {
+                    lexically_declared_names(&case.consequent, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// `function name ( params ) { body }` — the name is required for

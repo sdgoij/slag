@@ -675,4 +675,69 @@ mod tests {
             "[object Number]"
         );
     }
+
+    #[test]
+    fn to_string_radix_and_scientific_edges() {
+        assert_eq!(text("(255).toString(2)"), "11111111");
+        assert_eq!(text("(255).toString(36)"), "73");
+        assert_eq!(text("(-0).toString()"), "0");
+        assert_eq!(text("(1e21).toString()"), "1e+21");
+        assert_eq!(text("(1e-7).toString()"), "1e-7");
+        assert_eq!(text("(123.456).toString()"), "123.456");
+        assert!(matches!(
+            run("(10).toString(1)"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+        assert!(matches!(
+            run("(10).toString(37)"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+    }
+
+    #[test]
+    fn to_fixed_and_to_precision_boundaries() {
+        // 2.55 as a double is 2.54999..., so one decimal place rounds to 2.5.
+        assert_eq!(text("(2.55).toFixed(1)"), "2.5");
+        assert_eq!(text("(0.5).toFixed(0)"), "1");
+        // digits == 100 is allowed (spec: 0..=100); only 101 throws.
+        assert_eq!(text("(1).toFixed(100)"), format!("1.{}", "0".repeat(100)));
+        assert_eq!(text("(1.5).toPrecision(1)"), "2");
+        assert_eq!(text("(123.456).toPrecision(5)"), "123.46");
+        assert!(matches!(
+            run("(1.5).toPrecision(101)"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+    }
+
+    #[test]
+    fn parse_int_and_parse_float_quirks() {
+        // 0x7fff_ffff_ffff_ffff = 2^63 - 1; the nearest double is 2^63.
+        assert_eq!(number("parseInt('0x7fffffffffffffff', 16)"), 2f64.powi(63));
+        assert_eq!(number("parseInt('0x7fffffffffffffff')"), 2f64.powi(63));
+        // 0xffff_ffff_ffff_ffff = 2^64 - 1; the nearest double is 2^64.
+        assert_eq!(number("parseInt('0xffffffffffffffff', 16)"), 2f64.powi(64));
+        assert_eq!(number("parseInt('-0x1')"), -1.0);
+        assert_eq!(number("parseInt('  -0x10', 16)"), -16.0);
+        assert!(number("parseInt('0x1', 37)").is_nan());
+        assert_eq!(number("parseInt('1', 36)"), 1.0);
+        assert_eq!(number("parseInt('z', 36)"), 35.0);
+        assert_eq!(number("parseFloat('-Infinity')"), f64::NEG_INFINITY);
+        assert_eq!(number("parseFloat('1.2.3')"), 1.2);
+        assert!(number("parseFloat('   ')").is_nan());
+        assert_eq!(number("Number('0x1F')"), 31.0);
+        assert!(number("Number('  +0x1 ')").is_nan());
+        assert!(number("Number('-0b1')").is_nan());
+    }
+
+    #[test]
+    fn number_boundary_edges() {
+        assert_eq!(number("Number.MIN_SAFE_INTEGER"), -9007199254740991.0);
+        assert!(number("Number.MIN_VALUE") > 0.0);
+        assert!(!bool("Number.isSafeInteger(2 ** 53)"));
+        assert!(bool("Number.isSafeInteger(2 ** 53 - 1)"));
+        assert!(bool("Number.isSafeInteger(-0)"));
+        assert!(bool("Number.isInteger(-0)"));
+        assert!(!bool("Number.isInteger(0.5)"));
+        assert!(!bool("Number.isInteger(NaN)"));
+    }
 }

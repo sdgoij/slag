@@ -303,10 +303,13 @@ fn allocate_typed_array_buffer(
         ));
     }
     let buffer = SharedBuffer::new(byte_length);
+    // The backing store is a real ArrayBuffer object (spec 25.2.2.4): it
+    // must carry %ArrayBuffer.prototype% so `buffer.byteLength` and friends
+    // resolve through the usual prototype chain.
     let buffer_proto = agent
         .current_realm()?
         .intrinsics
-        .get("%Object.prototype%")
+        .get("%ArrayBuffer.prototype%")
         .and_then(|value| as_object(&value));
     let buffer_object = JsObject::ordinary_object_create(buffer_proto);
     agent.buffer_data.insert(
@@ -2953,5 +2956,105 @@ mod tests {
         );
         // Only Uint8Array has the hex/base64 methods.
         assert!(run("new Uint16Array(2).toHex()").is_err());
+    }
+
+    #[test]
+    fn bounds_detach_and_aliasing() {
+        // Out-of-bounds element writes are silently ignored.
+        assert_eq!(
+            text("(function(){ var a = new Uint8Array(3); a[3] = 5; return String(a[3]); })()"),
+            "undefined"
+        );
+        assert_eq!(
+            number("(function(){ var a = new Uint8Array(3); a[3] = 5; return a.length; })()"),
+            3.0
+        );
+        // Constructor buffer bounds.
+        assert!(run("new Uint8Array(new ArrayBuffer(4), 3, 2)").is_err());
+        assert!(run("new Uint8Array(new ArrayBuffer(4), -1)").is_err());
+        assert!(run("new Int32Array(new ArrayBuffer(8), 2)").is_err());
+        // set out of range throws.
+        assert!(run("new Uint8Array(3).set(new Uint8Array([1, 2, 3]), 2)").is_err());
+        // Empty constructors.
+        assert_eq!(number("new Uint8Array().length"), 0.0);
+        assert_eq!(number("new Uint8Array(0).length"), 0.0);
+        // Two views over one buffer alias each other.
+        assert_eq!(
+            number(
+                "(function(){ var b = new ArrayBuffer(4); var a = new Uint8Array(b); var c = new Uint8Array(b); a[0] = 42; return c[0]; })()"
+            ),
+            42.0
+        );
+        // subarray on a multi-byte kind shares the buffer with a byte offset.
+        assert_eq!(number("new Int32Array([1, 2, 3]).subarray(1).length"), 2.0);
+        assert_eq!(
+            number("new Int32Array([1, 2, 3]).subarray(1).byteOffset"),
+            4.0
+        );
+        assert!(bool(
+            "(function(){ var a = new Int32Array([1, 2, 3]); return a.subarray(1).buffer === a.buffer; })()"
+        ));
+        // Element conversion wraps modulo and truncates.
+        assert_eq!(text("new Uint8Array([256, -1, 1.5]).join(',')"), "0,255,1");
+        assert_eq!(
+            text("new Uint8Array(new Uint16Array([1, 2, 3])).join(',')"),
+            "1,2,3"
+        );
+        assert_eq!(
+            number("new Float32Array([0.1, 0.2])[0]"),
+            0.10000000149011612
+        );
+        // fill with a negative start.
+        assert_eq!(
+            text("new Uint8Array([1, 2, 3, 4]).fill(5, -2).join(',')"),
+            "1,2,5,5"
+        );
+        // TypedArray sort is numeric, not lexicographic.
+        assert_eq!(
+            text("new Uint8Array([10, 1, 3]).sort().join(',')"),
+            "1,3,10"
+        );
+        // transfer detaches the old buffer: methods on the old view throw.
+        assert_eq!(
+            number(
+                "(function(){ var buf = new ArrayBuffer(4); var t = new Uint8Array(buf); var nb = buf.transfer(); return nb.byteLength; })()"
+            ),
+            4.0
+        );
+        assert!(run(
+            "(function(){ var buf = new ArrayBuffer(4); var t = new Uint8Array(buf); buf.transfer(); return t.join(','); })()"
+        )
+        .is_err());
+        assert!(run(
+            "(function(){ var buf = new ArrayBuffer(4); var t = new Uint8Array(buf); buf.transfer(); return t.length; })()"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn backing_buffer_is_a_real_array_buffer() {
+        // The buffer of a self-allocated TypedArray must carry
+        // %ArrayBuffer.prototype% (spec 25.2.2.4).
+        assert_eq!(number("new Uint8Array(3).buffer.byteLength"), 3.0);
+        assert!(bool("new Uint8Array(3).buffer instanceof ArrayBuffer"));
+        assert!(bool("new Uint8Array(3).buffer.constructor === ArrayBuffer"));
+    }
+
+    #[test]
+    fn element_access_on_detached_views_throws() {
+        // spec 10.4.5.2: integer-indexed [[Get]] on a detached view throws a
+        // TypeError even for out-of-bounds indices.
+        assert!(run(
+            "(function(){ var buf = new ArrayBuffer(4); var t = new Uint8Array(buf); t[0] = 7; buf.transfer(); return t[0]; })()"
+        )
+        .is_err());
+        assert!(run(
+            "(function(){ var buf = new ArrayBuffer(4); var t = new Uint8Array(buf); buf.transfer(); return t[99]; })()"
+        )
+        .is_err());
+        assert!(run(
+            "(function(){ var buf = new ArrayBuffer(4); var t = new Uint8Array(buf); buf.transfer(); t[0] = 1; return 0; })()"
+        )
+        .is_err());
     }
 }

@@ -428,4 +428,29 @@ mod tests {
         assert_eq!(text("typeof 5n"), "bigint");
         assert_eq!(text("(5n).toString()"), "5");
     }
+
+    #[test]
+    fn literal_and_arithmetic_edges() {
+        assert_eq!(big("0n"), "0");
+        assert_eq!(text("String(-0n === 0n)"), "true");
+        assert_eq!(big("1n + 2n"), "3");
+        assert_eq!(big("2n ** 3n"), "8");
+        assert_eq!(big("5n / 2n"), "2");
+        assert_eq!(big("-5n / 2n"), "-2");
+        assert_eq!(big("5n % 2n"), "1");
+        assert_eq!(big("1n << 100n"), "1267650600228229401496703205376");
+    }
+
+    #[test]
+    fn comparison_with_numbers() {
+        assert_eq!(text("String(0n === 0)"), "false");
+        assert_eq!(text("String(0n == 0)"), "true");
+        assert_eq!(text("String(0n < 1)"), "true");
+    }
+
+    #[test]
+    fn as_uint_n_more() {
+        assert_eq!(big("BigInt.asUintN(8, 255n)"), "255");
+        assert_eq!(big("BigInt.asUintN(8, -1n)"), "255");
+    }
 }

@@ -1452,4 +1452,30 @@ mod tests {
             Ok(Value::Boolean(true))
         ));
     }
+
+    #[test]
+    fn invalid_dates() {
+        assert!(number("new Date(NaN).getTime()").is_nan());
+        assert!(number("Date.parse('')").is_nan());
+    }
+
+    #[test]
+    fn month_rollover_and_utc_edges() {
+        // Feb 29 in a non-leap year rolls to March 1 of the same year.
+        assert_eq!(number("new Date(2021, 1, 29).getMonth()"), 2.0);
+        assert_eq!(number("new Date(2021, 1, 29).getDate()"), 1.0);
+        assert_eq!(number("new Date(2021, 1, 29).getFullYear()"), 2021.0);
+        // Months are 0-indexed; month 12 rolls to January of the next year.
+        assert_eq!(number("new Date(2020, 0, 1).getMonth()"), 0.0);
+        assert_eq!(number("new Date(2020, 12, 1).getMonth()"), 0.0);
+        assert_eq!(number("new Date(2020, 12, 1).getFullYear()"), 2021.0);
+        assert_eq!(number("Date.UTC(2020, 0, 1)"), 1577836800000.0);
+        assert_eq!(
+            number(
+                "(function () { var d = new Date(0); d.setUTCFullYear(2020); \
+                 return d.getUTCFullYear(); })()"
+            ),
+            2020.0
+        );
+    }
 }

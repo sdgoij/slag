@@ -29,10 +29,12 @@ Two harnesses live in `crates/test262`:
 
 ## Current results
 
-Workspace-wide: **3943 tests pass, 0 failures** (`cargo test --workspace`),
+Workspace-wide: **4055 tests pass, 0 failures** (`cargo test --workspace`),
 of which the test262 crate contributes **3317 passing fixtures** (44
 language-area + 3275 built-ins fixtures); the remaining registered test is
-the ignored `scan_builtins_directories` directory scanner.
+the ignored `scan_builtins_directories` directory scanner. The `workers`
+feature build adds 444 runtime tests (`cargo test -p runtime --features
+workers`).
 
 The vendored fixtures cover, by phase: the execution model and language
 syntax (Phases 4-6), functions/classes/generators/async/modules (Phase 7),
@@ -43,6 +45,46 @@ the global object and fundamental objects (Phase 8), numbers and dates
 Proxy/Reflect (Phase 16). Phase 17's Atomics and worker changes added
 runtime-side unit tests; the Atomics fixture directories (`Atomics/`, 144
 fixtures) pass.
+
+## Edge-case unit-test campaign (Phase 18 hardening)
+
+Beyond the vendored fixtures, ~120 edge-case unit tests were added across
+the crates (lexer, parser, runtime core, and the built-ins), targeting the
+plan's per-phase test lists: numeric-literal/escape/ASI lexing, the ASI ×
+statement matrix and cover grammar, TDZ/hoisting/redeclaration/eval
+scoping, `-0`/`NaN`/`2^53` conversion boundaries, case-mapping expansion,
+split/replace substitution patterns, holes/length-mutation/species/sort,
+and buffer resize/transfer/detach semantics. `array_buffer.rs` and
+`dataview.rs` received their first unit tests.
+
+The campaign surfaced and fixed the following conformance bugs (each now
+has a regression test):
+
+- **Lexer:** escaped `$`/`_` could not start an identifier (`\u0024x`); the
+  escape branch now validates with the full IdentifierStart/Part predicate.
+- **Parser:** rest-element-must-be-last was not enforced in assignment
+  targets, array arrow parameters, or `for-of` heads (`[...a, b] = c`); the
+  catch-parameter redeclaration rules were wrong — `catch (e) { var e; }`
+  and `var e; … catch (e)` were rejected while `catch (e) { let e; }` was
+  accepted. Both directions now follow spec 15.1.8.
+- **For-head declarations:** `let`/`const` for-heads were instantiated as
+  global `var`s, so `for (let i …)` leaked `i` onto `globalThis` and
+  `for (let x = x;;)` missed the TDZ.
+- **String:** `String(Symbol('x'))` threw instead of returning
+  `"Symbol(x)"`; the Unicode Final_Sigma conditional mapping
+  (`'ΟΣ'.toLowerCase()` → `"ος"`) was missing.
+- **RegExp:** `RegExp.prototype[@@split]` result arrays lacked
+  `%Array.prototype%` (`.join` on them failed).
+- **Number:** `Number('0b101')`/`Number('0o17')` returned NaN; binary and
+  octal StringNumericLiterals are now parsed.
+- **Array:** the `@@species` accessor lived on `%Array.prototype%` instead
+  of the `Array` constructor (`Array[Symbol.species]` was `undefined`), and
+  `ArraySpeciesCreate` ignored custom `@@species` overrides.
+- **TypedArray/ArrayBuffer:** self-allocated views' backing buffers carried
+  `%Object.prototype%` (so `buffer.byteLength` was `undefined`); reads and
+  writes through views of a detached buffer returned stale data instead of
+  throwing; `transfer()` on an already-detached buffer returned it instead
+  of throwing.
 
 ## What is skipped and why
 

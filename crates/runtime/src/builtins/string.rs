@@ -160,7 +160,8 @@ fn to_clamped_index(value: &Value, len: usize) -> Result<usize, JsError> {
 /// A pure String static or non-agent method: `(this, args) -> value`.
 type StringFn = fn(&Value, &[Value]) -> Result<Value, JsError>;
 
-/// String(value) / new String(value) (spec 22.1.1.1): ToString the argument.
+/// String(value) / new String(value) (spec 22.1.1.1): ToString the argument,
+/// with the SymbolDescriptiveString rule for Symbol values.
 fn string_construct(
     agent: &mut Agent,
     args: &[Value],
@@ -168,6 +169,9 @@ fn string_construct(
 ) -> Result<Value, JsError> {
     let proto = instance_proto(agent, new_target)?;
     let text = match args.first() {
+        Some(Value::Symbol(symbol)) => {
+            JsString::from_utf8(&crux::symbol::descriptive_string(symbol))
+        }
         Some(value) => to_string(value)?,
         None => JsString::from_utf8(""),
     };
@@ -196,6 +200,9 @@ fn instance_proto(
 
 fn string_call(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
     let text = match args.first() {
+        Some(Value::Symbol(symbol)) => {
+            JsString::from_utf8(&crux::symbol::descriptive_string(symbol))
+        }
         Some(value) => crate::context::to_string(agent, value)?,
         None => JsString::from_utf8(""),
     };
@@ -955,15 +962,54 @@ fn to_locale_upper_case(
 
 /// spec 22.1.3.32 String.prototype.toLowerCase: Unicode Default Case
 /// Conversion over the code points.
+/// spec 22.1.3.31 String.prototype.toLowerCase: Unicode default case
+/// conversion, including the Final_Sigma conditional mapping: U+03A3 maps to
+/// U+03C2 when preceded by a cased character and not followed by a cased
+/// character (combining marks are skipped in the lookahead).
 fn to_lower_case(_agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
     let s = to_string(this)?;
-    let mut code_points: Vec<u32> = Vec::new();
-    for cp in s.code_points() {
-        code_points.extend(unicode::to_lowercase(cp));
+    let code_points: Vec<u32> = s.code_points().collect();
+    let mut lower: Vec<u32> = Vec::new();
+    for (index, cp) in code_points.iter().enumerate() {
+        if *cp == 0x03A3 && is_final_sigma(&code_points, index) {
+            lower.push(0x03C2);
+        } else {
+            lower.extend(unicode::to_lowercase(*cp));
+        }
     }
-    let text = crux::string::code_points_to_string(&code_points)?;
+    let text = crux::string::code_points_to_string(&lower)?;
     Ok(Value::String(Handle::new(text)))
+}
+
+/// The Final_Sigma condition: the sigma is preceded by a cased character
+/// (skipping combining marks) and is not followed by a cased character.
+fn is_final_sigma(code_points: &[u32], index: usize) -> bool {
+    let preceded = code_points[..index]
+        .iter()
+        .rev()
+        .find(|cp| !is_combining_mark(**cp))
+        .is_some_and(|cp| is_cased(*cp));
+    if !preceded {
+        return false;
+    }
+    let followed_cased = code_points[index + 1..]
+        .iter()
+        .find(|cp| !is_combining_mark(**cp))
+        .is_some_and(|cp| is_cased(*cp));
+    !followed_cased
+}
+
+/// Whether the code point has a case mapping (the Unicode "cased" property,
+/// approximated via the default lowercase/uppercase mappings).
+fn is_cased(cp: u32) -> bool {
+    unicode::to_lowercase(cp) != vec![cp] || unicode::to_uppercase(cp) != vec![cp]
+}
+
+/// Whether the code point is a nonspacing combining mark (Mn), skipped by
+/// the Final_Sigma lookahead.
+fn is_combining_mark(cp: u32) -> bool {
+    unicode::general_category(cp) == "Mn"
 }
 
 /// spec 22.1.3.33 String.prototype.toUpperCase.
@@ -2126,5 +2172,150 @@ mod tests {
             text("Object.prototype.toString.call('x')"),
             "[object String]"
         );
+    }
+
+    #[test]
+    fn case_mapping_expansion() {
+        // ß expands to two code points in the full uppercase mapping.
+        assert_eq!(text("('stra\u{00DF}e').toUpperCase()"), "STRASSE");
+        // U+03A3 alone lowercases to the plain sigma (no final-sigma context).
+        assert_eq!(text("('\u{03A3}').toLowerCase()"), "σ");
+        // The LATIN SMALL LIGATURE FI uppercases to the two letters FI.
+        assert_eq!(text("('\u{FB01}').toUpperCase()"), "FI");
+        assert_eq!(text("('abc').toUpperCase()"), "ABC");
+        // Round trip through both conversions.
+        assert_eq!(
+            text("('Hello World').toLowerCase().toUpperCase()"),
+            "HELLO WORLD"
+        );
+    }
+
+    #[test]
+    fn final_sigma_contextual_mapping() {
+        // U+03A3 maps to the final sigma (U+03C2) only when preceded by a
+        // cased character and not followed by one (spec 22.1.3.31).
+        assert_eq!(
+            text("('\u{039F}\u{03A3}').toLowerCase()"),
+            "\u{03BF}\u{03C2}"
+        );
+        // A medial sigma stays the plain sigma.
+        assert_eq!(
+            text("('\u{039F}\u{03A3}\u{0394}').toLowerCase()"),
+            "\u{03BF}\u{03C3}\u{03B4}"
+        );
+        // A word-initial sigma is not final.
+        assert_eq!(
+            text("('\u{03A3}\u{03BF}').toLowerCase()"),
+            "\u{03C3}\u{03BF}"
+        );
+    }
+
+    #[test]
+    fn string_of_symbol_uses_descriptive_string() {
+        // spec 22.1.1.1 step 2: String(Symbol) is SymbolDescriptiveString.
+        assert_eq!(text("String(Symbol('x'))"), "Symbol(x)");
+        assert_eq!(text("String(Symbol())"), "Symbol()");
+        assert_eq!(text("String(Symbol.iterator)"), "Symbol(Symbol.iterator)");
+        // Concatenation still throws for symbols.
+        assert!(matches!(
+            run("'' + Symbol('x')"),
+            Err(error) if error.kind == crux::ErrorKind::TypeError
+        ));
+    }
+
+    #[test]
+    fn split_edge_cases() {
+        assert_eq!(text("('abc').split('').join('|')"), "a|b|c");
+        assert_eq!(text("('abc').split('', 2).join('|')"), "a|b");
+        assert_eq!(text("('a,b,c').split(',', 2).join('|')"), "a|b");
+        assert_eq!(text("('abc').split(',').join('|')"), "abc");
+        assert_eq!(text("('a,b').split(undefined).join('|')"), "a,b");
+        assert_eq!(text("('').split(',').join('|')"), "");
+        // A regexp separator ends with a match, so the trailing empty string
+        // is part of the result (spec 22.2.7.5 step 17).
+        assert_eq!(number("('a1b2c3').split(/\\d/).length"), 4.0);
+        assert_eq!(text("('a1b2c3').split(/\\d/)[0]"), "a");
+        assert_eq!(text("('a1b2c3').split(/\\d/)[1]"), "b");
+        assert_eq!(text("('a1b2c3').split(/\\d/)[2]"), "c");
+        assert_eq!(text("('a1b2c3').split(/\\d/)[3]"), "");
+        // Capturing groups in a regexp separator are spliced into the result.
+        assert_eq!(number("('ab').split(/(.)/).length"), 5.0);
+        assert_eq!(text("('ab').split(/(.)/)[0]"), "");
+        assert_eq!(text("('ab').split(/(.)/)[1]"), "a");
+        assert_eq!(text("('ab').split(/(.)/)[2]"), "");
+        assert_eq!(text("('ab').split(/(.)/)[3]"), "b");
+        assert_eq!(text("('ab').split(/(.)/)[4]"), "");
+    }
+
+    #[test]
+    fn replace_substitution_patterns() {
+        assert_eq!(text("('abc').replace('b', 'X$&Y')"), "aXbYc");
+        // $$ is a literal dollar in the replacement template.
+        assert_eq!(text("('a1b').replace(/\\d/, '$$')"), "a$b");
+        // Numbered captures can be reordered in the template.
+        assert_eq!(text("('ab').replace(/(a)(b)/, '$2$1')"), "ba");
+        assert_eq!(text("('aaa').replaceAll('a', 'x')"), "xxx");
+        // replaceAll requires a global regexp.
+        assert!(matches!(
+            run("('aaa').replaceAll(/a/, 'x')"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+    }
+
+    #[test]
+    fn padding_edge_cases() {
+        assert_eq!(text("('5').padStart(3, '0')"), "005");
+        assert_eq!(text("('5').padStart(1, '0')"), "5");
+        assert_eq!(text("('ab').padEnd(4, 'xy')"), "abxy");
+        // The filler is truncated when it does not divide evenly.
+        assert_eq!(text("('ab').padStart(4, 'xyz')"), "xyab");
+        assert_eq!(text("('').padStart(3)"), "   ");
+    }
+
+    #[test]
+    fn slice_substring_edge_cases() {
+        assert_eq!(text("('hello').slice(-3)"), "llo");
+        assert_eq!(text("('hello').slice(1, -1)"), "ell");
+        // substring swaps a reversed argument pair.
+        assert_eq!(text("('hello').substring(3, 1)"), "el");
+        // Negative positions clamp to zero.
+        assert_eq!(text("('hello').substring(-5, 2)"), "he");
+    }
+
+    #[test]
+    fn surrogate_code_point_edge_cases() {
+        assert_eq!(number("('\\u{1F600}').charCodeAt(0)"), 0xD83D as f64);
+        assert_eq!(number("('\\u{1F600}').codePointAt(0)"), 128512.0);
+        assert_eq!(text("String.fromCodePoint(128512)"), "\u{1F600}");
+        assert_eq!(text("String.fromCharCode(0xD83D, 0xDE00)"), "\u{1F600}");
+        assert_eq!(text("('abc').charAt(5)"), "");
+        assert!(number("('abc').charCodeAt(5)").is_nan());
+    }
+
+    #[test]
+    fn search_trim_edge_cases() {
+        assert_eq!(number("('abcabc').indexOf('abc', 1)"), 3.0);
+        assert!(bool("('abc').includes('')"));
+        assert!(!bool("('abc').includes('x', 10)"));
+        assert!(bool("('abc').startsWith('')"));
+        assert!(bool("('abc').endsWith('')"));
+        // NBSP and BOM are both whitespace for trimming.
+        assert_eq!(text("('\\u{00A0}\\u{FEFF} x \\u{00A0}').trim()"), "x");
+    }
+
+    #[test]
+    fn length_and_stringification() {
+        // Length counts UTF-16 code units, so an astral char is two units.
+        assert_eq!(number("('\\u{1F600}').length"), 2.0);
+        assert_eq!(number("('').length"), 0.0);
+        assert_eq!(text("String(1e21)"), "1e+21");
+        assert_eq!(text("String(-0)"), "0");
+        // An array stringifies via its join.
+        assert_eq!(text("String([1, 2])"), "1,2");
+        // A Symbol has no string conversion (throws even in concatenation).
+        assert!(matches!(
+            run("'' + Symbol('x')"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
     }
 }

@@ -3,10 +3,7 @@
 
 use crux::{JsError, Span, intern};
 use syntax::{LexGoal, Token, TokenKind};
-use unicode::{
-    is_identifier_part, is_identifier_start, is_line_terminator, is_unicode_id_continue,
-    is_unicode_id_start, is_white_space,
-};
+use unicode::{is_identifier_part, is_identifier_start, is_line_terminator, is_white_space};
 
 use crate::text::TemplateKind;
 
@@ -213,9 +210,9 @@ impl<'s> Lexer<'s> {
             if u == b'\\' as u16 {
                 let cp = self.lex_unicode_escape(start)?;
                 let ok = if first {
-                    is_unicode_id_start(cp)
+                    is_identifier_start(cp)
                 } else {
-                    is_unicode_id_continue(cp)
+                    is_identifier_part(cp)
                 };
                 if !ok {
                     return Err(self.error_at(start, "Invalid identifier escape"));
@@ -243,9 +240,9 @@ impl<'s> Lexer<'s> {
             if u == b'\\' as u16 {
                 let cp = self.lex_unicode_escape(start)?;
                 let ok = if first {
-                    is_unicode_id_start(cp)
+                    is_identifier_start(cp)
                 } else {
-                    is_unicode_id_continue(cp)
+                    is_identifier_part(cp)
                 };
                 if !ok {
                     return Err(self.error_at(start, "Invalid private identifier"));
@@ -617,6 +614,32 @@ mod tests {
     }
 
     #[test]
+    fn escaped_dollar_and_underscore_start_identifiers() {
+        // \u0024 = $ and \u005F = _ are IdentifierStartChars; the escaped
+        // forms must lex (the escape branch previously validated only the
+        // Unicode ID_Start predicate).
+        assert_eq!(
+            kinds("\\u0024x"),
+            vec![TokenKind::Identifier(intern(&[0x24, 0x78])), TokenKind::Eof]
+        );
+        assert_eq!(
+            kinds("\\u005Fy"),
+            vec![TokenKind::Identifier(intern(&[0x5F, 0x79])), TokenKind::Eof]
+        );
+        assert_eq!(
+            kinds("a\\u0024b"),
+            vec![
+                TokenKind::Identifier(intern(&[0x61, 0x24, 0x62])),
+                TokenKind::Eof
+            ]
+        );
+        // An escaped digit still cannot start an identifier.
+        let src = syntax::SourceText::from_utf8("\\u0031bc");
+        let mut lexer = Lexer::new(&src, LexGoal::Div, false);
+        assert!(lexer.next_token().is_err());
+    }
+
+    #[test]
     fn skips_whitespace_and_comments() {
         let src = syntax::SourceText::from_utf8("// line\n/* block */\t\ra");
         let mut lexer = Lexer::new(&src, LexGoal::Div, false);
@@ -915,5 +938,455 @@ mod tests {
         let src = syntax::SourceText::from_utf8("}tail`");
         let mut lexer = Lexer::new(&src, LexGoal::Div, false);
         assert_eq!(lexer.next_token().unwrap().kind, TokenKind::RightBrace);
+    }
+
+    #[test]
+    fn numeric_literals_radix_prefixes_and_separators() {
+        assert_eq!(
+            kinds("0x1_000 0b1010 0o77 0X1F 0B101 0O17"),
+            vec![
+                TokenKind::NumericLiteral(NumericLiteral::Number(4096.0)),
+                TokenKind::NumericLiteral(NumericLiteral::Number(10.0)),
+                TokenKind::NumericLiteral(NumericLiteral::Number(63.0)),
+                TokenKind::NumericLiteral(NumericLiteral::Number(31.0)),
+                TokenKind::NumericLiteral(NumericLiteral::Number(5.0)),
+                TokenKind::NumericLiteral(NumericLiteral::Number(15.0)),
+                TokenKind::Eof,
+            ]
+        );
+        // Decimal forms: fractional-only, trailing point, exponents, and
+        // separators inside a fractional literal.
+        assert_eq!(
+            kinds(".5 1. 1e3 1e+3 1e-3 1_000.5"),
+            vec![
+                TokenKind::NumericLiteral(NumericLiteral::Number(0.5)),
+                TokenKind::NumericLiteral(NumericLiteral::Number(1.0)),
+                TokenKind::NumericLiteral(NumericLiteral::Number(1000.0)),
+                TokenKind::NumericLiteral(NumericLiteral::Number(1000.0)),
+                TokenKind::NumericLiteral(NumericLiteral::Number(0.001)),
+                TokenKind::NumericLiteral(NumericLiteral::Number(1000.5)),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn bigint_literals_across_radices() {
+        let toks = kinds("123n 0xFFn 0b11n 0o77n 0n");
+        let expected = [123i64, 255, 3, 63, 0];
+        for (tok, n) in toks.iter().zip(expected) {
+            assert_eq!(
+                *tok,
+                TokenKind::NumericLiteral(NumericLiteral::BigInt(BigInt::from(n))),
+                "wrong bigint for {n}"
+            );
+        }
+        assert_eq!(toks[5], TokenKind::Eof);
+    }
+
+    #[test]
+    fn legacy_octal_and_decimal_fallbacks() {
+        // Annex B: a leading-zero integer of only octal digits is legacy
+        // octal; 8/9 in the sequence forces the decimal fallback.
+        assert_eq!(
+            kinds("07 0777 08 09"),
+            vec![
+                TokenKind::NumericLiteral(NumericLiteral::Number(7.0)),
+                TokenKind::NumericLiteral(NumericLiteral::Number(511.0)),
+                TokenKind::NumericLiteral(NumericLiteral::Number(8.0)),
+                TokenKind::NumericLiteral(NumericLiteral::Number(9.0)),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn numeric_literal_invalid_forms_error() {
+        for bad in ["1e", "0b2", "0o8", "0o", "0x1_", "1e_2"] {
+            let src = syntax::SourceText::from_utf8(bad);
+            let mut lexer = Lexer::new(&src, LexGoal::Div, false);
+            assert!(lexer.next_token().is_err(), "expected error for {bad}");
+        }
+    }
+
+    #[test]
+    fn fraction_after_number_splits_into_two_literals() {
+        // `1.2.3` is two NumericLiterals (`1.2` then `.3`); the parser rejects
+        // the adjacent literals, but the lexer split is per spec.
+        assert_eq!(
+            kinds("1.2.3"),
+            vec![
+                TokenKind::NumericLiteral(NumericLiteral::Number(1.2)),
+                TokenKind::NumericLiteral(NumericLiteral::Number(0.3)),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn string_literals_cook_every_escape() {
+        let src = syntax::SourceText::from_utf8(r#""\n\t\r\b\f\v\0\x41\u0041\u{1F600}\'\"\\""#);
+        let mut lexer = Lexer::new(&src, LexGoal::Div, false);
+        let token = lexer.next_token().unwrap();
+        let TokenKind::StringLiteral {
+            value,
+            legacy_octal,
+        } = token.kind
+        else {
+            panic!("expected string literal")
+        };
+        assert!(!legacy_octal);
+        assert_eq!(
+            value.as_slice(),
+            &[
+                0x0A, 0x09, 0x0D, 0x08, 0x0C, 0x0B, 0x00, 0x41, 0x41, 0xD83D, 0xDE00, 0x27, 0x22,
+                0x5C
+            ]
+        );
+    }
+
+    #[test]
+    fn string_literal_invalid_escapes_error() {
+        for bad in [
+            r#""\xZZ""#,       // non-hex digit
+            r#""\u{110000}""#, // code point above U+10FFFF
+            r#""\u{""#,        // missing closing brace
+            r#""\u{}""#,       // no digits
+            r#""\x""#,         // truncated hex escape
+            r#""\u""#,         // truncated unicode escape
+        ] {
+            let src = syntax::SourceText::from_utf8(bad);
+            let mut lexer = Lexer::new(&src, LexGoal::Div, false);
+            assert!(lexer.next_token().is_err(), "expected error for {bad}");
+        }
+    }
+
+    #[test]
+    fn template_substitution_tokens_by_goal_driving() {
+        // The parser switches goals between tokens; simulate the stream for
+        // `a${b}c${d}` and `${{"s"}}tail`.
+        let src = syntax::SourceText::from_utf8("`a${b}c${d}`");
+        let mut lexer = Lexer::new(&src, LexGoal::Div, false);
+        let TokenKind::TemplateHead { cooked, raw } = lexer.next_token().unwrap().kind else {
+            panic!("expected template head")
+        };
+        assert_eq!(cooked.unwrap().as_slice(), &[0x61]);
+        assert_eq!(raw.as_slice(), &[0x61]);
+        assert_eq!(
+            lexer.next_token().unwrap().kind,
+            TokenKind::Identifier(intern(&[0x62]))
+        );
+        lexer.set_goal(LexGoal::TemplateTail);
+        let TokenKind::TemplateMiddle { cooked, .. } = lexer.next_token().unwrap().kind else {
+            panic!("expected template middle")
+        };
+        assert_eq!(cooked.unwrap().as_slice(), &[0x63]);
+        assert_eq!(
+            lexer.next_token().unwrap().kind,
+            TokenKind::Identifier(intern(&[0x64]))
+        );
+        let TokenKind::TemplateTail { cooked, .. } = lexer.next_token().unwrap().kind else {
+            panic!("expected template tail")
+        };
+        assert_eq!(cooked.unwrap().as_slice(), &[]);
+        assert_eq!(lexer.next_token().unwrap().kind, TokenKind::Eof);
+
+        // A string literal inside a substitution.
+        let src = syntax::SourceText::from_utf8("`${\"s\"}tail`");
+        let mut lexer = Lexer::new(&src, LexGoal::Div, false);
+        let TokenKind::TemplateHead { cooked, .. } = lexer.next_token().unwrap().kind else {
+            panic!("expected template head")
+        };
+        assert_eq!(cooked.unwrap().as_slice(), &[]);
+        assert!(matches!(
+            lexer.next_token().unwrap().kind,
+            TokenKind::StringLiteral { .. }
+        ));
+        lexer.set_goal(LexGoal::TemplateTail);
+        let TokenKind::TemplateTail { cooked, .. } = lexer.next_token().unwrap().kind else {
+            panic!("expected template tail")
+        };
+        assert_eq!(cooked.unwrap().as_slice(), &[0x74, 0x61, 0x69, 0x6C]);
+    }
+
+    #[test]
+    fn template_escaped_delimiters_stay_in_template() {
+        // An escaped backtick or `${` does not terminate the template or open
+        // a substitution; the `{` after an escaped `$` is an ordinary
+        // character and raw keeps the backslashes.
+        let src = syntax::SourceText::from_utf8("`\\`\\${`");
+        let mut lexer = Lexer::new(&src, LexGoal::Div, false);
+        let token = lexer.next_token().unwrap();
+        let TokenKind::NoSubstitutionTemplate { cooked, raw } = token.kind else {
+            panic!("expected template")
+        };
+        assert_eq!(cooked.unwrap().as_slice(), &[0x60, 0x24, 0x7B]);
+        assert_eq!(raw.as_slice(), &[0x5C, 0x60, 0x5C, 0x24, 0x7B]);
+
+        let src = syntax::SourceText::from_utf8("`a\\`b`");
+        let mut lexer = Lexer::new(&src, LexGoal::Div, false);
+        let token = lexer.next_token().unwrap();
+        let TokenKind::NoSubstitutionTemplate { cooked, raw } = token.kind else {
+            panic!("expected template")
+        };
+        assert_eq!(cooked.unwrap().as_slice(), &[0x61, 0x60, 0x62]);
+        assert_eq!(raw.as_slice(), &[0x61, 0x5C, 0x60, 0x62]);
+    }
+
+    #[test]
+    fn template_continuation_unterminated_error() {
+        let src = syntax::SourceText::from_utf8("}abc");
+        let mut lexer = Lexer::new(&src, LexGoal::TemplateTail, false);
+        assert!(lexer.next_token().is_err());
+    }
+
+    #[test]
+    fn unicode_identifiers_across_scripts() {
+        assert_eq!(
+            kinds("é 中文 α aé"),
+            vec![
+                TokenKind::Identifier(intern(&[0xE9])),
+                TokenKind::Identifier(intern(&[0x4E2D, 0x6587])),
+                TokenKind::Identifier(intern(&[0x3B1])),
+                TokenKind::Identifier(intern(&[0x61, 0xE9])),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn identifier_escapes_inside_and_out() {
+        // Escapes are resolved before checking identifier start/continue.
+        assert_eq!(
+            kinds("\\u0061bc a\\u0062c a\\u{200C}b a\\u{200D}b"),
+            vec![
+                TokenKind::Identifier(intern(&[0x61, 0x62, 0x63])),
+                TokenKind::Identifier(intern(&[0x61, 0x62, 0x63])),
+                TokenKind::Identifier(intern(&[0x61, 0x200C, 0x62])),
+                TokenKind::Identifier(intern(&[0x61, 0x200D, 0x62])),
+                TokenKind::Eof,
+            ]
+        );
+        // Escaped digit and escaped ZWNJ are not valid at the start.
+        for bad in ["\\u0031bc", "\\u{200C}a"] {
+            let src = syntax::SourceText::from_utf8(bad);
+            let mut lexer = Lexer::new(&src, LexGoal::Div, false);
+            assert!(lexer.next_token().is_err(), "expected error for {bad}");
+        }
+    }
+
+    #[test]
+    fn leading_digit_splits_number_then_identifier() {
+        // A digit is never an identifier start; the lexer produces a number
+        // followed by an identifier, which the parser rejects.
+        assert_eq!(
+            kinds("1abc"),
+            vec![
+                TokenKind::NumericLiteral(NumericLiteral::Number(1.0)),
+                TokenKind::Identifier(intern(&[0x61, 0x62, 0x63])),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn keywords_lex_as_identifiers() {
+        // The lexer emits Identifier for keywords too; classification is a
+        // parser concern, so `yield`/`await` behave the same way.
+        assert_eq!(
+            kinds("let if class yield await"),
+            vec![
+                TokenKind::Identifier(intern(&[0x6C, 0x65, 0x74])),
+                TokenKind::Identifier(intern(&[0x69, 0x66])),
+                TokenKind::Identifier(intern(&[0x63, 0x6C, 0x61, 0x73, 0x73])),
+                TokenKind::Identifier(intern(&[0x79, 0x69, 0x65, 0x6C, 0x64])),
+                TokenKind::Identifier(intern(&[0x61, 0x77, 0x61, 0x69, 0x74])),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn zero_width_joiners_are_parts_not_starts() {
+        // <ZWNJ>/<ZWJ> continue an identifier but cannot start one.
+        assert_eq!(
+            kinds("a\u{200C}b a\u{200D}b"),
+            vec![
+                TokenKind::Identifier(intern(&[0x61, 0x200C, 0x62])),
+                TokenKind::Identifier(intern(&[0x61, 0x200D, 0x62])),
+                TokenKind::Eof,
+            ]
+        );
+        for bad in ["\u{200C}a", "\u{200D}a"] {
+            let src = syntax::SourceText::from_utf8(bad);
+            let mut lexer = Lexer::new(&src, LexGoal::Div, false);
+            assert!(lexer.next_token().is_err(), "expected error for {bad}");
+        }
+    }
+
+    #[test]
+    fn line_break_after_restricted_keywords() {
+        // ASI/no-LineTerminator restrictions: the token after the line break
+        // is flagged for `return\nx` and `break\nlabel`.
+        for src in ["return\nx", "break\nlabel"] {
+            let src = syntax::SourceText::from_utf8(src);
+            let mut lexer = Lexer::new(&src, LexGoal::Div, false);
+            assert!(!lexer.next_token().unwrap().line_break_before);
+            assert!(lexer.next_token().unwrap().line_break_before);
+        }
+    }
+
+    #[test]
+    fn division_goal_preserves_slash_after_newline() {
+        // `a = b\n/c/g` must stay one expression: `/` is a Slash punctuator
+        // (Div goal), and the first one records the line break.
+        let toks = lex("a = b\n/c/g");
+        assert_eq!(toks[0].kind, TokenKind::Identifier(intern(&[0x61])));
+        assert_eq!(toks[1].kind, TokenKind::Equal);
+        assert_eq!(toks[2].kind, TokenKind::Identifier(intern(&[0x62])));
+        assert_eq!(toks[3].kind, TokenKind::Slash);
+        assert!(toks[3].line_break_before);
+        assert_eq!(toks[4].kind, TokenKind::Identifier(intern(&[0x63])));
+        assert_eq!(toks[5].kind, TokenKind::Slash);
+        assert!(!toks[5].line_break_before);
+        assert_eq!(toks[6].kind, TokenKind::Identifier(intern(&[0x67])));
+        assert_eq!(toks[7].kind, TokenKind::Eof);
+    }
+
+    #[test]
+    fn postfix_increment_line_break_restriction() {
+        // `++\n++x`: the second `++` follows a break, so it cannot be the
+        // postfix increment of the first. `x\n++y` is the same shape.
+        let toks = lex("++\n++x");
+        assert_eq!(toks[0].kind, TokenKind::PlusPlus);
+        assert!(!toks[0].line_break_before);
+        assert_eq!(toks[1].kind, TokenKind::PlusPlus);
+        assert!(toks[1].line_break_before);
+        assert_eq!(toks[2].kind, TokenKind::Identifier(intern(&[0x78])));
+
+        let toks = lex("x\n++y");
+        assert_eq!(toks[0].kind, TokenKind::Identifier(intern(&[0x78])));
+        assert_eq!(toks[1].kind, TokenKind::PlusPlus);
+        assert!(toks[1].line_break_before);
+        assert_eq!(toks[2].kind, TokenKind::Identifier(intern(&[0x79])));
+    }
+
+    #[test]
+    fn line_break_before_open_paren_matters() {
+        // `a\n(b)` keeps `a` and `(` as separate statements; the `(` carries
+        // the break that drives ASI.
+        let toks = lex("a\n(b)");
+        assert_eq!(toks[0].kind, TokenKind::Identifier(intern(&[0x61])));
+        assert!(!toks[0].line_break_before);
+        assert_eq!(toks[1].kind, TokenKind::LeftParen);
+        assert!(toks[1].line_break_before);
+        assert_eq!(toks[2].kind, TokenKind::Identifier(intern(&[0x62])));
+        assert_eq!(toks[3].kind, TokenKind::RightParen);
+        assert_eq!(toks[4].kind, TokenKind::Eof);
+    }
+
+    #[test]
+    fn unterminated_block_comment_errors() {
+        for bad in ["/* abc", "/*"] {
+            let src = syntax::SourceText::from_utf8(bad);
+            let mut lexer = Lexer::new(&src, LexGoal::Div, false);
+            assert!(lexer.next_token().is_err(), "expected error for {bad}");
+        }
+    }
+
+    #[test]
+    fn html_comments_respect_flag_and_line_start() {
+        // With the Annex B flag off, `<!--` and `-->` are plain punctuators.
+        let src = syntax::SourceText::from_utf8("<!--x");
+        let mut lexer = Lexer::new(&src, LexGoal::Div, false);
+        assert_eq!(lexer.next_token().unwrap().kind, TokenKind::LessThan);
+        assert_eq!(lexer.next_token().unwrap().kind, TokenKind::Not);
+        assert_eq!(lexer.next_token().unwrap().kind, TokenKind::MinusMinus);
+        assert_eq!(
+            lexer.next_token().unwrap().kind,
+            TokenKind::Identifier(intern(&[0x78]))
+        );
+        // `-->` with the flag off stays MinusMinus then GreaterThan.
+        let src = syntax::SourceText::from_utf8("-->");
+        let mut lexer = Lexer::new(&src, LexGoal::Div, false);
+        assert_eq!(lexer.next_token().unwrap().kind, TokenKind::MinusMinus);
+        assert_eq!(lexer.next_token().unwrap().kind, TokenKind::GreaterThan);
+        assert_eq!(lexer.next_token().unwrap().kind, TokenKind::Eof);
+
+        // With the flag on, `-->` is a comment only at line start.
+        let src = syntax::SourceText::from_utf8("-->x");
+        let mut lexer = Lexer::new(&src, LexGoal::Div, true);
+        assert_eq!(lexer.next_token().unwrap().kind, TokenKind::Eof);
+        let src = syntax::SourceText::from_utf8("x\n-->");
+        let mut lexer = Lexer::new(&src, LexGoal::Div, true);
+        assert_eq!(
+            lexer.next_token().unwrap().kind,
+            TokenKind::Identifier(intern(&[0x78]))
+        );
+        let t = lexer.next_token().unwrap();
+        assert_eq!(t.kind, TokenKind::Eof);
+        assert!(t.line_break_before);
+        // Mid-line `-->` stays punctuators even with the flag on.
+        let src = syntax::SourceText::from_utf8("x -->y");
+        let mut lexer = Lexer::new(&src, LexGoal::Div, true);
+        assert_eq!(
+            lexer.next_token().unwrap().kind,
+            TokenKind::Identifier(intern(&[0x78]))
+        );
+        assert_eq!(lexer.next_token().unwrap().kind, TokenKind::MinusMinus);
+        assert_eq!(lexer.next_token().unwrap().kind, TokenKind::GreaterThan);
+        assert_eq!(
+            lexer.next_token().unwrap().kind,
+            TokenKind::Identifier(intern(&[0x79]))
+        );
+    }
+
+    #[test]
+    fn punctuator_greedy_juxtaposition() {
+        // Adjacent punctuators match greedily, left to right.
+        assert_eq!(
+            kinds("==== >>>> >>>= a??b a**=b a?.[b]"),
+            vec![
+                TokenKind::StrictEqual,
+                TokenKind::Equal,
+                TokenKind::UnsignedRightShift,
+                TokenKind::GreaterThan,
+                TokenKind::UnsignedRightShiftEqual,
+                TokenKind::Identifier(intern(&[0x61])),
+                TokenKind::NullishCoalescing,
+                TokenKind::Identifier(intern(&[0x62])),
+                TokenKind::Identifier(intern(&[0x61])),
+                TokenKind::StarStarEqual,
+                TokenKind::Identifier(intern(&[0x62])),
+                TokenKind::Identifier(intern(&[0x61])),
+                TokenKind::QuestionDot,
+                TokenKind::LeftBracket,
+                TokenKind::Identifier(intern(&[0x62])),
+                TokenKind::RightBracket,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn question_dot_digit_lookahead() {
+        // `?.` is not recognized before a digit: `13.5` is one number and
+        // `?.5` splits into `?` plus `.5`.
+        assert_eq!(
+            kinds("13.5 13?.5 a?.5 a?.b"),
+            vec![
+                TokenKind::NumericLiteral(NumericLiteral::Number(13.5)),
+                TokenKind::NumericLiteral(NumericLiteral::Number(13.0)),
+                TokenKind::Question,
+                TokenKind::NumericLiteral(NumericLiteral::Number(0.5)),
+                TokenKind::Identifier(intern(&[0x61])),
+                TokenKind::Question,
+                TokenKind::NumericLiteral(NumericLiteral::Number(0.5)),
+                TokenKind::Identifier(intern(&[0x61])),
+                TokenKind::QuestionDot,
+                TokenKind::Identifier(intern(&[0x62])),
+                TokenKind::Eof,
+            ]
+        );
     }
 }

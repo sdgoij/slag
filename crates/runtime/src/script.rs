@@ -200,7 +200,9 @@ fn var_scoped_declarations<'a>(stmt: &'a Stmt, out: &mut Vec<VarScopedDecl<'a>>)
             var_scoped_declarations(body, out)
         }
         StmtKind::For { init, body, .. } => {
-            if let Some(ForInit::VarDecl { decls, .. }) = init {
+            if let Some(ForInit::VarDecl { kind, decls, .. }) = init
+                && *kind == VarDeclKind::Var
+            {
                 for decl in decls {
                     let mut names = Vec::new();
                     bound_names(&decl.pattern, &mut names);
@@ -210,7 +212,9 @@ fn var_scoped_declarations<'a>(stmt: &'a Stmt, out: &mut Vec<VarScopedDecl<'a>>)
             var_scoped_declarations(body, out);
         }
         StmtKind::ForIn { left, body, .. } | StmtKind::ForOf { left, body, .. } => {
-            if let ForBinding::VarDecl { pattern, .. } = left {
+            if let ForBinding::VarDecl { kind, pattern, .. } = left
+                && *kind == VarDeclKind::Var
+            {
                 let mut names = Vec::new();
                 bound_names(pattern, &mut names);
                 out.push(VarScopedDecl::Variable(names));

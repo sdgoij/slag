@@ -595,14 +595,14 @@ fn symbol_split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     let mut array: Vec<Value> = Vec::new();
     let size = string.len();
     if lim == 0 {
-        return array_from_values(&[]);
+        return array_from_values(agent, &[]);
     }
     if string.is_empty() {
         let match_result = regexp_builtin_exec(agent, &splitter, &string)?;
         if match_result.is_some() {
-            return array_from_values(&[]);
+            return array_from_values(agent, &[]);
         }
-        return array_from_values(&[Value::String(Handle::new(string))]);
+        return array_from_values(agent, &[Value::String(Handle::new(string))]);
     }
     let mut last_match_end = 0usize;
     let mut search_index = last_match_end;
@@ -636,7 +636,7 @@ fn symbol_split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
                     let segment = substring(&string, last_match_end, search_index);
                     array.push(Value::String(Handle::new(segment)));
                     if array.len() == lim as usize {
-                        return array_from_values(&array);
+                        return array_from_values(agent, &array);
                     }
                     last_match_end = match_end;
                     let result_length = array_length(agent, &match_result)?;
@@ -650,7 +650,7 @@ fn symbol_split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
                         )?;
                         array.push(capture);
                         if array.len() == lim as usize {
-                            return array_from_values(&array);
+                            return array_from_values(agent, &array);
                         }
                     }
                     search_index = last_match_end;
@@ -660,7 +660,7 @@ fn symbol_split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     }
     let tail = substring(&string, last_match_end, size);
     array.push(Value::String(Handle::new(tail)));
-    array_from_values(&array)
+    array_from_values(agent, &array)
 }
 
 fn to_integer_or_infinity(n: f64) -> f64 {
@@ -673,12 +673,8 @@ fn to_integer_or_infinity(n: f64) -> f64 {
     }
 }
 
-fn array_from_values(values: &[Value]) -> Result<Value, JsError> {
-    let array = JsObject::array_create(None, values.len() as f64)?;
-    for (index, value) in values.iter().enumerate() {
-        array.create_data_property(&JsString::from_utf8(&index.to_string()), value.clone())?;
-    }
-    Ok(Value::Object(array))
+fn array_from_values(agent: &Agent, values: &[Value]) -> Result<Value, JsError> {
+    crate::builtins::array::array_from_values(agent, values)
 }
 
 /// spec 22.2.7.3 RegExp.prototype[@@replace](string, replaceValue).
@@ -1240,6 +1236,15 @@ mod tests {
             Value::Boolean(b) => b,
             other => panic!("expected a boolean, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn split_result_uses_the_array_prototype() {
+        // The @@split result array must carry %Array.prototype% (it was
+        // created with a null prototype, so `.join` failed).
+        assert_eq!(text("('ab').split(/(.)/).join('|')"), "|a||b|");
+        assert_eq!(text("('a1b2').split(/\\d/).join(',')"), "a,b,");
+        assert!(bool("('a,b'.split(',') instanceof Array)"));
     }
 
     #[test]

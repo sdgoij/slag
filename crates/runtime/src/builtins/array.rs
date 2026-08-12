@@ -252,35 +252,37 @@ fn array_species_create(
     if !is_array(original_array) {
         return array_create(agent, length);
     }
+    // SpeciesConstructor (spec 10.1.15): C = Get(originalArray,
+    // "constructor"); if C is undefined use the default; else S =
+    // Get(C, @@species); null/undefined species means C; otherwise S must be
+    // a constructor.
     let c = get(agent, original_array, &JsString::from_utf8("constructor"))?;
-    if is_constructor(&c) {
-        let ctor = c;
-        let result = crate::function::construct(agent, &ctor, &[Value::Number(length)], &ctor)?;
-        return object_of(&result);
-    }
-    if matches!(c, Value::Object(_)) {
-        let species_key = PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone());
-        let species = crate::context::get_property_key(agent, &c, &species_key, c.clone())?;
-        if !matches!(species, Value::Null) {
-            if is_constructor(&species) {
-                let result = crate::function::construct(
-                    agent,
-                    &species,
-                    &[Value::Number(length)],
-                    &species,
-                )?;
-                return object_of(&result);
+    let ctor = match c {
+        Value::Undefined | Value::Null => return array_create(agent, length),
+        Value::Object(_) | Value::Function(_) => {
+            let species_key =
+                PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone());
+            let species = crate::context::get_property_key(agent, &c, &species_key, c.clone())?;
+            match species {
+                Value::Null | Value::Undefined => c,
+                value if is_constructor(&value) => value,
+                _ => {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "Array species constructor returned a non-constructible value".into(),
+                    ));
+                }
             }
-            if matches!(species, Value::Object(_)) {
-                return Err(JsError::new(
-                    ErrorKind::TypeError,
-                    "Array species constructor returned a non-constructible value".into(),
-                ));
-            }
-            // Fall through: non-object species means ArrayCreate.
         }
-    }
-    array_create(agent, length)
+        _ => {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "Array species constructor is not an object".into(),
+            ));
+        }
+    };
+    let result = crate::function::construct(agent, &ctor, &[Value::Number(length)], &ctor)?;
+    object_of(&result)
 }
 
 /// The Array constructor (spec 23.1.1.1), used for both call and construct.
@@ -2307,7 +2309,9 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         },
     )?;
 
-    // spec 23.1.3.41: @@species accessor returning `this`.
+    // spec 23.1.2.5: get Array [ @@species ] — an accessor on the Array
+    // constructor returning `this` (the species-using methods consult
+    // constructor[@@species] through ArraySpeciesCreate).
     let species_func = Function::create_builtin(
         Some(JsString::from_utf8("get [Symbol.species]")),
         0,
@@ -2318,7 +2322,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     realm
         .intrinsics
         .define(SPECIES, Value::Function(species_func.clone()));
-    array_proto.define_property_key(
+    array_ctor.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone()),
         &PropertyDescriptor {
             value: None,
@@ -2905,5 +2909,182 @@ mod tests {
             );
         }
         parts.join(",")
+    }
+
+    #[test]
+    fn holes_and_sparse_arrays() {
+        // `Array(3)` has length 3 and no own elements.
+        assert_eq!(number("Array(3).length"), 3.0);
+        assert_eq!(text("JSON.stringify(Array(3))"), "[null,null,null]");
+        assert!(!bool("Array(3).hasOwnProperty(0)"));
+        // map preserves holes but keeps the length.
+        assert_eq!(joined("[,1,,3].map(x => x)"), ",1,,3");
+        assert_eq!(number("[,1,,3].map(x => x).length"), 4.0);
+        // join renders holes as empty segments.
+        assert_eq!(text("[,,].join('-')"), "-");
+        assert_eq!(text("[1,,3].join('-')"), "1--3");
+        // for-of reads holes as undefined.
+        assert_eq!(
+            text(
+                "(function(){ var s = ''; for (var x of [1,,3]) { s += x === undefined ? 'u' : x; } return s; })()"
+            ),
+            "1u3"
+        );
+        // forEach skips holes.
+        assert_eq!(
+            number("(function(){ var c = 0; [1,,3].forEach(function(){ c++; }); return c; })()"),
+            2.0
+        );
+        assert!(!bool("[1,,3].hasOwnProperty(1)"));
+        // Array.from and spread materialize holes as undefined.
+        assert_eq!(joined("Array.from({length: 3})"), ",,");
+        assert!(bool(
+            "(function(){ var a = [...Array(3)]; return a.length === 3 && a[0] === undefined && a[2] === undefined; })()"
+        ));
+    }
+
+    #[test]
+    fn length_mutation_during_iteration() {
+        // forEach captures the length up front: elements pushed beyond it are
+        // never visited.
+        assert_eq!(
+            number(
+                "(function(){ var a = [1, 2, 3]; var c = 0; a.forEach(function(){ c++; a.push(4); }); return c; })()"
+            ),
+            3.0
+        );
+        assert_eq!(
+            number(
+                "(function(){ var a = [1, 2, 3]; a.forEach(function(){ a.push(4); }); return a.length; })()"
+            ),
+            6.0
+        );
+        // Popping during forEach can remove elements before the iteration
+        // reaches them (the captured length stays 3, but hasProperty fails).
+        assert_eq!(
+            number(
+                "(function(){ var a = [1, 2, 3]; var c = 0; a.forEach(function(){ c++; a.pop(); }); return c; })()"
+            ),
+            2.0
+        );
+        assert_eq!(
+            joined(
+                "(function(){ var a = [1, 2, 3]; a.forEach(function(){ a.pop(); }); return a; })()"
+            ),
+            "1"
+        );
+        // The values iterator reads the current index each step, so shifting
+        // during for-of skips the elements that move past it (1, then 3).
+        assert_eq!(
+            number(
+                "(function(){ var a = [1, 2, 3]; var s = 0; for (var v of a) { s += v; a.shift(); } return s; })()"
+            ),
+            4.0
+        );
+    }
+
+    #[test]
+    fn species_constructor() {
+        // The default species of an Array subclass is the subclass itself.
+        assert!(bool(
+            "class MyArr extends Array {}; new MyArr(1, 2, 3).map(x => x) instanceof MyArr"
+        ));
+        assert!(bool(
+            "class MyArr extends Array {}; new MyArr(1, 2, 3).map(x => x).constructor === MyArr"
+        ));
+        // concat on a plain array keeps the plain-array species; the subclass
+        // argument is spread in.
+        assert_eq!(
+            joined(
+                "(function(){ class MyArr extends Array {}; return [1, 2, 3].concat(new MyArr([4])); })()"
+            ),
+            "1,2,3,4"
+        );
+        assert!(!bool(
+            "(function(){ class MyArr extends Array {}; return [1, 2, 3].concat(new MyArr([4])) instanceof MyArr; })()"
+        ));
+    }
+
+    #[test]
+    fn species_accessor_lives_on_the_constructor() {
+        // spec 23.1.2.5: get Array [ @@species ] returns the constructor.
+        assert!(bool("Array[Symbol.species] === Array"));
+        assert_eq!(
+            run("typeof Array[Symbol.species]").unwrap().to_string(),
+            "function"
+        );
+        // Array.prototype has no @@species of its own.
+        assert_eq!(
+            run("Object.hasOwn(Array.prototype, Symbol.species)").unwrap(),
+            Value::Boolean(false)
+        );
+        // An overridden @@species is honored by species-creating methods.
+        assert!(bool(
+            "class MyArr extends Array { static get [Symbol.species]() { return Array; } } !(new MyArr(1,2,3).map(x => x) instanceof MyArr)"
+        ));
+        assert!(bool(
+            "class MyArr extends Array { static get [Symbol.species]() { return Array; } } new MyArr(1,2,3).map(x => x) instanceof Array"
+        ));
+        assert!(bool(
+            "class MyArr extends Array { static get [Symbol.species]() { return Array; } } new MyArr(1,2).slice(0) instanceof Array"
+        ));
+    }
+
+    #[test]
+    fn sort_comparator_and_hole_edge_cases() {
+        // Stability: equal keys keep their relative order.
+        assert_eq!(
+            text(
+                "(function(){ var a = [{k:1,v:'a'},{k:1,v:'b'}]; a.sort(function(x,y){ return x.k - y.k; }); return a[0].v + a[1].v; })()"
+            ),
+            "ab"
+        );
+        // A comparator returning NaN treats the pair as equal.
+        assert_eq!(joined("[2, 1, 3].sort(function(){ return NaN; })"), "2,1,3");
+        // The default sort is lexicographic.
+        assert_eq!(joined("[10, 1, 3].sort()"), "1,10,3");
+        // undefined sinks to the end; null sorts as the string "null".
+        assert_eq!(joined("[undefined, null, 1].sort()"), "1,,");
+        // A non-callable comparator throws a TypeError.
+        assert!(run("[1, 2, 3].sort(null)").is_err());
+        // Holes are skipped and land at the tail of the sorted array.
+        assert_eq!(number("[,1].sort().length"), 2.0);
+        assert_eq!(number("[,1].sort()[0]"), 1.0);
+        assert!(!bool("[,1].sort().hasOwnProperty(1)"));
+    }
+
+    #[test]
+    fn from_iteration_and_reduce_edge_cases() {
+        assert_eq!(joined("Array.from('abc')"), "a,b,c");
+        assert_eq!(joined("Array.from(new Set([1, 2]))"), "1,2");
+        assert_eq!(joined("Array.from({0:'a', 1:'b', length: 2})"), "a,b");
+        // mapFn with an explicit thisArg.
+        assert_eq!(
+            joined("Array.from([1, 2, 3], function(x){ return x + this.base; }, {base: 10})"),
+            "11,12,13"
+        );
+        // flat with an explicit depth.
+        assert!(bool("[[1],[2,[3]]].flat(1)[2] instanceof Array"));
+        assert!(!bool("[[1],[2,[3]]].flat(2)[2] instanceof Array"));
+        assert_eq!(joined("[[1],[2,[3]]].flat(2)"), "1,2,3");
+        // flatMap skips holes.
+        assert_eq!(joined("[1,,2].flatMap(x => [x])"), "1,2");
+        // %Array.prototype[@@iterator]% is the values method.
+        assert!(bool("[1, 2, 3][Symbol.iterator] === [1, 2, 3].values"));
+        // reduce without an initial value on an empty array throws.
+        assert!(run("[].reduce(function(a, b){ return a + b; })").is_err());
+        // reduceRight folds from the right.
+        assert_eq!(
+            number("[1, 2, 3].reduceRight(function(a, b){ return a - b; })"),
+            0.0
+        );
+        // indexOf uses strict equality; includes uses SameValueZero.
+        assert_eq!(number("[NaN].indexOf(NaN)"), -1.0);
+        assert!(bool("[NaN].includes(NaN)"));
+        // lastIndexOf with a negative fromIndex.
+        assert_eq!(number("[1, 2, 3].lastIndexOf(1, -1)"), 0.0);
+        // find returns undefined both for a found undefined and for no match.
+        assert!(bool("[undefined].find(x => x === undefined) === undefined"));
+        assert!(bool("[1, 2].find(x => x > 9) === undefined"));
     }
 }

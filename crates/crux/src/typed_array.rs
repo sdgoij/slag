@@ -4,7 +4,7 @@
 //! [[Get]]/[[Set]]/[[GetOwnProperty]]/[[DefineOwnProperty]].
 
 #[cfg(not(feature = "workers"))]
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 #[cfg(not(feature = "workers"))]
 use std::rc::Rc;
 
@@ -97,6 +97,14 @@ pub struct SharedBuffer {
     block: std::sync::Arc<[std::sync::atomic::AtomicU64]>,
     #[cfg(feature = "workers")]
     byte_length: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Whether the owning ArrayBuffer has been detached (spec 25.1.2.5). The
+    /// runtime's `BufferState.detached` is authoritative; this flag mirrors it
+    /// so crux's integer-indexed access can reject detached views without
+    /// reaching the agent. Views clone the same Rc/Arc, so the flag is shared.
+    #[cfg(not(feature = "workers"))]
+    detached: Rc<Cell<bool>>,
+    #[cfg(feature = "workers")]
+    detached: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The read-modify-write operations of the Atomics built-ins.
@@ -122,6 +130,7 @@ impl SharedBuffer {
         {
             SharedBuffer {
                 block: Rc::new(RefCell::new(vec![0u8; byte_length])),
+                detached: Rc::new(Cell::new(false)),
             }
         }
         #[cfg(feature = "workers")]
@@ -132,7 +141,33 @@ impl SharedBuffer {
                     .map(|_| std::sync::atomic::AtomicU64::new(0))
                     .collect::<std::sync::Arc<[_]>>(),
                 byte_length: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(byte_length)),
+                detached: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
+        }
+    }
+
+    /// Mark the owning buffer detached (mirrors the runtime's `BufferState`).
+    pub fn mark_detached(&self) {
+        #[cfg(not(feature = "workers"))]
+        {
+            self.detached.set(true);
+        }
+        #[cfg(feature = "workers")]
+        {
+            self.detached
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Whether the owning buffer has been detached.
+    pub fn is_detached(&self) -> bool {
+        #[cfg(not(feature = "workers"))]
+        {
+            self.detached.get()
+        }
+        #[cfg(feature = "workers")]
+        {
+            self.detached.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 

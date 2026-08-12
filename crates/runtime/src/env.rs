@@ -1130,4 +1130,50 @@ mod tests {
         assert!(module.has_this_binding());
         assert_eq!(module.get_this_binding().unwrap(), Value::Undefined);
     }
+
+    // ---- Phase 4 binding semantics: TDZ and global interactions ----
+
+    #[test]
+    fn tdz_read_errors_in_sloppy_mode_too() {
+        // An uninitialized binding is a TDZ ReferenceError regardless of the
+        // strict flag on GetBindingValue/SetMutableBinding (spec 9.2.1.5/6).
+        let env = declarative();
+        env.create_mutable_binding(&name("x"), false).unwrap();
+        let err = env.get_binding_value(&name("x"), false).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ReferenceError);
+        let err = env
+            .set_mutable_binding(&name("x"), Value::Number(1.0), false)
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ReferenceError);
+        // ...and a sloppy write does not initialize the binding.
+        assert!(env.get_binding_value(&name("x"), false).is_err());
+    }
+
+    #[test]
+    fn global_lexical_binding_stays_off_the_object() {
+        let global = JsObject::ordinary_object_create(None);
+        let env = new_global_environment(global.clone(), global.clone());
+        env.create_mutable_binding(&name("let_y"), false).unwrap();
+        env.initialize_binding(&name("let_y"), Value::Number(3.0))
+            .unwrap();
+        assert!(env.has_lexical_declaration(&name("let_y")));
+        assert!(!global.has_own_property(&name("let_y")).unwrap());
+        assert_eq!(
+            env.get_binding_value(&name("let_y"), true).unwrap(),
+            Value::Number(3.0)
+        );
+    }
+
+    #[test]
+    fn redeclared_global_var_binding_is_a_noop() {
+        // `var a; var a;` — the second declaration reuses the existing
+        // object property instead of failing (spec 9.2.6.10).
+        let global = JsObject::ordinary_object_create(None);
+        let env = new_global_environment(global.clone(), global.clone());
+        env.create_global_var_binding(&name("a"), false).unwrap();
+        assert!(global.has_own_property(&name("a")).unwrap());
+        env.create_global_var_binding(&name("a"), false).unwrap();
+        assert!(global.has_own_property(&name("a")).unwrap());
+        assert_eq!(global.own_property_keys().unwrap().len(), 1);
+    }
 }

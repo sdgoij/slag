@@ -1715,4 +1715,273 @@ mod tests {
             Value::Number(1.0)
         );
     }
+
+    // ---- Phase 4 binding semantics: hoisting, TDZ, redeclaration ----
+
+    #[test]
+    fn var_is_undefined_before_its_initializer_runs() {
+        // var bindings hoist and initialize to *undefined* during
+        // instantiation, before any statement runs (spec 16.1.8).
+        assert_eq!(
+            run("function f() { var y = x; var x = 1; return y; } f()").unwrap(),
+            Value::Undefined
+        );
+        assert_eq!(
+            run("function f() { return x; var x = 1; } f()").unwrap(),
+            Value::Undefined
+        );
+    }
+
+    #[test]
+    fn function_declarations_hoist_above_use() {
+        // Function declarations instantiate before the body runs, so a call
+        // appearing before the declaration still resolves it.
+        assert_eq!(
+            run("f(); function f() { return 42; }").unwrap(),
+            Value::Number(42.0)
+        );
+        assert_eq!(
+            run("function g() { return f(); function f() { return 7; } } g()").unwrap(),
+            Value::Number(7.0)
+        );
+    }
+
+    #[test]
+    fn var_hoists_out_of_blocks_to_function_scope() {
+        assert_eq!(
+            run("function f() { { var x = 1; } return x; } f()").unwrap(),
+            Value::Number(1.0)
+        );
+    }
+
+    #[test]
+    fn let_and_const_are_in_tdz_until_initialized() {
+        // Reading a binding before its declaration throws a ReferenceError,
+        // including via `typeof` (spec 14.2.1 / 13.3.1).
+        let err = run("{ typeof x; let x; }").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ReferenceError);
+        // A self-referencing initializer reads the binding while it is still
+        // uninitialized.
+        let err = run("let x = x;").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ReferenceError);
+        let err = run("const c = c;").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ReferenceError);
+    }
+
+    #[test]
+    fn for_let_headers_bind_lexically() {
+        // A let-headed loop binds fresh per iteration and reads its own
+        // binding correctly after initialization.
+        assert_eq!(
+            run("let s = 0; for (let i = 0; i < 3; i++) { s += i; } s").unwrap(),
+            Value::Number(3.0)
+        );
+    }
+
+    #[test]
+    fn closures_created_before_let_initialization_hit_tdz() {
+        // A closure created while a `let` is still uninitialized captures the
+        // uninitialized binding; calling it throws (spec 14.2.1).
+        let err = run("var f; f = function () { return x; }; f(); let x = 1;").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ReferenceError);
+        let err = run("function g() { let f = () => x; return f(); let x = 1; } g()").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ReferenceError);
+    }
+
+    #[test]
+    fn tdz_in_class_field_initializers() {
+        // Instance field initializers run at construction; a field reading a
+        // block-scoped binding still in its TDZ throws.
+        let err = run("{ class C { f = x; } new C(); let x = 1; }").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ReferenceError);
+    }
+
+    #[test]
+    fn var_redeclaration_is_allowed() {
+        assert_eq!(run("var a; var a; a = 5; a").unwrap(), Value::Number(5.0));
+        assert_eq!(run("var a = 1; var a = 2; a").unwrap(), Value::Number(2.0));
+    }
+
+    #[test]
+    fn function_and_var_declarations_may_share_a_name() {
+        // `function f() {} var f;` — the var is absorbed by the function
+        // declaration (spec 16.1.7).
+        assert_eq!(
+            run("function f() { return 1; } var f; f()").unwrap(),
+            Value::Number(1.0)
+        );
+    }
+
+    #[test]
+    fn redeclaration_errors_are_syntax_errors() {
+        // Duplicate lexical names, and lexical/var or lexical/function
+        // clashes in the same statement list, are parse-time SyntaxErrors
+        // (spec 14.2.1 / 15.2.6 / 16.1.7 early errors).
+        for source in [
+            "let a; let a;",
+            "const a = 1; const a = 2;",
+            "var a; let a;",
+            "var a = 1; let a = 2;",
+            "let f; function f() {}",
+        ] {
+            let err = run(source).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::SyntaxError, "{source}");
+        }
+    }
+
+    #[test]
+    fn var_declarations_create_global_object_properties() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.run_script("var g = 1;").unwrap();
+        let global = agent.running_context().unwrap().realm.global_object.clone();
+        assert_eq!(
+            global.get(&JsString::from_utf8("g")).unwrap(),
+            Value::Number(1.0)
+        );
+        assert_eq!(
+            agent.run_script("globalThis.g").unwrap(),
+            Value::Number(1.0)
+        );
+    }
+
+    #[test]
+    fn lexical_declarations_do_not_create_global_object_properties() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.run_script("let g2 = 2;").unwrap();
+        let global = agent.running_context().unwrap().realm.global_object.clone();
+        assert!(!global.has_own_property(&JsString::from_utf8("g2")).unwrap());
+        assert_eq!(agent.run_script("globalThis.g2").unwrap(), Value::Undefined);
+        assert_eq!(agent.run_script("g2").unwrap(), Value::Number(2.0));
+    }
+
+    #[test]
+    fn sloppy_undeclared_assignment_creates_a_global_property() {
+        // A sloppy write to an undeclared name inside a function still
+        // creates a property on the global object (spec 9.2.1.5).
+        assert_eq!(
+            run("(function () { u = 1; })(); globalThis.u").unwrap(),
+            Value::Number(1.0)
+        );
+    }
+
+    #[test]
+    fn strict_undeclared_assignment_throws() {
+        let err = run("(function () { 'use strict'; v = 1; })()").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ReferenceError);
+    }
+
+    // ---- Phase 8 eval scoping matrix ----
+
+    #[test]
+    fn direct_eval_sees_the_callers_local_vars() {
+        assert_eq!(
+            run("function f() { var x = 1; return eval('x'); } f()").unwrap(),
+            Value::Number(1.0)
+        );
+    }
+
+    #[test]
+    fn direct_eval_declares_vars_in_the_callers_scope() {
+        assert_eq!(
+            run("function f() { eval('var y = 2;'); return y; } f()").unwrap(),
+            Value::Number(2.0)
+        );
+    }
+
+    #[test]
+    fn indirect_eval_runs_in_global_scope() {
+        // An indirect eval's vars land on the global object, visible to the
+        // surrounding script afterwards.
+        assert_eq!(
+            run("(0, eval)('var z = 1;'); typeof z").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("number")))
+        );
+    }
+
+    #[test]
+    fn indirect_eval_does_not_see_caller_locals() {
+        let err = run("function f() { var x = 1; return (0, eval)('x'); } f()").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ReferenceError);
+    }
+
+    #[test]
+    fn strict_eval_gets_its_own_variable_scope() {
+        // A strict caller makes direct eval strict, so eval-declared vars
+        // stay inside the eval's own environment (spec 19.2.1.1).
+        assert_eq!(
+            run("'use strict'; function f() { eval('var w = 1;'); return typeof w; } f()").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("undefined")))
+        );
+        // A "use strict" directive inside the eval'd source has the same
+        // effect even when the caller is sloppy.
+        assert_eq!(
+            run("function f() { eval('\"use strict\"; var w = 1;'); return typeof w; } f()")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("undefined")))
+        );
+    }
+
+    #[test]
+    fn eval_returns_its_completion_value() {
+        assert_eq!(run("eval('1 + 2')").unwrap(), Value::Number(3.0));
+        assert_eq!(run("eval('let e = 6; e + 1')").unwrap(), Value::Number(7.0));
+    }
+
+    // ---- Phase 4 block scoping ----
+
+    #[test]
+    fn block_let_shadows_outer_scope() {
+        assert_eq!(
+            run("let x = 1; { let x = 2; x }").unwrap(),
+            Value::Number(2.0)
+        );
+        assert_eq!(
+            run("let x = 1; { let x = 2; } x").unwrap(),
+            Value::Number(1.0)
+        );
+    }
+
+    #[test]
+    fn for_let_creates_per_iteration_bindings() {
+        // Each iteration gets a fresh `i`; closures capture the per-iteration
+        // binding instead of the loop's final value (spec 14.7.4.3).
+        assert_eq!(
+            run("let fns = []; for (let i = 0; i < 3; i++) { fns.push(() => i); } fns[0]() + fns[1]() + fns[2]()")
+                .unwrap(),
+            Value::Number(3.0)
+        );
+        // A var-headed loop shares one binding, so every closure sees the
+        // final value.
+        assert_eq!(
+            run("let fns = []; for (var i = 0; i < 3; i++) { fns.push(() => i); } fns[0]() + fns[1]() + fns[2]()")
+                .unwrap(),
+            Value::Number(9.0)
+        );
+    }
+
+    #[test]
+    fn for_let_head_is_lexical_not_a_global_var() {
+        // A `let`-headed for loop must not create a global binding (the
+        // var-scoped-declaration collector previously treated every for-head
+        // declarator as `var`).
+        assert_eq!(run("'i' in globalThis").unwrap(), Value::Boolean(false));
+        // The initializer self-reference hits the loop binding's TDZ instead
+        // of resolving to a hoisted global var.
+        assert!(matches!(
+            run("for (let x = x; ; ) { break; }"),
+            Err(error) if error.kind == crux::ErrorKind::ReferenceError
+        ));
+        // A `var`-headed loop still creates a global binding.
+        assert_eq!(
+            run("for (var y = 1; ; ) { break; } 'y' in globalThis").unwrap(),
+            Value::Boolean(true)
+        );
+        // for-of/for-in `let` heads are lexical too.
+        assert_eq!(
+            run("for (let z of [1]) {} 'z' in globalThis").unwrap(),
+            Value::Boolean(false)
+        );
+    }
 }

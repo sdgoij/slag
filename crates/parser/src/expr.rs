@@ -1438,13 +1438,31 @@ fn expr_to_pattern(parser: &mut Parser, expr: Expr) -> Result<BindingPattern, Js
         ExprKind::Ident(name) => Ok(BindingPattern::Ident(name)),
         ExprKind::Array(lit) => {
             let mut elements = Vec::new();
+            let mut seen_rest = false;
             for el in lit.elements {
                 match el {
-                    ArrayElement::Hole => elements.push(ArrayBindingElement::Hole),
-                    ArrayElement::Expr(e) => elements.push(ArrayBindingElement::Element(
-                        expr_to_binding_element(parser, e)?,
-                    )),
+                    ArrayElement::Hole => {
+                        if seen_rest {
+                            return Err(
+                                parser.error_at(expr.span.start, "Rest element must be last")
+                            );
+                        }
+                        elements.push(ArrayBindingElement::Hole);
+                    }
+                    ArrayElement::Expr(e) => {
+                        if seen_rest {
+                            return Err(
+                                parser.error_at(expr.span.start, "Rest element must be last")
+                            );
+                        }
+                        elements.push(ArrayBindingElement::Element(expr_to_binding_element(
+                            parser, e,
+                        )?));
+                    }
                     ArrayElement::Spread(e) => {
+                        if seen_rest {
+                            return Err(parser.error_at(e.span.start, "Rest element must be last"));
+                        }
                         let span = e.span;
                         let pattern = expr_to_pattern(parser, e)?;
                         elements.push(ArrayBindingElement::Rest(BindingElement {
@@ -1453,6 +1471,7 @@ fn expr_to_pattern(parser: &mut Parser, expr: Expr) -> Result<BindingPattern, Js
                             rest: false,
                             span,
                         }));
+                        seen_rest = true;
                     }
                 }
             }

@@ -1723,6 +1723,15 @@ fn element_bytes(slots: &TypedArraySlots, index: f64) -> Result<Vec<u8>, JsError
         })
 }
 
+/// The TypeError for accessing a view whose buffer has been detached
+/// (spec 10.4.5.2 step 2 and the other Integer-Indexed methods).
+fn detached_typed_array_error() -> JsError {
+    JsError::new(
+        ErrorKind::TypeError,
+        "Cannot access a detached ArrayBuffer".into(),
+    )
+}
+
 /// TypedArray [[GetOwnProperty]] (spec 10.4.5.3): an in-bounds canonical
 /// index produces a writable/enumerable/configurable data property backed
 /// by the buffer; other canonical numeric strings produce no property.
@@ -1732,6 +1741,9 @@ fn typed_array_get_own_property(
     key: &PropertyKey,
 ) -> Result<Option<Property>, JsError> {
     if let Some(index) = canonical_index(key) {
+        if slots.buffer.is_detached() {
+            return Err(detached_typed_array_error());
+        }
         if typed_array_valid_index(slots, index) {
             let bytes = element_bytes(slots, index)?;
             let value = crate::typed_array::decode_element(slots.element_type, &bytes, 0)?;
@@ -1752,6 +1764,9 @@ fn typed_array_define_own_property(
     desc: &PropertyDescriptor,
 ) -> Result<bool, JsError> {
     if let Some(index) = canonical_index(key) {
+        if slots.buffer.is_detached() {
+            return Err(detached_typed_array_error());
+        }
         if !typed_array_valid_index(slots, index) {
             return Ok(false);
         }
@@ -1796,6 +1811,9 @@ fn typed_array_get(
     receiver: Value,
 ) -> Result<Value, JsError> {
     if let Some(index) = canonical_index(key) {
+        if slots.buffer.is_detached() {
+            return Err(detached_typed_array_error());
+        }
         if typed_array_valid_index(slots, index) {
             let bytes = element_bytes(slots, index)?;
             return crate::typed_array::decode_element(slots.element_type, &bytes, 0);
@@ -1816,6 +1834,9 @@ fn typed_array_set(
     receiver: Value,
 ) -> Result<bool, JsError> {
     if let Some(index) = canonical_index(key) {
+        if slots.buffer.is_detached() {
+            return Err(detached_typed_array_error());
+        }
         if same_value(&receiver, &obj.self_value()) {
             if !typed_array_valid_index(slots, index) {
                 return Ok(true);

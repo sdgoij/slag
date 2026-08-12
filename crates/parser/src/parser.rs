@@ -6,8 +6,8 @@ use std::collections::HashSet;
 use crux::{AtomId, JsError, Span, intern_utf8};
 use syntax::keywords::{Keyword, from_identifier, is_future_reserved_word};
 use syntax::{
-    ArrayBindingElement, AssignOp, BindingElement, BindingPattern, Expr, ExprKind,
-    ObjectBindingProperty, PropertyName, Token, TokenKind,
+    ArrayBindingElement, ArrayElement, AssignOp, BindingElement, BindingPattern, Expr, ExprKind,
+    ObjectBindingProperty, ObjectProperty, PropertyName, Token, TokenKind,
 };
 
 use crate::token_stream::{TokenStream, can_end_expression};
@@ -49,6 +49,10 @@ pub(crate) struct Scope {
     pub(crate) params: HashSet<AtomId>,
     /// True for the scope of a function body: `var` names do not escape it.
     pub(crate) is_function: bool,
+    /// True for the scope of a catch block: the catch parameter is a lexical
+    /// binding there, but it does not conflict with `var` declarations in the
+    /// catch body (the spec's var-rule was relaxed).
+    pub(crate) is_catch: bool,
 }
 
 pub struct Parser<'s> {
@@ -344,11 +348,27 @@ impl<'s> Parser<'s> {
         Ok(())
     }
 
+    /// Declares a catch-parameter name: duplicates inside the pattern are
+    /// early errors, but the parameter lives in its own scope and does not
+    /// clash with `var` names in the enclosing statement list (spec 15.1.8).
+    pub(crate) fn declare_catch_param(&mut self, name: AtomId, start: u32) -> Result<(), JsError> {
+        let scope = self.scopes.last_mut().unwrap();
+        if scope.lexical.contains(&name) || scope.params.contains(&name) {
+            return Err(self.error_at(start, "Identifier has already been declared"));
+        }
+        scope.lexical.insert(name);
+        Ok(())
+    }
+
     /// Declares a `var` name: it may repeat, but must not clash with a
     /// `let`/`const`/`class` name in any enclosing scope up to the function
-    /// boundary. Function-declared names coexist with `var`.
+    /// boundary. Function-declared names coexist with `var`; catch-parameter
+    /// names are skipped (a `var` in the catch body may share the name).
     pub(crate) fn declare_var(&mut self, name: AtomId, start: u32) -> Result<(), JsError> {
         for scope in self.scopes.iter().rev() {
+            if scope.is_catch {
+                continue;
+            }
             if scope.lexical.contains(&name) && !scope.functions.contains(&name) {
                 return Err(self.error_at(start, "Identifier has already been declared"));
             }
@@ -417,9 +437,77 @@ impl<'s> Parser<'s> {
                 }
                 Ok(())
             }
-            ExprKind::Array(_) | ExprKind::Object(_) if allow_pattern => Ok(()),
+            ExprKind::Array(_) | ExprKind::Object(_) if allow_pattern => {
+                self.check_rest_position(expr)
+            }
             _ => Err(self.error_at(expr.span.start, "Invalid assignment target")),
         }
+    }
+
+    /// The assignment-pattern rest rule (spec 13.15.1/13.2.2): in an array or
+    /// object assignment target, no element may follow a spread element. This
+    /// only inspects the target's own structure; default-value expressions
+    /// inside are not patterns.
+    fn check_rest_position(&mut self, expr: &Expr) -> Result<(), JsError> {
+        let mut seen_rest = false;
+        match &expr.kind {
+            ExprKind::Array(lit) => {
+                for el in &lit.elements {
+                    match el {
+                        ArrayElement::Hole => {
+                            if seen_rest {
+                                return Err(
+                                    self.error_at(expr.span.start, "Rest element must be last")
+                                );
+                            }
+                        }
+                        ArrayElement::Expr(e) => {
+                            if seen_rest {
+                                return Err(
+                                    self.error_at(expr.span.start, "Rest element must be last")
+                                );
+                            }
+                            self.check_rest_position(e)?;
+                        }
+                        ArrayElement::Spread(e) => {
+                            if seen_rest {
+                                return Err(
+                                    self.error_at(e.span.start, "Rest element must be last")
+                                );
+                            }
+                            self.check_rest_position(e)?;
+                            seen_rest = true;
+                        }
+                    }
+                }
+            }
+            ExprKind::Object(lit) => {
+                for prop in &lit.props {
+                    match prop {
+                        ObjectProperty::Init { value, .. } => {
+                            if seen_rest {
+                                return Err(
+                                    self.error_at(value.span.start, "Rest element must be last")
+                                );
+                            }
+                            self.check_rest_position(value)?;
+                        }
+                        ObjectProperty::Spread(e) => {
+                            if seen_rest {
+                                return Err(
+                                    self.error_at(e.span.start, "Rest element must be last")
+                                );
+                            }
+                            self.check_rest_position(e)?;
+                            seen_rest = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     // ---- identifiers and binding patterns ----

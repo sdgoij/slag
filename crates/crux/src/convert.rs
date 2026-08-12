@@ -124,7 +124,49 @@ fn string_numeric_literal(text: &JsString) -> f64 {
     }
     decimal_literal(body)
         .or_else(|| hex_literal(body))
+        .or_else(|| binary_literal(body))
+        .or_else(|| octal_literal(body))
         .unwrap_or(f64::NAN)
+}
+
+/// A StrBinaryIntegerLiteral covering the whole slice (spec 7.1.4.1), or
+/// None. A leading sign is not part of the literal (as with hex).
+fn binary_literal(body: &[u16]) -> Option<f64> {
+    if body.len() < 3 || body[0] != b'0' as u16 {
+        return None;
+    }
+    if body[1] != b'b' as u16 && body[1] != b'B' as u16 {
+        return None;
+    }
+    let mut value = 0.0;
+    for &unit in &body[2..] {
+        value = match unit {
+            0x30 => value * 2.0,
+            0x31 => value * 2.0 + 1.0,
+            _ => return None,
+        };
+    }
+    Some(value)
+}
+
+/// A StrOctalIntegerLiteral covering the whole slice (spec 7.1.4.1), or
+/// None.
+fn octal_literal(body: &[u16]) -> Option<f64> {
+    if body.len() < 3 || body[0] != b'0' as u16 {
+        return None;
+    }
+    if body[1] != b'o' as u16 && body[1] != b'O' as u16 {
+        return None;
+    }
+    let mut value = 0.0;
+    for &unit in &body[2..] {
+        let digit = match unit {
+            0x30..=0x37 => unit - 0x30,
+            _ => return None,
+        };
+        value = value * 8.0 + digit as f64;
+    }
+    Some(value)
 }
 
 /// spec 7.1.18 StringToBigInt: the BigInt of a StringIntegerLiteral, or None
@@ -656,8 +698,15 @@ mod tests {
         assert_eq!(to_number(&str("  -12.5  ")).unwrap(), -12.5);
         assert_eq!(to_number(&str("Infinity")).unwrap(), f64::INFINITY);
         assert!(to_number(&str("-0x10")).unwrap().is_nan());
-        assert!(to_number(&str("0b10")).unwrap().is_nan());
-        assert!(to_number(&str("0o10")).unwrap().is_nan());
+        assert_eq!(to_number(&str("0b10")).unwrap(), 2.0);
+        assert_eq!(to_number(&str("0o10")).unwrap(), 8.0);
+        assert_eq!(to_number(&str("0B11")).unwrap(), 3.0);
+        assert_eq!(to_number(&str("0O17")).unwrap(), 15.0);
+        assert!(to_number(&str("-0b10")).unwrap().is_nan());
+        assert!(to_number(&str("0b2")).unwrap().is_nan());
+        assert!(to_number(&str("0o8")).unwrap().is_nan());
+        assert!(to_number(&str("0b")).unwrap().is_nan());
+        assert!(to_number(&str("0o")).unwrap().is_nan());
         assert!(to_number(&str("abc")).unwrap().is_nan());
         assert!(to_number(&str("10e")).unwrap().is_nan());
         assert!(to_number(&str("0x")).unwrap().is_nan());

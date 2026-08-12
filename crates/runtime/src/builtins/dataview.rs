@@ -536,3 +536,182 @@ pub fn dispatch_construct(
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::Agent;
+
+    fn run(source: &str) -> Result<Value, JsError> {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm()?;
+        agent.run_script(source)
+    }
+
+    fn number(source: &str) -> f64 {
+        match run(source).unwrap() {
+            Value::Number(n) => n,
+            other => panic!("expected a number, got {other:?}"),
+        }
+    }
+
+    fn bool(source: &str) -> bool {
+        match run(source).unwrap() {
+            Value::Boolean(b) => b,
+            other => panic!("expected a boolean, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn construction_and_lengths() {
+        assert_eq!(number("new DataView(new ArrayBuffer(8)).byteLength"), 8.0);
+        assert_eq!(
+            number("new DataView(new ArrayBuffer(8), 4).byteLength"),
+            4.0
+        );
+        assert_eq!(
+            number("new DataView(new ArrayBuffer(8), 4, 2).byteLength"),
+            2.0
+        );
+        assert_eq!(
+            number("new DataView(new ArrayBuffer(8), 4).byteOffset"),
+            4.0
+        );
+        // Out-of-range offsets and lengths are RangeErrors.
+        assert!(matches!(
+            run("new DataView(new ArrayBuffer(4), 5)"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+        assert!(matches!(
+            run("new DataView(new ArrayBuffer(4), 2, 3)"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+        assert!(matches!(
+            run("new DataView(new ArrayBuffer(4), -1)"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+        // The first argument must be a buffer object.
+        assert!(matches!(
+            run("new DataView(123)"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+        assert!(matches!(
+            run("DataView(new ArrayBuffer(8))"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+    }
+
+    #[test]
+    fn accessors_reflect_constructor_args() {
+        assert!(bool(
+            "(function(){ var b = new ArrayBuffer(8); var dv = new DataView(b, 4, 2); return dv.buffer === b; })()"
+        ));
+        assert_eq!(
+            number("new DataView(new ArrayBuffer(8), 4, 2).byteOffset"),
+            4.0
+        );
+        assert_eq!(
+            number("new DataView(new ArrayBuffer(8), 4, 2).byteLength"),
+            2.0
+        );
+    }
+
+    #[test]
+    fn integer_round_trips() {
+        assert!(bool(
+            "(function(){ var dv = new DataView(new ArrayBuffer(16)); dv.setInt8(0, -5); dv.setUint8(1, 200); dv.setInt16(2, -300); dv.setUint16(4, 60000); dv.setInt32(8, 0x12345678); dv.setUint32(12, 0xDEADBEEF); return dv.getInt8(0) === -5 && dv.getUint8(1) === 200 && dv.getInt16(2) === -300 && dv.getUint16(4) === 60000 && dv.getInt32(8) === 0x12345678 && dv.getUint32(12) === 0xDEADBEEF; })()"
+        ));
+    }
+
+    #[test]
+    fn float_round_trips() {
+        assert_eq!(
+            number(
+                "(function(){ var dv = new DataView(new ArrayBuffer(8)); dv.setFloat64(0, Math.PI); return dv.getFloat64(0); })()"
+            ),
+            std::f64::consts::PI
+        );
+        assert_eq!(
+            number(
+                "(function(){ var dv = new DataView(new ArrayBuffer(8)); dv.setFloat32(0, 1.5); return dv.getFloat32(0); })()"
+            ),
+            1.5
+        );
+    }
+
+    #[test]
+    fn bigint_round_trips() {
+        assert!(bool(
+            "(function(){ var dv = new DataView(new ArrayBuffer(16)); dv.setBigInt64(0, 0x1122334455667788n); dv.setBigUint64(8, 0xFFFFFFFFFFFFFFFFn); return dv.getBigInt64(0) === 0x1122334455667788n && dv.getBigUint64(8) === 0xFFFFFFFFFFFFFFFFn; })()"
+        ));
+    }
+
+    #[test]
+    fn element_bounds_checks() {
+        assert!(matches!(
+            run("(function(){ var dv = new DataView(new ArrayBuffer(8)); dv.getInt8(8); })()"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+        assert!(matches!(
+            run("(function(){ var dv = new DataView(new ArrayBuffer(8)); dv.setInt8(-1, 1); })()"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+        // A Uint16 needs 2 bytes: offset 7 leaves only 1 in an 8-byte view.
+        assert!(matches!(
+            run("(function(){ var dv = new DataView(new ArrayBuffer(8)); dv.setUint16(7, 1); })()"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+    }
+
+    #[test]
+    fn little_endian_flag() {
+        // Big-endian default write, little-endian read: bytes swap.
+        assert_eq!(
+            number(
+                "(function(){ var dv = new DataView(new ArrayBuffer(2)); dv.setUint16(0, 0x0102); return dv.getUint16(0, true); })()"
+            ),
+            513.0
+        );
+        // Little-endian write, big-endian (default) read: bytes swap.
+        assert_eq!(
+            number(
+                "(function(){ var dv = new DataView(new ArrayBuffer(2)); dv.setUint16(0, 0x0102, true); return dv.getUint16(0); })()"
+            ),
+            513.0
+        );
+        assert_eq!(
+            number(
+                "(function(){ var dv = new DataView(new ArrayBuffer(2)); dv.setUint16(0, 0x0102, true); return dv.getUint16(0, true); })()"
+            ),
+            258.0
+        );
+    }
+
+    #[test]
+    fn unaligned_access_is_allowed() {
+        // DataView has no alignment requirement: an Int32 at byte offset 1
+        // of the buffer works.
+        assert_eq!(
+            number(
+                "(function(){ var dv = new DataView(new ArrayBuffer(8), 1); dv.setInt32(0, 0x12345678); return dv.getInt32(0); })()"
+            ),
+            305419896.0
+        );
+    }
+
+    #[test]
+    fn detached_buffer_access_throws() {
+        assert!(matches!(
+            run("(function(){ var b = new ArrayBuffer(8); var dv = new DataView(b); b.transfer(); dv.getInt8(0); })()"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+        assert!(matches!(
+            run("(function(){ var b = new ArrayBuffer(8); var dv = new DataView(b, 4); b.transfer(); dv.setInt32(0, 1); })()"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+        assert!(matches!(
+            run("(function(){ var b = new ArrayBuffer(8); b.transfer(); new DataView(b); })()"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+    }
+}

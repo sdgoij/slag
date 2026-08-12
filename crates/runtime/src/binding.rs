@@ -296,3 +296,59 @@ pub fn copy_data_properties_excluding(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::evaluate;
+
+    #[test]
+    fn var_bindings_put_through_resolution() {
+        // `var`-style binding initialization resolves the hoisted binding and
+        // PutValues the initializer (spec 13.2.3.4 note) — patterns land on
+        // the pre-created binding.
+        assert_eq!(
+            evaluate("var [a, b] = [1, 2]; a + b").unwrap(),
+            Value::Number(3.0)
+        );
+        assert_eq!(
+            evaluate("var { p, q } = { p: 5, q: 6 }; p + q").unwrap(),
+            Value::Number(11.0)
+        );
+    }
+
+    #[test]
+    fn lexical_bindings_initialize_in_place() {
+        // Lexical declarations pass the pre-created environment; the binding
+        // is filled with InitializeBinding (spec 13.2.3.4 step 2).
+        assert_eq!(evaluate("let [x] = [7]; x").unwrap(), Value::Number(7.0));
+        assert_eq!(
+            evaluate("const { y } = { y: 9 }; y").unwrap(),
+            Value::Number(9.0)
+        );
+    }
+
+    #[test]
+    fn rest_binding_excludes_bound_names() {
+        assert_eq!(
+            evaluate("let { a, ...rest } = { a: 1, b: 2, c: 3 }; rest.b + rest.c").unwrap(),
+            Value::Number(5.0)
+        );
+        assert_eq!(
+            evaluate("let [first, ...tail] = [1, 2, 3, 4]; tail.length").unwrap(),
+            Value::Number(3.0)
+        );
+    }
+
+    #[test]
+    fn binding_patterns_respect_tdz() {
+        // The pattern's value is evaluated before the binding initializes, so
+        // a self-referencing element hits the TDZ.
+        let err = evaluate("let [x] = [y]; let y = 1;").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ReferenceError);
+        // A default initializer for an element of the same binding runs while
+        // the binding is still uninitialized.
+        let err = evaluate("let { a = a } = {};").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ReferenceError);
+    }
+}

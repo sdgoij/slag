@@ -1007,4 +1007,42 @@ mod tests {
         assert!(sum(&[f64::INFINITY, f64::NEG_INFINITY]).is_nan());
         assert_eq!(sum(&[f64::INFINITY, 1.0]), f64::INFINITY);
     }
+
+    #[test]
+    fn sqrt_pow_and_roots() {
+        assert!(is_nan(number("Math.sqrt(-1)")));
+        assert_eq!(number("Math.sqrt(0)"), 0.0);
+        assert_eq!(number("1 / Math.sqrt(-0)"), f64::NEG_INFINITY);
+        assert_eq!(number("Math.pow(0, 0)"), 1.0);
+        assert!(is_nan(number("Math.pow(-1, 0.5)")));
+        assert!(is_nan(number("Math.pow(-8, 1 / 3)")));
+        assert_eq!(number("Math.cbrt(-27)"), -3.0);
+    }
+
+    #[test]
+    fn log_exp_and_trig() {
+        assert!(is_nan(number("Math.log(-1)")));
+        assert_eq!(number("Math.log(1)"), 0.0);
+        assert_eq!(number("Math.log2(8)"), 3.0);
+        assert_eq!(number("Math.log10(1000)"), 3.0);
+        assert_eq!(number("Math.exp(0)"), 1.0);
+        assert_eq!(number("Math.exp(1)"), std::f64::consts::E);
+        assert_eq!(number("Math.sin(0)"), 0.0);
+        assert_eq!(number("Math.cos(0)"), 1.0);
+        assert_eq!(number("Math.tan(0)"), 0.0);
+    }
+
+    #[test]
+    fn round_floor_ceil_and_abs_signed_zero() {
+        assert_eq!(number("Math.round(2.5)"), 3.0);
+        assert_eq!(number("Math.floor(-0.5)"), -1.0);
+        assert_eq!(number("1 / Math.ceil(-0.5)"), f64::NEG_INFINITY);
+        assert_eq!(number("1 / Math.abs(-0)"), f64::INFINITY);
+        assert!(is_nan(number("Math.sign(NaN)")));
+    }
+
+    #[test]
+    fn hypot_prefers_infinity_over_nan() {
+        assert_eq!(number("Math.hypot(Infinity, NaN)"), f64::INFINITY);
+    }
 }

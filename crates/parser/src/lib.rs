@@ -1296,6 +1296,35 @@ mod tests {
     }
 
     #[test]
+    fn rest_element_must_be_last_in_assignment_targets() {
+        // Assignment patterns, arrow parameters, and for-of heads (spec
+        // 13.15.1/13.2.2 early errors).
+        err("[...a, b] = c");
+        err("[a, ...b, c] = d");
+        err("({...a, b} = o)");
+        err("({...a, b = 1} = o)");
+        err("([...a, b]) => x");
+        err("for ([...a, b] of x) {}");
+        ok("[a, ...b] = c");
+        ok("({...a} = o)");
+    }
+
+    #[test]
+    fn catch_parameter_redeclaration_rules() {
+        // spec 15.1.8: CatchParameter names clash with the block's
+        // LexicallyDeclaredNames (let/class/function), but the var rule was
+        // relaxed — `var` in the catch body and outer vars may share the name.
+        ok("try {} catch (e) { var e; }");
+        ok("var e; try {} catch (e) {}");
+        ok("try {} catch (e) { var e; } var e;");
+        err("try {} catch (e) { let e; }");
+        err("try {} catch (e) { const e = 1; }");
+        err("try {} catch (e) { function e() {} }");
+        err("try {} catch (e) { { let e; } }");
+        err("try {} catch ([x, x]) {}");
+    }
+
+    #[test]
     fn parses_using_declarations() {
         // Statement forms, with required initializers.
         assert!(matches!(
@@ -1413,5 +1442,298 @@ mod tests {
         // Invalid bodies and parameter lists are syntax errors.
         assert!(parse_function("function f(a b) {}").is_err());
         assert!(parse_function("function f() { {").is_err());
+    }
+
+    #[test]
+    fn asi_statement_matrix() {
+        // ASI separates two lexical declarations and two assignments.
+        let program = ok("let a = 1\nlet b = 2");
+        assert_eq!(program.body.len(), 2);
+        assert!(program.body.iter().all(|s| matches!(
+            s.kind,
+            StmtKind::VarDecl {
+                kind: VarDeclKind::Let,
+                ..
+            }
+        )));
+        let program = ok("a = 1\nb = 2");
+        assert_eq!(program.body.len(), 2);
+        assert!(
+            program
+                .body
+                .iter()
+                .all(|s| matches!(s.kind, StmtKind::Expr(_)))
+        );
+
+        // `return` never takes an argument across a line terminator.
+        let program = ok("function f() { return\nx; }");
+        let StmtKind::FunctionDecl(f) = &program.body[0].kind else {
+            panic!("expected function declaration")
+        };
+        assert!(matches!(f.body.stmts[0].kind, StmtKind::Return(None)));
+        assert!(matches!(f.body.stmts[1].kind, StmtKind::Expr(_)));
+
+        // `break` cannot take a label across a line terminator: the label
+        // line becomes its own expression statement.
+        let program = ok("label: for (;;) { break\nlabel; }");
+        let StmtKind::Labeled { body, .. } = &program.body[0].kind else {
+            panic!("expected labeled statement")
+        };
+        let StmtKind::For {
+            body: loop_body, ..
+        } = &body.kind
+        else {
+            panic!("expected for statement")
+        };
+        let StmtKind::Block(block) = &loop_body.kind else {
+            panic!("expected block")
+        };
+        assert_eq!(block.stmts.len(), 2);
+        assert!(matches!(block.stmts[0].kind, StmtKind::Break(None)));
+        assert!(matches!(block.stmts[1].kind, StmtKind::Expr(_)));
+
+        // Restricted postfix `++`: `a` and `++b` are separate statements.
+        let program = ok("a\n++b");
+        assert_eq!(program.body.len(), 2);
+        assert!(matches!(
+            program.body[1].kind,
+            StmtKind::Expr(Expr {
+                kind: ExprKind::Update { prefix: true, .. },
+                ..
+            })
+        ));
+
+        // A `(` on the next line continues the call: `x = y(a + b)`.
+        let expr = expr_stmt("x = y\n(a + b)");
+        let ExprKind::Assign { op, value, .. } = expr.kind else {
+            panic!("expected assignment")
+        };
+        assert_eq!(op, syntax::AssignOp::Assign);
+        assert!(matches!(
+            value.kind,
+            ExprKind::Call(c) if matches!(c.callee.kind, ExprKind::Ident(_))
+        ));
+
+        // `else` always binds to the nearest preceding `if` (no ASI before
+        // else).
+        let s = stmt("if (a) b\nelse c");
+        assert!(matches!(
+            s.kind,
+            StmtKind::If {
+                alternate: Some(_),
+                ..
+            }
+        ));
+
+        // A do-while ends at its `)`: the next line is a fresh statement.
+        let program = ok("do {} while (a)\nb");
+        assert_eq!(program.body.len(), 2);
+        assert!(matches!(program.body[0].kind, StmtKind::DoWhile { .. }));
+        assert!(matches!(program.body[1].kind, StmtKind::Expr(_)));
+    }
+
+    #[test]
+    fn destructuring_assignment_edge_cases() {
+        // `({a = f()} = {})` — a shorthand default inside an assignment
+        // pattern target.
+        let expr = expr_stmt("({a = f()} = {})");
+        let ExprKind::Paren(inner) = expr.kind else {
+            panic!("expected parenthesized assignment")
+        };
+        let ExprKind::Assign { op, target, .. } = inner.kind else {
+            panic!("expected assignment")
+        };
+        assert_eq!(op, syntax::AssignOp::Assign);
+        assert!(matches!(target.kind, ExprKind::Object(_)));
+
+        // Array and object assignment patterns: defaults, nesting, rest.
+        ok("[a, b = c] = d");
+        ok("({x: {y} = {}} = o)");
+        ok("[a, ...rest] = arr");
+        ok("({a, ...rest} = o)");
+
+        // The same cover form is an arrow parameter or an object-literal
+        // expression depending on what follows.
+        assert!(matches!(
+            expr_stmt("({a}) => a").kind,
+            ExprKind::Arrow { .. }
+        ));
+        assert!(matches!(
+            expr_stmt("({a})").kind,
+            ExprKind::Paren(inner) if matches!(inner.kind, ExprKind::Object(_))
+        ));
+    }
+
+    #[test]
+    fn exponentiation_precedence_and_restrictions() {
+        // `**` is right-associative: 2 ** (3 ** 2).
+        let (op, _, right) = binary("2 ** 3 ** 2");
+        assert_eq!(op, BinaryOp::Exp);
+        assert!(matches!(
+            right.kind,
+            ExprKind::Binary {
+                op: BinaryOp::Exp,
+                ..
+            }
+        ));
+
+        // A unary expression on the left of `**` is an early error, but the
+        // same unary on the right (or parenthesized) is fine.
+        err("-2 ** 2");
+        ok("(-2) ** 2");
+        let (op, _, right) = binary("2 ** -2");
+        assert_eq!(op, BinaryOp::Exp);
+        assert!(matches!(
+            right.kind,
+            ExprKind::Unary {
+                op: UnaryOp::Minus,
+                ..
+            }
+        ));
+
+        // `**` binds tighter than `*`: 2 ** 3 * 4 = (2 ** 3) * 4.
+        let (op, left, _) = binary("2 ** 3 * 4");
+        assert_eq!(op, BinaryOp::Mul);
+        assert!(matches!(
+            left.kind,
+            ExprKind::Binary {
+                op: BinaryOp::Exp,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn cover_grammar_arrow_disambiguation() {
+        // Parenthesized, defaulted, and rest arrow parameters.
+        ok("(a, b) => a + b");
+        ok("(a = 1) => a");
+        ok("(a, ...b) => a");
+        ok("(a, b, ...c) => d");
+        assert!(matches!(
+            expr_stmt("async (a) => a").kind,
+            ExprKind::Arrow { is_async: true, .. }
+        ));
+
+        // Without `=>` the same parentheses are a sequence expression...
+        let expr = expr_stmt("(a, b)");
+        assert!(matches!(
+            expr.kind,
+            ExprKind::Paren(inner) if matches!(inner.kind, ExprKind::Sequence(_))
+        ));
+        // ...but a spread list has no expression reading.
+        err("(a, b, ...c)");
+
+        // `({a: 1})` is an object literal; `{a: 1}` is a labeled block.
+        assert!(matches!(
+            expr_stmt("({a: 1})").kind,
+            ExprKind::Paren(inner) if matches!(inner.kind, ExprKind::Object(_))
+        ));
+        assert!(matches!(stmt("{a: 1}").kind, StmtKind::Block(_)));
+
+        // Literal covers cannot become arrow parameters.
+        err("(0, 0) => 0");
+    }
+
+    #[test]
+    fn early_error_syntax_matrix() {
+        // Duplicate parameters: sloppy simple lists only.
+        ok("function f(a, a) {}");
+        err("function f(a, a = 1) {}");
+
+        // Duplicate and conflicting lexical declarations; missing const init.
+        err("let a; let a;");
+        err("var a; let a;");
+        err("const a;");
+
+        // `let` and `yield` as binding names in strict/generator contexts.
+        err("'use strict'; function f(let) {}");
+        err("'use strict'; var yield = 1;");
+        err("function* g() { var yield; }");
+        ok("function f(yield) {}");
+        ok("var yield = 1;");
+
+        // Strict-mode `with`, bare `super`, return outside a function.
+        err("'use strict'; with (x) {}");
+        err("super;");
+        err("return;");
+
+        // break/continue must resolve to a label or an enclosing loop.
+        err("a: for (;;) { break b; }");
+        err("a: for (;;) { continue b; }");
+
+        // await is a plain identifier in scripts: `await 1` cannot parse.
+        ok("var await = 1;");
+        ok("await;");
+        err("await 1;");
+    }
+
+    #[test]
+    fn for_head_forms() {
+        // Classic for head with a lexical binding.
+        let s = stmt("for (let i = 0; i < 3; i++) {}");
+        assert!(matches!(
+            s.kind,
+            StmtKind::For {
+                init: Some(ForInit::VarDecl {
+                    kind: VarDeclKind::Let,
+                    ..
+                }),
+                ..
+            }
+        ));
+
+        // for-of heads: lexical, var, and expression bindings.
+        let s = stmt("for (const x of [1, 2]) {}");
+        assert!(matches!(
+            s.kind,
+            StmtKind::ForOf {
+                left: ForBinding::VarDecl {
+                    kind: VarDeclKind::Const,
+                    ..
+                },
+                ..
+            }
+        ));
+        let s = stmt("for (var x of [1, 2]) {}");
+        assert!(matches!(
+            s.kind,
+            StmtKind::ForOf {
+                left: ForBinding::VarDecl {
+                    kind: VarDeclKind::Var,
+                    ..
+                },
+                ..
+            }
+        ));
+        let s = stmt("for (x of [1]) {}");
+        assert!(matches!(
+            s.kind,
+            StmtKind::ForOf {
+                left: ForBinding::Expr(_),
+                ..
+            }
+        ));
+
+        // for-in head with a var binding.
+        let s = stmt("for (var x in { a: 1 }) {}");
+        assert!(matches!(
+            s.kind,
+            StmtKind::ForIn {
+                left: ForBinding::VarDecl {
+                    kind: VarDeclKind::Var,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        // Destructuring in expression-headed for-of.
+        ok("for ([a, b] of pairs) {}");
+        ok("for ({ x } of objs) {}");
+
+        // Annex B initializer is identifier-only var in sloppy code.
+        ok("for (var x = 1 in obj) {}");
+        err("for (var { x } = y in obj) {}");
     }
 }
