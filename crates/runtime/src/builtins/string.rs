@@ -1283,17 +1283,19 @@ fn get_substitution(
 /// IsRegExp (spec 7.2.9): an object with a [[RegExpMatcher]] slot or a
 /// truthy `@@match` property.
 pub(crate) fn is_regexp(agent: &mut Agent, value: &Value) -> Result<bool, JsError> {
-    if let Value::Object(obj) = value
-        && agent.regexp_data.contains_key(&obj.id())
-    {
-        return Ok(true);
-    }
     if !matches!(value, Value::Object(_) | Value::Function(_)) {
         return Ok(false);
     }
+    // spec IsRegExp: the @@match property takes precedence over the
+    // [[RegExpMatcher]] slot (an explicit false makes the object a non-Regexp).
     let key = PropertyKey::Symbol(crux::symbol::well_known("match").as_ref().clone());
     let matcher = get_property_key(agent, value, &key, value.clone())?;
     if matches!(matcher, Value::Undefined) {
+        if let Value::Object(obj) = value
+            && agent.regexp_data.contains_key(&obj.id())
+        {
+            return Ok(true);
+        }
         return Ok(false);
     }
     Ok(crux::convert::to_boolean(&matcher))

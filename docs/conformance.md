@@ -225,6 +225,51 @@ property-escapes` (165), `RegExp/prototype/Symbol.split` (43),
   `%Object.prototype%` (its proto was never wired after the intrinsic
   table populated), so `globalThis.toString` and friends resolve.
 
+### RegExp built-ins full-area sweep (Phase 18)
+
+A sweep of the entire RegExp built-ins tree (`sweep.exe built-ins --filter
+'RegExp/*'`) reports **1283 pass, 0 fail, 596 skip, 0 hang** of 1879
+fixtures: **every runnable RegExp fixture passes**, up from 1079 pass / 218
+fail at the start of the session. The 596 skips are the standard taxonomy
+(`regExpUtils.js` includes, module/async flags, `$262.createRealm`), not
+engine gaps. Per-cluster gains: `RegExp/S15.10.2*` (Sputnik) 239→291 pass,
+`lookBehind*` 3→17, `named-groups*` 12→35, `regexp-modifiers*` 19→45,
+`prototype/unicodeSets` 9→27, and the Symbol.species / match-indices /
+unicode-restricted / quantifier-edge stragglers all closed to 0 fail.
+
+The fixes:
+
+- **Variable-length lookbehind:** matching is direction-aware (`dir`
+  threaded through `match_node`/`match_sequence`/`repeat_loop`), so
+  lookbehind alternations and quantifiers match right-to-left with correct
+  capture bookkeeping.
+- **RepeatMatcher semantics:** backreferences to groups that did not
+  participate match the empty string; captures are cleared per iteration;
+  empty optional iterations are discarded (spec 22.2.2.5.1 step 2.b); the
+  quantifier count is capped at 2^53−1.
+- **Duplicate named groups:** `\k<name>` resolves to the last participating
+  group with that name (`Node::Backref { indices }`), and duplicate names
+  in the same alternative are a parse-time error.
+- **Parser early errors:** reversed character ranges throw SyntaxError;
+  forward backreferences are validated against a full-pattern pre-scan;
+  group names accept `\u` escapes and ID_Start/ID_Continue code points
+  (with surrogate-pair decoding); u-mode restricts `{ } ]` atoms,
+  quantified assertions, incomplete `\u`, and the identity-escape set; the
+  v-mode class-char and doubled-punctuator rules are enforced; `\W` vs
+  `\P{…}` case-folding order matches the spec.
+- **Runtime wiring:** `RegExp` is branded via `[[RegExpMatcher]]` (so
+  `Object.prototype.toString` yields `[object RegExp]` again);
+  `RegExp[Symbol.species]` is an accessor; the `d`-flag index array maps
+  unmatched groups to `undefined` and always carries `indices.groups`;
+  `IsRegExp` consults `@@match` before the internal slot; the Unicode
+  crate's case-folding tables gained the simple/common pairs (`017F→0073`,
+  `03C2→03C3`, `00B5→03BC`, `0345→03B9`, `1FD3→0390`, `1FE3→03B0`,
+  `FB05→FB06`).
+- **Lexer/parser:** identifiers accept astral ID_Start/ID_Continue code
+  points (surrogate-pair decode in `lex_identifier`/
+  `lex_private_identifier`); `for`-head declarations are bound in their
+  own lexical scope.
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~120 edge-case unit tests were added across
@@ -323,21 +368,21 @@ against the runnable pass-rate target:
 
 ## Full-suite sweep (post-hardening)
 
-`test262-sweep` over all three areas in a release build (48,622 fixtures, 8
+`test262-sweep` over all three areas in a release build (48,608 fixtures, 8
 jobs, 20s batch timeout): **0 crashes**; the only hangs are three known-slow
 TypedArray fixtures that pass with the long timeout (see below).
 
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,812 | 15,393 | 5,015 | 3,401 | 3¹ | 75.4% |
+| built-ins | 23,798 | 15,597 | 4,797 | 3,401 | 3¹ | 76.5% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,622** | **31,836** | **7,621** | **9,162** | **3** | **80.7%** |
+| **Total** | **48,608** | **32,040** | **7,403** | **9,162** | **3** | **81.2%** |
 
 (Runnable = pass + fail; the 9,162 skips are module/async fixtures and
 unsupported harness includes.) The built-ins row reflects the current
-`Error*`/`BigInt*` hardening; the language and annexB rows are from the
-sweep recorded below.
+`Error*`/`BigInt*`/RegExp hardening; the language and annexB rows are from
+the sweep recorded below.
 
 ¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
 coerced-values fixtures — 10,000-element allocations that need the long
@@ -362,7 +407,7 @@ resolved:
 - **Crashes** were debug-build stack overflows from deep recursion; a release
   build runs them cleanly.
 
-The 9,862 failures triage into:
+The 7,403 failures triage into:
 
 - **Missing built-ins (excluded from runnable):** Temporal (~3,100
   fixtures across `Temporal/*` — not implemented), ShadowRealm (47), and
@@ -398,7 +443,6 @@ The 9,862 failures triage into:
   - `String/prototype` (290), `Array/prototype` (187),
     `Object/defineProperty`+`defineProperties`+`getOwnPropertyDescriptor`
     (313)
-  - `RegExp/prototype` + `property-escapes` + `regexp-modifiers` (388)
   - `Iterator/prototype` (278), `DataView/prototype` (140)
   - `dynamic-import/syntax/valid` (137), class-element `delete` early
     errors (192), `eval-code/direct` (103), `identifiers` (58),
@@ -424,12 +468,12 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 
 ## Open items
 
-- Certify the ≥95%-of-runnable target: the sweep now measures 75.1%
-  (≈80% excluding the not-implemented Temporal/ShadowRealm built-ins) with
+- Certify the ≥95%-of-runnable target: the sweep now measures 81.2%
+  (≈88% excluding the not-implemented Temporal/ShadowRealm built-ins) with
   0 hangs and 0 crashes. The remaining gap is the systematic bug clusters
-  listed above — the destructuring and TypedArray-Integer-Indexed clusters
-  are done; fix the TypedArray prototype-method/auto-length, descriptor,
-  and RegExp clusters next, then re-run the sweep and record the delta.
+  listed above — the destructuring, TypedArray-Integer-Indexed, and RegExp
+  clusters are done; fix the TypedArray prototype-method/auto-length and
+  descriptor clusters next, then re-run the sweep and record the delta.
   Note: the TypedArray sweep should be run with a longer deadline
   (`--timeout 120 --recheck-timeout 90`) — the O(n²) property store makes
   the 10,000-element crash-test fixtures take ~45s, which the default 5s

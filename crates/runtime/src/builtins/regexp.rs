@@ -39,6 +39,7 @@ const REPLACE: &str = "%RegExp.prototype[@@replace]%";
 const SEARCH: &str = "%RegExp.prototype[@@search]%";
 const SPLIT: &str = "%RegExp.prototype[@@split]%";
 const ESCAPE: &str = "%RegExp.escape%";
+const SPECIES: &str = "%get RegExp[Symbol.species]%";
 const STRING_ITERATOR: &str = "%RegExpStringIteratorPrototype%";
 const STRING_ITERATOR_NEXT: &str = "%RegExpStringIteratorPrototype.next%";
 
@@ -309,32 +310,32 @@ fn regexp_builtin_exec(
         };
         array.create_data_property(&JsString::from_utf8(&i.to_string()), value)?;
     }
-    // `d` flag: the indices array with named groups.
+    // `d` flag: the indices array with named groups (spec MakeIndicesArray).
     if has_indices {
         let indices_obj =
             crate::builtins::array::array_create(agent, (capturing_groups + 1) as f64)?;
         for (i, capture) in result.iter().enumerate() {
             let pair = match capture {
                 Some((s, e)) => pair_array(agent, *s, *e)?,
-                None => pair_array(agent, usize::MAX, usize::MAX)?,
+                None => Value::Undefined,
             };
             indices_obj.create_data_property(&JsString::from_utf8(&i.to_string()), pair)?;
         }
-        if state.compiled.has_group_names {
+        let groups_indices = if state.compiled.has_group_names {
             let groups_indices = JsObject::ordinary_object_create(None);
             for name in &state.compiled.named_group_order {
                 let pair = match last_named_span(&state.compiled, &result, name) {
                     Some((s, e)) => pair_array(agent, s, e)?,
-                    None => pair_array(agent, usize::MAX, usize::MAX)?,
+                    None => Value::Undefined,
                 };
                 groups_indices
                     .create_data_property(&JsString::from_utf16(&to_utf16(name)), pair)?;
             }
-            indices_obj.create_data_property(
-                &JsString::from_utf8("groups"),
-                Value::Object(groups_indices),
-            )?;
-        }
+            Value::Object(groups_indices)
+        } else {
+            Value::Undefined
+        };
+        indices_obj.create_data_property(&JsString::from_utf8("groups"), groups_indices.clone())?;
         array.create_data_property(&JsString::from_utf8("indices"), Value::Object(indices_obj))?;
     }
     Ok(Some(Value::Object(array)))
@@ -1162,6 +1163,30 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         },
     )?;
 
+    // spec 22.2.4.5: get RegExp [ @@species ] — an accessor on the
+    // constructor returning `this` (the split/matchAll cloning consults it).
+    let species_func = Function::create_builtin(
+        Some(JsString::from_utf8("get [Symbol.species]")),
+        0,
+        placeholder("species"),
+        None,
+        None,
+    )?;
+    realm
+        .intrinsics
+        .define(SPECIES, Value::Function(species_func.clone()));
+    regexp_ctor.define_property_key(
+        &PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone()),
+        &PropertyDescriptor {
+            value: None,
+            writable: None,
+            get: Some(Value::Function(species_func)),
+            set: Some(Value::Undefined),
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
+    )?;
+
     // RegExp.escape (spec 22.2.4.3).
     let escape_func = Function::create_builtin(
         Some(JsString::from_utf8("escape")),
@@ -1286,18 +1311,8 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         )?;
     }
 
-    // %RegExp.prototype%[@@toStringTag] = "RegExp".
-    regexp_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
-        &PropertyDescriptor {
-            value: Some(Value::String(Handle::new(JsString::from_utf8("RegExp")))),
-            writable: Some(false),
-            get: None,
-            set: None,
-            enumerable: Some(false),
-            configurable: Some(true),
-        },
-    )?;
+    // The `@@toStringTag` of RegExp.prototype was removed from the spec
+    // (RegExp is branded via [[RegExpMatcher]] in Object.prototype.toString).
 
     // %RegExpStringIteratorPrototype% (spec 22.2.6.2).
     let iterator_proto = JsObject::ordinary_object_create(object_proto.clone());
@@ -1414,6 +1429,9 @@ pub fn dispatch_call(
     }
     if intrinsics.get(ESCAPE).as_ref() == Some(callee) {
         return Some(escape(agent, this, args));
+    }
+    if intrinsics.get(SPECIES).as_ref() == Some(callee) {
+        return Some(Ok(this.clone()));
     }
     if intrinsics.get(STRING_ITERATOR_NEXT).as_ref() == Some(callee) {
         return Some(string_iterator_next(agent, this, args));

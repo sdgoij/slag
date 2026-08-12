@@ -278,6 +278,10 @@ fn prototype_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsError
                 "Boolean".to_string()
             } else if agent.error_data.contains(&obj.id()) {
                 "Error".to_string()
+            } else if agent.regexp_data.contains_key(&obj.id()) {
+                // RegExp is branded via its [[RegExpMatcher]] slot (its
+                // @@toStringTag was removed from the spec).
+                "RegExp".to_string()
             } else {
                 // spec step 6.c: an own or inherited @@toStringTag string
                 // overrides the built-in tag.

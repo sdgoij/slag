@@ -174,6 +174,15 @@ impl<'s> Lexer<'s> {
         match u {
             0x24 | 0x5F | 0x5C => self.lex_identifier(),
             u if is_identifier_start(u as u32) => self.lex_identifier(),
+            // A high surrogate starts an identifier when it pairs with a low
+            // surrogate into an astral ID_Start code point.
+            u if (0xD800..=0xDBFF).contains(&u)
+                && self
+                    .peek_n(1)
+                    .is_some_and(|lo| is_identifier_start(code_point(u, lo))) =>
+            {
+                self.lex_identifier()
+            }
             0x23 => self.lex_private_identifier(),
             0x30..=0x39 => self.lex_numeric(),
             0x2E if self.peek_n(1).is_some_and(|x| (0x30..=0x39).contains(&x)) => {
@@ -218,14 +227,29 @@ impl<'s> Lexer<'s> {
                     return Err(self.error_at(start, "Invalid identifier escape"));
                 }
                 push_utf16(&mut units, cp);
-            } else if (first && is_identifier_start(u as u32))
-                || (!first && is_identifier_part(u as u32))
-            {
-                units.push(u);
-                self.pos += 1;
+                first = false;
+                continue;
+            }
+            // Astral characters are two code units; combine the pair so the
+            // ID_Start/ID_Continue check sees the code point.
+            let cp = if (0xD800..=0xDBFF).contains(&u) {
+                match self.peek_n(1) {
+                    Some(lo) if (0xDC00..=0xDFFF).contains(&lo) => code_point(u, lo),
+                    _ => u as u32,
+                }
             } else {
+                u as u32
+            };
+            let ok = if first {
+                is_identifier_start(cp)
+            } else {
+                is_identifier_part(cp)
+            };
+            if !ok {
                 break;
             }
+            push_utf16(&mut units, cp);
+            self.pos += if cp > 0xFFFF { 2 } else { 1 };
             first = false;
         }
         Ok(TokenKind::Identifier(intern(&units)))
@@ -248,14 +272,27 @@ impl<'s> Lexer<'s> {
                     return Err(self.error_at(start, "Invalid private identifier"));
                 }
                 push_utf16(&mut units, cp);
-            } else if (first && is_identifier_start(u as u32))
-                || (!first && is_identifier_part(u as u32))
-            {
-                units.push(u);
-                self.pos += 1;
+                first = false;
+                continue;
+            }
+            let cp = if (0xD800..=0xDBFF).contains(&u) {
+                match self.peek_n(1) {
+                    Some(lo) if (0xDC00..=0xDFFF).contains(&lo) => code_point(u, lo),
+                    _ => u as u32,
+                }
             } else {
+                u as u32
+            };
+            let ok = if first {
+                is_identifier_start(cp)
+            } else {
+                is_identifier_part(cp)
+            };
+            if !ok {
                 break;
             }
+            push_utf16(&mut units, cp);
+            self.pos += if cp > 0xFFFF { 2 } else { 1 };
             first = false;
         }
         if units.is_empty() {
@@ -573,6 +610,11 @@ fn push_utf16(out: &mut Vec<u16>, cp: u32) {
         out.push(0xD800 + (x >> 10) as u16);
         out.push(0xDC00 + (x & 0x3FF) as u16);
     }
+}
+
+/// Combine a surrogate pair into its code point.
+fn code_point(hi: u16, lo: u16) -> u32 {
+    0x10000 + ((hi as u32 - 0xD800) << 10) + (lo as u32 - 0xDC00)
 }
 
 fn is_hex_digit(u: u16) -> bool {

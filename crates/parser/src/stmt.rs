@@ -445,39 +445,25 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
     }
     parser.expect_punct(TokenKind::LeftParen)?;
 
-    let (init, init_empty) = if parser.eat_punct(TokenKind::Semicolon)? {
+    // A lexical (let/const/using) head declares in the loop's own scope: the
+    // names neither clash with the enclosing statement list nor contribute to
+    // it (spec ForIn/ForOfStatement LexicallyDeclaredNames excludes the head;
+    // a classic head's names do join the enclosing list, re-declared below).
+    let (head_kind, init_empty) = if parser.eat_punct(TokenKind::Semicolon)? {
         (None, true)
     } else if parser.at_keyword(Keyword::Var)? {
         let kind = VarDeclKind::Var;
         parser.next()?;
-        (
-            Some(ForInit::VarDecl {
-                kind,
-                decls: parse_for_declarators(parser, kind)?,
-            }),
-            false,
-        )
+        (Some(kind), false)
     } else if parser.at_keyword(Keyword::Const)? {
         let kind = VarDeclKind::Const;
         parser.next()?;
-        (
-            Some(ForInit::VarDecl {
-                kind,
-                decls: parse_for_declarators(parser, kind)?,
-            }),
-            false,
-        )
+        (Some(kind), false)
     } else if parser.at_contextual("let")? && is_let_declaration_start(parser.peek2()?.kind.clone())
     {
         let kind = VarDeclKind::Let;
         parser.next()?;
-        (
-            Some(ForInit::VarDecl {
-                kind,
-                decls: parse_for_declarators(parser, kind)?,
-            }),
-            false,
-        )
+        (Some(kind), false)
     } else if parser.at_contextual("using")?
         && is_using_binding_start(parser.peek2()?.kind.clone())
         && !parser.peek2()?.line_break_before
@@ -487,13 +473,7 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
         // keeps `for (using of y)` an expression-headed for-of (spec 14.7.5).
         let kind = VarDeclKind::Using;
         parser.next()?;
-        (
-            Some(ForInit::VarDecl {
-                kind,
-                decls: parse_for_declarators(parser, kind)?,
-            }),
-            false,
-        )
+        (Some(kind), false)
     } else if parser.at_contextual("await")?
         && (parser.in_async || parser.top_level_await)
         && parser.peek2()?.kind == TokenKind::Identifier(intern_utf8("using"))
@@ -505,23 +485,37 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
         let kind = VarDeclKind::AwaitUsing;
         parser.next()?; // `await`
         parser.next()?; // `using`
-        (
-            Some(ForInit::VarDecl {
-                kind,
-                decls: parse_for_declarators(parser, kind)?,
-            }),
-            false,
-        )
+        (Some(kind), false)
     } else {
-        // The head may be a for-in/of pattern, so a cover form inside it is
-        // deferred until the `in`/`of`/`;` decision is known.
-        parser.suppress_cover_raise += 1;
-        let init = parse_expression(parser, false)?;
-        parser.suppress_cover_raise -= 1;
-        (Some(ForInit::Expr(init)), false)
+        (None, false)
+    };
+    let lexical = matches!(head_kind, Some(k) if k != VarDeclKind::Var);
+    if lexical {
+        parser.push_scope();
+    }
+    let saved_vars = if lexical {
+        Some(std::mem::take(&mut parser.list_vars))
+    } else {
+        None
     };
 
-    if parser.at_keyword(Keyword::In)? {
+    let init = match head_kind {
+        Some(kind) => Some(ForInit::VarDecl {
+            kind,
+            decls: parse_for_declarators(parser, kind)?,
+        }),
+        None if init_empty => None,
+        None => {
+            // The head may be a for-in/of pattern, so a cover form inside it is
+            // deferred until the `in`/`of`/`;` decision is known.
+            parser.suppress_cover_raise += 1;
+            let init = parse_expression(parser, false)?;
+            parser.suppress_cover_raise -= 1;
+            Some(ForInit::Expr(init))
+        }
+    };
+
+    let stmt = if parser.at_keyword(Keyword::In)? {
         // `for await ( … in … )` and `using` heads have no for-in form.
         if is_await {
             return Err(parser.error_at(start, "for await is only valid with of"));
@@ -540,12 +534,11 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
         parser.expect_punct(TokenKind::RightParen)?;
         let body = Box::new(parse_statement(parser, false)?);
         let end = parser.prev.as_ref().unwrap().span.end;
-        return Ok(Stmt {
+        Stmt {
             span: Span::new(start, end),
             kind: StmtKind::ForIn { left, right, body },
-        });
-    }
-    if parser.at_contextual("of")? {
+        }
+    } else if parser.at_contextual("of")? {
         if is_await && parser.peek()?.line_break_before {
             return Err(parser.error_at(start, "Unexpected line break after for await"));
         }
@@ -556,7 +549,7 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
         parser.expect_punct(TokenKind::RightParen)?;
         let body = Box::new(parse_statement(parser, false)?);
         let end = parser.prev.as_ref().unwrap().span.end;
-        return Ok(Stmt {
+        Stmt {
             span: Span::new(start, end),
             kind: StmtKind::ForOf {
                 left,
@@ -564,66 +557,88 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
                 body,
                 is_await,
             },
-        });
-    }
-
-    // Classic `for ( init ; test ; update )`. When the init slot was empty,
-    // its `;` is already consumed. A deferred cover form in the head is an
-    // error here (the head is an expression, not a pattern).
-    if let Some(span) = parser.cover_error.take() {
-        return Err(parser.error_at(span.start, "Invalid shorthand property initializer"));
-    }
-    let test = if init_empty {
-        if parser.at_punct(TokenKind::Semicolon)? {
-            None
-        } else {
-            Some(parse_expression(parser, true)?)
         }
     } else {
-        parser.expect_punct(TokenKind::Semicolon)?;
-        // `const`/`using` declarators need initializers in a classic head
-        // (for-in/of heads forbid them instead).
-        if let Some(ForInit::VarDecl { kind, decls }) = &init {
-            let needs_init = matches!(
-                kind,
-                VarDeclKind::Const | VarDeclKind::Using | VarDeclKind::AwaitUsing
-            );
-            if needs_init {
-                for decl in decls {
-                    if decl.init.is_none() {
-                        let message = match kind {
-                            VarDeclKind::Const => "Missing initializer in const declaration",
-                            _ => "Missing initializer in using declaration",
-                        };
-                        return Err(parser.error_at(decl.span.start, message));
+        // Classic `for ( init ; test ; update )`. When the init slot was empty,
+        // its `;` is already consumed. A deferred cover form in the head is an
+        // error here (the head is an expression, not a pattern).
+        if let Some(span) = parser.cover_error.take() {
+            return Err(parser.error_at(span.start, "Invalid shorthand property initializer"));
+        }
+        let test = if init_empty {
+            if parser.at_punct(TokenKind::Semicolon)? {
+                None
+            } else {
+                Some(parse_expression(parser, true)?)
+            }
+        } else {
+            parser.expect_punct(TokenKind::Semicolon)?;
+            // `const`/`using` declarators need initializers in a classic head
+            // (for-in/of heads forbid them instead).
+            if let Some(ForInit::VarDecl { kind, decls }) = &init {
+                let needs_init = matches!(
+                    kind,
+                    VarDeclKind::Const | VarDeclKind::Using | VarDeclKind::AwaitUsing
+                );
+                if needs_init {
+                    for decl in decls {
+                        if decl.init.is_none() {
+                            let message = match kind {
+                                VarDeclKind::Const => "Missing initializer in const declaration",
+                                _ => "Missing initializer in using declaration",
+                            };
+                            return Err(parser.error_at(decl.span.start, message));
+                        }
                     }
                 }
             }
-        }
-        if parser.at_punct(TokenKind::Semicolon)? {
+            if parser.at_punct(TokenKind::Semicolon)? {
+                None
+            } else {
+                Some(parse_expression(parser, true)?)
+            }
+        };
+        parser.expect_punct(TokenKind::Semicolon)?;
+        let update = if parser.at_punct(TokenKind::RightParen)? {
             None
         } else {
             Some(parse_expression(parser, true)?)
+        };
+        parser.expect_punct(TokenKind::RightParen)?;
+        let body = Box::new(parse_statement(parser, false)?);
+        let end = parser.prev.as_ref().unwrap().span.end;
+        Stmt {
+            span: Span::new(start, end),
+            kind: StmtKind::For {
+                init,
+                test,
+                update,
+                body,
+            },
         }
     };
-    parser.expect_punct(TokenKind::Semicolon)?;
-    let update = if parser.at_punct(TokenKind::RightParen)? {
-        None
-    } else {
-        Some(parse_expression(parser, true)?)
-    };
-    parser.expect_punct(TokenKind::RightParen)?;
-    let body = Box::new(parse_statement(parser, false)?);
-    let end = parser.prev.as_ref().unwrap().span.end;
-    Ok(Stmt {
-        span: Span::new(start, end),
-        kind: StmtKind::For {
-            init,
-            test,
-            update,
-            body,
-        },
-    })
+
+    // Loop-scope restore: merge body/head `var` names back into the enclosing
+    // statement list, and drop the head scope. A classic lexical head keeps
+    // its names in the enclosing list (they are its LexicallyDeclaredNames).
+    if let Some(saved) = saved_vars {
+        parser.list_vars.extend(saved);
+    }
+    if lexical {
+        parser.pop_scope();
+        if let StmtKind::For {
+            init: Some(ForInit::VarDecl { decls, .. }),
+            ..
+        } = &stmt.kind
+        {
+            for decl in decls {
+                for name in bound_names(&decl.pattern) {
+                    parser.declare_lexical(name, decl.span.start)?;
+                }
+            }
+        }
+    }
+    Ok(stmt)
 }
 
 /// Declarators in a for-head: `[~In]` throughout (the `in` of a for-in head

@@ -259,14 +259,20 @@ pub enum Node {
         min: u32,
         max: Option<u32>,
         greedy: bool,
+        /// Capture indices inside the repeated subexpression; each iteration
+        /// starts with them cleared (spec RepeatMatcher copies and clears the
+        /// atom's captures before matching).
+        owned_captures: Vec<usize>,
     },
     Capture {
         index: usize,
         node: Box<Node>,
     },
-    /// `\1` / `\k<name>` — `fold` canonicalizes the comparison units.
+    /// `\1` / `\k<name>` — every 1-based capture index the backref can bind
+    /// to (a duplicate name contributes several; the last that participated
+    /// wins). `fold` canonicalizes the comparison units.
     Backref {
-        index: usize,
+        indices: Vec<usize>,
         fold: bool,
     },
     Lookahead {
@@ -276,8 +282,6 @@ pub enum Node {
     Lookbehind {
         negate: bool,
         node: Box<Node>,
-        /// Fixed length in characters (input elements).
-        length: u32,
     },
 }
 
@@ -509,16 +513,18 @@ mod tests {
             re.exec(&"ab".encode_utf16().collect::<Vec<u16>>(), 0)
                 .is_none()
         );
-        // Unmatched group backreference fails.
+        // A backreference to a group that did not participate matches the
+        // empty string, so `(a)?b\1` matches "b" with group 1 unset.
         let re = compile(
             "(a)?b\\1".encode_utf16().collect::<Vec<u16>>().as_slice(),
             f(""),
         )
         .unwrap();
-        assert!(
-            re.exec(&"b".encode_utf16().collect::<Vec<u16>>(), 0)
-                .is_none()
-        );
+        let m = re
+            .exec(&"b".encode_utf16().collect::<Vec<u16>>(), 0)
+            .unwrap();
+        assert_eq!(m[0], Some((0, 1)));
+        assert_eq!(m[1], None);
     }
 
     #[test]
@@ -651,10 +657,10 @@ mod tests {
             .exec(&"hey".encode_utf16().collect::<Vec<u16>>(), 0)
             .unwrap();
         assert_eq!(m[1], Some((0, 3)));
-        // Duplicate names are valid (ES2025); `\k<a>` refers to the last group
-        // with that name.
+        // Duplicate names are valid only across alternatives (ES2025); `\k<a>`
+        // refers to the group that participated (the last one in source order).
         let re = compile(
-            "(?<a>x)(?<a>y)\\k<a>"
+            "(?:(?<a>x)|(?<a>y))\\k<a>"
                 .encode_utf16()
                 .collect::<Vec<u16>>()
                 .as_slice(),
@@ -662,10 +668,15 @@ mod tests {
         )
         .unwrap();
         let m = re
-            .exec(&"xyy".encode_utf16().collect::<Vec<u16>>(), 0)
+            .exec(&"xx".encode_utf16().collect::<Vec<u16>>(), 0)
             .unwrap();
         assert_eq!(m[1], Some((0, 1)));
-        assert_eq!(m[2], Some((1, 2)));
+        assert_eq!(m[2], None);
+        let m = re
+            .exec(&"yy".encode_utf16().collect::<Vec<u16>>(), 0)
+            .unwrap();
+        assert_eq!(m[1], None);
+        assert_eq!(m[2], Some((0, 1)));
         let re = compile(
             "\\x41".encode_utf16().collect::<Vec<u16>>().as_slice(),
             f(""),
@@ -692,7 +703,9 @@ mod tests {
             .unwrap();
             let _ = re.exec(&input, 0);
         }
-        // `(?:)*` matches empty with the one iteration's captures kept.
+        // `(?:)*` matches empty; an optional empty iteration is discarded, so
+        // the quantified group's captures are unset (spec RepeatMatcher
+        // step 2.b, matching V8's ["", null, null]).
         let re = compile(
             "(())*".encode_utf16().collect::<Vec<u16>>().as_slice(),
             f(""),
@@ -700,7 +713,7 @@ mod tests {
         .unwrap();
         let m = re.exec(&input, 0).unwrap();
         assert_eq!(m[0], Some((0, 0)));
-        assert_eq!(m[1], Some((0, 0)));
+        assert_eq!(m[1], None);
         // The empty iteration still counts toward `min`.
         let re = compile(
             "(?:){2}".encode_utf16().collect::<Vec<u16>>().as_slice(),

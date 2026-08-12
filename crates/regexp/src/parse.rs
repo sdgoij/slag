@@ -2,7 +2,7 @@
 //! descent over the pattern's code points (unicode mode) or code units
 //! (legacy mode), parameterized by the `u`/`v` flags and inline modifiers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{CharClass, Error, Flags, Node, Predicate, Regex};
 
@@ -20,9 +20,21 @@ struct Parser<'a> {
     multiline: bool,
     dot_all: bool,
     capturing_groups: usize,
+    /// Total capturing groups in the whole pattern, pre-scanned so decimal
+    /// escapes can resolve forward references (spec DecimalEscape uses the
+    /// full-pattern group count).
+    total_groups: usize,
+    /// Every name → capture indices over the whole pattern, pre-scanned so
+    /// `\k<name>` resolves forward references.
+    total_named_groups: HashMap<Vec<Atom>, Vec<usize>>,
     /// Named groups: name (code points) → the 1-based capture indices that
     /// use it, in source order (duplicate names are valid per ES2025).
     named_groups: HashMap<Vec<Atom>, Vec<usize>>,
+    /// Open alternatives' used group names, bottom (outermost) first. A name
+    /// may only repeat across alternatives of the same Disjunction (ES2025
+    /// early error); a disjunction's alternatives merge their union into the
+    /// enclosing alternative when it completes.
+    alt_names: Vec<HashSet<Vec<Atom>>>,
     /// The first-occurrence order of group names (drives the `groups` object
     /// key order).
     named_group_order: Vec<Vec<Atom>>,
@@ -43,6 +55,8 @@ pub(crate) fn compile_pattern(pattern: &[u16], flags: Flags) -> Result<Regex, Er
     } else {
         pattern.iter().map(|&u| u as Atom).collect()
     };
+    let (total_groups, total_named_groups) = scan_pattern(&atoms);
+    let has_group_names = !total_named_groups.is_empty();
     let mut parser = Parser {
         atoms: &atoms,
         pos: 0,
@@ -51,9 +65,12 @@ pub(crate) fn compile_pattern(pattern: &[u16], flags: Flags) -> Result<Regex, Er
         multiline: flags.m,
         dot_all: flags.s,
         capturing_groups: 0,
+        total_groups,
+        total_named_groups,
         named_groups: HashMap::new(),
         named_group_order: Vec::new(),
-        has_group_names: false,
+        alt_names: Vec::new(),
+        has_group_names,
         depth: 0,
     };
     let program = parser.parse_disjunction()?;
@@ -114,11 +131,25 @@ impl<'a> Parser<'a> {
         self.depth -= 1;
     }
 
-    /// Pattern :: Disjunction
+    /// Pattern :: Disjunction. Each alternative tracks its own group names;
+    /// the union merges into the enclosing alternative when the disjunction
+    /// completes (spec: duplicate names are only allowed across alternatives
+    /// of the same Disjunction).
     fn parse_disjunction(&mut self) -> Result<Node, Error> {
-        let mut alternatives = vec![self.parse_alternative()?];
-        while self.eat(0x7C) {
-            alternatives.push(self.parse_alternative()?);
+        let mut alternatives = Vec::new();
+        let mut all_names: HashSet<Vec<Atom>> = HashSet::new();
+        loop {
+            self.alt_names.push(HashSet::new());
+            let alt = self.parse_alternative();
+            let alt_names = self.alt_names.pop().unwrap_or_default();
+            all_names.extend(alt_names);
+            alternatives.push(alt?);
+            if !self.eat(0x7C) {
+                break;
+            }
+        }
+        if let Some(parent) = self.alt_names.last_mut() {
+            parent.extend(all_names);
         }
         if alternatives.len() == 1 {
             Ok(alternatives.pop().map(Node::Sequence).unwrap())
@@ -190,19 +221,44 @@ impl<'a> Parser<'a> {
             }
             Some(atom) => {
                 self.next();
+                if self.unicode() && matches!(atom, 0x7B | 0x7D | 0x5D) {
+                    // Annex B adds `{`/`}`/`]` as legacy PatternCharacters;
+                    // in unicode mode they are not atoms.
+                    return Err(self.error("Invalid pattern character"));
+                }
                 self.char_node(atom)
             }
             None => return Err(self.error("Unexpected end of pattern")),
         };
         let quantifier = self.parse_quantifier()?;
+        if quantifier.is_some()
+            && self.unicode()
+            && matches!(
+                node,
+                Node::Start { .. }
+                    | Node::End { .. }
+                    | Node::WordBoundary { .. }
+                    | Node::NotWordBoundary { .. }
+                    | Node::Lookahead { .. }
+                    | Node::Lookbehind { .. }
+            )
+        {
+            // Annex B's ExtendedTerm :: Assertion Quantifier does not apply
+            // in unicode mode (spec 22.2.1).
+            return Err(self.error("Assertion cannot be quantified"));
+        }
         match quantifier {
             None => Ok(node),
-            Some((min, max, greedy)) => Ok(Node::Repeat {
-                node: Box::new(node),
-                min,
-                max,
-                greedy,
-            }),
+            Some((min, max, greedy)) => {
+                let owned_captures = collect_captures(&node);
+                Ok(Node::Repeat {
+                    node: Box::new(node),
+                    min,
+                    max,
+                    greedy,
+                    owned_captures,
+                })
+            }
         }
     }
 
@@ -288,23 +344,25 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a run of decimal digits already started by `first` (a digit).
+    /// The spec caps the MV at 2^53 - 1; values beyond are a SyntaxError, and
+    /// anything above u32::MAX is clamped (no real match could ever need it).
     fn parse_decimal_digits(&mut self) -> Result<u32, Error> {
-        let mut value = 0u32;
+        let mut value = 0u64;
         let mut any = false;
         while let Some(d) = self.peek()
             && (0x30..=0x39).contains(&d)
         {
             self.next();
             any = true;
-            value = value
-                .checked_mul(10)
-                .and_then(|v| v.checked_add(d - 0x30))
-                .ok_or_else(|| self.error("Quantifier number too large"))?;
+            value = value * 10 + (d - 0x30) as u64;
+            if value > 0x1F_FFFF_FFFF_FFFF {
+                return Err(self.error("Quantifier number too large"));
+            }
         }
         if !any {
             return Err(self.error("Expected decimal digits"));
         }
-        Ok(value)
+        Ok(value.min(u32::MAX as u64) as u32)
     }
 
     /// Atom :: ... | `\` AtomEscape | CharacterClass | `(` GroupSpecifier? ...
@@ -352,22 +410,56 @@ impl<'a> Parser<'a> {
 
     /// `\d \w \s` and `\p{…}` class escapes. Predicates stay as predicates
     /// unless the class needs folding (ignore-case) or `/v` set arithmetic,
-    /// which force enumeration into explicit ranges.
-    fn escape_class(&mut self, predicate: Predicate, negated: bool) -> CharClass {
-        if self.ignore_case || self.flags.v {
-            let fold = self.ignore_case;
-            let ranges = crate::engine::scan_predicate(&predicate, fold, self.unicode());
+    /// which force enumeration into explicit ranges. Under ignore-case the
+    /// fold applies to the final set, so a negated class folds its complement.
+    fn predicate_class(&mut self, predicate: Predicate, negated: bool) -> CharClass {
+        if self.ignore_case {
+            let mut ranges = crate::engine::scan_predicate(&predicate, false, self.unicode());
+            if negated {
+                crate::engine::complement(&mut ranges);
+            }
+            CharClass {
+                ranges: crate::engine::fold_ranges(&ranges, self.unicode()),
+                strings: Vec::new(),
+                negated: false,
+                predicate: None,
+                fold: true,
+            }
+        } else if self.flags.v {
+            let ranges = crate::engine::scan_predicate(&predicate, false, self.unicode());
             CharClass {
                 ranges,
                 strings: Vec::new(),
                 negated,
                 predicate: None,
-                fold,
+                fold: false,
             }
         } else {
             let mut class = CharClass::from_predicate(predicate, negated);
             class.fold = false;
             class
+        }
+    }
+
+    fn escape_class(&mut self, predicate: Predicate, negated: bool) -> CharClass {
+        if self.ignore_case {
+            // GetWordCharacters & co. apply Canonicalize to the input char, so
+            // the base set is folded first and a negated escape is the
+            // complement of the folded set (unlike `\p{}`, whose fold happens
+            // at the class level, after the complement).
+            let mut ranges = crate::engine::scan_predicate(&predicate, true, self.unicode());
+            if negated {
+                crate::engine::complement(&mut ranges);
+            }
+            CharClass {
+                ranges,
+                strings: Vec::new(),
+                negated: false,
+                predicate: None,
+                fold: true,
+            }
+        } else {
+            self.predicate_class(predicate, negated)
         }
     }
 
@@ -441,21 +533,7 @@ impl<'a> Parser<'a> {
     }
 
     fn property_class(&mut self, predicate: Predicate, negated: bool) -> CharClass {
-        if self.ignore_case || self.flags.v {
-            let fold = self.ignore_case;
-            let ranges = crate::engine::scan_predicate(&predicate, fold, self.unicode());
-            CharClass {
-                ranges,
-                strings: Vec::new(),
-                negated,
-                predicate: None,
-                fold,
-            }
-        } else {
-            let mut class = CharClass::from_predicate(predicate, negated);
-            class.fold = false;
-            class
-        }
+        self.predicate_class(predicate, negated)
     }
 
     /// AtomEscape after the backslash has been consumed.
@@ -474,8 +552,9 @@ impl<'a> Parser<'a> {
             }
             0x31..=0x39 => {
                 let group = (atom - 0x30) as usize;
-                if group <= self.capturing_groups {
-                    // A backreference.
+                if group <= self.total_groups {
+                    // A backreference (forward references are valid: the
+                    // count is over the whole pattern).
                     let mut index = group;
                     // Annex B: \10 with 10+ groups refers to group 10; consume
                     // a second digit only when it forms a valid group number.
@@ -484,13 +563,13 @@ impl<'a> Parser<'a> {
                         && (0x30..=0x39).contains(&atom)
                     {
                         let two = group * 10 + (d - 0x30) as usize;
-                        if two <= self.capturing_groups {
+                        if two <= self.total_groups {
                             self.next();
                             index = two;
                         }
                     }
                     Ok(Node::Backref {
-                        index,
+                        indices: vec![index],
                         fold: self.ignore_case,
                     })
                 } else if self.unicode() {
@@ -522,23 +601,18 @@ impl<'a> Parser<'a> {
                     self.next();
                     return self.parse_unicode_code_point_escape();
                 }
-                if let (Some(h), Some(l)) = (
+                if let (Some(h), Some(l), Some(h2), Some(l2)) = (
                     self.peek().and_then(hex_value),
                     self.peek_at(1).and_then(hex_value),
+                    self.peek_at(2).and_then(hex_value),
+                    self.peek_at(3).and_then(hex_value),
                 ) {
                     self.next();
                     self.next();
-                    let value = (h << 12) | (l << 8);
-                    if let (Some(h2), Some(l2)) = (
-                        self.peek().and_then(hex_value),
-                        self.peek_at(1).and_then(hex_value),
-                    ) {
-                        self.next();
-                        self.next();
-                        let code_unit = value | (h2 << 4) | l2;
-                        return self.char_from_code_unit(code_unit);
-                    }
-                    return Ok(self.char_node(value as Atom));
+                    self.next();
+                    self.next();
+                    let code_unit = (h << 12) | (l << 8) | (h2 << 4) | l2;
+                    return self.char_from_code_unit(code_unit);
                 }
                 if self.unicode() {
                     Err(self.error("Invalid \\u escape"))
@@ -575,6 +649,13 @@ impl<'a> Parser<'a> {
                     Ok(self.char_node(0x6B))
                 }
             }
+            // Control escapes (spec 22.2.1 CharacterEscape): `\t` TAB, `\n`
+            // LF, `\v` VT, `\f` FF, `\r` CR.
+            0x74 => Ok(self.char_node(0x09)),
+            0x6E => Ok(self.char_node(0x0A)),
+            0x76 => Ok(self.char_node(0x0B)),
+            0x66 => Ok(self.char_node(0x0C)),
+            0x72 => Ok(self.char_node(0x0D)),
             _ => {
                 if self.unicode() && !is_identity_escape_allowed(atom) {
                     Err(self.error("Invalid escape"))
@@ -606,14 +687,36 @@ impl<'a> Parser<'a> {
     }
 
     /// A `\uXXXX` escape decodes to a code unit; in unicode mode a leading
-    /// surrogate must form a pair (or be a lone surrogate only if followed by
-    /// nothing), per the spec's escape semantics.
+    /// surrogate must form a `\uD800\uDC00` pair, per the spec's escape
+    /// semantics.
     fn char_from_code_unit(&mut self, code_unit: u32) -> Result<Node, Error> {
         if !self.unicode() {
             return Ok(self.char_node(code_unit));
         }
         if (0xD800..=0xDBFF).contains(&code_unit) {
-            // Leading surrogate: only valid as part of a pair.
+            // A leading surrogate is valid only as part of a pair: combine
+            // `\uD834\uDF06` into the code point when the next six atoms are
+            // a `\uDC00`-range escape.
+            if self.peek() == Some(0x5C)
+                && self.peek_at(1) == Some(0x75)
+                && let (Some(h), Some(l)) = (
+                    self.peek_at(2).and_then(hex_value),
+                    self.peek_at(3).and_then(hex_value),
+                )
+                && let (Some(h2), Some(l2)) = (
+                    self.peek_at(4).and_then(hex_value),
+                    self.peek_at(5).and_then(hex_value),
+                )
+            {
+                let low = (h << 12) | (l << 8) | (h2 << 4) | l2;
+                if (0xDC00..=0xDFFF).contains(&low) {
+                    for _ in 0..6 {
+                        self.next();
+                    }
+                    let cp = 0x10000 + ((code_unit - 0xD800) << 10) + (low - 0xDC00);
+                    return Ok(self.char_node(cp));
+                }
+            }
             return Err(self.error("Invalid unicode escape"));
         }
         Ok(self.char_node(code_unit))
@@ -629,26 +732,94 @@ impl<'a> Parser<'a> {
         match self
             .named_groups
             .get(&name)
-            .and_then(|indices| indices.last())
+            .or_else(|| self.total_named_groups.get(&name))
         {
-            Some(&index) => Ok(Node::Backref {
-                index,
+            Some(indices) => Ok(Node::Backref {
+                indices: indices.clone(),
                 fold: self.ignore_case,
             }),
             None => Err(self.error("Invalid named capture reference")),
         }
     }
 
-    /// GroupName :: `<` IdentifierName `>`
+    /// GroupName :: `<` IdentifierName `>` — `\uXXXX` / `\u{…}` escapes
+    /// decode into the name in both modes (spec RegExpIdentifierName).
     fn parse_group_name(&mut self) -> Result<Vec<Atom>, Error> {
         let mut name = Vec::new();
         while let Some(a) = self.peek() {
             if a == 0x3E {
                 break;
             }
-            name.push(self.next().unwrap());
+            if a == 0x5C {
+                // Only `\u` escapes may appear in a RegExpIdentifierName.
+                self.next();
+                if self.next() != Some(0x75) {
+                    return Err(self.error("Invalid capture group name"));
+                }
+                let value = if self.peek() == Some(0x7B) {
+                    self.next();
+                    let mut value = 0u32;
+                    let mut any = false;
+                    while let Some(h) = self.peek().and_then(hex_value) {
+                        self.next();
+                        any = true;
+                        value = value
+                            .checked_mul(16)
+                            .and_then(|v| v.checked_add(h))
+                            .ok_or_else(|| self.error("Invalid code point escape"))?;
+                    }
+                    if !any || !self.eat(0x7D) || value > 0x10FFFF {
+                        return Err(self.error("Invalid code point escape"));
+                    }
+                    value
+                } else if let (Some(h), Some(l)) = (
+                    self.peek().and_then(hex_value),
+                    self.peek_at(1).and_then(hex_value),
+                ) {
+                    self.next();
+                    self.next();
+                    let mut value = (h << 12) | (l << 8);
+                    if let (Some(h2), Some(l2)) = (
+                        self.peek().and_then(hex_value),
+                        self.peek_at(1).and_then(hex_value),
+                    ) {
+                        self.next();
+                        self.next();
+                        value |= (h2 << 4) | l2;
+                    }
+                    value
+                } else {
+                    return Err(self.error("Invalid \\u escape"));
+                };
+                name.push(value);
+            } else {
+                name.push(self.next().unwrap());
+            }
         }
         if name.is_empty() {
+            return Err(self.error("Invalid capture group name"));
+        }
+        // RegExpIdentifierStart/Part (spec): ID_Start then ID_Continue, with
+        // `\uD800\uDC00`-style surrogate pairs counted as one code point.
+        let mut cps: Vec<u32> = Vec::with_capacity(name.len());
+        let mut i = 0;
+        while i < name.len() {
+            let hi = name[i];
+            if (0xD800..=0xDBFF).contains(&hi)
+                && i + 1 < name.len()
+                && (0xDC00..=0xDFFF).contains(&name[i + 1])
+            {
+                let lo = name[i + 1];
+                cps.push(0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00));
+                i += 2;
+            } else {
+                cps.push(hi);
+                i += 1;
+            }
+        }
+        if !unicode::is_identifier_start(cps[0])
+            || cps[1..].iter().any(|&cp| !unicode::is_identifier_part(cp))
+        {
             return Err(self.error("Invalid capture group name"));
         }
         Ok(name)
@@ -705,11 +876,9 @@ impl<'a> Parser<'a> {
                             if !self.eat(0x29) {
                                 return Err(self.error("Unterminated group"));
                             }
-                            let length = self.fixed_length(&body)?;
                             Ok(Node::Lookbehind {
                                 negate: false,
                                 node: Box::new(body),
-                                length,
                             })
                         }
                         Some(0x21) => {
@@ -718,11 +887,9 @@ impl<'a> Parser<'a> {
                             if !self.eat(0x29) {
                                 return Err(self.error("Unterminated group"));
                             }
-                            let length = self.fixed_length(&body)?;
                             Ok(Node::Lookbehind {
                                 negate: true,
                                 node: Box::new(body),
-                                length,
                             })
                         }
                         _ => {
@@ -730,6 +897,16 @@ impl<'a> Parser<'a> {
                             let name = self.parse_group_name()?;
                             if !self.eat(0x3E) {
                                 return Err(self.error("Invalid capture group name"));
+                            }
+                            // Duplicate names are valid only across
+                            // alternatives of the same Disjunction (ES2025); a
+                            // name used elsewhere in the current alternative
+                            // is an early error.
+                            if self.alt_names.iter().any(|set| set.contains(&name)) {
+                                return Err(self.error("Duplicate named capture group"));
+                            }
+                            if let Some(top) = self.alt_names.last_mut() {
+                                top.insert(name.clone());
                             }
                             self.capturing_groups += 1;
                             let index = self.capturing_groups;
@@ -756,8 +933,9 @@ impl<'a> Parser<'a> {
                         }
                     }
                 }
-                Some(a) if a == 0x69 || a == 0x6D || a == 0x73 => {
-                    // Inline modifiers: (?ims-ims:…) or (?ims-ims).
+                Some(a) if a == 0x69 || a == 0x6D || a == 0x73 || a == 0x2D => {
+                    // Inline modifiers: (?ims-ims:…) or (?ims-ims), including
+                    // a remove-only head (?-ims:…).
                     self.parse_inline_modifiers()
                 }
                 _ => Err(self.error("Invalid group")),
@@ -784,27 +962,30 @@ impl<'a> Parser<'a> {
         loop {
             match self.peek() {
                 Some(0x69) => {
-                    if saw_minus {
-                        remove |= 1;
-                    } else {
-                        add |= 1;
+                    let bit = 1;
+                    let slot = if saw_minus { &mut remove } else { &mut add };
+                    if *slot & bit != 0 {
+                        return Err(self.error("Duplicate modifier"));
                     }
+                    *slot |= bit;
                     self.next();
                 }
                 Some(0x6D) => {
-                    if saw_minus {
-                        remove |= 2;
-                    } else {
-                        add |= 2;
+                    let bit = 2;
+                    let slot = if saw_minus { &mut remove } else { &mut add };
+                    if *slot & bit != 0 {
+                        return Err(self.error("Duplicate modifier"));
                     }
+                    *slot |= bit;
                     self.next();
                 }
                 Some(0x73) => {
-                    if saw_minus {
-                        remove |= 4;
-                    } else {
-                        add |= 4;
+                    let bit = 4;
+                    let slot = if saw_minus { &mut remove } else { &mut add };
+                    if *slot & bit != 0 {
+                        return Err(self.error("Duplicate modifier"));
                     }
+                    *slot |= bit;
                     self.next();
                 }
                 Some(0x2D) if !saw_minus => {
@@ -812,6 +993,12 @@ impl<'a> Parser<'a> {
                     self.next();
                 }
                 Some(0x3A) => {
+                    if add & remove != 0 {
+                        return Err(self.error("Modifier added and removed"));
+                    }
+                    if saw_minus && add == 0 && remove == 0 {
+                        return Err(self.error("Empty modifiers"));
+                    }
                     self.next();
                     let saved = (self.ignore_case, self.multiline, self.dot_all);
                     self.apply_modifiers(add, remove)?;
@@ -825,6 +1012,12 @@ impl<'a> Parser<'a> {
                     return Ok(body);
                 }
                 Some(0x29) => {
+                    if add & remove != 0 {
+                        return Err(self.error("Modifier added and removed"));
+                    }
+                    if saw_minus && add == 0 && remove == 0 {
+                        return Err(self.error("Empty modifiers"));
+                    }
                     self.next();
                     let saved = (self.ignore_case, self.multiline, self.dot_all);
                     self.apply_modifiers(add, remove)?;
@@ -857,54 +1050,6 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// Fixed length of a subpattern in characters (input elements), for
-    /// lookbehind (spec: the lookbehind Disjunction must be fixed-length).
-    fn fixed_length(&self, node: &Node) -> Result<u32, Error> {
-        match node {
-            Node::Empty
-            | Node::Start { .. }
-            | Node::End { .. }
-            | Node::WordBoundary { .. }
-            | Node::NotWordBoundary { .. }
-            | Node::Lookahead { .. }
-            | Node::Lookbehind { .. } => Ok(0),
-            Node::Char { .. } | Node::Any { .. } | Node::Class(_) => Ok(1),
-            Node::Backref { .. } => Err(self.error("Lookbehind assertion is not fixed length")),
-            Node::Sequence(nodes) => {
-                let mut total = 0u32;
-                for n in nodes {
-                    total = total
-                        .checked_add(self.fixed_length(n)?)
-                        .ok_or_else(|| self.error("Lookbehind too long"))?;
-                }
-                Ok(total)
-            }
-            Node::Alternate(alts) => {
-                let mut length = None;
-                for alt in alts {
-                    let l = self.fixed_length(&Node::Sequence(alt.clone()))?;
-                    match length {
-                        None => length = Some(l),
-                        Some(prev) if prev != l => {
-                            return Err(self.error("Lookbehind assertion is not fixed length"));
-                        }
-                        _ => {}
-                    }
-                }
-                Ok(length.unwrap_or(0))
-            }
-            Node::Capture { node, .. } => self.fixed_length(node),
-            Node::Repeat { node, min, max, .. } => {
-                if max.is_none() || *min != max.unwrap() {
-                    return Err(self.error("Lookbehind assertion is not fixed length"));
-                }
-                self.fixed_length(node)?
-                    .checked_mul(*min)
-                    .ok_or_else(|| self.error("Lookbehind too long"))
-            }
-        }
-    }
-
     /// CharacterClass :: `[` [lookahead != ^] ClassRanges? `]` | `[^` ClassRanges? `]`
     fn parse_character_class(&mut self, _in_set: bool) -> Result<Node, Error> {
         self.next(); // [
@@ -922,16 +1067,16 @@ impl<'a> Parser<'a> {
                     self.next();
                     break;
                 }
-                // `[]` / `[^]`: an empty class — the `]` closes it. In
-                // unicode mode the first `]` can never be a literal atom
-                // (the Annex B extension does not apply).
-                Some(0x5D) if self.peek_at(1).is_none() || self.unicode() => {
+                // `[]` / `[]a`: the `]` closes an (empty) class. In unicode
+                // mode the first `]` can never be a literal atom (the Annex B
+                // extension does not apply).
+                Some(0x5D) if self.unicode() || self.peek_at(1) != Some(0x5D) => {
                     self.next();
                     break;
                 }
                 Some(0x5D) => {
                     // `[]]`: the first `]` is a literal ClassAtom (Annex B)
-                    // when more characters follow.
+                    // when the closing `]` follows.
                     self.next();
                     members.push(ClassMember::Char(0x5D));
                     first = false;
@@ -947,12 +1092,10 @@ impl<'a> Parser<'a> {
                 match (&atom, &end) {
                     (ClassAtom::Char(s), ClassAtom::Char(e)) => {
                         let (s, e) = (*s, *e);
-                        if self.unicode() && s > e {
+                        if s > e {
                             return Err(self.error("Range out of order in character class"));
                         }
-                        if s <= e {
-                            members.push(ClassMember::Range(s, e));
-                        }
+                        members.push(ClassMember::Range(s, e));
                     }
                     _ => {
                         if self.unicode() {
@@ -1010,12 +1153,7 @@ impl<'a> Parser<'a> {
                 let negated = atom == 0x50;
                 Ok(ClassAtom::Escape(self.parse_property_escape(negated)?))
             }
-            0x62 => {
-                if self.unicode() {
-                    return Err(self.error("\\b in character class is invalid in unicode mode"));
-                }
-                Ok(ClassAtom::Char(0x08)) // backspace
-            }
+            0x62 => Ok(ClassAtom::Char(0x08)), // \b inside a class is BACKSPACE
             0x78 => {
                 if let (Some(h), Some(l)) = (
                     self.peek().and_then(hex_value),
@@ -1050,22 +1188,17 @@ impl<'a> Parser<'a> {
                     }
                     return Ok(ClassAtom::Char(value));
                 }
-                let Some(hi) = self.peek() else {
-                    return Err(self.error("Invalid \\u escape"));
-                };
-                if let (Some(h), Some(l)) = (hex_value(hi), self.peek_at(1).and_then(hex_value)) {
+                if let (Some(h), Some(l), Some(h2), Some(l2)) = (
+                    self.peek().and_then(hex_value),
+                    self.peek_at(1).and_then(hex_value),
+                    self.peek_at(2).and_then(hex_value),
+                    self.peek_at(3).and_then(hex_value),
+                ) {
                     self.next();
                     self.next();
-                    let mut value = (h << 12) | (l << 8);
-                    if let (Some(h2), Some(l2)) = (
-                        self.peek().and_then(hex_value),
-                        self.peek_at(1).and_then(hex_value),
-                    ) {
-                        self.next();
-                        self.next();
-                        value |= (h2 << 4) | l2;
-                    }
-                    Ok(ClassAtom::Char(value))
+                    self.next();
+                    self.next();
+                    Ok(ClassAtom::Char((h << 12) | (l << 8) | (h2 << 4) | l2))
                 } else if self.unicode() {
                     Err(self.error("Invalid \\u escape"))
                 } else {
@@ -1084,8 +1217,16 @@ impl<'a> Parser<'a> {
                     Ok(ClassAtom::Char(b'\\' as Atom))
                 }
             }
+            // Control escapes: `\t` TAB, `\n` LF, `\v` VT, `\f` FF, `\r` CR.
+            0x74 => Ok(ClassAtom::Char(0x09)),
+            0x6E => Ok(ClassAtom::Char(0x0A)),
+            0x76 => Ok(ClassAtom::Char(0x0B)),
+            0x66 => Ok(ClassAtom::Char(0x0C)),
+            0x72 => Ok(ClassAtom::Char(0x0D)),
             _ => {
-                if self.unicode() && !is_identity_escape_allowed(atom) {
+                if self.unicode() && !is_identity_escape_allowed(atom) && atom != 0x2D {
+                    // `-` is its own ClassEscape production (a literal dash);
+                    // any other identity escape is invalid in unicode mode.
                     Err(self.error("Invalid escape"))
                 } else {
                     Ok(ClassAtom::Char(atom))
@@ -1178,6 +1319,23 @@ impl<'a> Parser<'a> {
                 }
             }
             Some(atom) => {
+                if self.flags.v {
+                    // v-mode ClassSetCharacter (spec 22.2.1): the syntax
+                    // characters `( ) { } / - ] |` must be escaped, and a
+                    // doubled reserved punctuator is an early error (`&&` and
+                    // `--` are set operators handled by the caller).
+                    if matches!(atom, 0x28 | 0x29 | 0x7B | 0x7D | 0x2F | 0x2D | 0x5D | 0x7C) {
+                        return Err(self.error("Invalid class set character"));
+                    }
+                    if is_double_punctuator(atom) && self.peek_at(1) == Some(atom) {
+                        return Err(self.error("Invalid doubled punctuator"));
+                    }
+                    // `&&` at an operand position is the intersection operator
+                    // with a missing left operand (spec 22.2.1).
+                    if atom == 0x26 && self.peek_at(1) == Some(0x26) {
+                        return Err(self.error("Invalid class set intersection"));
+                    }
+                }
                 self.next();
                 Ok(CharClass::singleton(atom))
             }
@@ -1292,6 +1450,110 @@ impl ClassMember {
 /// predicate when possible (fast path) and enumerating into explicit ranges
 /// otherwise. `ignore_case` folds the explicit ranges; negated predicates are
 /// scanned and complemented.
+/// Pre-scan the whole pattern: the total capturing-group count (so decimal
+/// escapes resolve forward references) and every name → capture indices in
+/// source order (so `\k<name>` resolves forward references). Skips escapes,
+/// character classes, and non-capturing groups.
+fn scan_pattern(atoms: &[Atom]) -> (usize, HashMap<Vec<Atom>, Vec<usize>>) {
+    let mut count = 0usize;
+    let mut named: HashMap<Vec<Atom>, Vec<usize>> = HashMap::new();
+    let mut i = 0;
+    while i < atoms.len() {
+        match atoms[i] {
+            0x5C => i += 2, // escape + escaped code point
+            0x5B => {
+                i += 1;
+                while i < atoms.len() && atoms[i] != 0x5D {
+                    i += if atoms[i] == 0x5C { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            0x28 => {
+                if atoms.get(i + 1) == Some(&0x3F) {
+                    match atoms.get(i + 2) {
+                        // (?:, (?=, (?!
+                        Some(&0x3A) | Some(&0x3D) | Some(&0x21) => i += 3,
+                        Some(&0x3C) => {
+                            // (?<=, (?<! are lookbehind; otherwise a named
+                            // capture `(?<name>`.
+                            match atoms.get(i + 3) {
+                                Some(&0x3D) | Some(&0x21) => i += 4,
+                                _ => {
+                                    count += 1;
+                                    let index = count;
+                                    let mut name = Vec::new();
+                                    let mut j = i + 3;
+                                    while j < atoms.len() && atoms[j] != 0x3E {
+                                        name.push(atoms[j]);
+                                        j += 1;
+                                    }
+                                    named.entry(name).or_default().push(index);
+                                    i = j + 1;
+                                }
+                            }
+                        }
+                        _ => i += 2,
+                    }
+                } else {
+                    count += 1;
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    (count, named)
+}
+
+/// Capture indices within `node` (including nested groups and lookarounds),
+/// used to clear the atom's captures before each quantified iteration.
+fn collect_captures(node: &Node) -> Vec<usize> {
+    fn walk(node: &Node, out: &mut Vec<usize>) {
+        match node {
+            Node::Capture { index, node } => {
+                out.push(*index);
+                walk(node, out);
+            }
+            Node::Sequence(nodes) => nodes.iter().for_each(|n| walk(n, out)),
+            Node::Alternate(alts) => alts
+                .iter()
+                .for_each(|alt| alt.iter().for_each(|n| walk(n, out))),
+            Node::Repeat { node, .. } => walk(node, out),
+            Node::Lookahead { node, .. } | Node::Lookbehind { node, .. } => walk(node, out),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(node, &mut out);
+    out
+}
+
+/// Whether the code point is a /v-mode ClassSetReservedPunctuator whose
+/// doubled form is an early error (spec ClassSetReservedDoublePunctuator,
+/// minus the `&&`/`--` set operators).
+fn is_double_punctuator(atom: Atom) -> bool {
+    matches!(
+        atom,
+        0x21 | 0x23
+            | 0x24
+            | 0x25
+            | 0x2A
+            | 0x2B
+            | 0x2C
+            | 0x2E
+            | 0x3A
+            | 0x3B
+            | 0x3C
+            | 0x3D
+            | 0x3E
+            | 0x3F
+            | 0x40
+            | 0x5E
+            | 0x60
+            | 0x7E
+    )
+}
+
 fn assemble_class(
     members: Vec<ClassMember>,
     negated: bool,
@@ -1436,6 +1698,7 @@ fn is_letter_or_underscore_or_digit(atom: Atom) -> bool {
 /// Identity escapes allowed in unicode mode: SyntaxCharacter,
 /// `/`, and the legacy `$ & - _ ~` (spec IdentityEscape).
 fn is_identity_escape_allowed(atom: Atom) -> bool {
+    // spec IdentityEscape[+U]: SyntaxCharacter | `/` (B.1.4 does not apply).
     matches!(
         atom,
         0x24 | 0x28
@@ -1452,10 +1715,6 @@ fn is_identity_escape_allowed(atom: Atom) -> bool {
             | 0x7B
             | 0x7C
             | 0x7D
-            | 0x2D
-            | 0x5F
-            | 0x7E
-            | 0x26
     )
 }
 

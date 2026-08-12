@@ -122,9 +122,18 @@ pub fn to_uppercase(cp: u32) -> Vec<u32> {
 /// Approximated by `to_lowercase` when it yields a single code point, with
 /// the known multi-char-lowercase-but-single-fold divergence fixed.
 pub fn simple_case_fold(cp: u32) -> u32 {
-    if cp == 0x0130 {
-        // İ folds to i (to_lowercase yields i + combining dot above).
-        return 0x0069;
+    // CaseFolding.txt simple (S) / common (C) mappings that to_lowercase
+    // does not produce (multi-char or otherwise divergent forms).
+    match cp {
+        0x0130 => return 0x0069, // İ folds to i (lowercase is i + dot above)
+        0x017F => return 0x0073, // long s (C mapping) → s
+        0x0345 => return 0x03B9, // combining ypogegrammeni (C mapping) → iota
+        0x03C2 => return 0x03C3, // final sigma (S mapping) → sigma
+        0x00B5 => return 0x03BC, // micro sign (C mapping) → mu
+        0x1FD3 => return 0x0390, // iota with dialytika and oxia → tonos
+        0x1FE3 => return 0x03B0, // upsilon with dialytika and oxia → tonos
+        0xFB05 => return 0xFB06, // long s t ligature → st ligature
+        _ => {}
     }
     match char_of(cp) {
         Some(c) => {

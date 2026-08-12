@@ -169,7 +169,9 @@ pub(crate) fn exec(re: &Regex, input: &[u16], start: usize) -> Option<crate::Mat
         unicode: re.flags.has_unicode(),
     };
     let mut caps = Caps::new(re.capturing_groups);
-    match match_node(&re.program, &ctx, &mut caps, start, &mut |_, pos| Ok(pos)) {
+    match match_node(&re.program, &ctx, &mut caps, start, 1, &mut |_, pos| {
+        Ok(pos)
+    }) {
         Ok(end) => {
             caps.values[0] = Some((start, end));
             Some(caps.values)
@@ -178,16 +180,22 @@ pub(crate) fn exec(re: &Regex, input: &[u16], start: usize) -> Option<crate::Mat
     }
 }
 
+/// A position advanced by `len` input elements in the match direction.
+fn advance(pos: usize, dir: i32, len: usize) -> usize {
+    if dir > 0 { pos + len } else { pos - len }
+}
+
 fn match_node<'i>(
     node: &Node,
     ctx: &Ctx<'i>,
     caps: &mut Caps,
     pos: usize,
+    dir: i32,
     cont: &mut dyn FnMut(&mut Caps, usize) -> MatchResult,
 ) -> MatchResult {
     match node {
         Node::Empty => cont(caps, pos),
-        Node::Char { cp, fold } => match read_char(ctx, pos) {
+        Node::Char { cp, fold } => match read_char_dir(ctx, pos, dir) {
             Some((c, len)) => {
                 let c = if *fold {
                     canonicalize(ctx.unicode, c)
@@ -195,15 +203,17 @@ fn match_node<'i>(
                     c
                 };
                 if c == *cp {
-                    cont(caps, pos + len)
+                    cont(caps, advance(pos, dir, len))
                 } else {
                     Err(())
                 }
             }
             None => Err(()),
         },
-        Node::Any { dot_all } => match read_char(ctx, pos) {
-            Some((c, len)) if *dot_all || !unicode::is_line_terminator(c) => cont(caps, pos + len),
+        Node::Any { dot_all } => match read_char_dir(ctx, pos, dir) {
+            Some((c, len)) if *dot_all || !unicode::is_line_terminator(c) => {
+                cont(caps, advance(pos, dir, len))
+            }
             _ => Err(()),
         },
         Node::Start { multiline } => {
@@ -239,21 +249,21 @@ fn match_node<'i>(
                 Err(())
             }
         }
-        Node::Class(class) => match read_char(ctx, pos) {
+        Node::Class(class) => match read_char_dir(ctx, pos, dir) {
             Some((c, len)) => {
-                if class_matches(ctx, class, pos, c) {
-                    cont(caps, pos + len)
+                if class_matches(ctx, class, pos, c, dir) {
+                    cont(caps, advance(pos, dir, len))
                 } else {
                     Err(())
                 }
             }
             None => Err(()),
         },
-        Node::Sequence(nodes) => match_sequence(nodes, 0, ctx, caps, pos, cont),
+        Node::Sequence(nodes) => match_sequence(nodes, 0, ctx, caps, pos, dir, cont),
         Node::Alternate(alts) => {
             for alt in alts {
                 let mark = caps.mark();
-                match match_sequence(alt, 0, ctx, caps, pos, cont) {
+                match match_sequence(alt, 0, ctx, caps, pos, dir, cont) {
                     Ok(end) => return Ok(end),
                     Err(_) => caps.rollback(mark),
                 }
@@ -265,36 +275,69 @@ fn match_node<'i>(
             min,
             max,
             greedy,
-        } => repeat_loop(node, *min, *max, *greedy, ctx, caps, pos, 0, cont),
+            owned_captures,
+        } => repeat_loop(
+            node,
+            owned_captures,
+            *min,
+            *max,
+            *greedy,
+            ctx,
+            caps,
+            pos,
+            dir,
+            0,
+            cont,
+        ),
         Node::Capture { index, node } => {
             caps.set(*index, (pos, pos));
             let start = pos;
             let mut inner = |caps: &mut Caps, next: usize| {
-                caps.set(*index, (start, next));
+                caps.set(*index, (start.min(next), start.max(next)));
                 cont(caps, next)
             };
-            match_node(node, ctx, caps, pos, &mut inner)
+            match_node(node, ctx, caps, pos, dir, &mut inner)
         }
-        Node::Backref { index, fold } => match caps.values[*index] {
-            Some((s, e)) => {
-                let len = e - s;
-                if pos + len > ctx.input.len() {
-                    return Err(());
+        Node::Backref { indices, fold } => {
+            // A duplicate name resolves to the last of its groups that
+            // participated (spec: the match of the last matching group).
+            let chosen = indices
+                .iter()
+                .rev()
+                .find(|&&i| caps.values[i].is_some())
+                .copied();
+            match chosen.and_then(|i| caps.values[i]) {
+                Some((s, e)) => {
+                    let len = e - s;
+                    let (window_start, window_end) = if dir > 0 {
+                        (pos, pos + len)
+                    } else {
+                        (pos - len, pos)
+                    };
+                    if window_end > ctx.input.len() || window_start > window_end {
+                        return Err(());
+                    }
+                    let captured = &ctx.input[s..e];
+                    let window = &ctx.input[window_start..window_end];
+                    if units_eq(ctx, captured, window, *fold) {
+                        cont(caps, advance(pos, dir, len))
+                    } else {
+                        Err(())
+                    }
                 }
-                let captured = &ctx.input[s..e];
-                let window = &ctx.input[pos..pos + len];
-                if units_eq(ctx, captured, window, *fold) {
-                    cont(caps, pos + len)
-                } else {
-                    Err(())
-                }
+                // A backreference to a group that has not participated matches
+                // the empty string (spec BackreferenceMatcher, `captures[cp]`
+                // undefined).
+                None => cont(caps, pos),
             }
-            None => Err(()),
-        },
+        }
         Node::Lookahead { negate, node } => {
             let mark = caps.mark();
             let mut inner = |_: &mut Caps, _next: usize| Ok(pos);
-            match match_node(node, ctx, caps, pos, &mut inner) {
+            // The lookahead's subexpression always matches forward, even
+            // inside a lookbehind (the assertion is evaluated at its own
+            // position in the input).
+            match match_node(node, ctx, caps, pos, 1, &mut inner) {
                 Ok(_) => {
                     if *negate {
                         caps.rollback(mark);
@@ -309,23 +352,12 @@ fn match_node<'i>(
                 }
             }
         }
-        Node::Lookbehind {
-            negate,
-            node,
-            length,
-        } => {
-            let Some(start) = step_back(ctx, pos, *length as usize) else {
-                // Not enough input before the position.
-                if *negate {
-                    return cont(caps, pos);
-                }
-                return Err(());
-            };
+        Node::Lookbehind { negate, node } => {
+            // The subexpression runs right-to-left from the current position
+            // (variable-length lookbehind); on success the position resets.
             let mark = caps.mark();
-            let mut inner = |_: &mut Caps, end: usize| {
-                if end == pos { Ok(pos) } else { Err(()) }
-            };
-            match match_node(node, ctx, caps, start, &mut inner) {
+            let mut inner = |_: &mut Caps, _next: usize| Ok(pos);
+            match match_node(node, ctx, caps, pos, -1, &mut inner) {
                 Ok(_) => {
                     if *negate {
                         caps.rollback(mark);
@@ -349,42 +381,83 @@ fn match_sequence<'i>(
     ctx: &Ctx<'i>,
     caps: &mut Caps,
     pos: usize,
+    dir: i32,
     cont: &mut dyn FnMut(&mut Caps, usize) -> MatchResult,
 ) -> MatchResult {
-    if index == nodes.len() {
+    let len = nodes.len();
+    if index == len {
         return cont(caps, pos);
     }
+    // In reverse direction the terms match right-to-left.
+    let node_index = if dir > 0 { index } else { len - 1 - index };
     let mut inner =
-        |caps: &mut Caps, next: usize| match_sequence(nodes, index + 1, ctx, caps, next, cont);
-    match_node(&nodes[index], ctx, caps, pos, &mut inner)
+        |caps: &mut Caps, next: usize| match_sequence(nodes, index + 1, ctx, caps, next, dir, cont);
+    match_node(&nodes[node_index], ctx, caps, pos, dir, &mut inner)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn repeat_loop<'i>(
     node: &Node,
+    owned: &[usize],
     min: u32,
     max: Option<u32>,
     greedy: bool,
     ctx: &Ctx<'i>,
     caps: &mut Caps,
     pos: usize,
+    dir: i32,
     count: u32,
     cont: &mut dyn FnMut(&mut Caps, usize) -> MatchResult,
 ) -> MatchResult {
+    // Each iteration re-matches the atom from scratch, so captures owned by
+    // the atom from earlier iterations must not leak into this one (spec
+    // RepeatMatcher clears the atom's captures on the copy before matching).
     if greedy {
         if max.is_none_or(|m| count < m) {
             let mark = caps.mark();
-            // A zero-progress iteration (the atom matched the empty string) is
-            // the last one: it counts toward `min`, but recursing again could
-            // never advance the position, so stop once the minimum is met.
+            clear_owned(caps, owned);
+            // A zero-progress iteration is discarded when it was optional
+            // (spec RepeatMatcher step 2.b: an empty match after the minimum
+            // is reached fails, so the atom backtracks into a longer match);
+            // a forced one only counts toward the minimum.
             let mut inner = |caps: &mut Caps, next: usize| {
-                if next == pos && count + 1 >= min {
-                    cont(caps, next)
+                if next == pos && count >= min {
+                    Err(())
+                } else if next == pos {
+                    if count + 1 >= min {
+                        cont(caps, next)
+                    } else {
+                        repeat_loop(
+                            node,
+                            owned,
+                            min,
+                            max,
+                            greedy,
+                            ctx,
+                            caps,
+                            next,
+                            dir,
+                            count + 1,
+                            cont,
+                        )
+                    }
                 } else {
-                    repeat_loop(node, min, max, greedy, ctx, caps, next, count + 1, cont)
+                    repeat_loop(
+                        node,
+                        owned,
+                        min,
+                        max,
+                        greedy,
+                        ctx,
+                        caps,
+                        next,
+                        dir,
+                        count + 1,
+                        cont,
+                    )
                 }
             };
-            match match_node(node, ctx, caps, pos, &mut inner) {
+            match match_node(node, ctx, caps, pos, dir, &mut inner) {
                 Ok(end) => return Ok(end),
                 Err(_) => caps.rollback(mark),
             }
@@ -404,14 +477,45 @@ fn repeat_loop<'i>(
             return Err(());
         }
         let mark = caps.mark();
+        clear_owned(caps, owned);
         let mut inner = |caps: &mut Caps, next: usize| {
-            if next == pos && count + 1 >= min {
-                cont(caps, next)
+            if next == pos && count >= min {
+                Err(())
+            } else if next == pos {
+                if count + 1 >= min {
+                    cont(caps, next)
+                } else {
+                    repeat_loop(
+                        node,
+                        owned,
+                        min,
+                        max,
+                        greedy,
+                        ctx,
+                        caps,
+                        next,
+                        dir,
+                        count + 1,
+                        cont,
+                    )
+                }
             } else {
-                repeat_loop(node, min, max, greedy, ctx, caps, next, count + 1, cont)
+                repeat_loop(
+                    node,
+                    owned,
+                    min,
+                    max,
+                    greedy,
+                    ctx,
+                    caps,
+                    next,
+                    dir,
+                    count + 1,
+                    cont,
+                )
             }
         };
-        match match_node(node, ctx, caps, pos, &mut inner) {
+        match match_node(node, ctx, caps, pos, dir, &mut inner) {
             Ok(end) => Ok(end),
             Err(_) => {
                 caps.rollback(mark);
@@ -423,15 +527,40 @@ fn repeat_loop<'i>(
         if max.is_some_and(|m| count >= m) {
             return Err(());
         }
+        clear_owned(caps, owned);
         let mut inner = |caps: &mut Caps, next: usize| {
-            repeat_loop(node, min, max, greedy, ctx, caps, next, count + 1, cont)
+            repeat_loop(
+                node,
+                owned,
+                min,
+                max,
+                greedy,
+                ctx,
+                caps,
+                next,
+                dir,
+                count + 1,
+                cont,
+            )
         };
-        match_node(node, ctx, caps, pos, &mut inner)
+        match_node(node, ctx, caps, pos, dir, &mut inner)
     }
 }
 
-/// Whether the class matches the character at `pos` (given `c` = that char).
-fn class_matches(ctx: &Ctx<'_>, class: &CharClass, pos: usize, c: u32) -> bool {
+/// Clear the captures owned by a repeated atom, recording the previous
+/// values on the undo log so backtracking restores them.
+fn clear_owned(caps: &mut Caps, owned: &[usize]) {
+    for &index in owned {
+        if let Some(old) = caps.values[index] {
+            caps.trail.push((index, Some(old)));
+            caps.values[index] = None;
+        }
+    }
+}
+
+/// Whether the class matches the character at `pos` (given `c` = that char);
+/// `pos` is the character's start (forward) or end (backward) offset.
+fn class_matches(ctx: &Ctx<'_>, class: &CharClass, pos: usize, c: u32, dir: i32) -> bool {
     let cc = if class.fold {
         canonicalize(ctx.unicode, c)
     } else {
@@ -440,8 +569,33 @@ fn class_matches(ctx: &Ctx<'_>, class: &CharClass, pos: usize, c: u32) -> bool {
     let in_set = match &class.predicate {
         Some(pred) => predicate_matches(pred, cc),
         None => ranges_contain(&class.ranges, cc),
-    } || class.strings.iter().any(|s| string_at(ctx, pos, s));
+    } || class
+        .strings
+        .iter()
+        .any(|s| string_at_dir(ctx, pos, s, dir));
     in_set != class.negated
+}
+
+/// A `\q{…}` string atom: the code points adjacent to `pos` equal the string,
+/// in the match direction.
+fn string_at_dir(ctx: &Ctx<'_>, pos: usize, string: &[u32], dir: i32) -> bool {
+    if dir > 0 {
+        string_at(ctx, pos, string)
+    } else {
+        string_at_back(ctx, pos, string)
+    }
+}
+
+/// A `\q{…}` string atom matching leftward: the code points ending at `pos`.
+fn string_at_back(ctx: &Ctx<'_>, pos: usize, string: &[u32]) -> bool {
+    let mut index = pos;
+    for &want in string.iter().rev() {
+        match read_char_back(ctx, index) {
+            Some((c, len)) if c == want => index -= len,
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// A `\q{…}` string atom: the code points at `pos` equal the string.
@@ -456,6 +610,16 @@ fn string_at(ctx: &Ctx<'_>, pos: usize, string: &[u32]) -> bool {
     true
 }
 
+/// Read one input character in the match direction: the character at `pos`
+/// (forward) or the one ending at `pos` (backward).
+fn read_char_dir(ctx: &Ctx<'_>, pos: usize, dir: i32) -> Option<(u32, usize)> {
+    if dir > 0 {
+        read_char(ctx, pos)
+    } else {
+        read_char_back(ctx, pos)
+    }
+}
+
 /// Read one input character at `pos`: a code unit in legacy mode, a full code
 /// point in unicode mode.
 fn read_char(ctx: &Ctx<'_>, pos: usize) -> Option<(u32, usize)> {
@@ -465,6 +629,24 @@ fn read_char(ctx: &Ctx<'_>, pos: usize) -> Option<(u32, usize)> {
     } else {
         ctx.input.get(pos).map(|&u| (u as u32, 1))
     }
+}
+
+/// Read one input character ending at `pos` (the previous character, for
+/// backward matching).
+fn read_char_back(ctx: &Ctx<'_>, pos: usize) -> Option<(u32, usize)> {
+    if pos == 0 {
+        return None;
+    }
+    let u = ctx.input[pos - 1];
+    if ctx.unicode
+        && (0xDC00..=0xDFFF).contains(&u)
+        && pos >= 2
+        && (0xD800..=0xDBFF).contains(&ctx.input[pos - 2])
+    {
+        let hi = ctx.input[pos - 2] as u32;
+        return Some((0x10000 + ((hi - 0xD800) << 10) + (u as u32 - 0xDC00), 2));
+    }
+    Some((u as u32, 1))
 }
 
 fn is_line_terminator_at(ctx: &Ctx<'_>, pos: usize) -> bool {
@@ -496,31 +678,4 @@ fn units_eq(ctx: &Ctx<'_>, a: &[u16], b: &[u16], fold: bool) -> bool {
         }
     }
     true
-}
-
-/// Step back `count` characters (input elements) from `pos`, returning the
-/// code-unit index.
-fn step_back(ctx: &Ctx<'_>, pos: usize, count: usize) -> Option<usize> {
-    if count == 0 {
-        return Some(pos);
-    }
-    if !ctx.unicode {
-        return pos.checked_sub(count);
-    }
-    let mut index = pos;
-    for _ in 0..count {
-        if index == 0 {
-            return None;
-        }
-        // Find the start of the code point ending at `index`.
-        if (0xDC00..=0xDFFF).contains(&ctx.input[index - 1])
-            && index >= 2
-            && (0xD800..=0xDBFF).contains(&ctx.input[index - 2])
-        {
-            index -= 2;
-        } else {
-            index -= 1;
-        }
-    }
-    Some(index)
 }
