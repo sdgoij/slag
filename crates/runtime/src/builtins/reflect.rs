@@ -217,7 +217,9 @@ fn reflect_method(agent: &mut Agent, name: &str, args: &[Value]) -> Result<Value
         "getPrototypeOf" => {
             let obj = object_of(&arg(0))?;
             Ok(match obj.get_prototype_of()? {
-                Some(proto) => Value::Object(proto),
+                Some(proto) => proto
+                    .function_value()
+                    .unwrap_or_else(|| Value::Object(proto)),
                 None => Value::Null,
             })
         }

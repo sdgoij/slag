@@ -5,15 +5,15 @@
 
 use std::cmp::Ordering;
 
-use crux::convert::{to_boolean, to_integer_or_infinity, to_number};
+use crux::convert::{to_boolean, to_integer_or_infinity};
 use crux::error::{ErrorKind, JsError};
 use crux::function::{Function, NativeFn};
 use crux::handle::Handle;
-use crux::object::{JsObject, ObjectKind, TypedArraySlots};
+use crux::object::{JsObject, ObjectKind, TypedArraySlots, typed_array_effective_length};
 use crux::ops::{is_strictly_equal, same_value_zero};
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
-use crux::typed_array::{ElementType, SharedBuffer};
+use crux::typed_array::{ContentType, ElementType, SharedBuffer};
 use crux::value::{Value, is_callable, is_constructor};
 
 use crate::agent::Agent;
@@ -26,6 +26,7 @@ const TYPED_ARRAY_PROTO: &str = "%TypedArray.prototype%";
 const FROM: &str = "%TypedArray.from%";
 const OF: &str = "%TypedArray.of%";
 const SPECIES: &str = "%TypedArray.prototype[Symbol.species]%";
+const GET_TO_STRING_TAG: &str = "%TypedArray.prototype[Symbol.toStringTag]%";
 const AT: &str = "%TypedArray.prototype.at%";
 const COPY_WITHIN: &str = "%TypedArray.prototype.copyWithin%";
 const ENTRIES: &str = "%TypedArray.prototype.entries%";
@@ -185,33 +186,79 @@ fn typed_array_slots(value: &Value) -> Option<Handle<TypedArraySlots>> {
 }
 
 /// ValidateTypedArray (spec 25.2.4.3): the value is a TypedArray whose
-/// buffer is not detached (detachment joins with Phase 14).
+/// buffer is not detached.
+/// IsTypedArrayOutOfBounds (spec 10.4.5.2 with resizable buffers): a fixed
+/// view whose byte range exceeds the buffer, or an auto view whose byte
+/// offset exceeds the buffer.
+fn typed_array_out_of_bounds(agent: &Agent, slots: &TypedArraySlots) -> bool {
+    if typed_array_buffer_detached(agent, slots) {
+        return false;
+    }
+    if slots.auto_length {
+        slots.byte_offset > slots.buffer.byte_length()
+    } else {
+        slots.byte_length > 0 && slots.byte_offset + slots.byte_length > slots.buffer.byte_length()
+    }
+}
+
+/// ValidateTypedArray(O, write) (spec 25.2.4.5 with immutable buffers): the
+/// writing methods reject an immutable buffer before any argument coercion.
+fn validate_typed_array_write(
+    agent: &mut Agent,
+    value: &Value,
+) -> Result<Handle<TypedArraySlots>, JsError> {
+    let slots = validate_typed_array(agent, value)?;
+    if slots.buffer.is_immutable() {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "TypedArray buffer is immutable".into(),
+        ));
+    }
+    Ok(slots)
+}
+
 fn validate_typed_array(
     agent: &mut Agent,
     value: &Value,
 ) -> Result<Handle<TypedArraySlots>, JsError> {
-    let slots = typed_array_slots(value).ok_or_else(|| {
+    let slots = typed_array_slots_required(value)?;
+    if typed_array_buffer_detached(agent, &slots) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "TypedArray buffer is detached".into(),
+        ));
+    }
+    // A view whose byte range no longer fits the (resized) buffer is out of
+    // bounds and throws on validate (spec 25.2.4.5 step 5).
+    if typed_array_out_of_bounds(agent, &slots) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "TypedArray view is out of bounds".into(),
+        ));
+    }
+    Ok(slots)
+}
+
+/// RequireInternalSlot([[TypedArrayName]]): the value is a TypedArray. The
+/// `length`/`byteLength`/`byteOffset`/`buffer` accessors validate this way —
+/// they do not reject a detached buffer (spec 25.2.3.1-4).
+fn typed_array_slots_required(value: &Value) -> Result<Handle<TypedArraySlots>, JsError> {
+    typed_array_slots(value).ok_or_else(|| {
         JsError::new(
             ErrorKind::TypeError,
             "Method called on an incompatible receiver".into(),
         )
-    })?;
+    })
+}
+
+/// Whether the TypedArray's backing buffer is detached (missing from the
+/// buffer table or marked detached).
+fn typed_array_buffer_detached(agent: &Agent, slots: &TypedArraySlots) -> bool {
     let buffer_id = as_object(&slots.buffer_object)
         .map(|object| object.id())
         .unwrap_or(u64::MAX);
-    if !agent.buffer_data.contains_key(&buffer_id) {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "TypedArray buffer is detached".into(),
-        ));
-    }
-    if crate::builtins::array_buffer::is_detached(agent, buffer_id) {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "TypedArray buffer is detached".into(),
-        ));
-    }
-    Ok(slots)
+    !agent.buffer_data.contains_key(&buffer_id)
+        || crate::builtins::array_buffer::is_detached(agent, buffer_id)
 }
 
 /// IsArrayBuffer: an object registered in the buffer table (Phase 14 adds
@@ -326,17 +373,18 @@ fn allocate_typed_array_buffer(
         byte_length,
         byte_offset: 0,
         array_length: length,
+        auto_length: false,
     };
     let object = JsObject::integer_indexed_object_create(slots, Some(prototype))?;
     Ok(Value::Object(object))
 }
 
 /// The clamped end of `slice`/`fill`/`copyWithin` (undefined means `len`).
-fn clamped_end(args: &[Value], len: u64) -> Result<u64, JsError> {
+fn clamped_end(agent: &mut Agent, args: &[Value], len: u64) -> Result<u64, JsError> {
     match args.get(1) {
         None | Some(Value::Undefined) => Ok(len),
         Some(value) => {
-            let n = to_integer_or_infinity(to_number(value)?);
+            let n = to_integer_or_infinity(crate::context::to_number(agent, value)?);
             Ok(if n < 0.0 {
                 (len as i64).saturating_add(n as i64).max(0) as u64
             } else {
@@ -348,8 +396,9 @@ fn clamped_end(args: &[Value], len: u64) -> Result<u64, JsError> {
 
 /// ToIntegerOrInfinity of the first argument (undefined → 0), clamped to
 /// `[0, len]`.
-fn clamped_start(args: &[Value], len: u64) -> Result<u64, JsError> {
-    let n = to_integer_or_infinity(to_number(
+fn clamped_start(agent: &mut Agent, args: &[Value], len: u64) -> Result<u64, JsError> {
+    let n = to_integer_or_infinity(crate::context::to_number(
+        agent,
         &args.first().cloned().unwrap_or(Value::Undefined),
     )?);
     Ok(if n < 0.0 {
@@ -359,7 +408,9 @@ fn clamped_start(args: &[Value], len: u64) -> Result<u64, JsError> {
     })
 }
 
-/// TypedArrayCreate (spec 25.2.4.1): construct `constructor` with « length ».
+/// TypedArrayCreate (spec 25.2.4.1): construct `constructor` with « length »,
+/// then validate the result: it must be a TypedArray of the requested length
+/// whose buffer is not detached.
 fn typed_array_create(
     agent: &mut Agent,
     constructor: &Value,
@@ -371,19 +422,73 @@ fn typed_array_create(
         &[Value::Number(length as f64)],
         constructor,
     )?;
-    if !is_typed_array(&result) {
+    let result_slots = typed_array_slots_required(&result)?;
+    validate_typed_array(agent, &result)?;
+    // The created array is the write destination of the caller, so an
+    // immutable buffer is rejected here (spec 25.2.4.1 with accessMode
+    // write).
+    if result_slots.buffer.is_immutable() {
         return Err(JsError::new(
             ErrorKind::TypeError,
-            "TypedArrayCreate produced a non-TypedArray".into(),
+            "TypedArray buffer is immutable".into(),
+        ));
+    }
+    if typed_array_effective_length(&result_slots) < length {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "TypedArrayCreate produced a shorter TypedArray".into(),
         ));
     }
     Ok(result)
 }
 
-/// SpeciesConstructor + TypedArrayCreate (spec 25.2.4.2 TypedArraySpeciesCreate):
-/// the species of `exemplar` constructed with « length », with the content
-/// type preserved. The default (no custom species) is the exemplar's own
-/// kind constructor, which yields the same-kind result.
+/// SpeciesConstructor (spec 7.3.24): the exemplar's `constructor` (or the
+/// default when it is undefined), then its `[Symbol.species]`.
+fn species_constructor(
+    agent: &mut Agent,
+    exemplar: &Value,
+    default_ctor: Value,
+) -> Result<Value, JsError> {
+    let ctor = get(agent, exemplar, &JsString::from_utf8("constructor"))?;
+    if matches!(ctor, Value::Undefined) {
+        return Ok(default_ctor);
+    }
+    if !is_constructor(&ctor) && !matches!(ctor, Value::Object(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "constructor is not an object".into(),
+        ));
+    }
+    let species_key = PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone());
+    let species = crate::context::get_property_key(agent, &ctor, &species_key, ctor.clone())?;
+    match species {
+        Value::Null | Value::Undefined => Ok(default_ctor),
+        value if is_constructor(&value) => Ok(value),
+        _ => Err(JsError::new(
+            ErrorKind::TypeError,
+            "species is not a constructor".into(),
+        )),
+    }
+}
+
+/// The default constructor for `exemplar`'s element type (its realm's kind
+/// constructor).
+fn default_species_ctor(agent: &mut Agent, exemplar_slots: &TypedArraySlots) -> Value {
+    let kind = KINDS
+        .iter()
+        .find(|k| k.element_type == exemplar_slots.element_type)
+        .expect("known element type");
+    agent
+        .current_realm()
+        .ok()
+        .and_then(|realm| realm.intrinsics.get(kind.ctor))
+        .unwrap_or(Value::Undefined)
+}
+
+/// TypedArraySpeciesCreate (spec 25.2.4.2): the species of `exemplar`
+/// constructed with « length », with the content type preserved. The default
+/// (no custom species) is the exemplar's own kind constructor, which yields
+/// the same-kind result.
 fn typed_array_species_create(
     agent: &mut Agent,
     exemplar: &Value,
@@ -391,39 +496,48 @@ fn typed_array_species_create(
 ) -> Result<Value, JsError> {
     let exemplar_slots = typed_array_slots(exemplar)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "Incompatible receiver".into()))?;
-    let kind = KINDS
-        .iter()
-        .find(|k| k.element_type == exemplar_slots.element_type)
-        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "Unknown element type".into()))?;
-    let default_ctor = agent
-        .current_realm()?
-        .intrinsics
-        .get(kind.ctor)
-        .unwrap_or(Value::Undefined);
-    let ctor = get(agent, exemplar, &JsString::from_utf8("constructor"))?;
-    let constructor = if matches!(ctor, Value::Undefined) {
-        default_ctor
-    } else if !is_constructor(&ctor) && !matches!(ctor, Value::Object(_)) {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "constructor is not an object".into(),
-        ));
-    } else {
-        let species_key = PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone());
-        let species = crate::context::get_property_key(agent, &ctor, &species_key, ctor.clone())?;
-        match species {
-            Value::Null | Value::Undefined => default_ctor,
-            value if is_constructor(&value) => value,
-            _ => {
-                return Err(JsError::new(
-                    ErrorKind::TypeError,
-                    "species is not a constructor".into(),
-                ));
-            }
-        }
-    };
+    let default_ctor = default_species_ctor(agent, &exemplar_slots);
+    let constructor = species_constructor(agent, exemplar, default_ctor)?;
     let result = typed_array_create(agent, &constructor, length)?;
-    let result_slots = typed_array_slots(&result).ok_or_else(|| {
+    assert_same_content_type(&result, &exemplar_slots)?;
+    Ok(result)
+}
+
+/// TypedArraySpeciesCreate over an existing buffer (spec 25.2.3.30
+/// `subarray` step 17): the species constructed with « buffer, byteOffset,
+/// length » so the result shares the source buffer.
+fn typed_array_species_create_view(
+    agent: &mut Agent,
+    exemplar: &Value,
+    buffer: Value,
+    byte_offset: usize,
+    length: usize,
+) -> Result<Value, JsError> {
+    let exemplar_slots = typed_array_slots(exemplar)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "Incompatible receiver".into()))?;
+    let default_ctor = default_species_ctor(agent, &exemplar_slots);
+    let constructor = species_constructor(agent, exemplar, default_ctor)?;
+    let result = crate::function::construct(
+        agent,
+        &constructor,
+        &[
+            buffer,
+            Value::Number(byte_offset as f64),
+            Value::Number(length as f64),
+        ],
+        &constructor,
+    )?;
+    assert_same_content_type(&result, &exemplar_slots)?;
+    Ok(result)
+}
+
+/// The species result must be a TypedArray with the exemplar's content type
+/// (spec 25.2.4.2 steps 8-9).
+fn assert_same_content_type(
+    result: &Value,
+    exemplar_slots: &TypedArraySlots,
+) -> Result<(), JsError> {
+    let result_slots = typed_array_slots(result).ok_or_else(|| {
         JsError::new(
             ErrorKind::TypeError,
             "TypedArrayCreate produced a non-TypedArray".into(),
@@ -435,7 +549,7 @@ fn typed_array_species_create(
             "Species constructor changed the content type".into(),
         ));
     }
-    Ok(result)
+    Ok(())
 }
 
 /// The TypedArray constructor (spec 25.2.2.1): `new` only, with the length,
@@ -457,6 +571,18 @@ fn typed_array_construct(
         .iter()
         .find(|k| k.element_type == element_type)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "Unknown element type".into()))?;
+    // The argument is classified (ToIndex for a non-object, a content-type
+    // check for a typed-array source) before the constructor's prototype is
+    // read, so e.g. `new TA(Symbol())` throws the ToIndex TypeError first
+    // (spec 25.2.2.1).
+    if let Some(first) = args.first()
+        && !matches!(first, Value::Object(_) | Value::Function(_))
+        && args.len() == 1
+    {
+        let length = crate::context::to_index(agent, first)? as usize;
+        let prototype = get_prototype_from_constructor(agent, new_target, kind.proto)?;
+        return allocate_typed_array_buffer(agent, prototype, element_type, length);
+    }
     let prototype = get_prototype_from_constructor(agent, new_target, kind.proto)?;
     if args.is_empty() {
         return allocate_typed_array_buffer(agent, prototype, element_type, 0);
@@ -475,12 +601,6 @@ fn typed_array_construct(
         if args.len() == 1 {
             return iterate_source(agent, prototype, element_type, first);
         }
-    }
-    if args.len() == 1
-        && let Value::Number(_) = args[0]
-    {
-        let length = crux::convert::to_index(&args[0])? as usize;
-        return allocate_typed_array_buffer(agent, prototype, element_type, length);
     }
     // Multiple arguments: the argument list is the element list (spec step 7).
     let dst = allocate_typed_array_buffer(agent, prototype, element_type, args.len())?;
@@ -548,7 +668,7 @@ fn copy_typed_array(
             "Cannot mix BigInt and Number typed arrays".into(),
         ));
     }
-    let source_length = source_slots.array_length;
+    let source_length = typed_array_effective_length(&source_slots);
     let dst = allocate_typed_array_buffer(agent, prototype, element_type, source_length)?;
     if source_slots.element_type == element_type {
         // Same element type: copy the byte range directly.
@@ -580,23 +700,25 @@ fn typed_array_buffer_path(
             "ArrayBuffer expected".into(),
         ));
     };
-    let state = agent
-        .buffer_data
-        .get(&buffer_object.id())
-        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "Expected an ArrayBuffer".into()))?;
-    if state.borrow().detached {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "ArrayBuffer is detached".into(),
-        ));
-    }
-    let shared = state.borrow().shared.clone();
-    let buffer_byte_length = state.borrow().byte_length;
+    let (resizable, shared, buffer_byte_length) = {
+        let state = agent
+            .buffer_data
+            .get(&buffer_object.id())
+            .ok_or_else(|| JsError::new(ErrorKind::TypeError, "Expected an ArrayBuffer".into()))?;
+        if state.borrow().detached {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "ArrayBuffer is detached".into(),
+            ));
+        }
+        let state = state.borrow();
+        (state.resizable, state.shared.clone(), state.byte_length)
+    };
     let element_size = element_type.size();
     let byte_offset = match args.first() {
         None | Some(Value::Undefined) => 0,
         Some(value) => {
-            let offset = crux::convert::to_index(value)? as usize;
+            let offset = crate::context::to_index(agent, value)? as usize;
             if !offset.is_multiple_of(element_size) {
                 return Err(JsError::new(
                     ErrorKind::RangeError,
@@ -606,8 +728,35 @@ fn typed_array_buffer_path(
             offset
         }
     };
-    let byte_length = if args.len() > 1 && !matches!(args[1], Value::Undefined) {
-        let length = crux::convert::to_index(&args[1])? as usize;
+    // The byteOffset coercion may have detached the buffer (spec 25.2.2.1
+    // step 5.b: IsDetachedBuffer throws a TypeError).
+    if agent
+        .buffer_data
+        .get(&buffer_object.id())
+        .map(|state| state.borrow().detached)
+        .unwrap_or(false)
+    {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "ArrayBuffer is detached".into(),
+        ));
+    }
+    let explicit_length = args.len() > 1 && !matches!(args[1], Value::Undefined);
+    let byte_length = if explicit_length {
+        let length = crate::context::to_index(agent, &args[1])? as usize;
+        // The length coercion may have detached the buffer (spec 25.2.2.1
+        // step 5.b: IsDetachedBuffer throws a TypeError).
+        if agent
+            .buffer_data
+            .get(&buffer_object.id())
+            .map(|state| state.borrow().detached)
+            .unwrap_or(false)
+        {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "ArrayBuffer is detached".into(),
+            ));
+        }
         let bytes = length.checked_mul(element_size).ok_or_else(|| {
             JsError::new(ErrorKind::RangeError, "TypedArray length overflow".into())
         })?;
@@ -625,14 +774,16 @@ fn typed_array_buffer_path(
                 "byteOffset exceeds the buffer".into(),
             ));
         }
+        // A fixed-length view's byte range must be a whole number of
+        // elements (spec 25.2.2.1 step 13); a resizable buffer view is auto.
+        if !resizable && (buffer_byte_length - byte_offset) % element_size != 0 {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "byteLength must be a multiple of the element size".into(),
+            ));
+        }
         buffer_byte_length - byte_offset
     };
-    if byte_length % element_size != 0 {
-        return Err(JsError::new(
-            ErrorKind::RangeError,
-            "byteLength must be a multiple of the element size".into(),
-        ));
-    }
     let array_length = byte_length / element_size;
     let slots = TypedArraySlots {
         buffer_object: buffer.clone(),
@@ -641,6 +792,9 @@ fn typed_array_buffer_path(
         byte_length,
         byte_offset,
         array_length,
+        // A view over a resizable buffer without an explicit length tracks
+        // the buffer (spec 25.2.2.1: [[ArrayLength]] is auto).
+        auto_length: resizable && !explicit_length,
     };
     let object = JsObject::integer_indexed_object_create(slots, Some(prototype))?;
     Ok(Value::Object(object))
@@ -648,33 +802,54 @@ fn typed_array_buffer_path(
 
 /// spec 25.2.3.2 (per-kind) length accessor.
 fn get_length(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
-    let slots = validate_typed_array(agent, this)?;
-    Ok(Value::Number(slots.array_length as f64))
+    let slots = typed_array_slots_required(this)?;
+    if typed_array_buffer_detached(agent, &slots) {
+        return Ok(Value::Number(0.0));
+    }
+    Ok(Value::Number(typed_array_effective_length(&slots) as f64))
 }
 
-/// spec 25.2.3.1 buffer accessor.
 fn get_buffer(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
-    let slots = validate_typed_array(agent, this)?;
+    let slots = typed_array_slots_required(this)?;
+    let _ = agent;
     Ok(slots.buffer_object.clone())
 }
 
-/// spec 25.2.3.3 byteLength accessor.
 fn get_byte_length(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
-    let slots = validate_typed_array(agent, this)?;
+    let slots = typed_array_slots_required(this)?;
+    if typed_array_buffer_detached(agent, &slots) {
+        return Ok(Value::Number(0.0));
+    }
+    if typed_array_out_of_bounds(agent, &slots) {
+        return Ok(Value::Number(0.0));
+    }
+    if slots.auto_length {
+        // An auto-length view reports the current remaining buffer bytes,
+        // rounded down to a whole element.
+        let bytes = slots.buffer.byte_length().saturating_sub(slots.byte_offset);
+        let whole = bytes / slots.element_type.size() * slots.element_type.size();
+        return Ok(Value::Number(whole as f64));
+    }
     Ok(Value::Number(slots.byte_length as f64))
 }
 
-/// spec 25.2.3.4 byteOffset accessor.
 fn get_byte_offset(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
-    let slots = validate_typed_array(agent, this)?;
+    let slots = typed_array_slots_required(this)?;
+    if typed_array_buffer_detached(agent, &slots) {
+        return Ok(Value::Number(0.0));
+    }
+    if typed_array_out_of_bounds(agent, &slots) {
+        return Ok(Value::Number(0.0));
+    }
     Ok(Value::Number(slots.byte_offset as f64))
 }
 
 /// spec 25.2.3.5 TypedArray.prototype.at.
 fn at(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let slots = validate_typed_array(agent, this)?;
-    let length = slots.array_length as u64;
-    let relative = to_integer_or_infinity(to_number(
+    let length = typed_array_effective_length(&slots) as u64;
+    let relative = to_integer_or_infinity(crate::context::to_number(
+        agent,
         &args.first().cloned().unwrap_or(Value::Undefined),
     )?);
     let k = if relative >= 0.0 {
@@ -688,11 +863,25 @@ fn at(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError>
     get(agent, this, &key(k))
 }
 
+/// spec 25.2.3.32 get %TypedArray%.prototype[@@toStringTag]: the element
+/// type's name, or *undefined* when `this` is not a TypedArray.
+fn get_to_string_tag(_agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
+    let Some(slots) = typed_array_slots(this) else {
+        return Ok(Value::Undefined);
+    };
+    let kind = KINDS
+        .iter()
+        .find(|k| k.element_type == slots.element_type)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "Unknown element type".into()))?;
+    Ok(Value::String(Handle::new(JsString::from_utf8(kind.tag))))
+}
+
 /// spec 25.2.3.6 TypedArray.prototype.copyWithin.
 fn copy_within(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let slots = validate_typed_array(agent, this)?;
-    let length = slots.array_length as u64;
-    let relative_target = to_integer_or_infinity(to_number(
+    let slots = validate_typed_array_write(agent, this)?;
+    let length = typed_array_effective_length(&slots) as u64;
+    let relative_target = to_integer_or_infinity(crate::context::to_number(
+        agent,
         &args.first().cloned().unwrap_or(Value::Undefined),
     )?);
     let to = if relative_target < 0.0 {
@@ -702,7 +891,8 @@ fn copy_within(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
     } else {
         (relative_target as u64).min(length)
     };
-    let relative_start = to_integer_or_infinity(to_number(
+    let relative_start = to_integer_or_infinity(crate::context::to_number(
+        agent,
         &args.get(1).cloned().unwrap_or(Value::Undefined),
     )?);
     let from = if relative_start < 0.0 {
@@ -710,7 +900,13 @@ fn copy_within(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
     } else {
         (relative_start as u64).min(length)
     };
-    let final_index = clamped_end(args.get(1..).unwrap_or(&[]), length)?;
+    let final_index = clamped_end(agent, args.get(1..).unwrap_or(&[]), length)?;
+    if typed_array_buffer_detached(agent, &slots) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "TypedArray buffer is detached".into(),
+        ));
+    }
     let count = final_index
         .saturating_sub(from)
         .min(length.saturating_sub(to));
@@ -755,7 +951,7 @@ fn every(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
         ));
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    for k in 0..slots.array_length as u64 {
+    for k in 0..typed_array_effective_length(&slots) as u64 {
         let k_value = get(agent, this, &key(k))?;
         let test = crate::function::call(
             agent,
@@ -772,11 +968,29 @@ fn every(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
 
 /// spec 25.2.3.9 TypedArray.prototype.fill.
 fn fill(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let slots = validate_typed_array(agent, this)?;
-    let value = args.first().cloned().unwrap_or(Value::Undefined);
-    let length = slots.array_length as u64;
-    let k = clamped_start(args.get(1..).unwrap_or(&[]), length)?;
-    let final_index = clamped_end(args.get(1..).unwrap_or(&[]), length)?;
+    let slots = validate_typed_array_write(agent, this)?;
+    let length = typed_array_effective_length(&slots) as u64;
+    // The value is coerced exactly once, before the index arguments (spec
+    // 25.2.3.9 step 4); a coercion that detaches the buffer is caught by
+    // the detached check below.
+    let value = match slots.element_type.content_type() {
+        ContentType::BigInt => Value::BigInt(Handle::new(crate::context::to_big_int(
+            agent,
+            &args.first().cloned().unwrap_or(Value::Undefined),
+        )?)),
+        ContentType::Number => Value::Number(crate::context::to_number(
+            agent,
+            &args.first().cloned().unwrap_or(Value::Undefined),
+        )?),
+    };
+    let k = clamped_start(agent, args.get(1..).unwrap_or(&[]), length)?;
+    let final_index = clamped_end(agent, args.get(1..).unwrap_or(&[]), length)?;
+    if typed_array_buffer_detached(agent, &slots) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "TypedArray buffer is detached".into(),
+        ));
+    }
     for k in k..final_index {
         set_property(this, &key(k), value.clone())?;
     }
@@ -795,7 +1009,7 @@ fn filter(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
     let mut kept = Vec::new();
-    for k in 0..slots.array_length as u64 {
+    for k in 0..typed_array_effective_length(&slots) as u64 {
         let k_value = get(agent, this, &key(k))?;
         let selected = crate::function::call(
             agent,
@@ -830,7 +1044,7 @@ fn find_common(
         ));
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    for k in 0..slots.array_length as u64 {
+    for k in 0..typed_array_effective_length(&slots) as u64 {
         let k_value = get(agent, this, &key(k))?;
         let test = crate::function::call(
             agent,
@@ -879,7 +1093,7 @@ fn find_last_common(
         ));
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let mut k = slots.array_length as i64 - 1;
+    let mut k = typed_array_effective_length(&slots) as i64 - 1;
     while k >= 0 {
         let k_value = get(agent, this, &key(k as u64))?;
         let test = crate::function::call(
@@ -925,7 +1139,7 @@ fn for_each(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
         ));
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    for k in 0..slots.array_length as u64 {
+    for k in 0..typed_array_effective_length(&slots) as u64 {
         let k_value = get(agent, this, &key(k))?;
         crate::function::call(
             agent,
@@ -941,11 +1155,12 @@ fn for_each(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
 fn includes(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let slots = validate_typed_array(agent, this)?;
     let search_element = args.first().cloned().unwrap_or(Value::Undefined);
-    let length = slots.array_length as u64;
+    let length = typed_array_effective_length(&slots) as u64;
     if length == 0 {
         return Ok(Value::Boolean(false));
     }
-    let n = to_integer_or_infinity(to_number(
+    let n = to_integer_or_infinity(crate::context::to_number(
+        agent,
         &args.get(1).cloned().unwrap_or(Value::Undefined),
     )?);
     let k = if n >= 0.0 {
@@ -966,11 +1181,12 @@ fn includes(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
 fn index_of(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let slots = validate_typed_array(agent, this)?;
     let search_element = args.first().cloned().unwrap_or(Value::Undefined);
-    let length = slots.array_length as u64;
+    let length = typed_array_effective_length(&slots) as u64;
     if length == 0 {
         return Ok(Value::Number(-1.0));
     }
-    let n = to_integer_or_infinity(to_number(
+    let n = to_integer_or_infinity(crate::context::to_number(
+        agent,
         &args.get(1).cloned().unwrap_or(Value::Undefined),
     )?);
     let k = if n >= 0.0 {
@@ -979,9 +1195,14 @@ fn index_of(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
         (length as i64).saturating_add(n as i64).max(0) as u64
     };
     for k in k..length {
-        let element = get(agent, this, &key(k))?;
-        if is_strictly_equal(&element, &search_element) {
-            return Ok(Value::Number(k as f64));
+        let present = as_object(this)
+            .ok_or_else(|| JsError::new(ErrorKind::TypeError, "Incompatible receiver".into()))?
+            .has_property_key(&PropertyKey::from_utf8(&k.to_string()))?;
+        if present {
+            let element = get(agent, this, &key(k))?;
+            if is_strictly_equal(&element, &search_element) {
+                return Ok(Value::Number(k as f64));
+            }
         }
     }
     Ok(Value::Number(-1.0))
@@ -990,17 +1211,23 @@ fn index_of(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
 /// spec 25.2.3.18 TypedArray.prototype.join.
 fn join(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let slots = validate_typed_array(agent, this)?;
+    let length = typed_array_effective_length(&slots) as u64;
     let separator = match args.first() {
         Some(Value::Undefined) | None => ",".to_string(),
         Some(value) => crate::context::to_string(agent, value)?.to_string_lossy(),
     };
     let mut result = String::new();
-    for k in 0..slots.array_length as u64 {
+    for k in 0..length {
         if k > 0 {
             result.push_str(&separator);
         }
         let element = get(agent, this, &key(k))?;
-        result.push_str(&crate::context::to_string(agent, &element)?.to_string_lossy());
+        let text = if matches!(element, Value::Undefined | Value::Null) {
+            String::new()
+        } else {
+            crate::context::to_string(agent, &element)?.to_string_lossy()
+        };
+        result.push_str(&text);
     }
     Ok(Value::String(Handle::new(JsString::from_utf8(&result))))
 }
@@ -1019,27 +1246,30 @@ fn keys(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsErr
 fn last_index_of(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let slots = validate_typed_array(agent, this)?;
     let search_element = args.first().cloned().unwrap_or(Value::Undefined);
-    let length = slots.array_length as u64;
+    let length = typed_array_effective_length(&slots) as u64;
     if length == 0 {
         return Ok(Value::Number(-1.0));
     }
     let n = if args.len() < 2 {
         length as f64 - 1.0
     } else {
-        to_integer_or_infinity(to_number(&args[1])?)
+        to_integer_or_infinity(crate::context::to_number(agent, &args[1])?)
     };
-    let mut k = if n >= 0.0 {
-        (n as u64).min(length - 1)
+    let mut k: i64 = if n >= 0.0 {
+        (n as u64).min(length - 1) as i64
     } else {
-        (length as i64).saturating_add(n as i64).max(0) as u64
+        // Spec: k = len + n (no clamp to 0); a negative k skips the loop.
+        (length as i64).saturating_add(n as i64)
     };
-    loop {
-        let element = get(agent, this, &key(k))?;
-        if is_strictly_equal(&element, &search_element) {
-            return Ok(Value::Number(k as f64));
-        }
-        if k == 0 {
-            break;
+    while k >= 0 {
+        let present = as_object(this)
+            .ok_or_else(|| JsError::new(ErrorKind::TypeError, "Incompatible receiver".into()))?
+            .has_property_key(&PropertyKey::from_utf8(&k.to_string()))?;
+        if present {
+            let element = get(agent, this, &key(k as u64))?;
+            if is_strictly_equal(&element, &search_element) {
+                return Ok(Value::Number(k as f64));
+            }
         }
         k -= 1;
     }
@@ -1057,8 +1287,8 @@ fn map(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
         ));
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let result = typed_array_species_create(agent, this, slots.array_length)?;
-    for k in 0..slots.array_length as u64 {
+    let result = typed_array_species_create(agent, this, typed_array_effective_length(&slots))?;
+    for k in 0..typed_array_effective_length(&slots) as u64 {
         let k_value = get(agent, this, &key(k))?;
         let mapped = crate::function::call(
             agent,
@@ -1081,7 +1311,7 @@ fn reduce(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
             "TypedArray.prototype.reduce: callbackfn is not a function".into(),
         ));
     }
-    let length = slots.array_length as u64;
+    let length = typed_array_effective_length(&slots) as u64;
     let mut k = 0u64;
     let mut accumulator: Value;
     if args.len() >= 2 {
@@ -1119,7 +1349,7 @@ fn reduce_right(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
             "TypedArray.prototype.reduceRight: callbackfn is not a function".into(),
         ));
     }
-    let length = slots.array_length as u64;
+    let length = typed_array_effective_length(&slots) as u64;
     let mut k = length as i64 - 1;
     let mut accumulator: Value;
     if args.len() >= 2 {
@@ -1149,8 +1379,8 @@ fn reduce_right(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
 
 /// spec 25.2.3.24 TypedArray.prototype.reverse.
 fn reverse(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
-    let slots = validate_typed_array(agent, this)?;
-    let length = slots.array_length as u64;
+    let slots = validate_typed_array_write(agent, this)?;
+    let length = typed_array_effective_length(&slots) as u64;
     let mut lower = 0u64;
     while lower < length / 2 {
         let upper = length - 1 - lower;
@@ -1165,14 +1395,14 @@ fn reverse(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, Js
 
 /// spec 25.2.3.25 TypedArray.prototype.set.
 fn set(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let target_slots = validate_typed_array(agent, this)?;
+    let target_slots = validate_typed_array_write(agent, this)?;
     let source = args.first().cloned().unwrap_or(Value::Undefined);
-    let target_length = target_slots.array_length;
+    let target_length = typed_array_effective_length(&target_slots);
     if is_typed_array(&source) {
         let source_slots = validate_typed_array(agent, &source)?;
         let offset = match args.get(1) {
             None | Some(Value::Undefined) => 0,
-            Some(value) => crux::convert::to_index(value)? as usize,
+            Some(value) => crate::context::to_index(agent, value)? as usize,
         };
         if offset > target_length {
             return Err(JsError::new(
@@ -1180,11 +1410,21 @@ fn set(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
                 "Offset is out of bounds".into(),
             ));
         }
-        let source_length = source_slots.array_length;
+        let source_length = typed_array_effective_length(&source_slots);
         if source_length > target_length - offset {
             return Err(JsError::new(
                 ErrorKind::RangeError,
                 "Source is too large".into(),
+            ));
+        }
+        // The offset coercion may have detached either buffer (spec
+        // 25.2.3.25.2 steps 9-10).
+        if typed_array_buffer_detached(agent, &target_slots)
+            || typed_array_buffer_detached(agent, &source_slots)
+        {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "TypedArray buffer is detached".into(),
             ));
         }
         if target_slots.element_type == source_slots.element_type {
@@ -1211,8 +1451,14 @@ fn set(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
     let source_length = length_of_array_like(agent, &source_object)? as usize;
     let offset = match args.get(1) {
         None | Some(Value::Undefined) => 0,
-        Some(value) => crux::convert::to_index(value)? as usize,
+        Some(value) => crate::context::to_index(agent, value)? as usize,
     };
+    if typed_array_buffer_detached(agent, &target_slots) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "TypedArray buffer is detached".into(),
+        ));
+    }
     if offset > target_length || source_length > target_length - offset {
         return Err(JsError::new(
             ErrorKind::RangeError,
@@ -1221,7 +1467,15 @@ fn set(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
     }
     for k in 0..source_length {
         let value = get(agent, &source_object, &key(k as u64))?;
-        set_property(this, &key((offset + k) as u64), value)?;
+        // TypedArraySetElement coerces the source element through the agent
+        // (an element may be an object whose valueOf/toString are intrinsics).
+        let coerced = match target_slots.element_type.content_type() {
+            ContentType::BigInt => {
+                Value::BigInt(Handle::new(crate::context::to_big_int(agent, &value)?))
+            }
+            ContentType::Number => Value::Number(crate::context::to_number(agent, &value)?),
+        };
+        set_property(this, &key((offset + k) as u64), coerced)?;
     }
     Ok(Value::Undefined)
 }
@@ -1229,12 +1483,25 @@ fn set(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
 /// spec 25.2.3.26 TypedArray.prototype.slice.
 fn slice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let slots = validate_typed_array(agent, this)?;
-    let length = slots.array_length as u64;
-    let k = clamped_start(args, length)?;
-    let final_index = clamped_end(args, length)?;
+    let length = typed_array_effective_length(&slots) as u64;
+    let k = clamped_start(agent, args, length)?;
+    let final_index = clamped_end(agent, args, length)?;
     let count = final_index.saturating_sub(k);
     let result = typed_array_species_create(agent, this, count as usize)?;
-    for i in 0..count {
+    // The species constructor may detach the source buffer; per spec the
+    // copy only proceeds over a live buffer.
+    if count > 0 && typed_array_buffer_detached(agent, &slots) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "TypedArray buffer is detached".into(),
+        ));
+    }
+    // A resize during the start/end coercion may have shrunk the buffer: the
+    // result keeps its length but only the elements still in bounds are
+    // copied (spec 25.2.3.26 with resizable buffers).
+    let current = typed_array_effective_length(&slots) as u64;
+    let copy_count = count.min(current.saturating_sub(k));
+    for i in 0..copy_count {
         let value = get(agent, this, &key(k + i))?;
         set_property(&result, &key(i), value)?;
     }
@@ -1252,7 +1519,7 @@ fn some(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         ));
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    for k in 0..slots.array_length as u64 {
+    for k in 0..typed_array_effective_length(&slots) as u64 {
         let k_value = get(agent, this, &key(k))?;
         let test = crate::function::call(
             agent,
@@ -1288,7 +1555,7 @@ fn typed_sort_compare(
     }
     if !matches!(comparefn, Value::Undefined) {
         let v = crate::function::call(agent, comparefn, Value::Undefined, &[x.clone(), y.clone()])?;
-        let v = to_number(&v)?;
+        let v = crate::context::to_number(agent, &v)?;
         return Ok(if v.is_nan() { 0.0 } else { v });
     }
     let order = match (x, y) {
@@ -1319,16 +1586,20 @@ fn sort_indexed_properties(
     for k in 0..length {
         items.push(get(agent, object, &key(k))?);
     }
-    let mut error: Option<JsError> = None;
-    items.sort_by(|a, b| match typed_sort_compare(agent, comparefn, a, b) {
-        Ok(v) => v.partial_cmp(&0.0).unwrap_or(Ordering::Equal),
-        Err(e) => {
-            error = Some(e);
-            Ordering::Equal
+    // Insertion sort: a comparefn abrupt completion propagates immediately,
+    // so no further comparisons happen (spec 25.2.3.29: the sort stops on
+    // the first error).
+    for i in 1..items.len() {
+        let mut j = i;
+        while j > 0 {
+            let cmp = typed_sort_compare(agent, comparefn, &items[j - 1], &items[j])?;
+            if cmp > 0.0 {
+                items.swap(j - 1, j);
+                j -= 1;
+            } else {
+                break;
+            }
         }
-    });
-    if let Some(e) = error {
-        return Err(e);
     }
     for (k, item) in items.into_iter().enumerate() {
         set_property(object, &key(k as u64), item)?;
@@ -1338,7 +1609,7 @@ fn sort_indexed_properties(
 
 /// spec 25.2.3.28 TypedArray.prototype.sort.
 fn sort(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let slots = validate_typed_array(agent, this)?;
+    let slots = validate_typed_array_write(agent, this)?;
     let comparefn = args.first().cloned().unwrap_or(Value::Undefined);
     if !matches!(comparefn, Value::Undefined) && !is_callable(&comparefn) {
         return Err(JsError::new(
@@ -1346,46 +1617,50 @@ fn sort(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
             "TypedArray.prototype.sort: comparefn is not a function".into(),
         ));
     }
-    sort_indexed_properties(agent, this, slots.array_length as u64, &comparefn)?;
+    sort_indexed_properties(
+        agent,
+        this,
+        typed_array_effective_length(&slots) as u64,
+        &comparefn,
+    )?;
     Ok(this.clone())
 }
 
 /// spec 25.2.3.29 TypedArray.prototype.subarray.
 fn subarray(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let slots = validate_typed_array(agent, this)?;
-    let length = slots.array_length as u64;
-    let begin = clamped_start(args, length)?;
-    let end = clamped_end(args, length)?;
+    let slots = typed_array_slots_required(this)?;
+    let length = typed_array_effective_length(&slots) as u64;
+    let begin = clamped_start(agent, args, length)?;
+    let end = clamped_end(agent, args, length)?;
     let count = end.saturating_sub(begin);
     let new_byte_offset = slots.byte_offset + begin as usize * slots.element_type.size();
-    let byte_length = count as usize * slots.element_type.size();
     let buffer = slots.buffer_object.clone();
-    let new_slots = TypedArraySlots {
-        buffer_object: buffer.clone(),
-        buffer: slots.buffer.clone(),
-        element_type: slots.element_type,
-        byte_length,
-        byte_offset: new_byte_offset,
-        array_length: count as usize,
-    };
-    let kind = KINDS
-        .iter()
-        .find(|k| k.element_type == slots.element_type)
-        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "Unknown element type".into()))?;
-    let proto = agent
-        .current_realm()?
-        .intrinsics
-        .get(kind.proto)
-        .and_then(|value| as_object(&value));
-    let object = JsObject::integer_indexed_object_create(new_slots, proto)?;
-    Ok(Value::Object(object))
+    if slots.auto_length && matches!(args.get(1), None | Some(Value::Undefined)) {
+        // An auto-length view with no explicit end yields an auto-length
+        // result: species create with « buffer, byteOffset » (spec 25.2.3.30
+        // step 15).
+        let default_ctor = default_species_ctor(agent, &slots);
+        let constructor = species_constructor(agent, this, default_ctor)?;
+        let result = crate::function::construct(
+            agent,
+            &constructor,
+            &[buffer, Value::Number(new_byte_offset as f64)],
+            &constructor,
+        )?;
+        assert_same_content_type(&result, &slots)?;
+        return Ok(result);
+    }
+    // The result is a view over the same buffer, constructed through the
+    // species (spec 25.2.3.30 step 17: TypedArraySpeciesCreate with the
+    // buffer, byte offset, and new length).
+    typed_array_species_create_view(agent, this, buffer, new_byte_offset, count as usize)
 }
 
 /// spec 25.2.3.30 TypedArray.prototype.toLocaleString.
 fn to_locale_string(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     let slots = validate_typed_array(agent, this)?;
     let mut result = String::new();
-    for k in 0..slots.array_length as u64 {
+    for k in 0..typed_array_effective_length(&slots) as u64 {
         if k > 0 {
             result.push(',');
         }
@@ -1404,8 +1679,8 @@ fn to_locale_string(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<
 /// spec 25.2.3.31 TypedArray.prototype.toReversed.
 fn to_reversed(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     let slots = validate_typed_array(agent, this)?;
-    let length = slots.array_length;
-    let result = typed_array_species_create(agent, this, length)?;
+    let length = typed_array_effective_length(&slots);
+    let result = typed_array_create_same_type(agent, &slots, length)?;
     for k in 0..length as u64 {
         let value = get(agent, this, &key(length as u64 - 1 - k))?;
         set_property(&result, &key(k), value)?;
@@ -1423,12 +1698,17 @@ fn to_sorted(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, J
             "TypedArray.prototype.toSorted: comparefn is not a function".into(),
         ));
     }
-    let result = typed_array_species_create(agent, this, slots.array_length)?;
-    for k in 0..slots.array_length as u64 {
+    let result = typed_array_create_same_type(agent, &slots, typed_array_effective_length(&slots))?;
+    for k in 0..typed_array_effective_length(&slots) as u64 {
         let value = get(agent, this, &key(k))?;
         set_property(&result, &key(k), value)?;
     }
-    sort_indexed_properties(agent, &result, slots.array_length as u64, &comparefn)?;
+    sort_indexed_properties(
+        agent,
+        &result,
+        typed_array_effective_length(&slots) as u64,
+        &comparefn,
+    )?;
     Ok(result)
 }
 
@@ -1442,11 +1722,24 @@ fn values(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsE
     )
 }
 
+/// TypedArrayCreateSameType (spec 25.2.3.34 step 10 and the other
+/// change-array-by-copy methods): the result is always the exemplar's own
+/// kind constructor, ignoring @@species.
+fn typed_array_create_same_type(
+    agent: &mut Agent,
+    slots: &TypedArraySlots,
+    length: usize,
+) -> Result<Value, JsError> {
+    let ctor = default_species_ctor(agent, slots);
+    typed_array_create(agent, &ctor, length)
+}
+
 /// spec 25.2.3.34 TypedArray.prototype.with.
 fn with(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let slots = validate_typed_array(agent, this)?;
-    let length = slots.array_length as u64;
-    let relative_index = to_integer_or_infinity(to_number(
+    let length = typed_array_effective_length(&slots) as u64;
+    let relative_index = to_integer_or_infinity(crate::context::to_number(
+        agent,
         &args.first().cloned().unwrap_or(Value::Undefined),
     )?);
     let actual_index = if relative_index >= 0.0 {
@@ -1454,14 +1747,28 @@ fn with(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     } else {
         (length as i64).saturating_add(relative_index as i64) as u64
     };
-    if actual_index >= length {
+    // The value is coerced before the index is validated (spec 25.2.3.34
+    // steps 8-9): a throwing valueOf wins over a RangeError, and a resize
+    // during coercion changes the current length the index is checked
+    // against.
+    let value = match slots.element_type.content_type() {
+        ContentType::BigInt => Value::BigInt(Handle::new(crate::context::to_big_int(
+            agent,
+            &args.get(1).cloned().unwrap_or(Value::Undefined),
+        )?)),
+        ContentType::Number => Value::Number(crate::context::to_number(
+            agent,
+            &args.get(1).cloned().unwrap_or(Value::Undefined),
+        )?),
+    };
+    let current_slots = typed_array_slots_required(this)?;
+    if actual_index >= typed_array_effective_length(&current_slots) as u64 {
         return Err(JsError::new(
             ErrorKind::RangeError,
             "Index out of range".into(),
         ));
     }
-    let value = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let result = typed_array_species_create(agent, this, slots.array_length)?;
+    let result = typed_array_create_same_type(agent, &slots, length as usize)?;
     for k in 0..length {
         let new_value = if k == actual_index {
             value.clone()
@@ -1530,21 +1837,21 @@ fn from(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         let record = IteratorRecord { iterator, next };
         let mut values = Vec::new();
         while let Some(value) = crate::expr::iterator_step(agent, &record)? {
+            values.push(value);
+        }
+        let target = typed_array_create(agent, this, values.len())?;
+        for (k, value) in values.into_iter().enumerate() {
             let mapped = if mapping {
                 crate::function::call(
                     agent,
                     &mapfn,
                     this_arg.clone(),
-                    &[value, Value::Number(values.len() as f64), items.clone()],
+                    &[value, Value::Number(k as f64)],
                 )?
             } else {
                 value
             };
-            values.push(mapped);
-        }
-        let target = typed_array_create(agent, this, values.len())?;
-        for (k, value) in values.into_iter().enumerate() {
-            set_property(&target, &key(k as u64), value)?;
+            set_property(&target, &key(k as u64), mapped)?;
         }
         return Ok(target);
     }
@@ -1558,7 +1865,7 @@ fn from(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
                 agent,
                 &mapfn,
                 this_arg.clone(),
-                &[value, Value::Number(k as f64), array_like.clone()],
+                &[value, Value::Number(k as f64)],
             )?
         } else {
             value
@@ -1998,7 +2305,7 @@ fn decode_base64(
 /// SetUint8ArrayBytes (spec 25.2.4.2): copy the decoded bytes into the
 /// view's buffer range. `bytes.len()` never exceeds the array length.
 fn write_uint8_bytes(slots: &TypedArraySlots, bytes: &[u8]) -> Result<(), JsError> {
-    if bytes.len() > slots.array_length {
+    if bytes.len() > typed_array_effective_length(slots) {
         return Err(JsError::new(
             ErrorKind::RangeError,
             "Decoded bytes exceed the target length".into(),
@@ -2067,7 +2374,7 @@ fn from_base64(agent: &mut Agent, _this: &Value, args: &[Value]) -> Result<Value
 fn set_from_hex(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let slots = validate_uint8(agent, this)?;
     let hex = string_arg(args)?;
-    let result = decode_hex(hex.as_slice(), slots.array_length);
+    let result = decode_hex(hex.as_slice(), typed_array_effective_length(&slots));
     let written = result.bytes.len();
     let read = result.read;
     write_uint8_bytes(&slots, &result.bytes)?;
@@ -2085,7 +2392,12 @@ fn set_from_base64(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Va
     let options = get_options_object(agent, args.get(1))?;
     let alphabet = base64_alphabet_option(agent, &options)?;
     let last_chunk = last_chunk_handling_option(agent, &options)?;
-    let result = decode_base64(source.as_slice(), alphabet, last_chunk, slots.array_length);
+    let result = decode_base64(
+        source.as_slice(),
+        alphabet,
+        last_chunk,
+        typed_array_effective_length(&slots),
+    );
     let written = result.bytes.len();
     let read = result.read;
     write_uint8_bytes(&slots, &result.bytes)?;
@@ -2119,6 +2431,18 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     realm
         .intrinsics
         .define(TYPED_ARRAY_PROTO, typed_array_proto_value.clone());
+    // spec 25.2.2: %TypedArray% is exposed as the `TypedArray` global.
+    realm.global_object.define_property_or_throw(
+        &JsString::from_utf8("TypedArray"),
+        &PropertyDescriptor {
+            value: Some(typed_array_ctor_value.clone()),
+            writable: Some(true),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
+    )?;
     typed_array_ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
@@ -2199,6 +2523,28 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         )?;
     }
 
+    // spec 25.2.3.33: %TypedArray%.prototype.toString is the Array one.
+    let array_to_string = realm
+        .intrinsics
+        .get("%Array.prototype.toString%")
+        .ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                "%Array.prototype.toString% missing".into(),
+            )
+        })?;
+    typed_array_proto.define_property(
+        &JsString::from_utf8("toString"),
+        &PropertyDescriptor {
+            value: Some(array_to_string),
+            writable: Some(true),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
+    )?;
+
     // @@iterator = %TypedArray.prototype.values%.
     let values_func = realm.intrinsics.get(VALUES).ok_or_else(|| {
         JsError::new(
@@ -2219,11 +2565,11 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         },
     )?;
 
-    // @@species getter.
+    // @@species getter (returns `this`).
     let species_func = Function::create_builtin(
         Some(JsString::from_utf8("get [Symbol.species]")),
         0,
-        placeholder("species"),
+        Box::new(|this, _| Ok(this.clone())),
         None,
         None,
     )?;
@@ -2231,6 +2577,19 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .intrinsics
         .define(SPECIES, Value::Function(species_func.clone()));
     typed_array_proto.define_property_key(
+        &PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone()),
+        &PropertyDescriptor {
+            value: None,
+            writable: None,
+            get: Some(Value::Function(species_func.clone())),
+            set: Some(Value::Undefined),
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
+    )?;
+    // The same accessor on the %TypedArray% constructor (spec 25.2.3.31);
+    // the kind constructors inherit it through [[Prototype]] = %TypedArray%.
+    typed_array_ctor.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone()),
         &PropertyDescriptor {
             value: None,
@@ -2273,16 +2632,26 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         )?;
     }
 
-    // @@toStringTag.
+    // @@toStringTag: a single accessor on %TypedArray%.prototype that reads
+    // the instance's [[TypedArrayName]] (spec 25.2.3.32), not a data property
+    // per concrete prototype.
+    let tag_func = Function::create_builtin(
+        Some(JsString::from_utf8("get [Symbol.toStringTag]")),
+        0,
+        placeholder("toStringTag"),
+        None,
+        None,
+    )?;
+    realm
+        .intrinsics
+        .define(GET_TO_STRING_TAG, Value::Function(tag_func.clone()));
     typed_array_proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
         &PropertyDescriptor {
-            value: Some(Value::String(Handle::new(JsString::from_utf8(
-                "TypedArray",
-            )))),
-            writable: Some(false),
-            get: None,
-            set: None,
+            value: None,
+            writable: None,
+            get: Some(Value::Function(tag_func)),
+            set: Some(Value::Undefined),
             enumerable: Some(false),
             configurable: Some(true),
         },
@@ -2360,6 +2729,19 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
                 configurable: Some(false),
             },
         )?;
+        // spec 25.2.1 table: BYTES_PER_ELEMENT is also a non-writable,
+        // non-enumerable, non-configurable data property of the prototype.
+        kind_proto.define_property(
+            &JsString::from_utf8("BYTES_PER_ELEMENT"),
+            &PropertyDescriptor {
+                value: Some(Value::Number(kind.element_type.size() as f64)),
+                writable: Some(false),
+                get: None,
+                set: None,
+                enumerable: Some(false),
+                configurable: Some(false),
+            },
+        )?;
         kind_proto.define_property(
             &JsString::from_utf8("constructor"),
             &PropertyDescriptor {
@@ -2371,22 +2753,11 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
                 configurable: Some(true),
             },
         )?;
-        kind_proto.define_property_key(
-            &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
-            &PropertyDescriptor {
-                value: Some(Value::String(Handle::new(JsString::from_utf8(kind.tag)))),
-                writable: Some(false),
-                get: None,
-                set: None,
-                enumerable: Some(false),
-                configurable: Some(true),
-            },
-        )?;
         // Species per kind prototype.
         let species_func = Function::create_builtin(
             Some(JsString::from_utf8("get [Symbol.species]")),
             0,
-            placeholder("species"),
+            Box::new(|this, _| Ok(this.clone())),
             None,
             None,
         )?;
@@ -2614,6 +2985,9 @@ pub fn dispatch_call(
     }
     if intrinsics.get(GET_BYTE_OFFSET).as_ref() == Some(callee) {
         return Some(get_byte_offset(agent, this, args));
+    }
+    if intrinsics.get(GET_TO_STRING_TAG).as_ref() == Some(callee) {
+        return Some(get_to_string_tag(agent, this, args));
     }
     if intrinsics.get(FROM_HEX).as_ref() == Some(callee) {
         return Some(from_hex(agent, this, args));
@@ -3025,10 +3399,12 @@ mod tests {
             "(function(){ var buf = new ArrayBuffer(4); var t = new Uint8Array(buf); buf.transfer(); return t.join(','); })()"
         )
         .is_err());
-        assert!(run(
-            "(function(){ var buf = new ArrayBuffer(4); var t = new Uint8Array(buf); buf.transfer(); return t.length; })()"
-        )
-        .is_err());
+        assert_eq!(
+            text(
+                "(function(){ var buf = new ArrayBuffer(4); var t = new Uint8Array(buf); buf.transfer(); return String(t.length); })()"
+            ),
+            "0"
+        );
     }
 
     #[test]
@@ -3041,20 +3417,27 @@ mod tests {
     }
 
     #[test]
-    fn element_access_on_detached_views_throws() {
-        // spec 10.4.5.2: integer-indexed [[Get]] on a detached view throws a
-        // TypeError even for out-of-bounds indices.
-        assert!(run(
-            "(function(){ var buf = new ArrayBuffer(4); var t = new Uint8Array(buf); t[0] = 7; buf.transfer(); return t[0]; })()"
-        )
-        .is_err());
-        assert!(run(
-            "(function(){ var buf = new ArrayBuffer(4); var t = new Uint8Array(buf); buf.transfer(); return t[99]; })()"
-        )
-        .is_err());
-        assert!(run(
-            "(function(){ var buf = new ArrayBuffer(4); var t = new Uint8Array(buf); buf.transfer(); t[0] = 1; return 0; })()"
-        )
-        .is_err());
+    fn element_access_on_detached_views_is_a_noop() {
+        // spec 10.4.7 (align-detached-buffer-semantics-with-web-reality): the
+        // integer-indexed [[Get]]/[[Set]] on a detached view read *undefined*
+        // and ignore writes (no TypeError) for any canonical index.
+        assert_eq!(
+            text(
+                "(function(){ var buf = new ArrayBuffer(4); var t = new Uint8Array(buf); t[0] = 7; buf.transfer(); return String(t[0]); })()"
+            ),
+            "undefined"
+        );
+        assert_eq!(
+            text(
+                "(function(){ var buf = new ArrayBuffer(4); var t = new Uint8Array(buf); buf.transfer(); return String(t[99]); })()"
+            ),
+            "undefined"
+        );
+        assert_eq!(
+            text(
+                "(function(){ var buf = new ArrayBuffer(4); var t = new Uint8Array(buf); buf.transfer(); t[0] = 1; return String(t.length); })()"
+            ),
+            "0"
+        );
     }
 }

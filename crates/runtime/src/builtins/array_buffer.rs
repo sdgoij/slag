@@ -32,6 +32,7 @@ const AB_RESIZE: &str = "%ArrayBuffer.prototype.resize%";
 const AB_SLICE: &str = "%ArrayBuffer.prototype.slice%";
 const AB_TRANSFER: &str = "%ArrayBuffer.prototype.transfer%";
 const AB_TRANSFER_TO_FIXED_LENGTH: &str = "%ArrayBuffer.prototype.transferToFixedLength%";
+const AB_TRANSFER_TO_IMMUTABLE: &str = "%ArrayBuffer.prototype.transferToImmutable%";
 
 const SHARED_ARRAY_BUFFER: &str = "%SharedArrayBuffer%";
 const SHARED_ARRAY_BUFFER_PROTO: &str = "%SharedArrayBuffer.prototype%";
@@ -70,6 +71,9 @@ pub struct BufferState {
     pub is_shared: bool,
     /// [[ArrayBufferData]] is null (IsDetachedBuffer).
     pub detached: bool,
+    /// [[ArrayBufferImmutable]] (ES2026 transferToImmutable): writes through
+    /// views throw a TypeError.
+    pub immutable: bool,
 }
 
 impl BufferState {
@@ -82,6 +86,7 @@ impl BufferState {
             growable: false,
             is_shared: false,
             detached: false,
+            immutable: false,
         }
     }
 }
@@ -180,6 +185,7 @@ fn allocate_array_buffer(
             growable: false,
             is_shared: false,
             detached: false,
+            immutable: false,
         }),
     );
     Ok(())
@@ -211,6 +217,7 @@ fn allocate_shared_array_buffer(
             growable: is_growable,
             is_shared: true,
             detached: false,
+            immutable: false,
         }),
     );
     Ok(())
@@ -610,7 +617,53 @@ fn transfer(
             "ArrayBuffer is detached".into(),
         ));
     }
+    if state(agent, object.id())
+        .map(|s| s.immutable)
+        .unwrap_or(false)
+    {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "ArrayBuffer is immutable".into(),
+        ));
+    }
     array_buffer_copy_and_detach(agent, object.id(), new_length, preserve_resizability)
+}
+
+/// ArrayBuffer.prototype.transferToImmutable (ES2026 25.1.5.10): copy into a
+/// fresh immutable buffer and detach the source.
+fn transfer_to_immutable(
+    agent: &mut Agent,
+    this: &Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    let object = require_buffer_object(agent, this)?;
+    if is_shared(agent, this) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "transferToImmutable is not defined for SharedArrayBuffer".into(),
+        ));
+    }
+    if is_detached(agent, object.id()) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "ArrayBuffer is detached".into(),
+        ));
+    }
+    let new_length = match args.first() {
+        None | Some(Value::Undefined) => state(agent, object.id())
+            .map(|state| state.byte_length)
+            .unwrap_or(0),
+        Some(value) => to_index(value)? as usize,
+    };
+    let result = array_buffer_copy_and_detach(agent, object.id(), new_length, false)?;
+    if let Value::Object(obj) = &result
+        && let Some(cell) = agent.buffer_data.get(&obj.id())
+    {
+        let mut state = cell.borrow_mut();
+        state.immutable = true;
+        state.shared.mark_immutable();
+    }
+    Ok(result)
 }
 
 /// SharedArrayBuffer(length [, options]) (spec 25.3.3.1).
@@ -672,6 +725,7 @@ pub fn shared_array_buffer_from_block(
             growable: false,
             is_shared: true,
             detached: false,
+            immutable: false,
         }),
     );
     Ok(Value::Object(object))
@@ -987,11 +1041,12 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     }
 
     // ArrayBuffer prototype methods.
-    let ab_methods: [(&str, &str, u64); 4] = [
+    let ab_methods: [(&str, &str, u64); 5] = [
         ("resize", AB_RESIZE, 1),
         ("slice", AB_SLICE, 2),
         ("transfer", AB_TRANSFER, 1),
         ("transferToFixedLength", AB_TRANSFER_TO_FIXED_LENGTH, 1),
+        ("transferToImmutable", AB_TRANSFER_TO_IMMUTABLE, 1),
     ];
     for (name, intrinsic, length) in ab_methods {
         let func = Function::create_builtin(
@@ -1225,6 +1280,9 @@ pub fn dispatch_call(
     }
     if intrinsics.get(AB_TRANSFER_TO_FIXED_LENGTH).as_ref() == Some(callee) {
         return Some(transfer(agent, this, args, false));
+    }
+    if intrinsics.get(AB_TRANSFER_TO_IMMUTABLE).as_ref() == Some(callee) {
+        return Some(transfer_to_immutable(agent, this, args));
     }
     if intrinsics.get(SAB_BYTE_LENGTH).as_ref() == Some(callee) {
         return Some(sab_get_byte_length(agent, this, args));

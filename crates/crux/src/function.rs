@@ -175,6 +175,7 @@ impl Function {
             self_handle: RefCell::new(None),
         });
         *function.self_handle.borrow_mut() = Some(Handle::downgrade(&function));
+        *function.object.function_self.borrow_mut() = Some(Handle::downgrade(&function));
         function
     }
 
@@ -212,6 +213,7 @@ impl Function {
             self_handle: RefCell::new(None),
         });
         Self::link_self_handle(&function);
+        *function.object.function_self.borrow_mut() = Some(Handle::downgrade(&function));
         function.define_property(
             &JsString::from_utf8("length"),
             &PropertyDescriptor {
@@ -266,6 +268,7 @@ impl Function {
             self_handle: RefCell::new(None),
         });
         Self::link_self_handle(&function);
+        *function.object.function_self.borrow_mut() = Some(Handle::downgrade(&function));
         Ok(function)
     }
 

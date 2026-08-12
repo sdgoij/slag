@@ -38,6 +38,34 @@ pub fn to_primitive(
     if !matches!(value, Value::Object(_) | Value::Function(_)) {
         return Ok(value.clone());
     }
+    // spec 7.1.1 step 1.a: the @@toPrimitive method runs first, and its
+    // abrupt completion or object result decides.
+    let exotic = get_property_key(
+        agent,
+        value,
+        &PropertyKey::Symbol(crux::symbol::well_known("toPrimitive").as_ref().clone()),
+        value.clone(),
+    )?;
+    if crux::value::is_callable(&exotic) {
+        let hint_text = match hint {
+            crux::convert::ToPrimitiveHint::String => "string",
+            crux::convert::ToPrimitiveHint::Default => "default",
+            crux::convert::ToPrimitiveHint::Number => "number",
+        };
+        let result = crate::function::call(
+            agent,
+            &exotic,
+            value.clone(),
+            &[Value::String(Handle::new(JsString::from_utf8(hint_text)))],
+        )?;
+        if matches!(result, Value::Object(_) | Value::Function(_)) {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "Cannot convert object to primitive value".into(),
+            ));
+        }
+        return Ok(result);
+    }
     let (first, second) = match hint {
         crux::convert::ToPrimitiveHint::String | crux::convert::ToPrimitiveHint::Default => {
             ("toString", "valueOf")
@@ -93,6 +121,41 @@ pub fn to_property_key(agent: &mut Agent, value: &Value) -> Result<PropertyKey, 
     }
 }
 
+/// ToIndex (spec 7.1.5) with the agent-aware ToNumber, so an object offset
+/// reaches its valueOf/toString through the agent's dispatch (crux cannot
+/// invoke the default built-in methods).
+pub fn to_index(agent: &mut Agent, value: &Value) -> Result<u64, JsError> {
+    let number = to_number(agent, value)?;
+    crux::convert::to_index(&Value::Number(number))
+}
+
+/// ToBigInt (spec 7.1.16) with agent dispatch for object receivers.
+pub fn to_big_int(agent: &mut Agent, value: &Value) -> Result<crux::BigInt, JsError> {
+    let prim = to_primitive(agent, value, crux::convert::ToPrimitiveHint::Number)?;
+    match prim {
+        Value::Undefined | Value::Null => Err(JsError::new(
+            ErrorKind::TypeError,
+            "Cannot convert undefined or null to a BigInt".into(),
+        )),
+        Value::Boolean(true) => Ok(crux::BigInt::from(1u64)),
+        Value::Boolean(false) => Ok(crux::BigInt::from(0u64)),
+        Value::BigInt(b) => Ok(b.as_ref().clone()),
+        Value::String(_) => crux::convert::to_big_int(&prim),
+        Value::Number(_) => Err(JsError::new(
+            ErrorKind::TypeError,
+            "Cannot convert a Number to a BigInt".into(),
+        )),
+        Value::Symbol(_) => Err(JsError::new(
+            ErrorKind::TypeError,
+            "Cannot convert a Symbol to a BigInt".into(),
+        )),
+        Value::Object(_) | Value::Function(_) => Err(JsError::new(
+            ErrorKind::TypeError,
+            "Cannot convert an object to a BigInt".into(),
+        )),
+    }
+}
+
 /// ToObject (spec 7.1.19): box a primitive; null/undefined throw. Boolean
 /// and Symbol boxes carry their wrapped value in the agent tables so
 /// `valueOf`/`toString`/`description` read it back; the Number/BigInt
@@ -123,6 +186,7 @@ pub fn to_object(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
                 .get("%Boolean.prototype%")
                 .and_then(|v| as_object(&v));
             let object = JsObject::ordinary_object_create(proto);
+            *object.boxed.borrow_mut() = Some(crux::object::BoxedPrimitive::Boolean(*b));
             agent.boolean_data.insert(object.id(), *b);
             Ok(Value::Object(object))
         }
@@ -143,6 +207,7 @@ pub fn to_object(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
                 .get("%Number.prototype%")
                 .and_then(|v| as_object(&v));
             let object = JsObject::ordinary_object_create(proto);
+            *object.boxed.borrow_mut() = Some(crux::object::BoxedPrimitive::Number(*n));
             agent.number_data.insert(object.id(), *n);
             Ok(Value::Object(object))
         }
@@ -152,6 +217,8 @@ pub fn to_object(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
                 .get("%BigInt.prototype%")
                 .and_then(|v| as_object(&v));
             let object = JsObject::ordinary_object_create(proto);
+            *object.boxed.borrow_mut() =
+                Some(crux::object::BoxedPrimitive::BigInt(b.as_ref().clone()));
             agent.bigint_data.insert(object.id(), b.as_ref().clone());
             Ok(Value::Object(object))
         }
@@ -396,8 +463,15 @@ pub fn get_property_key(
         Value::Object(obj) => {
             // Accessors whose getter is an ECMAScript function cannot be
             // invoked by the crux layer (the body lives in the agent);
-            // dispatch them through the evaluator (spec 8.12.2 step 6.b).
-            if let Some(getter) = find_ecma_accessor(obj, key, AccessorKind::Get)? {
+            // dispatch them through the evaluator (spec 8.12.2 step 6.b). The
+            // Integer-Indexed exotic [[Get]] intercepts canonical numeric
+            // index keys, so the dispatch must not run for them (the prototype
+            // chain is not consulted).
+            let typed_array_index = matches!(obj.kind, crux::object::ObjectKind::IntegerIndexed(_))
+                && crux::object::is_canonical_index_key(key);
+            if !typed_array_index
+                && let Some(getter) = find_ecma_accessor(obj, key, AccessorKind::Get)?
+            {
                 return crate::function::call(agent, &getter, receiver, &[]);
             }
             obj.get_with_receiver_key(key, receiver)
@@ -451,6 +525,14 @@ fn find_ecma_accessor(
         if matches!(obj.kind, crux::object::ObjectKind::Proxy(_)) {
             return Ok(None);
         }
+        // The Integer-Indexed exotic intercepts canonical numeric index keys
+        // (its [[Get]]/[[Set]] do not consult the prototype chain), so
+        // neither its own nor any inherited accessor fires for them.
+        if matches!(obj.kind, crux::object::ObjectKind::IntegerIndexed(_))
+            && crux::object::is_canonical_index_key(key)
+        {
+            return Ok(None);
+        }
         if let Some(property) = obj.get_own_property_key(key)? {
             let crux::object::PropertyKind::Accessor { get, set } = property.kind else {
                 return Ok(None);
@@ -498,7 +580,12 @@ pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Resu
             };
             let result = match &base {
                 Value::Object(obj) => {
-                    if let Some(setter) = find_ecma_accessor(obj, key, AccessorKind::Set)? {
+                    let typed_array_index =
+                        matches!(obj.kind, crux::object::ObjectKind::IntegerIndexed(_))
+                            && crux::object::is_canonical_index_key(key);
+                    if !typed_array_index
+                        && let Some(setter) = find_ecma_accessor(obj, key, AccessorKind::Set)?
+                    {
                         crate::function::call(agent, &setter, base.clone(), &[value])?;
                         return Ok(());
                     }

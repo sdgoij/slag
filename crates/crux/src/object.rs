@@ -204,8 +204,13 @@ pub struct TypedArraySlots {
     pub byte_length: usize,
     /// [[ByteOffset]]: the offset of the first element in the buffer.
     pub byte_offset: usize,
-    /// [[ArrayLength]]: the number of elements.
+    /// [[ArrayLength]]: the number of elements. For a view over a resizable
+    /// buffer created without an explicit length this is "auto": the value
+    /// tracks the buffer via [`typed_array_effective_length`].
     pub array_length: usize,
+    /// Whether [[ArrayLength]] is auto (spec 25.2.2.1 step 12: a view over a
+    /// resizable buffer without an explicit length).
+    pub auto_length: bool,
 }
 
 /// The [[Exports]] of a module namespace exotic object (spec 10.4.6). Phase
@@ -270,6 +275,24 @@ pub struct JsObject {
     /// need `this` as a language value (accessor invocation, the arguments
     /// mapping) can recover the real handle instead of a copy.
     self_handle: RefCell<Option<Weak<JsObject>>>,
+    /// When this object is a function's object part, a weak back-reference to
+    /// that function so a prototype link recovers the function value (e.g.
+    /// `Object.getPrototypeOf(Int8Array)` is %TypedArray% the function, not
+    /// its object part).
+    pub function_self: RefCell<Option<Weak<crate::function::Function>>>,
+    /// The wrapped value of a primitive wrapper object (spec 10.4.2
+    /// [[NumberData]]/[[BooleanData]]/[[BigIntData]]), mirrored on the object
+    /// so crux's ToPrimitive/ToNumber coerce a boxed primitive without
+    /// invoking the agent-dispatched `valueOf`.
+    pub boxed: RefCell<Option<BoxedPrimitive>>,
+}
+
+/// The wrapped value of a primitive wrapper object (spec 10.4.2).
+#[derive(Debug, Clone)]
+pub enum BoxedPrimitive {
+    Number(f64),
+    BigInt(crate::BigInt),
+    Boolean(bool),
 }
 
 impl PartialEq for JsObject {
@@ -286,6 +309,17 @@ impl fmt::Debug for JsObject {
 }
 
 impl JsObject {
+    /// When this object is a function's object part, the function as a
+    /// language value (so a prototype link like `Object.getPrototypeOf(f)`
+    /// keeps `typeof`/`is_constructor` working).
+    pub fn function_value(&self) -> Option<Value> {
+        self.function_self
+            .borrow()
+            .as_ref()
+            .and_then(|weak| weak.upgrade())
+            .map(Value::Function)
+    }
+
     /// The raw object with ordinary behaviour (no handle back-reference).
     /// Used to embed an object inside `Function`; constructors that hand out
     /// a `Handle` call `link_self_handle` on the way out.
@@ -298,6 +332,8 @@ impl JsObject {
             properties: RefCell::new(Vec::new()),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
+            function_self: RefCell::new(None),
+            boxed: RefCell::new(None),
         }
     }
 
@@ -357,6 +393,8 @@ impl JsObject {
             properties: RefCell::new(Vec::new()),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
+            function_self: RefCell::new(None),
+            boxed: RefCell::new(None),
         });
         Self::link_self_handle(&array);
         let length_desc = PropertyDescriptor {
@@ -386,6 +424,8 @@ impl JsObject {
             properties: RefCell::new(Vec::new()),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
+            function_self: RefCell::new(None),
+            boxed: RefCell::new(None),
         });
         Self::link_self_handle(&string);
         let length_desc = PropertyDescriptor {
@@ -411,6 +451,8 @@ impl JsObject {
             properties: RefCell::new(Vec::new()),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
+            function_self: RefCell::new(None),
+            boxed: RefCell::new(None),
         });
         Self::link_self_handle(&proxy);
         proxy
@@ -430,6 +472,8 @@ impl JsObject {
             properties: RefCell::new(Vec::new()),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
+            function_self: RefCell::new(None),
+            boxed: RefCell::new(None),
         });
         Self::link_self_handle(&object);
         Ok(object)
@@ -448,6 +492,8 @@ impl JsObject {
             properties: RefCell::new(Vec::new()),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
+            function_self: RefCell::new(None),
+            boxed: RefCell::new(None),
         });
         Self::link_self_handle(&object);
         Ok(object)
@@ -475,6 +521,8 @@ impl JsObject {
             properties: RefCell::new(Vec::new()),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
+            function_self: RefCell::new(None),
+            boxed: RefCell::new(None),
         });
         Self::link_self_handle(&obj);
         // spec steps 15-16: index properties first, then length. The map is
@@ -744,6 +792,14 @@ impl JsObject {
         // walk.
         if let ObjectKind::Proxy(slots) = &self.kind {
             return crate::proxy::has_property(slots, key);
+        }
+        // The Integer-Indexed [[HasProperty]] intercepts canonical numeric
+        // index strings: an invalid index reads *undefined*, so the property
+        // is absent without consulting the prototype chain (spec 10.4.7.4).
+        if let ObjectKind::IntegerIndexed(slots) = &self.kind
+            && let Some(index) = canonical_index(key)
+        {
+            return Ok(typed_array_valid_index(slots, index));
         }
         if self.has_own_property_key(key)? {
             return Ok(true);
@@ -1649,14 +1705,15 @@ fn arguments_define_own_property(
 /// round-trip ToNumber/ToString. Non-integers and huge magnitudes return
 /// `None` (they are never valid string indices).
 fn canonical_numeric_index_string(text: &[u16]) -> Option<f64> {
+    // spec 7.1.21 CanonicalNumericIndexString: "-0" is its own case; any
+    // other string must round-trip through ToNumber → ToString (so "-1" and
+    // "1.1" are canonical while "01", "1e2", and "0x10" are not).
     if text == [b'-' as u16, b'0' as u16] {
         return Some(-0.0);
     }
-    let value = parse_canonical_u64(text)?;
-    if value > (1u64 << 53) {
-        return None;
-    }
-    Some(value as f64)
+    let value = crate::convert::string_numeric_literal(text);
+    let roundtrip = crate::number::to_string(value);
+    (roundtrip.as_slice() == text).then_some(value)
 }
 
 /// CanonicalNumericIndexString (spec 7.1.21) for a property key: `None` for
@@ -1666,6 +1723,13 @@ fn canonical_index(key: &PropertyKey) -> Option<f64> {
         return None;
     };
     canonical_numeric_index_string(lookup(*id).as_slice())
+}
+
+/// Whether `key` is a canonical numeric index string (spec 7.1.21); the
+/// Integer-Indexed exotic [[Get]]/[[Set]]/[[HasProperty]]/… intercept these,
+/// so property reads on a TypedArray must not consult the prototype chain.
+pub fn is_canonical_index_key(key: &PropertyKey) -> bool {
+    canonical_index(key).is_some()
 }
 
 /// Parse a canonical non-negative decimal integer (no leading zeros).
@@ -1702,10 +1766,31 @@ pub fn array_index_of(key: &PropertyKey) -> Option<u64> {
     }
 }
 
+/// The current number of elements a TypedArray view covers: for an auto-length
+/// view (resizable buffer without an explicit length) this tracks the buffer's
+/// current byte length; for a fixed-length view the elements are zero when the
+/// buffer has shrunk below the view's byte range and restored when it grows
+/// back (spec 25.2.2.1 steps 12-14 with resizable buffers).
+pub fn typed_array_effective_length(slots: &TypedArraySlots) -> usize {
+    let element_size = slots.element_type.size();
+    if slots.auto_length {
+        slots.buffer.byte_length().saturating_sub(slots.byte_offset) / element_size
+    } else if slots.byte_offset + slots.byte_length <= slots.buffer.byte_length() {
+        slots.array_length
+    } else {
+        0
+    }
+}
+
 /// Whether a canonical numeric index is an in-bounds TypedArray element
-/// (spec 10.4.5.10 IsValidIntegerIndex, minus the Phase 12 buffer witness).
+/// (spec 10.4.7.4 IsValidIntegerIndex): a detached buffer, a non-integer, and
+/// -0 are never valid.
 fn typed_array_valid_index(slots: &TypedArraySlots, index: f64) -> bool {
-    index >= 0.0 && index.trunc() == index && (index as usize) < slots.array_length
+    !slots.buffer.is_detached()
+        && index >= 0.0
+        && !index.is_sign_negative()
+        && index.trunc() == index
+        && (index as usize) < typed_array_effective_length(slots)
 }
 
 /// The element bytes of the TypedArray at a valid canonical index.
@@ -1723,27 +1808,16 @@ fn element_bytes(slots: &TypedArraySlots, index: f64) -> Result<Vec<u8>, JsError
         })
 }
 
-/// The TypeError for accessing a view whose buffer has been detached
-/// (spec 10.4.5.2 step 2 and the other Integer-Indexed methods).
-fn detached_typed_array_error() -> JsError {
-    JsError::new(
-        ErrorKind::TypeError,
-        "Cannot access a detached ArrayBuffer".into(),
-    )
-}
-
-/// TypedArray [[GetOwnProperty]] (spec 10.4.5.3): an in-bounds canonical
+/// TypedArray [[GetOwnProperty]] (spec 10.4.7.2): an in-bounds canonical
 /// index produces a writable/enumerable/configurable data property backed
-/// by the buffer; other canonical numeric strings produce no property.
+/// by the buffer; other canonical numeric strings (incl. a detached buffer,
+/// which reads *undefined*) produce no property.
 fn typed_array_get_own_property(
     obj: &JsObject,
     slots: &TypedArraySlots,
     key: &PropertyKey,
 ) -> Result<Option<Property>, JsError> {
     if let Some(index) = canonical_index(key) {
-        if slots.buffer.is_detached() {
-            return Err(detached_typed_array_error());
-        }
         if typed_array_valid_index(slots, index) {
             let bytes = element_bytes(slots, index)?;
             let value = crate::typed_array::decode_element(slots.element_type, &bytes, 0)?;
@@ -1764,11 +1838,17 @@ fn typed_array_define_own_property(
     desc: &PropertyDescriptor,
 ) -> Result<bool, JsError> {
     if let Some(index) = canonical_index(key) {
-        if slots.buffer.is_detached() {
-            return Err(detached_typed_array_error());
-        }
+        // IsValidIntegerIndex is false (a detached buffer, -0, or an
+        // out-of-bounds index): the define fails, and DefinePropertyOrThrow
+        // turns that into the TypeError the fixtures expect.
         if !typed_array_valid_index(slots, index) {
             return Ok(false);
+        }
+        if slots.buffer.is_immutable() {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "TypedArray buffer is immutable".into(),
+            ));
         }
         if desc.configurable == Some(false) {
             return Ok(false);
@@ -1811,13 +1891,12 @@ fn typed_array_get(
     receiver: Value,
 ) -> Result<Value, JsError> {
     if let Some(index) = canonical_index(key) {
-        if slots.buffer.is_detached() {
-            return Err(detached_typed_array_error());
-        }
         if typed_array_valid_index(slots, index) {
             let bytes = element_bytes(slots, index)?;
             return crate::typed_array::decode_element(slots.element_type, &bytes, 0);
         }
+        // An invalid index (incl. a detached buffer) reads *undefined*
+        // without consulting the prototype chain (spec 10.4.7.5).
         return Ok(Value::Undefined);
     }
     ordinary_get(obj, key, receiver)
@@ -1834,15 +1913,22 @@ fn typed_array_set(
     receiver: Value,
 ) -> Result<bool, JsError> {
     if let Some(index) = canonical_index(key) {
-        if slots.buffer.is_detached() {
-            return Err(detached_typed_array_error());
-        }
+        // IntegerIndexedElementSet coerces the value before the index check:
+        // a throwing ToNumber/ToBigInt propagates, and a write invalidated
+        // by the coercion (detach or resize) is a no-op that reports
+        // success; an invalid index on the live buffer also reports success
+        // (spec 10.4.7.6 with web-reality semantics).
         if same_value(&receiver, &obj.self_value()) {
-            if !typed_array_valid_index(slots, index) {
-                return Ok(true);
+            if slots.buffer.is_immutable() {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "TypedArray buffer is immutable".into(),
+                ));
             }
             let bytes = crate::typed_array::encode_element(slots.element_type, &value)?;
-            write_element_bytes(slots, index, &bytes)?;
+            if typed_array_valid_index(slots, index) {
+                write_element_bytes(slots, index, &bytes)?;
+            }
             return Ok(true);
         }
         if !typed_array_valid_index(slots, index) {
@@ -1876,21 +1962,25 @@ fn typed_array_delete(
 }
 
 /// TypedArray [[OwnPropertyKeys]] (spec 10.4.5.11): element indices first,
-/// then own non-index strings and symbols.
+/// then own non-index strings, then symbols (each in insertion order).
 fn typed_array_own_property_keys(slots: &TypedArraySlots, obj: &JsObject) -> Vec<PropertyKey> {
     let mut keys = Vec::new();
-    for index in 0..slots.array_length {
+    for index in 0..typed_array_effective_length(slots) {
         keys.push(PropertyKey::from_utf8(&index.to_string()));
     }
+    let mut string_keys = Vec::new();
+    let mut symbol_keys = Vec::new();
     for (stored_key, _) in obj.properties.borrow().iter() {
         match stored_key {
-            PropertyKey::Symbol(_) => keys.push(stored_key.clone()),
+            PropertyKey::Symbol(_) => symbol_keys.push(stored_key.clone()),
             PropertyKey::String(_) if array_index_of(stored_key).is_none() => {
-                keys.push(stored_key.clone())
+                string_keys.push(stored_key.clone())
             }
             _ => {}
         }
     }
+    keys.extend(string_keys);
+    keys.extend(symbol_keys);
     keys
 }
 
@@ -2693,6 +2783,7 @@ mod tests {
                 element_type: crate::typed_array::ElementType::Uint8,
                 byte_length: 4,
                 byte_offset: 0,
+                auto_length: false,
                 array_length: 3,
             },
             None,

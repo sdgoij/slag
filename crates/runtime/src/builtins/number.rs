@@ -87,6 +87,7 @@ fn number_construct(
         Some(value) => to_number(value)?,
         None => 0.0,
     };
+    *object.boxed.borrow_mut() = Some(crux::object::BoxedPrimitive::Number(value));
     agent.number_data.insert(object.id(), value);
     Ok(Value::Object(object))
 }

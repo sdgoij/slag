@@ -741,7 +741,9 @@ fn get_prototype_of(agent: &mut Agent, value: &Value) -> Result<Value, JsError> 
     let obj = as_object(&object)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
     match obj.get_prototype_of()? {
-        Some(proto) => Ok(Value::Object(proto)),
+        Some(proto) => Ok(proto
+            .function_value()
+            .unwrap_or_else(|| Value::Object(proto))),
         None => Ok(Value::Null),
     }
 }

@@ -167,6 +167,8 @@ pub fn dispatch_construct(
                 .get(BOOLEAN_PROTO)
                 .and_then(|v| as_object(&v));
             let object = JsObject::ordinary_object_create(proto);
+            *object.boxed.borrow_mut() =
+                Some(crux::object::BoxedPrimitive::Boolean(to_boolean(&value)));
             agent.boolean_data.insert(object.id(), to_boolean(&value));
             Ok(Value::Object(object))
         })());

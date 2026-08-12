@@ -1401,6 +1401,29 @@ pub(crate) fn function_declaration_instantiation(
         } else {
             param_env.create_mutable_binding(&JsString::from_utf8("arguments"), false)?;
         }
+        // spec 10.4.4.7/10.4.4.9: the arguments object's @@iterator is
+        // %Array.prototype.values% (a Phase 8 join the crux creation sites
+        // cannot make).
+        if let Some(obj) = crate::context::as_object(&arguments_obj)
+            && let Some(values) = agent
+                .current_realm()?
+                .intrinsics
+                .get("%Array.prototype.values%")
+        {
+            obj.define_property_key(
+                &crux::property::PropertyKey::Symbol(
+                    crux::symbol::well_known("iterator").as_ref().clone(),
+                ),
+                &crux::property::PropertyDescriptor {
+                    value: Some(values),
+                    writable: Some(true),
+                    get: None,
+                    set: None,
+                    enumerable: Some(false),
+                    configurable: Some(true),
+                },
+            )?;
+        }
         param_env.initialize_binding(&JsString::from_utf8("arguments"), arguments_obj)?;
         param_bindings.push(JsString::from_utf8("arguments"));
     }

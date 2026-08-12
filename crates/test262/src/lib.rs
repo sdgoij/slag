@@ -80,11 +80,72 @@ assert.compareArray = function (actual, expected) {
   }
 };
 
+// The bare `compareArray` of the real assert.js returns a boolean; fixtures
+// call `assert(compareArray(a, b))` as well as `assert.compareArray(a, b)`.
+function compareArray(a, b) {
+  if (b.length !== a.length) {
+    return false;
+  }
+  for (var i = 0; i < a.length; i++) {
+    var same = (a[i] === b[i]) || (typeof a[i] === "number" && typeof b[i] === "number" && Number.isNaN(a[i]) && Number.isNaN(b[i]));
+    if (!same) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// The global helpers of the real assert.js that the include files rely on
+// (testTypedArray.js's ctor-argument factories call `isPrimitive`; the
+// formatters are used by assert.sameValue messages).
+function isNegativeZero(value) {
+  return value === 0 && 1 / value === -Infinity;
+}
+
+function isPrimitive(value) {
+  return !value || (typeof value !== "object" && typeof value !== "function");
+}
+
+function formatIdentityFreeValue(value) {
+  switch (value === null ? "null" : typeof value) {
+    case "string":
+      return typeof JSON !== "undefined" ? JSON.stringify(value) : '"' + value + '"';
+    case "bigint":
+      return String(value) + "n";
+    case "number":
+      if (isNegativeZero(value)) return "-0";
+      // falls through
+    case "boolean":
+    case "undefined":
+    case "null":
+      return String(value);
+    default:
+      return undefined;
+  }
+}
+
+function formatSimpleValue(value) {
+  var basic = formatIdentityFreeValue(value);
+  if (basic !== undefined) return basic;
+  try {
+    return String(value);
+  } catch (err) {
+    if (err.name === "TypeError") {
+      return Object.prototype.toString.call(value);
+    }
+    throw err;
+  }
+}
+
 $262 = {};
 $262.global = globalThis;
 $262.detachArrayBuffer = function (buffer) {
   if (typeof buffer !== "object" || buffer === null || typeof buffer.transfer !== "function") {
     throw new Test262Error("No method available to detach an ArrayBuffer");
+  }
+  if (buffer.detached) {
+    // A host detach is idempotent (the sort fixtures detach repeatedly).
+    return;
   }
   buffer.transfer();
 };
@@ -11086,6 +11147,11 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
                 "unsupported includes: {}",
                 unsupported.join(", ")
             ));
+        }
+        // Cross-realm fixtures need the `$262.createRealm` host hook, which is
+        // not provided (host-dependent behavior).
+        if body.contains("$262.createRealm") {
+            return FixtureResult::Skip("host-dependent: $262.createRealm is not provided".into());
         }
         for mode in modes(&fm) {
             if let Err(e) = run_one(body, mode, &fm) {

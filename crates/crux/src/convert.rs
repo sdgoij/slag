@@ -40,22 +40,80 @@ fn trimmed(units: &[u16]) -> &[u16] {
 /// convert via OrdinaryToPrimitive (the @@toPrimitive symbol joins with the
 /// well-known symbol table in Phase 15).
 pub fn to_primitive(value: &Value, hint: ToPrimitiveHint) -> Result<Value, JsError> {
+    // spec 7.1.1 step 1.a: the @@toPrimitive method runs before the
+    // valueOf/toString loop, and its abrupt completion wins.
     match value {
-        Value::Object(obj) => ordinary_to_primitive(|name| obj.get(name), value.clone(), hint),
+        Value::Object(obj) => {
+            let key = crate::property::PropertyKey::Symbol(
+                crate::symbol::well_known("toPrimitive").as_ref().clone(),
+            );
+            let method = obj.get_key(&key)?;
+            if is_callable(&method) {
+                return call_exotic_to_primitive(&method, value.clone(), hint);
+            }
+            ordinary_to_primitive(|name| obj.get(name), value.clone(), hint)
+        }
         Value::Function(function) => {
+            let key = crate::property::PropertyKey::Symbol(
+                crate::symbol::well_known("toPrimitive").as_ref().clone(),
+            );
+            let method = function.get_key(&key)?;
+            if is_callable(&method) {
+                return call_exotic_to_primitive(&method, value.clone(), hint);
+            }
             ordinary_to_primitive(|name| function.get(name), value.clone(), hint)
         }
         _ => Ok(value.clone()),
     }
 }
 
+/// Call `method` (the @@toPrimitive hook) with the hint and reject an object
+/// result (spec 7.1.1 steps 1.a.i-iii).
+fn call_exotic_to_primitive(
+    method: &Value,
+    receiver: Value,
+    hint: ToPrimitiveHint,
+) -> Result<Value, JsError> {
+    let hint_text = match hint {
+        ToPrimitiveHint::String => "string",
+        ToPrimitiveHint::Default => "default",
+        ToPrimitiveHint::Number => "number",
+    };
+    let result = crate::function::call(
+        method,
+        receiver,
+        &[Value::String(crate::handle::Handle::new(
+            JsString::from_utf8(hint_text),
+        ))],
+    )?;
+    if matches!(result, Value::Object(_) | Value::Function(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Cannot convert object to primitive value".into(),
+        ));
+    }
+    Ok(result)
+}
+
 /// OrdinaryToPrimitive (spec 7.1.1.1): look up `toString`/`valueOf` on the
 /// object and call the first callable one with the object as receiver.
+/// A primitive wrapper object converts directly through its wrapped value.
 fn ordinary_to_primitive(
     get: impl Fn(&JsString) -> Result<Value, JsError>,
     receiver: Value,
     hint: ToPrimitiveHint,
 ) -> Result<Value, JsError> {
+    if let Value::Object(obj) = &receiver
+        && let Some(boxed) = &*obj.boxed.borrow()
+    {
+        return Ok(match boxed {
+            crate::object::BoxedPrimitive::Number(n) => Value::Number(*n),
+            crate::object::BoxedPrimitive::BigInt(b) => {
+                Value::BigInt(crate::handle::Handle::new(b.clone()))
+            }
+            crate::object::BoxedPrimitive::Boolean(b) => Value::Boolean(*b),
+        });
+    }
     let (first, second) = match hint {
         ToPrimitiveHint::String | ToPrimitiveHint::Default => ("toString", "valueOf"),
         ToPrimitiveHint::Number => ("valueOf", "toString"),
@@ -99,7 +157,7 @@ pub fn to_number(value: &Value) -> Result<f64, JsError> {
         Value::Null => Ok(0.0),
         Value::Boolean(true) => Ok(1.0),
         Value::Boolean(false) => Ok(0.0),
-        Value::String(s) => Ok(string_numeric_literal(s)),
+        Value::String(s) => Ok(string_numeric_literal(s.as_slice())),
         Value::BigInt(_) => Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert a BigInt value to a number".into(),
@@ -117,8 +175,8 @@ pub fn to_number(value: &Value) -> Result<f64, JsError> {
 
 /// The Number value of a StringNumericLiteral (spec 7.1.4.1), or NaN when
 /// `text` is not a StringNumericLiteral. Whitespace-only strings are +0.
-fn string_numeric_literal(text: &JsString) -> f64 {
-    let body = trimmed(text.as_slice());
+pub(crate) fn string_numeric_literal(text: &[u16]) -> f64 {
+    let body = trimmed(text);
     if body.is_empty() {
         return 0.0;
     }
@@ -438,13 +496,20 @@ pub fn to_big_int(value: &Value) -> Result<BigInt, JsError> {
         Value::Boolean(true) => Ok(BigInt::from(1u64)),
         Value::Boolean(false) => Ok(BigInt::from(0u64)),
         Value::BigInt(b) => Ok(b.as_ref().clone()),
-        Value::String(s) => match string_to_big_int(&s) {
-            Some(n) => Ok(n),
-            None => Err(JsError::new(
-                ErrorKind::SyntaxError,
-                "Cannot convert the string to a BigInt".into(),
-            )),
-        },
+        Value::String(s) => {
+            // ToBigInt('') is 0n (a whitespace-only StringIntegerLiteral);
+            // anything else must be a strict decimal integer literal.
+            if trimmed(s.as_slice()).is_empty() {
+                return Ok(crate::BigInt::zero());
+            }
+            match string_to_big_int(&s) {
+                Some(n) => Ok(n),
+                None => Err(JsError::new(
+                    ErrorKind::SyntaxError,
+                    "Cannot convert the string to a BigInt".into(),
+                )),
+            }
+        }
         Value::Number(_) => Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert a Number to a BigInt".into(),
@@ -781,7 +846,7 @@ mod tests {
         assert_eq!(to_big_int(&str("  -42 ")).unwrap(), BigInt::from(-42));
         assert_eq!(to_big_int(&Value::Boolean(true)).unwrap(), BigInt::from(1));
         assert_eq!(to_big_int(&big(9)).unwrap(), BigInt::from(9));
-        assert!(to_big_int(&str("")).is_err());
+        assert_eq!(to_big_int(&str("")).unwrap(), BigInt::from(0));
         assert!(to_big_int(&str("1.5")).is_err());
         assert!(to_big_int(&str("0x10")).is_err());
         assert!(to_big_int(&str("07")).is_err());

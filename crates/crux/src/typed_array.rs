@@ -105,6 +105,14 @@ pub struct SharedBuffer {
     detached: Rc<Cell<bool>>,
     #[cfg(feature = "workers")]
     detached: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the owning ArrayBuffer is immutable (ES2026
+    /// `transferToImmutable`): writes through views throw a TypeError. The
+    /// runtime's `BufferState.immutable` is authoritative; this flag mirrors
+    /// it for crux's integer-indexed writes.
+    #[cfg(not(feature = "workers"))]
+    immutable: Rc<Cell<bool>>,
+    #[cfg(feature = "workers")]
+    immutable: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The read-modify-write operations of the Atomics built-ins.
@@ -131,6 +139,7 @@ impl SharedBuffer {
             SharedBuffer {
                 block: Rc::new(RefCell::new(vec![0u8; byte_length])),
                 detached: Rc::new(Cell::new(false)),
+                immutable: Rc::new(Cell::new(false)),
             }
         }
         #[cfg(feature = "workers")]
@@ -142,6 +151,7 @@ impl SharedBuffer {
                     .collect::<std::sync::Arc<[_]>>(),
                 byte_length: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(byte_length)),
                 detached: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                immutable: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         }
     }
@@ -168,6 +178,31 @@ impl SharedBuffer {
         #[cfg(feature = "workers")]
         {
             self.detached.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Mark the owning buffer immutable (ES2026 transferToImmutable).
+    pub fn mark_immutable(&self) {
+        #[cfg(not(feature = "workers"))]
+        {
+            self.immutable.set(true);
+        }
+        #[cfg(feature = "workers")]
+        {
+            self.immutable
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Whether the owning buffer is immutable.
+    pub fn is_immutable(&self) -> bool {
+        #[cfg(not(feature = "workers"))]
+        {
+            self.immutable.get()
+        }
+        #[cfg(feature = "workers")]
+        {
+            self.immutable.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
