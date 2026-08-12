@@ -85,9 +85,14 @@ pub struct Parser<'s> {
     /// Inside arrow-function parameter cover grammar; `{a = 1}` shorthand
     /// initializers are only legal here (spec 13.2.5 CoverInitializedName).
     pub(crate) in_arrow_cover: bool,
-    /// First CoverInitializedName parsed while `in_arrow_cover`, if the
-    /// enclosing parenthesized list never disambiguates into an arrow.
+    /// First CoverInitializedName parsed, if the enclosing construct never
+    /// disambiguates into a pattern (an arrow list, an assignment target, or
+    /// a for-in/of head).
     pub(crate) cover_error: Option<Span>,
+    /// Depth of array/object literals and for-heads being parsed that may
+    /// still become patterns: while positive, a pending `cover_error` is not
+    /// raised by `parse_assignment` (the enclosing literal decides).
+    pub(crate) suppress_cover_raise: usize,
 
     // Early-error tracking.
     pub(crate) scopes: Vec<Scope>,
@@ -133,6 +138,7 @@ impl<'s> Parser<'s> {
             private_names: Vec::new(),
             in_arrow_cover: false,
             cover_error: None,
+            suppress_cover_raise: 0,
             scopes: vec![Scope::default()],
             list_vars: HashSet::new(),
         }
@@ -452,6 +458,9 @@ impl<'s> Parser<'s> {
         let mut seen_rest = false;
         match &expr.kind {
             ExprKind::Array(lit) => {
+                if lit.rest_trailing_comma {
+                    return Err(self.error_at(lit.span.start, "Rest element must be last"));
+                }
                 for el in &lit.elements {
                     match el {
                         ArrayElement::Hole => {
@@ -467,7 +476,7 @@ impl<'s> Parser<'s> {
                                     self.error_at(expr.span.start, "Rest element must be last")
                                 );
                             }
-                            self.check_rest_position(e)?;
+                            self.check_element_target(e)?;
                         }
                         ArrayElement::Spread(e) => {
                             if seen_rest {
@@ -475,13 +484,21 @@ impl<'s> Parser<'s> {
                                     self.error_at(e.span.start, "Rest element must be last")
                                 );
                             }
-                            self.check_rest_position(e)?;
+                            // A rest target may not carry an initializer
+                            // (spec 13.15.5.1 AssignmentRestElement).
+                            if matches!(e.kind, ExprKind::Assign { .. }) {
+                                return Err(self.error_at(e.span.start, "Invalid rest element"));
+                            }
+                            self.check_element_target(e)?;
                             seen_rest = true;
                         }
                     }
                 }
             }
             ExprKind::Object(lit) => {
+                if lit.rest_trailing_comma {
+                    return Err(self.error_at(lit.span.start, "Rest element must be last"));
+                }
                 for prop in &lit.props {
                     match prop {
                         ObjectProperty::Init { value, .. } => {
@@ -490,7 +507,7 @@ impl<'s> Parser<'s> {
                                     self.error_at(value.span.start, "Rest element must be last")
                                 );
                             }
-                            self.check_rest_position(value)?;
+                            self.check_element_target(value)?;
                         }
                         ObjectProperty::Spread(e) => {
                             if seen_rest {
@@ -498,16 +515,59 @@ impl<'s> Parser<'s> {
                                     self.error_at(e.span.start, "Rest element must be last")
                                 );
                             }
-                            self.check_rest_position(e)?;
+                            self.check_element_target(e)?;
                             seen_rest = true;
                         }
-                        _ => {}
+                        // Methods, accessors, and fields are never valid in an
+                        // assignment pattern (spec 13.15.5.1).
+                        _ => {
+                            return Err(self.error_at(expr.span.start, "Invalid assignment target"));
+                        }
                     }
                 }
             }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Validates one element/property target of an assignment pattern: a
+    /// plain `=` unwraps to its target, which must be a reference, a member
+    /// expression, or a nested pattern (spec 13.15.5.1).
+    fn check_element_target(&mut self, expr: &Expr) -> Result<(), JsError> {
+        let target = match &expr.kind {
+            ExprKind::Assign {
+                op: AssignOp::Assign,
+                target,
+                ..
+            } => target.as_ref(),
+            _ => expr,
+        };
+        match &target.kind {
+            ExprKind::Ident(name) => {
+                if self.strict
+                    && (*name == intern_utf8("eval") || *name == intern_utf8("arguments"))
+                {
+                    return Err(self.error_at(
+                        target.span.start,
+                        "Cannot assign to eval or arguments in strict mode",
+                    ));
+                }
+                Ok(())
+            }
+            ExprKind::Paren(inner) => self.check_element_target(inner),
+            ExprKind::Member(_) => {
+                if crate::expr::contains_optional(target) {
+                    return Err(self.error_at(
+                        target.span.start,
+                        "Invalid optional chain as assignment target",
+                    ));
+                }
+                Ok(())
+            }
+            ExprKind::Array(_) | ExprKind::Object(_) => self.check_rest_position(target),
+            _ => Err(self.error_at(target.span.start, "Invalid assignment target")),
+        }
     }
 
     // ---- identifiers and binding patterns ----
@@ -635,10 +695,20 @@ impl<'s> Parser<'s> {
                 });
             } else {
                 // Shorthand: `{ x }` or `{ x = 1 }`; the key must be a plain
-                // identifier.
+                // identifier, and a BindingIdentifier may not be a reserved
+                // word or (in strict mode) `eval`/`arguments` (spec 13.1.1).
                 let PropertyName::Ident(name) = key else {
                     return Err(self.error_at(start, "Invalid shorthand property name"));
                 };
+                if from_identifier(name).is_some()
+                    || (self.strict && is_future_reserved_word(name))
+                    || (self.strict
+                        && (name == intern_utf8("eval") || name == intern_utf8("arguments")))
+                    || (self.in_generator && name == intern_utf8("yield"))
+                    || ((self.in_async || self.in_module) && name == intern_utf8("await"))
+                {
+                    return Err(self.error_at(start, "Unexpected reserved word"));
+                }
                 let init = if self.eat_punct(TokenKind::Equal)? {
                     Some(crate::expr::parse_assignment(self, true)?)
                 } else {

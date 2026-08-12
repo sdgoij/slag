@@ -13,13 +13,14 @@ use crux::property::PropertyKey;
 use crux::string::JsString;
 use crux::value::Value;
 use syntax::ast::{
-    ArrayBindingElement, BindingElement, BindingPattern, ObjectBindingProperty, PropertyName,
+    ArrayBindingElement, ArrayElement, ArrayLiteral, AssignOp, BindingElement, BindingPattern,
+    Expr, ExprKind, ObjectBindingProperty, ObjectLiteral, ObjectProperty, PropertyName,
 };
 
 use crate::agent::Agent;
 use crate::context::{get_property_key, put_value, resolve_binding};
 use crate::env::EnvRef;
-use crate::expr::{eval_expr, get_iterator, iterator_close, iterator_step};
+use crate::expr::{eval_expr, eval_reference, get_iterator, iterator_close, iterator_step};
 
 /// BindingInitialization (spec 13.2.3.4): bind a pattern to a value.
 pub fn binding_initialization(
@@ -98,13 +99,8 @@ fn bind_element(
     env: Option<&EnvRef>,
     strict: bool,
 ) -> Result<(), JsError> {
-    let value = if matches!(value, Value::Undefined)
-        && let Some(init) = &element.init
-    {
-        eval_expr(agent, init, strict)?
-    } else {
-        value
-    };
+    let name = binding_ident_name(&element.pattern);
+    let value = apply_element_default(agent, value, element.init.as_ref(), name.as_ref(), strict)?;
     match &element.pattern {
         BindingPattern::Ident(name) => {
             let name = crux::lookup(*name);
@@ -167,11 +163,8 @@ fn keyed_binding_initialization(
     strict: bool,
 ) -> Result<(), JsError> {
     let mut value = get_property_key(agent, value, key, value.clone())?;
-    if matches!(value, Value::Undefined)
-        && let Some(init) = &element.init
-    {
-        value = eval_expr(agent, init, strict)?;
-    }
+    let name = binding_ident_name(&element.pattern);
+    value = apply_element_default(agent, value, element.init.as_ref(), name.as_ref(), strict)?;
     binding_initialization(agent, &element.pattern, value, env, strict)
 }
 
@@ -185,8 +178,10 @@ fn rest_binding_initialization(
     env: Option<&EnvRef>,
     strict: bool,
 ) -> Result<(), JsError> {
-    let rest_obj = JsObject::ordinary_object_create(None);
-    copy_data_properties_excluding(&rest_obj, value, excluded)?;
+    // CopyDataProperties (spec 13.2.3.6): the rest object is an ordinary
+    // object with %Object.prototype% as its prototype.
+    let rest_obj = rest_object(agent)?;
+    copy_data_properties_excluding(agent, &rest_obj, value, excluded)?;
     let BindingPattern::Ident(name) = &element.pattern else {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -198,8 +193,9 @@ fn rest_binding_initialization(
 }
 
 /// ArrayBindingPattern: consume the iterator, binding elements and holes in
-/// order and collecting the rest element. The iterator is closed on every
-/// completion (spec 13.2.3.4 steps 2-4).
+/// order and collecting the rest element. IteratorClose runs when the pattern
+/// ends without exhausting the iterator; an abrupt iterator step marks the
+/// iterator done so `return` is not called (spec 13.2.3.4).
 fn bind_array_pattern(
     agent: &mut Agent,
     elements: &[ArrayBindingElement],
@@ -208,23 +204,46 @@ fn bind_array_pattern(
     strict: bool,
 ) -> Result<(), JsError> {
     let iterator = get_iterator(agent, &value)?;
+    let mut done = false;
     let result = (|| -> Result<(), JsError> {
         for element in elements {
             match element {
-                ArrayBindingElement::Hole => {
-                    iterator_step(agent, &iterator)?;
-                }
-                ArrayBindingElement::Element(element) => {
-                    let next = iterator_step(agent, &iterator)?.unwrap_or(Value::Undefined);
-                    bind_element(agent, element, next, env, strict)?;
-                }
+                ArrayBindingElement::Hole => match iterator_step(agent, &iterator) {
+                    Ok(None) => done = true,
+                    Ok(Some(_)) => {}
+                    Err(error) => {
+                        done = true;
+                        return Err(error);
+                    }
+                },
+                ArrayBindingElement::Element(element) => match iterator_step(agent, &iterator) {
+                    Ok(Some(next)) => bind_element(agent, element, next, env, strict)?,
+                    Ok(None) => {
+                        done = true;
+                        bind_element(agent, element, Value::Undefined, env, strict)?;
+                    }
+                    Err(error) => {
+                        done = true;
+                        return Err(error);
+                    }
+                },
                 ArrayBindingElement::Rest(element) => {
                     let mut collected = Vec::new();
-                    while let Some(next) = iterator_step(agent, &iterator)? {
-                        collected.push(next);
+                    loop {
+                        match iterator_step(agent, &iterator) {
+                            Ok(Some(next)) => collected.push(next),
+                            Ok(None) => {
+                                done = true;
+                                break;
+                            }
+                            Err(error) => {
+                                done = true;
+                                return Err(error);
+                            }
+                        }
                     }
                     let array = crate::builtins::array::array_from_values(agent, &collected)?;
-                    return bind_rest_element(agent, element, array, env, strict);
+                    bind_rest_element(agent, element, array, env, strict)?;
                 }
             }
         }
@@ -232,17 +251,22 @@ fn bind_array_pattern(
     })();
     match result {
         Ok(()) => {
-            iterator_close(agent, &iterator)?;
-            Ok(())
+            // IteratorClose only when the iterator was not exhausted by the
+            // pattern (a done-first iterator must not have its `return`
+            // called).
+            if done {
+                Ok(())
+            } else {
+                iterator_close(agent, &iterator)
+            }
         }
         Err(error) => {
-            let close = iterator_close(agent, &iterator);
-            if let Err(close_error) = close {
-                return Err(JsError::new(
-                    ErrorKind::TypeError,
-                    format!("Iterator close failed: {}", close_error.message),
-                ));
+            if done {
+                return Err(error);
             }
+            // An error from the pattern body closes the not-done iterator
+            // once; a throwing `return` replaces the error (spec 7.4.11).
+            crate::expr::iterator_close_throw(agent, &iterator)?;
             Err(error)
         }
     }
@@ -267,15 +291,31 @@ fn property_name_to_key(
     }
 }
 
+/// A fresh ordinary object with %Object.prototype% as its prototype, for
+/// object rest patterns (CopyDataProperties, spec 7.3.25).
+pub(crate) fn rest_object(agent: &Agent) -> Result<crux::handle::Handle<JsObject>, JsError> {
+    let proto = agent
+        .current_realm()?
+        .intrinsics
+        .get("%Object.prototype%")
+        .and_then(|value| crate::context::as_object(&value));
+    Ok(JsObject::ordinary_object_create(proto))
+}
+
 /// CopyDataProperties (spec 14.1.16) with an excluded-name list: copy the
 /// enumerable own properties of `from` to `to`, skipping excluded keys and
-/// keys `to` already has.
+/// keys `to` already has. `null`/`undefined` contribute nothing; other
+/// primitives are boxed first (a String contributes its index properties).
 pub fn copy_data_properties_excluding(
+    agent: &mut Agent,
     to: &crux::object::JsObject,
     from: &Value,
     excluded: &[PropertyKey],
 ) -> Result<(), JsError> {
-    let Value::Object(from_obj) = from else {
+    if matches!(from, Value::Null | Value::Undefined) {
+        return Ok(());
+    }
+    let Value::Object(from_obj) = crate::context::to_object(agent, from)? else {
         return Ok(());
     };
     for key in from_obj.own_property_keys()? {
@@ -287,14 +327,279 @@ pub fn copy_data_properties_excluding(
             if !property.enumerable {
                 continue;
             }
-            let value = match property.kind {
-                crux::object::PropertyKind::Data { value, .. } => value,
-                crux::object::PropertyKind::Accessor { .. } => from_obj.get_key(&key)?,
-            };
+            // CopyDataProperties reads the value with Get after the
+            // enumerable check (spec 7.3.25 step 6.c.i-ii): for proxies this
+            // is what invokes the `get` trap, and the descriptor's data value
+            // would be a trap artifact.
+            let value = from_obj.get_key(&key)?;
             to.create_data_property_key(&key, value)?;
         }
     }
     Ok(())
+}
+
+/// DestructuringAssignmentEvaluation (spec 13.15.4): assign to the targets
+/// of an Array/Object assignment pattern from `value`. Unlike
+/// `binding_initialization` (which fills pre-created environment bindings),
+/// the writes go through references (PutValue); the target expressions are
+/// evaluated in order as part of the pattern.
+pub fn destructuring_assignment(
+    agent: &mut Agent,
+    target: &Expr,
+    value: Value,
+    strict: bool,
+) -> Result<(), JsError> {
+    match &target.kind {
+        ExprKind::Array(lit) => array_assignment(agent, lit, value, strict),
+        ExprKind::Object(lit) => object_assignment(agent, lit, value, strict),
+        ExprKind::Paren(inner) => destructuring_assignment(agent, inner, value, strict),
+        _ => {
+            let reference = eval_reference(agent, target, strict)?;
+            put_value(agent, &reference, value)
+        }
+    }
+}
+
+/// Assign `value` to one element target of an assignment pattern: `expr` may
+/// carry a default (`target = init`), a nested pattern, or a plain
+/// identifier/member target (spec 13.15.4.1 AssignmentElement).
+fn assign_element(
+    agent: &mut Agent,
+    expr: &Expr,
+    value: Value,
+    strict: bool,
+) -> Result<(), JsError> {
+    let (inner, init) = match &expr.kind {
+        ExprKind::Assign {
+            op: AssignOp::Assign,
+            target,
+            value: initializer,
+        } => (target.as_ref(), Some(initializer.as_ref())),
+        _ => (expr, None),
+    };
+    let name = match &inner.kind {
+        ExprKind::Ident(id) => Some(crux::lookup(*id)),
+        _ => None,
+    };
+    let value = apply_element_default(agent, value, init, name.as_ref(), strict)?;
+    assign_target(agent, inner, value, strict)
+}
+
+/// Write `value` to a single assignment target: a nested Array/Object pattern
+/// recurses, anything else is a reference.
+fn assign_target(
+    agent: &mut Agent,
+    target: &Expr,
+    value: Value,
+    strict: bool,
+) -> Result<(), JsError> {
+    match &target.kind {
+        ExprKind::Array(lit) => array_assignment(agent, lit, value, strict),
+        ExprKind::Object(lit) => object_assignment(agent, lit, value, strict),
+        ExprKind::Paren(inner) => assign_target(agent, inner, value, strict),
+        _ => {
+            let reference = eval_reference(agent, target, strict)?;
+            put_value(agent, &reference, value)
+        }
+    }
+}
+
+/// ArrayAssignmentPattern (spec 13.15.5.2): consume the RHS iterator, assign
+/// elements and holes in order, and assign the rest element a fresh array of
+/// the remaining values. IteratorClose runs when the pattern ends without
+/// exhausting the iterator, and on errors from reference evaluation or
+/// PutValue; an abrupt iterator step marks the iterator done so `return` is
+/// not called (spec 13.15.5.5).
+fn array_assignment(
+    agent: &mut Agent,
+    lit: &ArrayLiteral,
+    value: Value,
+    strict: bool,
+) -> Result<(), JsError> {
+    let iterator = get_iterator(agent, &value)?;
+    let mut done = false;
+    let result = (|| -> Result<(), JsError> {
+        for element in &lit.elements {
+            match element {
+                ArrayElement::Hole => match iterator_step(agent, &iterator) {
+                    Ok(None) => done = true,
+                    Ok(Some(_)) => {}
+                    Err(error) => {
+                        done = true;
+                        return Err(error);
+                    }
+                },
+                ArrayElement::Expr(expr) => {
+                    // A simple target's reference is evaluated before the
+                    // iterator steps (spec 13.15.5.5 note); an abrupt
+                    // reference leaves the iterator open so the close below
+                    // runs. A nested pattern steps in its place instead.
+                    let (inner, init) = match &expr.kind {
+                        ExprKind::Assign {
+                            op: AssignOp::Assign,
+                            target,
+                            value: initializer,
+                        } => (target.as_ref(), Some(initializer.as_ref())),
+                        _ => (expr, None),
+                    };
+                    let nested = matches!(&inner.kind, ExprKind::Array(_) | ExprKind::Object(_));
+                    let reference = if nested {
+                        None
+                    } else {
+                        Some(eval_reference(agent, inner, strict)?)
+                    };
+                    let next = match iterator_step(agent, &iterator) {
+                        Ok(Some(next)) => next,
+                        Ok(None) => {
+                            done = true;
+                            Value::Undefined
+                        }
+                        Err(error) => {
+                            done = true;
+                            return Err(error);
+                        }
+                    };
+                    let name = match &inner.kind {
+                        ExprKind::Ident(id) => Some(crux::lookup(*id)),
+                        _ => None,
+                    };
+                    let next = apply_element_default(agent, next, init, name.as_ref(), strict)?;
+                    match reference {
+                        Some(reference) => put_value(agent, &reference, next)?,
+                        None => assign_target(agent, inner, next, strict)?,
+                    }
+                }
+                ArrayElement::Spread(expr) => {
+                    // The rest target's reference is evaluated before the
+                    // remaining values are collected (spec 13.15.5.5); an
+                    // abrupt reference leaves the iterator open.
+                    let nested = matches!(&expr.kind, ExprKind::Array(_) | ExprKind::Object(_));
+                    let reference = if nested {
+                        None
+                    } else {
+                        Some(eval_reference(agent, expr, strict)?)
+                    };
+                    let mut collected = Vec::new();
+                    loop {
+                        match iterator_step(agent, &iterator) {
+                            Ok(Some(next)) => collected.push(next),
+                            Ok(None) => {
+                                done = true;
+                                break;
+                            }
+                            Err(error) => {
+                                done = true;
+                                return Err(error);
+                            }
+                        }
+                    }
+                    let array = crate::builtins::array::array_from_values(agent, &collected)?;
+                    match reference {
+                        Some(reference) => put_value(agent, &reference, array)?,
+                        None => assign_target(agent, expr, array, strict)?,
+                    }
+                }
+            }
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            // IteratorClose only when the iterator was not exhausted by the
+            // pattern; an empty pattern always closes (spec 13.15.5.2).
+            if done {
+                Ok(())
+            } else {
+                iterator_close(agent, &iterator)
+            }
+        }
+        Err(error) => {
+            if done {
+                return Err(error);
+            }
+            // An error from the pattern body closes the not-done iterator
+            // once; a throwing `return` replaces the error (spec 7.4.11).
+            crate::expr::iterator_close_throw(agent, &iterator)?;
+            Err(error)
+        }
+    }
+}
+
+/// ObjectAssignmentPattern (spec 13.15.4.2): RequireObjectCoercible, assign
+/// each property (defaults when the property is *undefined*), then the rest
+/// property collects the unbound enumerable own keys.
+fn object_assignment(
+    agent: &mut Agent,
+    lit: &ObjectLiteral,
+    value: Value,
+    strict: bool,
+) -> Result<(), JsError> {
+    if matches!(value, Value::Undefined | Value::Null) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Cannot destructure null or undefined".into(),
+        ));
+    }
+    let mut excluded: Vec<PropertyKey> = Vec::new();
+    for prop in &lit.props {
+        match prop {
+            ObjectProperty::Init {
+                key, value: target, ..
+            } => {
+                let key = property_name_to_key(agent, key, strict)?;
+                let prop_value = get_property_key(agent, &value, &key, value.clone())?;
+                assign_element(agent, target, prop_value, strict)?;
+                excluded.push(key);
+            }
+            ObjectProperty::Spread(expr) => {
+                let rest = rest_object(agent)?;
+                copy_data_properties_excluding(agent, &rest, &value, &excluded)?;
+                assign_target(agent, expr, Value::Object(rest), strict)?;
+            }
+            _ => {
+                return Err(JsError::new(
+                    ErrorKind::SyntaxError,
+                    "Invalid destructuring assignment target".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Apply an element's default initializer when `value` is *undefined*, then
+/// the spec's name-inference rule: an anonymous-function default assigned to
+/// an identifier target takes the identifier as its `name` (13.2.3.5/13.2.3.7,
+/// 13.15.4.1).
+fn apply_element_default(
+    agent: &mut Agent,
+    value: Value,
+    init: Option<&Expr>,
+    name: Option<&JsString>,
+    strict: bool,
+) -> Result<Value, JsError> {
+    let used_default = matches!(value, Value::Undefined) && init.is_some();
+    let value = if used_default {
+        eval_expr(agent, init.expect("checked"), strict)?
+    } else {
+        value
+    };
+    if used_default
+        && let Some(name) = name
+        && let Some(init) = init
+        && crate::function::is_anonymous_function_definition(init)
+    {
+        crate::function::set_function_name(&value, name, None)?;
+    }
+    Ok(value)
+}
+
+/// The bound name of an identifier pattern, if the pattern is one.
+fn binding_ident_name(pattern: &BindingPattern) -> Option<JsString> {
+    match pattern {
+        BindingPattern::Ident(id) => Some(crux::lookup(*id)),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

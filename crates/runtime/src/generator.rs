@@ -14,6 +14,7 @@ use crux::value::Value;
 
 use crate::agent::Agent;
 use crate::context::ExecutionContext;
+use crate::env::EnvRef;
 use crate::flow::Completion;
 use crate::function::ThisMode;
 use crate::ir::{CompiledBody, Resume, Suspension, Vm, VmOutcome};
@@ -43,9 +44,11 @@ pub struct GeneratorState {
     pub context: Option<ExecutionContext>,
     pub function: Value,
     pub realm: Handle<Realm>,
-    /// The call arguments, applied by GeneratorStart on the first `next()`.
-    pub start_this: Value,
-    pub start_args: Vec<Value>,
+    /// The post-instantiation environment: parameters are bound (and errors
+    /// surface) when the generator is *called* (spec EvaluateGeneratorBody
+    /// step 1), and the VM runs against this environment on the first
+    /// `next()`.
+    pub body_env: Option<EnvRef>,
 }
 
 pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
@@ -136,6 +139,9 @@ pub fn dispatch_call(
 
 /// GeneratorFunctionCall: calling a generator function returns a fresh
 /// generator object (the body does not run until the first `next()`).
+/// GeneratorFunctionCall (spec 15.5.2 EvaluateGeneratorBody): parameters are
+/// bound at call time — errors surface synchronously — and the generator
+/// object captures the instantiated environment for the first `next()`.
 pub fn call_generator(
     agent: &mut Agent,
     function: &Handle<Function>,
@@ -152,6 +158,62 @@ pub fn call_generator(
                 "Function body is not registered".into(),
             )
         })?;
+    let function_value = function.self_value();
+    let function_env = crate::env::new_function_environment(
+        Some(data.environment.clone()),
+        function_value.clone(),
+        Value::Undefined,
+        data.this_mode == ThisMode::Lexical,
+    );
+    let context = ExecutionContext {
+        function: Some(function_value.clone()),
+        realm: data.realm.clone(),
+        script_or_module: None,
+        lexical_environment: function_env.clone(),
+        variable_environment: function_env.clone(),
+        private_environment: data.private_environment.clone(),
+        source: agent
+            .running_context()
+            .ok()
+            .and_then(|context| context.source.clone()),
+    };
+    agent.execution_context_stack.push(context);
+    let instantiate = (|| -> Result<(), JsError> {
+        if data.this_mode != ThisMode::Lexical {
+            let this = if data.this_mode == ThisMode::Sloppy
+                && matches!(this, Value::Undefined | Value::Null)
+            {
+                let global = agent.running_context()?.realm.global_object.clone();
+                Value::Object(global)
+            } else {
+                this
+            };
+            function_env.bind_this_value(this)?;
+        }
+        crate::function::function_declaration_instantiation(
+            agent,
+            &function_value,
+            &data,
+            args,
+            &function_env,
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = instantiate {
+        agent.execution_context_stack.pop();
+        return Err(error);
+    }
+    // The VM drives the body's lexical environment (the one
+    // function_declaration_instantiation installed on the running context),
+    // so body-level let/const bindings are reachable.
+    let instantiated_context = agent
+        .execution_context_stack
+        .last()
+        .cloned()
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no context to capture".into()))?;
+    let body_env = instantiated_context.lexical_environment.clone();
+    agent.execution_context_stack.pop();
+
     let proto = data
         .realm
         .intrinsics
@@ -171,11 +233,10 @@ pub fn call_generator(
             flag: GeneratorFlag::SuspendedStart,
             vm: None,
             body: None,
-            context: None,
+            context: Some(instantiated_context),
             function: Value::Function(function.clone()),
             realm: data.realm.clone(),
-            start_this: this,
-            start_args: args.to_vec(),
+            body_env: Some(body_env),
         })),
     );
     Ok(object_value)
@@ -333,12 +394,21 @@ fn generator_resume_abrupt(
     }
 }
 
-/// GeneratorStart (spec 27.4.1): push the context, instantiate, run the VM.
+/// GeneratorStart (spec 27.4.1): push the context instantiated at call time
+/// and run the VM against its environment.
 fn start_body(
     agent: &mut Agent,
     state: &mut GeneratorState,
     _completion: Resume,
 ) -> Result<Value, JsError> {
+    let context = state
+        .context
+        .take()
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no saved context".into()))?;
+    let body_env = state
+        .body_env
+        .clone()
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no instantiated environment".into()))?;
     let function_value = state.function.clone();
     let Value::Function(function_handle) = &function_value else {
         return Err(JsError::new(ErrorKind::TypeError, "not a function".into()));
@@ -355,47 +425,7 @@ fn start_body(
             "generator body was not compiled".into(),
         )
     })?;
-    let function_env = crate::env::new_function_environment(
-        Some(data.environment.clone()),
-        function_value.clone(),
-        Value::Undefined,
-        data.this_mode == ThisMode::Lexical,
-    );
-    let context = ExecutionContext {
-        function: Some(function_value.clone()),
-        realm: data.realm.clone(),
-        script_or_module: None,
-        lexical_environment: function_env.clone(),
-        variable_environment: function_env.clone(),
-        private_environment: data.private_environment.clone(),
-        source: agent
-            .running_context()
-            .ok()
-            .and_then(|context| context.source.clone()),
-    };
-    agent.execution_context_stack.push(context.clone());
-    if data.this_mode != ThisMode::Lexical {
-        let this = if data.this_mode == ThisMode::Sloppy
-            && matches!(state.start_this, Value::Undefined | Value::Null)
-        {
-            let global = agent.running_context()?.realm.global_object.clone();
-            Value::Object(global)
-        } else {
-            state.start_this.clone()
-        };
-        function_env.bind_this_value(this)?;
-    }
-    crate::function::function_declaration_instantiation(
-        agent,
-        &function_value,
-        &data,
-        &state.start_args,
-        &function_env,
-    )?;
-    // The VM drives the body's lexical environment (the one
-    // function_declaration_instantiation installed on the running context),
-    // so body-level let/const bindings are reachable.
-    let body_env = agent.running_context()?.lexical_environment.clone();
+    agent.execution_context_stack.push(context);
     let vm = Vm::new(body_env, data.strict);
     state.body = Some(body.clone());
     state.vm = Some(vm);
@@ -620,5 +650,123 @@ mod tests {
         )
         .unwrap();
         assert_eq!(value, Value::String(Handle::new(JsString::from_utf8("f;"))));
+    }
+
+    #[test]
+    fn generator_destructure_default_yield_suspends_when_iterator_done() {
+        // The element still receives undefined after exhaustion, so the
+        // default initializer runs (and suspends) instead of the pattern
+        // finishing immediately.
+        let value = run(
+            "function* g() { var x; var vals = []; var result = [x = yield] = vals; return x; } \
+             var it = g(); var a = it.next(); var b = it.next(86); \
+             a.done + ',' + b.done + ',' + b.value",
+        )
+        .unwrap();
+        assert_eq!(
+            value,
+            Value::String(Handle::new(JsString::from_utf8("false,true,86")))
+        );
+    }
+
+    #[test]
+    fn generator_return_into_destructure_closes_iterator() {
+        let value = run("var returnCount = 0; \
+             var iterator = { next: function() { return {done: false, value: undefined}; }, \
+                              return: function() { returnCount += 1; return {}; } }; \
+             var iterable = {}; iterable[Symbol.iterator] = function() { return iterator; }; \
+             function* g() { var vals = iterable; [{} = yield] = vals; } \
+             var it = g(); it.next(); var r = it.return(777); \
+             returnCount + ',' + r.value + ',' + r.done")
+        .unwrap();
+        assert_eq!(
+            value,
+            Value::String(Handle::new(JsString::from_utf8("1,777,true")))
+        );
+    }
+
+    #[test]
+    fn generator_return_into_destructure_checks_return_result() {
+        // IteratorClose with a return completion: a non-object `return`
+        // result is a TypeError that replaces the return completion.
+        let value = run(
+            "var iterator = { next: function() { return {done: false, value: undefined}; }, \
+             return: function() { return null; } }; \
+             var iterable = {}; iterable[Symbol.iterator] = function() { return iterator; }; \
+             function* g() { var vals = iterable; [{} = yield] = vals; } \
+             var it = g(); it.next(); \
+             var threw = false; try { it.return(); } catch (e) { threw = e instanceof TypeError; } \
+             threw",
+        )
+        .unwrap();
+        assert_eq!(value, Value::Boolean(true));
+    }
+
+    #[test]
+    fn generator_throw_into_destructure_swallows_throwing_return() {
+        // IteratorClose with a throw completion: the original error wins, so
+        // a throwing `return` is swallowed.
+        let value = run(
+            "var returnCount = 0; \
+             var iterator = { next: function() { return {done: false, value: undefined}; }, \
+                              return: function() { returnCount += 1; throw new RangeError('x'); } }; \
+             var iterable = {}; iterable[Symbol.iterator] = function() { return iterator; }; \
+             function* g() { var vals = iterable; try { [{} = yield] = vals; } catch (e) { return 'caught:' + e; } } \
+             var it = g(); it.next(); var r = it.throw('boom'); \
+             returnCount + ',' + r.value + ',' + r.done",
+        )
+        .unwrap();
+        assert_eq!(
+            value,
+            Value::String(Handle::new(JsString::from_utf8("1,caught:boom,true")))
+        );
+    }
+
+    #[test]
+    fn generator_rest_member_target_evaluates_reference_before_collecting() {
+        // The rest target's reference (with a `yield` in its computed key) is
+        // evaluated before the remaining values are collected.
+        let value = run("var x = {}; \
+             function* g() { var vals = [33, 44, 55]; [...x[yield]] = vals; } \
+             var it = g(); it.next(); it.next('prop'); \
+             x.prop.length + ',' + x.prop[0] + ',' + x.prop[2]")
+        .unwrap();
+        assert_eq!(
+            value,
+            Value::String(Handle::new(JsString::from_utf8("3,33,55")))
+        );
+    }
+
+    #[test]
+    fn generator_destructure_with_iterator_lacking_next_suspends() {
+        // GetIterator does not require a callable `next`; the yield in the
+        // member target suspends before any step, and `return` still closes.
+        let value = run("var returnCount = 0; \
+             var iterator = { return: function() { returnCount += 1; return {}; } }; \
+             var iterable = {}; iterable[Symbol.iterator] = function() { return iterator; }; \
+             function* g() { var vals = iterable; [{}[yield]] = vals; } \
+             var it = g(); var a = it.next(); var r = it.return(5); \
+             a.done + ',' + returnCount + ',' + r.done")
+        .unwrap();
+        assert_eq!(
+            value,
+            Value::String(Handle::new(JsString::from_utf8("false,1,true")))
+        );
+    }
+
+    #[test]
+    fn generator_return_into_for_of_destructure_head_closes() {
+        let value = run("var returnCount = 0; \
+             var iterator = { next: function() { return {done: false, value: undefined}; }, \
+                              return: function() { returnCount += 1; return {}; } }; \
+             var iterable = {}; iterable[Symbol.iterator] = function() { return iterator; }; \
+             function* g() { for ([{} = yield] of [iterable]) {} } \
+             var it = g(); it.next(); var r = it.return(9); \
+             returnCount + ',' + r.value + ',' + r.done")
+        .unwrap();
+        assert_eq!(
+            value,
+            Value::String(Handle::new(JsString::from_utf8("1,9,true")))
+        );
     }
 }

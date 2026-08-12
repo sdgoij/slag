@@ -12,7 +12,9 @@ use crux::handle::Handle;
 use crux::property::PropertyKey;
 use crux::string::JsString;
 use crux::value::Value;
-use syntax::ast::{BindingPattern, ForBinding, ForInit, Program, Stmt, StmtKind, VarDeclKind};
+use syntax::ast::{
+    BindingPattern, ExprKind, ForBinding, ForInit, Program, Stmt, StmtKind, VarDeclKind,
+};
 
 use crate::agent::Agent;
 use crate::context::{initialize_referenced_binding, put_value, resolve_binding};
@@ -703,6 +705,12 @@ fn for_binding_put(
 ) -> Result<Option<EnvRef>, JsError> {
     match left {
         ForBinding::Expr(expr) => {
+            // Destructuring heads (`for ([a, b] of …)`) are assignment
+            // patterns, not references (spec 14.7.6 step 6.b).
+            if matches!(&expr.kind, ExprKind::Array(_) | ExprKind::Object(_)) {
+                crate::binding::destructuring_assignment(agent, expr, value, strict)?;
+                return Ok(None);
+            }
             let reference = eval_reference(agent, expr, strict)?;
             put_value(agent, &reference, value)?;
             Ok(None)
@@ -750,7 +758,16 @@ fn eval_for_of(
         let Some(value) = iterator_step(agent, &iterator)? else {
             return Ok(Completion::Normal(iteration_result));
         };
-        let restore = for_binding_put(agent, left, value, strict)?;
+        // A destructuring-assignment error in the head closes the iterator
+        // (ForIn/OfBodyEvaluation: abrupt status → IteratorClose); only a
+        // throwing `return` replaces the error (spec 7.4.11).
+        let restore = match for_binding_put(agent, left, value, strict) {
+            Ok(restore) => restore,
+            Err(error) => {
+                crate::expr::iterator_close_throw(agent, &iterator)?;
+                return Err(error);
+            }
+        };
         let result = eval_statement(agent, body, strict);
         if let Some(outer) = restore {
             agent.running_context_mut()?.lexical_environment = outer;
@@ -969,12 +986,16 @@ fn eval_catch(
     let old_env = agent.running_context()?.lexical_environment.clone();
     let catch_env = new_declarative_environment(Some(old_env.clone()));
     if let Some(param) = &handler.param {
-        let BindingPattern::Ident(name) = param else {
-            return Err(not_implemented("catch destructuring"));
-        };
-        let name = crux::lookup(*name);
-        catch_env.create_mutable_binding(&name, false)?;
-        catch_env.initialize_binding(&name, thrown)?;
+        // spec 18.2.3: the catch parameter's bound names are created
+        // uninitialized in a fresh declarative environment, then
+        // BindingInitialization fills them (the parameter may be a
+        // destructuring pattern).
+        let mut names = Vec::new();
+        crate::script::bound_names(param, &mut names);
+        for name in &names {
+            catch_env.create_mutable_binding(name, false)?;
+        }
+        crate::binding::binding_initialization(agent, param, thrown, Some(&catch_env), strict)?;
     }
     agent.running_context_mut()?.lexical_environment = catch_env;
     let result = eval_statement_list(agent, &handler.body.stmts, strict);

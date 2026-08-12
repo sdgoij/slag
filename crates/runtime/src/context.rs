@@ -445,6 +445,12 @@ fn find_ecma_accessor(
             None => object,
             Some(handle) => handle,
         };
+        // Proxies route [[Get]]/[[Set]] through their traps; probing own
+        // properties here would invoke the getOwnPropertyDescriptor trap for
+        // every read (spec 10.5.8).
+        if matches!(obj.kind, crux::object::ObjectKind::Proxy(_)) {
+            return Ok(None);
+        }
         if let Some(property) = obj.get_own_property_key(key)? {
             let crux::object::PropertyKind::Accessor { get, set } = property.kind else {
                 return Ok(None);

@@ -196,14 +196,21 @@ pub fn is_anonymous_function_definition(expr: &syntax::ast::Expr) -> bool {
         ExprKind::Function(f) => f.name.is_none(),
         ExprKind::Arrow { .. } => true,
         ExprKind::Class(c) => c.name.is_none(),
+        // spec 13.2.1: a parenthesized expression defers to its inner
+        // expression, so `(function () {})` is an anonymous function
+        // definition (but `(0, function () {})` is not).
+        ExprKind::Paren(inner) => is_anonymous_function_definition(inner),
         _ => false,
     }
 }
 
-/// SetFunctionName (spec 10.2.7): redefine the `name` own data property of
-/// a function value. The property is configurable, so this also replaces the
-/// empty name anonymous functions are created with. `prefix` ("get"/"set") is
-/// joined with a space per the spec's step 3.
+/// SetFunctionName (spec 10.2.11): redefine the `name` own data property of
+/// a function value. Fresh ECMAScript functions carry a `""` placeholder
+/// name; a non-empty own `name` (a static `name` element on a class
+/// constructor, which wins over the surrounding binding per
+/// ClassDefinitionEvaluation) must not be overwritten. The own descriptor is
+/// inspected rather than the value so a static accessor named `name` is never
+/// executed. `prefix` ("get"/"set") is joined with a space per spec step 3.
 pub fn set_function_name(
     function: &Value,
     name: &JsString,
@@ -212,6 +219,31 @@ pub fn set_function_name(
     let Value::Function(function) = function else {
         return Ok(());
     };
+    let own = function
+        .object
+        .get_own_property_key(&crux::property::PropertyKey::from_utf8("name"))?;
+    // SetFunctionName only runs on functions without a real own `name`: a
+    // freshly created function carries the "" placeholder, a bound function
+    // carries no own `name` at all. A non-empty own `name` (a static `name`
+    // element on a class constructor, which wins over the surrounding binding
+    // per ClassDefinitionEvaluation) is left alone. The own descriptor is
+    // inspected rather than the value so a static accessor named `name` is
+    // never executed.
+    let placeholder = match own {
+        None => true,
+        Some(crux::object::Property {
+            kind:
+                crux::object::PropertyKind::Data {
+                    value: Value::String(value),
+                    ..
+                },
+            ..
+        }) => value.is_empty(),
+        _ => false,
+    };
+    if !placeholder {
+        return Ok(());
+    }
     let name = match prefix {
         Some(prefix) => JsString::from_utf8(&format!("{prefix} {}", name.to_string_lossy())),
         None => name.clone(),
@@ -744,173 +776,95 @@ fn call_inner(
                 // Agent-dependent built-ins (the Function constructor and the
                 // %Function.prototype% methods) cannot run inside the crux
                 // closures; dispatch them here by intrinsic identity (the
-                // %eval% pattern).
-                if let Some(result) =
-                    crate::builtins::function::dispatch_call(agent, callee, &this, args)
-                {
-                    return result;
+                // %eval% pattern). Which dispatch (if any) applies is stable
+                // per function object, so the linear chain is memoized in
+                // `agent.builtin_dispatch_cache` — plain closure builtins
+                // (index 0) skip the chain entirely on warm calls.
+                let id = function.id();
+                let cached = agent.builtin_dispatch_cache.get(&id).copied();
+                let dispatched = match cached {
+                    Some(0) => None,
+                    Some(index) => builtin_dispatch_at(agent, index, callee, &this, args),
+                    None => {
+                        let (index, result) = resolve_builtin_dispatch(agent, callee, &this, args);
+                        agent.builtin_dispatch_cache.insert(id, index);
+                        result
+                    }
+                };
+                match dispatched {
+                    Some(result) => result,
+                    None => crux::function::call(callee, this, args),
                 }
-                if let Some(result) =
-                    crate::builtins::object::dispatch_call(agent, callee, &this, args)
-                {
-                    return result;
-                }
-                if let Some(result) =
-                    crate::builtins::array::dispatch_call(agent, callee, &this, args)
-                {
-                    return result;
-                }
-                if let Some(result) =
-                    crate::builtins::typed_array::dispatch_call(agent, callee, &this, args)
-                {
-                    return result;
-                }
-                if let Some(result) =
-                    crate::builtins::keyed::dispatch_call(agent, callee, &this, args)
-                {
-                    return result;
-                }
-                if let Some(result) =
-                    crate::builtins::array_buffer::dispatch_call(agent, callee, &this, args)
-                {
-                    return result;
-                }
-                if let Some(result) =
-                    crate::builtins::dataview::dispatch_call(agent, callee, &this, args)
-                {
-                    return result;
-                }
-                if let Some(result) =
-                    crate::builtins::atomics::dispatch_call(agent, callee, &this, args)
-                {
-                    return result;
-                }
-                if let Some(result) =
-                    crate::builtins::json::dispatch_call(agent, callee, &this, args)
-                {
-                    return result;
-                }
-                if let Some(result) =
-                    crate::builtins::boolean::dispatch_call(agent, callee, &this, args)
-                {
-                    return result;
-                }
-                if let Some(result) =
-                    crate::builtins::bigint::dispatch_call(agent, callee, &this, args)
-                {
-                    return result;
-                }
-                if let Some(result) =
-                    crate::builtins::date::dispatch_call(agent, callee, &this, args)
-                {
-                    return result;
-                }
-                if let Some(result) =
-                    crate::builtins::symbol::dispatch_call(agent, callee, &this, args)
-                {
-                    return result;
-                }
-                if let Some(result) =
-                    crate::builtins::error::dispatch_call(agent, callee, &this, args)
-                {
-                    return result;
-                }
-                if let Some(result) =
-                    crate::builtins::math::dispatch_call(agent, callee, &this, args)
-                {
-                    return result;
-                }
-                if let Some(result) =
-                    crate::builtins::number::dispatch_call(agent, callee, &this, args)
-                {
-                    return result;
-                }
-                if let Some(result) =
-                    crate::builtins::string::dispatch_call(agent, callee, &this, args)
-                {
-                    return result;
-                }
-                if let Some(result) =
-                    crate::builtins::regexp::dispatch_call(agent, callee, &this, args)
-                {
-                    return result;
-                }
-                if let Some(result) =
-                    crate::builtins::weakref::dispatch_call(agent, callee, &this, args)
-                {
-                    return result;
-                }
-                if let Some(result) =
-                    crate::builtins::promise::dispatch_call(agent, callee, &this, args)
-                {
-                    return result;
-                }
-                if let Some(result) = crate::async_await::dispatch_resume(agent, callee, args) {
-                    return result;
-                }
-                if let Some(result) =
-                    crate::async_await::dispatch_async_from_sync(agent, callee, args)
-                {
-                    return result;
-                }
-                if let Some(result) = crate::generator::dispatch_call(agent, callee, &this, args) {
-                    return result;
-                }
-                if let Some(result) =
-                    crate::async_generator::dispatch_call(agent, callee, &this, args)
-                {
-                    return result;
-                }
-                if let Some(result) = crate::async_generator::dispatch_await(agent, callee, args) {
-                    return result;
-                }
-                if let Some(result) = crate::async_generator::dispatch_resolver(agent, callee, args)
-                {
-                    return result;
-                }
-                if let Some(result) =
-                    crate::builtins::async_function::dispatch_call(agent, callee, &this, args)
-                {
-                    return result;
-                }
-                if let Some(result) =
-                    crate::builtins::iterator::dispatch_call(agent, callee, &this, args)
-                {
-                    return result;
-                }
-                if let Some(result) =
-                    crate::builtins::async_iterator::dispatch_call(agent, callee, &this, args)
-                {
-                    return result;
-                }
-                if let Some(result) =
-                    crate::builtins::disposable::dispatch_call(agent, callee, &this, args)
-                {
-                    return result;
-                }
-                if let Some(result) =
-                    crate::builtins::disposable::dispatch_continuation(agent, callee, args)
-                {
-                    return result;
-                }
-                if let Some(result) =
-                    crate::builtins::proxy::dispatch_call(agent, callee, &this, args)
-                {
-                    return result;
-                }
-                if let Some(result) =
-                    crate::builtins::reflect::dispatch_call(agent, callee, &this, args)
-                {
-                    return result;
-                }
-                if let Some(result) = crate::module::dispatch_import_resolver(agent, callee, args) {
-                    return result;
-                }
-                crux::function::call(callee, this, args)
             }
         },
         _ => crux::function::call(callee, this, args),
     }
+}
+
+/// Run the dispatch at `index` (the memoized per-function slot). Each arm
+/// mirrors one entry of the original `call_inner` chain; a stale entry
+/// (the dispatch no longer applies) returns `None`.
+fn builtin_dispatch_at(
+    agent: &mut Agent,
+    index: u8,
+    callee: &Value,
+    this: &Value,
+    args: &[Value],
+) -> Option<Result<Value, JsError>> {
+    match index {
+        1 => crate::builtins::function::dispatch_call(agent, callee, this, args),
+        2 => crate::builtins::object::dispatch_call(agent, callee, this, args),
+        3 => crate::builtins::array::dispatch_call(agent, callee, this, args),
+        4 => crate::builtins::typed_array::dispatch_call(agent, callee, this, args),
+        5 => crate::builtins::keyed::dispatch_call(agent, callee, this, args),
+        6 => crate::builtins::array_buffer::dispatch_call(agent, callee, this, args),
+        7 => crate::builtins::dataview::dispatch_call(agent, callee, this, args),
+        8 => crate::builtins::atomics::dispatch_call(agent, callee, this, args),
+        9 => crate::builtins::json::dispatch_call(agent, callee, this, args),
+        10 => crate::builtins::boolean::dispatch_call(agent, callee, this, args),
+        11 => crate::builtins::bigint::dispatch_call(agent, callee, this, args),
+        12 => crate::builtins::date::dispatch_call(agent, callee, this, args),
+        13 => crate::builtins::symbol::dispatch_call(agent, callee, this, args),
+        14 => crate::builtins::error::dispatch_call(agent, callee, this, args),
+        15 => crate::builtins::math::dispatch_call(agent, callee, this, args),
+        16 => crate::builtins::number::dispatch_call(agent, callee, this, args),
+        17 => crate::builtins::string::dispatch_call(agent, callee, this, args),
+        18 => crate::builtins::regexp::dispatch_call(agent, callee, this, args),
+        19 => crate::builtins::weakref::dispatch_call(agent, callee, this, args),
+        20 => crate::builtins::promise::dispatch_call(agent, callee, this, args),
+        21 => crate::async_await::dispatch_resume(agent, callee, args),
+        22 => crate::async_await::dispatch_async_from_sync(agent, callee, args),
+        23 => crate::generator::dispatch_call(agent, callee, this, args),
+        24 => crate::async_generator::dispatch_call(agent, callee, this, args),
+        25 => crate::async_generator::dispatch_await(agent, callee, args),
+        26 => crate::async_generator::dispatch_resolver(agent, callee, args),
+        27 => crate::builtins::async_function::dispatch_call(agent, callee, this, args),
+        28 => crate::builtins::iterator::dispatch_call(agent, callee, this, args),
+        29 => crate::builtins::async_iterator::dispatch_call(agent, callee, this, args),
+        30 => crate::builtins::disposable::dispatch_call(agent, callee, this, args),
+        31 => crate::builtins::disposable::dispatch_continuation(agent, callee, args),
+        32 => crate::builtins::proxy::dispatch_call(agent, callee, this, args),
+        33 => crate::builtins::reflect::dispatch_call(agent, callee, this, args),
+        34 => crate::module::dispatch_import_resolver(agent, callee, args),
+        _ => None,
+    }
+}
+
+/// Run the whole dispatch chain once, returning the first matching dispatch
+/// index (0 when none applies) with its result.
+fn resolve_builtin_dispatch(
+    agent: &mut Agent,
+    callee: &Value,
+    this: &Value,
+    args: &[Value],
+) -> (u8, Option<Result<Value, JsError>>) {
+    for index in 1..=34 {
+        let result = builtin_dispatch_at(agent, index, callee, this, args);
+        if result.is_some() {
+            return (index, result);
+        }
+    }
+    (0, None)
 }
 
 /// Construct (spec 10.2.1): like `call` for the `new` operator, with

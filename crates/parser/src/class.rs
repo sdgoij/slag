@@ -309,7 +309,9 @@ fn parse_static_block(parser: &mut Parser) -> Result<Block, JsError> {
     parser.strict = true;
     parser.in_function = true;
     parser.in_generator = false;
-    parser.in_async = false;
+    // Class static initialization blocks parse with an [Await] parameter
+    // (spec 15.7.13), so `await` is reserved there.
+    parser.in_async = true;
     parser.allow_super = true;
     parser.in_constructor = false;
     let saved_vars = std::mem::take(&mut parser.list_vars);

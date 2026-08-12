@@ -453,6 +453,11 @@ pub enum AssignOp {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArrayLiteral {
     pub elements: Vec<ArrayElement>,
+    /// A trailing comma directly after the rest element (`[...x,]`): an
+    /// elision may not follow an AssignmentRestElement (spec 13.15.5.1). The
+    /// AST keeps it separate from `Hole` because a trailing comma adds no
+    /// element in expression position.
+    pub rest_trailing_comma: bool,
     pub span: Span,
 }
 
@@ -469,6 +474,9 @@ pub enum ArrayElement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectLiteral {
     pub props: Vec<ObjectProperty>,
+    /// A trailing comma directly after the rest property (`{...x,}`): an
+    /// element may not follow an AssignmentRestProperty (spec 13.15.5.1).
+    pub rest_trailing_comma: bool,
     pub span: Span,
 }
 

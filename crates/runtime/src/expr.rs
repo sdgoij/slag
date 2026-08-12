@@ -347,6 +347,9 @@ fn eval_member_key(
 /// Evaluate a LeftHandSideExpression to a Reference (spec 13.3.1), for
 /// assignment targets and `delete`.
 pub fn eval_reference(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Reference, JsError> {
+    if let ExprKind::Paren(inner) = &expr.kind {
+        return eval_reference(agent, inner, strict);
+    }
     let chain = eval_chain(agent, expr, strict)?;
     match chain {
         Some(ChainResult::Reference(reference)) => Ok(reference),
@@ -772,6 +775,17 @@ fn eval_assignment(
     value_expr: &Expr,
     strict: bool,
 ) -> Result<Value, JsError> {
+    // Destructuring assignment targets (spec 13.15.4): an Array or Object
+    // literal on the left of `=` is a pattern, not a value. Evaluate the RHS
+    // first, then perform DestructuringAssignmentEvaluation; the result is
+    // the RHS value.
+    if matches!(op, AssignOp::Assign)
+        && matches!(&target.kind, ExprKind::Array(_) | ExprKind::Object(_))
+    {
+        let value = eval_expr(agent, value_expr, strict)?;
+        crate::binding::destructuring_assignment(agent, target, value.clone(), strict)?;
+        return Ok(value);
+    }
     let reference = eval_reference(agent, target, strict)?;
     match op {
         AssignOp::Assign => {
@@ -1318,11 +1332,34 @@ pub fn get_iterator(agent: &mut Agent, value: &Value) -> Result<IteratorRecord, 
             "Iterator must be an object".into(),
         ));
     }
+    // The `next` method is fetched and cached here (the getter fires once,
+    // spec 7.4.1-7.4.2), but a non-callable `next` only surfaces when it is
+    // called: a `yield`/`await` may suspend between GetIterator and the first
+    // step (spec 7.4.2 step 3 + 7.4.3).
     let next = get_property(
         agent,
         &iterator,
         &JsString::from_utf8("next"),
         iterator.clone(),
+    )?;
+    Ok(IteratorRecord { iterator, next })
+}
+
+/// The iterator's `next` method: the cached method from GetIterator, or a
+/// TypeError when it is not callable (the error surfaces at the first call,
+/// spec 7.4.2-7.4.3).
+pub fn iterator_next_method(
+    agent: &mut Agent,
+    iterator: &IteratorRecord,
+) -> Result<Value, JsError> {
+    if is_callable(&iterator.next) {
+        return Ok(iterator.next.clone());
+    }
+    let next = get_property(
+        agent,
+        &iterator.iterator,
+        &JsString::from_utf8("next"),
+        iterator.iterator.clone(),
     )?;
     if !is_callable(&next) {
         return Err(JsError::new(
@@ -1330,7 +1367,7 @@ pub fn get_iterator(agent: &mut Agent, value: &Value) -> Result<IteratorRecord, 
             "Iterator's next method is not callable".into(),
         ));
     }
-    Ok(IteratorRecord { iterator, next })
+    Ok(next)
 }
 
 /// IteratorStep + IteratorValue (spec 7.4.5-7.4.6): the next value, or `None`
@@ -1339,7 +1376,8 @@ pub fn iterator_step(
     agent: &mut Agent,
     iterator: &IteratorRecord,
 ) -> Result<Option<Value>, JsError> {
-    let result = crate::function::call(agent, &iterator.next, iterator.iterator.clone(), &[])?;
+    let next = iterator_next_method(agent, iterator)?;
+    let result = crate::function::call(agent, &next, iterator.iterator.clone(), &[])?;
     if !matches!(result, Value::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -1359,10 +1397,38 @@ pub fn iterator_step(
     Ok(Some(value))
 }
 
-/// IteratorClose (spec 7.4.7): invoke the iterator's `return` method when it
-/// exists. Phase 6 propagates the close result; `throw`-completions integrate
-/// in Phase 7.
+/// IteratorClose (spec 7.4.11): invoke the iterator's `return` method when it
+/// exists. Called with a normal completion: a non-object result is a TypeError
+/// (step 8).
 pub fn iterator_close(agent: &mut Agent, iterator: &IteratorRecord) -> Result<(), JsError> {
+    iterator_close_inner(agent, iterator, false)
+}
+
+/// IteratorClose with a throw completion (spec 7.4.11 steps 6-7): the
+/// original error wins, so a throwing `return` (or a throwing `return`
+/// lookup) is swallowed and the result-object check is skipped.
+pub fn iterator_close_throw(agent: &mut Agent, iterator: &IteratorRecord) -> Result<(), JsError> {
+    let return_method = match get_property(
+        agent,
+        &iterator.iterator,
+        &JsString::from_utf8("return"),
+        iterator.iterator.clone(),
+    ) {
+        Ok(method) => method,
+        Err(_) => return Ok(()),
+    };
+    if matches!(return_method, Value::Undefined | Value::Null) {
+        return Ok(());
+    }
+    let _ = crate::function::call(agent, &return_method, iterator.iterator.clone(), &[]);
+    Ok(())
+}
+
+fn iterator_close_inner(
+    agent: &mut Agent,
+    iterator: &IteratorRecord,
+    completion_is_throw: bool,
+) -> Result<(), JsError> {
     let return_method = get_property(
         agent,
         &iterator.iterator,
@@ -1372,7 +1438,13 @@ pub fn iterator_close(agent: &mut Agent, iterator: &IteratorRecord) -> Result<()
     if matches!(return_method, Value::Undefined | Value::Null) {
         return Ok(());
     }
-    crate::function::call(agent, &return_method, iterator.iterator.clone(), &[])?;
+    let result = crate::function::call(agent, &return_method, iterator.iterator.clone(), &[])?;
+    if !completion_is_throw && !matches!(result, Value::Object(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Iterator result return is not an object".into(),
+        ));
+    }
     Ok(())
 }
 

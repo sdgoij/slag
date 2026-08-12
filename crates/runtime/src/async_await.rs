@@ -373,7 +373,8 @@ fn run_async_from_sync(
     let method = entry.method;
     let result = match method {
         AsyncFromSyncMethod::Next => {
-            crate::function::call(agent, &sync.next, sync.iterator.clone(), args)?
+            let next = crate::expr::iterator_next_method(agent, &sync)?;
+            crate::function::call(agent, &next, sync.iterator.clone(), args)?
         }
         AsyncFromSyncMethod::Return => {
             let return_method = crate::context::get_property(

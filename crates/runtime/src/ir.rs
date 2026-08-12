@@ -88,6 +88,44 @@ pub enum Step {
     Destructure {
         pattern: BindingPattern,
     },
+    // ----- step-based destructuring (suspension-capable) -----
+    /// Pop the value and GetIterator, pushing the record on the destructure
+    /// stack.
+    DestructureBegin,
+    /// Step the innermost destructure iterator, pushing the value; when
+    /// exhausted the element still receives *undefined* (a default
+    /// initializer must run and may suspend) and the iterator is marked done
+    /// so the trailing close is skipped.
+    DestructureNext,
+    /// Pop the value; if undefined, jump to `use_default` (the value is
+    /// consumed); otherwise push it back for the assignment.
+    DestructureUndef {
+        use_default: usize,
+    },
+    /// Collect the remaining values of the innermost destructure iterator
+    /// into a fresh array, push it, and pop the iterator (no close).
+    DestructureRest,
+    /// Pop the value; if it is null or undefined throw a TypeError, else
+    /// push it back (RequireObjectCoercible of an object pattern).
+    DestructureObjCoercible,
+    /// Pop the object (a dup) and push the value of the constant property
+    /// key.
+    DestructureObjKey {
+        key: crux::property::PropertyKey,
+    },
+    /// Pop the key then the object (a dup) and push the property value.
+    DestructureObjKeyComputed,
+    /// Pop the object (a dup), CopyDataProperties into a fresh rest object,
+    /// and push it.
+    DestructureObjRest {
+        excluded: Vec<crux::property::PropertyKey>,
+    },
+    /// Pop the innermost destructure iterator and close it (a normal
+    /// completion: the pattern consumed fewer values than the iterator
+    /// held).
+    DestructureClose,
+    /// Pop the object pattern's base object off the object stack.
+    DestructureObjEnd,
     /// Initialize a let/const/using declaration's binding in the current
     /// lexical environment; the binding was created uninitialized by
     /// declaration instantiation (unlike `Destructure`, which puts a value
@@ -410,6 +448,11 @@ pub struct Vm {
     pub for_in_stack: Vec<(Vec<Value>, usize)>,
     pub for_of_stack: Vec<crate::expr::IteratorRecord>,
     pub async_for_of_stack: Vec<crate::expr::IteratorRecord>,
+    pub destructure_stack: Vec<crate::expr::IteratorRecord>,
+    /// Whether each destructure's iterator was exhausted by an element step;
+    /// an exhausted iterator is not closed (spec 13.15.5.2 step 5).
+    pub destructure_done: Vec<bool>,
+    pub destructure_obj_stack: Vec<Value>,
     pub yield_star_stack: Vec<YieldStarState>,
     pub switch_disc: Option<Value>,
     pub strict: bool,
@@ -438,6 +481,9 @@ impl Vm {
             for_in_stack: Vec::new(),
             for_of_stack: Vec::new(),
             async_for_of_stack: Vec::new(),
+            destructure_stack: Vec::new(),
+            destructure_done: Vec::new(),
+            destructure_obj_stack: Vec::new(),
             yield_star_stack: Vec::new(),
             switch_disc: None,
             strict,
@@ -496,14 +542,62 @@ impl Vm {
                 self.stack.push(value);
                 self.run_inner(agent, body)
             }
-            Resume::Throw(value) => match self.throw_machinery(body, value)? {
-                CtlResult::Continue => self.run_inner(agent, body),
-                CtlResult::Done(outcome) => Ok(outcome),
-            },
-            Resume::Return(value) => match self.control_transfer(body, Ctl::Return { value })? {
-                CtlResult::Continue => self.run_inner(agent, body),
-                CtlResult::Done(outcome) => Ok(outcome),
-            },
+            Resume::Throw(value) => {
+                // A resumed `yield`/`await` inside a destructure propagates
+                // the abrupt completion through the pattern, closing its
+                // iterators (spec 13.15.5.2 step 5 + 7.4.11).
+                self.close_destructures_abrupt(agent, false)?;
+                match self.throw_machinery(body, value)? {
+                    CtlResult::Continue => self.run_inner(agent, body),
+                    CtlResult::Done(outcome) => Ok(outcome),
+                }
+            }
+            Resume::Return(value) => {
+                match self.close_destructures_abrupt(agent, true) {
+                    Ok(()) => match self.control_transfer(body, Ctl::Return { value })? {
+                        CtlResult::Continue => self.run_inner(agent, body),
+                        CtlResult::Done(outcome) => Ok(outcome),
+                    },
+                    // A throwing or non-object `return` replaces the return
+                    // completion with that error (spec 7.4.11 steps 6-8).
+                    Err(error) => self.throw_error(agent, body, error),
+                }
+            }
+        }
+    }
+
+    /// Close every active destructure iterator when a suspended `yield`/
+    /// `await` inside a pattern is aborted (spec 13.15.5.2/13.15.5.5: an
+    /// abrupt element or rest evaluation closes the not-done iterator with
+    /// the abrupt completion). With a return completion the innermost close
+    /// runs first and a throwing or non-object `return` becomes the new
+    /// completion, so the remaining iterators close with the throw flavor
+    /// (spec 7.4.11 steps 4-8); with a throw completion all closes swallow.
+    fn close_destructures_abrupt(
+        &mut self,
+        agent: &mut Agent,
+        completion_is_return: bool,
+    ) -> Result<(), JsError> {
+        let mut first_error: Option<JsError> = None;
+        while let Some(index) = self.destructure_stack.len().checked_sub(1) {
+            let iterator = self.destructure_stack[index].clone();
+            let done = self.destructure_done.get(index).copied().unwrap_or(false);
+            if !done {
+                if completion_is_return && first_error.is_none() {
+                    if let Err(error) = iterator_close(agent, &iterator) {
+                        first_error = Some(error);
+                    }
+                } else {
+                    crate::expr::iterator_close_throw(agent, &iterator)?;
+                }
+            }
+            self.destructure_stack.pop();
+            self.destructure_done.pop();
+        }
+        self.destructure_obj_stack.clear();
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 
@@ -696,6 +790,116 @@ impl Vm {
                         self.strict,
                     )?;
                     self.stack.push(value);
+                }
+                Step::DestructureBegin => {
+                    let value = self.pop();
+                    let iterator = get_iterator(agent, &value)?;
+                    self.destructure_stack.push(iterator);
+                    self.destructure_done.push(false);
+                }
+                Step::DestructureNext => {
+                    let index = self.destructure_stack.len().checked_sub(1).ok_or_else(|| {
+                        JsError::new(
+                            ErrorKind::SyntaxError,
+                            "DestructureNext without a destructure".into(),
+                        )
+                    })?;
+                    let iterator = self.destructure_stack[index].clone();
+                    match iterator_step(agent, &iterator)? {
+                        Some(value) => self.stack.push(value),
+                        None => {
+                            // The iterator is exhausted but the element still
+                            // receives *undefined*: a default initializer must
+                            // run (and may suspend) even after exhaustion.
+                            self.destructure_done[index] = true;
+                            self.stack.push(Value::Undefined);
+                        }
+                    }
+                }
+                Step::DestructureUndef { use_default } => {
+                    let value = self.pop();
+                    if matches!(value, Value::Undefined) {
+                        self.ip = use_default;
+                    } else {
+                        self.stack.push(value);
+                    }
+                }
+                Step::DestructureRest => {
+                    let index = self.destructure_stack.len().checked_sub(1).ok_or_else(|| {
+                        JsError::new(
+                            ErrorKind::SyntaxError,
+                            "DestructureRest without a destructure".into(),
+                        )
+                    })?;
+                    let iterator = self.destructure_stack[index].clone();
+                    let mut collected = Vec::new();
+                    while let Some(value) = iterator_step(agent, &iterator)? {
+                        collected.push(value);
+                    }
+                    self.destructure_stack.pop();
+                    self.destructure_done.pop();
+                    let array = crate::builtins::array::array_from_values(agent, &collected)?;
+                    self.stack.push(array);
+                }
+                Step::DestructureObjCoercible => {
+                    let value = self.pop();
+                    if matches!(value, Value::Undefined | Value::Null) {
+                        return Err(JsError::new(
+                            ErrorKind::TypeError,
+                            "Cannot destructure null or undefined".into(),
+                        ));
+                    }
+                    self.destructure_obj_stack.push(value);
+                }
+                Step::DestructureObjKey { key } => {
+                    let object = self.destructure_obj_stack.last().cloned().ok_or_else(|| {
+                        JsError::new(
+                            ErrorKind::SyntaxError,
+                            "DestructureObjKey without an object".into(),
+                        )
+                    })?;
+                    let value =
+                        crate::context::get_property_key(agent, &object, &key, object.clone())?;
+                    self.stack.push(value);
+                }
+                Step::DestructureObjKeyComputed => {
+                    let key = self.pop();
+                    let object = self.destructure_obj_stack.last().cloned().ok_or_else(|| {
+                        JsError::new(
+                            ErrorKind::SyntaxError,
+                            "DestructureObjKeyComputed without an object".into(),
+                        )
+                    })?;
+                    let key = crate::context::to_property_key(agent, &key)?;
+                    let value =
+                        crate::context::get_property_key(agent, &object, &key, object.clone())?;
+                    self.stack.push(value);
+                }
+                Step::DestructureObjRest { excluded } => {
+                    let object = self.destructure_obj_stack.last().cloned().ok_or_else(|| {
+                        JsError::new(
+                            ErrorKind::SyntaxError,
+                            "DestructureObjRest without an object".into(),
+                        )
+                    })?;
+                    let rest = crate::binding::rest_object(agent)?;
+                    crate::binding::copy_data_properties_excluding(
+                        agent, &rest, &object, &excluded,
+                    )?;
+                    self.stack.push(Value::Object(rest));
+                }
+                Step::DestructureClose => {
+                    if let Some(index) = self.destructure_stack.len().checked_sub(1) {
+                        let iterator = self.destructure_stack[index].clone();
+                        if !self.destructure_done[index] {
+                            iterator_close(agent, &iterator)?;
+                        }
+                        self.destructure_stack.pop();
+                        self.destructure_done.pop();
+                    }
+                }
+                Step::DestructureObjEnd => {
+                    self.destructure_obj_stack.pop();
                 }
                 Step::DeclInit { pattern } => {
                     let value = self.pop();
@@ -1321,9 +1525,10 @@ impl Vm {
                     };
                     let received = state.received.clone();
                     let iterator = state.iterator.clone();
+                    let next = crate::expr::iterator_next_method(agent, &iterator)?;
                     let result = crate::function::call(
                         agent,
-                        &iterator.next,
+                        &next,
                         iterator.iterator.clone(),
                         &[received],
                     )?;
@@ -1448,9 +1653,10 @@ impl Vm {
                     };
                     let received = state.received.clone();
                     let iterator = state.iterator.clone();
+                    let next = crate::expr::iterator_next_method(agent, &iterator)?;
                     let result = crate::function::call(
                         agent,
-                        &iterator.next,
+                        &next,
                         iterator.iterator.clone(),
                         &[received],
                     )?;
@@ -1566,10 +1772,13 @@ impl Vm {
         body: &CompiledBody,
         error: JsError,
     ) -> Result<VmOutcome, JsError> {
-        let value = error
-            .value
-            .clone()
-            .unwrap_or_else(|| error_message_value(&error));
+        // Engine errors throw as real Error objects (spec ch. 17), matching
+        // the interpreter path (`to_throwable`); the message string is the
+        // fallback until the built-ins are installed.
+        let value = match crate::builtins::error::to_throwable(agent, &error) {
+            Ok(value) => value,
+            Err(_) => error_message_value(&error),
+        };
         match self.throw_machinery(body, value)? {
             CtlResult::Continue => self.run_inner(agent, body),
             CtlResult::Done(outcome) => Ok(outcome),
@@ -1976,6 +2185,19 @@ enum ThrowAction {
 
 fn is_nullish(value: &Value) -> bool {
     matches!(value, Value::Undefined | Value::Null)
+}
+
+/// Split an array/object element into its target and optional default
+/// initializer (`[x = init]` / `{x = init}` become an `Assign` node).
+fn unwrap_default(expr: &Expr) -> (&Expr, Option<&Expr>) {
+    match &expr.kind {
+        ExprKind::Assign {
+            op: AssignOp::Assign,
+            target,
+            value: initializer,
+        } => (target.as_ref(), Some(initializer.as_ref())),
+        _ => (expr, None),
+    }
 }
 
 fn nullish_error(what: &str) -> JsError {
@@ -2699,6 +2921,7 @@ enum Fixup {
     Exit(usize, usize),
     ForInNext(usize, usize),
     ForOfNext(usize, usize),
+    DestructureUndef(usize, usize),
     AsyncForOfNext(usize, usize),
     SwitchTest(usize, usize),
     YieldStarNext(usize, usize),
@@ -2805,6 +3028,17 @@ impl Compiler {
         self.fixups.push(Fixup::JumpIfNotNullishKeep(index, target));
     }
 
+    fn emit_destructure_next(&mut self) {
+        self.steps.push(Step::DestructureNext);
+    }
+
+    fn emit_destructure_undef(&mut self, use_default: usize) {
+        let index = self.steps.len();
+        self.steps.push(Step::DestructureUndef { use_default: 0 });
+        self.fixups
+            .push(Fixup::DestructureUndef(index, use_default));
+    }
+
     fn leave_scopes(&mut self, count: usize) {
         for _ in 0..count {
             self.emit(Step::LeaveBlock);
@@ -2848,6 +3082,11 @@ impl Compiler {
                 Fixup::ForOfNext(index, label) => {
                     self.steps[index] = Step::ForOfNext {
                         done: self.labels[&label],
+                    };
+                }
+                Fixup::DestructureUndef(index, label) => {
+                    self.steps[index] = Step::DestructureUndef {
+                        use_default: self.labels[&label],
                     };
                 }
                 Fixup::AsyncForOfNext(index, label) => {
@@ -3345,7 +3584,16 @@ impl Compiler {
         let step_index = self.steps.len();
         self.emit(Step::ForOfNext { done: 0 });
         self.fixups.push(Fixup::ForOfNext(step_index, end_label));
-        self.emit(Step::ForOfBind { left: left.clone() });
+        // A destructuring head is compiled as steps (member targets and
+        // defaults with `yield`/`await` need the resumable machinery).
+        match left {
+            ForBinding::Expr(expr)
+                if matches!(expr.kind, ExprKind::Array(_) | ExprKind::Object(_)) =>
+            {
+                self.compile_destructure_assign(expr)?;
+            }
+            _ => self.emit(Step::ForOfBind { left: left.clone() }),
+        }
         self.compile_statement(body)?;
         self.emit(Step::ForOfRestore);
         self.place(continue_label);
@@ -3812,8 +4060,14 @@ impl Compiler {
     ) -> Result<(), JsError> {
         if matches!(target.kind, ExprKind::Object(_) | ExprKind::Array(_)) {
             self.compile_expr(value)?;
-            let pattern = pattern_of_target(target)?;
-            self.emit(Step::Destructure { pattern });
+            if Self::destructure_needs_steps(target) {
+                // Keep a copy: the assignment expression's value is the RHS.
+                self.emit(Step::Dup);
+                self.compile_destructure_assign(target)?;
+            } else {
+                let pattern = pattern_of_target(target)?;
+                self.emit(Step::Destructure { pattern });
+            }
             return Ok(());
         }
         let set_name = matches!(target.kind, ExprKind::Ident(_))
@@ -3868,6 +4122,265 @@ impl Compiler {
                 "Invalid left-hand side in assignment".into(),
             )),
         }
+    }
+
+    /// Whether a destructuring assignment target needs step-based compilation:
+    /// a member target (the tree-walker has no reference machinery for it) or
+    /// a suspension point in a default or computed key.
+    fn destructure_needs_steps(target: &Expr) -> bool {
+        fn member_in(expr: &Expr) -> bool {
+            match &expr.kind {
+                ExprKind::Member(_) => true,
+                ExprKind::Assign { target, value, .. } => member_in(target) || member_in(value),
+                ExprKind::Array(lit) => lit.elements.iter().any(|el| match el {
+                    ArrayElement::Expr(e) | ArrayElement::Spread(e) => member_in(e),
+                    ArrayElement::Hole => false,
+                }),
+                ExprKind::Object(lit) => lit.props.iter().any(|prop| match prop {
+                    ObjectProperty::Init { value, .. } | ObjectProperty::Spread(value) => {
+                        member_in(value)
+                    }
+                    _ => false,
+                }),
+                ExprKind::Paren(inner) => member_in(inner),
+                _ => false,
+            }
+        }
+        member_in(target) || expr_contains_suspension(target)
+    }
+
+    /// Compile a destructuring assignment pattern into steps (spec 13.15.5):
+    /// the value is on top of the stack. Defaults and computed keys are
+    /// compiled inline, so `yield`/`await` in them suspends the resumable
+    /// body; member targets assign through references.
+    fn compile_destructure_assign(&mut self, target: &Expr) -> Result<(), JsError> {
+        match &target.kind {
+            ExprKind::Array(lit) => {
+                self.emit(Step::DestructureBegin);
+                let end_label = self.new_label();
+                for element in &lit.elements {
+                    match element {
+                        ArrayElement::Hole => {
+                            self.emit_destructure_next();
+                            self.emit(Step::Pop);
+                        }
+                        ArrayElement::Expr(expr) => {
+                            let (inner, init) = unwrap_default(expr);
+                            // A member target evaluates its reference before
+                            // the iterator steps (spec 13.15.5.5 note).
+                            if let ExprKind::Member(member) = &inner.kind {
+                                self.compile_member_reference(member)?;
+                            }
+                            self.emit_destructure_next();
+                            self.compile_assign_value(inner, init)?;
+                        }
+                        ArrayElement::Spread(expr) => {
+                            // The rest target's reference is evaluated before
+                            // the remaining values are collected (spec
+                            // 13.15.5.5); a `yield`/`await` in a computed key
+                            // suspends here.
+                            if let ExprKind::Member(member) = &expr.kind {
+                                self.compile_member_reference(member)?;
+                            }
+                            self.emit(Step::DestructureRest);
+                            self.compile_assign_value(expr, None)?;
+                            self.place(end_label);
+                            return Ok(());
+                        }
+                    }
+                }
+                self.emit(Step::DestructureClose);
+                self.place(end_label);
+                Ok(())
+            }
+            ExprKind::Object(lit) => {
+                let mut excluded: Vec<crux::property::PropertyKey> = Vec::new();
+                self.emit(Step::DestructureObjCoercible);
+                for prop in &lit.props {
+                    match prop {
+                        ObjectProperty::Init { key, value, .. } => {
+                            let (inner, init) = unwrap_default(value);
+                            // KeyedDestructuringAssignmentEvaluation: the
+                            // target reference is evaluated before the
+                            // property read (spec 13.15.5.6).
+                            if let ExprKind::Member(member) = &inner.kind {
+                                self.compile_member_reference(member)?;
+                            }
+                            match key {
+                                PropertyName::Ident(id) => {
+                                    let key = crux::property::PropertyKey::String(*id);
+                                    self.emit(Step::DestructureObjKey { key: key.clone() });
+                                    excluded.push(key);
+                                }
+                                PropertyName::Str(text) => {
+                                    let key = crux::property::PropertyKey::from_js_string(text);
+                                    self.emit(Step::DestructureObjKey { key: key.clone() });
+                                    excluded.push(key);
+                                }
+                                PropertyName::Number(n) => {
+                                    let key = crux::property::PropertyKey::from_js_string(
+                                        &crux::convert::to_string(&Value::Number(*n))?,
+                                    );
+                                    self.emit(Step::DestructureObjKey { key: key.clone() });
+                                    excluded.push(key);
+                                }
+                                PropertyName::Computed(expr) => {
+                                    self.compile_expr(expr)?;
+                                    self.emit(Step::DestructureObjKeyComputed);
+                                }
+                            }
+                            self.compile_assign_value(inner, init)?;
+                        }
+                        ObjectProperty::Spread(expr) => {
+                            self.emit(Step::DestructureObjRest {
+                                excluded: excluded.clone(),
+                            });
+                            self.compile_assign_value(expr, None)?;
+                        }
+                        _ => {
+                            return Err(JsError::new(
+                                ErrorKind::SyntaxError,
+                                "Invalid destructuring assignment target".into(),
+                            ));
+                        }
+                    }
+                }
+                self.emit(Step::DestructureObjEnd);
+                Ok(())
+            }
+            ExprKind::Paren(inner) => self.compile_destructure_assign(inner),
+            _ => Err(JsError::new(
+                ErrorKind::SyntaxError,
+                "Invalid destructuring assignment target".into(),
+            )),
+        }
+    }
+
+    /// Assign the value on top of the stack to an element target, applying
+    /// the default when it is undefined (spec 13.15.5.5). Nested patterns
+    /// recurse; member targets consume the pre-compiled reference below the
+    /// value.
+    fn compile_assign_value(&mut self, inner: &Expr, init: Option<&Expr>) -> Result<(), JsError> {
+        match &inner.kind {
+            ExprKind::Array(_) | ExprKind::Object(_) => {
+                if let Some(init) = init {
+                    let use_default = self.new_label();
+                    let after = self.new_label();
+                    self.emit_destructure_undef(use_default);
+                    self.compile_destructure_assign(inner)?;
+                    self.jump(after);
+                    self.place(use_default);
+                    self.compile_expr(init)?;
+                    self.compile_destructure_assign(inner)?;
+                    self.place(after);
+                } else {
+                    self.compile_destructure_assign(inner)?;
+                }
+                Ok(())
+            }
+            ExprKind::Ident(id) => {
+                if let Some(init) = init {
+                    let use_default = self.new_label();
+                    let after = self.new_label();
+                    let set_name = crate::function::is_anonymous_function_definition(init);
+                    self.emit_destructure_undef(use_default);
+                    self.emit(Step::AssignIdent {
+                        name: *id,
+                        op: AssignOp::Assign,
+                        set_name,
+                    });
+                    self.emit(Step::Pop);
+                    self.jump(after);
+                    self.place(use_default);
+                    self.compile_expr(init)?;
+                    self.emit(Step::AssignIdent {
+                        name: *id,
+                        op: AssignOp::Assign,
+                        set_name,
+                    });
+                    self.emit(Step::Pop);
+                    self.place(after);
+                } else {
+                    self.emit(Step::AssignIdent {
+                        name: *id,
+                        op: AssignOp::Assign,
+                        set_name: false,
+                    });
+                    self.emit(Step::Pop);
+                }
+                Ok(())
+            }
+            ExprKind::Member(member) => {
+                if let Some(init) = init {
+                    let use_default = self.new_label();
+                    let after = self.new_label();
+                    self.emit_destructure_undef(use_default);
+                    self.emit_member_assign(member)?;
+                    self.emit(Step::Pop);
+                    self.jump(after);
+                    self.place(use_default);
+                    self.compile_expr(init)?;
+                    self.emit_member_assign(member)?;
+                    self.emit(Step::Pop);
+                    self.place(after);
+                } else {
+                    self.emit_member_assign(member)?;
+                    self.emit(Step::Pop);
+                }
+                Ok(())
+            }
+            ExprKind::Paren(inner) => self.compile_assign_value(inner, init),
+            _ => Err(JsError::new(
+                ErrorKind::SyntaxError,
+                "Invalid destructuring assignment target".into(),
+            )),
+        }
+    }
+
+    /// The reference parts of a member target: the base (and computed key)
+    /// are pushed for the later `AssignMember*` step (spec 13.15.5.5: the
+    /// reference is evaluated before the iterator steps).
+    fn compile_member_reference(
+        &mut self,
+        member: &syntax::ast::MemberExpr,
+    ) -> Result<(), JsError> {
+        if matches!(member.object.kind, ExprKind::Super) {
+            self.emit(Step::GetSuperBase);
+            if let MemberProperty::Computed(key) = &member.property {
+                self.compile_expr(key)?;
+            }
+            return Ok(());
+        }
+        self.compile_expr(&member.object)?;
+        if let MemberProperty::Computed(key) = &member.property {
+            self.compile_expr(key)?;
+        }
+        Ok(())
+    }
+
+    /// The `AssignMember*`/`AssignPrivate` step consuming the pre-compiled
+    /// reference and the value on top of the stack.
+    fn emit_member_assign(&mut self, member: &syntax::ast::MemberExpr) -> Result<(), JsError> {
+        match &member.property {
+            MemberProperty::Name(name) => {
+                self.emit(Step::AssignMemberName {
+                    name: *name,
+                    op: AssignOp::Assign,
+                });
+            }
+            MemberProperty::Computed(_) => {
+                self.emit(Step::AssignMemberComputed {
+                    op: AssignOp::Assign,
+                });
+            }
+            MemberProperty::Private(atom) => {
+                self.emit(Step::AssignPrivate {
+                    atom: *atom,
+                    op: AssignOp::Assign,
+                });
+            }
+        }
+        Ok(())
     }
 
     fn compile_member_assign(

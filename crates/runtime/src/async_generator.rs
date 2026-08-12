@@ -21,6 +21,7 @@ use crux::value::{Value, is_callable};
 
 use crate::agent::Agent;
 use crate::context::ExecutionContext;
+use crate::env::EnvRef;
 use crate::flow::Completion;
 use crate::function::ThisMode;
 use crate::ir::{CompiledBody, Resume, Suspension, Vm, VmOutcome};
@@ -66,8 +67,11 @@ pub struct AsyncGeneratorState {
     pub context: Option<ExecutionContext>,
     pub function: Value,
     pub realm: Handle<Realm>,
-    pub start_this: Value,
-    pub start_args: Vec<Value>,
+    /// The post-instantiation environment: parameters are bound (and errors
+    /// surface) when the async generator is *called* (spec
+    /// EvaluateAsyncGeneratorBody step 1), and the VM runs against this
+    /// environment on the first request.
+    pub body_env: Option<EnvRef>,
 }
 
 /// The state of an await-resume closure of an async generator body.
@@ -190,6 +194,62 @@ pub fn call_async_generator(
                 "Function body is not registered".into(),
             )
         })?;
+    let function_value = function.self_value();
+    let function_env = crate::env::new_function_environment(
+        Some(data.environment.clone()),
+        function_value.clone(),
+        Value::Undefined,
+        data.this_mode == ThisMode::Lexical,
+    );
+    let context = ExecutionContext {
+        function: Some(function_value.clone()),
+        realm: data.realm.clone(),
+        script_or_module: None,
+        lexical_environment: function_env.clone(),
+        variable_environment: function_env.clone(),
+        private_environment: data.private_environment.clone(),
+        source: agent
+            .running_context()
+            .ok()
+            .and_then(|context| context.source.clone()),
+    };
+    // EvaluateAsyncGeneratorBody runs FunctionDeclarationInstantiation at
+    // call time, so parameter binding errors (e.g. a throwing @@iterator in a
+    // destructuring pattern) throw synchronously (spec 15.6.2).
+    agent.execution_context_stack.push(context);
+    let instantiate = (|| -> Result<(), JsError> {
+        if data.this_mode != ThisMode::Lexical {
+            let this = if data.this_mode == ThisMode::Sloppy
+                && matches!(this, Value::Undefined | Value::Null)
+            {
+                let global = agent.running_context()?.realm.global_object.clone();
+                Value::Object(global)
+            } else {
+                this
+            };
+            function_env.bind_this_value(this)?;
+        }
+        crate::function::function_declaration_instantiation(
+            agent,
+            &function_value,
+            &data,
+            args,
+            &function_env,
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = instantiate {
+        agent.execution_context_stack.pop();
+        return Err(error);
+    }
+    let instantiated_context = agent
+        .execution_context_stack
+        .last()
+        .cloned()
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no context to capture".into()))?;
+    let body_env = instantiated_context.lexical_environment.clone();
+    agent.execution_context_stack.pop();
+
     let proto = data
         .realm
         .intrinsics
@@ -212,11 +272,10 @@ pub fn call_async_generator(
             current: None,
             vm: None,
             body: None,
-            context: None,
+            context: Some(instantiated_context),
             function: Value::Function(function.clone()),
             realm: data.realm.clone(),
-            start_this: this,
-            start_args: args.to_vec(),
+            body_env: Some(body_env),
         })),
     );
     Ok(object_value)
@@ -540,23 +599,32 @@ fn drive(
     async_generator_resume_next(agent, object_id)
 }
 
-/// AsyncGeneratorStart (spec 27.6.1.4): push the context, instantiate, run
-/// the VM. Only normal completions reach here (throw/return on suspendedStart
-/// close the generator without resuming).
+/// AsyncGeneratorStart (spec 27.6.1.4): push the context instantiated at
+/// call time and run the VM against its environment. Only normal completions
+/// reach here (throw/return on suspendedStart close the generator without
+/// resuming).
 fn start_body(agent: &mut Agent, object_id: u64) -> Result<VmOutcome, JsError> {
-    let (function_value, start_this, start_args) = {
+    let (context, body_env) = {
         let state = agent
             .async_generators
             .get(&object_id)
             .cloned()
             .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async generator".into()))?;
-        let state = state.borrow();
+        let mut state = state.borrow_mut();
         (
-            state.function.clone(),
-            state.start_this.clone(),
-            state.start_args.clone(),
+            state
+                .context
+                .take()
+                .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no saved context".into()))?,
+            state.body_env.clone().ok_or_else(|| {
+                JsError::new(ErrorKind::TypeError, "no instantiated environment".into())
+            })?,
         )
     };
+    let function_value = context
+        .function
+        .clone()
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no function in context".into()))?;
     let Value::Function(function_handle) = &function_value else {
         return Err(JsError::new(ErrorKind::TypeError, "not a function".into()));
     };
@@ -572,47 +640,7 @@ fn start_body(agent: &mut Agent, object_id: u64) -> Result<VmOutcome, JsError> {
             "async generator body was not compiled".into(),
         )
     })?;
-    let function_env = crate::env::new_function_environment(
-        Some(data.environment.clone()),
-        function_value.clone(),
-        Value::Undefined,
-        data.this_mode == ThisMode::Lexical,
-    );
-    let context = ExecutionContext {
-        function: Some(function_value.clone()),
-        realm: data.realm.clone(),
-        script_or_module: None,
-        lexical_environment: function_env.clone(),
-        variable_environment: function_env.clone(),
-        private_environment: data.private_environment.clone(),
-        source: agent
-            .running_context()
-            .ok()
-            .and_then(|context| context.source.clone()),
-    };
     agent.execution_context_stack.push(context);
-    if data.this_mode != ThisMode::Lexical {
-        let this = if data.this_mode == ThisMode::Sloppy
-            && matches!(start_this, Value::Undefined | Value::Null)
-        {
-            let global = agent.running_context()?.realm.global_object.clone();
-            Value::Object(global)
-        } else {
-            start_this
-        };
-        function_env.bind_this_value(this)?;
-    }
-    crate::function::function_declaration_instantiation(
-        agent,
-        &function_value,
-        &data,
-        &start_args,
-        &function_env,
-    )?;
-    // The VM drives the body's lexical environment (the one
-    // function_declaration_instantiation installed on the running context),
-    // so body-level let/const bindings are reachable.
-    let body_env = agent.running_context()?.lexical_environment.clone();
     let mut vm = Vm::new(body_env, data.strict);
     let outcome = vm.start(agent, &body)?;
     let state = agent

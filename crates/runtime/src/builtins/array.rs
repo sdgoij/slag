@@ -1413,6 +1413,16 @@ fn splice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
         let delete_count = to_integer_or_infinity(to_number(&args[1])?);
         (delete_count.max(0.0) as u64).min(length - actual_start)
     };
+    // spec 23.1.3.30 step 8: the new length must not exceed 2^53-1 (the
+    // fixture `throws-if-integer-limit-exceeded` relies on this throwing
+    // before any shifting, which would otherwise loop over the huge tail).
+    let new_length = length + item_count - actual_delete_count;
+    if new_length > 9007199254740991 {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Array length exceeds 2^53-1".into(),
+        ));
+    }
     let removed = array_species_create(agent, &object, actual_delete_count as f64)?;
     for k in 0..actual_delete_count {
         let from_name = key(actual_start + k);
@@ -3028,6 +3038,24 @@ mod tests {
         assert!(bool(
             "class MyArr extends Array { static get [Symbol.species]() { return Array; } } new MyArr(1,2).slice(0) instanceof Array"
         ));
+    }
+
+    #[test]
+    fn splice_rejects_lengths_beyond_2_pow_53() {
+        // spec 23.1.3.30 step 8: a resulting length above 2^53-1 throws
+        // TypeError before any shifting (which would loop over the huge
+        // tail).
+        for source in [
+            "(function(){ var a = {}; a.length = 2 ** 53 - 1; Array.prototype.splice.call(a, 0, 0, null); })()",
+            "(function(){ var a = {}; a.length = 2 ** 53; Array.prototype.splice.call(a, 0, 0, null); })()",
+            "(function(){ var a = {}; a.length = 2 ** 53 + 2; Array.prototype.splice.call(a, 0, 0, null); })()",
+            "(function(){ var a = {}; a.length = Infinity; Array.prototype.splice.call(a, 0, 0, null); })()",
+        ] {
+            assert!(matches!(
+                run(source),
+                Err(error) if error.kind == crux::ErrorKind::TypeError
+            ));
+        }
     }
 
     #[test]

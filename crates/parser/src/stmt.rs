@@ -513,7 +513,12 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
             false,
         )
     } else {
-        (Some(ForInit::Expr(parse_expression(parser, false)?)), false)
+        // The head may be a for-in/of pattern, so a cover form inside it is
+        // deferred until the `in`/`of`/`;` decision is known.
+        parser.suppress_cover_raise += 1;
+        let init = parse_expression(parser, false)?;
+        parser.suppress_cover_raise -= 1;
+        (Some(ForInit::Expr(init)), false)
     };
 
     if parser.at_keyword(Keyword::In)? {
@@ -529,6 +534,7 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
             return Err(parser.error_at(start, "using declarations are not allowed in for-in"));
         }
         parser.next()?;
+        parser.cover_error = None;
         let left = for_binding_from_init(parser, init, true)?;
         let right = parse_expression(parser, true)?;
         parser.expect_punct(TokenKind::RightParen)?;
@@ -544,6 +550,7 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
             return Err(parser.error_at(start, "Unexpected line break after for await"));
         }
         parser.next()?;
+        parser.cover_error = None;
         let left = for_binding_from_init(parser, init, false)?;
         let right = parse_assignment(parser, true)?;
         parser.expect_punct(TokenKind::RightParen)?;
@@ -561,7 +568,11 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
     }
 
     // Classic `for ( init ; test ; update )`. When the init slot was empty,
-    // its `;` is already consumed.
+    // its `;` is already consumed. A deferred cover form in the head is an
+    // error here (the head is an expression, not a pattern).
+    if let Some(span) = parser.cover_error.take() {
+        return Err(parser.error_at(span.start, "Invalid shorthand property initializer"));
+    }
     let test = if init_empty {
         if parser.at_punct(TokenKind::Semicolon)? {
             None

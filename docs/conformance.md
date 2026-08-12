@@ -48,11 +48,11 @@ Two harnesses live in `crates/test262`:
 
 ## Current results
 
-Workspace-wide: **4055 tests pass, 0 failures** (`cargo test --workspace`),
+Workspace-wide: **4066 tests pass, 0 failures** (`cargo test --workspace`),
 of which the test262 crate contributes **3317 passing fixtures** (44
 language-area + 3275 built-ins fixtures); the remaining registered test is
 the ignored `scan_builtins_directories` directory scanner. The `workers`
-feature build adds 444 runtime tests (`cargo test -p runtime --features
+feature build adds 452 runtime tests (`cargo test -p runtime --features
 workers`).
 
 The vendored fixtures cover, by phase: the execution model and language
@@ -78,6 +78,38 @@ and buffer resize/transfer/detach semantics. `array_buffer.rs` and
 
 The campaign surfaced and fixed the following conformance bugs (each now
 has a regression test):
+
+- **Destructuring assignment (interpreter):** array/object assignment
+  targets were unsupported — `[a, b] = rhs`, `({x, y} = obj)`, defaults,
+  rest, and nested patterns all failed at parse time or threw "Invalid
+  left-hand side". `binding.rs` now implements
+  DestructuringAssignmentEvaluation (13.15.5): reference evaluation runs
+  before the iterator steps for simple targets, an abrupt iterator step
+  marks the iterator done (so `return` is not called), and object rest
+  values are boxed via `ToObject` with `%Object.prototype%` as the rest
+  object's prototype.
+- **Function-name inference:** `SetFunctionName` replaced the `""`
+  placeholder only when the own `name` property was still empty (the
+  previous "has own name" check always fired, since every function carries
+  the placeholder), and a static `name` element on a class constructor now
+  wins over the surrounding binding as the spec requires.
+- **Generator/async-generator parameter binding:** `EvaluateGeneratorBody`/
+  `EvaluateAsyncGeneratorBody` run `FunctionDeclarationInstantiation` at
+  call time, so a destructuring parameter with a throwing `@@iterator`
+  throws synchronously from the call (V8 does the same).
+- **Cover grammar:** `{x = 1}` shorthand-initializers are now accepted
+  where the object literal is (or may become) an assignment pattern —
+  `result = {x = 1} = vals`, `[{x = 1}] = arr`, `for ({x = 1} of …)`,
+  arrow params — and rejected everywhere else, via a deferred
+  `cover_error` cleared by pattern contexts (`parse_assignment`,
+  for-in/of heads, array/object/arrow-cover nesting).
+- **Pattern early errors:** reserved words (incl. escaped, incl.
+  strict-only `eval`/`arguments`/`let`/… and `await` in class static
+  blocks) are rejected as shorthand identifiers; a rest element may not be
+  followed by a comma (`[...x,]`, `{...x,}`) or carry an initializer
+  (`[...x = 1]`); nested pattern elements must be valid targets
+  (`[[(x, y)]]`, `[{ get x() {} }]`), enforced by a per-element target
+  walk.
 
 - **Lexer:** escaped `$`/`_` could not start an identifier (`\u0024x`); the
   escape branch now validates with the full IdentifierStart/Part predicate.
@@ -129,6 +161,71 @@ against the runnable pass-rate target:
   (throws, per spec `[[CanBlock]] = false`), timers (host globals, provided
   by the embedding API), `SharedArrayBuffer` worker creation (host hook).
 
+## Full-suite sweep (post-hardening)
+
+`test262-sweep` over all three areas in a release build (48,622 fixtures, 8
+jobs, 20s batch timeout): **0 hangs, 0 crashes**.
+
+| Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
+|---|---|---|---|---|---|---|
+| language | 23,724 | 16,001 | 2,070 | 5,653 | 0 | 88.5% |
+| built-ins | 23,812 | 13,301 | 7,256 | 3,255 | 0 | 64.7% |
+| annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
+| **Total** | **48,622** | **29,741** | **9,884** | **8,997** | **0** | **75.1%** |
+
+(Runnable = pass + fail; the 8,997 skips are module/async fixtures and
+unsupported harness includes.)
+
+The first sweep in a debug build reported 27 hangs and 92 crashes. Both are
+resolved:
+
+- **Slow builtin calls (the "decodeURI hangs")** — every builtin call walked a
+  34-entry linear dispatch chain (`function::call_inner`), each entry doing an
+  `intrinsics.get` (a `JsString` allocation + hash lookup). The dispatch
+  resolution is now memoized per function id
+  (`agent.builtin_dispatch_cache`), so plain closure builtins skip the chain
+  after the first call. Builtin calls dropped from ~100-400µs to ~2µs, making
+  the Sputnik stress fixtures (57-65k throw/catch iterations) 40-80× faster;
+  the reported hangs were simply slow fixtures, not infinite loops.
+- **`Array.prototype.splice` integer limit** — the spec's step-8 check
+  (`len + insertCount - actualDeleteCount > 2^53-1` → TypeError) was missing,
+  so a splice on a `2^53`-length array-like entered a 2^53-iteration tail
+  shift. The check now throws before any shifting
+  (`throws-if-integer-limit-exceeded.js` passes).
+- **Crashes** were debug-build stack overflows from deep recursion; a release
+  build runs them cleanly.
+
+The 9,976 failures triage into:
+
+- **Missing built-ins (excluded from runnable):** Temporal (~3,100
+  fixtures across `Temporal/*` — not implemented), ShadowRealm (47), and
+  Intl (never collected). Excluding them, the runnable pass rate is
+  ~80%.
+- **Systematic bug clusters (runnable, fix targets):**
+  - Destructuring (`dstr`): the ~2,300-fixture assignment/class/for-of/
+    generator/arrow cluster now passes **100% of runnable** (6,189 pass /
+    0 fail of 8,783). The final fixes landed in the VM's step-based
+    destructuring (`ir.rs`): the rest target's reference (with `yield` in a
+    computed key) is compiled before the remaining values are collected; an
+    exhausted iterator still feeds `undefined` to later elements so default
+    initializers run (and may suspend); and a resumed `yield`/`await`
+    aborted inside a pattern closes the active destructure iterators with
+    the correct `IteratorClose` flavor (`return` vs `throw` completion).
+    `GetIterator` also now caches a non-callable `next` without throwing, so
+    a `yield` between GetIterator and the first step suspends first
+  - `TypedArray/prototype` (944) and `TypedArrayConstructors/internals`
+    (119)
+  - `String/prototype` (290), `Array/prototype` (187),
+    `Object/defineProperty`+`defineProperties`+`getOwnPropertyDescriptor`
+    (313)
+  - `RegExp/prototype` + `property-escapes` + `regexp-modifiers` (388)
+  - `Iterator/prototype` (278), `DataView/prototype` (140)
+  - `dynamic-import/syntax/valid` (137), class-element `delete` early
+    errors (192), `eval-code/direct` (103), `identifiers` (58),
+    `arguments-object`
+  - Annex B: sloppy `eval`/`function`/`global` function-declaration
+    semantics (410), `RegExp` (57), `escape`/`unescape` (35)
+
 ## Annex B
 
 Annex B legacy behaviors are part of the spec and are tracked explicitly:
@@ -147,16 +244,17 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 
 ## Open items
 
-- The full ~49k-fixture sweep is now runnable and hang-safe via
-  `test262-sweep` (`--jobs` for parallelism, per-batch timeouts, hang
-  rechecks). Run each area (or a `--sample`) and record the per-directory
-  triage here to certify the ≥95%-of-runnable target from the plan.
-- Early sampled triage of `language/` shows the failure categories are
-  already triageable: real bugs (e.g. strict-mode function declarations in
-  `if`-statement position parse when they must be early errors, `arguments`
-  object strict-mode gaps), missing harness support (`_FIXTURE` helpers are
-  excluded; `tcoHelper.js` and other includes are skipped), and module tests
-  (skipped until a module loader exists).
+- Certify the ≥95%-of-runnable target: the sweep now measures 75.1%
+  (≈80% excluding the not-implemented Temporal/ShadowRealm built-ins) with
+  0 hangs and 0 crashes. The remaining gap is the systematic bug clusters
+  listed above — the destructuring cluster is done; fix the
+  TypedArray/RegExp/descriptor clusters next, then re-run the sweep and
+  record the delta.
+- The 27 original hangs were slow builtin calls (fixed via the dispatch
+  cache) plus one real `Array.prototype.splice` infinite loop (fixed); the
+  remaining sweep runs cleanly. Use a release build
+  (`cargo run --release -p test262 --bin sweep`) — the debug build's deep
+  recursion can overflow the stack on heavy fixtures.
 - `Intl` fixtures are excluded by design; anything else that fails the
   sweep should be triaged into bug / host-dependent / missing-hook
   categories and either fixed or documented here.

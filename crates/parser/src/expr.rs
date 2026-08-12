@@ -2,7 +2,7 @@
 //! templates, and destructuring targets (spec ch. 13).
 
 use crux::{AtomId, JsError, Span, intern_utf8};
-use syntax::keywords::{Keyword, from_identifier};
+use syntax::keywords::{Keyword, from_identifier, is_future_reserved_word};
 use syntax::{
     Argument, ArrayBindingElement, ArrayElement, ArrayLiteral, ArrowBody, AssignOp, BinaryOp,
     BindingElement, BindingPattern, Block, CallExpr, Expr, ExprKind, Function, Literal, LogicalOp,
@@ -184,6 +184,16 @@ pub(crate) fn parse_assignment(parser: &mut Parser, allow_in: bool) -> Result<Ex
                 value: Box::new(value),
             },
         });
+    }
+
+    // `left` is a plain expression: a deferred CoverInitializedName that was
+    // not absorbed by an enclosing pattern is an error (spec 13.2.5.1). The
+    // raise is skipped while parsing a pattern candidate (an array/object
+    // element or a for-head), whose enclosing literal decides instead.
+    if parser.suppress_cover_raise == 0
+        && let Some(span) = parser.cover_error
+    {
+        return Err(parser.error_at(span.start, "Invalid shorthand property initializer"));
     }
 
     Ok(left)
@@ -1291,6 +1301,7 @@ pub(crate) fn parse_paren_contents(parser: &mut Parser) -> Result<ParenResult, J
     let saved_error = parser.cover_error;
     parser.in_arrow_cover = true;
     parser.cover_error = None;
+    parser.suppress_cover_raise += 1;
 
     let mut items: Vec<ParenItem> = Vec::new();
     let mut trailing_comma = false;
@@ -1314,6 +1325,7 @@ pub(crate) fn parse_paren_contents(parser: &mut Parser) -> Result<ParenResult, J
         }
         parser.expect_punct(TokenKind::RightParen)?;
     }
+    parser.suppress_cover_raise -= 1;
 
     let is_arrow = parser.at_punct(TokenKind::Arrow)? && !parser.peek()?.line_break_before;
     if is_arrow {
@@ -1521,9 +1533,20 @@ fn expr_to_pattern(parser: &mut Parser, expr: Expr) -> Result<BindingPattern, Js
 }
 
 /// `[ … ]` array literal.
+/// `[ … ]` array literal. The literal may still be disambiguated into an
+/// assignment pattern, so element-level cover errors are deferred to the
+/// enclosing construct.
 fn parse_array_literal(parser: &mut Parser) -> Result<Expr, JsError> {
+    parser.suppress_cover_raise += 1;
+    let result = parse_array_literal_inner(parser);
+    parser.suppress_cover_raise -= 1;
+    result
+}
+
+fn parse_array_literal_inner(parser: &mut Parser) -> Result<Expr, JsError> {
     let start = parser.next()?.span.start; // '['
     let mut elements: Vec<ArrayElement> = Vec::new();
+    let mut rest_trailing_comma = false;
     while !parser.at_punct(TokenKind::RightBracket)? {
         if parser.at_punct(TokenKind::Comma)? {
             parser.next()?;
@@ -1533,6 +1556,13 @@ fn parse_array_literal(parser: &mut Parser) -> Result<Expr, JsError> {
         if parser.eat_punct(TokenKind::Ellipsis)? {
             let expr = parse_assignment(parser, true)?;
             elements.push(ArrayElement::Spread(expr));
+            // `[...x, ]`: a comma directly after the rest marks a trailing
+            // elision — an early error when the array is a pattern, and a
+            // harmless no-op in expression position.
+            if parser.at_punct(TokenKind::Comma)? && parser.peek2()?.kind == TokenKind::RightBracket
+            {
+                rest_trailing_comma = true;
+            }
         } else {
             elements.push(ArrayElement::Expr(parse_assignment(parser, true)?));
         }
@@ -1546,19 +1576,47 @@ fn parse_array_literal(parser: &mut Parser) -> Result<Expr, JsError> {
         span: Span::new(start, end),
         kind: ExprKind::Array(ArrayLiteral {
             elements,
+            rest_trailing_comma,
             span: Span::new(start, end),
         }),
     })
 }
 
-/// `{ … }` object literal, with cover-initialized names (spec 13.2.5).
+/// Whether `atom` cannot be an IdentifierReference in the current context
+/// (spec 13.1.1): keywords always, future-reserved words in strict mode, and
+/// `yield`/`await` in resumable or module code.
+fn is_reference_identifier_error(parser: &Parser, atom: AtomId) -> bool {
+    from_identifier(atom).is_some()
+        || (parser.strict && is_future_reserved_word(atom))
+        || (parser.strict && (atom == intern_utf8("eval") || atom == intern_utf8("arguments")))
+        || (parser.in_generator && atom == intern_utf8("yield"))
+        || ((parser.in_async || parser.in_module) && atom == intern_utf8("await"))
+}
+
+/// `{ … }` object literal, with cover-initialized names (spec 13.2.5). The
+/// literal may still be disambiguated into an assignment pattern, so a
+/// CoverInitializedName defers its error to the enclosing construct.
 fn parse_object_literal(parser: &mut Parser) -> Result<Expr, JsError> {
+    parser.suppress_cover_raise += 1;
+    let result = parse_object_literal_inner(parser);
+    parser.suppress_cover_raise -= 1;
+    result
+}
+
+fn parse_object_literal_inner(parser: &mut Parser) -> Result<Expr, JsError> {
     let start = parser.next()?.span.start; // '{'
     let mut props: Vec<ObjectProperty> = Vec::new();
+    let mut rest_trailing_comma = false;
     while !parser.at_punct(TokenKind::RightBrace)? {
         if parser.eat_punct(TokenKind::Ellipsis)? {
             let expr = parse_assignment(parser, true)?;
             props.push(ObjectProperty::Spread(expr));
+            // `{...x, }`: a comma directly after the rest marks a trailing
+            // element — an early error when the object is a pattern, and a
+            // harmless no-op in expression position.
+            if parser.at_punct(TokenKind::Comma)? && parser.peek2()?.kind == TokenKind::RightBrace {
+                rest_trailing_comma = true;
+            }
             if !parser.eat_punct(TokenKind::Comma)? {
                 break;
             }
@@ -1638,6 +1696,9 @@ fn parse_object_literal(parser: &mut Parser) -> Result<Expr, JsError> {
             let PropertyName::Ident(name) = key else {
                 return Err(parser.error_at(prop_start, "Invalid shorthand property initializer"));
             };
+            if is_reference_identifier_error(parser, name) {
+                return Err(parser.error_at(prop_start, "Unexpected reserved word"));
+            }
             let value = parse_assignment(parser, true)?;
             let span = Span::new(prop_start, parser.prev.as_ref().unwrap().span.end);
             let shorthand = Expr {
@@ -1651,23 +1712,23 @@ fn parse_object_literal(parser: &mut Parser) -> Result<Expr, JsError> {
                     value: Box::new(value),
                 },
             };
-            if parser.in_arrow_cover {
-                if parser.cover_error.is_none() {
-                    parser.cover_error = Some(span);
-                }
-                props.push(ObjectProperty::Init {
-                    key: PropertyName::Ident(name),
-                    value: shorthand,
-                    shorthand: true,
-                });
-            } else {
-                return Err(parser.error_at(prop_start, "Invalid shorthand property initializer"));
+            if parser.cover_error.is_none() {
+                parser.cover_error = Some(span);
             }
+            props.push(ObjectProperty::Init {
+                key: PropertyName::Ident(name),
+                value: shorthand,
+                shorthand: true,
+            });
         } else {
-            // Shorthand: `{ x }`.
+            // Shorthand: `{ x }` — the identifier is a reference, so reserved
+            // words are rejected (spec 13.1.1).
             let PropertyName::Ident(name) = key else {
                 return Err(parser.error_at(prop_start, "Invalid shorthand property name"));
             };
+            if is_reference_identifier_error(parser, name) {
+                return Err(parser.error_at(prop_start, "Unexpected reserved word"));
+            }
             let end = parser.prev.as_ref().unwrap().span.end;
             props.push(ObjectProperty::Init {
                 key: PropertyName::Ident(name),
@@ -1688,6 +1749,7 @@ fn parse_object_literal(parser: &mut Parser) -> Result<Expr, JsError> {
         span: Span::new(start, end),
         kind: ExprKind::Object(ObjectLiteral {
             props,
+            rest_trailing_comma,
             span: Span::new(start, end),
         }),
     })

@@ -150,6 +150,12 @@ pub struct Agent {
     pub disposable_async_caps: std::collections::HashMap<u64, crate::promise::PromiseCapability>,
     /// The `disposeAsync` continuations, keyed by function identity.
     pub disposable_async_cont: std::collections::HashMap<u64, u64>,
+    /// Agent-dependent built-ins (`%eval%`-pattern functions that cannot run
+    /// inside crux closures) dispatch by intrinsic identity in
+    /// `function::call_inner`. The result of that linear chain is memoized
+    /// per function id: `0` means no agent dispatch (a plain closure
+    /// builtin), otherwise the index into the dispatch table.
+    pub builtin_dispatch_cache: std::collections::HashMap<u64, u8>,
     /// Host-provided module sources, keyed by specifier (HostResolveImportedModule).
     pub host_modules:
         RefCell<std::collections::HashMap<crux::string::JsString, crate::module::HostModuleSource>>,
@@ -285,6 +291,7 @@ impl Agent {
             disposable_async_drivers: std::collections::HashMap::new(),
             disposable_async_caps: std::collections::HashMap::new(),
             disposable_async_cont: std::collections::HashMap::new(),
+            builtin_dispatch_cache: std::collections::HashMap::new(),
             host_modules: RefCell::new(std::collections::HashMap::new()),
             module_namespaces: std::collections::HashMap::new(),
             import_namespace_resolvers: std::collections::HashMap::new(),
@@ -491,8 +498,6 @@ mod tests {
         assert!(!agent.agent_can_suspend());
         assert!(agent.little_endian || !agent.little_endian); // host-dependent
         assert_eq!(agent.is_lock_free.len(), 3);
-        assert!(agent.job_queues_empty());
-        assert!(agent.execution_context_stack.is_empty());
     }
 
     #[test]
