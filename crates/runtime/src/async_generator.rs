@@ -609,7 +609,11 @@ fn start_body(agent: &mut Agent, object_id: u64) -> Result<VmOutcome, JsError> {
         &start_args,
         &function_env,
     )?;
-    let mut vm = Vm::new(function_env, data.strict);
+    // The VM drives the body's lexical environment (the one
+    // function_declaration_instantiation installed on the running context),
+    // so body-level let/const bindings are reachable.
+    let body_env = agent.running_context()?.lexical_environment.clone();
+    let mut vm = Vm::new(body_env, data.strict);
     let outcome = vm.start(agent, &body)?;
     let state = agent
         .async_generators
@@ -879,4 +883,176 @@ fn iterator_result(agent: &Agent, value: Value, done: bool) -> Result<Value, JsE
     object.create_data_property(&JsString::from_utf8("value"), value)?;
     object.create_data_property(&JsString::from_utf8("done"), Value::Boolean(done))?;
     Ok(Value::Object(object))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::Agent;
+
+    /// Evaluate a script whose final expression is a promise, drain the job
+    /// queue, and return the promise's settled value (or the rejection).
+    fn settle(source: &str) -> Result<Value, JsError> {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm()?;
+        let value = agent.run_script(source)?;
+        agent.run_jobs()?;
+        let Value::Object(obj) = &value else {
+            return Ok(value.clone());
+        };
+        let Some(data) = agent.promises.get(&obj.id()) else {
+            return Ok(value.clone());
+        };
+        match &data.borrow().state {
+            crate::promise::PromiseState::Fulfilled(v) => Ok(v.clone()),
+            crate::promise::PromiseState::Rejected(v) => Ok(v.clone()),
+            _ => Err(JsError::new(
+                ErrorKind::TypeError,
+                "promise not settled".into(),
+            )),
+        }
+    }
+
+    fn str(value: &str) -> Value {
+        Value::String(Handle::new(JsString::from_utf8(value)))
+    }
+
+    #[test]
+    fn async_generator_yields_iteration_results() {
+        assert_eq!(
+            settle(concat!(
+                "(async function () {",
+                "  async function* g() { yield 1; yield 2; }",
+                "  const it = g();",
+                "  const a = await it.next();",
+                "  const b = await it.next();",
+                "  const c = await it.next();",
+                "  return JSON.stringify([a.value, a.done, b.value, b.done, c.value, c.done]);",
+                "})()"
+            ))
+            .unwrap(),
+            str("[1,false,2,false,null,true]")
+        );
+    }
+
+    #[test]
+    fn async_generator_awaits_inside_the_body() {
+        assert_eq!(
+            settle(concat!(
+                "(async function () {",
+                "  async function* g() { const x = await Promise.resolve(10); yield x; }",
+                "  const it = g();",
+                "  const a = await it.next();",
+                "  return JSON.stringify([a.value, a.done]);",
+                "})()"
+            ))
+            .unwrap(),
+            str("[10,false]")
+        );
+    }
+
+    #[test]
+    fn async_generator_return_completes_and_closes() {
+        assert_eq!(
+            settle(concat!(
+                "(async function () {",
+                "  async function* g() { yield 1; yield 2; }",
+                "  const it = g();",
+                "  await it.next();",
+                "  const r = await it.return(99);",
+                "  const n = await it.next();",
+                "  return JSON.stringify([r.value, r.done, n.done]);",
+                "})()"
+            ))
+            .unwrap(),
+            str("[99,true,true]")
+        );
+    }
+
+    #[test]
+    fn async_generator_throw_reaches_the_body() {
+        assert_eq!(
+            settle(concat!(
+                "(async function () {",
+                "  async function* g() { try { yield 1; } catch (e) { return 'caught:' + e; } }",
+                "  const it = g();",
+                "  await it.next();",
+                "  const r = await it.throw('boom');",
+                "  return JSON.stringify([r.value, r.done]);",
+                "})()"
+            ))
+            .unwrap(),
+            str("[\"caught:boom\",true]")
+        );
+    }
+
+    #[test]
+    fn async_generator_finally_runs_on_return() {
+        assert_eq!(
+            settle(concat!(
+                "(async function () {",
+                "  var marker = '';",
+                "  async function* g() { try { yield 1; } finally { marker = 'cleaned'; } }",
+                "  const it = g();",
+                "  await it.next();",
+                "  await it.return(7);",
+                "  return marker;",
+                "})()"
+            ))
+            .unwrap(),
+            str("cleaned")
+        );
+    }
+
+    #[test]
+    fn async_generator_unwraps_thenable_yields() {
+        assert_eq!(
+            settle(concat!(
+                "(async function () {",
+                "  async function* g() { yield Promise.resolve(5); }",
+                "  const it = g();",
+                "  const a = await it.next();",
+                "  return a.value;",
+                "})()"
+            ))
+            .unwrap(),
+            Value::Number(5.0)
+        );
+    }
+
+    #[test]
+    fn async_generator_function_constructor_creates_working_generators() {
+        assert_eq!(
+            settle(concat!(
+                "(async function () {",
+                "  const AsyncGeneratorFunction = Object.getPrototypeOf(async function* () {}).constructor;",
+                "  const g = AsyncGeneratorFunction('n', 'for (let i = 0; i < n; i++) yield i * 2');",
+                "  const it = g(3);",
+                "  const a = await it.next();",
+                "  const b = await it.next();",
+                "  return a.value + b.value;",
+                "})()"
+            ))
+            .unwrap(),
+            Value::Number(2.0)
+        );
+    }
+
+    #[test]
+    fn async_generator_yield_star_delegates() {
+        assert_eq!(
+            settle(concat!(
+                "(async function () {",
+                "  async function* inner() { yield 1; yield 2; }",
+                "  async function* outer() { yield* inner(); }",
+                "  const it = outer();",
+                "  const a = await it.next();",
+                "  const b = await it.next();",
+                "  return a.value + b.value;",
+                "})()"
+            ))
+            .unwrap(),
+            Value::Number(3.0)
+        );
+    }
 }

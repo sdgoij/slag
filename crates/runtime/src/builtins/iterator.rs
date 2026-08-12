@@ -88,7 +88,6 @@ pub enum HelperMode {
         iterators: Vec<IteratorRecord>,
         /// The own keys of each yielded object (zipKeyed); empty for zip.
         keys: Vec<Value>,
-        index: usize,
         longest: bool,
         remainder: Value,
     },
@@ -977,15 +976,34 @@ fn flat_map_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Va
     )
 }
 
-fn chunks_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let size_arg = args.first().cloned().unwrap_or(Value::Undefined);
-    let size = to_integer_or_infinity(to_number(&size_arg)?);
-    if size < 1.0 {
+/// Validate a chunk/window size per the chunking proposal: it must already
+/// be an integral Number in [1, 2^32 - 1]. Unlike take/drop, no ToNumber
+/// coercion happens, so user-defined valueOf/toString are never called.
+fn chunk_window_size(arg: &Value) -> Result<f64, JsError> {
+    let Value::Number(size) = arg else {
         return Err(JsError::new(
-            ErrorKind::RangeError,
-            "Iterator.prototype.chunks requires a chunk size of at least 1".into(),
+            ErrorKind::TypeError,
+            "size must be a Number".into(),
+        ));
+    };
+    if !size.is_finite() || size.fract() != 0.0 {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "size must be an integral Number".into(),
         ));
     }
+    if *size < 1.0 || *size > 4294967295.0 {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "size must be in the range 1 to 2^32 - 1".into(),
+        ));
+    }
+    Ok(*size)
+}
+
+fn chunks_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    let size_arg = args.first().cloned().unwrap_or(Value::Undefined);
+    let size = chunk_window_size(&size_arg)?;
     let record = get_iterator_direct(agent, this)?;
     create_helper(
         agent,
@@ -1002,11 +1020,22 @@ fn chunks_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Valu
 
 fn windows_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let size_arg = args.first().cloned().unwrap_or(Value::Undefined);
-    let size = to_integer_or_infinity(to_number(&size_arg)?);
-    if size < 1.0 {
+    let size = chunk_window_size(&size_arg)?;
+    // undersized defaults to "only-full" and must be one of the two strings.
+    let undersized = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let valid_undersized = match &undersized {
+        Value::Undefined => true,
+        Value::String(text) => {
+            let text = text.to_string_lossy();
+            text == "only-full" || text == "allow-partial"
+        }
+        _ => false,
+    };
+    if !valid_undersized {
         return Err(JsError::new(
-            ErrorKind::RangeError,
-            "Iterator.prototype.windows requires a window size of at least 1".into(),
+            ErrorKind::TypeError,
+            "Iterator.prototype.windows requires undersized to be \"only-full\" or \"allow-partial\""
+                .into(),
         ));
     }
     let record = get_iterator_direct(agent, this)?;
@@ -1024,7 +1053,10 @@ fn windows_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
 }
 
 fn to_async_method(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
-    let record = get_iterator_direct(agent, this)?;
+    // toAsync wraps the sync iterator obtained from `this`; for plain
+    // iterables this means going through @@iterator (matching Array's
+    // [Symbol.asyncIterator]).
+    let record = crate::expr::get_iterator(agent, this)?;
     let object = crate::async_await::async_from_sync_iterator(agent, &record)?;
     Ok(Value::Object(object))
 }
@@ -1294,22 +1326,18 @@ fn step_helper(agent: &mut Agent, state: &mut HelperState) -> Result<Value, JsEr
         HelperMode::Zip {
             iterators,
             keys,
-            index,
             longest,
             remainder,
+            ..
         } => {
-            if *index >= iterators.len() {
+            if iterators.is_empty() {
                 state.done = true;
-                let records = std::mem::take(iterators);
-                for record in &records {
-                    iterator_close(agent, record)?;
-                }
                 return done_result(agent);
             }
             let mut values = Vec::with_capacity(iterators.len());
             let mut any_done = false;
             let mut all_done = true;
-            for record in iterators.iter() {
+            for record in iterators.iter_mut() {
                 match step_value(agent, record)? {
                     Some(value) => {
                         values.push(value);
@@ -1321,8 +1349,9 @@ fn step_helper(agent: &mut Agent, state: &mut HelperState) -> Result<Value, JsEr
                     }
                 }
             }
-            if !*longest && any_done {
-                // shortest mode: close everything and finish.
+            if (!*longest && any_done) || (all_done && any_done) {
+                // shortest mode ends at the first exhausted column; longest
+                // mode ends once every column is exhausted.
                 state.done = true;
                 let records = std::mem::take(iterators);
                 for record in &records {
@@ -1330,15 +1359,6 @@ fn step_helper(agent: &mut Agent, state: &mut HelperState) -> Result<Value, JsEr
                 }
                 return done_result(agent);
             }
-            if all_done && any_done {
-                state.done = true;
-                let records = std::mem::take(iterators);
-                for record in &records {
-                    iterator_close(agent, record)?;
-                }
-                return done_result(agent);
-            }
-            *index += 1;
             if keys.is_empty() {
                 iterator_result(
                     agent,
@@ -1607,7 +1627,6 @@ fn iterator_zip(
             mode: HelperMode::Zip {
                 iterators,
                 keys,
-                index: 0,
                 longest,
                 remainder,
             },
@@ -1712,7 +1731,9 @@ mod tests {
                 "{ length: 'longest', remainder: 'R' }).toArray())"
             ))
             .unwrap(),
-            Value::String(Handle::new(JsString::from_utf8("[[\"a\",1],[\"b\",2]]")))
+            Value::String(Handle::new(JsString::from_utf8(
+                "[[\"a\",1],[\"b\",2],[\"R\",3]]"
+            )))
         );
         assert_eq!(
             run(

@@ -88,6 +88,13 @@ pub enum Step {
     Destructure {
         pattern: BindingPattern,
     },
+    /// Initialize a let/const/using declaration's binding in the current
+    /// lexical environment; the binding was created uninitialized by
+    /// declaration instantiation (unlike `Destructure`, which puts a value
+    /// into an already-initialized binding).
+    DeclInit {
+        pattern: BindingPattern,
+    },
     UpdateIdent {
         name: crux::AtomId,
         op: UpdateOp,
@@ -251,6 +258,20 @@ pub enum Step {
         loop_top: usize,
         done: usize,
         yield_at: usize,
+    },
+    // ----- async-generator `yield*` (the inner iterator's results are
+    // promises; each step awaits them through the driver) -----
+    AsyncYieldStarBegin,
+    AsyncYieldStarNext {
+        done: usize,
+    },
+    AsyncYieldStarInspect {
+        done: usize,
+    },
+    AsyncYieldStarResume {
+        loop_top: usize,
+        done: usize,
+        inspect: usize,
     },
     // ----- modules -----
     ImportCall {
@@ -660,6 +681,17 @@ impl Vm {
                         &pattern,
                         value.clone(),
                         None,
+                        self.strict,
+                    )?;
+                    self.stack.push(value);
+                }
+                Step::DeclInit { pattern } => {
+                    let value = self.pop();
+                    crate::binding::binding_initialization(
+                        agent,
+                        &pattern,
+                        value.clone(),
+                        Some(&self.lexical_env),
                         self.strict,
                     )?;
                     self.stack.push(value);
@@ -1384,6 +1416,118 @@ impl Vm {
                                 self.stack.push(value);
                                 self.ip = done;
                             }
+                        }
+                    }
+                }
+                Step::AsyncYieldStarBegin => {
+                    let value = self.pop();
+                    let iterator = get_async_iterator_record(agent, &value)?;
+                    self.yield_star_stack.push(YieldStarState {
+                        iterator,
+                        received: Value::Undefined,
+                    });
+                }
+                Step::AsyncYieldStarNext { done: _ } => {
+                    let Some(state) = self.yield_star_stack.last() else {
+                        return Err(JsError::new(
+                            ErrorKind::SyntaxError,
+                            "AsyncYieldStarNext without a delegation".into(),
+                        ));
+                    };
+                    let received = state.received.clone();
+                    let iterator = state.iterator.clone();
+                    let result = crate::function::call(
+                        agent,
+                        &iterator.next,
+                        iterator.iterator.clone(),
+                        &[received],
+                    )?;
+                    // The await resume pushes the fulfilled iterator result.
+                    return Ok(VmOutcome::Suspended(Suspension::Await(result)));
+                }
+                Step::AsyncYieldStarInspect { done } => {
+                    let result = self.pop();
+                    if iterator_result_done(agent, &result)? {
+                        let value = iterator_result_value(agent, &result)?;
+                        self.yield_star_stack.pop();
+                        self.stack.push(value);
+                        self.ip = done;
+                    } else {
+                        let value = iterator_result_value(agent, &result)?;
+                        self.stack.push(value);
+                    }
+                }
+                Step::AsyncYieldStarResume {
+                    loop_top,
+                    done,
+                    inspect,
+                } => {
+                    let received = self.pop();
+                    match self.resume_abrupt.take() {
+                        None => {
+                            if let Some(state) = self.yield_star_stack.last_mut() {
+                                state.received = received;
+                            }
+                            self.ip = loop_top;
+                        }
+                        Some(ResumeAbrupt::Throw(value)) => {
+                            let Some(state) = self.yield_star_stack.last() else {
+                                return Err(JsError::new(
+                                    ErrorKind::SyntaxError,
+                                    "AsyncYieldStarResume without a delegation".into(),
+                                ));
+                            };
+                            let iterator = state.iterator.clone();
+                            let throw_method = crate::context::get_property(
+                                agent,
+                                &iterator.iterator,
+                                &JsString::from_utf8("throw"),
+                                iterator.iterator.clone(),
+                            )?;
+                            if is_callable(&throw_method) {
+                                let inner = crate::function::call(
+                                    agent,
+                                    &throw_method,
+                                    iterator.iterator.clone(),
+                                    &[value],
+                                )?;
+                                self.ip = inspect;
+                                return Ok(VmOutcome::Suspended(Suspension::Await(inner)));
+                            }
+                            iterator_close(agent, &iterator)?;
+                            self.yield_star_stack.pop();
+                            match self.throw_machinery(body, value)? {
+                                CtlResult::Continue => continue,
+                                CtlResult::Done(outcome) => return Ok(outcome),
+                            }
+                        }
+                        Some(ResumeAbrupt::Return(value)) => {
+                            let Some(state) = self.yield_star_stack.last() else {
+                                return Err(JsError::new(
+                                    ErrorKind::SyntaxError,
+                                    "AsyncYieldStarResume without a delegation".into(),
+                                ));
+                            };
+                            let iterator = state.iterator.clone();
+                            let return_method = crate::context::get_property(
+                                agent,
+                                &iterator.iterator,
+                                &JsString::from_utf8("return"),
+                                iterator.iterator.clone(),
+                            )?;
+                            if is_callable(&return_method) {
+                                let inner = crate::function::call(
+                                    agent,
+                                    &return_method,
+                                    iterator.iterator.clone(),
+                                    &[value],
+                                )?;
+                                self.ip = inspect;
+                                return Ok(VmOutcome::Suspended(Suspension::Await(inner)));
+                            }
+                            self.yield_star_stack.pop();
+                            self.stack.push(value);
+                            self.ip = done;
                         }
                     }
                 }
@@ -2171,6 +2315,48 @@ fn iterator_result_value(agent: &mut Agent, result: &Value) -> Result<Value, JsE
     crate::context::get_property(agent, result, &JsString::from_utf8("value"), result.clone())
 }
 
+/// GetIterator with the ~async~ hint for an async-generator `yield*` (spec
+/// 14.5.5 step 1): `@@asyncIterator` when present, else the sync iterator
+/// wrapped as an async-from-sync iterator.
+fn get_async_iterator_record(
+    agent: &mut Agent,
+    value: &Value,
+) -> Result<crate::expr::IteratorRecord, JsError> {
+    let method = crate::expr::get_method(agent, value, "@@asyncIterator")?;
+    if let Some(method) = method {
+        let iterator = crate::function::call(agent, &method, value.clone(), &[])?;
+        if !matches!(iterator, Value::Object(_)) {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "async iterator must be an object".into(),
+            ));
+        }
+        let next = crate::context::get_property(
+            agent,
+            &iterator,
+            &JsString::from_utf8("next"),
+            iterator.clone(),
+        )?;
+        if !crux::value::is_callable(&next) {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "async iterator has no callable next".into(),
+            ));
+        }
+        return Ok(crate::expr::IteratorRecord { iterator, next });
+    }
+    let sync = crate::expr::get_iterator(agent, value)?;
+    let object = crate::async_await::async_from_sync_iterator(agent, &sync)?;
+    let iterator = Value::Object(object);
+    let next = crate::context::get_property(
+        agent,
+        &iterator,
+        &JsString::from_utf8("next"),
+        iterator.clone(),
+    )?;
+    Ok(crate::expr::IteratorRecord { iterator, next })
+}
+
 /// GetAsyncIterator (spec 27.1.1.2): the async iterator, wrapping sync
 /// iterators in an AsyncFromSyncIterator.
 fn async_from_sync_or_async(
@@ -2505,6 +2691,9 @@ enum Fixup {
     SwitchTest(usize, usize),
     YieldStarNext(usize, usize),
     YieldStarResume(usize, usize, usize, usize),
+    AsyncYieldStarNext(usize, usize),
+    AsyncYieldStarInspect(usize, usize),
+    AsyncYieldStarResume(usize, usize, usize, usize),
 }
 
 #[derive(Debug)]
@@ -2542,6 +2731,9 @@ struct Compiler {
     scope_stack: Vec<Scope>,
     scope_count: usize,
     next_label: usize,
+    /// Whether the enclosing function is an async generator: `yield*` then
+    /// delegates through the async-iterator protocol with awaited results.
+    is_async_generator: bool,
 }
 
 impl Compiler {
@@ -2666,6 +2858,23 @@ impl Compiler {
                         loop_top: self.labels[&loop_label],
                         done: self.labels[&done_label],
                         yield_at: self.labels[&yield_label],
+                    };
+                }
+                Fixup::AsyncYieldStarNext(index, label) => {
+                    self.steps[index] = Step::AsyncYieldStarNext {
+                        done: self.labels[&label],
+                    };
+                }
+                Fixup::AsyncYieldStarInspect(index, label) => {
+                    self.steps[index] = Step::AsyncYieldStarInspect {
+                        done: self.labels[&label],
+                    };
+                }
+                Fixup::AsyncYieldStarResume(index, loop_label, done_label, inspect_index) => {
+                    self.steps[index] = Step::AsyncYieldStarResume {
+                        loop_top: self.labels[&loop_label],
+                        done: self.labels[&done_label],
+                        inspect: inspect_index,
                     };
                 }
             }
@@ -2817,13 +3026,21 @@ impl Compiler {
                 self.compile_expr(expr)?;
                 self.emit(Step::SetCompletion);
             }
-            StmtKind::VarDecl { decls, .. } => {
+            StmtKind::VarDecl { kind, decls, .. } => {
+                let declaration = *kind != VarDeclKind::Var;
                 for decl in decls {
                     if let Some(init) = &decl.init {
                         self.compile_expr(init)?;
-                        self.emit(Step::Destructure {
-                            pattern: decl.pattern.clone(),
-                        });
+                        let step = if declaration {
+                            Step::DeclInit {
+                                pattern: decl.pattern.clone(),
+                            }
+                        } else {
+                            Step::Destructure {
+                                pattern: decl.pattern.clone(),
+                            }
+                        };
+                        self.emit(step);
                     }
                 }
             }
@@ -2831,7 +3048,7 @@ impl Compiler {
                 for decl in decls {
                     if let Some(init) = &decl.init {
                         self.compile_expr(init)?;
-                        self.emit(Step::Destructure {
+                        self.emit(Step::DeclInit {
                             pattern: decl.pattern.clone(),
                         });
                     }
@@ -3389,31 +3606,61 @@ impl Compiler {
                     None => self.emit(Step::Push(Value::Undefined)),
                 }
                 if *delegate {
-                    // yield* (spec 14.5.5): the delegation loop.
-                    self.emit(Step::YieldStarBegin);
-                    let loop_label = self.new_label();
-                    let done_label = self.new_label();
-                    let yield_label = self.new_label();
-                    self.place(loop_label);
-                    let step_index = self.steps.len();
-                    self.emit(Step::YieldStarNext { done: 0 });
-                    self.fixups
-                        .push(Fixup::YieldStarNext(step_index, done_label));
-                    self.place(yield_label);
-                    self.emit(Step::Yield { delegate: true });
-                    let resume_index = self.steps.len();
-                    self.emit(Step::YieldStarResume {
-                        loop_top: 0,
-                        done: 0,
-                        yield_at: 0,
-                    });
-                    self.fixups.push(Fixup::YieldStarResume(
-                        resume_index,
-                        loop_label,
-                        done_label,
-                        yield_label,
-                    ));
-                    self.place(done_label);
+                    // yield* (spec 14.5.5): the delegation loop. Async
+                    // generators await each inner result through the driver.
+                    if self.is_async_generator {
+                        self.emit(Step::AsyncYieldStarBegin);
+                        let loop_label = self.new_label();
+                        let done_label = self.new_label();
+                        self.place(loop_label);
+                        let step_index = self.steps.len();
+                        self.emit(Step::AsyncYieldStarNext { done: 0 });
+                        self.fixups
+                            .push(Fixup::AsyncYieldStarNext(step_index, done_label));
+                        let inspect_index = self.steps.len();
+                        self.emit(Step::AsyncYieldStarInspect { done: 0 });
+                        self.fixups
+                            .push(Fixup::AsyncYieldStarInspect(inspect_index, done_label));
+                        self.emit(Step::Yield { delegate: true });
+                        let resume_index = self.steps.len();
+                        self.emit(Step::AsyncYieldStarResume {
+                            loop_top: 0,
+                            done: 0,
+                            inspect: 0,
+                        });
+                        self.fixups.push(Fixup::AsyncYieldStarResume(
+                            resume_index,
+                            loop_label,
+                            done_label,
+                            inspect_index,
+                        ));
+                        self.place(done_label);
+                    } else {
+                        self.emit(Step::YieldStarBegin);
+                        let loop_label = self.new_label();
+                        let done_label = self.new_label();
+                        let yield_label = self.new_label();
+                        self.place(loop_label);
+                        let step_index = self.steps.len();
+                        self.emit(Step::YieldStarNext { done: 0 });
+                        self.fixups
+                            .push(Fixup::YieldStarNext(step_index, done_label));
+                        self.place(yield_label);
+                        self.emit(Step::Yield { delegate: true });
+                        let resume_index = self.steps.len();
+                        self.emit(Step::YieldStarResume {
+                            loop_top: 0,
+                            done: 0,
+                            yield_at: 0,
+                        });
+                        self.fixups.push(Fixup::YieldStarResume(
+                            resume_index,
+                            loop_label,
+                            done_label,
+                            yield_label,
+                        ));
+                        self.place(done_label);
+                    }
                 } else {
                     self.emit(Step::Yield { delegate: false });
                 }
@@ -4066,10 +4313,20 @@ fn labeled_continue_target(body: &Stmt) -> Option<(usize, usize)> {
 
 /// Compile a function body for resumable execution.
 pub fn compile_body(function: &EcmaFunction) -> Result<CompiledBody, JsError> {
-    compile_statements(&function.body.stmts, function.strict)
+    let mut compiler = Compiler {
+        is_async_generator: function.is_generator && function.is_async,
+        ..Compiler::default()
+    };
+    compiler.compile_statements(&function.body.stmts)?;
+    compiler.resolve();
+    Ok(CompiledBody {
+        steps: compiler.steps,
+        handlers: compiler.handlers,
+        strict: function.strict,
+    })
 }
 
-/// Compile a statement list (module bodies and other resumable contexts).
+/// Compile a statement list standalone (modules and top-level await).
 pub fn compile_statements(stmts: &[Stmt], strict: bool) -> Result<CompiledBody, JsError> {
     let mut compiler = Compiler::default();
     compiler.compile_statements(stmts)?;

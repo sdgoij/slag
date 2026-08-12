@@ -187,7 +187,6 @@ fn set_default_global_bindings(realm: &Handle<Realm>) -> Result<(), JsError> {
     crate::builtins::async_function::install(realm)?;
     crate::builtins::weakref::install(realm)?;
     crate::builtins::iterator::install(realm)?;
-    crate::builtins::async_iterator::install(realm)?;
     crate::builtins::disposable::install(realm)?;
     // ES2022+: every built-in iterator prototype object inherits
     // %Iterator.prototype%, which installs after them. Re-parent them now
@@ -198,6 +197,7 @@ fn set_default_global_bindings(realm: &Handle<Realm>) -> Result<(), JsError> {
         .and_then(|value| as_object(&value))
     {
         for name in [
+            "%Generator.prototype%",
             "%ArrayIteratorPrototype%",
             "%StringIteratorPrototype%",
             "%MapIteratorPrototype%",

@@ -120,6 +120,11 @@ pub fn call_async_function(
             args,
             &function_env,
         )?;
+        // The VM drives the body's lexical environment (the one
+        // function_declaration_instantiation installed on the running
+        // context), not the outer function env, so body-level let/const
+        // bindings are reachable.
+        let body_env = agent.running_context()?.lexical_environment.clone();
         let body = data.ir.clone().ok_or_else(|| {
             JsError::new(ErrorKind::TypeError, "async body was not compiled".into())
         })?;
@@ -130,7 +135,7 @@ pub fn call_async_function(
             .unwrap_or(Value::Undefined);
         let capability = crate::promise::new_promise_capability(agent, &promise_ctor)?;
         let state = Rc::new(RefCell::new(AsyncFunctionState {
-            vm: Vm::new(function_env, data.strict),
+            vm: Vm::new(body_env, data.strict),
             body,
             context,
             promise: capability.promise.clone(),
@@ -306,7 +311,14 @@ pub fn async_from_sync_iterator(
     agent: &mut Agent,
     sync: &IteratorRecord,
 ) -> Result<Handle<JsObject>, JsError> {
-    let object = JsObject::ordinary_object_create(None);
+    // AsyncFromSyncIterator inherits %AsyncIterator.prototype% (spec
+    // 27.1.4.1) so the async iterator helpers are reachable on it.
+    let proto = agent
+        .current_realm()
+        .ok()
+        .and_then(|realm| realm.intrinsics.get("%AsyncIterator.prototype%"))
+        .and_then(|value| crate::context::as_object(&value));
+    let object = JsObject::ordinary_object_create(proto);
     for method in [
         AsyncFromSyncMethod::Next,
         AsyncFromSyncMethod::Return,

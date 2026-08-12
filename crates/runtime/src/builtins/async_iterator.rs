@@ -113,8 +113,30 @@ pub enum EagerMode {
 /// The continuation of an await in an async-iterator helper driver.
 #[derive(Debug, Clone)]
 pub enum AwaitEntry {
-    Lazy { object_id: u64, is_reject: bool },
-    Eager { driver_id: u64, is_reject: bool },
+    Lazy {
+        object_id: u64,
+        is_reject: bool,
+    },
+    Eager {
+        driver_id: u64,
+        is_reject: bool,
+    },
+    /// The awaited mapped value of a `map` helper.
+    Mapped {
+        object_id: u64,
+        is_reject: bool,
+    },
+    /// The awaited predicate result of a `filter` helper.
+    FilterKeep {
+        object_id: u64,
+        value: Value,
+        is_reject: bool,
+    },
+    /// A step of the current `flatMap` inner iterator.
+    FlatInner {
+        object_id: u64,
+        is_reject: bool,
+    },
 }
 
 pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
@@ -475,10 +497,8 @@ fn dispatch_await(
             is_reject,
         } => {
             if *is_reject {
-                return Err(
-                    JsError::new(ErrorKind::TypeError, "Uncaught rejection".into())
-                        .with_value(value),
-                );
+                reject_pending(agent, *object_id, value)?;
+                return Ok(Value::Undefined);
             }
             continue_lazy(agent, *object_id, value)
         }
@@ -487,14 +507,219 @@ fn dispatch_await(
             is_reject,
         } => {
             if *is_reject {
-                return Err(
-                    JsError::new(ErrorKind::TypeError, "Uncaught rejection".into())
-                        .with_value(value),
-                );
+                reject_eager(agent, *driver_id, value)?;
+                return Ok(Value::Undefined);
             }
             continue_eager(agent, *driver_id, value)
         }
+        AwaitEntry::Mapped {
+            object_id,
+            is_reject,
+        } => {
+            if *is_reject {
+                reject_pending(agent, *object_id, value)?;
+                return Ok(Value::Undefined);
+            }
+            continue_mapped(agent, *object_id, value)
+        }
+        AwaitEntry::FilterKeep {
+            object_id,
+            value: keep,
+            is_reject,
+        } => {
+            if *is_reject {
+                reject_pending(agent, *object_id, value)?;
+                return Ok(Value::Undefined);
+            }
+            continue_filter(agent, *object_id, keep.clone(), value)
+        }
+        AwaitEntry::FlatInner {
+            object_id,
+            is_reject,
+        } => {
+            if *is_reject {
+                reject_pending(agent, *object_id, value)?;
+                return Ok(Value::Undefined);
+            }
+            continue_flat_inner(agent, *object_id, value)
+        }
     }
+}
+
+/// Reject the pending `next()` promise of an async-iterator helper.
+fn reject_pending(agent: &mut Agent, object_id: u64, value: Value) -> Result<(), JsError> {
+    let capability = agent
+        .async_iterator_pending
+        .get(&object_id)
+        .cloned()
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no pending capability".into()))?;
+    let error = JsError::new(ErrorKind::TypeError, "Uncaught rejection".into()).with_value(value);
+    let rejection = crate::promise::error_value(agent, &error);
+    crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
+    Ok(())
+}
+
+/// Reject the result promise of an eager helper driver.
+fn reject_eager(agent: &mut Agent, driver_id: u64, value: Value) -> Result<(), JsError> {
+    let driver = agent
+        .async_iterator_eager
+        .get(&driver_id)
+        .cloned()
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no eager driver".into()))?;
+    let capability = driver.borrow().capability.clone();
+    let error = JsError::new(ErrorKind::TypeError, "Uncaught rejection".into()).with_value(value);
+    let rejection = crate::promise::error_value(agent, &error);
+    crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
+    Ok(())
+}
+
+/// The continuation of a `map` helper's awaited mapper result: resolve the
+/// pending `next()` promise with `{ mapped, done: false }`.
+fn continue_mapped(agent: &mut Agent, object_id: u64, mapped: Value) -> Result<Value, JsError> {
+    let capability = agent
+        .async_iterator_pending
+        .get(&object_id)
+        .cloned()
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no pending capability".into()))?;
+    crate::function::call(
+        agent,
+        &capability.resolve,
+        Value::Undefined,
+        &[iterator_result(agent, mapped, false)?],
+    )?;
+    Ok(Value::Undefined)
+}
+
+/// The continuation of a `filter` helper's awaited predicate result.
+fn continue_filter(
+    agent: &mut Agent,
+    object_id: u64,
+    value: Value,
+    keep: Value,
+) -> Result<Value, JsError> {
+    let capability = agent
+        .async_iterator_pending
+        .get(&object_id)
+        .cloned()
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no pending capability".into()))?;
+    if to_boolean(&keep) {
+        crate::function::call(
+            agent,
+            &capability.resolve,
+            Value::Undefined,
+            &[iterator_result(agent, value, false)?],
+        )?;
+        return Ok(Value::Undefined);
+    }
+    // The predicate was false: pull the next underlying value.
+    let record =
+        {
+            let state = agent
+                .async_iterator_helpers
+                .get(&object_id)
+                .cloned()
+                .ok_or_else(|| {
+                    JsError::new(ErrorKind::TypeError, "not an async iterator helper".into())
+                })?;
+            state.borrow().iterator.clone().ok_or_else(|| {
+                JsError::new(ErrorKind::TypeError, "no underlying iterator".into())
+            })?
+        };
+    let result = crate::function::call(agent, &record.next, record.iterator.clone(), &[])?;
+    let promise_ctor = agent
+        .current_realm()?
+        .intrinsics
+        .get("%Promise%")
+        .unwrap_or(Value::Undefined);
+    let promise = promise_resolve(agent, &promise_ctor, result)?;
+    let on_fulfilled = make_await_closure(
+        agent,
+        AwaitEntry::Lazy {
+            object_id,
+            is_reject: false,
+        },
+    )?;
+    let on_rejected = make_await_closure(
+        agent,
+        AwaitEntry::Lazy {
+            object_id,
+            is_reject: true,
+        },
+    )?;
+    perform_promise_then(agent, &promise, Some(on_fulfilled), Some(on_rejected), None)?;
+    Ok(Value::Undefined)
+}
+
+/// The continuation of a `flatMap` helper's inner-iterator step.
+fn continue_flat_inner(agent: &mut Agent, object_id: u64, result: Value) -> Result<Value, JsError> {
+    if !matches!(result, Value::Object(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Iterator result is not an object".into(),
+        ));
+    }
+    let done =
+        crate::context::get_property(agent, &result, &JsString::from_utf8("done"), result.clone())?;
+    let value = crate::context::get_property(
+        agent,
+        &result,
+        &JsString::from_utf8("value"),
+        result.clone(),
+    )?;
+    let capability = agent
+        .async_iterator_pending
+        .get(&object_id)
+        .cloned()
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no pending capability".into()))?;
+    if to_boolean(&done) {
+        // The inner iterator finished: clear it and continue the outer.
+        let record = {
+            let state = agent
+                .async_iterator_helpers
+                .get(&object_id)
+                .cloned()
+                .ok_or_else(|| {
+                    JsError::new(ErrorKind::TypeError, "not an async iterator helper".into())
+                })?;
+            let mut state = state.borrow_mut();
+            if let HelperMode::FlatMap { inner, .. } = &mut state.mode {
+                *inner = None;
+            }
+            state.iterator.clone().ok_or_else(|| {
+                JsError::new(ErrorKind::TypeError, "no underlying iterator".into())
+            })?
+        };
+        let result = crate::function::call(agent, &record.next, record.iterator.clone(), &[])?;
+        let promise_ctor = agent
+            .current_realm()?
+            .intrinsics
+            .get("%Promise%")
+            .unwrap_or(Value::Undefined);
+        let promise = promise_resolve(agent, &promise_ctor, result)?;
+        let on_fulfilled = make_await_closure(
+            agent,
+            AwaitEntry::Lazy {
+                object_id,
+                is_reject: false,
+            },
+        )?;
+        let on_rejected = make_await_closure(
+            agent,
+            AwaitEntry::Lazy {
+                object_id,
+                is_reject: true,
+            },
+        )?;
+        perform_promise_then(agent, &promise, Some(on_fulfilled), Some(on_rejected), None)?;
+        return Ok(Value::Undefined);
+    }
+    crate::function::call(
+        agent,
+        &capability.resolve,
+        Value::Undefined,
+        &[iterator_result(agent, value, false)?],
+    )?;
+    Ok(Value::Undefined)
 }
 
 /// The `next`/`return` dispatch of an async-iterator-helper object.
@@ -590,6 +815,54 @@ fn async_helper_method(
             Value::Undefined,
             &[iterator_result(agent, Value::Undefined, true)?],
         )?;
+        return Ok(result_promise);
+    }
+    // An exhausted `take` helper yields done without pulling the underlying
+    // iterator again.
+    if matches!(
+        &state.borrow().mode,
+        HelperMode::Take { remaining } if *remaining <= 0.0
+    ) {
+        crate::function::call(
+            agent,
+            &capability.resolve,
+            Value::Undefined,
+            &[iterator_result(agent, Value::Undefined, true)?],
+        )?;
+        return Ok(result_promise);
+    }
+    // A `flatMap` helper with an active inner iterator steps it instead of
+    // the outer one.
+    let flat_inner = {
+        let state = state.borrow();
+        match &state.mode {
+            HelperMode::FlatMap {
+                inner: Some(inner), ..
+            } => Some(inner.clone()),
+            _ => None,
+        }
+    };
+    if let Some(inner) = flat_inner {
+        let result = crate::function::call(agent, &inner.next, inner.iterator.clone(), &[])?;
+        let promise = promise_resolve(agent, &promise_ctor, result)?;
+        let on_fulfilled = make_await_closure(
+            agent,
+            AwaitEntry::FlatInner {
+                object_id: obj.id(),
+                is_reject: false,
+            },
+        )?;
+        let on_rejected = make_await_closure(
+            agent,
+            AwaitEntry::FlatInner {
+                object_id: obj.id(),
+                is_reject: true,
+            },
+        )?;
+        agent
+            .async_iterator_pending
+            .insert(obj.id(), capability.clone());
+        perform_promise_then(agent, &promise, Some(on_fulfilled), Some(on_rejected), None)?;
         return Ok(result_promise);
     }
     let record = state
@@ -704,54 +977,61 @@ fn continue_lazy(agent: &mut Agent, object_id: u64, result: Value) -> Result<Val
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no underlying iterator".into()))?;
     match &mut mode {
         HelperMode::Map { mapper } => {
+            // The mapper result must be awaited (spec 27.1.4.3).
             let mapped = crate::function::call(agent, mapper, Value::Undefined, &[value])?;
-            crate::function::call(
+            let promise_ctor = agent
+                .current_realm()?
+                .intrinsics
+                .get("%Promise%")
+                .unwrap_or(Value::Undefined);
+            let promise = promise_resolve(agent, &promise_ctor, mapped)?;
+            let on_fulfilled = make_await_closure(
                 agent,
-                &capability.resolve,
-                Value::Undefined,
-                &[iterator_result(agent, mapped, false)?],
+                AwaitEntry::Mapped {
+                    object_id,
+                    is_reject: false,
+                },
             )?;
+            let on_rejected = make_await_closure(
+                agent,
+                AwaitEntry::Mapped {
+                    object_id,
+                    is_reject: true,
+                },
+            )?;
+            perform_promise_then(agent, &promise, Some(on_fulfilled), Some(on_rejected), None)?;
         }
         HelperMode::Filter { filterer } => {
-            let keep = to_boolean(&crate::function::call(
+            // The predicate result must be awaited (spec 27.1.4.4).
+            let keep = crate::function::call(
                 agent,
                 filterer,
                 Value::Undefined,
                 std::slice::from_ref(&value),
-            )?);
-            if keep {
-                crate::function::call(
-                    agent,
-                    &capability.resolve,
-                    Value::Undefined,
-                    &[iterator_result(agent, value, false)?],
-                )?;
-            } else {
-                // Re-drive: chain the next underlying next().
-                let result =
-                    crate::function::call(agent, &record.next, record.iterator.clone(), &[])?;
-                let promise_ctor = agent
-                    .current_realm()?
-                    .intrinsics
-                    .get("%Promise%")
-                    .unwrap_or(Value::Undefined);
-                let promise = promise_resolve(agent, &promise_ctor, result)?;
-                let on_fulfilled = make_await_closure(
-                    agent,
-                    AwaitEntry::Lazy {
-                        object_id,
-                        is_reject: false,
-                    },
-                )?;
-                let on_rejected = make_await_closure(
-                    agent,
-                    AwaitEntry::Lazy {
-                        object_id,
-                        is_reject: true,
-                    },
-                )?;
-                perform_promise_then(agent, &promise, Some(on_fulfilled), Some(on_rejected), None)?;
-            }
+            )?;
+            let promise_ctor = agent
+                .current_realm()?
+                .intrinsics
+                .get("%Promise%")
+                .unwrap_or(Value::Undefined);
+            let promise = promise_resolve(agent, &promise_ctor, keep)?;
+            let on_fulfilled = make_await_closure(
+                agent,
+                AwaitEntry::FilterKeep {
+                    object_id,
+                    value: value.clone(),
+                    is_reject: false,
+                },
+            )?;
+            let on_rejected = make_await_closure(
+                agent,
+                AwaitEntry::FilterKeep {
+                    object_id,
+                    value: value.clone(),
+                    is_reject: true,
+                },
+            )?;
+            perform_promise_then(agent, &promise, Some(on_fulfilled), Some(on_rejected), None)?;
         }
         HelperMode::Take { remaining } => {
             if *remaining <= 0.0 {
@@ -814,55 +1094,69 @@ fn continue_lazy(agent: &mut Agent, object_id: u64, result: Value) -> Result<Val
                 )?;
             }
         }
-        HelperMode::FlatMap { mapper, inner } => {
-            let mapped = crate::function::call(agent, mapper, Value::Undefined, &[value])?;
-            let iter_method = get_method(agent, &mapped, "@@asyncIterator")?;
-            let iter_method = match iter_method {
-                Some(method) => method,
-                None => {
-                    // Fall back to a sync iterator wrapped as async-from-sync.
-                    let sync = crate::expr::get_iterator(agent, &mapped)?;
-                    let object = crate::async_await::async_from_sync_iterator(agent, &sync)?;
-                    let next = crate::context::get_property(
-                        agent,
-                        &Value::Object(object.clone()),
-                        &JsString::from_utf8("next"),
-                        Value::Object(object.clone()),
-                    )?;
-                    *inner = Some(AsyncIteratorRecord {
-                        iterator: Value::Object(object),
-                        next,
-                    });
-                    step_flat_inner(agent, object_id, inner.as_mut().expect("set"))?;
-                    return Ok(Value::Undefined);
+        HelperMode::FlatMap { mapper, inner } => match inner {
+            // An inner iterator is already active; step it.
+            Some(inner) => step_flat_inner(agent, object_id, inner)?,
+            // No inner yet: map the outer value and start its iterator.
+            None => {
+                let mapped = crate::function::call(agent, mapper, Value::Undefined, &[value])?;
+                let iter_method = get_method(agent, &mapped, "@@asyncIterator")?;
+                match iter_method {
+                    Some(method) => {
+                        let inner_value =
+                            crate::function::call(agent, &method, mapped.clone(), &[])?;
+                        if !matches!(inner_value, Value::Object(_)) {
+                            return Err(JsError::new(
+                                ErrorKind::TypeError,
+                                "flatMap inner async iterator must be an object".into(),
+                            ));
+                        }
+                        let next = crate::context::get_property(
+                            agent,
+                            &inner_value,
+                            &JsString::from_utf8("next"),
+                            inner_value.clone(),
+                        )?;
+                        if !is_callable(&next) {
+                            return Err(JsError::new(
+                                ErrorKind::TypeError,
+                                "flatMap inner async iterator has no callable next".into(),
+                            ));
+                        }
+                        *inner = Some(AsyncIteratorRecord {
+                            iterator: inner_value,
+                            next,
+                        });
+                        step_flat_inner(agent, object_id, inner.as_mut().expect("set"))?;
+                    }
+                    None => {
+                        // Fall back to a sync iterator wrapped as async-from-sync.
+                        let sync = crate::expr::get_iterator(agent, &mapped)?;
+                        let object = crate::async_await::async_from_sync_iterator(agent, &sync)?;
+                        let next = crate::context::get_property(
+                            agent,
+                            &Value::Object(object.clone()),
+                            &JsString::from_utf8("next"),
+                            Value::Object(object.clone()),
+                        )?;
+                        *inner = Some(AsyncIteratorRecord {
+                            iterator: Value::Object(object),
+                            next,
+                        });
+                        step_flat_inner(agent, object_id, inner.as_mut().expect("set"))?;
+                    }
                 }
-            };
-            let inner_value = crate::function::call(agent, &iter_method, mapped.clone(), &[])?;
-            if !matches!(inner_value, Value::Object(_)) {
-                return Err(JsError::new(
-                    ErrorKind::TypeError,
-                    "flatMap inner async iterator must be an object".into(),
-                ));
             }
-            let next = crate::context::get_property(
-                agent,
-                &inner_value,
-                &JsString::from_utf8("next"),
-                inner_value.clone(),
-            )?;
-            if !is_callable(&next) {
-                return Err(JsError::new(
-                    ErrorKind::TypeError,
-                    "flatMap inner async iterator has no callable next".into(),
-                ));
-            }
-            *inner = Some(AsyncIteratorRecord {
-                iterator: inner_value,
-                next,
-            });
-            step_flat_inner(agent, object_id, inner.as_mut().expect("set"))?;
-        }
+        },
     }
+    // Persist mode mutations (take/drop counts, the flatMap inner iterator)
+    // so later continuations see them.
+    let state = agent
+        .async_iterator_helpers
+        .get(&object_id)
+        .cloned()
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async iterator helper".into()))?;
+    state.borrow_mut().mode = mode;
     Ok(Value::Undefined)
 }
 
@@ -882,14 +1176,14 @@ fn step_flat_inner(
     let promise = promise_resolve(agent, &promise_ctor, result)?;
     let on_fulfilled = make_await_closure(
         agent,
-        AwaitEntry::Lazy {
+        AwaitEntry::FlatInner {
             object_id,
             is_reject: false,
         },
     )?;
     let on_rejected = make_await_closure(
         agent,
-        AwaitEntry::Lazy {
+        AwaitEntry::FlatInner {
             object_id,
             is_reject: true,
         },
@@ -1023,6 +1317,7 @@ fn start_eager(agent: &mut Agent, this: &Value, mode: EagerMode) -> Result<Value
         .get("%Promise%")
         .unwrap_or(Value::Undefined);
     let capability = new_promise_capability(agent, &promise_ctor)?;
+    let promise = capability.promise.clone();
     let driver = JsObject::ordinary_object_create(None);
     agent.async_iterator_eager.insert(
         driver.id(),
@@ -1032,7 +1327,8 @@ fn start_eager(agent: &mut Agent, this: &Value, mode: EagerMode) -> Result<Value
             capability: capability.clone(),
         })),
     );
-    eager_step(agent, driver.id())
+    eager_step(agent, driver.id())?;
+    Ok(promise)
 }
 
 /// Drive one step of an eager helper.
@@ -1322,4 +1618,235 @@ fn iterator_result(agent: &Agent, value: Value, done: bool) -> Result<Value, JsE
     object.create_data_property(&JsString::from_utf8("value"), value)?;
     object.create_data_property(&JsString::from_utf8("done"), Value::Boolean(done))?;
     Ok(Value::Object(object))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::Agent;
+
+    /// Evaluate a script whose final expression is a promise, drain the job
+    /// queue, and return the promise's settled value (or the rejection).
+    fn settle(source: &str) -> Result<Value, JsError> {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm()?;
+        let value = agent.run_script(source)?;
+        agent.run_jobs()?;
+        let Value::Object(obj) = &value else {
+            return Ok(value.clone());
+        };
+        let Some(data) = agent.promises.get(&obj.id()) else {
+            return Ok(value.clone());
+        };
+        match &data.borrow().state {
+            crate::promise::PromiseState::Fulfilled(v) => Ok(v.clone()),
+            crate::promise::PromiseState::Rejected(v) => Ok(v.clone()),
+            _ => Err(JsError::new(
+                ErrorKind::TypeError,
+                "promise not settled".into(),
+            )),
+        }
+    }
+
+    fn str(value: &str) -> Value {
+        Value::String(Handle::new(JsString::from_utf8(value)))
+    }
+
+    /// An async generator yielding the values 1..n.
+    fn ag(n: u32) -> &'static str {
+        match n {
+            3 => "(async function* () { yield 1; yield 2; yield 3; })()",
+            _ => "(async function* () { yield 1; yield 2; })()",
+        }
+    }
+
+    #[test]
+    fn map_projects_each_value() {
+        assert_eq!(
+            settle(&format!(
+                "(async function () {{ const it = {0}.map(x => x * 10); return JSON.stringify(await it.toArray()); }})()",
+                ag(3)
+            ))
+            .unwrap(),
+            str("[10,20,30]")
+        );
+    }
+
+    #[test]
+    fn map_awaits_mapper_results() {
+        assert_eq!(
+            settle(&format!(
+                "(async function () {{ const it = {0}.map(async x => x * 2); return JSON.stringify(await it.toArray()); }})()",
+                ag(2)
+            ))
+            .unwrap(),
+            str("[2,4]")
+        );
+    }
+
+    #[test]
+    fn filter_keeps_matching_values() {
+        assert_eq!(
+            settle(&format!(
+                "(async function () {{ const it = {0}.filter(x => x % 2 === 1); return JSON.stringify(await it.toArray()); }})()",
+                ag(3)
+            ))
+            .unwrap(),
+            str("[1,3]")
+        );
+    }
+
+    #[test]
+    fn take_limits_values() {
+        assert_eq!(
+            settle(&format!(
+                "(async function () {{ const it = {0}.take(2); return JSON.stringify(await it.toArray()); }})()",
+                ag(3)
+            ))
+            .unwrap(),
+            str("[1,2]")
+        );
+    }
+
+    #[test]
+    fn drop_skips_values() {
+        assert_eq!(
+            settle(&format!(
+                "(async function () {{ const it = {0}.drop(1); return JSON.stringify(await it.toArray()); }})()",
+                ag(3)
+            ))
+            .unwrap(),
+            str("[2,3]")
+        );
+    }
+
+    #[test]
+    fn flat_map_flattens_inner_async_iterables() {
+        assert_eq!(
+            settle(&format!(
+                "(async function () {{ const it = {0}.flatMap(x => (async function* () {{ yield x; yield x * 2; }})()); return JSON.stringify(await it.toArray()); }})()",
+                ag(2)
+            ))
+            .unwrap(),
+            str("[1,2,2,4]")
+        );
+    }
+
+    #[test]
+    fn reduce_accumulates_with_initial_value() {
+        assert_eq!(
+            settle(&format!(
+                "(async function () {{ const it = {0}; return await it.reduce((acc, x) => acc + x, 0); }})()",
+                ag(3)
+            ))
+            .unwrap(),
+            Value::Number(6.0)
+        );
+    }
+
+    #[test]
+    fn for_each_runs_for_every_value() {
+        assert_eq!(
+            settle(&format!(
+                "(async function () {{ const seen = []; const it = {0}; await it.forEach(x => seen.push(x)); return JSON.stringify(seen); }})()",
+                ag(2)
+            ))
+            .unwrap(),
+            str("[1,2]")
+        );
+    }
+
+    #[test]
+    fn some_and_every_and_find() {
+        assert_eq!(
+            settle(&format!(
+                "(async function () {{ const a = await {0}.some(x => x > 2); const b = await {0}.every(x => x > 0); const c = await {0}.find(x => x === 2); return JSON.stringify([a, b, c]); }})()",
+                ag(3)
+            ))
+            .unwrap(),
+            str("[true,true,2]")
+        );
+    }
+
+    #[test]
+    fn helper_is_an_async_iterator() {
+        assert_eq!(
+            settle(&format!(
+                "(async function () {{ const it = {0}.map(x => x); const first = await it.next(); const second = await it.next(); return JSON.stringify([first.value, first.done, second.value, second.done]); }})()",
+                ag(2)
+            ))
+            .unwrap(),
+            str("[1,false,2,false]")
+        );
+    }
+
+    #[test]
+    fn to_array_on_plain_async_iterable() {
+        assert_eq!(
+            settle(concat!(
+                "(async function () {",
+                "  const it = { *[Symbol.iterator]() { yield 'a'; yield 'b'; } };",
+                "  return JSON.stringify(await it[Symbol.iterator]().toAsync().toArray());",
+                "})()"
+            ))
+            .unwrap(),
+            str("[\"a\",\"b\"]")
+        );
+    }
+
+    #[test]
+    fn lazy_helper_is_lazy() {
+        assert_eq!(
+            settle(&format!(
+                "(async function () {{ let calls = 0; const it = {0}.map(x => {{ calls++; return x; }}); const a = await it.next(); const b = await it.next(); return JSON.stringify([calls, a.value, b.value]); }})()",
+                ag(3)
+            ))
+            .unwrap(),
+            str("[2,1,2]")
+        );
+    }
+
+    #[test]
+    fn async_dispose_closes_the_iterator_and_runs_finally() {
+        assert_eq!(
+            settle(
+                "(async function () { const it = (async function* () { try { yield 1; yield 2; } finally { globalThis.closed = true; } })(); await it.next(); await it[Symbol.asyncDispose](); const r = await it.next(); return JSON.stringify([globalThis.closed, r.done]); })()"
+            )
+            .unwrap(),
+            str("[true,true]")
+        );
+    }
+
+    #[test]
+    fn async_dispose_resolves_with_the_return_result() {
+        assert_eq!(
+            settle(
+                "(async function () { const it = (async function* () { yield 1; })(); const result = await it[Symbol.asyncDispose](); return result.done === true && 'value' in result; })()"
+            )
+            .unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn async_dispose_without_return_method_resolves_undefined() {
+        assert_eq!(
+            settle(
+                "(async function () { const proto = Object.getPrototypeOf(Object.getPrototypeOf((async function* () {}).prototype)); const it = Object.create(proto); return await it[Symbol.asyncDispose](); })()"
+            )
+            .unwrap(),
+            Value::Undefined
+        );
+    }
+
+    #[test]
+    fn async_dispose_rejects_when_return_rejects() {
+        assert_eq!(
+            settle(
+                "(async function () { const it = (async function* () { try { yield 1; } finally { throw new Error('boom'); } })(); await it.next(); try { await it[Symbol.asyncDispose](); return 'no-throw'; } catch (e) { return 'threw'; } })()"
+            )
+            .unwrap(),
+            str("threw")
+        );
+    }
 }

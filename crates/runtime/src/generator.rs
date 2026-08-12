@@ -392,7 +392,11 @@ fn start_body(
         &state.start_args,
         &function_env,
     )?;
-    let vm = Vm::new(function_env, data.strict);
+    // The VM drives the body's lexical environment (the one
+    // function_declaration_instantiation installed on the running context),
+    // so body-level let/const bindings are reachable.
+    let body_env = agent.running_context()?.lexical_environment.clone();
+    let vm = Vm::new(body_env, data.strict);
     state.body = Some(body.clone());
     state.vm = Some(vm);
     let outcome = state.vm.as_mut().expect("vm set").start(agent, &body)?;
