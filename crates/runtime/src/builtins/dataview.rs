@@ -282,9 +282,7 @@ fn read_element(
         let buffer = agent.buffer_data.get(&buffer_id).ok_or_else(|| {
             JsError::new(ErrorKind::TypeError, "DataView buffer is detached".into())
         })?;
-        let buffer_ref = buffer.borrow();
-        let data = buffer_ref.shared.0.borrow();
-        data[offset..offset + element_type.size()].to_vec()
+        buffer.borrow().shared.read(offset, element_type.size())?
     };
     if little_endian(args) != agent.little_endian {
         bytes.reverse();
@@ -310,9 +308,7 @@ fn write_element(
         .buffer_data
         .get(&buffer_id)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "DataView buffer is detached".into()))?;
-    let buffer_ref = buffer.borrow();
-    let mut data = buffer_ref.shared.0.borrow_mut();
-    data[offset..offset + element_type.size()].copy_from_slice(&bytes);
+    buffer.borrow().shared.write(offset, &bytes)?;
     Ok(Value::Undefined)
 }
 

@@ -28,6 +28,8 @@ pub mod module;
 pub mod promise;
 pub mod realm;
 pub mod script;
+#[cfg(feature = "workers")]
+pub mod workers;
 
 pub use agent::{Agent, evaluate};
 pub use context::{ExecutionContext, Reference, ReferenceBase};

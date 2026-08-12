@@ -4,7 +4,6 @@
 //! plain reads/writes; the agent's `[[CanBlock]]` is false, so `wait` throws
 //! and `waitAsync` never suspends (its promise resolves immediately).
 
-use crux::bigint;
 use crux::convert::{to_big_int64, to_big_uint64, to_index, to_number};
 use crux::error::{ErrorKind, JsError};
 use crux::function::{Function, NativeFn};
@@ -13,8 +12,12 @@ use crux::object::{JsObject, ObjectKind, TypedArraySlots};
 use crux::ops::same_value_zero;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
-use crux::typed_array::{ElementType, decode_element, encode_element};
+use crux::typed_array::{AtomicOp, ElementType, decode_element, encode_element};
 use crux::value::Value;
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::agent::Agent;
 use crate::context::as_object;
@@ -124,18 +127,36 @@ fn atomic_offset(slots: &TypedArraySlots, args: &[Value]) -> Result<usize, JsErr
     Ok(slots.byte_offset + index * slots.element_type.size())
 }
 
-/// Read the element at `offset` (spec 26.4.2 GetValueFromBuffer).
+/// Read the element at `offset` atomically (spec 26.4.2 GetValueFromBuffer
+/// with the atomic read mode).
 fn read_element(slots: &TypedArraySlots, offset: usize) -> Result<Value, JsError> {
-    let data = slots.buffer.0.borrow();
-    decode_element(slots.element_type, &data, offset)
+    let size = slots.element_type.size();
+    let raw = slots.buffer.atomic_load(offset, size)?;
+    raw_element(slots.element_type, raw)
 }
 
-/// Write `value` (already converted to the element type) at `offset`.
+/// Write `value` (already converted to the element type) at `offset`
+/// atomically (spec SetValueInBuffer with the atomic write mode).
 fn write_element(slots: &TypedArraySlots, offset: usize, value: &Value) -> Result<(), JsError> {
-    let bytes = encode_element(slots.element_type, value)?;
-    let mut data = slots.buffer.0.borrow_mut();
-    data[offset..offset + slots.element_type.size()].copy_from_slice(&bytes);
-    Ok(())
+    let size = slots.element_type.size();
+    let raw = element_raw(slots.element_type, value)?;
+    slots.buffer.atomic_store(offset, size, raw)
+}
+
+/// The native-order integer the element's bytes encode (the raw word the
+/// Atomics operations read-modify-write).
+fn element_raw(element_type: ElementType, value: &Value) -> Result<u64, JsError> {
+    let bytes = encode_element(element_type, value)?;
+    let mut buf = [0u8; 8];
+    buf[..bytes.len()].copy_from_slice(&bytes);
+    Ok(u64::from_ne_bytes(buf))
+}
+
+/// The element value stored in the raw word (the inverse of `element_raw`).
+fn raw_element(element_type: ElementType, raw: u64) -> Result<Value, JsError> {
+    let size = element_type.size();
+    let bytes = raw.to_ne_bytes()[..size].to_vec();
+    decode_element(element_type, &bytes, 0)
 }
 
 /// The convert-then-store used by `store` (spec 26.4.11): the element type
@@ -155,41 +176,27 @@ fn converted_value(slots: &TypedArraySlots, value: &Value) -> Result<Value, JsEr
     }
 }
 
-/// The Number-side of a read-modify-write (spec 26.4.3-8): apply `op` to the
-/// current element and the operand, both as Numbers; the wrapped result is
-/// stored by `encode_element`.
-fn number_rmw(
-    slots: &TypedArraySlots,
-    offset: usize,
-    operand: f64,
-    op: impl Fn(f64, f64) -> f64,
-) -> Result<Value, JsError> {
-    let current = to_number(&read_element(slots, offset)?)?;
-    let next = op(current, operand);
-    write_element(slots, offset, &Value::Number(next))?;
-    Ok(Value::Number(current))
-}
-
-/// The BigInt-side of a read-modify-write: the operand converts with
-/// ToBigInt64/ToBigUint64 and the result wraps through the element encode.
-fn bigint_rmw(
+/// The atomic read-modify-write of `op`: convert the operand to the raw
+/// word, perform the RMW, and decode the old value. BigInt and Number
+/// operands both funnel through `element_raw`, which wraps to the element
+/// type (two's complement for the signed kinds).
+fn raw_rmw(
     slots: &TypedArraySlots,
     offset: usize,
     operand: &Value,
-    op: impl Fn(&crux::BigInt, &crux::BigInt) -> crux::BigInt,
+    op: AtomicOp,
+    expected: Option<&Value>,
 ) -> Result<Value, JsError> {
-    let current = read_element(slots, offset)?;
-    let current_big = match &current {
-        Value::BigInt(big) => big.as_ref().clone(),
-        _ => return Err(JsError::new(ErrorKind::TypeError, "BigInt expected".into())),
+    let size = slots.element_type.size();
+    let operand_raw = element_raw(slots.element_type, operand)?;
+    let expected_raw = match expected {
+        Some(value) => Some(element_raw(slots.element_type, value)?),
+        None => None,
     };
-    let operand_big = match slots.element_type {
-        ElementType::BigInt64 => to_big_int64(operand)?,
-        _ => to_big_uint64(operand)?,
-    };
-    let next = op(&current_big, &operand_big);
-    write_element(slots, offset, &Value::BigInt(Handle::new(next)))?;
-    Ok(current)
+    let old = slots
+        .buffer
+        .atomic_rmw(op, offset, size, operand_raw, expected_raw)?;
+    raw_element(slots.element_type, old)
 }
 
 /// Atomics.add/sub/and/or/xor (spec 26.4.3-8): the read-modify-write ops.
@@ -197,19 +204,13 @@ fn binary_op(
     agent: &mut Agent,
     this: &Value,
     args: &[Value],
-    number_op: impl Fn(f64, f64) -> f64,
-    bigint_op: impl Fn(&crux::BigInt, &crux::BigInt) -> crux::BigInt,
+    op: AtomicOp,
 ) -> Result<Value, JsError> {
     let _ = this;
     let slots = validate_shared_typed_array(agent, args, false)?;
     let offset = atomic_offset(&slots, args)?;
     let operand = args.get(2).cloned().unwrap_or(Value::Undefined);
-    match slots.element_type {
-        ElementType::BigInt64 | ElementType::BigUint64 => {
-            bigint_rmw(&slots, offset, &operand, bigint_op)
-        }
-        _ => number_rmw(&slots, offset, to_number(&operand)?, number_op),
-    }
+    raw_rmw(&slots, offset, &operand, op, None)
 }
 
 fn placeholder(name: &'static str) -> NativeFn {
@@ -258,11 +259,8 @@ fn exchange(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
     let _ = this;
     let slots = validate_shared_typed_array(agent, args, false)?;
     let offset = atomic_offset(&slots, args)?;
-    let old = read_element(&slots, offset)?;
     let value = args.get(2).cloned().unwrap_or(Value::Undefined);
-    let converted = converted_value(&slots, &value)?;
-    write_element(&slots, offset, &converted)?;
-    Ok(old)
+    raw_rmw(&slots, offset, &value, AtomicOp::Exchange, None)
 }
 
 /// Atomics.compareExchange (spec 26.4.4): compare the current element to
@@ -273,26 +271,42 @@ fn compare_exchange(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
     let offset = atomic_offset(&slots, args)?;
     let expected = args.get(2).cloned().unwrap_or(Value::Undefined);
     let replacement = args.get(3).cloned().unwrap_or(Value::Undefined);
-    let old = read_element(&slots, offset)?;
-    let expected_value = match slots.element_type {
-        ElementType::BigInt64 | ElementType::BigUint64 => {
-            let big = match slots.element_type {
-                ElementType::BigInt64 => to_big_int64(&expected)?,
-                _ => to_big_uint64(&expected)?,
-            };
-            Value::BigInt(Handle::new(big))
-        }
-        _ => Value::Number(to_number(&expected)?),
-    };
-    if same_value_zero(&old, &expected_value) {
-        let converted = converted_value(&slots, &replacement)?;
-        write_element(&slots, offset, &converted)?;
-    }
-    Ok(old)
+    raw_rmw(
+        &slots,
+        offset,
+        &replacement,
+        AtomicOp::CompareExchange,
+        Some(&expected),
+    )
 }
 
-/// Atomics.notify (spec 26.4.13): wake waiting agents. There are no waiters
-/// (the runtime never suspends), so the count is always 0.
+/// The wait registry: pending `Atomics.wait` suspensions keyed by
+/// (byte-block, byte offset), so `notify` on any agent can wake them.
+struct WaiterEvent {
+    condvar: Condvar,
+    notified: Mutex<bool>,
+}
+
+type WaitQueue = VecDeque<Arc<WaiterEvent>>;
+type WaitRegistry = HashMap<(usize, usize), WaitQueue>;
+
+impl WaiterEvent {
+    fn new() -> Self {
+        WaiterEvent {
+            condvar: Condvar::new(),
+            notified: Mutex::new(false),
+        }
+    }
+}
+
+fn registry() -> &'static Mutex<WaitRegistry> {
+    static WAIT_REGISTRY: OnceLock<Mutex<WaitRegistry>> = OnceLock::new();
+    WAIT_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Atomics.notify (spec 26.4.13): wake up to `count` waiting agents on the
+/// byte offset and return how many were woken. The main agent never blocks,
+/// so on the main thread the count is 0 unless worker agents are waiting.
 fn notify(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let _ = this;
     let slots = validate_shared_typed_array(agent, args, false)?;
@@ -302,31 +316,127 @@ fn notify(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
             "Atomics.notify requires an Int32Array".into(),
         ));
     }
-    atomic_offset(&slots, args)?;
-    Ok(Value::Number(0.0))
+    let offset = atomic_offset(&slots, args)?;
+    let count_arg = args.get(2).cloned().unwrap_or(Value::Undefined);
+    let count =
+        crux::convert::to_integer_or_infinity(crate::context::to_number(agent, &count_arg)?);
+    let count = if count.is_infinite() {
+        usize::MAX
+    } else {
+        count.max(0.0) as usize
+    };
+    let key = (slots.buffer.block_id(), offset);
+    let mut events = Vec::new();
+    {
+        let mut registry = registry()
+            .lock()
+            .map_err(|_| JsError::new(ErrorKind::TypeError, "wait registry poisoned".into()))?;
+        if let Some(queue) = registry.get_mut(&key) {
+            for _ in 0..count {
+                let Some(event) = queue.pop_front() else {
+                    break;
+                };
+                events.push(event);
+            }
+        }
+    }
+    for event in &events {
+        let mut notified = event
+            .notified
+            .lock()
+            .map_err(|_| JsError::new(ErrorKind::TypeError, "wait registry poisoned".into()))?;
+        *notified = true;
+        drop(notified);
+        event.condvar.notify_one();
+    }
+    Ok(Value::Number(events.len() as f64))
 }
 
-/// Atomics.wait (spec 26.4.14): the agent cannot block, so the wait is
-/// rejected before suspending.
+/// The raw expected value of a wait/waitAsync: the Int32/BigInt64 element
+/// encoding of `requested`.
+fn wait_expected_raw(slots: &TypedArraySlots, requested: &Value) -> Result<u64, JsError> {
+    match slots.element_type {
+        ElementType::Int32 => {
+            element_raw(ElementType::Int32, &Value::Number(to_number(requested)?))
+        }
+        _ => element_raw(
+            ElementType::BigInt64,
+            &Value::BigInt(Handle::new(to_big_int64(requested)?)),
+        ),
+    }
+}
+
+/// Atomics.wait (spec 26.4.14): the agent suspends until the value changes,
+/// a notify arrives, or the timeout expires. Agents with [[CanBlock]] false
+/// (the main thread) throw instead of suspending.
 fn wait(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let _ = this;
     let slots = validate_shared_typed_array(agent, args, true)?;
-    atomic_offset(&slots, args)?;
-    match slots.element_type {
-        ElementType::Int32 => {
-            to_number(&args.get(2).cloned().unwrap_or(Value::Undefined))?;
-        }
-        _ => {
-            to_big_int64(&args.get(2).cloned().unwrap_or(Value::Undefined))?;
-        }
-    }
+    let offset = atomic_offset(&slots, args)?;
+    let requested = args.get(2).cloned().unwrap_or(Value::Undefined);
+    let requested_raw = wait_expected_raw(&slots, &requested)?;
     if !agent.can_block {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Atomics.wait cannot be called on the main thread".into(),
         ));
     }
-    Ok(str("timed-out"))
+    let timeout_arg = args.get(3).cloned().unwrap_or(Value::Number(f64::INFINITY));
+    let timeout_ms = crate::context::to_number(agent, &timeout_arg)?;
+    let deadline = if timeout_ms.is_infinite() {
+        None
+    } else {
+        Some(Instant::now() + Duration::from_millis(timeout_ms.max(0.0) as u64))
+    };
+    let size = slots.element_type.size();
+    let key = (slots.buffer.block_id(), offset);
+    let status = loop {
+        let current = slots.buffer.atomic_load(offset, size)?;
+        if current != requested_raw {
+            break "not-equal";
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break "timed-out";
+        }
+        // Register for this suspension; notify may pop the event before we
+        // start waiting, in which case the flag lets us re-check the value.
+        let event = Arc::new(WaiterEvent::new());
+        registry()
+            .lock()
+            .map_err(|_| JsError::new(ErrorKind::TypeError, "wait registry poisoned".into()))?
+            .entry(key)
+            .or_default()
+            .push_back(event.clone());
+        let mut notified = event
+            .notified
+            .lock()
+            .map_err(|_| JsError::new(ErrorKind::TypeError, "wait registry poisoned".into()))?;
+        while !*notified {
+            let remaining = match deadline {
+                Some(deadline) => deadline
+                    .saturating_duration_since(Instant::now())
+                    .max(Duration::from_millis(0)),
+                None => Duration::MAX,
+            };
+            let (guard, _) = event
+                .condvar
+                .wait_timeout(notified, remaining)
+                .map_err(|_| JsError::new(ErrorKind::TypeError, "wait registry poisoned".into()))?;
+            notified = guard;
+            if *notified || deadline.is_some_and(|d| Instant::now() >= d) {
+                break;
+            }
+        }
+        *notified = false;
+        drop(notified);
+        // Remove this suspension's event (already popped by notify, or self).
+        if let Ok(mut registry) = registry().lock()
+            && let Some(queue) = registry.get_mut(&key)
+        {
+            queue.retain(|e| !Arc::ptr_eq(e, &event));
+        }
+    };
+    Ok(str(status))
 }
 
 /// Atomics.waitAsync (spec 26.4.15): non-blocking; returns
@@ -463,37 +573,19 @@ pub fn dispatch_call(
     let realm = agent.current_realm().ok()?;
     let intrinsics = &realm.intrinsics;
     if intrinsics.get(ATOMICS_ADD).as_ref() == Some(callee) {
-        return Some(binary_op(agent, this, args, |a, b| a + b, bigint::add));
+        return Some(binary_op(agent, this, args, AtomicOp::Add));
     }
     if intrinsics.get(ATOMICS_SUB).as_ref() == Some(callee) {
-        return Some(binary_op(agent, this, args, |a, b| a - b, bigint::subtract));
+        return Some(binary_op(agent, this, args, AtomicOp::Sub));
     }
     if intrinsics.get(ATOMICS_AND).as_ref() == Some(callee) {
-        return Some(binary_op(
-            agent,
-            this,
-            args,
-            |a, b| (a as i64 & b as i64) as f64,
-            bigint::bitwise_and,
-        ));
+        return Some(binary_op(agent, this, args, AtomicOp::And));
     }
     if intrinsics.get(ATOMICS_OR).as_ref() == Some(callee) {
-        return Some(binary_op(
-            agent,
-            this,
-            args,
-            |a, b| (a as i64 | b as i64) as f64,
-            bigint::bitwise_or,
-        ));
+        return Some(binary_op(agent, this, args, AtomicOp::Or));
     }
     if intrinsics.get(ATOMICS_XOR).as_ref() == Some(callee) {
-        return Some(binary_op(
-            agent,
-            this,
-            args,
-            |a, b| (a as i64 ^ b as i64) as f64,
-            bigint::bitwise_xor,
-        ));
+        return Some(binary_op(agent, this, args, AtomicOp::Xor));
     }
     if intrinsics.get(ATOMICS_LOAD).as_ref() == Some(callee) {
         return Some(load(agent, this, args));
@@ -523,4 +615,178 @@ pub fn dispatch_call(
         return Some(pause(agent, this, args));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::evaluate;
+
+    fn run(source: &str) -> Result<Value, JsError> {
+        evaluate(source)
+    }
+
+    fn number(value: f64) -> Value {
+        Value::Number(value)
+    }
+
+    #[test]
+    fn atomic_rmw_semantics() {
+        // store returns the converted value; load reads it back.
+        assert_eq!(
+            run("const ta = new Int32Array(new SharedArrayBuffer(16)); Atomics.store(ta, 0, 5); Atomics.load(ta, 0)")
+                .unwrap(),
+            number(5.0)
+        );
+        // The RMW ops return the OLD value.
+        assert_eq!(
+            run("const ta = new Int32Array(new SharedArrayBuffer(16)); Atomics.store(ta, 0, 5); Atomics.add(ta, 0, 3)")
+                .unwrap(),
+            number(5.0)
+        );
+        assert_eq!(
+            run("const ta = new Int32Array(new SharedArrayBuffer(16)); Atomics.store(ta, 0, 5); Atomics.add(ta, 0, 3); Atomics.load(ta, 0)")
+                .unwrap(),
+            number(8.0)
+        );
+        assert_eq!(
+            run("const ta = new Int32Array(new SharedArrayBuffer(16)); Atomics.store(ta, 0, 8); Atomics.sub(ta, 0, 3); Atomics.load(ta, 0)")
+                .unwrap(),
+            number(5.0)
+        );
+        assert_eq!(
+            run("const ta = new Int32Array(new SharedArrayBuffer(16)); Atomics.store(ta, 0, 0xFF); Atomics.and(ta, 0, 0x0F); Atomics.load(ta, 0)")
+                .unwrap(),
+            number(15.0)
+        );
+        assert_eq!(
+            run("const ta = new Int32Array(new SharedArrayBuffer(16)); Atomics.store(ta, 0, 0x0F); Atomics.or(ta, 0, 0xF0); Atomics.load(ta, 0)")
+                .unwrap(),
+            number(255.0)
+        );
+        assert_eq!(
+            run("const ta = new Int32Array(new SharedArrayBuffer(16)); Atomics.store(ta, 0, 0xFF); Atomics.xor(ta, 0, 0x0F); Atomics.load(ta, 0)")
+                .unwrap(),
+            number(240.0)
+        );
+        // exchange stores the new value and returns the old.
+        assert_eq!(
+            run("const ta = new Int32Array(new SharedArrayBuffer(16)); Atomics.store(ta, 0, 5); [Atomics.exchange(ta, 0, 9), Atomics.load(ta, 0)].join(',')")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("5,9")))
+        );
+        // compareExchange replaces only when equal, returning the old value.
+        assert_eq!(
+            run("const ta = new Int32Array(new SharedArrayBuffer(16)); Atomics.store(ta, 0, 5); [Atomics.compareExchange(ta, 0, 5, 9), Atomics.load(ta, 0)].join(',')")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("5,9")))
+        );
+        assert_eq!(
+            run("const ta = new Int32Array(new SharedArrayBuffer(16)); Atomics.store(ta, 0, 5); [Atomics.compareExchange(ta, 0, 6, 9), Atomics.load(ta, 0)].join(',')")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("5,5")))
+        );
+        // Int32 wrapping is two's complement.
+        assert_eq!(
+            run("const ta = new Int32Array(new SharedArrayBuffer(16)); Atomics.store(ta, 0, 2147483647); Atomics.add(ta, 0, 1); Atomics.load(ta, 0)")
+                .unwrap(),
+            number(-2147483648.0)
+        );
+    }
+
+    #[test]
+    fn atomic_rmw_bigint64() {
+        assert_eq!(
+            run("const ta = new BigInt64Array(new SharedArrayBuffer(16)); Atomics.store(ta, 0, 5n); Atomics.add(ta, 0, 3n)")
+                .unwrap(),
+            run("5n").unwrap()
+        );
+        assert_eq!(
+            run("const ta = new BigInt64Array(new SharedArrayBuffer(16)); Atomics.store(ta, 0, 5n); Atomics.add(ta, 0, 3n); Atomics.load(ta, 0)")
+                .unwrap(),
+            run("8n").unwrap()
+        );
+        assert_eq!(
+            run("const ta = new BigInt64Array(new SharedArrayBuffer(16)); Atomics.store(ta, 0, 5n); [Atomics.compareExchange(ta, 0, 5n, 9n), Atomics.load(ta, 0)].join(',')")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("5,9")))
+        );
+    }
+
+    #[test]
+    fn atomics_reject_invalid_receivers() {
+        // A non-shared buffer is rejected.
+        assert!(run("Atomics.load(new Int32Array(4), 0)").is_err());
+        // Float element kinds are rejected.
+        assert!(run("Atomics.add(new Float64Array(new SharedArrayBuffer(16)), 0, 1)").is_err());
+        // wait/waitAsync accept only Int32/BigInt64.
+        assert!(run("Atomics.wait(new Uint8Array(new SharedArrayBuffer(4)), 0, 0)").is_err());
+        assert!(run("Atomics.waitAsync(new Uint8Array(new SharedArrayBuffer(4)), 0, 0)").is_err());
+        // wait on the main thread ([[CanBlock]] false) throws.
+        assert!(run("Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0)").is_err());
+        // notify requires Int32.
+        assert!(run("Atomics.notify(new BigInt64Array(new SharedArrayBuffer(16)), 0)").is_err());
+    }
+
+    #[test]
+    fn wait_async_returns_async_promise() {
+        // { async: true, value: promise } — resolves "ok" when the value
+        // matches the expected, "not-equal" otherwise.
+        assert_eq!(
+            run(
+                "const ta = new Int32Array(new SharedArrayBuffer(4)); Atomics.store(ta, 0, 0); Atomics.waitAsync(ta, 0, 0).async"
+            )
+            .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            settle(
+                "const ta = new Int32Array(new SharedArrayBuffer(4)); Atomics.store(ta, 0, 0); Atomics.waitAsync(ta, 0, 0).value"
+            )
+            .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("ok")))
+        );
+        assert_eq!(
+            settle(
+                "const ta = new Int32Array(new SharedArrayBuffer(4)); Atomics.store(ta, 0, 1); Atomics.waitAsync(ta, 0, 0).value"
+            )
+            .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("not-equal")))
+        );
+    }
+
+    #[test]
+    fn notify_on_main_thread_returns_zero() {
+        assert_eq!(
+            run("Atomics.notify(new Int32Array(new SharedArrayBuffer(4)), 0)").unwrap(),
+            number(0.0)
+        );
+        assert_eq!(
+            run("Atomics.notify(new Int32Array(new SharedArrayBuffer(4)), 0, 5)").unwrap(),
+            number(0.0)
+        );
+    }
+
+    /// Evaluate a script whose final expression is a promise, drain the job
+    /// queue, and return the settled value.
+    fn settle(source: &str) -> Result<Value, JsError> {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm()?;
+        let value = agent.run_script(source)?;
+        agent.run_jobs()?;
+        let Value::Object(obj) = &value else {
+            return Ok(value.clone());
+        };
+        let Some(data) = agent.promises.get(&obj.id()) else {
+            return Ok(value.clone());
+        };
+        match &data.borrow().state {
+            crate::promise::PromiseState::Fulfilled(value) => Ok(value.clone()),
+            crate::promise::PromiseState::Rejected(value) => Ok(value.clone()),
+            _ => Err(JsError::new(
+                ErrorKind::TypeError,
+                "promise not settled".into(),
+            )),
+        }
+    }
 }

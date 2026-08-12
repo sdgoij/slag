@@ -10,3 +10,10 @@ parser = { path = "../parser" }
 regexp = { path = "../regexp" }
 syntax = { path = "../syntax" }
 unicode = { path = "../unicode" }
+
+[features]
+# Experimental multi-agent mode (PLAN Phase 17): workers run as OS threads
+# with their own realms and job queues, sharing SharedArrayBuffer blocks
+# with the main agent; Atomics.wait blocks and notify wakes via a global
+# waiter registry.
+workers = ["crux/workers"]

@@ -11,5 +11,11 @@ num-traits = "0.2"
 ryu = "1"
 half = "2"
 
+[features]
+# Experimental multi-agent mode (PLAN Phase 17): SharedArrayBuffer storage
+# becomes `Arc`-backed and the Atomics operations use real atomic accesses,
+# so byte blocks can be shared across agent threads.
+workers = []
+
 [dev-dependencies]
 proptest = "1"

@@ -549,13 +549,10 @@ fn copy_typed_array(
     let dst = allocate_typed_array_buffer(agent, prototype, element_type, source_length)?;
     if source_slots.element_type == element_type {
         // Same element type: copy the byte range directly.
-        let src_bytes = source_slots.buffer.0.borrow();
         let start = source_slots.byte_offset;
-        let data: Vec<u8> = src_bytes[start..start + source_slots.byte_length].to_vec();
-        drop(src_bytes);
+        let data = source_slots.buffer.read(start, source_slots.byte_length)?;
         let dst_slots = typed_array_slots(&dst).expect("fresh typed array");
-        let mut dst_bytes = dst_slots.buffer.0.borrow_mut();
-        dst_bytes.copy_from_slice(&data);
+        dst_slots.buffer.write(0, &data)?;
     } else {
         for k in 0..source_length {
             let value = get(agent, source, &key(k as u64))?;
@@ -1191,15 +1188,14 @@ fn set(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
             // Same type: byte copy (aliasing is handled by the copy). The
             // destination space is clamped to the live buffer bytes so a
             // resized-shrunk buffer fails cleanly instead of panicking.
-            let src_bytes = source_slots.buffer.0.borrow();
             let start = source_slots.byte_offset;
-            let end = (start + source_slots.byte_length).min(src_bytes.len());
-            let data: Vec<u8> = src_bytes[start..end].to_vec();
-            drop(src_bytes);
-            let mut dst_bytes = target_slots.buffer.0.borrow_mut();
+            let end = (start + source_slots.byte_length).min(source_slots.buffer.byte_length());
+            let data = source_slots.buffer.read(start, end - start)?;
             let dst_start = target_slots.byte_offset + offset * target_slots.element_type.size();
-            let count = data.len().min(dst_bytes.len().saturating_sub(dst_start));
-            dst_bytes[dst_start..dst_start + count].copy_from_slice(&data[..count]);
+            let count = data
+                .len()
+                .min(target_slots.buffer.byte_length().saturating_sub(dst_start));
+            target_slots.buffer.write(dst_start, &data[..count])?;
         } else {
             for k in 0..source_length {
                 let value = get(agent, &source, &key(k as u64))?;
@@ -1598,11 +1594,10 @@ fn validate_uint8(agent: &mut Agent, this: &Value) -> Result<Handle<TypedArraySl
 /// spec 25.2.3.44 Uint8Array.prototype.toHex.
 fn to_hex(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     let slots = validate_uint8(agent, this)?;
-    let buffer = slots.buffer.0.borrow();
     let start = slots.byte_offset;
-    let bytes = &buffer[start..start + slots.byte_length];
+    let bytes = slots.buffer.read(start, slots.byte_length)?;
     let mut out = String::with_capacity(bytes.len() * 2);
-    for &byte in bytes {
+    for &byte in &bytes {
         out.push_str(&format!("{:02x}", byte));
     }
     Ok(Value::String(Handle::new(JsString::from_utf8(&out))))
@@ -1615,9 +1610,8 @@ fn to_base64(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, J
     let alphabet = base64_alphabet_option(agent, &options)?;
     let padding = get(agent, &options, &JsString::from_utf8("omitPadding"))?;
     let omit_padding = to_boolean(&padding);
-    let buffer = slots.buffer.0.borrow();
     let start = slots.byte_offset;
-    let bytes = &buffer[start..start + slots.byte_length];
+    let bytes = slots.buffer.read(start, slots.byte_length)?;
     let mut out = String::new();
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -2007,8 +2001,7 @@ fn write_uint8_bytes(slots: &TypedArraySlots, bytes: &[u8]) -> Result<(), JsErro
             "Decoded bytes exceed the target length".into(),
         ));
     }
-    let mut buffer = slots.buffer.0.borrow_mut();
-    buffer[slots.byte_offset..slots.byte_offset + bytes.len()].copy_from_slice(bytes);
+    slots.buffer.write(slots.byte_offset, bytes)?;
     Ok(())
 }
 

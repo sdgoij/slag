@@ -318,8 +318,10 @@ fn array_buffer_copy_and_detach(
     };
     let bytes = {
         let source = state(agent, source_id).expect("source present");
-        let data = source.shared.0.borrow();
-        data.iter().take(new_length).cloned().collect::<Vec<u8>>()
+        // Copy min(byteLength, newLength) bytes: growth zero-fills the tail
+        // of the fresh buffer (spec 25.1.5.5 ArrayBufferCopyAndDetach).
+        let copy_len = new_length.min(source.byte_length);
+        source.shared.read(0, copy_len)?
     };
     detach_array_buffer(agent, source_id);
     let proto = agent
@@ -345,7 +347,7 @@ fn array_buffer_copy_and_detach(
         .expect("fresh buffer")
         .shared
         .clone();
-    shared.0.borrow_mut()[..bytes.len()].copy_from_slice(&bytes);
+    shared.write(0, &bytes)?;
     Ok(Value::Object(object))
 }
 
@@ -504,7 +506,7 @@ fn resize(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
     }
     if let Some(cell) = agent.buffer_data.get(&object.id()) {
         let mut state = cell.borrow_mut();
-        state.shared.0.borrow_mut().resize(new_length, 0);
+        state.shared.resize(new_length)?;
         state.byte_length = new_length;
     }
     Ok(Value::Undefined)
@@ -568,14 +570,13 @@ fn slice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
     }
     let bytes = {
         let source = state(agent, object.id()).expect("source present");
-        let data = source.shared.0.borrow();
-        data[start as usize..(start as usize + new_len)].to_vec()
+        source.shared.read(start as usize, new_len)?
     };
     let target = state(agent, new_object.id())
         .expect("fresh buffer")
         .shared
         .clone();
-    target.0.borrow_mut()[..new_len].copy_from_slice(&bytes);
+    target.write(0, &bytes)?;
     Ok(new)
 }
 
@@ -632,6 +633,41 @@ fn shared_array_buffer_construct(
     let prototype = get_prototype_from_constructor(agent, new_target, SHARED_ARRAY_BUFFER_PROTO)?;
     let object = JsObject::ordinary_object_create(Some(prototype));
     allocate_shared_array_buffer(agent, &object, byte_length, is_growable, requested_max)?;
+    Ok(Value::Object(object))
+}
+
+/// Wrap an existing shared byte block as a SharedArrayBuffer object in this
+/// agent (used by the worker machinery to hand a block shared with another
+/// agent to a fresh realm; spec 25.3.2.1 with a supplied [[ArrayBufferData]]).
+pub fn shared_array_buffer_from_block(
+    agent: &mut Agent,
+    shared: SharedBuffer,
+    byte_length: usize,
+) -> Result<Value, JsError> {
+    let prototype = agent
+        .current_realm()?
+        .intrinsics
+        .get(SHARED_ARRAY_BUFFER_PROTO)
+        .and_then(|value| as_object(&value))
+        .ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                "%SharedArrayBuffer.prototype% missing".into(),
+            )
+        })?;
+    let object = JsObject::ordinary_object_create(Some(prototype));
+    agent.buffer_data.insert(
+        object.id(),
+        std::cell::RefCell::new(BufferState {
+            shared,
+            byte_length,
+            max_byte_length: None,
+            resizable: false,
+            growable: false,
+            is_shared: true,
+            detached: false,
+        }),
+    );
     Ok(Value::Object(object))
 }
 
@@ -727,7 +763,7 @@ fn sab_grow(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
     }
     if let Some(cell) = agent.buffer_data.get(&object.id()) {
         let mut state = cell.borrow_mut();
-        state.shared.0.borrow_mut().resize(new_length, 0);
+        state.shared.resize(new_length)?;
         state.byte_length = new_length;
     }
     Ok(Value::Undefined)
@@ -777,14 +813,13 @@ fn sab_slice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, J
     }
     let bytes = {
         let source = state(agent, object.id()).expect("source present");
-        let data = source.shared.0.borrow();
-        data[start as usize..(start as usize + new_len)].to_vec()
+        source.shared.read(start as usize, new_len)?
     };
     let target = state(agent, new_object.id())
         .expect("fresh buffer")
         .shared
         .clone();
-    target.0.borrow_mut()[..new_len].copy_from_slice(&bytes);
+    target.write(0, &bytes)?;
     Ok(new)
 }
 

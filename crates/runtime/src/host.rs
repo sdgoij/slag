@@ -41,6 +41,21 @@ pub trait HostHooks: std::fmt::Debug {
     ) -> Result<(), JsError> {
         Ok(())
     }
+
+    /// HostCreateWorker (spec 9.4.5): start a worker agent running `source`
+    /// with access to `shared` byte blocks. The default is unsupported; hosts
+    /// attach an implementation (the runtime's is `crate::workers::spawn_worker`,
+    /// behind the `workers` feature).
+    fn create_worker(
+        &self,
+        _source: &str,
+        _shared: &[crux::typed_array::SharedBuffer],
+    ) -> Result<(), JsError> {
+        Err(JsError::new(
+            crux::ErrorKind::TypeError,
+            "HostCreateWorker is not implemented by this host".into(),
+        ))
+    }
 }
 
 /// HostPromiseRejectionTracker dispatch: the agent's hooks if present, else

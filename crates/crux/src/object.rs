@@ -1712,11 +1712,10 @@ fn typed_array_valid_index(slots: &TypedArraySlots, index: f64) -> bool {
 fn element_bytes(slots: &TypedArraySlots, index: f64) -> Result<Vec<u8>, JsError> {
     let index = index as usize;
     let offset = slots.byte_offset + index * slots.element_type.size();
-    let buffer = slots.buffer.0.borrow();
-    buffer
-        .get(offset..offset + slots.element_type.size())
-        .map(<[u8]>::to_vec)
-        .ok_or_else(|| {
+    slots
+        .buffer
+        .read(offset, slots.element_type.size())
+        .map_err(|_| {
             JsError::new(
                 ErrorKind::TypeError,
                 "TypedArray element access out of bounds".into(),
@@ -1780,15 +1779,12 @@ fn typed_array_define_own_property(
 /// Write `bytes` to the buffer at element `index`.
 fn write_element_bytes(slots: &TypedArraySlots, index: f64, bytes: &[u8]) -> Result<(), JsError> {
     let offset = slots.byte_offset + index as usize * slots.element_type.size();
-    let mut buffer = slots.buffer.0.borrow_mut();
-    let Some(slot) = buffer.get_mut(offset..offset + bytes.len()) else {
-        return Err(JsError::new(
+    slots.buffer.write(offset, bytes).map_err(|_| {
+        JsError::new(
             ErrorKind::TypeError,
             "TypedArray element write out of bounds".into(),
-        ));
-    };
-    slot.copy_from_slice(bytes);
-    Ok(())
+        )
+    })
 }
 
 /// TypedArray [[Get]] (spec 10.4.5.7): an in-bounds element read from the
