@@ -197,23 +197,40 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
 
     // The six native error constructors plus AggregateError/SuppressedError:
-    // each prototype inherits %Error.prototype% and overrides `name`.
+    // each prototype inherits %Error.prototype% and overrides `name`, and
+    // each constructor inherits the %Error% constructor (spec 20.5.6).
+    let error_ctor_object = as_object(&error_ctor_value)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "%Error% is not an object".into()))?;
     for (key, name, aggregate, suppressed) in ERROR_CTORS {
         if *key == ERROR {
             continue;
         }
+        // spec 20.5.1: Error.length is 1, AggregateError.length is 2,
+        // SuppressedError.length is 3.
+        let length = if *aggregate {
+            2
+        } else if *suppressed {
+            3
+        } else {
+            1
+        };
         let ctor = Function::create_builtin(
             Some(JsString::from_utf8(name)),
-            1,
+            length,
             Box::new(placeholder(name)),
             Some(Box::new(placeholder(name))),
             None,
         )?;
         let ctor_value = Value::Function(ctor.clone());
+        ctor.object
+            .set_prototype_of(Some(error_ctor_object.clone()))?;
         realm.intrinsics.define(key, ctor_value.clone());
 
         let proto = JsObject::ordinary_object_create(Some(error_proto.clone()));
         let proto_value = Value::Object(proto.clone());
+        realm
+            .intrinsics
+            .define(&format!("%{name}.prototype%"), proto_value.clone());
         ctor.define_property(
             &JsString::from_utf8("prototype"),
             &PropertyDescriptor {
@@ -355,7 +372,7 @@ fn error_construct(
     aggregate: bool,
     suppressed: bool,
 ) -> Result<Value, JsError> {
-    let proto = instance_proto(agent, &new_target)?;
+    let proto = instance_proto(agent, &new_target, &format!("%{name}.prototype%"))?;
     let object = JsObject::ordinary_object_create(proto);
     agent.error_data.insert(object.id());
 
@@ -382,10 +399,13 @@ fn error_construct(
     Ok(Value::Object(object))
 }
 
-/// GetPrototypeFromConstructor (spec 10.1.14): `newTarget.prototype`.
+/// GetPrototypeFromConstructor (spec 10.1.14): `newTarget.prototype`, with
+/// the constructor's own intrinsic default prototype as the fallback when
+/// it is not an object.
 fn instance_proto(
     agent: &mut Agent,
     new_target: &Value,
+    default_proto_key: &str,
 ) -> Result<Option<Handle<JsObject>>, JsError> {
     let proto = crate::context::get_property(
         agent,
@@ -393,12 +413,16 @@ fn instance_proto(
         &JsString::from_utf8("prototype"),
         new_target.clone(),
     )?;
-    as_object(&proto).map(Some).ok_or_else(|| {
-        JsError::new(
-            ErrorKind::TypeError,
-            "Prototype must be an object or null".into(),
-        )
-    })
+    if let Some(object) = as_object(&proto) {
+        return Ok(Some(object));
+    }
+    // spec 10.1.14 steps 3-4: a non-object `prototype` falls back to the
+    // constructor's intrinsic default prototype.
+    Ok(agent
+        .current_realm()?
+        .intrinsics
+        .get(default_proto_key)
+        .and_then(|value| as_object(&value)))
 }
 
 fn define_message(object: &JsObject, message: Option<&Value>) -> Result<(), JsError> {
@@ -424,7 +448,7 @@ fn define_message(object: &JsObject, message: Option<&Value>) -> Result<(), JsEr
 }
 
 /// InstallErrorCause (spec 20.5.9.1): `options.cause` when options is an
-/// object and the property is present.
+/// object and the property is present (even when its value is undefined).
 fn install_cause(
     agent: &mut Agent,
     object: &JsObject,
@@ -433,7 +457,10 @@ fn install_cause(
     let Some(options) = options else {
         return Ok(());
     };
-    if !matches!(options, Value::Object(_)) {
+    let Some(options_object) = as_object(options) else {
+        return Ok(());
+    };
+    if !options_object.has_property(&JsString::from_utf8("cause"))? {
         return Ok(());
     }
     let cause = crate::context::get_property(
@@ -442,9 +469,6 @@ fn install_cause(
         &JsString::from_utf8("cause"),
         options.clone(),
     )?;
-    if matches!(cause, Value::Undefined) {
-        return Ok(());
-    }
     object.define_property(
         &JsString::from_utf8("cause"),
         &PropertyDescriptor {
@@ -507,14 +531,40 @@ fn define_stack(
     Ok(())
 }
 
-/// CreateListFromArrayLike (spec 7.3.19): copy the indexed elements of an
-/// array-like into a fresh Array.
+/// IterableToList for the AggregateError `errors` argument (spec 20.5.7.1):
+/// iterate when the value has @@iterator, otherwise fall back to the
+/// array-like copy.
 fn list_to_array(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
     if !matches!(value, Value::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "AggregateError requires an array-like errors argument".into(),
         ));
+    }
+    if let Some(method) = crate::expr::get_method(agent, value, "@@iterator")? {
+        let iterator = crate::function::call(agent, &method, value.clone(), &[])?;
+        let next = crate::context::get_property(
+            agent,
+            &iterator,
+            &JsString::from_utf8("next"),
+            iterator.clone(),
+        )?;
+        if !crux::value::is_callable(&next) {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "Iterator's next method is not callable".into(),
+            ));
+        }
+        let record = crate::expr::IteratorRecord { iterator, next };
+        let mut values = Vec::new();
+        while let Some(item) = crate::expr::iterator_step(agent, &record)? {
+            values.push(item);
+        }
+        let array = crate::builtins::array::array_create(agent, values.len() as f64)?;
+        for (index, item) in values.into_iter().enumerate() {
+            array.create_data_property(&JsString::from_utf8(&index.to_string()), item)?;
+        }
+        return Ok(Value::Object(array));
     }
     let length_value =
         crate::context::get_property(agent, value, &JsString::from_utf8("length"), value.clone())?;

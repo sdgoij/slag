@@ -123,6 +123,23 @@ and the length is set after the iteration for the iterable path, the mapfn
 receives « kValue, k », and an abrupt mapfn or define completion closes the
 iterator (`IteratorClose`) before propagating.
 
+### AggregateError cluster sweep (Phase 18 conformance)
+
+A sweep of `AggregateError*` reports **23 pass, 0 fail, 2 skip** of 25
+fixtures (the 2 skips are `$262.createRealm` and the `promiseHelper.js`
+include). Fixes in `crates/runtime/src/builtins/error.rs`:
+
+- The `errors` argument is `IterableToList`-ed: it iterates when the value
+  has `@@iterator` and falls back to the array-like copy.
+- The error constructors now inherit `%Error%` and carry their spec lengths
+  (`AggregateError.length` is 2, `SuppressedError.length` is 3); their
+  prototypes are registered as intrinsics.
+- `GetPrototypeFromConstructor` falls back to the constructor's own
+  intrinsic default prototype instead of throwing on a non-object
+  `newTarget.prototype`.
+- `InstallErrorCause` creates `cause` when the option is present even if its
+  value is `undefined` (a `HasProperty` check, not a value check).
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~120 edge-case unit tests were added across
