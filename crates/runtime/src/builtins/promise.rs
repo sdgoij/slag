@@ -139,8 +139,8 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         promise_ctor.object.set_prototype_of(Some(function_proto))?;
     }
 
-    install_methods(&promise_proto)?;
-    install_statics(&promise_ctor)?;
+    install_methods(realm, &promise_proto)?;
+    install_statics(realm, &promise_ctor)?;
 
     // %Promise.prototype%[@@toStringTag] = "Promise" (spec 27.2.5.5) and
     // %Promise%[@@species] (spec 27.2.4.6).
@@ -167,7 +167,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     Ok(())
 }
 
-fn install_methods(proto: &Handle<JsObject>) -> Result<(), JsError> {
+fn install_methods(realm: &Handle<Realm>, proto: &Handle<JsObject>) -> Result<(), JsError> {
     for (name, length) in [(THEN, 2), (CATCH, 1), (FINALLY, 1)] {
         let method = Function::create_builtin(
             Some(JsString::from_utf8(name)),
@@ -176,6 +176,10 @@ fn install_methods(proto: &Handle<JsObject>) -> Result<(), JsError> {
             None,
             None,
         )?;
+        realm.intrinsics.define(
+            &format!("%Promise.prototype.{name}%"),
+            Value::Function(method.clone()),
+        );
         proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -191,7 +195,7 @@ fn install_methods(proto: &Handle<JsObject>) -> Result<(), JsError> {
     Ok(())
 }
 
-fn install_statics(ctor: &Handle<Function>) -> Result<(), JsError> {
+fn install_statics(realm: &Handle<Realm>, ctor: &Handle<Function>) -> Result<(), JsError> {
     for (name, length) in [
         (RESOLVE, 1),
         (REJECT, 1),
@@ -209,6 +213,10 @@ fn install_statics(ctor: &Handle<Function>) -> Result<(), JsError> {
             None,
             None,
         )?;
+        realm.intrinsics.define(
+            &format!("%Promise.{name}%"),
+            Value::Function(method.clone()),
+        );
         ctor.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -255,46 +263,47 @@ pub fn dispatch_call(
     }
     let realm = agent.current_realm().ok()?;
     let intrinsics = &realm.intrinsics;
-    let proto_value = intrinsics.get(PROMISE_PROTO)?;
-    let Value::Object(proto_obj) = &proto_value else {
-        return None;
-    };
-    for (name, handler) in [
-        (
-            THEN,
-            promise_then as fn(&mut Agent, &Value, &[Value]) -> Result<Value, JsError>,
-        ),
-        (CATCH, promise_catch),
-        (FINALLY, promise_finally_method),
-    ] {
-        let Ok(method) = proto_obj.get(&JsString::from_utf8(name)) else {
-            continue;
-        };
-        if method == *callee {
+    // Dispatch by stored intrinsic identity (the %eval% pattern): comparing
+    // against the registered functions avoids re-reading properties, which
+    // could be user-modified accessors (e.g. `Promise.resolve` getters).
+    for name in [THEN, CATCH, FINALLY] {
+        let key = format!("%Promise.prototype.{name}%");
+        if intrinsics.get(&key).as_ref() == Some(callee) {
+            let handler = match name {
+                THEN => promise_then as fn(&mut Agent, &Value, &[Value]) -> Result<Value, JsError>,
+                CATCH => promise_catch,
+                FINALLY => promise_finally_method,
+                _ => unreachable!(),
+            };
             return Some(handler(agent, this, args));
         }
     }
-    let ctor_value = intrinsics.get(PROMISE)?;
-    let Value::Function(ctor) = &ctor_value else {
-        return None;
-    };
-    for (name, handler) in [
-        (
-            RESOLVE,
-            promise_static_resolve as fn(&mut Agent, &Value, &[Value]) -> Result<Value, JsError>,
-        ),
-        (REJECT, promise_static_reject),
-        (ALL, promise_all),
-        (ALL_SETTLED, promise_all_settled),
-        (ANY, promise_any),
-        (RACE, promise_race),
-        (WITH_RESOLVERS, promise_with_resolvers),
-        (TRY, promise_try),
+    for name in [
+        RESOLVE,
+        REJECT,
+        ALL,
+        ALL_SETTLED,
+        ANY,
+        RACE,
+        WITH_RESOLVERS,
+        TRY,
     ] {
-        let Ok(method) = ctor.get(&JsString::from_utf8(name)) else {
-            continue;
-        };
-        if method == *callee {
+        let key = format!("%Promise.{name}%");
+        if intrinsics.get(&key).as_ref() == Some(callee) {
+            let handler = match name {
+                RESOLVE => {
+                    promise_static_resolve
+                        as fn(&mut Agent, &Value, &[Value]) -> Result<Value, JsError>
+                }
+                REJECT => promise_static_reject,
+                ALL => promise_all,
+                ALL_SETTLED => promise_all_settled,
+                ANY => promise_any,
+                RACE => promise_race,
+                WITH_RESOLVERS => promise_with_resolvers,
+                TRY => promise_try,
+                _ => unreachable!(),
+            };
             return Some(handler(agent, this, args));
         }
     }
@@ -529,22 +538,34 @@ fn dispatch_finally(
     crate::function::call(agent, &then, promise, &[Value::Function(thunk)])
 }
 
-/// Promise.resolve (spec 27.2.4.5).
+/// Promise.resolve (spec 27.2.4.5): `this` (C) must be an object.
 fn promise_static_resolve(
     agent: &mut Agent,
     this: &Value,
     args: &[Value],
 ) -> Result<Value, JsError> {
+    if !matches!(this, Value::Object(_) | Value::Function(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Promise.resolve requires this to be an object".into(),
+        ));
+    }
     let x = args.first().cloned().unwrap_or(Value::Undefined);
     promise_resolve(agent, this, x)
 }
 
-/// Promise.reject (spec 27.2.4.4).
+/// Promise.reject (spec 27.2.4.4): `this` (C) must be an object.
 fn promise_static_reject(
     agent: &mut Agent,
     this: &Value,
     args: &[Value],
 ) -> Result<Value, JsError> {
+    if !matches!(this, Value::Object(_) | Value::Function(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Promise.reject requires this to be an object".into(),
+        ));
+    }
     let capability = new_promise_capability(agent, this)?;
     let reason = args.first().cloned().unwrap_or(Value::Undefined);
     crate::function::call(agent, &capability.reject, Value::Undefined, &[reason])?;

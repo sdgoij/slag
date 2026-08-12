@@ -10114,6 +10114,131 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
         AsyncDisposableStack_undefined_newtarget_throws,
         "AsyncDisposableStack/undefined-newtarget-throws.js"
     );
+    test262_builtin_fixture!(Proxy_constructor, "Proxy/constructor.js");
+    test262_builtin_fixture!(
+        Proxy_create_target_not_object_throw_undefined,
+        "Proxy/create-target-not-object-throw-undefined.js"
+    );
+    test262_builtin_fixture!(
+        Proxy_create_handler_not_object_throw_undefined,
+        "Proxy/create-handler-not-object-throw-undefined.js"
+    );
+    test262_builtin_fixture!(
+        Proxy_create_target_is_not_callable,
+        "Proxy/create-target-is-not-callable.js"
+    );
+    test262_builtin_fixture!(Proxy_function_prototype, "Proxy/function-prototype.js");
+    test262_builtin_fixture!(Proxy_revocable_builtin, "Proxy/revocable/builtin.js");
+    test262_builtin_fixture!(Proxy_revocable_proxy, "Proxy/revocable/proxy.js");
+    test262_builtin_fixture!(Proxy_revocable_revoke, "Proxy/revocable/revoke.js");
+    test262_builtin_fixture!(
+        Proxy_revocable_revoke_consecutive_call_returns_undefined,
+        "Proxy/revocable/revoke-consecutive-call-returns-undefined.js"
+    );
+    test262_builtin_fixture!(
+        Proxy_revocable_revoke_returns_undefined,
+        "Proxy/revocable/revoke-returns-undefined.js"
+    );
+    test262_builtin_fixture!(
+        Proxy_revocable_revocation_function_length,
+        "Proxy/revocable/revocation-function-length.js"
+    );
+    test262_builtin_fixture!(
+        Proxy_revocable_revocation_function_name,
+        "Proxy/revocable/revocation-function-name.js"
+    );
+    test262_builtin_fixture!(Proxy_get_call_parameters, "Proxy/get/call-parameters.js");
+    test262_builtin_fixture!(Proxy_get_null_handler, "Proxy/get/null-handler.js");
+    test262_builtin_fixture!(
+        Proxy_get_not_same_value_configurable_false_writable_false_throws,
+        "Proxy/get/not-same-value-configurable-false-writable-false-throws.js"
+    );
+    test262_builtin_fixture!(
+        Proxy_get_return_trap_result,
+        "Proxy/get/return-trap-result.js"
+    );
+    test262_builtin_fixture!(Proxy_get_return_is_abrupt, "Proxy/get/return-is-abrupt.js");
+    test262_builtin_fixture!(Proxy_has_call_in, "Proxy/has/call-in.js");
+    test262_builtin_fixture!(Proxy_set_call_parameters, "Proxy/set/call-parameters.js");
+    test262_builtin_fixture!(
+        Proxy_ownKeys_extensible_return_trap_result,
+        "Proxy/ownKeys/extensible-return-trap-result.js"
+    );
+    test262_builtin_fixture!(
+        Proxy_apply_call_parameters,
+        "Proxy/apply/call-parameters.js"
+    );
+    test262_builtin_fixture!(
+        Proxy_construct_call_parameters_new_target,
+        "Proxy/construct/call-parameters-new-target.js"
+    );
+    test262_builtin_fixture!(Reflect_prop_desc, "Reflect/prop-desc.js");
+    test262_builtin_fixture!(Reflect_apply_apply, "Reflect/apply/apply.js");
+    test262_builtin_fixture!(Reflect_apply_call_target, "Reflect/apply/call-target.js");
+    test262_builtin_fixture!(
+        Reflect_apply_target_is_not_callable_throws,
+        "Reflect/apply/target-is-not-callable-throws.js"
+    );
+    test262_builtin_fixture!(
+        Reflect_construct_return_with_newtarget_argument,
+        "Reflect/construct/return-with-newtarget-argument.js"
+    );
+    test262_builtin_fixture!(
+        Reflect_construct_return_without_newtarget_argument,
+        "Reflect/construct/return-without-newtarget-argument.js"
+    );
+    test262_builtin_fixture!(
+        Reflect_construct_newtarget_is_not_constructor_throws,
+        "Reflect/construct/newtarget-is-not-constructor-throws.js"
+    );
+    test262_builtin_fixture!(
+        Reflect_defineProperty_defineProperty,
+        "Reflect/defineProperty/defineProperty.js"
+    );
+    test262_builtin_fixture!(
+        Reflect_deleteProperty_deleteProperty,
+        "Reflect/deleteProperty/deleteProperty.js"
+    );
+    test262_builtin_fixture!(Reflect_get_get, "Reflect/get/get.js");
+    test262_builtin_fixture!(Reflect_get_return_value, "Reflect/get/return-value.js");
+    test262_builtin_fixture!(
+        Reflect_get_return_value_from_receiver,
+        "Reflect/get/return-value-from-receiver.js"
+    );
+    test262_builtin_fixture!(
+        Reflect_getOwnPropertyDescriptor_return_from_data_descriptor,
+        "Reflect/getOwnPropertyDescriptor/return-from-data-descriptor.js"
+    );
+    test262_builtin_fixture!(
+        Reflect_getPrototypeOf_getPrototypeOf,
+        "Reflect/getPrototypeOf/getPrototypeOf.js"
+    );
+    test262_builtin_fixture!(Reflect_has_has, "Reflect/has/has.js");
+    test262_builtin_fixture!(Reflect_has_return_boolean, "Reflect/has/return-boolean.js");
+    test262_builtin_fixture!(
+        Reflect_isExtensible_isExtensible,
+        "Reflect/isExtensible/isExtensible.js"
+    );
+    test262_builtin_fixture!(
+        Reflect_ownKeys_return_empty_array,
+        "Reflect/ownKeys/return-empty-array.js"
+    );
+    test262_builtin_fixture!(
+        Reflect_ownKeys_return_on_corresponding_order,
+        "Reflect/ownKeys/return-on-corresponding-order.js"
+    );
+    test262_builtin_fixture!(
+        Reflect_preventExtensions_preventExtensions,
+        "Reflect/preventExtensions/preventExtensions.js"
+    );
+    test262_builtin_fixture!(
+        Reflect_set_creates_a_data_descriptor,
+        "Reflect/set/creates-a-data-descriptor.js"
+    );
+    test262_builtin_fixture!(
+        Reflect_setPrototypeOf_proto_is_not_object_and_not_null_throws,
+        "Reflect/setPrototypeOf/proto-is-not-object-and-not-null-throws.js"
+    );
     test262_builtin_fixture!(Promise_all_ctx_non_ctor, "Promise/all/ctx-non-ctor.js");
     test262_builtin_fixture!(Promise_all_ctx_non_object, "Promise/all/ctx-non-object.js");
     test262_builtin_fixture!(

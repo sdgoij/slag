@@ -27,6 +27,34 @@ use crate::script::{
     top_level_lexically_scoped_declarations, top_level_var_scoped_declarations,
 };
 
+/// The crux-side hook that runs ECMAScript function bodies: re-enter the
+/// agent's call/construct path with the recorded current agent.
+fn crux_ecma_executor(
+    agent: *mut (),
+    callee: &Value,
+    this: Value,
+    args: &[Value],
+    new_target: Option<&Value>,
+) -> Result<Value, JsError> {
+    // SAFETY: crux invokes this only while `crux::function::with_agent` has
+    // recorded a live `&mut Agent` (see `call`/`construct` above).
+    let agent = unsafe { &mut *(agent as *mut Agent) };
+    match new_target {
+        Some(new_target) => construct(agent, callee, args, new_target),
+        None => call(agent, callee, this, args),
+    }
+}
+
+static INSTALL_ECMA_HOOK: std::sync::Once = std::sync::Once::new();
+
+/// Install the crux ECMAScript executor once per process; `Agent::new` calls
+/// this so proxy traps and object coercion can run user-function bodies.
+pub fn ensure_ecma_hook() {
+    INSTALL_ECMA_HOOK.call_once(|| {
+        crux::function::install_ecma_hook(crux_ecma_executor);
+    });
+}
+
 /// [[ThisMode]] (spec 10.2.1): how the function binds `this`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ThisMode {
@@ -655,8 +683,20 @@ pub fn instantiate_arrow(
 
 /// Call (spec 10.2.1): dispatch an ECMAScript function through its body, and
 /// everything else through `crux::function::call`. Bound chains are unwrapped
-/// here so they can reach user-function targets.
+/// here so they can reach user-function targets. The agent is recorded for
+/// the duration so crux-side ECMAScript calls (proxy traps) can reach us.
 pub fn call(
+    agent: &mut Agent,
+    callee: &Value,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    crux::function::with_agent(agent as *mut Agent as *mut (), || {
+        call_inner(agent, callee, this, args)
+    })
+}
+
+fn call_inner(
     agent: &mut Agent,
     callee: &Value,
     this: Value,
@@ -853,6 +893,16 @@ pub fn call(
                 {
                     return result;
                 }
+                if let Some(result) =
+                    crate::builtins::proxy::dispatch_call(agent, callee, &this, args)
+                {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::builtins::reflect::dispatch_call(agent, callee, &this, args)
+                {
+                    return result;
+                }
                 if let Some(result) = crate::module::dispatch_import_resolver(agent, callee, args) {
                     return result;
                 }
@@ -864,8 +914,20 @@ pub fn call(
 }
 
 /// Construct (spec 10.2.1): like `call` for the `new` operator, with
-/// newTarget propagation through bound functions.
+/// newTarget propagation through bound functions. The agent is recorded for
+/// the duration so crux-side ECMAScript constructs (proxy traps) reach us.
 pub fn construct(
+    agent: &mut Agent,
+    callee: &Value,
+    args: &[Value],
+    new_target: &Value,
+) -> Result<Value, JsError> {
+    crux::function::with_agent(agent as *mut Agent as *mut (), || {
+        construct_inner(agent, callee, args, new_target)
+    })
+}
+
+fn construct_inner(
     agent: &mut Agent,
     callee: &Value,
     args: &[Value],
@@ -1000,6 +1062,11 @@ pub fn construct(
                 }
                 if let Some(result) =
                     crate::builtins::disposable::dispatch_construct(agent, callee, args, new_target)
+                {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::builtins::proxy::dispatch_construct(agent, callee, args, new_target)
                 {
                     return result;
                 }

@@ -246,6 +246,7 @@ pub struct Agent {
 
 impl Agent {
     pub fn new() -> Self {
+        crate::function::ensure_ecma_hook();
         Self {
             execution_context_stack: Vec::new(),
             promise_jobs: VecDeque::new(),
@@ -406,6 +407,10 @@ impl Agent {
     /// RunJobs: drain the job queues — promise jobs first (FIFO), then due
     /// timeouts, then generic jobs — until nothing runnable remains.
     pub fn run_jobs(&mut self) -> Result<(), JsError> {
+        crux::function::with_agent(self as *mut Agent as *mut (), || self.run_jobs_inner())
+    }
+
+    fn run_jobs_inner(&mut self) -> Result<(), JsError> {
         loop {
             if let Some(job) = self.promise_jobs.pop_front() {
                 self.run_job(job)?;
@@ -443,9 +448,11 @@ impl Agent {
     /// Parse and evaluate a Script (spec 16.1.4-16.1.6) in the current
     /// realm, returning the script's completion value.
     pub fn run_script(&mut self, source: &str) -> Result<Value, JsError> {
-        let realm = self.current_realm()?;
-        let script = crate::script::parse_script(source, realm)?;
-        crate::script::script_evaluation(self, &script)
+        crux::function::with_agent(self as *mut Agent as *mut (), || {
+            let realm = self.current_realm()?;
+            let script = crate::script::parse_script(source, realm)?;
+            crate::script::script_evaluation(self, &script)
+        })
     }
 }
 

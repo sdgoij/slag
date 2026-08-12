@@ -508,6 +508,18 @@ impl Vm {
     }
 
     fn run_inner(&mut self, agent: &mut Agent, body: &CompiledBody) -> Result<VmOutcome, JsError> {
+        // Record the agent for the duration so crux-side ECMAScript calls
+        // (proxy traps reached through property access) can find the runtime.
+        crux::function::with_agent(agent as *mut Agent as *mut (), || {
+            self.run_inner_inner(agent, body)
+        })
+    }
+
+    fn run_inner_inner(
+        &mut self,
+        agent: &mut Agent,
+        body: &CompiledBody,
+    ) -> Result<VmOutcome, JsError> {
         loop {
             let steps = &body.steps;
             if self.ip >= steps.len() {

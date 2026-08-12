@@ -25,6 +25,60 @@ use crate::value::{Value, is_callable, is_constructor};
 
 static NEXT_FUNCTION_ID: AtomicU64 = AtomicU64::new(1);
 
+/// The runtime's executor for ECMAScript function bodies. The bodies live in
+/// the runtime's agent, so `call`/`construct` on `FunctionKind::EcmaScript`
+/// route through this hook when the runtime has installed it; `agent` is the
+/// pointer recorded by [`with_agent`]. `new_target` is `Some` for `construct`.
+type EcmaHook = fn(
+    agent: *mut (),
+    callee: &Value,
+    this: Value,
+    args: &[Value],
+    new_target: Option<&Value>,
+) -> Result<Value, JsError>;
+
+thread_local! {
+    static CURRENT_AGENT: RefCell<*mut ()> = const { RefCell::new(std::ptr::null_mut()) };
+}
+
+/// The ECMAScript executor is a plain function pointer: process-global.
+static ECMA_HOOK: std::sync::OnceLock<EcmaHook> = std::sync::OnceLock::new();
+
+/// Install the ECMAScript executor (the runtime calls this once at startup).
+pub fn install_ecma_hook(hook: EcmaHook) {
+    let _ = ECMA_HOOK.set(hook);
+}
+
+/// Run `body` with `agent` recorded as the current agent. Crux code that
+/// invokes an ECMAScript function (proxy traps, object coercion) consults the
+/// recorded pointer inside this window; `agent` must stay alive for the whole
+/// of `body`, which is synchronous.
+pub fn with_agent<T>(agent: *mut (), body: impl FnOnce() -> T) -> T {
+    let previous = CURRENT_AGENT.with(|slot| slot.replace(agent));
+    let result = body();
+    CURRENT_AGENT.with(|slot| slot.replace(previous));
+    result
+}
+
+/// Run an ECMAScript function through the runtime's executor, or report the
+/// Phase-6 stub error when no executor is installed.
+fn ecma_call(
+    callee: &Value,
+    this: Value,
+    args: &[Value],
+    new_target: Option<&Value>,
+) -> Result<Value, JsError> {
+    let agent = CURRENT_AGENT.with(|slot| *slot.borrow());
+    let hook = ECMA_HOOK.get().copied();
+    match hook {
+        Some(hook) if !agent.is_null() => hook(agent, callee, this, args, new_target),
+        _ => Err(JsError::new(
+            ErrorKind::TypeError,
+            "ECMAScript function bodies require the runtime".into(),
+        )),
+    }
+}
+
 /// A native function body: `(this, args) -> result`. Host-provided closures
 /// implement built-in methods; the Phase 7 evaluator bridges them.
 pub type NativeFn = Box<dyn Fn(&Value, &[Value]) -> Result<Value, JsError>>;
@@ -303,10 +357,7 @@ pub fn call(callee: &Value, this: Value, args: &[Value]) -> Result<Value, JsErro
                 ErrorKind::TypeError,
                 "value is not a function".into(),
             )),
-            FunctionKind::EcmaScript => Err(JsError::new(
-                ErrorKind::TypeError,
-                "calling ECMAScript functions is not implemented until Phase 7".into(),
-            )),
+            FunctionKind::EcmaScript => ecma_call(callee, this, args, None),
             FunctionKind::Bound {
                 target,
                 bound_this,
@@ -344,10 +395,7 @@ pub fn construct(callee: &Value, args: &[Value], new_target: &Value) -> Result<V
             FunctionKind::Builtin {
                 construct: None, ..
             } => Err(not_constructible(callee)),
-            FunctionKind::EcmaScript => Err(JsError::new(
-                ErrorKind::TypeError,
-                "constructing ECMAScript functions is not implemented until Phase 7".into(),
-            )),
+            FunctionKind::EcmaScript => ecma_call(callee, Value::Undefined, args, Some(new_target)),
             FunctionKind::Bound {
                 target, bound_args, ..
             } => {
