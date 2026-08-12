@@ -110,6 +110,19 @@ The fixes clustered into spec-order and feature work:
   `BYTES_PER_ELEMENT` prototype properties, the `TypedArray` global, and the
   `toString = %Array.prototype.toString%` identity were added.
 
+### Array.from cluster sweep (Phase 18 conformance)
+
+A follow-up sweep of the `Array/from` fixture tree (`sweep.exe built-ins
+--filter 'Array/from*'`) reports **51 pass, 0 fail, 91 skip** of 142
+fixtures: every runnable `Array.from` fixture passes. The 91 skips are the
+standard taxonomy (90 `flags: async` fromAsync tests, 1 `$262.createRealm`).
+`Array.from` previously passed the mapfn a third `array` argument and
+constructed the custom constructor with « 0 » before iterating; it now
+follows spec 23.1.2.2 exactly: the constructor is invoked with no arguments
+and the length is set after the iteration for the iterable path, the mapfn
+receives « kValue, k », and an abrupt mapfn or define completion closes the
+iterator (`IteratorClose`) before propagating.
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~120 edge-case unit tests were added across

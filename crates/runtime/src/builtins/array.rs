@@ -360,6 +360,13 @@ fn array_from(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
     };
     let using_iterator = get_method(agent, &items, "@@iterator")?;
     if let Some(iterator_method) = using_iterator {
+        // spec 23.1.2.2 step 4.a: the constructor is invoked (with no
+        // arguments) before the iterator method runs.
+        let array = if is_constructor(this) {
+            crate::function::construct(agent, this, &[], this)?
+        } else {
+            Value::Object(array_create(agent, 0.0)?)
+        };
         let iterator = crate::function::call(agent, &iterator_method, items.clone(), &[])?;
         if !matches!(iterator, Value::Object(_)) {
             return Err(JsError::new(
@@ -380,11 +387,6 @@ fn array_from(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
             ));
         }
         let iterator_record = IteratorRecord { iterator, next };
-        let array = if is_constructor(this) {
-            crate::function::construct(agent, this, &[Value::Number(0.0)], this)?
-        } else {
-            Value::Object(array_create(agent, 0.0)?)
-        };
         let mut k = 0u64;
         loop {
             let next_value = match crate::expr::iterator_step(agent, &iterator_record)? {
@@ -398,17 +400,30 @@ fn array_from(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
                     return Ok(array);
                 }
             };
+            // The mapfn receives « nextValue, k » and an abrupt completion
+            // closes the iterator (spec 23.1.2.2 step 4.g).
             let mapped_value = if mapping {
-                crate::function::call(
+                match crate::function::call(
                     agent,
                     &mapfn,
                     this_arg.clone(),
-                    &[next_value, Value::Number(k as f64), array.clone()],
-                )?
+                    &[next_value, Value::Number(k as f64)],
+                ) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = crate::expr::iterator_close_throw(agent, &iterator_record);
+                        return Err(error);
+                    }
+                }
             } else {
                 next_value
             };
-            object_of(&array)?.create_data_property_or_throw(&key(k), mapped_value)?;
+            if let Err(error) =
+                object_of(&array)?.create_data_property_or_throw(&key(k), mapped_value)
+            {
+                let _ = crate::expr::iterator_close_throw(agent, &iterator_record);
+                return Err(error);
+            }
             k += 1;
         }
     }
@@ -426,7 +441,7 @@ fn array_from(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
                 agent,
                 &mapfn,
                 this_arg.clone(),
-                &[k_value, Value::Number(k as f64), array.clone()],
+                &[k_value, Value::Number(k as f64)],
             )?
         } else {
             k_value
