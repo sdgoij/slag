@@ -30,6 +30,8 @@ const TYPE_ERROR: &str = "%TypeError%";
 const URI_ERROR: &str = "%URIError%";
 const AGGREGATE_ERROR: &str = "%AggregateError%";
 const SUPPRESSED_ERROR: &str = "%SuppressedError%";
+const GET_STACK: &str = "%get Error.prototype.stack%";
+const SET_STACK: &str = "%set Error.prototype.stack%";
 
 /// (constructor intrinsic key, prototype name, has an `errors` list arg,
 /// is the SuppressedError shape).
@@ -147,9 +149,39 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             configurable: Some(true),
         },
     )?;
-    error_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
-        &PropertyDescriptor::none(Value::String(Handle::new(JsString::from_utf8("Error")))),
+
+    // %Error.prototype.stack% (spec 20.5.3.4-5): an accessor served by the
+    // agent-dispatched getter/setter.
+    let stack_getter = Function::create_builtin(
+        Some(JsString::from_utf8("get stack")),
+        0,
+        Box::new(placeholder("get stack")),
+        None,
+        None,
+    )?;
+    let stack_setter = Function::create_builtin(
+        Some(JsString::from_utf8("set stack")),
+        1,
+        Box::new(placeholder("set stack")),
+        None,
+        None,
+    )?;
+    realm
+        .intrinsics
+        .define(GET_STACK, Value::Function(stack_getter.clone()));
+    realm
+        .intrinsics
+        .define(SET_STACK, Value::Function(stack_setter.clone()));
+    error_proto.define_property(
+        &JsString::from_utf8("stack"),
+        &PropertyDescriptor {
+            value: None,
+            writable: None,
+            get: Some(Value::Function(stack_getter)),
+            set: Some(Value::Function(stack_setter)),
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
     )?;
 
     // %Error.prototype.toString% (20.5.3.4) and %Error.isError% (20.5.2.1).
@@ -334,6 +366,12 @@ pub fn dispatch_call(
             args.first().cloned().unwrap_or(Value::Undefined),
         ))));
     }
+    if intrinsics.get(GET_STACK).as_ref() == Some(callee) {
+        return Some(stack_getter(agent, this, args));
+    }
+    if intrinsics.get(SET_STACK).as_ref() == Some(callee) {
+        return Some(stack_setter(agent, this, args));
+    }
     None
 }
 
@@ -395,7 +433,7 @@ fn error_construct(
         define_message(&object, args.first())?;
         install_cause(agent, &object, args.get(1))?;
     }
-    define_stack(agent, &object, name, args.first())?;
+    define_stack(agent, &object, name)?;
     Ok(Value::Object(object))
 }
 
@@ -484,19 +522,22 @@ fn install_cause(
 }
 
 /// A V8-style stack trace captured at construction time (host-defined, spec
-/// 20.5.4): the header plus the active function frames.
-fn define_stack(
-    agent: &Agent,
-    object: &JsObject,
-    name: &str,
-    message: Option<&Value>,
-) -> Result<(), JsError> {
-    let message = match message {
-        Some(value) if !matches!(value, Value::Undefined) => to_string(value)
-            .map(|text| text.to_string_lossy())
-            .unwrap_or_default(),
-        _ => String::new(),
-    };
+/// 20.5.4): the header plus the active function frames. Stored per-instance
+/// and served by the `%Error.prototype.stack%` accessor (the property itself
+/// is not an own data property). The header uses the already-coerced own
+/// `message` property so the constructor's single ToString (spec 20.5.1.1
+/// step 2a) is not repeated.
+fn define_stack(agent: &mut Agent, object: &JsObject, name: &str) -> Result<(), JsError> {
+    let message = object
+        .get_own_property_key(&PropertyKey::from_utf8("message"))?
+        .and_then(|property| match property.kind {
+            crux::object::PropertyKind::Data {
+                value: Value::String(text),
+                ..
+            } => Some(text.to_string_lossy()),
+            _ => None,
+        })
+        .unwrap_or_default();
     let header = if message.is_empty() {
         name.to_string()
     } else {
@@ -515,20 +556,76 @@ fn define_stack(
             .unwrap_or_else(|| "<anonymous>".into());
         lines.push(format!("    at {frame}"));
     }
-    object.define_property(
-        &JsString::from_utf8("stack"),
-        &PropertyDescriptor {
-            value: Some(Value::String(Handle::new(JsString::from_utf8(
-                &lines.join("\n"),
-            )))),
-            writable: Some(true),
-            get: None,
-            set: None,
-            enumerable: Some(false),
-            configurable: Some(true),
-        },
-    )?;
+    agent
+        .error_stack
+        .insert(object.id(), JsString::from_utf8(&lines.join("\n")));
     Ok(())
+}
+
+/// get %Error.prototype.stack% (spec 20.5.3.4): a TypeError for non-object
+/// receivers, *undefined* for objects without [[ErrorData]], else the
+/// captured stack string.
+fn stack_getter(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
+    let Some(object) = crate::context::as_object(this) else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Error.prototype.stack getter called on a non-object".into(),
+        ));
+    };
+    if !is_error(agent, this.clone()) {
+        return Ok(Value::Undefined);
+    }
+    let stack = agent
+        .error_stack
+        .get(&object.id())
+        .cloned()
+        .unwrap_or_else(|| JsString::from_utf8(""));
+    Ok(Value::String(Handle::new(stack)))
+}
+
+/// set %Error.prototype.stack% (spec 20.5.3.5): SetterThatIgnores
+/// PrototypeProperties — a TypeError for non-object receivers or non-string
+/// values or when the receiver is %Error.prototype% itself; otherwise an own
+/// `stack` data property is created or the existing one is set.
+fn stack_setter(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    let Some(object) = crate::context::as_object(this) else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Error.prototype.stack setter called on a non-object".into(),
+        ));
+    };
+    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    if !matches!(value, Value::String(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Error.prototype.stack setter expects a string".into(),
+        ));
+    }
+    let error_proto = agent
+        .current_realm()?
+        .intrinsics
+        .get("%Error.prototype%")
+        .and_then(|value| as_object(&value));
+    if error_proto
+        .as_ref()
+        .map(|proto| Handle::ptr_eq(proto, &object))
+        .unwrap_or(false)
+    {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Cannot set stack on %Error.prototype%".into(),
+        ));
+    }
+    let name = JsString::from_utf8("stack");
+    if object
+        .get_own_property_key(&PropertyKey::from_utf8("stack"))?
+        .is_none()
+    {
+        object.create_data_property_or_throw(&name, value)?;
+    } else {
+        object.set(&name, value, true)?;
+    }
+    Ok(Value::Undefined)
 }
 
 /// IterableToList for the AggregateError `errors` argument (spec 20.5.7.1):

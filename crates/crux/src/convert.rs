@@ -510,10 +510,13 @@ pub fn to_big_int(value: &Value) -> Result<BigInt, JsError> {
                 )),
             }
         }
-        Value::Number(_) => Err(JsError::new(
-            ErrorKind::TypeError,
-            "Cannot convert a Number to a BigInt".into(),
-        )),
+        Value::Number(n) => match BigInt::from_f64_exact(n) {
+            Some(b) => Ok(b),
+            None => Err(JsError::new(
+                ErrorKind::RangeError,
+                "The number cannot be converted to a BigInt because it is not an integer".into(),
+            )),
+        },
         Value::Symbol(_) => Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert a Symbol to a BigInt".into(),

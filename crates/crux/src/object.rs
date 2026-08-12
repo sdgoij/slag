@@ -874,7 +874,22 @@ impl JsObject {
         throw: bool,
     ) -> Result<bool, JsError> {
         match &self.kind {
-            ObjectKind::Proxy(slots) => return crate::proxy::set(slots, key, value, receiver),
+            ObjectKind::Proxy(slots) => {
+                // spec 7.3.5 Set step 4: a false [[Set]] result with Throw
+                // true becomes a TypeError. The proxy internal method itself
+                // only reports success.
+                let success = crate::proxy::set(slots, key, value, receiver)?;
+                return if success {
+                    Ok(true)
+                } else if throw {
+                    Err(JsError::new(
+                        ErrorKind::TypeError,
+                        format!("Cannot set property {:?}", key.display_string()),
+                    ))
+                } else {
+                    Ok(false)
+                };
+            }
             ObjectKind::IntegerIndexed(slots) => {
                 return typed_array_set(self, slots, key, value, receiver);
             }

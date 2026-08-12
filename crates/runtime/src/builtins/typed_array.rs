@@ -3101,8 +3101,12 @@ mod tests {
             text("new Uint8Array({length: 2, 0: 7, 1: 8}).join(',')"),
             "7,8"
         );
+        // A BigInt cannot coerce to a Number element; an integral Number does
+        // coerce to a BigInt element, while a fractional one throws a
+        // RangeError (spec 7.1.16 NumberToBigInt).
         assert!(run("new Int8Array([1n])").is_err());
-        assert!(run("new BigInt64Array([1])").is_err());
+        assert_eq!(text("new BigInt64Array([1]).join(',')"), "1");
+        assert!(run("new BigInt64Array([1.5])").is_err());
     }
 
     #[test]

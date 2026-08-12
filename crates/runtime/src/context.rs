@@ -141,10 +141,13 @@ pub fn to_big_int(agent: &mut Agent, value: &Value) -> Result<crux::BigInt, JsEr
         Value::Boolean(false) => Ok(crux::BigInt::from(0u64)),
         Value::BigInt(b) => Ok(b.as_ref().clone()),
         Value::String(_) => crux::convert::to_big_int(&prim),
-        Value::Number(_) => Err(JsError::new(
-            ErrorKind::TypeError,
-            "Cannot convert a Number to a BigInt".into(),
-        )),
+        Value::Number(n) => match crux::BigInt::from_f64_exact(n) {
+            Some(b) => Ok(b),
+            None => Err(JsError::new(
+                ErrorKind::RangeError,
+                "The number cannot be converted to a BigInt because it is not an integer".into(),
+            )),
+        },
         Value::Symbol(_) => Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert a Symbol to a BigInt".into(),

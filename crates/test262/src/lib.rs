@@ -10881,12 +10881,15 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
     }
 
     /// The source of a harness include file, read from the pinned submodule.
-    /// Only the large helper files the preludes cannot replicate are loaded;
-    /// the rest (isConstructor.js needs Reflect, propertyHelper.js restores
-    /// writability through defineProperty) are provided by the preludes
+    /// The large helper files the preludes cannot replicate are loaded; the
+    /// rest (isConstructor.js needs Reflect, detachArrayBuffer.js is
+    /// replicated by $262.detachArrayBuffer) are provided by the preludes
     /// instead.
     fn harness_include_source(name: &str) -> Result<String, String> {
-        if !matches!(name, "testAtomics.js" | "testTypedArray.js") {
+        if !matches!(
+            name,
+            "testAtomics.js" | "testTypedArray.js" | "nativeErrors.js" | "propertyHelper.js"
+        ) {
             return Ok(String::new());
         }
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -11139,6 +11142,7 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
                         | "propertyHelper.js"
                         | "testAtomics.js"
                         | "testTypedArray.js"
+                        | "nativeErrors.js"
                 )
             })
             .collect();

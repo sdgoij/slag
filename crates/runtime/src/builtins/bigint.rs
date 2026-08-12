@@ -68,10 +68,13 @@ fn to_bigint(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
                 "Cannot convert string to a BigInt".into(),
             )),
         },
-        Value::Number(_) => Err(JsError::new(
-            ErrorKind::TypeError,
-            "Cannot convert a Number to a BigInt".into(),
-        )),
+        Value::Number(n) => match crux::BigInt::from_f64_exact(*n) {
+            Some(b) => Ok(Value::BigInt(Handle::new(b))),
+            None => Err(JsError::new(
+                ErrorKind::RangeError,
+                "The number cannot be converted to a BigInt because it is not an integer".into(),
+            )),
+        },
         Value::Symbol(_) => Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert a Symbol to a BigInt".into(),
@@ -360,9 +363,27 @@ mod tests {
         assert_eq!(big("BigInt(false)"), "0");
         assert_eq!(big("BigInt(5n)"), "5");
         assert_eq!(big("BigInt(-3n)"), "-3");
+        // NumberToBigInt: integral numbers convert exactly, the rest throw a
+        // RangeError (spec 7.1.16).
+        assert_eq!(big("BigInt(5)"), "5");
+        assert_eq!(big("BigInt(-3)"), "-3");
+        assert_eq!(big("BigInt(0)"), "0");
+        assert_eq!(big("BigInt(Number.MAX_SAFE_INTEGER)"), "9007199254740991");
+        assert_eq!(
+            big("BigInt(Number.MAX_SAFE_INTEGER + 2)"),
+            "9007199254740992"
+        );
         assert!(matches!(
-            run("BigInt(5)"),
-            Err(e) if e.kind == ErrorKind::TypeError
+            run("BigInt(1.5)"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+        assert!(matches!(
+            run("BigInt(NaN)"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+        assert!(matches!(
+            run("BigInt(Infinity)"),
+            Err(e) if e.kind == ErrorKind::RangeError
         ));
         assert!(matches!(
             run("BigInt('abc')"),

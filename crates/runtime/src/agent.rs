@@ -192,6 +192,10 @@ pub struct Agent {
     /// [[ErrorData]] markers of Error instances, keyed by object identity
     /// (spec 20.5.4: `Error.isError` and the `[object Error]` tag need it).
     pub error_data: std::collections::HashSet<u64>,
+    /// The captured V8-style stack trace of Error instances, keyed by object
+    /// identity (read by the `%Error.prototype.stack%` accessor; the property
+    /// itself is not an own data property, spec 20.5.3.4).
+    pub error_stack: std::collections::HashMap<u64, crux::string::JsString>,
     /// [[WeakRefTarget]] of WeakRef instances, keyed by object identity
     /// (spec 26.1.1: without a GC, the target never dies, so `deref` always
     /// returns it).
@@ -304,6 +308,7 @@ impl Agent {
             regexp_string_iter_data: std::collections::HashMap::new(),
             string_iter_data: std::collections::HashMap::new(),
             error_data: std::collections::HashSet::new(),
+            error_stack: std::collections::HashMap::new(),
             weak_ref_targets: std::collections::HashMap::new(),
             finalization_registries: std::collections::HashMap::new(),
             array_iter_data: std::collections::HashMap::new(),

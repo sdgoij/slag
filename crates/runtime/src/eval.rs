@@ -570,36 +570,35 @@ fn eval_for(
 pub(crate) fn for_in_keys(_agent: &mut Agent, rhs: &Value) -> Result<Vec<Value>, JsError> {
     let mut seen: HashSet<PropertyKey> = HashSet::new();
     let mut keys: Vec<Value> = Vec::new();
-    match rhs {
-        Value::Object(obj) => {
-            let mut current = Some(obj.clone());
-            while let Some(obj) = current {
-                for key in obj.own_property_keys()? {
-                    let PropertyKey::String(_) = key else {
-                        continue;
-                    };
-                    if !seen.insert(key.clone()) {
-                        continue;
-                    }
-                    if let Some(property) = obj.get_own_property_key(&key)?
-                        && property.enumerable
-                    {
-                        keys.push(key_value(&key));
-                    }
+    // ToObject of the enumerated value (spec step 2): functions box to
+    // themselves, so a callable receiver enumerates its own properties too.
+    if let Some(obj) = crate::context::as_object(rhs) {
+        let mut current = Some(obj);
+        while let Some(obj) = current {
+            for key in obj.own_property_keys()? {
+                let PropertyKey::String(_) = key else {
+                    continue;
+                };
+                if !seen.insert(key.clone()) {
+                    continue;
                 }
-                current = obj.get_prototype_of()?;
+                if let Some(property) = obj.get_own_property_key(&key)?
+                    && property.enumerable
+                {
+                    keys.push(key_value(&key));
+                }
             }
+            current = obj.get_prototype_of()?;
         }
-        Value::String(text) => {
-            // ToObject of a primitive string: its own enumerable index keys.
-            for index in 0..text.len() {
-                keys.push(Value::String(Handle::new(JsString::from_utf8(
-                    &index.to_string(),
-                ))));
-            }
+    } else if let Value::String(text) = rhs {
+        // ToObject of a primitive string: its own enumerable index keys.
+        for index in 0..text.len() {
+            keys.push(Value::String(Handle::new(JsString::from_utf8(
+                &index.to_string(),
+            ))));
         }
-        Value::Undefined | Value::Null => return Ok(Vec::new()),
-        _ => {}
+    } else if matches!(rhs, Value::Undefined | Value::Null) {
+        return Ok(Vec::new());
     }
     Ok(keys)
 }
@@ -615,39 +614,7 @@ fn eval_for_in(
     labels: &[crux::string::AtomId],
 ) -> Result<Completion, JsError> {
     let rhs = eval_expr(agent, right, strict)?;
-    let mut seen: HashSet<PropertyKey> = HashSet::new();
-    let mut keys: Vec<Value> = Vec::new();
-    match &rhs {
-        Value::Object(obj) => {
-            let mut current = Some(obj.clone());
-            while let Some(obj) = current {
-                for key in obj.own_property_keys()? {
-                    let PropertyKey::String(_) = key else {
-                        continue;
-                    };
-                    if !seen.insert(key.clone()) {
-                        continue;
-                    }
-                    if let Some(property) = obj.get_own_property_key(&key)?
-                        && property.enumerable
-                    {
-                        keys.push(key_value(&key));
-                    }
-                }
-                current = obj.get_prototype_of()?;
-            }
-        }
-        Value::String(text) => {
-            // ToObject of a primitive string: its own enumerable index keys.
-            for index in 0..text.len() {
-                keys.push(Value::String(Handle::new(JsString::from_utf8(
-                    &index.to_string(),
-                ))));
-            }
-        }
-        Value::Undefined | Value::Null => return Ok(Completion::normal()),
-        _ => {}
-    }
+    let keys = for_in_keys(agent, &rhs)?;
     let mut iteration_result = Value::Undefined;
     for key in keys {
         let restore = for_binding_put(agent, left, key, strict)?;

@@ -140,6 +140,47 @@ include). Fixes in `crates/runtime/src/builtins/error.rs`:
 - `InstallErrorCause` creates `cause` when the option is present even if its
   value is `undefined` (a `HasProperty` check, not a value check).
 
+### Error.prototype.stack and Error area sweep (Phase 18 conformance)
+
+A sweep of `Error*` (93 fixtures) reports **85 pass, 0 fail, 8 skip**: every
+runnable fixture passes, including the `Error/prototype/stack*` cluster (30
+runnable of 35). The 8 skips are the standard taxonomy (5
+`$262.createRealm`, 3 `proxyTrapsHelper.js` includes). Fixes:
+
+- **`%Error.prototype.stack%` accessor (ES2026, spec 20.5.3.4-5):** the stack
+  is a per-instance string captured at construction and served through the
+  accessor (not an own data property). The getter TypeErrors on non-object
+  receivers and returns `undefined` for objects without `[[ErrorData]]`; the
+  setter (SetterThatIgnoresPrototypeProperties) rejects non-string values and
+  `%Error.prototype%` as the receiver, creates an own data property when
+  absent, and throws when a proxy's `defineProperty`/`set` trap reports
+  false. The accessor carries the required `get stack`/`set stack` names and
+  lengths.
+- **BigInt(Number) — NumberToBigInt (spec 7.1.16):** `BigInt(0)` and
+  `BigInt(1.5)` were both rejected with a TypeError; integral doubles now
+  convert exactly (mantissa/exponent decomposition, so `BigInt(1e23)` is the
+  exact double value) and NaN/±Infinity/non-integral throw a RangeError. The
+  BigInt constructor, `asIntN`/`asUintN`, and BigInt typed-array element
+  coercion share the conversion.
+- **Proxy `[[Set]]` with throw:** `Set(O, P, V, true)` now converts a false
+  proxy `set`-trap result into a TypeError instead of silently succeeding
+  (spec 7.3.5 step 4).
+- **`for-in` over functions:** enumeration matched `Value::Object` only, so
+  `for (var k in fn)` yielded nothing; callables are now boxed like any
+  object (spec 14.7.5.6 step 2 ToObject).
+- **`%Error.prototype%[@@toStringTag]` removed:** the current spec does not
+  define it (instances tag as `[object Error]` via `[[ErrorData]]`), so
+  `Object.prototype.toString.call(Error.prototype)` is `[object Object]`
+  again.
+- **Error construction coercion order (spec 20.5.1.1):** the message's
+  `ToString` ran once for the `message` property and again for the stack
+  capture, invoking a side-effecting `toString` twice; the stack header now
+  reuses the coerced own `message` property.
+- **Harness:** the real `propertyHelper.js` is loaded from the submodule
+  instead of the simplified prelude stub, so `verifyPrimordialAccessor
+  Property` name/length checks and the configurable-deletes-property cleanup
+  behave as upstream expects.
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~120 edge-case unit tests were added across
@@ -239,17 +280,24 @@ against the runnable pass-rate target:
 ## Full-suite sweep (post-hardening)
 
 `test262-sweep` over all three areas in a release build (48,622 fixtures, 8
-jobs, 20s batch timeout): **0 hangs, 0 crashes**.
+jobs, 20s batch timeout): **0 crashes**; the only hangs are three known-slow
+TypedArray fixtures that pass with the long timeout (see below).
 
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,812 | 13,301 | 7,256 | 3,255 | 0 | 64.7% |
+| built-ins | 23,812 | 14,873 | 5,535 | 3,401 | 3¹ | 72.9% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,622** | **29,744** | **9,862** | **9,016** | **0** | **75.1%** |
+| **Total** | **48,622** | **31,316** | **8,141** | **9,162** | **3** | **79.4%** |
 
-(Runnable = pass + fail; the 8,997 skips are module/async fixtures and
-unsupported harness includes.)
+(Runnable = pass + fail; the 9,162 skips are module/async fixtures and
+unsupported harness includes.) The built-ins row reflects the current
+`Error*`/`BigInt*` hardening; the language and annexB rows are from the
+sweep recorded below.
+
+¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
+coerced-values fixtures — 10,000-element allocations that need the long
+(`--timeout 120`) config, not a bug (see the TypedArray cluster section).
 
 The first sweep in a debug build reported 27 hangs and 92 crashes. Both are
 resolved:

@@ -46,6 +46,39 @@ impl BigInt {
     pub fn to_f64(&self) -> f64 {
         self.0.to_str_radix(10).parse().unwrap_or(f64::NAN)
     }
+
+    /// NumberToBigInt (spec 7.1.16): the exact integer value of an integral
+    /// double, or None when `number` is NaN, +Infinity, -Infinity, or not an
+    /// integral number. The mantissa/exponent decomposition is exact (the
+    /// shortest decimal round-trip of a large double can round to a different
+    /// mathematical value than the double itself).
+    pub fn from_f64_exact(number: f64) -> Option<BigInt> {
+        if !number.is_finite() || number.fract() != 0.0 {
+            return None;
+        }
+        let bits = number.to_bits();
+        let negative = bits >> 63 == 1;
+        let exponent_bits = ((bits >> 52) & 0x7ff) as i32;
+        let fraction = bits & ((1u64 << 52) - 1);
+        let (mantissa, shift) = if exponent_bits == 0 {
+            // Subnormal: value = fraction * 2^-1074.
+            (fraction, -1074)
+        } else {
+            // Normal: value = (2^52 + fraction) * 2^(exponent_bits - 1023 - 52).
+            ((1u64 << 52) + fraction, exponent_bits - 1023 - 52)
+        };
+        let mut value = NumBigInt::from(mantissa);
+        if shift > 0 {
+            value <<= shift as usize;
+        } else if shift < 0 {
+            // `number` is integral, so the division is exact.
+            value >>= (-shift) as usize;
+        }
+        if negative {
+            value = -value;
+        }
+        Some(BigInt(value))
+    }
 }
 
 /// spec 6.1.6.2.1
