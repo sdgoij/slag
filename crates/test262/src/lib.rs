@@ -179,6 +179,7 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
     enum Area {
         Language,
         Builtins,
+        AnnexB,
     }
 
     impl Area {
@@ -186,6 +187,7 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
             Path::new(env!("CARGO_MANIFEST_DIR")).join(match self {
                 Area::Language => "../../test262/test/language",
                 Area::Builtins => "../../test262/test/built-ins",
+                Area::AnnexB => "../../test262/test/annexB",
             })
         }
     }
@@ -11182,6 +11184,126 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
             for reason in failures.iter().take(8) {
                 println!("  FAIL {reason}");
             }
+        }
+    }
+
+    /// Full-suite conformance sweep: run every fixture under `test/language`,
+    /// `test/built-ins`, and `test/annexB` and triage the results (PLAN
+    /// Phase 18). `run_fixture` reuses the vendored-fixture runner, so the
+    /// module/async/unsupported-include skips apply here too. Set `SWEEP` to
+    /// `language`, `built-ins`, or `annexB` to scan one area; the output
+    /// feeds `docs/conformance.md`.
+    #[test]
+    #[ignore = "full test262 sweep (slow); set SWEEP=language|built-ins|annexB"]
+    fn full_sweep() {
+        let sweep = std::env::var("SWEEP").unwrap_or_else(|_| "all".into());
+        let areas: Vec<(&str, Area)> = match sweep.as_str() {
+            "language" => vec![("language", Area::Language)],
+            "built-ins" => vec![("built-ins", Area::Builtins)],
+            "annexB" => vec![("annexB", Area::AnnexB)],
+            _ => vec![
+                ("language", Area::Language),
+                ("built-ins", Area::Builtins),
+                ("annexB", Area::AnnexB),
+            ],
+        };
+        for (label, area) in areas {
+            sweep_area(label, area);
+        }
+    }
+
+    /// Sweep one area and print a pass/fail/skip triage. When `SWEEP_SAMPLE`
+    /// is set, only that many fixtures per top-level directory are run (the
+    /// full suite is tens of thousands of files; the sample keeps the triage
+    /// shape representative without the multi-minute run).
+    fn sweep_area(label: &str, area: Area) {
+        let sample: Option<usize> = std::env::var("SWEEP_SAMPLE")
+            .ok()
+            .and_then(|v| v.parse().ok());
+        let mut files = Vec::new();
+        if let Err(e) = collect_js_files(&area.root(), &mut files) {
+            println!("{label}: cannot read ({e})");
+            return;
+        }
+        files.sort();
+        let mut per_top_dir: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut pass = 0usize;
+        let mut fail = 0usize;
+        let mut skip = 0usize;
+        let mut skip_reasons: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        let mut dir_stats: std::collections::BTreeMap<String, (usize, usize, usize)> =
+            std::collections::BTreeMap::new();
+        let mut fail_samples = Vec::new();
+        for path in &files {
+            let relative = path
+                .strip_prefix(area.root())
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let top = relative.split('/').next().unwrap_or("").to_string();
+            let dir = relative
+                .rsplit_once('/')
+                .map(|(dir, _)| dir.to_string())
+                .unwrap_or_else(|| ".".into());
+            if let Some(limit) = sample {
+                let seen = per_top_dir.entry(top).or_default();
+                if *seen >= limit {
+                    continue;
+                }
+                *seen += 1;
+            }
+            let entry = dir_stats.entry(dir).or_default();
+            match run_fixture(area, &relative) {
+                FixtureResult::Pass => {
+                    pass += 1;
+                    entry.0 += 1;
+                }
+                FixtureResult::Skip(reason) => {
+                    skip += 1;
+                    entry.1 += 1;
+                    *skip_reasons.entry(reason).or_default() += 1;
+                }
+                FixtureResult::Fail(reason) => {
+                    fail += 1;
+                    entry.2 += 1;
+                    if fail_samples.len() < 15 {
+                        fail_samples.push(format!("{relative}: {reason}"));
+                    }
+                }
+            }
+        }
+        let total = pass + fail + skip;
+        let runnable_pct = if total == 0 {
+            0.0
+        } else {
+            100.0 * (pass + fail) as f64 / total as f64
+        };
+        println!("== {label}: {pass} pass, {fail} fail, {skip} skip of {total}");
+        println!(
+            "   runnable {}/{} ({runnable_pct:.1}%), pass rate of runnable {:.1}%",
+            pass + fail,
+            total,
+            if pass + fail == 0 {
+                0.0
+            } else {
+                100.0 * pass as f64 / (pass + fail) as f64
+            }
+        );
+        for (reason, count) in skip_reasons {
+            println!("   skip x{count}: {reason}");
+        }
+        let mut dirs: Vec<(&String, &(usize, usize, usize))> = dir_stats.iter().collect();
+        dirs.sort_by(|a, b| b.1.2.cmp(&a.1.2).then(a.0.cmp(b.0)));
+        println!("   worst directories by failing fixtures:");
+        for (dir, (p, s, f)) in dirs.iter().take(30) {
+            if *f > 0 {
+                println!("     {dir}: {p} pass, {s} skip, {f} fail");
+            }
+        }
+        for sample in fail_samples {
+            println!("   FAIL {sample}");
         }
     }
 }

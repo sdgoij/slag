@@ -240,8 +240,9 @@ fn math_f16round(x: f64) -> f64 {
 }
 
 /// A simple xorshift64* PRNG for Math.random (spec 21.3.2.27: host-defined,
-/// uniform in [0, 1)).
-fn math_random() -> f64 {
+/// uniform in [0, 1)). Re-exported as the embedding API's default random
+/// source when no host callback overrides it.
+pub(crate) fn default_random() -> f64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static STATE: AtomicU64 = AtomicU64::new(0);
     let mut x = STATE.load(Ordering::Relaxed);
@@ -652,7 +653,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         (
             "random",
             0,
-            Box::new(|_: &Value, _: &[Value]| Ok(Value::Number(math_random()))),
+            Box::new(|_: &Value, _: &[Value]| Ok(Value::Number(default_random()))),
         ),
         ("round", 1, unary(math_round)),
         (

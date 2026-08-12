@@ -60,6 +60,15 @@ pub fn with_agent<T>(agent: *mut (), body: impl FnOnce() -> T) -> T {
     result
 }
 
+/// The agent pointer recorded by the innermost active [`with_agent`] window,
+/// or null outside any window. Built-in closures that need the runtime's
+/// agent (timers, console, host globals) cast this to `&mut Agent` inside
+/// their closures; the pointer is only valid while the enclosing
+/// `with_agent` call is on the stack.
+pub fn current_agent() -> *mut () {
+    CURRENT_AGENT.with(|slot| *slot.borrow())
+}
+
 /// Run an ECMAScript function through the runtime's executor, or report the
 /// Phase-6 stub error when no executor is installed.
 fn ecma_call(

@@ -32,11 +32,13 @@ pub trait HostHooks: std::fmt::Debug {
 
     /// HostPromiseRejectionTracker (spec 27.2.1.9): called when a promise is
     /// rejected without a handler (`operation` = Reject) or when a handler is
-    /// attached to a rejected promise (`operation` = Handle). The default does
+    /// attached to a rejected promise (`operation` = Handle). `reason` is the
+    /// rejection value when the runtime has one in hand. The default does
     /// nothing; hosts surface unhandled rejections here.
     fn promise_rejection_tracker(
         &self,
         _promise: &crux::value::Value,
+        _reason: Option<&crux::value::Value>,
         _operation: bool,
     ) -> Result<(), JsError> {
         Ok(())
@@ -63,10 +65,11 @@ pub trait HostHooks: std::fmt::Debug {
 pub fn promise_rejection_tracker(
     agent: &crate::agent::Agent,
     promise: &crux::value::Value,
+    reason: Option<&crux::value::Value>,
     operation: bool,
 ) -> Result<(), JsError> {
     match &agent.host_hooks {
-        Some(hooks) => hooks.promise_rejection_tracker(promise, operation),
+        Some(hooks) => hooks.promise_rejection_tracker(promise, reason, operation),
         None => Ok(()),
     }
 }

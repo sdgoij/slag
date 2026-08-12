@@ -10,7 +10,6 @@ use crux::error::JsError;
 use crux::property::PropertyDescriptor;
 use crux::string::JsString;
 use crux::typed_array::SharedBuffer;
-use crux::value::Value;
 
 use crate::agent::Agent;
 
@@ -62,6 +61,7 @@ pub fn spawn_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crux::value::Value;
 
     /// Extract the shared byte block of the SharedArrayBuffer `source`
     /// evaluates to.

@@ -253,7 +253,7 @@ pub fn reject_promise(agent: &mut Agent, promise: &Value, reason: Value) -> Resu
     };
     data.borrow_mut().state = PromiseState::Rejected(reason.clone());
     if !was_handled {
-        crate::host::promise_rejection_tracker(agent, promise, false)?;
+        crate::host::promise_rejection_tracker(agent, promise, Some(&reason), false)?;
     }
     for reaction in reactions {
         enqueue_reaction_job(agent, reaction, reason.clone());
@@ -356,7 +356,11 @@ pub fn perform_promise_then(
     let was_handled = agent.promises[&id].borrow().is_handled;
     if !was_handled {
         agent.promises[&id].borrow_mut().is_handled = true;
-        crate::host::promise_rejection_tracker(agent, &promise_again, true)?;
+        let reason = match &agent.promises[&id].borrow().state {
+            PromiseState::Rejected(value) => Some(value.clone()),
+            _ => None,
+        };
+        crate::host::promise_rejection_tracker(agent, &promise_again, reason.as_ref(), true)?;
     }
     // The result promise, per the spec's step 9.
     Ok(result_promise.unwrap_or(Value::Undefined))

@@ -2055,6 +2055,35 @@ phase therefore delivers:
 **Exit criteria:** conformance target met; GC stress clean; perf milestones each pass their gate
 or are explicitly deferred in `docs/perf.md`; embedding API documented with examples.
 
+**Status (in progress):** the embedding API and CLI workstreams are delivered and documented
+with doc-tests/examples; the conformance and perf docs exist; the GC and performance
+milestones are explicitly deferred (gates and rationale in `docs/perf.md`).
+
+Delivered:
+- **Embedding API** (`crates/runtime/src/embed.rs`, exported as `runtime::Context`):
+  `Context::new()`, `eval`, `call`, `construct`, `global`/`set_global`, `JsValue`/`JsObject`
+  handle types, and `HostCallbacks` (console output, timers, `Math.random` override, promise
+  rejection tracking). Host globals (`console`, `setTimeout`/`setInterval`/
+  `clearTimeout`/`clearInterval`, `process.argv`) are installed per-Context; `crux` gained a
+  `current_agent()` accessor so host-global builtins reach the agent, and
+  `HostHooks::promise_rejection_tracker` now carries the rejection reason.
+- **CLI polish** (`crates/cli`): `jsrt file.js [args]` with `process.argv`; multi-line REPL;
+  `--dump-ast`/`--dump-tokens`; `--bench` micro-benchmarks; accepted no-op knobs
+  (`--print-bytecode`, `--stack-size`, `--max-old-space`, `--harmony-*`).
+- **Conformance tooling**: `full_sweep` scanner in `crates/test262` walks `language`,
+  `built-ins`, and `annexB` (new `Area::AnnexB`) with `SWEEP`/`SWEEP_SAMPLE` knobs;
+  `docs/conformance.md` documents methodology, the 3317 passing vendored fixtures, the
+  skip taxonomy, and the expected non-runnable categories (Intl, `dynamic import` without a
+  loader, host-dependent behavior). `docs/perf.md` documents the benchmark gate and the
+  deferred milestones.
+
+Remaining before exit criteria:
+- Certify the ≥ 95%-of-runnable conformance target by running the full ~49k-fixture sweep
+  (unbounded run is ~10 min; `SWEEP_SAMPLE` bounds it) and recording the triage.
+- GC milestone (arena heap + mark-sweep, `--gc-stress`, leak harness) and the performance
+  milestones (NaN-boxed `Value`, bytecode VM, shapes/ICs, string ropes) stay deferred per
+  `docs/perf.md`.
+
 ---
 
 ## 7. Milestone summary
@@ -2079,7 +2108,7 @@ or are explicitly deferred in `docs/perf.md`; embedding API documented with exam
 | 15 | Iterator/async/promise/dispose | ch. 26 | 85% |
 | 16 | Proxy, Reflect | ch. 27 | 90–92% |
 | 17 | Memory model (feature-gated) | ch. 28 | unchanged |
-| 18 | Hardening, GC, perf, embedder | all | ≥ 95% |
+| 18 | Hardening, GC, perf, embedder | all | ≥ 95% (vendored: 3317 pass; full sweep pending) |
 
 Percentages are planning estimates; the exit criteria in each phase are authoritative.
 
