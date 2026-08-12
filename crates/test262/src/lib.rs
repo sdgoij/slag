@@ -60,6 +60,9 @@ assert.throws = function (expectedErrorConstructor, func) {
     /// The `verifyProperty`-family comes from the real propertyHelper.js when
     /// included.
     const HARNESS_PRELUDE: &str = r#"
+// Host shell functions the fixtures assume (d8/shell `print`); a no-op that
+// echoes the argument is enough for the vendored fixtures.
+print = function (s) { return s; };
 Test262Error = function (message) {
   var err = { name: "Test262Error", message: message };
   err.constructor = Test262Error;

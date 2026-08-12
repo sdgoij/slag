@@ -840,7 +840,7 @@ fn split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
     {
         return crate::function::call(agent, &splitter, separator, &[this.clone(), limit]);
     }
-    let string = to_string(this)?;
+    let string = crate::context::to_string(agent, this)?;
     let lim = if matches!(limit, Value::Undefined) {
         u32::MAX
     } else {
@@ -1315,7 +1315,7 @@ pub(crate) fn get_substitution_public(
         .iter()
         .map(|c| match c {
             Value::Undefined => Ok(None),
-            other => Ok(Some(to_string(other)?)),
+            other => Ok(Some(crate::context::to_string(agent, other)?)),
         })
         .collect::<Result<Vec<_>, JsError>>()?;
     let named = match named_captures {

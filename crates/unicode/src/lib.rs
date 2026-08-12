@@ -248,6 +248,7 @@ pub fn binary_property(cp: u32, name: &str) -> Option<bool> {
         "Alphabetic" => char_of(cp).is_some_and(char::is_alphabetic),
         "Any" => true,
         "Assigned" => general_category(cp) != "Cn",
+        "Hex_Digit" => matches!(cp, 0x30..=0x39 | 0x41..=0x46 | 0x61..=0x66),
         "ID_Continue" => char_of(cp).is_some_and(|c| {
             use unicode_id::UnicodeID;
             c.is_id_continue()

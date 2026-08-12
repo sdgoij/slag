@@ -103,16 +103,22 @@ fn ordinary_to_primitive(
     receiver: Value,
     hint: ToPrimitiveHint,
 ) -> Result<Value, JsError> {
-    if let Value::Object(obj) = &receiver
-        && let Some(boxed) = &*obj.boxed.borrow()
-    {
-        return Ok(match boxed {
-            crate::object::BoxedPrimitive::Number(n) => Value::Number(*n),
-            crate::object::BoxedPrimitive::BigInt(b) => {
-                Value::BigInt(crate::handle::Handle::new(b.clone()))
-            }
-            crate::object::BoxedPrimitive::Boolean(b) => Value::Boolean(*b),
-        });
+    if let Value::Object(obj) = &receiver {
+        // A String exotic object converts directly through its wrapped
+        // value (its toString/valueOf return [[StringData]]), like the
+        // boxed Number/BigInt/Boolean wrappers below.
+        if let crate::object::ObjectKind::String(text) = &obj.kind {
+            return Ok(Value::String(text.clone()));
+        }
+        if let Some(boxed) = &*obj.boxed.borrow() {
+            return Ok(match boxed {
+                crate::object::BoxedPrimitive::Number(n) => Value::Number(*n),
+                crate::object::BoxedPrimitive::BigInt(b) => {
+                    Value::BigInt(crate::handle::Handle::new(b.clone()))
+                }
+                crate::object::BoxedPrimitive::Boolean(b) => Value::Boolean(*b),
+            });
+        }
     }
     let (first, second) = match hint {
         ToPrimitiveHint::String | ToPrimitiveHint::Default => ("toString", "valueOf"),

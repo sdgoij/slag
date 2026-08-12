@@ -162,6 +162,16 @@ fn set_default_global_bindings(realm: &Handle<Realm>) -> Result<(), JsError> {
         },
     )?;
     crate::builtins::object::install(realm)?;
+    // The global object's [[Prototype]] is implementation-defined but the
+    // host-standard shape (browsers, Node, the test262 harness) inherits
+    // %Object.prototype% so `globalThis.toString` and friends resolve.
+    if let Some(object_proto) = realm
+        .intrinsics
+        .get("%Object.prototype%")
+        .and_then(|value| as_object(&value))
+    {
+        realm.global_object.set_prototype_of(Some(object_proto))?;
+    }
     crate::builtins::function::install(realm)?;
     crate::builtins::array::install(realm)?;
     crate::builtins::typed_array::install(realm)?;

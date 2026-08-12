@@ -1109,6 +1109,13 @@ fn parse_primary(parser: &mut Parser) -> Result<Expr, JsError> {
             })
         }
         TokenKind::RegExpLiteral { pattern, flags } => {
+            // Early errors (spec 13.3.2): a regexp literal's pattern and
+            // flags must be valid; unknown or duplicate flags and malformed
+            // patterns are SyntaxErrors at parse time.
+            let parsed_flags = regexp::Flags::parse(flags.as_slice())
+                .map_err(|e| parser.error_at(tok.span.start, &e.message))?;
+            regexp::compile(pattern.as_slice(), parsed_flags)
+                .map_err(|e| parser.error_at(tok.span.start, &e.message))?;
             parser.next()?;
             Ok(Expr {
                 span: tok.span,

@@ -288,8 +288,12 @@ pub struct Regex {
     pub flags: Flags,
     /// Number of capturing groups (excluding group 0).
     pub capturing_groups: usize,
-    /// Named groups: name (code points) → 1-based capture index.
-    pub named_groups: HashMap<Vec<u32>, usize>,
+    /// Named groups: name (code points) → every 1-based capture index using
+    /// it, in source order (duplicate names are valid per ES2025).
+    pub named_groups: HashMap<Vec<u32>, Vec<usize>>,
+    /// The first-occurrence order of group names (drives the `groups` object
+    /// key order).
+    pub named_group_order: Vec<Vec<u32>>,
     /// Whether any GroupName appears (drives the `groups` object).
     pub has_group_names: bool,
 }
@@ -647,16 +651,21 @@ mod tests {
             .exec(&"hey".encode_utf16().collect::<Vec<u16>>(), 0)
             .unwrap();
         assert_eq!(m[1], Some((0, 3)));
-        assert!(
-            compile(
-                "(?<a>x)(?<a>y)"
-                    .encode_utf16()
-                    .collect::<Vec<u16>>()
-                    .as_slice(),
-                f("")
-            )
-            .is_err()
-        );
+        // Duplicate names are valid (ES2025); `\k<a>` refers to the last group
+        // with that name.
+        let re = compile(
+            "(?<a>x)(?<a>y)\\k<a>"
+                .encode_utf16()
+                .collect::<Vec<u16>>()
+                .as_slice(),
+            f(""),
+        )
+        .unwrap();
+        let m = re
+            .exec(&"xyy".encode_utf16().collect::<Vec<u16>>(), 0)
+            .unwrap();
+        assert_eq!(m[1], Some((0, 1)));
+        assert_eq!(m[2], Some((1, 2)));
         let re = compile(
             "\\x41".encode_utf16().collect::<Vec<u16>>().as_slice(),
             f(""),

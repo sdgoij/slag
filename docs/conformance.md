@@ -181,6 +181,50 @@ runnable of 35). The 8 skips are the standard taxonomy (5
   Property` name/length checks and the configurable-deletes-property cleanup
   behave as upstream expects.
 
+### String.prototype.split and RegExp method cluster sweeps (Phase 18)
+
+A sweep of `String/prototype/split*` reports **120 pass, 0 fail** of 120
+fixtures, and the RegExp area improved from 762 pass / 535 fail to **1079
+pass / 218 fail** (of 1896; 599 skips are the standard taxonomy, mostly
+`regExpUtils.js` includes). Closed to 100%-of-runnable: `RegExp/
+property-escapes` (165), `RegExp/prototype/Symbol.split` (43),
+`Symbol.match`+`Symbol.matchAll` (72), `%RegExpStringIteratorPrototype%
+.next` (14), `Symbol.replace` (70), `Symbol.search` (23), and
+`RegExp.prototype.flags` + every flag accessor. Fixes:
+
+- **Boxed-string and object coercion:** crux `ToPrimitive` unwraps a String
+  exotic object directly (like the boxed Number/BigInt/Boolean wrappers),
+  and the regexp `@@` methods coerce their string arguments through the
+  agent (`ToObject`/`ToString`), so `new String("abc").split(/x/)` and
+  plain-object receivers work.
+- **Regexp literal early errors (spec 13.3.2):** the JS parser now
+  validates regexp literals at parse time (flags + pattern), so
+  `phase: parse` negatives (`/\p{ASCII=Y}/u`, `a**`, `*a`, `x{1}{1,}`,
+  `\k` without groups, `\x`/`\u` without hex digits, empty `[]` classes)
+  are SyntaxErrors at the right phase.
+- **`@@split`/`@@match`/`@@matchAll`/`@@replace`/`@@search` (spec
+  22.2.7.x):** the flags come from `Get(rx, "flags")` (whose accessor
+  composes each flag via Get in the `dgimsuvy` order, honoring overrides
+  and `%RegExp.prototype%` returning `""`), the splitter/matcher is built
+  through `SpeciesConstructor`, `RegExpExec` calls the custom `exec`
+  method, empty matches advance lastIndex via `AdvanceStringIndex`, and
+  `@@search` restores lastIndex only after a successful exec.
+- **Property escapes:** the `=` value separator was rejected by the name
+  scan (the value split was dead code), so every `\p{Script=…}`/
+  `\p{scx=…}`/`\p{General_Category=…}` fixture failed; `Hex`/`Hex_Digit`
+  were added to the binary properties, and `\p{…}` inside character
+  classes works.
+- **Host `print`:** the test262 shell `print` function is provided by the
+  harness (a no-op echo), unblocking fixtures that alias it.
+- **Duplicate named groups (ES2025):** the parser accepts duplicate
+  `(?<x>…)` names and `\k<x>` resolves to the last group with that name;
+  the `groups` object keeps first-occurrence key order. (The disjoint-
+  capture and last-participating-group matching semantics of the proposal
+  are still open.)
+- **Global object prototype:** the global object now inherits
+  `%Object.prototype%` (its proto was never wired after the intrinsic
+  table populated), so `globalThis.toString` and friends resolve.
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~120 edge-case unit tests were added across
@@ -286,9 +330,9 @@ TypedArray fixtures that pass with the long timeout (see below).
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,812 | 14,873 | 5,535 | 3,401 | 3¹ | 72.9% |
+| built-ins | 23,812 | 15,393 | 5,015 | 3,401 | 3¹ | 75.4% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,622** | **31,316** | **8,141** | **9,162** | **3** | **79.4%** |
+| **Total** | **48,622** | **31,836** | **7,621** | **9,162** | **3** | **80.7%** |
 
 (Runnable = pass + fail; the 9,162 skips are module/async fixtures and
 unsupported harness includes.) The built-ins row reflects the current

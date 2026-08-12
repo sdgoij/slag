@@ -5,17 +5,17 @@
 //! pattern lives in the agent's `regexp_data` table; `lastIndex` is an own
 //! data property on each instance.
 
-use crux::convert::{to_length, to_number, to_string, to_uint32};
+use crux::convert::{to_boolean, to_length, to_number, to_string, to_uint32};
 use crux::error::{ErrorKind, JsError};
 use crux::function::{Function, NativeFn};
 use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
-use crux::value::{Value, is_callable};
+use crux::value::{Value, is_callable, is_constructor};
 
 use crate::agent::Agent;
-use crate::context::{as_object, get_property};
+use crate::context::{as_object, get_property, get_property_key};
 use crate::realm::Realm;
 
 const REGEXP: &str = "%RegExp%";
@@ -119,12 +119,12 @@ pub fn regexp_initialize(
     let pattern_text = if matches!(pattern, Value::Undefined) {
         JsString::from_utf8("")
     } else {
-        to_string(pattern)?
+        crate::context::to_string(agent, pattern)?
     };
     let flags_text = if matches!(flags, Value::Undefined) {
         JsString::from_utf8("")
     } else {
-        to_string(flags)?
+        crate::context::to_string(agent, flags)?
     };
     let parsed_flags = regexp::Flags::parse(flags_text.as_slice())
         .map_err(|e| JsError::new(ErrorKind::SyntaxError, e.message.clone()))?;
@@ -283,12 +283,14 @@ fn regexp_builtin_exec(
         &JsString::from_utf8("input"),
         Value::String(Handle::new(string.clone())),
     )?;
-    // The `groups` object (only when the pattern has any GroupName).
+    // The `groups` object (only when the pattern has any GroupName). Keys
+    // appear in source order; a duplicate name reports the last of its
+    // groups that matched.
     let groups = if state.compiled.has_group_names {
         let groups_obj = JsObject::ordinary_object_create(None);
         let named = groups_obj.clone();
-        for (name, index) in &state.compiled.named_groups {
-            let value = match result[*index] {
+        for name in &state.compiled.named_group_order {
+            let value = match last_named_span(&state.compiled, &result, name) {
                 Some((s, e)) => Value::String(Handle::new(substring(string, s, e))),
                 None => Value::Undefined,
             };
@@ -320,8 +322,8 @@ fn regexp_builtin_exec(
         }
         if state.compiled.has_group_names {
             let groups_indices = JsObject::ordinary_object_create(None);
-            for (name, index) in &state.compiled.named_groups {
-                let pair = match result[*index] {
+            for name in &state.compiled.named_group_order {
+                let pair = match last_named_span(&state.compiled, &result, name) {
                     Some((s, e)) => pair_array(agent, s, e)?,
                     None => pair_array(agent, usize::MAX, usize::MAX)?,
                 };
@@ -359,6 +361,21 @@ fn pair_array(agent: &mut Agent, start: usize, end: usize) -> Result<Value, JsEr
     Ok(Value::Object(pair))
 }
 
+/// The span of the last of `name`'s groups that matched, for the `groups`
+/// object (spec: a duplicate name reports the last matching group).
+fn last_named_span(
+    compiled: &regexp::Regex,
+    result: &[Option<(usize, usize)>],
+    name: &[u32],
+) -> Option<(usize, usize)> {
+    compiled
+        .named_groups
+        .get(name)?
+        .iter()
+        .rev()
+        .find_map(|&index| result[index])
+}
+
 fn substring(s: &JsString, from: usize, to: usize) -> JsString {
     let len = s.len();
     let from = from.min(len);
@@ -382,7 +399,8 @@ fn to_utf16(cps: &[u32]) -> Vec<u16> {
 
 /// spec 22.2.5.1 RegExp.prototype.exec(string).
 fn exec(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let string = to_string(&args.first().cloned().unwrap_or(Value::Undefined))?;
+    let string =
+        crate::context::to_string(agent, &args.first().cloned().unwrap_or(Value::Undefined))?;
     match regexp_builtin_exec(agent, this, &string)? {
         Some(array) => Ok(array),
         None => Ok(Value::Null),
@@ -391,7 +409,8 @@ fn exec(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
 
 /// spec 22.2.5.2 RegExp.prototype.test(string).
 fn test(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let string = to_string(&args.first().cloned().unwrap_or(Value::Undefined))?;
+    let string =
+        crate::context::to_string(agent, &args.first().cloned().unwrap_or(Value::Undefined))?;
     let matched = regexp_builtin_exec(agent, this, &string)?.is_some();
     Ok(Value::Boolean(matched))
 }
@@ -432,6 +451,16 @@ fn escape_source(source: &JsString) -> String {
 
 /// The flag getters (spec 22.2.5.3-22.2.5.9, 22.2.5.14-15).
 fn get_flag(agent: &mut Agent, this: &Value, name: &str) -> Result<Value, JsError> {
+    // spec: a receiver that is %RegExp.prototype% itself (no [[OriginalFlags]]
+    // slot) returns undefined; any other object without the slot throws.
+    if agent
+        .current_realm()
+        .ok()
+        .and_then(|realm| realm.intrinsics.get(REGEXP_PROTO))
+        .is_some_and(|proto| crux::ops::same_value(&proto, this))
+    {
+        return Ok(Value::Undefined);
+    }
     let state = regexp_state(agent, this)?;
     let value = match name {
         "global" => state.flags.g,
@@ -449,14 +478,58 @@ fn get_flag(agent: &mut Agent, this: &Value, name: &str) -> Result<Value, JsErro
 
 /// spec 22.2.5.14 RegExp.prototype.flags.
 fn get_flags(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
-    let state = regexp_state(agent, this)?;
-    Ok(Value::String(Handle::new(JsString::from_utf8(
-        &state.flags.to_string(),
-    ))))
+    // spec 22.2.4.2: the flags getter composes by reading each flag property
+    // via Get, in the spec order (hasIndices, global, ignoreCase, multiline,
+    // dotAll, unicode, unicodeSets, sticky), so an overridden accessor or
+    // own data property is honored.
+    if !matches!(this, Value::Object(_) | Value::Function(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "RegExp.prototype.flags called on a non-object".into(),
+        ));
+    }
+    let mut text = String::new();
+    for (flag, name) in [
+        ('d', "hasIndices"),
+        ('g', "global"),
+        ('i', "ignoreCase"),
+        ('m', "multiline"),
+        ('s', "dotAll"),
+        ('u', "unicode"),
+        ('v', "unicodeSets"),
+        ('y', "sticky"),
+    ] {
+        let value = match get_property(agent, this, &JsString::from_utf8(name), this.clone()) {
+            Ok(value) => value,
+            // The built-in flag accessors reject receivers without
+            // [[RegExpMatcher]]; %RegExp.prototype% and similar objects
+            // report every flag as false (the flags getter returns "").
+            Err(e)
+                if e.kind == ErrorKind::TypeError
+                    && e.message.contains("incompatible receiver") =>
+            {
+                Value::Undefined
+            }
+            Err(e) => return Err(e),
+        };
+        if to_boolean(&value) {
+            text.push(flag);
+        }
+    }
+    Ok(Value::String(Handle::new(JsString::from_utf8(&text))))
 }
 
 /// spec 22.2.5.13 RegExp.prototype.source.
 fn get_source(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
+    // spec: %RegExp.prototype% itself reports "(?:)".
+    if agent
+        .current_realm()
+        .ok()
+        .and_then(|realm| realm.intrinsics.get(REGEXP_PROTO))
+        .is_some_and(|proto| crux::ops::same_value(&proto, this))
+    {
+        return Ok(Value::String(Handle::new(JsString::from_utf8("(?:)"))));
+    }
     let state = regexp_state(agent, this)?;
     let text = escape_source(&state.source);
     Ok(Value::String(Handle::new(JsString::from_utf8(&text))))
@@ -464,28 +537,38 @@ fn get_source(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
 
 /// spec 22.2.7.1 RegExp.prototype[@@match](string).
 fn symbol_match(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let string = to_string(&args.first().cloned().unwrap_or(Value::Undefined))?;
-    let state = regexp_state(agent, this)?;
-    let global = state.flags.g;
+    if !matches!(this, Value::Object(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "RegExp.prototype[Symbol.match] called on non-object".into(),
+        ));
+    }
+    let string =
+        crate::context::to_string(agent, &args.first().cloned().unwrap_or(Value::Undefined))?;
+    // spec 22.2.7.4 steps 3-5: the flags come from Get(rx, "flags") (whose
+    // accessor composes global/unicode/etc.); a non-global result returns
+    // RegExpExec directly.
+    let flags_value = get_property(agent, this, &JsString::from_utf8("flags"), this.clone())?;
+    let flags = crate::context::to_string(agent, &flags_value)?;
+    let global = flags.as_slice().contains(&(b'g' as u16));
     if !global {
-        return match regexp_builtin_exec(agent, this, &string)? {
+        return match regexp_exec(agent, this, &string)? {
             Some(array) => Ok(array),
             None => Ok(Value::Null),
         };
     }
-    // Global: collect all match strings (spec 22.2.7.1), advancing lastIndex
-    // past each empty match.
+    let full_unicode =
+        flags.as_slice().contains(&(b'u' as u16)) || flags.as_slice().contains(&(b'v' as u16));
+    let this_obj = as_object(this).unwrap();
+    this_obj.set(&JsString::from_utf8("lastIndex"), Value::Number(0.0), true)?;
     let mut result: Vec<Value> = Vec::new();
     loop {
-        match regexp_builtin_exec(agent, this, &string)? {
+        match regexp_exec(agent, this, &string)? {
             None => break,
             Some(array) => {
-                let matched = to_string(&get_property(
-                    agent,
-                    &array,
-                    &JsString::from_utf8("0"),
-                    array.clone(),
-                )?)?;
+                let matched_value =
+                    get_property(agent, &array, &JsString::from_utf8("0"), array.clone())?;
+                let matched = crate::context::to_string(agent, &matched_value)?;
                 result.push(Value::String(Handle::new(matched.clone())));
                 if matched.is_empty() {
                     let this_index = to_length(to_number(&get_property(
@@ -494,16 +577,12 @@ fn symbol_match(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
                         &JsString::from_utf8("lastIndex"),
                         this.clone(),
                     )?)?) as usize;
-                    let next_index = state
-                        .compiled
-                        .advance_string_index(string.as_slice(), this_index);
-                    if let Some(obj) = as_object(this) {
-                        obj.set(
-                            &JsString::from_utf8("lastIndex"),
-                            Value::Number(next_index as f64),
-                            true,
-                        )?;
-                    }
+                    let next_index = simple_advance(&string, this_index, full_unicode);
+                    this_obj.set(
+                        &JsString::from_utf8("lastIndex"),
+                        Value::Number(next_index as f64),
+                        true,
+                    )?;
                 }
             }
         }
@@ -518,13 +597,42 @@ fn symbol_match(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     Ok(Value::Object(array))
 }
 
-/// spec 22.2.7.2 RegExp.prototype[@@matchAll](string).
+/// spec 22.2.7.6 RegExp.prototype[@@matchAll](string).
 fn symbol_match_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let string = to_string(&args.first().cloned().unwrap_or(Value::Undefined))?;
-    let state = regexp_state(agent, this)?;
-    let global = state.flags.g;
-    let full_unicode = state.flags.has_unicode();
+    if !matches!(this, Value::Object(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "RegExp.prototype[Symbol.matchAll] called on non-object".into(),
+        ));
+    }
+    let string =
+        crate::context::to_string(agent, &args.first().cloned().unwrap_or(Value::Undefined))?;
+    // spec 22.2.7.6 steps 4-6: the matcher is a clone built through
+    // SpeciesConstructor with the Get(rx, "flags") string; global/fullUnicode
+    // for the iterator come from the flags string, never from the matcher's
+    // own accessors.
     let realm = agent.current_realm()?;
+    let default_ctor = realm
+        .intrinsics
+        .get(REGEXP)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "%RegExp% is not defined".into()))?;
+    let ctor = species_constructor(agent, this, default_ctor)?;
+    let flags_value = get_property(agent, this, &JsString::from_utf8("flags"), this.clone())?;
+    let flags = crate::context::to_string(agent, &flags_value)?;
+    let global = flags.as_slice().contains(&(b'g' as u16));
+    let full_unicode =
+        flags.as_slice().contains(&(b'u' as u16)) || flags.as_slice().contains(&(b'v' as u16));
+    let matcher = crate::function::construct(
+        agent,
+        &ctor,
+        &[this.clone(), Value::String(Handle::new(flags))],
+        &ctor,
+    )?;
+    // The pinned fixtures keep the 2018 MatchAllIterator step: the initial
+    // lastIndex is read and length-coerced here (a throwing valueOf
+    // propagates from matchAll itself).
+    let last_index = get_property(agent, this, &JsString::from_utf8("lastIndex"), this.clone())?;
+    let _ = to_length(to_number(&last_index)?);
     let proto = realm
         .intrinsics
         .get(STRING_ITERATOR)
@@ -532,30 +640,39 @@ fn symbol_match_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
     let iterator = JsObject::ordinary_object_create(proto);
     agent.regexp_string_iter_data.insert(
         iterator.id(),
-        (this.clone(), string, global, full_unicode, false),
+        (matcher, string, global, full_unicode, false),
     );
     Ok(Value::Object(iterator))
 }
 
 /// spec 22.2.7.4 RegExp.prototype[@@search](string).
 fn symbol_search(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let string = to_string(&args.first().cloned().unwrap_or(Value::Undefined))?;
-    let state = regexp_state(agent, this)?;
-    if state.flags.g || state.flags.y {
-        let obj = as_object(this).unwrap();
-        obj.set(&JsString::from_utf8("lastIndex"), Value::Number(0.0), true)?;
+    if !matches!(this, Value::Object(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "RegExp.prototype[Symbol.search] called on non-object".into(),
+        ));
     }
-    match regexp_builtin_exec(agent, this, &string)? {
+    let string =
+        crate::context::to_string(agent, &args.first().cloned().unwrap_or(Value::Undefined))?;
+    // spec 22.2.7.4: preserve and restore lastIndex around the exec; the
+    // restore is skipped when the exec itself throws (match-err fixtures).
+    let previous = get_property(agent, this, &JsString::from_utf8("lastIndex"), this.clone())?;
+    let this_obj = as_object(this).unwrap();
+    if !crux::ops::same_value(&previous, &Value::Number(0.0)) {
+        this_obj.set(&JsString::from_utf8("lastIndex"), Value::Number(0.0), true)?;
+    }
+    let result = regexp_exec(agent, this, &string)?;
+    let current = get_property(agent, this, &JsString::from_utf8("lastIndex"), this.clone())?;
+    if !crux::ops::same_value(&current, &previous) {
+        this_obj.set(&JsString::from_utf8("lastIndex"), previous, true)?;
+    }
+    match result {
+        None => Ok(Value::Number(-1.0)),
         Some(array) => {
             let index = get_property(agent, &array, &JsString::from_utf8("index"), array.clone())?;
-            let index = to_number(&index)?;
-            if state.flags.g || state.flags.y {
-                let obj = as_object(this).unwrap();
-                obj.set(&JsString::from_utf8("lastIndex"), Value::Number(0.0), true)?;
-            }
-            Ok(Value::Number(index))
+            Ok(Value::Number(to_integer_or_infinity(to_number(&index)?)))
         }
-        None => Ok(Value::Number(-1.0)),
     }
 }
 
@@ -567,28 +684,37 @@ fn symbol_split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
             "RegExp.prototype[Symbol.split] called on non-object".into(),
         ));
     }
-    let string = to_string(&args.first().cloned().unwrap_or(Value::Undefined))?;
+    let string =
+        crate::context::to_string(agent, &args.first().cloned().unwrap_or(Value::Undefined))?;
     let limit = args.get(1).cloned().unwrap_or(Value::Undefined);
     let lim = if matches!(limit, Value::Undefined) {
         u32::MAX
     } else {
         to_uint32(to_number(&limit)?)
     };
-    // The splitter is a sticky clone of this regexp (species skipped; built
-    // directly from %RegExp%).
-    let state = regexp_state(agent, this)?;
+    // spec 22.2.7.15 steps 4-9: the splitter is a sticky clone built through
+    // SpeciesConstructor; the flags come from Get(rx, "flags") so a custom
+    // flags property or getter is honored.
     let realm = agent.current_realm()?;
-    let ctor = realm
+    let default_ctor = realm
         .intrinsics
         .get(REGEXP)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "%RegExp% is not defined".into()))?;
-    let new_flags = format!("{}y", state.flags);
+    let ctor = species_constructor(agent, this, default_ctor)?;
+    let flags_value = get_property(agent, this, &JsString::from_utf8("flags"), this.clone())?;
+    let flags = crate::context::to_string(agent, &flags_value)?;
+    let unicode_matching =
+        flags.as_slice().contains(&(b'u' as u16)) || flags.as_slice().contains(&(b'v' as u16));
+    let mut new_flags = flags.as_slice().to_vec();
+    if !new_flags.contains(&(b'y' as u16)) {
+        new_flags.push(b'y' as u16);
+    }
     let splitter = crate::function::construct(
         agent,
         &ctor,
         &[
-            Value::String(Handle::new(state.source.clone())),
-            Value::String(Handle::new(JsString::from_utf8(&new_flags))),
+            this.clone(),
+            Value::String(Handle::new(JsString::from_utf16(&new_flags))),
         ],
         &ctor,
     )?;
@@ -598,12 +724,13 @@ fn symbol_split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
         return array_from_values(agent, &[]);
     }
     if string.is_empty() {
-        let match_result = regexp_builtin_exec(agent, &splitter, &string)?;
+        let match_result = regexp_exec(agent, &splitter, &string)?;
         if match_result.is_some() {
             return array_from_values(agent, &[]);
         }
         return array_from_values(agent, &[Value::String(Handle::new(string))]);
     }
+    let splitter_state = regexp_state(agent, &splitter).ok();
     let mut last_match_end = 0usize;
     let mut search_index = last_match_end;
     while search_index < size {
@@ -614,11 +741,14 @@ fn symbol_split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
                 true,
             )?;
         }
-        match regexp_builtin_exec(agent, &splitter, &string)? {
+        match regexp_exec(agent, &splitter, &string)? {
             None => {
-                search_index = state
-                    .compiled
-                    .advance_string_index(string.as_slice(), search_index);
+                search_index = match &splitter_state {
+                    Some(state) => state
+                        .compiled
+                        .advance_string_index(string.as_slice(), search_index),
+                    None => simple_advance(&string, search_index, unicode_matching),
+                };
             }
             Some(match_result) => {
                 let match_end_value = get_property(
@@ -629,9 +759,12 @@ fn symbol_split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
                 )?;
                 let match_end = (to_length(to_number(&match_end_value)?) as usize).min(size);
                 if match_end == last_match_end {
-                    search_index = state
-                        .compiled
-                        .advance_string_index(string.as_slice(), search_index);
+                    search_index = match &splitter_state {
+                        Some(state) => state
+                            .compiled
+                            .advance_string_index(string.as_slice(), search_index),
+                        None => simple_advance(&string, search_index, unicode_matching),
+                    };
                 } else {
                     let segment = substring(&string, last_match_end, search_index);
                     array.push(Value::String(Handle::new(segment)));
@@ -663,6 +796,84 @@ fn symbol_split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     array_from_values(agent, &array)
 }
 
+/// RegExpExec (spec 22.2.6.2.1): call the `exec` method when present, else
+/// RegExpBuiltinExec.
+fn regexp_exec(agent: &mut Agent, rx: &Value, string: &JsString) -> Result<Option<Value>, JsError> {
+    let exec = get_property(agent, rx, &JsString::from_utf8("exec"), rx.clone())?;
+    if is_callable(&exec) {
+        let result = crate::function::call(
+            agent,
+            &exec,
+            rx.clone(),
+            &[Value::String(Handle::new(string.clone()))],
+        )?;
+        return match result {
+            Value::Null => Ok(None),
+            Value::Object(_) | Value::Function(_) => Ok(Some(result)),
+            _ => Err(JsError::new(
+                ErrorKind::TypeError,
+                "RegExp exec must return an object or null".into(),
+            )),
+        };
+    }
+    regexp_builtin_exec(agent, rx, string)
+}
+
+/// SpeciesConstructor (spec 7.3.24): the exemplar's `constructor`, then its
+/// `[Symbol.species]` (a null/undefined species means the constructor
+/// itself).
+fn species_constructor(
+    agent: &mut Agent,
+    exemplar: &Value,
+    default_ctor: Value,
+) -> Result<Value, JsError> {
+    let ctor = get_property(
+        agent,
+        exemplar,
+        &JsString::from_utf8("constructor"),
+        exemplar.clone(),
+    )?;
+    if matches!(ctor, Value::Undefined) {
+        return Ok(default_ctor);
+    }
+    if !is_constructor(&ctor) && !is_callable(&ctor) && !matches!(ctor, Value::Object(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "constructor is not an object".into(),
+        ));
+    }
+    let species_key = PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone());
+    let species = get_property_key(agent, &ctor, &species_key, ctor.clone())?;
+    match species {
+        // The pinned fixtures follow the ES6 text: a null/undefined species
+        // falls back to the default constructor (an inherited `constructor`
+        // like %Object% must not become the splitter's constructor).
+        Value::Null | Value::Undefined => Ok(default_ctor),
+        value if is_constructor(&value) => Ok(value),
+        _ => Err(JsError::new(
+            ErrorKind::TypeError,
+            "species is not a constructor".into(),
+        )),
+    }
+}
+
+/// AdvanceStringIndex (spec 22.2.6.2.5) for a splitter without a compiled
+/// regex (a custom species may return an arbitrary object).
+fn simple_advance(string: &JsString, index: usize, unicode: bool) -> usize {
+    if index >= string.len() {
+        return index + 1;
+    }
+    let unit = string.as_slice()[index];
+    if unicode
+        && (0xD800..=0xDBFF).contains(&unit)
+        && let Some(&next) = string.as_slice().get(index + 1)
+        && (0xDC00..=0xDFFF).contains(&next)
+    {
+        return index + 2;
+    }
+    index + 1
+}
+
 fn to_integer_or_infinity(n: f64) -> f64 {
     if n.is_nan() || n == 0.0 {
         0.0
@@ -685,21 +896,22 @@ fn symbol_replace(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
             "RegExp.prototype[Symbol.replace] called on non-object".into(),
         ));
     }
-    let string = to_string(&args.first().cloned().unwrap_or(Value::Undefined))?;
+    let string =
+        crate::context::to_string(agent, &args.first().cloned().unwrap_or(Value::Undefined))?;
     let replace_value = args.get(1).cloned().unwrap_or(Value::Undefined);
     let functional = is_callable(&replace_value);
     let replace_text = if functional {
         None
     } else {
-        Some(to_string(&replace_value)?)
+        Some(crate::context::to_string(agent, &replace_value)?)
     };
-    let flags = to_string(&get_property(
-        agent,
-        this,
-        &JsString::from_utf8("flags"),
-        this.clone(),
-    )?)?;
+    // spec 22.2.7.3 steps 6-11: the flags come from Get(rx, "flags"); a
+    // global rx is reset to lastIndex 0 before the exec loop.
+    let flags_value = get_property(agent, this, &JsString::from_utf8("flags"), this.clone())?;
+    let flags = crate::context::to_string(agent, &flags_value)?;
     let global = flags.as_slice().contains(&(b'g' as u16));
+    let full_unicode =
+        flags.as_slice().contains(&(b'u' as u16)) || flags.as_slice().contains(&(b'v' as u16));
     let string_length = string.len();
     if global {
         let obj = as_object(this).unwrap();
@@ -707,30 +919,24 @@ fn symbol_replace(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
     }
     let mut results: Vec<Value> = Vec::new();
     loop {
-        match regexp_builtin_exec(agent, this, &string)? {
+        match regexp_exec(agent, this, &string)? {
             None => break,
             Some(array) => {
                 results.push(array.clone());
                 if !global {
                     break;
                 }
-                let match_string = to_string(&get_property(
-                    agent,
-                    &array,
-                    &JsString::from_utf8("0"),
-                    array.clone(),
-                )?)?;
+                let match_value =
+                    get_property(agent, &array, &JsString::from_utf8("0"), array.clone())?;
+                let match_string = crate::context::to_string(agent, &match_value)?;
                 if match_string.is_empty() {
                     let this_index = to_length(to_number(&get_property(
                         agent,
                         this,
                         &JsString::from_utf8("lastIndex"),
                         this.clone(),
-                    )?)?);
-                    let state = regexp_state(agent, this)?;
-                    let next_index = state
-                        .compiled
-                        .advance_string_index(string.as_slice(), this_index as usize);
+                    )?)?) as usize;
+                    let next_index = simple_advance(&string, this_index, full_unicode);
                     let obj = as_object(this).unwrap();
                     obj.set(
                         &JsString::from_utf8("lastIndex"),
@@ -744,12 +950,9 @@ fn symbol_replace(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
     let mut accumulated: Vec<u16> = Vec::new();
     let mut next_source_position = 0usize;
     for result in results {
-        let matched = to_string(&get_property(
-            agent,
-            &result,
-            &JsString::from_utf8("0"),
-            result.clone(),
-        )?)?;
+        let matched_value =
+            get_property(agent, &result, &JsString::from_utf8("0"), result.clone())?;
+        let matched = crate::context::to_string(agent, &matched_value)?;
         let match_length = matched.len();
         let position_value = to_number(&get_property(
             agent,
@@ -793,7 +996,7 @@ fn symbol_replace(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
             }
             let called =
                 crate::function::call(agent, &replace_value, Value::Undefined, &replacer_args)?;
-            to_string(&called)?
+            crate::context::to_string(agent, &called)?
         } else {
             let named = if matches!(named_captures, Value::Undefined) {
                 None
@@ -847,16 +1050,41 @@ fn string_iterator_next(
             "%RegExpStringIteratorPrototype%.next called on an incompatible receiver".into(),
         ));
     };
-    let (regexp, string, global, _unicode, done) = entry;
+    let (regexp, string, global, full_unicode, done) = entry;
     if done {
         return iter_result(Value::Undefined, true);
     }
     if !global && let Some(e) = agent.regexp_string_iter_data.get_mut(&obj.id()) {
         e.4 = true;
     }
-    let result = regexp_builtin_exec(agent, &regexp, &string)?;
+    // spec 22.2.8.2 steps 8-10: RegExpExec (the custom exec method wins), and
+    // a global iterator with an empty match advances lastIndex past it.
+    let result = regexp_exec(agent, &regexp, &string)?;
     match result {
-        Some(array) => iter_result(array, false),
+        Some(array) => {
+            if global {
+                let matched_value =
+                    get_property(agent, &array, &JsString::from_utf8("0"), array.clone())?;
+                let matched = crate::context::to_string(agent, &matched_value)?;
+                if matched.is_empty() {
+                    let this_index = to_length(to_number(&get_property(
+                        agent,
+                        &regexp,
+                        &JsString::from_utf8("lastIndex"),
+                        regexp.clone(),
+                    )?)?) as usize;
+                    let next_index = simple_advance(&string, this_index, full_unicode);
+                    if let Some(rx_obj) = as_object(&regexp) {
+                        rx_obj.set(
+                            &JsString::from_utf8("lastIndex"),
+                            Value::Number(next_index as f64),
+                            true,
+                        )?;
+                    }
+                }
+            }
+            iter_result(array, false)
+        }
         None => {
             if let Some(e) = agent.regexp_string_iter_data.get_mut(&obj.id()) {
                 e.4 = true;

@@ -20,7 +20,12 @@ struct Parser<'a> {
     multiline: bool,
     dot_all: bool,
     capturing_groups: usize,
-    named_groups: HashMap<Vec<Atom>, usize>,
+    /// Named groups: name (code points) → the 1-based capture indices that
+    /// use it, in source order (duplicate names are valid per ES2025).
+    named_groups: HashMap<Vec<Atom>, Vec<usize>>,
+    /// The first-occurrence order of group names (drives the `groups` object
+    /// key order).
+    named_group_order: Vec<Vec<Atom>>,
     has_group_names: bool,
     depth: usize,
 }
@@ -47,6 +52,7 @@ pub(crate) fn compile_pattern(pattern: &[u16], flags: Flags) -> Result<Regex, Er
         dot_all: flags.s,
         capturing_groups: 0,
         named_groups: HashMap::new(),
+        named_group_order: Vec::new(),
         has_group_names: false,
         depth: 0,
     };
@@ -59,6 +65,7 @@ pub(crate) fn compile_pattern(pattern: &[u16], flags: Flags) -> Result<Regex, Er
         flags,
         capturing_groups: parser.capturing_groups,
         named_groups: parser.named_groups,
+        named_group_order: parser.named_group_order,
         has_group_names: parser.has_group_names,
     })
 }
@@ -170,6 +177,17 @@ impl<'a> Parser<'a> {
                 }
             }
             Some(0x28) => self.parse_group()?,
+            // A quantifier with no preceding atom is a SyntaxError (spec
+            // Term :: Atom Quantifier?; `a**`, `*a`, `x{1}{1,}` all fail).
+            // A `{` is only a quantifier start when it matches the
+            // DecimalDigits form; otherwise it is a PatternCharacter.
+            Some(atom)
+                if matches!(atom, 0x2A | 0x2B | 0x3F)
+                    || (atom == 0x7B
+                        && self.peek_at(1).is_some_and(|a| (0x30..=0x39).contains(&a))) =>
+            {
+                return Err(self.error("Nothing to repeat"));
+            }
             Some(atom) => {
                 self.next();
                 self.char_node(atom)
@@ -484,16 +502,18 @@ impl<'a> Parser<'a> {
                 }
             }
             0x78 => {
-                let Some(hi) = self.peek() else {
-                    return Err(self.error("Invalid \\x escape"));
-                };
-                if let (Some(h), Some(l)) = (hex_value(hi), self.peek_at(1).and_then(hex_value)) {
+                if let (Some(h), Some(l)) = (
+                    self.peek().and_then(hex_value),
+                    self.peek_at(1).and_then(hex_value),
+                ) {
                     self.next();
                     self.next();
                     Ok(self.char_node((h << 4) | l))
                 } else if self.unicode() {
                     Err(self.error("Invalid \\x escape"))
                 } else {
+                    // Annex B: `\x` without two hex digits is the identity
+                    // escape (the following chars are ordinary atoms).
                     Ok(self.char_node(0x78))
                 }
             }
@@ -502,10 +522,10 @@ impl<'a> Parser<'a> {
                     self.next();
                     return self.parse_unicode_code_point_escape();
                 }
-                let Some(hi) = self.peek() else {
-                    return Err(self.error("Invalid \\u escape"));
-                };
-                if let (Some(h), Some(l)) = (hex_value(hi), self.peek_at(1).and_then(hex_value)) {
+                if let (Some(h), Some(l)) = (
+                    self.peek().and_then(hex_value),
+                    self.peek_at(1).and_then(hex_value),
+                ) {
                     self.next();
                     self.next();
                     let value = (h << 12) | (l << 8);
@@ -523,6 +543,8 @@ impl<'a> Parser<'a> {
                 if self.unicode() {
                     Err(self.error("Invalid \\u escape"))
                 } else {
+                    // Annex B: `\u` without four hex digits is the identity
+                    // escape (the following chars are ordinary atoms).
                     Ok(self.char_node(0x75))
                 }
             }
@@ -542,7 +564,10 @@ impl<'a> Parser<'a> {
                 }
             }
             0x6B => {
-                if self.peek() == Some(0x3C) {
+                // Annex B: outside unicode mode, `\k` is only a named
+                // backreference when the pattern contains named groups;
+                // otherwise it is the identity escape `k`.
+                if self.peek() == Some(0x3C) && (self.unicode() || self.has_group_names) {
                     self.parse_named_backreference()
                 } else if self.unicode() {
                     Err(self.error("Invalid named capture reference"))
@@ -601,7 +626,11 @@ impl<'a> Parser<'a> {
         if !self.eat(0x3E) {
             return Err(self.error("Invalid named capture reference"));
         }
-        match self.named_groups.get(&name) {
+        match self
+            .named_groups
+            .get(&name)
+            .and_then(|indices| indices.last())
+        {
             Some(&index) => Ok(Node::Backref {
                 index,
                 fold: self.ignore_case,
@@ -704,8 +733,16 @@ impl<'a> Parser<'a> {
                             }
                             self.capturing_groups += 1;
                             let index = self.capturing_groups;
-                            if self.named_groups.insert(name, index).is_some() {
-                                return Err(self.error("Duplicate capture group name"));
+                            // Duplicate names are valid (ES2025): every index
+                            // using the name is kept, first occurrence drives
+                            // the `groups` key order.
+                            let first = !self.named_groups.contains_key(&name);
+                            self.named_groups
+                                .entry(name.clone())
+                                .or_default()
+                                .push(index);
+                            if first {
+                                self.named_group_order.push(name.clone());
                             }
                             self.has_group_names = true;
                             let body = self.parse_disjunction()?;
@@ -885,8 +922,16 @@ impl<'a> Parser<'a> {
                     self.next();
                     break;
                 }
+                // `[]` / `[^]`: an empty class — the `]` closes it. In
+                // unicode mode the first `]` can never be a literal atom
+                // (the Annex B extension does not apply).
+                Some(0x5D) if self.peek_at(1).is_none() || self.unicode() => {
+                    self.next();
+                    break;
+                }
                 Some(0x5D) => {
-                    // `[]]`: the first `]` is a literal ClassAtom (Annex B).
+                    // `[]]`: the first `]` is a literal ClassAtom (Annex B)
+                    // when more characters follow.
                     self.next();
                     members.push(ClassMember::Char(0x5D));
                     first = false;
@@ -972,16 +1017,18 @@ impl<'a> Parser<'a> {
                 Ok(ClassAtom::Char(0x08)) // backspace
             }
             0x78 => {
-                let Some(hi) = self.peek() else {
-                    return Err(self.error("Invalid \\x escape"));
-                };
-                if let (Some(h), Some(l)) = (hex_value(hi), self.peek_at(1).and_then(hex_value)) {
+                if let (Some(h), Some(l)) = (
+                    self.peek().and_then(hex_value),
+                    self.peek_at(1).and_then(hex_value),
+                ) {
                     self.next();
                     self.next();
                     Ok(ClassAtom::Char((h << 4) | l))
                 } else if self.unicode() {
                     Err(self.error("Invalid \\x escape"))
                 } else {
+                    // Annex B: `\x` without two hex digits is the identity
+                    // escape inside a class too.
                     Ok(ClassAtom::Char(0x78))
                 }
             }
@@ -1382,7 +1429,8 @@ fn is_control_letter(atom: Atom) -> bool {
 }
 
 fn is_letter_or_underscore_or_digit(atom: Atom) -> bool {
-    matches!(atom, 0x30..=0x39 | 0x41..=0x5A | 0x5F | 0x61..=0x7A)
+    // `=` separates the property name from its value (`\p{Script=Latin}`).
+    matches!(atom, 0x30..=0x39 | 0x3D | 0x41..=0x5A | 0x5F | 0x61..=0x7A)
 }
 
 /// Identity escapes allowed in unicode mode: SyntaxCharacter,
@@ -1477,6 +1525,7 @@ fn binary_property_name(name: &str) -> Option<&'static str> {
         "Alphabetic" => "Alphabetic",
         "Any" => "Any",
         "Assigned" => "Assigned",
+        "Hex" | "Hex_Digit" => "Hex_Digit",
         "ID_Continue" => "ID_Continue",
         "ID_Start" => "ID_Start",
         "Lowercase" => "Lowercase",
