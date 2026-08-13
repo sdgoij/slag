@@ -591,9 +591,12 @@ pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Resu
         }
         ReferenceBase::Value(base) => {
             let key = &reference.name;
-            // Primitive bases are boxed (spec 7.3.4 step 5.b): the write lands
-            // on the temporary wrapper, which makes strict mode throw and
-            // sloppy mode ignore it.
+            // Primitive bases are boxed for the write (spec 7.3.6 step 5.b),
+            // but the receiver stays the primitive: an inherited accessor
+            // setter sees `this` as the primitive, and a write that reaches
+            // the end of the chain fails (strict) instead of landing on the
+            // ephemeral wrapper.
+            let receiver = base.clone();
             let base = if matches!(base, Value::Object(_) | Value::Function(_)) {
                 base.clone()
             } else {
@@ -607,18 +610,18 @@ pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Resu
                     if !typed_array_index
                         && let Some(setter) = find_ecma_accessor(obj, key, AccessorKind::Set)?
                     {
-                        crate::function::call(agent, &setter, base.clone(), &[value])?;
+                        crate::function::call(agent, &setter, receiver.clone(), &[value])?;
                         return Ok(());
                     }
-                    obj.set_with_receiver_key(key, value, base.clone(), reference.strict)
+                    obj.set_with_receiver_key(key, value, receiver.clone(), reference.strict)
                 }
                 Value::Function(f) => {
                     if let Some(setter) = find_ecma_accessor(&f.object, key, AccessorKind::Set)? {
-                        crate::function::call(agent, &setter, base.clone(), &[value])?;
+                        crate::function::call(agent, &setter, receiver.clone(), &[value])?;
                         return Ok(());
                     }
                     f.object
-                        .set_with_receiver_key(key, value, base.clone(), reference.strict)
+                        .set_with_receiver_key(key, value, receiver.clone(), reference.strict)
                 }
                 _ => {
                     return Err(JsError::new(

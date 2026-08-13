@@ -64,12 +64,20 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let symbol_proto = JsObject::ordinary_object_create(object_proto);
     let symbol_proto_value = Value::Object(symbol_proto.clone());
 
-    // %Symbol% (20.4.1): non-constructible, so `new Symbol()` throws.
+    // %Symbol% (20.4.1): non-constructible when called with new (the body
+    // throws), but it still has a [[Construct]] internal method so
+    // IsConstructor(Symbol) is true (subclassable per spec; the proxy
+    // construct trap fires over it).
     let symbol_ctor = Function::create_builtin(
         Some(JsString::from_utf8("Symbol")),
         0,
         Box::new(placeholder("Symbol")),
-        None,
+        Some(Box::new(|_new_target, _args| {
+            Err(JsError::new(
+                ErrorKind::TypeError,
+                "Symbol is not a constructor".into(),
+            ))
+        })),
         None,
     )?;
     let symbol_ctor_value = Value::Function(symbol_ctor.clone());
@@ -211,9 +219,18 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             configurable: Some(true),
         },
     )?;
+    // Symbol.prototype[@@toStringTag] (20.4.3.6): "Symbol", writable and
+    // enumerable false, configurable true.
     symbol_proto.define_property_key(
         &PropertyKey::Symbol(well_known("toStringTag").as_ref().clone()),
-        &PropertyDescriptor::none(Value::String(Handle::new(JsString::from_utf8("Symbol")))),
+        &PropertyDescriptor {
+            value: Some(Value::String(Handle::new(JsString::from_utf8("Symbol")))),
+            writable: Some(false),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
     )?;
 
     realm.global_object.define_property_or_throw(

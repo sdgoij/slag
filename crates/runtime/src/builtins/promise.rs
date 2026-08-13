@@ -143,14 +143,29 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     install_statics(realm, &promise_ctor)?;
 
     // %Promise.prototype%[@@toStringTag] = "Promise" (spec 27.2.5.5) and
-    // %Promise%[@@species] (spec 27.2.4.6).
+    // %Promise%[@@species] (spec 27.2.4.6): an accessor whose getter is
+    // named "get [Symbol.species]" and returns `this`.
     promise_proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
         &PropertyDescriptor::none(Value::String(Handle::new(JsString::from_utf8("Promise")))),
     )?;
+    let species_getter = Function::create_builtin(
+        Some(JsString::from_utf8("get [Symbol.species]")),
+        0,
+        Box::new(|this: &Value, _args: &[Value]| Ok(this.clone())),
+        None,
+        None,
+    )?;
     promise_ctor.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone()),
-        &PropertyDescriptor::none(promise_ctor_value.clone()),
+        &PropertyDescriptor {
+            value: None,
+            writable: None,
+            get: Some(Value::Function(species_getter)),
+            set: Some(Value::Undefined),
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
     )?;
 
     realm.global_object.define_property_or_throw(

@@ -703,6 +703,30 @@ rebuilt around the spec algorithms:
   right records (collected columns reverse, the outer iterables iterator
   only for the flattenable-abrupt case, never for the step-abrupt case).
 
+### Symbol cluster sweep (Phase 18 conformance)
+
+A sweep of the `Symbol/*` tree (`sweep.exe built-ins --filter 'Symbol/*'`)
+reports **81 pass, 0 fail, 17 skip** of 98 fixtures: every runnable fixture
+passes (up from 76 pass / 5 fail). Fixes in
+`crates/runtime/src/builtins/symbol.rs`,
+`crates/runtime/src/builtins/promise.rs`, and `crates/runtime/src/context.rs`:
+
+- **Strict writes to primitives** — `PutValue` boxed a primitive base and
+  used the *wrapper* as the receiver, so `"use strict"; sym.a = 0` (and
+  `(5).a = 1`, `"abc".a = 1`) silently created a property on the ephemeral
+  wrapper instead of throwing. The receiver now stays the primitive: an
+  inherited accessor setter sees `this` as the primitive and a chain-ending
+  write fails with a TypeError (spec 7.3.6 step 5.b).
+- **`Symbol.prototype[@@toStringTag]`** was defined with all attributes
+  false; the spec requires `configurable: true` (spec 20.4.3.6).
+- **`IsConstructor(Symbol)`** — Symbol was created with no [[Construct]],
+  so `isConstructor(Symbol)` (via the proxy construct trap) was false.
+  Symbol now carries a throwing construct body: `new Symbol()` still
+  throws, but the proxy trap fires and subclass `extends` semantics hold
+  (spec 20.4.1).
+- **`%Promise%[@@species]`** was a data property; the spec (27.2.4.6)
+  defines a getter accessor named `get [Symbol.species]` returning `this`.
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~120 edge-case unit tests were added across
@@ -809,9 +833,9 @@ TypedArray fixtures that pass with the long timeout (see below).
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,798 | 16,284 | 4,101 | 3,410 | 3¹ | 79.9% |
+| built-ins | 23,798 | 16,289 | 4,096 | 3,410 | 3¹ | 79.9% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,608** | **32,727** | **6,707** | **9,171** | **3** | **83.0%** |
+| **Total** | **48,608** | **32,732** | **6,702** | **9,171** | **3** | **83.0%** |
 
 (Runnable = pass + fail; the 9,171 skips are module/async fixtures,
 unsupported harness includes, and the out-of-scope Temporal proposal
@@ -819,9 +843,9 @@ fixtures.) The built-ins row reflects the current
 `Error*`/`BigInt*`/RegExp/Object-descriptor hardening plus the
 String/prototype, Object/create, DisposableStack, AsyncDisposableStack,
 ArrayBuffer/SharedArrayBuffer, Date, BigInt, global-functions, Function,
-Iterator/prototype, and Iterator statics (concat/from/zip/zipKeyed)
-cluster closures (all 0 fail); the language and annexB rows are from the
-sweep recorded below.
+Iterator/prototype, Iterator statics (concat/from/zip/zipKeyed), and
+Symbol cluster closures (all 0 fail); the language and annexB rows are
+from the sweep recorded below.
 
 ¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
 coerced-values fixtures — 10,000-element allocations that need the long
