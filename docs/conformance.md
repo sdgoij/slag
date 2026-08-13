@@ -378,6 +378,42 @@ of the session. The 4 skips are the standard taxonomy (`$262.createRealm`,
   receiver objects now resolve `toString`, clearing the
   "Cannot convert object to primitive value" class of failures.
 
+### DisposableStack / AsyncDisposableStack cluster sweep (Phase 18 conformance)
+
+Sweeps of both explicit-resource-management trees (`sweep.exe built-ins
+--filter 'DisposableStack*'` and `'AsyncDisposableStack*'`) report **91
+pass, 0 fail, 2 skip** of 93 and **74 pass, 0 fail, 30 skip** of 104:
+every runnable fixture passes (up from 82 pass / 9 fail and 72 pass /
+2 fail). The skips are the standard taxonomy (async-flag fixtures,
+`$262.createRealm`, `deepEqual.js` includes). Fixes in
+`crates/runtime/src/builtins/disposable.rs`:
+
+- **adopt/defer closures:** resources stored the raw `onDispose` and were
+  invoked as `method.call(value)`; the adopt closure must call
+  `onDispose(undefined, « value »)` and defer's `onDispose(undefined)`.
+  Resources now carry a call kind (`Receiver`/`Argument`/`Plain`) used by
+  both the sync and async disposal drivers.
+- **Sync/async stack branding:** both stack kinds shared one table with no
+  type flag, so `DisposableStack.prototype.use.call(asyncStack)`
+  succeeded; `[[DisposableState]]`/`[[AsyncDisposableState]]` are now
+  distinguished, so cross-kind method calls throw the RequireInternalSlot
+  TypeError.
+- **`use` on a disposed stack:** the disposed check ran after the value
+  handling, so `use(undefined)`/`use(1)` on a disposed stack returned or
+  type-errored instead of the spec ReferenceError; the check now runs
+  first (also in `adopt`/`defer`).
+- **Async-dispose fallback:** `use` on an async stack rejected values with
+  only `@@dispose`; `GetDisposeMethod` now falls back from
+  `@@asyncDispose` to `@@dispose`, and values with no matching method
+  throw the use-step TypeError.
+- **`disposeAsync` returns a promise:** the empty-stack fast path returned
+  the driver's `undefined` instead of the capability promise.
+- **`Symbol.dispose`/`Symbol.asyncDispose` identity and name:** the
+  `@@dispose` property was a second function named `[dispose]`; it is now
+  the same function object as `dispose`/`disposeAsync`, named per spec.
+- **`@@toStringTag` descriptor:** built with `configurable: true` (the
+  `PropertyDescriptor::none` helper forces `configurable: false`).
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~120 edge-case unit tests were added across
@@ -483,15 +519,16 @@ TypedArray fixtures that pass with the long timeout (see below).
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,798 | 15,755 | 4,639 | 3,401 | 3¹ | 77.3% |
+| built-ins | 23,798 | 15,766 | 4,628 | 3,401 | 3¹ | 77.3% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,608** | **32,198** | **7,245** | **9,162** | **3** | **81.6%** |
+| **Total** | **48,608** | **32,209** | **7,234** | **9,162** | **3** | **81.7%** |
 
 (Runnable = pass + fail; the 9,162 skips are module/async fixtures and
 unsupported harness includes.) The built-ins row reflects the current
 `Error*`/`BigInt*`/RegExp/Object-descriptor hardening plus the
-String/prototype (0 fail) and Object/create (0 fail) cluster closures; the
-language and annexB rows are from the sweep recorded below.
+String/prototype, Object/create, DisposableStack, and AsyncDisposableStack
+cluster closures (all 0 fail); the language and annexB rows are from the
+sweep recorded below.
 
 ¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
 coerced-values fixtures — 10,000-element allocations that need the long

@@ -24,20 +24,36 @@ const DISPOSABLE_STACK_PROTO: &str = "%DisposableStack.prototype%";
 const ASYNC_DISPOSABLE_STACK: &str = "%AsyncDisposableStack%";
 const ASYNC_DISPOSABLE_STACK_PROTO: &str = "%AsyncDisposableStack.prototype%";
 
+/// How a dispose method is invoked (spec 27.4.1.3 `Dispose` and the
+/// adopt/defer closures).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DisposalCall {
+    /// `Call(method, V)`: the `use` resource's method receives the value.
+    Receiver,
+    /// The adopt closure: `Call(onDispose, undefined, « value »)`.
+    Argument,
+    /// The defer closure: `Call(onDispose, undefined)`.
+    Plain,
+}
+
 /// A disposable resource: the value the method is called on, the dispose
-/// method, and whether the hint is ~async-dispose~.
+/// method, the hint (true = async-dispose), and how the method is invoked.
 #[derive(Debug, Clone)]
 pub struct DisposableResource {
     pub value: Value,
     pub method: Value,
     pub hint: bool,
+    pub call: DisposalCall,
 }
 
-/// [[DisposableState]] and [[DisposeCapability]] of a stack instance.
-#[derive(Debug, Default)]
+/// [[DisposableState]] and [[DisposeCapability]] of a stack instance. The
+/// `is_async` flag brands the stack so a sync method rejects an async
+/// instance and vice versa (RequireInternalSlot).
+#[derive(Debug)]
 pub struct DisposableStackData {
     pub disposed: bool,
     pub resources: Vec<DisposableResource>,
+    pub is_async: bool,
 }
 
 /// The driver of an in-flight `disposeAsync`.
@@ -119,15 +135,10 @@ fn install_stack(realm: &Handle<Realm>, name: &str, is_async: bool) -> Result<()
         },
     )?;
 
-    // Methods: adopt, defer, dispose/disposeAsync, move, use, and the
-    // Symbol.dispose/Symbol.asyncDispose method.
-    for (method_name, length) in [
-        ("adopt", 2),
-        ("defer", 1),
-        (dispose_name, 0),
-        ("move", 0),
-        ("use", 1),
-    ] {
+    // Methods: adopt, defer, move, use, and the dispose/disposeAsync method
+    // (also aliased as the Symbol.dispose / Symbol.asyncDispose property —
+    // the same function object, spec 27.4.2.7/27.4.3.8).
+    for (method_name, length) in [("adopt", 2), ("defer", 1), ("move", 0), ("use", 1)] {
         let method = Function::create_builtin(
             Some(JsString::from_utf8(method_name)),
             length,
@@ -151,22 +162,36 @@ fn install_stack(realm: &Handle<Realm>, name: &str, is_async: bool) -> Result<()
             },
         )?;
     }
-    // The Symbol.dispose / Symbol.asyncDispose method.
-    let symbol_method = Function::create_builtin(
-        Some(JsString::from_utf8(&format!("[{dispose_symbol}]"))),
+    let dispose_method = Function::create_builtin(
+        Some(JsString::from_utf8(dispose_name)),
         0,
-        Box::new(placeholder(dispose_symbol.to_string())),
+        Box::new(placeholder(dispose_name.to_string())),
         None,
         None,
     )?;
     realm.intrinsics.define(
+        &format!("%{name}.prototype.{dispose_name}%"),
+        Value::Function(dispose_method.clone()),
+    );
+    proto.define_property(
+        &JsString::from_utf8(dispose_name),
+        &PropertyDescriptor {
+            value: Some(Value::Function(dispose_method.clone())),
+            writable: Some(true),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
+    )?;
+    realm.intrinsics.define(
         &format!("%{name}.prototype.@@{dispose_symbol}%"),
-        Value::Function(symbol_method.clone()),
+        Value::Function(dispose_method.clone()),
     );
     proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known(dispose_symbol).as_ref().clone()),
         &PropertyDescriptor {
-            value: Some(Value::Function(symbol_method)),
+            value: Some(Value::Function(dispose_method)),
             writable: Some(true),
             get: None,
             set: None,
@@ -203,7 +228,14 @@ fn install_stack(realm: &Handle<Realm>, name: &str, is_async: bool) -> Result<()
     // @@toStringTag.
     proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
-        &PropertyDescriptor::none(Value::String(Handle::new(JsString::from_utf8(tag)))),
+        &PropertyDescriptor {
+            value: Some(Value::String(Handle::new(JsString::from_utf8(tag)))),
+            writable: Some(false),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
     )?;
 
     realm.global_object.define_property_or_throw(
@@ -290,7 +322,7 @@ pub fn dispatch_call(
             });
         }
         if intrinsics.get(&method_key("disposed-get")).as_ref() == Some(callee) {
-            return Some(disposed_getter(agent, this));
+            return Some(disposed_getter(agent, this, is_async));
         }
         let _ = proto_obj;
     }
@@ -305,12 +337,12 @@ pub fn dispatch_construct(
     new_target: &Value,
 ) -> Option<Result<Value, JsError>> {
     let realm = agent.current_realm().ok()?;
-    for (key, proto_key) in [
-        (DISPOSABLE_STACK, DISPOSABLE_STACK_PROTO),
-        (ASYNC_DISPOSABLE_STACK, ASYNC_DISPOSABLE_STACK_PROTO),
+    for (key, proto_key, is_async) in [
+        (DISPOSABLE_STACK, DISPOSABLE_STACK_PROTO, false),
+        (ASYNC_DISPOSABLE_STACK, ASYNC_DISPOSABLE_STACK_PROTO, true),
     ] {
         if realm.intrinsics.get(key).as_ref() == Some(callee) {
-            return Some(stack_construct(agent, new_target, proto_key));
+            return Some(stack_construct(agent, new_target, proto_key, is_async));
         }
     }
     None
@@ -320,6 +352,7 @@ fn stack_construct(
     agent: &mut Agent,
     new_target: &Value,
     proto_key: &str,
+    is_async: bool,
 ) -> Result<Value, JsError> {
     let proto = crate::context::get_property_key(
         agent,
@@ -339,21 +372,34 @@ fn stack_construct(
             })?,
     };
     let object = JsObject::ordinary_object_create(Some(proto));
-    agent
-        .disposable_stacks
-        .insert(object.id(), RefCell::new(DisposableStackData::default()));
+    agent.disposable_stacks.insert(
+        object.id(),
+        RefCell::new(DisposableStackData {
+            disposed: false,
+            resources: Vec::new(),
+            is_async,
+        }),
+    );
     Ok(Value::Object(object))
 }
 
 /// RequireInternalSlot on the stack.
-fn stack_data(agent: &Agent, this: &Value) -> Result<u64, JsError> {
+fn stack_data(agent: &Agent, this: &Value, is_async: bool) -> Result<u64, JsError> {
     let Value::Object(obj) = this else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Method called on a non-object".into(),
         ));
     };
-    if !agent.disposable_stacks.contains_key(&obj.id()) {
+    let Some(data) = agent.disposable_stacks.get(&obj.id()) else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Method called on a non-stack object".into(),
+        ));
+    };
+    // A sync method rejects an async stack and vice versa (RequireInternalSlot
+    // checks the sync/async state slot).
+    if data.borrow().is_async != is_async {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Method called on a non-stack object".into(),
@@ -362,8 +408,8 @@ fn stack_data(agent: &Agent, this: &Value) -> Result<u64, JsError> {
     Ok(obj.id())
 }
 
-fn disposed_getter(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
-    let id = stack_data(agent, this)?;
+fn disposed_getter(agent: &mut Agent, this: &Value, is_async: bool) -> Result<Value, JsError> {
+    let id = stack_data(agent, this, is_async)?;
     let disposed = agent
         .disposable_stacks
         .get(&id)
@@ -382,6 +428,11 @@ fn get_dispose_method(agent: &mut Agent, value: &Value, is_async: bool) -> Resul
         &PropertyKey::Symbol(crux::symbol::well_known(symbol).as_ref().clone()),
         value.clone(),
     )?;
+    if is_async && matches!(method, Value::Undefined | Value::Null) {
+        // async-dispose falls back to the sync @@dispose method (an async
+        // context can dispose sync resources, spec 27.4.1.1).
+        return get_dispose_method(agent, value, false);
+    }
     match method {
         Value::Undefined | Value::Null => Ok(Value::Undefined),
         value if is_callable(&value) => Ok(value),
@@ -398,7 +449,8 @@ fn adopt(
     args: &[Value],
     is_async: bool,
 ) -> Result<Value, JsError> {
-    let id = stack_data(agent, this)?;
+    let id = stack_data(agent, this, is_async)?;
+    check_not_disposed(agent, id)?;
     let on_dispose = args.get(1).cloned().unwrap_or(Value::Undefined);
     if !is_callable(&on_dispose) {
         return Err(JsError::new(
@@ -407,7 +459,15 @@ fn adopt(
         ));
     }
     let value = args.first().cloned().unwrap_or(Value::Undefined);
-    add_resource(agent, id, value.clone(), on_dispose, is_async)?;
+    // The adopt closure calls `onDispose(undefined, « value »)`.
+    add_resource(
+        agent,
+        id,
+        value.clone(),
+        on_dispose,
+        is_async,
+        DisposalCall::Argument,
+    )?;
     Ok(value)
 }
 
@@ -417,7 +477,8 @@ fn defer(
     args: &[Value],
     is_async: bool,
 ) -> Result<Value, JsError> {
-    let id = stack_data(agent, this)?;
+    let id = stack_data(agent, this, is_async)?;
+    check_not_disposed(agent, id)?;
     let on_dispose = args.first().cloned().unwrap_or(Value::Undefined);
     if !is_callable(&on_dispose) {
         return Err(JsError::new(
@@ -425,7 +486,15 @@ fn defer(
             "DisposableStack.prototype.defer requires a callable onDispose".into(),
         ));
     }
-    add_resource(agent, id, Value::Undefined, on_dispose, is_async)?;
+    // The defer closure calls `onDispose(undefined)`.
+    add_resource(
+        agent,
+        id,
+        Value::Undefined,
+        on_dispose,
+        is_async,
+        DisposalCall::Plain,
+    )?;
     Ok(Value::Undefined)
 }
 
@@ -435,17 +504,14 @@ fn use_value(
     args: &[Value],
     is_async: bool,
 ) -> Result<Value, JsError> {
-    let id = stack_data(agent, this)?;
+    let id = stack_data(agent, this, is_async)?;
+    check_not_disposed(agent, id)?;
     let value = args.first().cloned().unwrap_or(Value::Undefined);
     if matches!(value, Value::Undefined | Value::Null) {
         return Ok(value);
     }
-    if !matches!(value, Value::Object(_) | Value::Function(_)) {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "DisposableStack.prototype.use requires an object value".into(),
-        ));
-    }
+    // GetDisposeMethod throws for a value with no (matching) dispose
+    // method; primitives box during the property lookup and land here too.
     let method = get_dispose_method(agent, &value, is_async)?;
     if matches!(method, Value::Undefined) {
         return Err(JsError::new(
@@ -453,8 +519,31 @@ fn use_value(
             "value is not disposable".into(),
         ));
     }
-    add_resource(agent, id, value.clone(), method, is_async)?;
+    add_resource(
+        agent,
+        id,
+        value.clone(),
+        method,
+        is_async,
+        DisposalCall::Receiver,
+    )?;
     Ok(value)
+}
+
+/// Throw a ReferenceError when the stack is already disposed (spec 27.4.2.3
+/// step 3 and the sibling methods).
+fn check_not_disposed(agent: &Agent, id: u64) -> Result<(), JsError> {
+    let data = agent
+        .disposable_stacks
+        .get(&id)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not a stack".into()))?;
+    if data.borrow().disposed {
+        return Err(JsError::new(
+            ErrorKind::ReferenceError,
+            "DisposableStack is already disposed".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// AddDisposableResource (spec 27.4.1.2): append `{ value, method, hint }`
@@ -465,22 +554,19 @@ fn add_resource(
     value: Value,
     method: Value,
     is_async: bool,
+    call: DisposalCall,
 ) -> Result<(), JsError> {
+    check_not_disposed(agent, id)?;
     let data = agent
         .disposable_stacks
         .get(&id)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not a stack".into()))?;
     let mut data = data.borrow_mut();
-    if data.disposed {
-        return Err(JsError::new(
-            ErrorKind::ReferenceError,
-            "DisposableStack is already disposed".into(),
-        ));
-    }
     data.resources.push(DisposableResource {
         value,
         method,
         hint: is_async,
+        call,
     });
     Ok(())
 }
@@ -491,7 +577,7 @@ fn move_stack(
     _args: &[Value],
     is_async: bool,
 ) -> Result<Value, JsError> {
-    let id = stack_data(agent, this)?;
+    let id = stack_data(agent, this, is_async)?;
     let (proto_key, name) = if is_async {
         (ASYNC_DISPOSABLE_STACK_PROTO, "AsyncDisposableStack")
     } else {
@@ -524,6 +610,7 @@ fn move_stack(
         RefCell::new(DisposableStackData {
             disposed: false,
             resources,
+            is_async,
         }),
     );
     Ok(Value::Object(object))
@@ -531,11 +618,7 @@ fn move_stack(
 
 /// DisposeResources (spec 27.4.1.3): run the resources in reverse order,
 /// chaining multiple failures into SuppressedError objects.
-fn dispose_resources(
-    agent: &mut Agent,
-    id: u64,
-    sync_only: bool,
-) -> Result<Option<Value>, JsError> {
+fn dispose_resources(agent: &mut Agent, id: u64) -> Result<Option<Value>, JsError> {
     let resources = {
         let data = agent
             .disposable_stacks
@@ -548,7 +631,12 @@ fn dispose_resources(
         if resource.method == Value::Undefined {
             continue;
         }
-        let result = crate::function::call(agent, &resource.method, resource.value.clone(), &[]);
+        let result = crate::function::call(
+            agent,
+            &resource.method,
+            resource_receiver(resource),
+            &resource_arguments(resource),
+        );
         match result {
             Ok(_) => {}
             Err(error) => {
@@ -561,16 +649,29 @@ fn dispose_resources(
                 }
             }
         }
-        if sync_only && resource.hint {
-            // Async-dispose hint on the sync stack is unreachable (the sync
-            // stack only ever pushes sync resources).
-        }
     }
     Ok(completion)
 }
 
+/// The receiver of a resource's dispose method per its call kind (spec
+/// 27.4.1.3 and the adopt/defer closures).
+fn resource_receiver(resource: &DisposableResource) -> Value {
+    match resource.call {
+        DisposalCall::Receiver => resource.value.clone(),
+        DisposalCall::Argument | DisposalCall::Plain => Value::Undefined,
+    }
+}
+
+/// The argument list of a resource's dispose method per its call kind.
+fn resource_arguments(resource: &DisposableResource) -> Vec<Value> {
+    match resource.call {
+        DisposalCall::Argument => vec![resource.value.clone()],
+        DisposalCall::Receiver | DisposalCall::Plain => vec![],
+    }
+}
+
 fn dispose_method(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
-    let id = stack_data(agent, this)?;
+    let id = stack_data(agent, this, false)?;
     let data = agent
         .disposable_stacks
         .get(&id)
@@ -582,7 +683,7 @@ fn dispose_method(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
         }
         data.disposed = true;
     }
-    let completion = dispose_resources(agent, id, true)?;
+    let completion = dispose_resources(agent, id)?;
     match completion {
         Some(error) => Err(
             JsError::new(ErrorKind::TypeError, "Uncaught disposal error".into()).with_value(error),
@@ -592,7 +693,7 @@ fn dispose_method(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
 }
 
 fn dispose_async_method(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
-    let id = stack_data(agent, this)?;
+    let id = stack_data(agent, this, true)?;
     let promise_ctor = agent
         .current_realm()?
         .intrinsics
@@ -633,7 +734,8 @@ fn dispose_async_method(agent: &mut Agent, this: &Value) -> Result<Value, JsErro
     agent
         .disposable_async_caps
         .insert(driver.id(), capability.clone());
-    drive_async_disposal(agent, driver.id())
+    drive_async_disposal(agent, driver.id())?;
+    Ok(result_promise)
 }
 
 /// Drive one step of `disposeAsync`: dispose the next resource, awaiting
@@ -676,7 +778,12 @@ fn drive_async_disposal(agent: &mut Agent, driver_id: u64) -> Result<Value, JsEr
         return Ok(Value::Undefined);
     }
     let resource = resources[index].clone();
-    let result = crate::function::call(agent, &resource.method, resource.value.clone(), &[]);
+    let result = crate::function::call(
+        agent,
+        &resource.method,
+        resource_receiver(&resource),
+        &resource_arguments(&resource),
+    );
     let result = match result {
         Ok(result) => result,
         Err(error) => {
