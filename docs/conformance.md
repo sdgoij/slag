@@ -1080,6 +1080,28 @@ Validation: `cargo test --workspace` **4085 pass, 0 failures**;
 (`git stash` baseline) shows **0 new failures and 0 new crashes** across
 all 23,812 fixtures, with **10 fixtures fixed** (8 Array/of + 2 Math).
 
+### Object.fromEntries cluster sweep (Phase 18 conformance)
+
+A sweep of the `Object/fromEntries/*` tree (25 fixtures) reports **25 pass,
+0 fail** of 25 fixtures: every fixture passes (up from 19 pass / 6 fail).
+`Object.fromEntries` in `crates/runtime/src/builtins/object.rs` now follows
+AddEntriesFromIterable (spec 10.1.4.3):
+
+- **Non-object entries were accepted** — a `null`/`undefined`/string/…
+  entry was boxed and read for `"0"`/`"1"` instead of throwing. The loop
+  now closes the iterator with a TypeError for any entry whose type is
+  not Object (spec step 4.d; `iterator-closed-for-null-entry.js`,
+  `string-entry-primitive-throws.js`).
+- **Abrupt entry steps left the iterator open** — a throwing `"0"`/`"1"`
+  accessor and a throwing key `toString` propagated without closing the
+  iterator. Each step now IfAbruptCloseIterators (`iterator-closed-for-
+  throwing-entry-*-*.js`).
+
+Validation: `cargo test --workspace` **4085 pass, 0 failures**;
+`cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo fmt --all --check` clean. A full `built-ins` re-sweep shows exactly
+**6 fixtures fixed** (16,898 pass / 375 fail / 0 crash) and no regressions.
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~120 edge-case unit tests were added across
@@ -1189,9 +1211,9 @@ annexB rows are from the earlier run and have not changed since.
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,812 | 16,892 | 381 | 6,536 | 3¹ | 97.8% |
+| built-ins | 23,812 | 16,898 | 375 | 6,536 | 3¹ | 97.8% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,622** | **33,335** | **2,987** | **12,297** | **3** | **91.8%** |
+| **Total** | **48,622** | **33,341** | **2,981** | **12,297** | **3** | **91.8%** |
 
 (Runnable = pass + fail; the 9,171 skips are module/async fixtures,
 unsupported harness includes, and the out-of-scope Temporal proposal
@@ -1202,12 +1224,12 @@ ArrayBuffer/SharedArrayBuffer, Date, BigInt, global-functions, Function,
 Iterator/prototype, Iterator statics (concat/from/zip/zipKeyed), Symbol,
 Boolean, Number, Object.prototype.toString, Object/prototype legacy
 accessors, Proxy, Reflect, Object.groupBy, Object
-freeze/seal/isFrozen/isSealed, Array iteration-method, Array.of, and Math
-cluster closures (all 0 fail); the language and annexB rows are from the
-sweep recorded below. The 6,536 built-ins skips are dominated by the
-out-of-scope Temporal proposal (4,611), with the async/module flags,
-host-dependent `$262.createRealm`, and unsupported harness includes
-making up the rest.
+freeze/seal/isFrozen/isSealed, Array iteration-method, Array.of, Math, and
+Object.fromEntries cluster closures (all 0 fail); the language and annexB
+rows are from the sweep recorded below. The 6,536 built-ins skips are
+dominated by the out-of-scope Temporal proposal (4,611), with the
+async/module flags, host-dependent `$262.createRealm`, and unsupported
+harness includes making up the rest.
 
 ¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
 coerced-values fixtures — 10,000-element allocations that need the long
@@ -1292,7 +1314,7 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 ## Open items
 
 - Certify the ≥95%-of-runnable target: the built-ins area now measures
-  **97.8%** of runnable (16,892 pass / 381 fail of 17,273, with the
+  **97.8%** of runnable (16,898 pass / 375 fail of 17,273, with the
   out-of-scope Temporal fixtures skipped, `--timeout 60
   --recheck-timeout 45`, release build), 0 crashes and 0 hangs with the
   long timeout. The remaining gap is the systematic bug clusters triaged

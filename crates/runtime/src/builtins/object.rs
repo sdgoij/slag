@@ -1141,11 +1141,48 @@ fn from_entries(agent: &mut Agent, iterable: &Value) -> Result<Value, JsError> {
         .and_then(|v| as_object(&v));
     let obj = JsObject::ordinary_object_create(proto);
     while let Some(entry) = crate::expr::iterator_step(agent, &iterator)? {
-        let key =
-            crate::context::get_property(agent, &entry, &JsString::from_utf8("0"), entry.clone())?;
-        let value =
-            crate::context::get_property(agent, &entry, &JsString::from_utf8("1"), entry.clone())?;
-        let key = crate::context::to_property_key(agent, &key)?;
+        // AddEntriesFromIterable (spec 10.1.4.3 step 4.d): a non-object
+        // entry closes the iterator with a TypeError.
+        if !matches!(entry, Value::Object(_) | Value::Function(_)) {
+            let _ = crate::expr::iterator_close(agent, &iterator);
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "Object.fromEntries requires object entries".into(),
+            ));
+        }
+        // IfAbruptCloseIterator around the key read, the value read, and
+        // the key coercion.
+        let key = match crate::context::get_property(
+            agent,
+            &entry,
+            &JsString::from_utf8("0"),
+            entry.clone(),
+        ) {
+            Ok(key) => key,
+            Err(error) => {
+                let _ = crate::expr::iterator_close(agent, &iterator);
+                return Err(error);
+            }
+        };
+        let value = match crate::context::get_property(
+            agent,
+            &entry,
+            &JsString::from_utf8("1"),
+            entry.clone(),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = crate::expr::iterator_close(agent, &iterator);
+                return Err(error);
+            }
+        };
+        let key = match crate::context::to_property_key(agent, &key) {
+            Ok(key) => key,
+            Err(error) => {
+                let _ = crate::expr::iterator_close(agent, &iterator);
+                return Err(error);
+            }
+        };
         obj.define_property_key(&key, &PropertyDescriptor::data(value))?;
     }
     Ok(Value::Object(obj))
