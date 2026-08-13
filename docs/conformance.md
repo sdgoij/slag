@@ -906,6 +906,27 @@ all 23,812 built-ins fixtures; the 16 Proxy fixtures plus 91 more
 (DataView getters/setters unmasked by the dispatcher fix, Math, Atomics,
 Array, String, Object.preventExtensions) now pass.
 
+### Reflect cluster sweep (Phase 18 conformance)
+
+A sweep of the whole `Reflect/*` tree (153 fixtures) reports **153 pass, 0
+fail, 0 skip** of 153 fixtures: every fixture passes (up from 151 pass /
+2 fail). Fixes in `crates/runtime/src/builtins/reflect.rs`:
+
+- **`Reflect` was missing its `@@toStringTag`** — spec 28.1.3.2 gives the
+  Reflect object `[Symbol.toStringTag] = "Reflect"` (`{ writable: false,
+  enumerable: false, configurable: true }`); it is now defined at install.
+- **`Reflect.apply`/`construct` rejected a function `argumentsList`** —
+  `CreateListFromArrayLike` (spec 7.3.18 step 1) throws only for
+  primitives; a Function value is an Object, so `Reflect.apply(fn, null,
+  new Function())` now reads its array-like indices from the function
+  object instead of throwing "argumentsList must be an object".
+
+Validation: `cargo test --workspace` **4085 pass, 0 failures**;
+`cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo fmt --all --check` clean. A full `built-ins` re-sweep shows **16,702
+pass / 571 fail / 0 crash / 3 hang** — exactly the 2 cluster fixtures
+fixed and 0 new failures across all 23,812 fixtures.
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~120 edge-case unit tests were added across
@@ -1015,9 +1036,9 @@ annexB rows are from the earlier run and have not changed since.
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,812 | 16,700 | 573 | 6,536 | 3¹ | 96.7% |
+| built-ins | 23,812 | 16,702 | 571 | 6,536 | 3¹ | 96.7% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,622** | **33,143** | **3,179** | **12,297** | **3** | **91.3%** |
+| **Total** | **48,622** | **33,145** | **3,177** | **12,297** | **3** | **91.3%** |
 
 (Runnable = pass + fail; the 9,171 skips are module/async fixtures,
 unsupported harness includes, and the out-of-scope Temporal proposal
@@ -1027,10 +1048,10 @@ String/prototype, Object/create, DisposableStack, AsyncDisposableStack,
 ArrayBuffer/SharedArrayBuffer, Date, BigInt, global-functions, Function,
 Iterator/prototype, Iterator statics (concat/from/zip/zipKeyed), Symbol,
 Boolean, Number, Object.prototype.toString, Object/prototype legacy
-accessors, and Proxy cluster closures (all 0 fail); the language and
-annexB rows are from the sweep recorded below. The 6,536 built-ins skips
-are dominated by the out-of-scope Temporal proposal (4,611), with the
-async/module flags, host-dependent `$262.createRealm`, and unsupported
+accessors, Proxy, and Reflect cluster closures (all 0 fail); the language
+and annexB rows are from the sweep recorded below. The 6,536 built-ins
+skips are dominated by the out-of-scope Temporal proposal (4,611), with
+the async/module flags, host-dependent `$262.createRealm`, and unsupported
 harness includes making up the rest.
 
 ¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
@@ -1116,7 +1137,7 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 ## Open items
 
 - Certify the ≥95%-of-runnable target: the built-ins area now measures
-  **96.7%** of runnable (16,700 pass / 573 fail of 17,273, with the
+  **96.7%** of runnable (16,702 pass / 571 fail of 17,273, with the
   out-of-scope Temporal fixtures skipped, `--timeout 60
   --recheck-timeout 45`, release build), 0 crashes and 0 hangs with the
   long timeout. The remaining gap is the systematic bug clusters triaged

@@ -53,6 +53,19 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let reflect = JsObject::ordinary_object_create(object_proto);
     let reflect_value = Value::Object(reflect.clone());
     realm.intrinsics.define(REFLECT, reflect_value.clone());
+    // spec 28.1.3.2: Reflect[@@toStringTag] = "Reflect", non-writable,
+    // non-enumerable, configurable.
+    reflect.define_property_key(
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyDescriptor {
+            value: Some(Value::String(Handle::new(JsString::from_utf8("Reflect")))),
+            writable: Some(false),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
+    )?;
     for (name, _key, length) in METHODS {
         let method = Function::create_builtin(
             Some(JsString::from_utf8(name)),
@@ -123,9 +136,11 @@ fn object_of(value: &Value) -> Result<Handle<JsObject>, JsError> {
 }
 
 /// CreateListFromArrayLike (spec 7.3.18) with the ~anything~ element kind,
-/// as `Reflect.apply`/`construct` require.
+/// as `Reflect.apply`/`construct` require. Only primitives are rejected: a
+/// function value is an Object (its function-object part reads the
+/// array-like indices).
 fn list_from_array_like(agent: &mut Agent, value: &Value) -> Result<Vec<Value>, JsError> {
-    if !matches!(value, Value::Object(_)) {
+    if !matches!(value, Value::Object(_) | Value::Function(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "argumentsList must be an object".into(),
