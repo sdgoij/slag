@@ -625,6 +625,34 @@ harness:
   `includes:` and ran without the helper. It now splits on CR and LF,
   filtering the empty segments CRLF produces.
 
+### Iterator/prototype cluster sweep (Phase 18 conformance)
+
+A sweep of `%Iterator.prototype%` and its helpers (`sweep.exe built-ins
+--filter 'Iterator/prototype/*'`) reports **513 pass, 0 fail, 0 skip** of
+513 fixtures: every fixture passes (up from 248 pass / 265 fail). Fixes in
+`crates/runtime/src/builtins/iterator.rs` and
+`crates/runtime/src/builtins/object.rs`:
+
+- **`Object.freeze`/`seal` corrupted accessor properties** —
+  SetIntegrityLevel rebuilt every configurable property as a data property
+  (dropping `get`/`set`), so freezing `%Iterator.prototype%` silently
+  deleted its `constructor`/`@@toStringTag` accessors and made
+  `Fake[Symbol.toStringTag] = v` a no-op. Accessors now keep their
+  getter/setter (spec 7.3.15 steps 2.c-2.d); only data properties gain the
+  writable: false constraint.
+- **`new Iterator()` no longer threw** — `dispatch_construct` created the
+  object unconditionally, but spec 27.1.1.1 throws when NewTarget is the
+  active function object; subclass `super()` calls still construct via
+  GetPrototypeFromConstructor.
+- **`chunks` yielded an empty chunk on closure** — closing the underlying
+  iterator before the first `next()` returned `{ value: [], done: true }`;
+  it now returns `{ value: undefined, done: true }` (spec step 8.a.ii.2).
+- **Helper plumbing** — `%Iterator%` construct, `define_method` prototype
+  wiring, `HelperState.counter`, `includes` `fromIndex`, `flatMap` flat
+  iterators, `windows` `allow-partial`, `join` separator coercion, and
+  `reduce` counter-start were brought in line with Node v24 behavior as the
+  cluster's fixtures exercised them.
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~120 edge-case unit tests were added across
@@ -731,18 +759,18 @@ TypedArray fixtures that pass with the long timeout (see below).
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,798 | 15,957 | 4,428 | 3,410 | 3¹ | 78.3% |
+| built-ins | 23,798 | 16,222 | 4,163 | 3,410 | 3¹ | 79.6% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,608** | **32,400** | **7,034** | **9,171** | **3** | **82.2%** |
+| **Total** | **48,608** | **32,665** | **6,769** | **9,171** | **3** | **82.8%** |
 
 (Runnable = pass + fail; the 9,171 skips are module/async fixtures,
 unsupported harness includes, and the out-of-scope Temporal proposal
 fixtures.) The built-ins row reflects the current
 `Error*`/`BigInt*`/RegExp/Object-descriptor hardening plus the
 String/prototype, Object/create, DisposableStack, AsyncDisposableStack,
-ArrayBuffer/SharedArrayBuffer, Date, BigInt, global-functions, and
-Function cluster closures (all 0 fail); the language and annexB rows are
-from the sweep recorded below.
+ArrayBuffer/SharedArrayBuffer, Date, BigInt, global-functions, Function,
+and Iterator/prototype cluster closures (all 0 fail); the language and
+annexB rows are from the sweep recorded below.
 
 ¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
 coerced-values fixtures — 10,000-element allocations that need the long

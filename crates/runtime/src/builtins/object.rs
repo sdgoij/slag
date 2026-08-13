@@ -353,13 +353,26 @@ fn set_integrity_level(agent: &mut Agent, value: &Value, freeze: bool) -> Result
         if let Some(current) = obj.get_own_property_key(&key)?
             && current.configurable
         {
-            let desc = PropertyDescriptor {
-                value: if freeze { current.value() } else { None },
-                writable: if freeze { Some(false) } else { None },
-                get: None,
-                set: None,
-                enumerable: Some(current.enumerable),
-                configurable: Some(false),
+            // Accessor properties keep their getter/setter; only data
+            // properties gain the writable: false constraint (spec 7.3.15
+            // steps 2.c-2.d).
+            let desc = match &current.kind {
+                crux::object::PropertyKind::Data { .. } => PropertyDescriptor {
+                    value: if freeze { current.value() } else { None },
+                    writable: if freeze { Some(false) } else { None },
+                    get: None,
+                    set: None,
+                    enumerable: Some(current.enumerable),
+                    configurable: Some(false),
+                },
+                crux::object::PropertyKind::Accessor { get, set } => PropertyDescriptor {
+                    value: None,
+                    writable: None,
+                    get: get.clone(),
+                    set: set.clone(),
+                    enumerable: Some(current.enumerable),
+                    configurable: Some(false),
+                },
             };
             obj.define_property_key(&key, &desc)?;
         }

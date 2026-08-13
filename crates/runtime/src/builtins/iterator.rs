@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
-use crux::convert::{to_boolean, to_integer_or_infinity, to_number};
+use crux::convert::{to_boolean, to_integer_or_infinity};
 use crux::error::{ErrorKind, JsError};
 use crux::function::Function;
 use crux::handle::Handle;
@@ -79,6 +79,8 @@ pub enum HelperMode {
     Windows {
         window_size: f64,
         buffer: VecDeque<Value>,
+        /// `undersized` is "allow-partial": a partial final window is yielded.
+        allow_partial: bool,
     },
     Concat {
         iterators: Vec<IteratorRecord>,
@@ -98,6 +100,8 @@ pub enum HelperMode {
 pub struct HelperState {
     pub iterator: Option<IteratorRecord>,
     pub done: bool,
+    /// The per-value counter passed to callbacks (spec 27.1.3.5 step 5.d).
+    pub counter: f64,
     pub mode: HelperMode,
 }
 
@@ -195,7 +199,9 @@ fn define_method(
         length,
         Box::new(placeholder(name.to_string())),
         None,
-        Some(proto.clone()),
+        // A builtin method's [[Prototype]] is %Function.prototype%; the realm
+        // post-pass links null-prototyped intrinsic functions.
+        None,
     )?;
     realm
         .intrinsics
@@ -294,6 +300,10 @@ fn install_prototype_methods(
         None,
         None,
     )?;
+    realm.intrinsics.define(
+        "%Iterator.prototype.@@iterator%",
+        Value::Function(iterator_method.clone()),
+    );
     proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
         &PropertyDescriptor {
@@ -306,10 +316,40 @@ fn install_prototype_methods(
         },
     )?;
 
-    // @@toStringTag (spec 27.1.3.10).
+    // @@toStringTag (spec 27.1.3.10): an accessor returning "Iterator"; the
+    // setter ignores prototype properties (SetterThatIgnoresPrototypeProperties).
+    let tag_get = Function::create_builtin(
+        Some(JsString::from_utf8("get [Symbol.toStringTag]")),
+        0,
+        Box::new(|_, _| Ok(Value::String(Handle::new(JsString::from_utf8("Iterator"))))),
+        None,
+        None,
+    )?;
+    let tag_set = Function::create_builtin(
+        Some(JsString::from_utf8("set [Symbol.toStringTag]")),
+        1,
+        Box::new(placeholder("set [Symbol.toStringTag]".to_string())),
+        None,
+        None,
+    )?;
+    realm.intrinsics.define(
+        "%Iterator.prototype.@@toStringTag-get%",
+        Value::Function(tag_get.clone()),
+    );
+    realm.intrinsics.define(
+        "%Iterator.prototype.@@toStringTag-set%",
+        Value::Function(tag_set.clone()),
+    );
     proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
-        &PropertyDescriptor::none(Value::String(Handle::new(JsString::from_utf8("Iterator")))),
+        &PropertyDescriptor {
+            value: None,
+            writable: None,
+            get: Some(Value::Function(tag_get)),
+            set: Some(Value::Function(tag_set)),
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
     )?;
 
     // %Iterator.prototype%.constructor is an accessor (spec 27.1.3.1); the
@@ -419,6 +459,10 @@ fn install_helper_prototype(realm: &Handle<Realm>) -> Result<(), JsError> {
         None,
         None,
     )?;
+    realm.intrinsics.define(
+        "%IteratorHelper.prototype.@@iterator%",
+        Value::Function(iterator_method.clone()),
+    );
     proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
         &PropertyDescriptor {
@@ -480,6 +524,10 @@ fn install_wrap_prototype(realm: &Handle<Realm>) -> Result<(), JsError> {
         None,
         None,
     )?;
+    realm.intrinsics.define(
+        "%WrapForValidIterator.prototype.@@iterator%",
+        Value::Function(iterator_method.clone()),
+    );
     proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
         &PropertyDescriptor {
@@ -568,7 +616,24 @@ pub fn dispatch_call(
         == Some(callee)
     {
         return Some(setter_that_ignores_prototype_properties(
-            agent, this, args, proto_obj,
+            agent,
+            this,
+            args,
+            proto_obj,
+            PropertyKey::from_utf8("constructor"),
+        ));
+    }
+    if intrinsics
+        .get("%Iterator.prototype.@@toStringTag-set%")
+        .as_ref()
+        == Some(callee)
+    {
+        return Some(setter_that_ignores_prototype_properties(
+            agent,
+            this,
+            args,
+            proto_obj,
+            PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
         ));
     }
     if intrinsics.get(ITERATOR).as_ref() == Some(callee) {
@@ -593,30 +658,58 @@ pub fn dispatch_call(
     None
 }
 
-/// Dispatch a construct: the Iterator constructor throws (spec 27.1.1).
+/// Dispatch a construct: `new Iterator()` throws, while a subclass
+/// `super()` call creates an object with the newTarget prototype (spec
+/// 27.1.1.1 steps 1-2).
 pub fn dispatch_construct(
     agent: &mut Agent,
     callee: &Value,
     _args: &[Value],
-    _new_target: &Value,
+    new_target: &Value,
 ) -> Option<Result<Value, JsError>> {
     let realm = agent.current_realm().ok()?;
     if realm.intrinsics.get(ITERATOR).as_ref() == Some(callee) {
-        return Some(Err(JsError::new(
-            ErrorKind::TypeError,
-            "The Iterator constructor cannot be constructed".into(),
-        )));
+        return Some((|| {
+            // spec step 2: NewTarget being the active function object (the
+            // %Iterator% constructor itself) throws; only subclass
+            // newTargets construct.
+            if realm.intrinsics.get(ITERATOR).as_ref() == Some(new_target) {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "The Iterator constructor cannot be called without 'new' on a subclass".into(),
+                ));
+            }
+            // GetPrototypeFromConstructor (spec 10.2.4): newTarget's
+            // `prototype`, falling back to %Iterator.prototype%.
+            let prototype = match crate::context::get_property(
+                agent,
+                new_target,
+                &JsString::from_utf8("prototype"),
+                new_target.clone(),
+            ) {
+                Ok(value) => as_object(&value),
+                Err(e) => return Err(e),
+            };
+            let prototype = prototype.or_else(|| {
+                realm
+                    .intrinsics
+                    .get(ITERATOR_PROTO)
+                    .and_then(|value| as_object(&value))
+            });
+            Ok(Value::Object(JsObject::ordinary_object_create(prototype)))
+        })());
     }
     None
 }
 
-/// SetterThatIgnoresPrototypeProperties for the `constructor` accessor
-/// (spec 10.2.2.2).
+/// SetterThatIgnoresPrototypeProperties for the `constructor`/`@@toStringTag`
+/// accessors (spec 10.2.2.2).
 fn setter_that_ignores_prototype_properties(
     agent: &mut Agent,
     this: &Value,
     args: &[Value],
     home: &Handle<JsObject>,
+    key: PropertyKey,
 ) -> Result<Value, JsError> {
     let Some(object) = as_object(this) else {
         return Err(JsError::new(
@@ -627,17 +720,16 @@ fn setter_that_ignores_prototype_properties(
     if object.id() == home.id() {
         return Err(JsError::new(
             ErrorKind::TypeError,
-            "Cannot assign to the prototype's constructor".into(),
+            "Cannot assign to the prototype's property".into(),
         ));
     }
     let value = args.first().cloned().unwrap_or(Value::Undefined);
-    let key = PropertyKey::from_utf8("constructor");
     if !object.has_own_property_key(&key)? {
-        object.create_data_property(&JsString::from_utf8("constructor"), value)?;
+        object.create_data_property_or_throw_key(&key, value)?;
         return Ok(Value::Undefined);
     }
     let _ = get_property_key(agent, this, &key, this.clone())?;
-    object.set(&JsString::from_utf8("constructor"), value, true)?;
+    object.set_key(&key, value, true)?;
     Ok(Value::Undefined)
 }
 
@@ -663,13 +755,9 @@ fn get_iterator_direct(agent: &mut Agent, this: &Value) -> Result<IteratorRecord
             "Iterator method called on a non-object".into(),
         ));
     };
+    // The next method is stored as-is; a non-callable one surfaces as a
+    // TypeError from the first step (spec: the helpers defer the check).
     let next = get_property(agent, this, &JsString::from_utf8("next"), this.clone())?;
-    if !is_callable(&next) {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "Iterator's next method is not callable".into(),
-        ));
-    }
     Ok(IteratorRecord {
         iterator: this.clone(),
         next,
@@ -681,28 +769,76 @@ fn step_value(agent: &mut Agent, record: &IteratorRecord) -> Result<Option<Value
     iterator_step(agent, record)
 }
 
+/// IteratorClose the receiver's `return` method after an argument-validation
+/// failure (spec: the helpers validate their argument before GetIteratorDirect
+/// and close the receiver on failure). The close error is suppressed — the
+/// validation error wins.
+fn close_this_on_error(agent: &mut Agent, this: &Value, error: JsError) -> Result<Value, JsError> {
+    let return_key = JsString::from_utf8("return");
+    if let Ok(return_method) = get_property(agent, this, &return_key, this.clone())
+        && is_callable(&return_method)
+    {
+        let _ = crate::function::call(agent, &return_method, this.clone(), &[]);
+    }
+    Err(error)
+}
+
+/// Close the underlying iterator(s) of a helper, suppressing close errors
+/// (the original completion wins, spec IteratorClose step 8).
+fn close_helper_iterators(agent: &mut Agent, state: &mut HelperState) {
+    if let Some(record) = state.iterator.take() {
+        let _ = iterator_close(agent, &record);
+    }
+    if let HelperMode::FlatMap { inner, .. } = &mut state.mode
+        && let Some(inner) = inner.take()
+    {
+        let _ = iterator_close(agent, &inner);
+    }
+}
+
 /// IterateUntilCompletion for the eager helpers: step the iterator, running
-/// `body` per value; `body` returns `None` to keep iterating or `Some(value)`
-/// to stop, closing the iterator (spec 27.1.3.1 iterated-until-completion).
-/// Returns the stopped value, or `None` when the iterator was exhausted.
+/// `body` per value with the value's counter; `body` returns `None` to keep
+/// iterating or `Some(value)` to stop, closing the iterator (spec 27.1.3.1
+/// iterated-until-completion). A body error closes the iterator too, and the
+/// error propagates. Returns the stopped value, or `None` when exhausted.
 fn iterate_eager(
     agent: &mut Agent,
     record: &IteratorRecord,
-    mut body: impl FnMut(&mut Agent, Value) -> Result<Option<Value>, JsError>,
+    start_counter: f64,
+    mut body: impl FnMut(&mut Agent, Value, f64) -> Result<Option<Value>, JsError>,
 ) -> Result<Option<Value>, JsError> {
+    let mut counter = start_counter;
     loop {
         let Some(value) = step_value(agent, record)? else {
             return Ok(None);
         };
-        if let Some(result) = body(agent, value)? {
-            iterator_close(agent, record)?;
-            return Ok(Some(result));
+        match body(agent, value, counter) {
+            Ok(Some(result)) => {
+                iterator_close(agent, record)?;
+                return Ok(Some(result));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let _ = iterator_close(agent, record);
+                return Err(e);
+            }
         }
+        counter += 1.0;
     }
 }
 
-fn call_predicate(agent: &mut Agent, f: &Value, value: &Value) -> Result<bool, JsError> {
-    let result = crate::function::call(agent, f, Value::Undefined, std::slice::from_ref(value))?;
+fn call_predicate(
+    agent: &mut Agent,
+    f: &Value,
+    value: &Value,
+    counter: f64,
+) -> Result<bool, JsError> {
+    let result = crate::function::call(
+        agent,
+        f,
+        Value::Undefined,
+        &[value.clone(), Value::Number(counter)],
+    )?;
     Ok(to_boolean(&result))
 }
 
@@ -711,14 +847,15 @@ fn call_predicate(agent: &mut Agent, f: &Value, value: &Value) -> Result<bool, J
 fn every_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let predicate = args.first().cloned().unwrap_or(Value::Undefined);
     if !is_callable(&predicate) {
-        return Err(JsError::new(
+        let error = JsError::new(
             ErrorKind::TypeError,
             "Iterator.prototype.every requires a callable predicate".into(),
-        ));
+        );
+        return close_this_on_error(agent, this, error);
     }
     let record = get_iterator_direct(agent, this)?;
-    let result = iterate_eager(agent, &record, |agent, value| {
-        if call_predicate(agent, &predicate, &value)? {
+    let result = iterate_eager(agent, &record, 0.0, |agent, value, counter| {
+        if call_predicate(agent, &predicate, &value, counter)? {
             Ok(None)
         } else {
             Ok(Some(Value::Boolean(false)))
@@ -730,14 +867,15 @@ fn every_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
 fn some_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let predicate = args.first().cloned().unwrap_or(Value::Undefined);
     if !is_callable(&predicate) {
-        return Err(JsError::new(
+        let error = JsError::new(
             ErrorKind::TypeError,
             "Iterator.prototype.some requires a callable predicate".into(),
-        ));
+        );
+        return close_this_on_error(agent, this, error);
     }
     let record = get_iterator_direct(agent, this)?;
-    let result = iterate_eager(agent, &record, |agent, value| {
-        if call_predicate(agent, &predicate, &value)? {
+    let result = iterate_eager(agent, &record, 0.0, |agent, value, counter| {
+        if call_predicate(agent, &predicate, &value, counter)? {
             Ok(Some(Value::Boolean(true)))
         } else {
             Ok(None)
@@ -749,14 +887,15 @@ fn some_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
 fn find_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let predicate = args.first().cloned().unwrap_or(Value::Undefined);
     if !is_callable(&predicate) {
-        return Err(JsError::new(
+        let error = JsError::new(
             ErrorKind::TypeError,
             "Iterator.prototype.find requires a callable predicate".into(),
-        ));
+        );
+        return close_this_on_error(agent, this, error);
     }
     let record = get_iterator_direct(agent, this)?;
-    let result = iterate_eager(agent, &record, |agent, value| {
-        if call_predicate(agent, &predicate, &value)? {
+    let result = iterate_eager(agent, &record, 0.0, |agent, value, counter| {
+        if call_predicate(agent, &predicate, &value, counter)? {
             Ok(Some(value))
         } else {
             Ok(None)
@@ -768,14 +907,20 @@ fn find_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
 fn for_each_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let f = args.first().cloned().unwrap_or(Value::Undefined);
     if !is_callable(&f) {
-        return Err(JsError::new(
+        let error = JsError::new(
             ErrorKind::TypeError,
             "Iterator.prototype.forEach requires a callable function".into(),
-        ));
+        );
+        return close_this_on_error(agent, this, error);
     }
     let record = get_iterator_direct(agent, this)?;
-    iterate_eager(agent, &record, |agent, value| {
-        crate::function::call(agent, &f, Value::Undefined, &[value])?;
+    iterate_eager(agent, &record, 0.0, |agent, value, counter| {
+        crate::function::call(
+            agent,
+            &f,
+            Value::Undefined,
+            &[value, Value::Number(counter)],
+        )?;
         Ok(None)
     })?;
     Ok(Value::Undefined)
@@ -784,16 +929,22 @@ fn for_each_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Va
 fn reduce_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let reducer = args.first().cloned().unwrap_or(Value::Undefined);
     if !is_callable(&reducer) {
-        return Err(JsError::new(
+        let error = JsError::new(
             ErrorKind::TypeError,
             "Iterator.prototype.reduce requires a callable reducer".into(),
-        ));
+        );
+        return close_this_on_error(agent, this, error);
     }
     let record = get_iterator_direct(agent, this)?;
     let mut accumulator = args.get(1).cloned();
-    if accumulator.is_none() {
+    // With no initial value the first element seeds the accumulator without a
+    // reducer call, so the first reducer call sees counter 1 (spec 27.1.3.?).
+    let start_counter = if accumulator.is_none() {
         match step_value(agent, &record)? {
-            Some(value) => accumulator = Some(value),
+            Some(value) => {
+                accumulator = Some(value);
+                1.0
+            }
             None => {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
@@ -801,14 +952,16 @@ fn reduce_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Valu
                 ));
             }
         }
-    }
-    iterate_eager(agent, &record, |agent, value| {
+    } else {
+        0.0
+    };
+    iterate_eager(agent, &record, start_counter, |agent, value, counter| {
         let acc = accumulator.clone().unwrap_or(Value::Undefined);
         accumulator = Some(crate::function::call(
             agent,
             &reducer,
             Value::Undefined,
-            &[acc, value],
+            &[acc, value, Value::Number(counter)],
         )?);
         Ok(None)
     })?;
@@ -818,7 +971,7 @@ fn reduce_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Valu
 fn to_array_method(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     let record = get_iterator_direct(agent, this)?;
     let mut values = Vec::new();
-    iterate_eager(agent, &record, |_agent, value| {
+    iterate_eager(agent, &record, 0.0, |_agent, value, _counter| {
         values.push(value);
         Ok(None)
     })?;
@@ -826,9 +979,60 @@ fn to_array_method(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<V
 }
 
 fn includes_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    // spec 27.1.3.?: an Object this is required (no ToObject coercion).
+    if !matches!(this, Value::Object(_) | Value::Function(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Iterator.prototype.includes requires an object this".into(),
+        ));
+    }
     let search = args.first().cloned().unwrap_or(Value::Undefined);
+    // skippedElements: undefined -> 0; otherwise it must be an integral
+    // Number (Infinity allowed) with no coercion, else TypeError + close.
+    let mut to_skip = match args.get(1).cloned() {
+        None | Some(Value::Undefined) => 0.0,
+        Some(Value::Number(n)) => {
+            let integral = n.is_infinite() || n.fract() == 0.0;
+            if !integral {
+                let error = JsError::new(
+                    ErrorKind::TypeError,
+                    "Iterator.prototype.includes requires skippedElements to be an integral Number"
+                        .into(),
+                );
+                return close_this_on_error(agent, this, error);
+            }
+            if n < 0.0 {
+                let error = JsError::new(
+                    ErrorKind::RangeError,
+                    "Iterator.prototype.includes requires skippedElements to be non-negative"
+                        .into(),
+                );
+                return close_this_on_error(agent, this, error);
+            }
+            if n.is_finite() && n > 9007199254740991.0 {
+                let error = JsError::new(
+                    ErrorKind::RangeError,
+                    "Iterator.prototype.includes requires skippedElements within 2^53 - 1".into(),
+                );
+                return close_this_on_error(agent, this, error);
+            }
+            n
+        }
+        Some(_) => {
+            let error = JsError::new(
+                ErrorKind::TypeError,
+                "Iterator.prototype.includes requires skippedElements to be an integral Number"
+                    .into(),
+            );
+            return close_this_on_error(agent, this, error);
+        }
+    };
     let record = get_iterator_direct(agent, this)?;
-    let result = iterate_eager(agent, &record, |_agent, value| {
+    let result = iterate_eager(agent, &record, 0.0, |_agent, value, _counter| {
+        if to_skip > 0.0 {
+            to_skip -= 1.0;
+            return Ok(None);
+        }
         if crux::ops::same_value_zero(&value, &search) {
             Ok(Some(Value::Boolean(true)))
         } else {
@@ -839,14 +1043,24 @@ fn includes_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Va
 }
 
 fn join_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let record = get_iterator_direct(agent, this)?;
+    // spec 27.1.3.?: the separator is coerced first, and a coercion error
+    // closes the receiver.
     let separator = match args.first() {
         Some(Value::Undefined) | None => JsString::from_utf8(","),
-        Some(value) => context_to_string(agent, value)?,
+        Some(value) => match context_to_string(agent, value) {
+            Ok(text) => text,
+            Err(e) => return close_this_on_error(agent, this, e),
+        },
     };
+    let record = get_iterator_direct(agent, this)?;
     let mut parts = Vec::new();
-    iterate_eager(agent, &record, |agent, value| {
-        parts.push(context_to_string(agent, &value)?.to_string_lossy());
+    iterate_eager(agent, &record, 0.0, |agent, value, _counter| {
+        // Nullish contents join as the empty string (like Array.prototype.join).
+        let text = match value {
+            Value::Null | Value::Undefined => String::new(),
+            other => context_to_string(agent, &other)?.to_string_lossy(),
+        };
+        parts.push(text);
         Ok(None)
     })?;
     Ok(Value::String(Handle::new(JsString::from_utf8(
@@ -854,10 +1068,15 @@ fn join_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
     ))))
 }
 
-/// `Iterator.prototype[Symbol.dispose]`: close the iterator (spec 27.1.3.12).
+/// `Iterator.prototype[Symbol.dispose]`: call the receiver's `return` method
+/// (spec 27.1.3.12) — the receiver need not have a `next`.
 fn dispose_method(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
-    let record = get_iterator_direct(agent, this)?;
-    iterator_close(agent, &record)?;
+    let return_key = JsString::from_utf8("return");
+    if let Ok(return_method) = get_property(agent, this, &return_key, this.clone())
+        && is_callable(&return_method)
+    {
+        crate::function::call(agent, &return_method, this.clone(), &[])?;
+    }
     Ok(Value::Undefined)
 }
 
@@ -879,10 +1098,11 @@ fn create_helper(agent: &mut Agent, state: HelperState) -> Result<Value, JsError
 fn map_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let mapper = args.first().cloned().unwrap_or(Value::Undefined);
     if !is_callable(&mapper) {
-        return Err(JsError::new(
+        let error = JsError::new(
             ErrorKind::TypeError,
             "Iterator.prototype.map requires a callable mapper".into(),
-        ));
+        );
+        return close_this_on_error(agent, this, error);
     }
     let record = get_iterator_direct(agent, this)?;
     create_helper(
@@ -890,6 +1110,7 @@ fn map_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
         HelperState {
             iterator: Some(record),
             done: false,
+            counter: 0.0,
             mode: HelperMode::Map { mapper },
         },
     )
@@ -898,10 +1119,11 @@ fn map_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
 fn filter_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let filterer = args.first().cloned().unwrap_or(Value::Undefined);
     if !is_callable(&filterer) {
-        return Err(JsError::new(
+        let error = JsError::new(
             ErrorKind::TypeError,
             "Iterator.prototype.filter requires a callable filterer".into(),
-        ));
+        );
+        return close_this_on_error(agent, this, error);
     }
     let record = get_iterator_direct(agent, this)?;
     create_helper(
@@ -909,46 +1131,43 @@ fn filter_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Valu
         HelperState {
             iterator: Some(record),
             done: false,
+            counter: 0.0,
             mode: HelperMode::Filter { filterer },
         },
     )
 }
 
 fn take_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let limit_arg = args.first().cloned().unwrap_or(Value::Undefined);
-    let limit = to_integer_or_infinity(to_number(&limit_arg)?);
-    if limit < 0.0 {
-        return Err(JsError::new(
-            ErrorKind::RangeError,
-            "Iterator.prototype.take requires a non-negative limit".into(),
-        ));
-    }
+    let limit = take_drop_limit(
+        agent,
+        this,
+        args.first().cloned().unwrap_or(Value::Undefined),
+    )?;
     let record = get_iterator_direct(agent, this)?;
     create_helper(
         agent,
         HelperState {
             iterator: Some(record),
             done: false,
+            counter: 0.0,
             mode: HelperMode::Take { remaining: limit },
         },
     )
 }
 
 fn drop_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let limit_arg = args.first().cloned().unwrap_or(Value::Undefined);
-    let limit = to_integer_or_infinity(to_number(&limit_arg)?);
-    if limit < 0.0 {
-        return Err(JsError::new(
-            ErrorKind::RangeError,
-            "Iterator.prototype.drop requires a non-negative limit".into(),
-        ));
-    }
+    let limit = take_drop_limit(
+        agent,
+        this,
+        args.first().cloned().unwrap_or(Value::Undefined),
+    )?;
     let record = get_iterator_direct(agent, this)?;
     create_helper(
         agent,
         HelperState {
             iterator: Some(record),
             done: false,
+            counter: 0.0,
             mode: HelperMode::Drop { remaining: limit },
         },
     )
@@ -957,10 +1176,11 @@ fn drop_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
 fn flat_map_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let mapper = args.first().cloned().unwrap_or(Value::Undefined);
     if !is_callable(&mapper) {
-        return Err(JsError::new(
+        let error = JsError::new(
             ErrorKind::TypeError,
             "Iterator.prototype.flatMap requires a callable mapper".into(),
-        ));
+        );
+        return close_this_on_error(agent, this, error);
     }
     let record = get_iterator_direct(agent, this)?;
     create_helper(
@@ -968,6 +1188,7 @@ fn flat_map_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Va
         HelperState {
             iterator: Some(record),
             done: false,
+            counter: 0.0,
             mode: HelperMode::FlatMap {
                 mapper,
                 inner: None,
@@ -1001,15 +1222,54 @@ fn chunk_window_size(arg: &Value) -> Result<f64, JsError> {
     Ok(*size)
 }
 
+/// The take/drop limit (spec 27.1.3.3 steps 2-6 / 27.1.3.6): ToNumber through
+/// the agent, then a RangeError (with the receiver closed) when the value is
+/// NaN, finite and above 2^53 - 1, or truncates below zero.
+fn take_drop_limit(agent: &mut Agent, this: &Value, arg: Value) -> Result<f64, JsError> {
+    // RequireObjectCoercible (spec 27.1.3.3 step 1): a nullish this fails
+    // before the argument is coerced.
+    if !matches!(this, Value::Object(_) | Value::Function(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Iterator.prototype.take/drop requires an object this".into(),
+        ));
+    }
+    let num = match crate::context::to_number(agent, &arg) {
+        Ok(number) => number,
+        Err(e) => return Err(close_this_on_error(agent, this, e).unwrap_err()),
+    };
+    let limit = to_integer_or_infinity(num);
+    let invalid = num.is_nan() || (num.is_finite() && num > 9007199254740991.0) || limit < 0.0;
+    if invalid {
+        let error = JsError::new(
+            ErrorKind::RangeError,
+            "Iterator.prototype.take/drop requires a valid limit".into(),
+        );
+        return Err(close_this_on_error(agent, this, error).unwrap_err());
+    }
+    Ok(limit)
+}
+
 fn chunks_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    // RequireObjectCoercible first (spec 27.1.3.?: step 2).
+    if !matches!(this, Value::Object(_) | Value::Function(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Iterator.prototype.chunks requires an object this".into(),
+        ));
+    }
     let size_arg = args.first().cloned().unwrap_or(Value::Undefined);
-    let size = chunk_window_size(&size_arg)?;
+    let size = match chunk_window_size(&size_arg) {
+        Ok(size) => size,
+        Err(e) => return close_this_on_error(agent, this, e),
+    };
     let record = get_iterator_direct(agent, this)?;
     create_helper(
         agent,
         HelperState {
             iterator: Some(record),
             done: false,
+            counter: 0.0,
             mode: HelperMode::Chunks {
                 chunk_size: size,
                 buffer: Vec::new(),
@@ -1019,24 +1279,37 @@ fn chunks_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Valu
 }
 
 fn windows_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    // RequireObjectCoercible first.
+    if !matches!(this, Value::Object(_) | Value::Function(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Iterator.prototype.windows requires an object this".into(),
+        ));
+    }
     let size_arg = args.first().cloned().unwrap_or(Value::Undefined);
-    let size = chunk_window_size(&size_arg)?;
+    let size = match chunk_window_size(&size_arg) {
+        Ok(size) => size,
+        Err(e) => return close_this_on_error(agent, this, e),
+    };
     // undersized defaults to "only-full" and must be one of the two strings.
     let undersized = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let mut allow_partial = false;
     let valid_undersized = match &undersized {
         Value::Undefined => true,
         Value::String(text) => {
             let text = text.to_string_lossy();
+            allow_partial = text == "allow-partial";
             text == "only-full" || text == "allow-partial"
         }
         _ => false,
     };
     if !valid_undersized {
-        return Err(JsError::new(
+        let error = JsError::new(
             ErrorKind::TypeError,
             "Iterator.prototype.windows requires undersized to be \"only-full\" or \"allow-partial\""
                 .into(),
-        ));
+        );
+        return close_this_on_error(agent, this, error);
     }
     let record = get_iterator_direct(agent, this)?;
     create_helper(
@@ -1044,9 +1317,11 @@ fn windows_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
         HelperState {
             iterator: Some(record),
             done: false,
+            counter: 0.0,
             mode: HelperMode::Windows {
                 window_size: size,
                 buffer: VecDeque::new(),
+                allow_partial,
             },
         },
     )
@@ -1150,7 +1425,21 @@ fn step_helper(agent: &mut Agent, state: &mut HelperState) -> Result<Value, JsEr
                 state.done = true;
                 return done_result(agent);
             };
-            let mapped = crate::function::call(agent, mapper, Value::Undefined, &[value])?;
+            let counter = state.counter;
+            state.counter += 1.0;
+            let mapped = match crate::function::call(
+                agent,
+                mapper,
+                Value::Undefined,
+                &[value, Value::Number(counter)],
+            ) {
+                Ok(mapped) => mapped,
+                Err(e) => {
+                    state.done = true;
+                    close_helper_iterators(agent, state);
+                    return Err(e);
+                }
+            };
             iterator_result(agent, mapped, false)
         }
         HelperMode::Filter { filterer } => {
@@ -1162,7 +1451,17 @@ fn step_helper(agent: &mut Agent, state: &mut HelperState) -> Result<Value, JsEr
                     state.done = true;
                     return done_result(agent);
                 };
-                if call_predicate(agent, filterer, &value)? {
+                let counter = state.counter;
+                state.counter += 1.0;
+                let keep = match call_predicate(agent, filterer, &value, counter) {
+                    Ok(keep) => keep,
+                    Err(e) => {
+                        state.done = true;
+                        close_helper_iterators(agent, state);
+                        return Err(e);
+                    }
+                };
+                if keep {
                     return iterator_result(agent, value, false);
                 }
             }
@@ -1219,45 +1518,31 @@ fn step_helper(agent: &mut Agent, state: &mut HelperState) -> Result<Value, JsEr
                     state.done = true;
                     return done_result(agent);
                 };
-                let mapped = crate::function::call(agent, mapper, Value::Undefined, &[value])?;
+                let counter = state.counter;
+                state.counter += 1.0;
+                let mapped = match crate::function::call(
+                    agent,
+                    mapper,
+                    Value::Undefined,
+                    &[value, Value::Number(counter)],
+                ) {
+                    Ok(mapped) => mapped,
+                    Err(e) => {
+                        state.done = true;
+                        close_helper_iterators(agent, state);
+                        return Err(e);
+                    }
+                };
                 if !matches!(mapped, Value::Object(_) | Value::Function(_)) {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
                         "flatMap mapper must return an iterable object".into(),
                     ));
                 }
-                // Strings are rejected by flatMap (GetIteratorFlattenable with
-                // hint ~reject-strings~).
-                let mapped_iterable = get_method(agent, &mapped, "@@iterator")?;
-                let Some(method) = mapped_iterable else {
-                    return Err(JsError::new(
-                        ErrorKind::TypeError,
-                        "flatMap mapper must return an iterable object".into(),
-                    ));
-                };
-                let inner_value = crate::function::call(agent, &method, mapped.clone(), &[])?;
-                if !matches!(inner_value, Value::Object(_)) {
-                    return Err(JsError::new(
-                        ErrorKind::TypeError,
-                        "flatMap inner iterator must be an object".into(),
-                    ));
-                }
-                let next = get_property(
-                    agent,
-                    &inner_value,
-                    &JsString::from_utf8("next"),
-                    inner_value.clone(),
-                )?;
-                if !is_callable(&next) {
-                    return Err(JsError::new(
-                        ErrorKind::TypeError,
-                        "flatMap inner iterator has no callable next".into(),
-                    ));
-                }
-                *inner = Some(IteratorRecord {
-                    iterator: inner_value,
-                    next,
-                });
+                // GetIteratorFlattenable (spec 27.1.3.2): an @@iterator when
+                // present, otherwise the object's own `next` (a flat iterator).
+                let (inner_record, _) = get_iterator_flattenable(agent, &mapped)?;
+                *inner = Some(inner_record);
             }
         }
         HelperMode::Chunks { chunk_size, buffer } => {
@@ -1269,8 +1554,9 @@ fn step_helper(agent: &mut Agent, state: &mut HelperState) -> Result<Value, JsEr
                 let Some(value) = step_value(agent, record)? else {
                     state.done = true;
                     if buffer.is_empty() {
-                        let array = crate::builtins::array::array_from_values(agent, &[])?;
-                        return iterator_result(agent, array, true);
+                        // Exhausted with an empty buffer: done, no chunk
+                        // (spec 27.1.3.? step 8.a.ii.2).
+                        return iterator_result(agent, Value::Undefined, true);
                     }
                     let array = crate::builtins::array::array_from_values(agent, buffer)?;
                     return iterator_result(agent, array, false);
@@ -1283,6 +1569,7 @@ fn step_helper(agent: &mut Agent, state: &mut HelperState) -> Result<Value, JsEr
         HelperMode::Windows {
             window_size,
             buffer,
+            allow_partial,
         } => {
             let record = state.iterator.as_ref().ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "no underlying iterator".into())
@@ -1290,6 +1577,18 @@ fn step_helper(agent: &mut Agent, state: &mut HelperState) -> Result<Value, JsEr
             // Fill the window on the first next().
             while (buffer.len() as f64) < *window_size {
                 let Some(value) = step_value(agent, record)? else {
+                    // Exhausted: a partial window is yielded only when
+                    // undersized is "allow-partial" (spec 27.1.3.? step 8.a.ii).
+                    if *allow_partial && !buffer.is_empty() {
+                        let partial: Vec<Value> = buffer.iter().cloned().collect();
+                        buffer.clear();
+                        state.done = true;
+                        return iterator_result(
+                            agent,
+                            crate::builtins::array::array_from_values(agent, &partial)?,
+                            false,
+                        );
+                    }
                     state.done = true;
                     return iterator_result(agent, Value::Undefined, true);
                 };
@@ -1559,6 +1858,7 @@ fn iterator_concat(agent: &mut Agent, _this: &Value, args: &[Value]) -> Result<V
         HelperState {
             iterator: None,
             done: false,
+            counter: 0.0,
             mode: HelperMode::Concat {
                 iterators,
                 index: 0,
@@ -1624,6 +1924,7 @@ fn iterator_zip(
         HelperState {
             iterator: None,
             done: false,
+            counter: 0.0,
             mode: HelperMode::Zip {
                 iterators,
                 keys,
