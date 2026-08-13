@@ -212,7 +212,12 @@ fn reflect_method(agent: &mut Agent, name: &str, args: &[Value]) -> Result<Value
             let Some(property) = obj.get_own_property_key(&key)? else {
                 return Ok(Value::Undefined);
             };
-            crux::property::from_property_descriptor(&property.to_descriptor())
+            let prototype = agent
+                .current_realm()?
+                .intrinsics
+                .get("%Object.prototype%")
+                .and_then(|v| crate::context::as_object(&v));
+            crux::property::from_property_descriptor(&property.to_descriptor(), prototype)
         }
         "getPrototypeOf" => {
             let obj = object_of(&arg(0))?;

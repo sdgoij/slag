@@ -270,6 +270,62 @@ The fixes:
   `lex_private_identifier`); `for`-head declarations are bound in their
   own lexical scope.
 
+### Object descriptor cluster sweep (Phase 18)
+
+Sweeps of the Object descriptor cluster report 100%-of-runnable:
+`Object/defineProperty*` **1128 pass, 0 fail, 3 skip** of 1131 (up from
+1044 pass / 84 fail), `Object/getOwnPropertyDescriptor*` **326 pass, 0
+fail, 2 skip** of 328 (up from 323 / 3), and `Object/getOwnPropertyNames*`
+**45 pass, 0 fail** of 45 (up from 43 / 2). The skips are the standard
+taxonomy (`resizableArrayBufferUtils.js`, `proxyTrapsHelper.js` includes).
+Fixes across `crates/crux` and `crates/runtime`:
+
+- **Primitive receivers (spec 20.1.2.4/20.1.2.3 step 1):**
+  `Object.defineProperty(5, …)` and `Object.defineProperties(5, …)` boxed
+  the primitive via `to_object` instead of throwing the TypeError the
+  spec requires; the dispatches now reject non-object receivers.
+- **Agent-aware property keys:** the dispatches coerced the key with the
+  crux (non-agent) `to_property_key`, so an array key like `[1, 2]` failed
+  with "toString must be called through the agent". All Object dispatch
+  sites now use the agent-aware `crate::context::to_property_key`.
+- **`to_property_descriptor` accepts functions (spec 6.2.5.4):** a
+  *function* (or an object inheriting the descriptor fields) as the
+  Attributes argument hit "Property description must be an object"; the
+  match now unwraps `Value::Function`'s object part.
+- **Descriptor and arguments objects inherit `%Object.prototype%`:**
+  `from_property_descriptor` (the `getOwnPropertyDescriptor` result) and
+  both `*_arguments_object_create` built with `ordinary_object_create
+  (None)`, so `desc.hasOwnProperty(…)` was undefined and
+  `Object.prototype.value`/`writable`/`get`/`set` were unreachable
+  through an arguments-object Attributes. Both now wire the realm's
+  `%Object.prototype%`.
+- **Unmapped arguments objects are Arguments-exotic:** the strict-mode
+  creator built a plain Ordinary object, so
+  `Object.prototype.toString.call(arguments)` was `[object Object]`;
+  they now carry `ObjectKind::Arguments` with a `None` parameter map.
+- **Accessor redefine with `get: undefined` (spec 10.1.6.4):**
+  `validate_and_apply` stored the field as `Some(undefined)`, which the
+  runtime then *called* ("value is not a function"); undefined
+  getters/setters are now canonicalized to absent, and `find_ecma_accessor`
+  only returns callable accessors so the crux [[Get]]/[[Set]] handles the
+  undefined case.
+- **`ArraySetLength` object values:** `Object.defineProperty(arr,
+  "length", { value: {toString…} })` coerced the value with the crux
+  `to_number` ("must be called through the agent"); the dispatch now
+  pre-coerces object length values through the agent.
+- **Built-in statics are non-enumerable:** Object's static methods were
+  installed with `enumerable: true`; every built-in function property is
+  `{ writable: true, enumerable: false, configurable: true }`.
+- **`getOwnPropertyDescriptors` includes symbol keys** (its loop skipped
+  `PropertyKey::Symbol`), and **array own-property keys no longer list
+  holes** (ArrayOwnPropertyKeys only returns stored index keys — the
+  ES5-era "append holes descending" behavior was removed and its test
+  updated).
+- **Parser: multi-declarator `for` heads** — `parse_for_declarators`
+  parsed exactly one declarator, so `for (var i = 0, len = n; …)` was a
+  SyntaxError; it now loops over comma-separated declarators (keeping the
+  `[~In]` initializer restriction).
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~120 edge-case unit tests were added across
@@ -375,14 +431,14 @@ TypedArray fixtures that pass with the long timeout (see below).
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,798 | 15,597 | 4,797 | 3,401 | 3¹ | 76.5% |
+| built-ins | 23,798 | 15,686 | 4,708 | 3,401 | 3¹ | 76.9% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,608** | **32,040** | **7,403** | **9,162** | **3** | **81.2%** |
+| **Total** | **48,608** | **32,129** | **7,314** | **9,162** | **3** | **81.5%** |
 
 (Runnable = pass + fail; the 9,162 skips are module/async fixtures and
 unsupported harness includes.) The built-ins row reflects the current
-`Error*`/`BigInt*`/RegExp hardening; the language and annexB rows are from
-the sweep recorded below.
+`Error*`/`BigInt*`/RegExp/Object-descriptor hardening; the language and
+annexB rows are from the sweep recorded below.
 
 ¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
 coerced-values fixtures — 10,000-element allocations that need the long
@@ -407,7 +463,7 @@ resolved:
 - **Crashes** were debug-build stack overflows from deep recursion; a release
   build runs them cleanly.
 
-The 7,403 failures triage into:
+The 7,314 failures triage into:
 
 - **Missing built-ins (excluded from runnable):** Temporal (~3,100
   fixtures across `Temporal/*` — not implemented), ShadowRealm (47), and
@@ -440,9 +496,7 @@ The 7,403 failures triage into:
     remaining TypedArray failures are resizable/auto-length views (5) and
     cross-crate coercion of wrapper objects (2); the `-realm` fixtures are
     skipped as host-dependent
-  - `String/prototype` (290), `Array/prototype` (187),
-    `Object/defineProperty`+`defineProperties`+`getOwnPropertyDescriptor`
-    (313)
+  - `String/prototype` (290), `Array/prototype` (187)
   - `Iterator/prototype` (278), `DataView/prototype` (140)
   - `dynamic-import/syntax/valid` (137), class-element `delete` early
     errors (192), `eval-code/direct` (103), `identifiers` (58),
@@ -468,12 +522,13 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 
 ## Open items
 
-- Certify the ≥95%-of-runnable target: the sweep now measures 81.2%
+- Certify the ≥95%-of-runnable target: the sweep now measures 81.5%
   (≈88% excluding the not-implemented Temporal/ShadowRealm built-ins) with
   0 hangs and 0 crashes. The remaining gap is the systematic bug clusters
-  listed above — the destructuring, TypedArray-Integer-Indexed, and RegExp
-  clusters are done; fix the TypedArray prototype-method/auto-length and
-  descriptor clusters next, then re-run the sweep and record the delta.
+  listed above — the destructuring, TypedArray-Integer-Indexed, RegExp, and
+  Object-descriptor clusters are done; fix the TypedArray
+  prototype-method/auto-length cluster next, then re-run the sweep and
+  record the delta.
   Note: the TypedArray sweep should be run with a longer deadline
   (`--timeout 120 --recheck-timeout 90`) — the O(n²) property store makes
   the 10,000-element crash-test fixtures take ~45s, which the default 5s

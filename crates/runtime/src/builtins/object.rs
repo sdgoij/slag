@@ -4,7 +4,6 @@
 //! (the %eval% pattern), because the operations reach user code and the
 //! agent.
 
-use crux::convert::to_property_key;
 use crux::error::{ErrorKind, JsError};
 use crux::function::{Function, NativeFn};
 use crux::handle::Handle;
@@ -229,7 +228,7 @@ fn install_statics(realm: &Handle<Realm>, ctor: &JsObject) -> Result<(), JsError
         ("setPrototypeOf", 2, SET_PROTO),
         ("values", 1, VALUES),
     ] {
-        define_method(realm, ctor, name, length, key, true)?;
+        define_method(realm, ctor, name, length, key, false)?;
     }
     Ok(())
 }
@@ -250,14 +249,6 @@ fn arg(args: &[Value], index: usize) -> &Value {
 
 fn str(value: &str) -> Value {
     Value::String(Handle::new(JsString::from_utf8(value)))
-}
-
-/// The object handle behind a (possibly boxed) value: ordinary objects
-/// directly, functions through their object part.
-fn object_of(agent: &mut Agent, value: &Value) -> Result<Handle<JsObject>, JsError> {
-    let object = to_object(agent, value)?;
-    as_object(&object)
-        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))
 }
 
 /// Object.prototype.toString (spec 20.1.3.6): `[object Tag]` from the value's
@@ -411,11 +402,15 @@ fn object_define_properties(
     let props = to_object(agent, properties)?;
     let props_obj = as_object(&props)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
-    let target = object_of(agent, object)?;
+    // spec 20.1.2.3 step 1: a primitive receiver throws (functions are
+    // objects, so `as_object` accepts them).
+    let target = as_object(object).ok_or_else(|| {
+        JsError::new(
+            ErrorKind::TypeError,
+            "Object.defineProperties called on non-object".into(),
+        )
+    })?;
     for key in props_obj.own_property_keys()? {
-        let PropertyKey::String(_) = key else {
-            continue;
-        };
         let Some(prop) = props_obj.get_own_property_key(&key)? else {
             continue;
         };
@@ -423,7 +418,19 @@ fn object_define_properties(
             continue;
         }
         let value = crate::context::get_property_key(agent, &props, &key, props.clone())?;
-        let desc = crux::property::to_property_descriptor(&value)?;
+        let mut desc = crux::property::to_property_descriptor(&value)?;
+        // ArraySetLength coerces an object [[Value]] through the agent
+        // (spec 10.4.2.4 steps 3-4); crux cannot invoke user toString.
+        if matches!(target.kind, crux::object::ObjectKind::Array)
+            && key == PropertyKey::from_utf8("length")
+            && let Some(length_value) = &desc.value
+            && matches!(length_value, Value::Object(_) | Value::Function(_))
+        {
+            desc.value = Some(Value::Number(crate::context::to_number(
+                agent,
+                length_value,
+            )?));
+        }
         if !target.define_property_key(&key, &desc)? {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -457,7 +464,7 @@ pub fn dispatch_call(
     }
     if intrinsics.get(PROTO_HAS_OWN).as_ref() == Some(callee) {
         return Some((|| {
-            let key = to_property_key(arg(args, 0))?;
+            let key = crate::context::to_property_key(agent, arg(args, 0))?;
             let object = to_object(agent, this)?;
             let obj = as_object(&object).ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "value is not an object".into())
@@ -487,7 +494,7 @@ pub fn dispatch_call(
     }
     if intrinsics.get(PROTO_PROP_IS_ENUM).as_ref() == Some(callee) {
         return Some((|| {
-            let key = to_property_key(arg(args, 0))?;
+            let key = crate::context::to_property_key(agent, arg(args, 0))?;
             let object = to_object(agent, this)?;
             let obj = as_object(&object).ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "value is not an object".into())
@@ -542,12 +549,26 @@ pub fn dispatch_call(
     }
     if intrinsics.get(DEFINE_PROPERTY).as_ref() == Some(callee) {
         return Some((|| {
-            let object = to_object(agent, arg(args, 0))?;
-            let key = to_property_key(arg(args, 1))?;
-            let desc = crux::property::to_property_descriptor(arg(args, 2))?;
-            let obj = as_object(&object).ok_or_else(|| {
-                JsError::new(ErrorKind::TypeError, "value is not an object".into())
+            // spec 20.1.2.4 step 1: a primitive receiver throws (functions
+            // are objects, so `as_object` accepts them).
+            let receiver = arg(args, 0);
+            let obj = as_object(receiver).ok_or_else(|| {
+                JsError::new(
+                    ErrorKind::TypeError,
+                    "Object.defineProperty called on non-object".into(),
+                )
             })?;
+            let key = crate::context::to_property_key(agent, arg(args, 1))?;
+            let mut desc = crux::property::to_property_descriptor(arg(args, 2))?;
+            // ArraySetLength coerces an object [[Value]] through the agent
+            // (spec 10.4.2.4 steps 3-4); crux cannot invoke user toString.
+            if matches!(obj.kind, crux::object::ObjectKind::Array)
+                && key == PropertyKey::from_utf8("length")
+                && let Some(value) = &desc.value
+                && matches!(value, Value::Object(_) | Value::Function(_))
+            {
+                desc.value = Some(Value::Number(crate::context::to_number(agent, value)?));
+            }
             if !obj.define_property_key(&key, &desc)? {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
@@ -557,7 +578,7 @@ pub fn dispatch_call(
                     ),
                 ));
             }
-            Ok(object)
+            Ok(receiver.clone())
         })());
     }
     if intrinsics.get(DEFINE_PROPERTIES).as_ref() == Some(callee) {
@@ -609,7 +630,7 @@ pub fn dispatch_call(
     if intrinsics.get(GET_OWN_DESC).as_ref() == Some(callee) {
         return Some((|| {
             let object = to_object(agent, arg(args, 0))?;
-            let key = to_property_key(arg(args, 1))?;
+            let key = crate::context::to_property_key(agent, arg(args, 1))?;
             let obj = as_object(&object).ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "value is not an object".into())
             })?;
@@ -617,7 +638,13 @@ pub fn dispatch_call(
                 return Ok(Value::Undefined);
             };
             let desc = prop.to_descriptor();
-            crux::property::from_property_descriptor(&desc)
+            crux::property::from_property_descriptor(
+                &desc,
+                realm
+                    .intrinsics
+                    .get(OBJECT_PROTO)
+                    .and_then(|v| as_object(&v)),
+            )
         })());
     }
     if intrinsics.get(GET_OWN_DESCS).as_ref() == Some(callee) {
@@ -633,11 +660,14 @@ pub fn dispatch_call(
                     .and_then(|v| as_object(&v)),
             );
             for key in obj.own_property_keys()? {
-                let PropertyKey::String(_) = key else {
-                    continue;
-                };
                 if let Some(prop) = obj.get_own_property_key(&key)? {
-                    let desc = crux::property::from_property_descriptor(&prop.to_descriptor())?;
+                    let desc = crux::property::from_property_descriptor(
+                        &prop.to_descriptor(),
+                        realm
+                            .intrinsics
+                            .get(OBJECT_PROTO)
+                            .and_then(|v| as_object(&v)),
+                    )?;
                     result.create_data_property_key(&key, desc)?;
                 }
             }
@@ -653,7 +683,7 @@ pub fn dispatch_call(
     if intrinsics.get(HAS_OWN).as_ref() == Some(callee) {
         return Some((|| {
             let object = to_object(agent, arg(args, 0))?;
-            let key = to_property_key(arg(args, 1))?;
+            let key = crate::context::to_property_key(agent, arg(args, 1))?;
             let obj = as_object(&object).ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "value is not an object".into())
             })?;
@@ -828,7 +858,7 @@ fn from_entries(agent: &mut Agent, iterable: &Value) -> Result<Value, JsError> {
             crate::context::get_property(agent, &entry, &JsString::from_utf8("0"), entry.clone())?;
         let value =
             crate::context::get_property(agent, &entry, &JsString::from_utf8("1"), entry.clone())?;
-        let key = to_property_key(&key)?;
+        let key = crate::context::to_property_key(agent, &key)?;
         obj.define_property_key(&key, &PropertyDescriptor::data(value))?;
     }
     Ok(Value::Object(obj))

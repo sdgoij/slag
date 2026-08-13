@@ -1301,6 +1301,14 @@ pub(crate) fn function_declaration_instantiation(
     let strict = data.strict;
     let simple = is_simple_parameter_list(&data.params);
 
+    // Per spec 10.4.4.2/10.4.4.7 the arguments object is an ordinary object
+    // with %Object.prototype% as its prototype.
+    let arguments_prototype = agent
+        .current_realm()
+        .ok()
+        .and_then(|realm| realm.intrinsics.get("%Object.prototype%"))
+        .and_then(|value| crate::context::as_object(&value));
+
     // BoundNames of the formal parameters.
     let mut param_names: Vec<JsString> = Vec::new();
     for param in &data.params {
@@ -1352,7 +1360,10 @@ pub(crate) fn function_declaration_instantiation(
     let mut param_bindings = param_names.clone();
     if arguments_obj_needed {
         let arguments_obj = if strict || !simple {
-            Value::Object(JsObject::unmapped_arguments_object_create(args)?)
+            Value::Object(JsObject::unmapped_arguments_object_create(
+                arguments_prototype.clone(),
+                args,
+            )?)
         } else {
             let env = function_env.clone();
             let make_getter = move |name: &JsString| -> Value {
@@ -1389,6 +1400,7 @@ pub(crate) fn function_declaration_instantiation(
                 )
             };
             Value::Object(JsObject::mapped_arguments_object_create(
+                arguments_prototype.clone(),
                 function_value.clone(),
                 &param_names,
                 args,

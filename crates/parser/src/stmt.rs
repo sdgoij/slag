@@ -648,39 +648,50 @@ fn parse_for_declarators(
     parser: &mut Parser,
     kind: VarDeclKind,
 ) -> Result<Vec<VarDeclarator>, JsError> {
-    let start = parser.peek()?.span.start;
-    // A `using` ForBinding is identifier-only (`~Pattern`).
-    if matches!(kind, VarDeclKind::Using | VarDeclKind::AwaitUsing)
-        && !matches!(parser.peek()?.kind, TokenKind::Identifier(_))
-    {
-        let tok = parser.peek()?.clone();
-        return Err(parser.unexpected(&tok));
-    }
-    let pattern = parser.parse_binding_pattern()?;
-    for name in bound_names(&pattern) {
-        parser.check_binding_name(name, start)?;
-        match kind {
-            VarDeclKind::Var => parser.declare_var(name, start)?,
-            VarDeclKind::Let | VarDeclKind::Const => parser.declare_lexical(name, start)?,
-            VarDeclKind::Using | VarDeclKind::AwaitUsing => parser.declare_lexical(name, start)?,
+    let mut decls = Vec::new();
+    loop {
+        let start = parser.peek()?.span.start;
+        // A `using` ForBinding is identifier-only (`~Pattern`).
+        if matches!(kind, VarDeclKind::Using | VarDeclKind::AwaitUsing)
+            && !matches!(parser.peek()?.kind, TokenKind::Identifier(_))
+        {
+            let tok = parser.peek()?.clone();
+            return Err(parser.unexpected(&tok));
         }
-        // `let` is never a valid bound name of a ForDeclaration (spec 14.7.5
-        // early errors); `var` heads are unrestricted.
-        if kind != VarDeclKind::Var && name == intern_utf8("let") {
-            return Err(parser.error_at(start, "let is disallowed as a lexically bound name"));
+        let pattern = parser.parse_binding_pattern()?;
+        for name in bound_names(&pattern) {
+            parser.check_binding_name(name, start)?;
+            match kind {
+                VarDeclKind::Var => parser.declare_var(name, start)?,
+                VarDeclKind::Let | VarDeclKind::Const => parser.declare_lexical(name, start)?,
+                VarDeclKind::Using | VarDeclKind::AwaitUsing => {
+                    parser.declare_lexical(name, start)?
+                }
+            }
+            // `let` is never a valid bound name of a ForDeclaration (spec
+            // 14.7.5 early errors); `var` heads are unrestricted.
+            if kind != VarDeclKind::Var && name == intern_utf8("let") {
+                return Err(parser.error_at(start, "let is disallowed as a lexically bound name"));
+            }
+        }
+        // The initializer is `[~In]`: a `for (var x = a in b)` head must not
+        // consume the `in` as part of the expression.
+        let init = if parser.eat_punct(TokenKind::Equal)? {
+            Some(parse_assignment(parser, false)?)
+        } else {
+            None
+        };
+        let end = parser.prev.as_ref().unwrap().span.end;
+        decls.push(VarDeclarator {
+            pattern,
+            init,
+            span: Span::new(start, end),
+        });
+        if !parser.eat_punct(TokenKind::Comma)? {
+            break;
         }
     }
-    let init = if parser.eat_punct(TokenKind::Equal)? {
-        Some(parse_assignment(parser, false)?)
-    } else {
-        None
-    };
-    let end = parser.prev.as_ref().unwrap().span.end;
-    Ok(vec![VarDeclarator {
-        pattern,
-        init,
-        span: Span::new(start, end),
-    }])
+    Ok(decls)
 }
 
 /// Converts a for-head init into the for-in/for-of binding.

@@ -1,6 +1,7 @@
 //! Property keys and Property Descriptor records (spec 6.1.7, 6.2.5).
 
 use crate::error::{ErrorKind, JsError};
+use crate::handle::Handle;
 use crate::object::JsObject;
 use crate::string::{AtomId, JsString, intern, intern_utf8, lookup};
 use crate::symbol::{Symbol, descriptive_string};
@@ -129,11 +130,15 @@ impl PropertyDescriptor {
 /// descriptor object. A descriptor with both data and accessor fields is an
 /// error.
 pub fn to_property_descriptor(value: &Value) -> Result<PropertyDescriptor, JsError> {
-    let Value::Object(obj) = value else {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "Property description must be an object".into(),
-        ));
+    let obj = match value {
+        Value::Object(obj) => obj.clone(),
+        Value::Function(function) => function.object.clone(),
+        _ => {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "Property description must be an object".into(),
+            ));
+        }
     };
     let mut desc = PropertyDescriptor {
         value: None,
@@ -192,8 +197,11 @@ pub fn to_property_descriptor(value: &Value) -> Result<PropertyDescriptor, JsErr
 
 /// FromPropertyDescriptor (spec 6.2.5.5): build the descriptor object from a
 /// Property Descriptor, copying only the present fields.
-pub fn from_property_descriptor(desc: &PropertyDescriptor) -> Result<Value, JsError> {
-    let obj = JsObject::ordinary_object_create(None);
+pub fn from_property_descriptor(
+    desc: &PropertyDescriptor,
+    prototype: Option<Handle<JsObject>>,
+) -> Result<Value, JsError> {
+    let obj = JsObject::ordinary_object_create(prototype);
     if let Some(value) = &desc.value {
         obj.create_data_property_or_throw(&JsString::from_utf8("value"), value.clone())?;
     }

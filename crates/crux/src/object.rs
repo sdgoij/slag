@@ -127,8 +127,8 @@ impl Property {
             PropertyKind::Accessor { get, set } => PropertyDescriptor {
                 value: None,
                 writable: None,
-                get: get.clone(),
-                set: set.clone(),
+                get: Some(get.clone().unwrap_or(Value::Undefined)),
+                set: Some(set.clone().unwrap_or(Value::Undefined)),
                 enumerable: Some(self.enumerable),
                 configurable: Some(self.configurable),
             },
@@ -504,6 +504,7 @@ impl JsObject {
     /// (MakeArgGetter/MakeArgSetter); the runtime supplies closures over the
     /// parameter environment at call time (Phase 7).
     pub fn mapped_arguments_object_create(
+        prototype: Option<Handle<JsObject>>,
         func: Value,
         formals: &[JsString],
         args: &[Value],
@@ -516,7 +517,7 @@ impl JsObject {
             kind: ObjectKind::Arguments(Handle::new(ArgumentsSlots {
                 parameter_map: Some(map.clone()),
             })),
-            prototype: RefCell::new(None),
+            prototype: RefCell::new(prototype),
             extensible: Cell::new(true),
             properties: RefCell::new(Vec::new()),
             private_elements: RefCell::new(Vec::new()),
@@ -597,8 +598,24 @@ impl JsObject {
     /// CreateUnmappedArgumentsObject (spec 10.4.4.9): an ordinary object
     /// with index properties, `length`, @@iterator, and a throwing `callee`
     /// accessor.
-    pub fn unmapped_arguments_object_create(args: &[Value]) -> Result<Handle<JsObject>, JsError> {
-        let obj = JsObject::ordinary_object_create(None);
+    pub fn unmapped_arguments_object_create(
+        prototype: Option<Handle<JsObject>>,
+        args: &[Value],
+    ) -> Result<Handle<JsObject>, JsError> {
+        let obj = Handle::new(Self {
+            id: NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
+            kind: ObjectKind::Arguments(Handle::new(ArgumentsSlots {
+                parameter_map: None,
+            })),
+            prototype: RefCell::new(prototype),
+            extensible: Cell::new(true),
+            properties: RefCell::new(Vec::new()),
+            private_elements: RefCell::new(Vec::new()),
+            self_handle: RefCell::new(None),
+            function_self: RefCell::new(None),
+            boxed: RefCell::new(None),
+        });
+        Self::link_self_handle(&obj);
         obj.define_property(
             &JsString::from_utf8("length"),
             &PropertyDescriptor {
@@ -1169,33 +1186,11 @@ fn ordinary_own_property_keys(obj: &JsObject) -> Vec<PropertyKey> {
 
 /// ArrayOwnPropertyKeys (spec 10.4.2.5): ordinary keys plus the missing
 /// index names from `length - 1` down to 0, appended at the end.
+/// ArrayExoticObject [[OwnPropertyKeys]] (spec 10.4.2.6): the ordinary keys
+/// plus the array-index keys — only those actually present as own properties;
+/// holes are not own keys.
 fn array_own_property_keys(array: &JsObject) -> Vec<PropertyKey> {
-    let mut keys = ordinary_own_property_keys(array);
-    let length = array
-        .properties
-        .borrow()
-        .iter()
-        .find(|(name, _)| *name == PropertyKey::from_utf8("length"))
-        .and_then(|(_, p)| p.value())
-        .and_then(|v| match v {
-            Value::Number(n) if n.is_finite() && n >= 0.0 && n.trunc() == n => Some(n as u64),
-            _ => None,
-        })
-        .unwrap_or(0);
-    if length > 0 {
-        let mut index = length - 1;
-        loop {
-            let index_str = PropertyKey::from_utf8(&index.to_string());
-            if !keys.contains(&index_str) {
-                keys.push(index_str);
-            }
-            if index == 0 {
-                break;
-            }
-            index -= 1;
-        }
-    }
-    keys
+    ordinary_own_property_keys(array)
 }
 
 /// StringOwnPropertyKeys (spec 10.4.3.4): code-unit indices first, then own
@@ -1369,10 +1364,10 @@ fn validate_and_apply(
         next.configurable = configurable;
     }
     if let (Some(get), PropertyKind::Accessor { get: slot, .. }) = (&desc.get, &mut next.kind) {
-        *slot = Some(get.clone());
+        *slot = Some(get.clone()).filter(|v| !matches!(v, Value::Undefined));
     }
     if let (Some(set), PropertyKind::Accessor { set: slot, .. }) = (&desc.set, &mut next.kind) {
-        *slot = Some(set.clone());
+        *slot = Some(set.clone()).filter(|v| !matches!(v, Value::Undefined));
     }
     let mut props = obj.properties.borrow_mut();
     if let Some((_, slot)) = props.iter_mut().find(|(name, _)| name == key) {
@@ -2600,7 +2595,7 @@ mod tests {
     }
 
     #[test]
-    fn array_own_property_keys_appends_holes_descending() {
+    fn array_own_property_keys_omits_holes() {
         let array = JsObject::array_create(None, 2.0).unwrap();
         array
             .create_data_property(&key("1"), Value::Number(1.0))
@@ -2611,9 +2606,9 @@ mod tests {
             .iter()
             .map(|k| k.display_string())
             .collect();
-        // Ordinary keys ("1", "length") then the hole "0" appended by
-        // ArrayOwnPropertyKeys.
-        assert_eq!(names, ["1", "length", "0"]);
+        // Spec 10.4.2.6: only the stored array-index keys appear; the hole
+        // at "0" is not an own property key (ES5-era behavior appended it).
+        assert_eq!(names, ["1", "length"]);
     }
 
     #[test]
@@ -2734,6 +2729,7 @@ mod tests {
         let binding_for_getter = binding.clone();
         let binding_for_setter = binding.clone();
         let args = JsObject::mapped_arguments_object_create(
+            None,
             Value::Undefined,
             &[JsString::from_utf8("a"), JsString::from_utf8("b")],
             &[Value::Number(1.0), Value::Number(2.0)],
@@ -2768,6 +2764,7 @@ mod tests {
     #[test]
     fn mapped_arguments_callee_and_duplicate_names() {
         let args = JsObject::mapped_arguments_object_create(
+            None,
             Value::Number(7.0),
             &[JsString::from_utf8("a"), JsString::from_utf8("a")],
             &[Value::Number(1.0), Value::Number(2.0)],
@@ -2782,7 +2779,7 @@ mod tests {
 
     #[test]
     fn unmapped_arguments_have_throwing_callee() {
-        let args = JsObject::unmapped_arguments_object_create(&[Value::Number(1.0)]).unwrap();
+        let args = JsObject::unmapped_arguments_object_create(None, &[Value::Number(1.0)]).unwrap();
         assert_eq!(args.get(&key("0")).unwrap(), Value::Number(1.0));
         assert!(args.get(&key("callee")).is_err());
         assert!(args.set(&key("callee"), Value::Undefined, false).is_err());

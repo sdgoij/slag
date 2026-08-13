@@ -267,7 +267,7 @@ pub fn define_own_property(
     let Some(trap) = value_get_method(&handler, &trap_key("defineProperty"))? else {
         return value_define_property(&target, key, desc);
     };
-    let desc_obj = from_property_descriptor(desc)?;
+    let desc_obj = from_property_descriptor(desc, None)?;
     let result = value_call(&trap, handler, &[target.clone(), key_value(key), desc_obj])?;
     if !crate::convert::to_boolean(&result) {
         return Ok(false);

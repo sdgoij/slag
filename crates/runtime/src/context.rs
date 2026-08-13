@@ -547,6 +547,13 @@ fn find_ecma_accessor(
             let Some(accessor) = accessor else {
                 return Ok(None);
             };
+            // The comment above promises a *callable* accessor; a stored
+            // `undefined` getter/setter (an accessor redefine with
+            // `get: undefined`) must fall through to the crux [[Get]]/[[Set]],
+            // which returns undefined / ignores the write.
+            if !crux::value::is_callable(&accessor) {
+                return Ok(None);
+            }
             return Ok(Some(accessor));
         }
         match obj.get_prototype_of()? {
