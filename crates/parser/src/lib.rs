@@ -1736,4 +1736,17 @@ mod tests {
         ok("for (var x = 1 in obj) {}");
         err("for (var { x } = y in obj) {}");
     }
+
+    #[test]
+    fn for_loop_heads_are_loop_scoped() {
+        // A classic lexical head does not declare into the enclosing list: a
+        // sibling loop, a later `let`, or an enclosing `var` may reuse the name.
+        ok("for (let i = 0; i < 3; i++) {} for (let i = 0; i < 3; i++) {}");
+        ok("for (let i = 0; i < 3; i++) {} let i = 1;");
+        ok("let i = 1; for (let i = 0; i < 3; i++) {}");
+        ok("for (let i = 0; i < 3; i++) {} var i;");
+        // The head still clashes with `var` names in its own body (14.7.4).
+        err("for (let i = 0; i < 3; i++) { var i; }");
+        err("for (const i = 0; i < 3; i++) { var i; }");
+    }
 }

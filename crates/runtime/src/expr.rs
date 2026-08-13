@@ -932,8 +932,8 @@ pub(crate) fn apply_binary(
         BinaryOp::GreaterEqual => Ok(Value::Boolean(
             !abstract_relational(agent, left, right)?.unwrap_or(false),
         )),
-        BinaryOp::Equal => Ok(Value::Boolean(crux::ops::is_loosely_equal(left, right)?)),
-        BinaryOp::NotEqual => Ok(Value::Boolean(!crux::ops::is_loosely_equal(left, right)?)),
+        BinaryOp::Equal => Ok(Value::Boolean(abstract_loosely_equal(agent, left, right)?)),
+        BinaryOp::NotEqual => Ok(Value::Boolean(!abstract_loosely_equal(agent, left, right)?)),
         BinaryOp::StrictEqual => Ok(Value::Boolean(is_strictly_equal(left, right))),
         BinaryOp::StrictNotEqual => Ok(Value::Boolean(!is_strictly_equal(left, right))),
         BinaryOp::In => {
@@ -1170,6 +1170,14 @@ fn abstract_relational(
         }
         _ => unreachable!("ToNumeric produces Number or BigInt"),
     }
+}
+
+/// IsLooselyEqual (spec 7.2.15) with agent-dispatched ToPrimitive for object
+/// operands (the crux `is_loosely_equal` cannot reach valueOf/toString).
+fn abstract_loosely_equal(agent: &mut Agent, left: &Value, right: &Value) -> Result<bool, JsError> {
+    let left_prim = crate::context::to_primitive(agent, left, ToPrimitiveHint::Default)?;
+    let right_prim = crate::context::to_primitive(agent, right, ToPrimitiveHint::Default)?;
+    crux::ops::is_loosely_equal(&left_prim, &right_prim)
 }
 
 /// Compare a BigInt with a finite or infinite Number; `None` for NaN.

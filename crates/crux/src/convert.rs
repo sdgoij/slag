@@ -258,6 +258,22 @@ pub fn string_to_bigint(text: &JsString) -> Option<crate::BigInt> {
         Some(&u) if u == b'+' as u16 => (false, &body[1..]),
         _ => (false, body),
     };
+    // A sign is only part of a decimal StringIntegerLiteral: "-0x1" is not a
+    // StringIntegerLiteral, so StringToBigInt yields NaN for it (spec 7.1.17.1).
+    let signed = rest.len() != body.len();
+    const NON_DECIMAL_MARK: [u16; 6] = [
+        b'x' as u16,
+        b'X' as u16,
+        b'o' as u16,
+        b'O' as u16,
+        b'b' as u16,
+        b'B' as u16,
+    ];
+    let non_decimal =
+        matches!(rest, [hi, lo, ..] if *hi == b'0' as u16 && NON_DECIMAL_MARK.contains(lo));
+    if signed && non_decimal {
+        return None;
+    }
     let (radix, digits) = match rest {
         [hi, lo, tail @ ..] if *hi == b'0' as u16 && (*lo == b'x' as u16 || *lo == b'X' as u16) => {
             (16, tail)
@@ -879,6 +895,23 @@ mod tests {
                 None
             ))))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn string_to_bigint_rejects_signed_non_decimal() {
+        // A sign is only part of a decimal StringIntegerLiteral (7.1.17.1).
+        assert!(string_to_bigint(&JsString::from_utf8("-0x1")).is_none());
+        assert!(string_to_bigint(&JsString::from_utf8("+0b10")).is_none());
+        assert!(string_to_bigint(&JsString::from_utf8("-0O7")).is_none());
+        assert!(string_to_bigint(&JsString::from_utf8("-0x")).is_none());
+        assert_eq!(
+            string_to_bigint(&JsString::from_utf8("0x1")).unwrap(),
+            BigInt::from(1)
+        );
+        assert_eq!(
+            string_to_bigint(&JsString::from_utf8("-1")).unwrap(),
+            BigInt::from(-1)
         );
     }
 

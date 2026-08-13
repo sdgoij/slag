@@ -5,7 +5,7 @@
 //! identity (the %eval% pattern) because ThisNumberValue and the constructor's
 //! ToPrimitive need the agent.
 
-use crux::convert::{to_integer_or_infinity, to_number, to_string};
+use crux::convert::{ToPrimitiveHint, to_integer_or_infinity, to_number, to_string};
 use crux::error::{ErrorKind, JsError};
 use crux::function::{Function, NativeFn};
 use crux::handle::Handle;
@@ -73,9 +73,24 @@ fn instance_proto(
     })
 }
 
-/// `Number(value)` / `new Number(value)` (spec 21.1.1.1): ToNumber the
+/// `Number(value)` / `new Number(value)` (spec 21.1.1.1): convert the
 /// argument, returning the bare Number for a call and a wrapper object for a
 /// construct.
+fn number_argument(agent: &mut Agent, value: &Value) -> Result<f64, JsError> {
+    // ToPrimitive runs through the agent (user valueOf/toString), then BigInt
+    // converts to its numeric value while Symbol throws (crux ToNumber rejects
+    // both and cannot reach the agent's dispatch).
+    let prim = crate::context::to_primitive(agent, value, ToPrimitiveHint::Number)?;
+    match prim {
+        Value::BigInt(b) => Ok(b.as_ref().to_f64()),
+        Value::Symbol(_) => Err(JsError::new(
+            ErrorKind::TypeError,
+            "Cannot convert a Symbol value to a number".into(),
+        )),
+        other => to_number(&other),
+    }
+}
+
 fn number_construct(
     agent: &mut Agent,
     args: &[Value],
@@ -84,7 +99,7 @@ fn number_construct(
     let proto = instance_proto(agent, new_target)?;
     let object = JsObject::ordinary_object_create(proto);
     let value = match args.first() {
-        Some(value) => to_number(value)?,
+        Some(value) => number_argument(agent, value)?,
         None => 0.0,
     };
     *object.boxed.borrow_mut() = Some(crux::object::BoxedPrimitive::Number(value));
@@ -92,9 +107,9 @@ fn number_construct(
     Ok(Value::Object(object))
 }
 
-fn number_call(args: &[Value]) -> Result<Value, JsError> {
+fn number_call(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
     let value = match args.first() {
-        Some(value) => to_number(value)?,
+        Some(value) => number_argument(agent, value)?,
         None => 0.0,
     };
     Ok(Value::Number(value))
@@ -495,7 +510,7 @@ pub fn dispatch_call(
     let realm = agent.current_realm().ok()?;
     let intrinsics = &realm.intrinsics;
     if intrinsics.get(NUMBER).as_ref() == Some(callee) {
-        return Some(number_call(args));
+        return Some(number_call(agent, args));
     }
     if intrinsics.get(TO_STRING).as_ref() == Some(callee) {
         return Some(to_string_method(agent, this, args));
@@ -564,6 +579,27 @@ mod tests {
             Value::Boolean(b) => b,
             other => panic!("expected a boolean, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn constructor_bigint_and_symbol() {
+        // Number(bigint) converts through ℝ (21.1.1.1); Symbol throws.
+        assert_eq!(number("Number(1n)"), 1.0);
+        assert_eq!(number("Number(-3n)"), -3.0);
+        assert_eq!(number("Number(9007199254740992n)"), 9007199254740992.0);
+        assert_eq!(
+            number("Number({ valueOf: function () { return 7n; } })"),
+            7.0
+        );
+        assert_eq!(number("Number(Object(5))"), 5.0);
+        assert!(matches!(
+            run("Number(Symbol())"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+        assert!(matches!(
+            run("Number(Object(Symbol()))"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
     }
 
     #[test]

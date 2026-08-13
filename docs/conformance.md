@@ -48,7 +48,7 @@ Two harnesses live in `crates/test262`:
 
 ## Current results
 
-Workspace-wide: **4066 tests pass, 0 failures** (`cargo test --workspace`),
+Workspace-wide: **4075 tests pass, 0 failures** (`cargo test --workspace`),
 of which the test262 crate contributes **3317 passing fixtures** (44
 language-area + 3275 built-ins fixtures); the remaining registered test is
 the ignored `scan_builtins_directories` directory scanner. The `workers`
@@ -504,6 +504,54 @@ a stage-3 proposal, out of scope like Intl. Fixes in
   null `Ctor.prototype` threw instead of falling back to `%Date.prototype%`
   (GetPrototypeFromConstructor, spec 10.1.8).
 
+### BigInt cluster sweep (Phase 18 conformance)
+
+A sweep of the whole `BigInt/*` tree (`sweep.exe built-ins --filter
+'BigInt/*'`) reports **76 pass, 0 fail, 1 skip** of 77 fixtures: every
+runnable fixture passes (up from 55 pass / 21 fail). The skip is the
+standard `$262.createRealm` host-dependency taxonomy. Fixes in
+`crates/runtime/src/builtins/bigint.rs`, `crates/runtime/src/builtins/number.rs`,
+`crates/runtime/src/expr.rs`, `crates/crux/src/convert.rs`, and
+`crates/parser/src/stmt.rs`:
+
+- **`BigInt.asIntN`/`asUintN` argument coercion** — `bits` went through a
+  non-agent `ToIndex` (object bits hit `%Object.prototype.valueOf%`
+  placeholders) and `bigint` through a lenient NumberToBigInt that
+  converted Numbers; strict `ToBigInt` (spec 7.1.17) rejects Numbers with
+  a TypeError, so `BigInt.asIntN(0, 0)` and `BigInt.asIntN(0, Object(0))`
+  now throw. Both arguments coerce through the agent
+  (`context::to_index`/`context::to_primitive`), and
+  `crux::bigint::as_int_n`/`as_uint_n` take a `u64` width (ToIndex can
+  exceed `u32`) with a magnitude guard that skips allocating `2^bits` when
+  the value fits.
+- **StringToBigInt sign rule** — a sign is only part of a decimal
+  StringIntegerLiteral: `BigInt("-0x1")`/`BigInt("+0b10")` are
+  SyntaxErrors (spec 7.1.17.1), not -1/2. `BigInt("0b1111")` and long
+  0b/0B strings still convert exactly.
+- **The BigInt constructor's Number case is unchanged** (integral Numbers
+  convert, non-integral throw a RangeError), but its object path now runs
+  `ToPrimitive` through the agent: `BigInt(Object(5))` and
+  `BigInt({ valueOf: () => 5 })` work, and `BigInt({})` throws a
+  SyntaxError (its toString is "[object Object]").
+- **`BigInt.prototype.toString.length` was 1; the spec says 0** (the radix
+  is read from the arguments list, not a declared parameter).
+- **`Number(bigint)`** — the Number constructor used the non-agent
+  `ToNumber`, which rejects BigInt; it now converts BigInt through ℝ
+  (`Number(1n)` → 1) and keeps Symbol's TypeError, with `ToPrimitive`
+  through the agent for object arguments.
+- **`==`/`!=` bypassed the agent** — `IsLooselyEqual` ran the pure crux
+  conversion, whose boxed-wrapper fast path read the wrapped value directly
+  and skipped an overridden `valueOf`/`toString`. `expr.rs` now routes
+  object operands through the agent's `ToPrimitive` first, so `Object(1n)`
+  with a `valueOf` override compares through it
+  (`BigInt/wrapper-object-ordinary-toprimitive.js`).
+- **Classic `for (let …)` head scope** — the parser re-declared a classic
+  for-head's lexical names in the *enclosing* statement list, so two
+  sibling `for (let i …)` loops (or a later `let i`) raised "Identifier has
+  already been declared". The head names stay in the loop scope, while the
+  head still clashes with a same-named `var` in the loop body
+  (`BigInt/constructor-from-binary-string.js` uses two such loops).
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~120 edge-case unit tests were added across
@@ -610,17 +658,17 @@ TypedArray fixtures that pass with the long timeout (see below).
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,798 | 15,857 | 4,529 | 3,409 | 3¹ | 77.8% |
+| built-ins | 23,798 | 15,878 | 4,508 | 3,409 | 3¹ | 77.9% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,608** | **32,300** | **7,135** | **9,170** | **3** | **81.9%** |
+| **Total** | **48,608** | **32,321** | **7,114** | **9,170** | **3** | **82.0%** |
 
 (Runnable = pass + fail; the 9,170 skips are module/async fixtures,
 unsupported harness includes, and the out-of-scope Temporal proposal
 fixtures.) The built-ins row reflects the current
 `Error*`/`BigInt*`/RegExp/Object-descriptor hardening plus the
 String/prototype, Object/create, DisposableStack, AsyncDisposableStack,
-ArrayBuffer/SharedArrayBuffer, and Date cluster closures (all 0 fail); the
-language and annexB rows are from the sweep recorded below.
+ArrayBuffer/SharedArrayBuffer, Date, and BigInt cluster closures (all 0
+fail); the language and annexB rows are from the sweep recorded below.
 
 ¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
 coerced-values fixtures — 10,000-element allocations that need the long

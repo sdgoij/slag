@@ -448,7 +448,8 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
     // A lexical (let/const/using) head declares in the loop's own scope: the
     // names neither clash with the enclosing statement list nor contribute to
     // it (spec ForIn/ForOfStatement LexicallyDeclaredNames excludes the head;
-    // a classic head's names do join the enclosing list, re-declared below).
+    // a classic head is loop-scoped too, so it cannot clash with a sibling
+    // loop's head or with a later `let` in the same list).
     let (head_kind, init_empty) = if parser.eat_punct(TokenKind::Semicolon)? {
         (None, true)
     } else if parser.at_keyword(Keyword::Var)? {
@@ -619,24 +620,14 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
     };
 
     // Loop-scope restore: merge body/head `var` names back into the enclosing
-    // statement list, and drop the head scope. A classic lexical head keeps
-    // its names in the enclosing list (they are its LexicallyDeclaredNames).
+    // statement list and drop the head scope. The head's lexical names stay in
+    // the loop scope (a classic head does not declare into the enclosing list:
+    // sibling `for (let i …)` loops and a later `let i` are both legal).
     if let Some(saved) = saved_vars {
         parser.list_vars.extend(saved);
     }
     if lexical {
         parser.pop_scope();
-        if let StmtKind::For {
-            init: Some(ForInit::VarDecl { decls, .. }),
-            ..
-        } = &stmt.kind
-        {
-            for decl in decls {
-                for name in bound_names(&decl.pattern) {
-                    parser.declare_lexical(name, decl.span.start)?;
-                }
-            }
-        }
     }
     Ok(stmt)
 }

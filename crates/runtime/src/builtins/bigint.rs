@@ -54,69 +54,62 @@ fn this_bigint_value(agent: &Agent, this: &Value) -> Result<crux::BigInt, JsErro
     }
 }
 
-/// spec 7.1.17 ToBigInt. The agent is only needed for the ToPrimitive of
-/// object inputs.
-#[allow(clippy::only_used_in_recursion)]
-fn to_bigint(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
-    match value {
-        Value::BigInt(b) => Ok(Value::BigInt(b.clone())),
-        Value::Boolean(b) => Ok(Value::BigInt(Handle::new(crux::BigInt::from(*b as i64)))),
+/// spec 7.1.17 ToBigInt (strict): the abstract operation behind asIntN and
+/// asUintN. Objects coerce through the agent, and Numbers throw a TypeError
+/// (the constructor's integral-Number case is separate, 21.2.1.1).
+fn to_big_int(agent: &mut Agent, value: &Value) -> Result<crux::BigInt, JsError> {
+    let prim = crate::context::to_primitive(agent, value, crux::convert::ToPrimitiveHint::Number)?;
+    match &prim {
+        Value::BigInt(b) => Ok(b.as_ref().clone()),
+        Value::Boolean(b) => Ok(crux::BigInt::from(*b as i64)),
         Value::String(s) => match crux::convert::string_to_bigint(s) {
-            Some(b) => Ok(Value::BigInt(Handle::new(b))),
+            Some(b) => Ok(b),
             None => Err(JsError::new(
                 ErrorKind::SyntaxError,
                 "Cannot convert string to a BigInt".into(),
             )),
         },
-        Value::Number(n) => match crux::BigInt::from_f64_exact(*n) {
+        Value::Undefined | Value::Null => Err(JsError::new(
+            ErrorKind::TypeError,
+            "Cannot convert undefined or null to a BigInt".into(),
+        )),
+        Value::Number(_) => Err(JsError::new(
+            ErrorKind::TypeError,
+            "Cannot convert a Number to a BigInt".into(),
+        )),
+        Value::Symbol(_) => Err(JsError::new(
+            ErrorKind::TypeError,
+            "Cannot convert a Symbol to a BigInt".into(),
+        )),
+        // ToPrimitive never returns an object; keep the match exhaustive.
+        Value::Object(_) | Value::Function(_) => Err(JsError::new(
+            ErrorKind::TypeError,
+            "Cannot convert an object to a BigInt".into(),
+        )),
+    }
+}
+
+/// `BigInt(value)` (spec 21.2.1.1): ToPrimitive, then the integral-Number
+/// case converts exactly and everything else follows ToBigInt.
+fn bigint_construct(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
+    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    let prim = crate::context::to_primitive(agent, &value, crux::convert::ToPrimitiveHint::Number)?;
+    match prim {
+        Value::Number(n) => match crux::BigInt::from_f64_exact(n) {
             Some(b) => Ok(Value::BigInt(Handle::new(b))),
             None => Err(JsError::new(
                 ErrorKind::RangeError,
                 "The number cannot be converted to a BigInt because it is not an integer".into(),
             )),
         },
-        Value::Symbol(_) => Err(JsError::new(
-            ErrorKind::TypeError,
-            "Cannot convert a Symbol to a BigInt".into(),
-        )),
-        Value::Undefined | Value::Null => Err(JsError::new(
-            ErrorKind::TypeError,
-            "Cannot convert undefined or null to a BigInt".into(),
-        )),
-        Value::Object(_) | Value::Function(_) => {
-            let prim = crux::convert::to_primitive(value, crux::convert::ToPrimitiveHint::Number)?;
-            to_bigint(agent, &prim)
-        }
+        other => Ok(Value::BigInt(Handle::new(to_big_int(agent, &other)?))),
     }
-}
-
-/// `BigInt(value)` (spec 21.2.1.1): ToBigInt, then recheck that the result is
-/// a BigInt (a string that parsed to a Number is impossible here; the primitive
-/// cases are exact).
-fn bigint_construct(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
-    let value = args.first().cloned().unwrap_or(Value::Undefined);
-    to_bigint(agent, &value)
-}
-
-/// spec 7.1.5 ToIndex: ToIntegerOrInfinity, then reject negative/infinite.
-fn to_index(value: &Value) -> Result<u32, JsError> {
-    let number = to_integer_or_infinity(to_number(value)?);
-    if number < 0.0 || number == f64::INFINITY {
-        return Err(JsError::new(
-            ErrorKind::RangeError,
-            "Index must be a non-negative finite number".into(),
-        ));
-    }
-    Ok(number as u32)
 }
 
 /// spec 21.2.2.3 BigInt.asIntN(bits, bigint).
 fn as_int_n(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
-    let bits = to_index(args.first().unwrap_or(&Value::Undefined))?;
-    let int = to_bigint(agent, args.get(1).unwrap_or(&Value::Undefined))?;
-    let Value::BigInt(int) = int else {
-        unreachable!("ToBigInt returns a BigInt");
-    };
+    let bits = crate::context::to_index(agent, args.first().unwrap_or(&Value::Undefined))?;
+    let int = to_big_int(agent, args.get(1).unwrap_or(&Value::Undefined))?;
     Ok(Value::BigInt(Handle::new(crux::bigint::as_int_n(
         &int, bits,
     ))))
@@ -124,11 +117,8 @@ fn as_int_n(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
 
 /// spec 21.2.2.4 BigInt.asUintN(bits, bigint).
 fn as_uint_n(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
-    let bits = to_index(args.first().unwrap_or(&Value::Undefined))?;
-    let int = to_bigint(agent, args.get(1).unwrap_or(&Value::Undefined))?;
-    let Value::BigInt(int) = int else {
-        unreachable!("ToBigInt returns a BigInt");
-    };
+    let bits = crate::context::to_index(agent, args.first().unwrap_or(&Value::Undefined))?;
+    let int = to_big_int(agent, args.get(1).unwrap_or(&Value::Undefined))?;
     Ok(Value::BigInt(Handle::new(crux::bigint::as_uint_n(
         &int, bits,
     ))))
@@ -223,9 +213,10 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         )?;
     }
 
-    // spec 21.2.3: prototype methods.
+    // spec 21.2.3: prototype methods. toString's length is 0 (the radix is
+    // read from the arguments list, not a declared parameter).
     for (name, key, length) in [
-        ("toString", PROTO_TO_STRING, 1),
+        ("toString", PROTO_TO_STRING, 0),
         ("valueOf", PROTO_VALUE_OF, 0),
         ("toLocaleString", PROTO_TO_LOCALE_STRING, 0),
     ] {
@@ -473,5 +464,144 @@ mod tests {
     fn as_uint_n_more() {
         assert_eq!(big("BigInt.asUintN(8, 255n)"), "255");
         assert_eq!(big("BigInt.asUintN(8, -1n)"), "255");
+    }
+
+    #[test]
+    fn as_int_n_strict_to_bigint() {
+        // ToBigInt rejects Numbers outright (spec 7.1.17 step 8); the
+        // BigInt constructor's integral-Number case does not apply here.
+        for src in [
+            "BigInt.asIntN(0, 0)",
+            "BigInt.asIntN(0, 1.5)",
+            "BigInt.asIntN(0, NaN)",
+            "BigInt.asIntN(0, Infinity)",
+            "BigInt.asIntN(0, Object(0))",
+            "BigInt.asIntN(0, { valueOf: function () { return 0; } })",
+            "BigInt.asIntN(0, { toString: function () { return 0; } })",
+            "BigInt.asIntN(0, { [Symbol.toPrimitive]: function () { return 0; } })",
+            "BigInt.asIntN(0, Symbol('x'))",
+            "BigInt.asIntN(0, Object(Symbol('x')))",
+        ] {
+            assert!(
+                matches!(run(src), Err(e) if e.kind == ErrorKind::TypeError),
+                "{src} should throw a TypeError"
+            );
+        }
+        // Strings, booleans, and BigInts convert; objects unbox through the
+        // agent's valueOf/toString dispatch.
+        assert_eq!(big("BigInt.asIntN(2, '3')"), "-1");
+        assert_eq!(big("BigInt.asIntN(2, true)"), "1");
+        assert_eq!(big("BigInt.asIntN(2, Object(3n))"), "-1");
+        assert_eq!(
+            big("BigInt.asIntN(2, { valueOf: function () { return 3n; } })"),
+            "-1"
+        );
+        // Strings that are not integer literals throw a SyntaxError.
+        assert!(matches!(
+            run("BigInt.asIntN(0, '0b2')"),
+            Err(e) if e.kind == ErrorKind::SyntaxError
+        ));
+        assert!(matches!(
+            run("BigInt.asIntN(0, '1n')"),
+            Err(e) if e.kind == ErrorKind::SyntaxError
+        ));
+    }
+
+    #[test]
+    fn as_int_n_bits_to_index() {
+        // bits goes through ToIndex: truncation towards 0, NaN => 0,
+        // strings parse, objects unbox via the agent.
+        assert_eq!(big("BigInt.asIntN(2.9, 3n)"), "-1");
+        assert_eq!(big("BigInt.asIntN(-0.9, 1n)"), "0");
+        assert_eq!(big("BigInt.asIntN('4', 3n)"), "3");
+        assert_eq!(big("BigInt.asIntN(NaN, 3n)"), "0");
+        assert_eq!(big("BigInt.asIntN(undefined, 3n)"), "0");
+        assert_eq!(big("BigInt.asIntN([1], 1n)"), "-1");
+        assert_eq!(
+            big("BigInt.asIntN({ valueOf: function () { return 4; } }, 3n)"),
+            "3"
+        );
+        // Negative, infinite, and overlarge bits throw a RangeError; BigInt
+        // and Symbol bits throw a TypeError.
+        for src in [
+            "BigInt.asIntN(-1, 3n)",
+            "BigInt.asIntN(-2.5, 3n)",
+            "BigInt.asIntN(Infinity, 3n)",
+            "BigInt.asIntN(9007199254740992, 3n)",
+        ] {
+            assert!(
+                matches!(run(src), Err(e) if e.kind == ErrorKind::RangeError),
+                "{src} should throw a RangeError"
+            );
+        }
+        for src in ["BigInt.asIntN(2n, 3n)", "BigInt.asIntN(Symbol(), 3n)"] {
+            assert!(
+                matches!(run(src), Err(e) if e.kind == ErrorKind::TypeError),
+                "{src} should throw a TypeError"
+            );
+        }
+    }
+
+    #[test]
+    fn constructor_object_inputs() {
+        // The constructor's ToPrimitive runs through the agent too, and its
+        // integral-Number case converts while ToBigInt rejects Numbers.
+        assert_eq!(big("BigInt(Object(5))"), "5");
+        assert_eq!(big("BigInt(Object('3'))"), "3");
+        assert_eq!(big("BigInt(Object(1n))"), "1");
+        assert_eq!(big("BigInt({ valueOf: function () { return 5; } })"), "5");
+        assert_eq!(
+            big("BigInt({ [Symbol.toPrimitive]: function () { return '7'; } })"),
+            "7"
+        );
+        assert!(matches!(
+            run("BigInt({})"),
+            Err(e) if e.kind == ErrorKind::SyntaxError
+        ));
+        assert!(matches!(
+            run("BigInt({ valueOf: function () { return 1.5; } })"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+    }
+
+    #[test]
+    fn constructor_string_edges() {
+        // Signed non-decimal strings and other malformed literals are not
+        // StringIntegerLiterals (7.1.17.1); the binary-string fixture also
+        // exercises long 0b/0B strings.
+        for src in [
+            "BigInt('-0x1')",
+            "BigInt('00o')",
+            "BigInt('0oa')",
+            "BigInt('-0XFFab')",
+        ] {
+            assert!(
+                matches!(run(src), Err(e) if e.kind == ErrorKind::SyntaxError),
+                "{src} should throw a SyntaxError"
+            );
+        }
+        assert_eq!(big("BigInt('0b1111')"), "15");
+        assert_eq!(big("BigInt('0B10')"), "2");
+        assert_eq!(big("BigInt('-0')"), "0");
+    }
+
+    #[test]
+    fn to_string_length_is_zero() {
+        assert_eq!(text("String(BigInt.prototype.toString.length)"), "0");
+        assert_eq!(text("String(BigInt.prototype.valueOf.length)"), "0");
+    }
+
+    #[test]
+    fn loose_equality_unboxes_through_the_agent() {
+        // IsLooselyEqual must call an overridden valueOf via the agent rather
+        // than reading the boxed value directly (spec 7.2.15 step 1).
+        assert_eq!(
+            text("var o = Object(1n); o.valueOf = function () { return 2n; }; String(o == 2n)"),
+            "true"
+        );
+        assert_eq!(
+            text("var o = Object(1n); o.valueOf = function () { return 2n; }; String(o != 1n)"),
+            "true"
+        );
     }
 }

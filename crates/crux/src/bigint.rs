@@ -184,11 +184,17 @@ pub fn less_than(a: &BigInt, b: &BigInt) -> bool {
 }
 
 /// spec 21.2.2.4 BigInt.asUintN: `int mod 2^bits` as a non-negative value.
-pub fn as_uint_n(int: &BigInt, bits: u32) -> BigInt {
+/// `bits` comes from ToIndex, so it can exceed u32 and the value's magnitude.
+pub fn as_uint_n(int: &BigInt, bits: u64) -> BigInt {
     if bits == 0 || int.is_zero() {
         return BigInt::zero();
     }
-    let modulus = BigInt(NumBigInt::from(1u64) << bits);
+    // A non-negative value that fits in `bits` bits is unchanged; skipping the
+    // modulus avoids allocating 2^bits when ToIndex yields a huge width.
+    if int.0.sign() != num_bigint::Sign::Minus && int.0.bits() < bits {
+        return BigInt(int.0.clone());
+    }
+    let modulus = BigInt(NumBigInt::from(1u64) << (bits as usize));
     let mut result = BigInt(&int.0 % &modulus.0);
     if result.0.sign() == num_bigint::Sign::Minus {
         result = BigInt(&result.0 + &modulus.0);
@@ -198,12 +204,15 @@ pub fn as_uint_n(int: &BigInt, bits: u32) -> BigInt {
 
 /// spec 21.2.2.3 BigInt.asIntN: the signed two's-complement truncation to
 /// `bits` bits.
-pub fn as_int_n(int: &BigInt, bits: u32) -> BigInt {
+pub fn as_int_n(int: &BigInt, bits: u64) -> BigInt {
     if bits == 0 || int.is_zero() {
         return BigInt::zero();
     }
-    let modulus = BigInt(NumBigInt::from(1u64) << bits);
-    let half = BigInt(NumBigInt::from(1u64) << (bits - 1));
+    if int.0.sign() != num_bigint::Sign::Minus && int.0.bits() < bits {
+        return BigInt(int.0.clone());
+    }
+    let modulus = BigInt(NumBigInt::from(1u64) << (bits as usize));
+    let half = BigInt(NumBigInt::from(1u64) << (bits as usize - 1));
     let mut result = as_uint_n(int, bits);
     if result.0 >= half.0 {
         result = BigInt(&result.0 - &modulus.0);
