@@ -653,6 +653,56 @@ A sweep of `%Iterator.prototype%` and its helpers (`sweep.exe built-ins
   `reduce` counter-start were brought in line with Node v24 behavior as the
   cluster's fixtures exercised them.
 
+### Iterator statics cluster sweep (Phase 18 conformance)
+
+A sweep of the `Iterator/*` statics (`Iterator.concat`, `Iterator.from`,
+`Iterator.zip`, `Iterator.zipKeyed`, plus the constructor fixtures —
+`sweep.exe built-ins --filter 'Iterator/*'`) reports **637 pass, 0 fail,
+0 crash, 17 skip** of 654 fixtures: every runnable fixture passes (the
+statics went from 62 fail / 0 crash to 0 fail; the full tree went from
+513 to 637 passing fixtures). The zip/zipKeyed options were read from
+`length`/`remainder` and supported only a longest flag; the clusters were
+rebuilt around the spec algorithms:
+
+- **`Iterator.concat` lazy opening** — the methods were called during
+  validation, so `@@iterator` getters ran early and inner iterators were
+  created up front. Concat now validates each item is an Object with a
+  callable `@@iterator` (in order) and opens each iterable only as iteration
+  reaches it; `return()` forwards only to the currently active inner
+  iterator, and natural exhaustion never closes (spec 27.1.4.3).
+- **`Iterator.from` primitives and flat fallback** — non-string primitives
+  now throw a TypeError (spec 7.4.3 REJECT_STRINGS for concat/zip,
+  ACCEPT_STRINGS for from), and the flat-iterator `next` callability check
+  is deferred to the first `next()` call.
+- **Primitive receivers** — property reads on primitives boxed the value
+  for the read but passed the *box* as the accessor receiver; getters now
+  see the primitive as `this` (`Iterator.from('')` reports `typeof this
+  === 'string'`, spec 10.4.3.4).
+- **`Iterator.zip`/`zipKeyed` modes** — `options.mode` (shortest/longest/
+  strict) and the longest-mode padding were reimplemented: strict mode
+  throws on uneven lengths (closing the open columns), and the closure
+  tracks the open columns so every terminating path runs
+  IteratorCloseAll in reverse (fixture-verified close orders and trap
+  sequences).
+- **Padding is per-cluster** — zip pads from an eagerly iterated padding
+  iterable (index-aligned to the columns, spec 27.1.4.4.1 step 14);
+  zipKeyed pads by reading the padding object's property per column key
+  (spec 27.1.4.5.1 step 14).
+- **zipKeyed input** — the first argument is an object whose own
+  enumerable properties are the columns (spec 27.1.4.5.1), not an iterable
+  of pairs; result objects are null-prototyped.
+- **Helper state machine** — `HelperState` now tracks `started`/`executing`
+  so a return before the first `next()` closes with the helper already
+  completed (recursive calls short-circuit) while a mid-iteration return
+  closes with it executing (recursive calls throw a TypeError, spec
+  27.1.3.8/27.5.3.2); the state is no longer removed from the registry
+  during a close, and `try_borrow_mut` turns callback re-entrancy into a
+  TypeError instead of a panic.
+- **Helper `return()` value** — the result is always `{ value: undefined,
+  done: true }` (spec 27.1.3.8 step 7), and abrupt paths now close the
+  right records (collected columns reverse, the outer iterables iterator
+  only for the flattenable-abrupt case, never for the step-abrupt case).
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~120 edge-case unit tests were added across
@@ -759,9 +809,9 @@ TypedArray fixtures that pass with the long timeout (see below).
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,798 | 16,222 | 4,163 | 3,410 | 3¹ | 79.6% |
+| built-ins | 23,798 | 16,284 | 4,101 | 3,410 | 3¹ | 79.9% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,608** | **32,665** | **6,769** | **9,171** | **3** | **82.8%** |
+| **Total** | **48,608** | **32,727** | **6,707** | **9,171** | **3** | **83.0%** |
 
 (Runnable = pass + fail; the 9,171 skips are module/async fixtures,
 unsupported harness includes, and the out-of-scope Temporal proposal
@@ -769,8 +819,9 @@ fixtures.) The built-ins row reflects the current
 `Error*`/`BigInt*`/RegExp/Object-descriptor hardening plus the
 String/prototype, Object/create, DisposableStack, AsyncDisposableStack,
 ArrayBuffer/SharedArrayBuffer, Date, BigInt, global-functions, Function,
-and Iterator/prototype cluster closures (all 0 fail); the language and
-annexB rows are from the sweep recorded below.
+Iterator/prototype, and Iterator statics (concat/from/zip/zipKeyed)
+cluster closures (all 0 fail); the language and annexB rows are from the
+sweep recorded below.
 
 ¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
 coerced-values fixtures — 10,000-element allocations that need the long

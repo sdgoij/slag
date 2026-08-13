@@ -1439,7 +1439,7 @@ pub fn iterator_close_throw(agent: &mut Agent, iterator: &IteratorRecord) -> Res
     Ok(())
 }
 
-fn iterator_close_inner(
+pub(crate) fn iterator_close_inner(
     agent: &mut Agent,
     iterator: &IteratorRecord,
     completion_is_throw: bool,
@@ -1461,6 +1461,27 @@ fn iterator_close_inner(
         ));
     }
     Ok(())
+}
+
+/// IteratorCloseAll over plain records: close in list order carrying the
+/// completion; the first abrupt result becomes the completion and later
+/// closes see a throw completion (their errors are swallowed).
+pub fn iterator_close_all(agent: &mut Agent, iters: &[IteratorRecord]) -> Result<(), JsError> {
+    let mut throw: Option<JsError> = None;
+    for record in iters {
+        match iterator_close_inner(agent, record, throw.is_some()) {
+            Ok(()) => {}
+            Err(e) => {
+                if throw.is_none() {
+                    throw = Some(e);
+                }
+            }
+        }
+    }
+    match throw {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// GetMethod (spec 7.3.11) through a language value; the `@@iterator` key is

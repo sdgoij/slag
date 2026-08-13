@@ -83,16 +83,33 @@ pub enum HelperMode {
         allow_partial: bool,
     },
     Concat {
-        iterators: Vec<IteratorRecord>,
+        /// Not-yet-opened iterables: the open method is invoked lazily as
+        /// iteration reaches each one (spec 27.1.4.3 steps 2-3).
+        items: Vec<ConcatItem>,
         index: usize,
+        /// The inner iterator currently being stepped, if any.
+        active: Option<IteratorRecord>,
     },
     Zip {
-        iterators: Vec<IteratorRecord>,
-        /// The own keys of each yielded object (zipKeyed); empty for zip.
-        keys: Vec<Value>,
-        longest: bool,
-        remainder: Value,
+        /// The columns; `None` marks a finished column (removed from the
+        /// open set).
+        columns: Vec<Option<IteratorRecord>>,
+        /// The own enumerable keys of the zipKeyed object (zipKeyed); empty
+        /// for zip.
+        keys: Vec<crux::property::PropertyKey>,
+        mode: ZipMode,
+        /// The longest-mode padding values, index-aligned to the columns
+        /// (spec 27.1.4.4.1 step 14).
+        padding: Vec<Value>,
     },
+}
+
+/// The `Iterator.zip`/`zipKeyed` mode option (spec 27.1.4.4.1 step 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZipMode {
+    Shortest,
+    Longest,
+    Strict,
 }
 
 /// The state of an iterator-helper object, keyed by object identity.
@@ -100,9 +117,22 @@ pub enum HelperMode {
 pub struct HelperState {
     pub iterator: Option<IteratorRecord>,
     pub done: bool,
+    /// Whether any `next()` has run (spec 27.1.3.8 step 5: a return before
+    /// the first next is a suspended-start close).
+    pub started: bool,
+    /// True while the helper runs user code (a close in progress): recursive
+    /// `next`/`return` throw a TypeError (GeneratorValidate).
+    pub executing: bool,
     /// The per-value counter passed to callbacks (spec 27.1.3.5 step 5.d).
     pub counter: f64,
     pub mode: HelperMode,
+}
+
+/// A not-yet-opened `Iterator.concat` iterable (spec 27.1.4.3 step 2.d).
+#[derive(Debug, Clone)]
+pub struct ConcatItem {
+    pub iterable: Value,
+    pub open_method: Value,
 }
 
 /// The state of a `%WrapForValidIterator%` object (`Iterator.from` on a flat
@@ -1110,6 +1140,8 @@ fn map_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
         HelperState {
             iterator: Some(record),
             done: false,
+            started: false,
+            executing: false,
             counter: 0.0,
             mode: HelperMode::Map { mapper },
         },
@@ -1131,6 +1163,8 @@ fn filter_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Valu
         HelperState {
             iterator: Some(record),
             done: false,
+            started: false,
+            executing: false,
             counter: 0.0,
             mode: HelperMode::Filter { filterer },
         },
@@ -1149,6 +1183,8 @@ fn take_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
         HelperState {
             iterator: Some(record),
             done: false,
+            started: false,
+            executing: false,
             counter: 0.0,
             mode: HelperMode::Take { remaining: limit },
         },
@@ -1167,6 +1203,8 @@ fn drop_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
         HelperState {
             iterator: Some(record),
             done: false,
+            started: false,
+            executing: false,
             counter: 0.0,
             mode: HelperMode::Drop { remaining: limit },
         },
@@ -1188,6 +1226,8 @@ fn flat_map_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Va
         HelperState {
             iterator: Some(record),
             done: false,
+            started: false,
+            executing: false,
             counter: 0.0,
             mode: HelperMode::FlatMap {
                 mapper,
@@ -1269,6 +1309,8 @@ fn chunks_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Valu
         HelperState {
             iterator: Some(record),
             done: false,
+            started: false,
+            executing: false,
             counter: 0.0,
             mode: HelperMode::Chunks {
                 chunk_size: size,
@@ -1317,6 +1359,8 @@ fn windows_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
         HelperState {
             iterator: Some(record),
             done: false,
+            started: false,
+            executing: false,
             counter: 0.0,
             mode: HelperMode::Windows {
                 window_size: size,
@@ -1351,47 +1395,78 @@ fn helper_method(
     };
     let state = agent
         .iterator_helpers
-        .remove(&obj.id())
+        .get(&obj.id())
+        .cloned()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an iterator helper".into()))?;
-    let result = if is_return {
+    if is_return {
         helper_return(agent, &state, args)
     } else {
         helper_next(agent, &state, args)
-    };
-    agent.iterator_helpers.insert(obj.id(), state);
-    result
+    }
 }
 
 fn helper_return(
     agent: &mut Agent,
     state: &Rc<RefCell<HelperState>>,
-    args: &[Value],
+    _args: &[Value],
 ) -> Result<Value, JsError> {
-    let value = args.first().cloned().unwrap_or(Value::Undefined);
-    let mut state = state.borrow_mut();
-    if state.done {
-        return iterator_result(agent, Value::Undefined, true);
-    }
-    state.done = true;
     let mut records: Vec<IteratorRecord> = Vec::new();
-    if let Some(record) = state.iterator.take() {
-        records.push(record);
-    }
-    if let HelperMode::FlatMap { inner, .. } = &mut state.mode
-        && let Some(inner) = inner.take()
     {
-        records.push(inner);
+        let mut state = state.borrow_mut();
+        if state.done {
+            return iterator_result(agent, Value::Undefined, true);
+        }
+        if state.executing {
+            // spec 27.1.3.4 GeneratorValidate step 6: the helper is executing
+            // a close, so a recursive return throws.
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "Generator is already running".into(),
+            ));
+        }
+        // Mark executing for the close below: recursive calls see a TypeError
+        // while the close runs (suspended-yield), or short-circuit on the
+        // completed state (suspended-start, spec 27.1.3.8 step 5).
+        state.executing = true;
+        if !state.started {
+            state.done = true;
+        }
+        if let Some(record) = state.iterator.take() {
+            records.push(record);
+        }
+        if let HelperMode::FlatMap { inner, .. } = &mut state.mode
+            && let Some(inner) = inner.take()
+        {
+            records.push(inner);
+        }
+        // Iterator.concat forwards return only to the currently active inner
+        // iterator; not-yet-opened iterables are never opened or closed (spec
+        // 27.1.4.3.2 closure [[Return]]).
+        if let HelperMode::Concat { active, .. } = &mut state.mode
+            && let Some(active) = active.take()
+        {
+            records.push(active);
+        }
+        // Iterator.zip closes every still-open column, in reverse order (spec
+        // 27.1.4.3.2 step vi.1).
+        if let HelperMode::Zip { columns, .. } = &mut state.mode {
+            for column in columns.iter_mut().rev() {
+                if let Some(record) = column.take() {
+                    records.push(record);
+                }
+            }
+        }
     }
-    if let HelperMode::Concat { iterators, .. } = &mut state.mode {
-        records.append(iterators);
-    }
-    if let HelperMode::Zip { iterators, .. } = &mut state.mode {
-        records.append(iterators);
-    }
-    for record in &records {
-        iterator_close(agent, record)?;
-    }
-    iterator_result(agent, value, true)
+    // The closes run user code (the `return` methods) which may re-enter the
+    // helper; the state is executing (or completed for a suspended-start
+    // close), so the re-entry resolves as the spec dictates.
+    let result = crate::expr::iterator_close_all(agent, &records);
+    let mut state = state.borrow_mut();
+    state.executing = false;
+    state.done = true;
+    result?;
+    // spec 27.1.3.8 step 7: the helper return result value is undefined.
+    iterator_result(agent, Value::Undefined, true)
 }
 
 fn helper_next(
@@ -1399,10 +1474,27 @@ fn helper_next(
     state: &Rc<RefCell<HelperState>>,
     _args: &[Value],
 ) -> Result<Value, JsError> {
-    let mut state = state.borrow_mut();
+    // try_borrow_mut: the helper is already executing user code (a callback
+    // re-entered `next`), which GeneratorValidate rejects with a TypeError
+    // (spec 27.5.3.2 step 6).
+    let Ok(mut state) = state.try_borrow_mut() else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Generator is already running".into(),
+        ));
+    };
     if state.done {
         return iterator_result(agent, Value::Undefined, true);
     }
+    if state.executing {
+        // spec 27.1.3.4 GeneratorValidate step 6: a generator that is
+        // executing cannot be resumed.
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Generator is already running".into(),
+        ));
+    }
+    state.started = true;
     let result = step_helper(agent, &mut state);
     if state.done {
         // Natural exhaustion: the underlying iterators were already consumed.
@@ -1540,8 +1632,9 @@ fn step_helper(agent: &mut Agent, state: &mut HelperState) -> Result<Value, JsEr
                     ));
                 }
                 // GetIteratorFlattenable (spec 27.1.3.2): an @@iterator when
-                // present, otherwise the object's own `next` (a flat iterator).
-                let (inner_record, _) = get_iterator_flattenable(agent, &mapped)?;
+                // present, otherwise the object's own `next` (a flat iterator);
+                // strings are rejected.
+                let (inner_record, _) = get_iterator_flattenable(agent, &mapped, false)?;
                 *inner = Some(inner_record);
             }
         }
@@ -1603,127 +1696,240 @@ fn step_helper(agent: &mut Agent, state: &mut HelperState) -> Result<Value, JsEr
                 false,
             )
         }
-        HelperMode::Concat { iterators, index } => {
+        HelperMode::Concat {
+            items,
+            index,
+            active,
+        } => {
             loop {
-                if *index >= iterators.len() {
-                    state.done = true;
-                    // spec: closing semantics — close every iterable on completion.
-                    let records = std::mem::take(iterators);
-                    for record in &records {
-                        iterator_close(agent, record)?;
+                if let Some(record) = active {
+                    match step_value(agent, record) {
+                        Ok(Some(value)) => return iterator_result(agent, value, false),
+                        Ok(None) => {
+                            // The inner iterator is exhausted: move to the
+                            // next iterable (spec 27.1.4.3.2 step 6.c).
+                            // Natural exhaustion never closes the iterator.
+                            *active = None;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
                     }
+                }
+                if *index >= items.len() {
+                    state.done = true;
                     return done_result(agent);
                 }
-                let record = &iterators[*index];
-                let Some(value) = step_value(agent, record)? else {
-                    *index += 1;
-                    continue;
-                };
-                return iterator_result(agent, value, false);
+                let item = &items[*index];
+                *index += 1;
+                // GetIteratorDirect (spec 7.4.1): call the open method and
+                // require an object iterator with a callable next.
+                let iterator =
+                    crate::function::call(agent, &item.open_method, item.iterable.clone(), &[])?;
+                if !matches!(iterator, Value::Object(_) | Value::Function(_)) {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "Iterator must be an object".into(),
+                    ));
+                }
+                let next = get_property(
+                    agent,
+                    &iterator,
+                    &JsString::from_utf8("next"),
+                    iterator.clone(),
+                )?;
+                if !is_callable(&next) {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "Iterator's next method is not callable".into(),
+                    ));
+                }
+                *active = Some(IteratorRecord { iterator, next });
             }
         }
-        HelperMode::Zip {
-            iterators,
-            keys,
-            longest,
-            remainder,
-            ..
-        } => {
-            if iterators.is_empty() {
-                state.done = true;
-                return done_result(agent);
+        HelperMode::Zip { .. } => step_zip(agent, state),
+    }
+}
+
+/// Drive one `next()` of a zip helper: one pass over the columns, per mode
+/// (spec 27.1.4.3.2 IteratorZip closure). Terminating paths close the still-
+/// open columns (reverse order) as the spec's IteratorCloseAll does.
+fn step_zip(agent: &mut Agent, state: &mut HelperState) -> Result<Value, JsError> {
+    let HelperMode::Zip {
+        columns,
+        keys,
+        mode,
+        padding,
+    } = &mut state.mode
+    else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "not a zip helper".into(),
+        ));
+    };
+    let mode = *mode;
+    let done_result = |agent: &Agent| iterator_result(agent, Value::Undefined, true);
+    let mut nexts: Vec<Value> = Vec::with_capacity(columns.len());
+    let mut all_done = true;
+    for (i, column) in columns.iter_mut().enumerate() {
+        let Some(record) = column else {
+            // A finished column (only longest mode re-visits one): pad it
+            // with the index-aligned padding value (spec 27.1.4.3.2 step 2.b).
+            nexts.push(padding.get(i).cloned().unwrap_or(Value::Undefined));
+            continue;
+        };
+        match step_value(agent, record) {
+            Ok(Some(value)) => {
+                nexts.push(value);
+                all_done = false;
             }
-            let mut values = Vec::with_capacity(iterators.len());
-            let mut any_done = false;
-            let mut all_done = true;
-            for record in iterators.iter_mut() {
-                match step_value(agent, record)? {
-                    Some(value) => {
-                        values.push(value);
-                        all_done = false;
+            Ok(None) => {
+                *column = None;
+                match mode {
+                    ZipMode::Shortest => {
+                        // Close the remaining open iterators, then finish
+                        // (spec 27.1.4.3.2 step 6.d.ii.1).
+                        close_zip_columns(agent, columns, false)?;
+                        state.done = true;
+                        return done_result(agent);
                     }
-                    None => {
-                        any_done = true;
-                        values.push(remainder.clone());
+                    ZipMode::Longest => {
+                        nexts.push(padding.get(i).cloned().unwrap_or(Value::Undefined));
                     }
-                }
-            }
-            if (!*longest && any_done) || (all_done && any_done) {
-                // shortest mode ends at the first exhausted column; longest
-                // mode ends once every column is exhausted.
-                state.done = true;
-                let records = std::mem::take(iterators);
-                for record in &records {
-                    iterator_close(agent, record)?;
-                }
-                return done_result(agent);
-            }
-            if keys.is_empty() {
-                iterator_result(
-                    agent,
-                    crate::builtins::array::array_from_values(agent, &values)?,
-                    false,
-                )
-            } else {
-                // zipKeyed: an object with the collected keys.
-                let object_proto = agent
-                    .current_realm()
-                    .ok()
-                    .and_then(|realm| realm.intrinsics.get("%Object.prototype%"))
-                    .and_then(|value| as_object(&value));
-                let object = JsObject::ordinary_object_create(object_proto);
-                for (key, value) in keys.iter().zip(values.iter()) {
-                    let key = crate::context::to_property_key(agent, key)?;
-                    match key {
-                        PropertyKey::String(name) => {
-                            object.create_data_property(&crux::lookup(name), value.clone())?;
+                    ZipMode::Strict => {
+                        if i != 0 {
+                            // A non-first column finished first: TypeError.
+                            let error = JsError::new(
+                                ErrorKind::TypeError,
+                                "Iterator.zip strict mode: iterables have different lengths".into(),
+                            );
+                            close_zip_columns(agent, columns, true)?;
+                            return Err(error);
                         }
-                        PropertyKey::Symbol(symbol) => {
-                            object.define_property_key(
-                                &PropertyKey::Symbol(symbol),
-                                &PropertyDescriptor {
-                                    value: Some(value.clone()),
-                                    writable: Some(true),
-                                    get: None,
-                                    set: None,
-                                    enumerable: Some(true),
-                                    configurable: Some(true),
-                                },
-                            )?;
+                        // The first column finished: every later column must
+                        // finish in this same pass (spec 27.1.4.3.2 step
+                        // 6.d.iv.2).
+                        for other in columns.iter_mut().skip(1) {
+                            let Some(other_record) = other else {
+                                continue;
+                            };
+                            match step_value(agent, other_record) {
+                                Ok(Some(_)) => {
+                                    let error = JsError::new(
+                                        ErrorKind::TypeError,
+                                        "Iterator.zip strict mode: iterables have different lengths"
+                                            .into(),
+                                    );
+                                    close_zip_columns(agent, columns, true)?;
+                                    return Err(error);
+                                }
+                                Ok(None) => {
+                                    *other = None;
+                                }
+                                Err(e) => {
+                                    *other = None;
+                                    close_zip_columns(agent, columns, true)?;
+                                    return Err(e);
+                                }
+                            }
                         }
+                        state.done = true;
+                        return done_result(agent);
                     }
                 }
-                iterator_result(agent, Value::Object(object), false)
+            }
+            Err(e) => {
+                *column = None;
+                // An abrupt step: close the remaining open iterators, then
+                // rethrow (spec 27.1.4.3.2 step 6.b).
+                close_zip_columns(agent, columns, true)?;
+                return Err(e);
             }
         }
     }
+    if !all_done {
+        // A full pass with at least one fresh value: yield.
+        let value = if keys.is_empty() {
+            crate::builtins::array::array_from_values(agent, &nexts)?
+        } else {
+            zip_keyed_object(keys, &nexts)?
+        };
+        return iterator_result(agent, value, false);
+    }
+    // Longest mode: every column finished in this pass.
+    state.done = true;
+    done_result(agent)
+}
+
+/// IteratorCloseAll over the still-open zip columns (spec 27.1.4.3.2 step
+/// vi.1): close them in reverse list order. With `completion_is_throw` the
+/// caller's error wins and close errors are swallowed.
+fn close_zip_columns(
+    agent: &mut Agent,
+    columns: &mut [Option<IteratorRecord>],
+    completion_is_throw: bool,
+) -> Result<(), JsError> {
+    let mut throw: Option<JsError> = None;
+    for column in columns.iter_mut().rev() {
+        let Some(record) = column.take() else {
+            continue;
+        };
+        match crate::expr::iterator_close_inner(
+            agent,
+            &record,
+            completion_is_throw || throw.is_some(),
+        ) {
+            Ok(()) => {}
+            Err(e) => {
+                if !completion_is_throw && throw.is_none() {
+                    throw = Some(e);
+                }
+            }
+        }
+    }
+    match throw {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// The zipKeyed result object (spec 27.1.4.5.1 step 15): a null-prototype
+/// object with a default-attribute data property per collected key.
+fn zip_keyed_object(
+    keys: &[crux::property::PropertyKey],
+    values: &[Value],
+) -> Result<Value, JsError> {
+    let object = JsObject::ordinary_object_create(None);
+    for (key, value) in keys.iter().zip(values.iter()) {
+        object.create_data_property_key(key, value.clone())?;
+    }
+    Ok(Value::Object(object))
 }
 
 // ---- the statics ----
 
 /// GetIteratorFlattenable (spec 7.4.3): a value is either an iterable (has
 /// @@iterator) or a flat iterator (wrapped). Returns the record and whether a
-/// wrapper object was created.
+/// wrapper object was created. `accept_strings` distinguishes Iterator.from
+/// (ACCEPT_STRINGS) from Iterator.concat/zip (REJECT_STRINGS).
 fn get_iterator_flattenable(
     agent: &mut Agent,
     value: &Value,
+    accept_strings: bool,
 ) -> Result<(IteratorRecord, bool), JsError> {
-    if matches!(value, Value::Undefined | Value::Null) {
+    if !matches!(value, Value::Object(_) | Value::Function(_))
+        && !(accept_strings && matches!(value, Value::String(_)))
+    {
         return Err(JsError::new(
             ErrorKind::TypeError,
-            "Iterator.from requires an iterable value".into(),
+            "Iterator requires an iterable object".into(),
         ));
     }
     let method = get_method(agent, value, "@@iterator")?;
     let Some(method) = method else {
-        // A flat iterable: wrap the value itself.
+        // A flat iterable: the wrapper stores the value's own `next`; a
+        // non-callable one surfaces as a TypeError from the first next()
+        // (spec 7.4.3 step 3: the check is deferred).
         let next = get_property(agent, value, &JsString::from_utf8("next"), value.clone())?;
-        if !is_callable(&next) {
-            return Err(JsError::new(
-                ErrorKind::TypeError,
-                "Flat iterable has no callable next method".into(),
-            ));
-        }
         return Ok((
             IteratorRecord {
                 iterator: value.clone(),
@@ -1756,7 +1962,7 @@ fn get_iterator_flattenable(
 
 fn iterator_from(agent: &mut Agent, _this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let value = args.first().cloned().unwrap_or(Value::Undefined);
-    let (record, wrapped) = get_iterator_flattenable(agent, &value)?;
+    let (record, wrapped) = get_iterator_flattenable(agent, &value, true)?;
     if !wrapped {
         return Ok(record.iterator);
     }
@@ -1813,11 +2019,9 @@ fn wrap_method(
             if is_callable(&return_method) {
                 crate::function::call(agent, &return_method, record.iterator.clone(), args)
             } else {
-                let value = args.first().cloned().unwrap_or(Value::Undefined);
-                let object = JsObject::ordinary_object_create(None);
-                object.create_data_property(&JsString::from_utf8("value"), value)?;
-                object.create_data_property(&JsString::from_utf8("done"), Value::Boolean(true))?;
-                Ok(Value::Object(object))
+                // spec 27.1.4.2.2 step 6: no return method — a fresh result
+                // object with an undefined value (not the argument).
+                iterator_result(agent, Value::Undefined, true)
             }
         }
         THROW => {
@@ -1842,26 +2046,40 @@ fn wrap_method(
 }
 
 fn iterator_concat(agent: &mut Agent, _this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let mut iterators = Vec::new();
+    // spec 27.1.4.3 steps 2.a-2.d: validate every item (an Object with a
+    // callable @@iterator) without opening it; opening is lazy, one iterable
+    // at a time, as iteration reaches it.
+    let mut items = Vec::new();
     for value in args {
-        let (record, wrapped) = get_iterator_flattenable(agent, value)?;
-        let record = if wrapped {
-            // The flat wrap's record has the value's own next; keep it.
-            record
-        } else {
-            record
-        };
-        iterators.push(record);
+        if !matches!(value, Value::Object(_) | Value::Function(_)) {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "Iterator.concat requires each item to be an object".into(),
+            ));
+        }
+        let method = get_method(agent, value, "@@iterator")?.ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                "Iterator.concat requires each item to be iterable".into(),
+            )
+        })?;
+        items.push(ConcatItem {
+            iterable: value.clone(),
+            open_method: method,
+        });
     }
     create_helper(
         agent,
         HelperState {
             iterator: None,
             done: false,
+            started: false,
+            executing: false,
             counter: 0.0,
             mode: HelperMode::Concat {
-                iterators,
+                items,
                 index: 0,
+                active: None,
             },
         },
     )
@@ -1874,65 +2092,270 @@ fn iterator_zip(
     keyed: bool,
 ) -> Result<Value, JsError> {
     let iterables = args.first().cloned().unwrap_or(Value::Undefined);
-    let options = args.get(1).cloned();
-    let (mut longest, mut remainder) = (false, Value::Undefined);
-    if let Some(options) = options
-        && let Value::Object(_) | Value::Function(_) = options
-    {
-        let length = get_property(
-            agent,
-            &options,
-            &JsString::from_utf8("length"),
-            options.clone(),
-        )?;
-        if let Value::String(text) = length {
-            longest = text.to_string_lossy() == "longest";
-        }
-        let rem = get_property(
-            agent,
-            &options,
-            &JsString::from_utf8("remainder"),
-            options.clone(),
-        )?;
-        remainder = rem;
+    // spec step 1: the iterables argument must be an Object.
+    if !matches!(iterables, Value::Object(_) | Value::Function(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Iterator.zip requires an object iterables argument".into(),
+        ));
     }
+    // GetOptionsObject + mode + padding (spec 27.1.4.4.1 steps 2-4), read
+    // before the iterables argument is touched.
+    let (mode, padding_option) = zip_options(agent, args.get(1).cloned())?;
+
     let mut iterators = Vec::new();
     let mut keys = Vec::new();
-    let record = get_iterator(agent, &iterables)?;
-    while let Some(element) = iterator_step(agent, &record)? {
-        if keyed {
-            // zipKeyed: each element is a pair [key, iterable].
-            let pair_record = get_iterator(agent, &element)?;
-            let key = match iterator_step(agent, &pair_record)? {
-                Some(key) => key,
-                None => Value::Undefined,
+    if keyed {
+        // CreateZipKeyedRecords (spec 27.1.4.5.1): the own enumerable
+        // properties of `iterables` are the columns, keyed by name. An abrupt
+        // step closes the opened columns in reverse.
+        let object = as_object(&iterables).ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                "Iterator.zipKeyed requires an object iterables argument".into(),
+            )
+        })?;
+        for key in object.own_property_keys()? {
+            let Some(desc) = (match object.get_own_property_key(&key) {
+                Ok(desc) => desc,
+                Err(e) => {
+                    close_collected_throw(agent, &mut iterators);
+                    return Err(e);
+                }
+            }) else {
+                continue;
             };
-            let value = match iterator_step(agent, &pair_record)? {
-                Some(value) => value,
-                None => Value::Undefined,
+            if !desc.enumerable {
+                continue;
+            }
+            let value = match get_property_key(agent, &iterables, &key, iterables.clone()) {
+                Ok(value) => value,
+                Err(e) => {
+                    close_collected_throw(agent, &mut iterators);
+                    return Err(e);
+                }
             };
-            let (inner, _) = get_iterator_flattenable(agent, &value)?;
-            iterators.push(inner);
+            if matches!(value, Value::Undefined) {
+                continue;
+            }
+            let (inner, _) = match get_iterator_flattenable(agent, &value, false) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    close_collected_throw(agent, &mut iterators);
+                    return Err(e);
+                }
+            };
             keys.push(key);
-        } else {
-            let (inner, _) = get_iterator_flattenable(agent, &element)?;
+            iterators.push(inner);
+        }
+    } else {
+        // CreateIterablesList (spec 27.1.4.3.1): iterate the iterables and
+        // open every element.
+        let record = get_iterator(agent, &iterables)?;
+        while let Some(element) = match iterator_step(agent, &record) {
+            Ok(value) => value,
+            Err(e) => {
+                // IfAbruptCloseIterators (spec 27.1.4.4.1 step 12.b): close
+                // the opened columns in reverse; the outer iterables iterator
+                // itself is not closed.
+                close_collected_throw(agent, &mut iterators);
+                return Err(e);
+            }
+        } {
+            let (inner, _) = match get_iterator_flattenable(agent, &element, false) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    // IfAbruptCloseIterators (spec 27.1.4.4.1 step 12.c.ii):
+                    // close the opened columns in reverse, then the outer
+                    // iterables iterator, with the error as the completion
+                    // (close errors are swallowed).
+                    close_collected_throw(agent, &mut iterators);
+                    let _ = crate::expr::iterator_close_throw(agent, &record);
+                    return Err(e);
+                }
+            };
             iterators.push(inner);
         }
     }
+    let iter_count = iterators.len();
+    let padding = if mode == ZipMode::Longest {
+        if keyed {
+            // spec 27.1.4.5.1 step 14: the padding is an object read per key.
+            build_keyed_padding(agent, padding_option, &keys, &mut iterators)?
+        } else {
+            build_padding(agent, padding_option, iter_count, &mut iterators)?
+        }
+    } else {
+        Vec::new()
+    };
     create_helper(
         agent,
         HelperState {
             iterator: None,
             done: false,
+            started: false,
+            executing: false,
             counter: 0.0,
             mode: HelperMode::Zip {
-                iterators,
+                columns: iterators.into_iter().map(Some).collect(),
                 keys,
-                longest,
-                remainder,
+                mode,
+                padding,
             },
         },
     )
+}
+
+/// GetOptionsObject + mode + padding (spec 27.1.4.4.1 steps 2-4): `mode`
+/// must be undefined or one of the three strings; the padding option is only
+/// read for longest mode and must be undefined or an Object.
+fn zip_options(
+    agent: &mut Agent,
+    options: Option<Value>,
+) -> Result<(ZipMode, Option<Value>), JsError> {
+    let options = match options {
+        None | Some(Value::Undefined) => Value::Object(JsObject::ordinary_object_create(None)),
+        Some(value @ (Value::Object(_) | Value::Function(_))) => value,
+        Some(_) => {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "Iterator.zip options must be an object".into(),
+            ));
+        }
+    };
+    let mode_value = get_property(
+        agent,
+        &options,
+        &JsString::from_utf8("mode"),
+        options.clone(),
+    )?;
+    let mode = match &mode_value {
+        Value::Undefined => ZipMode::Shortest,
+        Value::String(text) if text.to_string_lossy() == "shortest" => ZipMode::Shortest,
+        Value::String(text) if text.to_string_lossy() == "longest" => ZipMode::Longest,
+        Value::String(text) if text.to_string_lossy() == "strict" => ZipMode::Strict,
+        _ => {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "Iterator.zip mode must be \"shortest\", \"longest\", or \"strict\"".into(),
+            ));
+        }
+    };
+    let padding = if mode == ZipMode::Longest {
+        let padding = get_property(
+            agent,
+            &options,
+            &JsString::from_utf8("padding"),
+            options.clone(),
+        )?;
+        if !matches!(
+            padding,
+            Value::Undefined | Value::Object(_) | Value::Function(_)
+        ) {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "Iterator.zip padding must be an object".into(),
+            ));
+        }
+        Some(padding)
+    } else {
+        None
+    };
+    Ok((mode, padding))
+}
+
+/// Build the longest-mode padding list (spec 27.1.4.4.1 step 14): iterate
+/// the padding option up to `iter_count` times, index-aligned to the columns;
+/// once the padding iterator is exhausted the rest are undefined, and an
+/// active iterator is closed after the loop. An abrupt step closes the
+/// padding iterator and the opened columns (reverse) with the error as the
+/// throw completion.
+fn build_padding(
+    agent: &mut Agent,
+    padding_option: Option<Value>,
+    iter_count: usize,
+    iterators: &mut Vec<IteratorRecord>,
+) -> Result<Vec<Value>, JsError> {
+    let Some(padding_value) = padding_option else {
+        return Ok(Vec::new());
+    };
+    if matches!(padding_value, Value::Undefined) {
+        return Ok(Vec::new());
+    }
+    let record = match get_iterator(agent, &padding_value) {
+        Ok(record) => record,
+        Err(e) => {
+            close_collected_throw(agent, iterators);
+            return Err(e);
+        }
+    };
+    let mut padding = Vec::with_capacity(iter_count);
+    let mut active = true;
+    for _ in 0..iter_count {
+        if active {
+            match iterator_step(agent, &record) {
+                Ok(Some(value)) => padding.push(value),
+                Ok(None) => {
+                    active = false;
+                    padding.push(Value::Undefined);
+                }
+                Err(e) => {
+                    // spec 27.1.4.4.1 step 14.b.v.1.b: an abrupt padding step
+                    // closes the columns; the padding iterator itself is not
+                    // closed.
+                    close_collected_throw(agent, iterators);
+                    return Err(e);
+                }
+            }
+        } else {
+            padding.push(Value::Undefined);
+        }
+    }
+    if active && let Err(e) = crate::expr::iterator_close(agent, &record) {
+        // The padding close error closes the columns too, then propagates
+        // (fixture: padding-iteration-iterator-close-abrupt-completion).
+        close_collected_throw(agent, iterators);
+        return Err(e);
+    }
+    Ok(padding)
+}
+
+/// Build the zipKeyed longest-mode padding list (spec 27.1.4.5.1 step 14):
+/// the padding option is an object read per key (`Get(paddingOption, key)`),
+/// aligned to the collected keys. An abrupt read closes the opened columns
+/// in reverse with the error as the throw completion.
+fn build_keyed_padding(
+    agent: &mut Agent,
+    padding_option: Option<Value>,
+    keys: &[crux::property::PropertyKey],
+    iterators: &mut Vec<IteratorRecord>,
+) -> Result<Vec<Value>, JsError> {
+    let Some(padding_value) = padding_option else {
+        return Ok(Vec::new());
+    };
+    if matches!(padding_value, Value::Undefined) {
+        return Ok(Vec::new());
+    }
+    let mut padding = Vec::with_capacity(keys.len());
+    for key in keys {
+        let value = match get_property_key(agent, &padding_value, key, padding_value.clone()) {
+            Ok(value) => value,
+            Err(e) => {
+                close_collected_throw(agent, iterators);
+                return Err(e);
+            }
+        };
+        padding.push(value);
+    }
+    Ok(padding)
+}
+
+/// Close the collected columns in reverse with the given error as the throw
+/// completion: their own close errors are swallowed (spec 7.4.11 step 5).
+fn close_collected_throw(agent: &mut Agent, iterators: &mut Vec<IteratorRecord>) {
+    for record in iterators.drain(..).rev() {
+        let _ = crate::expr::iterator_close_throw(agent, &record);
+    }
 }
 
 #[cfg(test)]
@@ -2029,18 +2452,19 @@ mod tests {
         assert_eq!(
             run(concat!(
                 "JSON.stringify(Iterator.zip([['a', 'b'], [1, 2, 3]],",
-                "{ length: 'longest', remainder: 'R' }).toArray())"
+                "{ mode: 'longest', padding: ['R'] }).toArray()) "
             ))
             .unwrap(),
+            // The padding list is index-aligned: column 0 (a, b) is padded
+            // with 'R' on its final step, and the zip ends once column 1
+            // (1, 2, 3) finishes too (no trailing all-padding row).
             Value::String(Handle::new(JsString::from_utf8(
                 "[[\"a\",1],[\"b\",2],[\"R\",3]]"
             )))
         );
         assert_eq!(
-            run(
-                "JSON.stringify(Iterator.zipKeyed([['k1', [1, 2]], ['k2', ['a', 'b']]]).toArray())"
-            )
-            .unwrap(),
+            run("JSON.stringify(Iterator.zipKeyed({k1: [1, 2], k2: ['a', 'b']}).toArray())")
+                .unwrap(),
             Value::String(Handle::new(JsString::from_utf8(
                 "[{\"k1\":1,\"k2\":\"a\"},{\"k1\":2,\"k2\":\"b\"}]"
             )))

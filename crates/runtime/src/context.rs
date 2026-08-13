@@ -496,9 +496,11 @@ pub fn get_property_key(
         }
         _ => {
             // Primitive bases are boxed for the property read (spec 7.3.2
-            // step 3): the boxed wrapper becomes the receiver.
+            // step 5.b), but the receiver stays the primitive: accessors see
+            // `this` as the primitive (spec 10.4.3.4 StringExoticObject.
+            // [[Get]] passes Receiver through to OrdinaryGet).
             let object = to_object(agent, base)?;
-            get_property_key(agent, &object, key, object.clone())
+            get_property_key(agent, &object, key, receiver)
         }
     }
 }
