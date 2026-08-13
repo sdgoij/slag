@@ -844,6 +844,68 @@ Validation: `cargo test --workspace` **4085 pass, 0 failures**;
 (`git stash` baseline) shows exactly the 57 cluster fixtures fixed and
 **0 new failures** across all 23,812 built-ins fixtures.
 
+### Proxy cluster sweep (Phase 18 conformance)
+
+A sweep of the whole `Proxy/*` tree (311 fixtures) reports **268 pass, 0
+fail, 43 skip, 0 crash, 0 hang** of 311 fixtures: every runnable fixture
+passes (up from 252 pass / 16 fail). The skips are the standard taxonomy
+(37 host-dependent `$262.createRealm`, 5 unsupported `proxyTrapsHelper.js`
+includes, 1 module-flag fixture). Fixes in `crates/crux/src/{function,
+object,proxy,value}.rs`, `crates/runtime/src/{function,builtins/object,
+builtins/proxy}.rs`:
+
+- **Nested-proxy forwarding bypassed the agent dispatcher** — with no
+  get/set/apply/construct trap a proxy forwards to its target, and a
+  proxy-over-proxy chain ends on an agent-dispatched built-in (e.g.
+  `new Proxy(Object.prototype.hasOwnProperty, {})`); the crux-level call
+  ran the placeholder closure and threw "must be called through the
+  agent". `crux::function::call`/`construct` now route built-in closures
+  through the runtime dispatcher whenever a `with_agent` window is active
+  (spec 10.5.12 step 6.a / 10.5.13 step 7.a), and the runtime's fallback
+  runs the closure directly to avoid re-entering the hook. `%eval%`
+  reached as a value (indirect eval, or forwarded through a proxy) is
+  dispatched before the built-in chain.
+- **The ordinary prototype-chain get skipped proxies** — `ordinary_get`
+  recursed with the ordinary walk, so a proxy anywhere in the chain never
+  ran its get trap (`Object.create(proxy).foo` was undefined). It now
+  recurses through the parent's own `[[Get]]`
+  (`parent.get_with_receiver_key`), matching `ordinary_set`.
+- **The chain-end set skipped the receiver's own-descriptor check** —
+  writing past the end of the chain called CreateDataProperty directly,
+  so a proxy receiver's getOwnPropertyDescriptor trap never fired for the
+  first write to a new key. The chain end now goes through the full
+  step-2 receiver write (spec 10.1.3.3 steps 1c-2e).
+- **`Object.preventExtensions` ignored a failed `[[PreventExtensions]]`** —
+  a proxy trap returning false was a silent no-op; it now throws a
+  TypeError (spec 20.1.2.18 step 4).
+- **The `ownKeys` trap result was not type-checked** —
+  `CreateListFromArrayLike` with element kind «String, Symbol» accepted
+  booleans/numbers/null/undefined by converting them to strings; it now
+  throws a TypeError (spec 7.3.18 step 6.d).
+- **Callability followed the live target** — `typeof`/`IsConstructor` on a
+  revoked proxy over a function reported "object"; ProxyCreate now
+  records the target's callability in the slots (spec 10.5.15 steps
+  10-11), so revocation does not remove the proxy's `[[Call]]`/`[[Construct]]`.
+- **The Proxy constructor had a `prototype` property** — spec 26.2.1
+  gives %Proxy% none; the intrinsic `%Proxy.prototype%` still exists (with
+  its `@@toStringTag`) but is no longer linked from the constructor. The
+  `Proxy.revocable` revocation function also links `%Function.prototype%`
+  instead of a null prototype (spec 28.2.2.1.1).
+- **The String-exotic `[[Delete]]` ignored virtual indices** — deleting
+  `"0"` of `new String("str")` succeeded; in-range code-unit index
+  properties are non-configurable (spec 10.4.3.7), so `delete
+  stringProxy[0]` in strict mode now throws, and `DataView` setters with
+  no value argument no longer panic (`setInt8()` had sliced `args[1..]`
+  on an empty argument list, crashing the sweep worker).
+
+Validation: `cargo test --workspace` **4085 pass, 0 failures**;
+`cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo fmt --all --check` clean. A full `built-ins` sweep before/after
+(`git stash` baseline) shows **0 new failures and 0 new crashes** across
+all 23,812 built-ins fixtures; the 16 Proxy fixtures plus 91 more
+(DataView getters/setters unmasked by the dispatcher fix, Math, Atomics,
+Array, String, Object.preventExtensions) now pass.
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~120 edge-case unit tests were added across
@@ -953,9 +1015,9 @@ annexB rows are from the earlier run and have not changed since.
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,812 | 16,593 | 680 | 6,536 | 3¹ | 96.1% |
+| built-ins | 23,812 | 16,700 | 573 | 6,536 | 3¹ | 96.7% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,622** | **33,036** | **3,286** | **12,297** | **3** | **91.0%** |
+| **Total** | **48,622** | **33,143** | **3,179** | **12,297** | **3** | **91.3%** |
 
 (Runnable = pass + fail; the 9,171 skips are module/async fixtures,
 unsupported harness includes, and the out-of-scope Temporal proposal
@@ -964,12 +1026,12 @@ fixtures.) The built-ins row reflects the current
 String/prototype, Object/create, DisposableStack, AsyncDisposableStack,
 ArrayBuffer/SharedArrayBuffer, Date, BigInt, global-functions, Function,
 Iterator/prototype, Iterator statics (concat/from/zip/zipKeyed), Symbol,
-Boolean, Number, Object.prototype.toString, and Object/prototype legacy
-accessors cluster closures (all 0 fail); the language and annexB rows are
-from the sweep recorded below. The 6,536 built-ins skips are dominated by
-the out-of-scope Temporal proposal (4,611), with the async/module flags,
-host-dependent `$262.createRealm`, and unsupported harness includes making
-up the rest.
+Boolean, Number, Object.prototype.toString, Object/prototype legacy
+accessors, and Proxy cluster closures (all 0 fail); the language and
+annexB rows are from the sweep recorded below. The 6,536 built-ins skips
+are dominated by the out-of-scope Temporal proposal (4,611), with the
+async/module flags, host-dependent `$262.createRealm`, and unsupported
+harness includes making up the rest.
 
 ¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
 coerced-values fixtures — 10,000-element allocations that need the long
@@ -1054,7 +1116,7 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 ## Open items
 
 - Certify the ≥95%-of-runnable target: the built-ins area now measures
-  **96.1%** of runnable (16,593 pass / 680 fail of 17,273, with the
+  **96.7%** of runnable (16,700 pass / 573 fail of 17,273, with the
   out-of-scope Temporal fixtures skipped, `--timeout 60
   --recheck-timeout 45`, release build), 0 crashes and 0 hangs with the
   long timeout. The remaining gap is the systematic bug clusters triaged

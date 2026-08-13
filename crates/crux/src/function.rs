@@ -88,6 +88,42 @@ fn ecma_call(
     }
 }
 
+/// Route a built-in closure through the runtime's dispatcher when one is
+/// active: nested proxy/bound forwarding (spec 10.5.12 step 6.a) can reach
+/// an agent-dispatched built-in (whose closure is a placeholder) from inside
+/// a `with_agent` window, and only the runtime knows the intrinsic identity.
+/// Outside any agent window the closure runs directly.
+fn call_with_hook(
+    callee: &Value,
+    this: Value,
+    args: &[Value],
+    native: &NativeFn,
+) -> Result<Value, JsError> {
+    let agent = CURRENT_AGENT.with(|slot| *slot.borrow());
+    let hook = ECMA_HOOK.get().copied();
+    match hook {
+        Some(hook) if !agent.is_null() => hook(agent, callee, this, args, None),
+        _ => native(&this, args),
+    }
+}
+
+/// The construct half of [`call_with_hook`] (spec 10.5.13 step 7.a).
+fn construct_with_hook(
+    callee: &Value,
+    args: &[Value],
+    new_target: &Value,
+    ctor: &NativeCtor,
+) -> Result<Value, JsError> {
+    let agent = CURRENT_AGENT.with(|slot| *slot.borrow());
+    let hook = ECMA_HOOK.get().copied();
+    match hook {
+        Some(hook) if !agent.is_null() => {
+            hook(agent, callee, Value::Undefined, args, Some(new_target))
+        }
+        _ => ctor(new_target, args),
+    }
+}
+
 /// A native function body: `(this, args) -> result`. Host-provided closures
 /// implement built-in methods; the Phase 7 evaluator bridges them.
 pub type NativeFn = Box<dyn Fn(&Value, &[Value]) -> Result<Value, JsError>>;
@@ -364,7 +400,7 @@ pub fn call(callee: &Value, this: Value, args: &[Value]) -> Result<Value, JsErro
         Value::Function(function) => match &function.kind {
             FunctionKind::Builtin {
                 call: Some(native), ..
-            } => native(&this, args),
+            } => call_with_hook(callee, this, args, native),
             FunctionKind::Builtin { call: None, .. } => Err(JsError::new(
                 ErrorKind::TypeError,
                 "value is not a function".into(),
@@ -403,7 +439,7 @@ pub fn construct(callee: &Value, args: &[Value], new_target: &Value) -> Result<V
             FunctionKind::Builtin {
                 construct: Some(ctor),
                 ..
-            } => ctor(new_target, args),
+            } => construct_with_hook(callee, args, new_target, ctor),
             FunctionKind::Builtin {
                 construct: None, ..
             } => Err(not_constructible(callee)),

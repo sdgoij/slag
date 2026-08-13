@@ -64,18 +64,10 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .intrinsics
         .define(PROXY_PROTO, proxy_proto_value.clone());
 
-    // 28.2.1.3: Proxy.prototype is non-writable and non-configurable.
-    proxy_ctor.define_property(
-        &JsString::from_utf8("prototype"),
-        &PropertyDescriptor {
-            value: Some(proxy_proto_value.clone()),
-            writable: Some(false),
-            get: None,
-            set: None,
-            enumerable: Some(false),
-            configurable: Some(false),
-        },
-    )?;
+    // spec 26.2.1: the Proxy constructor has no `prototype` property; the
+    // %Proxy.prototype% intrinsic still exists (with its own constructor
+    // back-reference and @@toStringTag) but is not linked from the
+    // constructor.
     proxy_proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
@@ -180,7 +172,8 @@ fn proxy_revocable(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> 
         _ => unreachable!("proxy_create returns a proxy object"),
     };
     let revoke = Function::create_builtin(
-        // spec 28.2.2.1.1: the revocation function is anonymous (name "").
+        // spec 28.2.2.1.1: the revocation function is anonymous (name ""),
+        // and its [[Prototype]] is %Function.prototype%.
         Some(JsString::from_utf8("")),
         0,
         Box::new(move |_, _| {
@@ -188,7 +181,11 @@ fn proxy_revocable(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> 
             Ok(Value::Undefined)
         }),
         None,
-        None,
+        agent
+            .current_realm()?
+            .intrinsics
+            .get("%Function.prototype%")
+            .and_then(|value| as_object(&value)),
     )?;
     let object_proto = agent
         .current_realm()?
@@ -332,13 +329,17 @@ mod tests {
     #[test]
     fn proxy_prototype_shapes() {
         assert_eq!(run("typeof Proxy.revocable").unwrap(), str("function"));
+        // spec 26.2.1: the Proxy constructor has no prototype property.
+        assert_eq!(run("Proxy.prototype").unwrap(), Value::Undefined);
         assert_eq!(
-            run("Object.getPrototypeOf(Proxy.prototype) === Object.prototype").unwrap(),
+            run("Object.getPrototypeOf(Proxy) === Function.prototype").unwrap(),
             Value::Boolean(true)
         );
+        // The revocation function's [[Prototype]] is %Function.prototype%.
         assert_eq!(
-            run("Proxy.prototype[Symbol.toStringTag]").unwrap(),
-            str("Proxy")
+            run("Object.getPrototypeOf(Proxy.revocable({}, {}).revoke) === Function.prototype")
+                .unwrap(),
+            Value::Boolean(true)
         );
     }
 }

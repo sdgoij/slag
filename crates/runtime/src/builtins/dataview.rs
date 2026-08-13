@@ -301,7 +301,8 @@ fn write_element(
     let (buffer_id, offset) = view_offset(agent, this, args, element_type.size())?;
     let value = args.get(1).cloned().unwrap_or(Value::Undefined);
     let mut bytes = encode_element(element_type, &value)?;
-    if little_endian(&args[1..]) != agent.little_endian {
+    // The isLittleEndian flag is the third parameter, read past the value.
+    if little_endian(args.get(1..).unwrap_or(&[])) != agent.little_endian {
         bytes.reverse();
     }
     let buffer = agent

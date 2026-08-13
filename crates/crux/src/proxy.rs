@@ -26,11 +26,17 @@ use crate::string::JsString;
 use crate::value::{Value, is_constructor};
 
 /// The [[ProxyTarget]] and [[ProxyHandler]] internal slots. Both are `None`
-/// once the proxy has been revoked (spec 10.5).
+/// once the proxy has been revoked (spec 10.5). `callable`/`constructible`
+/// record the target's callability at creation (ProxyCreate, spec 10.5.15
+/// steps 10-11): revocation clears the slots but the proxy keeps its
+/// [[Call]]/[[Construct]] internal methods, so `typeof` and IsConstructor
+/// must not follow the (now empty) target.
 #[derive(Debug, Clone)]
 pub struct ProxySlots {
     pub target: RefCell<Option<Value>>,
     pub handler: RefCell<Option<Value>>,
+    pub callable: std::cell::Cell<bool>,
+    pub constructible: std::cell::Cell<bool>,
 }
 
 fn revoked_error() -> JsError {
@@ -73,9 +79,15 @@ pub fn proxy_create(target: Value, handler: Value) -> Result<Handle<JsObject>, J
             "Proxy handler must be an object".into(),
         ));
     }
+    // ProxyCreate (spec 10.5.15 steps 10-11): callability is fixed at
+    // creation, before the target is stored.
+    let callable = crate::value::is_callable(&target);
+    let constructible = is_constructor(&target);
     let proxy = JsObject::proxy_object_create(ProxySlots {
         target: RefCell::new(Some(target)),
         handler: RefCell::new(Some(handler)),
+        callable: std::cell::Cell::new(callable),
+        constructible: std::cell::Cell::new(constructible),
     });
     Ok(proxy)
 }
@@ -562,7 +574,8 @@ fn key_value(key: &PropertyKey) -> Value {
 }
 
 /// LengthOfArrayLike (spec 7.3.20) + CreateListFromArrayLike (spec 7.3.18)
-/// with the ~property-key~ element kind, as the ownKeys trap requires.
+/// with the ~property-key~ element kind, as the ownKeys trap requires:
+/// every element must be a String or Symbol (spec 7.3.18 step 6.d).
 fn create_list_from_array_like(value: &Value) -> Result<Vec<PropertyKey>, JsError> {
     let length = length_of_array_like(value)?;
     let mut list = Vec::with_capacity(length as usize);
@@ -572,7 +585,16 @@ fn create_list_from_array_like(value: &Value) -> Result<Vec<PropertyKey>, JsErro
             &PropertyKey::from_utf8(&index.to_string()),
             value.clone(),
         )?;
-        list.push(crate::convert::to_property_key(&element)?);
+        let key = match &element {
+            Value::String(_) | Value::Symbol(_) => crate::convert::to_property_key(&element)?,
+            _ => {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "ownKeys trap must return a list of strings and symbols".into(),
+                ));
+            }
+        };
+        list.push(key);
     }
     Ok(list)
 }

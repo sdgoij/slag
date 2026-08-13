@@ -56,18 +56,14 @@ pub fn type_of(value: &Value) -> &'static str {
     }
 }
 
-/// `IsCallable` (spec 7.2.3): function values and proxies whose target is
-/// callable.
+/// `IsCallable` (spec 7.2.3): function values and proxies whose target was
+/// callable at creation (ProxyCreate, spec 10.5.15 step 10 — revocation
+/// does not remove the proxy's [[Call]] internal method).
 pub fn is_callable(value: &Value) -> bool {
     match value {
         Value::Function(_) => true,
         Value::Object(obj) => match &obj.kind {
-            crate::object::ObjectKind::Proxy(slots) => slots
-                .target
-                .borrow()
-                .as_ref()
-                .map(is_callable)
-                .unwrap_or(false),
+            crate::object::ObjectKind::Proxy(slots) => slots.callable.get(),
             _ => false,
         },
         _ => false,
@@ -75,18 +71,13 @@ pub fn is_callable(value: &Value) -> bool {
 }
 
 /// `IsConstructor` (spec 7.2.4): built-ins with a [[Construct]], ECMAScript
-/// (non-arrow) functions, bound functions, and proxies whose target is a
-/// constructor.
+/// (non-arrow) functions, bound functions, and proxies whose target was a
+/// constructor at creation.
 pub fn is_constructor(value: &Value) -> bool {
     match value {
         Value::Function(function) => function.is_constructor(),
         Value::Object(obj) => match &obj.kind {
-            crate::object::ObjectKind::Proxy(slots) => slots
-                .target
-                .borrow()
-                .as_ref()
-                .map(is_constructor)
-                .unwrap_or(false),
+            crate::object::ObjectKind::Proxy(slots) => slots.constructible.get(),
             _ => false,
         },
         _ => false,

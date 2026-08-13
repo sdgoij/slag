@@ -806,6 +806,18 @@ fn call_inner(
                 // per function object, so the linear chain is memoized in
                 // `agent.builtin_dispatch_cache` — plain closure builtins
                 // (index 0) skip the chain entirely on warm calls.
+                // %eval% reached as a value (indirect eval, or forwarded
+                // through a proxy) is dispatched before the chain.
+                if agent.current_realm()?.intrinsics.get("%eval%").as_ref() == Some(callee) {
+                    let source = args.first().cloned().unwrap_or(Value::Undefined);
+                    let text = crate::context::to_string(agent, &source)?;
+                    return crate::script::perform_eval(
+                        agent,
+                        &text.to_string_lossy(),
+                        false,
+                        false,
+                    );
+                }
                 let id = function.id();
                 let cached = agent.builtin_dispatch_cache.get(&id).copied();
                 let dispatched = match cached {
@@ -819,7 +831,15 @@ fn call_inner(
                 };
                 match dispatched {
                     Some(result) => result,
-                    None => crux::function::call(callee, this, args),
+                    // The native closure runs directly here: re-entering
+                    // `crux::function::call` would route back through the
+                    // agent hook and loop.
+                    None => match &function.kind {
+                        crux::function::FunctionKind::Builtin {
+                            call: Some(native), ..
+                        } => native(&this, args),
+                        _ => crux::function::call(callee, this, args),
+                    },
                 }
             }
         },
@@ -1050,7 +1070,16 @@ fn construct_inner(
                 {
                     return result;
                 }
-                crux::function::construct(callee, args, new_target)
+                // The native constructor closure runs directly here: re-entering
+                // `crux::function::construct` would route back through the
+                // agent hook and loop.
+                match &function.kind {
+                    crux::function::FunctionKind::Builtin {
+                        construct: Some(ctor),
+                        ..
+                    } => ctor(new_target, args),
+                    _ => crux::function::construct(callee, args, new_target),
+                }
             }
         },
         _ => crux::function::construct(callee, args, new_target),

@@ -801,7 +801,14 @@ pub fn dispatch_call(
             let obj = as_object(&object).ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "value is not an object".into())
             })?;
-            obj.prevent_extensions()?;
+            // spec 20.1.2.18 step 4: a failed [[PreventExtensions]] (e.g. a
+            // proxy trap returning false) is a TypeError.
+            if !obj.prevent_extensions()? {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "Cannot prevent extensions of the object".into(),
+                ));
+            }
             Ok(object)
         })());
     }

@@ -1116,6 +1116,21 @@ impl JsObject {
             // A module namespace never deletes (its properties are
             // non-configurable).
             ObjectKind::ModuleNamespace(_) => return Ok(false),
+            ObjectKind::String(string) => {
+                // spec 10.4.3.7: the virtual code-unit index properties are
+                // non-configurable; deleting an in-range index fails, out of
+                // range falls through to the ordinary delete.
+                if let PropertyKey::String(id) = key {
+                    let text = lookup(*id);
+                    if let Some(index) = canonical_numeric_index_string(text.as_slice())
+                        && index >= 0.0
+                        && index.trunc() == index
+                        && (index as usize) < string.len()
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
             ObjectKind::Arguments(slots) => {
                 let mapped = slots
                     .parameter_map
@@ -1419,7 +1434,10 @@ fn ordinary_get(obj: &JsObject, key: &PropertyKey, receiver: Value) -> Result<Va
         };
     }
     match obj.get_prototype_of()? {
-        Some(parent) => ordinary_get(&parent, key, receiver),
+        // spec 10.1.9.1 step 5: recurse through the parent's own [[Get]]
+        // (a proxy parent runs its get trap, an Integer-Indexed exotic its
+        // indexed read), not the ordinary walk.
+        Some(parent) => parent.get_with_receiver_key(key, receiver),
         None => Ok(Value::Undefined),
     }
 }
@@ -1447,12 +1465,12 @@ fn ordinary_set_with_own_descriptor(
 ) -> Result<bool, JsError> {
     let Some(own_desc) = own_desc else {
         // spec steps 1a-1c: not an own property — recurse into the parent's
-        // [[Set]], or CreateDataProperty on the receiver at the end of the
-        // chain.
+        // [[Set]], or a synthesized writable data descriptor at the end of
+        // the chain whose write lands on the receiver.
         if let Some(parent) = obj.get_prototype_of()? {
             return parent.set_with_receiver_key(key, value, receiver, throw);
         }
-        return receiver_create_data_property(&receiver, key, value, throw);
+        return receiver_data_write(&receiver, key, value, throw);
     };
     match own_desc.kind {
         // spec steps 2a-2e: a writable data property on the receiver.
@@ -1460,24 +1478,7 @@ fn ordinary_set_with_own_descriptor(
             if !writable {
                 return set_failure(throw, key);
             }
-            if !matches!(receiver, Value::Object(_) | Value::Function(_)) {
-                return Ok(false);
-            }
-            if let Some(existing) = receiver_get_own_property(&receiver, key)? {
-                if !existing.is_data() || existing.writable() != Some(true) {
-                    return Ok(false);
-                }
-                let value_desc = PropertyDescriptor {
-                    value: Some(value),
-                    writable: None,
-                    get: None,
-                    set: None,
-                    enumerable: None,
-                    configurable: None,
-                };
-                return receiver_define_property(&receiver, key, &value_desc);
-            }
-            receiver_create_data_property(&receiver, key, value, throw)
+            receiver_data_write(&receiver, key, value, throw)
         }
         // spec steps 3a-3e: an accessor — invoke the setter.
         PropertyKind::Accessor { set, .. } => match set {
@@ -1499,6 +1500,35 @@ fn ordinary_set_with_own_descriptor(
             }
         },
     }
+}
+
+/// spec 10.1.3.3 steps 2b-2e: write a data value to the receiver, checking
+/// the receiver's own descriptor first (a proxy receiver runs its
+/// getOwnPropertyDescriptor and defineProperty traps).
+fn receiver_data_write(
+    receiver: &Value,
+    key: &PropertyKey,
+    value: Value,
+    throw: bool,
+) -> Result<bool, JsError> {
+    if !matches!(receiver, Value::Object(_) | Value::Function(_)) {
+        return Ok(false);
+    }
+    if let Some(existing) = receiver_get_own_property(receiver, key)? {
+        if !existing.is_data() || existing.writable() != Some(true) {
+            return Ok(false);
+        }
+        let value_desc = PropertyDescriptor {
+            value: Some(value),
+            writable: None,
+            get: None,
+            set: None,
+            enumerable: None,
+            configurable: None,
+        };
+        return receiver_define_property(receiver, key, &value_desc);
+    }
+    receiver_create_data_property(receiver, key, value, throw)
 }
 
 fn set_failure(throw: bool, key: &PropertyKey) -> Result<bool, JsError> {
