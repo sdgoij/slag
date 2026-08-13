@@ -61,10 +61,11 @@ impl Kind {
         }
     }
 
-    fn tag(self) -> &'static str {
+    /// The @@toStringTag value (spec 27.4.3.3/27.5.3.3/27.6.3.3).
+    fn tag(&self) -> &'static str {
         match self {
             Kind::Generator => "GeneratorFunction",
-            Kind::Async => "Async Function",
+            Kind::Async => "AsyncFunction",
             Kind::AsyncGenerator => "AsyncGeneratorFunction",
         }
     }

@@ -251,57 +251,99 @@ fn str(value: &str) -> Value {
     Value::String(Handle::new(JsString::from_utf8(value)))
 }
 
-/// Object.prototype.toString (spec 20.1.3.6): `[object Tag]` from the value's
-/// kind, honoring the `@@toStringTag` override (the Symbol builtin installs
-/// the well-known symbols).
+/// Object.prototype.toString (spec 20.1.3.6): `[object Tag]` from the
+/// value's kind, honoring the `@@toStringTag` override. Every value is
+/// ToObject'd first; the built-in tag (steps 4-14) comes from IsArray, the
+/// [[Call]]/[[ParameterMap]] slots, the boxed-primitive marker, the error/
+/// RegExp brands, or the object kind, and a string @@toStringTag overrides it.
 fn prototype_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     let tag = match this {
         Value::Undefined => "Undefined".to_string(),
         Value::Null => "Null".to_string(),
-        Value::Boolean(_) => "Boolean".to_string(),
-        Value::Number(_) => "Number".to_string(),
-        Value::String(_) => "String".to_string(),
-        Value::BigInt(_) => "BigInt".to_string(),
-        Value::Symbol(_) => "Symbol".to_string(),
-        Value::Function(_) => "Function".to_string(),
-        Value::Object(obj) => {
-            // Wrapper objects and the %Boolean%/%Number% prototypes carry the
-            // boxed-primitive marker; errors and RegExp are branded by their
-            // agent slots.
-            match &*obj.boxed.borrow() {
-                Some(crux::object::BoxedPrimitive::Boolean(_)) => "Boolean".to_string(),
-                Some(crux::object::BoxedPrimitive::Number(_)) => "Number".to_string(),
-                Some(crux::object::BoxedPrimitive::BigInt(_)) => "BigInt".to_string(),
-                None => {
-                    if agent.error_data.contains(&obj.id()) {
-                        "Error".to_string()
-                    } else if agent.regexp_data.contains_key(&obj.id()) {
-                        // RegExp is branded via its [[RegExpMatcher]] slot (its
-                        // @@toStringTag was removed from the spec).
-                        "RegExp".to_string()
-                    } else {
-                        // spec step 6.c: an own or inherited @@toStringTag
-                        // string overrides the built-in tag.
-                        let tag = crate::context::get_property_key(
-                            agent,
-                            this,
-                            &PropertyKey::Symbol(
-                                crux::symbol::well_known("toStringTag").as_ref().clone(),
-                            ),
-                            this.clone(),
-                        )?;
-                        match tag {
-                            Value::String(text) => {
-                                return Ok(str(&format!("[object {}]", text.to_string_lossy())));
-                            }
-                            _ => obj.kind.name().to_string(),
-                        }
-                    }
+        _ => {
+            // spec step 3: ToObject. Function values pass through unchanged.
+            let object = crate::context::to_object(agent, this)?;
+            let builtin_tag = builtin_tag(agent, &object)?;
+            // spec steps 15-16: an own or inherited @@toStringTag string
+            // overrides the built-in tag.
+            let tag = crate::context::get_property_key(
+                agent,
+                &object,
+                &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+                object.clone(),
+            )?;
+            match tag {
+                Value::String(text) => {
+                    return Ok(str(&format!("[object {}]", text.to_string_lossy())));
                 }
+                _ => builtin_tag,
             }
         }
     };
-    Ok(str(&format!("[object {}]", tag)))
+    Ok(str(&format!("[object {tag}]")))
+}
+
+/// The built-in tag of a ToObject'd value (spec 20.1.3.6 steps 4-14). Note
+/// that there is no BigInt built-in tag: BigInt wrappers fall to "Object".
+fn builtin_tag(agent: &mut Agent, object: &Value) -> Result<String, JsError> {
+    if is_array_for_to_string(object)? {
+        return Ok("Array".to_string());
+    }
+    let Value::Object(obj) = object else {
+        return Ok("Function".to_string());
+    };
+    if matches!(obj.kind, crux::object::ObjectKind::Arguments(_)) {
+        return Ok("Arguments".to_string());
+    }
+    // spec step 7: [[Call]] — functions and proxies over callables.
+    if crux::value::is_callable(object) {
+        return Ok("Function".to_string());
+    }
+    if let Some(boxed) = &*obj.boxed.borrow() {
+        return Ok(match boxed {
+            crux::object::BoxedPrimitive::Boolean(_) => "Boolean",
+            crux::object::BoxedPrimitive::Number(_) => "Number",
+            crux::object::BoxedPrimitive::BigInt(_) => "Object",
+        }
+        .to_string());
+    }
+    if agent.error_data.contains(&obj.id()) {
+        return Ok("Error".to_string());
+    }
+    if agent.date_data.contains_key(&obj.id()) {
+        // The [[DateValue]] slot (spec 20.1.3.6 step 12).
+        return Ok("Date".to_string());
+    }
+    if agent.regexp_data.contains_key(&obj.id()) {
+        // RegExp is branded via its [[RegExpMatcher]] slot (its @@toStringTag
+        // was removed from the spec).
+        return Ok("RegExp".to_string());
+    }
+    if matches!(obj.kind, crux::object::ObjectKind::Proxy(_)) {
+        // A proxy over a plain object has no built-in tag of its own
+        // (spec 20.1.3.6 steps 6-14 check O's own slots).
+        return Ok("Object".to_string());
+    }
+    Ok(obj.kind.name().to_string())
+}
+
+/// IsArray (spec 7.2.2) for the built-in tag: proxies recurse to their
+/// target; a revoked proxy's target is empty.
+fn is_array_for_to_string(value: &Value) -> Result<bool, JsError> {
+    match value {
+        Value::Object(obj) => match &obj.kind {
+            crux::object::ObjectKind::Array => Ok(true),
+            crux::object::ObjectKind::Proxy(slots) => {
+                let Some(target) = slots.target.borrow().as_ref().cloned() else {
+                    return Ok(false);
+                };
+                is_array_for_to_string(&target)
+            }
+            _ => Ok(false),
+        },
+        Value::Function(f) => Ok(matches!(f.object.kind, crux::object::ObjectKind::Array)),
+        _ => Ok(false),
+    }
 }
 
 /// EnumerableOwnPropertyNames (spec 7.3.23) restricted to string keys.

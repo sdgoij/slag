@@ -1030,18 +1030,8 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         )?;
     }
 
-    // Date.prototype[@@toStringTag] = "Date".
-    date_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
-        &PropertyDescriptor {
-            value: Some(Value::String(Handle::new(JsString::from_utf8("Date")))),
-            writable: Some(false),
-            get: None,
-            set: None,
-            enumerable: Some(false),
-            configurable: Some(true),
-        },
-    )?;
+    // The Date tag comes from the [[DateValue]] slot in
+    // Object.prototype.toString; there is no @@toStringTag on the prototype.
 
     // Date.prototype[@@toPrimitive] (writable: false per spec 21.4.3.5).
     let to_primitive = Function::create_builtin(

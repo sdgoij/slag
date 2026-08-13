@@ -216,19 +216,6 @@ fn install_methods(
         },
     )?;
 
-    // 20.2.3.7 Function.prototype[@@toStringTag] = "Function".
-    function_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
-        &PropertyDescriptor {
-            value: Some(Value::String(Handle::new(JsString::from_utf8("Function")))),
-            writable: Some(false),
-            get: None,
-            set: None,
-            enumerable: Some(false),
-            configurable: Some(true),
-        },
-    )?;
-
     // 20.2.3.1 Function.prototype.caller/arguments: own accessor properties
     // whose get and set are the same thrower, so reads/writes on functions
     // without their own restricted properties (strict, bound, async,

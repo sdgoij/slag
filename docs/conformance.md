@@ -758,6 +758,36 @@ report **50 pass, 0 fail** and **339 pass, 0 fail** respectively (up from
   they are now the same built-in function objects as the global
   `parseInt`/`parseFloat` (spec 21.1.2.9/13).
 
+### Object.prototype.toString cluster sweep (Phase 18 conformance)
+
+A sweep of the `Object/prototype/toString` tree (41 fixtures) reports **41
+pass, 0 fail**: every fixture passes (up from 29 pass / 12 fail). The
+implementation was rebuilt around spec 20.1.3.6 in
+`crates/runtime/src/builtins/object.rs` plus the related installs:
+
+- **The value is ToObject'd first and the `@@toStringTag` string always
+  overrides** (steps 3/15-16) — previously the override applied only to
+  plain objects, so own/inherited tags on arrays, functions, arguments,
+  errors, boxed wrappers, and primitives were ignored.
+- **Built-in tags from slots/kinds** (steps 4-14): IsArray recurses through
+  proxies, the [[Call]]/[[ParameterMap]] checks precede the boxed-primitive
+  marker, and the error/RegExp/Date brands. BigInt wrappers have no
+  built-in tag ("Object"), and a proxy over a plain object is "Object".
+- **`%Function.prototype%`/`%Number.prototype%`/`%Date.prototype%` lost
+  their `@@toStringTag`** — the spec brands those kinds through the
+  [[Call]]/[[NumberData]]/[[DateValue]] slots (V8 confirms); their presence
+  made the override fixtures' assignments silently fail against the
+  non-writable tags. Symbol/BigInt/Promise keep their spec'd tags.
+- **Generator/async function tags** — `%Generator.prototype%[@@toStringTag]`
+  = "Generator" was added, `%AsyncFunction.prototype%`'s tag is now
+  "AsyncFunction" (was "Async Function"), and the generator object's
+  [[Prototype]] is the generator function's `prototype` property (an
+  object inheriting %Generator.prototype%) instead of the intrinsic
+  directly, so `Object.getPrototypeOf(genFn()) === genFn.prototype`.
+- **`%Promise.prototype%[@@toStringTag]`** is configurable (spec 27.2.5.5),
+  so `delete` works and the object falls back to the "Object" built-in
+  tag.
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~120 edge-case unit tests were added across
@@ -864,9 +894,9 @@ TypedArray fixtures that pass with the long timeout (see below).
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,798 | 16,345 | 4,040 | 3,410 | 3¹ | 80.2% |
+| built-ins | 23,798 | 16,357 | 4,028 | 3,410 | 3¹ | 80.2% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,608** | **32,788** | **6,646** | **9,171** | **3** | **83.2%** |
+| **Total** | **48,608** | **32,800** | **6,634** | **9,171** | **3** | **83.2%** |
 
 (Runnable = pass + fail; the 9,171 skips are module/async fixtures,
 unsupported harness includes, and the out-of-scope Temporal proposal
@@ -875,8 +905,8 @@ fixtures.) The built-ins row reflects the current
 String/prototype, Object/create, DisposableStack, AsyncDisposableStack,
 ArrayBuffer/SharedArrayBuffer, Date, BigInt, global-functions, Function,
 Iterator/prototype, Iterator statics (concat/from/zip/zipKeyed), Symbol,
-Boolean, and Number cluster closures (all 0 fail); the language and
-annexB rows are from the sweep recorded below.
+Boolean, Number, and Object.prototype.toString cluster closures (all 0
+fail); the language and annexB rows are from the sweep recorded below.
 
 ¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
 coerced-values fixtures — 10,000-element allocations that need the long

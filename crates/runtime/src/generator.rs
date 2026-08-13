@@ -104,6 +104,20 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             configurable: Some(true),
         },
     )?;
+    // %Generator.prototype%[@@toStringTag] = "Generator" (spec 27.4.3.3).
+    proto.define_property_key(
+        &crux::property::PropertyKey::Symbol(
+            crux::symbol::well_known("toStringTag").as_ref().clone(),
+        ),
+        &PropertyDescriptor {
+            value: Some(Value::String(Handle::new(JsString::from_utf8("Generator")))),
+            writable: Some(false),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
+    )?;
     Ok(())
 }
 
@@ -214,17 +228,18 @@ pub fn call_generator(
     let body_env = instantiated_context.lexical_environment.clone();
     agent.execution_context_stack.pop();
 
-    let proto = data
-        .realm
-        .intrinsics
-        .get(GENERATOR_PROTO)
-        .and_then(|value| crate::context::as_object(&value))
-        .ok_or_else(|| {
-            JsError::new(
-                ErrorKind::TypeError,
-                format!("{GENERATOR_PROTO} is not defined"),
-            )
-        })?;
+    let proto_value = crate::context::get_property(
+        agent,
+        &Value::Function(function.clone()),
+        &JsString::from_utf8("prototype"),
+        Value::Function(function.clone()),
+    )?;
+    let proto = crate::context::as_object(&proto_value).ok_or_else(|| {
+        JsError::new(
+            ErrorKind::TypeError,
+            "generator function prototype is not an object".into(),
+        )
+    })?;
     let object = JsObject::ordinary_object_create(Some(proto));
     let object_value = Value::Object(object.clone());
     agent.generators.insert(

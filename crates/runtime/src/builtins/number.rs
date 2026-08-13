@@ -10,7 +10,7 @@ use crux::error::{ErrorKind, JsError};
 use crux::function::{Function, NativeFn};
 use crux::handle::Handle;
 use crux::object::JsObject;
-use crux::property::{PropertyDescriptor, PropertyKey};
+use crux::property::PropertyDescriptor;
 use crux::string::JsString;
 use crux::value::Value;
 
@@ -511,19 +511,6 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             },
         )?;
     }
-
-    // spec 21.1.3: Number.prototype[@@toStringTag] = "Number".
-    number_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
-        &PropertyDescriptor {
-            value: Some(Value::String(Handle::new(JsString::from_utf8("Number")))),
-            writable: Some(false),
-            get: None,
-            set: None,
-            enumerable: Some(false),
-            configurable: Some(true),
-        },
-    )?;
 
     realm.global_object.define_property_or_throw(
         &JsString::from_utf8("Number"),
