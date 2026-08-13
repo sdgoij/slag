@@ -994,6 +994,57 @@ Validation: `cargo test --workspace` **4085 pass, 0 failures**;
 all 23,812 fixtures, with **37 fixtures fixed** (the 19 integrity-cluster
 ones plus 18 more that freeze/seal/freeze-check objects in their setup).
 
+### Array iteration-method cluster sweeps (Phase 18 conformance)
+
+Sweeps of the Array iteration trees report **0 fail** across the whole
+family: map 211/0, filter 237/0, reduce 257/0, reduceRight 257/0, forEach
+187/0, every 215/0, some 216/0, find 20/0, findIndex 20/0, findLast 21/0,
+findLastIndex 21/0 (up from 10-17 fails per method). Fixes in
+`crates/runtime/src/builtins/array.rs` plus two shared-correctness bugs in
+`crates/runtime/src/eval.rs` and `crates/runtime/src/module.rs`:
+
+- **`ArraySpeciesCreate` (spec 9.4.2.3) mishandled the constructor** — a
+  `null` or primitive `constructor` was treated as undefined (throwing
+  only on non-constructible species) instead of a TypeError, and a
+  `null`/`undefined` `@@species` fell back to the *constructor* instead of
+  a plain ArrayCreate. It now matches the fixtures' algorithm:
+  `undefined` constructor or `null`/`undefined` species → ArrayCreate;
+  null/primitive constructor or non-constructible species → TypeError
+  (`create-ctor-non-object.js`, `create-species-null.js`,
+  `create-species-undef.js`).
+- **`IsArray` (spec 7.2.2) did not recurse through proxies** — a proxy
+  over an array fell back to ArrayCreate, ignoring the species
+  constructor. It now follows `[[ProxyTarget]]` recursively
+  (`create-proxy.js`).
+- **The iteration methods read `length` after checking the callback** —
+  spec order reads `LengthOfArrayLike` (step 3) before `IsCallable`
+  (step 4), so a length getter's side effects/errors were invisible when
+  the callback was missing or non-callable. All eleven methods now read
+  the length first (`15.4.4.19-4-8/9/10/11/15` and the sibling
+  `15.4.4.20-4-*`/`15.4.4.21-*` fixtures).
+- **A function declaration statement re-created the hoisted function** —
+  `eval_function_declaration` instantiated and re-bound the function at
+  statement evaluation, so `foo.prototype = new Array(1,2,3); function
+  foo() {}` discarded the prototype assignment (the declaration statement
+  evaluates to empty per spec 15.2.6; only the Annex B statement-position
+  forms — if/while bodies — create at evaluation). It now skips
+  re-creation when the variable environment already holds the binding
+  (`15.4.4.19-9-3.js`).
+- **Module functions carried the whole module as their `source`** and the
+  synthesized `*default*` binding was clobbered to `undefined` after a
+  default function/class declaration was bound — the module instantiation
+  now slices the function's own source span, and the `export default
+  <expr>` binding initializer only runs when no default declaration exists
+  (module `Function.prototype.toString` and default-export tests).
+
+Validation: `cargo test --workspace` **4085 pass, 0 failures**;
+`cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo fmt --all --check` clean. A full `built-ins` sweep before/after
+(`git stash` baseline) shows **0 new failures and 0 new crashes** across
+all 23,812 fixtures, with **131 fixtures fixed** (the iteration clusters
+plus every species-using Array method — splice, concat, flat, toReversed,
+toSorted, with — and hoisted-function users).
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~120 edge-case unit tests were added across
@@ -1103,9 +1154,9 @@ annexB rows are from the earlier run and have not changed since.
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,812 | 16,751 | 522 | 6,536 | 3¹ | 97.0% |
+| built-ins | 23,812 | 16,882 | 391 | 6,536 | 3¹ | 97.7% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,622** | **33,194** | **3,128** | **12,297** | **3** | **91.4%** |
+| **Total** | **48,622** | **33,325** | **2,997** | **12,297** | **3** | **91.8%** |
 
 (Runnable = pass + fail; the 9,171 skips are module/async fixtures,
 unsupported harness includes, and the out-of-scope Temporal proposal
@@ -1115,12 +1166,12 @@ String/prototype, Object/create, DisposableStack, AsyncDisposableStack,
 ArrayBuffer/SharedArrayBuffer, Date, BigInt, global-functions, Function,
 Iterator/prototype, Iterator statics (concat/from/zip/zipKeyed), Symbol,
 Boolean, Number, Object.prototype.toString, Object/prototype legacy
-accessors, Proxy, Reflect, Object.groupBy, and Object
-freeze/seal/isFrozen/isSealed cluster closures (all 0 fail); the language
-and annexB rows are from the sweep recorded below. The 6,536 built-ins
-skips are dominated by the out-of-scope Temporal proposal (4,611), with
-the async/module flags, host-dependent `$262.createRealm`, and unsupported
-harness includes making up the rest.
+accessors, Proxy, Reflect, Object.groupBy, Object
+freeze/seal/isFrozen/isSealed, and Array iteration-method cluster closures
+(all 0 fail); the language and annexB rows are from the sweep recorded
+below. The 6,536 built-ins skips are dominated by the out-of-scope
+Temporal proposal (4,611), with the async/module flags, host-dependent
+`$262.createRealm`, and unsupported harness includes making up the rest.
 
 ¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
 coerced-values fixtures — 10,000-element allocations that need the long
@@ -1205,7 +1256,7 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 ## Open items
 
 - Certify the ≥95%-of-runnable target: the built-ins area now measures
-  **97.0%** of runnable (16,751 pass / 522 fail of 17,273, with the
+  **97.7%** of runnable (16,882 pass / 391 fail of 17,273, with the
   out-of-scope Temporal fixtures skipped, `--timeout 60
   --recheck-timeout 45`, release build), 0 crashes and 0 hangs with the
   long timeout. The remaining gap is the systematic bug clusters triaged

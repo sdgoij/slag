@@ -241,11 +241,21 @@ fn eval_function_declaration(
     let Some(name) = f.name else {
         return Ok(());
     };
+    let name = crux::lookup(name);
+    let variable_env = agent.running_context()?.variable_environment.clone();
+    // Var-scoped function declarations were already instantiated and bound
+    // by declaration instantiation (global/function/eval/block); the
+    // FunctionDeclaration statement itself evaluates to empty (spec 15.2.6).
+    // Re-creating the function here would replace the hoisted binding and
+    // discard properties set on it before the declaration statement. Only
+    // the Annex B statement-position forms (if/while bodies) create the
+    // binding at evaluation time.
+    if variable_env.has_binding(&name)? {
+        return Ok(());
+    }
     let env = agent.running_context()?.lexical_environment.clone();
     let func_obj = crate::function::instantiate_function(agent, f, env, strict)?;
-    let env = agent.running_context()?.variable_environment.clone();
-    let name = crux::lookup(name);
-    env.set_mutable_binding(&name, func_obj, false)?;
+    variable_env.set_mutable_binding(&name, func_obj, false)?;
     Ok(())
 }
 

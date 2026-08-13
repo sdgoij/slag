@@ -526,12 +526,18 @@ fn instantiate_module_declarations(
             if !env.has_binding(&name)? {
                 env.create_mutable_binding(&name, false)?;
             }
+            // The function's own source span, not the whole module text
+            // (Function.prototype.toString, spec 20.2.3.5).
+            let module_text = module.source.as_slice();
+            let (start, end) = (function.span.start as usize, function.span.end as usize);
+            let source = (start < end && end <= module_text.len())
+                .then(|| JsString::from_utf16(&module_text[start..end]));
             let func = crate::function::instantiate_function_with_source(
                 agent,
                 function,
                 env.clone(),
                 true,
-                Some(module.source.clone()),
+                source,
             )?;
             env.initialize_binding(&name, func)?;
         }
@@ -562,7 +568,18 @@ fn instantiate_module_declarations(
             _ => {}
         }
     }
-    // The synthesized `*default*` binding for `export default expr`.
+    // The synthesized `*default*` binding for `export default expr`. Only an
+    // expression default needs the undefined initial value: a default
+    // function/class declaration was already instantiated and bound above.
+    let default_declared = stmts.iter().any(|stmt| match &stmt.kind {
+        StmtKind::FunctionDecl(f) => f
+            .name
+            .is_some_and(|n| crux::lookup(n) == JsString::from_utf8("*default*")),
+        StmtKind::ClassDecl(c) => c
+            .name
+            .is_some_and(|n| crux::lookup(n) == JsString::from_utf8("*default*")),
+        _ => false,
+    });
     for export in &module.local_export_entries {
         if let Some(local) = export.local_name
             && crux::lookup(local) == JsString::from_utf8("*default*")
@@ -571,7 +588,9 @@ fn instantiate_module_declarations(
             if !env.has_binding(&name)? {
                 env.create_mutable_binding(&name, false)?;
             }
-            env.initialize_binding(&name, Value::Undefined)?;
+            if !default_declared {
+                env.initialize_binding(&name, Value::Undefined)?;
+            }
         }
     }
     Ok(())

@@ -96,9 +96,20 @@ fn key(index: u64) -> JsString {
 
 /// IsArray (spec 7.2.2): an Array exotic object. Proxy targets join in
 /// Phase 16.
+/// IsArray (spec 7.2.2): Array exotics and proxies whose target is an
+/// array (recursively).
 pub fn is_array(value: &Value) -> bool {
     match value {
-        Value::Object(obj) => matches!(obj.kind, ObjectKind::Array),
+        Value::Object(obj) => match &obj.kind {
+            ObjectKind::Array => true,
+            ObjectKind::Proxy(slots) => slots
+                .target
+                .borrow()
+                .as_ref()
+                .map(is_array)
+                .unwrap_or(false),
+            _ => false,
+        },
         Value::Function(function) => matches!(function.object.kind, ObjectKind::Array),
         _ => false,
     }
@@ -242,8 +253,11 @@ fn get_prototype_from_constructor(
     }
 }
 
-/// ArraySpeciesCreate (spec 23.1.3.1): the species constructor of
-/// `original_array`, or `%Array.prototype%`-linked ArrayCreate.
+/// ArraySpeciesCreate (spec 9.4.2.3): the species constructor of
+/// `original_array`, or a plain `%Array.prototype%`-linked ArrayCreate.
+/// A null or primitive `constructor` throws; an object's `@@species` of
+/// null/undefined falls back to ArrayCreate; anything else must be a
+/// constructor.
 fn array_species_create(
     agent: &mut Agent,
     original_array: &Value,
@@ -252,32 +266,28 @@ fn array_species_create(
     if !is_array(original_array) {
         return array_create(agent, length);
     }
-    // SpeciesConstructor (spec 10.1.15): C = Get(originalArray,
-    // "constructor"); if C is undefined use the default; else S =
-    // Get(C, @@species); null/undefined species means C; otherwise S must be
-    // a constructor.
     let c = get(agent, original_array, &JsString::from_utf8("constructor"))?;
-    let ctor = match c {
-        Value::Undefined | Value::Null => return array_create(agent, length),
+    let species = match c {
+        Value::Undefined => return array_create(agent, length),
         Value::Object(_) | Value::Function(_) => {
             let species_key =
                 PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone());
-            let species = crate::context::get_property_key(agent, &c, &species_key, c.clone())?;
-            match species {
-                Value::Null | Value::Undefined => c,
-                value if is_constructor(&value) => value,
-                _ => {
-                    return Err(JsError::new(
-                        ErrorKind::TypeError,
-                        "Array species constructor returned a non-constructible value".into(),
-                    ));
-                }
-            }
+            crate::context::get_property_key(agent, &c, &species_key, c.clone())?
         }
         _ => {
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "Array species constructor is not an object".into(),
+            ));
+        }
+    };
+    let ctor = match species {
+        Value::Null | Value::Undefined => return array_create(agent, length),
+        value if is_constructor(&value) => value,
+        _ => {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "Array species constructor returned a non-constructible value".into(),
             ));
         }
     };
@@ -617,6 +627,8 @@ fn entries(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, Js
 fn every(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
     let object = crate::context::to_object(agent, this)?;
+    // spec: the length is read before the callback is checked.
+    let length = length_of_array_like(agent, &object)?;
     let callbackfn = args.first().cloned().unwrap_or(Value::Undefined);
     if !is_callable(&callbackfn) {
         return Err(JsError::new(
@@ -625,7 +637,6 @@ fn every(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
         ));
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let length = length_of_array_like(agent, &object)?;
     for k in 0..length {
         if has_property(&object, &key(k))? {
             let k_value = get(agent, &object, &key(k))?;
@@ -668,6 +679,8 @@ fn fill(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
 fn filter(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
     let object = crate::context::to_object(agent, this)?;
+    // spec: the length is read before the callback is checked.
+    let length = length_of_array_like(agent, &object)?;
     let callbackfn = args.first().cloned().unwrap_or(Value::Undefined);
     if !is_callable(&callbackfn) {
         return Err(JsError::new(
@@ -676,7 +689,6 @@ fn filter(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
         ));
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let length = length_of_array_like(agent, &object)?;
     let array = array_species_create(agent, &object, 0.0)?;
     let mut to_index = 0u64;
     for k in 0..length {
@@ -706,6 +718,8 @@ fn filter(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
 fn find(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
     let object = crate::context::to_object(agent, this)?;
+    // spec: the length is read before the predicate is checked.
+    let length = length_of_array_like(agent, &object)?;
     let predicate = args.first().cloned().unwrap_or(Value::Undefined);
     if !is_callable(&predicate) {
         return Err(JsError::new(
@@ -714,7 +728,6 @@ fn find(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         ));
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let length = length_of_array_like(agent, &object)?;
     for k in 0..length {
         let k_value = get(agent, &object, &key(k))?;
         let test = crate::function::call(
@@ -734,6 +747,8 @@ fn find(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
 fn find_index(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
     let object = crate::context::to_object(agent, this)?;
+    // spec: the length is read before the predicate is checked.
+    let length = length_of_array_like(agent, &object)?;
     let predicate = args.first().cloned().unwrap_or(Value::Undefined);
     if !is_callable(&predicate) {
         return Err(JsError::new(
@@ -742,7 +757,6 @@ fn find_index(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
         ));
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let length = length_of_array_like(agent, &object)?;
     for k in 0..length {
         let k_value = get(agent, &object, &key(k))?;
         let test = crate::function::call(
@@ -767,15 +781,16 @@ fn find_last_common(
 ) -> Result<Value, JsError> {
     require_object_coercible(this)?;
     let object = crate::context::to_object(agent, this)?;
+    // spec: the length is read before the predicate is checked.
+    let length = length_of_array_like(agent, &object)?;
     let predicate = args.first().cloned().unwrap_or(Value::Undefined);
     if !is_callable(&predicate) {
         return Err(JsError::new(
             ErrorKind::TypeError,
-            "predicate is not a function".into(),
+            "Array.prototype.findLast: predicate is not a function".into(),
         ));
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let length = length_of_array_like(agent, &object)?;
     let mut k = length as i64 - 1;
     while k >= 0 {
         let k_value = get(agent, &object, &key(k as u64))?;
@@ -901,6 +916,8 @@ fn flat_map(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
 fn for_each(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
     let object = crate::context::to_object(agent, this)?;
+    // spec: the length is read before the callback is checked.
+    let length = length_of_array_like(agent, &object)?;
     let callbackfn = args.first().cloned().unwrap_or(Value::Undefined);
     if !is_callable(&callbackfn) {
         return Err(JsError::new(
@@ -909,7 +926,6 @@ fn for_each(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
         ));
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let length = length_of_array_like(agent, &object)?;
     for k in 0..length {
         if has_property(&object, &key(k))? {
             let k_value = get(agent, &object, &key(k))?;
@@ -1046,6 +1062,10 @@ fn last_index_of(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Valu
 fn map(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
     let object = crate::context::to_object(agent, this)?;
+    // spec steps 3-4: the length is read before the callback is checked, so
+    // a length getter's side effects and errors are visible when the
+    // callback is missing or non-callable.
+    let length = length_of_array_like(agent, &object)?;
     let callbackfn = args.first().cloned().unwrap_or(Value::Undefined);
     if !is_callable(&callbackfn) {
         return Err(JsError::new(
@@ -1054,7 +1074,6 @@ fn map(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
         ));
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let length = length_of_array_like(agent, &object)?;
     let array = array_species_create(agent, &object, length as f64)?;
     for k in 0..length {
         if has_property(&object, &key(k))? {
@@ -1112,6 +1131,8 @@ fn push(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
 fn reduce(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
     let object = crate::context::to_object(agent, this)?;
+    // spec: the length is read before the callback is checked.
+    let length = length_of_array_like(agent, &object)?;
     let callbackfn = args.first().cloned().unwrap_or(Value::Undefined);
     if !is_callable(&callbackfn) {
         return Err(JsError::new(
@@ -1119,7 +1140,6 @@ fn reduce(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
             "Array.prototype.reduce: callbackfn is not a function".into(),
         ));
     }
-    let length = length_of_array_like(agent, &object)?;
     let mut k = 0u64;
     let mut accumulator: Option<Value> = None;
     if args.len() >= 2 {
@@ -1160,6 +1180,8 @@ fn reduce(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
 fn reduce_right(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
     let object = crate::context::to_object(agent, this)?;
+    // spec: the length is read before the callback is checked.
+    let length = length_of_array_like(agent, &object)?;
     let callbackfn = args.first().cloned().unwrap_or(Value::Undefined);
     if !is_callable(&callbackfn) {
         return Err(JsError::new(
@@ -1167,7 +1189,6 @@ fn reduce_right(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
             "Array.prototype.reduceRight: callbackfn is not a function".into(),
         ));
     }
-    let length = length_of_array_like(agent, &object)?;
     let mut k = length as i64 - 1;
     let mut accumulator: Option<Value> = None;
     if args.len() >= 2 {
@@ -1301,6 +1322,8 @@ fn slice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
 fn some(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
     let object = crate::context::to_object(agent, this)?;
+    // spec: the length is read before the callback is checked.
+    let length = length_of_array_like(agent, &object)?;
     let callbackfn = args.first().cloned().unwrap_or(Value::Undefined);
     if !is_callable(&callbackfn) {
         return Err(JsError::new(
@@ -1309,7 +1332,6 @@ fn some(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         ));
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let length = length_of_array_like(agent, &object)?;
     for k in 0..length {
         if has_property(&object, &key(k))? {
             let k_value = get(agent, &object, &key(k))?;
