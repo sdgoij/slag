@@ -1,9 +1,9 @@
 //! Global function properties (spec 19.2): `isFinite`, `isNaN`, `parseFloat`,
 //! `parseInt`, and the URI handling functions (`encodeURI[Component]` /
-//! `decodeURI[Component]`). Every one runs on pure crux conversions, so the
-//! native closures need no agent dispatch.
+//! `decodeURI[Component]`). Their ToString/ToNumber arguments can be objects,
+//! so the conversions run through the agent (recovered from the crux
+//! `with_agent` window) instead of the pure crux helpers.
 
-use crux::convert::{to_number, to_string};
 use crux::error::{ErrorKind, JsError};
 use crux::function::Function;
 use crux::handle::Handle;
@@ -24,9 +24,47 @@ fn uri_error() -> JsError {
     JsError::new(ErrorKind::UriError, "URI malformed".into())
 }
 
+/// The agent recorded by the innermost `crux::function::with_agent` window;
+/// the global functions are plain crux closures and cannot take it as a
+/// parameter, but they only run inside those windows.
+fn current_agent_mut() -> Result<&'static mut crate::agent::Agent, JsError> {
+    let agent = crux::function::current_agent();
+    if agent.is_null() {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "host global called outside an agent window".into(),
+        ));
+    }
+    // SAFETY: `with_agent` guarantees a live `&mut Agent` for the duration of
+    // the enclosing call.
+    Ok(unsafe { &mut *(agent as *mut crate::agent::Agent) })
+}
+
+/// ToString with the agent's ToPrimitive dispatch (the pure crux `to_string`
+/// cannot call the %Object.prototype.toString%/valueOf builtins).
+fn to_string_agent(value: &Value) -> Result<JsString, JsError> {
+    crate::context::to_string(current_agent_mut()?, value)
+}
+
+/// ToNumber with the agent's ToPrimitive dispatch.
+fn to_number_agent(value: &Value) -> Result<f64, JsError> {
+    crate::context::to_number(current_agent_mut()?, value)
+}
+
 /// Install the eight global function properties during
 /// SetDefaultGlobalBindings (spec 19.2).
 pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
+    // CreateBuiltinFunction (spec 10.2.3 step 1): the [[Prototype]] defaults
+    // to %Function.prototype%. The realm's post-pass only links intrinsics,
+    // and these functions live on the global object, so set it here.
+    let function_proto =
+        realm
+            .intrinsics
+            .get("%Function.prototype%")
+            .and_then(|value| match value {
+                Value::Function(function) => function.object.handle(),
+                _ => None,
+            });
     for (name, length, call) in [
         (
             "isFinite",
@@ -48,6 +86,11 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
+        if let Some(function_proto) = &function_proto {
+            function
+                .object
+                .set_prototype_of(Some(function_proto.clone()))?;
+        }
         realm.global_object.define_property_or_throw(
             &JsString::from_utf8(name),
             &crux::property::PropertyDescriptor {
@@ -63,22 +106,17 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     Ok(())
 }
 
-/// isFinite (spec 19.2.2): false for NaN and infinities.
+/// isFinite (spec 19.2.2): ToNumber (abrupt completions propagate), then
+/// false for NaN and infinities.
 fn is_finite(_this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let value = match to_number(&arg(args, 0)) {
-        Ok(number) => number,
-        Err(_) => return Ok(Value::Boolean(false)),
-    };
-    Ok(Value::Boolean(value.is_finite()))
+    let number = to_number_agent(&arg(args, 0))?;
+    Ok(Value::Boolean(number.is_finite()))
 }
 
 /// isNaN (spec 19.2.3).
 fn is_nan(_this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let value = match to_number(&arg(args, 0)) {
-        Ok(number) => number,
-        Err(_) => return Ok(Value::Boolean(true)),
-    };
-    Ok(Value::Boolean(value.is_nan()))
+    let number = to_number_agent(&arg(args, 0))?;
+    Ok(Value::Boolean(number.is_nan()))
 }
 
 /// The code points of the `uriReserved` set (`decodeURI`'s keep-set).
@@ -96,7 +134,7 @@ fn in_set(cp: u32, set: &[u8]) -> bool {
 /// Encode (spec 19.2.6.5): percent-encode every code point outside the
 /// unescaped set as UTF-8, rejecting lone surrogates.
 fn encode(args: &[Value], component: bool) -> Result<Value, JsError> {
-    let string = to_string(&arg(args, 0))?;
+    let string = to_string_agent(&arg(args, 0))?;
     let unescaped = if component {
         URI_UNESCAPED
     } else {
@@ -140,7 +178,7 @@ fn hex_value(unit: u16) -> Option<u8> {
 /// Decode (spec 19.2.6.6): un-percent-encode `%XX` escapes, validating the
 /// UTF-8 of multi-byte sequences; the reserved set keeps its escapes literal.
 fn decode(args: &[Value], component: bool) -> Result<Value, JsError> {
-    let string = to_string(&arg(args, 0))?;
+    let string = to_string_agent(&arg(args, 0))?;
     let reserved = if component { b"" } else { URI_RESERVED };
     let units = string.as_slice();
     let mut out = Vec::<u16>::new();
@@ -233,8 +271,9 @@ fn digit_value(unit: u16) -> Option<u32> {
 /// parseInt (spec 19.2.5): optional sign and radix, with the 0x/0o/0b
 /// inference when the radix is 0 or 16.
 pub(crate) fn parse_int(_this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let string = to_string(&arg(args, 0))?;
-    let radix_value = to_number(&arg(args, 1)).unwrap_or(0.0);
+    let string = to_string_agent(&arg(args, 0))?;
+    // spec step 6: R = ℝ(? ToInt32(radix)); NaN and infinities map to 0.
+    let radix_value = to_number_agent(&arg(args, 1))?;
     let units = string.as_slice();
     let mut index = 0;
     // Leading white space and line terminators (spec step 5).
@@ -255,7 +294,7 @@ pub(crate) fn parse_int(_this: &Value, args: &[Value]) -> Result<Value, JsError>
     }
     // spec steps 10-13: R = ToInt32(radix); the 0x/0o/0b prefixes are only
     // stripped when R is 0 or 16.
-    let r = radix_value as i32;
+    let r = crux::convert::to_int32(radix_value);
     let strip_prefix = r == 0 || r == 16;
     if r != 0 && !(2..=36).contains(&r) {
         return Ok(Value::Number(f64::NAN));
@@ -303,7 +342,7 @@ pub(crate) fn parse_int(_this: &Value, args: &[Value]) -> Result<Value, JsError>
 /// parseFloat (spec 19.2.4): the longest prefix matching the decimal-literal
 /// grammar, or NaN.
 pub(crate) fn parse_float(_this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let string = to_string(&arg(args, 0))?;
+    let string = to_string_agent(&arg(args, 0))?;
     let units = string.as_slice();
     let mut index = 0;
     while index < units.len() && is_whitespace(units[index]) {
@@ -402,6 +441,106 @@ mod tests {
         assert_eq!(run("isNaN(NaN)").unwrap(), Value::Boolean(true));
         assert_eq!(run("isNaN('x')").unwrap(), Value::Boolean(true));
         assert_eq!(run("isNaN(5)").unwrap(), Value::Boolean(false));
+    }
+
+    #[test]
+    fn is_finite_is_nan_coercion_and_abrupts() {
+        // Objects unbox through the agent's valueOf/toString (spec 19.2.2/3).
+        assert_eq!(run("isFinite([1])").unwrap(), Value::Boolean(true));
+        assert_eq!(run("isFinite([Infinity])").unwrap(), Value::Boolean(false));
+        assert_eq!(
+            run("isFinite({ valueOf: function () { return 5; } })").unwrap(),
+            Value::Boolean(true)
+        );
+        // ToNumber abrupt completions propagate instead of collapsing to a
+        // boolean (spec step 1 uses ? ToNumber).
+        assert!(matches!(
+            run("isFinite(Symbol())"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+        assert!(matches!(
+            run("isNaN(Symbol())"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+        // A user valueOf throw propagates as a wrapped TypeError (the thrown
+        // value is attached), not a collapsed false/true.
+        assert!(matches!(
+            run("isFinite({ valueOf: function () { throw 'boom'; } })"),
+            Err(e) if e.kind == ErrorKind::TypeError && e.value.is_some()
+        ));
+    }
+
+    #[test]
+    fn parse_int_radix_to_int32() {
+        // ToInt32 semantics for the radix (spec 19.2.5 step 6): NaN and the
+        // infinities map to 0, and out-of-range values wrap modulo 2^32.
+        assert_eq!(
+            run("parseInt('11', NaN)").unwrap(),
+            run("parseInt('11', 10)").unwrap()
+        );
+        assert_eq!(
+            run("parseInt('11', Infinity)").unwrap(),
+            run("parseInt('11', 10)").unwrap()
+        );
+        assert_eq!(
+            run("parseInt('11', 4294967298)").unwrap(),
+            run("parseInt('11', 2)").unwrap()
+        );
+        assert_eq!(
+            run("parseInt('11', 4294967296)").unwrap(),
+            run("parseInt('11', 10)").unwrap()
+        );
+        assert!(is_nan_value(&run("parseInt('11', -2147483650)").unwrap()));
+        // An object radix unboxes through the agent, and a throwing valueOf
+        // propagates.
+        assert_eq!(
+            run("parseInt('11', { valueOf: function () { return 2; } })").unwrap(),
+            Value::Number(3.0)
+        );
+        assert!(matches!(
+            run("parseInt('11', { valueOf: function () { throw 'e'; } })"),
+            Err(e) if e.kind == ErrorKind::TypeError && e.value.is_some()
+        ));
+    }
+
+    #[test]
+    fn parse_float_and_int_unbox_objects() {
+        assert_eq!(
+            run("parseFloat({ toString: function () { return '3.5'; } })").unwrap(),
+            Value::Number(3.5)
+        );
+        assert!(is_nan_value(
+            &run("parseFloat({ valueOf: function () { return 1; } })").unwrap()
+        ));
+        assert_eq!(
+            run("parseInt({ toString: function () { return '11'; } }, { valueOf: function () { return 2; } })")
+                .unwrap(),
+            Value::Number(3.0)
+        );
+    }
+
+    #[test]
+    fn global_functions_inherit_function_prototype() {
+        // CreateBuiltinFunction (spec 10.2.3): the [[Prototype]] is
+        // %Function.prototype%, so hasOwnProperty/call/apply resolve.
+        assert_eq!(
+            run("encodeURI.hasOwnProperty('length')").unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            run("Object.getPrototypeOf(parseInt) === Function.prototype").unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            run("parseInt.call(null, '10', 2)").unwrap(),
+            Value::Number(2.0)
+        );
+        // After deleting its own length, the lookup reaches
+        // %Function.prototype%'s length (0), so it is not undefined.
+        assert_eq!(
+            run("delete encodeURI.length; String(encodeURI.length)").unwrap(),
+            str("0")
+        );
     }
 
     #[test]

@@ -48,7 +48,7 @@ Two harnesses live in `crates/test262`:
 
 ## Current results
 
-Workspace-wide: **4075 tests pass, 0 failures** (`cargo test --workspace`),
+Workspace-wide: **4079 tests pass, 0 failures** (`cargo test --workspace`),
 of which the test262 crate contributes **3317 passing fixtures** (44
 language-area + 3275 built-ins fixtures); the remaining registered test is
 the ignored `scan_builtins_directories` directory scanner. The `workers`
@@ -504,6 +504,35 @@ a stage-3 proposal, out of scope like Intl. Fixes in
   null `Ctor.prototype` threw instead of falling back to `%Date.prototype%`
   (GetPrototypeFromConstructor, spec 10.1.8).
 
+### Global functions cluster sweep (Phase 18 conformance)
+
+Sweeps of the six global-function trees (`isFinite*`, `isNaN*`,
+`parseFloat*`, `parseInt*`, `encodeURI*`, `decodeURI*`) report **231 pass,
+0 fail, 81 skip** of 312 fixtures: every runnable fixture passes (up from
+200 pass / 31 fail). The skips are the standard taxonomy (unsupported
+includes `decimalToHexString.js`/`nans.js`, host-dependent
+`$262.createRealm`). Fixes in `crates/runtime/src/builtins/global.rs`:
+
+- **The global functions had a null [[Prototype]]** — `create_builtin` is
+  called with `None` and the realm's post-pass only re-parents
+  *intrinsic*-registered functions, so `encodeURI.hasOwnProperty` and
+  `parseInt.call` were undefined. The install now links
+  `%Function.prototype%` explicitly (CreateBuiltinFunction, spec 10.2.3);
+  after `delete encodeURI.length` the lookup resolves to
+  `%Function.prototype%`'s own length (0), as the Sputnik fixtures expect.
+- **Coercions ran the pure crux conversions** — object arguments hit the
+  `%Object.prototype.valueOf%`/`toString` placeholders. All ToString and
+  ToNumber now run through the agent recovered from the `with_agent`
+  window (`isFinite([1])`, `parseFloat({ toString: () => "3.5" })`,
+  `parseInt({ toString: ... }, { valueOf: ... })`, `encodeURI(...)`).
+- **`isFinite`/`isNaN` swallowed ToNumber errors** — spec 19.2.2/19.2.3
+  use `? ToNumber`, so `isFinite(Symbol())` and a throwing `valueOf` now
+  propagate instead of collapsing to false/true.
+- **`parseInt` radix used `f64 as i32`** — ±Infinity saturated to
+  `i32::MAX`/`MIN` instead of ToInt32's 0, and out-of-range values did not
+  wrap. The radix now goes through `crux::convert::to_int32`
+  (`parseInt("11", Infinity)` → 11, `parseInt("11", 4294967298)` → 3).
+
 ### BigInt cluster sweep (Phase 18 conformance)
 
 A sweep of the whole `BigInt/*` tree (`sweep.exe built-ins --filter
@@ -658,17 +687,18 @@ TypedArray fixtures that pass with the long timeout (see below).
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,798 | 15,878 | 4,508 | 3,409 | 3¹ | 77.9% |
+| built-ins | 23,798 | 15,909 | 4,477 | 3,409 | 3¹ | 78.0% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,608** | **32,321** | **7,114** | **9,170** | **3** | **82.0%** |
+| **Total** | **48,608** | **32,352** | **7,083** | **9,170** | **3** | **82.0%** |
 
 (Runnable = pass + fail; the 9,170 skips are module/async fixtures,
 unsupported harness includes, and the out-of-scope Temporal proposal
 fixtures.) The built-ins row reflects the current
 `Error*`/`BigInt*`/RegExp/Object-descriptor hardening plus the
 String/prototype, Object/create, DisposableStack, AsyncDisposableStack,
-ArrayBuffer/SharedArrayBuffer, Date, and BigInt cluster closures (all 0
-fail); the language and annexB rows are from the sweep recorded below.
+ArrayBuffer/SharedArrayBuffer, Date, BigInt, and global-functions cluster
+closures (all 0 fail); the language and annexB rows are from the sweep
+recorded below.
 
 ¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
 coerced-values fixtures — 10,000-element allocations that need the long
