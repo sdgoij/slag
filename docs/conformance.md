@@ -1102,6 +1102,40 @@ Validation: `cargo test --workspace` **4085 pass, 0 failures**;
 `cargo fmt --all --check` clean. A full `built-ins` re-sweep shows exactly
 **6 fixtures fixed** (16,898 pass / 375 fail / 0 crash) and no regressions.
 
+### JSON.stringify cluster sweep (Phase 18 conformance)
+
+A sweep of the `JSON/stringify/*` tree (66 fixtures) reports **64 pass, 0
+fail, 2 skip** of 66 fixtures: every runnable fixture passes (up from 58
+pass / 6 fail). Fixes in `crates/runtime/src/builtins/json.rs`:
+
+- **Boxed Number/String values used their stored primitive instead of the
+  conversion** — SerializeJSONProperty (spec 26.6.3.2 steps 4.a/4.d)
+  converts wrappers via `ToNumber`/`ToString`, which must invoke an
+  overridden `valueOf`/`toString` (`new Number(42)` with `valueOf: () =>
+  2` serialized as `42`, not `2`, and a throwing `toString` was never
+  reached). The conversion now runs through the agent; Boolean/BigInt
+  wrappers keep their stored primitive per the fixtures (`value-number-
+  object.js`, `value-string-object.js`).
+- **The replacer array coerced every object** — only values with a
+  [[StringData]]/[[NumberData]] slot are converted (via ToString, honoring
+  overrides); `true`/`false`/`null`/Symbols/plain objects are ignored
+  (spec 26.6.3.1 step 5; `replacer-array-wrong-type.js`,
+  `replacer-array-number-object.js`).
+- **The `space` argument ToPrimitive'd every object** — a plain `{}`
+  became `"[object Ob"` (the first ten chars of its `toString`) instead
+  of the empty gap. Only objects with [[NumberData]]/[[StringData]] are
+  converted (spec 26.6.3.1 steps 8-10); everything else is ignored
+  (`space-wrong-type.js`, `space-string-object.js`).
+- **A revoked-proxy replacer array was treated as empty** — `IsArray` on
+  a revoked proxy throws a TypeError (spec 7.2.2 step 3.a); the replacer
+  handling now rejects it before the property-list walk
+  (`replacer-array-proxy-revoked.js`).
+
+Validation: `cargo test --workspace` **4085 pass, 0 failures**;
+`cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo fmt --all --check` clean. A full `built-ins` re-sweep shows exactly
+**6 fixtures fixed** (16,904 pass / 369 fail / 0 crash) and no regressions.
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~120 edge-case unit tests were added across
@@ -1211,9 +1245,9 @@ annexB rows are from the earlier run and have not changed since.
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,812 | 16,898 | 375 | 6,536 | 3¹ | 97.8% |
+| built-ins | 23,812 | 16,904 | 369 | 6,536 | 3¹ | 97.9% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,622** | **33,341** | **2,981** | **12,297** | **3** | **91.8%** |
+| **Total** | **48,622** | **33,347** | **2,975** | **12,297** | **3** | **91.8%** |
 
 (Runnable = pass + fail; the 9,171 skips are module/async fixtures,
 unsupported harness includes, and the out-of-scope Temporal proposal
@@ -1224,12 +1258,12 @@ ArrayBuffer/SharedArrayBuffer, Date, BigInt, global-functions, Function,
 Iterator/prototype, Iterator statics (concat/from/zip/zipKeyed), Symbol,
 Boolean, Number, Object.prototype.toString, Object/prototype legacy
 accessors, Proxy, Reflect, Object.groupBy, Object
-freeze/seal/isFrozen/isSealed, Array iteration-method, Array.of, Math, and
-Object.fromEntries cluster closures (all 0 fail); the language and annexB
-rows are from the sweep recorded below. The 6,536 built-ins skips are
-dominated by the out-of-scope Temporal proposal (4,611), with the
-async/module flags, host-dependent `$262.createRealm`, and unsupported
-harness includes making up the rest.
+freeze/seal/isFrozen/isSealed, Array iteration-method, Array.of, Math,
+Object.fromEntries, and JSON.stringify cluster closures (all 0 fail); the
+language and annexB rows are from the sweep recorded below. The 6,536
+built-ins skips are dominated by the out-of-scope Temporal proposal
+(4,611), with the async/module flags, host-dependent `$262.createRealm`,
+and unsupported harness includes making up the rest.
 
 ¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
 coerced-values fixtures — 10,000-element allocations that need the long
@@ -1314,7 +1348,7 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 ## Open items
 
 - Certify the ≥95%-of-runnable target: the built-ins area now measures
-  **97.8%** of runnable (16,898 pass / 375 fail of 17,273, with the
+  **97.9%** of runnable (16,904 pass / 369 fail of 17,273, with the
   out-of-scope Temporal fixtures skipped, `--timeout 60
   --recheck-timeout 45`, release build), 0 crashes and 0 hangs with the
   long timeout. The remaining gap is the systematic bug clusters triaged

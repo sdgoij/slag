@@ -567,23 +567,42 @@ fn json_stringify(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
         Value::Object(_) | Value::Function(_) => {
             if is_callable(&replacer) {
                 (Some(replacer.clone()), None)
-            } else if crate::builtins::array::is_array(&replacer) {
-                (None, Some(property_list_from(agent, &replacer)?))
             } else {
-                (None, None)
+                // spec 26.6.3.1 step 4.b.i: IsArray on a revoked proxy
+                // throws a TypeError.
+                if let Value::Object(obj) = &replacer
+                    && let crux::object::ObjectKind::Proxy(slots) = &obj.kind
+                    && slots.target.borrow().is_none()
+                {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "Cannot perform operation on a revoked Proxy".into(),
+                    ));
+                }
+                if crate::builtins::array::is_array(&replacer) {
+                    (None, Some(property_list_from(agent, &replacer)?))
+                } else {
+                    (None, None)
+                }
             }
         }
         _ => (None, None),
     };
 
     let gap = match &space {
-        Value::Object(_) | Value::Function(_) => {
-            let prim = crate::context::to_primitive(
-                agent,
-                &space,
-                crux::convert::ToPrimitiveHint::Number,
-            )?;
-            space_string(&prim)?
+        Value::Object(obj) => {
+            // spec 26.6.3.1 steps 8-10: only wrappers with [[NumberData]]
+            // or [[StringData]] are converted (honoring overrides); any
+            // other object is ignored.
+            if agent.number_data.contains_key(&obj.id()) {
+                space_string(&Value::Number(crate::context::to_number(agent, &space)?))?
+            } else if matches!(obj.kind, crux::object::ObjectKind::String(_)) {
+                space_string(&Value::String(Handle::new(crate::context::to_string(
+                    agent, &space,
+                )?)))?
+            } else {
+                String::new()
+            }
         }
         other => space_string(other)?,
     };
@@ -653,10 +672,17 @@ fn property_list_from(agent: &mut Agent, replacer: &Value) -> Result<Vec<JsStrin
                     list.push(text);
                 }
             }
-            Value::Object(_) | Value::Function(_) => {
-                let text = to_string_arg(agent, &item)?;
-                if !list.contains(&text) {
-                    list.push(text);
+            Value::Object(obj) => {
+                // spec 26.6.3.1 step 5.e: an object with [[StringData]] or
+                // [[NumberData]] is coerced via ToString (honoring
+                // overrides); any other object is ignored.
+                let has_slot = agent.number_data.contains_key(&obj.id())
+                    || matches!(obj.kind, crux::object::ObjectKind::String(_));
+                if has_slot {
+                    let text = crate::context::to_string(agent, &item)?;
+                    if !list.contains(&text) {
+                        list.push(text);
+                    }
                 }
             }
             _ => {}
@@ -693,13 +719,15 @@ fn serialize_json_property(
             return Ok(Some(source));
         }
         // Unbox the Number/String/Boolean/BigInt wrappers (spec 26.6.3.2
-        // steps 4.b-d).
-        if let Some(n) = agent.number_data.get(&obj.id()) {
-            value = Value::Number(*n);
+        // steps 4.a-d). Number and String wrappers convert through the
+        // agent (ToNumber/ToString honor overridden valueOf/toString);
+        // Boolean/BigInt wrappers serialize their stored primitive.
+        if agent.number_data.contains_key(&obj.id()) {
+            value = Value::Number(crate::context::to_number(agent, &value)?);
         } else if let Some(b) = agent.boolean_data.get(&obj.id()) {
             value = Value::Boolean(*b);
-        } else if let crux::object::ObjectKind::String(s) = &obj.kind {
-            value = Value::String(s.clone());
+        } else if matches!(obj.kind, crux::object::ObjectKind::String(_)) {
+            value = Value::String(Handle::new(crate::context::to_string(agent, &value)?));
         } else if let Some(big) = agent.bigint_data.get(&obj.id()) {
             value = Value::BigInt(Handle::new(big.clone()));
         }
