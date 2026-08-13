@@ -40,13 +40,26 @@ fn placeholder(name: &'static str) -> NativeFn {
 fn this_number_value(agent: &Agent, this: &Value) -> Result<f64, JsError> {
     match this {
         Value::Number(n) => Ok(*n),
-        Value::Object(obj) => match agent.number_data.get(&obj.id()) {
-            Some(n) => Ok(*n),
-            None => Err(JsError::new(
-                ErrorKind::TypeError,
-                "Number.prototype method called on an incompatible receiver".into(),
-            )),
-        },
+        Value::Object(obj) => {
+            // %Number.prototype% wraps 0 per spec (21.1.3.1); the agent tables
+            // are populated only by `new Number(v)`.
+            let is_prototype = agent
+                .current_realm()
+                .ok()
+                .and_then(|realm| realm.intrinsics.get(NUMBER_PROTO))
+                .as_ref()
+                == Some(this);
+            if is_prototype {
+                return Ok(0.0);
+            }
+            match agent.number_data.get(&obj.id()) {
+                Some(n) => Ok(*n),
+                None => Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "Number.prototype method called on an incompatible receiver".into(),
+                )),
+            }
+        }
         _ => Err(JsError::new(
             ErrorKind::TypeError,
             "Number.prototype method called on an incompatible receiver".into(),
@@ -117,13 +130,14 @@ fn number_call(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
 
 /// spec 21.1.3.4 Number.prototype.toFixed(fractionDigits): exact digits with
 /// half-up rounding at 10^f (spec 21.1.3.4 steps 9-15).
-fn to_fixed(agent: &Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+fn to_fixed(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    // spec 21.1.3.4 step 1: ThisNumberValue — a Number object or primitive.
     let number = this_number_value(agent, this)?;
     let fraction = args.first().cloned().unwrap_or(Value::Undefined);
     let fraction_count = if matches!(fraction, Value::Undefined) {
         0.0
     } else {
-        to_integer_or_infinity(to_number(&fraction)?)
+        to_integer_or_infinity(crate::context::to_number(agent, &fraction)?)
     };
     if !fraction_count.is_finite() || fraction_count < 0.0 || fraction_count > 100.0 {
         return Err(JsError::new(
@@ -176,20 +190,23 @@ fn shortest_digits(x: f64) -> (String, i32) {
     let lead = combined
         .find(|c| c != '0')
         .unwrap_or(combined.len().saturating_sub(1));
-    let digits = combined[lead..].to_string();
+    // The shortest round-trip mantissa drops trailing zeros ("100" → "1").
+    let digits = combined[lead..].trim_end_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits }.to_string();
     let exponent = int_part.len() as i32 - lead as i32 - 1 + e_notation;
     (digits, exponent)
 }
 
 /// spec 21.1.3.2 Number.prototype.toExponential(fractionDigits).
-fn to_exponential(agent: &Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+fn to_exponential(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    // spec 21.1.3.3 step 1: ThisNumberValue — a Number object or primitive.
     let number = this_number_value(agent, this)?;
     let fraction = args.first().cloned().unwrap_or(Value::Undefined);
     let f_is_undefined = matches!(fraction, Value::Undefined);
     let fraction_count = if f_is_undefined {
         0.0
     } else {
-        to_integer_or_infinity(to_number(&fraction)?)
+        to_integer_or_infinity(crate::context::to_number(agent, &fraction)?)
     };
     if !number.is_finite() {
         return Ok(number_to_string(number));
@@ -200,7 +217,8 @@ fn to_exponential(agent: &Agent, this: &Value, args: &[Value]) -> Result<Value, 
             "toExponential() digits argument must be between 0 and 100".into(),
         ));
     }
-    let negative = number < 0.0 || (number == 0.0 && number.is_sign_negative());
+    // spec 21.1.3.3 step 3: the sign is present only when x < 0 (-0 has none).
+    let negative = number < 0.0;
     let abs = number.abs();
     let (exponent, digits) = if abs == 0.0 {
         (0i32, "0".repeat(fraction_count as usize + 1))
@@ -224,13 +242,14 @@ fn to_exponential(agent: &Agent, this: &Value, args: &[Value]) -> Result<Value, 
 }
 
 /// spec 21.1.3.5 Number.prototype.toPrecision(precision).
-fn to_precision(agent: &Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+fn to_precision(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    // spec 21.1.3.6 step 1: ThisNumberValue — a Number object or primitive.
     let number = this_number_value(agent, this)?;
     let precision = args.first().cloned().unwrap_or(Value::Undefined);
     if matches!(precision, Value::Undefined) {
         return Ok(number_to_string(number));
     }
-    let precision_count = to_integer_or_infinity(to_number(&precision)?);
+    let precision_count = to_integer_or_infinity(crate::context::to_number(agent, &precision)?);
     if !number.is_finite() {
         return Ok(number_to_string(number));
     }
@@ -241,7 +260,8 @@ fn to_precision(agent: &Agent, this: &Value, args: &[Value]) -> Result<Value, Js
         ));
     }
     let p = precision_count as u32;
-    let negative = number < 0.0 || (number == 0.0 && number.is_sign_negative());
+    // spec 21.1.3.6 step 4: the sign is present only when x < 0 (-0 has none).
+    let negative = number < 0.0;
     let abs = number.abs();
     let mut out = String::new();
     if negative {
@@ -284,13 +304,14 @@ fn to_precision(agent: &Agent, this: &Value, args: &[Value]) -> Result<Value, Js
 }
 
 /// spec 21.1.3.6 Number.prototype.toString(radix).
-fn to_string_method(agent: &Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+fn to_string_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    // spec 21.1.3.2 step 1: ThisNumberValue — a Number object or primitive.
     let number = this_number_value(agent, this)?;
     let radix = args.first().cloned().unwrap_or(Value::Undefined);
     let radix_value = if matches!(radix, Value::Undefined) {
         10.0
     } else {
-        to_integer_or_infinity(to_number(&radix)?)
+        to_integer_or_infinity(crate::context::to_number(agent, &radix)?)
     };
     if radix_value < 2.0 || radix_value > 36.0 {
         return Err(JsError::new(
@@ -349,6 +370,10 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .get("%Object.prototype%")
         .and_then(|value| as_object(&value));
     let number_proto = JsObject::ordinary_object_create(object_proto);
+    // spec 21.1.3: %Number.prototype% is a Number object wrapping 0, so
+    // `%Object.prototype.toString%` reports "[object Number]" and ToNumber
+    // coercion yields 0.
+    *number_proto.boxed.borrow_mut() = Some(crux::object::BoxedPrimitive::Number(0.0));
     let number_proto_value = Value::Object(number_proto.clone());
 
     let number_ctor = Function::create_builtin(
@@ -413,9 +438,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     }
 
     // spec 21.1.2: function statics have { W: true, E: false, C: true }.
-    let statics: [(&str, u64, StaticFn); 6] = [
-        ("parseFloat", 1, crate::builtins::global::parse_float),
-        ("parseInt", 2, crate::builtins::global::parse_int),
+    let statics: [(&str, u64, StaticFn); 4] = [
         ("isFinite", 1, is_finite),
         ("isInteger", 1, is_integer),
         ("isNaN", 1, is_nan),
@@ -440,6 +463,23 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
                 configurable: Some(true),
             },
         )?;
+    }
+    // spec 21.1.2.9/21.1.2.13: Number.parseInt/parseFloat are the same
+    // built-in function objects as the global properties (spec 18.2.4/5).
+    for name in ["parseInt", "parseFloat"] {
+        if let Ok(value) = realm.global_object.get(&JsString::from_utf8(name)) {
+            number_ctor.define_property(
+                &JsString::from_utf8(name),
+                &PropertyDescriptor {
+                    value: Some(value),
+                    writable: Some(true),
+                    get: None,
+                    set: None,
+                    enumerable: Some(false),
+                    configurable: Some(true),
+                },
+            )?;
+        }
     }
 
     // spec 21.1.3: prototype methods, all agent-dispatched.
@@ -528,10 +568,7 @@ pub fn dispatch_call(
         return Some(this_number_value(agent, this).map(Value::Number));
     }
     if intrinsics.get(TO_LOCALE_STRING).as_ref() == Some(callee) {
-        return match this_number_value(agent, this) {
-            Ok(n) => Some(Ok(number_to_string(n))),
-            Err(e) => Some(Err(e)),
-        };
+        return Some(this_number_value(agent, this).map(number_to_string));
     }
     None
 }

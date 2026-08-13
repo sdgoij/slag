@@ -38,6 +38,10 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .get("%Object.prototype%")
         .and_then(|value| as_object(&value));
     let boolean_proto = JsObject::ordinary_object_create(object_proto);
+    // spec 20.3.3: %Boolean.prototype% is a Boolean object wrapping false, so
+    // `%Object.prototype.toString%` reports "[object Boolean]" and the `==`
+    // coercion yields false.
+    *boolean_proto.boxed.borrow_mut() = Some(crux::object::BoxedPrimitive::Boolean(false));
     let boolean_proto_value = Value::Object(boolean_proto.clone());
 
     let boolean_ctor = Function::create_builtin(

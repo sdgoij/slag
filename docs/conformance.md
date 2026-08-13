@@ -727,6 +727,37 @@ passes (up from 76 pass / 5 fail). Fixes in
 - **`%Promise%[@@species]`** was a data property; the spec (27.2.4.6)
   defines a getter accessor named `get [Symbol.species]` returning `this`.
 
+### Boolean and Number cluster sweeps (Phase 18 conformance)
+
+Sweeps of the `Boolean/*` (51 fixtures) and `Number/*` (340 fixtures) trees
+report **50 pass, 0 fail** and **339 pass, 0 fail** respectively (up from
+49 + 1 and 284 + 55). Fixes in `crates/runtime/src/builtins/boolean.rs`,
+`crates/runtime/src/builtins/number.rs`, and
+`crates/runtime/src/builtins/object.rs`:
+
+- **`%Boolean.prototype%` / `%Number.prototype%` are wrappers** — per spec
+  (20.3.3/21.1.3) the prototypes are Boolean/Number objects wrapping
+  *false*/*+0*; both now carry the boxed-primitive marker, so
+  `Boolean.prototype == false`, `Boolean.prototype.toString()` is
+  "[object Boolean]", and `Number.prototype.toString(2)` is "0" (the
+  methods' ThisNumberValue accepts the prototypes).
+- **`%Object.prototype.toString%` tags** now come from the boxed marker
+  (Boolean/Number/BigInt wrappers) before falling back to the agent brand
+  slots and the object kind (spec 20.1.3.6 steps 6-14).
+- **Number method receivers** — the Sputnik `S15.7.4*` fixtures call the
+  prototype methods directly and on foreign objects; ThisNumberValue
+  rejects the foreign receivers with a TypeError as spec'd, while the
+  `fractionDigits`/`precision`/`radix` arguments now coerce through the
+  agent (object arguments with `valueOf`/`toString` work).
+- **`-0` formatting** — `toExponential`/`toPrecision` printed a leading
+  "-" for `-0`; the sign is present only when `x < 0` (spec 21.1.3.3/6).
+- **`toExponential()` shortest digits** — the mantissa kept trailing zeros
+  (`(100).toExponential()` → "1.00e+2"); the round-trip digits are now
+  trimmed to the shortest form ("1e+2").
+- **`Number.parseInt`/`parseFloat`** — the statics were fresh functions;
+  they are now the same built-in function objects as the global
+  `parseInt`/`parseFloat` (spec 21.1.2.9/13).
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~120 edge-case unit tests were added across
@@ -833,9 +864,9 @@ TypedArray fixtures that pass with the long timeout (see below).
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,798 | 16,289 | 4,096 | 3,410 | 3¹ | 79.9% |
+| built-ins | 23,798 | 16,345 | 4,040 | 3,410 | 3¹ | 80.2% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,608** | **32,732** | **6,702** | **9,171** | **3** | **83.0%** |
+| **Total** | **48,608** | **32,788** | **6,646** | **9,171** | **3** | **83.2%** |
 
 (Runnable = pass + fail; the 9,171 skips are module/async fixtures,
 unsupported harness includes, and the out-of-scope Temporal proposal
@@ -843,9 +874,9 @@ fixtures.) The built-ins row reflects the current
 `Error*`/`BigInt*`/RegExp/Object-descriptor hardening plus the
 String/prototype, Object/create, DisposableStack, AsyncDisposableStack,
 ArrayBuffer/SharedArrayBuffer, Date, BigInt, global-functions, Function,
-Iterator/prototype, Iterator statics (concat/from/zip/zipKeyed), and
-Symbol cluster closures (all 0 fail); the language and annexB rows are
-from the sweep recorded below.
+Iterator/prototype, Iterator statics (concat/from/zip/zipKeyed), Symbol,
+Boolean, and Number cluster closures (all 0 fail); the language and
+annexB rows are from the sweep recorded below.
 
 ¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
 coerced-values fixtures — 10,000-element allocations that need the long

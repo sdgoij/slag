@@ -265,28 +265,38 @@ fn prototype_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsError
         Value::Symbol(_) => "Symbol".to_string(),
         Value::Function(_) => "Function".to_string(),
         Value::Object(obj) => {
-            if agent.boolean_data.contains_key(&obj.id()) {
-                "Boolean".to_string()
-            } else if agent.error_data.contains(&obj.id()) {
-                "Error".to_string()
-            } else if agent.regexp_data.contains_key(&obj.id()) {
-                // RegExp is branded via its [[RegExpMatcher]] slot (its
-                // @@toStringTag was removed from the spec).
-                "RegExp".to_string()
-            } else {
-                // spec step 6.c: an own or inherited @@toStringTag string
-                // overrides the built-in tag.
-                let tag = crate::context::get_property_key(
-                    agent,
-                    this,
-                    &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
-                    this.clone(),
-                )?;
-                match tag {
-                    Value::String(text) => {
-                        return Ok(str(&format!("[object {}]", text.to_string_lossy())));
+            // Wrapper objects and the %Boolean%/%Number% prototypes carry the
+            // boxed-primitive marker; errors and RegExp are branded by their
+            // agent slots.
+            match &*obj.boxed.borrow() {
+                Some(crux::object::BoxedPrimitive::Boolean(_)) => "Boolean".to_string(),
+                Some(crux::object::BoxedPrimitive::Number(_)) => "Number".to_string(),
+                Some(crux::object::BoxedPrimitive::BigInt(_)) => "BigInt".to_string(),
+                None => {
+                    if agent.error_data.contains(&obj.id()) {
+                        "Error".to_string()
+                    } else if agent.regexp_data.contains_key(&obj.id()) {
+                        // RegExp is branded via its [[RegExpMatcher]] slot (its
+                        // @@toStringTag was removed from the spec).
+                        "RegExp".to_string()
+                    } else {
+                        // spec step 6.c: an own or inherited @@toStringTag
+                        // string overrides the built-in tag.
+                        let tag = crate::context::get_property_key(
+                            agent,
+                            this,
+                            &PropertyKey::Symbol(
+                                crux::symbol::well_known("toStringTag").as_ref().clone(),
+                            ),
+                            this.clone(),
+                        )?;
+                        match tag {
+                            Value::String(text) => {
+                                return Ok(str(&format!("[object {}]", text.to_string_lossy())));
+                            }
+                            _ => obj.kind.name().to_string(),
+                        }
                     }
-                    _ => obj.kind.name().to_string(),
                 }
             }
         }
