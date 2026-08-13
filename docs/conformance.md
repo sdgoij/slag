@@ -454,6 +454,56 @@ Note: the two pre-existing `TypedArray/prototype/set/BigInt/*` failures
 (BigInt/non-BigInt typed-array `set` mismatch) are outside this cluster
 and remain open.
 
+### Date cluster sweep (Phase 18 conformance)
+
+A sweep of the entire Date tree (`sweep.exe built-ins --filter 'Date*'`)
+reports **573 pass, 0 fail, 21 skip** of 594 fixtures: every runnable
+fixture passes (up from 507 pass / 74 fail). The skips are the standard
+taxonomy plus a new one: fixtures declaring `features: [Temporal]` (the
+`Date/prototype/toTemporalInstant` cluster) are skipped because Temporal is
+a stage-3 proposal, out of scope like Intl. Fixes in
+`crates/runtime/src/builtins/date.rs` and the harness:
+
+- **`Date.prototype[@@toPrimitive]` was missing** — unary `+`/binary `+`/
+  comparisons on dates fell through to a placeholder. Implemented per spec
+  21.4.3.5: the hint is compared as a String value (anything else,
+  including a missing argument, throws a TypeError), `"default"` prefers
+  the string form (tryFirst string), and OrdinaryToPrimitive runs with the
+  chosen order.
+- **Setter argument coercion order:** `setHours`/`setFullYear`/etc.
+  returned NaN for invalid dates before coercing their arguments, and the
+  crux (non-agent) `to_number` failed on object arguments. The provided
+  arguments are now ToNumber'd in order through the agent first; the
+  namesake component is always coerced (an absent argument is undefined
+  and yields NaN), later components keep the base when absent.
+- **`setFullYear`/`setUTCFullYear` on invalid dates:** the spec converts a
+  NaN stored value to +0 instead of failing, so `setFullYear(2016)` on
+  `new Date(NaN)` produces a real date.
+- **`setDate`/`setTime`:** the argument is coerced before the NaN check but
+  the slot is left untouched on NaN; `setTime` validates the receiver's
+  [[DateValue]] slot before coercing (a non-Date receiver throws first).
+- **TimeClip -0:** `new Date(-0).getTime()` returned -0; TimeClip now adds
+  +0 per spec 21.4.1.15 step 3.
+- **`Date.UTC`/constructor year offset:** the 0-99 → 1900 offset applied
+  to the raw year, so `Date.UTC(-0.999999, 0)` missed the offset; it now
+  applies to `ToInteger(year)` (where -0.9 truncates to -0 and counts as
+  0), and both coerce their arguments through the agent in order.
+- **`Date.parse`:** results were not TimeClip'd (out-of-range strings
+  returned values instead of NaN) and `-000000` extended years were
+  accepted; both fixed, and the string is coerced through the agent.
+- **1-argument constructor:** an object with a `[[DateValue]]` slot is
+  cloned directly (no ToPrimitive), so `new Date(date)` with overridden
+  `toString`/`valueOf` still copies the time value.
+- **`toJSON` was Date-specific:** it rejected plain-object receivers;
+  rewritten as the generic spec 21.4.4.36 (ToObject, ToPrimitive(Number)
+  for the non-finite → null check, then Invoke `toISOString`).
+- **Negative-year serialization:** `toDateString`/`toString`/`toUTCString`
+  padded negative years to six digits (`-000001`); they now pad to at
+  least four (`-0001`).
+- **`new Date` subclassing:** `Reflect.construct(Date, …, Ctor)` with a
+  null `Ctor.prototype` threw instead of falling back to `%Date.prototype%`
+  (GetPrototypeFromConstructor, spec 10.1.8).
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~120 edge-case unit tests were added across
@@ -534,6 +584,7 @@ The harness's skip taxonomy (also used by the sweep):
 |---|---|
 | `flags: module` | No module loader: `import`/`export` parse, but linking, `dynamic import`, and `import.meta` are host-dependent (see below). |
 | `flags: async` | The `$DONE` async harness is not provided; async semantics are covered by the runtime's own async test suites. |
+| `features: [Temporal]` | Temporal is a stage-3 proposal, not part of ECMA-262 ES2026 (out of scope like Intl). |
 | Unsupported `includes:` | Fixtures needing harness helpers beyond `assert.js`, `compareArray.js`, `detachArrayBuffer.js`, `isConstructor.js`, `propertyHelper.js`, `testAtomics.js`, `testTypedArray.js` are not run. |
 | Intl directories | `Intl` (ECMA-402) is out of scope for this runtime (PLAN scope decision). |
 
@@ -559,16 +610,17 @@ TypedArray fixtures that pass with the long timeout (see below).
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,798 | 15,791 | 4,603 | 3,401 | 3¹ | 77.4% |
+| built-ins | 23,798 | 15,857 | 4,529 | 3,409 | 3¹ | 77.8% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,608** | **32,234** | **7,209** | **9,162** | **3** | **81.7%** |
+| **Total** | **48,608** | **32,300** | **7,135** | **9,170** | **3** | **81.9%** |
 
-(Runnable = pass + fail; the 9,162 skips are module/async fixtures and
-unsupported harness includes.) The built-ins row reflects the current
+(Runnable = pass + fail; the 9,170 skips are module/async fixtures,
+unsupported harness includes, and the out-of-scope Temporal proposal
+fixtures.) The built-ins row reflects the current
 `Error*`/`BigInt*`/RegExp/Object-descriptor hardening plus the
-String/prototype, Object/create, DisposableStack, AsyncDisposableStack, and
-ArrayBuffer/SharedArrayBuffer cluster closures (all 0 fail); the language
-and annexB rows are from the sweep recorded below.
+String/prototype, Object/create, DisposableStack, AsyncDisposableStack,
+ArrayBuffer/SharedArrayBuffer, and Date cluster closures (all 0 fail); the
+language and annexB rows are from the sweep recorded below.
 
 ¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
 coerced-values fixtures — 10,000-element allocations that need the long

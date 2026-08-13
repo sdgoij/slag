@@ -6,14 +6,14 @@
 //! plumbing is documented follow-up work); every other spec algorithm is
 //! exact.
 
-use crux::convert::to_number;
+use crux::convert::{to_integer_or_infinity, to_number};
 use crux::error::{ErrorKind, JsError};
 use crux::function::{Function, NativeFn};
 use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
-use crux::value::Value;
+use crux::value::{Value, is_callable};
 
 use crate::agent::Agent;
 use crate::context::as_object;
@@ -21,6 +21,7 @@ use crate::realm::Realm;
 
 const DATE: &str = "%Date%";
 const DATE_PROTO: &str = "%Date.prototype%";
+const DATE_TO_PRIMITIVE: &str = "%Date.prototype.@@toPrimitive%";
 
 const MS_PER_DAY: f64 = 86_400_000.0;
 const MS_PER_HOUR: f64 = 3_600_000.0;
@@ -39,6 +40,53 @@ fn placeholder(name: &'static str) -> NativeFn {
             format!("{name} must be called through the agent"),
         ))
     })
+}
+
+/// Date.prototype[@@toPrimitive] (spec 21.4.3.5): OrdinaryToPrimitive with
+/// the tryFirst order chosen by the hint — "default" prefers the string
+/// form, so binary `+` yields the date text while unary `+` (number hint)
+/// yields the time value. The hint is compared as a String value; any other
+/// value (undefined included) throws a TypeError.
+fn date_to_primitive(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    if !matches!(this, Value::Object(_) | Value::Function(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Date.prototype[Symbol.toPrimitive] called on a non-object".into(),
+        ));
+    }
+    let hint = args.first().cloned().unwrap_or(Value::Undefined);
+    let is_text = |s: &JsString, text: &str| {
+        s.as_slice() == text.encode_utf16().collect::<Vec<u16>>().as_slice()
+    };
+    let (first, second) = match hint {
+        Value::String(text) if is_text(&text, "string") => ("toString", "valueOf"),
+        Value::String(text) if is_text(&text, "default") => ("toString", "valueOf"),
+        Value::String(text) if is_text(&text, "number") => ("valueOf", "toString"),
+        _ => {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "Invalid hint value for Date.prototype[Symbol.toPrimitive]".into(),
+            ));
+        }
+    };
+    for name in [first, second] {
+        let method = crate::context::get_property_key(
+            agent,
+            this,
+            &PropertyKey::from_utf8(name),
+            this.clone(),
+        )?;
+        if is_callable(&method) {
+            let result = crate::function::call(agent, &method, this.clone(), &[])?;
+            if !matches!(result, Value::Object(_) | Value::Function(_)) {
+                return Ok(result);
+            }
+        }
+    }
+    Err(JsError::new(
+        ErrorKind::TypeError,
+        "Cannot convert object to primitive value".into(),
+    ))
 }
 
 /// The [[DateValue]] time value of `this` (spec 21.4.3.1 RequireInternalSlot).
@@ -198,7 +246,8 @@ fn time_clip(time: f64) -> f64 {
     if time.is_nan() || time.abs() > 8.64e15 {
         f64::NAN
     } else {
-        time.trunc()
+        // TimeClip adds +0 to convert -0 to +0 (spec 21.4.1.15 step 3).
+        time.trunc() + 0.0
     }
 }
 
@@ -226,9 +275,11 @@ fn now_ms() -> f64 {
 fn format_year(year: i64) -> String {
     if (0..=9999).contains(&year) {
         format!("{year:04}")
+    } else if year < 0 {
+        // Negative years pad to at least four digits (no forced six).
+        format!("-{:04}", year.abs())
     } else {
-        let sign = if year < 0 { "-" } else { "+" };
-        format!("{sign}{:06}", year.abs())
+        format!("+{year:06}")
     }
 }
 
@@ -236,73 +287,55 @@ fn format_year(year: i64) -> String {
 // Constructor and statics.
 // ---------------------------------------------------------------------------
 
-fn instance_proto(
-    agent: &mut Agent,
-    new_target: &Value,
-) -> Result<Option<Handle<JsObject>>, JsError> {
+fn instance_proto(agent: &mut Agent, new_target: &Value) -> Result<Handle<JsObject>, JsError> {
     let proto = crate::context::get_property(
         agent,
         new_target,
         &JsString::from_utf8("prototype"),
         new_target.clone(),
     )?;
-    as_object(&proto).map(Some).ok_or_else(|| {
-        JsError::new(
-            ErrorKind::TypeError,
-            "new.target.prototype is not an object".into(),
-        )
-    })
+    if let Some(obj) = as_object(&proto) {
+        return Ok(obj);
+    }
+    // GetPrototypeFromConstructor (spec 10.1.8): a non-object prototype
+    // falls back to %Date.prototype%.
+    agent
+        .current_realm()?
+        .intrinsics
+        .get(DATE_PROTO)
+        .and_then(|value| as_object(&value))
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "%Date.prototype% missing".into()))
 }
 
 /// The time value from the constructor's arguments (spec 21.4.2.1).
-fn date_value_from_args(args: &[Value]) -> Result<f64, JsError> {
+fn date_value_from_args(agent: &mut Agent, args: &[Value]) -> Result<f64, JsError> {
     if args.is_empty() {
         return Ok(now_ms());
     }
     if args.len() == 1 {
         let value = &args[0];
-        if matches!(value, Value::String(_)) {
-            return Ok(date_parse(value));
+        // spec 21.4.3.1: an object with a [[DateValue]] slot clones it
+        // directly (no ToPrimitive); other objects are ToPrimitive'd.
+        if let Value::Object(obj) = value
+            && let Some(t) = agent.date_data.get(&obj.id())
+        {
+            return Ok(*t);
         }
-        return Ok(time_clip(to_number(value)?));
+        let prim =
+            crate::context::to_primitive(agent, value, crux::convert::ToPrimitiveHint::Default)?;
+        if let Value::String(text) = prim {
+            return Ok(date_parse(&text));
+        }
+        return Ok(time_clip(crate::context::to_number(agent, &prim)?));
     }
-    let year = to_number(&args[0])?;
-    let month = to_number(&args[1])?;
-    let date = match args.get(2) {
-        Some(v) => to_number(v)?,
-        None => 1.0,
-    };
-    let hours = match args.get(3) {
-        Some(v) => to_number(v)?,
-        None => 0.0,
-    };
-    let minutes = match args.get(4) {
-        Some(v) => to_number(v)?,
-        None => 0.0,
-    };
-    let seconds = match args.get(5) {
-        Some(v) => to_number(v)?,
-        None => 0.0,
-    };
-    let ms = match args.get(6) {
-        Some(v) => to_number(v)?,
-        None => 0.0,
-    };
-    let year = if (0.0..=99.0).contains(&year) {
-        year + 1900.0
-    } else {
-        year
-    };
-    let day = make_day(year, month, date);
-    let time = make_time(hours, minutes, seconds, ms);
-    Ok(time_clip(utc_time(make_date(day, time))))
+    multi_arg_time(agent, args)
 }
 
 /// `new Date(...)` (spec 21.4.2.1).
 fn date_construct(agent: &mut Agent, args: &[Value], new_target: &Value) -> Result<Value, JsError> {
     let proto = instance_proto(agent, new_target)?;
-    let object = JsObject::ordinary_object_create(proto);
-    let time = date_value_from_args(args)?;
+    let object = JsObject::ordinary_object_create(Some(proto));
+    let time = date_value_from_args(agent, args)?;
     agent.date_data.insert(object.id(), time);
     Ok(Value::Object(object))
 }
@@ -316,39 +349,47 @@ fn date_call() -> Result<Value, JsError> {
 
 /// The shared multi-argument time computation (spec 21.4.2.4 Date.UTC and
 /// the constructor's 2+ argument form), with the 0-99 year adjustment.
-fn multi_arg_time(args: &[Value]) -> Result<f64, JsError> {
+/// Arguments are ToNumber'd in order through the agent (each may throw).
+fn multi_arg_time(agent: &mut Agent, args: &[Value]) -> Result<f64, JsError> {
     let year = match args.first() {
-        Some(v) => to_number(v)?,
+        Some(v) => crate::context::to_number(agent, v)?,
         None => f64::NAN,
     };
     let month = match args.get(1) {
-        Some(v) => to_number(v)?,
+        Some(v) => crate::context::to_number(agent, v)?,
         None => 0.0,
     };
     let date = match args.get(2) {
-        Some(v) => to_number(v)?,
+        Some(v) => crate::context::to_number(agent, v)?,
         None => 1.0,
     };
     let hours = match args.get(3) {
-        Some(v) => to_number(v)?,
+        Some(v) => crate::context::to_number(agent, v)?,
         None => 0.0,
     };
     let minutes = match args.get(4) {
-        Some(v) => to_number(v)?,
+        Some(v) => crate::context::to_number(agent, v)?,
         None => 0.0,
     };
     let seconds = match args.get(5) {
-        Some(v) => to_number(v)?,
+        Some(v) => crate::context::to_number(agent, v)?,
         None => 0.0,
     };
     let ms = match args.get(6) {
-        Some(v) => to_number(v)?,
+        Some(v) => crate::context::to_number(agent, v)?,
         None => 0.0,
     };
-    let year = if (0.0..=99.0).contains(&year) {
-        year + 1900.0
-    } else {
+    // spec 21.4.2.4 step 8: the 1900 offset applies to ToInteger(y) in
+    // [0, 99]; -0.9 truncates to -0 and counts as 0.
+    let year = if year.is_nan() {
         year
+    } else {
+        let year_int = to_integer_or_infinity(year);
+        if (0.0..=99.0).contains(&year_int) {
+            year_int + 1900.0
+        } else {
+            year
+        }
     };
     Ok(time_clip(make_date(
         make_day(year, month, date),
@@ -381,6 +422,11 @@ fn parse_iso(text: &[u16]) -> Option<f64> {
     };
     if negative_year {
         year = -year;
+        // "-000000" is invalid: a negative extended year is never zero
+        // (spec 21.4.1.16 step 4).
+        if year == 0 {
+            return None;
+        }
     }
     if !(-271821..=275760).contains(&year) {
         return None;
@@ -570,12 +616,8 @@ fn parse_fallback(text: &[u16]) -> Option<f64> {
     Some(utc_time(make_date(day, time)))
 }
 
-/// spec 21.4.2.3 Date.parse.
-fn date_parse(value: &Value) -> f64 {
-    let text = match crux::convert::to_string(value) {
-        Ok(text) => text,
-        Err(_) => return f64::NAN,
-    };
+/// spec 21.4.2.3 Date.parse: parse the already-coerced string value.
+fn date_parse(text: &JsString) -> f64 {
     let units = text.as_slice();
     let mut start = 0;
     let mut end = units.len();
@@ -586,9 +628,12 @@ fn date_parse(value: &Value) -> f64 {
         end -= 1;
     }
     let body = &units[start..end];
-    parse_iso(body)
-        .or_else(|| parse_fallback(body))
-        .unwrap_or(f64::NAN)
+    // Date.parse returns TimeClip of the parsed value (spec 21.4.2.3 step 5).
+    time_clip(
+        parse_iso(body)
+            .or_else(|| parse_fallback(body))
+            .unwrap_or(f64::NAN),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -707,6 +752,7 @@ fn set_components(
     args: &[Value],
     local: bool,
     present: &[bool; 7],
+    nan_is_zero: bool,
 ) -> Result<Value, JsError> {
     let Value::Object(obj) = this else {
         return Err(JsError::new(
@@ -723,6 +769,22 @@ fn set_components(
             ));
         }
     };
+    // The provided arguments are ToNumber'd in order before the stored value
+    // decides anything (spec 21.4.4.x steps 2+); setFullYear converts an
+    // invalid date to +0 instead of failing. The namesake component (the
+    // first set bit) is always ToNumber'd — an absent argument is undefined
+    // and yields NaN — while later components keep the base when absent.
+    let first = present.iter().position(|p| *p).unwrap_or(0);
+    let mut coerced = [0.0f64; 7];
+    for i in 0..7 {
+        if present[i] && (i == first || args.get(i - first).is_some()) {
+            coerced[i] = crate::context::to_number(
+                agent,
+                &args.get(i - first).cloned().unwrap_or(Value::Undefined),
+            )?;
+        }
+    }
+    let t = if nan_is_zero && t.is_nan() { 0.0 } else { t };
     if t.is_nan() {
         return Ok(Value::Number(f64::NAN));
     }
@@ -736,14 +798,9 @@ fn set_components(
         sec_from_time(base) as f64,
         ms_from_time(base) as f64,
     ];
-    // The arguments align with the components starting at the first set bit
-    // of the mask (e.g. setHours' first argument is the hours component).
-    let first = present.iter().position(|p| *p).unwrap_or(0);
     for i in 0..7 {
-        if present[i]
-            && let Some(v) = args.get(i - first)
-        {
-            values[i] = to_number(v)?;
+        if present[i] && (i == first || args.get(i - first).is_some()) {
+            values[i] = coerced[i];
         }
     }
     let day = make_day(values[0], values[1], values[2]);
@@ -781,14 +838,16 @@ fn set_date(
             ));
         }
     };
+    // The argument is ToNumber'd before the NaN check (spec 21.4.4.3 step
+    // 4 comes before step 5), but the slot is left untouched on NaN.
+    let date = match args.first() {
+        Some(v) => crate::context::to_number(agent, v)?,
+        None => f64::NAN,
+    };
     if t.is_nan() {
         return Ok(Value::Number(f64::NAN));
     }
     let base = if local { local_time(t) } else { t };
-    let date = match args.first() {
-        Some(v) => to_number(v)?,
-        None => f64::NAN,
-    };
     let day = make_day(
         year_from_time(base) as f64,
         month_from_time(base) as f64,
@@ -984,6 +1043,29 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         },
     )?;
 
+    // Date.prototype[@@toPrimitive] (writable: false per spec 21.4.3.5).
+    let to_primitive = Function::create_builtin(
+        Some(JsString::from_utf8("[Symbol.toPrimitive]")),
+        1,
+        placeholder("Date.prototype[Symbol.toPrimitive]"),
+        None,
+        None,
+    )?;
+    realm
+        .intrinsics
+        .define(DATE_TO_PRIMITIVE, Value::Function(to_primitive.clone()));
+    date_proto.define_property_key(
+        &PropertyKey::Symbol(crux::symbol::well_known("toPrimitive").as_ref().clone()),
+        &PropertyDescriptor {
+            value: Some(Value::Function(to_primitive)),
+            writable: Some(false),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
+    )?;
+
     realm.global_object.define_property_or_throw(
         &JsString::from_utf8("Date"),
         &PropertyDescriptor {
@@ -1013,10 +1095,14 @@ pub fn dispatch_call(
     }
     if intrinsics.get("%Date.parse%").as_ref() == Some(callee) {
         let value = args.first().cloned().unwrap_or(Value::Undefined);
-        return Some(Ok(Value::Number(date_parse(&value))));
+        // spec 21.4.2.3 step 1: ToString is abrupt-completing; the parse
+        // failure itself yields NaN.
+        return Some(
+            crate::context::to_string(agent, &value).map(|text| Value::Number(date_parse(&text))),
+        );
     }
     if intrinsics.get("%Date.UTC%").as_ref() == Some(callee) {
-        return Some(multi_arg_time(args).map(Value::Number));
+        return Some(multi_arg_time(agent, args).map(Value::Number));
     }
     if intrinsics.get("%Date.now%").as_ref() == Some(callee) {
         return Some(date_now());
@@ -1136,7 +1222,16 @@ pub fn dispatch_call(
             if key == "%Date.prototype.setYear%" {
                 return Some(set_year(agent, this, args));
             }
-            return Some(set_components(agent, this, args, local, present));
+            let nan_is_zero =
+                key == "%Date.prototype.setFullYear%" || key == "%Date.prototype.setUTCFullYear%";
+            return Some(set_components(
+                agent,
+                this,
+                args,
+                local,
+                present,
+                nan_is_zero,
+            ));
         }
     }
     if intrinsics.get("%Date.prototype.setDate%").as_ref() == Some(callee) {
@@ -1147,14 +1242,26 @@ pub fn dispatch_call(
     }
     if intrinsics.get("%Date.prototype.setTime%").as_ref() == Some(callee) {
         return Some((|| {
+            // thisTimeValue first: a non-Date receiver throws before the
+            // argument is coerced (spec 21.4.4.44 step 1).
+            let Value::Object(obj) = this else {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "Date.prototype method called on an incompatible receiver".into(),
+                ));
+            };
+            if !agent.date_data.contains_key(&obj.id()) {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "Date.prototype method called on an incompatible receiver".into(),
+                ));
+            }
             let value = match args.first() {
-                Some(v) => to_number(v)?,
+                Some(v) => crate::context::to_number(agent, v)?,
                 None => f64::NAN,
             };
             let clipped = time_clip(value);
-            if let Value::Object(obj) = this {
-                agent.date_data.insert(obj.id(), clipped);
-            }
+            agent.date_data.insert(obj.id(), clipped);
             Ok(Value::Number(clipped))
         })());
     }
@@ -1208,12 +1315,39 @@ pub fn dispatch_call(
             Err(e) => Err(e),
         });
     }
+    if intrinsics.get(DATE_TO_PRIMITIVE).as_ref() == Some(callee) {
+        return Some(date_to_primitive(agent, this, args));
+    }
     if intrinsics.get("%Date.prototype.toJSON%").as_ref() == Some(callee) {
-        return Some(match this_date_value(agent, this) {
-            Ok(t) if t.is_nan() || t.is_infinite() => Ok(Value::Null),
-            Ok(t) => to_iso_string(t).map(|s| Value::String(Handle::new(JsString::from_utf8(&s)))),
-            Err(e) => Err(e),
-        });
+        return Some((|| {
+            // toJSON is generic (spec 21.4.4.36): ToObject the receiver,
+            // ToPrimitive(Number) for the finite check, then Invoke
+            // "toISOString".
+            let object = crate::context::to_object(agent, this)?;
+            let tv = crate::context::to_primitive(
+                agent,
+                &object,
+                crux::convert::ToPrimitiveHint::Number,
+            )?;
+            if let Value::Number(n) = tv
+                && !n.is_finite()
+            {
+                return Ok(Value::Null);
+            }
+            let to_iso = crate::context::get_property_key(
+                agent,
+                &object,
+                &PropertyKey::from_utf8("toISOString"),
+                object.clone(),
+            )?;
+            if !is_callable(&to_iso) {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "toISOString is not a function".into(),
+                ));
+            }
+            crate::function::call(agent, &to_iso, object, &[])
+        })());
     }
     None
 }

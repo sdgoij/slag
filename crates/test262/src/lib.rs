@@ -10730,6 +10730,7 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
         negative_type: Option<String>,
         flags: Vec<String>,
         includes: Vec<String>,
+        features: Vec<String>,
     }
 
     /// Split the `/*--- ... ---*/` frontmatter (which follows the copyright
@@ -10761,6 +10762,8 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
                 fm.flags = list_items(value);
             } else if let Some(value) = trimmed.strip_prefix("includes:") {
                 fm.includes = list_items(value);
+            } else if let Some(value) = trimmed.strip_prefix("features:") {
+                fm.features = list_items(value);
             }
         }
         Some((fm, body))
@@ -11130,6 +11133,11 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
         }
         if fm.flags.iter().any(|f| f == "async") {
             return FixtureResult::Skip("async tests are Phase 7".into());
+        }
+        if fm.features.iter().any(|f| f == "Temporal") {
+            // Temporal is a stage-3 proposal, not part of ECMA-262 ES2026
+            // (out of scope like Intl/ECMA-402).
+            return FixtureResult::Skip("Temporal is out of scope".into());
         }
         let unsupported: Vec<&str> = fm
             .includes
