@@ -1261,28 +1261,46 @@ fn add_entries_from_iterable(
     }
 }
 
-/// GroupBy (spec 7.3.38) with ~collection~ key coercion: `Map.groupBy`.
-fn map_group_by(agent: &mut Agent, _this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let items = args.first().cloned().unwrap_or(Value::Undefined);
-    require_object_coercible(&items)?;
-    let callback = args.get(1).cloned().unwrap_or(Value::Undefined);
-    if !is_callable(&callback) {
+/// GroupBy (spec 7.3.38): iterate `items` with GetIterator, call
+/// `callback(value, k)` for each element, and group by the coerced key. The
+/// callback and key-coercion completions close the iterator (IfAbruptCloseIterator);
+/// a step-count overflow closes it with a TypeError. `coerce` maps a callback
+/// result to the group key: ~property~ (ToPropertyKey) for Object.groupBy,
+/// ~collection~ (CanonicalizeKeyedCollectionKey) for Map.groupBy.
+pub(crate) fn group_by<F>(
+    agent: &mut Agent,
+    items: &Value,
+    callback: &Value,
+    coerce: F,
+) -> Result<Vec<(Value, Vec<Value>)>, JsError>
+where
+    F: Fn(&mut Agent, Value) -> Result<Value, JsError>,
+{
+    require_object_coercible(items)?;
+    if !is_callable(callback) {
         return Err(JsError::new(
             ErrorKind::TypeError,
-            "Map.groupBy: callback is not a function".into(),
+            "groupBy: callback is not a function".into(),
         ));
     }
-    let iterator = crate::expr::get_iterator(agent, &items)?;
+    let iterator = crate::expr::get_iterator(agent, items)?;
     let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
     let mut k = 0u64;
     loop {
+        // spec step 6.a: a step-count overflow closes the iterator with a
+        // TypeError.
+        if k >= 9007199254740991 {
+            let error = JsError::new(ErrorKind::TypeError, "Too many elements to group".into());
+            let _ = crate::expr::iterator_close(agent, &iterator);
+            return Err(error);
+        }
         let next = match crate::expr::iterator_step(agent, &iterator)? {
             Some(value) => value,
             None => break,
         };
         let key = match crate::function::call(
             agent,
-            &callback,
+            callback,
             Value::Undefined,
             &[next.clone(), Value::Number(k as f64)],
         ) {
@@ -1292,7 +1310,13 @@ fn map_group_by(agent: &mut Agent, _this: &Value, args: &[Value]) -> Result<Valu
                 return Err(error);
             }
         };
-        let key = canonicalize_key(key);
+        let key = match coerce(agent, key) {
+            Ok(key) => key,
+            Err(error) => {
+                let _ = crate::expr::iterator_close(agent, &iterator);
+                return Err(error);
+            }
+        };
         match groups
             .iter_mut()
             .find(|(existing, _)| same_value(existing, &key))
@@ -1302,6 +1326,16 @@ fn map_group_by(agent: &mut Agent, _this: &Value, args: &[Value]) -> Result<Valu
         }
         k += 1;
     }
+    Ok(groups)
+}
+
+/// GroupBy (spec 7.3.38) with ~collection~ key coercion: `Map.groupBy`.
+fn map_group_by(agent: &mut Agent, _this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    let items = args.first().cloned().unwrap_or(Value::Undefined);
+    let callback = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let groups = group_by(agent, &items, &callback, |_agent, key| {
+        Ok(canonicalize_key(key))
+    })?;
     let proto = agent
         .current_realm()?
         .intrinsics

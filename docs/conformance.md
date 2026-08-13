@@ -927,6 +927,38 @@ Validation: `cargo test --workspace` **4085 pass, 0 failures**;
 pass / 571 fail / 0 crash / 3 hang** — exactly the 2 cluster fixtures
 fixed and 0 new failures across all 23,812 fixtures.
 
+### Object.groupBy cluster sweep (Phase 18 conformance)
+
+A sweep of the `Object/groupBy/*` tree (14 fixtures) reports **14 pass, 0
+fail, 0 skip** of 14 fixtures: every fixture passes (up from 2 pass / 12
+fail — the method was not implemented at all). `Object.groupBy`
+(ES2024, spec 20.1.2.9) is now installed (length 2, name `groupBy`) and
+shares the GroupBy abstract operation (spec 7.3.38) with the existing
+`Map.groupBy` in `crates/runtime/src/builtins/keyed.rs`:
+
+- **The GroupBy loop was factored out of `map_group_by`** into a shared
+  `group_by` helper that iterates `items` (GetIterator), calls
+  `callback(value, k)` per element, closes the iterator on any abrupt
+  completion (IfAbruptCloseIterator, including the key coercion), and
+  closes it with a TypeError on the 2^53-1 step-count overflow.
+- **`Object.groupBy` uses ~property~ key coercion** — each callback
+  result goes through the agent-aware `ToPropertyKey`, so a Symbol key
+  stays a Symbol, a Number/String/object key becomes its string, a
+  throwing `toString` propagates, and `1`/`"1"`/`{toString: () => 1}`
+  all group under `"1"` (`toPropertyKey.js`, `invalid-property-key.js`).
+  `Map.groupBy` keeps ~collection~ coercion (`CanonicalizeKeyedCollectionKey`).
+- **The result is `OrdinaryObjectCreate(null)`** with one
+  `CreateDataPropertyOrThrow` per group — `Object.getPrototypeOf(obj) ===
+  null` and `obj.hasOwnProperty === undefined` (`null-prototype.js`), with
+  the group arrays in first-seen key order.
+
+Validation: `cargo test --workspace` **4085 pass, 0 failures**;
+`cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo fmt --all --check` clean. The `Map/groupBy` tree re-sweeps 14/0
+(the shared helper did not regress it), and a full `built-ins` re-sweep
+shows **16,714 pass / 559 fail / 0 crash / 3 hang** — exactly the 12
+cluster fixtures fixed and 0 new failures across all 23,812 fixtures.
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~120 edge-case unit tests were added across
@@ -1036,9 +1068,9 @@ annexB rows are from the earlier run and have not changed since.
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,812 | 16,702 | 571 | 6,536 | 3¹ | 96.7% |
+| built-ins | 23,812 | 16,714 | 559 | 6,536 | 3¹ | 96.8% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,622** | **33,145** | **3,177** | **12,297** | **3** | **91.3%** |
+| **Total** | **48,622** | **33,157** | **3,165** | **12,297** | **3** | **91.3%** |
 
 (Runnable = pass + fail; the 9,171 skips are module/async fixtures,
 unsupported harness includes, and the out-of-scope Temporal proposal
@@ -1048,11 +1080,11 @@ String/prototype, Object/create, DisposableStack, AsyncDisposableStack,
 ArrayBuffer/SharedArrayBuffer, Date, BigInt, global-functions, Function,
 Iterator/prototype, Iterator statics (concat/from/zip/zipKeyed), Symbol,
 Boolean, Number, Object.prototype.toString, Object/prototype legacy
-accessors, Proxy, and Reflect cluster closures (all 0 fail); the language
-and annexB rows are from the sweep recorded below. The 6,536 built-ins
-skips are dominated by the out-of-scope Temporal proposal (4,611), with
-the async/module flags, host-dependent `$262.createRealm`, and unsupported
-harness includes making up the rest.
+accessors, Proxy, Reflect, and Object.groupBy cluster closures (all 0
+fail); the language and annexB rows are from the sweep recorded below.
+The 6,536 built-ins skips are dominated by the out-of-scope Temporal
+proposal (4,611), with the async/module flags, host-dependent
+`$262.createRealm`, and unsupported harness includes making up the rest.
 
 ¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
 coerced-values fixtures — 10,000-element allocations that need the long
@@ -1137,7 +1169,7 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 ## Open items
 
 - Certify the ≥95%-of-runnable target: the built-ins area now measures
-  **96.7%** of runnable (16,702 pass / 571 fail of 17,273, with the
+  **96.8%** of runnable (16,714 pass / 559 fail of 17,273, with the
   out-of-scope Temporal fixtures skipped, `--timeout 60
   --recheck-timeout 45`, release build), 0 crashes and 0 hangs with the
   long timeout. The remaining gap is the systematic bug clusters triaged

@@ -42,6 +42,7 @@ const GET_OWN_DESC: &str = "%Object.getOwnPropertyDescriptor%";
 const GET_OWN_DESCS: &str = "%Object.getOwnPropertyDescriptors%";
 const GET_OWN_NAMES: &str = "%Object.getOwnPropertyNames%";
 const GET_OWN_SYMBOLS: &str = "%Object.getOwnPropertySymbols%";
+const GROUP_BY: &str = "%Object.groupBy%";
 const GET_PROTO: &str = "%Object.getPrototypeOf%";
 const HAS_OWN: &str = "%Object.hasOwn%";
 const IS: &str = "%Object.is%";
@@ -229,6 +230,7 @@ fn install_statics(realm: &Handle<Realm>, ctor: &JsObject) -> Result<(), JsError
         ("getOwnPropertyNames", 1, GET_OWN_NAMES),
         ("getOwnPropertySymbols", 1, GET_OWN_SYMBOLS),
         ("getPrototypeOf", 1, GET_PROTO),
+        ("groupBy", 2, GROUP_BY),
         ("hasOwn", 2, HAS_OWN),
         ("is", 2, IS),
         ("isExtensible", 1, IS_EXTENSIBLE),
@@ -720,6 +722,9 @@ pub fn dispatch_call(
     if intrinsics.get(GET_OWN_SYMBOLS).as_ref() == Some(callee) {
         return Some(own_keys_of(agent, arg(args, 0), true));
     }
+    if intrinsics.get(GROUP_BY).as_ref() == Some(callee) {
+        return Some(object_group_by(agent, args));
+    }
     if intrinsics.get(GET_OWN_DESC).as_ref() == Some(callee) {
         return Some((|| {
             let object = to_object(agent, arg(args, 0))?;
@@ -1021,6 +1026,34 @@ fn lookup_legacy_accessor(
         }
         return Ok(Value::Undefined);
     }
+}
+
+/// Object.groupBy (spec 20.1.2.9): GroupBy with ~property~ key coercion,
+/// returned as an ordinary object with a null prototype whose own data
+/// properties are the group arrays.
+fn object_group_by(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
+    let items = arg(args, 0).clone();
+    let callback = arg(args, 1).clone();
+    let groups = crate::builtins::keyed::group_by(agent, &items, &callback, |agent, key| {
+        let key = crate::context::to_property_key(agent, &key)?;
+        Ok(match key {
+            PropertyKey::String(id) => Value::String(Handle::new(crux::string::lookup(id))),
+            PropertyKey::Symbol(symbol) => Value::Symbol(Handle::new(symbol)),
+        })
+    })?;
+    // spec 20.1.2.9 steps 2-4: OrdinaryObjectCreate(null), then one
+    // CreateDataPropertyOrThrow per group.
+    let obj = JsObject::ordinary_object_create(None);
+    for (key, elements) in groups {
+        let array = crate::builtins::array::array_from_values(agent, &elements)?;
+        let key = match &key {
+            Value::String(text) => PropertyKey::String(crux::intern(text.as_slice())),
+            Value::Symbol(symbol) => PropertyKey::Symbol(symbol.as_ref().clone()),
+            _ => continue,
+        };
+        obj.create_data_property_key(&key, array)?;
+    }
+    Ok(Value::Object(obj))
 }
 
 /// Object.assign (spec 20.1.2.1): copy the own enumerable properties of each
