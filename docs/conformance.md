@@ -326,6 +326,58 @@ Fixes across `crates/crux` and `crates/runtime`:
   SyntaxError; it now loops over comma-separated declarators (keeping the
   `[~In]` initializer restriction).
 
+### String.prototype cluster sweep (Phase 18 conformance)
+
+A sweep of the entire `String/prototype*` tree (`sweep.exe built-ins --filter
+'String/prototype*'`) reports **1069 pass, 0 fail, 4 skip** of 1073 fixtures:
+**every runnable fixture passes**, up from 1003 pass / 66 fail at the start
+of the session. The 4 skips are the standard taxonomy (`$262.createRealm`,
+`compareIterator.js`/`regExpUtils.js` includes). `Object/create*` also closed
+(320 pass, 0 fail, from 3 fail). Fixes:
+
+- **UTF-16-unit string `+` concatenation (`expr.rs`):** the string branch of
+  the `+` operator formatted through `JsString`'s lossy `Display`, which
+  replaced lone surrogates with U+FFFD — `'\uD83D' + '\uDCA9'` produced
+  `\uFFFD\uFFFD`, so `wholePoo.slice(0, 1).isWellFormed()` was `true`.
+  Concatenation now extends the UTF-16 unit slices directly.
+- **`ToPrimitive` GetMethod semantics (`context.rs`, `crux/convert.rs`):** a
+  non-callable `@@toPrimitive` that is neither `undefined` nor `null` (e.g.
+  `1` or `{}`) must throw a TypeError (spec 7.3.9); the coercions silently
+  skipped it, so the `indexOf` position/searchString top-primitive fixtures'
+  `assert.throws(TypeError)` cases failed.
+- **OrdinaryToPrimitive hint order:** hint `default` is grouped with
+  `number` (valueOf first) — only the `string` hint prefers toString. The
+  old grouping made `'str' + { valueOf: String.prototype.valueOf }` succeed
+  (toString first) instead of throwing the thisStringValue TypeError.
+- **Final_Sigma casing (`string.rs`):** the lookahead only skipped `Mn`, so
+  U+180E (Cf) and U+00AD (Cf) broke the preceded/followed scans, and
+  `is_cased` (via the case mappings) missed `𝒢` because Rust's tables omit
+  the mathematical alphanumerics. Cased is now the general category
+  `Lu`/`Ll`/`Lt`; the ignorable set is `Mn`/`Me`/`Cf`/`Lm`/`Sk` plus the
+  hangul fillers and — per the spec's Final_Sigma note — FULL STOP and
+  MIDDLE DOT.
+- **Agent-aware `normalize`/`repeat`:** the form and count were coerced
+  through the non-agent crux path, so an object form/`count` with a
+  user `toString` failed ("toString must be called through the agent") and
+  `repeat` swallowed abrupt completions from the count coercion.
+- **`localeCompare` canonical equivalence:** pairs like `"o\u0308"` vs
+  `"ö"` compared unequal; both sides are NFC-normalized before the code
+  unit comparison (Unicode default collation treats canonically equivalent
+  strings as equal).
+- **`RegExp.prototype.toString` (`regexp.rs`):** composed from the stored
+  raw flags, so `/./iyg` stringified as `/./iyg`; it now Get-s `source` and
+  `flags` (honoring overridden accessors, flags in the canonical `dgimsuvy`
+  order), which fixes `replaceAll`'s searchValue-tostring-regexp fixture
+  (`/./iyg` searches for the literal `/./giy`).
+- **`Object.create` with `undefined` Properties (`object.rs`):** step 3 of
+  spec 20.1.2.2 skips `ObjectDefineProperties` when Properties is
+  `undefined`; the dispatch coerced it to an object and threw.
+- **Function `prototype` objects inherit `%Object.prototype%`
+  (`function.rs`):** `MakeConstructor` (spec 10.2.5) wires the fresh
+  prototype through `ordinary_object_create(%Object.prototype%)`; plain
+  receiver objects now resolve `toString`, clearing the
+  "Cannot convert object to primitive value" class of failures.
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~120 edge-case unit tests were added across
@@ -431,14 +483,15 @@ TypedArray fixtures that pass with the long timeout (see below).
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,798 | 15,686 | 4,708 | 3,401 | 3¹ | 76.9% |
+| built-ins | 23,798 | 15,755 | 4,639 | 3,401 | 3¹ | 77.3% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,608** | **32,129** | **7,314** | **9,162** | **3** | **81.5%** |
+| **Total** | **48,608** | **32,198** | **7,245** | **9,162** | **3** | **81.6%** |
 
 (Runnable = pass + fail; the 9,162 skips are module/async fixtures and
 unsupported harness includes.) The built-ins row reflects the current
-`Error*`/`BigInt*`/RegExp/Object-descriptor hardening; the language and
-annexB rows are from the sweep recorded below.
+`Error*`/`BigInt*`/RegExp/Object-descriptor hardening plus the
+String/prototype (0 fail) and Object/create (0 fail) cluster closures; the
+language and annexB rows are from the sweep recorded below.
 
 ¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
 coerced-values fixtures — 10,000-element allocations that need the long

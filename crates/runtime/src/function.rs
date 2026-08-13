@@ -551,7 +551,14 @@ fn register_function(
                 .and_then(|value| crate::context::as_object(&value));
             JsObject::ordinary_object_create(proto)
         } else {
-            JsObject::ordinary_object_create(None)
+            // MakeConstructor (spec 10.2.5 step 2): the prototype is an
+            // ordinary object with %Object.prototype% as its prototype.
+            let proto = agent
+                .current_realm()?
+                .intrinsics
+                .get("%Object.prototype%")
+                .and_then(|value| crate::context::as_object(&value));
+            JsObject::ordinary_object_create(proto)
         };
         make_constructor(&function, prototype, true)?;
     }

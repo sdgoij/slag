@@ -147,8 +147,8 @@ fn string_last_index_of(s: &JsString, search: &JsString, from: usize) -> Option<
 
 /// spec 7.3.13 ToClampedIndex: relative negative indices, clamped to
 /// `[0, length]`.
-fn to_clamped_index(value: &Value, len: usize) -> Result<usize, JsError> {
-    let int = to_integer_or_infinity(to_number(value)?);
+fn to_clamped_index(agent: &mut Agent, value: &Value, len: usize) -> Result<usize, JsError> {
+    let int = to_integer_or_infinity(crate::context::to_number(agent, value)?);
     let index = if int.is_finite() && int < 0.0 {
         len as f64 + int
     } else {
@@ -172,7 +172,7 @@ fn string_construct(
         Some(Value::Symbol(symbol)) => {
             JsString::from_utf8(&crux::symbol::descriptive_string(symbol))
         }
-        Some(value) => to_string(value)?,
+        Some(value) => crate::context::to_string(agent, value)?,
         None => JsString::from_utf8(""),
     };
     let object = JsObject::string_create(text, proto)?;
@@ -257,12 +257,12 @@ fn raw(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
             &JsString::from_utf8(&next_index.to_string()),
             literals.clone(),
         )?;
-        result.extend_from_slice(to_string(&literal_value)?.as_slice());
+        result.extend_from_slice(crate::context::to_string(agent, &literal_value)?.as_slice());
         if next_index + 1 == literal_count {
             return Ok(Value::String(Handle::new(JsString::from_utf16(&result))));
         }
         if let Some(sub) = substitutions.get(next_index as usize) {
-            result.extend_from_slice(to_string(sub)?.as_slice());
+            result.extend_from_slice(crate::context::to_string(agent, sub)?.as_slice());
         }
         next_index += 1;
     }
@@ -271,16 +271,16 @@ fn raw(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
 /// LengthOfArrayLike (spec 7.3.22).
 fn length_of_array_like(agent: &mut Agent, value: &Value) -> Result<u64, JsError> {
     let length = get_property(agent, value, &JsString::from_utf8("length"), value.clone())?;
-    Ok(to_length(to_number(&length)?))
+    Ok(to_length(crate::context::to_number(agent, &length)?))
 }
 
 /// spec 22.1.3.2 String.prototype.at.
-fn at(_agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+fn at(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
-    let s = to_string(this)?;
+    let s = crate::context::to_string(agent, this)?;
     let len = s.len();
     let index = args.first().cloned().unwrap_or(Value::Undefined);
-    let int = to_integer_or_infinity(to_number(&index)?);
+    let int = to_integer_or_infinity(crate::context::to_number(agent, &index)?);
     let k = if int.is_finite() && int < 0.0 {
         len as f64 + int
     } else {
@@ -294,10 +294,11 @@ fn at(_agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
 }
 
 /// spec 22.1.3.3 String.prototype.charAt.
-fn char_at(_agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+fn char_at(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
-    let s = to_string(this)?;
-    let position = to_integer_or_infinity(to_number(
+    let s = crate::context::to_string(agent, this)?;
+    let position = to_integer_or_infinity(crate::context::to_number(
+        agent,
         &args.first().cloned().unwrap_or(Value::Undefined),
     )?);
     let size = s.len() as f64;
@@ -309,10 +310,11 @@ fn char_at(_agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
 }
 
 /// spec 22.1.3.4 String.prototype.charCodeAt.
-fn char_code_at(_agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+fn char_code_at(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
-    let s = to_string(this)?;
-    let position = to_integer_or_infinity(to_number(
+    let s = crate::context::to_string(agent, this)?;
+    let position = to_integer_or_infinity(crate::context::to_number(
+        agent,
         &args.first().cloned().unwrap_or(Value::Undefined),
     )?);
     let size = s.len() as f64;
@@ -325,10 +327,11 @@ fn char_code_at(_agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Valu
 }
 
 /// spec 22.1.3.5 String.prototype.codePointAt.
-fn code_point_at(_agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+fn code_point_at(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
-    let s = to_string(this)?;
-    let position = to_integer_or_infinity(to_number(
+    let s = crate::context::to_string(agent, this)?;
+    let position = to_integer_or_infinity(crate::context::to_number(
+        agent,
         &args.first().cloned().unwrap_or(Value::Undefined),
     )?);
     let size = s.len() as f64;
@@ -340,11 +343,11 @@ fn code_point_at(_agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
 }
 
 /// spec 22.1.3.6 String.prototype.concat.
-fn concat(_agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+fn concat(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
-    let mut units: Vec<u16> = to_string(this)?.as_slice().to_vec();
+    let mut units: Vec<u16> = crate::context::to_string(agent, this)?.as_slice().to_vec();
     for arg in args {
-        units.extend_from_slice(to_string(arg)?.as_slice());
+        units.extend_from_slice(crate::context::to_string(agent, arg)?.as_slice());
     }
     Ok(Value::String(Handle::new(JsString::from_utf16(&units))))
 }
@@ -352,16 +355,17 @@ fn concat(_agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsE
 /// spec 22.1.3.7 String.prototype.endsWith.
 fn ends_with(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
-    let s = to_string(this)?;
+    let s = crate::context::to_string(agent, this)?;
     let search_value = args.first().cloned().unwrap_or(Value::Undefined);
     if is_regexp(agent, &search_value)? {
         return Err(regexp_argument_error("endsWith"));
     }
-    let search = to_string(&search_value)?;
+    let search = crate::context::to_string(agent, &search_value)?;
     let len = s.len();
     let end = match args.get(1).cloned().unwrap_or(Value::Undefined) {
         Value::Undefined => len,
-        other => to_integer_or_infinity(to_number(&other)?).clamp(0.0, len as f64) as usize,
+        other => to_integer_or_infinity(crate::context::to_number(agent, &other)?)
+            .clamp(0.0, len as f64) as usize,
     };
     let search_len = search.len();
     if search_len == 0 {
@@ -378,28 +382,31 @@ fn ends_with(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, J
 /// spec 22.1.3.8 String.prototype.includes.
 fn includes(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
-    let s = to_string(this)?;
+    let s = crate::context::to_string(agent, this)?;
     let search_value = args.first().cloned().unwrap_or(Value::Undefined);
     if is_regexp(agent, &search_value)? {
         return Err(regexp_argument_error("includes"));
     }
-    let search = to_string(&search_value)?;
+    let search = crate::context::to_string(agent, &search_value)?;
     let len = s.len();
     let position = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let start = to_integer_or_infinity(to_number(&position)?).clamp(0.0, len as f64) as usize;
+    let start = to_integer_or_infinity(crate::context::to_number(agent, &position)?)
+        .clamp(0.0, len as f64) as usize;
     Ok(Value::Boolean(
         string_index_of(&s, &search, start).is_some(),
     ))
 }
 
 /// spec 22.1.3.9 String.prototype.indexOf.
-fn index_of(_agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+fn index_of(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
-    let s = to_string(this)?;
-    let search = to_string(&args.first().cloned().unwrap_or(Value::Undefined))?;
+    let s = crate::context::to_string(agent, this)?;
+    let search =
+        crate::context::to_string(agent, &args.first().cloned().unwrap_or(Value::Undefined))?;
     let len = s.len();
     let position = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let start = to_integer_or_infinity(to_number(&position)?).clamp(0.0, len as f64) as usize;
+    let start = to_integer_or_infinity(crate::context::to_number(agent, &position)?)
+        .clamp(0.0, len as f64) as usize;
     match string_index_of(&s, &search, start) {
         Some(i) => Ok(Value::Number(i as f64)),
         None => Ok(Value::Number(-1.0)),
@@ -407,9 +414,9 @@ fn index_of(_agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, J
 }
 
 /// spec 22.1.3.10 String.prototype.isWellFormed.
-fn is_well_formed(_agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
+fn is_well_formed(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
-    let s = to_string(this)?;
+    let s = crate::context::to_string(agent, this)?;
     Ok(Value::Boolean(is_well_formed_string(&s)))
 }
 
@@ -436,16 +443,18 @@ fn is_well_formed_string(s: &JsString) -> bool {
 }
 
 /// spec 22.1.3.11 String.prototype.lastIndexOf.
-fn last_index_of(_agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+fn last_index_of(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
-    let s = to_string(this)?;
-    let search = to_string(&args.first().cloned().unwrap_or(Value::Undefined))?;
+    let s = crate::context::to_string(agent, this)?;
+    let search =
+        crate::context::to_string(agent, &args.first().cloned().unwrap_or(Value::Undefined))?;
     let len = s.len();
     let search_len = search.len();
     let Some(max_start) = len.checked_sub(search_len) else {
         return Ok(Value::Number(-1.0));
     };
-    let number_position = to_number(&args.get(1).cloned().unwrap_or(Value::Undefined))?;
+    let number_position =
+        crate::context::to_number(agent, &args.get(1).cloned().unwrap_or(Value::Undefined))?;
     let start = if number_position.is_nan() {
         max_start
     } else {
@@ -459,15 +468,26 @@ fn last_index_of(_agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
 
 /// spec 22.1.3.19 String.prototype.localeCompare: an implementation-defined
 /// ordering; this engine compares code units lexicographically.
-fn locale_compare(_agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+fn locale_compare(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
-    let s = to_string(this)?;
-    let that = to_string(&args.first().cloned().unwrap_or(Value::Undefined))?;
-    Ok(Value::Number(match s.as_slice().cmp(that.as_slice()) {
+    let s = crate::context::to_string(agent, this)?;
+    let that =
+        crate::context::to_string(agent, &args.first().cloned().unwrap_or(Value::Undefined))?;
+    // Canonically equivalent strings must compare equal (Unicode default
+    // collation); normalize both sides to NFC first.
+    let a = normalize_text(&s);
+    let b = normalize_text(&that);
+    Ok(Value::Number(match a.as_slice().cmp(b.as_slice()) {
         std::cmp::Ordering::Less => -1.0,
         std::cmp::Ordering::Equal => 0.0,
         std::cmp::Ordering::Greater => 1.0,
     }))
+}
+
+fn normalize_text(text: &JsString) -> JsString {
+    let cps: Vec<u32> = text.code_points().collect();
+    let normalized = unicode::normalize_code_points(&cps, unicode::NormalizationForm::Nfc);
+    crux::string::code_points_to_string(&normalized).unwrap_or_else(|_| text.clone())
 }
 
 /// spec 22.1.3.12 String.prototype.match: `@@match` delegation, then
@@ -475,12 +495,14 @@ fn locale_compare(_agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Va
 fn match_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
     let regexp = args.first().cloned().unwrap_or(Value::Undefined);
-    if !matches!(regexp, Value::Undefined)
+    // spec 22.1.3.17 step 2: a non-Object regexp argument never consults
+    // its @@match property; it is coerced by RegExpCreate instead.
+    if matches!(regexp, Value::Object(_) | Value::Function(_))
         && let Some(matcher) = crate::expr::get_method(agent, &regexp, "@@match")?
     {
         return crate::function::call(agent, &matcher, regexp, std::slice::from_ref(this));
     }
-    let s = to_string(this)?;
+    let s = crate::context::to_string(agent, this)?;
     let rx = regexp_create(agent, &regexp, None)?;
     let matcher = crate::expr::get_method(agent, &rx, "@@match")?
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "RegExp has no @@match".into()))?;
@@ -492,7 +514,9 @@ fn match_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
 fn match_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
     let regexp = args.first().cloned().unwrap_or(Value::Undefined);
-    if !matches!(regexp, Value::Undefined) {
+    // spec 22.1.3.13 step 2: a non-Object regexp argument never consults
+    // its @@matchAll property; it is coerced by RegExpCreate instead.
+    if matches!(regexp, Value::Object(_) | Value::Function(_)) {
         if is_regexp(agent, &regexp)? {
             let flags = get_property(
                 agent,
@@ -501,7 +525,7 @@ fn match_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, J
                 regexp.clone(),
             )?;
             require_object_coercible(&flags)?;
-            let flag_text = to_string(&flags)?;
+            let flag_text = crate::context::to_string(agent, &flags)?;
             if !flag_text.as_slice().contains(&(b'g' as u16)) {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
@@ -513,7 +537,7 @@ fn match_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, J
             return crate::function::call(agent, &matcher, regexp, std::slice::from_ref(this));
         }
     }
-    let s = to_string(this)?;
+    let s = crate::context::to_string(agent, this)?;
     let rx = regexp_create(agent, &regexp, Some("g"))?;
     let matcher = crate::expr::get_method(agent, &rx, "@@matchAll")?
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "RegExp has no @@matchAll".into()))?;
@@ -521,14 +545,14 @@ fn match_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, J
 }
 
 /// spec 22.1.3.17 String.prototype.normalize.
-fn normalize(_agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+fn normalize(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
-    let s = to_string(this)?;
+    let s = crate::context::to_string(agent, this)?;
     let form = args.first().cloned().unwrap_or(Value::Undefined);
     let form = if matches!(form, Value::Undefined) {
         unicode::NormalizationForm::Nfc
     } else {
-        let form_text = to_string(&form)?;
+        let form_text = crate::context::to_string(agent, &form)?;
         if eq_ascii(&form_text, "NFC") {
             unicode::NormalizationForm::Nfc
         } else if eq_ascii(&form_text, "NFD") {
@@ -625,11 +649,11 @@ fn string_pad(s: &JsString, max_length: u64, fill: &JsString, start: bool) -> Js
 }
 
 /// spec 22.1.3.21 String.prototype.repeat.
-fn repeat(_agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+fn repeat(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
-    let s = to_string(this)?;
+    let s = crate::context::to_string(agent, this)?;
     let count = args.first().cloned().unwrap_or(Value::Undefined);
-    let n = to_integer_or_infinity(to_number(&count)?);
+    let n = to_integer_or_infinity(crate::context::to_number(agent, &count)?);
     if n < 0.0 || n == f64::INFINITY {
         return Err(JsError::new(
             ErrorKind::RangeError,
@@ -669,13 +693,13 @@ fn replace(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsE
             &[this.clone(), replace_value],
         );
     }
-    let string = to_string(this)?;
-    let search_string = to_string(&search_value)?;
+    let string = crate::context::to_string(agent, this)?;
+    let search_string = crate::context::to_string(agent, &search_value)?;
     let functional = is_callable(&replace_value);
     let replace_text = if functional {
         None
     } else {
-        Some(to_string(&replace_value)?)
+        Some(crate::context::to_string(agent, &replace_value)?)
     };
     let search_len = search_string.len();
     let Some(position) = string_index_of(&string, &search_string, 0) else {
@@ -694,7 +718,7 @@ fn replace(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsE
                 Value::String(Handle::new(string)),
             ],
         )?;
-        to_string(&called)?
+        crate::context::to_string(agent, &called)?
     } else {
         get_substitution(
             agent,
@@ -727,7 +751,7 @@ fn replace_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
                 search_value.clone(),
             )?;
             require_object_coercible(&flags)?;
-            let flag_text = to_string(&flags)?;
+            let flag_text = crate::context::to_string(agent, &flags)?;
             if !flag_text.as_slice().contains(&(b'g' as u16)) {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
@@ -744,13 +768,13 @@ fn replace_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
             );
         }
     }
-    let string = to_string(this)?;
-    let search_string = to_string(&search_value)?;
+    let string = crate::context::to_string(agent, this)?;
+    let search_string = crate::context::to_string(agent, &search_value)?;
     let functional = is_callable(&replace_value);
     let replace_text = if functional {
         None
     } else {
-        Some(to_string(&replace_value)?)
+        Some(crate::context::to_string(agent, &replace_value)?)
     };
     let search_len = search_string.len();
     let advance_by = search_len.max(1);
@@ -775,7 +799,7 @@ fn replace_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
                     Value::String(Handle::new(string.clone())),
                 ],
             )?;
-            to_string(&called)?
+            crate::context::to_string(agent, &called)?
         } else {
             get_substitution(
                 agent,
@@ -801,12 +825,14 @@ fn replace_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
 fn search(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
     let regexp = args.first().cloned().unwrap_or(Value::Undefined);
-    if !matches!(regexp, Value::Undefined)
+    // spec 22.1.3.24 step 2: a non-Object searchValue never consults its
+    // @@search property; it is coerced by RegExpCreate instead.
+    if matches!(regexp, Value::Object(_) | Value::Function(_))
         && let Some(searcher) = crate::expr::get_method(agent, &regexp, "@@search")?
     {
         return crate::function::call(agent, &searcher, regexp, std::slice::from_ref(this));
     }
-    let s = to_string(this)?;
+    let s = crate::context::to_string(agent, this)?;
     let rx = regexp_create(agent, &regexp, None)?;
     let searcher = crate::expr::get_method(agent, &rx, "@@search")?
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "RegExp has no @@search".into()))?;
@@ -814,14 +840,18 @@ fn search(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
 }
 
 /// spec 22.1.3.25 String.prototype.slice.
-fn slice(_agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+fn slice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
-    let s = to_string(this)?;
+    let s = crate::context::to_string(agent, this)?;
     let len = s.len();
-    let from = to_clamped_index(&args.first().cloned().unwrap_or(Value::Undefined), len)?;
+    let from = to_clamped_index(
+        agent,
+        &args.first().cloned().unwrap_or(Value::Undefined),
+        len,
+    )?;
     let to = match args.get(1).cloned().unwrap_or(Value::Undefined) {
         Value::Undefined => len,
-        other => to_clamped_index(&other, len)?,
+        other => to_clamped_index(agent, &other, len)?,
     };
     if from >= to {
         return Ok(Value::String(Handle::new(JsString::from_utf8(""))));
@@ -844,9 +874,9 @@ fn split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
     let lim = if matches!(limit, Value::Undefined) {
         u32::MAX
     } else {
-        to_uint32(to_number(&limit)?)
+        to_uint32(crate::context::to_number(agent, &limit)?)
     };
-    let separator_string = to_string(&separator)?;
+    let separator_string = crate::context::to_string(agent, &separator)?;
     if lim == 0 {
         return array_from_list(agent, &[]);
     }
@@ -886,15 +916,16 @@ fn split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
 /// spec 22.1.3.27 String.prototype.startsWith.
 fn starts_with(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
-    let s = to_string(this)?;
+    let s = crate::context::to_string(agent, this)?;
     let search_value = args.first().cloned().unwrap_or(Value::Undefined);
     if is_regexp(agent, &search_value)? {
         return Err(regexp_argument_error("startsWith"));
     }
-    let search = to_string(&search_value)?;
+    let search = crate::context::to_string(agent, &search_value)?;
     let len = s.len();
     let position = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let start = to_integer_or_infinity(to_number(&position)?).clamp(0.0, len as f64) as usize;
+    let start = to_integer_or_infinity(crate::context::to_number(agent, &position)?)
+        .clamp(0.0, len as f64) as usize;
     let search_len = search.len();
     if search_len == 0 {
         return Ok(Value::Boolean(true));
@@ -908,14 +939,19 @@ fn starts_with(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
 }
 
 /// Annex B.2.3.1 String.prototype.substr.
-fn substr(_agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+fn substr(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
-    let s = to_string(this)?;
+    let s = crate::context::to_string(agent, this)?;
     let size = s.len();
-    let int_start = to_clamped_index(&args.first().cloned().unwrap_or(Value::Undefined), size)?;
+    let int_start = to_clamped_index(
+        agent,
+        &args.first().cloned().unwrap_or(Value::Undefined),
+        size,
+    )?;
     let int_length = match args.get(1).cloned().unwrap_or(Value::Undefined) {
         Value::Undefined => size,
-        other => to_integer_or_infinity(to_number(&other)?).clamp(0.0, size as f64) as usize,
+        other => to_integer_or_infinity(crate::context::to_number(agent, &other)?)
+            .clamp(0.0, size as f64) as usize,
     };
     let int_end = (int_start + int_length).min(size);
     Ok(Value::String(Handle::new(substring(
@@ -924,17 +960,19 @@ fn substr(_agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsE
 }
 
 /// spec 22.1.3.28 String.prototype.substring.
-fn substring_method(_agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+fn substring_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
-    let s = to_string(this)?;
+    let s = crate::context::to_string(agent, this)?;
     let len = s.len();
-    let final_start = to_integer_or_infinity(to_number(
+    let final_start = to_integer_or_infinity(crate::context::to_number(
+        agent,
         &args.first().cloned().unwrap_or(Value::Undefined),
     )?)
     .clamp(0.0, len as f64) as usize;
     let final_end = match args.get(1).cloned().unwrap_or(Value::Undefined) {
         Value::Undefined => len,
-        other => to_integer_or_infinity(to_number(&other)?).clamp(0.0, len as f64) as usize,
+        other => to_integer_or_infinity(crate::context::to_number(agent, &other)?)
+            .clamp(0.0, len as f64) as usize,
     };
     let from = final_start.min(final_end);
     let to = final_start.max(final_end);
@@ -944,20 +982,20 @@ fn substring_method(_agent: &mut Agent, this: &Value, args: &[Value]) -> Result<
 /// spec 22.1.3.30 String.prototype.toLocaleLowerCase: identical to
 /// `toLowerCase` under the default locale.
 fn to_locale_lower_case(
-    _agent: &mut Agent,
+    agent: &mut Agent,
     this: &Value,
     _args: &[Value],
 ) -> Result<Value, JsError> {
-    to_lower_case(_agent, this, &[])
+    to_lower_case(agent, this, &[])
 }
 
 /// spec 22.1.3.31 String.prototype.toLocaleUpperCase.
 fn to_locale_upper_case(
-    _agent: &mut Agent,
+    agent: &mut Agent,
     this: &Value,
     _args: &[Value],
 ) -> Result<Value, JsError> {
-    to_upper_case(_agent, this, &[])
+    to_upper_case(agent, this, &[])
 }
 
 /// spec 22.1.3.32 String.prototype.toLowerCase: Unicode Default Case
@@ -966,9 +1004,9 @@ fn to_locale_upper_case(
 /// conversion, including the Final_Sigma conditional mapping: U+03A3 maps to
 /// U+03C2 when preceded by a cased character and not followed by a cased
 /// character (combining marks are skipped in the lookahead).
-fn to_lower_case(_agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
+fn to_lower_case(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
-    let s = to_string(this)?;
+    let s = crate::context::to_string(agent, this)?;
     let code_points: Vec<u32> = s.code_points().collect();
     let mut lower: Vec<u32> = Vec::new();
     for (index, cp) in code_points.iter().enumerate() {
@@ -983,39 +1021,46 @@ fn to_lower_case(_agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Va
 }
 
 /// The Final_Sigma condition: the sigma is preceded by a cased character
-/// (skipping combining marks) and is not followed by a cased character.
+/// (skipping Case_Ignorable characters) and is not followed by a cased
+/// character.
 fn is_final_sigma(code_points: &[u32], index: usize) -> bool {
     let preceded = code_points[..index]
         .iter()
         .rev()
-        .find(|cp| !is_combining_mark(**cp))
+        .find(|cp| !is_case_ignorable(**cp))
         .is_some_and(|cp| is_cased(*cp));
     if !preceded {
         return false;
     }
     let followed_cased = code_points[index + 1..]
         .iter()
-        .find(|cp| !is_combining_mark(**cp))
+        .find(|cp| !is_case_ignorable(**cp))
         .is_some_and(|cp| is_cased(*cp));
     !followed_cased
 }
 
-/// Whether the code point has a case mapping (the Unicode "cased" property,
-/// approximated via the default lowercase/uppercase mappings).
+/// Whether the code point has the Unicode "cased" property (general
+/// category Lu, Ll, or Lt). The case mappings are not a reliable proxy:
+/// Rust's tables omit the mathematical alphanumeric block, so `𝒢`
+/// (U+1D4A2, Lu) must be cased by category.
 fn is_cased(cp: u32) -> bool {
-    unicode::to_lowercase(cp) != vec![cp] || unicode::to_uppercase(cp) != vec![cp]
+    matches!(unicode::general_category(cp), "Lu" | "Ll" | "Lt")
 }
 
-/// Whether the code point is a nonspacing combining mark (Mn), skipped by
-/// the Final_Sigma lookahead.
-fn is_combining_mark(cp: u32) -> bool {
-    unicode::general_category(cp) == "Mn"
+/// Whether the code point is Case_Ignorable (spec 3.13): the Mn/Me/Cf/Lm/Sk
+/// categories plus the isolated hangul fillers, and the Final_Sigma special
+/// case where FULL STOP and MIDDLE DOT are also skipped.
+fn is_case_ignorable(cp: u32) -> bool {
+    matches!(
+        unicode::general_category(cp),
+        "Mn" | "Me" | "Cf" | "Lm" | "Sk"
+    ) || matches!(cp, 0x002E | 0x00B7 | 0x115F | 0x1160 | 0x3164 | 0xFFA0)
 }
 
 /// spec 22.1.3.33 String.prototype.toUpperCase.
-fn to_upper_case(_agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
+fn to_upper_case(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
-    let s = to_string(this)?;
+    let s = crate::context::to_string(agent, this)?;
     let mut code_points: Vec<u32> = Vec::new();
     for cp in s.code_points() {
         code_points.extend(unicode::to_uppercase(cp));
@@ -1031,9 +1076,9 @@ fn to_string_method(_agent: &mut Agent, this: &Value, _args: &[Value]) -> Result
 }
 
 /// spec 22.1.3.35 String.prototype.toWellFormed.
-fn to_well_formed(_agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
+fn to_well_formed(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
-    let s = to_string(this)?;
+    let s = crate::context::to_string(agent, this)?;
     let units = s.as_slice();
     let mut result: Vec<u16> = Vec::new();
     let mut k = 0;
@@ -1058,23 +1103,23 @@ fn to_well_formed(_agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<V
 }
 
 /// spec 22.1.3.36 String.prototype.trim.
-fn trim(_agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
+fn trim(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
-    let s = to_string(this)?;
+    let s = crate::context::to_string(agent, this)?;
     Ok(Value::String(Handle::new(trim_string(&s, true, true))))
 }
 
 /// spec 22.1.3.37 String.prototype.trimEnd.
-fn trim_end(_agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
+fn trim_end(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
-    let s = to_string(this)?;
+    let s = crate::context::to_string(agent, this)?;
     Ok(Value::String(Handle::new(trim_string(&s, false, true))))
 }
 
 /// spec 22.1.3.38 String.prototype.trimStart.
-fn trim_start(_agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
+fn trim_start(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
-    let s = to_string(this)?;
+    let s = crate::context::to_string(agent, this)?;
     Ok(Value::String(Handle::new(trim_string(&s, true, false))))
 }
 

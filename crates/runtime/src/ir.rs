@@ -1153,21 +1153,18 @@ impl Vm {
                 Step::ConcatStr => {
                     let value = self.pop();
                     let acc = self.pop();
-                    let text = crate::context::to_string(agent, &value)?.to_string_lossy();
-                    let acc_text = string_of(&acc);
+                    let text = crate::context::to_string(agent, &value)?;
+                    let mut units = string_units_of(&acc);
+                    units.extend_from_slice(text.as_slice());
                     self.stack
-                        .push(Value::String(Handle::new(JsString::from_utf8(&format!(
-                            "{acc_text}{text}"
-                        )))));
+                        .push(Value::String(Handle::new(JsString::from_utf16(&units))));
                 }
                 Step::ConcatStrConst(text) => {
                     let acc = self.pop();
-                    let acc_text = string_of(&acc);
+                    let mut units = string_units_of(&acc);
+                    units.extend_from_slice(text.as_slice());
                     self.stack
-                        .push(Value::String(Handle::new(JsString::from_utf8(&format!(
-                            "{acc_text}{}",
-                            text.to_string_lossy()
-                        )))));
+                        .push(Value::String(Handle::new(JsString::from_utf16(&units))));
                 }
                 Step::ArgsPush => {
                     let value = self.pop();
@@ -2204,12 +2201,15 @@ fn nullish_error(what: &str) -> JsError {
     JsError::new(ErrorKind::TypeError, what.into())
 }
 
-fn string_of(value: &Value) -> String {
+/// The UTF-16 units of a value converted to a string; used by the string
+/// concatenation steps, which must preserve lone surrogates (a lossy UTF-8
+/// round-trip would replace them with U+FFFD).
+fn string_units_of(value: &Value) -> Vec<u16> {
     match value {
-        Value::String(s) => s.to_string_lossy(),
+        Value::String(s) => s.as_slice().to_vec(),
         other => crux::convert::to_string(other)
-            .map(|s| s.to_string_lossy())
-            .unwrap_or_else(|_| "undefined".into()),
+            .map(|s| s.as_slice().to_vec())
+            .unwrap_or_else(|_| vec![]),
     }
 }
 

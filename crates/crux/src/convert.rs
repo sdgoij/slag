@@ -48,7 +48,13 @@ pub fn to_primitive(value: &Value, hint: ToPrimitiveHint) -> Result<Value, JsErr
                 crate::symbol::well_known("toPrimitive").as_ref().clone(),
             );
             let method = obj.get_key(&key)?;
-            if is_callable(&method) {
+            if !matches!(method, Value::Undefined | Value::Null) {
+                if !is_callable(&method) {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "Symbol.toPrimitive is not a function".into(),
+                    ));
+                }
                 return call_exotic_to_primitive(&method, value.clone(), hint);
             }
             ordinary_to_primitive(|name| obj.get(name), value.clone(), hint)
@@ -58,7 +64,13 @@ pub fn to_primitive(value: &Value, hint: ToPrimitiveHint) -> Result<Value, JsErr
                 crate::symbol::well_known("toPrimitive").as_ref().clone(),
             );
             let method = function.get_key(&key)?;
-            if is_callable(&method) {
+            if !matches!(method, Value::Undefined | Value::Null) {
+                if !is_callable(&method) {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "Symbol.toPrimitive is not a function".into(),
+                    ));
+                }
                 return call_exotic_to_primitive(&method, value.clone(), hint);
             }
             ordinary_to_primitive(|name| function.get(name), value.clone(), hint)
@@ -121,8 +133,8 @@ fn ordinary_to_primitive(
         }
     }
     let (first, second) = match hint {
-        ToPrimitiveHint::String | ToPrimitiveHint::Default => ("toString", "valueOf"),
-        ToPrimitiveHint::Number => ("valueOf", "toString"),
+        ToPrimitiveHint::String => ("toString", "valueOf"),
+        ToPrimitiveHint::Default | ToPrimitiveHint::Number => ("valueOf", "toString"),
     };
     for name in [first, second] {
         let key = JsString::from_utf8(name);

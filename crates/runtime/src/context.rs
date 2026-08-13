@@ -39,14 +39,21 @@ pub fn to_primitive(
         return Ok(value.clone());
     }
     // spec 7.1.1 step 1.a: the @@toPrimitive method runs first, and its
-    // abrupt completion or object result decides.
+    // abrupt completion or object result decides. GetMethod semantics: only
+    // undefined/null skip the hook; any other non-callable value throws.
     let exotic = get_property_key(
         agent,
         value,
         &PropertyKey::Symbol(crux::symbol::well_known("toPrimitive").as_ref().clone()),
         value.clone(),
     )?;
-    if crux::value::is_callable(&exotic) {
+    if !matches!(exotic, Value::Undefined | Value::Null) {
+        if !crux::value::is_callable(&exotic) {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "Symbol.toPrimitive is not a function".into(),
+            ));
+        }
         let hint_text = match hint {
             crux::convert::ToPrimitiveHint::String => "string",
             crux::convert::ToPrimitiveHint::Default => "default",
@@ -66,11 +73,13 @@ pub fn to_primitive(
         }
         return Ok(result);
     }
+    // OrdinaryToPrimitive: only the string hint prefers toString; "default"
+    // and "number" both try valueOf first.
     let (first, second) = match hint {
-        crux::convert::ToPrimitiveHint::String | crux::convert::ToPrimitiveHint::Default => {
-            ("toString", "valueOf")
+        crux::convert::ToPrimitiveHint::String => ("toString", "valueOf"),
+        crux::convert::ToPrimitiveHint::Default | crux::convert::ToPrimitiveHint::Number => {
+            ("valueOf", "toString")
         }
-        crux::convert::ToPrimitiveHint::Number => ("valueOf", "toString"),
     };
     for name in [first, second] {
         let method = get_property_key(agent, value, &PropertyKey::from_utf8(name), value.clone())?;

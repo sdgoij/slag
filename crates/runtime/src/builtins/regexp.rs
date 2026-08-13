@@ -416,12 +416,21 @@ fn test(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     Ok(Value::Boolean(matched))
 }
 
-/// spec 22.2.5.10 RegExp.prototype.toString.
+/// spec 22.2.5.10 RegExp.prototype.toString: compose from Get(R, "source")
+/// and Get(R, "flags") so overridden accessors are honored and the flags
+/// come back in the canonical (sorted) order.
 fn to_string_method(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
-    let state = regexp_state(agent, this)?;
-    let source = escape_source(&state.source);
-    let text = format!("/{source}/{}", state.flags_text);
-    Ok(Value::String(Handle::new(JsString::from_utf8(&text))))
+    regexp_state(agent, this)?; // thisRegExpValue brand check
+    let source = get_property(agent, this, &JsString::from_utf8("source"), this.clone())?;
+    let flags = get_property(agent, this, &JsString::from_utf8("flags"), this.clone())?;
+    let source_text = crate::context::to_string(agent, &source)?;
+    let flags_text = crate::context::to_string(agent, &flags)?;
+    let mut units = Vec::with_capacity(source_text.len() + flags_text.len() + 2);
+    units.push(b'/' as u16);
+    units.extend_from_slice(source_text.as_slice());
+    units.push(b'/' as u16);
+    units.extend_from_slice(flags_text.as_slice());
+    Ok(Value::String(Handle::new(JsString::from_utf16(&units))))
 }
 
 /// EscapeRegExpPattern (spec 22.2.4.4): escape `/` and line terminators so

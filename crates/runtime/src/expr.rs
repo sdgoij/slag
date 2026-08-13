@@ -901,12 +901,13 @@ pub(crate) fn apply_binary(
             let left_prim = crate::context::to_primitive(agent, left, ToPrimitiveHint::Default)?;
             let right_prim = crate::context::to_primitive(agent, right, ToPrimitiveHint::Default)?;
             if matches!(left_prim, Value::String(_)) || matches!(right_prim, Value::String(_)) {
-                let text = format!(
-                    "{}{}",
-                    crate::context::to_string(agent, &left_prim)?,
-                    crate::context::to_string(agent, &right_prim)?
-                );
-                return Ok(Value::String(Handle::new(JsString::from_utf8(&text))));
+                // Concatenate at the UTF-16 unit level; a lossy Display path
+                // would replace lone surrogates with U+FFFD.
+                let left_text = crate::context::to_string(agent, &left_prim)?;
+                let right_text = crate::context::to_string(agent, &right_prim)?;
+                let mut units = left_text.as_slice().to_vec();
+                units.extend_from_slice(right_text.as_slice());
+                return Ok(Value::String(Handle::new(JsString::from_utf16(&units))));
             }
             numeric_add(&left_prim, &right_prim)
         }

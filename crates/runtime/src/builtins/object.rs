@@ -541,8 +541,12 @@ pub fn dispatch_call(
             };
             let obj = JsObject::ordinary_object_create(proto);
             let value = Value::Object(obj);
+            // spec 20.1.2.2 step 3: undefined Properties are skipped.
             if args.len() > 1 {
-                object_define_properties(agent, &value, arg(args, 1))?;
+                let properties = arg(args, 1);
+                if !matches!(properties, Value::Undefined) {
+                    object_define_properties(agent, &value, properties)?;
+                }
             }
             Ok(value)
         })());
