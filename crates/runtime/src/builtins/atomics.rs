@@ -67,12 +67,16 @@ fn typed_array_slots(value: &Value) -> Option<TypedArraySlots> {
     Some(slots.as_ref().clone())
 }
 
-/// ValidateIntegerTypedArray (spec 26.4.1) + the SharedArrayBuffer
-/// requirement shared by every Atomics method (spec 26.4.2 step 2).
-fn validate_shared_typed_array(
+/// ValidateIntegerTypedArray (spec 26.4.1): an integer TypedArray whose
+/// buffer is not detached or (for write access) immutable. The modern
+/// Atomics operations also run on non-shared buffers; only `wait`/
+/// `waitAsync` (which require a SharedArrayBuffer) and `notify` (which
+/// returns 0) check sharing.
+fn validate_integer_typed_array(
     agent: &mut Agent,
     args: &[Value],
     wait_type: bool,
+    write: bool,
 ) -> Result<TypedArraySlots, JsError> {
     let value = args.first().cloned().unwrap_or(Value::Undefined);
     let slots = typed_array_slots(&value).ok_or_else(|| {
@@ -105,10 +109,17 @@ fn validate_shared_typed_array(
             "TypedArray buffer is detached".into(),
         ));
     }
-    if !crate::builtins::array_buffer::is_shared(agent, &slots.buffer_object) {
+    // ValidateTypedArray (spec 26.4.1): a write through an immutable buffer
+    // throws before any argument is read (immutable-buffer.js).
+    if write
+        && agent
+            .buffer_data
+            .get(&buffer_id)
+            .is_some_and(|cell| cell.borrow().immutable)
+    {
         return Err(JsError::new(
             ErrorKind::TypeError,
-            "Atomics operation on a non-shared buffer".into(),
+            "Atomics operation on an immutable buffer".into(),
         ));
     }
     Ok(slots)
@@ -207,7 +218,7 @@ fn binary_op(
     op: AtomicOp,
 ) -> Result<Value, JsError> {
     let _ = this;
-    let slots = validate_shared_typed_array(agent, args, false)?;
+    let slots = validate_integer_typed_array(agent, args, false, true)?;
     let offset = atomic_offset(&slots, args)?;
     let operand = args.get(2).cloned().unwrap_or(Value::Undefined);
     raw_rmw(&slots, offset, &operand, op, None)
@@ -229,7 +240,8 @@ fn str(text: &str) -> Value {
 /// Atomics.load (spec 26.4.9).
 fn load(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let _ = this;
-    let slots = validate_shared_typed_array(agent, args, false)?;
+    // A read: immutable buffers are readable.
+    let slots = validate_integer_typed_array(agent, args, false, false)?;
     let offset = atomic_offset(&slots, args)?;
     read_element(&slots, offset)
 }
@@ -246,18 +258,30 @@ fn is_lock_free(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
 /// Atomics.store (spec 26.4.11).
 fn store(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let _ = this;
-    let slots = validate_shared_typed_array(agent, args, false)?;
+    let slots = validate_integer_typed_array(agent, args, false, true)?;
     let offset = atomic_offset(&slots, args)?;
     let value = args.get(2).cloned().unwrap_or(Value::Undefined);
     let converted = converted_value(&slots, &value)?;
     write_element(&slots, offset, &converted)?;
-    Ok(converted)
+    // spec 26.4.11 step 8: the returned value is ToIntegerOrInfinity of the
+    // input (normalizing -0 to +0, spec 26.4.1.6).
+    match converted {
+        Value::Number(_) => Ok(Value::Number(crux::convert::to_integer_or_infinity(
+            crate::context::to_number(agent, &value)?,
+        ))),
+        // spec 26.4.11 step 8: the returned value is ToBigInt (unwrapped,
+        // unlike the stored element).
+        Value::BigInt(_) => Ok(Value::BigInt(Handle::new(crate::context::to_big_int(
+            agent, &value,
+        )?))),
+        _ => unreachable!("store converts to Number or BigInt"),
+    }
 }
 
 /// Atomics.exchange (spec 26.4.5): store the new value, return the old.
 fn exchange(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let _ = this;
-    let slots = validate_shared_typed_array(agent, args, false)?;
+    let slots = validate_integer_typed_array(agent, args, false, true)?;
     let offset = atomic_offset(&slots, args)?;
     let value = args.get(2).cloned().unwrap_or(Value::Undefined);
     raw_rmw(&slots, offset, &value, AtomicOp::Exchange, None)
@@ -267,7 +291,7 @@ fn exchange(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
 /// `expected` and store `replacement` when equal; return the old value.
 fn compare_exchange(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let _ = this;
-    let slots = validate_shared_typed_array(agent, args, false)?;
+    let slots = validate_integer_typed_array(agent, args, false, true)?;
     let offset = atomic_offset(&slots, args)?;
     let expected = args.get(2).cloned().unwrap_or(Value::Undefined);
     let replacement = args.get(3).cloned().unwrap_or(Value::Undefined);
@@ -305,17 +329,12 @@ fn registry() -> &'static Mutex<WaitRegistry> {
 }
 
 /// Atomics.notify (spec 26.4.13): wake up to `count` waiting agents on the
-/// byte offset and return how many were woken. The main agent never blocks,
-/// so on the main thread the count is 0 unless worker agents are waiting.
+/// byte offset and return how many were woken. A non-shared buffer returns 0
+/// after the index/count coercions (spec 26.4.13 steps 2-7).
 fn notify(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let _ = this;
-    let slots = validate_shared_typed_array(agent, args, false)?;
-    if slots.element_type != ElementType::Int32 {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "Atomics.notify requires an Int32Array".into(),
-        ));
-    }
+    // ValidateIntegerTypedArray(typedArray, true): Int32 and BigInt64 only.
+    let slots = validate_integer_typed_array(agent, args, true, false)?;
     let offset = atomic_offset(&slots, args)?;
     let count_arg = args.get(2).cloned().unwrap_or(Value::Undefined);
     let count =
@@ -325,6 +344,9 @@ fn notify(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
     } else {
         count.max(0.0) as usize
     };
+    if !crate::builtins::array_buffer::is_shared(agent, &slots.buffer_object) {
+        return Ok(Value::Number(0.0));
+    }
     let key = (slots.buffer.block_id(), offset);
     let mut events = Vec::new();
     {
@@ -367,29 +389,49 @@ fn wait_expected_raw(slots: &TypedArraySlots, requested: &Value) -> Result<u64, 
 }
 
 /// Atomics.wait (spec 26.4.14): the agent suspends until the value changes,
-/// a notify arrives, or the timeout expires. Agents with [[CanBlock]] false
-/// (the main thread) throw instead of suspending.
+/// a notify arrives, or the timeout expires. The shared-buffer check runs
+/// before any argument is read (ValidateSharedIntegerTypedArray), and agents
+/// with [[CanBlock]] false throw before the zero-timeout fast path.
 fn wait(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let _ = this;
-    let slots = validate_shared_typed_array(agent, args, true)?;
+    let slots = validate_integer_typed_array(agent, args, true, false)?;
+    // spec 26.4.14 step 9: wait requires a SharedArrayBuffer (checked
+    // before the index/value/timeout coercions, non-shared-bufferdata-throws).
+    if !crate::builtins::array_buffer::is_shared(agent, &slots.buffer_object) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Atomics.wait on a non-shared buffer".into(),
+        ));
+    }
     let offset = atomic_offset(&slots, args)?;
     let requested = args.get(2).cloned().unwrap_or(Value::Undefined);
     let requested_raw = wait_expected_raw(&slots, &requested)?;
+    let timeout_arg = args.get(3).cloned().unwrap_or(Value::Number(f64::INFINITY));
+    let timeout_ms = crate::context::to_number(agent, &timeout_arg)?;
+    let size = slots.element_type.size();
+    let key = (slots.buffer.block_id(), offset);
+    // spec steps 13-14: a value mismatch is "not-equal".
+    let current = slots.buffer.atomic_load(offset, size)?;
+    if current != requested_raw {
+        return Ok(str("not-equal"));
+    }
+    // spec steps 16-17: an agent that cannot suspend throws even for a
+    // zero timeout (cannot-suspend-throws.js).
     if !agent.can_block {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Atomics.wait cannot be called on the main thread".into(),
         ));
     }
-    let timeout_arg = args.get(3).cloned().unwrap_or(Value::Number(f64::INFINITY));
-    let timeout_ms = crate::context::to_number(agent, &timeout_arg)?;
+    // spec step 15: a zero timeout returns "timed-out" without suspending.
+    if timeout_ms.max(0.0) == 0.0 {
+        return Ok(str("timed-out"));
+    }
     let deadline = if timeout_ms.is_infinite() {
         None
     } else {
         Some(Instant::now() + Duration::from_millis(timeout_ms.max(0.0) as u64))
     };
-    let size = slots.element_type.size();
-    let key = (slots.buffer.block_id(), offset);
     let status = loop {
         let current = slots.buffer.atomic_load(offset, size)?;
         if current != requested_raw {
@@ -439,13 +481,22 @@ fn wait(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     Ok(str(status))
 }
 
-/// Atomics.waitAsync (spec 26.4.15): non-blocking; returns
-/// `{ async: true, value: promise }` on the main agent. A value mismatch
-/// resolves the promise with "not-equal"; otherwise it resolves "ok" (the
-/// runtime never actually suspends, so there is no later notify to await).
+/// Atomics.waitAsync (spec 26.4.15): non-blocking. An immediate outcome
+/// (value mismatch, or a match with a zero timeout) returns
+/// `{ async: false, value: "not-equal" | "timed-out" }`; a match with a
+/// positive timeout would wait for a notify the runtime cannot deliver, so it
+/// returns `{ async: true, value: promise }` left pending.
 fn wait_async(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let _ = this;
-    let slots = validate_shared_typed_array(agent, args, true)?;
+    let slots = validate_integer_typed_array(agent, args, true, false)?;
+    // spec 26.4.14 step 9: waitAsync requires a SharedArrayBuffer (checked
+    // before the argument coercions, non-shared-bufferdata-throws).
+    if !crate::builtins::array_buffer::is_shared(agent, &slots.buffer_object) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Atomics.waitAsync on a non-shared buffer".into(),
+        ));
+    }
     let offset = atomic_offset(&slots, args)?;
     let requested = args.get(2).cloned().unwrap_or(Value::Undefined);
     let current = read_element(&slots, offset)?;
@@ -456,25 +507,36 @@ fn wait_async(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
             Value::BigInt(Handle::new(big))
         }
     };
-    let status = if same_value_zero(&current, &requested_value) {
-        "ok"
-    } else {
-        "not-equal"
-    };
+    let timeout_arg = args.get(3).cloned().unwrap_or(Value::Number(f64::INFINITY));
+    let timeout_ms = crate::context::to_number(agent, &timeout_arg)?;
+    let object_proto = agent
+        .current_realm()?
+        .intrinsics
+        .get("%Object.prototype%")
+        .and_then(|value| as_object(&value));
+    // spec DoWait steps 15-17: a mismatch is "not-equal"; a match with a
+    // zero timeout is "timed-out"; both are immediate (async: false).
+    if !same_value_zero(&current, &requested_value) || timeout_ms.max(0.0) == 0.0 {
+        let status = if same_value_zero(&current, &requested_value) {
+            "timed-out"
+        } else {
+            "not-equal"
+        };
+        let result = JsObject::ordinary_object_create(object_proto);
+        result
+            .create_data_property_or_throw(&JsString::from_utf8("async"), Value::Boolean(false))?;
+        result.create_data_property_or_throw(&JsString::from_utf8("value"), str(status))?;
+        return Ok(Value::Object(result));
+    }
+    // A match with a positive timeout: the promise stays pending (no agent
+    // can notify it), reported as async: true.
     let promise_ctor = agent
         .current_realm()?
         .intrinsics
         .get("%Promise%")
         .unwrap_or(Value::Undefined);
     let capability = crate::promise::new_promise_capability(agent, &promise_ctor)?;
-    crate::promise::resolve_promise(agent, &capability.promise, str(status))?;
-    let result = JsObject::ordinary_object_create(
-        agent
-            .current_realm()?
-            .intrinsics
-            .get("%Object.prototype%")
-            .and_then(|value| as_object(&value)),
-    );
+    let result = JsObject::ordinary_object_create(object_proto);
     result.create_data_property_or_throw(&JsString::from_utf8("async"), Value::Boolean(true))?;
     result.create_data_property_or_throw(&JsString::from_utf8("value"), capability.promise)?;
     Ok(Value::Object(result))
@@ -507,11 +569,11 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         ("load", ATOMICS_LOAD, 2),
         ("notify", ATOMICS_NOTIFY, 3),
         ("or", ATOMICS_OR, 3),
-        ("pause", ATOMICS_PAUSE, 1),
+        ("pause", ATOMICS_PAUSE, 0),
         ("store", ATOMICS_STORE, 3),
         ("sub", ATOMICS_SUB, 3),
         ("wait", ATOMICS_WAIT, 4),
-        ("waitAsync", ATOMICS_WAIT_ASYNC, 2),
+        ("waitAsync", ATOMICS_WAIT_ASYNC, 4),
         ("xor", ATOMICS_XOR, 3),
     ];
     for (name, intrinsic, length) in methods {
@@ -715,40 +777,57 @@ mod tests {
 
     #[test]
     fn atomics_reject_invalid_receivers() {
-        // A non-shared buffer is rejected.
-        assert!(run("Atomics.load(new Int32Array(4), 0)").is_err());
+        // The RMW/read/write ops run on non-shared buffers (the modern spec).
+        assert_eq!(
+            run("Atomics.load(new Int32Array(4), 0)").unwrap(),
+            Value::Number(0.0)
+        );
         // Float element kinds are rejected.
         assert!(run("Atomics.add(new Float64Array(new SharedArrayBuffer(16)), 0, 1)").is_err());
         // wait/waitAsync accept only Int32/BigInt64.
         assert!(run("Atomics.wait(new Uint8Array(new SharedArrayBuffer(4)), 0, 0)").is_err());
         assert!(run("Atomics.waitAsync(new Uint8Array(new SharedArrayBuffer(4)), 0, 0)").is_err());
-        // wait on the main thread ([[CanBlock]] false) throws.
-        assert!(run("Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0)").is_err());
-        // notify requires Int32.
-        assert!(run("Atomics.notify(new BigInt64Array(new SharedArrayBuffer(16)), 0)").is_err());
+        // wait on the main thread ([[CanBlock]] false) throws — even for a
+        // zero timeout (cannot-suspend-throws.js).
+        assert!(run("Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 0)").is_err());
+        assert!(run("Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100)").is_err());
+        // notify accepts Int32 and BigInt64 (returns 0 with no waiters).
+        assert_eq!(
+            run("Atomics.notify(new Int32Array(new SharedArrayBuffer(4)), 0)").unwrap(),
+            Value::Number(0.0)
+        );
+        assert_eq!(
+            run("Atomics.notify(new BigInt64Array(new SharedArrayBuffer(16)), 0)").unwrap(),
+            Value::Number(0.0)
+        );
+        // notify on a non-shared buffer returns 0.
+        assert_eq!(
+            run("Atomics.notify(new Int32Array(4), 0)").unwrap(),
+            Value::Number(0.0)
+        );
     }
 
     #[test]
     fn wait_async_returns_async_promise() {
-        // { async: true, value: promise } — resolves "ok" when the value
-        // matches the expected, "not-equal" otherwise.
+        // Immediate outcomes are reported as { async: false, value: string }:
+        // "timed-out" for a match, "not-equal" for a mismatch.
         assert_eq!(
             run(
-                "const ta = new Int32Array(new SharedArrayBuffer(4)); Atomics.store(ta, 0, 0); Atomics.waitAsync(ta, 0, 0).async"
+                "const ta = new Int32Array(new SharedArrayBuffer(4)); Atomics.store(ta, 0, 0); Atomics.waitAsync(ta, 0, 0, 0).async"
             )
             .unwrap(),
-            Value::Boolean(true)
+            Value::Boolean(false)
         );
         assert_eq!(
-            settle(
-                "const ta = new Int32Array(new SharedArrayBuffer(4)); Atomics.store(ta, 0, 0); Atomics.waitAsync(ta, 0, 0).value"
+            run(
+                "const ta = new Int32Array(new SharedArrayBuffer(4)); Atomics.store(ta, 0, 0); Atomics.waitAsync(ta, 0, 0, 0).value"
             )
             .unwrap(),
-            Value::String(Handle::new(JsString::from_utf8("ok")))
+            Value::String(Handle::new(JsString::from_utf8("timed-out")))
         );
         assert_eq!(
-            settle(
-                "const ta = new Int32Array(new SharedArrayBuffer(4)); Atomics.store(ta, 0, 1); Atomics.waitAsync(ta, 0, 0).value"
+            run(
+                "const ta = new Int32Array(new SharedArrayBuffer(4)); Atomics.store(ta, 0, 1); Atomics.waitAsync(ta, 0, 0, 0).value"
             )
             .unwrap(),
             Value::String(Handle::new(JsString::from_utf8("not-equal")))
@@ -765,28 +844,5 @@ mod tests {
             run("Atomics.notify(new Int32Array(new SharedArrayBuffer(4)), 0, 5)").unwrap(),
             number(0.0)
         );
-    }
-
-    /// Evaluate a script whose final expression is a promise, drain the job
-    /// queue, and return the settled value.
-    fn settle(source: &str) -> Result<Value, JsError> {
-        let mut agent = Agent::new();
-        agent.initialize_host_defined_realm()?;
-        let value = agent.run_script(source)?;
-        agent.run_jobs()?;
-        let Value::Object(obj) = &value else {
-            return Ok(value.clone());
-        };
-        let Some(data) = agent.promises.get(&obj.id()) else {
-            return Ok(value.clone());
-        };
-        match &data.borrow().state {
-            crate::promise::PromiseState::Fulfilled(value) => Ok(value.clone()),
-            crate::promise::PromiseState::Rejected(value) => Ok(value.clone()),
-            _ => Err(JsError::new(
-                ErrorKind::TypeError,
-                "promise not settled".into(),
-            )),
-        }
     }
 }

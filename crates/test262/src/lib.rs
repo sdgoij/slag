@@ -11153,6 +11153,15 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
             // proposal) are not part of ECMA-262 ES2026.
             return FixtureResult::Skip("await-dictionary is out of scope".into());
         }
+        if fm.features.iter().any(|f| f == "ShadowRealm") {
+            // ShadowRealm is a stage-3 proposal, not part of ECMA-262 ES2026.
+            return FixtureResult::Skip("ShadowRealm is out of scope".into());
+        }
+        if fm.flags.iter().any(|f| f == "CanBlockIsTrue") {
+            // Atomics.wait fixtures that assume [[CanBlock]] = true: the
+            // engine's main agent cannot suspend (host-dependent).
+            return FixtureResult::Skip("host-dependent: can_block is false".into());
+        }
         let unsupported: Vec<&str> = fm
             .includes
             .iter()

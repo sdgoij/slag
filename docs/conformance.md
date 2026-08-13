@@ -1286,6 +1286,52 @@ Validation: `cargo test --workspace` **4094 pass, 0 failures**;
 **61 fixtures fixed** and **33 await-dictionary fixtures skipped**
 (17,067 pass / 173 fail / 0 crash) and no regressions.
 
+### Atomics cluster sweep and out-of-scope gates (Phase 18 conformance)
+
+A sweep of the entire Atomics tree (`sweep.exe built-ins --filter
+'Atomics*'`) reports **257 pass, 0 fail, 132 skip** of 389 fixtures:
+every runnable fixture passes (up from ~208 pass / 35 fail). Fixes in
+`crates/runtime/src/builtins/atomics.rs`:
+
+- **Ops now run on non-shared buffers** — the RMW/read/write methods
+  (`add`/`and`/`compareExchange`/`exchange`/`load`/`or`/`store`/`sub`/
+  `xor`) rejected plain `ArrayBuffer` views; per the modern spec they
+  operate on them, and only `wait`/`waitAsync` (TypeError) and `notify`
+  (returns 0) check sharing (`non-shared-bufferdata.js`).
+- **Write access rejects immutable buffers before any coercion** —
+  `ValidateTypedArray` with the ~write~ access mode throws a TypeError for
+  an immutable buffer with no user code running (`immutable-buffer.js`);
+  `load` (a read) still works on immutable buffers.
+- **`notify` accepts `BigInt64Array`** (ValidateIntegerTypedArray with
+  waitable=true) and performs the index/count coercions before the
+  non-shared 0-return (`bad-range.js`, `non-shared-bufferdata-*.js`).
+- **`wait` argument order** — the shared-buffer TypeError fires before any
+  argument coercion (`non-shared-bufferdata-throws.js`), the timeout is
+  coerced before the `[[CanBlock]]` check (`poisoned/symbol-for-timeout-
+  throws.js`), and a non-suspending agent throws even for a zero timeout
+  (`cannot-suspend-throws.js`).
+- **`waitAsync` immediate results** — a value mismatch or a zero-timeout
+  match returns `{ async: false, value: "not-equal" | "timed-out" }` per
+  the pinned test262 semantics (`returns-result-object-value-is-string-
+  *.js`, `null-for-timeout.js`); a positive-timeout match returns
+  `{ async: true, value: promise }` left pending.
+- **`store` return values** — the returned Number is `ToIntegerOrInfinity`
+  of the input (normalizing `-0` to `+0`, `expected-return-value-negative-
+  zero.js`, `good-views.js`) and the returned BigInt is the unwrapped
+  `ToBigInt` (`store/bigint/good-views.js`).
+- **`pause.length` is 0 and `waitAsync.length` is 4** (`pause/length.js`,
+  `waitAsync/length.js`).
+
+Harness gates: `flags: [CanBlockIsTrue]` fixtures are skipped (the main
+agent cannot suspend — host-dependent), and the `ShadowRealm` stage-3
+proposal fixtures (55) are now skipped like Temporal and await-dictionary.
+
+Validation: `cargo test --workspace` **4099 pass, 0 failures**;
+`cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo fmt --all --check` clean. A full `built-ins` re-sweep shows exactly
+**44 fixtures fixed** and **64 fixtures skipped** (17,111 pass / 65 fail /
+0 crash) and no regressions.
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~134 edge-case unit tests were added across
@@ -1366,8 +1412,10 @@ The harness's skip taxonomy (also used by the sweep):
 |---|---|
 | `flags: module` | No module loader: `import`/`export` parse, but linking, `dynamic import`, and `import.meta` are host-dependent (see below). |
 | `flags: async` | The `$DONE` async harness is not provided; async semantics are covered by the runtime's own async test suites. |
+| `flags: [CanBlockIsTrue]` | `Atomics.wait` fixtures assuming `[[CanBlock]] = true`; the engine's main agent cannot suspend (host-dependent). |
 | `features: [Temporal]` | Temporal is a stage-3 proposal, not part of ECMA-262 ES2026 (out of scope like Intl). |
 | `features: [await-dictionary]` | `Promise.allKeyed`/`allSettledKeyed` (the await-dictionary stage-3 proposal) are not part of ECMA-262 ES2026. |
+| `features: [ShadowRealm]` | ShadowRealm is a stage-3 proposal, not part of ECMA-262 ES2026. |
 | Unsupported `includes:` | Fixtures needing harness helpers beyond `assert.js`, `compareArray.js`, `detachArrayBuffer.js`, `isConstructor.js`, `propertyHelper.js`, `testAtomics.js`, `testTypedArray.js` are not run. |
 | Intl directories | `Intl` (ECMA-402) is out of scope for this runtime (PLAN scope decision). |
 
@@ -1396,26 +1444,28 @@ annexB rows are from the earlier run and have not changed since.
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,812 | 17,067 | 173 | 6,569 | 3¹ | 99.0% |
+| built-ins | 23,812 | 17,111 | 65 | 6,633 | 3¹ | 99.6% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,622** | **33,510** | **2,779** | **12,330** | **3** | **92.3%** |
+| **Total** | **48,622** | **33,554** | **2,671** | **12,394** | **3** | **92.6%** |
 
-(Runnable = pass + fail; the 9,204 skips are module/async fixtures,
-unsupported harness includes, and the out-of-scope Temporal and
-await-dictionary proposal fixtures.) The built-ins row reflects the
-current `Error*`/`BigInt*`/RegExp/Object-descriptor hardening plus the
-String/prototype, Object/create, DisposableStack, AsyncDisposableStack,
+(Runnable = pass + fail; the 9,268 skips are module/async fixtures,
+unsupported harness includes, the host-dependent `CanBlockIsTrue` waits,
+and the out-of-scope Temporal, await-dictionary, and ShadowRealm proposal
+fixtures.) The built-ins row reflects the current `Error*`/`BigInt*`/
+RegExp/Object-descriptor hardening plus the String/prototype,
+Object/create, DisposableStack, AsyncDisposableStack,
 ArrayBuffer/SharedArrayBuffer, Date, BigInt, global-functions, Function,
 Iterator/prototype, Iterator statics (concat/from/zip/zipKeyed), Symbol,
 Boolean, Number, Object.prototype.toString, Object/prototype legacy
 accessors, Proxy, Reflect, Object.groupBy, Object
 freeze/seal/isFrozen/isSealed, Array iteration-method, Array.of, Math,
 Object.fromEntries, JSON.stringify, DataView, Object statics/
-constructor, and Promise cluster closures (all 0 fail); the language and
-annexB rows are from the sweep recorded below. The 6,569 built-ins skips
-are dominated by the out-of-scope Temporal proposal (4,611) and
-await-dictionary (33), with the async/module flags, host-dependent
-`$262.createRealm`, and unsupported harness includes making up the rest.
+constructor, Promise, and Atomics cluster closures (all 0 fail); the
+language and annexB rows are from the sweep recorded below. The 6,633
+built-ins skips are dominated by the out-of-scope Temporal proposal
+(4,611), await-dictionary (33), and ShadowRealm (55), with the
+async/module flags, host-dependent `$262.createRealm`/`CanBlockIsTrue`,
+and unsupported harness includes making up the rest.
 
 ¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
 coerced-values fixtures — 10,000-element allocations that need the long
@@ -1443,9 +1493,9 @@ resolved:
 The 7,314 failures triage into:
 
 - **Missing built-ins (excluded from runnable):** Temporal (~3,100
-  fixtures across `Temporal/*` — not implemented), ShadowRealm (47), and
-  Intl (never collected). Excluding them, the runnable pass rate is
-  ~80%.
+  fixtures across `Temporal/*` — not implemented), ShadowRealm (47, now
+  skipped as out of scope), and Intl (never collected). Excluding them,
+  the runnable pass rate is ~80%.
 - **Systematic bug clusters (runnable, fix targets):**
   - Destructuring (`dstr`): the ~2,300-fixture assignment/class/for-of/
     generator/arrow cluster now passes **100% of runnable** (6,189 pass /
@@ -1500,15 +1550,16 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 ## Open items
 
 - Certify the ≥95%-of-runnable target: the built-ins area now measures
-  **99.0%** of runnable (17,067 pass / 173 fail of 17,240, with the
-  out-of-scope Temporal and await-dictionary fixtures skipped,
-  `--timeout 60 --recheck-timeout 45`, release build), 0 crashes and 0
-  hangs with the long timeout. The remaining gap is the systematic bug
-  clusters triaged above — fix the next cluster, then re-run the sweep
-  and record the delta. Note: the TypedArray sweep should be run with a
-  longer deadline (`--timeout 120 --recheck-timeout 90`) — the O(n²)
-  property store makes the 10,000-element crash-test fixtures take
-  ~45s, which the default 5s recheck misclassifies as hangs.
+  **99.6%** of runnable (17,111 pass / 65 fail of 17,176, with the
+  out-of-scope Temporal, await-dictionary, and ShadowRealm fixtures and
+  the host-dependent `CanBlockIsTrue` waits skipped, `--timeout 60
+  --recheck-timeout 45`, release build), 0 crashes and 0 hangs with the
+  long timeout. The remaining gap is the systematic bug clusters triaged
+  above — fix the next cluster, then re-run the sweep and record the
+  delta. Note: the TypedArray sweep should be run with a longer deadline
+  (`--timeout 120 --recheck-timeout 90`) — the O(n²) property store makes
+  the 10,000-element crash-test fixtures take ~45s, which the default 5s
+  recheck misclassifies as hangs.
 - The 27 original hangs were slow builtin calls (fixed via the dispatch
   cache) plus one real `Array.prototype.splice` infinite loop (fixed); the
   remaining sweep runs cleanly. Use a release build
