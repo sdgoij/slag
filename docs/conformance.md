@@ -1045,6 +1045,41 @@ all 23,812 fixtures, with **131 fixtures fixed** (the iteration clusters
 plus every species-using Array method — splice, concat, flat, toReversed,
 toSorted, with — and hoisted-function users).
 
+### Array.of and Math cluster sweeps (Phase 18 conformance)
+
+Sweeps report **Array/of 15 pass / 0 fail** (up from 7 pass / 8 fail) and
+**Math 326 pass / 0 fail** (up from 324 pass / 2 fail). Fixes in
+`crates/runtime/src/builtins/array.rs` and
+`crates/runtime/src/builtins/math.rs`:
+
+- **`Array.of` used `ArraySpeciesCreate`** — spec 23.2.2.2 constructs the
+  *receiver* (`Construct(C, « len »)` when `IsConstructor(C)`) and only
+  falls back to ArrayCreate for non-constructors, so a custom `this`
+  constructor was never invoked (`Array.of.call(Pack, …)` missed the
+  length setter, and non-extensible constructor `this` objects accepted
+  the items). The species machinery is not involved
+  (`construct-this-with-the-number-of-arguments.js`, `sets-length.js`,
+  `return-abrupt-from-data-property.js`).
+- **`Math` method functions had a null `[[Prototype]]`** — they were
+  plain closure builtins never registered as intrinsics, so the realm's
+  re-parenting post-pass skipped them and `Math.cos.bind` was undefined.
+  The install now links `%Function.prototype%` explicitly
+  (CreateBuiltinFunction, spec 10.2.3 step 1).
+- **`Math.sign` returned ±Infinity instead of ±1** — the infinite input
+  short-circuit returned the input; it now falls through to the sign
+  comparison (`Math.sign(-Infinity)` is -1).
+- **`ExactSum::to_f64` never negated negative sums** — the sign flag was
+  `-0.0`, and `-0.0 != 0.0` is false in IEEE 754, so every negative
+  `Math.sumPrecise` result came out positive (the spec's maximally
+  precise summation cases with negative exact sums). The magnitude is
+  now applied as a plain ±1.0 multiplier.
+
+Validation: `cargo test --workspace` **4085 pass, 0 failures**;
+`cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo fmt --all --check` clean. A full `built-ins` sweep before/after
+(`git stash` baseline) shows **0 new failures and 0 new crashes** across
+all 23,812 fixtures, with **10 fixtures fixed** (8 Array/of + 2 Math).
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~120 edge-case unit tests were added across
@@ -1154,9 +1189,9 @@ annexB rows are from the earlier run and have not changed since.
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,812 | 16,882 | 391 | 6,536 | 3¹ | 97.7% |
+| built-ins | 23,812 | 16,892 | 381 | 6,536 | 3¹ | 97.8% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,622** | **33,325** | **2,997** | **12,297** | **3** | **91.8%** |
+| **Total** | **48,622** | **33,335** | **2,987** | **12,297** | **3** | **91.8%** |
 
 (Runnable = pass + fail; the 9,171 skips are module/async fixtures,
 unsupported harness includes, and the out-of-scope Temporal proposal
@@ -1167,11 +1202,12 @@ ArrayBuffer/SharedArrayBuffer, Date, BigInt, global-functions, Function,
 Iterator/prototype, Iterator statics (concat/from/zip/zipKeyed), Symbol,
 Boolean, Number, Object.prototype.toString, Object/prototype legacy
 accessors, Proxy, Reflect, Object.groupBy, Object
-freeze/seal/isFrozen/isSealed, and Array iteration-method cluster closures
-(all 0 fail); the language and annexB rows are from the sweep recorded
-below. The 6,536 built-ins skips are dominated by the out-of-scope
-Temporal proposal (4,611), with the async/module flags, host-dependent
-`$262.createRealm`, and unsupported harness includes making up the rest.
+freeze/seal/isFrozen/isSealed, Array iteration-method, Array.of, and Math
+cluster closures (all 0 fail); the language and annexB rows are from the
+sweep recorded below. The 6,536 built-ins skips are dominated by the
+out-of-scope Temporal proposal (4,611), with the async/module flags,
+host-dependent `$262.createRealm`, and unsupported harness includes
+making up the rest.
 
 ¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
 coerced-values fixtures — 10,000-element allocations that need the long
@@ -1256,7 +1292,7 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 ## Open items
 
 - Certify the ≥95%-of-runnable target: the built-ins area now measures
-  **97.7%** of runnable (16,882 pass / 391 fail of 17,273, with the
+  **97.8%** of runnable (16,892 pass / 381 fail of 17,273, with the
   out-of-scope Temporal fixtures skipped, `--timeout 60
   --recheck-timeout 45`, release build), 0 crashes and 0 hangs with the
   long timeout. The remaining gap is the systematic bug clusters triaged

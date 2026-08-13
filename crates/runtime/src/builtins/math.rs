@@ -403,11 +403,7 @@ impl ExactSum {
         if bits == 0 {
             return if self.negative { -0.0 } else { 0.0 };
         }
-        let (sign, magnitude) = if self.negative {
-            (-0.0f64, -1.0f64)
-        } else {
-            (0.0f64, 1.0f64)
-        };
+        let magnitude = if self.negative { -1.0f64 } else { 1.0f64 };
         if bits <= 53 {
             // Exactly representable: significand is the value itself at 2^-1074.
             let (top, _, _) = self.top_bits(0);
@@ -432,7 +428,7 @@ impl ExactSum {
         }
         let biased = (exponent + 1023) as u64;
         let result = f64::from_bits((biased << 52) | (mantissa & 0xF_FFFF_FFFF_FFFF));
-        if sign != 0.0 { -result } else { result }
+        result * magnitude
     }
 }
 
@@ -660,7 +656,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             "sign",
             1,
             unary(|x| {
-                if x.is_nan() || x == 0.0 || x.is_infinite() {
+                if x.is_nan() || x == 0.0 {
                     x
                 } else if x < 0.0 {
                     -1.0
@@ -690,10 +686,22 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     }
 
     // spec 21.3.1: function properties have { [[Writable]]: true,
-    // [[Enumerable]]: false, [[Configurable]]: true }.
+    // [[Enumerable]]: false, [[Configurable]]: true }. The realm's
+    // post-pass only links intrinsic-registered functions, so the
+    // [[Prototype]] defaults to %Function.prototype% here
+    // (CreateBuiltinFunction, spec 10.2.3 step 1).
+    let function_proto = realm
+        .intrinsics
+        .get("%Function.prototype%")
+        .and_then(|value| as_object(&value));
     for (name, length, body) in functions {
-        let func =
-            Function::create_builtin(Some(JsString::from_utf8(name)), length, body, None, None)?;
+        let func = Function::create_builtin(
+            Some(JsString::from_utf8(name)),
+            length,
+            body,
+            None,
+            function_proto.clone(),
+        )?;
         math.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {

@@ -342,14 +342,29 @@ fn array_is_array(_agent: &mut Agent, _this: &Value, args: &[Value]) -> Result<V
 }
 
 /// spec 23.1.2.3 Array.of.
+/// spec 23.2.2.2 Array.of: the receiver is the constructor (not the
+/// species); a non-constructor receiver makes a plain ArrayCreate.
 fn array_of(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    // spec steps 3-5: Construct(C, « len ») or ArrayCreate(len).
     let length = args.len() as f64;
-    let array = array_species_create(agent, this, length)?;
+    let array = if is_constructor(this) {
+        crate::function::construct(agent, this, &[Value::Number(length)], this)?
+    } else {
+        Value::Object(array_create(agent, length)?)
+    };
+    let obj = as_object(&array).ok_or_else(|| {
+        JsError::new(
+            ErrorKind::TypeError,
+            "Array.of result is not an object".into(),
+        )
+    })?;
+    // spec steps 7-8: CreateDataPropertyOrThrow per item, then Set the
+    // length (which invokes an own length setter).
     for (index, item) in args.iter().enumerate() {
-        array.create_data_property_or_throw(&key(index as u64), item.clone())?;
+        obj.create_data_property_or_throw(&key(index as u64), item.clone())?;
     }
-    array.set(&JsString::from_utf8("length"), Value::Number(length), true)?;
-    Ok(Value::Object(array))
+    obj.set(&JsString::from_utf8("length"), Value::Number(length), true)?;
+    Ok(array)
 }
 
 /// spec 23.1.2.1 Array.from.
