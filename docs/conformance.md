@@ -414,6 +414,46 @@ every runnable fixture passes (up from 82 pass / 9 fail and 72 pass /
 - **`@@toStringTag` descriptor:** built with `configurable: true` (the
   `PropertyDescriptor::none` helper forces `configurable: false`).
 
+### ArrayBuffer / SharedArrayBuffer cluster sweep (Phase 18 conformance)
+
+Sweeps of both buffer trees (`sweep.exe built-ins --filter 'ArrayBuffer*'`
+and `'SharedArrayBuffer*'`) report **220 pass, 0 fail, 1 skip** of 221 and
+**103 pass, 0 fail, 1 skip** of 104: every runnable fixture passes
+(ArrayBuffer up from 196 pass / 24 fail). The skips are `$262.createRealm`.
+Fixes in `crates/runtime/src/builtins/array_buffer.rs`:
+
+- **`immutable` getter (ES2026):** `ArrayBuffer.prototype.immutable` was
+  missing; the accessor now reports `[[ArrayBufferImmutable]]` (TypeError
+  for non-buffer receivers and SharedArrayBuffers, `false` for plain and
+  detached buffers).
+- **`sliceToImmutable` (ES2026):** the method was missing; it resolves
+  bounds against the pre-coercion length (arguments through the agent),
+  re-checks detachment after coercion, RangeErrors when the current length
+  shrank below the requested end, and returns a fresh immutable copy
+  (no species).
+- **`transferToImmutable` ordering:** newLength was read after the
+  detached check; ArrayBufferCopyAndDetach coerces first (spec 25.1.2.2
+  steps 3-6), so the detached/immutable TypeErrors follow the coercion.
+- **`resize` on immutable buffers:** the immutable TypeError is verified
+  before newLength is read.
+- **`transfer`/`transferToFixedLength`/`transferToImmutable` length:** all
+  are 0 (were 1).
+- **Species result validation:** `slice` and SharedArrayBuffer `slice`
+  throw a TypeError when the species constructor returns `this` or an
+  immutable buffer.
+- **`maxByteLength` host limit:** `new ArrayBuffer(0, { maxByteLength: …
+  })` with a max beyond the host limit (the 7 PiB / 2^53−1
+  allocation-limit fixtures) now throws a RangeError in both constructors.
+- **Agent-aware `ToIndex`:** the constructors, `resize`, `transfer`,
+  `transferToImmutable`, and SharedArrayBuffer `grow` coerced lengths
+  through the crux (non-agent) `to_index`, failing on object arguments;
+  `to_index_agent` routes object receivers through the agent (also used
+  for `slice`/`sliceToImmutable` bounds).
+
+Note: the two pre-existing `TypedArray/prototype/set/BigInt/*` failures
+(BigInt/non-BigInt typed-array `set` mismatch) are outside this cluster
+and remain open.
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~120 edge-case unit tests were added across
@@ -519,16 +559,16 @@ TypedArray fixtures that pass with the long timeout (see below).
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,798 | 15,766 | 4,628 | 3,401 | 3¹ | 77.3% |
+| built-ins | 23,798 | 15,791 | 4,603 | 3,401 | 3¹ | 77.4% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,608** | **32,209** | **7,234** | **9,162** | **3** | **81.7%** |
+| **Total** | **48,608** | **32,234** | **7,209** | **9,162** | **3** | **81.7%** |
 
 (Runnable = pass + fail; the 9,162 skips are module/async fixtures and
 unsupported harness includes.) The built-ins row reflects the current
 `Error*`/`BigInt*`/RegExp/Object-descriptor hardening plus the
-String/prototype, Object/create, DisposableStack, and AsyncDisposableStack
-cluster closures (all 0 fail); the language and annexB rows are from the
-sweep recorded below.
+String/prototype, Object/create, DisposableStack, AsyncDisposableStack, and
+ArrayBuffer/SharedArrayBuffer cluster closures (all 0 fail); the language
+and annexB rows are from the sweep recorded below.
 
 ¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
 coerced-values fixtures — 10,000-element allocations that need the long

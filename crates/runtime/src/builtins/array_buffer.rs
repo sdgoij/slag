@@ -6,7 +6,7 @@
 //! detachment) is a `BufferState` in the agent's `buffer_data` table keyed by
 //! object identity.
 
-use crux::convert::{to_index, to_integer_or_infinity, to_number};
+use crux::convert::{to_index, to_integer_or_infinity};
 use crux::error::{ErrorKind, JsError};
 use crux::function::{Function, NativeFn};
 use crux::handle::Handle;
@@ -26,10 +26,12 @@ const AB_IS_VIEW: &str = "%ArrayBuffer.isView%";
 const AB_SPECIES: &str = "%get ArrayBuffer[Symbol.species]%";
 const AB_BYTE_LENGTH: &str = "%get ArrayBuffer.prototype.byteLength%";
 const AB_DETACHED: &str = "%get ArrayBuffer.prototype.detached%";
+const AB_IMMUTABLE: &str = "%get ArrayBuffer.prototype.immutable%";
 const AB_MAX_BYTE_LENGTH: &str = "%get ArrayBuffer.prototype.maxByteLength%";
 const AB_RESIZABLE: &str = "%get ArrayBuffer.prototype.resizable%";
 const AB_RESIZE: &str = "%ArrayBuffer.prototype.resize%";
 const AB_SLICE: &str = "%ArrayBuffer.prototype.slice%";
+const AB_SLICE_TO_IMMUTABLE: &str = "%ArrayBuffer.prototype.sliceToImmutable%";
 const AB_TRANSFER: &str = "%ArrayBuffer.prototype.transfer%";
 const AB_TRANSFER_TO_FIXED_LENGTH: &str = "%ArrayBuffer.prototype.transferToFixedLength%";
 const AB_TRANSFER_TO_IMMUTABLE: &str = "%ArrayBuffer.prototype.transferToImmutable%";
@@ -239,8 +241,9 @@ fn detach_array_buffer(agent: &mut Agent, id: u64) {
 
 /// The byte range copy behind `slice`/`transfer`: the clamped `start`/`end`
 /// indices into the buffer (spec ToIntegerOrInfinity + clamping, 25.1.5.5).
-fn clamped_bounds(args: &[Value], len: u64) -> Result<(u64, u64), JsError> {
-    let relative_start = to_integer_or_infinity(to_number(
+fn clamped_bounds(agent: &mut Agent, args: &[Value], len: u64) -> Result<(u64, u64), JsError> {
+    let relative_start = to_integer_or_infinity(crate::context::to_number(
+        agent,
         &args.first().cloned().unwrap_or(Value::Undefined),
     )?);
     let start = if relative_start < 0.0 {
@@ -250,7 +253,7 @@ fn clamped_bounds(args: &[Value], len: u64) -> Result<(u64, u64), JsError> {
     };
     let relative_end = match args.get(1) {
         None | Some(Value::Undefined) => len as f64,
-        Some(value) => to_integer_or_infinity(to_number(value)?),
+        Some(value) => to_integer_or_infinity(crate::context::to_number(agent, value)?),
     };
     let end = if relative_end < 0.0 {
         (len as i64).saturating_add(relative_end as i64).max(0) as u64
@@ -374,6 +377,23 @@ fn str(text: &str) -> Value {
     Value::String(Handle::new(JsString::from_utf8(text)))
 }
 
+/// ToIndex (spec 7.1.20) with agent dispatch for object receivers; the crux
+/// `to_index` cannot run user `valueOf`/`toString`.
+fn to_index_agent(agent: &mut Agent, value: &Value) -> Result<u64, JsError> {
+    if matches!(value, Value::Undefined) {
+        return Ok(0);
+    }
+    let number = crate::context::to_number(agent, value)?;
+    let integer = to_integer_or_infinity(number);
+    if integer < 0.0 || integer >= 9007199254740991.0 {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "Index out of range".into(),
+        ));
+    }
+    Ok(integer as u64)
+}
+
 /// ArrayBuffer(length [, options]) (spec 25.1.4.1).
 fn array_buffer_construct(
     agent: &mut Agent,
@@ -386,16 +406,25 @@ fn array_buffer_construct(
             "ArrayBuffer must be called with 'new'".into(),
         ));
     }
-    let byte_length = to_index(&args.first().cloned().unwrap_or(Value::Undefined))? as usize;
+    let byte_length =
+        to_index_agent(agent, &args.first().cloned().unwrap_or(Value::Undefined))? as usize;
     let requested_max = max_byte_length_option(agent, args.get(1).unwrap_or(&Value::Undefined))?;
     let is_resizable = requested_max.is_some();
-    if let Some(max) = requested_max
-        && byte_length > max
-    {
-        return Err(JsError::new(
-            ErrorKind::RangeError,
-            "byteLength exceeds maxByteLength".into(),
-        ));
+    if let Some(max) = requested_max {
+        // AllocateArrayBuffer: a maxByteLength beyond the host limit is a
+        // RangeError before any data block is created.
+        if max > MAX_BYTE_LENGTH {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "maxByteLength exceeds the host limit".into(),
+            ));
+        }
+        if byte_length > max {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "byteLength exceeds maxByteLength".into(),
+            ));
+        }
     }
     let prototype = get_prototype_from_constructor(agent, new_target, ARRAY_BUFFER_PROTO)?;
     let object = JsObject::ordinary_object_create(Some(prototype));
@@ -476,6 +505,89 @@ fn get_resizable(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Val
     Ok(Value::Boolean(resizable))
 }
 
+/// ArrayBuffer.prototype.immutable (ES2026 25.1.5.5): RequireInternalSlot,
+/// then a SharedArrayBuffer receiver throws and the immutable flag is
+/// reported (detached buffers report false).
+fn get_immutable(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
+    let object = require_buffer_object(agent, this)?;
+    if is_shared(agent, this) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "immutable is not defined for SharedArrayBuffer".into(),
+        ));
+    }
+    let immutable = state(agent, object.id())
+        .map(|state| state.immutable)
+        .unwrap_or(false);
+    Ok(Value::Boolean(immutable))
+}
+
+/// ArrayBuffer.prototype.sliceToImmutable (ES2026 25.1.5.9): like slice,
+/// but the fresh buffer is immutable and %ArrayBuffer% is used directly (no
+/// species constructor). Bounds resolve against the length captured before
+/// the argument coercion.
+fn slice_to_immutable(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    let object = require_buffer_object(agent, this)?;
+    if is_shared(agent, this) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "sliceToImmutable is not defined for SharedArrayBuffer".into(),
+        ));
+    }
+    let len = state(agent, object.id())
+        .expect("registered buffer")
+        .byte_length as u64;
+    // Detachment is verified before the arguments are read (spec 25.1.5.9
+    // step 4); the post-coercion re-check catches a detach during coercion.
+    if is_detached(agent, object.id()) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "ArrayBuffer is detached".into(),
+        ));
+    }
+    let (start, end) = clamped_bounds(agent, args, len)?;
+    if is_detached(agent, object.id()) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "ArrayBuffer is detached".into(),
+        ));
+    }
+    let new_len = end.saturating_sub(start) as usize;
+    // Bounds were resolved against the pre-coercion length; a shrink below
+    // the requested end is a RangeError (spec 25.1.5.9 step 14).
+    let current_len = state(agent, object.id()).expect("present").byte_length as u64;
+    if current_len < end {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "current length is smaller than the requested end".into(),
+        ));
+    }
+    let bytes = {
+        let source = state(agent, object.id()).expect("source present");
+        source.shared.read(start as usize, new_len)?
+    };
+    let proto = agent
+        .current_realm()?
+        .intrinsics
+        .get("%ArrayBuffer.prototype%")
+        .and_then(|value| as_object(&value))
+        .ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                "%ArrayBuffer.prototype% missing".into(),
+            )
+        })?;
+    let new_object = JsObject::ordinary_object_create(Some(proto));
+    allocate_array_buffer(agent, &new_object, new_len, false, None)?;
+    if let Some(cell) = agent.buffer_data.get(&new_object.id()) {
+        let mut state = cell.borrow_mut();
+        state.shared.write(0, &bytes)?;
+        state.immutable = true;
+        state.shared.mark_immutable();
+    }
+    Ok(Value::Object(new_object))
+}
+
 /// ArrayBuffer.prototype.resize (spec 25.1.5.6).
 fn resize(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let object = require_buffer_object(agent, this)?;
@@ -485,7 +597,19 @@ fn resize(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
             "resize is not defined for SharedArrayBuffer".into(),
         ));
     }
-    let new_length = to_index(&args.first().cloned().unwrap_or(Value::Undefined))? as usize;
+    // Immutable buffers are verified before newLength is read (spec
+    // 25.1.5.6: the immutable check precedes ToIndex).
+    if state(agent, object.id())
+        .map(|s| s.immutable)
+        .unwrap_or(false)
+    {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "ArrayBuffer is immutable".into(),
+        ));
+    }
+    let new_length =
+        to_index_agent(agent, &args.first().cloned().unwrap_or(Value::Undefined))? as usize;
     let (resizable, max, detached) = {
         let state = state(agent, object.id()).expect("registered buffer");
         (state.resizable, state.max_byte_length, state.detached)
@@ -541,7 +665,7 @@ fn slice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
             "ArrayBuffer is detached".into(),
         ));
     }
-    let (start, end) = clamped_bounds(args, byte_length as u64)?;
+    let (start, end) = clamped_bounds(agent, args, byte_length as u64)?;
     let new_len = end.saturating_sub(start) as usize;
     let default_ctor = agent
         .current_realm()?
@@ -556,6 +680,12 @@ fn slice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
             "slice constructor returned a non-object".into(),
         )
     })?;
+    if crux::ops::same_value(&new, this) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "slice constructor returned the receiver".into(),
+        ));
+    }
     if !agent.buffer_data.contains_key(&new_object.id()) {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -576,6 +706,15 @@ fn slice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
         return Err(JsError::new(
             ErrorKind::TypeError,
             "slice constructor produced an invalid ArrayBuffer".into(),
+        ));
+    }
+    if state(agent, new_object.id())
+        .map(|s| s.immutable)
+        .unwrap_or(false)
+    {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "slice constructor produced an immutable ArrayBuffer".into(),
         ));
     }
     let bytes = {
@@ -609,7 +748,7 @@ fn transfer(
         None | Some(Value::Undefined) => state(agent, object.id())
             .map(|state| state.byte_length)
             .unwrap_or(0),
-        Some(value) => to_index(value)? as usize,
+        Some(value) => to_index_agent(agent, value)? as usize,
     };
     if is_detached(agent, object.id()) {
         return Err(JsError::new(
@@ -643,18 +782,29 @@ fn transfer_to_immutable(
             "transferToImmutable is not defined for SharedArrayBuffer".into(),
         ));
     }
+    // ArrayBufferCopyAndDetach reads newLength before the detachability
+    // checks (spec 25.1.2.2 steps 3-6).
+    let new_length = match args.first() {
+        None | Some(Value::Undefined) => state(agent, object.id())
+            .map(|state| state.byte_length)
+            .unwrap_or(0),
+        Some(value) => to_index_agent(agent, value)? as usize,
+    };
     if is_detached(agent, object.id()) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "ArrayBuffer is detached".into(),
         ));
     }
-    let new_length = match args.first() {
-        None | Some(Value::Undefined) => state(agent, object.id())
-            .map(|state| state.byte_length)
-            .unwrap_or(0),
-        Some(value) => to_index(value)? as usize,
-    };
+    if state(agent, object.id())
+        .map(|s| s.immutable)
+        .unwrap_or(false)
+    {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "ArrayBuffer is immutable".into(),
+        ));
+    }
     let result = array_buffer_copy_and_detach(agent, object.id(), new_length, false)?;
     if let Value::Object(obj) = &result
         && let Some(cell) = agent.buffer_data.get(&obj.id())
@@ -678,16 +828,23 @@ fn shared_array_buffer_construct(
             "SharedArrayBuffer must be called with 'new'".into(),
         ));
     }
-    let byte_length = to_index(&args.first().cloned().unwrap_or(Value::Undefined))? as usize;
+    let byte_length =
+        to_index_agent(agent, &args.first().cloned().unwrap_or(Value::Undefined))? as usize;
     let requested_max = max_byte_length_option(agent, args.get(1).unwrap_or(&Value::Undefined))?;
     let is_growable = requested_max.is_some();
-    if let Some(max) = requested_max
-        && byte_length > max
-    {
-        return Err(JsError::new(
-            ErrorKind::RangeError,
-            "byteLength exceeds maxByteLength".into(),
-        ));
+    if let Some(max) = requested_max {
+        if max > MAX_BYTE_LENGTH {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "maxByteLength exceeds the host limit".into(),
+            ));
+        }
+        if byte_length > max {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "byteLength exceeds maxByteLength".into(),
+            ));
+        }
     }
     let prototype = get_prototype_from_constructor(agent, new_target, SHARED_ARRAY_BUFFER_PROTO)?;
     let object = JsObject::ordinary_object_create(Some(prototype));
@@ -792,7 +949,8 @@ fn sab_grow(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
             "grow is not defined for ArrayBuffer".into(),
         ));
     }
-    let new_length = to_index(&args.first().cloned().unwrap_or(Value::Undefined))? as usize;
+    let new_length =
+        to_index_agent(agent, &args.first().cloned().unwrap_or(Value::Undefined))? as usize;
     let (growable, max, byte_length) = {
         let state = state(agent, object.id()).expect("registered buffer");
         (state.growable, state.max_byte_length, state.byte_length)
@@ -841,7 +999,7 @@ fn sab_slice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, J
     let byte_length = state(agent, object.id())
         .map(|state| state.byte_length)
         .unwrap_or(0);
-    let (start, end) = clamped_bounds(args, byte_length as u64)?;
+    let (start, end) = clamped_bounds(agent, args, byte_length as u64)?;
     let new_len = end.saturating_sub(start) as usize;
     let default_ctor = agent
         .current_realm()?
@@ -856,6 +1014,12 @@ fn sab_slice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, J
             "slice constructor returned a non-object".into(),
         )
     })?;
+    if crux::ops::same_value(&new, this) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "slice constructor returned the receiver".into(),
+        ));
+    }
     if !is_shared(agent, &new) {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -1010,9 +1174,10 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
 
     // ArrayBuffer prototype accessors.
-    let ab_accessors: [(&str, &str); 4] = [
+    let ab_accessors: [(&str, &str); 5] = [
         ("byteLength", AB_BYTE_LENGTH),
         ("detached", AB_DETACHED),
+        ("immutable", AB_IMMUTABLE),
         ("maxByteLength", AB_MAX_BYTE_LENGTH),
         ("resizable", AB_RESIZABLE),
     ];
@@ -1041,12 +1206,13 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     }
 
     // ArrayBuffer prototype methods.
-    let ab_methods: [(&str, &str, u64); 5] = [
+    let ab_methods: [(&str, &str, u64); 6] = [
         ("resize", AB_RESIZE, 1),
         ("slice", AB_SLICE, 2),
-        ("transfer", AB_TRANSFER, 1),
-        ("transferToFixedLength", AB_TRANSFER_TO_FIXED_LENGTH, 1),
-        ("transferToImmutable", AB_TRANSFER_TO_IMMUTABLE, 1),
+        ("sliceToImmutable", AB_SLICE_TO_IMMUTABLE, 2),
+        ("transfer", AB_TRANSFER, 0),
+        ("transferToFixedLength", AB_TRANSFER_TO_FIXED_LENGTH, 0),
+        ("transferToImmutable", AB_TRANSFER_TO_IMMUTABLE, 0),
     ];
     for (name, intrinsic, length) in ab_methods {
         let func = Function::create_builtin(
@@ -1269,11 +1435,17 @@ pub fn dispatch_call(
     if intrinsics.get(AB_RESIZABLE).as_ref() == Some(callee) {
         return Some(get_resizable(agent, this, args));
     }
+    if intrinsics.get(AB_IMMUTABLE).as_ref() == Some(callee) {
+        return Some(get_immutable(agent, this, args));
+    }
     if intrinsics.get(AB_RESIZE).as_ref() == Some(callee) {
         return Some(resize(agent, this, args));
     }
     if intrinsics.get(AB_SLICE).as_ref() == Some(callee) {
         return Some(slice(agent, this, args));
+    }
+    if intrinsics.get(AB_SLICE_TO_IMMUTABLE).as_ref() == Some(callee) {
+        return Some(slice_to_immutable(agent, this, args));
     }
     if intrinsics.get(AB_TRANSFER).as_ref() == Some(callee) {
         return Some(transfer(agent, this, args, true));
