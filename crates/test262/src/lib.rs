@@ -68,6 +68,11 @@ Test262Error = function (message) {
   err.constructor = Test262Error;
   return err;
 };
+// The sta.js helper: a function that always throws (used as the reject
+// function in the Promise capability fixtures).
+Test262Error.thrower = function (message) {
+  throw new Test262Error(message);
+};
 assert.compareArray = function (actual, expected) {
   if (actual === expected) return;
   if (actual.length !== expected.length) {
@@ -11142,6 +11147,11 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
             // Temporal is a stage-3 proposal, not part of ECMA-262 ES2026
             // (out of scope like Intl/ECMA-402).
             return FixtureResult::Skip("Temporal is out of scope".into());
+        }
+        if fm.features.iter().any(|f| f == "await-dictionary") {
+            // Promise.allKeyed/allSettledKeyed (the await-dictionary stage-3
+            // proposal) are not part of ECMA-262 ES2026.
+            return FixtureResult::Skip("await-dictionary is out of scope".into());
         }
         let unsupported: Vec<&str> = fm
             .includes

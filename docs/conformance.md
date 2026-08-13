@@ -1221,9 +1221,74 @@ Validation: `cargo test --workspace` **4089 pass, 0 failures**;
 **16 fixtures fixed** (17,006 pass / 267 fail / 0 crash) and no
 regressions.
 
+### Promise cluster sweep (Phase 18 conformance)
+
+A sweep of the entire Promise tree (`sweep.exe built-ins --filter
+'Promise*'`) reports **274 pass, 0 fail, 458 skip** of 732 fixtures:
+every runnable fixture passes (up from 213 pass / 94 fail). The 415
+`flags: async` fixtures remain skipped (async semantics are covered by
+the runtime's own async suites) and the 33 `Promise/allKeyed`+
+`allSettledKeyed` fixtures are now skipped as the out-of-scope
+`await-dictionary` stage-3 proposal. Fixes in
+`crates/runtime/src/builtins/promise.rs`, `crates/runtime/src/promise.rs`,
+and the harness:
+
+- **Combinator loop ordering and guards** — `Promise.all`/`allSettled`/
+  `any` incremented the remaining-counter *after* `then` ran, so a
+  synchronously-fulfilled element double-resolved; the counter now bumps
+  before `Invoke(then)` (spec 27.2.4.1.1 step 6.m precedes 6.n) and each
+  element closure carries the spec's [[AlreadyCalled]] guard, so repeated
+  calls from a thenable are no-ops (`call-resolve-element-after-return.js`,
+  `reject-element-function-multiple-calls.js`).
+- **Iterator-close semantics** — an `IteratorStepValue` abrupt completion
+  marks `[[Done]]` and must *not* close the iterator (`iter-*-err-no-
+  close.js`), while an error from the `promiseResolve` call or `then`
+  invocation closes it with the throw completion winning
+  (`invoke-resolve-error-close.js`, `resolve-throws-iterator-return-is-
+  not-callable.js`). The `resolve` capability call on the done path is now
+  caught and rejected (IfAbruptRejectPromise, `capability-resolve-throws-
+  no-close.js`).
+- **`GetCapabilitiesExecutor` twice-call guard** — the executor captured
+  by `NewPromiseCapability` silently overwrote on a second call; per spec
+  27.2.1.5.1 a second call with a captured resolve/reject throws a
+  TypeError while a prior `(undefined, undefined)` call leaves the slot
+  free (`capability-executor-called-twice.js`).
+- **Species resolution read the wrong symbol** — `SpeciesConstructor`
+  looked up `%Symbol.species%` in the intrinsic table (never registered),
+  silently falling back to the constructor, so custom `@@species`
+  overrides were ignored (`then/ctor-custom.js`, `then/ctor-throws.js`,
+  `then/ctor-null.js`); it now reads the well-known symbol directly and
+  TypeErrors on a non-constructor species.
+- **Builtin closures had null prototypes** — the combinator element
+  functions, the promise resolving functions, the executor, the finally
+  closures, and the `%Promise%[@@species]` getter were created with a
+  null [[Prototype]], so `resolveElement.call(...)` / `desc.get.call(...)`
+  failed and `Object.getPrototypeOf` disagreed with `%Function.prototype%`
+  (spec 17). They now link `%Function.prototype%`, and the resolving
+  functions' `name` is the empty string per spec 27.2.1.3.1
+  (`*-function-prototype.js`, `*-function-name.js`,
+  `Symbol.species/return-value.js`).
+- **`finally` required a real promise** — spec 27.2.5.3 only requires an
+  object receiver: thenables and proxies are accepted and their own
+  `then` is invoked (`this-value-thenable.js`, `this-value-proxy.js`); the
+  thenFinally/catchFinally closures are anonymous (`invokes-then-with-
+  function.js`).
+- **`Promise.try` wrapped promise values** — per spec 27.2.4.11 step 6.b
+  a promise return value is returned unwrapped, including for subclass
+  receivers (`avoids-wrap.js`, `avoids-wrap-for-subclass.js`).
+- **Harness** — `Test262Error.thrower` (the `sta.js` helper used as the
+  reject function across the capability fixtures) was missing, and the
+  `await-dictionary` feature gate (out of scope) was added.
+
+Validation: `cargo test --workspace` **4094 pass, 0 failures**;
+`cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo fmt --all --check` clean. A full `built-ins` re-sweep shows exactly
+**61 fixtures fixed** and **33 await-dictionary fixtures skipped**
+(17,067 pass / 173 fail / 0 crash) and no regressions.
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
-Beyond the vendored fixtures, ~129 edge-case unit tests were added across
+Beyond the vendored fixtures, ~134 edge-case unit tests were added across
 the crates (lexer, parser, runtime core, and the built-ins), targeting the
 plan's per-phase test lists: numeric-literal/escape/ASI lexing, the ASI ×
 statement matrix and cover grammar, TDZ/hoisting/redeclaration/eval
@@ -1302,6 +1367,7 @@ The harness's skip taxonomy (also used by the sweep):
 | `flags: module` | No module loader: `import`/`export` parse, but linking, `dynamic import`, and `import.meta` are host-dependent (see below). |
 | `flags: async` | The `$DONE` async harness is not provided; async semantics are covered by the runtime's own async test suites. |
 | `features: [Temporal]` | Temporal is a stage-3 proposal, not part of ECMA-262 ES2026 (out of scope like Intl). |
+| `features: [await-dictionary]` | `Promise.allKeyed`/`allSettledKeyed` (the await-dictionary stage-3 proposal) are not part of ECMA-262 ES2026. |
 | Unsupported `includes:` | Fixtures needing harness helpers beyond `assert.js`, `compareArray.js`, `detachArrayBuffer.js`, `isConstructor.js`, `propertyHelper.js`, `testAtomics.js`, `testTypedArray.js` are not run. |
 | Intl directories | `Intl` (ECMA-402) is out of scope for this runtime (PLAN scope decision). |
 
@@ -1330,26 +1396,26 @@ annexB rows are from the earlier run and have not changed since.
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,812 | 17,006 | 267 | 6,536 | 3¹ | 98.5% |
+| built-ins | 23,812 | 17,067 | 173 | 6,569 | 3¹ | 99.0% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,622** | **33,449** | **2,873** | **12,297** | **3** | **92.1%** |
+| **Total** | **48,622** | **33,510** | **2,779** | **12,330** | **3** | **92.3%** |
 
-(Runnable = pass + fail; the 9,171 skips are module/async fixtures,
-unsupported harness includes, and the out-of-scope Temporal proposal
-fixtures.) The built-ins row reflects the current
-`Error*`/`BigInt*`/RegExp/Object-descriptor hardening plus the
+(Runnable = pass + fail; the 9,204 skips are module/async fixtures,
+unsupported harness includes, and the out-of-scope Temporal and
+await-dictionary proposal fixtures.) The built-ins row reflects the
+current `Error*`/`BigInt*`/RegExp/Object-descriptor hardening plus the
 String/prototype, Object/create, DisposableStack, AsyncDisposableStack,
 ArrayBuffer/SharedArrayBuffer, Date, BigInt, global-functions, Function,
 Iterator/prototype, Iterator statics (concat/from/zip/zipKeyed), Symbol,
 Boolean, Number, Object.prototype.toString, Object/prototype legacy
 accessors, Proxy, Reflect, Object.groupBy, Object
 freeze/seal/isFrozen/isSealed, Array iteration-method, Array.of, Math,
-Object.fromEntries, JSON.stringify, DataView, and Object statics/
-constructor cluster closures (all 0 fail); the language and annexB rows
-are from the sweep recorded below. The 6,536 built-ins skips are
-dominated by the out-of-scope Temporal proposal (4,611), with the
-async/module flags, host-dependent `$262.createRealm`, and unsupported
-harness includes making up the rest.
+Object.fromEntries, JSON.stringify, DataView, Object statics/
+constructor, and Promise cluster closures (all 0 fail); the language and
+annexB rows are from the sweep recorded below. The 6,569 built-ins skips
+are dominated by the out-of-scope Temporal proposal (4,611) and
+await-dictionary (33), with the async/module flags, host-dependent
+`$262.createRealm`, and unsupported harness includes making up the rest.
 
 ¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
 coerced-values fixtures — 10,000-element allocations that need the long
@@ -1434,15 +1500,15 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 ## Open items
 
 - Certify the ≥95%-of-runnable target: the built-ins area now measures
-  **98.5%** of runnable (17,006 pass / 267 fail of 17,273, with the
-  out-of-scope Temporal fixtures skipped, `--timeout 60
-  --recheck-timeout 45`, release build), 0 crashes and 0 hangs with the
-  long timeout. The remaining gap is the systematic bug clusters triaged
-  above — fix the next cluster, then re-run the sweep and record the
-  delta. Note: the TypedArray sweep should be run with a longer deadline
-  (`--timeout 120 --recheck-timeout 90`) — the O(n²) property store makes
-  the 10,000-element crash-test fixtures take ~45s, which the default 5s
-  recheck misclassifies as hangs.
+  **99.0%** of runnable (17,067 pass / 173 fail of 17,240, with the
+  out-of-scope Temporal and await-dictionary fixtures skipped,
+  `--timeout 60 --recheck-timeout 45`, release build), 0 crashes and 0
+  hangs with the long timeout. The remaining gap is the systematic bug
+  clusters triaged above — fix the next cluster, then re-run the sweep
+  and record the delta. Note: the TypedArray sweep should be run with a
+  longer deadline (`--timeout 120 --recheck-timeout 90`) — the O(n²)
+  property store makes the 10,000-element crash-test fixtures take
+  ~45s, which the default 5s recheck misclassifies as hangs.
 - The 27 original hangs were slow builtin calls (fixed via the dispatch
   cache) plus one real `Array.prototype.splice` infinite loop (fixed); the
   remaining sweep runs cleanly. Use a release build

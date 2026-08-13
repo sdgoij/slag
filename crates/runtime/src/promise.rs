@@ -113,20 +113,37 @@ pub fn new_promise_capability(
         ));
     }
     let captured: Rc<RefCell<Option<(Value, Value)>>> = Rc::new(RefCell::new(None));
+    let function_proto = agent
+        .current_realm()
+        .ok()
+        .and_then(|realm| realm.intrinsics.get("%Function.prototype%"))
+        .and_then(|v| crate::context::as_object(&v));
     let executor = Function::create_builtin(
         Some(JsString::from_utf8("")),
         2,
         Box::new({
             let captured = captured.clone();
             move |_, args| {
+                let mut slot = captured.borrow_mut();
+                // GetCapabilitiesExecutor (spec 27.2.1.5.1 steps 1-4): a
+                // second call throws once a resolve/reject was captured; a
+                // prior (undefined, undefined) call leaves the slot free.
+                if let Some((resolve, reject)) = &*slot
+                    && (!matches!(resolve, Value::Undefined) || !matches!(reject, Value::Undefined))
+                {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "Promise executor called twice".into(),
+                    ));
+                }
                 let resolve = args.first().cloned().unwrap_or(Value::Undefined);
                 let reject = args.get(1).cloned().unwrap_or(Value::Undefined);
-                *captured.borrow_mut() = Some((resolve, reject));
+                *slot = Some((resolve, reject));
                 Ok(Value::Undefined)
             }
         }),
         None,
-        None,
+        function_proto,
     )?;
     let promise = crate::function::construct(
         agent,
@@ -156,6 +173,11 @@ pub fn new_promise_capability(
 /// CreateResolvingFunctions (spec 27.2.1.3.1): two built-in functions whose
 /// identity the call dispatcher routes back here.
 pub fn create_resolving_functions(agent: &mut Agent, promise: &Value) -> (Value, Value) {
+    let function_proto = agent
+        .current_realm()
+        .ok()
+        .and_then(|realm| realm.intrinsics.get("%Function.prototype%"))
+        .and_then(|v| crate::context::as_object(&v));
     let mut make = |is_reject: bool, name: &str| -> Value {
         let resolver = Function::create_builtin(
             Some(JsString::from_utf8(name)),
@@ -167,7 +189,7 @@ pub fn create_resolving_functions(agent: &mut Agent, promise: &Value) -> (Value,
                 ))
             }),
             None,
-            None,
+            function_proto.clone(),
         )
         .expect("builtin creation cannot fail");
         agent.promise_resolvers.insert(
@@ -180,7 +202,9 @@ pub fn create_resolving_functions(agent: &mut Agent, promise: &Value) -> (Value,
         );
         Value::Function(resolver)
     };
-    (make(false, "resolve"), make(true, "reject"))
+    // The promise resolving functions are anonymous (spec 27.2.1.3.1): the
+    // `name` property is the empty string.
+    (make(false, ""), make(true, ""))
 }
 
 /// The Promise Resolve Function algorithm (spec 27.2.1.3.2): resolve
