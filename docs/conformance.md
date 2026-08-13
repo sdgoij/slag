@@ -1136,9 +1136,50 @@ Validation: `cargo test --workspace` **4085 pass, 0 failures**;
 `cargo fmt --all --check` clean. A full `built-ins` re-sweep shows exactly
 **6 fixtures fixed** (16,904 pass / 369 fail / 0 crash) and no regressions.
 
+### DataView cluster sweep (Phase 18 conformance)
+
+A sweep of the entire DataView tree (`sweep.exe built-ins --filter
+'DataView*'`) reports **549 pass, 0 fail, 12 skip** of 561 fixtures: every
+runnable fixture passes (up from 463 pass / 86 fail). The skips are the
+standard taxonomy (`$262.createRealm` × 2 and the `byteConversionValues.js`
+harness includes). Fixes in `crates/runtime/src/builtins/dataview.rs`:
+
+- **Check ordering in the get/set paths** — `GetViewValue`/`SetViewValue`
+  ran the detached and bounds checks before coercing the arguments. The
+  sequences now follow spec 25.4.2.2/25.4.2.3: an immutable buffer throws
+  before `ToIndex(requestIndex)` (so no user code runs, `immutable-
+  buffer.js`), the setters convert the value before the detached and
+  bounds checks (`detached-buffer-after-number-value.js`,
+  `range-check-after-value-conversion.js`), and `ToIndex` runs before the
+  detached check (`detached-buffer-after-toindex-byteoffset.js`).
+- **`IsViewOutOfBounds` was missing** — a fixed-length view whose range no
+  longer fits the shrunken buffer kept reading/writing stale memory; the
+  get/set paths and the `byteLength`/`byteOffset` accessors now throw a
+  TypeError for an out-of-bounds view (spec 25.4.1.5, `resizable-
+  buffer.js`).
+- **Auto byte length** — a DataView created without a `length` argument on
+  a resizable buffer records `auto` [[ByteLength]] (spec 25.4.2.1 step
+  8.b) and the accessors compute it from the current buffer length, so
+  `new DataView(ab, 1)` on a 4-byte buffer reports 3 and follows
+  `resize` (`resizable-array-buffer-auto.js`).
+- **Constructor argument-order and final checks** — the first detached
+  check ran before `ToIndex(byteOffset)` (the offset's `valueOf` must run
+  first, `DataView/detached-buffer.js`), and after
+  `OrdinaryCreateFromConstructor` (whose prototype getter can run user
+  code) the constructor now re-checks for a detached buffer (TypeError)
+  and an out-of-bounds view (RangeError), so a prototype getter that
+  detaches or resizes the buffer mid-construction is honored
+  (`custom-proto-access-*.js`).
+
+Validation: `cargo test --workspace` **4085 pass, 0 failures**;
+`cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo fmt --all --check` clean. A full `built-ins` re-sweep shows exactly
+**86 fixtures fixed** (16,990 pass / 283 fail / 0 crash) and no
+regressions.
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
-Beyond the vendored fixtures, ~120 edge-case unit tests were added across
+Beyond the vendored fixtures, ~124 edge-case unit tests were added across
 the crates (lexer, parser, runtime core, and the built-ins), targeting the
 plan's per-phase test lists: numeric-literal/escape/ASI lexing, the ASI ×
 statement matrix and cover grammar, TDZ/hoisting/redeclaration/eval
@@ -1245,9 +1286,9 @@ annexB rows are from the earlier run and have not changed since.
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,812 | 16,904 | 369 | 6,536 | 3¹ | 97.9% |
+| built-ins | 23,812 | 16,990 | 283 | 6,536 | 3¹ | 98.4% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,622** | **33,347** | **2,975** | **12,297** | **3** | **91.8%** |
+| **Total** | **48,622** | **33,433** | **2,889** | **12,297** | **3** | **92.0%** |
 
 (Runnable = pass + fail; the 9,171 skips are module/async fixtures,
 unsupported harness includes, and the out-of-scope Temporal proposal
@@ -1259,11 +1300,11 @@ Iterator/prototype, Iterator statics (concat/from/zip/zipKeyed), Symbol,
 Boolean, Number, Object.prototype.toString, Object/prototype legacy
 accessors, Proxy, Reflect, Object.groupBy, Object
 freeze/seal/isFrozen/isSealed, Array iteration-method, Array.of, Math,
-Object.fromEntries, and JSON.stringify cluster closures (all 0 fail); the
-language and annexB rows are from the sweep recorded below. The 6,536
-built-ins skips are dominated by the out-of-scope Temporal proposal
-(4,611), with the async/module flags, host-dependent `$262.createRealm`,
-and unsupported harness includes making up the rest.
+Object.fromEntries, JSON.stringify, and DataView cluster closures (all 0
+fail); the language and annexB rows are from the sweep recorded below.
+The 6,536 built-ins skips are dominated by the out-of-scope Temporal
+proposal (4,611), with the async/module flags, host-dependent
+`$262.createRealm`, and unsupported harness includes making up the rest.
 
 ¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
 coerced-values fixtures — 10,000-element allocations that need the long
@@ -1322,7 +1363,7 @@ The 7,314 failures triage into:
     cross-crate coercion of wrapper objects (2); the `-realm` fixtures are
     skipped as host-dependent
   - `String/prototype` (290), `Array/prototype` (187)
-  - `Iterator/prototype` (278), `DataView/prototype` (140)
+  - `Iterator/prototype` (278)
   - `dynamic-import/syntax/valid` (137), class-element `delete` early
     errors (192), `eval-code/direct` (103), `identifiers` (58),
     `arguments-object`
@@ -1348,7 +1389,7 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 ## Open items
 
 - Certify the ≥95%-of-runnable target: the built-ins area now measures
-  **97.9%** of runnable (16,904 pass / 369 fail of 17,273, with the
+  **98.4%** of runnable (16,990 pass / 283 fail of 17,273, with the
   out-of-scope Temporal fixtures skipped, `--timeout 60
   --recheck-timeout 45`, release build), 0 crashes and 0 hangs with the
   long timeout. The remaining gap is the systematic bug clusters triaged

@@ -25,11 +25,13 @@ const DV_BYTE_LENGTH: &str = "%get DataView.prototype.byteLength%";
 const DV_BYTE_OFFSET: &str = "%get DataView.prototype.byteOffset%";
 
 /// The [[ViewedArrayBuffer]], [[ByteLength]], and [[ByteOffset]] of a
-/// DataView instance (spec 25.4.1).
+/// DataView instance (spec 25.4.1). [[ByteLength]] is `None` for the auto
+/// length of a resizable-buffer view created without a length argument
+/// (spec 25.4.2.1 step 8.b): the view's byte length then tracks the buffer.
 #[derive(Debug, Clone)]
 pub struct DataViewState {
     pub buffer_object: Value,
-    pub byte_length: usize,
+    pub byte_length: Option<usize>,
     pub byte_offset: usize,
 }
 
@@ -144,12 +146,8 @@ fn data_view_construct(
             "First argument is not an ArrayBuffer".into(),
         ));
     }
-    if crate::builtins::array_buffer::is_detached(agent, buffer_object.id()) {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "ArrayBuffer is detached".into(),
-        ));
-    }
+    // spec 25.4.2.1 steps 3-4: ToIndex(byteOffset) runs before the first
+    // detached check (the argument's valueOf may itself detach or throw).
     let byte_offset = to_index(&args.get(1).cloned().unwrap_or(Value::Undefined))? as usize;
     if crate::builtins::array_buffer::is_detached(agent, buffer_object.id()) {
         return Err(JsError::new(
@@ -164,13 +162,14 @@ fn data_view_construct(
         .unwrap_or(0);
     let byte_length = match args.get(2) {
         None | Some(Value::Undefined) => {
+            // step 8: an omitted length is auto; the offset must still fit.
             if byte_offset > buffer_byte_length {
                 return Err(JsError::new(
                     ErrorKind::RangeError,
                     "byteOffset exceeds the buffer length".into(),
                 ));
             }
-            buffer_byte_length - byte_offset
+            None
         }
         Some(value) => {
             let length = to_index(value)? as usize;
@@ -183,10 +182,25 @@ fn data_view_construct(
                     "DataView range exceeds the buffer".into(),
                 ));
             }
-            length
+            Some(length)
         }
     };
     let prototype = get_prototype_from_constructor(agent, new_target, DATA_VIEW_PROTO)?;
+    // spec 25.4.2.1 steps 11-12: OrdinaryCreateFromConstructor ran user code
+    // (the prototype getter) that may have detached or resized the buffer;
+    // a detached buffer is a TypeError, an out-of-bounds view a RangeError.
+    if crate::builtins::array_buffer::is_detached(agent, buffer_object.id()) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "ArrayBuffer is detached".into(),
+        ));
+    }
+    if view_out_of_bounds(agent, buffer_object.id(), byte_offset, byte_length) {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "DataView is out of bounds".into(),
+        ));
+    }
     let object = JsObject::ordinary_object_create(Some(prototype));
     agent.dataview_data.insert(
         object.id(),
@@ -210,58 +224,148 @@ fn get_buffer(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value,
 /// DataView.prototype.byteLength (spec 25.4.4.2).
 fn get_byte_length(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     let object = require_data_view(agent, this)?;
-    Ok(Value::Number(
-        state(agent, object.id())
-            .map(|state| state.byte_length as f64)
-            .unwrap_or(0.0),
-    ))
-}
-
-/// DataView.prototype.byteOffset (spec 25.4.4.3).
-fn get_byte_offset(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
-    let object = require_data_view(agent, this)?;
-    Ok(Value::Number(
-        state(agent, object.id())
-            .map(|state| state.byte_offset as f64)
-            .unwrap_or(0.0),
-    ))
-}
-
-/// ValidateDataView + the offset/size bounds check (spec 25.4.4.6 step 1-8):
-/// the view's buffer must not be detached and the element must fit in the
-/// view's [[ByteLength]]. Returns the view's buffer id and absolute offset.
-fn view_offset(
-    agent: &mut Agent,
-    this: &Value,
-    args: &[Value],
-    size: usize,
-) -> Result<(u64, usize), JsError> {
-    let object = require_data_view(agent, this)?;
-    let (buffer_object, byte_offset, byte_length) = {
+    let (buffer_object, byte_length, byte_offset) = {
         let state = state(agent, object.id()).expect("registered data view");
         (
             state.buffer_object.clone(),
-            state.byte_offset,
             state.byte_length,
+            state.byte_offset,
         )
     };
     let buffer_id = as_object(&buffer_object)
         .map(|object| object.id())
         .unwrap_or(u64::MAX);
+    // spec 25.4.4.2 steps 2-3: a detached or out-of-bounds view throws.
+    if crate::builtins::array_buffer::is_detached(agent, buffer_id)
+        || view_out_of_bounds(agent, buffer_id, byte_offset, byte_length)
+    {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "DataView view is out of bounds".into(),
+        ));
+    }
+    let length = match byte_length {
+        Some(length) => length,
+        // auto: the view's byte length tracks the buffer (spec 25.4.4.2
+        // step 4); the checks above guarantee no underflow.
+        None => {
+            let buffer_length = agent
+                .buffer_data
+                .get(&buffer_id)
+                .map(|cell| cell.borrow().byte_length)
+                .unwrap_or(0);
+            buffer_length - byte_offset
+        }
+    };
+    Ok(Value::Number(length as f64))
+}
+
+/// DataView.prototype.byteOffset (spec 25.4.4.3).
+fn get_byte_offset(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
+    let object = require_data_view(agent, this)?;
+    let (buffer_object, byte_length, byte_offset) = {
+        let state = state(agent, object.id()).expect("registered data view");
+        (
+            state.buffer_object.clone(),
+            state.byte_length,
+            state.byte_offset,
+        )
+    };
+    let buffer_id = as_object(&buffer_object)
+        .map(|object| object.id())
+        .unwrap_or(u64::MAX);
+    if crate::builtins::array_buffer::is_detached(agent, buffer_id)
+        || view_out_of_bounds(agent, buffer_id, byte_offset, byte_length)
+    {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "DataView view is out of bounds".into(),
+        ));
+    }
+    Ok(Value::Number(byte_offset as f64))
+}
+
+/// IsViewOutOfBounds (spec 25.4.1.5): the view's byte range no longer fits
+/// the (possibly resized or detached) buffer. An auto-length view tracks the
+/// buffer, so only the offset can push it out of bounds.
+fn view_out_of_bounds(
+    agent: &Agent,
+    buffer_id: u64,
+    byte_offset: usize,
+    byte_length: Option<usize>,
+) -> bool {
+    let Some(buffer) = agent.buffer_data.get(&buffer_id) else {
+        return false;
+    };
+    let buffer = buffer.borrow();
+    match byte_length {
+        None => byte_offset > buffer.byte_length,
+        Some(length) => byte_offset + length > buffer.byte_length,
+    }
+}
+
+/// RequireInternalSlot([[DataView]]) (spec 25.4.2.2/25.4.2.3 step 1): the
+/// view's buffer id, byte offset, and byte length.
+fn view_state(agent: &Agent, this: &Value) -> Result<(u64, usize, Option<usize>), JsError> {
+    let object = require_data_view(agent, this)?;
+    let (buffer_object, byte_length, byte_offset) = {
+        let state = state(agent, object.id()).expect("registered data view");
+        (
+            state.buffer_object.clone(),
+            state.byte_length,
+            state.byte_offset,
+        )
+    };
+    let buffer_id = as_object(&buffer_object)
+        .map(|object| object.id())
+        .unwrap_or(u64::MAX);
+    Ok((buffer_id, byte_offset, byte_length))
+}
+
+/// The remaining checks of GetViewValue/SetViewValue (spec 25.4.2.2 steps
+/// 14-16 / 25.4.2.3 steps 14-16): the buffer must not be detached, the view
+/// must not be out of bounds, and the element must fit in the view's byte
+/// length. Returns the absolute byte offset into the buffer.
+fn check_view(
+    agent: &Agent,
+    buffer_id: u64,
+    byte_offset: usize,
+    byte_length: Option<usize>,
+    index: usize,
+    size: usize,
+) -> Result<usize, JsError> {
     if crate::builtins::array_buffer::is_detached(agent, buffer_id) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "DataView buffer is detached".into(),
         ));
     }
-    let offset = to_index(&args.first().cloned().unwrap_or(Value::Undefined))? as usize;
-    if offset.checked_add(size).is_none_or(|end| end > byte_length) {
+    if view_out_of_bounds(agent, buffer_id, byte_offset, byte_length) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "DataView view is out of bounds".into(),
+        ));
+    }
+    let view_size = match byte_length {
+        Some(length) => length,
+        // auto: the view's byte length tracks the buffer (spec 25.4.2.2
+        // step 9); the OOB check above guarantees no underflow.
+        None => {
+            let buffer_length = agent
+                .buffer_data
+                .get(&buffer_id)
+                .map(|cell| cell.borrow().byte_length)
+                .unwrap_or(0);
+            buffer_length - byte_offset
+        }
+    };
+    if index.checked_add(size).is_none_or(|end| end > view_size) {
         return Err(JsError::new(
             ErrorKind::RangeError,
             "DataView element is out of bounds".into(),
         ));
     }
-    Ok((buffer_id, byte_offset + offset))
+    Ok(byte_offset + index)
 }
 
 /// The littleEndian option (ToBoolean of the second argument, default false).
@@ -269,7 +373,7 @@ fn little_endian(args: &[Value]) -> bool {
     to_boolean(&args.get(1).cloned().unwrap_or(Value::Undefined))
 }
 
-/// The read path of the get* methods (spec GetValueFromBuffer): fetch the
+/// The read path of the get* methods (spec GetViewValue): fetch the
 /// `size` bytes at the absolute offset, reorder for endianness, and decode.
 fn read_element(
     agent: &mut Agent,
@@ -277,7 +381,16 @@ fn read_element(
     args: &[Value],
     element_type: ElementType,
 ) -> Result<Value, JsError> {
-    let (buffer_id, offset) = view_offset(agent, this, args, element_type.size())?;
+    let (buffer_id, byte_offset, byte_length) = view_state(agent, this)?;
+    let index = to_index(&args.first().cloned().unwrap_or(Value::Undefined))? as usize;
+    let offset = check_view(
+        agent,
+        buffer_id,
+        byte_offset,
+        byte_length,
+        index,
+        element_type.size(),
+    )?;
     let mut bytes = {
         let buffer = agent.buffer_data.get(&buffer_id).ok_or_else(|| {
             JsError::new(ErrorKind::TypeError, "DataView buffer is detached".into())
@@ -290,17 +403,44 @@ fn read_element(
     decode_element(element_type, &bytes, 0)
 }
 
-/// The write path of the set* methods (spec SetValueInBuffer): encode the
-/// value natively, reorder for endianness, and store.
+/// The write path of the set* methods (spec SetViewValue): encode the
+/// value natively, reorder for endianness, and store. The immutable check
+/// precedes ToIndex(requestIndex) (spec 25.4.2.3 step 3) and the value
+/// conversion runs before the detached/out-of-bounds/bounds checks (steps
+/// 5-6).
 fn write_element(
     agent: &mut Agent,
     this: &Value,
     args: &[Value],
     element_type: ElementType,
 ) -> Result<Value, JsError> {
-    let (buffer_id, offset) = view_offset(agent, this, args, element_type.size())?;
+    let (buffer_id, byte_offset, byte_length) = view_state(agent, this)?;
+    if agent
+        .buffer_data
+        .get(&buffer_id)
+        .is_some_and(|cell| cell.borrow().immutable)
+    {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "DataView buffer is immutable".into(),
+        ));
+    }
+    let index = to_index(&args.first().cloned().unwrap_or(Value::Undefined))? as usize;
     let value = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let mut bytes = encode_element(element_type, &value)?;
+    let converted = if matches!(element_type, ElementType::BigInt64 | ElementType::BigUint64) {
+        Value::BigInt(Handle::new(crate::context::to_big_int(agent, &value)?))
+    } else {
+        Value::Number(crate::context::to_number(agent, &value)?)
+    };
+    let offset = check_view(
+        agent,
+        buffer_id,
+        byte_offset,
+        byte_length,
+        index,
+        element_type.size(),
+    )?;
+    let mut bytes = encode_element(element_type, &converted)?;
     // The isLittleEndian flag is the third parameter, read past the value.
     if little_endian(args.get(1..).unwrap_or(&[])) != agent.little_endian {
         bytes.reverse();
@@ -714,5 +854,88 @@ mod tests {
             run("(function(){ var b = new ArrayBuffer(8); b.transfer(); new DataView(b); })()"),
             Err(e) if e.kind == ErrorKind::TypeError
         ));
+    }
+
+    #[test]
+    fn setter_rejects_immutable_buffer_before_argument_coercion() {
+        // SetViewValue step 3: the immutable TypeError precedes ToIndex and
+        // the value conversion, so no user code runs (the `calls` array must
+        // stay empty). Reads on an immutable buffer still work.
+        assert!(bool(concat!(
+            "(function(){\n",
+            "  var iab = (new ArrayBuffer(8)).transferToImmutable();\n",
+            "  var view = new DataView(iab);\n",
+            "  var calls = [];\n",
+            "  var byteOffset = { valueOf: function(){ calls.push('offset'); return 0; } };\n",
+            "  var value = { valueOf: function(){ calls.push('value'); return 1; } };\n",
+            "  var threw = false;\n",
+            "  try { view.setInt32(byteOffset, value); } catch (e) { threw = e instanceof TypeError; }\n",
+            "  return threw && calls.length === 0 && view.getInt32(0) === 0;\n",
+            "})()",
+        )));
+    }
+
+    #[test]
+    fn setter_value_conversion_precedes_detached_and_bounds_checks() {
+        // SetViewValue steps 5-6: ToNumber(value) runs before the detached
+        // check and before the RangeError bounds check, so a poisoned
+        // valueOf wins over both.
+        assert!(bool(concat!(
+            "(function(){\n",
+            "  var b = new ArrayBuffer(8);\n",
+            "  var view = new DataView(b);\n",
+            "  var poisoned = { valueOf: function(){ throw new TypeError('poison'); } };\n",
+            "  var caught = null;\n",
+            "  try { view.setInt32(100, poisoned); } catch (e) { caught = e.message; }\n",
+            "  b.transfer();\n",
+            "  try { view.setInt32(0, poisoned); } catch (e) { caught = caught + '|' + e.message; }\n",
+            "  return caught === 'poison|poison';\n",
+            "})()",
+        )));
+    }
+
+    #[test]
+    fn resizable_view_out_of_bounds() {
+        // A fixed-length view whose range no longer fits the shrunken buffer
+        // is out of bounds: get/set and the length/offset accessors throw a
+        // TypeError, and the constructor RangeErrors when the prototype
+        // getter shrank the buffer under the view.
+        assert!(bool(concat!(
+            "(function(){\n",
+            "  var ab = new ArrayBuffer(24, { maxByteLength: 32 });\n",
+            "  var view = new DataView(ab, 0, 16);\n",
+            "  ab.resize(8);\n",
+            "  var threw = false;\n",
+            "  try { view.setInt8(0, 1); } catch (e) { threw = e instanceof TypeError; }\n",
+            "  var threwLength = false;\n",
+            "  try { view.byteLength; } catch (e) { threwLength = e instanceof TypeError; }\n",
+            "  return threw && threwLength;\n",
+            "})()",
+        )));
+        assert!(matches!(
+            run(concat!(
+                "(function(){\n",
+                "  var b = new ArrayBuffer(3, { maxByteLength: 3 });\n",
+                "  var t = function(){}.bind(null);\n",
+                "  Object.defineProperty(t, 'prototype', { get: function(){ b.resize(1); } });\n",
+                "  Reflect.construct(DataView, [b, 2], t);\n",
+                "})()",
+            )),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+    }
+
+    #[test]
+    fn auto_byte_length_tracks_resizable_buffer() {
+        // A view created without a length argument has an auto [[ByteLength]]
+        // that follows the buffer (spec 25.4.2.1 step 8.b).
+        assert!(bool(concat!(
+            "(function(){\n",
+            "  var ab = new ArrayBuffer(4, { maxByteLength: 5 });\n",
+            "  var view = new DataView(ab, 1);\n",
+            "  ab.resize(5);\n",
+            "  return view.byteLength === 4 && view.byteOffset === 1;\n",
+            "})()",
+        )));
     }
 }
