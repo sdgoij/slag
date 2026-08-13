@@ -410,45 +410,83 @@ fn own_keys_of(agent: &mut Agent, value: &Value, want_symbols: bool) -> Result<V
     array_of(agent, &keys)
 }
 
+/// Object.freeze/Object.seal (spec 20.1.2.7 / 20.1.2.20): a primitive
+/// receiver is returned as-is; SetIntegrityLevel failure throws a TypeError.
+fn freeze_or_seal(value: &Value, freeze: bool) -> Result<Value, JsError> {
+    // spec step 1: Type(O) is not Object → return O unchanged.
+    if !matches!(value, Value::Object(_) | Value::Function(_)) {
+        return Ok(value.clone());
+    }
+    if !set_integrity_level(value, freeze)? {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            if freeze {
+                "Cannot freeze the object".into()
+            } else {
+                "Cannot seal the object".into()
+            },
+        ));
+    }
+    Ok(value.clone())
+}
+
 /// SetIntegrityLevel (spec 7.3.15): freeze (writable off too) or seal.
-fn set_integrity_level(agent: &mut Agent, value: &Value, freeze: bool) -> Result<Value, JsError> {
-    let object = to_object(agent, value)?;
-    let obj = as_object(&object)
+/// Returns the status; a failed [[PreventExtensions]] aborts with `false`.
+fn set_integrity_level(value: &Value, freeze: bool) -> Result<bool, JsError> {
+    let obj = as_object(value)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
+    // spec steps 1-2: prevent extensions first; a false status returns false.
+    if !obj.prevent_extensions()? {
+        return Ok(false);
+    }
     for key in obj.own_property_keys()? {
-        if let Some(current) = obj.get_own_property_key(&key)?
-            && current.configurable
-        {
-            // Accessor properties keep their getter/setter; only data
-            // properties gain the writable: false constraint (spec 7.3.15
-            // steps 2.c-2.d).
-            let desc = match &current.kind {
-                crux::object::PropertyKind::Data { .. } => PropertyDescriptor {
-                    value: if freeze { current.value() } else { None },
-                    writable: if freeze { Some(false) } else { None },
-                    get: None,
-                    set: None,
-                    enumerable: Some(current.enumerable),
-                    configurable: Some(false),
-                },
-                crux::object::PropertyKind::Accessor { get, set } => PropertyDescriptor {
-                    value: None,
-                    writable: None,
-                    get: get.clone(),
-                    set: set.clone(),
-                    enumerable: Some(current.enumerable),
-                    configurable: Some(false),
-                },
-            };
-            obj.define_property_key(&key, &desc)?;
+        let Some(current) = obj.get_own_property_key(&key)? else {
+            continue;
+        };
+        // spec steps 4-5: seal sets only [[Configurable]] false; freeze also
+        // sets [[Writable]] false on data properties. The descriptors are
+        // partial, so a proxy defineProperty trap sees only those fields
+        // (no value/enumerable/get/set).
+        let desc = if current.is_accessor() {
+            PropertyDescriptor {
+                value: None,
+                writable: None,
+                get: None,
+                set: None,
+                enumerable: None,
+                configurable: Some(false),
+            }
+        } else {
+            PropertyDescriptor {
+                value: None,
+                writable: if freeze { Some(false) } else { None },
+                get: None,
+                set: None,
+                enumerable: None,
+                configurable: Some(false),
+            }
+        };
+        // DefinePropertyOrThrow (spec steps 4.a.i / 5.b.iii).
+        if !obj.define_property_key(&key, &desc)? {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                format!(
+                    "Cannot define property {} on a non-extensible object",
+                    key.display_string()
+                ),
+            ));
         }
     }
-    obj.prevent_extensions()?;
-    Ok(object)
+    Ok(true)
 }
 
 /// TestIntegrityLevel (spec 7.3.16).
 fn test_integrity_level(agent: &mut Agent, value: &Value, freeze: bool) -> Result<bool, JsError> {
+    // spec 20.1.2.12 step 1 / 20.1.2.14 step 1: a primitive is frozen and
+    // sealed trivially (no own properties, not extensible).
+    if !matches!(value, Value::Object(_) | Value::Function(_)) {
+        return Ok(true);
+    }
     let object = to_object(agent, value)?;
     let obj = match as_object(&object) {
         Some(obj) => obj,
@@ -818,21 +856,27 @@ pub fn dispatch_call(
         })());
     }
     if intrinsics.get(FREEZE).as_ref() == Some(callee) {
-        return Some(set_integrity_level(agent, arg(args, 0), true));
+        return Some(freeze_or_seal(arg(args, 0), true));
     }
     if intrinsics.get(SEAL).as_ref() == Some(callee) {
-        return Some(set_integrity_level(agent, arg(args, 0), false));
+        return Some(freeze_or_seal(arg(args, 0), false));
     }
     if intrinsics.get(IS_FROZEN).as_ref() == Some(callee) {
         return Some((|| {
-            let object = to_object(agent, arg(args, 0))?;
-            Ok(Value::Boolean(test_integrity_level(agent, &object, true)?))
+            Ok(Value::Boolean(test_integrity_level(
+                agent,
+                arg(args, 0),
+                true,
+            )?))
         })());
     }
     if intrinsics.get(IS_SEALED).as_ref() == Some(callee) {
         return Some((|| {
-            let object = to_object(agent, arg(args, 0))?;
-            Ok(Value::Boolean(test_integrity_level(agent, &object, false)?))
+            Ok(Value::Boolean(test_integrity_level(
+                agent,
+                arg(args, 0),
+                false,
+            )?))
         })());
     }
     if intrinsics.get(FROM_ENTRIES).as_ref() == Some(callee) {

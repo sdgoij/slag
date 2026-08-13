@@ -959,6 +959,41 @@ Validation: `cargo test --workspace` **4085 pass, 0 failures**;
 shows **16,714 pass / 559 fail / 0 crash / 3 hang** — exactly the 12
 cluster fixtures fixed and 0 new failures across all 23,812 fixtures.
 
+### Object freeze/seal/isFrozen/isSealed cluster sweeps (Phase 18 conformance)
+
+Sweeps of the four integrity trees (`Object/freeze/*`, `Object/seal/*`,
+`Object/isFrozen/*`, `Object/isSealed/*`) report **52 + 94 + 59 + 33 pass,
+0 fail** (the freeze/isFrozen/isSealed trees were 39/13, 54/5, and 32/1;
+seal was already green): every runnable fixture passes. `SetIntegrityLevel`
+(spec 7.3.15) in `crates/runtime/src/builtins/object.rs` was rebuilt:
+
+- **Non-configurable properties were skipped** — the loop only touched
+  configurable properties, so `Object.freeze` left a non-configurable
+  writable data property writable. The freeze/seal descriptors now apply
+  to every own property (`15.2.3.9-2-b-i-1.js`).
+- **Full descriptors were passed where the spec wants partial ones** — a
+  proxy `defineProperty` trap saw `value`/`enumerable`/`get`/`set`
+  populated; it now receives only `{ configurable: false, writable:
+  false }` (data, freeze) or `{ configurable: false }` (accessors and
+  seal), per spec steps 4-5 (`proxy-with-defineProperty-handler.js`).
+- **`[[PreventExtensions]]` ran after the defines and its `false` was
+  ignored** — it now runs first (spec step 1), a `false` status returns
+  `false`, and `Object.freeze`/`seal` throw the TypeError
+  (`throws-when-false.js`).
+- **Primitive receivers** — `Object.freeze(0)` returned the boxed
+  wrapper (and threw for null/undefined) instead of the primitive, and
+  `Object.isFrozen(0)`/`Object.isSealed(0)` returned `false` instead of
+  `true`. Both now take the spec's `Type(O) is not Object` shortcut and
+  pass the raw argument through to `SetIntegrityLevel`/`TestIntegrityLevel`
+  (the ES5-era `15.2.3.9-1*`/`15.2.3.12-1*`/`15.2.3.11-1` fixtures).
+
+Validation: `cargo test --workspace` **4085 pass, 0 failures**;
+`cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo fmt --all --check` clean. A full `built-ins` sweep before/after
+(`git stash` baseline) shows **0 new failures and 0 new crashes** across
+all 23,812 fixtures, with **37 fixtures fixed** (the 19 integrity-cluster
+ones plus 18 more that freeze/seal/freeze-check objects in their setup).
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~120 edge-case unit tests were added across
@@ -1068,9 +1103,9 @@ annexB rows are from the earlier run and have not changed since.
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,812 | 16,714 | 559 | 6,536 | 3¹ | 96.8% |
+| built-ins | 23,812 | 16,751 | 522 | 6,536 | 3¹ | 97.0% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,622** | **33,157** | **3,165** | **12,297** | **3** | **91.3%** |
+| **Total** | **48,622** | **33,194** | **3,128** | **12,297** | **3** | **91.4%** |
 
 (Runnable = pass + fail; the 9,171 skips are module/async fixtures,
 unsupported harness includes, and the out-of-scope Temporal proposal
@@ -1080,11 +1115,12 @@ String/prototype, Object/create, DisposableStack, AsyncDisposableStack,
 ArrayBuffer/SharedArrayBuffer, Date, BigInt, global-functions, Function,
 Iterator/prototype, Iterator statics (concat/from/zip/zipKeyed), Symbol,
 Boolean, Number, Object.prototype.toString, Object/prototype legacy
-accessors, Proxy, Reflect, and Object.groupBy cluster closures (all 0
-fail); the language and annexB rows are from the sweep recorded below.
-The 6,536 built-ins skips are dominated by the out-of-scope Temporal
-proposal (4,611), with the async/module flags, host-dependent
-`$262.createRealm`, and unsupported harness includes making up the rest.
+accessors, Proxy, Reflect, Object.groupBy, and Object
+freeze/seal/isFrozen/isSealed cluster closures (all 0 fail); the language
+and annexB rows are from the sweep recorded below. The 6,536 built-ins
+skips are dominated by the out-of-scope Temporal proposal (4,611), with
+the async/module flags, host-dependent `$262.createRealm`, and unsupported
+harness includes making up the rest.
 
 ¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
 coerced-values fixtures — 10,000-element allocations that need the long
@@ -1169,7 +1205,7 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 ## Open items
 
 - Certify the ≥95%-of-runnable target: the built-ins area now measures
-  **96.8%** of runnable (16,714 pass / 559 fail of 17,273, with the
+  **97.0%** of runnable (16,751 pass / 522 fail of 17,273, with the
   out-of-scope Temporal fixtures skipped, `--timeout 60
   --recheck-timeout 45`, release build), 0 crashes and 0 hangs with the
   long timeout. The remaining gap is the systematic bug clusters triaged
