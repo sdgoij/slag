@@ -533,6 +533,25 @@ fn register_function(
     let function = Function::new(name.clone());
     agent.ecma_functions.insert(function.id(), data);
     set_function_properties(&function, &params, name.as_ref())?;
+    // AddRestrictedFunctionProperties (spec 10.2.1): sloppy ordinary
+    // functions carry own `caller`/`arguments` (value null, non-writable,
+    // non-configurable). Strict, async, and generator functions have none, so
+    // their reads/writes fall through to the %Function.prototype% accessors.
+    if !strict && !kind.is_async && !kind.is_generator {
+        for name in ["caller", "arguments"] {
+            function.define_property(
+                &JsString::from_utf8(name),
+                &PropertyDescriptor {
+                    value: Some(Value::Null),
+                    writable: Some(false),
+                    get: None,
+                    set: None,
+                    enumerable: Some(false),
+                    configurable: Some(false),
+                },
+            )?;
+        }
+    }
     // Plain async functions are never constructors and have no `prototype`;
     // generator and async-generator functions get a `prototype` that inherits
     // %Generator.prototype% / %AsyncGenerator.prototype%, writable per
@@ -1077,14 +1096,19 @@ fn ordinary_call(
             .and_then(|context| context.source.clone()),
     });
     let result = (|| -> Result<Value, JsError> {
-        // OrdinaryCallBindThis: strict keeps `this`; sloppy coerces
-        // undefined/null to the global object; lexical binds nothing.
+        // OrdinaryCallBindThis: strict keeps `this` as-is; sloppy coerces
+        // undefined/null to the global object and boxes primitives; lexical
+        // binds nothing.
         if data.this_mode != ThisMode::Lexical {
-            let this = if data.this_mode == ThisMode::Sloppy
-                && matches!(this, Value::Undefined | Value::Null)
-            {
-                let global = agent.running_context()?.realm.global_object.clone();
-                Value::Object(global)
+            let this = if data.this_mode == ThisMode::Sloppy {
+                match this {
+                    Value::Undefined | Value::Null => {
+                        let global = agent.running_context()?.realm.global_object.clone();
+                        Value::Object(global)
+                    }
+                    Value::Object(_) | Value::Function(_) => this,
+                    other => crate::context::to_object(agent, &other)?,
+                }
             } else {
                 this
             };
@@ -1117,6 +1141,16 @@ fn evaluate_body(agent: &mut Agent, data: &EcmaFunction) -> Result<Value, JsErro
 /// from the constructor's prototype, bind it, and run the body. Base class
 /// constructors initialize instance fields before the body; derived
 /// constructors leave `this` uninitialized until `super()` binds it.
+/// Whether `value` is a Proxy whose [[ProxyHandler]] slot has been cleared
+/// (spec 10.5.13): its internal methods all throw a TypeError.
+fn is_revoked_proxy(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Object(obj)
+            if matches!(&obj.kind, crux::object::ObjectKind::Proxy(slots) if slots.target.borrow().is_none())
+    )
+}
+
 fn ordinary_construct(
     agent: &mut Agent,
     function: &Handle<Function>,
@@ -1146,16 +1180,26 @@ fn ordinary_construct(
         Value::Undefined
     } else {
         // OrdinaryCreateFromConstructor (spec 10.2.4): newTarget's
-        // `prototype`, or a null-prototype object until %Object.prototype%.
+        // `prototype` (an object — including a function value), or a
+        // null-prototype object until %Object.prototype%.
         let prototype = crate::context::get_property(
             agent,
             new_target,
             &JsString::from_utf8("prototype"),
             new_target.clone(),
         )?;
-        let proto = match prototype {
-            Value::Object(obj) => Some(obj),
-            _ => None,
+        let proto = match crate::context::as_object(&prototype) {
+            Some(obj) => Some(obj),
+            None => {
+                // GetFunctionRealm (spec 10.2.5): a revoked Proxy throws.
+                if is_revoked_proxy(new_target) {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "Cannot perform operation on a revoked Proxy".into(),
+                    ));
+                }
+                None
+            }
         };
         Value::Object(JsObject::ordinary_object_create(proto))
     };

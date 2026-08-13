@@ -10741,7 +10741,11 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
         let body = &rest[end + 5..];
         let mut fm = Frontmatter::default();
         let mut in_negative = false;
-        for raw in rest[..end].lines() {
+        // CR-only fixtures (e.g. the toString line-terminator tests) have no
+        // LF to split on; both CR and LF are line terminators per the spec.
+        // Filter the empty segments CRLF produces between adjacent separators
+        // (an empty "line" would otherwise reset the `negative:` block).
+        for raw in rest[..end].split(['\n', '\r']).filter(|s| !s.is_empty()) {
             let trimmed = raw.trim();
             if trimmed.starts_with("negative:") {
                 in_negative = true;

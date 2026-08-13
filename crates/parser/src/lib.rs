@@ -1738,6 +1738,19 @@ mod tests {
     }
 
     #[test]
+    fn private_identifiers_require_an_enclosing_class() {
+        // AllPrivateIdentifiersValid: a PrivateIdentifier outside any class
+        // is a SyntaxError (spec 13.4/13.11), so dynamic function bodies
+        // like `new Function('o.#f')` fail at CreateDynamicFunction.
+        err("o.#f;");
+        err("#f in o;");
+        err("function g() { return this.#f; }");
+        // Inside a class the name may be declared and is accepted.
+        ok("class C { #f; m() { return this.#f; } }");
+        ok("class C { #f; m(o) { return #f in o; } }");
+    }
+
+    #[test]
     fn for_loop_heads_are_loop_scoped() {
         // A classic lexical head does not declare into the enclosing list: a
         // sibling loop, a later `let`, or an enclosing `var` may reuse the name.

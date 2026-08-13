@@ -987,6 +987,12 @@ pub fn ordinary_has_instance(
     if !is_callable(constructor) {
         return Ok(Value::Boolean(false));
     }
+    // spec 7.3.19 step 2: a bound function delegates to its target.
+    if let Value::Function(function) = constructor
+        && let crux::function::FunctionKind::Bound { target, .. } = &function.kind
+    {
+        return ordinary_has_instance(agent, target, value);
+    }
     let Some(value_obj) = crate::context::as_object(value) else {
         return Ok(Value::Boolean(false));
     };

@@ -360,6 +360,11 @@ fn parse_binary(parser: &mut Parser, allow_in: bool, min_prec: u8) -> Result<Exp
         let TokenKind::PrivateIdentifier(atom) = parser.next()?.kind else {
             unreachable!("peeked a private identifier")
         };
+        // AllPrivateIdentifiersValid (spec 13.11): a PrivateIdentifier needs
+        // an enclosing class that declares it.
+        if parser.private_names.is_empty() {
+            return Err(parser.error_at(start, "Private field access is only valid inside a class"));
+        }
         if !allow_in || !parser.at_keyword(Keyword::In)? {
             return Err(parser.error_at(start, "Private field access is only valid inside a class"));
         }
@@ -780,6 +785,14 @@ fn parse_member_property(parser: &mut Parser) -> Result<MemberProperty, JsError>
             Ok(MemberProperty::Name(atom))
         }
         TokenKind::PrivateIdentifier(atom) => {
+            // AllPrivateIdentifiersValid (spec 13.4): a PrivateIdentifier
+            // needs an enclosing class that declares it.
+            if parser.private_names.is_empty() {
+                let at = parser.peek()?.span.start;
+                return Err(
+                    parser.error_at(at, "Private field access is only valid inside a class")
+                );
+            }
             parser.next()?;
             Ok(MemberProperty::Private(atom))
         }

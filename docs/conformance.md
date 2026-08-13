@@ -48,7 +48,7 @@ Two harnesses live in `crates/test262`:
 
 ## Current results
 
-Workspace-wide: **4079 tests pass, 0 failures** (`cargo test --workspace`),
+Workspace-wide: **4085 tests pass, 0 failures** (`cargo test --workspace`),
 of which the test262 crate contributes **3317 passing fixtures** (44
 language-area + 3275 built-ins fixtures); the remaining registered test is
 the ignored `scan_builtins_directories` directory scanner. The `workers`
@@ -581,6 +581,50 @@ standard `$262.createRealm` host-dependency taxonomy. Fixes in
   head still clashes with a same-named `var` in the loop body
   (`BigInt/constructor-from-binary-string.js` uses two such loops).
 
+### Function cluster sweep (Phase 18 conformance)
+
+A sweep of the whole `Function/*` tree (`sweep.exe built-ins --filter
+'Function*'`) reports **425 pass, 0 fail, 84 skip** of 509 fixtures:
+every runnable fixture passes (up from 377 pass / 49 fail). The skips are
+the standard taxonomy (unsupported includes `nativeFunctionMatcher.js`,
+host-dependent `$262.createRealm`). Fixes in
+`crates/runtime/src/function.rs`, `crates/runtime/src/builtins/function.rs`,
+`crates/runtime/src/expr.rs`, `crates/parser/src/expr.rs`, and the test262
+harness:
+
+- **Restricted `caller`/`arguments` properties** — sloppy ordinary
+  functions now carry own `caller`/`arguments` data properties (value
+  null, non-writable, non-configurable) per AddRestrictedFunctionProperties,
+  and `%Function.prototype%` defines own `caller`/`arguments` accessors
+  whose get and set are the same thrower (20.2.3.1). Strict, bound, async,
+  and generator functions have no own properties, so reads and writes
+  fall through to the accessors and throw a TypeError — covering the
+  `15.3.5*`/`15.3.5.4_2-*gs` and StrictFunction/BoundFunction
+  restricted-properties fixtures.
+- **Sloppy `[[Call]]` `this` boxing** — OrdinaryCallBindThis coerced only
+  null/undefined to the global object; primitives are now ToObject'd, so
+  `Function("this.x = 1; return this;").apply(5)` sees a Number wrapper
+  (apply/call pass `thisArg` through unchanged per spec 20.2.3.2/20.2.3.4,
+  so a strict callee still sees the raw value).
+- **Function-valued construct prototypes** — OrdinaryCreateFromConstructor
+  only accepted `Value::Object`; a function-valued `prototype`
+  (`F.prototype = Function()`) left the new object null-prototyped. It now
+  goes through `as_object`, and a revoked-Proxy `newTarget` throws via
+  GetFunctionRealm (spec 10.2.5).
+- **`instanceof` with a bound right-hand side** — OrdinaryHasInstance now
+  unwraps a bound function to its target (spec 7.3.19 step 2).
+- **`Function` constructor ToString** — `new Function({})` failed at the
+  pure ToString placeholder; params and body now convert through the
+  agent, and the "[object Object]" body throws a SyntaxError.
+- **Private identifiers outside classes** — the parser accepted `o.#f`
+  (and `#f in o`) outside any class; AllPrivateIdentifiersValid now makes
+  them a SyntaxError, so `new Function("o.#f")` throws at
+  CreateDynamicFunction (spec 20.2.1.1 step 30).
+- **Harness CR-only frontmatter** — `parse_fixture` split on `\n` only, so
+  CR-only fixtures (the toString line-terminator tests) missed their
+  `includes:` and ran without the helper. It now splits on CR and LF,
+  filtering the empty segments CRLF produces.
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~120 edge-case unit tests were added across
@@ -687,18 +731,18 @@ TypedArray fixtures that pass with the long timeout (see below).
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,798 | 15,909 | 4,477 | 3,409 | 3¹ | 78.0% |
+| built-ins | 23,798 | 15,957 | 4,428 | 3,410 | 3¹ | 78.3% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,608** | **32,352** | **7,083** | **9,170** | **3** | **82.0%** |
+| **Total** | **48,608** | **32,400** | **7,034** | **9,171** | **3** | **82.2%** |
 
-(Runnable = pass + fail; the 9,170 skips are module/async fixtures,
+(Runnable = pass + fail; the 9,171 skips are module/async fixtures,
 unsupported harness includes, and the out-of-scope Temporal proposal
 fixtures.) The built-ins row reflects the current
 `Error*`/`BigInt*`/RegExp/Object-descriptor hardening plus the
 String/prototype, Object/create, DisposableStack, AsyncDisposableStack,
-ArrayBuffer/SharedArrayBuffer, Date, BigInt, and global-functions cluster
-closures (all 0 fail); the language and annexB rows are from the sweep
-recorded below.
+ArrayBuffer/SharedArrayBuffer, Date, BigInt, global-functions, and
+Function cluster closures (all 0 fail); the language and annexB rows are
+from the sweep recorded below.
 
 ¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
 coerced-values fixtures — 10,000-element allocations that need the long

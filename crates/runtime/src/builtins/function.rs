@@ -1,6 +1,6 @@
 //! The Function constructor and %Function.prototype% (spec 20.2).
 
-use crux::convert::{to_integer_or_infinity, to_length, to_number, to_string};
+use crux::convert::{to_integer_or_infinity, to_length, to_number};
 use crux::error::{ErrorKind, JsError};
 use crux::function::Function;
 use crux::handle::Handle;
@@ -199,7 +199,7 @@ fn install_methods(
         1,
         Box::new(placeholder("Function.prototype[@@hasInstance]")),
         None,
-        Some(proto),
+        Some(proto.clone()),
     )?;
     realm
         .intrinsics
@@ -228,6 +228,38 @@ fn install_methods(
             configurable: Some(true),
         },
     )?;
+
+    // 20.2.3.1 Function.prototype.caller/arguments: own accessor properties
+    // whose get and set are the same thrower, so reads/writes on functions
+    // without their own restricted properties (strict, bound, async,
+    // generator) throw a TypeError. Sloppy ordinary functions shadow them
+    // with their own null-valued data properties.
+    let restricted_thrower = Function::create_builtin(
+        Some(JsString::from_utf8("")),
+        0,
+        Box::new(|_, _| {
+            Err(JsError::new(
+                ErrorKind::TypeError,
+                "'caller', 'callee', and 'arguments' properties may not be accessed".into(),
+            ))
+        }),
+        None,
+        Some(proto.clone()),
+    )?;
+    let thrower_value = Value::Function(restricted_thrower);
+    for name in ["caller", "arguments"] {
+        function_proto.define_property(
+            &JsString::from_utf8(name),
+            &PropertyDescriptor {
+                value: None,
+                writable: None,
+                get: Some(thrower_value.clone()),
+                set: Some(thrower_value.clone()),
+                enumerable: Some(false),
+                configurable: Some(true),
+            },
+        )?;
+    }
     Ok(())
 }
 
@@ -323,10 +355,10 @@ fn create_dynamic_function(
     };
     let mut param_strings = Vec::new();
     for arg in param_args {
-        param_strings.push(to_string(arg)?.to_string_lossy());
+        param_strings.push(crate::context::to_string(agent, arg)?.to_string_lossy());
     }
     let body_string = match body_arg {
-        Some(arg) => to_string(arg)?.to_string_lossy(),
+        Some(arg) => crate::context::to_string(agent, arg)?.to_string_lossy(),
         None => String::new(),
     };
     let param_string = param_strings.join(",");
@@ -744,5 +776,93 @@ mod tests {
             value("let g = 20; Function('return typeof g')()"),
             Value::String(Handle::new(JsString::from_utf8("number")))
         );
+    }
+
+    #[test]
+    fn restricted_caller_arguments_properties() {
+        // Sloppy ordinary functions have own null-valued caller/arguments
+        // data properties (ES5-style AddRestrictedFunctionProperties).
+        assert_eq!(
+            value(
+                "(function () { var d = Object.getOwnPropertyDescriptor(arguments.callee, 'caller'); return d.value === null && d.writable === false && d.configurable === false; })()"
+            ),
+            Value::Boolean(true)
+        );
+        // %Function.prototype% carries own caller/arguments accessors whose
+        // get and set are the same function, non-enumerable, configurable.
+        assert_eq!(
+            value(
+                "(function () { var d = Object.getOwnPropertyDescriptor(Function.prototype, 'caller'); var a = Object.getOwnPropertyDescriptor(Function.prototype, 'arguments'); return typeof d.get === 'function' && d.get === d.set && d.get === a.get && d.enumerable === false && d.configurable === true; })()"
+            ),
+            Value::Boolean(true)
+        );
+        // Strict functions have no own properties; reads and writes throw.
+        assert_eq!(
+            value(
+                "(function () { 'use strict'; function f() {} return f.hasOwnProperty('caller') === false && f.hasOwnProperty('arguments') === false; })()"
+            ),
+            Value::Boolean(true)
+        );
+        errors("(function () { 'use strict'; function f() {} f.caller; })()");
+        errors("(function () { 'use strict'; function f() {} f.caller = {}; })()");
+        errors("(function () { 'use strict'; function f() {} f.arguments; })()");
+        // Bound functions have no own properties; reads and writes throw.
+        errors("(function () { var b = (function () {}).bind(null); return b.caller; })()");
+        errors("(function () { var b = (function () {}).bind(null); b.arguments = 1; })()");
+    }
+
+    #[test]
+    fn apply_call_box_non_nullish_this_arg() {
+        // spec 20.2.3.2/20.2.3.4: a non-nullish thisArg is ToObject'd, so
+        // the callee sees a Number wrapper with the property set.
+        assert_eq!(
+            value("Function('this.touched = true; return this;').apply(1) instanceof Number"),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            value("Function('this.touched = true; return this;').call('s').touched"),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn function_values_work_as_prototypes_in_construct() {
+        // OrdinaryCreateFromConstructor accepts a function-valued prototype:
+        // new objects inherit through it to %Function.prototype%.
+        assert_eq!(
+            value(
+                "var p = Function(); function F() {} F.prototype = p; var o = new F; typeof o.apply"
+            ),
+            Value::String(Handle::new(JsString::from_utf8("function")))
+        );
+    }
+
+    #[test]
+    fn bound_functions_delegate_instanceof() {
+        // OrdinaryHasInstance (spec 7.3.19 step 2): a bound function unwraps
+        // to its target.
+        assert_eq!(
+            value(
+                "var BC = function () {}; var bc = new BC(); var bound = BC.bind(); bound[Symbol.hasInstance](bc)"
+            ),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            value(
+                "var BC = function () {}; var bound = BC.bind(); var other = {}; other instanceof bound"
+            ),
+            Value::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn dynamic_function_string_coercion_and_private_identifiers() {
+        // ToString runs through the agent: new Function({}) parses
+        // "[object Object]" and throws a SyntaxError.
+        errors("new Function({})");
+        // CreateDynamicFunction: private identifiers in the body are a
+        // SyntaxError (AllPrivateIdentifiersValid with no enclosing class).
+        errors("new Function('o.#f')");
+        errors("new Function('return #f in o')");
     }
 }
