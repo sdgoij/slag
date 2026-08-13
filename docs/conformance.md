@@ -1177,9 +1177,53 @@ Validation: `cargo test --workspace` **4085 pass, 0 failures**;
 **86 fixtures fixed** (16,990 pass / 283 fail / 0 crash) and no
 regressions.
 
+### Object statics and constructor cluster sweep (Phase 18 conformance)
+
+A sweep of the `Object/*` tree (3,411 fixtures) reports **3,398 pass, 0
+fail, 13 skip** of 3,411 fixtures: every runnable fixture passes (up from
+3,382 pass / 16 fail). Fixes in `crates/runtime/src/builtins/object.rs`
+and `crates/crux/src/object.rs`:
+
+- **`Object.isExtensible`/`Object.preventExtensions` on primitives** —
+  both coerced the argument with `ToObject` first, so `undefined`/`null`
+  threw and boxed primitives reported extensible. Per spec 20.1.2.13 /
+  20.1.2.18 the argument is not coerced: `isExtensible` returns `false`
+  and `preventExtensions` returns the value unchanged for any non-object
+  (`15.2.3.13-1-*.js`, `15.2.3.10-1-*.js`).
+- **`Object.assign` ignored a failed `[[Set]]`** —
+  `receiver_create_data_property` discarded the `CreateDataProperty`
+  status, so assigning onto a non-extensible or sealed target was silent.
+  With Throw true the failure is now a TypeError per
+  OrdinarySetWithOwnDescriptor step 3.e.ii
+  (`target-is-non-extensible/sealed-property-creation-throws.js`).
+- **`Object.entries`/`Object.values` precomputed the key list** —
+  `EnumerableOwnProperties` re-reads each key's descriptor during
+  iteration, so a getter hit for an earlier key can hide a later one
+  (make it non-enumerable or delete it). The loops now check
+  enumerability per key after the previous value was read
+  (`getter-making-future-key-nonenumerable.js`,
+  `getter-removing-future-key.js`).
+- **`Object.setPrototypeOf` boxed primitive targets** — step 3 of spec
+  20.1.2.22 returns a non-object `O` unchanged (after
+  `RequireObjectCoercible` and the prototype-type check), so
+  `setPrototypeOf(true, null)` is `true`, not a boxed Boolean
+  (`o-not-obj.js`, `bigint.js`).
+- **`Object` constructor ignored a derived NewTarget** — `new
+  O({a:1})`/`Reflect.construct(Object, [x], O)` for a subclass `O` must
+  build an empty object with `O.prototype` and ignore the value argument
+  (spec 20.1.1.1 step 1); the constructor now compares NewTarget against
+  `%Object%` and runs `OrdinaryCreateFromConstructor` for any other
+  target (`subclass-object-arg.js`).
+
+Validation: `cargo test --workspace` **4089 pass, 0 failures**;
+`cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo fmt --all --check` clean. A full `built-ins` re-sweep shows exactly
+**16 fixtures fixed** (17,006 pass / 267 fail / 0 crash) and no
+regressions.
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
-Beyond the vendored fixtures, ~124 edge-case unit tests were added across
+Beyond the vendored fixtures, ~129 edge-case unit tests were added across
 the crates (lexer, parser, runtime core, and the built-ins), targeting the
 plan's per-phase test lists: numeric-literal/escape/ASI lexing, the ASI ×
 statement matrix and cover grammar, TDZ/hoisting/redeclaration/eval
@@ -1286,9 +1330,9 @@ annexB rows are from the earlier run and have not changed since.
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,812 | 16,990 | 283 | 6,536 | 3¹ | 98.4% |
+| built-ins | 23,812 | 17,006 | 267 | 6,536 | 3¹ | 98.5% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,622** | **33,433** | **2,889** | **12,297** | **3** | **92.0%** |
+| **Total** | **48,622** | **33,449** | **2,873** | **12,297** | **3** | **92.1%** |
 
 (Runnable = pass + fail; the 9,171 skips are module/async fixtures,
 unsupported harness includes, and the out-of-scope Temporal proposal
@@ -1300,11 +1344,12 @@ Iterator/prototype, Iterator statics (concat/from/zip/zipKeyed), Symbol,
 Boolean, Number, Object.prototype.toString, Object/prototype legacy
 accessors, Proxy, Reflect, Object.groupBy, Object
 freeze/seal/isFrozen/isSealed, Array iteration-method, Array.of, Math,
-Object.fromEntries, JSON.stringify, and DataView cluster closures (all 0
-fail); the language and annexB rows are from the sweep recorded below.
-The 6,536 built-ins skips are dominated by the out-of-scope Temporal
-proposal (4,611), with the async/module flags, host-dependent
-`$262.createRealm`, and unsupported harness includes making up the rest.
+Object.fromEntries, JSON.stringify, DataView, and Object statics/
+constructor cluster closures (all 0 fail); the language and annexB rows
+are from the sweep recorded below. The 6,536 built-ins skips are
+dominated by the out-of-scope Temporal proposal (4,611), with the
+async/module flags, host-dependent `$262.createRealm`, and unsupported
+harness includes making up the rest.
 
 ¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
 coerced-values fixtures — 10,000-element allocations that need the long
@@ -1389,7 +1434,7 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 ## Open items
 
 - Certify the ≥95%-of-runnable target: the built-ins area now measures
-  **98.4%** of runnable (16,990 pass / 283 fail of 17,273, with the
+  **98.5%** of runnable (17,006 pass / 267 fail of 17,273, with the
   out-of-scope Temporal fixtures skipped, `--timeout 60
   --recheck-timeout 45`, release build), 0 crashes and 0 hangs with the
   long timeout. The remaining gap is the systematic bug clusters triaged

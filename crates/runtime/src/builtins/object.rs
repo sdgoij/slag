@@ -14,7 +14,7 @@ use crux::string::JsString;
 use crux::value::Value;
 
 use crate::agent::Agent;
-use crate::context::{as_object, to_object};
+use crate::context::{as_object, get_property_key, to_object};
 use crate::realm::Realm;
 
 const OBJECT: &str = "%Object%";
@@ -571,7 +571,7 @@ pub fn dispatch_call(
     let realm = agent.current_realm().ok()?;
     let intrinsics = &realm.intrinsics;
     if intrinsics.get(OBJECT).as_ref() == Some(callee) {
-        return Some(object_constructor(agent, callee, args));
+        return Some(object_constructor(agent, callee, args, &Value::Undefined));
     }
     if intrinsics.get(PROTO_TO_STRING).as_ref() == Some(callee) {
         return Some(prototype_to_string(agent, this));
@@ -719,13 +719,30 @@ pub fn dispatch_call(
     }
     if intrinsics.get(ENTRIES).as_ref() == Some(callee) {
         return Some((|| {
-            let keys = enumerable_string_keys(agent, arg(args, 0))?;
             let object = to_object(agent, arg(args, 0))?;
+            let obj = as_object(&object).ok_or_else(|| {
+                JsError::new(ErrorKind::TypeError, "value is not an object".into())
+            })?;
             let mut entries = Vec::new();
-            for key in keys {
-                let value = crate::context::get_property(agent, &object, &key, object.clone())?;
+            for key in obj.own_property_keys()? {
+                // EnumerableOwnProperties (spec 7.3.26): the descriptor's
+                // enumerability is re-read for every key, so a getter hit for
+                // an earlier key can hide a later one (getter-making-future-
+                // key-nonenumerable.js).
+                let PropertyKey::String(id) = key else {
+                    continue;
+                };
+                let key = PropertyKey::String(id);
+                if !obj
+                    .get_own_property_key(&key)?
+                    .is_some_and(|prop| prop.enumerable)
+                {
+                    continue;
+                }
+                let text = crux::lookup(id);
+                let value = crate::context::get_property(agent, &object, &text, object.clone())?;
                 let pair = crate::builtins::array::array_create(agent, 2.0)?;
-                pair.create_data_property(&JsString::from_utf8("0"), str(&key.to_string_lossy()))?;
+                pair.create_data_property(&JsString::from_utf8("0"), str(&text.to_string_lossy()))?;
                 pair.create_data_property(&JsString::from_utf8("1"), value)?;
                 entries.push(Value::Object(pair));
             }
@@ -734,11 +751,26 @@ pub fn dispatch_call(
     }
     if intrinsics.get(VALUES).as_ref() == Some(callee) {
         return Some((|| {
-            let keys = enumerable_string_keys(agent, arg(args, 0))?;
             let object = to_object(agent, arg(args, 0))?;
+            let obj = as_object(&object).ok_or_else(|| {
+                JsError::new(ErrorKind::TypeError, "value is not an object".into())
+            })?;
             let mut values = Vec::new();
-            for key in keys {
-                let value = crate::context::get_property(agent, &object, &key, object.clone())?;
+            for key in obj.own_property_keys()? {
+                // EnumerableOwnProperties re-reads each descriptor, so a
+                // getter for an earlier key can hide a later one.
+                let PropertyKey::String(id) = key else {
+                    continue;
+                };
+                let key = PropertyKey::String(id);
+                if !obj
+                    .get_own_property_key(&key)?
+                    .is_some_and(|prop| prop.enumerable)
+                {
+                    continue;
+                }
+                let text = crux::lookup(id);
+                let value = crate::context::get_property(agent, &object, &text, object.clone())?;
                 values.push(value);
             }
             array_of(agent, &values)
@@ -831,28 +863,30 @@ pub fn dispatch_call(
     }
     if intrinsics.get(IS_EXTENSIBLE).as_ref() == Some(callee) {
         return Some((|| {
-            let object = to_object(agent, arg(args, 0))?;
-            let obj = as_object(&object).ok_or_else(|| {
-                JsError::new(ErrorKind::TypeError, "value is not an object".into())
-            })?;
+            // spec 20.1.2.13 step 1: a non-object is trivially not extensible
+            // (undefined/null included — no RequireObjectCoercible).
+            let Some(obj) = as_object(arg(args, 0)) else {
+                return Ok(Value::Boolean(false));
+            };
             Ok(Value::Boolean(obj.is_extensible()?))
         })());
     }
     if intrinsics.get(PREVENT_EXTENSIONS).as_ref() == Some(callee) {
         return Some((|| {
-            let object = to_object(agent, arg(args, 0))?;
-            let obj = as_object(&object).ok_or_else(|| {
-                JsError::new(ErrorKind::TypeError, "value is not an object".into())
-            })?;
-            // spec 20.1.2.18 step 4: a failed [[PreventExtensions]] (e.g. a
-            // proxy trap returning false) is a TypeError.
+            // spec 20.1.2.18 step 1: a non-object is returned unchanged.
+            let value = arg(args, 0);
+            let Some(obj) = as_object(value) else {
+                return Ok(value.clone());
+            };
+            // spec step 4: a failed [[PreventExtensions]] (e.g. a proxy trap
+            // returning false) is a TypeError.
             if !obj.prevent_extensions()? {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
                     "Cannot prevent extensions of the object".into(),
                 ));
             }
-            Ok(object)
+            Ok(value.clone())
         })());
     }
     if intrinsics.get(FREEZE).as_ref() == Some(callee) {
@@ -886,29 +920,42 @@ pub fn dispatch_call(
 }
 
 /// Construct `new Object(...)` (spec 20.1.1.1): same wrapping behaviour as
-/// the call form; derived-constructor reification is deferred.
+/// the call form, except a derived NewTarget builds an empty object with the
+/// new target's prototype (subclass-object-arg.js).
 pub fn dispatch_construct(
     agent: &mut Agent,
     callee: &Value,
     args: &[Value],
-    _new_target: &Value,
+    new_target: &Value,
 ) -> Option<Result<Value, JsError>> {
     if is_intrinsic(agent, callee, OBJECT) {
-        return Some(object_constructor(agent, callee, args));
+        return Some(object_constructor(agent, callee, args, new_target));
     }
     None
 }
 
 /// Object(value) (spec 20.1.1.1): undefined/null make a fresh object,
-/// otherwise ToObject.
+/// otherwise ToObject; a derived NewTarget builds an empty object with the
+/// new target's prototype and ignores the value.
 fn object_constructor(
     agent: &mut Agent,
     _callee: &Value,
     args: &[Value],
+    new_target: &Value,
 ) -> Result<Value, JsError> {
+    let realm = agent.current_realm()?;
+    // spec step 1: NewTarget is neither undefined nor the active function —
+    // OrdinaryCreateFromConstructor(NewTarget, "%Object.prototype%"). The
+    // active function is %Object% itself, so any other new target (a derived
+    // constructor or Reflect.construct's target) builds an empty object with
+    // its own prototype and ignores the value argument.
+    let active = realm.intrinsics.get(OBJECT).as_ref() == Some(new_target);
+    if !matches!(new_target, Value::Undefined) && !active {
+        let proto = get_prototype_from_constructor(agent, new_target, OBJECT_PROTO)?;
+        return Ok(Value::Object(JsObject::ordinary_object_create(Some(proto))));
+    }
     match args.first() {
         None | Some(Value::Undefined | Value::Null) => {
-            let realm = agent.current_realm()?;
             let proto = realm
                 .intrinsics
                 .get(OBJECT_PROTO)
@@ -916,6 +963,38 @@ fn object_constructor(
             Ok(Value::Object(JsObject::ordinary_object_create(proto)))
         }
         Some(value) => to_object(agent, value),
+    }
+}
+
+/// GetPrototypeFromConstructor (spec 10.1.14): `newTarget.prototype`, or the
+/// default intrinsic prototype when it is not an object.
+fn get_prototype_from_constructor(
+    agent: &mut Agent,
+    constructor: &Value,
+    default_name: &str,
+) -> Result<Handle<JsObject>, JsError> {
+    let proto = get_property_key(
+        agent,
+        constructor,
+        &PropertyKey::from_utf8("prototype"),
+        constructor.clone(),
+    )?;
+    match as_object(&proto) {
+        Some(object) => Ok(object),
+        None => {
+            let default = agent
+                .current_realm()?
+                .intrinsics
+                .get(default_name)
+                .and_then(|value| as_object(&value))
+                .ok_or_else(|| {
+                    JsError::new(
+                        ErrorKind::TypeError,
+                        format!("{default_name} is not defined"),
+                    )
+                })?;
+            Ok(default)
+        }
     }
 }
 
@@ -932,10 +1011,17 @@ fn get_prototype_of(agent: &mut Agent, value: &Value) -> Result<Value, JsError> 
 }
 
 fn set_prototype_of(
-    agent: &mut Agent,
+    _agent: &mut Agent,
     value: &Value,
     proto_value: &Value,
 ) -> Result<Value, JsError> {
+    // spec 20.1.2.22 step 1: RequireObjectCoercible (undefined/null throw).
+    if matches!(value, Value::Undefined | Value::Null) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Cannot convert undefined or null to object".into(),
+        ));
+    }
     let proto = match proto_value {
         Value::Object(obj) => Some(obj.clone()),
         Value::Null => None,
@@ -946,12 +1032,13 @@ fn set_prototype_of(
             ));
         }
     };
-    let object = to_object(agent, value)?;
-    let obj = as_object(&object)
-        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
-    // Setting the same prototype is a no-op (spec 20.1.2.22 step 5).
+    // spec step 3: a non-object O is returned unchanged.
+    let Some(obj) = as_object(value) else {
+        return Ok(value.clone());
+    };
+    // Setting the same prototype is a no-op (spec step 5).
     if obj.get_prototype_of()? == proto {
-        return Ok(object);
+        return Ok(value.clone());
     }
     if !obj.set_prototype_of(proto)? {
         return Err(JsError::new(
@@ -959,7 +1046,7 @@ fn set_prototype_of(
             "Cannot set prototype of a non-extensible object".into(),
         ));
     }
-    Ok(object)
+    Ok(value.clone())
 }
 
 /// Object.prototype.__proto__ setter (spec B.2.2.1.3): a silent no-op for
@@ -1501,6 +1588,143 @@ mod tests {
                 .run_script("let o = Object.fromEntries(iter); o.a + ',' + o.b")
                 .unwrap(),
             str("1,2")
+        );
+    }
+
+    #[test]
+    fn is_extensible_and_prevent_extensions_accept_primitives() {
+        // spec 20.1.2.13/20.1.2.18: non-objects are trivially not
+        // extensible (isExtensible → false) and pass through unchanged.
+        assert_eq!(
+            run("Object.isExtensible(undefined)").unwrap(),
+            Value::Boolean(false)
+        );
+        assert_eq!(
+            run("Object.isExtensible(true)").unwrap(),
+            Value::Boolean(false)
+        );
+        assert_eq!(
+            run("Object.preventExtensions(undefined)").unwrap(),
+            Value::Undefined
+        );
+        assert_eq!(
+            run("Object.preventExtensions('s') === 's'").unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            run("Object.isExtensible(Object.preventExtensions({}))").unwrap(),
+            Value::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn set_prototype_of_returns_primitives_unchanged() {
+        // spec 20.1.2.22 step 3: a non-object O is returned unchanged (no
+        // boxing), while undefined/null still throw.
+        assert_eq!(
+            run("Object.setPrototypeOf(true, null) === true").unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            run("Object.setPrototypeOf('s', null) === 's'").unwrap(),
+            Value::Boolean(true)
+        );
+        assert!(matches!(
+            run("Object.setPrototypeOf(undefined, null)"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+        assert!(matches!(
+            run("Object.setPrototypeOf({}, 1)"),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+        assert_eq!(
+            run("Object.getPrototypeOf(Object.setPrototypeOf({}, null)) === null").unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn assign_to_non_extensible_target_throws() {
+        // OrdinarySetWithOwnDescriptor 3.e.ii: creating a property on a
+        // non-extensible target with Throw true is a TypeError.
+        assert!(matches!(
+            run(concat!(
+                "(function(){\n",
+                "  var t = Object.preventExtensions({ foo: 1 });\n",
+                "  Object.assign(t, { get bar() {} });\n",
+                "})()",
+            )),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+        assert!(matches!(
+            run(concat!(
+                "(function(){\n",
+                "  var t = {};\n",
+                "  Object.preventExtensions(t);\n",
+                "  Object.assign(t, { [Symbol()]: 1 });\n",
+                "})()",
+            )),
+            Err(e) if e.kind == ErrorKind::TypeError
+        ));
+    }
+
+    #[test]
+    fn entries_values_recheck_enumerability_per_key() {
+        // EnumerableOwnProperties re-reads each descriptor, so a getter for
+        // an earlier key can hide a later one mid-iteration.
+        assert_eq!(
+            run(concat!(
+                "(function(){\n",
+                "  var o = {\n",
+                "    a: 'A',\n",
+                "    get b() { Object.defineProperty(this, 'c', { enumerable: false }); return 'B'; },\n",
+                "    c: 'C'\n",
+                "  };\n",
+                "  var entries = Object.entries(o);\n",
+                "  return entries.length + '|' + entries[0][0] + entries[0][1] + '|' + entries[1][0] + entries[1][1];\n",
+                "})()",
+            ))
+            .unwrap(),
+            str("2|aA|bB")
+        );
+        assert_eq!(
+            run(concat!(
+                "(function(){\n",
+                "  var o = {\n",
+                "    a: 'A',\n",
+                "    get b() { delete this.c; return 'B'; },\n",
+                "    c: 'C'\n",
+                "  };\n",
+                "  return Object.values(o).length;\n",
+                "})()",
+            ))
+            .unwrap(),
+            Value::Number(2.0)
+        );
+    }
+
+    #[test]
+    fn object_constructor_respects_derived_new_target() {
+        // spec 20.1.1.1 step 1: a derived new target builds an empty object
+        // with its own prototype, ignoring the value argument.
+        assert_eq!(
+            run(concat!(
+                "(function(){\n",
+                "  class O extends Object {}\n",
+                "  var o1 = new O({ a: 1 });\n",
+                "  var o2 = Reflect.construct(Object, [{ b: 2 }], O);\n",
+                "  return (o1.a === undefined) + '|' + (o2.b === undefined) + '|' +\n",
+                "    (Object.getPrototypeOf(o1) === O.prototype) + '|' +\n",
+                "    (Object.getPrototypeOf(o2) === O.prototype);\n",
+                "})()",
+            ))
+            .unwrap(),
+            str("true|true|true|true")
+        );
+        // A direct new target (Object itself) still boxes the value.
+        assert_eq!(
+            run("new Object(5) instanceof Number").unwrap(),
+            Value::Boolean(true)
         );
     }
 }

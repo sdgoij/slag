@@ -1552,21 +1552,25 @@ fn receiver_create_data_property(
     value: Value,
     throw: bool,
 ) -> Result<bool, JsError> {
-    match receiver {
-        Value::Object(obj) => obj.create_data_property_key(key, value),
-        Value::Function(f) => f.object.create_data_property_key(key, value),
-        _ => {
-            if throw {
-                return Err(JsError::new(
-                    ErrorKind::TypeError,
-                    format!(
-                        "Cannot create property {:?} on a primitive",
-                        key.display_string()
-                    ),
-                ));
-            }
-            Ok(false)
-        }
+    let created = match receiver {
+        Value::Object(obj) => obj.create_data_property_key(key, value)?,
+        Value::Function(f) => f.object.create_data_property_key(key, value)?,
+        _ => false,
+    };
+    if created {
+        Ok(true)
+    } else if throw {
+        // spec 10.1.9.3 step 3.e.ii: CreateDataProperty failing on a
+        // non-extensible receiver with Throw true is a TypeError.
+        Err(JsError::new(
+            ErrorKind::TypeError,
+            format!(
+                "Cannot create property {:?} on a non-extensible object",
+                key.display_string()
+            ),
+        ))
+    } else {
+        Ok(false)
     }
 }
 
