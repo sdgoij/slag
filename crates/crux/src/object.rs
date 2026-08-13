@@ -265,6 +265,9 @@ pub struct JsObject {
     pub prototype: RefCell<Option<Handle<JsObject>>>,
     /// [[Extensible]].
     pub extensible: Cell<bool>,
+    /// Whether this object is an immutable prototype exotic object (spec
+    /// 9.4.7): `[[SetPrototypeOf]]` accepts only a SameValue prototype.
+    immutable_prototype: Cell<bool>,
     /// Own properties in insertion order (the [[OwnPropertyKeys]] string
     /// order for ordinary objects).
     pub properties: RefCell<Vec<(PropertyKey, Property)>>,
@@ -329,6 +332,7 @@ impl JsObject {
             kind: ObjectKind::Ordinary,
             prototype: RefCell::new(prototype),
             extensible: Cell::new(true),
+            immutable_prototype: Cell::new(false),
             properties: RefCell::new(Vec::new()),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
@@ -390,6 +394,7 @@ impl JsObject {
             kind: ObjectKind::Array,
             prototype: RefCell::new(prototype),
             extensible: Cell::new(true),
+            immutable_prototype: Cell::new(false),
             properties: RefCell::new(Vec::new()),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
@@ -421,6 +426,7 @@ impl JsObject {
             kind: ObjectKind::String(Handle::new(value)),
             prototype: RefCell::new(prototype),
             extensible: Cell::new(true),
+            immutable_prototype: Cell::new(false),
             properties: RefCell::new(Vec::new()),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
@@ -448,6 +454,7 @@ impl JsObject {
             kind: ObjectKind::Proxy(Handle::new(slots)),
             prototype: RefCell::new(None),
             extensible: Cell::new(true),
+            immutable_prototype: Cell::new(false),
             properties: RefCell::new(Vec::new()),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
@@ -469,6 +476,7 @@ impl JsObject {
             kind: ObjectKind::IntegerIndexed(Handle::new(slots)),
             prototype: RefCell::new(prototype),
             extensible: Cell::new(true),
+            immutable_prototype: Cell::new(false),
             properties: RefCell::new(Vec::new()),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
@@ -489,6 +497,7 @@ impl JsObject {
             kind: ObjectKind::ModuleNamespace(Handle::new(ModuleNamespaceSlots { exports })),
             prototype: RefCell::new(None),
             extensible: Cell::new(false),
+            immutable_prototype: Cell::new(false),
             properties: RefCell::new(Vec::new()),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
@@ -519,6 +528,7 @@ impl JsObject {
             })),
             prototype: RefCell::new(prototype),
             extensible: Cell::new(true),
+            immutable_prototype: Cell::new(false),
             properties: RefCell::new(Vec::new()),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
@@ -609,6 +619,7 @@ impl JsObject {
             })),
             prototype: RefCell::new(prototype),
             extensible: Cell::new(true),
+            immutable_prototype: Cell::new(false),
             properties: RefCell::new(Vec::new()),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
@@ -701,6 +712,12 @@ impl JsObject {
             (None, None) => true,
             _ => false,
         };
+        // spec 9.4.7: an immutable prototype exotic object (e.g.
+        // %Object.prototype%) never changes its prototype; only a SameValue
+        // assignment succeeds (SetImmutablePrototype, spec 9.4.7.1).
+        if self.immutable_prototype.get() {
+            return Ok(same);
+        }
         if same {
             return Ok(true);
         }
@@ -713,11 +730,24 @@ impl JsObject {
                 if obj.id == self.id {
                     return Ok(false);
                 }
-                ancestor = obj.get_prototype_of()?;
+                // spec 9.1.2.2 step 8c: the cycle scan stops at any object
+                // whose [[GetPrototypeOf]] is not the ordinary internal
+                // method (proxies, module namespace objects), since a proxy's
+                // prototype can change at any time.
+                match &obj.kind {
+                    ObjectKind::Proxy(_) | ObjectKind::ModuleNamespace(_) => break,
+                    _ => ancestor = obj.get_prototype_of()?,
+                }
             }
         }
         *self.prototype.borrow_mut() = proto;
         Ok(true)
+    }
+
+    /// Mark this object as an immutable prototype exotic object (spec
+    /// 9.4.7): its `[[SetPrototypeOf]]` accepts only a SameValue prototype.
+    pub fn mark_immutable_prototype(&self) {
+        self.immutable_prototype.set(true);
     }
 
     /// OrdinaryGetOwnProperty (spec 10.1.7.1) with exotic fallback: `None`

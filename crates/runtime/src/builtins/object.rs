@@ -27,6 +27,10 @@ const PROTO_PROP_IS_ENUM: &str = "%Object.prototype.propertyIsEnumerable%";
 const PROTO_TO_LOCALE: &str = "%Object.prototype.toLocaleString%";
 const PROTO_GET_PROTO: &str = "%Object.prototype.__proto__%";
 const PROTO_SET_PROTO: &str = "%Object.prototype.__proto__set%";
+const PROTO_DEFINE_GETTER: &str = "%Object.prototype.__defineGetter__%";
+const PROTO_DEFINE_SETTER: &str = "%Object.prototype.__defineSetter__%";
+const PROTO_LOOKUP_GETTER: &str = "%Object.prototype.__lookupGetter__%";
+const PROTO_LOOKUP_SETTER: &str = "%Object.prototype.__lookupSetter__%";
 const ASSIGN: &str = "%Object.assign%";
 const CREATE: &str = "%Object.create%";
 const DEFINE_PROPERTIES: &str = "%Object.defineProperties%";
@@ -64,6 +68,9 @@ fn placeholder(name: &'static str) -> NativeFn {
 /// built-ins can link their prototypes to `%Object.prototype%`.
 pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let object_proto = JsObject::ordinary_object_create(None);
+    // spec 20.1.3: %Object.prototype% is an immutable prototype exotic
+    // object (9.4.7): its prototype is null and never changes.
+    object_proto.mark_immutable_prototype();
     let object_proto_value = Value::Object(object_proto.clone());
 
     let object_ctor = Function::create_builtin(
@@ -165,6 +172,11 @@ fn install_prototype_methods(realm: &Handle<Realm>, proto: &JsObject) -> Result<
         ("isPrototypeOf", 1, PROTO_IS_PROTO_OF),
         ("propertyIsEnumerable", 1, PROTO_PROP_IS_ENUM),
         ("toLocaleString", 0, PROTO_TO_LOCALE),
+        // Annex B: the legacy accessor methods (spec B.2.2.2-B.2.2.5).
+        ("__defineGetter__", 2, PROTO_DEFINE_GETTER),
+        ("__defineSetter__", 2, PROTO_DEFINE_SETTER),
+        ("__lookupGetter__", 1, PROTO_LOOKUP_GETTER),
+        ("__lookupSetter__", 1, PROTO_LOOKUP_SETTER),
     ] {
         define_method(realm, proto, name, length, key, false)?;
     }
@@ -586,7 +598,19 @@ pub fn dispatch_call(
         return Some(get_prototype_of(agent, this));
     }
     if intrinsics.get(PROTO_SET_PROTO).as_ref() == Some(callee) {
-        return Some(set_prototype_of(agent, this, arg(args, 0)));
+        return Some(proto_setter(this, arg(args, 0)));
+    }
+    if intrinsics.get(PROTO_DEFINE_GETTER).as_ref() == Some(callee) {
+        return Some(define_legacy_accessor(agent, this, args, true));
+    }
+    if intrinsics.get(PROTO_DEFINE_SETTER).as_ref() == Some(callee) {
+        return Some(define_legacy_accessor(agent, this, args, false));
+    }
+    if intrinsics.get(PROTO_LOOKUP_GETTER).as_ref() == Some(callee) {
+        return Some(lookup_legacy_accessor(agent, this, arg(args, 0), true));
+    }
+    if intrinsics.get(PROTO_LOOKUP_SETTER).as_ref() == Some(callee) {
+        return Some(lookup_legacy_accessor(agent, this, arg(args, 0), false));
     }
     if intrinsics.get(ASSIGN).as_ref() == Some(callee) {
         return Some(object_assign(agent, args));
@@ -880,6 +904,116 @@ fn set_prototype_of(
         ));
     }
     Ok(object)
+}
+
+/// Object.prototype.__proto__ setter (spec B.2.2.1.3): a silent no-op for
+/// non-object receivers and non-object prototypes, throwing only when the
+/// object's own [[SetPrototypeOf]] rejects the change.
+fn proto_setter(this: &Value, proto_value: &Value) -> Result<Value, JsError> {
+    // step 1: RequireObjectCoercible(this value).
+    if matches!(this, Value::Undefined | Value::Null) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Cannot convert undefined or null to object".into(),
+        ));
+    }
+    // step 2: a prototype that is neither an Object nor null is ignored.
+    let proto = match proto_value {
+        Value::Object(obj) => Some(obj.clone()),
+        Value::Null => None,
+        _ => return Ok(Value::Undefined),
+    };
+    // step 3: a non-object receiver is ignored.
+    let Some(obj) = as_object(this) else {
+        return Ok(Value::Undefined);
+    };
+    // steps 4-5: [[SetPrototypeOf]] failure throws a TypeError.
+    if !obj.set_prototype_of(proto)? {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Cannot set prototype of an immutable or non-extensible object".into(),
+        ));
+    }
+    Ok(Value::Undefined)
+}
+
+/// Object.prototype.__defineGetter__/__defineSetter__ (spec B.2.2.2.1 /
+/// B.2.2.3.1): define an enumerable, configurable accessor for `P`.
+fn define_legacy_accessor(
+    agent: &mut Agent,
+    this: &Value,
+    args: &[Value],
+    getter: bool,
+) -> Result<Value, JsError> {
+    // step 1: ToObject(this value).
+    let object = to_object(agent, this)?;
+    let obj = as_object(&object)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
+    // step 2: the accessor must be callable, checked before ToPropertyKey.
+    let accessor = arg(args, 1);
+    if !crux::value::is_callable(accessor) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            if getter {
+                "Getter must be a function".into()
+            } else {
+                "Setter must be a function".into()
+            },
+        ));
+    }
+    // steps 3-4: the descriptor and the property key.
+    let key = crate::context::to_property_key(agent, arg(args, 0))?;
+    let desc = if getter {
+        PropertyDescriptor::accessor(Some(accessor.clone()), None)
+    } else {
+        PropertyDescriptor::accessor(None, Some(accessor.clone()))
+    };
+    // step 5: DefinePropertyOrThrow.
+    if !obj.define_property_key(&key, &desc)? {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            format!(
+                "Cannot define property {} on a non-extensible object",
+                key.display_string()
+            ),
+        ));
+    }
+    Ok(Value::Undefined)
+}
+
+/// Object.prototype.__lookupGetter__/__lookupSetter__ (spec B.2.2.4.1 /
+/// B.2.2.5.1): walk the prototype chain for the first accessor named `P` and
+/// return its getter/setter (or undefined for a data property / miss).
+fn lookup_legacy_accessor(
+    agent: &mut Agent,
+    this: &Value,
+    key_value: &Value,
+    getter: bool,
+) -> Result<Value, JsError> {
+    let object = to_object(agent, this)?;
+    let mut obj = as_object(&object)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
+    let key = crate::context::to_property_key(agent, key_value)?;
+    loop {
+        let Some(property) = obj.get_own_property_key(&key)? else {
+            // The chain walk dispatches through proxies, whose
+            // [[GetPrototypeOf]] trap may throw.
+            match obj.get_prototype_of()? {
+                Some(next) => obj = next,
+                None => return Ok(Value::Undefined),
+            }
+            continue;
+        };
+        if property.is_accessor() {
+            let accessor = if getter {
+                property.getter()
+            } else {
+                property.setter()
+            };
+            return Ok(accessor.unwrap_or(Value::Undefined));
+        }
+        return Ok(Value::Undefined);
+    }
 }
 
 /// Object.assign (spec 20.1.2.1): copy the own enumerable properties of each

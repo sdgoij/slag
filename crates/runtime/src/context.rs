@@ -533,11 +533,46 @@ fn find_ecma_accessor(
             None => object,
             Some(handle) => handle,
         };
-        // Proxies route [[Get]]/[[Set]] through their traps; probing own
-        // properties here would invoke the getOwnPropertyDescriptor trap for
-        // every read (spec 10.5.8).
-        if matches!(obj.kind, crux::object::ObjectKind::Proxy(_)) {
-            return Ok(None);
+        // A proxy forwards [[Get]]/[[Set]] to its target when the handler
+        // has no get/set trap (spec 10.5.8 step 5 / 10.5.9 step 5): the
+        // target's own descriptor and prototype chain are then probed with
+        // ordinary internal methods, never with the proxy's traps. When the
+        // trap is present the crux [[Get]]/[[Set]] runs it, so report no
+        // agent-dispatched accessor here.
+        if let crux::object::ObjectKind::Proxy(slots) = &obj.kind {
+            let (target, handler) = match (
+                slots.target.borrow().clone(),
+                slots.handler.borrow().clone(),
+            ) {
+                (Some(target), Some(handler)) => (target, handler),
+                // A revoked proxy throws via the crux path; report no
+                // accessor so [[Get]]/[[Set]] surfaces the TypeError.
+                _ => return Ok(None),
+            };
+            let trap_name = match which {
+                AccessorKind::Get => "get",
+                AccessorKind::Set => "set",
+            };
+            // GetMethod on the handler (spec 10.5.8/10.5.9 step 2).
+            let trap = match &handler {
+                Value::Object(handler_obj) => {
+                    handler_obj.get_method(&JsString::from_utf8(trap_name))?
+                }
+                _ => None,
+            };
+            if trap.is_some() {
+                return Ok(None);
+            }
+            let target_obj = match &target {
+                Value::Object(obj) => Some(obj.clone()),
+                Value::Function(f) => f.object.handle(),
+                _ => None,
+            };
+            let Some(target_obj) = target_obj else {
+                return Ok(None);
+            };
+            prototype = Some(target_obj);
+            continue;
         }
         // The Integer-Indexed exotic intercepts canonical numeric index keys
         // (its [[Get]]/[[Set]] do not consult the prototype chain), so

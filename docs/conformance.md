@@ -788,6 +788,62 @@ implementation was rebuilt around spec 20.1.3.6 in
   so `delete` works and the object falls back to the "Object" built-in
   tag.
 
+### Object/prototype legacy accessors cluster sweep (Phase 18 conformance)
+
+A sweep of the whole `Object/prototype/*` tree (248 fixtures) reports **247
+pass, 0 fail, 1 skip** of 248 fixtures: every runnable fixture passes (up
+from 190 pass / 57 fail). The skip is the standard unsupported-includes
+taxonomy (`proxyTrapsHelper.js`). The failures were the Annex B legacy
+accessor surface plus two `__proto__`/prototype-set bugs. Fixes in
+`crates/crux/src/object.rs`, `crates/runtime/src/builtins/object.rs`, and
+`crates/runtime/src/context.rs`:
+
+- **The four legacy accessor methods were missing entirely** — Annex B
+  defines `__defineGetter__`/`__defineSetter__` (spec B.2.2.2/B.2.2.3) and
+  `__lookupGetter__`/`__lookupSetter__` (spec B.2.2.4/B.2.2.5) on
+  `%Object.prototype%`. All four are now installed (length 2/2/1/1,
+  `{ writable: true, enumerable: false, configurable: true }`): the
+  define pair check `IsCallable` before `ToPropertyKey` (a non-callable
+  getter throws without touching the key, spec step order), then
+  `DefinePropertyOrThrow` a `{ get/set, enumerable: true, configurable:
+  true }` accessor; the lookup pair walk the prototype chain with
+  `[[GetOwnProperty]]`/`[[GetPrototypeOf]]` (proxy traps propagate) and
+  return the first accessor's getter/setter, or undefined for a data
+  property or a miss.
+- **The `__proto__` setter ran `Object.setPrototypeOf` semantics** — a
+  non-object prototype or receiver now returns undefined silently (spec
+  B.2.2.1.3 steps 2-3), only a failed `[[SetPrototypeOf]]` throws, and
+  `RequireObjectCoercible` still rejects null/undefined receivers.
+- **`%Object.prototype%` is now an immutable prototype exotic object**
+  (spec 9.4.7): `JsObject` gained an `immutable_prototype` marker whose
+  `[[SetPrototypeOf]]` accepts only a SameValue prototype
+  (`SetImmutablePrototype`). `Object.setPrototypeOf(Object.prototype, …)`
+  now throws and `Reflect.setPrototypeOf` returns false for any
+  non-identical value, even though the object is extensible — previously
+  only the cycle check caught `{}` (which inherits Object.prototype), so
+  `{ __proto__: null }` wrongly succeeded.
+- **The `[[SetPrototypeOf]]` cycle scan walked through proxies** — spec
+  9.1.2.2 step 8c stops the scan at any object whose `[[GetPrototypeOf]]`
+  is not the ordinary internal method (proxies, module namespace objects),
+  since a proxy's prototype can change at any time. `root.__proto__ =
+  leaf` with a proxy in the chain now succeeds (`set-cycle-shadowed.js`).
+- **Proxy receivers bypassed the agent accessor path** — the runtime's
+  `find_ecma_accessor` bailed at any proxy, so `proxy.__proto__` reads and
+  `proxy.__proto__ = v` writes fell to the crux `[[Get]]`/`[[Set]]`, which
+  invoked the builtin getter/setter closures directly and threw "must be
+  called through the agent". It now follows spec 10.5.8/10.5.9: with no
+  get/set trap the proxy forwards to its target's own descriptor and
+  prototype chain (walked with ordinary internal methods, never the
+  proxy's traps), so the `__proto__` accessor runs with the proxy as
+  receiver and a `setPrototypeOf` trap's throw propagates
+  (`set-abrupt.js`).
+
+Validation: `cargo test --workspace` **4085 pass, 0 failures**;
+`cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo fmt --all --check` clean. A full `built-ins` sweep before/after
+(`git stash` baseline) shows exactly the 57 cluster fixtures fixed and
+**0 new failures** across all 23,812 built-ins fixtures.
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~120 edge-case unit tests were added across
@@ -887,16 +943,19 @@ against the runnable pass-rate target:
 
 ## Full-suite sweep (post-hardening)
 
-`test262-sweep` over all three areas in a release build (48,608 fixtures, 8
+`test262-sweep` over all three areas in a release build (48,622 fixtures, 8
 jobs, 20s batch timeout): **0 crashes**; the only hangs are three known-slow
-TypedArray fixtures that pass with the long timeout (see below).
+TypedArray fixtures that pass with the long timeout (see below). The
+built-ins row below is re-measured each cluster with the longer config
+(`--jobs 8 --batch 32 --timeout 60 --recheck-timeout 45`); the language and
+annexB rows are from the earlier run and have not changed since.
 
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,798 | 16,357 | 4,028 | 3,410 | 3¹ | 80.2% |
+| built-ins | 23,812 | 16,593 | 680 | 6,536 | 3¹ | 96.1% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,608** | **32,800** | **6,634** | **9,171** | **3** | **83.2%** |
+| **Total** | **48,622** | **33,036** | **3,286** | **12,297** | **3** | **91.0%** |
 
 (Runnable = pass + fail; the 9,171 skips are module/async fixtures,
 unsupported harness includes, and the out-of-scope Temporal proposal
@@ -905,8 +964,12 @@ fixtures.) The built-ins row reflects the current
 String/prototype, Object/create, DisposableStack, AsyncDisposableStack,
 ArrayBuffer/SharedArrayBuffer, Date, BigInt, global-functions, Function,
 Iterator/prototype, Iterator statics (concat/from/zip/zipKeyed), Symbol,
-Boolean, Number, and Object.prototype.toString cluster closures (all 0
-fail); the language and annexB rows are from the sweep recorded below.
+Boolean, Number, Object.prototype.toString, and Object/prototype legacy
+accessors cluster closures (all 0 fail); the language and annexB rows are
+from the sweep recorded below. The 6,536 built-ins skips are dominated by
+the out-of-scope Temporal proposal (4,611), with the async/module flags,
+host-dependent `$262.createRealm`, and unsupported harness includes making
+up the rest.
 
 ¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
 coerced-values fixtures — 10,000-element allocations that need the long
@@ -990,14 +1053,13 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 
 ## Open items
 
-- Certify the ≥95%-of-runnable target: the sweep now measures 81.5%
-  (≈88% excluding the not-implemented Temporal/ShadowRealm built-ins) with
-  0 hangs and 0 crashes. The remaining gap is the systematic bug clusters
-  listed above — the destructuring, TypedArray-Integer-Indexed, RegExp, and
-  Object-descriptor clusters are done; fix the TypedArray
-  prototype-method/auto-length cluster next, then re-run the sweep and
-  record the delta.
-  Note: the TypedArray sweep should be run with a longer deadline
+- Certify the ≥95%-of-runnable target: the built-ins area now measures
+  **96.1%** of runnable (16,593 pass / 680 fail of 17,273, with the
+  out-of-scope Temporal fixtures skipped, `--timeout 60
+  --recheck-timeout 45`, release build), 0 crashes and 0 hangs with the
+  long timeout. The remaining gap is the systematic bug clusters triaged
+  above — fix the next cluster, then re-run the sweep and record the
+  delta. Note: the TypedArray sweep should be run with a longer deadline
   (`--timeout 120 --recheck-timeout 90`) — the O(n²) property store makes
   the 10,000-element crash-test fixtures take ~45s, which the default 5s
   recheck misclassifies as hangs.
