@@ -3,6 +3,8 @@
 > The stony waste matter separated from metals during the smelting or
 > refining of ore. It's gritty, memorable, and definitely unconventional.
 
+> A test262 runner. It also happens to execute JavaScript.
+
 Slag is a from-scratch, spec-faithful JavaScript engine in Rust,
 implementing the ECMAScript® 2026 Language Specification (17th edition). It
 began as a spite project — when Bun refused to compile JavaScriptCore for
