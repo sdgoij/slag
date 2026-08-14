@@ -1,6 +1,6 @@
-//! `jsrt` command-line runner and REPL (PLAN Phase 18 CLI polish).
+//! `slag` command-line runner and REPL (PLAN Phase 18 CLI polish).
 //!
-//! Usage: `jsrt [options] [file.js [args...]]`
+//! Usage: `slag [options] [file.js [args...]]`
 //! - With a file: parse and evaluate it, exposing `process.argv` to the
 //!   script; extra arguments are script arguments.
 //! - Without a file: start the REPL (multi-line input; `.exit` or Ctrl-D
@@ -66,7 +66,7 @@ fn parse(args: &[String]) -> Command {
             }
             flag if flag.starts_with("--harmony") => {}
             flag if flag.starts_with('-') && flag != "-" => {
-                eprintln!("jsrt: unknown flag {flag}");
+                eprintln!("slag: unknown flag {flag}");
                 return Command::Help;
             }
             _ => positional.push(arg.clone()),
@@ -95,11 +95,11 @@ fn main() -> ExitCode {
 fn run(command: Command) -> Result<(), u8> {
     match command {
         Command::Version => {
-            println!("jsrt {VERSION}");
+            println!("slag {VERSION}");
             Ok(())
         }
         Command::Help => {
-            eprintln!("usage: jsrt [options] [file.js [args...]]");
+            eprintln!("usage: slag [options] [file.js [args...]]");
             eprintln!("options:");
             eprintln!("  --version, -V");
             eprintln!("  --help, -h");
@@ -127,7 +127,7 @@ fn run(command: Command) -> Result<(), u8> {
 }
 
 fn report(error: impl std::fmt::Display) -> u8 {
-    eprintln!("jsrt: {error}");
+    eprintln!("slag: {error}");
     1
 }
 
@@ -135,7 +135,7 @@ fn report(error: impl std::fmt::Display) -> u8 {
 /// ScriptEvaluation in a fresh realm), exposing `process.argv`.
 fn run_file(file: &str, args: &[String], options: &Options) -> Result<(), u8> {
     let source = std::fs::read_to_string(file).map_err(|e| {
-        eprintln!("jsrt: {file}: {e}");
+        eprintln!("slag: {file}: {e}");
         1
     })?;
     if options.dump_tokens {
@@ -149,7 +149,7 @@ fn run_file(file: &str, args: &[String], options: &Options) -> Result<(), u8> {
         let mut argv = vec![
             std::env::current_exe()
                 .map(|path| path.display().to_string())
-                .unwrap_or_else(|_| "jsrt".to_string()),
+                .unwrap_or_else(|_| "slag".to_string()),
             file.to_string(),
         ];
         argv.extend(args.iter().cloned());
@@ -161,7 +161,7 @@ fn run_file(file: &str, args: &[String], options: &Options) -> Result<(), u8> {
             Ok(())
         }
         Err(error) => {
-            eprintln!("jsrt: {error}");
+            eprintln!("slag: {error}");
             Err(1)
         }
     }
@@ -180,7 +180,7 @@ fn dump_tokens(source: &str) -> Result<(), u8> {
                 }
             }
             Err(error) => {
-                eprintln!("jsrt: tokenize: {error}");
+                eprintln!("slag: tokenize: {error}");
                 return Err(1);
             }
         }
@@ -196,7 +196,7 @@ fn dump_ast(source: &str) -> Result<(), u8> {
             Ok(())
         }
         Err(error) => {
-            eprintln!("jsrt: parse: {error}");
+            eprintln!("slag: parse: {error}");
             Err(1)
         }
     }
@@ -206,14 +206,14 @@ fn dump_ast(source: &str) -> Result<(), u8> {
 /// incomplete, evaluate complete inputs, and print the completion value.
 fn repl() -> Result<(), u8> {
     let mut context = Context::new().map_err(report)?;
-    println!("jsrt {VERSION} REPL (type .exit or Ctrl-D to quit)");
+    println!("slag {VERSION} REPL (type .exit or Ctrl-D to quit)");
     let stdin = io::stdin();
     let mut buffer = String::new();
     loop {
         let prompt = if buffer.is_empty() { "> " } else { "... " };
         print!("{prompt}");
         io::stdout().flush().map_err(|e| {
-            eprintln!("jsrt: {e}");
+            eprintln!("slag: {e}");
             1
         })?;
         let mut line = String::new();
@@ -224,7 +224,7 @@ fn repl() -> Result<(), u8> {
             }
             Ok(_) => {}
             Err(error) => {
-                eprintln!("jsrt: {error}");
+                eprintln!("slag: {error}");
                 return Err(1);
             }
         }
@@ -344,7 +344,7 @@ fn run_benchmarks(context: &mut Context) -> Result<(), u8> {
             "function f(x) { return x + 1; } let n = 0; for (let i = 0; i < 1_000_000; i++) { n = f(n); } n",
         ),
     ];
-    println!("jsrt {VERSION} micro-benchmarks");
+    println!("slag {VERSION} micro-benchmarks");
     for (name, source) in benchmarks {
         let _ = context.eval(source);
         let start = Instant::now();
@@ -426,7 +426,7 @@ mod tests {
 
     #[test]
     fn runs_a_simple_script_file() {
-        let path = std::env::temp_dir().join(format!("jsrt_cli_test_{}.js", std::process::id()));
+        let path = std::env::temp_dir().join(format!("slag_cli_test_{}.js", std::process::id()));
         std::fs::write(&path, "42;").unwrap();
         let result = run_file(path.to_str().unwrap(), &[], &Options::default());
         std::fs::remove_file(&path).ok();

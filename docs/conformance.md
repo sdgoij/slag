@@ -1,6 +1,6 @@
 # Conformance
 
-Status of ECMAScript conformance for the jsrt runtime, and how it is
+Status of ECMAScript conformance for the slag runtime, and how it is
 measured (PLAN Phase 18, "Conformance hardening").
 
 ## How conformance is measured

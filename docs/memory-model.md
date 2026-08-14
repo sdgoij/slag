@@ -1,4 +1,4 @@
-# jsrt memory model (ECMAScript ch. 28) and the thread-per-agent design
+# slag memory model (ECMAScript ch. 28) and the thread-per-agent design
 
 Phase 17's scope decision (PLAN): ES2026's memory model only becomes
 observable with multi-agent execution — workers sharing a
@@ -10,7 +10,7 @@ today.
 ## 1. Shared Data Blocks (ch. 28.2)
 
 A Shared Data Block is the `[[ArrayBufferData]]` of a `SharedArrayBuffer`:
-raw bytes that agents on separate threads read and write. In jsrt the block
+raw bytes that agents on separate threads read and write. In slag the block
 is `crux::typed_array::SharedBuffer`:
 
 - **Single-agent build** (`workers` feature off): the block is an
@@ -47,7 +47,7 @@ exposed); they exist so the model can reason about which agent wrote a byte.
 
 An execution is a set of events — Read/Write/ReadModifyWrite — plus the
 partial orders `SynchronizesWith`, `HappensBefore` and `ChronologicalOrder`.
-jsrt maps the shared-memory operations onto events as follows:
+slag maps the shared-memory operations onto events as follows:
 
 | Language operation | Event(s) |
 | --- | --- |
@@ -66,7 +66,7 @@ synchronized (section 5); the Atomics operations are always atomic events.
 A synchronization edge (`sw`) is created by:
 
 1. **`Atomics.notify` → `Atomics.wait`**: a `notify` that wakes a suspended
-   waiter synchronizes with that waiter's subsequent reads. In jsrt the edge
+   waiter synchronizes with that waiter's subsequent reads. In slag the edge
    is the OS-level `Condvar` wake-up: the notifier (after releasing the
    wait-registry lock) `notify_one`s, and the woken waiter observes the
    notifier's prior SeqCst writes because the mutex/condvar pair provides the
@@ -92,7 +92,7 @@ wake each other correctly.
 `HappensBefore` is the transitive closure of `SynchronizesWith` and
 `sequenced-before` (program order within an agent). A data race is two
 non-atomic accesses to the same memory location that are not ordered by
-`HappensBefore`, where at least one is a Write. jsrt's guarantees:
+`HappensBefore`, where at least one is a Write. slag's guarantees:
 
 - **No tear**: Atomics accesses of 1/2/4/8 bytes are single hardware atomic
   operations on the aligned word; a torn read (half an old value, half a
@@ -109,10 +109,10 @@ non-atomic accesses to the same memory location that are not ordered by
 ## 6. Write buffers (ch. 28.9) and flushing
 
 The spec lets an agent hold a write buffer of its own writes and flush it
-under the memory-model rules. jsrt's Rust implementation delegates to the
+under the memory-model rules. slag's Rust implementation delegates to the
 hardware/compiler memory model: SeqCst accesses on the `Atomic*` types
 compile to locked/`mfence`-style instructions (x86) or the equivalent, and
-the condvar wake-up publishes prior writes. There is no jsrt-level write
+the condvar wake-up publishes prior writes. There is no slag-level write
 buffer: every Atomics store is immediately visible to the memory system, and
 the `SeqCst` ordering in Rust provides the total order ch. 28.9's flushed
 execution requires. A future port to a weaker compiler target must audit the

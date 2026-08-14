@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# The product binary is `slag`; the package stays `cli` so a future rename
+# only touches this one line.
+[[bin]]
+name = "slag"
+path = "src/main.rs"
+
 [dependencies]
 lexer = { path = "../lexer" }
 parser = { path = "../parser" }

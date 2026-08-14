@@ -833,10 +833,10 @@ mod tests {
     fn process_argv_is_installed() {
         let mut context = Context::new().unwrap();
         context
-            .install_process_argv(&["jsrt".into(), "file.js".into(), "arg".into()])
+            .install_process_argv(&["slag".into(), "file.js".into(), "arg".into()])
             .unwrap();
         let argv = context.eval("process.argv.join(',')").unwrap();
-        assert_eq!(argv.as_string().as_deref(), Some("jsrt,file.js,arg"));
+        assert_eq!(argv.as_string().as_deref(), Some("slag,file.js,arg"));
     }
 
     #[test]

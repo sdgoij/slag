@@ -1,6 +1,6 @@
 # Performance
 
-Current performance state of the jsrt runtime and the PLAN Phase 18
+Current performance state of the slag runtime and the PLAN Phase 18
 performance milestones, each behind a benchmark gate rather than a
 correctness gate.
 

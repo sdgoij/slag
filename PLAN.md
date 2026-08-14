@@ -1,4 +1,4 @@
-# jsrt — JavaScript Runtime: Implementation Plan
+# slag — JavaScript Runtime: Implementation Plan
 
 **Target:** a from-scratch, spec-faithful JavaScript engine in Rust that implements the complete
 ECMAScript® 2026 Language Specification (17th edition), as captured in [`spec.html`](spec.html).
@@ -23,7 +23,7 @@ Build a JavaScript engine in Rust that is:
    diffing against `spec.html`.
 3. **Tested** — every phase ships with unit tests, and the project tracks `test262` pass rates as
    its primary correctness metric.
-4. **Usable** — a `jsrt` CLI (script runner + REPL) and a `jsrt::Context` embedding API.
+4. **Usable** — a `slag` CLI (script runner + REPL) and a `runtime::Context` embedding API.
 
 ## 2. Scope and non-goals
 
@@ -41,7 +41,7 @@ Build a JavaScript engine in Rust that is:
 
 - **ECMA-402 (Intl)** — not part of `spec.html`. Locale-sensitive methods (`toLocaleString`,
   `toLocaleLowerCase`, `localeCompare`, …) are implemented per the "no Intl" behavior the spec
-  permits (usually identity with their non-locale counterparts). A later `jsrt-intl` crate could
+  permits (usually identity with their non-locale counterparts). A later `slag-intl` crate could
   add Intl on top.
 - **Host environments** — no DOM, no Node APIs. Host facilities (`console`, timers, file I/O,
   `import()` resolution, `import.meta`) arrive through a `HostCallbacks`/`HostHooks` embedding API.
@@ -94,7 +94,7 @@ graph TD
 | `parser` | Recursive-descent parser, cover-grammar desugaring, all early errors, ASI | ch. 13–17 |
 | `regexp` | RegExp pattern parser (per `u`/`v` flags) + backtracking matcher; used both for literal early errors and at runtime | ch. 21 (RegExp), 12 |
 | `runtime` | Realms, environment records, execution contexts, job queue, evaluator (tree-walker → bytecode), module linking, all built-ins (ch. 18–26), Annex B | ch. 9–10, 13–26 |
-| `cli` | `jsrt file.js`, REPL, flags (`--dump-ast`, `--dump-tokens`, `--stack-size`, …) | — |
+| `cli` | `slag file.js`, REPL, flags (`--dump-ast`, `--dump-tokens`, `--stack-size`, …) | — |
 | `test262` | test262 runner + harness files | — |
 
 ## 4. Core design decisions
@@ -248,7 +248,7 @@ Follow ch. 16 exactly: Source Text Module Records with `[[RequestedModules]]`,
 `[[StarExportEntries]]`, and the linking algorithm (`InnerModuleLinking`, `InnerModuleEvaluation`,
 `ExecuteAsyncModule`, DFS for cycles, `[[PendingAsyncDependencies]]`, top-level await). Host
 resolution (`HostResolveImportedModule`, `HostGetImportMetaProperties`,
-`HostFinalizeImportMeta`) goes through `HostHooks`, so `jsrt` itself stays embeddable. JSON
+`HostFinalizeImportMeta`) goes through `HostHooks`, so `slag` itself stays embeddable. JSON
 modules and import attributes (`with { type: "json" }`) are part of the base engine.
 
 ### 4.8 Errors
@@ -351,11 +351,11 @@ Each phase below lists its concrete test targets; exit criteria are explicit so 
   `lexer`, `parser`, `regexp`, `runtime`, `cli`, `test262`.
 - `crux`: `Span`/`SourceLocation`, basic `JsError` enum + constructors, workspace-wide
   `Error` conversions.
-- `cli`: `jsrt --version` and `jsrt file.js` stub that reports "not implemented".
+- `cli`: `slag --version` and `slag file.js` stub that reports "not implemented".
 
 **Exit criteria:** `cargo build`/`test`/`clippy` clean across the workspace; the inline-unit-test
 convention from §5 is established (every skeleton crate ships a `#[cfg(test)]` module that runs via
-`cargo test --workspace`); `jsrt` binary runs.
+`cargo test --workspace`); `slag` binary runs.
 
 ---
 
@@ -571,7 +571,7 @@ keyed by `PropertyKey` (string or symbol), and the deferred Phase 1 well-known s
 (13 symbols incl. `%Symbol.unscopables%`) lives in `crux::symbol`. The full descriptor model,
 accessor properties, and the Array/String/Arguments exotics landed in Phase 5; Proxy,
 Integer-Indexed, Module namespace, and ECMAScript function bodies land in later phases. The
-CLI's `jsrt file.js` now parses and evaluates scripts. `crates/runtime` runs 53 unit suites;
+CLI's `slag file.js` now parses and evaluates scripts. `crates/runtime` runs 53 unit suites;
 the workspace runs 270 tests with `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 **Remaining in Phase 4:** the Object Environment Record `with`-unscopables check is done
@@ -764,7 +764,7 @@ close paths (throw during body → `.return()` called); switch fallthrough; try/
 (return in finally wins); `using` disposal order + `SuppressedError`; `typeof` of
 `undefined` bindings; loose equality full matrix. Begin running a small `test262`
 `language/` subset.
-**Exit criteria:** `jsrt` can run non-trivial scripts end-to-end (fibonacci, closures, strings,
+**Exit criteria:** `slag` can run non-trivial scripts end-to-end (fibonacci, closures, strings,
 arrays, objects) and prints correct output; Phase 6 test fixtures all pass.
 
 **Status (current):** the statement/expression evaluator lives in `crates/runtime`, built on the
@@ -2045,10 +2045,10 @@ phase therefore delivers:
      representation; parser fast paths; interned-key hashing.
    - Micro-benchmarks: property access, calls, arithmetic, string concat, array iteration;
      `--bench` mode in CLI; track against an early snapshot build.
-4. **Embedding API:** `jsrt::Context::new()`, `context.eval(src)`, `context.call(fn, …)`,
+4. **Embedding API:** `runtime::Context::new()`, `context.eval(src)`, `context.call(fn, …)`,
    `HostCallbacks` (console, timers, module resolution, `import.meta`, random, promise rejection
    tracking), `JsValue`/`JsObject` handle types for interop; rustdocs + examples.
-5. **CLI polish:** `jsrt file.js [args]`, REPL (line editing, multi-line input, `--harmony`-style
+5. **CLI polish:** `slag file.js [args]`, REPL (line editing, multi-line input, `--harmony`-style
    flag no-ops), `--stack-size`, `--max-old-space`-style memory cap, `--print-bytecode`,
    `--dump-ast`, `--dump-tokens`.
 
@@ -2068,7 +2068,7 @@ Delivered:
   `clearTimeout`/`clearInterval`, `process.argv`) are installed per-Context; `crux` gained a
   `current_agent()` accessor so host-global builtins reach the agent, and
   `HostHooks::promise_rejection_tracker` now carries the rejection reason.
-- **CLI polish** (`crates/cli`): `jsrt file.js [args]` with `process.argv`; multi-line REPL;
+- **CLI polish** (`crates/cli`): `slag file.js [args]` with `process.argv`; multi-line REPL;
   `--dump-ast`/`--dump-tokens`; `--bench` micro-benchmarks; accepted no-op knobs
   (`--print-bytecode`, `--stack-size`, `--max-old-space`, `--harmony-*`).
 - **Conformance tooling**: `full_sweep` scanner in `crates/test262` walks `language`,
@@ -2151,11 +2151,11 @@ Percentages are planning estimates; the exit criteria in each phase are authorit
 - [x] `cargo build --workspace` and `cargo test --workspace` green on stable Rust; clippy clean.
 - [ ] Every `pub` item in every crate has inline unit tests (§5); the coverage gate passes at 100%
       `pub`-item coverage.
-- [x] `jsrt file.js` and the REPL execute ES2026 scripts; `--dump-ast`/`--dump-tokens` work.
+- [x] `slag file.js` and the REPL execute ES2026 scripts; `--dump-ast`/`--dump-tokens` work.
 - [x] test262 at **≥ 95%** of runnable tests; all failures triaged in `docs/conformance.md`
       (100% of runnable measured across language/built-ins/annexB).
 - [ ] GC milestone active (no unbounded leaks on long-running programs; `WeakRef`/`FinalizationRegistry`
       semantics verified).
-- [ ] Embedding API (`jsrt::Context`, host hooks) documented with working examples.
+- [ ] Embedding API (`runtime::Context`, host hooks) documented with working examples.
 - [ ] `docs/memory-model.md` present; worker mode feature-gated and stress-tested.
 - [ ] Every phase's exit criteria satisfied; milestone table up to date.
