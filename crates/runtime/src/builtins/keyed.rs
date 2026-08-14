@@ -214,6 +214,34 @@ fn set_of(agent: &Agent, this: &Value) -> Result<Handle<JsObject>, JsError> {
     Ok(object.clone())
 }
 
+/// The number of live elements of a Set's [[SetData]].
+fn set_data_count(agent: &Agent, id: u64) -> usize {
+    agent
+        .set_data
+        .get(&id)
+        .map(|cell| cell.borrow().iter().filter(|entry| entry.is_some()).count())
+        .unwrap_or(0)
+}
+
+/// The element at `index` of the live [[SetData]], or `None` past the end.
+/// The set-methods' per-element loops re-read the list each step, because a
+/// user `has`/`keys` call can mutate the receiver (set-like-class-mutation).
+fn set_data_at(agent: &Agent, id: u64, index: usize) -> Option<Value> {
+    agent
+        .set_data
+        .get(&id)?
+        .borrow()
+        .get(index)
+        .cloned()
+        .flatten()
+}
+
+/// Whether the live [[SetData]] contains `value`.
+fn set_data_contains(agent: &Agent, id: u64, value: &Value) -> bool {
+    let data = agent.set_data.get(&id).map(|cell| cell.borrow()).unwrap();
+    find_set_index(&data, value).is_some()
+}
+
 fn weak_map_of(agent: &Agent, this: &Value) -> Result<Handle<JsObject>, JsError> {
     let Value::Object(object) = this else {
         return Err(JsError::new(
@@ -248,7 +276,7 @@ fn weak_set_of(agent: &Agent, this: &Value) -> Result<Handle<JsObject>, JsError>
 
 /// CanBeHeldWeakly (spec 26.1.1): Object, or a Symbol without a global
 /// registry entry (`Symbol.for` symbols lack language identity).
-fn can_be_held_weakly(agent: &Agent, value: &Value) -> bool {
+pub(crate) fn can_be_held_weakly(agent: &Agent, value: &Value) -> bool {
     match value {
         Value::Object(_) | Value::Function(_) => true,
         Value::Symbol(symbol) => {
@@ -925,8 +953,12 @@ fn set_symmetric_difference(
     let object = set_of(agent, this)?;
     let other = args.first().cloned().unwrap_or(Value::Undefined);
     let record = get_set_record(agent, &other)?;
-    let data = agent.set_data.get(&object.id()).unwrap().borrow().clone();
-    let mut result = data.clone();
+    let id = object.id();
+    // The result starts as a copy of [[SetData]]; each key's membership is
+    // checked against the *live* set, because the key iterator's `next` can
+    // mutate the receiver (set-like-class-mutation keeps values deleted by
+    // the mutation and drops values re-added by it).
+    let mut result = agent.set_data.get(&id).unwrap().borrow().clone();
     let keys = get_iterator_from_method(agent, &record.object, &record.keys)?;
     loop {
         let next = match crate::expr::iterator_step(agent, &keys)? {
@@ -934,13 +966,13 @@ fn set_symmetric_difference(
             None => break,
         };
         let value = canonicalize_key(next);
-        let already = find_set_index(&result, &value).is_some();
-        if find_set_index(&data, &value).is_some() {
-            if already && let Some(index) = find_set_index(&result, &value) {
-                result[index] = None;
-            }
-        } else if !already {
-            result.push(Some(value));
+        if find_set_index(&result, &value).is_none() {
+            result.push(Some(value.clone()));
+        }
+        if set_data_contains(agent, id, &value)
+            && let Some(index) = find_set_index(&result, &value)
+        {
+            result[index] = None;
         }
     }
     new_set_from_data(agent, result)
@@ -952,21 +984,25 @@ fn set_is_subset_of(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
     let object = set_of(agent, this)?;
     let other = args.first().cloned().unwrap_or(Value::Undefined);
     let record = get_set_record(agent, &other)?;
-    let data = agent.set_data.get(&object.id()).unwrap().borrow().clone();
-    let this_size = data.iter().filter(|e| e.is_some()).count();
-    if this_size > record.size {
+    let id = object.id();
+    // The size is read once (spec step 3), then the loop walks the live
+    // [[SetData]]: `has` can delete from the receiver mid-iteration, and
+    // deleted entries must not be visited (set-like-class-mutation).
+    if set_data_count(agent, id) > record.size {
         return Ok(Value::Boolean(false));
     }
-    for value in data.iter().flatten() {
+    let mut index = 0;
+    while let Some(value) = set_data_at(agent, id, index) {
         let in_other = to_boolean(&crate::function::call(
             agent,
             &record.has,
             record.object.clone(),
-            std::slice::from_ref(value),
+            std::slice::from_ref(&value),
         )?);
         if !in_other {
             return Ok(Value::Boolean(false));
         }
+        index += 1;
     }
     Ok(Value::Boolean(true))
 }
@@ -1001,19 +1037,22 @@ fn set_is_disjoint_from(agent: &mut Agent, this: &Value, args: &[Value]) -> Resu
     let object = set_of(agent, this)?;
     let other = args.first().cloned().unwrap_or(Value::Undefined);
     let record = get_set_record(agent, &other)?;
-    let data = agent.set_data.get(&object.id()).unwrap().borrow().clone();
-    let this_size = data.iter().filter(|e| e.is_some()).count();
-    if this_size <= record.size {
-        for value in data.iter().flatten() {
+    let id = object.id();
+    // The size is read once; the element loop walks the live [[SetData]]
+    // (set-like-class-mutation: `has` deletes and re-adds mid-iteration).
+    if set_data_count(agent, id) <= record.size {
+        let mut index = 0;
+        while let Some(value) = set_data_at(agent, id, index) {
             let in_other = to_boolean(&crate::function::call(
                 agent,
                 &record.has,
                 record.object.clone(),
-                std::slice::from_ref(value),
+                std::slice::from_ref(&value),
             )?);
             if in_other {
                 return Ok(Value::Boolean(false));
             }
+            index += 1;
         }
         return Ok(Value::Boolean(true));
     }
@@ -1023,7 +1062,7 @@ fn set_is_disjoint_from(agent: &mut Agent, this: &Value, args: &[Value]) -> Resu
             Some(value) => value,
             None => break,
         };
-        if find_set_index(&data, &canonicalize_key(next)).is_some() {
+        if set_data_contains(agent, id, &canonicalize_key(next)) {
             crate::expr::iterator_close(agent, &keys)?;
             return Ok(Value::Boolean(false));
         }

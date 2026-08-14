@@ -285,13 +285,11 @@ fn eval_call_chain(
     // intrinsic %eval% reached through the identifier `eval` runs its first
     // argument as a Script; any other route to %eval% is an indirect eval.
     if is_eval_function(agent, &callee_value)? {
-        let Some(source) = args.first() else {
-            return Err(JsError::new(
-                ErrorKind::TypeError,
-                "eval requires a string argument".into(),
-            ));
-        };
-        let source = to_string(source)?;
+        // spec 19.2.1.1 step 3: a missing argument is *undefined*, which
+        // ToStrings to "undefined" and parses as the identifier
+        // (S15.5.1.1_A1_T6); non-strings coerce the same way.
+        let source = args.first().cloned().unwrap_or(Value::Undefined);
+        let source = to_string(&source)?;
         let direct = matches!(
             call.callee.kind,
             ExprKind::Ident(id) if crux::lookup(id) == crux::string::JsString::from_utf8("eval")

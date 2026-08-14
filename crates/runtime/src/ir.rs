@@ -2079,7 +2079,11 @@ impl Vm {
         for (i, frame) in self.try_stack.iter().enumerate().rev() {
             let handler = body.handlers.get(frame.handler)?;
             let covered_end = handler.catch.map(|c| c.end).unwrap_or(handler.try_end);
-            if self.ip < handler.start || self.ip >= covered_end {
+            // The ip is the *next* step to run (advanced at loop top), so a
+            // try region's own `Exit` step runs with ip == try_end + 1; that
+            // frame must still be found so its finally runs on the normal
+            // path (GeneratorPrototype/throw/try-finally*).
+            if self.ip < handler.start || self.ip > covered_end + 1 {
                 continue;
             }
             let leaves = match ctl {

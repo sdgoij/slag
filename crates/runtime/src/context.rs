@@ -150,13 +150,13 @@ pub fn to_big_int(agent: &mut Agent, value: &Value) -> Result<crux::BigInt, JsEr
         Value::Boolean(false) => Ok(crux::BigInt::from(0u64)),
         Value::BigInt(b) => Ok(b.as_ref().clone()),
         Value::String(_) => crux::convert::to_big_int(&prim),
-        Value::Number(n) => match crux::BigInt::from_f64_exact(n) {
-            Some(b) => Ok(b),
-            None => Err(JsError::new(
-                ErrorKind::RangeError,
-                "The number cannot be converted to a BigInt because it is not an integer".into(),
-            )),
-        },
+        // spec 7.1.17 ToBigInt: a Number throws a TypeError (the integral
+        // NumberToBigInt case belongs to the BigInt() constructor and the
+        // TypedArray constructor paths, which special-case Numbers).
+        Value::Number(_) => Err(JsError::new(
+            ErrorKind::TypeError,
+            "Cannot convert a Number to a BigInt".into(),
+        )),
         Value::Symbol(_) => Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert a Symbol to a BigInt".into(),

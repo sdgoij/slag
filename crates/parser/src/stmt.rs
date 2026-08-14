@@ -1049,8 +1049,12 @@ fn parse_function_declaration(parser: &mut Parser, is_async: bool) -> Result<Stm
     parser.check_binding_name(name, name_start)?;
     parser.declare_function(name, name_start)?;
     parser.expect_punct(TokenKind::LeftParen)?;
+    let saved_generator = parser.in_generator;
+    parser.in_generator = is_generator;
     let params = crate::expr::parse_parameter_list(parser)?;
+    parser.in_generator = saved_generator;
     crate::expr::check_duplicate_params(parser, &params, false)?;
+    crate::expr::check_generator_params_no_yield(parser, &params)?;
     let body = crate::expr::parse_function_body_block(
         parser,
         is_async,

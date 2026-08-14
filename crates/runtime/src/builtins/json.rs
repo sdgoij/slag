@@ -488,7 +488,10 @@ fn internalize_json_property(
                 if matches!(new_element, Value::Undefined) {
                     obj.delete_key(&PropertyKey::from_js_string(&index_key))?;
                 } else {
-                    obj.create_data_property_or_throw(&index_key, new_element)?;
+                    // spec step 28.a.3: CreateDataProperty is silent — a
+                    // reviver that froze/non-configurified the property keeps
+                    // the old value (reviver-*-non-configurable-prop-create).
+                    obj.create_data_property(&index_key, new_element)?;
                 }
             }
         } else {
@@ -508,7 +511,7 @@ fn internalize_json_property(
                 if matches!(new_element, Value::Undefined) {
                     obj.delete_key(&PropertyKey::from_js_string(&key))?;
                 } else {
-                    obj.create_data_property_or_throw(&key, new_element)?;
+                    obj.create_data_property(&key, new_element)?;
                 }
             }
         }

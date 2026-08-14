@@ -416,7 +416,7 @@ fn check_static_block(block: &Block) -> Result<(), JsError> {
 /// Walks every expression reachable without crossing a function, arrow, or
 /// class boundary (the spec's `Contains` rules do not look into function
 /// definitions, and arrows have their own `arguments`/`await`).
-fn walk_exprs(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
+pub(crate) fn walk_exprs(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
     visit(expr);
     match &expr.kind {
         ExprKind::Literal(_)

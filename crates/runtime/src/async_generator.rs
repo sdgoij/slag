@@ -119,7 +119,10 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         0,
         Box::new(|this, _| Ok(this.clone())),
         None,
-        None,
+        realm
+            .intrinsics
+            .get("%Function.prototype%")
+            .and_then(|v| crate::context::as_object(&v)),
     )?;
     proto.define_property_key(
         &crux::property::PropertyKey::Symbol(
@@ -134,13 +137,24 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             configurable: Some(true),
         },
     )?;
+    // spec 27.6.3.3: the tag is an own property of %AsyncGenerator.prototype%
+    // with { writable: false, enumerable: false, configurable: true }
+    // (AsyncGeneratorPrototype/Symbol.toStringTag.js reads the
+    // double-getPrototypeOf chain).
     proto.define_property_key(
         &crux::property::PropertyKey::Symbol(
             crux::symbol::well_known("toStringTag").as_ref().clone(),
         ),
-        &PropertyDescriptor::none(Value::String(Handle::new(JsString::from_utf8(
-            "Async Generator",
-        )))),
+        &PropertyDescriptor {
+            value: Some(Value::String(Handle::new(JsString::from_utf8(
+                "AsyncGenerator",
+            )))),
+            writable: Some(false),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
     )?;
     Ok(())
 }
@@ -250,17 +264,32 @@ pub fn call_async_generator(
     let body_env = instantiated_context.lexical_environment.clone();
     agent.execution_context_stack.pop();
 
-    let proto = data
-        .realm
-        .intrinsics
-        .get(ASYNC_GENERATOR_PROTO)
-        .and_then(|value| crate::context::as_object(&value))
-        .ok_or_else(|| {
-            JsError::new(
-                ErrorKind::TypeError,
-                format!("{ASYNC_GENERATOR_PROTO} is not defined"),
-            )
-        })?;
+    // OrdinaryCreateFromConstructor (spec 10.2.4): the instance inherits the
+    // function's own `prototype` property (a per-function object whose
+    // prototype is %AsyncGenerator.prototype%), falling back to the intrinsic
+    // when that property is not an object. This keeps the
+    // double-getPrototypeOf chain of Symbol.toStringTag.js intact.
+    let function_value = function_value.clone();
+    let prototype = crate::context::get_property(
+        agent,
+        &function_value,
+        &JsString::from_utf8("prototype"),
+        function_value.clone(),
+    )?;
+    let proto = match crate::context::as_object(&prototype) {
+        Some(object) => object,
+        None => data
+            .realm
+            .intrinsics
+            .get(ASYNC_GENERATOR_PROTO)
+            .and_then(|value| crate::context::as_object(&value))
+            .ok_or_else(|| {
+                JsError::new(
+                    ErrorKind::TypeError,
+                    format!("{ASYNC_GENERATOR_PROTO} is not defined"),
+                )
+            })?,
+    };
     let object = JsObject::ordinary_object_create(Some(proto));
     let object_value = Value::Object(object.clone());
     agent.async_generators.insert(

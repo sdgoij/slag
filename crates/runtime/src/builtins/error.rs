@@ -422,12 +422,14 @@ fn error_construct(
         define_message(&object, args.get(1))?;
         install_cause(agent, &object, args.get(2))?;
     } else if suppressed {
-        // SuppressedError(error, suppressed, message) (spec 20.5.8.1).
+        // SuppressedError(error, suppressed, message) (spec 20.5.8.1): own
+        // properties are created message, then error, then suppressed
+        // (order-of-args-evaluation.js checks the property order).
         let error = args.first().cloned().unwrap_or(Value::Undefined);
         let suppressed_value = args.get(1).cloned().unwrap_or(Value::Undefined);
+        define_message(&object, args.get(2))?;
         object.create_data_property(&JsString::from_utf8("error"), error)?;
         object.create_data_property(&JsString::from_utf8("suppressed"), suppressed_value)?;
-        define_message(&object, args.get(2))?;
         install_cause(agent, &object, args.get(2))?;
     } else {
         define_message(&object, args.first())?;

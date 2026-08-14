@@ -1440,9 +1440,23 @@ pub(crate) fn function_declaration_instantiation(
     let mut param_bindings = param_names.clone();
     if arguments_obj_needed {
         let arguments_obj = if strict || !simple {
+            // spec 10.4.4.9: the `callee` accessor's get/set is the shared
+            // %ThrowTypeError% — the same object as Function.prototype's
+            // caller/arguments throwers (ThrowTypeError/unique-per-realm-*).
+            let thrower = agent
+                .current_realm()?
+                .intrinsics
+                .get("%ThrowTypeError%")
+                .ok_or_else(|| {
+                    JsError::new(
+                        ErrorKind::TypeError,
+                        "%ThrowTypeError% intrinsic missing".into(),
+                    )
+                })?;
             Value::Object(JsObject::unmapped_arguments_object_create(
                 arguments_prototype.clone(),
                 args,
+                thrower,
             )?)
         } else {
             let env = function_env.clone();

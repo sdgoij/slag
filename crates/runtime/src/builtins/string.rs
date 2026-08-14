@@ -160,8 +160,9 @@ fn to_clamped_index(agent: &mut Agent, value: &Value, len: usize) -> Result<usiz
 /// A pure String static or non-agent method: `(this, args) -> value`.
 type StringFn = fn(&Value, &[Value]) -> Result<Value, JsError>;
 
-/// String(value) / new String(value) (spec 22.1.1.1): ToString the argument,
-/// with the SymbolDescriptiveString rule for Symbol values.
+/// String(value) / new String(value) (spec 22.1.1.1): ToString the argument;
+/// only the call form returns SymbolDescriptiveString for Symbols — the
+/// constructor ToStrings, and ToString of a Symbol throws.
 fn string_construct(
     agent: &mut Agent,
     args: &[Value],
@@ -169,8 +170,13 @@ fn string_construct(
 ) -> Result<Value, JsError> {
     let proto = instance_proto(agent, new_target)?;
     let text = match args.first() {
-        Some(Value::Symbol(symbol)) => {
-            JsString::from_utf8(&crux::symbol::descriptive_string(symbol))
+        // spec 22.1.1.1 step 2: SymbolDescriptiveString applies only when
+        // NewTarget is undefined (new String(Symbol) throws, symbol-wrapping).
+        Some(Value::Symbol(_)) => {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "Cannot convert a Symbol value to a string".into(),
+            ));
         }
         Some(value) => crate::context::to_string(agent, value)?,
         None => JsString::from_utf8(""),

@@ -611,6 +611,7 @@ impl JsObject {
     pub fn unmapped_arguments_object_create(
         prototype: Option<Handle<JsObject>>,
         args: &[Value],
+        thrower: Value,
     ) -> Result<Handle<JsObject>, JsError> {
         let obj = Handle::new(Self {
             id: NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
@@ -652,7 +653,6 @@ impl JsObject {
                 configurable: Some(true),
             },
         )?;
-        let thrower = Value::Function(crate::function::throw_type_error()?);
         obj.define_property(
             &JsString::from_utf8("callee"),
             &PropertyDescriptor {
@@ -2843,7 +2843,9 @@ mod tests {
 
     #[test]
     fn unmapped_arguments_have_throwing_callee() {
-        let args = JsObject::unmapped_arguments_object_create(None, &[Value::Number(1.0)]).unwrap();
+        let thrower = Value::Function(crate::function::throw_type_error(None).unwrap());
+        let args = JsObject::unmapped_arguments_object_create(None, &[Value::Number(1.0)], thrower)
+            .unwrap();
         assert_eq!(args.get(&key("0")).unwrap(), Value::Number(1.0));
         assert!(args.get(&key("callee")).is_err());
         assert!(args.set(&key("callee"), Value::Undefined, false).is_err());

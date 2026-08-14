@@ -217,23 +217,17 @@ fn install_methods(
     )?;
 
     // 20.2.3.1 Function.prototype.caller/arguments: own accessor properties
-    // whose get and set are the same thrower, so reads/writes on functions
-    // without their own restricted properties (strict, bound, async,
-    // generator) throw a TypeError. Sloppy ordinary functions shadow them
-    // with their own null-valued data properties.
-    let restricted_thrower = Function::create_builtin(
-        Some(JsString::from_utf8("")),
-        0,
-        Box::new(|_, _| {
-            Err(JsError::new(
-                ErrorKind::TypeError,
-                "'caller', 'callee', and 'arguments' properties may not be accessed".into(),
-            ))
-        }),
-        None,
-        Some(proto.clone()),
-    )?;
-    let thrower_value = Value::Function(restricted_thrower);
+    // whose get and set are %ThrowTypeError% (spec 10.2.2), so reads/writes
+    // on functions without their own restricted properties (strict, bound,
+    // async, generator) throw a TypeError. Sloppy ordinary functions shadow
+    // them with their own null-valued data properties. The same intrinsic is
+    // the get/set of unmapped arguments objects' `callee`, so all six slots
+    // are one object (ThrowTypeError/unique-per-realm-*).
+    let thrower = crux::function::throw_type_error(Some(proto.clone()))?;
+    let thrower_value = Value::Function(thrower.clone());
+    realm
+        .intrinsics
+        .define("%ThrowTypeError%", Value::Function(thrower));
     for name in ["caller", "arguments"] {
         function_proto.define_property(
             &JsString::from_utf8(name),

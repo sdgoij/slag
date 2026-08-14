@@ -48,7 +48,7 @@ Two harnesses live in `crates/test262`:
 
 ## Current results
 
-Workspace-wide: **4085 tests pass, 0 failures** (`cargo test --workspace`),
+Workspace-wide: **4099 tests pass, 0 failures** (`cargo test --workspace`),
 of which the test262 crate contributes **3317 passing fixtures** (44
 language-area + 3275 built-ins fixtures); the remaining registered test is
 the ignored `scan_builtins_directories` directory scanner. The `workers`
@@ -1332,6 +1332,72 @@ Validation: `cargo test --workspace` **4099 pass, 0 failures**;
 **44 fixtures fixed** and **64 fixtures skipped** (17,111 pass / 65 fail /
 0 crash) and no regressions.
 
+### Final built-ins cleanup sweep (Phase 18 conformance)
+
+The last 65 failing built-ins are closed: a full `built-ins` re-sweep
+(`--jobs 8 --batch 32 --timeout 120 --recheck-timeout 120`) reports
+**17,179 pass, 0 fail, 6,633 skip, 0 crash, 0 hang** of 23,812 fixtures
+— **100% of runnable** (up from 17,111 pass / 65 fail / 3 hang). Fixes
+across the VM, the parser, and the built-ins:
+
+- **Generator/async-generator try/finally (`ir.rs`, `generator.rs`)** —
+  `find_finally_frame` skipped a try region's own `Exit` step (the ip is
+  advanced before dispatch), so the `finally` never ran on the normal
+  path: `GeneratorPrototype/throw/try-finally*` (within-finally,
+  following-finally, nested-try-catch-within-inner-try) and every plain
+  try-finally in a resumable body now run the finalizer. The coverage
+  check admits the boundary step (`ip > covered_end + 1`).
+  `generator_resume_abrupt` propagates a throw from a completed
+  generator; iterator-result objects inherit `%Object.prototype%`.
+- **Async-generator prototype identity (`async_generator.rs`)** — the
+  instance inherits the function's own `prototype` (OrdinaryCreateFrom-
+  Constructor), not `%AsyncGenerator.prototype%` directly, and
+  `%AsyncGenerator.prototype%` carries the own
+  `@@toStringTag = "AsyncGenerator"` descriptor (the
+  `%AsyncIterator.prototype%` tag stays "Async Iterator"), fixing
+  `AsyncGeneratorPrototype/constructor` and `Symbol.toStringTag`.
+- **GeneratorFunction parameters (`parser/`)** — generator parameters
+  parse with the `[Yield]` grammar and a `YieldExpression` in them is a
+  SyntaxError, so `GeneratorFunction('x = yield', '')` throws in the
+  dynamic-constructor and in-generator call forms.
+- **`%ThrowTypeError%`** — one per realm, with `%Function.prototype%` as
+  its prototype, shared by `Function.prototype.caller`/`arguments` (get
+  and set) and unmapped arguments objects' `callee`; registered
+  (`Symbol.for`) symbols are rejected by `CanBeHeldWeakly`.
+- **Array residuals** — toSpliced deleteCount (no args deletes 0,
+  start-only deletes the rest), `toReversed`/`toSorted`/`toSpliced`/`with`
+  ignore @@species, revoked-proxy `isArray`, `toLocaleString` primitive
+  receivers, sort stops at a comparefn error, the array-length
+  defineOwnProperty double coercion, `reverse` read order, `lastIndexOf`
+  negative fromIndex, `push` 2^53-1 limit, splice clamp, the
+  `Symbol.unscopables` change-array-by-copy removal, and the
+  array-iterator detach check.
+- **WeakRef/FinalizationRegistry** — symbol targets and unregister tokens
+  (ES2023 `symbols-as-weakmap-keys`), GetPrototypeFromConstructor
+  fallback, `deref` on a non-WeakRef receiver, `register.length` 2, and
+  the spec `@@toStringTag` descriptors.
+- **Uint8Array base64/hex** — `toBase64`/`setFromBase64` run their option
+  getters before the spec's detached check, write-mode validation rejects
+  immutable destinations before any argument is read, and the write
+  re-checks detached/immutable after the options (a getter can detach).
+- **TypedArray `ToBigInt`** — `.set()`/`[[Set]]`/`fill`/`with`/DataView
+  convert Numbers with strict `ToBigInt` (TypeError); only `BigInt()` and
+  the typed-array *constructor* use `NumberToBigInt` — so
+  `BigInt64Array.prototype.set([1])` and `ta[0] = 1` throw.
+- **Set set-methods** — `isSubsetOf`/`isDisjointFrom`/`symmetricDiffer-
+  ence` walk the *live* `[[SetData]]`: a user `has`/`keys` can mutate the
+  receiver mid-iteration, and deleted entries must not be visited.
+- **JSON.parse reviver** — CreateDataProperty failures are silent (a
+  reviver that non-configurifies a property keeps the old value), and the
+  strict-mode duplicate top-level function declarations of
+  `reviver-forward-modifies-object.js` are legal (function declarations
+  are var-scoped in both modes, spec 16.1.2).
+- **String and eval** — `eval()` with no argument ToStrings `undefined`
+  and parses it; `new String(Symbol)` throws (only the call form returns
+  `SymbolDescriptiveString`).
+- **SuppressedError** — own properties are created in the spec order
+  (message, error, suppressed).
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~134 edge-case unit tests were added across
@@ -1435,41 +1501,43 @@ against the runnable pass-rate target:
 ## Full-suite sweep (post-hardening)
 
 `test262-sweep` over all three areas in a release build (48,622 fixtures, 8
-jobs, 20s batch timeout): **0 crashes**; the only hangs are three known-slow
-TypedArray fixtures that pass with the long timeout (see below). The
-built-ins row below is re-measured each cluster with the longer config
-(`--jobs 8 --batch 32 --timeout 60 --recheck-timeout 45`); the language and
-annexB rows are from the earlier run and have not changed since.
+jobs, 20s batch timeout): **0 crashes, 0 hangs**. The built-ins row below
+is re-measured with the long config (`--jobs 8 --batch 32 --timeout 120
+--recheck-timeout 120`); the language and annexB rows are from the earlier
+run and have not changed since.
 
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
-| built-ins | 23,812 | 17,111 | 65 | 6,633 | 3¹ | 99.6% |
+| built-ins | 23,812 | 17,179 | 0 | 6,633 | 0 | 100.0% |
 | annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,622** | **33,554** | **2,671** | **12,394** | **3** | **92.6%** |
+| **Total** | **48,622** | **33,622** | **2,606** | **12,394** | **0** | **92.8%** |
 
 (Runnable = pass + fail; the 9,268 skips are module/async fixtures,
 unsupported harness includes, the host-dependent `CanBlockIsTrue` waits,
 and the out-of-scope Temporal, await-dictionary, and ShadowRealm proposal
-fixtures.) The built-ins row reflects the current `Error*`/`BigInt*`/
-RegExp/Object-descriptor hardening plus the String/prototype,
-Object/create, DisposableStack, AsyncDisposableStack,
-ArrayBuffer/SharedArrayBuffer, Date, BigInt, global-functions, Function,
+fixtures.) The built-ins row reflects every cluster closure through the
+final cleanup: the Error/BigInt/RegExp/Object-descriptor hardening,
+String/prototype, Object/create, DisposableStack, AsyncDisposableStack,
+ArrayBuffer/SharedArrayBuffer, Date, global-functions, Function,
 Iterator/prototype, Iterator statics (concat/from/zip/zipKeyed), Symbol,
 Boolean, Number, Object.prototype.toString, Object/prototype legacy
 accessors, Proxy, Reflect, Object.groupBy, Object
 freeze/seal/isFrozen/isSealed, Array iteration-method, Array.of, Math,
 Object.fromEntries, JSON.stringify, DataView, Object statics/
-constructor, Promise, and Atomics cluster closures (all 0 fail); the
-language and annexB rows are from the sweep recorded below. The 6,633
-built-ins skips are dominated by the out-of-scope Temporal proposal
-(4,611), await-dictionary (33), and ShadowRealm (55), with the
-async/module flags, host-dependent `$262.createRealm`/`CanBlockIsTrue`,
-and unsupported harness includes making up the rest.
+constructor, Promise, Atomics, and the final Array/generator, Throw-
+TypeError, WeakRef/FinalizationRegistry, Uint8Array base64/hex, Set
+set-methods, JSON/parse, TypedArray BigInt, String, and SuppressedError
+closures (all 0 fail). The 6,633 built-ins skips are dominated by the
+out-of-scope Temporal proposal (4,611), await-dictionary (33), and
+ShadowRealm (60), with the async/module flags, host-dependent
+`$262.createRealm`/`CanBlockIsTrue`, and unsupported harness includes
+making up the rest.
 
-¹ The 3 built-ins hangs are the `TypedArray/prototype/copyWithin`
-coerced-values fixtures — 10,000-element allocations that need the long
-(`--timeout 120`) config, not a bug (see the TypedArray cluster section).
+¹ The 3 built-ins hangs recorded earlier were the
+`TypedArray/prototype/copyWithin` coerced-values fixtures — 10,000-element
+allocations that pass with the long (`--timeout 120`) config, not a bug
+(see the TypedArray cluster section). The final sweep reports 0 hangs.
 
 The first sweep in a debug build reported 27 hangs and 92 crashes. Both are
 resolved:
@@ -1549,17 +1617,18 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 
 ## Open items
 
-- Certify the ≥95%-of-runnable target: the built-ins area now measures
-  **99.6%** of runnable (17,111 pass / 65 fail of 17,176, with the
-  out-of-scope Temporal, await-dictionary, and ShadowRealm fixtures and
-  the host-dependent `CanBlockIsTrue` waits skipped, `--timeout 60
-  --recheck-timeout 45`, release build), 0 crashes and 0 hangs with the
-  long timeout. The remaining gap is the systematic bug clusters triaged
-  above — fix the next cluster, then re-run the sweep and record the
-  delta. Note: the TypedArray sweep should be run with a longer deadline
-  (`--timeout 120 --recheck-timeout 90`) — the O(n²) property store makes
-  the 10,000-element crash-test fixtures take ~45s, which the default 5s
-  recheck misclassifies as hangs.
+- The built-ins area now measures **100% of runnable**: 17,179 pass / 0
+  fail / 0 crash / 0 hang of 23,812 fixtures (out-of-scope Temporal,
+  await-dictionary, and ShadowRealm fixtures and the host-dependent
+  `$262.createRealm`/`CanBlockIsTrue` waits skipped, `--timeout 120
+  --recheck-timeout 120`, release build). The remaining gap to the
+  plan's ≥95% target is the language area (2,048 fails, 88.6% of
+  runnable) and Annex B (558 fails, 44.0%): the systematic bug clusters
+  triaged above. Fix the next cluster, re-run the sweep, and record the
+  delta. Note: the TypedArray sweep should be run with the long deadline
+  (`--timeout 120 --recheck-timeout 120`) — the O(n²) property store
+  makes the 10,000-element crash-test fixtures take ~45s, which the
+  default 5s recheck misclassifies as hangs.
 - The 27 original hangs were slow builtin calls (fixed via the dispatch
   cache) plus one real `Array.prototype.splice` infinite loop (fixed); the
   remaining sweep runs cleanly. Use a release build

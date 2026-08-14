@@ -149,12 +149,16 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     realm.intrinsics.define(ASYNC_ITERATOR_PROTO, proto_value);
 
     // @@asyncIterator returns `this` (spec 27.1.4.2).
+    let function_proto = realm
+        .intrinsics
+        .get("%Function.prototype%")
+        .and_then(|v| as_object(&v));
     let async_iterator = Function::create_builtin(
         Some(JsString::from_utf8("[Symbol.asyncIterator]")),
         0,
         Box::new(|this, _| Ok(this.clone())),
         None,
-        None,
+        function_proto.clone(),
     )?;
     proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("asyncIterator").as_ref().clone()),
@@ -174,7 +178,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         0,
         Box::new(placeholder("[Symbol.asyncDispose]")),
         None,
-        None,
+        function_proto,
     )?;
     realm.intrinsics.define(
         "%AsyncIterator.prototype.@@asyncDispose%",
@@ -192,12 +196,20 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         },
     )?;
 
-    // @@toStringTag = "Async Iterator".
+    // @@toStringTag = "Async Iterator" with { writable: false, enumerable:
+    // false, configurable: true } (spec 27.1.4.3).
     proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
-        &PropertyDescriptor::none(Value::String(Handle::new(JsString::from_utf8(
-            "Async Iterator",
-        )))),
+        &PropertyDescriptor {
+            value: Some(Value::String(Handle::new(JsString::from_utf8(
+                "Async Iterator",
+            )))),
+            writable: Some(false),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
     )?;
 
     // The helper surface.

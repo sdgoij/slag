@@ -1794,8 +1794,12 @@ fn parse_method_tail(
 ) -> Result<Function, JsError> {
     let start = parser.prev.as_ref().unwrap().span.start;
     parser.expect_punct(TokenKind::LeftParen)?;
+    let saved_generator = parser.in_generator;
+    parser.in_generator = is_generator;
     let params = parse_parameter_list(parser)?;
+    parser.in_generator = saved_generator;
     check_duplicate_params(parser, &params, false)?;
+    check_generator_params_no_yield(parser, &params)?;
     // Methods have a [[HomeObject]], so `super` is available.
     let body = parse_function_body_block(parser, is_async, is_generator, &params, true, false)?;
     let end = body.span.end;
@@ -1824,8 +1828,14 @@ pub(crate) fn parse_function_expression(
         None
     };
     parser.expect_punct(TokenKind::LeftParen)?;
+    // Generator params parse with the [Yield] grammar (spec 15.2.2.1), so
+    // `yield` is reserved in them.
+    let saved_generator = parser.in_generator;
+    parser.in_generator = is_generator;
     let params = parse_parameter_list(parser)?;
+    parser.in_generator = saved_generator;
     check_duplicate_params(parser, &params, false)?;
+    check_generator_params_no_yield(parser, &params)?;
     let body = parse_function_body_block(parser, is_async, is_generator, &params, false, false)?;
     let end = body.span.end;
     Ok(Expr {
@@ -1963,6 +1973,33 @@ fn is_simple_params(params: &[BindingElement]) -> bool {
     params
         .iter()
         .all(|p| !p.rest && p.init.is_none() && matches!(p.pattern, BindingPattern::Ident(_)))
+}
+
+/// spec 15.2.2.1: a generator function's FormalParameters must not contain a
+/// YieldExpression. The params parse with the function's own [Yield] grammar
+/// (the callers set `parser.in_generator` first), so `yield` in a default
+/// initializer is a YieldExpression node to walk (instance-yield-expr-in-param).
+pub(crate) fn check_generator_params_no_yield(
+    parser: &mut Parser,
+    params: &[BindingElement],
+) -> Result<(), JsError> {
+    for p in params {
+        if let Some(init) = &p.init {
+            let mut found = false;
+            crate::early_errors::walk_exprs(init, &mut |e| {
+                if matches!(e.kind, ExprKind::Yield { .. }) {
+                    found = true;
+                }
+            });
+            if found {
+                return Err(parser.error_at(
+                    init.span.start,
+                    "Yield expression not allowed in generator parameters",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Validates a parameter list: duplicates are an error in strict mode, for

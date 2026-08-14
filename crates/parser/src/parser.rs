@@ -387,13 +387,11 @@ impl<'s> Parser<'s> {
     }
 
     /// Declares a function-declaration name: it coexists with `var`, clashes
-    /// with `let`/`const`, and may repeat only in sloppy mode.
+    /// with `let`/`const`, and may repeat (function declarations are
+    /// var-scoped in both modes, spec 16.1.2).
     pub(crate) fn declare_function(&mut self, name: AtomId, start: u32) -> Result<(), JsError> {
         let scope = self.scopes.last_mut().unwrap();
         if scope.lexical.contains(&name) && !scope.functions.contains(&name) {
-            return Err(self.error_at(start, "Identifier has already been declared"));
-        }
-        if self.strict && scope.functions.contains(&name) {
             return Err(self.error_at(start, "Identifier has already been declared"));
         }
         scope.lexical.insert(name);

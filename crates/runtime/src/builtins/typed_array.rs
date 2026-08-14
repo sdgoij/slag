@@ -1901,6 +1901,21 @@ fn validate_uint8(agent: &mut Agent, this: &Value) -> Result<Handle<TypedArraySl
     Ok(slots)
 }
 
+/// The internal-slot and element-type check without the detachment test:
+/// toBase64/setFromBase64 must run their option getters before the spec's
+/// later detached-buffer throw (toBase64/detached-buffer.js asserts the
+/// getter runs exactly once even on a pre-detached receiver).
+fn validate_uint8_slot(value: &Value) -> Result<Handle<TypedArraySlots>, JsError> {
+    let slots = typed_array_slots_required(value)?;
+    if slots.element_type != ElementType::Uint8 {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Method is only defined on Uint8Array".into(),
+        ));
+    }
+    Ok(slots)
+}
+
 /// spec 25.2.3.44 Uint8Array.prototype.toHex.
 fn to_hex(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     let slots = validate_uint8(agent, this)?;
@@ -1915,11 +1930,19 @@ fn to_hex(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsE
 
 /// spec 25.2.3.45 Uint8Array.prototype.toBase64.
 fn to_base64(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let slots = validate_uint8(agent, this)?;
+    let slots = validate_uint8_slot(this)?;
     let options = get_options_object(agent, args.first())?;
     let alphabet = base64_alphabet_option(agent, &options)?;
     let padding = get(agent, &options, &JsString::from_utf8("omitPadding"))?;
     let omit_padding = to_boolean(&padding);
+    // spec step 5: the detached check follows the option reads (a getter can
+    // detach the buffer; a pre-detached buffer still runs the getters).
+    if slots.buffer.is_detached() {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "TypedArray buffer is detached".into(),
+        ));
+    }
     let start = slots.byte_offset;
     let bytes = slots.buffer.read(start, slots.byte_length)?;
     let mut out = String::new();
@@ -2305,6 +2328,20 @@ fn decode_base64(
 /// SetUint8ArrayBytes (spec 25.2.4.2): copy the decoded bytes into the
 /// view's buffer range. `bytes.len()` never exceeds the array length.
 fn write_uint8_bytes(slots: &TypedArraySlots, bytes: &[u8]) -> Result<(), JsError> {
+    // SetValueInBuffer semantics: a buffer detached (possibly by an options
+    // getter) or made immutable before the write throws a TypeError.
+    if slots.buffer.is_detached() {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "TypedArray buffer is detached".into(),
+        ));
+    }
+    if slots.buffer.is_immutable() {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "TypedArray buffer is immutable".into(),
+        ));
+    }
     if bytes.len() > typed_array_effective_length(slots) {
         return Err(JsError::new(
             ErrorKind::RangeError,
@@ -2373,6 +2410,14 @@ fn from_base64(agent: &mut Agent, _this: &Value, args: &[Value]) -> Result<Value
 /// throw if the input was invalid (writes survive the error).
 fn set_from_hex(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let slots = validate_uint8(agent, this)?;
+    // spec 25.2.4.6: a write-mode target backed by an immutable buffer throws
+    // before any decoding (immutable-arraybuffer fixtures).
+    if slots.buffer.is_immutable() {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "TypedArray buffer is immutable".into(),
+        ));
+    }
     let hex = string_arg(args)?;
     let result = decode_hex(hex.as_slice(), typed_array_effective_length(&slots));
     let written = result.bytes.len();
@@ -2384,10 +2429,20 @@ fn set_from_hex(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     written_read_result(agent, written, read)
 }
 
-/// SetUint8ArrayFromBase64 (spec 25.2.4.8): decode into the target (up to
+/// spec 25.2.4.8 SetUint8ArrayFromBase64: decode into the target (up to
 /// its length), then throw if the input was invalid.
 fn set_from_base64(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let slots = validate_uint8(agent, this)?;
+    let slots = validate_uint8_slot(this)?;
+    // spec 25.2.4.8: write-mode ValidateTypedArray rejects an immutable
+    // backing buffer before any argument is read (the immutable fixture
+    // asserts the option getters never run); the detached check comes later,
+    // after the getters, per the spec's step ordering.
+    if slots.buffer.is_immutable() {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "TypedArray buffer is immutable".into(),
+        ));
+    }
     let source = string_arg(args)?;
     let options = get_options_object(agent, args.get(1))?;
     let alphabet = base64_alphabet_option(agent, &options)?;
@@ -3103,9 +3158,12 @@ mod tests {
         );
         // A BigInt cannot coerce to a Number element; an integral Number does
         // coerce to a BigInt element, while a fractional one throws a
-        // RangeError (spec 7.1.16 NumberToBigInt).
+        // ToBigInt rejects Numbers (spec 7.1.17), in the constructor's
+        // element lists too (ctors-bigint/object-arg/number-tobigint); a
+        // BigInt cannot coerce to a Number element either.
         assert!(run("new Int8Array([1n])").is_err());
-        assert_eq!(text("new BigInt64Array([1]).join(',')"), "1");
+        assert!(run("new BigInt64Array([1])").is_err());
+        assert_eq!(text("new BigInt64Array([1n, 2n]).join(',')"), "1,2");
         assert!(run("new BigInt64Array([1.5])").is_err());
     }
 

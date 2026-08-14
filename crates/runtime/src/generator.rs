@@ -369,7 +369,18 @@ fn generator_resume_abrupt(
             ErrorKind::TypeError,
             "Generator is already running".into(),
         )),
-        GeneratorFlag::Completed => iterator_result(agent, Value::Undefined, true),
+        // spec 27.4.3.3/27.4.3.4 step: a completed generator propagates the
+        // abrupt completion (throw throws; return yields its value and stays
+        // done).
+        GeneratorFlag::Completed => match completion {
+            Resume::Return(value) => iterator_result(agent, value, true),
+            Resume::Throw(value) => Err(JsError::new(
+                ErrorKind::TypeError,
+                "Uncaught generator throw".into(),
+            )
+            .with_value(value)),
+            Resume::Normal(_) => unreachable!("abrupt resume"),
+        },
         GeneratorFlag::SuspendedStart => {
             // The body never ran: complete immediately with the abrupt
             // completion (spec 27.4.3.4 step 5).
@@ -538,8 +549,15 @@ fn finish_resume(
 }
 
 /// The iterator-result object `{ value, done }` (spec 27.4.3.2 step 11).
-fn iterator_result(_agent: &mut Agent, value: Value, done: bool) -> Result<Value, JsError> {
-    let object = JsObject::ordinary_object_create(None);
+fn iterator_result(agent: &mut Agent, value: Value, done: bool) -> Result<Value, JsError> {
+    // CreateIterResultObject (spec 7.3.17): an object inheriting
+    // %Object.prototype% (result-prototype.js).
+    let proto = agent
+        .current_realm()?
+        .intrinsics
+        .get("%Object.prototype%")
+        .and_then(|v| crate::context::as_object(&v));
+    let object = JsObject::ordinary_object_create(proto);
     object.create_data_property(&JsString::from_utf8("value"), value)?;
     object.create_data_property(&JsString::from_utf8("done"), Value::Boolean(done))?;
     Ok(Value::Object(object))

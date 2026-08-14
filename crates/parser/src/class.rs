@@ -418,8 +418,12 @@ fn parse_class_method_tail_with(
 ) -> Result<Function, JsError> {
     let start = parser.prev.as_ref().unwrap().span.start;
     parser.expect_punct(TokenKind::LeftParen)?;
+    let saved_generator = parser.in_generator;
+    parser.in_generator = is_generator;
     let params = parse_parameter_list(parser)?;
+    parser.in_generator = saved_generator;
     check_duplicate_params(parser, &params, false)?;
+    crate::expr::check_generator_params_no_yield(parser, &params)?;
     let body = parse_function_body_block(
         parser,
         is_async,

@@ -688,9 +688,12 @@ mod tests {
         err("label: { continue label; }");
         ok("label: for (;;) { continue label; }");
         err("for (;;) { continue missing; }");
-        // Duplicate function declarations are strict-mode errors.
+        // Duplicate function declarations are allowed in both modes (they
+        // are var-scoped, spec 16.1.2); a lexical redeclaration still errors.
         ok("function f() {} function f() {}");
-        err("'use strict'; function f() {} function f() {}");
+        ok("'use strict'; function f() {} function f() {}");
+        err("let f; function f() {}");
+        err("function f() {} let f;");
         // for-in/of restrictions.
         // Annex B.2.6 allows `for (var x = 0 in obj)` in sloppy code.
         ok("for (var x = 0 in obj) {}");

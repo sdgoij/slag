@@ -693,14 +693,19 @@ pub fn dispatch_call(
             })?;
             let key = crate::context::to_property_key(agent, arg(args, 1))?;
             let mut desc = crux::property::to_property_descriptor(arg(args, 2))?;
-            // ArraySetLength coerces an object [[Value]] through the agent
-            // (spec 10.4.2.4 steps 3-4); crux cannot invoke user toString.
+            // ArraySetLength coerces an object [[Value]] twice (ToUint32 and
+            // ToNumber, spec 10.4.2.4 steps 3-4) before the descriptor
+            // validation; crux cannot invoke user valueOf, so both coercions
+            // run here through the agent (their side effects are observable,
+            // define-own-prop-length-coercion-order.js).
             if matches!(obj.kind, crux::object::ObjectKind::Array)
                 && key == PropertyKey::from_utf8("length")
                 && let Some(value) = &desc.value
                 && matches!(value, Value::Object(_) | Value::Function(_))
             {
-                desc.value = Some(Value::Number(crate::context::to_number(agent, value)?));
+                let number = crate::context::to_number(agent, value)?;
+                let _ = crate::context::to_number(agent, value)?;
+                desc.value = Some(Value::Number(number));
             }
             if !obj.define_property_key(&key, &desc)? {
                 return Err(JsError::new(

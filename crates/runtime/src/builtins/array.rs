@@ -94,8 +94,6 @@ fn key(index: u64) -> JsString {
     JsString::from_utf8(&index.to_string())
 }
 
-/// IsArray (spec 7.2.2): an Array exotic object. Proxy targets join in
-/// Phase 16.
 /// IsArray (spec 7.2.2): Array exotics and proxies whose target is an
 /// array (recursively).
 pub fn is_array(value: &Value) -> bool {
@@ -112,6 +110,28 @@ pub fn is_array(value: &Value) -> bool {
         },
         Value::Function(function) => matches!(function.object.kind, ObjectKind::Array),
         _ => false,
+    }
+}
+
+/// IsArray (spec 7.2.2) that reports a revoked proxy as a TypeError (step
+/// 3.a) instead of false.
+pub fn is_array_or_throw(value: &Value) -> Result<bool, JsError> {
+    match value {
+        Value::Object(obj) => match &obj.kind {
+            ObjectKind::Array => Ok(true),
+            ObjectKind::Proxy(slots) => {
+                let Some(target) = slots.target.borrow().as_ref().cloned() else {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "Cannot perform operation on a revoked Proxy".into(),
+                    ));
+                };
+                is_array_or_throw(&target)
+            }
+            _ => Ok(false),
+        },
+        Value::Function(function) => Ok(matches!(function.object.kind, ObjectKind::Array)),
+        _ => Ok(false),
     }
 }
 
@@ -338,7 +358,12 @@ fn array_call(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
 
 /// spec 23.1.2.2 Array.isArray.
 fn array_is_array(_agent: &mut Agent, _this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    Ok(Value::Boolean(args.first().map(is_array).unwrap_or(false)))
+    let result = args
+        .first()
+        .map(is_array_or_throw)
+        .transpose()?
+        .unwrap_or(false);
+    Ok(Value::Boolean(result))
 }
 
 /// spec 23.1.2.3 Array.of.
@@ -515,7 +540,7 @@ fn is_concat_spreadable(agent: &mut Agent, value: &Value) -> Result<bool, JsErro
     if !matches!(spreadable, Value::Undefined) {
         return Ok(to_boolean(&spreadable));
     }
-    Ok(is_array(value))
+    is_array_or_throw(value)
 }
 
 /// spec 23.1.3.2 Array.prototype.concat.
@@ -1056,7 +1081,13 @@ fn last_index_of(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Valu
     let mut k = if n >= 0.0 {
         (n as u64).min(length - 1)
     } else {
-        (length as i64).saturating_add(n as i64).max(0) as u64
+        // spec step 8: a negative fromIndex is added to the length; a
+        // still-negative result means "not found" (15.4.4.15-5-13.js).
+        let kf = length as f64 + n;
+        if kf < 0.0 {
+            return Ok(Value::Number(-1.0));
+        }
+        kf as u64
     };
     loop {
         if has_property(&object, &key(k))? {
@@ -1130,6 +1161,14 @@ fn push(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     require_object_coercible(this)?;
     let object = crate::context::to_object(agent, this)?;
     let mut length = length_of_array_like(agent, &object)?;
+    // spec 23.1.3.22 step 5: len + argCount > 2^53-1 throws before any
+    // write (throws-if-integer-limit-exceeded.js).
+    if length.saturating_add(args.len() as u64) > 9007199254740991 {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Array length exceeds 2^53-1".into(),
+        ));
+    }
     for item in args {
         set_property(&object, &key(length), item.clone())?;
         length += 1;
@@ -1250,20 +1289,29 @@ fn reverse(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, Js
         let upper = length - 1 - lower;
         let lower_name = key(lower);
         let upper_name = key(upper);
+        // spec steps 7.d-7.i: the lower value is read before HasProperty of
+        // the upper index, so a getter that mutates the array (e.g. its
+        // length) is observed (get_if_present_with_delete.js).
         let lower_exists = has_property(&object, &lower_name)?;
+        let lower_value = if lower_exists {
+            Some(get(agent, &object, &lower_name)?)
+        } else {
+            None
+        };
         let upper_exists = has_property(&object, &upper_name)?;
+        let upper_value = if upper_exists {
+            Some(get(agent, &object, &upper_name)?)
+        } else {
+            None
+        };
         if lower_exists && upper_exists {
-            let lower_value = get(agent, &object, &lower_name)?;
-            let upper_value = get(agent, &object, &upper_name)?;
-            set_property(&object, &lower_name, upper_value)?;
-            set_property(&object, &upper_name, lower_value)?;
-        } else if lower_exists && !upper_exists {
-            let lower_value = get(agent, &object, &lower_name)?;
-            set_property(&object, &upper_name, lower_value)?;
+            set_property(&object, &lower_name, upper_value.unwrap())?;
+            set_property(&object, &upper_name, lower_value.unwrap())?;
+        } else if lower_exists {
+            set_property(&object, &upper_name, lower_value.unwrap())?;
             delete_property_or_throw(&object, &lower_name)?;
-        } else if !lower_exists && upper_exists {
-            let upper_value = get(agent, &object, &upper_name)?;
-            set_property(&object, &lower_name, upper_value)?;
+        } else if upper_exists {
+            set_property(&object, &lower_name, upper_value.unwrap())?;
             delete_property_or_throw(&object, &upper_name)?;
         }
         lower += 1;
@@ -1410,11 +1458,18 @@ fn sort_indexed_properties(
         }
     }
     let mut error: Option<JsError> = None;
-    items.sort_by(|a, b| match sort_compare(agent, comparefn, a, b) {
-        Ok(v) => v.partial_cmp(&0.0).unwrap_or(std::cmp::Ordering::Equal),
-        Err(e) => {
-            error = Some(e);
-            std::cmp::Ordering::Equal
+    items.sort_by(|a, b| {
+        // comparefn-stop-after-error.js: no further calls once a comparison
+        // returned an abrupt completion.
+        if error.is_some() {
+            return std::cmp::Ordering::Equal;
+        }
+        match sort_compare(agent, comparefn, a, b) {
+            Ok(v) => v.partial_cmp(&0.0).unwrap_or(std::cmp::Ordering::Equal),
+            Err(e) => {
+                error = Some(e);
+                std::cmp::Ordering::Equal
+            }
         }
     });
     if let Some(e) = error {
@@ -1459,7 +1514,11 @@ fn splice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
         (relative_start as u64).min(length)
     };
     let item_count = args.len().saturating_sub(2) as u64;
-    let actual_delete_count = if args.len() < 2 {
+    let actual_delete_count = if args.is_empty() {
+        // spec step 5: no arguments deletes nothing (clamps-length-to-
+        // integer-limit.js).
+        0
+    } else if args.len() < 2 {
         length - actual_start
     } else {
         let delete_count = to_integer_or_infinity(to_number(&args[1])?);
@@ -1548,7 +1607,10 @@ fn to_locale_string(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<
         }
         let boxed = crate::context::to_object(agent, &element)?;
         let method = get(agent, &boxed, &JsString::from_utf8("toLocaleString"))?;
-        let text = crate::function::call(agent, &method, boxed, &[])?;
+        // spec steps 10-12: the method is invoked with the *element* as the
+        // receiver (not the box), so a primitives' overridden toString sees
+        // the primitive (primitive_this_value.js).
+        let text = crate::function::call(agent, &method, element, &[])?;
         result.push_str(&crate::context::to_string(agent, &text)?.to_string_lossy());
     }
     Ok(Value::String(Handle::new(JsString::from_utf8(&result))))
@@ -1559,7 +1621,8 @@ fn to_reversed(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value
     require_object_coercible(this)?;
     let object = crate::context::to_object(agent, this)?;
     let length = length_of_array_like(agent, &object)?;
-    let array = array_species_create(agent, &object, length as f64)?;
+    // spec step 3: ArrayCreate — @@species is ignored (ignores-species.js).
+    let array = array_create(agent, length as f64)?;
     for k in 0..length {
         let from_name = key(length - 1 - k);
         let value = get(agent, &object, &from_name)?;
@@ -1580,7 +1643,8 @@ fn to_sorted(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, J
         ));
     }
     let length = length_of_array_like(agent, &object)?;
-    let array = array_species_create(agent, &object, length as f64)?;
+    // spec step 6: ArrayCreate — @@species is ignored (ignores-species.js).
+    let array = array_create(agent, length as f64)?;
     for k in 0..length {
         let value = get(agent, &object, &key(k))?;
         array.create_data_property_or_throw(&key(k), value)?;
@@ -1604,14 +1668,28 @@ fn to_spliced(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
         (relative_start as u64).min(length)
     };
     let insert_count = args.len().saturating_sub(2) as u64;
-    let actual_delete_count = if args.len() < 2 {
+    // spec steps 8-9: no arguments delete nothing; a missing deleteCount
+    // (start only) deletes the tail — unlike splice's no-arg case.
+    let actual_delete_count = if args.is_empty() {
+        0
+    } else if args.len() < 2 {
         length - actual_start
     } else {
         let delete_count = to_integer_or_infinity(to_number(&args[1])?);
         (delete_count.max(0.0) as u64).min(length - actual_start)
     };
     let new_length = length - actual_delete_count + insert_count;
-    let array = array_species_create(agent, &object, new_length as f64)?;
+    // spec step 12: the new length must not exceed 2^53-1 (TypeError), and
+    // ArrayCreate rejects lengths over 2^32-1 with a RangeError
+    // (length-exceeding-array-length-limit.js).
+    if new_length > 9007199254740991 {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Array length exceeds 2^53-1".into(),
+        ));
+    }
+    // spec step 13: ArrayCreate — @@species is ignored (ignores-species.js).
+    let array = array_create(agent, new_length as f64)?;
     // spec steps 11-14: copy the prefix, insert the items, copy the suffix.
     let mut i = 0u64;
     while i < actual_start {
@@ -1715,7 +1793,8 @@ fn with(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         ));
     }
     let value = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let array = array_species_create(agent, &object, length as f64)?;
+    // spec step 8: ArrayCreate — @@species is ignored (ignores-species.js).
+    let array = array_create(agent, length as f64)?;
     for i in 0..length {
         let name = key(i);
         let new_value = if i == actual_index {
@@ -1757,6 +1836,17 @@ fn array_iterator_next(agent: &mut Agent, this: &Value, _args: &[Value]) -> Resu
     };
     if matches!(array, Value::Undefined) {
         return iter_result(agent, Value::Undefined, true);
+    }
+    // spec %ArrayIteratorPrototype%.next step 8: a TypedArray whose buffer
+    // was detached mid-iteration throws (detach-typedarray-in-progress.js).
+    if let Value::Object(iter_obj) = &array
+        && let crux::object::ObjectKind::IntegerIndexed(slots) = &iter_obj.kind
+        && slots.buffer.is_detached()
+    {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "TypedArray buffer is detached".into(),
+        ));
     }
     let length = length_of_array_like(agent, &array)?;
     let next_index = index as u64;
@@ -2429,7 +2519,6 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         "toSorted",
         "toSpliced",
         "values",
-        "with",
     ] {
         unscopables.create_data_property(&JsString::from_utf8(name), Value::Boolean(true))?;
     }

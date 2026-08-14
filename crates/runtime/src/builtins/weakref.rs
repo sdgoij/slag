@@ -30,12 +30,14 @@ const FR_REGISTER: &str = "%FinalizationRegistry.prototype.register%";
 const FR_UNREGISTER: &str = "%FinalizationRegistry.prototype.unregister%";
 
 /// One FinalizationRegistry cell (spec 26.2.1.2): the weakly-held target's
-/// identity, the held value, and the optional unregister token's identity.
+/// identity, the held value, and the optional unregister token. Targets and
+/// tokens are objects, functions, or symbols (symbols-as-weakmap-keys), so
+/// they are stored by value and compared with SameValue.
 #[derive(Debug, Clone)]
 pub struct FrCell {
-    pub target_id: u64,
+    pub target: Value,
     pub held_value: Value,
-    pub unregister_token: Option<u64>,
+    pub unregister_token: Option<Value>,
 }
 
 /// [[Cells]] and [[CleanupCallback]] of a FinalizationRegistry instance.
@@ -54,20 +56,17 @@ fn placeholder(name: &'static str) -> NativeFn {
     })
 }
 
-/// The object handle of a target, or an error for non-weakly-holdable values.
-fn weakly_holdable(value: &Value) -> Result<Handle<JsObject>, JsError> {
-    match value {
-        Value::Object(obj) => Ok(obj.clone()),
-        Value::Function(function) => function.object.handle().ok_or_else(|| {
-            JsError::new(
-                ErrorKind::TypeError,
-                "cannot hold a function without an object part".into(),
-            )
-        }),
-        _ => Err(JsError::new(
+/// Validates a weakly-holdable value: an object, a function, or a symbol
+/// without a global-registry entry (spec 26.1.1 with symbols-as-weakmap-keys;
+/// `Symbol.for` symbols lack language identity and are rejected).
+fn weakly_holdable(agent: &Agent, value: &Value) -> Result<(), JsError> {
+    if crate::builtins::keyed::can_be_held_weakly(agent, value) {
+        Ok(())
+    } else {
+        Err(JsError::new(
             ErrorKind::TypeError,
-            "WeakRef and FinalizationRegistry targets must be objects".into(),
-        )),
+            "WeakRef and FinalizationRegistry targets must be objects or symbols".into(),
+        ))
     }
 }
 
@@ -141,7 +140,14 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     weak_ref_proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
-        &PropertyDescriptor::none(Value::String(Handle::new(JsString::from_utf8("WeakRef")))),
+        &PropertyDescriptor {
+            value: Some(Value::String(Handle::new(JsString::from_utf8("WeakRef")))),
+            writable: Some(false),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
     )?;
 
     // %FinalizationRegistry% (26.2.1) and %FinalizationRegistry.prototype%
@@ -185,7 +191,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         },
     )?;
     for (name, length, key) in [
-        ("register", 3, FR_REGISTER),
+        ("register", 2, FR_REGISTER),
         ("unregister", 1, FR_UNREGISTER),
     ] {
         let method = Function::create_builtin(
@@ -212,9 +218,16 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     }
     fr_proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
-        &PropertyDescriptor::none(Value::String(Handle::new(JsString::from_utf8(
-            "FinalizationRegistry",
-        )))),
+        &PropertyDescriptor {
+            value: Some(Value::String(Handle::new(JsString::from_utf8(
+                "FinalizationRegistry",
+            )))),
+            writable: Some(false),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
     )?;
 
     for (name, value) in [
@@ -237,19 +250,31 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
 }
 
 /// GetPrototypeFromConstructor (spec 10.1.14): `newTarget.prototype`.
-fn instance_proto(agent: &mut Agent, new_target: &Value) -> Result<Handle<JsObject>, JsError> {
+fn instance_proto(
+    agent: &mut Agent,
+    new_target: &Value,
+    intrinsic: &str,
+) -> Result<Handle<JsObject>, JsError> {
+    // GetPrototypeFromConstructor (spec 10.2.4): newTarget.prototype when it
+    // is an object, else the realm's intrinsic (newtarget-prototype-is-not-
+    // object.js passes undefined/null/primitives as the prototype).
     let proto = crate::context::get_property(
         agent,
         new_target,
         &JsString::from_utf8("prototype"),
         new_target.clone(),
     )?;
-    as_object(&proto).ok_or_else(|| {
-        JsError::new(
-            ErrorKind::TypeError,
-            "Prototype must be an object or null".into(),
-        )
-    })
+    match as_object(&proto) {
+        Some(object) => Ok(object),
+        None => agent
+            .current_realm()?
+            .intrinsics
+            .get(intrinsic)
+            .and_then(|value| as_object(&value))
+            .ok_or_else(|| {
+                JsError::new(ErrorKind::TypeError, format!("{intrinsic} is not defined"))
+            }),
+    }
 }
 
 pub fn dispatch_call(
@@ -271,17 +296,23 @@ pub fn dispatch_call(
     }
     if intrinsics.get(WEAK_REF_DEREF).as_ref() == Some(callee) {
         return Some((|| {
+            // spec 26.1.3.2: a TypeError unless `this` has a [[Target]] slot.
             let Value::Object(obj) = this else {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
                     "WeakRef.prototype.deref requires a WeakRef".into(),
                 ));
             };
-            Ok(agent
+            agent
                 .weak_ref_targets
                 .get(&obj.id())
                 .cloned()
-                .unwrap_or(Value::Undefined))
+                .ok_or_else(|| {
+                    JsError::new(
+                        ErrorKind::TypeError,
+                        "WeakRef.prototype.deref requires a WeakRef".into(),
+                    )
+                })
         })());
     }
     if intrinsics.get(FR_REGISTER).as_ref() == Some(callee) {
@@ -304,8 +335,8 @@ pub fn dispatch_construct(
     if intrinsics.get(WEAK_REF).as_ref() == Some(callee) {
         return Some((|| {
             let target = args.first().cloned().unwrap_or(Value::Undefined);
-            weakly_holdable(&target)?;
-            let proto = instance_proto(agent, new_target)?;
+            weakly_holdable(agent, &target)?;
+            let proto = instance_proto(agent, new_target, WEAK_REF_PROTO)?;
             let object = JsObject::ordinary_object_create(Some(proto));
             agent.weak_ref_targets.insert(object.id(), target);
             Ok(Value::Object(object))
@@ -320,7 +351,7 @@ pub fn dispatch_construct(
                     "FinalizationRegistry requires a callable callback".into(),
                 ));
             }
-            let proto = instance_proto(agent, new_target)?;
+            let proto = instance_proto(agent, new_target, FINALIZATION_REGISTRY_PROTO)?;
             let object = JsObject::ordinary_object_create(Some(proto));
             agent.finalization_registries.insert(
                 object.id(),
@@ -354,7 +385,7 @@ fn finalization_register(
         ));
     };
     let target = args.first().cloned().unwrap_or(Value::Undefined);
-    let target_id = weakly_holdable(&target)?.id();
+    weakly_holdable(agent, &target)?;
     let held_value = args.get(1).cloned().unwrap_or(Value::Undefined);
     if same_value(&target, &held_value) {
         return Err(JsError::new(
@@ -363,14 +394,17 @@ fn finalization_register(
         ));
     }
     let token = args.get(2).cloned().unwrap_or(Value::Undefined);
-    let token_id = match token {
+    let token = match token {
         Value::Undefined => None,
-        _ => Some(weakly_holdable(&token)?.id()),
+        _ => {
+            weakly_holdable(agent, &token)?;
+            Some(token)
+        }
     };
     data.borrow_mut().cells.push(FrCell {
-        target_id,
+        target,
         held_value,
-        unregister_token: token_id,
+        unregister_token: token,
     });
     Ok(Value::Undefined)
 }
@@ -394,11 +428,15 @@ fn finalization_unregister(
         ));
     };
     let token = args.first().cloned().unwrap_or(Value::Undefined);
-    let token_id = weakly_holdable(&token)?.id();
+    weakly_holdable(agent, &token)?;
     let mut data = data.borrow_mut();
     let before = data.cells.len();
-    data.cells
-        .retain(|cell| cell.unregister_token != Some(token_id));
+    data.cells.retain(|cell| {
+        !cell
+            .unregister_token
+            .as_ref()
+            .is_some_and(|held| same_value(held, &token))
+    });
     Ok(Value::Boolean(data.cells.len() != before))
 }
 
@@ -493,7 +531,7 @@ mod tests {
         );
         assert_eq!(
             run("FinalizationRegistry.prototype.register.length").unwrap(),
-            Value::Number(3.0)
+            Value::Number(2.0)
         );
         assert_eq!(
             run("Object.prototype.toString.call(new WeakRef({}))").unwrap(),

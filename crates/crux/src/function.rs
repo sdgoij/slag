@@ -477,8 +477,9 @@ fn not_constructible(callee: &Value) -> JsError {
 
 /// %ThrowTypeError% (spec 10.2.2): the anonymous built-in that always throws,
 /// with non-extensible [[Extensible]] and fully restricted `length`/`name`.
-/// Created once per realm by the runtime; the intrinsic table owns it.
-pub fn throw_type_error() -> Result<Handle<Function>, JsError> {
+/// Created once per realm by the runtime; the intrinsic table owns it. The
+/// `prototype` is %Function.prototype% (spec 8.2.2 steps 6-11).
+pub fn throw_type_error(proto: Option<Handle<JsObject>>) -> Result<Handle<Function>, JsError> {
     let function = Function::create_builtin(
         Some(JsString::from_utf8("")),
         0,
@@ -489,7 +490,7 @@ pub fn throw_type_error() -> Result<Handle<Function>, JsError> {
             ))
         }),
         None,
-        None,
+        proto,
     )?;
     // Restricted attributes: length and name are non-configurable.
     let restricted = PropertyDescriptor {
@@ -662,7 +663,7 @@ mod tests {
 
     #[test]
     fn throw_type_error_always_throws_and_is_restricted() {
-        let thrower = throw_type_error().unwrap();
+        let thrower = throw_type_error(None).unwrap();
         assert!(call(&Value::Function(thrower.clone()), Value::Undefined, &[]).is_err());
         assert!(!thrower.object.is_extensible().unwrap());
         for key in ["length", "name"] {

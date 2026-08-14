@@ -130,7 +130,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             proto.define_property(
                 &JsString::from_utf8("prototype"),
                 &PropertyDescriptor {
-                    value: Some(instance_proto),
+                    value: Some(instance_proto.clone()),
                     writable: Some(false),
                     get: None,
                     set: None,
@@ -138,6 +138,23 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
                     configurable: Some(true),
                 },
             )?;
+            // spec 27.4.3.1/27.6.3.1: %Generator.prototype%.constructor is
+            // the GeneratorFunction prototype object (the "Generator" in
+            // `Object.getPrototypeOf(g)`), so `G.prototype.constructor === G`
+            // (GeneratorPrototype/constructor.js).
+            if let Value::Object(instance_obj) = &instance_proto {
+                instance_obj.define_property(
+                    &JsString::from_utf8("constructor"),
+                    &PropertyDescriptor {
+                        value: Some(proto_value.clone()),
+                        writable: Some(false),
+                        get: None,
+                        set: None,
+                        enumerable: Some(false),
+                        configurable: Some(true),
+                    },
+                )?;
+            }
         }
 
         // `constructor` back-reference (spec 27.4.3.1/27.5.3.1/27.6.3.1).
