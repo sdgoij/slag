@@ -385,7 +385,7 @@ fn to_index_agent(agent: &mut Agent, value: &Value) -> Result<u64, JsError> {
     }
     let number = crate::context::to_number(agent, value)?;
     let integer = to_integer_or_infinity(number);
-    if integer < 0.0 || integer >= 9007199254740991.0 {
+    if !(0.0..9007199254740991.0).contains(&integer) {
         return Err(JsError::new(
             ErrorKind::RangeError,
             "Index out of range".into(),

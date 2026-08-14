@@ -507,7 +507,7 @@ mod tests {
         let agent = Agent::new();
         assert!(!agent.can_block);
         assert!(!agent.agent_can_suspend());
-        assert!(agent.little_endian || !agent.little_endian); // host-dependent
+        assert_eq!(agent.little_endian, cfg!(target_endian = "little"));
         assert_eq!(agent.is_lock_free.len(), 3);
     }
 

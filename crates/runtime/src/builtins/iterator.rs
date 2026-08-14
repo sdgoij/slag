@@ -1916,8 +1916,8 @@ fn get_iterator_flattenable(
     value: &Value,
     accept_strings: bool,
 ) -> Result<(IteratorRecord, bool), JsError> {
-    if !matches!(value, Value::Object(_) | Value::Function(_))
-        && !(accept_strings && matches!(value, Value::String(_)))
+    if !(matches!(value, Value::Object(_) | Value::Function(_))
+        || accept_strings && matches!(value, Value::String(_)))
     {
         return Err(JsError::new(
             ErrorKind::TypeError,

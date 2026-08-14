@@ -133,7 +133,7 @@ fn to_string_method(agent: &Agent, this: &Value, args: &[Value]) -> Result<Value
     } else {
         to_integer_or_infinity(to_number(&radix)?)
     };
-    if radix_value < 2.0 || radix_value > 36.0 {
+    if !(2.0..=36.0).contains(&radix_value) {
         return Err(JsError::new(
             ErrorKind::RangeError,
             "toString() radix argument must be between 2 and 36".into(),

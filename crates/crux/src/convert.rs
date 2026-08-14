@@ -648,7 +648,7 @@ pub fn to_index(value: &Value) -> Result<u64, JsError> {
     }
     let number = to_number(value)?;
     let integer = to_integer_or_infinity(number);
-    if integer < 0.0 || integer >= 9007199254740991.0 {
+    if !(0.0..9007199254740991.0).contains(&integer) {
         return Err(JsError::new(
             ErrorKind::RangeError,
             "Index out of range".into(),

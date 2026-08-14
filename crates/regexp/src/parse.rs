@@ -1106,7 +1106,7 @@ impl<'a> Parser<'a> {
             }
             first = false;
             let atom = self.parse_class_atom()?;
-            if self.peek() == Some(0x2D) && !self.peek_at(1).is_none_or(|a| a == 0x5D) {
+            if self.peek() == Some(0x2D) && self.peek_at(1).is_some_and(|a| a != 0x5D) {
                 self.next();
                 let end = self.parse_class_atom()?;
                 match (&atom, &end) {

@@ -139,7 +139,7 @@ fn to_fixed(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
     } else {
         to_integer_or_infinity(crate::context::to_number(agent, &fraction)?)
     };
-    if !fraction_count.is_finite() || fraction_count < 0.0 || fraction_count > 100.0 {
+    if !fraction_count.is_finite() || !(0.0..=100.0).contains(&fraction_count) {
         return Err(JsError::new(
             ErrorKind::RangeError,
             "toFixed() digits argument must be between 0 and 100".into(),
@@ -211,7 +211,7 @@ fn to_exponential(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
     if !number.is_finite() {
         return Ok(number_to_string(number));
     }
-    if fraction_count < 0.0 || fraction_count > 100.0 {
+    if !(0.0..=100.0).contains(&fraction_count) {
         return Err(JsError::new(
             ErrorKind::RangeError,
             "toExponential() digits argument must be between 0 and 100".into(),
@@ -253,7 +253,7 @@ fn to_precision(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     if !number.is_finite() {
         return Ok(number_to_string(number));
     }
-    if precision_count < 1.0 || precision_count > 100.0 {
+    if !(1.0..=100.0).contains(&precision_count) {
         return Err(JsError::new(
             ErrorKind::RangeError,
             "toPrecision() precision argument must be between 1 and 100".into(),
@@ -313,7 +313,7 @@ fn to_string_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
     } else {
         to_integer_or_infinity(crate::context::to_number(agent, &radix)?)
     };
-    if radix_value < 2.0 || radix_value > 36.0 {
+    if !(2.0..=36.0).contains(&radix_value) {
         return Err(JsError::new(
             ErrorKind::RangeError,
             "toString() radix argument must be between 2 and 36".into(),

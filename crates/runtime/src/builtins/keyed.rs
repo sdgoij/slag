@@ -577,7 +577,7 @@ fn set_add(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsE
     let object = set_of(agent, this)?;
     let value = canonicalize_key(args.first().cloned().unwrap_or(Value::Undefined));
     let mut data = agent.set_data.get(&object.id()).unwrap().borrow_mut();
-    if !find_set_index(&data, &value).is_some() {
+    if find_set_index(&data, &value).is_none() {
         data.push(Some(value));
     }
     Ok(this.clone())
@@ -856,7 +856,7 @@ fn set_union(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, J
             None => break,
         };
         let value = canonicalize_key(next);
-        if !find_set_index(&result, &value).is_some() {
+        if find_set_index(&result, &value).is_none() {
             result.push(Some(value));
         }
     }
@@ -880,7 +880,7 @@ fn set_intersection(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
                 record.object.clone(),
                 std::slice::from_ref(value),
             )?);
-            if in_other && !find_set_index(&result, value).is_some() {
+            if in_other && find_set_index(&result, value).is_none() {
                 result.push(Some(value.clone()));
             }
         }
@@ -892,7 +892,7 @@ fn set_intersection(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
                 None => break,
             };
             let value = canonicalize_key(next);
-            if find_set_index(&data, &value).is_some() && !find_set_index(&result, &value).is_some()
+            if find_set_index(&data, &value).is_some() && find_set_index(&result, &value).is_none()
             {
                 result.push(Some(value));
             }
@@ -1024,7 +1024,7 @@ fn set_is_superset_of(agent: &mut Agent, this: &Value, args: &[Value]) -> Result
             Some(value) => value,
             None => break,
         };
-        if !find_set_index(&data, &canonicalize_key(next)).is_some() {
+        if find_set_index(&data, &canonicalize_key(next)).is_none() {
             crate::expr::iterator_close(agent, &keys)?;
             return Ok(Value::Boolean(false));
         }
@@ -1222,7 +1222,7 @@ fn weak_set_add(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
         ));
     }
     let mut data = agent.weak_set_data.get(&object.id()).unwrap().borrow_mut();
-    if !find_set_index(&data, &value).is_some() {
+    if find_set_index(&data, &value).is_none() {
         data.push(Some(value));
     }
     Ok(this.clone())
