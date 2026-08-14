@@ -20,18 +20,74 @@ pub use parser::Parser;
 /// Parses a Script (spec 16.1): a statement list with Annex B HTML comments
 /// enabled.
 pub fn parse_script(source: &str) -> Result<Program, JsError> {
-    parse_script_units(&source.encode_utf16().collect::<Vec<u16>>())
+    parse_script_units(
+        &source.encode_utf16().collect::<Vec<u16>>(),
+        false,
+        None,
+        &[],
+    )
 }
 
 /// Like `parse_script`, for UTF-16 source text (the `eval` path, where the
-/// code is a `JsString` and lone surrogates must survive intact).
+/// code is a `JsString` and lone surrogates must survive intact). The eval
+/// goal tolerates a HashbangComment after a leading directive prologue: the
+/// runtime's strict-eval validation re-parses the source with a synthetic
+/// `'use strict';` prefix, which would otherwise push a leading hashbang off
+/// the first position.
 pub fn parse_script_utf16(units: &[u16]) -> Result<Program, JsError> {
-    parse_script_units(units)
+    parse_script_units(units, true, None, &[])
 }
 
-fn parse_script_units(units: &[u16]) -> Result<Program, JsError> {
+/// The eval-caller context that relaxes the Script early errors for a direct
+/// eval (spec 19.2.1.1): `new.target` and `super` are legal in eval code
+/// when the caller is inside function/method code, and PrivateIdentifiers
+/// parse when the caller has a private environment (the runtime resolves
+/// them against the inherited private names).
+#[derive(Debug, Clone, Copy)]
+pub struct EvalContext {
+    /// The caller is inside a non-arrow function: `new.target` is valid.
+    pub in_function: bool,
+    /// The caller is inside a method: `super` property access is valid.
+    pub in_method: bool,
+    /// The caller has a private environment: `#name` is valid.
+    pub allow_private: bool,
+}
+
+/// Like `parse_script_utf16`, for eval code whose early errors depend on the
+/// caller's context (spec 19.2.1.1 steps 5-7). `caller_private_names` are the
+/// caller's private identifiers (without the `#`), used to validate eval'd
+/// `#name` uses against the inherited private environment.
+pub fn parse_script_utf16_eval(
+    units: &[u16],
+    eval: &EvalContext,
+    caller_private_names: &[crux::AtomId],
+) -> Result<Program, JsError> {
+    parse_script_units(units, true, Some(*eval), caller_private_names)
+}
+
+fn parse_script_units(
+    units: &[u16],
+    allow_hashbang_after_directives: bool,
+    eval: Option<EvalContext>,
+    caller_private_names: &[crux::AtomId],
+) -> Result<Program, JsError> {
     let source = SourceText::from_utf16(units.to_vec());
-    let mut parser = Parser::new(&source, true);
+    let mut parser = Parser::new(&source, true, allow_hashbang_after_directives);
+    if let Some(eval) = eval {
+        // The eval goal inherits the caller's function/method context: the
+        // Script early errors for `new.target`/`super` are relaxed, and a
+        // caller inside a class makes PrivateIdentifiers parse (their
+        // declaration check runs against the caller's names below).
+        parser.nt_context = eval.in_function;
+        parser.allow_super = eval.in_method;
+        if eval.allow_private {
+            let mut names = std::collections::HashMap::new();
+            for name in caller_private_names {
+                names.insert(*name, Default::default());
+            }
+            parser.private_names.push(names);
+        }
+    }
     let strict = expr::scan_directive_prologue(&mut parser)?;
     parser.strict = strict;
     let body = stmt::parse_statement_list(&mut parser, syntax::TokenKind::Eof)?;
@@ -42,7 +98,10 @@ fn parse_script_units(units: &[u16]) -> Result<Program, JsError> {
     }
     let span = crux::Span::new(0, source.len() as u32);
     let program = Program { body, span };
-    early_errors::check_script(&program)?;
+    match eval {
+        Some(_) => early_errors::check_script_eval(&program, caller_private_names)?,
+        None => early_errors::check_script(&program)?,
+    }
     Ok(program)
 }
 
@@ -51,7 +110,7 @@ fn parse_script_units(units: &[u16]) -> Result<Program, JsError> {
 /// `await` is allowed, and HTML comments are rejected.
 pub fn parse_module(source: &str) -> Result<Module, JsError> {
     let source = SourceText::from_utf8(source);
-    let mut parser = Parser::new(&source, false);
+    let mut parser = Parser::new(&source, false, false);
     parser.in_module = true;
     parser.strict = true;
     parser.top_level_await = true;
@@ -83,7 +142,7 @@ pub fn parse_function_with_async(
     is_async: bool,
 ) -> Result<syntax::ast::Function, JsError> {
     let source = SourceText::from_utf8(source);
-    let mut parser = Parser::new(&source, true);
+    let mut parser = Parser::new(&source, true, false);
     if is_async {
         parser.next()?; // `async`
     }
@@ -112,6 +171,13 @@ mod tests {
     fn ok(source: &str) -> Program {
         parse_script(source)
             .unwrap_or_else(|e| panic!("expected {source:?} to parse: {e} at {:?}", e.span))
+    }
+
+    #[test]
+    fn html_close_comment_with_leading_whitespace() {
+        ok("--> a comment\nthrow 1;");
+        ok("  --> a comment\nthrow 1;");
+        ok("/* c */ --> a comment\nthrow 1;");
     }
 
     fn err(source: &str) {
@@ -494,6 +560,25 @@ mod tests {
     }
 
     #[test]
+    fn template_invalid_escapes_are_early_errors() {
+        // An untagged template whose TV is undefined (an invalid escape
+        // sequence) is a SyntaxError (spec 13.2.8.1); tagged templates are
+        // exempt.
+        err("`\\x0`;");
+        err("`\\x1`;");
+        err("`\\u0`;");
+        err("`\\u`;");
+        err("`\\u{1F_639}`;");
+        err("`\\00`;");
+        err("`\\8`;");
+        err("`\\9`;");
+        err("`a${b}\\x1`;");
+        ok("tag`\\x0`;");
+        ok("`a${tag`\\x0`}b`;");
+        ok("`a\\nb`;");
+    }
+
+    #[test]
     fn division_vs_regexp_goal() {
         assert!(matches!(
             expr_stmt("a / b").kind,
@@ -719,6 +804,84 @@ mod tests {
     }
 
     #[test]
+    fn escaped_keywords_are_not_keywords() {
+        // Terminal symbols must appear exactly as written (spec 5.1.5): an
+        // escaped keyword is an IdentifierName, and as an expression it is an
+        // invalid IdentifierReference (a reserved word).
+        err("f\\u{61}lse;");
+        err("tru\\u{65};");
+        err("n\\u{75}ll;");
+        err("n\\u0065w.target;");
+        err("im\\u0070ort('./x.js');");
+        err("t\\u0068is;");
+        // Escaped non-keywords are ordinary identifiers.
+        ok("\\u0061bc;");
+        ok("var o = { \\u0074rue: 1 };");
+        ok("obj.\\u0074rue;");
+    }
+
+    #[test]
+    fn async_params_reject_await_and_yield() {
+        // Async and async-generator formal parameters must not contain an
+        // AwaitExpression; generators reject YieldExpression (spec 15.5.1).
+        err("(async function*(x = await 1) { });");
+        err("(async function(x = await 1) { });");
+        err("(function*(x = yield 1) { });");
+        err("async function f(x = await 1) { }");
+        err("async function* g(x = await 1) { }");
+        // Outside an async function `await` is a plain identifier, so
+        // `await 1` cannot parse; it is only usable as a bare name.
+        err("function f(x = await 1) { }");
+        ok("function f(x = await) { }");
+        ok("(async function*(x = 1) { });");
+    }
+
+    #[test]
+    fn parenthesized_import_call_in_new_is_valid() {
+        // `new (import(…))` is a NewExpression whose callee is a
+        // PrimaryExpression (the parenthesized cover grammar); only the
+        // direct `new import(…)` form is excluded (spec 13.3.4).
+        ok("new (import(''));");
+        ok("new (function() {}, import(''));");
+        ok("typeof new (import(''), function() {});");
+        err("new import('');");
+    }
+
+    #[test]
+    fn for_of_let_lhs_lookahead() {
+        // `for (let of …)` cannot be an expression-headed for-of (the
+        // `[lookahead ≠ let]` restriction), and `let of` as a ForDeclaration
+        // leaves no `of` keyword (spec 14.7.5).
+        err("for (let of []) {}");
+        err("for (let of x) {}");
+        err("for (const of []) {}");
+        // `let of` binding with the `of` keyword after it is a declaration.
+        ok("for (let of of []) {}");
+        ok("for (let of in x) {}");
+        ok("let of; for (of of []) {}");
+        ok("for (let of = 1; ; ) {}");
+        ok("for (let x of []) {}");
+    }
+
+    #[test]
+    fn static_block_contains_await_skips_arrow_bodies() {
+        // The static-block early error is `Contains await` (spec 15.7.11):
+        // arrows are opaque to it (spec sec-static-semantics-contains), so
+        // `await` in an arrow body is fine while a direct reference is not.
+        ok("class C { static { (() => ({ await })); } }");
+        ok("class C { static { (async () => await 1); } }");
+        ok("class C { static { (() => await); } }");
+        // Arrow parameters inherit [+Await] and the arrow's own early error
+        // rejects an AwaitExpression there.
+        err("class C { static { (x = await 1) => {}; } }");
+        err("class C { static { ({ await }); } }");
+        err("class C { static { await 1; } }");
+        // `arguments` still counts inside arrow bodies (ContainsArguments
+        // recurses through arrows).
+        err("class C { static { (() => arguments); } }");
+    }
+
+    #[test]
     fn statements_that_are_not_expressions() {
         // `{` and `function` cannot start an expression statement; here `{ }`
         // is a block followed by a unary `+1` statement.
@@ -824,6 +987,139 @@ mod tests {
     }
 
     #[test]
+    fn class_name_is_always_strict() {
+        // A class definition is strict mode code (spec 15.7.3), so the
+        // strict-reserved words are not valid class names, escaped or not.
+        err("class let {}");
+        err("class static {}");
+        err("class yield {}");
+        err("class l\\u0065t {}");
+        err("class st\\u0061tic {}");
+        err("var C = class let {};");
+        ok("class await {}");
+        // Escaped contextual keywords are ordinary identifiers.
+        err("class C { st\\u0061tic m() {} }");
+        err("class C { \\u0061sync m() {} }");
+        ok("class C { static m() {} }");
+    }
+
+    #[test]
+    fn function_names_and_strict_bodies() {
+        // A strict body (enclosing or directive) forbids eval/arguments names
+        // (spec 15.4.1); sloppy bodies allow them.
+        err("(function eval() { 'use strict'; });");
+        err("(function arguments() { 'use strict'; });");
+        err("'use strict'; (function eval() {});");
+        ok("(function eval() {});");
+        ok("function eval() {}");
+        err("function eval() { 'use strict'; }");
+        err("function arguments() { 'use strict'; }");
+        // FunctionExpression names parse with [~Yield, ~Await]: `yield` and
+        // `await` are ordinary names even in resumable code, while generator
+        // and async-generator expression names keep their restrictions.
+        ok("function* g() { (function yield() {}); }");
+        ok("function* g() { (function await() {}); }");
+        ok("class C { static { (function* await(await) {}); } }");
+        err("var g = function* yield() {};");
+        err("(async function* yield() {});");
+        err("(async function* await() {});");
+        ok("(async function await() {});");
+        // Async function/method formals reserve `await` (spec 15.8.1).
+        err("async function foo(await) {}");
+        err("async function foo(x = await) {}");
+        err("class A { async m(await) {} }");
+        err("(async function*(await) {});");
+    }
+
+    #[test]
+    fn yield_grammar_rules() {
+        // A yield operand in a for-head parses with [~In] (spec 14.4.1).
+        err("function* g() { for (yield '' in {}; ; ) ; }");
+        err("function* g() { for (yield * '' in {}; ; ) ; }");
+        ok("function* g() { yield '' in {}; }");
+        // After `yield` the lexical goal is RegExp, so `/` starts a literal.
+        ok("function* g() { received = yield/abc/i; }");
+        // Arrow parameters may not contain a YieldExpression (spec 15.4.1).
+        err("function* g() { (x = yield) => {}; }");
+        err("async function f() { (x = await) => {}; }");
+    }
+
+    #[test]
+    fn private_name_early_errors() {
+        // A private reference must be declared in an enclosing class.
+        err("class C { m() { this.#x; } }");
+        err("class C { y = this.#x; }");
+        err("class C { [this.#f] = 1; }");
+        err("class C { f = (() => {})().#x; }");
+        err("class C { m() { this.#x; class D extends C { #x; } } }");
+        // A class's heritage cannot see the class's own private names.
+        err("var C = class extends class { x = this.#foo; } { #foo; };");
+        err("var C = class extends function() { x = this.#foo; } { #foo; };");
+        // Forward references within a class are allowed.
+        ok("class C { m() { return this.#x; } #x; }");
+        // Duplicate private methods (all forms) are rejected.
+        err("class C { #m() {} #m() {} }");
+        err("class C { *#m() {} *#m() {} }");
+        err("class C { async #m() {} async #m() {} }");
+        err("class C { async *#m() {} async *#m() {} }");
+    }
+
+    #[test]
+    fn delete_and_super_private_rules() {
+        // delete of a private member is an early error (spec 13.6.2).
+        err("class C { #x; m = delete this.#x; }");
+        err("class C { #x; m = delete (g()).#x; }");
+        // super may not access a private name (spec 15.7.10).
+        err("class C { #m() {} m() { return super.#m; } }");
+        // super() requires a derived class (spec 15.7.11).
+        err("class C { constructor() { super(); } }");
+        ok("class C extends B { constructor() { super(); } }");
+    }
+
+    #[test]
+    fn private_in_grammar() {
+        // `#name in ShiftExpression` (spec 13.11): the right operand must be
+        // a ShiftExpression, so a nested private-in or a bare arrow function
+        // at that level is a SyntaxError.
+        err("class C { #f; m() { return #f in #f in this; } }");
+        err("class C { #f; m() { return #f in () => {}; } }");
+        err("class C { #f; m() { return #f in (x) => {}; } }");
+        err("class C { #f; m() { return #f in async () => {}; } }");
+        // Arrows nested inside a paren/arguments/literal are still valid.
+        ok("class C { #f; m() { return #f in (() => {}); } }");
+        ok("class C { #f; m() { return #f in (() => {})(); } }");
+        ok("class C { #f; m() { return #f in f(() => {}); } }");
+        ok("class C { #f; m() { return #f in new Foo(() => {}); } }");
+        ok("class C { #f; m() { return #f in { m: () => {} }; } }");
+        ok("class C { #f; m() { return #f in [() => {}]; } }");
+        ok("class C { #f; m() { return #f in `x${() => {}}`; } }");
+        ok("class C { #f; m() { return #f in (#g in this); } #g; }");
+        // `#f in x` is a RelationalExpression and may be `in`-chained.
+        ok("class C { #f; m(o) { return #f in o in this; } }");
+    }
+
+    #[test]
+    fn setter_defaults_and_accessor_fields() {
+        // A setter parameter may carry an initializer.
+        ok("var C = class { set m(x = 1) {} };");
+        // `accessor`-prefixed fields parse (decorators proposal).
+        ok("var C = class { accessor $; accessor _; };");
+        ok("var C = class { accessor \\u{6F}; };");
+        // Without a following name-start it is a plain field.
+        ok("var C = class { accessor = 1; };");
+    }
+
+    #[test]
+    fn static_blocks_and_decorators() {
+        // Static blocks are return-less.
+        err("class C { static { return; } }");
+        // Decorated classes and elements parse (syntax only).
+        ok("@dec class C {};");
+        ok("var C = @a.b @(c) class {};");
+        ok("class C { @dec() m() {} }");
+    }
+
+    #[test]
     fn parses_conditional_and_sequence() {
         let expr = expr_stmt("a ? b : c");
         assert!(matches!(expr.kind, ExprKind::Conditional { .. }));
@@ -854,8 +1150,9 @@ mod tests {
     fn parses_import_call_and_meta() {
         ok("import('x')");
         ok("import('x', { with: { type: 'json' } })");
-        // import.meta is parseable as an expression in scripts too.
-        ok("import.meta");
+        // import.meta is only valid in module code (spec 16.2.1.5).
+        err("import.meta");
+        mod_ok("import.meta");
     }
 
     #[test]
@@ -876,6 +1173,22 @@ mod tests {
     #[test]
     fn html_comments_allowed_in_scripts() {
         ok("<!-- x\n--> y");
+    }
+
+    #[test]
+    fn eval_scripts_tolerate_hashbang_after_directive_prologue() {
+        // A HashbangComment at position 0 is always fine.
+        ok("#!x\n1");
+        // The runtime's strict-eval validation re-parses the user's source
+        // with a synthetic `'use strict';` prefix; the hashbang then follows
+        // the directive prologue instead of sitting at position 0. The eval
+        // entry point accepts that shape; a regular script does not.
+        let units = "'use strict';\n#!x\n1".encode_utf16().collect::<Vec<u16>>();
+        assert!(parse_script_utf16(&units).is_ok());
+        assert!(parse_script("'use strict';\n#!x\n1").is_err());
+        // The tolerance never accepts a hashbang after real code.
+        let units = "x = 1;\n#!x\n2".encode_utf16().collect::<Vec<u16>>();
+        assert!(parse_script_utf16(&units).is_err());
     }
 
     #[test]
@@ -1221,14 +1534,16 @@ mod tests {
     #[test]
     fn early_error_pass_class_bodies() {
         // `arguments` is an early error in field initializers and static
-        // blocks, but arrows and nested functions have their own.
+        // blocks; arrows inherit `arguments` (they have none of their own),
+        // while nested functions have their own (spec 15.7.9 ContainsArguments).
         err("class A { x = arguments; }");
         err("class A { x = arguments[0]; }");
-        ok("class A { x = () => arguments; }");
+        err("class A { x = () => arguments; }");
         ok("class A { x = function () { return arguments; }; }");
         err("class A { static { arguments; } }");
-        ok("class A { static { () => arguments; } }");
-        // `await` is an early error in static blocks.
+        err("class A { static { () => arguments; } }");
+        // `await` is an early error in static blocks; arrow bodies are
+        // opaque to the check, function bodies are not.
         err("class A { static { await 1; } }");
         err("class A { static { await; } }");
         ok("class A { static { (async () => await 1); } }");
@@ -1263,9 +1578,70 @@ mod tests {
         ok("'use strict'; 0b101;");
         ok("'use strict'; 0o17;");
         ok("'use strict'; 0.5;");
-        ok("'use strict'; 0e1;");
-        ok("'use strict'; 0;");
-        ok("'use strict'; 1;");
+    }
+
+    #[test]
+    fn string_escapes_strict_via_later_directive() {
+        // A legacy octal/non-octal escape before a `"use strict"` directive
+        // in the same prologue is an error (spec 12.9.4): the function is
+        // strict and the escape is not part of strict EscapeSequence.
+        err("function f() { \"\\1\"; \"use strict\"; }");
+        err("function f() { \"\\8\"; \"use strict\"; }");
+        err("function f() { \"\\052\"; \"use strict\"; }");
+        err("(function() { \"asterisk: \\052\"; \"use strict\"; });");
+        err("function f() { \"use strict\"; \"\\1\"; }");
+        // Without a strict directive the same strings are sloppy-legal.
+        ok("function f() { \"\\1\"; }");
+        ok("function f() { \"\\8\"; }");
+        // An escaped non-strict directive does not stop the prologue.
+        ok("function f() { \"\\x41\"; \"use strict\"; }");
+    }
+
+    #[test]
+    fn delete_unwraps_parentheses() {
+        // The delete early errors see through parentheses (spec 13.6.2).
+        err("'use strict'; delete (identifier);");
+        err("'use strict'; delete ((identifier));");
+        err("'use strict'; delete (((identifier)));");
+        ok("delete (identifier);");
+        ok("delete (a.b);");
+    }
+
+    #[test]
+    fn new_target_context() {
+        // `new.target` needs a real (non-arrow) enclosing function or a
+        // class field initializer/static block (spec 13.3.4).
+        err("new.target;");
+        err("() => { new.target; };");
+        err("function f() { new.t\\u0061rget; }");
+        ok("function f() { new.target; }");
+        ok("function g() { return () => new.target; }");
+        ok("() => { function f() { new.target; } };");
+        ok("class C { static { new.target; } }");
+        ok("class C { x = new.target; }");
+        ok("new (function() { return new.target; });");
+    }
+
+    #[test]
+    fn do_while_semicolon_asi() {
+        // The do-while terminating semicolon is inserted before the next
+        // token when the previous token is `)` (spec 12.10.1).
+        ok("do {} while (0) x = 42;");
+        ok("do do do ; while (x) while (x) while (x) x = 39;");
+        ok("do break ; while (0) x = 42;");
+        ok("do {} while (0);");
+        ok("do {} while (0)");
+    }
+
+    #[test]
+    fn static_block_accessor_await_is_an_identifier() {
+        // An accessor method's params and body reset the [Await] context: a
+        // static block's reserved `await` does not leak in (spec 15.7.13).
+        ok("class C { static { ({ set accessor(await) {} }); } }");
+        ok(
+            "var await = 0; class C { static { ({ set accessor(x = await) { await; } }).accessor = undefined; } }",
+        );
+        err("class C { static { ({ async m(await) {} }); } }");
     }
 
     #[test]
@@ -1281,7 +1657,9 @@ mod tests {
         // `var let` and class/function names are unrestricted in sloppy code.
         ok("var let = 1;");
         ok("for (var let of x) {}");
-        ok("class let {}");
+        // A class definition is always strict mode code (spec 15.7.3), so
+        // `let` is not a valid class name; function names are unrestricted.
+        err("class let {}");
         ok("function let() {}");
         // Strict mode rejects `let` as any identifier.
         err("'use strict'; var let = 1;");
@@ -1325,34 +1703,44 @@ mod tests {
     #[test]
     fn catch_parameter_redeclaration_rules() {
         // spec 15.1.8: CatchParameter names clash with the block's
-        // LexicallyDeclaredNames (let/class), but the var rule was relaxed —
-        // `var` and block-level function declarations in the catch body may
-        // share the name (Annex B).
+        // LexicallyDeclaredNames (let/class/function), but `var` in the
+        // catch body may share the name (Annex B).
         ok("try {} catch (e) { var e; }");
         ok("var e; try {} catch (e) {}");
         ok("try {} catch (e) { var e; } var e;");
-        ok("try {} catch (e) { function e() {} }");
+        err("try {} catch (e) { function e() {} }");
         err("try {} catch (e) { let e; }");
         err("try {} catch (e) { const e = 1; }");
-        err("try {} catch (e) { { let e; } }");
+        // A nested block shadows the catch parameter instead of clashing.
+        ok("try {} catch (e) { { let e; } }");
         err("try {} catch ([x, x]) {}");
     }
 
     #[test]
     fn parses_using_declarations() {
-        // Statement forms, with required initializers.
+        // Statement forms, with required initializers. A `using` declaration
+        // must be contained in a block/function body, never at script top
+        // level (spec 14.5.1).
+        err("using x = 1;");
+        let s = stmt("{ using x = 1; }");
+        let StmtKind::Block(block) = s.kind else {
+            panic!("expected a block");
+        };
         assert!(matches!(
-            stmt("using x = 1;").kind,
+            block.stmts[0].kind,
             StmtKind::UsingDecl {
                 is_await: false,
                 ref decls,
             } if decls.len() == 1
         ));
-        let s = stmt("using x = 1, y = 2;");
+        let s = stmt("{ using x = 1, y = 2; }");
+        let StmtKind::Block(block) = s.kind else {
+            panic!("expected a block");
+        };
         let StmtKind::UsingDecl {
             is_await: false,
             ref decls,
-        } = s.kind
+        } = block.stmts[0].kind
         else {
             panic!("expected a using declaration");
         };

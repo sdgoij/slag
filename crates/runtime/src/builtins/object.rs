@@ -1029,6 +1029,7 @@ fn set_prototype_of(
     }
     let proto = match proto_value {
         Value::Object(obj) => Some(obj.clone()),
+        Value::Function(f) => Some(f.object.clone()),
         Value::Null => None,
         _ => {
             return Err(JsError::new(

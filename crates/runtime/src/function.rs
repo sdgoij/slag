@@ -12,7 +12,7 @@ use crux::property::PropertyDescriptor;
 use crux::string::JsString;
 use crux::value::Value;
 use syntax::ast::{
-    ArrowBody, BindingElement, BindingPattern, Block, ExprKind, Literal, Stmt, StmtKind,
+    ArrowBody, BindingElement, BindingPattern, Block, Expr, ExprKind, Literal, Stmt, StmtKind,
 };
 
 use crate::agent::Agent;
@@ -89,7 +89,10 @@ pub struct ClassField {
 pub struct EcmaFunction {
     pub name: Option<JsString>,
     pub params: Vec<BindingElement>,
-    pub body: Block,
+    /// Shared so clones of the record (ordinary_call reads a copy) keep the
+    /// same body AST nodes — the template-object cache keys sites by node
+    /// identity within a parse.
+    pub body: std::rc::Rc<Block>,
     /// [[Environment]]: the lexical environment at instantiation.
     pub environment: EnvRef,
     pub this_mode: ThisMode,
@@ -102,6 +105,9 @@ pub struct EcmaFunction {
     pub constructor_kind: ConstructorKind,
     /// [[IsClassConstructor]]: class constructors reject bare calls.
     pub is_class_constructor: bool,
+    /// A method or accessor definition (no [[Construct]], no `prototype` own
+    /// property); class constructors set this too but are constructible.
+    pub is_method: bool,
     /// [[Fields]]: instance fields initialized when the constructor runs.
     pub fields: Vec<ClassField>,
     /// [[PrivateMethods]]: instance private methods/accessors added to each
@@ -119,6 +125,11 @@ pub struct EcmaFunction {
     pub realm: Handle<Realm>,
     pub is_async: bool,
     pub is_generator: bool,
+    /// [[ClassFieldInitializerName]] (spec 15.7.10 step 8): non-empty for
+    /// functions created inside a class field initializer, so a direct eval
+    /// in their bodies (or in arrows they create) applies the "Eval Inside
+    /// Initializer" early errors (spec 19.2.1.1).
+    pub class_field_initializer: bool,
     /// The exact source text of the definition (Function.prototype.toString,
     /// spec 20.2.3.5); `None` for synthesized/native callables.
     pub source: Option<JsString>,
@@ -129,8 +140,8 @@ pub struct EcmaFunction {
 
 /// FunctionBodyContainsUseStrict (spec 15.2.1): a `"use strict"` directive in
 /// the function body's directive prologue.
-pub fn function_is_strict(f: &syntax::ast::Function) -> bool {
-    body_is_strict(&f.body)
+pub fn function_is_strict(agent: &Agent, f: &syntax::ast::Function) -> bool {
+    body_is_strict(agent, &f.body, None)
 }
 
 /// IsSimpleParameterList (spec 15.1.1): every parameter is a bare binding
@@ -269,18 +280,24 @@ fn make_constructor(
     function: &Handle<Function>,
     prototype: Handle<JsObject>,
     writable: bool,
+    add_constructor_property: bool,
 ) -> Result<(), JsError> {
-    prototype.define_property(
-        &JsString::from_utf8("constructor"),
-        &PropertyDescriptor {
-            value: Some(function.self_value()),
-            writable: Some(true),
-            get: None,
-            set: None,
-            enumerable: Some(false),
-            configurable: Some(true),
-        },
-    )?;
+    // MakeConstructor (spec 10.2.5) only adds the `constructor` property when
+    // it creates the prototype itself; a provided prototype (the generator
+    // function's %Generator.prototype%-based object) has no own properties.
+    if add_constructor_property {
+        prototype.define_property(
+            &JsString::from_utf8("constructor"),
+            &PropertyDescriptor {
+                value: Some(function.self_value()),
+                writable: Some(true),
+                get: None,
+                set: None,
+                enumerable: Some(false),
+                configurable: Some(true),
+            },
+        )?;
+    }
     function.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
@@ -349,16 +366,74 @@ pub fn instantiate_function_with_source(
     source: Option<JsString>,
 ) -> Result<Value, JsError> {
     let source = source.or_else(|| capture_source(agent, f.span));
+    let body = shared_function_body(agent, f, source.as_ref());
     register_function(
         agent,
         f.name.map(crux::lookup),
         f.params.clone(),
-        f.body.clone(),
+        body,
         environment,
         enclosing_strict,
         DefinitionKind::function(f.is_async, f.is_generator),
         source,
+        None,
     )
+}
+
+/// Instantiate a function declaration or expression whose body AST is shared
+/// across instantiations of the same parse node: two closures from the same
+/// factory share the site nodes, so the template-object cache keys by node
+/// identity hold (cache-different-functions-same-site.js). The shared body is
+/// immutable, so reentrancy is safe. The key carries the node's span and the
+/// hash of the node's source slice: raw node addresses are reused after a
+/// parse is dropped, and distinct parses of same-length sources (e.g. two
+/// modules whose functions sit at identical offsets) can otherwise collide on
+/// (address, realm, span) alone.
+pub fn shared_function_body(
+    agent: &Agent,
+    f: &syntax::ast::Function,
+    source: Option<&JsString>,
+) -> std::rc::Rc<Block> {
+    let realm = agent
+        .current_realm()
+        .map(|realm| crux::handle::Handle::as_ptr(&realm) as usize)
+        .unwrap_or(0);
+    let source_key = source.map(source_hash).unwrap_or(0);
+    let key = (
+        f as *const syntax::ast::Function as usize,
+        realm,
+        f.span.start as usize,
+        f.span.end as usize,
+        source_key,
+    );
+    FUNCTION_BODY_CACHE.with(|cache| {
+        if let Some(body) = cache.borrow().get(&key) {
+            return body.clone();
+        }
+        let body = std::rc::Rc::new(f.body.clone());
+        cache.borrow_mut().insert(key, body.clone());
+        body
+    })
+}
+
+/// A stable content hash of a function's source slice, used to disambiguate
+/// cache keys across parses (see `shared_function_body`).
+fn source_hash(source: &JsString) -> usize {
+    let mut hash: usize = 0xcbf2_9ce4_8422_2325;
+    for unit in source.as_slice() {
+        hash ^= *unit as usize;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+type FunctionBodyKey = (usize, usize, usize, usize, usize);
+
+type FunctionBodyCache = std::collections::HashMap<FunctionBodyKey, std::rc::Rc<Block>>;
+
+thread_local! {
+    static FUNCTION_BODY_CACHE: std::cell::RefCell<FunctionBodyCache> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// Instantiate a method definition (object literal `m() {}` and class
@@ -371,15 +446,17 @@ pub fn instantiate_method(
     enclosing_strict: bool,
 ) -> Result<Value, JsError> {
     let source = capture_source(agent, f.span);
+    let body = shared_function_body(agent, f, source.as_ref());
     register_function(
         agent,
         None,
         f.params.clone(),
-        f.body.clone(),
+        body,
         environment,
         enclosing_strict,
         DefinitionKind::method(f.is_async, f.is_generator),
         source,
+        None,
     )
 }
 
@@ -397,10 +474,11 @@ pub fn instantiate_accessor(
         agent,
         None,
         params,
-        body,
+        std::rc::Rc::new(body),
         environment,
         enclosing_strict,
         DefinitionKind::method(false, false),
+        None,
         None,
     )
 }
@@ -411,7 +489,7 @@ pub fn instantiate_accessor(
 pub fn instantiate_class_constructor(
     agent: &mut Agent,
     params: Vec<BindingElement>,
-    body: Block,
+    body: std::rc::Rc<Block>,
     environment: EnvRef,
     enclosing_strict: bool,
 ) -> Result<Value, JsError> {
@@ -428,10 +506,10 @@ pub fn instantiate_default_derived_constructor(
     instantiate_class_constructor_with(
         agent,
         Vec::new(),
-        Block {
+        std::rc::Rc::new(Block {
             stmts: Vec::new(),
             span: crux::Span::new(0, 0),
-        },
+        }),
         environment,
         enclosing_strict,
         true,
@@ -441,7 +519,7 @@ pub fn instantiate_default_derived_constructor(
 fn instantiate_class_constructor_with(
     agent: &mut Agent,
     params: Vec<BindingElement>,
-    body: Block,
+    body: std::rc::Rc<Block>,
     environment: EnvRef,
     enclosing_strict: bool,
     default_derived: bool,
@@ -459,6 +537,7 @@ fn instantiate_class_constructor_with(
             is_generator: false,
             is_class_constructor: true,
         },
+        None,
         None,
     )?;
     if default_derived
@@ -491,19 +570,24 @@ fn register_function(
     agent: &mut Agent,
     name: Option<JsString>,
     params: Vec<BindingElement>,
-    body: Block,
+    body: std::rc::Rc<Block>,
     environment: EnvRef,
     enclosing_strict: bool,
     kind: DefinitionKind,
     source: Option<JsString>,
+    strict: Option<bool>,
 ) -> Result<Value, JsError> {
-    let strict = body_is_strict(&body) || enclosing_strict;
+    // `strict` overrides the body-directive check (CreateDynamicFunction
+    // computes it against its assembled source, which the running context
+    // cannot provide); `enclosing_strict` still forces strictness.
+    let strict = strict.unwrap_or_else(|| body_is_strict(agent, &body, None)) || enclosing_strict;
     let this_mode = if strict {
         ThisMode::Strict
     } else {
         ThisMode::Sloppy
     };
     let realm = agent.current_realm()?;
+    let private_environment = agent.running_context()?.private_environment.clone();
     let mut data = EcmaFunction {
         name: name.clone(),
         params: params.clone(),
@@ -514,14 +598,16 @@ fn register_function(
         home_object: None,
         constructor_kind: ConstructorKind::Base,
         is_class_constructor: kind.is_class_constructor,
+        is_method: kind.is_method,
         fields: Vec::new(),
         private_methods: Vec::new(),
-        private_environment: None,
+        private_environment,
         super_constructor: None,
         default_derived: false,
         realm,
         is_async: kind.is_async,
         is_generator: kind.is_generator,
+        class_field_initializer: false,
         source,
         ir: None,
     };
@@ -534,15 +620,18 @@ fn register_function(
     agent.ecma_functions.insert(function.id(), data);
     set_function_properties(&function, &params, name.as_ref())?;
     // AddRestrictedFunctionProperties (spec 10.2.1): sloppy ordinary
-    // functions carry own `caller`/`arguments` (value null, non-writable,
-    // non-configurable). Strict, async, and generator functions have none, so
-    // their reads/writes fall through to the %Function.prototype% accessors.
-    if !strict && !kind.is_async && !kind.is_generator {
+    // functions carry own `caller`/`arguments` (value undefined when no
+    // caller is known, non-writable, non-configurable). Strict, async, and
+    // generator functions have none, so their reads/writes fall through to
+    // the %Function.prototype% accessors. Methods never get them either
+    // (spec 10.2.4: own caller/arguments are created only for ordinary
+    // non-method functions).
+    if !strict && !kind.is_method && !kind.is_async && !kind.is_generator {
         for name in ["caller", "arguments"] {
             function.define_property(
                 &JsString::from_utf8(name),
                 &PropertyDescriptor {
-                    value: Some(Value::Null),
+                    value: Some(Value::Undefined),
                     writable: Some(false),
                     get: None,
                     set: None,
@@ -553,10 +642,10 @@ fn register_function(
         }
     }
     // Plain async functions are never constructors and have no `prototype`;
-    // generator and async-generator functions get a `prototype` that inherits
-    // %Generator.prototype% / %AsyncGenerator.prototype%, writable per
-    // MakeConstructor's default.
-    if !kind.is_method && !(kind.is_async && !kind.is_generator) {
+    // generator and async-generator functions *and methods* get a `prototype`
+    // that inherits %Generator.prototype% / %AsyncGenerator.prototype%,
+    // writable per MakeConstructor's default (spec 15.4.5 GeneratorMethod).
+    if kind.is_generator || (!kind.is_method && !kind.is_async) {
         let prototype = if kind.is_generator {
             let intrinsic = if kind.is_async {
                 "%AsyncGenerator.prototype%"
@@ -579,7 +668,7 @@ fn register_function(
                 .and_then(|value| crate::context::as_object(&value));
             JsObject::ordinary_object_create(proto)
         };
-        make_constructor(&function, prototype, true)?;
+        make_constructor(&function, prototype, true, !kind.is_generator)?;
     }
     set_function_prototype(agent, &function)?;
     Ok(Value::Function(function))
@@ -588,7 +677,7 @@ fn register_function(
 /// The exact source slice of a definition (Function.prototype.toString),
 /// cut from the running context's source text using the definition's span.
 /// Returns `None` when no source is tracked (synthesized/native callables).
-fn capture_source(agent: &Agent, span: crux::Span) -> Option<JsString> {
+pub(crate) fn capture_source(agent: &Agent, span: crux::Span) -> Option<JsString> {
     let source = agent.running_context().ok()?.source.clone()?;
     let (start, end) = (span.start as usize, span.end as usize);
     if start >= end || end > source.len() {
@@ -618,7 +707,10 @@ fn set_function_prototype(agent: &Agent, function: &Handle<Function>) -> Result<
 }
 
 /// FunctionBodyContainsUseStrict for a body block (spec 15.2.1).
-fn body_is_strict(body: &Block) -> bool {
+/// `span_source` is the source text the body's spans refer to, for bodies
+/// parsed against their own text (CreateDynamicFunction); scripts use the
+/// running context's source via capture_source.
+fn body_is_strict(agent: &Agent, body: &Block, span_source: Option<&JsString>) -> bool {
     for stmt in &body.stmts {
         let StmtKind::Expr(expr) = &stmt.kind else {
             return false;
@@ -626,11 +718,51 @@ fn body_is_strict(body: &Block) -> bool {
         let ExprKind::Literal(Literal::Str(value)) = &expr.kind else {
             return false;
         };
-        if value.to_string_lossy() == "use strict" {
+        if directive_is_use_strict(agent, expr, value, span_source) {
             return true;
         }
     }
     false
+}
+
+/// Whether a directive-prologue literal is a genuine `"use strict"`
+/// directive (spec 14.1.1): its raw source text between the quotes must be
+/// exactly `use strict`. The cooked value alone cannot distinguish
+/// `'use str\ict'` (line continuation) or `'use\u0020strict'` (escape), which
+/// cook to the same value but are not directives. Synthesized bodies without
+/// source text fall back to the cooked value.
+fn directive_is_use_strict(
+    agent: &Agent,
+    expr: &Expr,
+    cooked: &JsString,
+    span_source: Option<&JsString>,
+) -> bool {
+    if cooked.to_string_lossy() != "use strict" {
+        return false;
+    }
+    let Some(source) = span_source
+        .cloned()
+        .or_else(|| capture_source(agent, expr.span))
+    else {
+        return true;
+    };
+    let units = source.as_slice();
+    let (start, end) = (expr.span.start as usize, expr.span.end as usize);
+    // capture_source already returns the span slice; an explicit source is
+    // the whole text the span refers to, so slice it down first.
+    let span_units = if span_source.is_some() {
+        if start >= end || end > units.len() {
+            return true;
+        }
+        &units[start..end]
+    } else {
+        units
+    };
+    if span_units.len() < 2 {
+        return true;
+    }
+    &span_units[1..span_units.len() - 1]
+        == "use strict".encode_utf16().collect::<Vec<u16>>().as_slice()
 }
 
 /// InstantiateOrdinaryFunctionExpression (spec 15.2.5): a named function
@@ -647,7 +779,9 @@ pub fn instantiate_function_expression(
     let name = crux::lookup(name);
     let scope = new_declarative_environment(Some(environment));
     let value = instantiate_function(agent, f, scope.clone(), enclosing_strict)?;
-    scope.create_immutable_binding(&name, true)?;
+    // spec 15.2.5 step 6: the self-binding is a non-strict immutable binding,
+    // so a sloppy-mode assignment to the function's own name is ignored.
+    scope.create_immutable_binding(&name, false)?;
     scope.initialize_binding(&name, value.clone())?;
     Ok(value)
 }
@@ -658,22 +792,31 @@ pub fn instantiate_function_expression(
 /// `parser::parse_function` already named it `anonymous` and checked the
 /// early errors. The async/generator flags come from the parsed form, so the
 /// GeneratorFunction/AsyncFunction/AsyncGeneratorFunction constructors reuse
-/// this path.
+/// this path. `source` is the assembled `function anonymous(...) {...}` text
+/// the body's spans refer to: it drives the "use strict" directive check
+/// (the running context's source is the caller's script, not the body) and
+/// Function.prototype.toString.
 pub fn instantiate_dynamic_function(
     agent: &mut Agent,
     f: &syntax::ast::Function,
     environment: EnvRef,
     proto: Handle<JsObject>,
+    source: Option<JsString>,
 ) -> Result<Value, JsError> {
+    let strict = source
+        .as_ref()
+        .map(|source| body_is_strict(agent, &f.body, Some(source)))
+        .unwrap_or(false);
     let value = register_function(
         agent,
         f.name.map(crux::lookup),
         f.params.clone(),
-        f.body.clone(),
+        shared_function_body(agent, f, source.as_ref()),
         environment,
         false,
         DefinitionKind::function(f.is_async, f.is_generator),
-        None,
+        source,
+        Some(strict),
     )?;
     // GetPrototypeFromConstructor wins over the default %Function.prototype%.
     let Value::Function(function) = &value else {
@@ -707,24 +850,29 @@ pub fn instantiate_arrow(
         ArrowBody::Block(block) => block,
     };
     let realm = agent.current_realm()?;
+    let private_environment = agent.running_context()?.private_environment.clone();
+    let strict = body_is_strict(agent, &body, None) || enclosing_strict;
+    let class_field_initializer = agent.field_initializer_depth > 0;
     let mut data = EcmaFunction {
         name: None,
         params,
-        body,
+        body: std::rc::Rc::new(body),
         environment,
         this_mode: ThisMode::Lexical,
-        strict: enclosing_strict,
+        strict,
         home_object: None,
         constructor_kind: ConstructorKind::Base,
         is_class_constructor: false,
+        is_method: false,
         fields: Vec::new(),
         private_methods: Vec::new(),
-        private_environment: None,
+        private_environment,
         super_constructor: None,
         default_derived: false,
         realm,
         is_async,
         is_generator: false,
+        class_field_initializer,
         source: None,
         ir: None,
     };
@@ -776,18 +924,28 @@ fn call_inner(
                     ));
                 }
                 let data = agent.ecma_functions.get(&function.id());
-                if data.is_some_and(|data| data.is_async && data.is_generator) {
-                    return crate::async_generator::call_async_generator(
-                        agent, function, this, args,
-                    );
-                }
-                if data.is_some_and(|data| data.is_async) {
-                    return crate::async_await::call_async_function(agent, function, this, args);
-                }
-                if data.is_some_and(|data| data.is_generator) {
-                    return crate::generator::call_generator(agent, function, this, args);
-                }
-                ordinary_call(agent, function, this, args)
+                // A function created inside a class field initializer runs
+                // its body with the "Eval Inside Initializer" context (spec
+                // 19.2.1.1: `func.[[ClassFieldInitializerName]]`). Only
+                // arrows carry the marker, so the body of a plain function
+                // resets the context (its `arguments` is its own).
+                let marked = data.is_some_and(|data| data.class_field_initializer);
+                let is_async_gen = data.is_some_and(|data| data.is_async && data.is_generator);
+                let is_async = data.is_some_and(|data| data.is_async);
+                let is_generator = data.is_some_and(|data| data.is_generator);
+                let saved_depth = agent.field_initializer_depth;
+                agent.field_initializer_depth = if marked { saved_depth + 1 } else { 0 };
+                let result = if is_async_gen {
+                    crate::async_generator::call_async_generator(agent, function, this, args)
+                } else if is_async {
+                    crate::async_await::call_async_function(agent, function, this, args)
+                } else if is_generator {
+                    crate::generator::call_generator(agent, function, this, args)
+                } else {
+                    ordinary_call(agent, function, this, args)
+                };
+                agent.field_initializer_depth = saved_depth;
+                result
             }
             crux::function::FunctionKind::Bound {
                 target,
@@ -946,18 +1104,27 @@ fn construct_inner(
         Value::Function(function) => match &function.kind {
             crux::function::FunctionKind::EcmaScript => {
                 // Generator, async, and async-generator functions have no
-                // [[Construct]] (spec 27.4.2/27.5.2/27.6.2 FunctionAllocate).
+                // [[Construct]] (spec 27.4.2/27.5.2/27.6.2 FunctionAllocate);
+                // neither do arrows (lexical this) or methods/accessors.
                 if agent
                     .ecma_functions
                     .get(&function.id())
-                    .is_some_and(|data| data.is_async || data.is_generator)
+                    .is_some_and(is_constructible_data)
                 {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
                         "not a constructor".into(),
                     ));
                 }
-                ordinary_construct(agent, function, args, new_target)
+                let marked = agent
+                    .ecma_functions
+                    .get(&function.id())
+                    .is_some_and(|data| data.class_field_initializer);
+                let saved_depth = agent.field_initializer_depth;
+                agent.field_initializer_depth = if marked { saved_depth + 1 } else { 0 };
+                let result = ordinary_construct(agent, function, args, new_target);
+                agent.field_initializer_depth = saved_depth;
+                result
             }
             crux::function::FunctionKind::Bound {
                 target, bound_args, ..
@@ -1095,6 +1262,33 @@ fn construct_inner(
     }
 }
 
+/// Whether the function's slots deny [[Construct]] (spec 7.2.4): arrows
+/// (lexical this), methods/accessors, and async/generator functions.
+fn is_constructible_data(data: &EcmaFunction) -> bool {
+    data.is_async
+        || data.is_generator
+        || data.this_mode == ThisMode::Lexical
+        || (data.is_method && !data.is_class_constructor)
+}
+
+/// IsConstructor (spec 7.2.4) at the runtime level. Crux's Function-level
+/// check reports every ECMAScript function as constructible; the slots above
+/// narrow it (a class extends an arrow, or `new` on a method, must throw).
+pub fn is_constructor(agent: &Agent, value: &Value) -> bool {
+    let Value::Function(function) = value else {
+        return crux::value::is_constructor(value);
+    };
+    match &function.kind {
+        crux::function::FunctionKind::EcmaScript => agent
+            .ecma_functions
+            .get(&function.id())
+            .is_some_and(|data| !is_constructible_data(data)),
+        // A bound function is constructible iff its target is (spec 10.4.1.2).
+        crux::function::FunctionKind::Bound { target, .. } => is_constructor(agent, target),
+        _ => crux::value::is_constructor(value),
+    }
+}
+
 /// PrepareForOrdinaryCall (spec 10.2.1.2) + OrdinaryCallBindThis (10.2.1.1)
 /// + OrdinaryCallEvaluateBody: the full `[[Call]]` of an ordinary function.
 fn ordinary_call(
@@ -1219,8 +1413,8 @@ fn ordinary_construct(
         Value::Undefined
     } else {
         // OrdinaryCreateFromConstructor (spec 10.2.4): newTarget's
-        // `prototype` (an object — including a function value), or a
-        // null-prototype object until %Object.prototype%.
+        // `prototype` (an object — including a function value), falling back
+        // to %Object.prototype% when it isn't an object (S13.2.2_A3_T1).
         let prototype = crate::context::get_property(
             agent,
             new_target,
@@ -1237,7 +1431,11 @@ fn ordinary_construct(
                         "Cannot perform operation on a revoked Proxy".into(),
                     ));
                 }
-                None
+                agent
+                    .current_realm()?
+                    .intrinsics
+                    .get("%Object.prototype%")
+                    .and_then(|value| crate::context::as_object(&value))
             }
         };
         Value::Object(JsObject::ordinary_object_create(proto))
@@ -1348,20 +1546,54 @@ pub fn initialize_instance_elements(
     let Value::Object(obj) = obj else {
         return Ok(());
     };
-    // Private methods/accessors first (spec 7.3.27 step 1).
+    // Private methods/accessors first (spec 7.3.27 step 1); both private
+    // methods and fields cannot be added to a non-extensible object (spec
+    // 10.2.10 step 1 / 10.2.13).
     for method in &data.private_methods {
+        if !obj.is_extensible()? {
+            return Err(private_add_extensible_error());
+        }
         obj.private_element_add(method.clone())?;
     }
     // Fields (spec 7.3.27 step 2): private fields via PrivateFieldAdd.
     for field in &data.fields {
         // DefineField (spec 7.3.23): the initializer runs in the class scope
         // with the current `this` (the running context already chains to the
-        // class environment through the constructor's [[Environment]]).
+        // class environment through the constructor's [[Environment]]). A
+        // direct eval inside an initializer applies the "Eval Inside
+        // Initializer" early errors (spec 19.2.1.1).
         let value = match &field.init {
-            Some(init) => eval_expr(agent, init, true)?,
+            Some(init) => {
+                agent.field_initializer_depth += 1;
+                // The initializer runs in a function context of its own
+                // (spec 15.7.14 FieldDefinition): `new.target` is
+                // *undefined* there, `this` is the instance, and `super`
+                // resolves through the constructor's [[HomeObject]] (the
+                // class prototype). A direct eval inside the initializer
+                // inherits this context, so its `new.target` is also
+                // *undefined*.
+                let init_env = crate::env::new_function_environment(
+                    Some(agent.running_context()?.lexical_environment.clone()),
+                    Value::Function(ctor.clone()),
+                    Value::Undefined,
+                    false,
+                );
+                init_env.bind_this_value(Value::Object(obj.clone()))?;
+                let saved_lexical = agent.running_context_mut()?.lexical_environment.clone();
+                agent.running_context_mut()?.lexical_environment = init_env.clone();
+                let result = eval_expr(agent, init, true);
+                agent.running_context_mut()?.lexical_environment = saved_lexical;
+                agent.field_initializer_depth -= 1;
+                result?
+            }
             None => Value::Undefined,
         };
         if let Some(name_id) = field.private_name {
+            // The initializer may have made `this` non-extensible; the add
+            // still fails then (spec 10.2.10 step 1).
+            if !obj.is_extensible()? {
+                return Err(private_add_extensible_error());
+            }
             obj.private_element_add(crux::object::PrivateElement {
                 name_id,
                 kind: crux::object::PrivateElementKind::Field(value),
@@ -1371,6 +1603,13 @@ pub fn initialize_instance_elements(
         }
     }
     Ok(())
+}
+
+fn private_add_extensible_error() -> JsError {
+    JsError::new(
+        ErrorKind::TypeError,
+        "Cannot add private field to a non-extensible object".into(),
+    )
 }
 
 /// FunctionDeclarationInstantiation (spec 16.1.8): bind the parameters,
@@ -1584,23 +1823,41 @@ pub(crate) fn function_declaration_instantiation(
         Vec::new()
     };
     for decl in top_level_var_scoped_declarations(&data.body.stmts) {
-        let crate::script::VarScopedDecl::Variable(names) = decl else {
-            continue;
-        };
-        for name in names {
-            if instantiated.contains(&name) {
-                continue;
+        match decl {
+            crate::script::VarScopedDecl::Variable(names) => {
+                for name in names {
+                    if instantiated.contains(&name) {
+                        continue;
+                    }
+                    instantiated.push(name.clone());
+                    variable_env.create_mutable_binding(&name, false)?;
+                    if !simple {
+                        let initial =
+                            if !param_bindings.contains(&name) || func_names.contains(&name) {
+                                Value::Undefined
+                            } else {
+                                param_env.get_binding_value(&name, false)?
+                            };
+                        variable_env.initialize_binding(&name, initial)?;
+                    } else {
+                        variable_env.initialize_binding(&name, Value::Undefined)?;
+                    }
+                }
             }
-            instantiated.push(name.clone());
-            variable_env.create_mutable_binding(&name, false)?;
-            if !simple {
-                let initial = if !param_bindings.contains(&name) || func_names.contains(&name) {
-                    Value::Undefined
-                } else {
-                    param_env.get_binding_value(&name, false)?
+            // Function declarations are var-scoped too (spec 10.2.11 step
+            // 27): the binding must exist (non-deletable) before step 30
+            // binds the function value, so `delete f` returns false
+            // (S13_A12_T2).
+            crate::script::VarScopedDecl::Function(f) => {
+                let Some(name_atom) = f.name else {
+                    continue;
                 };
-                variable_env.initialize_binding(&name, initial)?;
-            } else {
+                let name = crux::lookup(name_atom);
+                if instantiated.contains(&name) {
+                    continue;
+                }
+                instantiated.push(name.clone());
+                variable_env.create_mutable_binding(&name, false)?;
                 variable_env.initialize_binding(&name, Value::Undefined)?;
             }
         }
@@ -2499,6 +2756,48 @@ mod tests {
             )
             .unwrap(),
             number(2.0)
+        );
+    }
+
+    #[test]
+    fn methods_and_arrows_are_not_constructors() {
+        // spec 7.2.4: MethodDefinition and arrow closures have no [[Construct]]
+        // (name-invoke-ctor.js, superclass-arrow-function.js).
+        assert_eq!(
+            run("var o = { m() {} }; var threw = false; try { new o.m(); } catch (e) { threw = e instanceof TypeError; } threw")
+                .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            run("var fn = () => {}; var threw = false; try { class C extends fn {} } catch (e) { threw = e instanceof TypeError; } threw")
+                .unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn generator_methods_get_a_prototype_property() {
+        // GeneratorMethod evaluation (spec 15.4.5): the method's `prototype`
+        // inherits %Generator.prototype% and is writable/non-configurable
+        // (generator-prototype-prop.js).
+        assert_eq!(
+            run("var m = { *method() {} }.method; \
+                 Object.getPrototypeOf(m.prototype) === Object.getPrototypeOf(function* () {}).prototype && \
+                 Object.getOwnPropertyDescriptor(m, 'prototype').writable === true && \
+                 Object.getOwnPropertyDescriptor(m, 'prototype').configurable === false")
+                .unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn new_evaluates_args_before_the_ctor_check() {
+        // EvaluateNew (spec 13.3.5.1.1): the argument list runs before
+        // IsConstructor (ctorExpr-isCtor-after-args-eval.js).
+        assert_eq!(
+            run("var x = {}; var threw = false; try { new x(x = Array); } catch (e) { threw = true; } threw && x === Array")
+                .unwrap(),
+            Value::Boolean(true)
         );
     }
 }

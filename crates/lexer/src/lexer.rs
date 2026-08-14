@@ -14,6 +14,23 @@ pub struct Lexer<'s> {
     goal: LexGoal,
     allow_html_comments: bool,
     line_break_before: bool,
+    /// Whether only whitespace and comments have been consumed since the
+    /// last LineTerminator (or the start of input): an Annex B `-->`
+    /// HTMLCloseComment is recognized there (spec 12.2 InputElement
+    /// HTMLCloseComment: WhiteSpaceSequence[opt] ... --> ...).
+    line_start: bool,
+    /// Whether the next produced identifier token contained a `\u` escape.
+    escaped_identifier: bool,
+    /// Eval-path tolerance: a HashbangComment may appear immediately after a
+    /// leading directive prologue, not only at position 0. The runtime's
+    /// strict-eval validation re-parses the user's source with a synthetic
+    /// `'use strict';` prefix, which would otherwise push a leading hashbang
+    /// off the first position.
+    allow_hashbang_after_directives: bool,
+    /// Whether every token lexed so far was trivia, a StringLiteral, or a
+    /// Semicolon — i.e. the source prefix is a directive prologue. Reset on
+    /// repositioning so a re-lex re-derives it.
+    only_directive_prologue: bool,
 }
 
 impl<'s> Lexer<'s> {
@@ -24,7 +41,19 @@ impl<'s> Lexer<'s> {
             goal,
             allow_html_comments,
             line_break_before: false,
+            line_start: true,
+            escaped_identifier: false,
+            allow_hashbang_after_directives: false,
+            only_directive_prologue: true,
         }
+    }
+
+    /// Enables the eval-path hashbang tolerance: a `#!` comment is accepted
+    /// after a leading directive prologue, not just at position 0 (the
+    /// runtime's strict-eval validation prepends a synthetic `'use strict';`
+    /// directive to the user's source).
+    pub fn set_allow_hashbang_after_directives(&mut self) {
+        self.allow_hashbang_after_directives = true;
     }
 
     /// The parser switches the goal between tokens (division vs regexp vs
@@ -42,6 +71,12 @@ impl<'s> Lexer<'s> {
     /// as a TemplateMiddle/Tail continuation).
     pub fn set_position(&mut self, pos: usize) {
         self.pos = pos;
+        // A repositioning re-lexes from the new point, so the directive
+        // prologue prefix is re-derived token by token. Position 0 is always
+        // a line start (a preceding LineTerminator is re-encountered by the
+        // trivia skip, which re-derives `line_start`).
+        self.only_directive_prologue = true;
+        self.line_start = pos == 0;
     }
 
     pub(crate) fn peek(&self) -> Option<u16> {
@@ -70,16 +105,24 @@ impl<'s> Lexer<'s> {
     /// Produces the next token, consuming trivia (whitespace and comments).
     pub fn next_token(&mut self) -> Result<Token, JsError> {
         self.line_break_before = false;
+        self.escaped_identifier = false;
         self.skip_trivia()?;
         let start = self.pos;
         let kind = match self.peek() {
             None => TokenKind::Eof,
             Some(u) => self.lex_token(u)?,
         };
+        self.line_start = false;
+        // Only StringLiteral and Semicolon tokens keep the source prefix a
+        // directive prologue (trivia never produces a token). Anything else
+        // ends it; `#!` after it is then no longer a hashbang.
+        self.only_directive_prologue &=
+            matches!(kind, TokenKind::StringLiteral { .. } | TokenKind::Semicolon);
         Ok(Token {
             kind,
             span: Span::new(start as u32, self.pos as u32),
             line_break_before: self.line_break_before,
+            escaped: self.escaped_identifier,
         })
     }
 
@@ -92,6 +135,7 @@ impl<'s> Lexer<'s> {
                 self.pos += 1;
             } else if is_line_terminator(u as u32) {
                 self.line_break_before = true;
+                self.line_start = true;
                 self.consume_line_terminator();
             } else if u == 0x2F {
                 match self.peek_n(1) {
@@ -106,14 +150,23 @@ impl<'s> Lexer<'s> {
                     }
                     _ => return Ok(()),
                 }
-            } else if u == 0x23
-                && self.peek_n(1) == Some(0x21)
-                && self.pos == 0
-                && matches!(self.goal, LexGoal::HashbangOrRegExp)
-            {
-                // Hashbang comment at the very start of a Script or Module.
-                self.pos += 2;
-                self.skip_line_comment();
+            } else if u == 0x23 && self.peek_n(1) == Some(0x21) {
+                // Hashbang comment at the very start of a Script or Module, or
+                // (eval path only) directly after a leading directive prologue.
+                let hashbang_here = (self.pos == 0
+                    && matches!(self.goal, LexGoal::HashbangOrRegExp))
+                    || (self.allow_hashbang_after_directives
+                        && self.only_directive_prologue
+                        && matches!(
+                            self.goal,
+                            LexGoal::Div | LexGoal::RegExp | LexGoal::HashbangOrRegExp
+                        ));
+                if hashbang_here {
+                    self.pos += 2;
+                    self.skip_line_comment();
+                } else {
+                    return Ok(());
+                }
             } else if self.allow_html_comments
                 && ((u == 0x3C
                     && self.peek_n(1) == Some(0x21)
@@ -122,7 +175,7 @@ impl<'s> Lexer<'s> {
                     || (u == 0x2D
                         && self.peek_n(1) == Some(0x2D)
                         && self.peek_n(2) == Some(0x3E)
-                        && (self.pos == 0 || self.line_break_before)))
+                        && self.line_start))
             {
                 // Annex B HTML comments (script code only).
                 self.pos += 3;
@@ -163,6 +216,7 @@ impl<'s> Lexer<'s> {
                 }
                 Some(u) if is_line_terminator(u as u32) => {
                     self.line_break_before = true;
+                    self.line_start = true;
                     self.consume_line_terminator();
                 }
                 Some(_) => self.pos += 1,
@@ -217,6 +271,7 @@ impl<'s> Lexer<'s> {
         let mut first = true;
         while let Some(u) = self.peek() {
             if u == b'\\' as u16 {
+                self.escaped_identifier = true;
                 let cp = self.lex_unicode_escape(start)?;
                 let ok = if first {
                     is_identifier_start(cp)
@@ -252,7 +307,8 @@ impl<'s> Lexer<'s> {
             self.pos += if cp > 0xFFFF { 2 } else { 1 };
             first = false;
         }
-        Ok(TokenKind::Identifier(intern(&units)))
+        let atom = intern(&units);
+        Ok(TokenKind::Identifier(atom))
     }
 
     fn lex_private_identifier(&mut self) -> Result<TokenKind, JsError> {
@@ -262,6 +318,7 @@ impl<'s> Lexer<'s> {
         let mut first = true;
         while let Some(u) = self.peek() {
             if u == b'\\' as u16 {
+                self.escaped_identifier = true;
                 let cp = self.lex_unicode_escape(start)?;
                 let ok = if first {
                     is_identifier_start(cp)
@@ -595,6 +652,10 @@ impl<'s> Lexer<'s> {
                 self.pos += 1;
                 TokenKind::Colon
             }
+            0x40 => {
+                self.pos += 1;
+                TokenKind::At
+            }
             _ => return Err(self.error_here("Unexpected character")),
         };
         Ok(kind)
@@ -700,6 +761,120 @@ mod tests {
             TokenKind::NumericLiteral(NumericLiteral::Number(1.0))
         );
         assert!(token.line_break_before);
+    }
+
+    #[test]
+    fn hashbang_only_at_the_very_start() {
+        // A `#!` preceded by trivia or tokens is not a hashbang: the `#` is
+        // a private identifier and must fail to lex.
+        for bad in ["// comment\n#!", " #!", "\n#!", ";#!", "/* c */\n#!"] {
+            let src = syntax::SourceText::from_utf8(bad);
+            let mut lexer = Lexer::new(&src, LexGoal::HashbangOrRegExp, false);
+            let mut failed = false;
+            loop {
+                match lexer.next_token() {
+                    Ok(token) if token.kind == TokenKind::Eof => break,
+                    Ok(_) => continue,
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            assert!(failed, "expected a lex error for {bad:?}");
+        }
+        // An escaped `#`/`!` is not a hashbang either.
+        for bad in ["\\u0023\\u0021", "\\u0023!", "#\\u0021", "\\x23!", "#\\x21"] {
+            let src = syntax::SourceText::from_utf8(bad);
+            let mut lexer = Lexer::new(&src, LexGoal::HashbangOrRegExp, false);
+            assert!(
+                lexer.next_token().is_err(),
+                "expected a lex error for {bad:?}"
+            );
+        }
+        // A second hashbang after a line terminator is not a hashbang.
+        let src = syntax::SourceText::from_utf8("#!a\n#!");
+        let mut lexer = Lexer::new(&src, LexGoal::HashbangOrRegExp, false);
+        assert!(lexer.next_token().is_err());
+    }
+
+    #[test]
+    fn hashbang_after_directives_with_eval_tolerance() {
+        // The eval tolerance accepts `#!` after a leading directive prologue
+        // (the runtime's strict-eval validation re-parse shape).
+        let src = syntax::SourceText::from_utf8("'use strict';\n#!x\n1");
+        let mut lexer = Lexer::new(&src, LexGoal::HashbangOrRegExp, false);
+        lexer.set_allow_hashbang_after_directives();
+        let mut kinds = Vec::new();
+        loop {
+            let token = lexer.next_token().unwrap();
+            let done = token.kind == TokenKind::Eof;
+            kinds.push(token.kind);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(kinds.len(), 4); // 'use strict', ;, 1, Eof
+        assert!(matches!(kinds[0], TokenKind::StringLiteral { .. }));
+        assert_eq!(kinds[1], TokenKind::Semicolon);
+        assert!(matches!(
+            kinds[2],
+            TokenKind::NumericLiteral(NumericLiteral::Number(1.0))
+        ));
+        // Without the tolerance the same source errors on the `#`.
+        let src = syntax::SourceText::from_utf8("'use strict';\n#!x\n1");
+        let mut lexer = Lexer::new(&src, LexGoal::HashbangOrRegExp, false);
+        let mut failed = false;
+        loop {
+            match lexer.next_token() {
+                Ok(token) if token.kind == TokenKind::Eof => break,
+                Ok(_) => continue,
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        assert!(failed, "expected a lex error without the tolerance");
+        // A `#!` after a non-directive token is still an error with the
+        // tolerance on: the directive-prologue prefix has ended.
+        let src = syntax::SourceText::from_utf8("x = 1;\n#!");
+        let mut lexer = Lexer::new(&src, LexGoal::HashbangOrRegExp, false);
+        lexer.set_allow_hashbang_after_directives();
+        let mut failed = false;
+        loop {
+            match lexer.next_token() {
+                Ok(token) if token.kind == TokenKind::Eof => break,
+                Ok(_) => continue,
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        assert!(failed, "expected a lex error after non-directive code");
+    }
+
+    #[test]
+    fn html_close_after_leading_whitespace() {
+        // HTMLCloseComment allows leading whitespace and comments at line
+        // start (spec 12.2): `  -->` and `/* c */ -->` are comments, and the
+        // first token comes with a line break before it.
+        for src in [
+            "  --> a comment\nthrow 1;",
+            "/* c */ --> a comment\nthrow 1;",
+        ] {
+            let src = syntax::SourceText::from_utf8(src);
+            let mut lexer = Lexer::new(&src, LexGoal::Div, true);
+            let t1 = lexer.next_token().unwrap();
+            assert!(
+                matches!(t1.kind, TokenKind::Identifier(_)),
+                "got {:?}",
+                t1.kind
+            );
+            assert!(t1.line_break_before, "comment is followed by a line break");
+            while !matches!(lexer.next_token().unwrap().kind, TokenKind::Eof) {}
+        }
     }
 
     #[test]
@@ -1219,16 +1394,12 @@ mod tests {
 
     #[test]
     fn leading_digit_splits_number_then_identifier() {
-        // A digit is never an identifier start; the lexer produces a number
-        // followed by an identifier, which the parser rejects.
-        assert_eq!(
-            kinds("1abc"),
-            vec![
-                TokenKind::NumericLiteral(NumericLiteral::Number(1.0)),
-                TokenKind::Identifier(intern(&[0x61, 0x62, 0x63])),
-                TokenKind::Eof,
-            ]
-        );
+        // A digit is never an identifier start, so a number immediately
+        // followed by an identifier is a SyntaxError (`1abc`, `3in`), never
+        // two tokens (spec 12.9.3).
+        let src = syntax::SourceText::from_utf8("1abc");
+        let mut lexer = Lexer::new(&src, LexGoal::Div, false);
+        assert!(lexer.next_token().is_err());
     }
 
     #[test]

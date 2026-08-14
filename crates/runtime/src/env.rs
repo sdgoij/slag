@@ -150,6 +150,29 @@ impl EnvRecord {
         }
     }
 
+    /// AddDisposableResource (spec 9.3.1): push a `using` resource onto the
+    /// environment's disposal stack.
+    pub fn add_disposable_resource(&self, resource: DisposableResource) {
+        match self {
+            EnvRecord::Declarative(e) => e.add_disposable_resource(resource),
+            EnvRecord::Function(e) => e.declarative.add_disposable_resource(resource),
+            EnvRecord::Global(e) => e.declarative.add_disposable_resource(resource),
+            EnvRecord::Module(e) => e.declarative.add_disposable_resource(resource),
+            EnvRecord::Object(_) => {}
+        }
+    }
+
+    /// Take the [[DisposableResourceStack]] for DisposeResources.
+    pub fn drain_disposable_resources(&self) -> Vec<DisposableResource> {
+        match self {
+            EnvRecord::Declarative(e) => e.drain_disposable_resources(),
+            EnvRecord::Function(e) => e.declarative.drain_disposable_resources(),
+            EnvRecord::Global(e) => e.declarative.drain_disposable_resources(),
+            EnvRecord::Module(e) => e.declarative.drain_disposable_resources(),
+            EnvRecord::Object(_) => Vec::new(),
+        }
+    }
+
     /// spec 9.2.1.7 DeleteBinding.
     pub fn delete_binding(&self, name: &JsString) -> Result<bool, JsError> {
         match self {
@@ -299,6 +322,14 @@ pub struct Binding {
     pub parameter: bool,
 }
 
+/// One `using` declaration's resource (spec 9.3.1): the value and the
+/// dispose method captured when the declaration was evaluated.
+#[derive(Debug, Clone)]
+pub struct DisposableResource {
+    pub value: Value,
+    pub method: Value,
+}
+
 /// A Declarative Environment Record (spec 9.2.2), also the base of the
 /// Function and Module records.
 #[derive(Debug)]
@@ -306,8 +337,8 @@ pub struct DeclarativeEnv {
     pub outer: Option<EnvRef>,
     pub bindings: RefCell<Vec<(JsString, Binding)>>,
     /// [[DisposableResourceStack]] (spec 9.2.2): populated by `using`
-    /// evaluation in Phase 15.
-    pub disposable_resources: RefCell<Vec<Value>>,
+    /// evaluation and drained by DisposeResources at scope exit.
+    pub disposable_resources: RefCell<Vec<DisposableResource>>,
     /// Annex B (B.3.2.1): the block-level FunctionDeclarations this block
     /// hoisted into the variable environment. FunctionDeclaration evaluation
     /// copies the block binding into the var binding for these names.
@@ -336,6 +367,18 @@ impl DeclarativeEnv {
 
     pub fn annex_b_hoists(&self, name: &JsString) -> bool {
         self.annex_b_functions.borrow().contains(name)
+    }
+
+    /// AddDisposableResource (spec 9.3.1): push a `using` resource onto this
+    /// environment's disposable-resource stack, drained by DisposeResources
+    /// when the scope exits.
+    pub fn add_disposable_resource(&self, resource: DisposableResource) {
+        self.disposable_resources.borrow_mut().push(resource);
+    }
+
+    /// Take the stack for disposal, leaving the environment with none.
+    pub fn drain_disposable_resources(&self) -> Vec<DisposableResource> {
+        std::mem::take(&mut *self.disposable_resources.borrow_mut())
     }
 
     /// Mark a binding as a formal parameter or `arguments` (the Annex B
@@ -773,6 +816,15 @@ impl GlobalEnv {
     ) -> Result<(), JsError> {
         if self.declarative.has_binding(name) {
             return self.declarative.set_mutable_binding(name, value, strict);
+        }
+        // spec 9.2.6.5 steps 2.b-c: a write to a global property that no
+        // longer exists (e.g. a getter deleted it) throws a ReferenceError
+        // in strict mode instead of recreating the property.
+        if !self.object.has_property(name)? && strict {
+            return Err(JsError::new(
+                ErrorKind::ReferenceError,
+                format!("{:?} is not defined", name.to_string_lossy()),
+            ));
         }
         self.object.set(name, value, strict)?;
         Ok(())

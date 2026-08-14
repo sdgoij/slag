@@ -12,9 +12,9 @@ use crux::convert::{ToPrimitiveHint, to_boolean, to_number, to_numeric, to_strin
 use crux::error::{ErrorKind, JsError};
 use crux::handle::Handle;
 use crux::ops::{is_strictly_equal, same_value};
-use crux::property::PropertyKey;
+use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
-use crux::value::{Value, is_callable, is_constructor, type_of};
+use crux::value::{Value, is_callable, type_of};
 use syntax::ast::{
     Argument, ArrayElement, AssignOp, BinaryOp, BindingElement, Expr, ExprKind, Literal, LogicalOp,
     MemberExpr, MemberProperty, ObjectLiteral, ObjectProperty, PropertyName, TemplateLiteral,
@@ -87,9 +87,16 @@ pub fn eval_expr(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Value, 
             }
         }
         ExprKind::PrivateIn { name, object } => {
-            // PrivateIn (spec 13.11.1): the `#name in obj` brand check.
+            // PrivateIn (spec 13.11.1): the `#name in obj` brand check. The
+            // right-hand side must be an object (spec 13.10.3).
             let name_id = crate::context::resolve_private_name(agent, *name)?.id;
             let object = eval_expr(agent, object, strict)?;
+            if !matches!(object, Value::Object(_) | Value::Function(_)) {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "Cannot use 'in' operator with a non-object value".into(),
+                ));
+            }
             Ok(Value::Boolean(crate::context::private_in(
                 &object, name_id,
             )?))
@@ -100,7 +107,7 @@ pub fn eval_expr(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Value, 
             let reference = eval_chain(agent, expr, strict)?;
             match reference {
                 None => Ok(Value::Undefined),
-                Some(ChainResult::Reference(reference)) => get_value(agent, &reference),
+                Some(ChainResult::Reference(reference)) => get_reference_value(agent, &reference),
                 Some(ChainResult::Value(value)) => Ok(value),
             }
         }
@@ -142,6 +149,16 @@ pub fn eval_expr(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Value, 
     }
 }
 
+/// Whether the operand (through parentheses) is a `super.x`/`super[key]`
+/// member expression.
+fn is_super_member_operand(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Paren(inner) => is_super_member_operand(inner),
+        ExprKind::Member(member) => matches!(member.object.kind, ExprKind::Super),
+        _ => false,
+    }
+}
+
 /// The result of evaluating an optional-chain link: a Reference (member or
 /// identifier, keeping the `this` for calls) or a plain value.
 pub enum ChainResult {
@@ -158,17 +175,19 @@ pub fn eval_chain(
     strict: bool,
 ) -> Result<Option<ChainResult>, JsError> {
     match &expr.kind {
+        // Parentheses do not change the reference-ness of the wrapped
+        // expression: `typeof (x)` on an unresolvable `x` is still
+        // "undefined", and `delete (obj.prop)` still deletes (spec 13.2.8).
+        ExprKind::Paren(inner) => eval_chain(agent, inner, strict),
         ExprKind::Member(member) => {
             if matches!(member.object.kind, ExprKind::Super) {
-                // MakeSuperPropertyReference (spec 13.3.6.2): the base is the
-                // method's [[HomeObject]] prototype, and calls through the
-                // reference receive the current `this`.
-                let base = crate::context::get_super_base(agent)?;
-                if is_nullish(&base) {
-                    return Err(nullish_member_error(member));
-                }
-                let name = eval_member_key(agent, member, strict)?;
+                // SuperProperty (spec 13.3.7.1): GetThisBinding runs before
+                // the key expression is evaluated, so `super[super()]` in a
+                // derived constructor throws a ReferenceError for the
+                // uninitialized `this` instead of running the inner call.
                 let this = crate::context::resolve_this_binding(agent)?;
+                let base = crate::context::get_super_base(agent)?;
+                let name = eval_member_key(agent, member, strict)?;
                 let reference = Reference {
                     base: ReferenceBase::Value(base),
                     name,
@@ -188,7 +207,7 @@ pub fn eval_chain(
                     return Ok(None);
                 };
                 let object_value = match object {
-                    ChainResult::Reference(reference) => get_value(agent, &reference)?,
+                    ChainResult::Reference(reference) => get_reference_value(agent, &reference)?,
                     ChainResult::Value(value) => value,
                 };
                 if member.optional && is_nullish(&object_value) {
@@ -208,16 +227,30 @@ pub fn eval_chain(
                 return Ok(None);
             };
             let object_value = match object {
-                ChainResult::Reference(reference) => get_value(agent, &reference)?,
+                ChainResult::Reference(reference) => get_reference_value(agent, &reference)?,
                 ChainResult::Value(value) => value,
             };
-            if member.optional && is_nullish(&object_value) {
-                return Ok(None);
-            }
-            if !member.optional && is_nullish(&object_value) {
+            // A computed property key is evaluated before the nullish-base
+            // check (spec 13.3.2.2: RequireObjectCoercible precedes
+            // ToPropertyKey), so `null[key]` runs the key expression but
+            // throws TypeError before converting it. An optional `?.[` link
+            // short-circuits on a nullish base without evaluating its key.
+            let computed_key = match &member.property {
+                MemberProperty::Computed(expr) if !member.optional => {
+                    Some(eval_expr(agent, expr, strict)?)
+                }
+                _ => None,
+            };
+            if is_nullish(&object_value) {
+                if member.optional {
+                    return Ok(None);
+                }
                 return Err(nullish_member_error(member));
             }
-            let name = eval_member_key(agent, member, strict)?;
+            let name = match computed_key {
+                Some(key) => crate::context::to_property_key(agent, &key)?,
+                None => eval_member_key(agent, member, strict)?,
+            };
             let reference = Reference {
                 base: ReferenceBase::Value(object_value),
                 name,
@@ -267,34 +300,44 @@ fn eval_call_chain(
     let (this, callee_value) = match callee {
         ChainResult::Reference(reference) => {
             let this = get_this_value(&reference);
-            (this, get_value(agent, &reference)?)
+            (this, get_reference_value(agent, &reference)?)
         }
         ChainResult::Value(value) => (Value::Undefined, value),
     };
     if call.optional && is_nullish(&callee_value) {
         return Ok(None);
     }
+    // spec 13.3.6.1: the arguments are evaluated before the callable check
+    // (step 5 precedes step 6), so `o.bar(foo())` runs `foo()` even though
+    // `o.bar` is not callable.
+    let args = eval_arguments(agent, &call.args, strict)?;
     if !is_callable(&callee_value) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             format!("{} is not a function", type_of(&callee_value)),
         ));
     }
-    let args = eval_arguments(agent, &call.args, strict)?;
     // Direct eval (spec 13.3.6.1 step 5): a call whose callee is the
     // intrinsic %eval% reached through the identifier `eval` runs its first
     // argument as a Script; any other route to %eval% is an indirect eval.
     if is_eval_function(agent, &callee_value)? {
-        // spec 19.2.1.1 step 3: a missing argument is *undefined*, which
-        // ToStrings to "undefined" and parses as the identifier
-        // (S15.5.1.1_A1_T6); non-strings coerce the same way.
+        // spec 19.2.1.1 step 2: a non-string argument (including a missing
+        // one, which is *undefined*) is returned as-is — eval never coerces
+        // (S15.1.2.1_A1.1_T2).
         let source = args.first().cloned().unwrap_or(Value::Undefined);
-        let source = to_string(&source)?;
-        let direct = matches!(
-            call.callee.kind,
-            ExprKind::Ident(id) if crux::lookup(id) == crux::string::JsString::from_utf8("eval")
-        );
-        let result = crate::script::perform_eval(agent, &source, strict, direct)?;
+        let Value::String(source) = source else {
+            return Ok(Some(ChainResult::Value(source)));
+        };
+        // Only a plain identifier callee makes a direct eval; an optional
+        // call `eval?.(...)` routes the callee through the chain and is an
+        // indirect eval (spec 13.3.9.1: the callee is a value, not the
+        // `eval` identifier reference).
+        let direct = !call.optional
+            && matches!(
+                call.callee.kind,
+                ExprKind::Ident(id) if crux::lookup(id) == crux::string::JsString::from_utf8("eval")
+            );
+        let result = crate::script::perform_eval(agent, source.as_ref(), strict, direct)?;
         return Ok(Some(ChainResult::Value(result)));
     }
     let result = crate::function::call(agent, &callee_value, this, &args)?;
@@ -356,6 +399,217 @@ pub fn eval_reference(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Re
             "Invalid left-hand side in assignment".into(),
         )),
     }
+}
+
+/// GetValue of a Reference, honoring a super reference's [[ThisValue]]
+/// receiver: the property read is base.[[Get]](name, GetThisValue(V)) (spec
+/// 6.2.3.1 step 5.b), not base.[[Get]](name, base).
+fn get_reference_value(agent: &mut Agent, reference: &Reference) -> Result<Value, JsError> {
+    let Some(receiver) = &reference.this_value else {
+        return get_value(agent, reference);
+    };
+    let ReferenceBase::Value(base) = &reference.base else {
+        return get_value(agent, reference);
+    };
+    get_property_key(agent, base, &reference.name, receiver.clone())
+}
+
+/// PutValue of a Reference, honoring a super reference's [[ThisValue]]
+/// receiver: the property write is base.[[Set]](name, W, GetThisValue(V))
+/// (spec 6.2.3.2 step 6.b).
+fn put_reference_value(
+    agent: &mut Agent,
+    reference: &Reference,
+    value: Value,
+) -> Result<(), JsError> {
+    let Some(receiver) = &reference.this_value else {
+        return put_value(agent, reference, value);
+    };
+    let ReferenceBase::Value(base) = &reference.base else {
+        return put_value(agent, reference, value);
+    };
+    let object = if matches!(base, Value::Object(_) | Value::Function(_)) {
+        base.clone()
+    } else {
+        crate::context::to_object(agent, base)?
+    };
+    let succeeded = match &object {
+        Value::Object(obj) => obj.set_with_receiver_key(
+            &reference.name,
+            value.clone(),
+            receiver.clone(),
+            reference.strict,
+        )?,
+        Value::Function(f) => f.object.set_with_receiver_key(
+            &reference.name,
+            value.clone(),
+            receiver.clone(),
+            reference.strict,
+        )?,
+        _ => false,
+    };
+    if !succeeded && reference.strict {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            format!(
+                "Cannot assign to read only property {:?}",
+                reference.name.display_string()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// An assignment target whose computed property key is converted lazily.
+/// Evaluating `a[b] = c` leaves `b` unconverted until PutValue, after `c`
+/// has run (spec 13.15.2 and EvaluatePropertyAccessWithExpressionKey's
+/// note). The nullish-base TypeError also surfaces in PutValue.
+pub(crate) enum LazyReference {
+    /// An identifier or non-computed member target: nothing deferred.
+    Reference(Reference),
+    /// `base[key]`: both evaluated, the key still raw.
+    Computed {
+        base: Value,
+        key: Value,
+        strict: bool,
+    },
+    /// `super[key]`: the super base and `this` resolved, the key raw.
+    SuperComputed {
+        base: Value,
+        this: Value,
+        key: Value,
+        strict: bool,
+    },
+}
+
+impl LazyReference {
+    /// PutValue, converting the deferred key first (spec 6.2.3.2 step 6.c:
+    /// ToPropertyKey after ToObject).
+    pub fn put(self, agent: &mut Agent, value: Value) -> Result<(), JsError> {
+        match self {
+            LazyReference::Reference(reference) => put_reference_value(agent, &reference, value),
+            LazyReference::Computed { base, key, strict } => {
+                let key = crate::context::to_property_key(agent, &key)?;
+                let reference = Reference {
+                    base: ReferenceBase::Value(base),
+                    name: key,
+                    strict,
+                    this_value: None,
+                    private_name: None,
+                };
+                put_value(agent, &reference, value)
+            }
+            LazyReference::SuperComputed {
+                base,
+                this,
+                key,
+                strict,
+            } => {
+                let key = crate::context::to_property_key(agent, &key)?;
+                let reference = Reference {
+                    base: ReferenceBase::Value(base),
+                    name: key,
+                    strict,
+                    this_value: Some(this),
+                    private_name: None,
+                };
+                put_reference_value(agent, &reference, value)
+            }
+        }
+    }
+}
+
+/// Evaluate a LeftHandSideExpression as an assignment target, deferring the
+/// nullish-base check and a computed member key's ToPropertyKey to
+/// `LazyReference::put` (spec 13.15.2 and EvaluatePropertyAccessWith-
+/// ExpressionKey's note).
+pub(crate) fn eval_assignment_target(
+    agent: &mut Agent,
+    expr: &Expr,
+    strict: bool,
+) -> Result<LazyReference, JsError> {
+    if let ExprKind::Paren(inner) = &expr.kind {
+        return eval_assignment_target(agent, inner, strict);
+    }
+    if let ExprKind::Member(member) = &expr.kind {
+        if let MemberProperty::Private(atom) = &member.property {
+            // `obj.#name` — the private name resolves now; the brand check
+            // happens in PrivateSet at PutValue.
+            let name_id = crate::context::resolve_private_name(agent, *atom)?.id;
+            let object = eval_chain(agent, &member.object, strict)?;
+            let Some(object) = object else {
+                return Err(JsError::new(
+                    ErrorKind::ReferenceError,
+                    "Invalid left-hand side in assignment".into(),
+                ));
+            };
+            let base = match object {
+                ChainResult::Reference(reference) => get_reference_value(agent, &reference)?,
+                ChainResult::Value(value) => value,
+            };
+            return Ok(LazyReference::Reference(Reference {
+                base: ReferenceBase::Value(base),
+                name: PropertyKey::from_utf8(""),
+                strict,
+                this_value: None,
+                private_name: Some(name_id),
+            }));
+        }
+        if matches!(member.object.kind, ExprKind::Super) {
+            let base = crate::context::get_super_base(agent)?;
+            let this = crate::context::resolve_this_binding(agent)?;
+            return match &member.property {
+                MemberProperty::Computed(key_expr) => {
+                    let key = eval_expr(agent, key_expr, strict)?;
+                    Ok(LazyReference::SuperComputed {
+                        base,
+                        this,
+                        key,
+                        strict,
+                    })
+                }
+                _ => {
+                    let key = eval_member_key(agent, member, strict)?;
+                    Ok(LazyReference::Reference(Reference {
+                        base: ReferenceBase::Value(base),
+                        name: key,
+                        strict,
+                        this_value: Some(this),
+                        private_name: None,
+                    }))
+                }
+            };
+        }
+        let object = eval_chain(agent, &member.object, strict)?;
+        let Some(object) = object else {
+            return Err(JsError::new(
+                ErrorKind::ReferenceError,
+                "Invalid left-hand side in assignment".into(),
+            ));
+        };
+        let base = match object {
+            ChainResult::Reference(reference) => get_reference_value(agent, &reference)?,
+            ChainResult::Value(value) => value,
+        };
+        return match &member.property {
+            MemberProperty::Computed(key_expr) => {
+                let key = eval_expr(agent, key_expr, strict)?;
+                Ok(LazyReference::Computed { base, key, strict })
+            }
+            _ => {
+                let key = eval_member_key(agent, member, strict)?;
+                Ok(LazyReference::Reference(Reference {
+                    base: ReferenceBase::Value(base),
+                    name: key,
+                    strict,
+                    this_value: None,
+                    private_name: None,
+                }))
+            }
+        };
+    }
+    let reference = eval_reference(agent, expr, strict)?;
+    Ok(LazyReference::Reference(reference))
 }
 
 fn eval_literal(agent: &mut Agent, literal: &Literal) -> Result<Value, JsError> {
@@ -434,7 +688,7 @@ fn eval_object_literal(
             ObjectProperty::Init {
                 key,
                 value: value_expr,
-                ..
+                shorthand,
             } => {
                 let key = eval_property_name(agent, key, strict)?;
                 let value = eval_expr(agent, value_expr, strict)?;
@@ -442,31 +696,31 @@ fn eval_object_literal(
                     // spec 15.4.2 step 5: SetFunctionName from the property key.
                     crate::function::set_function_name(&value, &property_key_display(&key), None)?;
                 }
-                let is_proto = matches!(&key, PropertyKey::String(id) if crux::lookup(*id).to_string_lossy() == "__proto__");
-                if is_proto {
+                // Only a non-computed, non-shorthand `__proto__` key is the
+                // prototype setter (Annex B.3.1); computed keys and shorthand
+                // properties are ordinary own data properties, and duplicate
+                // shorthand `__proto__` is permitted.
+                let proto_setter = !shorthand
+                    && !matches!(
+                        property,
+                        ObjectProperty::Init {
+                            key: PropertyName::Computed(_),
+                            ..
+                        }
+                    )
+                    && matches!(&key, PropertyKey::String(id) if crux::lookup(*id).to_string_lossy() == "__proto__");
+                if proto_setter {
                     match value {
                         Value::Object(proto) => {
-                            if !object.set_prototype_of(Some(proto))? {
-                                return Err(JsError::new(
-                                    ErrorKind::TypeError,
-                                    "Cannot set prototype of non-extensible object".into(),
-                                ));
-                            }
+                            set_proto_or_throw(&object, Some(proto))?;
                         }
                         Value::Null => {
-                            if !object.set_prototype_of(None)? {
-                                return Err(JsError::new(
-                                    ErrorKind::TypeError,
-                                    "Cannot set prototype of non-extensible object".into(),
-                                ));
-                            }
+                            set_proto_or_throw(&object, None)?;
                         }
-                        _ => {
-                            object.create_data_property_key(
-                                &PropertyKey::from_utf8("__proto__"),
-                                value,
-                            )?;
-                        }
+                        // B.3.1 step 6: a non-object, non-null value sets
+                        // neither the prototype nor an own property — the
+                        // property definition is a no-op.
+                        _ => {}
                     }
                 } else {
                     object.create_data_property_key(&key, value)?;
@@ -511,7 +765,12 @@ fn eval_object_literal(
                     },
                 )?;
             }
-            ObjectProperty::Set { key, param, body } => {
+            ObjectProperty::Set {
+                key,
+                param,
+                init,
+                body,
+            } => {
                 // PropertyDefinition : set PropertyName ( BindingElement ) { FunctionBody }
                 let key = eval_property_name(agent, key, strict)?;
                 let env = agent.running_context()?.lexical_environment.clone();
@@ -519,7 +778,7 @@ fn eval_object_literal(
                     agent,
                     vec![BindingElement {
                         pattern: param.clone(),
-                        init: None,
+                        init: init.clone(),
                         rest: false,
                         span: body.span,
                     }],
@@ -547,35 +806,50 @@ fn eval_object_literal(
             }
             ObjectProperty::Spread(expr) => {
                 let from = eval_expr(agent, expr, strict)?;
-                copy_data_properties(&object, &from)?;
+                copy_data_properties(agent, &object, &from)?;
             }
         }
     }
     Ok(Value::Object(object))
 }
 
-/// CopyDataProperties (spec 14.1.16): copy the enumerable own properties of
-/// `from` onto `to`, skipping keys that already exist.
+/// The `__proto__` prototype-setter step (Annex B.3.1): SetPrototypeOf, with
+/// a TypeError when the object is non-extensible.
+fn set_proto_or_throw(
+    object: &crux::object::JsObject,
+    proto: Option<crux::handle::Handle<crux::object::JsObject>>,
+) -> Result<(), JsError> {
+    if !object.set_prototype_of(proto)? {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Cannot set prototype of non-extensible object".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// CopyDataProperties (spec 14.1.16) for object-literal spread: copy every
+/// enumerable own property of `from` onto `to`, overwriting any existing key
+/// (a later spread overrides an earlier definition). Values are read with
+/// `Get`, so accessor and proxy traps run even when the key already exists.
 pub(crate) fn copy_data_properties(
+    agent: &mut Agent,
     to: &crux::object::JsObject,
     from: &Value,
 ) -> Result<(), JsError> {
-    let Value::Object(from_obj) = from else {
+    if matches!(from, Value::Null | Value::Undefined) {
+        return Ok(());
+    }
+    let Value::Object(from_obj) = crate::context::to_object(agent, from)? else {
         return Ok(());
     };
     for key in from_obj.own_property_keys()? {
-        if to.has_own_property_key(&key)? {
-            continue;
-        }
         let property = from_obj.get_own_property_key(&key)?;
         if let Some(property) = property {
             if !property.enumerable {
                 continue;
             }
-            let value = match property.kind {
-                crux::object::PropertyKind::Data { value, .. } => value,
-                crux::object::PropertyKind::Accessor { .. } => from_obj.get_key(&key)?,
-            };
+            let value = from_obj.get_key(&key)?;
             to.create_data_property_key(&key, value)?;
         }
     }
@@ -601,15 +875,17 @@ fn eval_property_name(
     }
 }
 
-/// The display name SetFunctionName uses for a key: the string, or the
-/// symbol's description (empty when there is none) (spec 13.3.4).
-fn property_key_display(key: &PropertyKey) -> JsString {
+/// The display name SetFunctionName uses for a key: the string, or a symbol's
+/// bracketed description (empty when there is none) (spec 13.3.4 step 2).
+pub(crate) fn property_key_display(key: &PropertyKey) -> JsString {
     match key {
         PropertyKey::String(id) => crux::lookup(*id),
-        PropertyKey::Symbol(symbol) => symbol
-            .description
-            .clone()
-            .unwrap_or_else(|| JsString::from_utf8("")),
+        PropertyKey::Symbol(symbol) => match &symbol.description {
+            Some(description) if !description.is_empty() => {
+                JsString::from_utf8(&format!("[{}]", description.to_string_lossy()))
+            }
+            _ => JsString::from_utf8(""),
+        },
     }
 }
 
@@ -622,7 +898,40 @@ fn eval_unary(
 ) -> Result<Value, JsError> {
     match op {
         UnaryOp::Delete => {
-            let reference = eval_reference(agent, operand, strict)?;
+            // delete of a non-reference (a literal, a parenthesized
+            // expression, a short-circuited optional chain) returns true
+            // (spec 13.5.1.2 step 3).
+            // delete super.x / delete super[key] is a ReferenceError before
+            // any ToPropertyKey of a computed key (spec 13.5.1.2 step 4.b):
+            // the deferred-key evaluation keeps the key raw, so a key whose
+            // toString throws still surfaces the ReferenceError
+            // (super-property-topropertykey.js).
+            if is_super_member_operand(operand) {
+                let deferred = eval_assignment_target(agent, operand, strict)?;
+                if matches!(deferred, LazyReference::SuperComputed { .. })
+                    || matches!(
+                        &deferred,
+                        LazyReference::Reference(reference) if reference.this_value.is_some()
+                    )
+                {
+                    return Err(JsError::new(
+                        ErrorKind::ReferenceError,
+                        "Unsupported reference to 'super'".into(),
+                    ));
+                }
+            }
+            let reference = match eval_chain(agent, operand, strict)? {
+                Some(ChainResult::Reference(reference)) => reference,
+                Some(ChainResult::Value(_)) | None => return Ok(Value::Boolean(true)),
+            };
+            // delete of a super property reference is a ReferenceError (spec
+            // 13.5.1.2 step 5.b); the null base is never reached.
+            if reference.this_value.is_some() {
+                return Err(JsError::new(
+                    ErrorKind::ReferenceError,
+                    "Unsupported reference to 'super'".into(),
+                ));
+            }
             let deleted = delete_property_or_throw(&reference)?;
             Ok(Value::Boolean(deleted))
         }
@@ -637,13 +946,27 @@ fn eval_unary(
                 None => Value::Undefined,
                 Some(ChainResult::Reference(reference)) => match &reference.base {
                     ReferenceBase::Unresolvable => Value::Undefined,
-                    _ => get_value(agent, &reference)?,
+                    _ => get_reference_value(agent, &reference)?,
                 },
                 Some(ChainResult::Value(value)) => value,
             };
-            Ok(Value::String(Handle::new(JsString::from_utf8(type_of(
-                &value,
-            )))))
+            // typeof null is "object" (spec 13.5.3.2 step 3); a proxy's
+            // [[Call]] is fixed at creation, so a revoked callable proxy still
+            // reads "function" (the crux type_of consults the revoked
+            // target).
+            let type_name = match &value {
+                Value::Null => "object",
+                Value::Object(obj)
+                    if matches!(
+                        &obj.kind,
+                        crux::object::ObjectKind::Proxy(slots) if slots.callable.get()
+                    ) =>
+                {
+                    "function"
+                }
+                other => type_of(other),
+            };
+            Ok(Value::String(Handle::new(JsString::from_utf8(type_name))))
         }
         UnaryOp::Plus => {
             let value = eval_expr(agent, operand, strict)?;
@@ -662,7 +985,9 @@ fn eval_unary(
             let value = eval_expr(agent, operand, strict)?;
             let numeric = to_numeric_operand(agent, &value)?;
             match numeric {
-                Value::Number(n) => Ok(Value::Number((!(n as i32)) as f64)),
+                // ToInt32 (mod 2^32), not a saturating cast: ~-2147483649 is
+                // ~2147483647 (S9.5_A2.1_T2).
+                Value::Number(n) => Ok(Value::Number((!to_int32(n)) as f64)),
                 Value::BigInt(b) => Ok(Value::BigInt(Handle::new(bigint::bitwise_not(&b)))),
                 _ => unreachable!(),
             }
@@ -698,7 +1023,7 @@ pub(crate) fn eval_unary_value(
         UnaryOp::BitNot => {
             let numeric = to_numeric_operand(agent, &value)?;
             match numeric {
-                Value::Number(n) => Ok(Value::Number((!(n as i32)) as f64)),
+                Value::Number(n) => Ok(Value::Number((!to_int32(n)) as f64)),
                 Value::BigInt(b) => Ok(Value::BigInt(Handle::new(bigint::bitwise_not(&b)))),
                 _ => unreachable!(),
             }
@@ -716,9 +1041,9 @@ fn eval_update(
     strict: bool,
 ) -> Result<Value, JsError> {
     let reference = eval_reference(agent, target, strict)?;
-    let old = get_value(agent, &reference)?;
+    let old = get_reference_value(agent, &reference)?;
     let old_numeric = to_numeric_operand(agent, &old)?;
-    let new = match old_numeric {
+    let new = match old_numeric.clone() {
         Value::Number(n) => {
             let delta = if matches!(op, UpdateOp::Increment) {
                 1.0
@@ -738,8 +1063,10 @@ fn eval_update(
         }
         _ => unreachable!(),
     };
-    put_value(agent, &reference, new.clone())?;
-    if prefix { Ok(new) } else { Ok(old) }
+    put_reference_value(agent, &reference, new.clone())?;
+    // spec 13.4.4: a postfix update returns the old ToNumeric value (the
+    // object is coerced, not returned as-is).
+    if prefix { Ok(new) } else { Ok(old_numeric) }
 }
 
 /// LogicalExpression evaluation (spec 13.13.2-4): short-circuit on the left
@@ -784,58 +1111,87 @@ fn eval_assignment(
         crate::binding::destructuring_assignment(agent, target, value.clone(), strict)?;
         return Ok(value);
     }
+    if matches!(op, AssignOp::Assign) {
+        // Simple assignment (spec 13.15.2): the target reference is evaluated
+        // with its computed key conversion deferred past the RHS, and the
+        // nullish-base TypeError surfaces in PutValue.
+        let reference = eval_assignment_target(agent, target, strict)?;
+        let value = named_eval_rhs(agent, target, value_expr, strict)?;
+        reference.put(agent, value.clone())?;
+        return Ok(value);
+    }
+    // Compound and logical assignments: GetValue(lref) runs before the RHS,
+    // so the reference (and its key conversion) happens up front.
     let reference = eval_reference(agent, target, strict)?;
     match op {
-        AssignOp::Assign => {
-            let value = eval_expr(agent, value_expr, strict)?;
-            // spec 13.15.2 step 1.e: an anonymous function assigned to an
-            // identifier reference takes the identifier as its name.
-            if let ExprKind::Ident(name) = &target.kind
-                && crate::function::is_anonymous_function_definition(value_expr)
-            {
-                crate::function::set_function_name(&value, &crux::lookup(*name), None)?;
-            }
-            put_value(agent, &reference, value.clone())?;
-            Ok(value)
-        }
+        AssignOp::Assign => unreachable!("handled above"),
         AssignOp::AndAssign => {
-            let old = get_value(agent, &reference)?;
+            let old = get_reference_value(agent, &reference)?;
             if to_boolean(&old) {
-                let new = eval_expr(agent, value_expr, strict)?;
-                put_value(agent, &reference, new.clone())?;
+                let new = named_eval_rhs(agent, target, value_expr, strict)?;
+                put_reference_value(agent, &reference, new.clone())?;
                 Ok(new)
             } else {
                 Ok(old)
             }
         }
         AssignOp::OrAssign => {
-            let old = get_value(agent, &reference)?;
+            let old = get_reference_value(agent, &reference)?;
             if to_boolean(&old) {
                 Ok(old)
             } else {
-                let new = eval_expr(agent, value_expr, strict)?;
-                put_value(agent, &reference, new.clone())?;
+                let new = named_eval_rhs(agent, target, value_expr, strict)?;
+                put_reference_value(agent, &reference, new.clone())?;
                 Ok(new)
             }
         }
         AssignOp::NullishAssign => {
-            let old = get_value(agent, &reference)?;
+            let old = get_reference_value(agent, &reference)?;
             if is_nullish(&old) {
-                let new = eval_expr(agent, value_expr, strict)?;
-                put_value(agent, &reference, new.clone())?;
+                let new = named_eval_rhs(agent, target, value_expr, strict)?;
+                put_reference_value(agent, &reference, new.clone())?;
                 Ok(new)
             } else {
                 Ok(old)
             }
         }
         _ => {
-            let old = get_value(agent, &reference)?;
+            let old = get_reference_value(agent, &reference)?;
             let right = eval_expr(agent, value_expr, strict)?;
             let new = apply_compound(agent, *op, &old, &right)?;
-            put_value(agent, &reference, new.clone())?;
+            put_reference_value(agent, &reference, new.clone())?;
             Ok(new)
         }
     }
+}
+
+/// Evaluate the RHS of an assignment: when the target is an identifier and
+/// the RHS is an anonymous function/class/arrow definition, it takes the
+/// identifier as its name (spec 13.15.2 NamedEvaluation); otherwise the RHS
+/// evaluates normally. An anonymous class expression is created with the
+/// inferred name already applied, so its static field initializers observe it.
+fn named_eval_rhs(
+    agent: &mut Agent,
+    target: &Expr,
+    value_expr: &Expr,
+    strict: bool,
+) -> Result<Value, JsError> {
+    let value = match &value_expr.kind {
+        ExprKind::Class(class) if class.name.is_none() => {
+            if let ExprKind::Ident(binding) = &target.kind {
+                crate::class::class_definition_evaluation(agent, class, Some(*binding), strict)?
+            } else {
+                eval_expr(agent, value_expr, strict)?
+            }
+        }
+        _ => eval_expr(agent, value_expr, strict)?,
+    };
+    if let ExprKind::Ident(name) = &target.kind
+        && crate::function::is_anonymous_function_definition(value_expr)
+    {
+        crate::function::set_function_name(&value, &crux::lookup(*name), None)?;
+    }
+    Ok(value)
 }
 
 /// Map a compound assignment operator onto its binary operator.
@@ -919,17 +1275,21 @@ pub(crate) fn apply_binary(
         | BinaryOp::BitXor
         | BinaryOp::BitOr => bitwise_binary(agent, op, left, right),
         BinaryOp::LessThan => Ok(Value::Boolean(
-            abstract_relational(agent, left, right)?.unwrap_or(false),
+            abstract_relational(agent, left, right, true)?.unwrap_or(false),
         )),
         BinaryOp::GreaterThan => Ok(Value::Boolean(
-            abstract_relational(agent, right, left)?.unwrap_or(false),
+            abstract_relational(agent, right, left, false)?.unwrap_or(false),
         )),
-        BinaryOp::LessEqual => Ok(Value::Boolean(
-            !abstract_relational(agent, right, left)?.unwrap_or(false),
-        )),
-        BinaryOp::GreaterEqual => Ok(Value::Boolean(
-            !abstract_relational(agent, left, right)?.unwrap_or(false),
-        )),
+        // x <= y is true only when IsLessThan(y, x) is false: an undefined
+        // (NaN / incomparable) relation is false (spec 13.10.2).
+        BinaryOp::LessEqual => Ok(Value::Boolean(matches!(
+            abstract_relational(agent, right, left, false)?,
+            Some(false)
+        ))),
+        BinaryOp::GreaterEqual => Ok(Value::Boolean(matches!(
+            abstract_relational(agent, left, right, true)?,
+            Some(false)
+        ))),
         BinaryOp::Equal => Ok(Value::Boolean(abstract_loosely_equal(agent, left, right)?)),
         BinaryOp::NotEqual => Ok(Value::Boolean(!abstract_loosely_equal(agent, left, right)?)),
         BinaryOp::StrictEqual => Ok(Value::Boolean(is_strictly_equal(left, right))),
@@ -1077,7 +1437,7 @@ fn numeric_binary(
                 BinaryOp::Mul => a * b,
                 BinaryOp::Div => a / b,
                 BinaryOp::Rem => a % b,
-                BinaryOp::Exp => a.powf(b),
+                BinaryOp::Exp => number_exponentiate(a, b),
                 _ => unreachable!("non-arithmetic op"),
             };
             Ok(Value::Number(result))
@@ -1097,6 +1457,65 @@ fn bigint_shift(count: &crux::BigInt) -> i64 {
     count.to_f64().clamp(-SHIFT_LIMIT, SHIFT_LIMIT) as i64
 }
 
+/// BigInt::leftShift/rightShift: a negative count divides, rounding down
+/// toward -infinity (spec 6.1.6.2.10 step 1), while num_bigint's `/` rounds
+/// toward zero (`-5n >> 1n` is -3n, not -2n).
+fn bigint_shifted_floor(x: &crux::BigInt, shift: i64) -> crux::BigInt {
+    if shift >= 0 {
+        return crux::bigint::left_shift(x, shift);
+    }
+    let divisor = crux::BigInt::from(2u64).0.pow((-shift) as u32);
+    let q = &x.0 / &divisor;
+    if x.0 < &q * &divisor {
+        // Rounding was upward: subtract one to reach the floor.
+        crux::BigInt(&q - &crux::BigInt::from(1i64).0)
+    } else {
+        crux::BigInt(q)
+    }
+}
+
+/// Number::exponentiate (spec 6.1.6.1.8): a NaN base or exponent is NaN
+/// unless the exponent is ±0 (which yields 1), and an infinite exponent with
+/// |base| = 1 is NaN (Rust's `powf` returns 1 for those cases).
+fn number_exponentiate(base: f64, exponent: f64) -> f64 {
+    if exponent == 0.0 {
+        return 1.0;
+    }
+    if base.is_nan() || exponent.is_nan() {
+        return f64::NAN;
+    }
+    if exponent.is_infinite() {
+        let abs = base.abs();
+        if abs > 1.0 {
+            return if exponent > 0.0 { f64::INFINITY } else { 0.0 };
+        }
+        if abs == 1.0 {
+            return f64::NAN;
+        }
+        return if exponent > 0.0 { 0.0 } else { f64::INFINITY };
+    }
+    base.powf(exponent)
+}
+
+/// ToInt32 (spec 7.1.6): truncate toward zero, reduce modulo 2^32; NaN and
+/// the infinities map to 0 (Rust's `as` casts saturate instead).
+fn to_int32(n: f64) -> i32 {
+    if !n.is_finite() {
+        return 0;
+    }
+    let wrapped = n.trunc() % 4294967296.0;
+    (if wrapped < 0.0 {
+        wrapped + 4294967296.0
+    } else {
+        wrapped
+    }) as u32 as i32
+}
+
+/// ToUint32 (spec 7.1.7): like ToInt32, reinterpreting the low 32 bits.
+fn to_uint32(n: f64) -> u32 {
+    to_int32(n) as u32
+}
+
 /// spec 13.9 shifts and 13.11 bitwise operators.
 fn bitwise_binary(
     agent: &mut Agent,
@@ -1112,8 +1531,8 @@ fn bitwise_binary(
                 return Err(mixed_bigint_error());
             }
             let result = match op {
-                BinaryOp::LeftShift => bigint::left_shift(&a, bigint_shift(&b)),
-                BinaryOp::RightShift => bigint::right_shift(&a, bigint_shift(&b)),
+                BinaryOp::LeftShift => bigint_shifted_floor(&a, bigint_shift(&b)),
+                BinaryOp::RightShift => bigint_shifted_floor(&a, -bigint_shift(&b)),
                 BinaryOp::UnsignedRightShift => unreachable!(),
                 BinaryOp::BitAnd => bigint::bitwise_and(&a, &b),
                 BinaryOp::BitXor => bigint::bitwise_xor(&a, &b),
@@ -1124,14 +1543,12 @@ fn bitwise_binary(
         }
         (Value::Number(a), Value::Number(b)) => {
             let result = match op {
-                BinaryOp::LeftShift => ((a as i32) << ((b as u32) & 0x1F)) as f64,
-                BinaryOp::RightShift => ((a as i32) >> ((b as u32) & 0x1F)) as f64,
-                // ToUint32's bit pattern: `x as u32` saturates negative f64s
-                // to zero, so convert through i32 first (mod 2^32).
-                BinaryOp::UnsignedRightShift => ((a as i32) as u32 >> ((b as u32) & 0x1F)) as f64,
-                BinaryOp::BitAnd => ((a as i32) & (b as i32)) as f64,
-                BinaryOp::BitXor => ((a as i32) ^ (b as i32)) as f64,
-                BinaryOp::BitOr => ((a as i32) | (b as i32)) as f64,
+                BinaryOp::LeftShift => (to_int32(a) << (to_uint32(b) & 0x1F)) as f64,
+                BinaryOp::RightShift => (to_int32(a) >> (to_uint32(b) & 0x1F)) as f64,
+                BinaryOp::UnsignedRightShift => (to_uint32(a) >> (to_uint32(b) & 0x1F)) as f64,
+                BinaryOp::BitAnd => (to_int32(a) & to_int32(b)) as f64,
+                BinaryOp::BitXor => (to_int32(a) ^ to_int32(b)) as f64,
+                BinaryOp::BitOr => (to_int32(a) | to_int32(b)) as f64,
                 _ => unreachable!("non-bitwise op"),
             };
             Ok(Value::Number(result))
@@ -1145,15 +1562,36 @@ fn bitwise_binary(
 
 /// Abstract Relational Comparison (spec 7.2.10): `None` when a NaN makes the
 /// relation undefined.
+/// IsLessThan with the spec's `leftFirst` parameter (spec 7.2.11 steps 1-2):
+/// `true` ToPrimitives the left operand first, `false` the right. The
+/// relational operators swap arguments so the *source-left* operand's
+/// valueOf/toString always runs first (S11.8.2_A2.3_T1).
 fn abstract_relational(
     agent: &mut Agent,
     left: &Value,
     right: &Value,
+    left_first: bool,
 ) -> Result<Option<bool>, JsError> {
-    let left_prim = crate::context::to_primitive(agent, left, ToPrimitiveHint::Number)?;
-    let right_prim = crate::context::to_primitive(agent, right, ToPrimitiveHint::Number)?;
+    let (left_prim, right_prim) = if left_first {
+        let left_prim = crate::context::to_primitive(agent, left, ToPrimitiveHint::Number)?;
+        let right_prim = crate::context::to_primitive(agent, right, ToPrimitiveHint::Number)?;
+        (left_prim, right_prim)
+    } else {
+        let right_prim = crate::context::to_primitive(agent, right, ToPrimitiveHint::Number)?;
+        let left_prim = crate::context::to_primitive(agent, left, ToPrimitiveHint::Number)?;
+        (left_prim, right_prim)
+    };
     if let (Value::String(a), Value::String(b)) = (&left_prim, &right_prim) {
         return Ok(Some(a.as_slice() < b.as_slice()));
+    }
+    // spec 7.2.11 steps 4-5: a BigInt and a String compare by StringToBigInt;
+    // a non-integer string makes the relation undefined. The type check uses
+    // the ToPrimitive results, not the ToNumeric results below.
+    if let (Value::BigInt(a), Value::String(b)) = (&left_prim, &right_prim) {
+        return Ok(crux::convert::string_to_bigint(b).map(|ny| bigint::less_than(a, &ny)));
+    }
+    if let (Value::String(a), Value::BigInt(b)) = (&left_prim, &right_prim) {
+        return Ok(crux::convert::string_to_bigint(a).map(|nx| bigint::less_than(&nx, b)));
     }
     let left_num = to_numeric(&left_prim)?;
     let right_num = to_numeric(&right_prim)?;
@@ -1176,11 +1614,39 @@ fn abstract_relational(
     }
 }
 
-/// IsLooselyEqual (spec 7.2.15) with agent-dispatched ToPrimitive for object
-/// operands (the crux `is_loosely_equal` cannot reach valueOf/toString).
+/// IsLooselyEqual (spec 7.2.15): the object/object case is identity (same
+/// type, spec step 1), so ToPrimitive runs only on the object side of a
+/// mixed comparison (step 12) — the crux `is_loosely_equal` cannot dispatch
+/// valueOf/toString.
 fn abstract_loosely_equal(agent: &mut Agent, left: &Value, right: &Value) -> Result<bool, JsError> {
-    let left_prim = crate::context::to_primitive(agent, left, ToPrimitiveHint::Default)?;
-    let right_prim = crate::context::to_primitive(agent, right, ToPrimitiveHint::Default)?;
+    let left_obj = matches!(left, Value::Object(_) | Value::Function(_));
+    let right_obj = matches!(right, Value::Object(_) | Value::Function(_));
+    if left_obj && right_obj {
+        return Ok(is_strictly_equal(left, right));
+    }
+    let left_prim = if left_obj {
+        crate::context::to_primitive(agent, left, ToPrimitiveHint::Default)?
+    } else {
+        left.clone()
+    };
+    let right_prim = if right_obj {
+        crate::context::to_primitive(agent, right, ToPrimitiveHint::Default)?
+    } else {
+        right.clone()
+    };
+    // spec 7.2.15 steps 6-7: a BigInt and a String compare by StringToBigInt.
+    // The crux `is_loosely_equal` uses a variant that rejects the empty
+    // string, which StringToBigInt maps to 0n.
+    if let (Value::BigInt(a), Value::String(s)) = (&left_prim, &right_prim) {
+        return Ok(crux::convert::string_to_bigint(s).is_some_and(|n| {
+            is_strictly_equal(&Value::BigInt(Handle::new(n)), &Value::BigInt(a.clone()))
+        }));
+    }
+    if let (Value::String(s), Value::BigInt(b)) = (&left_prim, &right_prim) {
+        return Ok(crux::convert::string_to_bigint(s).is_some_and(|n| {
+            is_strictly_equal(&Value::BigInt(Handle::new(n)), &Value::BigInt(b.clone()))
+        }));
+    }
     crux::ops::is_loosely_equal(&left_prim, &right_prim)
 }
 
@@ -1249,13 +1715,16 @@ fn eval_call(
 /// both constructor and newTarget.
 fn eval_new(agent: &mut Agent, new: &syntax::ast::NewExpr, strict: bool) -> Result<Value, JsError> {
     let constructor = eval_expr(agent, &new.callee, strict)?;
-    if !is_constructor(&constructor) {
+    // EvaluateNew (spec 13.3.5.1.1): the argument list is evaluated before
+    // the IsConstructor check, so `new x(x = Array)` runs the assignment
+    // (ctorExpr-isCtor-after-args-eval.js).
+    let args = eval_arguments(agent, &new.args, strict)?;
+    if !crate::function::is_constructor(agent, &constructor) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             format!("{} is not a constructor", type_of(&constructor)),
         ));
     }
-    let args = eval_arguments(agent, &new.args, strict)?;
     crate::function::construct(agent, &constructor, &args, &constructor)
 }
 
@@ -1281,44 +1750,137 @@ fn eval_template(
     Ok(Value::String(Handle::new(JsString::from_utf8(&text))))
 }
 
-/// TaggedTemplate evaluation (spec 13.3.6.2): build the template object
-/// (cooked strings with a `raw` array) and call the tag with the
-/// substitutions. The per-site template-object cache is Phase 8.
+// The per-realm template-object cache (spec 12.2.9.3 GetTemplateObject):
+// template objects are keyed by the parse node of the site. Within one parse
+// the same site shares a node pointer, so a (realm, node) key gives the
+// spec's same-site identity; each `eval` re-parses and gets a fresh site.
+thread_local! {
+    static TEMPLATE_OBJECT_CACHE: std::cell::RefCell<
+        Vec<((usize, usize), Value)>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn eval_tagged_template(
     agent: &mut Agent,
     tag: &Expr,
     template: &TemplateLiteral,
     strict: bool,
 ) -> Result<Value, JsError> {
-    let tag_value = eval_expr(agent, tag, strict)?;
+    // EvaluateCall with the tag reference (spec 13.3.11.1): `obj.fn`x keeps
+    // `obj` as the call's this value.
+    let tag_chain = eval_chain(agent, tag, strict)?;
+    let (this, tag_value) = match tag_chain {
+        Some(ChainResult::Reference(reference)) => {
+            let this = get_this_value(&reference);
+            (this, get_reference_value(agent, &reference)?)
+        }
+        Some(ChainResult::Value(value)) => (Value::Undefined, value),
+        None => (Value::Undefined, Value::Undefined),
+    };
     if !is_callable(&tag_value) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             format!("{} is not a function", type_of(&tag_value)),
         ));
     }
-    let template_object = crux::object::JsObject::array_create(None, template.quasis.len() as f64)?;
-    let raw = crux::object::JsObject::array_create(None, template.quasis.len() as f64)?;
-    for (index, quasi) in template.quasis.iter().enumerate() {
-        let cooked = quasi
-            .cooked
-            .clone()
-            .unwrap_or_else(|| JsString::from_utf8(""));
-        template_object.create_data_property(
-            &JsString::from_utf8(&index.to_string()),
-            Value::String(Handle::new(cooked)),
-        )?;
-        raw.create_data_property(
-            &JsString::from_utf8(&index.to_string()),
-            Value::String(Handle::new(quasi.raw.clone())),
-        )?;
-    }
-    template_object.create_data_property(&JsString::from_utf8("raw"), Value::Object(raw))?;
-    let mut args = vec![Value::Object(template_object)];
+    let realm = agent.current_realm()?;
+    let key = (
+        crux::handle::Handle::as_ptr(&realm) as usize,
+        template as *const TemplateLiteral as usize,
+    );
+    let cached = TEMPLATE_OBJECT_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .iter()
+            .find(|(cached_key, _)| *cached_key == key)
+            .map(|(_, value)| value.clone())
+    });
+    let template_object = match cached {
+        Some(value) => value,
+        None => {
+            // GetTemplateObject (spec 12.2.9.3): index properties are
+            // non-writable/non-configurable, `raw` is non-enumerable, and both
+            // arrays are frozen.
+            let obj = crux::object::JsObject::array_create(None, template.quasis.len() as f64)?;
+            let raw = crux::object::JsObject::array_create(None, template.quasis.len() as f64)?;
+            for (index, quasi) in template.quasis.iter().enumerate() {
+                let key = &index.to_string();
+                // A quasi whose TV is undefined (an invalid escape sequence)
+                // yields the value *undefined*, not a string (spec 12.2.9.3).
+                let cooked = match quasi.cooked.clone() {
+                    Some(cooked) => Value::String(Handle::new(cooked)),
+                    None => Value::Undefined,
+                };
+                obj.define_property_key(
+                    &PropertyKey::from_utf8(key),
+                    &PropertyDescriptor {
+                        value: Some(cooked),
+                        writable: Some(false),
+                        get: None,
+                        set: None,
+                        enumerable: Some(true),
+                        configurable: Some(false),
+                    },
+                )?;
+                raw.define_property_key(
+                    &PropertyKey::from_utf8(key),
+                    &PropertyDescriptor {
+                        value: Some(Value::String(Handle::new(quasi.raw.clone()))),
+                        writable: Some(false),
+                        get: None,
+                        set: None,
+                        enumerable: Some(true),
+                        configurable: Some(false),
+                    },
+                )?;
+            }
+            raw.define_property_key(
+                &PropertyKey::from_utf8("length"),
+                &PropertyDescriptor {
+                    value: Some(Value::Number(template.quasis.len() as f64)),
+                    writable: Some(false),
+                    get: None,
+                    set: None,
+                    enumerable: None,
+                    configurable: Some(false),
+                },
+            )?;
+            raw.prevent_extensions()?;
+            obj.define_property_key(
+                &PropertyKey::from_utf8("raw"),
+                &PropertyDescriptor {
+                    value: Some(Value::Object(raw)),
+                    writable: Some(false),
+                    get: None,
+                    set: None,
+                    enumerable: Some(false),
+                    configurable: Some(false),
+                },
+            )?;
+            obj.define_property_key(
+                &PropertyKey::from_utf8("length"),
+                &PropertyDescriptor {
+                    value: Some(Value::Number(template.quasis.len() as f64)),
+                    writable: Some(false),
+                    get: None,
+                    set: None,
+                    enumerable: None,
+                    configurable: Some(false),
+                },
+            )?;
+            obj.prevent_extensions()?;
+            let value = Value::Object(obj);
+            TEMPLATE_OBJECT_CACHE.with(|cache| {
+                cache.borrow_mut().push((key, value.clone()));
+            });
+            value
+        }
+    };
+    let mut args = vec![template_object];
     for expr in &template.exprs {
         args.push(eval_expr(agent, expr, strict)?);
     }
-    crate::function::call(agent, &tag_value, Value::Undefined, &args)
+    crate::function::call(agent, &tag_value, this, &args)
 }
 
 /// The Iterator Record of GetIterator (spec 7.4.2).

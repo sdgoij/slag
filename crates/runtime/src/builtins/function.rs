@@ -347,7 +347,13 @@ fn create_dynamic_function(
     let function_ast = parser::parse_function(&source)?;
     let func_proto = get_prototype_from_constructor(agent, &new_target)?;
     let environment = agent.current_realm()?.global_env();
-    crate::function::instantiate_dynamic_function(agent, &function_ast, environment, func_proto)
+    crate::function::instantiate_dynamic_function(
+        agent,
+        &function_ast,
+        environment,
+        func_proto,
+        Some(crux::string::JsString::from_utf8(&source)),
+    )
 }
 
 /// GetPrototypeFromConstructor (spec 10.2.4): `constructor.prototype` when it
@@ -761,11 +767,12 @@ mod tests {
 
     #[test]
     fn restricted_caller_arguments_properties() {
-        // Sloppy ordinary functions have own null-valued caller/arguments
-        // data properties (ES5-style AddRestrictedFunctionProperties).
+        // Sloppy ordinary functions have own undefined-valued caller/
+        // arguments data properties (no caller tracked, so reads are
+        // undefined rather than the actual caller).
         assert_eq!(
             value(
-                "(function () { var d = Object.getOwnPropertyDescriptor(arguments.callee, 'caller'); return d.value === null && d.writable === false && d.configurable === false; })()"
+                "(function () { var d = Object.getOwnPropertyDescriptor(arguments.callee, 'caller'); return d.value === undefined && d.writable === false && d.configurable === false; })()"
             ),
             Value::Boolean(true)
         );

@@ -608,6 +608,44 @@ mod tests {
     }
 
     #[test]
+    fn unicode_surrogate_pairs_in_classes() {
+        // `[\uD834\uDF06]` is one class member (a code point) in unicode
+        // mode: it matches the pair, not either lone surrogate (spec 22.2.1).
+        let re = compile(
+            "[\\uD834\\uDF06]"
+                .encode_utf16()
+                .collect::<Vec<u16>>()
+                .as_slice(),
+            f("u"),
+        )
+        .unwrap();
+        assert!(re.exec(&[0xD834, 0xDF06], 0).is_some());
+        assert!(re.exec(&[0xD834], 0).is_none());
+        assert!(re.exec(&[0xDF06], 0).is_none());
+        let re = compile(
+            "[\\uD800\\uDC00]"
+                .encode_utf16()
+                .collect::<Vec<u16>>()
+                .as_slice(),
+            f("u"),
+        )
+        .unwrap();
+        assert!(re.exec(&[0xD800, 0xDC00], 0).is_some());
+        assert!(re.exec(&[0xD800], 0).is_none());
+        assert!(re.exec(&[0xDC00], 0).is_none());
+        // Outside unicode mode each escape stays a code unit.
+        let re = compile(
+            "[\\uD834\\uDF06]"
+                .encode_utf16()
+                .collect::<Vec<u16>>()
+                .as_slice(),
+            f(""),
+        )
+        .unwrap();
+        assert!(re.exec(&[0xD834], 0).is_some());
+    }
+
+    #[test]
     fn property_escapes() {
         let re = compile(
             "\\p{Letter}+"
@@ -744,5 +782,46 @@ mod tests {
                 "expected error for {bad:?}"
             );
         }
+        // Lookbehind assertions can never be quantified (spec 22.2.1); in
+        // non-unicode mode lookaheads may be (Annex B).
+        for bad in ["(?<=.)?", "(?<!.)?", "(?<=.){2,3}", "(?<=.)*", "(?<=.)+"] {
+            assert!(
+                compile(bad.encode_utf16().collect::<Vec<u16>>().as_slice(), f("")).is_err(),
+                "expected error for {bad:?}"
+            );
+        }
+        for good in ["(?=.)?", "(?=.){2,3}"] {
+            assert!(
+                compile(good.encode_utf16().collect::<Vec<u16>>().as_slice(), f("")).is_ok(),
+                "expected {good:?} to parse"
+            );
+        }
+        // A `\k` not followed by a name is an error when the pattern has
+        // named groups, and always in unicode mode; a lone `\k` stays the
+        // identity escape otherwise (Annex B).
+        for bad in ["(?<a>.)\\k", "\\k(?<a>.)"] {
+            assert!(
+                compile(bad.encode_utf16().collect::<Vec<u16>>().as_slice(), f("")).is_err(),
+                "expected error for {bad:?}"
+            );
+        }
+        assert!(
+            compile(
+                "\\k".encode_utf16().collect::<Vec<u16>>().as_slice(),
+                f("u")
+            )
+            .is_err()
+        );
+        assert!(compile("\\k".encode_utf16().collect::<Vec<u16>>().as_slice(), f("")).is_ok());
+        assert!(
+            compile(
+                "(?<a>.)\\k<a>"
+                    .encode_utf16()
+                    .collect::<Vec<u16>>()
+                    .as_slice(),
+                f("")
+            )
+            .is_ok()
+        );
     }
 }

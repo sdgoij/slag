@@ -605,10 +605,12 @@ fn drive(
                 })?
             };
             match completion {
-                Completion::Return(value) | Completion::Normal(value) => {
-                    resolve_request(agent, &request, value, true)?;
+                // Only a `return` completion carries a value; a normal
+                // completion resolves the request with *undefined*.
+                Completion::Return(value) => resolve_request(agent, &request, value, true)?,
+                Completion::Normal(_) | Completion::Empty => {
+                    resolve_request(agent, &request, Value::Undefined, true)?
                 }
-                Completion::Empty => resolve_request(agent, &request, Value::Undefined, true)?,
                 Completion::Throw(value) => reject_request(agent, &request, value)?,
                 Completion::Break { .. } | Completion::Continue { .. } => {
                     let error = JsError::new(

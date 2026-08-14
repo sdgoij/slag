@@ -18,9 +18,10 @@ use crux::property::PropertyKey;
 use crux::string::JsString;
 use crux::value::{Value, is_callable};
 use syntax::ast::{
-    Argument, ArrayElement, AssignOp, BinaryOp, BindingElement, BindingPattern, Expr, ExprKind,
-    ForBinding, ForInit, Function, LogicalOp, MemberProperty, ObjectLiteral, ObjectProperty,
-    PropertyName, Stmt, StmtKind, SwitchCase, UnaryOp, UpdateOp, VarDeclKind, VarDeclarator,
+    Argument, ArrayElement, AssignOp, BinaryOp, BindingElement, BindingPattern, Class,
+    ClassElement, ClassElementName, Expr, ExprKind, ForBinding, ForInit, Function, LogicalOp,
+    MemberProperty, ObjectLiteral, ObjectProperty, PropertyName, Stmt, StmtKind, SwitchCase,
+    UnaryOp, UpdateOp, VarDeclKind, VarDeclarator,
 };
 
 use crate::agent::Agent;
@@ -185,6 +186,19 @@ pub enum Step {
     ArrayElement,
     ArraySpread,
     ArrayHole,
+    // ----- class definitions with suspending heritage/computed names -----
+    ClassBegin {
+        class: Box<Class>,
+        binding: Option<crux::string::AtomId>,
+        key_count: usize,
+    },
+    ClassHeritage,
+    ClassKeyToPropertyKey,
+    ClassFinish {
+        class: Box<Class>,
+        binding: Option<crux::string::AtomId>,
+        key_count: usize,
+    },
     ObjectBegin,
     ObjectInitName {
         name: crux::AtomId,
@@ -203,12 +217,12 @@ pub enum Step {
     ObjectAccessorName {
         name: crux::AtomId,
         get: bool,
-        param: Option<BindingPattern>,
+        param: Option<BindingElement>,
         body: syntax::ast::Block,
     },
     ObjectAccessorComputed {
         get: bool,
-        param: Option<BindingPattern>,
+        param: Option<BindingElement>,
         body: syntax::ast::Block,
     },
     ObjectSpread,
@@ -454,8 +468,21 @@ pub struct Vm {
     pub destructure_done: Vec<bool>,
     pub destructure_obj_stack: Vec<Value>,
     pub yield_star_stack: Vec<YieldStarState>,
+    /// Pending class definitions whose heritage/computed names suspend.
+    pub class_stack: Vec<ClassEvalState>,
     pub switch_disc: Option<Value>,
     pub strict: bool,
+}
+
+/// The per-class-definition state while the resumable VM evaluates a
+/// suspending heritage or computed element names.
+#[derive(Debug)]
+pub struct ClassEvalState {
+    pub class_env: EnvRef,
+    pub class_private_env: crux::handle::Handle<crate::context::PrivateEnvironment>,
+    pub outer_private_env: Option<crux::handle::Handle<crate::context::PrivateEnvironment>>,
+    pub outer_env: EnvRef,
+    pub heritage: Option<Value>,
 }
 
 /// The per-`yield*` delegation state.
@@ -485,6 +512,7 @@ impl Vm {
             destructure_done: Vec::new(),
             destructure_obj_stack: Vec::new(),
             yield_star_stack: Vec::new(),
+            class_stack: Vec::new(),
             switch_disc: None,
             strict,
         }
@@ -1126,7 +1154,7 @@ impl Vm {
                         &object,
                         &PropertyName::Ident(name),
                         get,
-                        param,
+                        param.as_ref(),
                         &body,
                     )?;
                     self.stack.push(object);
@@ -1135,7 +1163,7 @@ impl Vm {
                     let key = self.pop();
                     let object = self.pop();
                     let name = property_name_from_value(agent, key)?;
-                    object_accessor(agent, &object, &name, get, param, &body)?;
+                    object_accessor(agent, &object, &name, get, param.as_ref(), &body)?;
                     self.stack.push(object);
                 }
                 Step::ObjectSpread => {
@@ -1144,8 +1172,107 @@ impl Vm {
                     let Value::Object(obj) = &object else {
                         return Err(JsError::new(ErrorKind::TypeError, "not an object".into()));
                     };
-                    crate::expr::copy_data_properties(obj, &from)?;
+                    crate::expr::copy_data_properties(agent, obj, &from)?;
                     self.stack.push(object);
+                }
+                Step::ClassBegin {
+                    class,
+                    binding,
+                    key_count: _,
+                } => {
+                    // Create the class scope and PrivateEnvironment and
+                    // activate them, so the heritage and computed names run
+                    // with the class name in TDZ and `super`/private names
+                    // visible (spec 15.7.14 steps 2-11).
+                    let outer_env = self.lexical_env.clone();
+                    let class_env = new_declarative_environment(Some(outer_env.clone()));
+                    if let Some(binding) = binding {
+                        let name = crux::lookup(binding);
+                        class_env.create_immutable_binding(&name, true)?;
+                    }
+                    let outer_private_env = agent.running_context()?.private_environment.clone();
+                    let class_private_env =
+                        crate::context::new_private_environment(outer_private_env.clone());
+                    {
+                        let mut names = class_private_env.names.borrow_mut();
+                        for element in &class.elements {
+                            let Some(atom) = crate::class::private_element_name(element) else {
+                                continue;
+                            };
+                            let description = JsString::from_utf8(&format!(
+                                "#{}",
+                                crux::lookup(atom).to_string_lossy()
+                            ));
+                            if !names.iter().any(|name| name.description == description) {
+                                names.push(crate::context::new_private_name(description));
+                            }
+                        }
+                    }
+                    if let Ok(context) = agent.running_context_mut() {
+                        context.lexical_environment = class_env.clone();
+                        context.private_environment = Some(class_private_env.clone());
+                    }
+                    self.lexical_env = class_env.clone();
+                    self.class_stack.push(ClassEvalState {
+                        class_env,
+                        class_private_env,
+                        outer_private_env,
+                        outer_env,
+                        heritage: None,
+                    });
+                }
+                Step::ClassHeritage => {
+                    let value = self.pop();
+                    let Some(state) = self.class_stack.last_mut() else {
+                        return Err(JsError::new(
+                            ErrorKind::SyntaxError,
+                            "ClassHeritage without a pending class".into(),
+                        ));
+                    };
+                    state.heritage = Some(value);
+                }
+                Step::ClassKeyToPropertyKey => {
+                    // ToPropertyKey runs before the next name is evaluated
+                    // (user code ordering, spec 15.7.13), so convert here.
+                    let value = self.pop();
+                    let key = crate::context::to_property_key(agent, &value)?;
+                    let key = match key {
+                        PropertyKey::String(id) => Value::String(Handle::new(crux::lookup(id))),
+                        PropertyKey::Symbol(symbol) => Value::Symbol(Handle::new(symbol)),
+                    };
+                    self.stack.push(key);
+                }
+                Step::ClassFinish {
+                    class,
+                    binding,
+                    key_count,
+                } => {
+                    let mut keys: Vec<Option<PropertyKey>> = Vec::with_capacity(key_count);
+                    for _ in 0..key_count {
+                        let value = self.pop();
+                        let key = crate::context::to_property_key(agent, &value)?;
+                        keys.push(Some(key));
+                    }
+                    keys.reverse();
+                    let state = self.class_stack.pop().ok_or_else(|| {
+                        JsError::new(
+                            ErrorKind::SyntaxError,
+                            "ClassFinish without a pending class".into(),
+                        )
+                    })?;
+                    self.lexical_env = state.outer_env.clone();
+                    if let Ok(context) = agent.running_context_mut() {
+                        context.lexical_environment = state.outer_env.clone();
+                        context.private_environment = state.outer_private_env.clone();
+                    }
+                    let class_value = crate::class::class_definition_evaluation_with_keys(
+                        agent,
+                        &class,
+                        binding,
+                        state.heritage.clone(),
+                        &keys,
+                    )?;
+                    self.stack.push(class_value);
                 }
                 Step::PushStr(text) => {
                     self.stack.push(Value::String(Handle::new(text)));
@@ -1507,7 +1634,16 @@ impl Vm {
                 }
                 Step::YieldStarBegin => {
                     let value = self.pop();
-                    let iterator = get_iterator(agent, &value)?;
+                    // GetIterator runs inside the generator body, so its
+                    // TypeError is catchable by the body's try/catch (spec
+                    // 15.5.5 step 4 uses `?`).
+                    let iterator = match get_iterator(agent, &value) {
+                        Ok(iterator) => iterator,
+                        Err(error) => match self.throw_js_error(agent, body, error)? {
+                            CtlResult::Continue => continue,
+                            CtlResult::Done(outcome) => return Ok(outcome),
+                        },
+                    };
                     self.yield_star_stack.push(YieldStarState {
                         iterator,
                         received: Value::Undefined,
@@ -1522,21 +1658,59 @@ impl Vm {
                     };
                     let received = state.received.clone();
                     let iterator = state.iterator.clone();
-                    let next = crate::expr::iterator_next_method(agent, &iterator)?;
-                    let result = crate::function::call(
+                    let next = match crate::expr::iterator_next_method(agent, &iterator) {
+                        Ok(next) => next,
+                        Err(error) => match self.throw_js_error(agent, body, error)? {
+                            CtlResult::Continue => continue,
+                            CtlResult::Done(outcome) => return Ok(outcome),
+                        },
+                    };
+                    let result = match crate::function::call(
                         agent,
                         &next,
                         iterator.iterator.clone(),
                         &[received],
-                    )?;
-                    if iterator_result_done(agent, &result)? {
-                        let value = iterator_result_value(agent, &result)?;
+                    ) {
+                        Ok(result) => result,
+                        Err(error) => match self.throw_js_error(agent, body, error)? {
+                            CtlResult::Continue => continue,
+                            CtlResult::Done(outcome) => return Ok(outcome),
+                        },
+                    };
+                    if !matches!(result, Value::Object(_)) {
+                        // Spec 15.5.5 normal case step a.iii.
+                        let error = JsError::new(
+                            ErrorKind::TypeError,
+                            "yield*: iterator next() result is not an object".into(),
+                        );
+                        match self.throw_js_error(agent, body, error)? {
+                            CtlResult::Continue => continue,
+                            CtlResult::Done(outcome) => return Ok(outcome),
+                        }
+                    }
+                    let done_flag = match iterator_result_done(agent, &result) {
+                        Ok(done_flag) => done_flag,
+                        Err(error) => match self.throw_js_error(agent, body, error)? {
+                            CtlResult::Continue => continue,
+                            CtlResult::Done(outcome) => return Ok(outcome),
+                        },
+                    };
+                    if done_flag {
+                        let value = match iterator_result_value(agent, &result) {
+                            Ok(value) => value,
+                            Err(error) => match self.throw_js_error(agent, body, error)? {
+                                CtlResult::Continue => continue,
+                                CtlResult::Done(outcome) => return Ok(outcome),
+                            },
+                        };
                         self.yield_star_stack.pop();
                         self.stack.push(value);
                         self.ip = done;
                     } else {
-                        let value = iterator_result_value(agent, &result)?;
-                        self.stack.push(value);
+                        // Spec 15.5.5: GeneratorYield(innerResult) yields the
+                        // inner iterator result object itself, so the outer
+                        // consumer reads its `value`/`done` lazily.
+                        self.stack.push(result);
                     }
                 }
                 Step::YieldStarResume {
@@ -1560,34 +1734,87 @@ impl Vm {
                                 ));
                             };
                             let iterator = state.iterator.clone();
-                            let throw_method = crate::context::get_property(
+                            // GetMethod(iterator, "throw"); errors propagate
+                            // through the generator body's handlers (spec
+                            // 15.5.5 throw case).
+                            let throw_method = match crate::context::get_property(
                                 agent,
                                 &iterator.iterator,
                                 &JsString::from_utf8("throw"),
                                 iterator.iterator.clone(),
-                            )?;
+                            ) {
+                                Ok(method) => method,
+                                Err(error) => match self.throw_js_error(agent, body, error)? {
+                                    CtlResult::Continue => continue,
+                                    CtlResult::Done(outcome) => return Ok(outcome),
+                                },
+                            };
                             if is_callable(&throw_method) {
-                                let inner = crate::function::call(
+                                let inner = match crate::function::call(
                                     agent,
                                     &throw_method,
                                     iterator.iterator.clone(),
                                     &[value],
-                                )?;
-                                if iterator_result_done(agent, &inner)? {
-                                    let value = iterator_result_value(agent, &inner)?;
+                                ) {
+                                    Ok(inner) => inner,
+                                    Err(error) => match self.throw_js_error(agent, body, error)? {
+                                        CtlResult::Continue => continue,
+                                        CtlResult::Done(outcome) => return Ok(outcome),
+                                    },
+                                };
+                                if !matches!(inner, Value::Object(_)) {
+                                    // Spec 15.5.5 throw case step b.iii.
+                                    let error = JsError::new(
+                                        ErrorKind::TypeError,
+                                        "yield*: iterator throw() result is not an object".into(),
+                                    );
+                                    match self.throw_js_error(agent, body, error)? {
+                                        CtlResult::Continue => continue,
+                                        CtlResult::Done(outcome) => return Ok(outcome),
+                                    }
+                                }
+                                let done_flag = match iterator_result_done(agent, &inner) {
+                                    Ok(done_flag) => done_flag,
+                                    Err(error) => match self.throw_js_error(agent, body, error)? {
+                                        CtlResult::Continue => continue,
+                                        CtlResult::Done(outcome) => return Ok(outcome),
+                                    },
+                                };
+                                if done_flag {
+                                    let value = match iterator_result_value(agent, &inner) {
+                                        Ok(value) => value,
+                                        Err(error) => {
+                                            match self.throw_js_error(agent, body, error)? {
+                                                CtlResult::Continue => continue,
+                                                CtlResult::Done(outcome) => return Ok(outcome),
+                                            }
+                                        }
+                                    };
                                     self.yield_star_stack.pop();
                                     self.stack.push(value);
                                     self.ip = done;
                                 } else {
-                                    let value = iterator_result_value(agent, &inner)?;
-                                    self.stack.push(value);
+                                    self.stack.push(inner);
                                     self.ip = yield_at;
                                 }
                             } else {
-                                // IteratorClose then rethrow.
-                                iterator_close(agent, &iterator)?;
+                                // No throw method: IteratorClose with a normal
+                                // completion, then a protocol-violation
+                                // TypeError. Errors from the close propagate
+                                // (spec 15.5.5 throw case, no-throw branch).
+                                if let Err(error) = iterator_close(agent, &iterator) {
+                                    match self.throw_js_error(agent, body, error)? {
+                                        CtlResult::Continue => continue,
+                                        CtlResult::Done(outcome) => return Ok(outcome),
+                                    }
+                                }
                                 self.yield_star_stack.pop();
-                                match self.throw_machinery(body, value)? {
+                                let violation = JsError::new(
+                                    ErrorKind::TypeError,
+                                    "yield* protocol violation: iterator has no throw method"
+                                        .into(),
+                                );
+                                match self.throw_js_error(agent, body, violation)? {
                                     CtlResult::Continue => continue,
                                     CtlResult::Done(outcome) => return Ok(outcome),
                                 }
@@ -1601,34 +1828,83 @@ impl Vm {
                                 ));
                             };
                             let iterator = state.iterator.clone();
-                            let return_method = crate::context::get_property(
+                            // GetMethod(iterator, "return"); errors propagate
+                            // through the generator body's handlers (spec
+                            // 15.5.5 return case).
+                            let return_method = match crate::context::get_property(
                                 agent,
                                 &iterator.iterator,
                                 &JsString::from_utf8("return"),
                                 iterator.iterator.clone(),
-                            )?;
+                            ) {
+                                Ok(method) => method,
+                                Err(error) => match self.throw_js_error(agent, body, error)? {
+                                    CtlResult::Continue => continue,
+                                    CtlResult::Done(outcome) => return Ok(outcome),
+                                },
+                            };
                             if is_callable(&return_method) {
-                                let inner = crate::function::call(
+                                let inner = match crate::function::call(
                                     agent,
                                     &return_method,
                                     iterator.iterator.clone(),
                                     &[value],
-                                )?;
-                                if iterator_result_done(agent, &inner)? {
-                                    let value = iterator_result_value(agent, &inner)?;
+                                ) {
+                                    Ok(inner) => inner,
+                                    Err(error) => match self.throw_js_error(agent, body, error)? {
+                                        CtlResult::Continue => continue,
+                                        CtlResult::Done(outcome) => return Ok(outcome),
+                                    },
+                                };
+                                if !matches!(inner, Value::Object(_)) {
+                                    // Spec 15.5.5 return case step c.vi.
+                                    let error = JsError::new(
+                                        ErrorKind::TypeError,
+                                        "yield*: iterator return() result is not an object".into(),
+                                    );
+                                    match self.throw_js_error(agent, body, error)? {
+                                        CtlResult::Continue => continue,
+                                        CtlResult::Done(outcome) => return Ok(outcome),
+                                    }
+                                }
+                                let done_flag = match iterator_result_done(agent, &inner) {
+                                    Ok(done_flag) => done_flag,
+                                    Err(error) => match self.throw_js_error(agent, body, error)? {
+                                        CtlResult::Continue => continue,
+                                        CtlResult::Done(outcome) => return Ok(outcome),
+                                    },
+                                };
+                                if done_flag {
+                                    // A done return result completes the
+                                    // generator with ReturnCompletion of its
+                                    // value (spec 15.5.5 return case).
+                                    let value = match iterator_result_value(agent, &inner) {
+                                        Ok(value) => value,
+                                        Err(error) => {
+                                            match self.throw_js_error(agent, body, error)? {
+                                                CtlResult::Continue => continue,
+                                                CtlResult::Done(outcome) => return Ok(outcome),
+                                            }
+                                        }
+                                    };
                                     self.yield_star_stack.pop();
-                                    self.stack.push(value);
-                                    self.ip = done;
+                                    match self.control_transfer(body, Ctl::Return { value })? {
+                                        CtlResult::Continue => continue,
+                                        CtlResult::Done(outcome) => return Ok(outcome),
+                                    }
                                 } else {
-                                    let value = iterator_result_value(agent, &inner)?;
-                                    self.stack.push(value);
+                                    self.stack.push(inner);
                                     self.ip = yield_at;
                                 }
                             } else {
-                                // No return method: the delegation completes.
+                                // No return method: the delegation completes
+                                // with the return completion carrying the
+                                // received value (spec 15.5.5 return case).
                                 self.yield_star_stack.pop();
-                                self.stack.push(value);
-                                self.ip = done;
+                                match self.control_transfer(body, Ctl::Return { value })? {
+                                    CtlResult::Continue => continue,
+                                    CtlResult::Done(outcome) => return Ok(outcome),
+                                }
                             }
                         }
                     }
@@ -2162,6 +2438,20 @@ impl Vm {
             }
         }
     }
+
+    /// Convert an engine error into a thrown value and route it through the
+    /// body's handler table. `yield*` protocol errors (GetIterator, inner
+    /// `next`/`throw`/`return` errors) are catchable by the generator body
+    /// (spec 15.5.5 uses `?` on every step).
+    fn throw_js_error(
+        &mut self,
+        agent: &mut Agent,
+        body: &CompiledBody,
+        error: JsError,
+    ) -> Result<CtlResult, JsError> {
+        let thrown = crate::promise::error_value(agent, &error);
+        self.throw_machinery(body, thrown)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2453,7 +2743,7 @@ fn object_accessor(
     object: &Value,
     key: &PropertyName,
     get: bool,
-    param: Option<BindingPattern>,
+    param: Option<&BindingElement>,
     body: &syntax::ast::Block,
 ) -> Result<(), JsError> {
     let Value::Object(obj) = object else {
@@ -2477,12 +2767,7 @@ fn object_accessor(
     };
     let env = agent.running_context()?.lexical_environment.clone();
     let params = if let Some(param) = param {
-        vec![BindingElement {
-            pattern: param,
-            init: None,
-            rest: false,
-            span: body.span,
-        }]
+        vec![param.clone()]
     } else {
         Vec::new()
     };
@@ -2519,14 +2804,13 @@ fn tagged_template(
         crate::builtins::array::array_create(agent, template.quasis.len() as f64)?;
     let raw = crate::builtins::array::array_create(agent, template.quasis.len() as f64)?;
     for (index, quasi) in template.quasis.iter().enumerate() {
-        let cooked = quasi
-            .cooked
-            .clone()
-            .unwrap_or_else(|| JsString::from_utf8(""));
-        template_object.create_data_property(
-            &JsString::from_utf8(&index.to_string()),
-            Value::String(Handle::new(cooked)),
-        )?;
+        // A quasi whose TV is undefined (an invalid escape sequence) yields
+        // the value *undefined*, not a string (spec 12.2.9.3).
+        let cooked = match quasi.cooked.clone() {
+            Some(cooked) => Value::String(Handle::new(cooked)),
+            None => Value::Undefined,
+        };
+        template_object.create_data_property(&JsString::from_utf8(&index.to_string()), cooked)?;
         raw.create_data_property(
             &JsString::from_utf8(&index.to_string()),
             Value::String(Handle::new(quasi.raw.clone())),
@@ -2730,7 +3014,8 @@ fn pattern_of_target(target: &Expr) -> Result<BindingPattern, JsError> {
 pub fn expr_contains_suspension(expr: &Expr) -> bool {
     match &expr.kind {
         ExprKind::Yield { .. } | ExprKind::Await(_) => true,
-        ExprKind::Function(_) | ExprKind::Arrow { .. } | ExprKind::Class(_) => false,
+        ExprKind::Function(_) | ExprKind::Arrow { .. } => false,
+        ExprKind::Class(class) => class_contains_suspension(class),
         ExprKind::Unary { operand, .. } => expr_contains_suspension(operand),
         ExprKind::Update { target, .. } => expr_contains_suspension(target),
         ExprKind::Binary { left, right, .. } => {
@@ -2786,6 +3071,53 @@ pub fn expr_contains_suspension(expr: &Expr) -> bool {
         ExprKind::MetaProperty { .. } => true,
         _ => false,
     }
+}
+
+/// Whether a class definition's heritage or a computed element name contains a
+/// suspension point. Field initializer values run at construction (not class
+/// definition) and do not count; element bodies are separate resumable units.
+fn class_contains_suspension(class: &Class) -> bool {
+    class
+        .heritage
+        .as_ref()
+        .is_some_and(expr_contains_suspension)
+        || class
+            .elements
+            .iter()
+            .any(class_element_name_contains_suspension)
+}
+
+fn class_element_name_contains_suspension(element: &ClassElement) -> bool {
+    let name = match element {
+        ClassElement::Method { name, .. }
+        | ClassElement::Get { name, .. }
+        | ClassElement::Set { name, .. }
+        | ClassElement::Field { name, .. } => name,
+        ClassElement::StaticBlock(_) => return false,
+    };
+    matches!(
+        name,
+        ClassElementName::Property(PropertyName::Computed(expr)) if expr_contains_suspension(expr)
+    )
+}
+
+/// The computed public name expression of a class element, if any.
+fn computed_public_name(element: &ClassElement) -> Option<&Expr> {
+    let name = match element {
+        ClassElement::Method { name, .. }
+        | ClassElement::Get { name, .. }
+        | ClassElement::Set { name, .. }
+        | ClassElement::Field { name, .. } => name,
+        ClassElement::StaticBlock(_) => return None,
+    };
+    match name {
+        ClassElementName::Property(PropertyName::Computed(expr)) => Some(expr),
+        _ => None,
+    }
+}
+
+fn has_computed_public_name(element: &ClassElement) -> bool {
+    computed_public_name(element).is_some()
 }
 
 fn object_prop_contains_suspension(prop: &ObjectProperty) -> bool {
@@ -2878,6 +3210,7 @@ pub fn stmt_contains_suspension(stmt: &Stmt) -> bool {
                     .as_ref()
                     .is_some_and(|f| f.stmts.iter().any(stmt_contains_suspension))
         }
+        StmtKind::ClassDecl(class) => class_contains_suspension(class),
         StmtKind::VarDecl { decls, .. } | StmtKind::UsingDecl { decls, .. } => decls
             .iter()
             .any(|d| d.init.as_ref().is_some_and(expr_contains_suspension)),
@@ -3434,6 +3767,18 @@ impl Compiler {
                 self.scope_count -= 1;
                 self.emit(Step::LeaveBlock);
             }
+            StmtKind::ClassDecl(class) => {
+                // A class declaration whose heritage or computed names
+                // suspend: evaluate the definition through the VM, then
+                // initialize the declaration's binding (created uninitialized
+                // by declaration instantiation).
+                self.compile_class(class)?;
+                if let Some(name) = class.name {
+                    self.emit(Step::DeclInit {
+                        pattern: BindingPattern::Ident(name),
+                    });
+                }
+            }
             _ => {
                 // Empty, Debugger, FunctionDecl, ClassDecl.
                 self.emit(Step::Stmt(stmt.clone()));
@@ -3876,6 +4221,7 @@ impl Compiler {
                 }
                 Ok(())
             }
+            ExprKind::Class(class) => self.compile_class(class),
             ExprKind::Object(literal) => self.compile_object(literal),
             ExprKind::Yield { delegate, argument } => {
                 match argument {
@@ -4692,6 +5038,40 @@ impl Compiler {
         Ok(())
     }
 
+    /// A class definition whose heritage or a computed element name contains a
+    /// suspension point: the VM sets up the class scope, evaluates the
+    /// heritage and each computed name in order (suspending as needed), and
+    /// builds the class from the precomputed keys (spec 15.7.14).
+    fn compile_class(&mut self, class: &Class) -> Result<(), JsError> {
+        let binding = class.name;
+        let key_count = class
+            .elements
+            .iter()
+            .filter(|e| has_computed_public_name(e))
+            .count();
+        self.emit(Step::ClassBegin {
+            class: Box::new(class.clone()),
+            binding,
+            key_count,
+        });
+        if let Some(heritage) = &class.heritage {
+            self.compile_expr(heritage)?;
+            self.emit(Step::ClassHeritage);
+        }
+        for element in &class.elements {
+            if let Some(expr) = computed_public_name(element) {
+                self.compile_expr(expr)?;
+                self.emit(Step::ClassKeyToPropertyKey);
+            }
+        }
+        self.emit(Step::ClassFinish {
+            class: Box::new(class.clone()),
+            binding,
+            key_count,
+        });
+        Ok(())
+    }
+
     fn compile_object(&mut self, literal: &ObjectLiteral) -> Result<(), JsError> {
         self.emit(Step::ObjectBegin);
         for property in &literal.props {
@@ -4756,8 +5136,19 @@ impl Compiler {
                 ObjectProperty::Get { key, body } => {
                     self.compile_accessor(key, true, None, body)?;
                 }
-                ObjectProperty::Set { key, param, body } => {
-                    self.compile_accessor(key, false, Some(param.clone()), body)?;
+                ObjectProperty::Set {
+                    key,
+                    param,
+                    init,
+                    body,
+                } => {
+                    let element = BindingElement {
+                        pattern: param.clone(),
+                        init: init.clone(),
+                        rest: false,
+                        span: body.span,
+                    };
+                    self.compile_accessor(key, false, Some(element), body)?;
                 }
                 ObjectProperty::Spread(expr) => {
                     self.compile_expr(expr)?;
@@ -4772,7 +5163,7 @@ impl Compiler {
         &mut self,
         key: &PropertyName,
         get: bool,
-        param: Option<BindingPattern>,
+        param: Option<BindingElement>,
         body: &syntax::ast::Block,
     ) -> Result<(), JsError> {
         match key {

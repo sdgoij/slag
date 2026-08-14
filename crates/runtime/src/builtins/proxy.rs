@@ -156,7 +156,19 @@ pub fn dispatch_construct(
     {
         let target = args.first().cloned().unwrap_or(Value::Undefined);
         let handler = args.get(1).cloned().unwrap_or(Value::Undefined);
-        return Some(crux::proxy::proxy_create(target, handler).map(Value::Object));
+        let proxy = match crux::proxy::proxy_create(target.clone(), handler) {
+            Ok(proxy) => proxy,
+            Err(error) => return Some(Err(error)),
+        };
+        // Crux can't see the runtime's arrow/method slots; correct the
+        // constructible flag so `new`/`extends` on a proxy of an arrow (or a
+        // method) throws (spec 10.5.13).
+        if !crate::function::is_constructor(agent, &target)
+            && let crux::object::ObjectKind::Proxy(slots) = &proxy.kind
+        {
+            slots.constructible.set(false);
+        }
+        return Some(Ok(Value::Object(proxy)));
     }
     None
 }
@@ -166,7 +178,12 @@ pub fn dispatch_construct(
 fn proxy_revocable(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
     let target = args.first().cloned().unwrap_or(Value::Undefined);
     let handler = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let proxy = crux::proxy::proxy_create(target, handler)?;
+    let proxy = crux::proxy::proxy_create(target.clone(), handler)?;
+    if !crate::function::is_constructor(agent, &target)
+        && let crux::object::ObjectKind::Proxy(slots) = &proxy.kind
+    {
+        slots.constructible.set(false);
+    }
     let slots = match &proxy.kind {
         ObjectKind::Proxy(slots) => slots.clone(),
         _ => unreachable!("proxy_create returns a proxy object"),

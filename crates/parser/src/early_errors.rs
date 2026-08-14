@@ -19,7 +19,7 @@ use syntax::keywords::is_reserved_word;
 use syntax::{
     Argument, ArrayBindingElement, ArrayElement, ArrowBody, BindingElement, BindingPattern, Block,
     Class, ClassElement, ClassElementName, ExportDecl, ExportName, ExportSpecifier, Expr, ExprKind,
-    Module, ModuleItem, ObjectBindingProperty, ObjectLiteral, ObjectProperty, Program,
+    Function, Module, ModuleItem, ObjectBindingProperty, ObjectLiteral, ObjectProperty, Program,
     PropertyName, Stmt, StmtKind, SwitchCase,
 };
 
@@ -48,7 +48,22 @@ fn error_at(span: Span, message: &str) -> JsError {
 
 /// Checks the statement list of a Script.
 pub(crate) fn check_script(program: &Program) -> Result<(), JsError> {
-    check_stmts(&program.body, &mut LabelState::default())
+    check_stmts(&program.body, &mut LabelState::default())?;
+    check_private_names(program)
+}
+
+/// Checks the statement list of eval code (spec 19.2.1.1): the
+/// AllPrivateIdentifiersValid walk is seeded with the caller's private names,
+/// so `#name` in eval resolves against the inherited private environment
+/// while nested classes still validate their own declarations.
+pub(crate) fn check_script_eval(
+    program: &Program,
+    caller_private_names: &[AtomId],
+) -> Result<(), JsError> {
+    check_stmts(&program.body, &mut LabelState::default())?;
+    let mut env = Vec::new();
+    env.push(caller_private_names.iter().copied().collect());
+    check_private_stmts(&program.body, &mut env)
 }
 
 /// Checks a Module's statements, labels, and exports.
@@ -61,7 +76,8 @@ pub(crate) fn check_module(module: &Module) -> Result<(), JsError> {
             ModuleItem::Export(decl) => check_export(decl, &mut labels)?,
         }
     }
-    check_exported_names(module)
+    check_exported_names(module)?;
+    check_private_names_module(module)
 }
 
 fn check_stmts(stmts: &[Stmt], labels: &mut LabelState) -> Result<(), JsError> {
@@ -352,11 +368,18 @@ fn check_class(c: &Class, labels: &mut LabelState) -> Result<(), JsError> {
                 check_function_body(body)?;
             }
             ClassElement::Set {
-                name, param, body, ..
+                name,
+                param,
+                init,
+                body,
+                ..
             } => {
                 check_class_element_name(name, labels)?;
                 let mut fresh = LabelState::default();
                 check_binding_pattern(param, &mut fresh)?;
+                if let Some(init) = init {
+                    check_expr(init, &mut fresh)?;
+                }
                 check_function_body(body)?;
             }
             ClassElement::Field { name, init, .. } => {
@@ -382,9 +405,9 @@ fn check_class_element_name(
 }
 
 /// A field initializer is evaluated in the constructor's environment but
-/// `arguments` is an early error there (spec 15.7.9); nested arrows and
-/// functions have their own `arguments` and are checked with a fresh label
-/// scope.
+/// `arguments` is an early error there (spec 15.7.9); nested arrows inherit
+/// `arguments` and are checked too, while nested functions have their own
+/// `arguments` (spec 15.7.9 ContainsArguments).
 fn check_field_initializer(init: &Expr) -> Result<(), JsError> {
     if contains_arguments(init) {
         return Err(error_at(
@@ -533,70 +556,274 @@ fn walk_property_name(name: &PropertyName, visit: &mut impl FnMut(&Expr)) {
 
 fn contains_arguments(expr: &Expr) -> bool {
     let mut found = false;
-    walk_exprs(expr, &mut |e| {
-        if matches!(e.kind, ExprKind::Ident(atom) if atom == intern_utf8("arguments")) {
-            found = true;
-        }
-    });
+    walk_contained_exprs(
+        expr,
+        &mut |e| {
+            if matches!(e.kind, ExprKind::Ident(atom) if atom == intern_utf8("arguments")) {
+                found = true;
+            }
+        },
+        true,
+    );
     found
 }
 
 fn contains_arguments_in_stmts(stmts: &[Stmt]) -> bool {
     let mut found = false;
-    walk_stmts(stmts, &mut |e| {
-        if matches!(e.kind, ExprKind::Ident(atom) if atom == intern_utf8("arguments")) {
-            found = true;
-        }
-    });
+    walk_contained_stmts(
+        stmts,
+        &mut |e| {
+            if matches!(e.kind, ExprKind::Ident(atom) if atom == intern_utf8("arguments")) {
+                found = true;
+            }
+        },
+        true,
+    );
     found
 }
 
 fn contains_await_in_stmts(stmts: &[Stmt]) -> bool {
     let mut found = false;
-    walk_stmts(stmts, &mut |e| {
-        if matches!(e.kind, ExprKind::Await(_))
-            || matches!(e.kind, ExprKind::Ident(atom) if atom == intern_utf8("await"))
-        {
-            found = true;
-        }
-    });
+    walk_contained_stmts(
+        stmts,
+        &mut |e| {
+            if matches!(e.kind, ExprKind::Await(_))
+                || matches!(e.kind, ExprKind::Ident(atom) if atom == intern_utf8("await"))
+            {
+                found = true;
+            }
+        },
+        false,
+    );
     found
 }
 
-/// Collects the expressions of a statement list without crossing function,
-/// arrow, or class boundaries.
-fn walk_stmts(stmts: &[Stmt], visit: &mut impl FnMut(&Expr)) {
+/// Walks the expressions reachable from a field initializer or a class
+/// static block without crossing a function or class-method boundary, for
+/// the spec `ContainsArguments`/`ContainsAwait` checks (15.7.9/15.7.11):
+/// nested functions and method bodies are opaque, and a nested class
+/// contributes its heritage, computed property names, and field initializers
+/// but not its method bodies or static blocks. `through_arrows` selects the
+/// per-check arrow behavior: `ContainsArguments` recurses through arrows
+/// (they inherit the enclosing `arguments`), while the static block's
+/// `Contains await` treats them as opaque (spec sec-static-semantics-contains).
+fn walk_contained_exprs(expr: &Expr, visit: &mut impl FnMut(&Expr), through_arrows: bool) {
+    visit(expr);
+    match &expr.kind {
+        ExprKind::Literal(_)
+        | ExprKind::Ident(_)
+        | ExprKind::This
+        | ExprKind::Super
+        | ExprKind::MetaProperty { .. }
+        | ExprKind::Function(_) => {}
+        ExprKind::Class(class) => walk_contained_class(class, visit, through_arrows),
+        ExprKind::Arrow { params, body, .. } => {
+            // The spec `Contains` operation makes arrows opaque to every
+            // symbol but `new.target`/`super`/`this`, so the static-block
+            // `await` check skips arrow bodies and params (an arrow's own
+            // params-await is its own early error). `arguments` recurses
+            // through arrows: they inherit the enclosing `arguments`.
+            if through_arrows {
+                for param in params {
+                    if let Some(init) = &param.init {
+                        walk_contained_exprs(init, visit, through_arrows);
+                    }
+                }
+                match body {
+                    ArrowBody::Expr(expr) => walk_contained_exprs(expr, visit, through_arrows),
+                    ArrowBody::Block(block) => {
+                        walk_contained_stmts(&block.stmts, visit, through_arrows)
+                    }
+                }
+            }
+        }
+        ExprKind::PrivateIn { object, .. } => walk_contained_exprs(object, visit, through_arrows),
+        ExprKind::Array(array) => {
+            for element in &array.elements {
+                match element {
+                    ArrayElement::Expr(e) | ArrayElement::Spread(e) => {
+                        walk_contained_exprs(e, visit, through_arrows)
+                    }
+                    ArrayElement::Hole => {}
+                }
+            }
+        }
+        ExprKind::Object(object) => {
+            for prop in &object.props {
+                match prop {
+                    ObjectProperty::Init { key, value, .. } => {
+                        walk_contained_property_name(key, visit, through_arrows);
+                        walk_contained_exprs(value, visit, through_arrows);
+                    }
+                    ObjectProperty::Method { key, .. }
+                    | ObjectProperty::Get { key, .. }
+                    | ObjectProperty::Set { key, .. } => {
+                        walk_contained_property_name(key, visit, through_arrows)
+                    }
+                    ObjectProperty::Spread(e) => walk_contained_exprs(e, visit, through_arrows),
+                }
+            }
+        }
+        ExprKind::Unary { operand, .. } => walk_contained_exprs(operand, visit, through_arrows),
+        ExprKind::Update { target, .. } => walk_contained_exprs(target, visit, through_arrows),
+        ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
+            walk_contained_exprs(left, visit, through_arrows);
+            walk_contained_exprs(right, visit, through_arrows);
+        }
+        ExprKind::Assign { target, value, .. } => {
+            walk_contained_exprs(target, visit, through_arrows);
+            walk_contained_exprs(value, visit, through_arrows);
+        }
+        ExprKind::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            walk_contained_exprs(test, visit, through_arrows);
+            walk_contained_exprs(consequent, visit, through_arrows);
+            walk_contained_exprs(alternate, visit, through_arrows);
+        }
+        ExprKind::Call(call) => {
+            walk_contained_exprs(&call.callee, visit, through_arrows);
+            for arg in &call.args {
+                walk_contained_argument(arg, visit, through_arrows);
+            }
+        }
+        ExprKind::New(new) => {
+            walk_contained_exprs(&new.callee, visit, through_arrows);
+            for arg in &new.args {
+                walk_contained_argument(arg, visit, through_arrows);
+            }
+        }
+        ExprKind::Member(member) => {
+            walk_contained_exprs(&member.object, visit, through_arrows);
+            if let syntax::MemberProperty::Computed(index) = &member.property {
+                walk_contained_exprs(index, visit, through_arrows);
+            }
+        }
+        ExprKind::TaggedTemplate { tag, quasi } => {
+            walk_contained_exprs(tag, visit, through_arrows);
+            for e in &quasi.exprs {
+                walk_contained_exprs(e, visit, through_arrows);
+            }
+        }
+        ExprKind::Template(template) => {
+            for e in &template.exprs {
+                walk_contained_exprs(e, visit, through_arrows);
+            }
+        }
+        ExprKind::Paren(inner) => walk_contained_exprs(inner, visit, through_arrows),
+        ExprKind::Sequence(exprs) => {
+            for e in exprs {
+                walk_contained_exprs(e, visit, through_arrows);
+            }
+        }
+        ExprKind::Yield { argument, .. } => {
+            if let Some(argument) = argument {
+                walk_contained_exprs(argument, visit, through_arrows);
+            }
+        }
+        ExprKind::Await(operand) => walk_contained_exprs(operand, visit, through_arrows),
+        ExprKind::ImportCall { specifier, options } => {
+            walk_contained_exprs(specifier, visit, through_arrows);
+            if let Some(options) = options {
+                walk_contained_exprs(options, visit, through_arrows);
+            }
+        }
+    }
+}
+
+fn walk_contained_argument(
+    argument: &Argument,
+    visit: &mut impl FnMut(&Expr),
+    through_arrows: bool,
+) {
+    match argument {
+        Argument::Expr(e) | Argument::Spread(e) => walk_contained_exprs(e, visit, through_arrows),
+    }
+}
+
+fn walk_contained_property_name(
+    name: &PropertyName,
+    visit: &mut impl FnMut(&Expr),
+    through_arrows: bool,
+) {
+    if let PropertyName::Computed(expr) = name {
+        walk_contained_exprs(expr, visit, through_arrows);
+    }
+}
+
+/// The parts of a nested class that are evaluated in the enclosing class's
+/// containment: the heritage, computed element names, and field
+/// initializers. Method bodies/params and static blocks have their own
+/// `arguments`/`await` rules.
+fn walk_contained_class(class: &Class, visit: &mut impl FnMut(&Expr), through_arrows: bool) {
+    if let Some(heritage) = &class.heritage {
+        walk_contained_exprs(heritage, visit, through_arrows);
+    }
+    for element in &class.elements {
+        match element {
+            ClassElement::Method { name, .. }
+            | ClassElement::Get { name, .. }
+            | ClassElement::Set { name, .. } => {
+                walk_contained_class_name(name, visit, through_arrows)
+            }
+            ClassElement::Field { name, init, .. } => {
+                walk_contained_class_name(name, visit, through_arrows);
+                if let Some(init) = init {
+                    walk_contained_exprs(init, visit, through_arrows);
+                }
+            }
+            ClassElement::StaticBlock(_) => {}
+        }
+    }
+}
+
+fn walk_contained_class_name(
+    name: &ClassElementName,
+    visit: &mut impl FnMut(&Expr),
+    through_arrows: bool,
+) {
+    if let ClassElementName::Property(PropertyName::Computed(expr)) = name {
+        walk_contained_exprs(expr, visit, through_arrows);
+    }
+}
+
+/// Statement-list counterpart of `walk_contained_exprs`.
+fn walk_contained_stmts(stmts: &[Stmt], visit: &mut impl FnMut(&Expr), through_arrows: bool) {
     for stmt in stmts {
         match &stmt.kind {
-            StmtKind::Block(block) => walk_stmts(&block.stmts, visit),
-            StmtKind::Expr(expr) => walk_exprs(expr, visit),
+            StmtKind::Block(block) => walk_contained_stmts(&block.stmts, visit, through_arrows),
+            StmtKind::Expr(expr) => walk_contained_exprs(expr, visit, through_arrows),
             StmtKind::If {
                 test,
                 consequent,
                 alternate,
             } => {
-                walk_exprs(test, visit);
-                walk_stmts(std::slice::from_ref(consequent), visit);
+                walk_contained_exprs(test, visit, through_arrows);
+                walk_contained_stmts(std::slice::from_ref(consequent), visit, through_arrows);
                 if let Some(alt) = alternate {
-                    walk_stmts(std::slice::from_ref(alt), visit);
+                    walk_contained_stmts(std::slice::from_ref(alt), visit, through_arrows);
                 }
             }
             StmtKind::VarDecl { decls, .. } | StmtKind::UsingDecl { decls, .. } => {
                 for decl in decls {
                     if let Some(init) = &decl.init {
-                        walk_exprs(init, visit);
+                        walk_contained_exprs(init, visit, through_arrows);
                     }
                 }
             }
-            StmtKind::Return(Some(expr)) | StmtKind::Throw(expr) => walk_exprs(expr, visit),
+            StmtKind::Return(Some(expr)) | StmtKind::Throw(expr) => {
+                walk_contained_exprs(expr, visit, through_arrows)
+            }
             StmtKind::Return(None) => {}
             StmtKind::While { test, body } => {
-                walk_exprs(test, visit);
-                walk_stmts(std::slice::from_ref(body), visit);
+                walk_contained_exprs(test, visit, through_arrows);
+                walk_contained_stmts(std::slice::from_ref(body), visit, through_arrows);
             }
             StmtKind::DoWhile { body, test } => {
-                walk_stmts(std::slice::from_ref(body), visit);
-                walk_exprs(test, visit);
+                walk_contained_stmts(std::slice::from_ref(body), visit, through_arrows);
+                walk_contained_exprs(test, visit, through_arrows);
             }
             StmtKind::For {
                 init,
@@ -604,66 +831,73 @@ fn walk_stmts(stmts: &[Stmt], visit: &mut impl FnMut(&Expr)) {
                 update,
                 body,
             } => {
-                walk_for_init(init, visit);
+                walk_contained_for_init(init, visit, through_arrows);
                 if let Some(t) = test {
-                    walk_exprs(t, visit);
+                    walk_contained_exprs(t, visit, through_arrows);
                 }
                 if let Some(u) = update {
-                    walk_exprs(u, visit);
+                    walk_contained_exprs(u, visit, through_arrows);
                 }
-                walk_stmts(std::slice::from_ref(body), visit);
+                walk_contained_stmts(std::slice::from_ref(body), visit, through_arrows);
             }
             StmtKind::ForIn { left, right, body }
             | StmtKind::ForOf {
                 left, right, body, ..
             } => {
-                walk_for_binding(left, visit);
-                walk_exprs(right, visit);
-                walk_stmts(std::slice::from_ref(body), visit);
+                walk_contained_for_binding(left, visit, through_arrows);
+                walk_contained_exprs(right, visit, through_arrows);
+                walk_contained_stmts(std::slice::from_ref(body), visit, through_arrows);
             }
             StmtKind::Try {
                 block,
                 handler,
                 finalizer,
             } => {
-                walk_stmts(&block.stmts, visit);
+                walk_contained_stmts(&block.stmts, visit, through_arrows);
                 if let Some(handler) = handler {
-                    walk_stmts(&handler.body.stmts, visit);
+                    walk_contained_stmts(&handler.body.stmts, visit, through_arrows);
                 }
                 if let Some(finalizer) = finalizer {
-                    walk_stmts(&finalizer.stmts, visit);
+                    walk_contained_stmts(&finalizer.stmts, visit, through_arrows);
                 }
             }
             StmtKind::Switch {
                 discriminant,
                 cases,
             } => {
-                walk_exprs(discriminant, visit);
+                walk_contained_exprs(discriminant, visit, through_arrows);
                 for case in cases {
                     if let Some(test) = &case.test {
-                        walk_exprs(test, visit);
+                        walk_contained_exprs(test, visit, through_arrows);
                     }
-                    walk_stmts(&case.consequent, visit);
+                    walk_contained_stmts(&case.consequent, visit, through_arrows);
                 }
             }
             StmtKind::With { object, body } => {
-                walk_exprs(object, visit);
-                walk_stmts(std::slice::from_ref(body), visit);
+                walk_contained_exprs(object, visit, through_arrows);
+                walk_contained_stmts(std::slice::from_ref(body), visit, through_arrows);
             }
-            StmtKind::Labeled { body, .. } => walk_stmts(std::slice::from_ref(body), visit),
-            StmtKind::FunctionDecl(_) | StmtKind::ClassDecl(_) => {}
+            StmtKind::Labeled { body, .. } => {
+                walk_contained_stmts(std::slice::from_ref(body), visit, through_arrows)
+            }
+            StmtKind::FunctionDecl(_) => {}
+            StmtKind::ClassDecl(class) => walk_contained_class(class, visit, through_arrows),
             StmtKind::Empty | StmtKind::Debugger | StmtKind::Break(_) | StmtKind::Continue(_) => {}
         }
     }
 }
 
-fn walk_for_init(init: &Option<syntax::ForInit>, visit: &mut impl FnMut(&Expr)) {
+fn walk_contained_for_init(
+    init: &Option<syntax::ForInit>,
+    visit: &mut impl FnMut(&Expr),
+    through_arrows: bool,
+) {
     match init {
-        Some(syntax::ForInit::Expr(expr)) => walk_exprs(expr, visit),
+        Some(syntax::ForInit::Expr(expr)) => walk_contained_exprs(expr, visit, through_arrows),
         Some(syntax::ForInit::VarDecl { decls, .. }) => {
             for decl in decls {
                 if let Some(init) = &decl.init {
-                    walk_exprs(init, visit);
+                    walk_contained_exprs(init, visit, through_arrows);
                 }
             }
         }
@@ -671,12 +905,16 @@ fn walk_for_init(init: &Option<syntax::ForInit>, visit: &mut impl FnMut(&Expr)) 
     }
 }
 
-fn walk_for_binding(binding: &syntax::ForBinding, visit: &mut impl FnMut(&Expr)) {
+fn walk_contained_for_binding(
+    binding: &syntax::ForBinding,
+    visit: &mut impl FnMut(&Expr),
+    through_arrows: bool,
+) {
     match binding {
-        syntax::ForBinding::Expr(expr) => walk_exprs(expr, visit),
+        syntax::ForBinding::Expr(expr) => walk_contained_exprs(expr, visit, through_arrows),
         syntax::ForBinding::VarDecl { init, .. } => {
             if let Some(init) = init {
-                walk_exprs(init, visit);
+                walk_contained_exprs(init, visit, through_arrows);
             }
         }
     }
@@ -837,6 +1075,13 @@ fn collect_pattern_names(pattern: &BindingPattern, out: &mut Vec<JsString>) {
 // ---- expressions (spec 13.2.5) ----
 
 fn check_expr(expr: &Expr, labels: &mut LabelState) -> Result<(), JsError> {
+    check_expr_with(expr, labels, false)
+}
+
+/// Like `check_expr`, but descending into a destructuring-assignment target:
+/// the `__proto__` duplicate rule applies to ObjectInitializers, not to
+/// ObjectAssignmentPatterns (spec 13.2.5, Annex B.2.2).
+fn check_expr_with(expr: &Expr, labels: &mut LabelState, pattern: bool) -> Result<(), JsError> {
     match &expr.kind {
         ExprKind::Function(f) => check_function(f),
         ExprKind::Class(c) => check_class(c, labels),
@@ -848,14 +1093,13 @@ fn check_expr(expr: &Expr, labels: &mut LabelState) -> Result<(), JsError> {
                 ArrowBody::Block(block) => check_stmts(&block.stmts, &mut fresh),
             }
         }
-        ExprKind::Object(object) => {
-            check_object_literal(object, labels)?;
-            Ok(())
-        }
+        ExprKind::Object(object) => check_object_literal(object, labels, pattern),
         ExprKind::Array(array) => {
             for element in &array.elements {
                 match element {
-                    ArrayElement::Expr(e) | ArrayElement::Spread(e) => check_expr(e, labels)?,
+                    ArrayElement::Expr(e) | ArrayElement::Spread(e) => {
+                        check_expr_with(e, labels, pattern)?;
+                    }
                     ArrayElement::Hole => {}
                 }
             }
@@ -869,7 +1113,7 @@ fn check_expr(expr: &Expr, labels: &mut LabelState) -> Result<(), JsError> {
         }
         ExprKind::PrivateIn { object, .. } => check_expr(object, labels),
         ExprKind::Assign { target, value, .. } => {
-            check_expr(target, labels)?;
+            check_expr_with(target, labels, true)?;
             check_expr(value, labels)
         }
         ExprKind::Conditional {
@@ -948,22 +1192,29 @@ fn check_expr(expr: &Expr, labels: &mut LabelState) -> Result<(), JsError> {
     }
 }
 
-/// `__proto__` may appear as a data property only once (spec 13.2.5 early
-/// errors); shorthand and method entries do not count.
-fn check_object_literal(object: &ObjectLiteral, labels: &mut LabelState) -> Result<(), JsError> {
-    let mut proto_count = 0usize;
-    for prop in &object.props {
-        if is_proto_data_property(prop) {
-            proto_count += 1;
-            if proto_count > 1 {
-                let span = match prop {
-                    ObjectProperty::Init { value, .. } => value.span,
-                    _ => object.span,
-                };
-                return Err(error_at(
-                    span,
-                    "Duplicate __proto__ fields are not allowed in object literals",
-                ));
+/// `__proto__` may appear as a data property only once in an object
+/// initializer (spec 13.2.5 early errors); shorthand and method entries do
+/// not count, and assignment-pattern objects are exempt.
+fn check_object_literal(
+    object: &ObjectLiteral,
+    labels: &mut LabelState,
+    pattern: bool,
+) -> Result<(), JsError> {
+    if !pattern {
+        let mut proto_count = 0usize;
+        for prop in &object.props {
+            if is_proto_data_property(prop) {
+                proto_count += 1;
+                if proto_count > 1 {
+                    let span = match prop {
+                        ObjectProperty::Init { value, .. } => value.span,
+                        _ => object.span,
+                    };
+                    return Err(error_at(
+                        span,
+                        "Duplicate __proto__ fields are not allowed in object literals",
+                    ));
+                }
             }
         }
     }
@@ -973,7 +1224,7 @@ fn check_object_literal(object: &ObjectLiteral, labels: &mut LabelState) -> Resu
                 if let PropertyName::Computed(computed) = key {
                     check_expr(computed, labels)?;
                 }
-                check_expr(value, labels)?;
+                check_expr_with(value, labels, pattern)?;
             }
             ObjectProperty::Method { key, function } => {
                 if let PropertyName::Computed(computed) = key {
@@ -1026,4 +1277,480 @@ fn check_export(decl: &ExportDecl, labels: &mut LabelState) -> Result<(), JsErro
             syntax::ExportDefault::Expr(e) => check_expr(e, labels),
         },
     }
+}
+
+// ---- AllPrivateNamesValid (spec 15.7.9) ----
+
+/// Validates every private-name reference: the name must be declared in the
+/// class containing the reference or in an enclosing class (the private
+/// environment is lexically scoped, and forward references within a class
+/// are allowed). A class's heritage is evaluated with the class's own
+/// private names not yet in scope, so those are excluded there.
+pub(crate) fn check_private_names(program: &Program) -> Result<(), JsError> {
+    let mut env = Vec::new();
+    check_private_stmts(&program.body, &mut env)
+}
+
+/// Like `check_private_names`, for a Module's items.
+pub(crate) fn check_private_names_module(module: &Module) -> Result<(), JsError> {
+    let mut env = Vec::new();
+    for item in &module.body {
+        match item {
+            ModuleItem::Stmt(stmt) => check_private_stmt(stmt, &mut env)?,
+            ModuleItem::Import(_) => {}
+            ModuleItem::Export(decl) => match decl {
+                ExportDecl::Named { .. } | ExportDecl::From { .. } => {}
+                ExportDecl::Declaration(stmt) => check_private_stmt(stmt, &mut env)?,
+                ExportDecl::Default(inner) => match &**inner {
+                    syntax::ExportDefault::Function(f) => check_private_function(f, &mut env)?,
+                    syntax::ExportDefault::Class(c) => check_private_class(c, &mut env)?,
+                    syntax::ExportDefault::Expr(e) => check_private_expr(e, &mut env)?,
+                },
+            },
+        }
+    }
+    Ok(())
+}
+
+fn private_names_contain(env: &[std::collections::HashSet<AtomId>], name: AtomId) -> bool {
+    env.iter().rev().any(|set| set.contains(&name))
+}
+
+fn check_private_class(
+    class: &Class,
+    env: &mut Vec<std::collections::HashSet<AtomId>>,
+) -> Result<(), JsError> {
+    let names: std::collections::HashSet<AtomId> = class
+        .elements
+        .iter()
+        .filter_map(|element| match element {
+            ClassElement::Method { name, .. }
+            | ClassElement::Get { name, .. }
+            | ClassElement::Set { name, .. }
+            | ClassElement::Field { name, .. } => match name {
+                ClassElementName::Private(atom) => Some(*atom),
+                ClassElementName::Property(_) => None,
+            },
+            ClassElement::StaticBlock(_) => None,
+        })
+        .collect();
+    if let Some(heritage) = &class.heritage {
+        check_private_expr(heritage, env)?;
+    }
+    env.push(names);
+    for element in &class.elements {
+        check_private_element(element, env)?;
+    }
+    env.pop();
+    Ok(())
+}
+
+fn check_private_element(
+    element: &ClassElement,
+    env: &mut Vec<std::collections::HashSet<AtomId>>,
+) -> Result<(), JsError> {
+    match element {
+        ClassElement::Method { name, function, .. } => {
+            check_private_class_name(name, env)?;
+            check_private_function(function, env)
+        }
+        ClassElement::Get { name, body, .. } => {
+            check_private_class_name(name, env)?;
+            check_private_stmts(&body.stmts, env)
+        }
+        ClassElement::Set {
+            name,
+            param,
+            init,
+            body,
+            ..
+        } => {
+            check_private_class_name(name, env)?;
+            check_private_binding_pattern(param, env)?;
+            if let Some(init) = init {
+                check_private_expr(init, env)?;
+            }
+            check_private_stmts(&body.stmts, env)
+        }
+        ClassElement::Field { name, init, .. } => {
+            check_private_class_name(name, env)?;
+            if let Some(init) = init {
+                check_private_expr(init, env)?;
+            }
+            Ok(())
+        }
+        ClassElement::StaticBlock(block) => check_private_stmts(&block.stmts, env),
+    }
+}
+
+fn check_private_class_name(
+    name: &ClassElementName,
+    env: &mut Vec<std::collections::HashSet<AtomId>>,
+) -> Result<(), JsError> {
+    if let ClassElementName::Property(PropertyName::Computed(expr)) = name {
+        check_private_expr(expr, env)?;
+    }
+    Ok(())
+}
+
+fn check_private_function(
+    function: &Function,
+    env: &mut Vec<std::collections::HashSet<AtomId>>,
+) -> Result<(), JsError> {
+    for param in &function.params {
+        check_private_binding_element(param, env)?;
+    }
+    check_private_stmts(&function.body.stmts, env)
+}
+
+fn check_private_binding_element(
+    element: &BindingElement,
+    env: &mut Vec<std::collections::HashSet<AtomId>>,
+) -> Result<(), JsError> {
+    check_private_binding_pattern(&element.pattern, env)?;
+    if let Some(init) = &element.init {
+        check_private_expr(init, env)?;
+    }
+    Ok(())
+}
+
+fn check_private_binding_pattern(
+    pattern: &BindingPattern,
+    env: &mut Vec<std::collections::HashSet<AtomId>>,
+) -> Result<(), JsError> {
+    match pattern {
+        BindingPattern::Ident(_) => Ok(()),
+        BindingPattern::Object(props) => {
+            for prop in props {
+                match prop {
+                    ObjectBindingProperty::Property { element, .. }
+                    | ObjectBindingProperty::Rest(element) => {
+                        check_private_binding_element(element, env)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        BindingPattern::Array(elements) => {
+            for element in elements {
+                match element {
+                    ArrayBindingElement::Hole => {}
+                    ArrayBindingElement::Element(e) | ArrayBindingElement::Rest(e) => {
+                        check_private_binding_element(e, env)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn check_private_stmts(
+    stmts: &[Stmt],
+    env: &mut Vec<std::collections::HashSet<AtomId>>,
+) -> Result<(), JsError> {
+    for stmt in stmts {
+        check_private_stmt(stmt, env)?;
+    }
+    Ok(())
+}
+
+fn check_private_stmt(
+    stmt: &Stmt,
+    env: &mut Vec<std::collections::HashSet<AtomId>>,
+) -> Result<(), JsError> {
+    match &stmt.kind {
+        StmtKind::Block(block) => check_private_stmts(&block.stmts, env),
+        StmtKind::Empty | StmtKind::Debugger => Ok(()),
+        StmtKind::Expr(expr) => check_private_expr(expr, env),
+        StmtKind::If {
+            test,
+            consequent,
+            alternate,
+        } => {
+            check_private_expr(test, env)?;
+            check_private_stmt(consequent, env)?;
+            if let Some(alt) = alternate {
+                check_private_stmt(alt, env)?;
+            }
+            Ok(())
+        }
+        StmtKind::VarDecl { decls, .. } | StmtKind::UsingDecl { decls, .. } => {
+            for decl in decls {
+                check_private_binding_pattern(&decl.pattern, env)?;
+                if let Some(init) = &decl.init {
+                    check_private_expr(init, env)?;
+                }
+            }
+            Ok(())
+        }
+        StmtKind::FunctionDecl(f) => check_private_function(f, env),
+        StmtKind::ClassDecl(c) => check_private_class(c, env),
+        StmtKind::Return(Some(expr)) | StmtKind::Throw(expr) => check_private_expr(expr, env),
+        StmtKind::Return(None) => Ok(()),
+        StmtKind::Labeled { body, .. } => check_private_stmt(body, env),
+        StmtKind::Break(_) | StmtKind::Continue(_) => Ok(()),
+        StmtKind::While { test, body } => {
+            check_private_expr(test, env)?;
+            check_private_stmt(body, env)
+        }
+        StmtKind::DoWhile { body, test } => {
+            check_private_stmt(body, env)?;
+            check_private_expr(test, env)
+        }
+        StmtKind::For {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            check_private_for_init(init, env)?;
+            if let Some(t) = test {
+                check_private_expr(t, env)?;
+            }
+            if let Some(u) = update {
+                check_private_expr(u, env)?;
+            }
+            check_private_stmt(body, env)
+        }
+        StmtKind::ForIn { left, right, body } => {
+            check_private_for_binding(left, env)?;
+            check_private_expr(right, env)?;
+            check_private_stmt(body, env)
+        }
+        StmtKind::ForOf {
+            left, right, body, ..
+        } => {
+            check_private_for_binding(left, env)?;
+            check_private_expr(right, env)?;
+            check_private_stmt(body, env)
+        }
+        StmtKind::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            check_private_stmts(&block.stmts, env)?;
+            if let Some(handler) = handler {
+                if let Some(param) = &handler.param {
+                    check_private_binding_pattern(param, env)?;
+                }
+                check_private_stmts(&handler.body.stmts, env)?;
+            }
+            if let Some(finalizer) = finalizer {
+                check_private_stmts(&finalizer.stmts, env)?;
+            }
+            Ok(())
+        }
+        StmtKind::Switch {
+            discriminant,
+            cases,
+        } => {
+            check_private_expr(discriminant, env)?;
+            for case in cases {
+                if let Some(test) = &case.test {
+                    check_private_expr(test, env)?;
+                }
+                check_private_stmts(&case.consequent, env)?;
+            }
+            Ok(())
+        }
+        StmtKind::With { object, body } => {
+            check_private_expr(object, env)?;
+            check_private_stmt(body, env)
+        }
+    }
+}
+
+fn check_private_for_init(
+    init: &Option<syntax::ForInit>,
+    env: &mut Vec<std::collections::HashSet<AtomId>>,
+) -> Result<(), JsError> {
+    match init {
+        Some(syntax::ForInit::Expr(expr)) => check_private_expr(expr, env),
+        Some(syntax::ForInit::VarDecl { decls, .. }) => {
+            for decl in decls {
+                check_private_binding_pattern(&decl.pattern, env)?;
+                if let Some(init) = &decl.init {
+                    check_private_expr(init, env)?;
+                }
+            }
+            Ok(())
+        }
+        None => Ok(()),
+    }
+}
+
+fn check_private_for_binding(
+    binding: &syntax::ForBinding,
+    env: &mut Vec<std::collections::HashSet<AtomId>>,
+) -> Result<(), JsError> {
+    match binding {
+        syntax::ForBinding::Expr(expr) => check_private_expr(expr, env),
+        syntax::ForBinding::VarDecl { pattern, init, .. } => {
+            check_private_binding_pattern(pattern, env)?;
+            if let Some(init) = init {
+                check_private_expr(init, env)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn check_private_expr(
+    expr: &Expr,
+    env: &mut Vec<std::collections::HashSet<AtomId>>,
+) -> Result<(), JsError> {
+    match &expr.kind {
+        ExprKind::Literal(_)
+        | ExprKind::Ident(_)
+        | ExprKind::This
+        | ExprKind::Super
+        | ExprKind::MetaProperty { .. } => Ok(()),
+        ExprKind::Function(f) => check_private_function(f, env),
+        ExprKind::Class(c) => check_private_class(c, env),
+        ExprKind::Arrow { params, body, .. } => {
+            for param in params {
+                check_private_binding_element(param, env)?;
+            }
+            match body {
+                ArrowBody::Expr(expr) => check_private_expr(expr, env),
+                ArrowBody::Block(block) => check_private_stmts(&block.stmts, env),
+            }
+        }
+        ExprKind::PrivateIn { name, object } => {
+            if !private_names_contain(env, *name) {
+                return Err(error_at(
+                    expr.span,
+                    "Private field must be declared in an enclosing class",
+                ));
+            }
+            check_private_expr(object, env)
+        }
+        ExprKind::Array(array) => {
+            for element in &array.elements {
+                match element {
+                    ArrayElement::Expr(e) | ArrayElement::Spread(e) => check_private_expr(e, env)?,
+                    ArrayElement::Hole => {}
+                }
+            }
+            Ok(())
+        }
+        ExprKind::Object(object) => {
+            for prop in &object.props {
+                match prop {
+                    ObjectProperty::Init { key, value, .. } => {
+                        check_private_property_name(key, env)?;
+                        check_private_expr(value, env)?;
+                    }
+                    ObjectProperty::Method { key, function } => {
+                        check_private_property_name(key, env)?;
+                        check_private_function(function, env)?;
+                    }
+                    ObjectProperty::Get { key, body } | ObjectProperty::Set { key, body, .. } => {
+                        check_private_property_name(key, env)?;
+                        check_private_stmts(&body.stmts, env)?;
+                    }
+                    ObjectProperty::Spread(e) => check_private_expr(e, env)?,
+                }
+            }
+            Ok(())
+        }
+        ExprKind::Unary { operand, .. } => check_private_expr(operand, env),
+        ExprKind::Update { target, .. } => check_private_expr(target, env),
+        ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
+            check_private_expr(left, env)?;
+            check_private_expr(right, env)
+        }
+        ExprKind::Assign { target, value, .. } => {
+            check_private_expr(target, env)?;
+            check_private_expr(value, env)
+        }
+        ExprKind::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            check_private_expr(test, env)?;
+            check_private_expr(consequent, env)?;
+            check_private_expr(alternate, env)
+        }
+        ExprKind::Call(call) => {
+            check_private_expr(&call.callee, env)?;
+            for arg in &call.args {
+                match arg {
+                    Argument::Expr(e) | Argument::Spread(e) => check_private_expr(e, env)?,
+                }
+            }
+            Ok(())
+        }
+        ExprKind::New(new) => {
+            check_private_expr(&new.callee, env)?;
+            for arg in &new.args {
+                match arg {
+                    Argument::Expr(e) | Argument::Spread(e) => check_private_expr(e, env)?,
+                }
+            }
+            Ok(())
+        }
+        ExprKind::Member(member) => {
+            if let syntax::MemberProperty::Private(name) = member.property
+                && !private_names_contain(env, name)
+            {
+                return Err(error_at(
+                    member.span,
+                    "Private field must be declared in an enclosing class",
+                ));
+            }
+            check_private_expr(&member.object, env)?;
+            if let syntax::MemberProperty::Computed(index) = &member.property {
+                check_private_expr(index, env)?;
+            }
+            Ok(())
+        }
+        ExprKind::TaggedTemplate { tag, quasi } => {
+            check_private_expr(tag, env)?;
+            for e in &quasi.exprs {
+                check_private_expr(e, env)?;
+            }
+            Ok(())
+        }
+        ExprKind::Template(template) => {
+            for e in &template.exprs {
+                check_private_expr(e, env)?;
+            }
+            Ok(())
+        }
+        ExprKind::Paren(inner) => check_private_expr(inner, env),
+        ExprKind::Sequence(exprs) => {
+            for e in exprs {
+                check_private_expr(e, env)?;
+            }
+            Ok(())
+        }
+        ExprKind::Yield { argument, .. } => {
+            if let Some(argument) = argument {
+                check_private_expr(argument, env)?;
+            }
+            Ok(())
+        }
+        ExprKind::Await(operand) => check_private_expr(operand, env),
+        ExprKind::ImportCall { specifier, options } => {
+            check_private_expr(specifier, env)?;
+            if let Some(options) = options {
+                check_private_expr(options, env)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn check_private_property_name(
+    name: &PropertyName,
+    env: &mut Vec<std::collections::HashSet<AtomId>>,
+) -> Result<(), JsError> {
+    if let PropertyName::Computed(expr) = name {
+        check_private_expr(expr, env)?;
+    }
+    Ok(())
 }

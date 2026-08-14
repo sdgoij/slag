@@ -29,8 +29,38 @@ pub(crate) fn parse_statement(
     parser: &mut Parser,
     allow_declaration: bool,
 ) -> Result<Stmt, JsError> {
+    parse_statement_with(parser, allow_declaration, false)
+}
+
+/// Like `parse_statement`, but the position allows the Annex B web-compat
+/// plain-function relaxations: a `function` declaration as the body of an
+/// `if` clause (B.3.4) or of a labelled statement (B.3.2), sloppy mode only.
+pub(crate) fn parse_statement_with(
+    parser: &mut Parser,
+    allow_declaration: bool,
+    annex_b_function: bool,
+) -> Result<Stmt, JsError> {
+    let stmt = parse_statement_inner(parser, allow_declaration, annex_b_function)?;
+    // A statement ending in `}` (block, function/class declaration, switch,
+    // or a body block) is followed by an expression start: the next `/` must
+    // lex as a RegularExpressionLiteral, not division (spec 12.1).
+    if matches!(
+        parser.prev.as_ref().map(|t| &t.kind),
+        Some(TokenKind::RightBrace)
+    ) {
+        parser.after_statement_brace = true;
+    }
+    Ok(stmt)
+}
+
+fn parse_statement_inner(
+    parser: &mut Parser,
+    allow_declaration: bool,
+    annex_b_function: bool,
+) -> Result<Stmt, JsError> {
     let start = parser.peek()?.span.start;
-    let kind = match parser.peek()?.kind.clone() {
+    let tok = parser.peek()?.clone();
+    let kind = match tok.kind.clone() {
         TokenKind::LeftBrace => {
             return parse_block(parser).map(|b| Stmt {
                 span: b.span,
@@ -40,6 +70,25 @@ pub(crate) fn parse_statement(
         TokenKind::Semicolon => {
             parser.next()?;
             StmtKind::Empty
+        }
+        TokenKind::At => {
+            // A decorated class declaration: `@dec class C { … }`. The
+            // decorators are validated syntactically and not evaluated.
+            if !allow_declaration {
+                return Err(parser.error_at(
+                    start,
+                    "Lexical declaration cannot appear in a single-statement context",
+                ));
+            }
+            crate::class::parse_decorators(parser)?;
+            parser.expect_keyword(Keyword::Class)?;
+            let class_start = parser.prev.as_ref().unwrap().span.start;
+            let class = crate::class::parse_class(parser, class_start, true)?;
+            let end = class.span.end;
+            return Ok(Stmt {
+                span: Span::new(start, end),
+                kind: StmtKind::ClassDecl(class),
+            });
         }
         TokenKind::Identifier(atom) => match from_identifier(atom) {
             Some(Keyword::Var) => return parse_var_statement(parser, VarDeclKind::Var),
@@ -71,7 +120,12 @@ pub(crate) fn parse_statement(
                 StmtKind::Debugger
             }
             Some(Keyword::Function) => {
-                return parse_function_declaration(parser, false, !allow_declaration);
+                return parse_function_declaration(
+                    parser,
+                    false,
+                    !allow_declaration,
+                    annex_b_function,
+                );
             }
             Some(Keyword::Class) => {
                 if !allow_declaration {
@@ -89,26 +143,34 @@ pub(crate) fn parse_statement(
                 });
             }
             _ if atom == intern_utf8("let")
+                && !tok.escaped
                 && is_let_declaration_start(parser.peek2()?.kind.clone()) =>
             {
-                if !allow_declaration && !parser.peek2()?.line_break_before {
-                    return Err(parser.error_at(
-                        start,
-                        "Lexical declaration cannot appear in a single-statement context",
-                    ));
+                if !allow_declaration {
+                    // `let [` is excluded from ExpressionStatement even
+                    // across a line break (spec 13.8), so `if (x) let\n[a]`
+                    // is an early error rather than an ASI'd `let` reference.
+                    if matches!(parser.peek2()?.kind, TokenKind::LeftBracket) {
+                        return Err(parser.error_at(start, "Unexpected token '[' after let"));
+                    }
+                    if !parser.peek2()?.line_break_before {
+                        return Err(parser.error_at(
+                            start,
+                            "Lexical declaration cannot appear in a single-statement context",
+                        ));
+                    }
+                    // Statement position with a line break before the
+                    // declaration start: `let` is an expression statement
+                    // (ASI), e.g. `if (x) let\n{}`.
+                    if is_label_start(parser)? {
+                        return parse_labeled(parser);
+                    }
+                    return parse_expression_statement(parser);
                 }
-                if allow_declaration {
-                    return parse_var_statement(parser, VarDeclKind::Let);
-                }
-                // Statement position with a line break before the declaration
-                // start: `let` is an expression statement (ASI), e.g.
-                // `if (x) let\n{}`.
-                if is_label_start(parser)? {
-                    return parse_labeled(parser);
-                }
-                return parse_expression_statement(parser);
+                return parse_var_statement(parser, VarDeclKind::Let);
             }
             _ if atom == intern_utf8("using")
+                && !tok.escaped
                 && is_using_binding_start(parser.peek2()?.kind.clone())
                 && !parser.peek2()?.line_break_before =>
             {
@@ -121,6 +183,7 @@ pub(crate) fn parse_statement(
                 return parse_using_declaration(parser, false);
             }
             _ if atom == intern_utf8("await")
+                && !tok.escaped
                 && (parser.in_async || parser.top_level_await)
                 && parser.peek2()?.kind == TokenKind::Identifier(intern_utf8("using"))
                 && !parser.peek2()?.line_break_before
@@ -137,11 +200,17 @@ pub(crate) fn parse_statement(
                 return parse_using_declaration(parser, true);
             }
             _ if atom == intern_utf8("async")
+                && !tok.escaped
                 && parser.peek2()?.kind == TokenKind::Identifier(intern_utf8("function"))
                 && !parser.peek2()?.line_break_before =>
             {
                 parser.next()?; // `async`
-                return parse_function_declaration(parser, true, !allow_declaration);
+                return parse_function_declaration(
+                    parser,
+                    true,
+                    !allow_declaration,
+                    annex_b_function,
+                );
             }
             _ => {
                 if is_label_start(parser)? {
@@ -159,12 +228,16 @@ pub(crate) fn parse_statement(
     })
 }
 
-/// `let` starts a declaration when followed by an identifier, `[`, or `{`.
+/// `let` starts a declaration when followed by a binding identifier, `[`, or
+/// `{`. Keywords and the `of` contextual keyword after `let` mean `let` is an
+/// identifier (the `[lookahead ∉ { let [, let of }]` restrictions of the
+/// for-head grammar).
 fn is_let_declaration_start(kind: TokenKind) -> bool {
-    matches!(
-        kind,
-        TokenKind::Identifier(_) | TokenKind::LeftBracket | TokenKind::LeftBrace
-    )
+    match kind {
+        TokenKind::Identifier(atom) => from_identifier(atom).is_none(),
+        TokenKind::LeftBracket | TokenKind::LeftBrace => true,
+        _ => false,
+    }
 }
 
 /// A `using` token starts a declaration when followed by a non-keyword
@@ -204,7 +277,7 @@ fn parse_labeled(parser: &mut Parser) -> Result<Stmt, JsError> {
         return Err(parser.error_at(start, "Unexpected strict mode reserved word"));
     }
     parser.expect_punct(TokenKind::Colon)?;
-    let body = Box::new(parse_statement(parser, false)?);
+    let body = Box::new(parse_statement_with(parser, false, true)?);
     let end = parser.prev.as_ref().unwrap().span.end;
     Ok(Stmt {
         span: Span::new(start, end),
@@ -212,10 +285,25 @@ fn parse_labeled(parser: &mut Parser) -> Result<Stmt, JsError> {
     })
 }
 
+/// IsLabelledFunction (spec 13.13): a labelled statement whose innermost
+/// statement is a FunctionDeclaration. Such a declaration is never permitted
+/// as the sole body of an if/while/do/for/with statement.
+fn is_labelled_function(stmt: &Stmt) -> bool {
+    match &stmt.kind {
+        StmtKind::Labeled { body, .. } => match &body.kind {
+            StmtKind::FunctionDecl(_) => true,
+            StmtKind::Labeled { .. } => is_labelled_function(body),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn parse_block(parser: &mut Parser) -> Result<Block, JsError> {
     let start = parser.next()?.span.start; // '{'
     let saved_vars = std::mem::take(&mut parser.list_vars);
     parser.push_scope();
+    parser.scopes.last_mut().unwrap().is_block = true;
     let stmts = parse_statement_list(parser, TokenKind::RightBrace)?;
     parser.expect_punct(TokenKind::RightBrace)?;
     let end = parser.prev.as_ref().unwrap().span.end;
@@ -256,6 +344,15 @@ fn parse_var_statement(parser: &mut Parser, kind: VarDeclKind) -> Result<Stmt, J
 /// initializers, declared lexically.
 fn parse_using_declaration(parser: &mut Parser, is_await: bool) -> Result<Stmt, JsError> {
     let start = parser.next()?.span.start; // `using`
+    // A UsingDeclaration is only valid inside a function body, a module, or
+    // a block — not directly in a script's top-level statement list (spec
+    // 15.14.2), since there is no enclosing resource-management scope.
+    if parser.scopes.len() == 1 && !parser.in_module {
+        return Err(parser.error_at(
+            start,
+            "using declarations are not allowed at the top level of a script",
+        ));
+    }
     let mut decls = Vec::new();
     loop {
         let decl_start = parser.peek()?.span.start;
@@ -388,9 +485,22 @@ fn parse_if(parser: &mut Parser) -> Result<Stmt, JsError> {
     parser.expect_punct(TokenKind::LeftParen)?;
     let test = parse_expression(parser, true)?;
     parser.expect_punct(TokenKind::RightParen)?;
-    let consequent = Box::new(parse_statement(parser, false)?);
+    let consequent = Box::new(parse_statement_with(parser, false, true)?);
+    if is_labelled_function(&consequent) {
+        return Err(parser.error_at(
+            consequent.span.start,
+            "A labelled function declaration is not allowed in statement position",
+        ));
+    }
     let alternate = if parser.eat_keyword(Keyword::Else)? {
-        Some(Box::new(parse_statement(parser, false)?))
+        let stmt = parse_statement_with(parser, false, true)?;
+        if is_labelled_function(&stmt) {
+            return Err(parser.error_at(
+                stmt.span.start,
+                "A labelled function declaration is not allowed in statement position",
+            ));
+        }
+        Some(Box::new(stmt))
     } else {
         None
     };
@@ -410,7 +520,13 @@ fn parse_while(parser: &mut Parser) -> Result<Stmt, JsError> {
     parser.expect_punct(TokenKind::LeftParen)?;
     let test = parse_expression(parser, true)?;
     parser.expect_punct(TokenKind::RightParen)?;
-    let body = Box::new(parse_statement(parser, false)?);
+    let body = Box::new(parse_statement_with(parser, false, false)?);
+    if is_labelled_function(&body) {
+        return Err(parser.error_at(
+            body.span.start,
+            "A labelled function declaration is not allowed in statement position",
+        ));
+    }
     let end = parser.prev.as_ref().unwrap().span.end;
     Ok(Stmt {
         span: Span::new(start, end),
@@ -420,12 +536,21 @@ fn parse_while(parser: &mut Parser) -> Result<Stmt, JsError> {
 
 fn parse_do_while(parser: &mut Parser) -> Result<Stmt, JsError> {
     let start = parser.next()?.span.start; // `do`
-    let body = Box::new(parse_statement(parser, false)?);
+    let body = Box::new(parse_statement_with(parser, false, false)?);
+    if is_labelled_function(&body) {
+        return Err(parser.error_at(
+            body.span.start,
+            "A labelled function declaration is not allowed in statement position",
+        ));
+    }
     parser.expect_keyword(Keyword::While)?;
     parser.expect_punct(TokenKind::LeftParen)?;
     let test = parse_expression(parser, true)?;
     parser.expect_punct(TokenKind::RightParen)?;
-    parser.expect_semicolon()?;
+    // spec 12.10.1: the terminating semicolon of a do-while is inserted
+    // before the next token even without a line terminator when the previous
+    // token is `)` (the while clause's closing paren).
+    parser.eat_punct(TokenKind::Semicolon)?;
     let end = parser.prev.as_ref().unwrap().span.end;
     Ok(Stmt {
         span: Span::new(start, end),
@@ -470,10 +595,13 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
     } else if parser.at_contextual("using")?
         && is_using_binding_start(parser.peek2()?.kind.clone())
         && !parser.peek2()?.line_break_before
-        && parser.peek2()?.kind != TokenKind::Identifier(intern_utf8("of"))
+        && !(parser.peek2()?.kind == TokenKind::Identifier(intern_utf8("of"))
+            && parser.peek3()?.kind != TokenKind::Equal)
     {
         // `for (using x of y)` / `for (using x = 0; …)`. The `of` lookahead
-        // keeps `for (using of y)` an expression-headed for-of (spec 14.7.5).
+        // only applies to for-of heads: `for (using of y)` is an
+        // expression-headed for-of, while `for (using of = null;;)` is a
+        // classic for with a binding named `of` (spec 14.7.5).
         let kind = VarDeclKind::Using;
         parser.next()?;
         (Some(kind), false)
@@ -535,7 +663,13 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
         let left = for_binding_from_init(parser, init, true)?;
         let right = parse_expression(parser, true)?;
         parser.expect_punct(TokenKind::RightParen)?;
-        let body = Box::new(parse_statement(parser, false)?);
+        let body = Box::new(parse_statement_with(parser, false, false)?);
+        if is_labelled_function(&body) {
+            return Err(parser.error_at(
+                body.span.start,
+                "A labelled function declaration is not allowed in statement position",
+            ));
+        }
         let end = parser.prev.as_ref().unwrap().span.end;
         Stmt {
             span: Span::new(start, end),
@@ -550,7 +684,13 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
         let left = for_binding_from_init(parser, init, false)?;
         let right = parse_assignment(parser, true)?;
         parser.expect_punct(TokenKind::RightParen)?;
-        let body = Box::new(parse_statement(parser, false)?);
+        let body = Box::new(parse_statement_with(parser, false, false)?);
+        if is_labelled_function(&body) {
+            return Err(parser.error_at(
+                body.span.start,
+                "A labelled function declaration is not allowed in statement position",
+            ));
+        }
         let end = parser.prev.as_ref().unwrap().span.end;
         Stmt {
             span: Span::new(start, end),
@@ -608,7 +748,13 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
             Some(parse_expression(parser, true)?)
         };
         parser.expect_punct(TokenKind::RightParen)?;
-        let body = Box::new(parse_statement(parser, false)?);
+        let body = Box::new(parse_statement_with(parser, false, false)?);
+        if is_labelled_function(&body) {
+            return Err(parser.error_at(
+                body.span.start,
+                "A labelled function declaration is not allowed in statement position",
+            ));
+        }
         let end = parser.prev.as_ref().unwrap().span.end;
         Stmt {
             span: Span::new(start, end),
@@ -701,6 +847,14 @@ fn for_binding_from_init(
             Ok(ForBinding::Expr(expr))
         }
         Some(ForInit::VarDecl { kind, decls }) => {
+            // A for-in/of head has a single ForBinding (spec 14.7.5), so
+            // `for (let x, y in obj)` is an early error.
+            if decls.len() > 1 {
+                return Err(parser.error_at(
+                    decls[1].span.start,
+                    "Invalid multiple bindings in for-in/of declaration",
+                ));
+            }
             let decl = decls
                 .into_iter()
                 .next()
@@ -779,6 +933,12 @@ fn parse_return(parser: &mut Parser) -> Result<Stmt, JsError> {
     if !parser.in_function {
         return Err(parser.error_at(start, "Illegal return statement"));
     }
+    if parser.in_static_block {
+        return Err(parser.error_at(
+            start,
+            "Illegal return statement in a class static initialization block",
+        ));
+    }
     let argument = if parser.peek()?.line_break_before {
         None
     } else if can_start_expression(parser.peek()?.kind.clone()) {
@@ -802,7 +962,13 @@ fn parse_with(parser: &mut Parser) -> Result<Stmt, JsError> {
     parser.expect_punct(TokenKind::LeftParen)?;
     let object = parse_expression(parser, true)?;
     parser.expect_punct(TokenKind::RightParen)?;
-    let body = Box::new(parse_statement(parser, false)?);
+    let body = Box::new(parse_statement_with(parser, false, false)?);
+    if is_labelled_function(&body) {
+        return Err(parser.error_at(
+            body.span.start,
+            "A labelled function declaration is not allowed in statement position",
+        ));
+    }
     let end = parser.prev.as_ref().unwrap().span.end;
     Ok(Stmt {
         span: Span::new(start, end),
@@ -819,6 +985,7 @@ fn parse_switch(parser: &mut Parser) -> Result<Stmt, JsError> {
     let mut cases: Vec<SwitchCase> = Vec::new();
     let mut saw_default = false;
     parser.push_scope();
+    parser.scopes.last_mut().unwrap().is_block = true;
     let saved_vars = std::mem::take(&mut parser.list_vars);
     while !parser.at_punct(TokenKind::RightBrace)? {
         let case_start = parser.peek()?.span.start;
@@ -872,7 +1039,16 @@ fn parse_switch_consequents(parser: &mut Parser) -> Result<Vec<Stmt>, JsError> {
         {
             break;
         }
-        stmts.push(parse_statement(parser, true)?);
+        let stmt = parse_statement(parser, true)?;
+        // A UsingDeclaration directly in a case/default clause's statement
+        // list is an early error (spec 15.14.2); a nested block is fine.
+        if matches!(stmt.kind, StmtKind::UsingDecl { .. }) {
+            return Err(parser.error_at(
+                stmt.span.start,
+                "using declarations are not allowed in a switch case clause",
+            ));
+        }
+        stmts.push(stmt);
     }
     Ok(stmts)
 }
@@ -922,7 +1098,7 @@ fn parse_try(parser: &mut Parser) -> Result<Stmt, JsError> {
         // `function` declarations anywhere inside the block).
         if let Some(pattern) = &param {
             let mut declared = Vec::new();
-            lexically_declared_names(&body.stmts, &mut declared, false);
+            lexically_declared_names(&body.stmts, &mut declared);
             for name in bound_names(pattern) {
                 if declared.contains(&name) {
                     return Err(
@@ -954,11 +1130,14 @@ fn parse_try(parser: &mut Parser) -> Result<Stmt, JsError> {
     })
 }
 
-/// LexicallyDeclaredNames of a statement list (spec 15.2.1): `let`/`const`/
-/// `class`/`using` declarations and (optionally) function declarations,
-/// recursively through nested statement lists. Used by the catch-parameter
-/// early error, which exempts block-level function declarations (Annex B).
-fn lexically_declared_names(stmts: &[Stmt], out: &mut Vec<AtomId>, include_functions: bool) {
+/// LexicallyDeclaredNames of a statement list (spec 15.2.1), used by the
+/// catch-parameter early error: `let`/`const`/`class`/`using`/function
+/// declarations count when they are direct statement-list items or the body
+/// of an if/while/do/for/with statement, but names inside plain nested
+/// blocks, try/catch/finally, switch cases, or labelled statements do not
+/// (spec 15.2.1.1; a nested block shadows the catch parameter instead of
+/// clashing with it).
+fn lexically_declared_names(stmts: &[Stmt], out: &mut Vec<AtomId>) {
     for stmt in stmts {
         match &stmt.kind {
             StmtKind::VarDecl { kind, decls, .. } if *kind != VarDeclKind::Var => {
@@ -972,7 +1151,13 @@ fn lexically_declared_names(stmts: &[Stmt], out: &mut Vec<AtomId>, include_funct
                 }
             }
             StmtKind::FunctionDecl(function) => {
-                if include_functions && let Some(name) = function.name {
+                // A statement-position declaration (`if (x) function f(){}`)
+                // is Annex B var-scoped: it is not a LexicallyDeclaredName of
+                // the enclosing statement list, so it may share a catch
+                // parameter's name (B.3.3). Block-level declarations clash.
+                if !function.statement_position
+                    && let Some(name) = function.name
+                {
                     out.push(name);
                 }
             }
@@ -981,64 +1166,26 @@ fn lexically_declared_names(stmts: &[Stmt], out: &mut Vec<AtomId>, include_funct
                     out.push(name);
                 }
             }
-            StmtKind::Block(block) => {
-                lexically_declared_names(&block.stmts, out, include_functions)
-            }
             StmtKind::If {
                 consequent,
                 alternate,
                 ..
             } => {
-                lexically_declared_names(std::slice::from_ref(consequent), out, include_functions);
+                lexically_declared_names(std::slice::from_ref(consequent), out);
                 if let Some(alternate) = alternate {
-                    lexically_declared_names(
-                        std::slice::from_ref(alternate),
-                        out,
-                        include_functions,
-                    );
+                    lexically_declared_names(std::slice::from_ref(alternate), out);
                 }
             }
             StmtKind::While { body, .. }
             | StmtKind::DoWhile { body, .. }
-            | StmtKind::Labeled { body, .. }
             | StmtKind::With { body, .. } => {
-                lexically_declared_names(std::slice::from_ref(body), out, include_functions);
+                lexically_declared_names(std::slice::from_ref(body), out);
             }
-            StmtKind::For { init, body, .. } => {
-                if let Some(ForInit::VarDecl { kind, decls, .. }) = init
-                    && *kind != VarDeclKind::Var
-                {
-                    for decl in decls {
-                        out.extend(bound_names(&decl.pattern));
-                    }
-                }
-                lexically_declared_names(std::slice::from_ref(body), out, include_functions);
+            StmtKind::For { body, .. } => {
+                lexically_declared_names(std::slice::from_ref(body), out);
             }
-            StmtKind::ForIn { left, body, .. } | StmtKind::ForOf { left, body, .. } => {
-                if let ForBinding::VarDecl { kind, pattern, .. } = left
-                    && *kind != VarDeclKind::Var
-                {
-                    out.extend(bound_names(pattern));
-                }
-                lexically_declared_names(std::slice::from_ref(body), out, include_functions);
-            }
-            StmtKind::Try {
-                block,
-                handler,
-                finalizer,
-            } => {
-                lexically_declared_names(&block.stmts, out, include_functions);
-                if let Some(catch) = handler {
-                    lexically_declared_names(&catch.body.stmts, out, include_functions);
-                }
-                if let Some(finalizer) = finalizer {
-                    lexically_declared_names(&finalizer.stmts, out, include_functions);
-                }
-            }
-            StmtKind::Switch { cases, .. } => {
-                for case in cases {
-                    lexically_declared_names(&case.consequent, out, include_functions);
-                }
+            StmtKind::ForIn { body, .. } | StmtKind::ForOf { body, .. } => {
+                lexically_declared_names(std::slice::from_ref(body), out);
             }
             _ => {}
         }
@@ -1046,36 +1193,55 @@ fn lexically_declared_names(stmts: &[Stmt], out: &mut Vec<AtomId>, include_funct
 }
 
 /// `function name ( params ) { body }` — the name is required for
-/// declarations.
+/// declarations. `annex_b` marks the Annex B statement positions (`if` clause
+/// bodies and labelled statements) where a plain `function` declaration is
+/// accepted in sloppy mode (spec B.3.4/B.3.2); generator and async
+/// declarations are never accepted at Statement position.
 fn parse_function_declaration(
     parser: &mut Parser,
     is_async: bool,
     statement_position: bool,
+    annex_b: bool,
 ) -> Result<Stmt, JsError> {
     let start = parser.next()?.span.start; // `function`
     let is_generator = parser.eat_punct(TokenKind::Star)?;
+    if statement_position && !(annex_b && !parser.strict && !is_generator && !is_async) {
+        return Err(parser.error_at(
+            start,
+            "Function declarations are not allowed in statement position",
+        ));
+    }
     if !parser.at_identifier()? {
         let tok = parser.peek()?.clone();
         return Err(parser.unexpected(&tok));
     }
     let (name, name_start) = parser.parse_identifier()?;
     parser.check_binding_name(name, name_start)?;
-    parser.declare_function(name, name_start, statement_position)?;
+    parser.declare_function(name, name_start, statement_position, is_async, is_generator)?;
     parser.expect_punct(TokenKind::LeftParen)?;
-    let saved_generator = parser.in_generator;
+    // Params parse with the function's own [Yield, Await] grammar: async
+    // declarations reserve `await` in their formal parameters (spec 15.8.1).
+    let saved = (parser.in_generator, parser.in_async);
     parser.in_generator = is_generator;
+    parser.in_async = is_async;
     let params = crate::expr::parse_parameter_list(parser)?;
-    parser.in_generator = saved_generator;
+    (parser.in_generator, parser.in_async) = saved;
     crate::expr::check_duplicate_params(parser, &params, false)?;
-    crate::expr::check_generator_params_no_yield(parser, &params)?;
-    let body = crate::expr::parse_function_body_block(
+    crate::expr::check_function_params(parser, &params, is_async, is_generator)?;
+    let (body, strict) = crate::expr::parse_function_body_block(
         parser,
         is_async,
         is_generator,
         &params,
         false,
         false,
+        false,
     )?;
+    // A strict body (enclosing strict code or a `"use strict"` directive)
+    // forbids `eval`/`arguments` as the declaration's name (spec 15.4.1).
+    if strict {
+        crate::expr::check_function_name_strict(parser, Some(name), name_start)?;
+    }
     let end = body.span.end;
     Ok(Stmt {
         span: Span::new(start, end),

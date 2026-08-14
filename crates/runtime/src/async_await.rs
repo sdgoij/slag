@@ -282,10 +282,12 @@ fn settle_async(
         (state.resolve.clone(), state.reject.clone())
     };
     match completion {
-        Completion::Return(value) | Completion::Normal(value) => {
+        // Only a `return` completion carries a value; a normal completion
+        // resolves the promise with *undefined*.
+        Completion::Return(value) => {
             crate::function::call(agent, &resolve, Value::Undefined, &[value])?;
         }
-        Completion::Empty => {
+        Completion::Normal(_) | Completion::Empty => {
             crate::function::call(agent, &resolve, Value::Undefined, &[Value::Undefined])?;
         }
         Completion::Throw(value) => {
@@ -469,13 +471,19 @@ mod tests {
 
     #[test]
     fn async_function_body_completion_is_the_resolve_value() {
-        // The body's completion value resolves the promise (spec 27.7.4.1).
+        // The promise resolves with the body's completion (spec 27.7.4.1
+        // AsyncFunctionStart): only a `return` completion carries a value;
+        // any other normal completion resolves with *undefined*.
         assert_eq!(
             settle("async function f() { await 1; } f()").unwrap(),
-            number(1.0)
+            Value::Undefined
         );
         assert_eq!(
             settle("async function f() { 5; } f()").unwrap(),
+            Value::Undefined
+        );
+        assert_eq!(
+            settle("async function f() { return 5; } f()").unwrap(),
             number(5.0)
         );
     }

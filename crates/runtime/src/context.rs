@@ -734,13 +734,19 @@ pub fn initialize_referenced_binding(reference: &Reference, value: Value) -> Res
 
 /// spec 6.2.5.10 GetThisValue: the base value of a property reference, or
 /// the [[ThisValue]] carried by `super` references.
+/// GetThisValue of a reference (spec 6.2.5.7): a `super` reference carries
+/// its own receiver, a property reference's base is the receiver, and an
+/// environment reference is the environment's WithBaseObject — the binding
+/// object of a `with` environment, *undefined* otherwise (spec 13.3.6.1
+/// step 4.b.ii).
 pub fn get_this_value(reference: &Reference) -> Value {
     if let Some(this) = &reference.this_value {
         return this.clone();
     }
     match &reference.base {
         ReferenceBase::Value(base) => base.clone(),
-        _ => Value::Undefined,
+        ReferenceBase::Environment(env) => env.with_base_object(),
+        ReferenceBase::Unresolvable => Value::Undefined,
     }
 }
 
@@ -837,7 +843,12 @@ pub fn private_get(agent: &mut Agent, obj: &Value, name_id: u64) -> Result<Value
         crux::object::PrivateElementKind::Accessor {
             get: Some(getter), ..
         } => crate::function::call(agent, &getter, obj.clone(), &[]),
-        crux::object::PrivateElementKind::Accessor { .. } => Ok(Value::Undefined),
+        // spec 10.2.9 step 6.b: a private accessor with no getter throws on
+        // read (e.g. a setter-only accessor, possibly shadowing a getter in
+        // an outer class).
+        crux::object::PrivateElementKind::Accessor { .. } => {
+            Err(private_access_error(name_id, "Cannot read private member"))
+        }
     }
 }
 
@@ -906,8 +917,9 @@ fn private_access_error(name_id: u64, what: &str) -> JsError {
     )
 }
 
-/// GetSuperConstructor (spec 9.2.4.6): the heritage constructor of the
-/// current derived constructor, used by `super()` calls.
+/// GetSuperConstructor (spec 9.2.4.6): the active constructor's current
+/// [[Prototype]] — `Object.setPrototypeOf` can change it after the class
+/// definition — restricted to derived constructors.
 pub fn get_super_constructor(agent: &Agent) -> Result<Value, JsError> {
     let env = get_this_environment(agent)?;
     let EnvRecord::Function(function_env) = &*env else {
@@ -922,16 +934,26 @@ pub fn get_super_constructor(agent: &Agent) -> Result<Value, JsError> {
             "super() is only valid inside a derived constructor".into(),
         ));
     };
-    agent
+    let derived = agent
         .ecma_functions
         .get(&function.id())
-        .and_then(|data| data.super_constructor.clone())
-        .ok_or_else(|| {
-            JsError::new(
-                ErrorKind::TypeError,
-                "super() is only valid inside a derived constructor".into(),
-            )
-        })
+        .is_some_and(|data| data.super_constructor.is_some());
+    if !derived {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "super() is only valid inside a derived constructor".into(),
+        ));
+    }
+    match function.object.get_prototype_of()? {
+        // The prototype may be a function's object part (a superclass
+        // constructor): recover the function value so IsConstructor keeps
+        // working (e.g. `class C extends B {}` with `super()`).
+        Some(proto) => Ok(proto.function_value().unwrap_or(Value::Object(proto))),
+        None => Err(JsError::new(
+            ErrorKind::TypeError,
+            "super() is only valid inside a derived constructor".into(),
+        )),
+    }
 }
 
 /// GetSuperBase (spec 9.2.4.5): the prototype of the nearest method's
@@ -961,12 +983,16 @@ pub fn get_super_base(agent: &Agent) -> Result<Value, JsError> {
     else {
         return Ok(Value::Undefined);
     };
-    let Value::Object(home_object) = home else {
-        return Ok(Value::Undefined);
+    // The home object of a static method/accessor/static-block is the class
+    // constructor (a Function); instance members use the class prototype.
+    let home_object = match &home {
+        Value::Object(obj) => obj.clone(),
+        Value::Function(f) => f.object.clone(),
+        _ => return Ok(Value::Undefined),
     };
     Ok(home_object
         .get_prototype_of()?
-        .map(Value::Object)
+        .map(|proto| proto.function_value().unwrap_or(Value::Object(proto)))
         .unwrap_or(Value::Undefined))
 }
 
@@ -1055,6 +1081,38 @@ mod tests {
         assert_eq!(
             resolve_private_identifier(&nested, &name("#z")).unwrap().id,
             2
+        );
+    }
+
+    #[test]
+    fn get_super_constructor_returns_the_function_value() {
+        // GetSuperConstructor recovers the superclass as a Function value
+        // (not its bare object part), so `super()` in a derived constructor
+        // constructs it (statements/class/super/in-constructor.js).
+        let value = crate::agent::evaluate(
+            "class B {} class C extends B { constructor() { super(); } } new C() instanceof B",
+        )
+        .unwrap();
+        assert_eq!(value, Value::Boolean(true));
+    }
+
+    #[test]
+    fn relational_operators_to_primitive_the_left_operand_first() {
+        // `>`/`<=` swap the operands for IsLessThan with leftFirst=false, but
+        // the *source-left* operand's valueOf still runs first
+        // (S11.8.2_A2.3_T1 / S11.8.3_A2.3_T1).
+        let value = crate::agent::evaluate(
+            "var x = { valueOf: function () { return 'x'; } }; \
+             var y = { valueOf: function () { return 'y'; } }; \
+             var log = []; \
+             var a = { valueOf: function () { log.push('a'); return 1; } }; \
+             var b = { valueOf: function () { log.push('b'); return 2; } }; \
+             a > b; log.join(',')",
+        )
+        .unwrap();
+        assert_eq!(
+            value,
+            Value::String(Handle::new(JsString::from_utf8("a,b")))
         );
     }
 }

@@ -232,19 +232,21 @@ impl<'a> Parser<'a> {
         };
         let quantifier = self.parse_quantifier()?;
         if quantifier.is_some()
-            && self.unicode()
-            && matches!(
-                node,
-                Node::Start { .. }
-                    | Node::End { .. }
-                    | Node::WordBoundary { .. }
-                    | Node::NotWordBoundary { .. }
-                    | Node::Lookahead { .. }
-                    | Node::Lookbehind { .. }
-            )
+            && (matches!(node, Node::Lookbehind { .. })
+                || (self.unicode()
+                    && matches!(
+                        node,
+                        Node::Start { .. }
+                            | Node::End { .. }
+                            | Node::WordBoundary { .. }
+                            | Node::NotWordBoundary { .. }
+                            | Node::Lookahead { .. }
+                            | Node::Lookbehind { .. }
+                    )))
         {
             // Annex B's ExtendedTerm :: Assertion Quantifier does not apply
-            // in unicode mode (spec 22.2.1).
+            // in unicode mode (spec 22.2.1), and never applies to a
+            // lookbehind assertion in any mode.
             return Err(self.error("Assertion cannot be quantified"));
         }
         match quantifier {
@@ -647,10 +649,12 @@ impl<'a> Parser<'a> {
             0x6B => {
                 // Annex B: outside unicode mode, `\k` is only a named
                 // backreference when the pattern contains named groups;
-                // otherwise it is the identity escape `k`.
+                // otherwise it is the identity escape `k`. In either mode a
+                // `\k` that is not followed by `<name>` is an error when the
+                // pattern has (or will have) named groups.
                 if self.peek() == Some(0x3C) && (self.unicode() || self.has_group_names) {
                     self.parse_named_backreference()
-                } else if self.unicode() {
+                } else if self.unicode() || self.has_group_names {
                     Err(self.error("Invalid named capture reference"))
                 } else {
                     Ok(self.char_node(0x6B))
@@ -701,32 +705,41 @@ impl<'a> Parser<'a> {
             return Ok(self.char_node(code_unit));
         }
         if (0xD800..=0xDBFF).contains(&code_unit) {
-            // A leading surrogate is valid only as part of a pair: combine
-            // `\uD834\uDF06` into the code point when the next six atoms are
-            // a `\uDC00`-range escape.
-            if self.peek() == Some(0x5C)
-                && self.peek_at(1) == Some(0x75)
-                && let (Some(h), Some(l)) = (
-                    self.peek_at(2).and_then(hex_value),
-                    self.peek_at(3).and_then(hex_value),
-                )
-                && let (Some(h2), Some(l2)) = (
-                    self.peek_at(4).and_then(hex_value),
-                    self.peek_at(5).and_then(hex_value),
-                )
-            {
-                let low = (h << 12) | (l << 8) | (h2 << 4) | l2;
-                if (0xDC00..=0xDFFF).contains(&low) {
-                    for _ in 0..6 {
-                        self.next();
-                    }
-                    let cp = 0x10000 + ((code_unit - 0xD800) << 10) + (low - 0xDC00);
-                    return Ok(self.char_node(cp));
-                }
+            if let Some(cp) = self.combine_surrogate_pair(code_unit) {
+                return Ok(self.char_node(cp));
             }
             return Err(self.error("Invalid unicode escape"));
         }
         Ok(self.char_node(code_unit))
+    }
+
+    /// If the next atoms are a `\u` escape of a trail surrogate, consume them
+    /// and return the code point the `lead` surrogate pairs with (spec 22.2.1
+    /// `u LeadSurrogate \u TrailSurrogate`).
+    fn combine_surrogate_pair(&mut self, lead: u32) -> Option<u32> {
+        if self.peek() != Some(0x5C) || self.peek_at(1) != Some(0x75) {
+            return None;
+        }
+        let (Some(h), Some(l)) = (
+            self.peek_at(2).and_then(hex_value),
+            self.peek_at(3).and_then(hex_value),
+        ) else {
+            return None;
+        };
+        let (Some(h2), Some(l2)) = (
+            self.peek_at(4).and_then(hex_value),
+            self.peek_at(5).and_then(hex_value),
+        ) else {
+            return None;
+        };
+        let low = (h << 12) | (l << 8) | (h2 << 4) | l2;
+        if !(0xDC00..=0xDFFF).contains(&low) {
+            return None;
+        }
+        for _ in 0..6 {
+            self.next();
+        }
+        Some(0x10000 + ((lead - 0xD800) << 10) + (low - 0xDC00))
     }
 
     /// `\k<name>` — a named backreference.
@@ -1205,7 +1218,18 @@ impl<'a> Parser<'a> {
                     self.next();
                     self.next();
                     self.next();
-                    Ok(ClassAtom::Char((h << 12) | (l << 8) | (h2 << 4) | l2))
+                    let code_unit = (h << 12) | (l << 8) | (h2 << 4) | l2;
+                    // In unicode mode a `\uXXXX` lead surrogate combines with
+                    // a following `\uXXXX` trail surrogate into one class
+                    // member (spec 22.2.1); a lone surrogate stays a code
+                    // unit, so it can never match half of a code-point pair.
+                    if self.unicode()
+                        && (0xD800..=0xDBFF).contains(&code_unit)
+                        && let Some(cp) = self.combine_surrogate_pair(code_unit)
+                    {
+                        return Ok(ClassAtom::Char(cp));
+                    }
+                    Ok(ClassAtom::Char(code_unit))
                 } else if self.unicode() {
                     Err(self.error("Invalid \\u escape"))
                 } else {

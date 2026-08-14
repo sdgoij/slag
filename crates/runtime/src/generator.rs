@@ -235,12 +235,27 @@ pub fn call_generator(
         &JsString::from_utf8("prototype"),
         Value::Function(function.clone()),
     )?;
-    let proto = crate::context::as_object(&proto_value).ok_or_else(|| {
-        JsError::new(
-            ErrorKind::TypeError,
-            "generator function prototype is not an object".into(),
-        )
-    })?;
+    // GetPrototypeFromConstructor (spec 9.1.14): a non-object `prototype`
+    // (e.g. `g.prototype = null`) falls back to the realm's intrinsic
+    // generator prototype.
+    let proto = match crate::context::as_object(&proto_value) {
+        Some(proto) => proto,
+        None => {
+            let intrinsic = if data.is_async {
+                "%AsyncGenerator.prototype%"
+            } else {
+                "%Generator.prototype%"
+            };
+            agent
+                .current_realm()?
+                .intrinsics
+                .get(intrinsic)
+                .and_then(|value| crate::context::as_object(&value))
+                .ok_or_else(|| {
+                    JsError::new(ErrorKind::TypeError, format!("{intrinsic} is not defined"))
+                })?
+        }
+    };
     let object = JsObject::ordinary_object_create(Some(proto));
     let object_value = Value::Object(object.clone());
     agent.generators.insert(
@@ -515,8 +530,14 @@ fn finish_resume(
                 .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no context to pop".into()))?;
             state.context = Some(context);
             state.flag = GeneratorFlag::SuspendedYield;
-            let _ = delegate;
-            iterator_result(agent, value, false)
+            if delegate {
+                // Spec 15.5.5: GeneratorYield(innerResult) yields the inner
+                // iterator result object itself, so the outer consumer reads
+                // its `value`/`done` lazily.
+                Ok(value)
+            } else {
+                iterator_result(agent, value, false)
+            }
         }
         VmOutcome::Suspended(Suspension::Await(_)) => {
             agent.execution_context_stack.pop();
@@ -529,12 +550,23 @@ fn finish_resume(
         VmOutcome::Completed(completion) => {
             agent.execution_context_stack.pop();
             state.flag = GeneratorFlag::Completed;
+            // spec 27.4.2.1 step 4.j: the generator body's `using` resources
+            // are disposed when the body completes (implicit or explicit
+            // return), even on an abrupt completion.
+            let env = state.vm.as_ref().map(|vm| vm.lexical_env.clone());
             state.vm = None;
+            let completion = match env {
+                Some(env) => crate::eval::dispose_env_resources(agent, &env, Ok(completion))?,
+                None => completion,
+            };
             match completion {
-                Completion::Return(value) | Completion::Normal(value) => {
-                    iterator_result(agent, value, true)
+                // Only a `return` completion carries a value; a normal
+                // completion (the last statement's value, e.g. `[yield]` or
+                // a `yield*` delegate's return) yields *undefined*.
+                Completion::Return(value) => iterator_result(agent, value, true),
+                Completion::Normal(_) | Completion::Empty => {
+                    iterator_result(agent, Value::Undefined, true)
                 }
-                Completion::Empty => iterator_result(agent, Value::Undefined, true),
                 Completion::Throw(value) => Err(JsError::new(
                     ErrorKind::TypeError,
                     "Uncaught generator throw".into(),
@@ -644,6 +676,116 @@ mod tests {
         assert_eq!(
             value,
             Value::String(Handle::new(JsString::from_utf8("1,2,3,undefined,true")))
+        );
+    }
+
+    #[test]
+    fn generator_yield_star_defers_inner_value_read() {
+        // Spec 15.5.5: GeneratorYield(innerResult) yields the inner iterator
+        // result object itself, so the inner `.value` getter is not read until
+        // the outer consumer reads the yielded result's `value`.
+        let value = run(
+            "var callCount = 0; \
+             var spyValue = Object.defineProperty({ done: false }, 'value', { \
+               get: function() { callCount += 1; return 42; } }); \
+             var iterable = {}; \
+             iterable[Symbol.iterator] = function() { return { next: function() { return spyValue; } }; }; \
+             function* g() { yield* iterable; } \
+             var it = g(); \
+             var first = it.next(); \
+             var afterNext = callCount; \
+             var read = first.value; \
+             afterNext + ',' + read + ',' + callCount",
+        )
+        .unwrap();
+        assert_eq!(
+            value,
+            Value::String(Handle::new(JsString::from_utf8("0,42,1")))
+        );
+    }
+
+    #[test]
+    fn generator_yield_star_return_completion_completes_generator() {
+        // A done `return()` result completes the generator with ReturnCompletion
+        // of its value: the statement after `yield*` never runs, but `finally`
+        // does (spec 15.5.5 return case).
+        let value = run(
+            "var hitNext = false; var hitFinally = false; \
+             var iterable = {}; \
+             iterable[Symbol.iterator] = function() { \
+               return { next: function() { return { done: false }; }, \
+                        return: function() { return { done: true, value: 3333 }; } }; }; \
+             function* g() { try { yield* iterable; hitNext = true; } finally { hitFinally = true; } } \
+             var it = g(); it.next(); var r = it.return(2222); \
+             r.value + ',' + r.done + ',' + hitNext + ',' + hitFinally",
+        )
+        .unwrap();
+        assert_eq!(
+            value,
+            Value::String(Handle::new(JsString::from_utf8("3333,true,false,true")))
+        );
+    }
+
+    #[test]
+    fn generator_yield_star_get_iterator_error_is_catchable() {
+        // The TypeError from GetIterator propagates through the generator
+        // body's try/catch (spec 15.5.5 step 4).
+        let value = run("var badIter = {}; \
+             badIter[Symbol.iterator] = function() { return 7; }; \
+             function* g() { try { yield* badIter; } catch (e) { return 'caught'; } } \
+             var it = g(); var r = it.next(); r.value + ',' + r.done")
+        .unwrap();
+        assert_eq!(
+            value,
+            Value::String(Handle::new(JsString::from_utf8("caught,true")))
+        );
+    }
+
+    #[test]
+    fn generator_yield_star_no_return_method_propagates_return() {
+        // Without a `return` method the delegation completes with the return
+        // completion, running `finally` but not the statement after `yield*`.
+        let value = run(
+            "var hitNext = false; var hitFinally = false; \
+             var iterable = {}; \
+             iterable[Symbol.iterator] = function() { return { next: function() { return { done: false }; } }; }; \
+             function* g() { try { yield* iterable; hitNext = true; } finally { hitFinally = true; } } \
+             var it = g(); it.next(); it.return(9); \
+             hitNext + ',' + hitFinally",
+        )
+        .unwrap();
+        assert_eq!(
+            value,
+            Value::String(Handle::new(JsString::from_utf8("false,true")))
+        );
+    }
+
+    #[test]
+    fn generator_yield_star_non_object_next_result_throws() {
+        let value = run(
+            "var iterable = {}; \
+             iterable[Symbol.iterator] = function() { return { next: function() { return 8; } }; }; \
+             function* g() { try { yield* iterable; } catch (e) { return e instanceof TypeError; } } \
+             var it = g(); var r = it.next(); r.value + ',' + r.done",
+        )
+        .unwrap();
+        assert_eq!(
+            value,
+            Value::String(Handle::new(JsString::from_utf8("true,true")))
+        );
+    }
+
+    #[test]
+    fn generator_yield_star_for_of_loop() {
+        let value = run("function* inner() { yield 1; yield 2; return 3; } \
+             function* outer() { var r = yield* inner(); yield r; } \
+             var it = outer(); var out = ''; var r; \
+             while (!(r = it.next()).done) { out += r.value + ';'; } \
+             out")
+        .unwrap();
+        assert_eq!(
+            value,
+            Value::String(Handle::new(JsString::from_utf8("1;2;3;")))
         );
     }
 
@@ -801,6 +943,82 @@ mod tests {
         assert_eq!(
             value,
             Value::String(Handle::new(JsString::from_utf8("1,9,true")))
+        );
+    }
+
+    #[test]
+    fn generator_class_computed_names_suspend_at_yield() {
+        // A class definition inside a generator evaluates its computed names
+        // as suspension points: each `[yield]` suspends and resumes with the
+        // `.next()` argument as the property name (spec 15.7.14).
+        let value = run("function* g() { \
+               class C { \
+                 [yield]() { return 'm'; } \
+                 static [yield]() { return 's'; } \
+               } \
+               var c = new C(); \
+               return c[1]() + ',' + C[2](); } \
+             var it = g(); \
+             var a = it.next(); it.next(1); var b = it.next(2); \
+             a.done + ',' + b.value")
+        .unwrap();
+        assert_eq!(
+            value,
+            Value::String(Handle::new(JsString::from_utf8("false,m,s")))
+        );
+    }
+
+    #[test]
+    fn generator_class_expression_computed_names_suspend_at_yield() {
+        let value = run("function* g() { \
+               var C = class { [yield]() { return 9; } }; \
+               var c = new C(); \
+               return c[yield](); } \
+             var it = g(); it.next(); it.next('k'); var r = it.next('k'); \
+             r.done + ',' + r.value")
+        .unwrap();
+        assert_eq!(
+            value,
+            Value::String(Handle::new(JsString::from_utf8("true,9")))
+        );
+    }
+
+    #[test]
+    fn generator_class_accessor_computed_names_suspend_at_yield() {
+        let value = run("var yieldSet; \
+             function* g() { \
+               class C { \
+                 get [yield]() { return 'get'; } \
+                 set [yield](v) { yieldSet = v; } \
+               } \
+               return C; } \
+             var it = g(); it.next(); it.next('a'); var r = it.next('b'); \
+             r.value.prototype.a + '|' + (r.value.prototype.b = 'set', yieldSet)")
+        .unwrap();
+        assert_eq!(
+            value,
+            Value::String(Handle::new(JsString::from_utf8("get|set")))
+        );
+    }
+
+    #[test]
+    fn generator_using_is_disposed_on_completion() {
+        // `using` resources in a generator body are disposed when the body
+        // completes, not while suspended (spec 27.4.2.1 step 4.j).
+        let value = run("var disposed = 0; \
+             var resource = { [Symbol.dispose]: function() { disposed += 1; } }; \
+             function* g() { using _ = resource; yield; } \
+             var it = g(); \
+             var beforeStart = disposed; \
+             it.next(); \
+             var whileSuspended = disposed; \
+             it.next(); \
+             var afterDone = disposed; \
+             beforeStart + ',' + whileSuspended + ',' + afterDone")
+        .unwrap();
+        assert_eq!(
+            value,
+            Value::String(Handle::new(JsString::from_utf8("0,0,1")))
         );
     }
 }

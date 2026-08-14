@@ -10843,6 +10843,7 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
         if let Err(e) = parser::parse_script(&wrapped) {
             return Err(format!("parse error: {}", e.message));
         }
+        let skip_harness = fm.flags.iter().any(|f| f == "__debug_skip_harness");
         let mut agent = Agent::new();
         agent
             .initialize_host_defined_realm()
@@ -10856,7 +10857,9 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
         agent
             .run_script(ASSERT_THROWS_PRELUDE)
             .map_err(|e| e.message)?;
-        agent.run_script(HARNESS_PRELUDE).map_err(|e| e.message)?;
+        if !skip_harness {
+            agent.run_script(HARNESS_PRELUDE).map_err(|e| e.message)?;
+        }
         // `$262.evalScript` evaluates its source as a Script (test262 host
         // spec) — global declaration instantiation, not direct eval. The
         // native closure cannot reach the agent, so it is dispatched by
@@ -11278,8 +11281,17 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
         if body.contains("$262.createRealm") {
             return FixtureResult::Skip("host-dependent: $262.createRealm is not provided".into());
         }
+        // Raw fixtures are executed as-is: the whole file, header and all, is
+        // the program (test262-harness convention). This is what makes the
+        // hashbang tests meaningful — the `#!` line sits before the
+        // frontmatter, so a body-only run would never see it.
+        let program = if fm.flags.iter().any(|f| f == "raw") {
+            source.as_str()
+        } else {
+            body
+        };
         for mode in modes(&fm) {
-            if let Err(e) = run_one(body, mode, &fm) {
+            if let Err(e) = run_one(program, mode, &fm) {
                 return FixtureResult::Fail(format!("{relative} ({mode:?}): {e}"));
             }
         }

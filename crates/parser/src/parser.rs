@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use crux::{AtomId, JsError, Span, intern_utf8};
+use crux::{AtomId, JsError, JsString, Span, intern_utf8};
 use syntax::keywords::{Keyword, from_identifier, is_future_reserved_word};
 use syntax::{
     ArrayBindingElement, ArrayElement, AssignOp, BindingElement, BindingPattern, Expr, ExprKind,
@@ -45,6 +45,10 @@ pub(crate) struct Scope {
     /// Names declared by function declarations in this scope (var/function
     /// coexistence rules).
     pub(crate) functions: HashSet<AtomId>,
+    /// Block-scope names bound by a plain (non-async, non-generator) function
+    /// declaration in sloppy code: duplicate FunctionDeclarations are allowed
+    /// there (Annex B.3.3.4), while a `var`/`let`/async involvement is not.
+    pub(crate) sloppy_block_functions: HashSet<AtomId>,
     /// Formal-parameter names (clash with body `let`/`const` only).
     pub(crate) params: HashSet<AtomId>,
     /// Catch-parameter names: a block-level function declaration may share a
@@ -56,6 +60,10 @@ pub(crate) struct Scope {
     /// binding there, but it does not conflict with `var` declarations in the
     /// catch body (the spec's var-rule was relaxed).
     pub(crate) is_catch: bool,
+    /// True for a Block or CaseBlock statement list: its LexicallyDeclaredNames
+    /// and VarDeclaredNames must be disjoint, so a `var` and a function
+    /// declaration cannot share a name there (spec 14.2.1).
+    pub(crate) is_block: bool,
 }
 
 pub struct Parser<'s> {
@@ -77,12 +85,22 @@ pub struct Parser<'s> {
     pub(crate) top_level_await: bool,
     /// Inside a class method/field/static-block body: `super.x` is legal.
     pub(crate) allow_super: bool,
+    /// Inside a real (non-arrow) function, class static block, or field
+    /// initializer: `new.target` is valid there. Arrows inherit the value
+    /// instead of establishing one (spec 13.3.4).
+    pub(crate) nt_context: bool,
     /// Inside a constructor: `super()` is legal.
     pub(crate) in_constructor: bool,
     /// Inside a class field initializer: `new.target` is legal there even
     /// outside functions (spec: field initializers are not contained by the
     /// enclosing StatementList).
     pub(crate) in_field_initializer: bool,
+    /// Inside a class static initialization block: `return` is an early
+    /// error (the block parses with a `~Return` grammar parameter).
+    pub(crate) in_static_block: bool,
+    /// The enclosing class has an `extends` clause: `super()` is only legal
+    /// in the constructor of a derived class.
+    pub(crate) in_derived_class: bool,
     /// Per-class private-name declarations, for duplicate checks.
     pub(crate) private_names: Vec<std::collections::HashMap<AtomId, PrivateNameKind>>,
     /// Inside arrow-function parameter cover grammar; `{a = 1}` shorthand
@@ -96,6 +114,17 @@ pub struct Parser<'s> {
     /// still become patterns: while positive, a pending `cover_error` is not
     /// raised by `parse_assignment` (the enclosing literal decides).
     pub(crate) suppress_cover_raise: usize,
+    /// The last consumed token closed a statement (a `}` ending a block,
+    /// function/class declaration, or switch): the next token is an
+    /// expression start, so `/` must lex as a RegularExpressionLiteral. The
+    /// flag survives lookahead peeks and is cleared once a token is consumed.
+    pub(crate) after_statement_brace: bool,
+    /// Parsing the right operand of a `PrivateIdentifier in` expression, whose
+    /// grammar is a ShiftExpression: an arrow function at that level is never
+    /// valid, while arrows nested in parens/arguments/literals are. The flag
+    /// is cleared at every sub-expression boundary in `parse_primary` and
+    /// `parse_arguments`.
+    pub(crate) reject_arrow: bool,
 
     // Early-error tracking.
     pub(crate) scopes: Vec<Scope>,
@@ -124,9 +153,13 @@ pub(crate) enum ParenResult {
 }
 
 impl<'s> Parser<'s> {
-    pub fn new(source: &'s syntax::SourceText, allow_html_comments: bool) -> Self {
+    pub fn new(
+        source: &'s syntax::SourceText,
+        allow_html_comments: bool,
+        allow_hashbang_after_directives: bool,
+    ) -> Self {
         Self {
-            stream: TokenStream::new(source, allow_html_comments),
+            stream: TokenStream::new(source, allow_html_comments, allow_hashbang_after_directives),
             source,
             prev: None,
             strict: false,
@@ -136,12 +169,17 @@ impl<'s> Parser<'s> {
             in_module: false,
             top_level_await: false,
             allow_super: false,
+            nt_context: false,
             in_constructor: false,
             in_field_initializer: false,
+            in_static_block: false,
+            in_derived_class: false,
             private_names: Vec::new(),
             in_arrow_cover: false,
             cover_error: None,
             suppress_cover_raise: 0,
+            after_statement_brace: false,
+            reject_arrow: false,
             scopes: vec![Scope::default()],
             list_vars: HashSet::new(),
         }
@@ -157,15 +195,36 @@ impl<'s> Parser<'s> {
     // ---- tokens ----
 
     /// Peeks the next token, first applying the lexical goal implied by the
-    /// previous token (division vs regexp).
+    /// previous token (division vs regexp). A `}` that closed a statement is
+    /// followed by an expression start, so the RegExp goal applies.
     pub(crate) fn peek(&mut self) -> Result<&Token, JsError> {
-        let goal = match &self.prev {
-            None => syntax::LexGoal::HashbangOrRegExp,
-            Some(prev) if can_end_expression(&prev.kind) => syntax::LexGoal::Div,
-            Some(_) => syntax::LexGoal::RegExp,
+        let goal = if self.after_statement_brace {
+            syntax::LexGoal::RegExp
+        } else {
+            match &self.prev {
+                None => syntax::LexGoal::HashbangOrRegExp,
+                Some(prev) if self.prev_ends_expression(prev) => syntax::LexGoal::Div,
+                Some(_) => syntax::LexGoal::RegExp,
+            }
         };
         self.stream.set_goal(goal);
         self.stream.peek()
+    }
+
+    /// Whether the previous token can terminate an expression, driving the
+    /// division-vs-regexp lexical goal (spec 12.1). `yield` in generators and
+    /// `await` in async contexts are contextual keywords whose operand
+    /// position requires the RegExp goal (spec 14.4.1). Escaped forms are
+    /// ordinary identifiers.
+    fn prev_ends_expression(&self, prev: &Token) -> bool {
+        if let TokenKind::Identifier(atom) = prev.kind
+            && !prev.escaped
+            && ((self.in_generator && atom == intern_utf8("yield"))
+                || ((self.in_async || self.top_level_await) && atom == intern_utf8("await")))
+        {
+            return false;
+        }
+        can_end_expression(&prev.kind)
     }
 
     pub(crate) fn peek2(&mut self) -> Result<&Token, JsError> {
@@ -191,6 +250,7 @@ impl<'s> Parser<'s> {
         self.peek()?;
         let token = self.stream.next()?;
         self.prev = Some(token.clone());
+        self.after_statement_brace = false;
         Ok(token)
     }
 
@@ -200,6 +260,7 @@ impl<'s> Parser<'s> {
         self.stream.set_goal(goal);
         let token = self.stream.next()?;
         self.prev = Some(token.clone());
+        self.after_statement_brace = false;
         Ok(token)
     }
 
@@ -226,10 +287,13 @@ impl<'s> Parser<'s> {
     }
 
     pub(crate) fn at_keyword(&mut self, kw: Keyword) -> Result<bool, JsError> {
-        let TokenKind::Identifier(atom) = self.peek()?.kind else {
+        let tok = self.peek()?;
+        let TokenKind::Identifier(atom) = tok.kind else {
             return Ok(false);
         };
-        Ok(from_identifier(atom) == Some(kw))
+        // Terminal symbols must appear exactly as written (spec 5.1.5): an
+        // escaped keyword is an IdentifierName, never the keyword itself.
+        Ok(!tok.escaped && from_identifier(atom) == Some(kw))
     }
 
     pub(crate) fn eat_keyword(&mut self, kw: Keyword) -> Result<bool, JsError> {
@@ -251,10 +315,24 @@ impl<'s> Parser<'s> {
     }
 
     /// Whether the current token is the identifier with the given text
-    /// (contextual keywords such as `async`, `of`, `get`, `set`).
+    /// (contextual keywords such as `async`, `of`, `get`, `set`). Escaped
+    /// forms are ordinary identifiers (spec 5.1.5.1), so they never match.
     pub(crate) fn at_contextual(&mut self, text: &str) -> Result<bool, JsError> {
         let id = intern_utf8(text);
-        Ok(self.peek()?.kind == TokenKind::Identifier(id))
+        let tok = self.peek()?;
+        Ok(!tok.escaped && tok.kind == TokenKind::Identifier(id))
+    }
+
+    /// Like `at_contextual`, but only when the identifier was written without
+    /// escape sequences: escaped contextual keywords are ordinary identifiers
+    /// (terminal symbols must appear exactly as written, spec 5.1.5.1).
+    pub(crate) fn at_contextual_unescaped(&mut self, text: &str) -> Result<bool, JsError> {
+        if !self.at_contextual(text)? {
+            return Ok(false);
+        }
+        let span = self.peek()?.span;
+        let raw = self.source_slice(span);
+        Ok(!raw.contains(&0x5C_u16))
     }
 
     /// Consumes the current token if it is the contextual keyword `text`.
@@ -379,7 +457,11 @@ impl<'s> Parser<'s> {
             if scope.is_catch {
                 continue;
             }
-            if scope.lexical.contains(&name) && !scope.functions.contains(&name) {
+            // Function declarations coexist with `var` only where functions
+            // are var-scoped (a function body or the script top level); in a
+            // Block, a function name is lexically declared and clashes.
+            let function_coexist = !scope.is_block && scope.functions.contains(&name);
+            if scope.lexical.contains(&name) && !function_coexist {
                 return Err(self.error_at(start, "Identifier has already been declared"));
             }
             if scope.is_function {
@@ -395,12 +477,17 @@ impl<'s> Parser<'s> {
     /// var-scoped in both modes, spec 16.1.2). A block-level function may
     /// share a catch parameter's name (Annex B); a statement-position
     /// function (`if (x) function f(){}`) may share an enclosing lexical
-    /// name (its hoist is simply suppressed).
+    /// name (its hoist is simply suppressed). Duplicate block-level plain
+    /// FunctionDeclarations are allowed in sloppy mode (Annex B.3.3.4); a
+    /// duplicate that involves a `var` or an async/generator declaration is
+    /// not.
     pub(crate) fn declare_function(
         &mut self,
         name: AtomId,
         start: u32,
         relaxed: bool,
+        is_async: bool,
+        is_generator: bool,
     ) -> Result<(), JsError> {
         let scope = self.scopes.last_mut().unwrap();
         let is_catch_param = scope.is_catch && scope.catch_params.contains(&name);
@@ -410,6 +497,23 @@ impl<'s> Parser<'s> {
             && !relaxed
         {
             return Err(self.error_at(start, "Identifier has already been declared"));
+        }
+        // In a Block, a function declaration is a LexicallyDeclaredName, so a
+        // `var` of the same name in the same statement list is an early error
+        // (spec 14.2.1) — only duplicate plain FunctionDeclarations in sloppy
+        // code are exempt (Annex B.3.3.4). At the script top level and in
+        // function bodies both are var-scoped and coexist.
+        let plain_function = !is_async && !is_generator;
+        let annex_b_duplicate = scope.is_block
+            && self.list_vars.contains(&name)
+            && !self.strict
+            && plain_function
+            && scope.sloppy_block_functions.contains(&name);
+        if scope.is_block && self.list_vars.contains(&name) && !annex_b_duplicate {
+            return Err(self.error_at(start, "Identifier has already been declared"));
+        }
+        if !self.strict && plain_function && scope.is_block {
+            scope.sloppy_block_functions.insert(name);
         }
         scope.lexical.insert(name);
         scope.functions.insert(name);
@@ -432,10 +536,26 @@ impl<'s> Parser<'s> {
         expr: &Expr,
         op: AssignOp,
     ) -> Result<(), JsError> {
-        self.check_target(expr, op == AssignOp::Assign)
+        let web_compat = !matches!(
+            op,
+            AssignOp::AndAssign | AssignOp::OrAssign | AssignOp::NullishAssign
+        );
+        self.check_target(expr, op == AssignOp::Assign, web_compat)
     }
 
-    fn check_target(&mut self, expr: &Expr, allow_pattern: bool) -> Result<(), JsError> {
+    /// Validates an update target (`x++`, `--x`): no destructuring patterns
+    /// are allowed, but the Annex B call-expression web-compat exception
+    /// applies in sloppy code (spec 13.5.2).
+    pub(crate) fn check_update_target(&mut self, expr: &Expr) -> Result<(), JsError> {
+        self.check_target(expr, false, true)
+    }
+
+    fn check_target(
+        &mut self,
+        expr: &Expr,
+        allow_pattern: bool,
+        web_compat_call: bool,
+    ) -> Result<(), JsError> {
         match &expr.kind {
             ExprKind::Ident(name) => {
                 if self.strict
@@ -448,7 +568,10 @@ impl<'s> Parser<'s> {
                 }
                 Ok(())
             }
-            ExprKind::Paren(inner) => self.check_target(inner, allow_pattern),
+            // A parenthesized object/array literal is an expression, not a
+            // destructuring pattern: `({}) = x` and `(f()) &&= x` are errors
+            // even in sloppy code (spec 13.15.1).
+            ExprKind::Paren(inner) => self.check_target(inner, false, web_compat_call),
             ExprKind::Member(_) => {
                 if crate::expr::contains_optional(expr) {
                     return Err(self.error_at(
@@ -463,9 +586,10 @@ impl<'s> Parser<'s> {
             }
             // Annex B web-compat: a CallExpression assignment target parses in
             // sloppy code and throws a ReferenceError at runtime (spec
-            // "Runtime Errors for Function Call Assignment Targets"); strict
-            // code keeps the early error.
-            ExprKind::Call(_) if !self.strict => Ok(()),
+            // "Runtime Errors for Function Call Assignment Targets"). The
+            // exception does not extend to the logical-assignment operators,
+            // whose targets must be simple.
+            ExprKind::Call(_) if !self.strict && web_compat_call => Ok(()),
             _ => Err(self.error_at(expr.span.start, "Invalid assignment target")),
         }
     }
@@ -769,11 +893,12 @@ impl<'s> Parser<'s> {
                 self.next()?;
                 Ok(PropertyName::Number(match value {
                     syntax::NumericLiteral::Number(n) => n,
-                    syntax::NumericLiteral::BigInt(_) => {
-                        return Err(self.error_at(
-                            self.prev.as_ref().unwrap().span.start,
-                            "Unexpected BigInt property name",
-                        ));
+                    // A BigInt literal is a valid LiteralPropertyName; the
+                    // property key is the decimal string of the value (spec
+                    // 12.9.3, 13.2.6), which may exceed f64 precision.
+                    syntax::NumericLiteral::BigInt(b) => {
+                        let text = crux::bigint::to_string(&b, 10);
+                        return Ok(PropertyName::Str(JsString::from_utf8(&text)));
                     }
                 }))
             }

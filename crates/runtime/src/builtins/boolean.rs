@@ -154,7 +154,7 @@ pub fn dispatch_construct(
     agent: &mut Agent,
     callee: &Value,
     args: &[Value],
-    _new_target: &Value,
+    new_target: &Value,
 ) -> Option<Result<Value, JsError>> {
     if agent
         .current_realm()
@@ -165,12 +165,22 @@ pub fn dispatch_construct(
     {
         return Some((|| {
             let value = args.first().cloned().unwrap_or(Value::Undefined);
-            let realm = agent.current_realm()?;
-            let proto = realm
-                .intrinsics
-                .get(BOOLEAN_PROTO)
-                .and_then(|v| as_object(&v));
-            let object = JsObject::ordinary_object_create(proto);
+            // GetPrototypeFromConstructor (spec 10.1.14): subclasses of
+            // Boolean get the newTarget's prototype, not %Boolean.prototype%
+            // (subclass-Boolean.js).
+            let proto = crate::context::get_property(
+                agent,
+                new_target,
+                &JsString::from_utf8("prototype"),
+                new_target.clone(),
+            )?;
+            let proto = as_object(&proto).ok_or_else(|| {
+                JsError::new(
+                    ErrorKind::TypeError,
+                    "new.target.prototype is not an object".into(),
+                )
+            })?;
+            let object = JsObject::ordinary_object_create(Some(proto));
             *object.boxed.borrow_mut() =
                 Some(crux::object::BoxedPrimitive::Boolean(to_boolean(&value)));
             agent.boolean_data.insert(object.id(), to_boolean(&value));

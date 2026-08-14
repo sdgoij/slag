@@ -497,10 +497,13 @@ pub enum ObjectProperty {
     },
     /// `get key ( ) { body }`.
     Get { key: PropertyName, body: Block },
-    /// `set key ( param ) { body }`.
+    /// `set key ( param ) { body }`. The parameter may carry a default
+    /// initializer (`set x(v = 1) {}`).
     Set {
         key: PropertyName,
         param: BindingPattern,
+        /// The setter parameter's initializer, if any.
+        init: Option<Expr>,
         body: Block,
     },
     /// `...expr`.
@@ -634,11 +637,14 @@ pub enum ClassElement {
         name: ClassElementName,
         body: Block,
     },
-    /// `set name ( param ) { body }`.
+    /// `set name ( param ) { body }`. The parameter may carry a default
+    /// initializer (`set x(v = 1) {}`).
     Set {
         is_static: bool,
         name: ClassElementName,
         param: BindingPattern,
+        /// The setter parameter's initializer, if any.
+        init: Option<Expr>,
         body: Block,
     },
     /// A class field with an optional initializer.

@@ -1002,8 +1002,13 @@ pub fn dynamic_import(
         .unwrap_or(Value::Undefined);
     let capability = crate::promise::new_promise_capability(agent, &promise_ctor)?;
     let specifier_text = crux::convert::to_string(specifier)?;
-    // Import attributes: only `type: "json"` is supported.
-    if let Some(options) = options {
+    // Import attributes: only `type: "json"` is supported; *undefined*
+    // options (including the evaluation of an options expression that yields
+    // undefined) skip the attribute validation entirely (spec 13.3.10.2
+    // step 4: "If options is not undefined").
+    if let Some(options) = options
+        && !matches!(options, Value::Undefined)
+    {
         let attributes = import_attributes(options)?;
         for (key, value) in attributes {
             let key = key.to_string_lossy();

@@ -119,6 +119,8 @@ pub enum TokenKind {
     NullishCoalescingEqual,
     Not,
     Tilde,
+    /// `@` — the decorator prefix (stage-3 decorators proposal).
+    At,
     Eof,
 }
 
@@ -130,4 +132,8 @@ pub struct Token {
     /// Whether a LineTerminator occurred before this token; drives ASI and
     /// the `[no LineTerminator here]` restrictions.
     pub line_break_before: bool,
+    /// Whether an identifier token contained a `\u` escape sequence. Escaped
+    /// contextual keywords are ordinary identifiers, and escaped reserved
+    /// words are early errors (spec 12.6.1, 5.1.5).
+    pub escaped: bool,
 }

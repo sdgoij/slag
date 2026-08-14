@@ -23,9 +23,17 @@ pub struct TokenStream<'s> {
 }
 
 impl<'s> TokenStream<'s> {
-    pub fn new(source: &'s syntax::SourceText, allow_html_comments: bool) -> Self {
+    pub fn new(
+        source: &'s syntax::SourceText,
+        allow_html_comments: bool,
+        allow_hashbang_after_directives: bool,
+    ) -> Self {
+        let mut lexer = Lexer::new(source, LexGoal::HashbangOrRegExp, allow_html_comments);
+        if allow_hashbang_after_directives {
+            lexer.set_allow_hashbang_after_directives();
+        }
         Self {
-            lexer: Lexer::new(source, LexGoal::HashbangOrRegExp, allow_html_comments),
+            lexer,
             buffer: VecDeque::new(),
             starts: VecDeque::new(),
             peeked_goal: LexGoal::HashbangOrRegExp,
@@ -114,10 +122,21 @@ impl<'s> TokenStream<'s> {
 }
 
 /// Whether a token can terminate an expression; drives the division-vs-regexp
-/// lexical goal (spec 12.1).
+/// lexical goal (spec 12.1). Keywords that are expression literals (`true`,
+/// `false`, `null`, `this`) end expressions like any other literal; the other
+/// keywords are prefixes or modifiers.
 pub fn can_end_expression(kind: &TokenKind) -> bool {
     match kind {
-        TokenKind::Identifier(atom) => syntax::keywords::from_identifier(*atom).is_none(),
+        TokenKind::Identifier(atom) => match syntax::keywords::from_identifier(*atom) {
+            None
+            | Some(
+                syntax::keywords::Keyword::True
+                | syntax::keywords::Keyword::False
+                | syntax::keywords::Keyword::Null
+                | syntax::keywords::Keyword::This,
+            ) => true,
+            Some(_) => false,
+        },
         TokenKind::PrivateIdentifier(_)
         | TokenKind::NullLiteral
         | TokenKind::BooleanLiteral(_)
@@ -141,7 +160,7 @@ mod tests {
     use syntax::{NumericLiteral, SourceText, TokenKind};
 
     fn stream<'s>(src: &'s SourceText) -> TokenStream<'s> {
-        TokenStream::new(src, false)
+        TokenStream::new(src, false, false)
     }
 
     #[test]

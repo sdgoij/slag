@@ -2,6 +2,7 @@
 
 use crux::{BigInt, JsError};
 use syntax::{NumericLiteral, TokenKind};
+use unicode::is_identifier_start;
 
 use crate::lexer::Lexer;
 
@@ -10,24 +11,39 @@ impl Lexer<'_> {
     /// by a digit.
     pub(crate) fn lex_numeric(&mut self) -> Result<TokenKind, JsError> {
         let start = self.pos;
+        let kind = self.lex_numeric_inner()?;
+        // The source character immediately following a NumericLiteral must
+        // not be an IdentifierStart or DecimalDigit (spec 12.9.3), so `3in`
+        // and `123abc` are early errors rather than two tokens.
+        if let Some(u) = self.peek()
+            && (is_identifier_start(u as u32) || (0x30..=0x39).contains(&u))
+        {
+            return Err(self.error_at(start, "Unexpected number"));
+        }
+        Ok(kind)
+    }
+
+    fn lex_numeric_inner(&mut self) -> Result<TokenKind, JsError> {
         if self.peek() == Some(b'.' as u16) {
-            return self.lex_decimal(start);
+            return self.lex_decimal();
         }
         if self.peek() == Some(b'0' as u16) {
             match self.peek_n(1) {
-                Some(0x78) | Some(0x58) => return self.lex_non_decimal(start, 16),
-                Some(0x6F) | Some(0x4F) => return self.lex_non_decimal(start, 8),
-                Some(0x62) | Some(0x42) => return self.lex_non_decimal(start, 2),
+                Some(0x78) | Some(0x58) => return self.lex_non_decimal(16),
+                Some(0x6F) | Some(0x4F) => return self.lex_non_decimal(8),
+                Some(0x62) | Some(0x42) => return self.lex_non_decimal(2),
                 _ => {}
             }
         }
-        self.lex_decimal(start)
+        self.lex_decimal()
     }
 
     /// Consumes digits of `radix` with optional `_` separators strictly
-    /// between digits; returns the cleaned digit characters.
-    fn scan_digits(&mut self, radix: u32) -> Result<Vec<u16>, JsError> {
+    /// between digits; returns the cleaned digit characters and whether a
+    /// separator was seen.
+    fn scan_digits(&mut self, radix: u32) -> Result<(Vec<u16>, bool), JsError> {
         let mut out = Vec::new();
+        let mut has_separator = false;
         let mut expect_digit = true;
         loop {
             match self.peek() {
@@ -42,6 +58,7 @@ impl Lexer<'_> {
                     }
                     self.pos += 1;
                     expect_digit = true;
+                    has_separator = true;
                 }
                 _ => break,
             }
@@ -49,17 +66,24 @@ impl Lexer<'_> {
         if expect_digit && !out.is_empty() {
             return Err(self.error_here("Invalid numeric separator"));
         }
-        Ok(out)
+        Ok((out, has_separator))
     }
 
-    fn lex_decimal(&mut self, start: usize) -> Result<TokenKind, JsError> {
-        let int_digits = self.scan_digits(10)?;
+    fn lex_decimal(&mut self) -> Result<TokenKind, JsError> {
+        let start = self.pos;
+        let (int_digits, int_has_separator) = self.scan_digits(10)?;
+        // A NumericLiteralSeparator is not allowed in any decimal integer
+        // form that starts with `0` (`0_1`, `00_1`, `08_1`; spec 12.9.3).
+        if int_digits.first() == Some(&0x30) && int_has_separator {
+            return Err(self.error_at(start, "Invalid numeric separator"));
+        }
         let mut has_point = false;
         let mut frac_digits: Vec<u16> = Vec::new();
         if self.peek() == Some(b'.' as u16) {
             has_point = true;
             self.pos += 1;
-            frac_digits = self.scan_digits(10)?;
+            let (digits, _) = self.scan_digits(10)?;
+            frac_digits = digits;
         }
         let mut has_exponent = false;
         let mut exponent: Vec<u16> = Vec::new();
@@ -71,7 +95,7 @@ impl Lexer<'_> {
                 exponent.push(self.peek().unwrap());
                 self.pos += 1;
             }
-            let digits = self.scan_digits(10)?;
+            let (digits, _) = self.scan_digits(10)?;
             if digits.is_empty() {
                 return Err(self.error_at(exp_start, "Invalid exponent"));
             }
@@ -117,9 +141,10 @@ impl Lexer<'_> {
         Ok(TokenKind::NumericLiteral(NumericLiteral::Number(value)))
     }
 
-    fn lex_non_decimal(&mut self, start: usize, radix: u32) -> Result<TokenKind, JsError> {
+    fn lex_non_decimal(&mut self, radix: u32) -> Result<TokenKind, JsError> {
+        let start = self.pos;
         self.pos += 2; // skip the 0x/0o/0b prefix
-        let digits = self.scan_digits(radix)?;
+        let (digits, _) = self.scan_digits(radix)?;
         if digits.is_empty() {
             return Err(self.error_at(start, "Invalid numeric literal"));
         }

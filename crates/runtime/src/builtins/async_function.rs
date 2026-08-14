@@ -290,7 +290,13 @@ fn create_dynamic_function(
     let function_ast = parser::parse_function_with_async(&source, kind.is_async())?;
     let func_proto = get_prototype_from_constructor(agent, &new_target, kind.proto_key())?;
     let environment = agent.current_realm()?.global_env();
-    crate::function::instantiate_dynamic_function(agent, &function_ast, environment, func_proto)
+    crate::function::instantiate_dynamic_function(
+        agent,
+        &function_ast,
+        environment,
+        func_proto,
+        Some(crux::string::JsString::from_utf8(&source)),
+    )
 }
 
 /// GetPrototypeFromConstructor (spec 10.2.4): `constructor.prototype` when it

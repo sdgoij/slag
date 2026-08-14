@@ -144,6 +144,7 @@ struct Options {
     recheck_timeout: Duration,
     sample: Option<usize>,
     filter: Option<String>,
+    list: Option<std::path::PathBuf>,
     json: bool,
     areas: Vec<Area>,
 }
@@ -160,6 +161,7 @@ options:
   --recheck-timeout S  per-fixture hang-recheck deadline (default: 5)
   --sample N           at most N fixtures per top-level directory
   --filter GLOB        only fixtures whose relative path matches (* and ?)
+  --list FILE          only the fixtures listed in FILE (one relative path per line)
   --json               emit a JSON report instead of the text report
   --help, -h";
 
@@ -173,6 +175,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
         recheck_timeout: Duration::from_secs(5),
         sample: None,
         filter: None,
+        list: None,
         json: false,
         areas: vec![Area::Language, Area::Builtins, Area::AnnexB],
     };
@@ -206,6 +209,14 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
                     args.get(index)
                         .ok_or_else(|| "--filter needs a value".to_string())?
                         .clone(),
+                );
+            }
+            "--list" => {
+                index += 1;
+                options.list = Some(
+                    args.get(index)
+                        .ok_or_else(|| "--list needs a value".to_string())?
+                        .into(),
                 );
             }
             "--json" => options.json = true,
@@ -249,10 +260,22 @@ fn parse_u64(args: &[String], index: usize, flag: &str) -> Result<u64, String> {
 /// sample cap per top-level directory and the path filter applied.
 fn collect_fixtures(options: &Options) -> Result<Vec<Fixture>, String> {
     let mut fixtures = Vec::new();
+    let listed: Option<std::collections::HashSet<String>> = match &options.list {
+        Some(list_file) => Some(
+            std::fs::read_to_string(list_file)
+                .map_err(|error| format!("{}: {error}", list_file.display()))?
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect(),
+        ),
+        None => None,
+    };
     for &area in &options.areas {
         let mut files = Vec::new();
         collect_js_files(&area.root(), &mut files)
-            .map_err(|error| format!("{}: {error}", area_label(area)))?;
+            .map_err(|error| format!("{error}: {}", area_label(area)))?;
         files.sort();
         let mut per_dir: BTreeMap<String, usize> = BTreeMap::new();
         for path in files {
@@ -263,6 +286,11 @@ fn collect_fixtures(options: &Options) -> Result<Vec<Fixture>, String> {
                 .replace('\\', "/");
             if let Some(filter) = &options.filter
                 && !glob_match(filter, &relative)
+            {
+                continue;
+            }
+            if let Some(listed) = &listed
+                && !listed.contains(&relative)
             {
                 continue;
             }

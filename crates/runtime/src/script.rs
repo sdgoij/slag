@@ -11,8 +11,9 @@ use crux::handle::Handle;
 use crux::string::{JsString, lookup};
 use crux::value::Value;
 use syntax::ast::{
-    ArrayBindingElement, BindingPattern, ForBinding, ForInit, ObjectBindingProperty, Program, Stmt,
-    StmtKind, VarDeclKind,
+    Argument, ArrayBindingElement, ArrayElement, ArrowBody, BindingPattern, Class, ClassElement,
+    ClassElementName, Expr, ExprKind, ForBinding, ForInit, ObjectBindingProperty, ObjectProperty,
+    Program, PropertyName, Stmt, StmtKind, VarDeclKind,
 };
 
 use crate::agent::Agent;
@@ -61,7 +62,7 @@ pub fn script_evaluation(
     };
     agent.execution_context_stack.push(context);
 
-    let strict = script_is_strict(&script.code);
+    let strict = script_is_strict(&script.source, &script.code);
     let result = (|| -> Result<Value, JsError> {
         global_declaration_instantiation(agent, &script.code, &global_env, strict)?;
         crate::eval::eval_program(agent, &script.code, strict)
@@ -108,8 +109,10 @@ pub fn is_constant_declaration(stmt: &Stmt) -> bool {
     )
 }
 
-/// ScriptIsStrict (spec 16.1.2): a directive prologue `"use strict"`.
-pub fn script_is_strict(program: &Program) -> bool {
+/// ScriptIsStrict (spec 16.1.2): a directive prologue `"use strict"`. The
+/// directive must be a genuine one — raw text `use strict` between the quotes
+/// (spec 14.1.1) — so `'use str\ict'` and `'use\u0020strict'` do not count.
+pub fn script_is_strict(source: &JsString, program: &Program) -> bool {
     for stmt in &program.body {
         let StmtKind::Expr(expr) = &stmt.kind else {
             return false;
@@ -117,7 +120,17 @@ pub fn script_is_strict(program: &Program) -> bool {
         let syntax::ast::ExprKind::Literal(syntax::ast::Literal::Str(value)) = &expr.kind else {
             return false;
         };
-        if value.to_string_lossy() == "use strict" {
+        if value.to_string_lossy() != "use strict" {
+            continue;
+        }
+        let units = source.as_slice();
+        let (start, end) = (expr.span.start as usize, expr.span.end as usize);
+        let inner = if start + 1 < end && end <= units.len() {
+            &units[start + 1..end - 1]
+        } else {
+            return true;
+        };
+        if inner == "use strict".encode_utf16().collect::<Vec<u16>>().as_slice() {
             return true;
         }
     }
@@ -339,7 +352,7 @@ fn walk_annex_b_list(
     stack.push(current.clone());
     for stmt in stmts {
         match &stmt.kind {
-            StmtKind::FunctionDecl(f) => {
+            StmtKind::FunctionDecl(f) if !f.is_async && !f.is_generator => {
                 if let Some(name) = f.name {
                     let name = lookup(name);
                     if nested {
@@ -365,7 +378,7 @@ fn walk_annex_b_stmt(
     _current: &HashSet<JsString>,
 ) {
     match &stmt.kind {
-        StmtKind::FunctionDecl(f) => {
+        StmtKind::FunctionDecl(f) if !f.is_async && !f.is_generator => {
             // Statement-position function: check all enclosing scopes.
             if let Some(name) = f.name {
                 let name = lookup(name);
@@ -599,6 +612,41 @@ pub fn global_declaration_instantiation(
     Ok(())
 }
 
+/// The caller's position for PerformEval's Script early errors (spec
+/// 19.2.1.1 steps 5-7): `in_function` when GetThisEnvironment is a function
+/// Environment Record, `in_method` when that function has a [[HomeObject]].
+fn eval_caller_context(agent: &Agent) -> (bool, bool) {
+    let Ok(this_env) = crate::context::get_this_environment(agent) else {
+        return (false, false);
+    };
+    if !matches!(&*this_env, EnvRecord::Function(_)) {
+        return (false, false);
+    }
+    (true, this_env.has_super_binding(agent))
+}
+
+/// The caller's private identifiers (without the `#`), walking the running
+/// context's PrivateEnvironment chain (spec 9.4.1).
+fn collect_private_names(agent: &Agent) -> Vec<crux::AtomId> {
+    let Some(private_env) = agent
+        .running_context()
+        .ok()
+        .and_then(|context| context.private_environment.clone())
+    else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    let mut current: Option<Handle<crate::context::PrivateEnvironment>> = Some(private_env);
+    while let Some(env) = current {
+        for name in env.names.borrow().iter() {
+            let units = name.description.as_slice();
+            names.push(crux::intern(units.get(1..).unwrap_or(&[])));
+        }
+        current = env.outer.clone();
+    }
+    names
+}
+
 /// PerformEval (spec 19.2.1.1): parse `source` as a Script and evaluate it
 /// in a new execution context nested on the stack.
 ///
@@ -613,11 +661,32 @@ pub fn perform_eval(
     direct: bool,
 ) -> Result<Value, JsError> {
     let eval_realm = agent.current_realm()?;
-    // The caller-context checks of spec step 5-7 (inFunc, inMethod,
-    // inDerivedCtor, inClassFieldInitializer) are subsumed by the Script
-    // early errors the parser applies: Phase 4 code never runs inside a
-    // function, and the parser rejects new.target/super/arguments in
-    // scripts. Phase 7 wires the function-environment flags.
+    // The caller-context checks of spec 19.2.1.1 steps 5-7: a *direct* eval
+    // inherits the caller's function/method position, so the eval'd code may
+    // use `new.target`/`super` there, and a caller inside a class makes
+    // PrivateIdentifiers parse (they resolve against the inherited private
+    // environment). An indirect eval runs in the global scope: all flags stay
+    // false. The eval'd `arguments` inside a field initializer is rejected
+    // separately below.
+    let (in_function, in_method) = if direct {
+        eval_caller_context(agent)
+    } else {
+        (false, false)
+    };
+    let allow_private = direct && agent.running_context()?.private_environment.is_some();
+    let eval_context = parser::EvalContext {
+        in_function,
+        in_method,
+        allow_private,
+    };
+    // The caller's private identifiers (without the `#`), for validating
+    // eval'd `#name` uses against the inherited private environment (spec
+    // 19.2.1.1 AllPrivateNamesValid).
+    let caller_private_names = if allow_private {
+        collect_private_names(agent)
+    } else {
+        Vec::new()
+    };
 
     // HostEnsureCanCompileStrings (spec 19.2.1.1 step 4).
     let body_string = source.clone();
@@ -625,12 +694,58 @@ pub fn perform_eval(
         hooks.ensure_can_compile_strings(&eval_realm, &[], &body_string, direct)?;
     }
 
-    let program = parser::parse_script_utf16(source.as_slice())?;
+    let program =
+        parser::parse_script_utf16_eval(source.as_slice(), &eval_context, &caller_private_names)?;
     // A script with no body evaluates to undefined.
     if program.body.is_empty() {
         return Ok(Value::Undefined);
     }
-    let strict_eval = strict_caller || script_is_strict(&program);
+    // spec 19.2.1.1 steps 10-11: strictCaller applies to direct eval only —
+    // an indirect eval is always sloppy unless its own directive prologue
+    // says otherwise.
+    let strict_eval = if direct {
+        strict_caller || script_is_strict(source, &program)
+    } else {
+        script_is_strict(source, &program)
+    };
+    if strict_eval && !script_is_strict(source, &program) {
+        // The caller's strictness subjects the eval'd code to the strict-mode
+        // early errors (reserved-word bindings, `with`, octal escapes, …) the
+        // first parse could not apply. Re-parse with a synthetic use-strict
+        // directive solely to validate; the original program runs.
+        let mut units = Vec::with_capacity(source.len() + 14);
+        units.extend_from_slice(
+            "'use strict';\n"
+                .encode_utf16()
+                .collect::<Vec<u16>>()
+                .as_slice(),
+        );
+        units.extend_from_slice(source.as_slice());
+        parser::parse_script_utf16_eval(&units, &eval_context, &caller_private_names)?;
+    }
+    // spec 15.14.2 early errors: a `using` declaration at the top level of a
+    // Script (the eval goal) is a SyntaxError unless nested in a Block,
+    // ForStatement, ForInOfStatement, or function body — which the parser
+    // already enforces for those contexts.
+    if program
+        .body
+        .iter()
+        .any(|stmt| matches!(stmt.kind, StmtKind::UsingDecl { .. }))
+    {
+        return Err(JsError::new(
+            ErrorKind::SyntaxError,
+            "using declarations are not allowed at the top level of eval".into(),
+        ));
+    }
+    // spec 19.2.1.1 step 10: a direct eval inside a class field initializer
+    // is a SyntaxError when the eval'd code references `arguments` (arrows
+    // count; nested functions have their own `arguments`).
+    if direct && agent.field_initializer_depth > 0 && contains_arguments(&program) {
+        return Err(JsError::new(
+            ErrorKind::SyntaxError,
+            "'arguments' is not allowed in direct eval inside a class field initializer".into(),
+        ));
+    }
 
     let running = agent.running_context()?;
     let (lexical_env, variable_env, private_env) = if direct {
@@ -879,6 +994,292 @@ fn bound_names_of_decl(stmt: &Stmt, out: &mut Vec<JsString>) {
     }
 }
 
+/// ContainsArguments (spec 15.7.9) over a Script body, for the eval-inside-
+/// class-field-initializer early error (spec 19.2.1.1 step 10): an
+/// `arguments` IdentifierReference counts unless a nested function or class
+/// method body would own its own `arguments` (arrows are transparent).
+fn contains_arguments(program: &Program) -> bool {
+    let mut found = false;
+    walk_stmts(&program.body, &mut |expr| {
+        if matches!(expr.kind, ExprKind::Ident(atom) if atom == crux::intern_utf8("arguments")) {
+            found = true;
+        }
+    });
+    found
+}
+
+fn walk_stmts(stmts: &[Stmt], visit: &mut impl FnMut(&Expr)) {
+    for stmt in stmts {
+        match &stmt.kind {
+            StmtKind::Block(block) => walk_stmts(&block.stmts, visit),
+            StmtKind::Expr(expr) => walk_exprs(expr, visit),
+            StmtKind::If {
+                test,
+                consequent,
+                alternate,
+            } => {
+                walk_exprs(test, visit);
+                walk_stmts(std::slice::from_ref(consequent), visit);
+                if let Some(alt) = alternate {
+                    walk_stmts(std::slice::from_ref(alt), visit);
+                }
+            }
+            StmtKind::VarDecl { decls, .. } | StmtKind::UsingDecl { decls, .. } => {
+                for decl in decls {
+                    if let Some(init) = &decl.init {
+                        walk_exprs(init, visit);
+                    }
+                }
+            }
+            StmtKind::Return(Some(expr)) | StmtKind::Throw(expr) => walk_exprs(expr, visit),
+            StmtKind::Return(None) => {}
+            StmtKind::While { test, body } => {
+                walk_exprs(test, visit);
+                walk_stmts(std::slice::from_ref(body), visit);
+            }
+            StmtKind::DoWhile { body, test } => {
+                walk_stmts(std::slice::from_ref(body), visit);
+                walk_exprs(test, visit);
+            }
+            StmtKind::For {
+                init,
+                test,
+                update,
+                body,
+            } => {
+                walk_for_init(init, visit);
+                if let Some(t) = test {
+                    walk_exprs(t, visit);
+                }
+                if let Some(u) = update {
+                    walk_exprs(u, visit);
+                }
+                walk_stmts(std::slice::from_ref(body), visit);
+            }
+            StmtKind::ForIn { left, right, body }
+            | StmtKind::ForOf {
+                left, right, body, ..
+            } => {
+                walk_for_binding(left, visit);
+                walk_exprs(right, visit);
+                walk_stmts(std::slice::from_ref(body), visit);
+            }
+            StmtKind::Try {
+                block,
+                handler,
+                finalizer,
+            } => {
+                walk_stmts(&block.stmts, visit);
+                if let Some(handler) = handler {
+                    walk_stmts(&handler.body.stmts, visit);
+                }
+                if let Some(finalizer) = finalizer {
+                    walk_stmts(&finalizer.stmts, visit);
+                }
+            }
+            StmtKind::Switch {
+                discriminant,
+                cases,
+            } => {
+                walk_exprs(discriminant, visit);
+                for case in cases {
+                    if let Some(test) = &case.test {
+                        walk_exprs(test, visit);
+                    }
+                    walk_stmts(&case.consequent, visit);
+                }
+            }
+            StmtKind::With { object, body } => {
+                walk_exprs(object, visit);
+                walk_stmts(std::slice::from_ref(body), visit);
+            }
+            StmtKind::Labeled { body, .. } => walk_stmts(std::slice::from_ref(body), visit),
+            StmtKind::FunctionDecl(_) => {}
+            StmtKind::ClassDecl(class) => walk_class(class, visit),
+            StmtKind::Empty | StmtKind::Debugger | StmtKind::Break(_) | StmtKind::Continue(_) => {}
+        }
+    }
+}
+
+fn walk_exprs(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
+    visit(expr);
+    match &expr.kind {
+        ExprKind::Literal(_)
+        | ExprKind::Ident(_)
+        | ExprKind::This
+        | ExprKind::Super
+        | ExprKind::MetaProperty { .. }
+        | ExprKind::Function(_) => {}
+        ExprKind::Class(class) => walk_class(class, visit),
+        ExprKind::Arrow { params, body, .. } => {
+            for param in params {
+                if let Some(init) = &param.init {
+                    walk_exprs(init, visit);
+                }
+            }
+            match body {
+                ArrowBody::Expr(expr) => walk_exprs(expr, visit),
+                ArrowBody::Block(block) => walk_stmts(&block.stmts, visit),
+            }
+        }
+        ExprKind::PrivateIn { object, .. } => walk_exprs(object, visit),
+        ExprKind::Array(array) => {
+            for element in &array.elements {
+                match element {
+                    ArrayElement::Expr(e) | ArrayElement::Spread(e) => walk_exprs(e, visit),
+                    ArrayElement::Hole => {}
+                }
+            }
+        }
+        ExprKind::Object(object) => {
+            for prop in &object.props {
+                match prop {
+                    ObjectProperty::Init { key, value, .. } => {
+                        walk_property_name(key, visit);
+                        walk_exprs(value, visit);
+                    }
+                    ObjectProperty::Method { key, .. }
+                    | ObjectProperty::Get { key, .. }
+                    | ObjectProperty::Set { key, .. } => walk_property_name(key, visit),
+                    ObjectProperty::Spread(e) => walk_exprs(e, visit),
+                }
+            }
+        }
+        ExprKind::Unary { operand, .. } => walk_exprs(operand, visit),
+        ExprKind::Update { target, .. } => walk_exprs(target, visit),
+        ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
+            walk_exprs(left, visit);
+            walk_exprs(right, visit);
+        }
+        ExprKind::Assign { target, value, .. } => {
+            walk_exprs(target, visit);
+            walk_exprs(value, visit);
+        }
+        ExprKind::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            walk_exprs(test, visit);
+            walk_exprs(consequent, visit);
+            walk_exprs(alternate, visit);
+        }
+        ExprKind::Call(call) => {
+            walk_exprs(&call.callee, visit);
+            for arg in &call.args {
+                walk_argument(arg, visit);
+            }
+        }
+        ExprKind::New(new) => {
+            walk_exprs(&new.callee, visit);
+            for arg in &new.args {
+                walk_argument(arg, visit);
+            }
+        }
+        ExprKind::Member(member) => {
+            walk_exprs(&member.object, visit);
+            if let syntax::MemberProperty::Computed(index) = &member.property {
+                walk_exprs(index, visit);
+            }
+        }
+        ExprKind::TaggedTemplate { tag, quasi } => {
+            walk_exprs(tag, visit);
+            for e in &quasi.exprs {
+                walk_exprs(e, visit);
+            }
+        }
+        ExprKind::Template(template) => {
+            for e in &template.exprs {
+                walk_exprs(e, visit);
+            }
+        }
+        ExprKind::Paren(inner) => walk_exprs(inner, visit),
+        ExprKind::Sequence(exprs) => {
+            for e in exprs {
+                walk_exprs(e, visit);
+            }
+        }
+        ExprKind::Yield { argument, .. } => {
+            if let Some(argument) = argument {
+                walk_exprs(argument, visit);
+            }
+        }
+        ExprKind::Await(operand) => walk_exprs(operand, visit),
+        ExprKind::ImportCall { specifier, options } => {
+            walk_exprs(specifier, visit);
+            if let Some(options) = options {
+                walk_exprs(options, visit);
+            }
+        }
+    }
+}
+
+fn walk_argument(argument: &Argument, visit: &mut impl FnMut(&Expr)) {
+    match argument {
+        Argument::Expr(e) | Argument::Spread(e) => walk_exprs(e, visit),
+    }
+}
+
+fn walk_property_name(name: &PropertyName, visit: &mut impl FnMut(&Expr)) {
+    if let PropertyName::Computed(expr) = name {
+        walk_exprs(expr, visit);
+    }
+}
+
+/// The parts of a nested class that inherit the enclosing containment:
+/// heritage, computed element names, and field initializers. Method bodies,
+/// params, and static blocks own their own `arguments`.
+fn walk_class(class: &Class, visit: &mut impl FnMut(&Expr)) {
+    if let Some(heritage) = &class.heritage {
+        walk_exprs(heritage, visit);
+    }
+    for element in &class.elements {
+        match element {
+            ClassElement::Method { name, .. }
+            | ClassElement::Get { name, .. }
+            | ClassElement::Set { name, .. } => walk_class_name(name, visit),
+            ClassElement::Field { name, init, .. } => {
+                walk_class_name(name, visit);
+                if let Some(init) = init {
+                    walk_exprs(init, visit);
+                }
+            }
+            ClassElement::StaticBlock(_) => {}
+        }
+    }
+}
+
+fn walk_class_name(name: &ClassElementName, visit: &mut impl FnMut(&Expr)) {
+    if let ClassElementName::Property(PropertyName::Computed(expr)) = name {
+        walk_exprs(expr, visit);
+    }
+}
+
+fn walk_for_init(init: &Option<ForInit>, visit: &mut impl FnMut(&Expr)) {
+    match init {
+        Some(ForInit::Expr(expr)) => walk_exprs(expr, visit),
+        Some(ForInit::VarDecl { decls, .. }) => {
+            for decl in decls {
+                if let Some(init) = &decl.init {
+                    walk_exprs(init, visit);
+                }
+            }
+        }
+        None => {}
+    }
+}
+
+fn walk_for_binding(binding: &ForBinding, visit: &mut impl FnMut(&Expr)) {
+    match binding {
+        ForBinding::Expr(expr) => walk_exprs(expr, visit),
+        ForBinding::VarDecl { init, .. } => {
+            if let Some(init) = init {
+                walk_exprs(init, visit);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -928,10 +1329,14 @@ mod tests {
 
     #[test]
     fn script_is_strict_detects_directives() {
-        assert!(script_is_strict(&parse("'use strict'; 1;")));
-        assert!(!script_is_strict(&parse("1;")));
+        let strict = |src: &str| script_is_strict(&JsString::from_utf8(src), &parse(src));
+        assert!(strict("'use strict'; 1;"));
+        assert!(!strict("1;"));
         // The directive must be first.
-        assert!(!script_is_strict(&parse("1; 'use strict';")));
+        assert!(!strict("1; 'use strict';"));
+        // Escapes and line continuations are not directives (spec 14.1.1).
+        assert!(!strict("'use\\u0020strict'; 1;"));
+        assert!(!strict("'use str\\\n ict'; 1;"));
     }
 
     #[test]
@@ -1113,6 +1518,50 @@ mod tests {
     }
 
     #[test]
+    fn direct_eval_in_field_initializer_rejects_arguments() {
+        // spec 19.2.1.1: a direct eval inside a class field initializer is a
+        // SyntaxError when the eval'd code references `arguments` — including
+        // inside arrows created by the initializer and called later.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let result = agent.run_script(
+            "var executed = false; \
+             class C { x = eval('executed = true; arguments;'); } \
+             var threw = false; \
+             try { new C(); } catch (e) { threw = e instanceof SyntaxError; } \
+             threw + ',' + executed",
+        );
+        assert_eq!(
+            result.unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("true,false")))
+        );
+        // An arrow created in the initializer and called later still counts.
+        let result = agent.run_script(
+            "var executed = false; \
+             class D { x = () => { eval('executed = true; arguments;'); }; } \
+             var threw = false; \
+             try { new D().x(); } catch (e) { threw = e instanceof SyntaxError; } \
+             threw + ',' + executed",
+        );
+        assert_eq!(
+            result.unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("true,false")))
+        );
+        // A plain function expression has its own `arguments`: no error.
+        let result = agent.run_script(
+            "var executed = false; \
+             class E { x = function() { eval('executed = true; arguments;'); }; } \
+             var threw = false; \
+             try { new E().x(); } catch (e) { threw = e instanceof SyntaxError; } \
+             threw + ',' + executed",
+        );
+        assert_eq!(
+            result.unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("false,true")))
+        );
+    }
+
+    #[test]
     fn eval_function_declarations_bind_to_the_variable_environment() {
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
@@ -1128,5 +1577,81 @@ mod tests {
             global.get(&JsString::from_utf8("ef")).unwrap(),
             Value::Function(_)
         ));
+    }
+
+    #[test]
+    fn indirect_eval_ignores_the_callers_strictness() {
+        // spec 19.2.1.1 step 10: strictCaller applies to direct eval only;
+        // an indirect eval in strict caller code is still sloppy.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let result = perform_eval(
+            &mut agent,
+            &JsString::from_utf8("with ({}) {} var iv = 3; iv"),
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(result, Value::Number(3.0));
+        let global = agent.running_context().unwrap().realm.global_object.clone();
+        assert_eq!(
+            global.get(&JsString::from_utf8("iv")).unwrap(),
+            Value::Number(3.0)
+        );
+    }
+
+    #[test]
+    fn strict_eval_rejects_with_and_reserved_word_bindings() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        assert!(
+            perform_eval(
+                &mut agent,
+                &JsString::from_utf8("var public = 1;"),
+                true,
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            perform_eval(&mut agent, &JsString::from_utf8("with ({}) {}"), true, true,).is_err()
+        );
+        // The same code in a sloppy caller parses and runs.
+        assert_eq!(
+            perform_eval(
+                &mut agent,
+                &JsString::from_utf8("var public = 2; public"),
+                false,
+                true
+            )
+            .unwrap(),
+            Value::Number(2.0)
+        );
+    }
+
+    #[test]
+    fn top_level_using_in_eval_is_rejected() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        assert!(
+            perform_eval(
+                &mut agent,
+                &JsString::from_utf8("using x = null;"),
+                false,
+                true
+            )
+            .is_err()
+        );
+        // A block-nested `using` is fine.
+        assert_eq!(
+            perform_eval(
+                &mut agent,
+                &JsString::from_utf8("{ using x = null; } 5"),
+                false,
+                true
+            )
+            .unwrap(),
+            Value::Number(5.0)
+        );
     }
 }

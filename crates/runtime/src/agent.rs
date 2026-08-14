@@ -252,6 +252,10 @@ pub struct Agent {
     /// The [[IteratedSet]], [[SetNextIndex]], and [[SetIterationKind]] of Set
     /// iterators, keyed by iterator-object identity (spec 24.2.6).
     pub set_iter_data: std::collections::HashMap<u64, RefCell<(Option<Value>, usize, u8)>>,
+    /// The nesting depth of class field initializers currently evaluating.
+    /// A direct eval inside one applies the "Eval Inside Initializer" early
+    /// errors (spec 19.2.1.1): `arguments` is a SyntaxError there.
+    pub field_initializer_depth: usize,
 }
 
 impl Agent {
@@ -322,6 +326,7 @@ impl Agent {
             weak_set_data: std::collections::HashMap::new(),
             map_iter_data: std::collections::HashMap::new(),
             set_iter_data: std::collections::HashMap::new(),
+            field_initializer_depth: 0,
         }
     }
 

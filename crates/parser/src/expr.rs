@@ -49,9 +49,25 @@ pub(crate) fn parse_expression(parser: &mut Parser, allow_in: bool) -> Result<Ex
 pub(crate) fn parse_assignment(parser: &mut Parser, allow_in: bool) -> Result<Expr, JsError> {
     let start = parser.peek()?.span.start;
 
+    // Decorated class expressions: `@dec1 @dec2 class { … }`. The decorator
+    // list is a stage-3 proposal; the expressions are validated syntactically
+    // and not evaluated.
+    if parser.at_punct(TokenKind::At)? {
+        crate::class::parse_decorators(parser)?;
+        parser.expect_keyword(Keyword::Class)?;
+        let class_start = parser.prev.as_ref().unwrap().span.start;
+        let class = crate::class::parse_class(parser, class_start, false)?;
+        let span = class.span;
+        let expr = Expr {
+            span,
+            kind: ExprKind::Class(Box::new(class)),
+        };
+        return parse_subscripts(parser, expr, false);
+    }
+
     // `yield` in generators.
     if parser.in_generator && parser.at_contextual("yield")? {
-        return parse_yield(parser);
+        return parse_yield(parser, allow_in);
     }
 
     // `async function …`, `async x => …`, `async (…) => …` — `async` is
@@ -59,7 +75,7 @@ pub(crate) fn parse_assignment(parser: &mut Parser, allow_in: bool) -> Result<Ex
     // A call form (`async()`) falls through to the arrow/assignment handling
     // below so `async() = 1` parses as an assignment target (Annex B).
     let left: Expr = 'parsed: {
-        if parser.at_contextual("async")? && !parser.peek2()?.line_break_before {
+        if parser.at_contextual_unescaped("async")? && !parser.peek2()?.line_break_before {
             let next_kind = parser.peek2()?.kind.clone();
             match next_kind {
                 TokenKind::Identifier(atom) if from_identifier(atom) == Some(Keyword::Function) => {
@@ -70,9 +86,14 @@ pub(crate) fn parse_assignment(parser: &mut Parser, allow_in: bool) -> Result<Ex
                     return parse_subscripts(parser, function, false);
                 }
                 TokenKind::Identifier(atom) if is_binding_identifier(parser, atom) => {
-                    // `async x => …`
+                    // `async x => …` — the single parameter is a
+                    // `BindingIdentifier[~Yield, +Await]` (spec 15.8.1).
                     parser.next()?; // `async`
+                    let saved_async = parser.in_async;
+                    parser.in_async = true;
                     let params = parse_single_arrow_param(parser)?;
+                    parser.in_async = saved_async;
+                    check_arrow_params(parser, &params)?;
                     parser.expect_punct(TokenKind::Arrow)?;
                     let body = parse_arrow_body(parser, true, &params)?;
                     let end = parser.prev.as_ref().unwrap().span.end;
@@ -86,10 +107,14 @@ pub(crate) fn parse_assignment(parser: &mut Parser, allow_in: bool) -> Result<Ex
                     });
                 }
                 TokenKind::LeftParen => {
-                    // `async (…) => …` or `async(…)` call.
+                    // `async (…) => …` or `async(…)` call. The parameter list
+                    // parses with [+Await] (spec 15.8.1).
                     parser.next()?; // `async`
                     parser.expect_punct(TokenKind::LeftParen)?;
+                    let saved_async = parser.in_async;
+                    parser.in_async = true;
                     let result = parse_paren_contents(parser)?;
+                    parser.in_async = saved_async;
                     match result {
                         ParenResult::ArrowParams(params) => {
                             parser.expect_punct(TokenKind::Arrow)?;
@@ -148,7 +173,7 @@ pub(crate) fn parse_assignment(parser: &mut Parser, allow_in: bool) -> Result<Ex
     // special-case above skipped parse_conditional, which normally consumes
     // the update operator.
     if parser.at_punct(TokenKind::PlusPlus)? && !parser.peek()?.line_break_before {
-        parser.check_assignment_target(&left, AssignOp::Assign)?;
+        parser.check_update_target(&left)?;
         let end = parser.peek()?.span.end;
         parser.next()?;
         return Ok(Expr {
@@ -161,7 +186,7 @@ pub(crate) fn parse_assignment(parser: &mut Parser, allow_in: bool) -> Result<Ex
         });
     }
     if parser.at_punct(TokenKind::MinusMinus)? && !parser.peek()?.line_break_before {
-        parser.check_assignment_target(&left, AssignOp::Assign)?;
+        parser.check_update_target(&left)?;
         let end = parser.peek()?.span.end;
         parser.next()?;
         return Ok(Expr {
@@ -185,6 +210,7 @@ pub(crate) fn parse_assignment(parser: &mut Parser, allow_in: bool) -> Result<Ex
             rest: false,
             span: left.span,
         }];
+        check_arrow_params(parser, &params)?;
         parser.next()?; // `=>`
         let body = parse_arrow_body(parser, false, &params)?;
         let end = parser.prev.as_ref().unwrap().span.end;
@@ -274,7 +300,7 @@ fn split_sequence_into_args(expr: Expr) -> Vec<Argument> {
     }
 }
 
-fn parse_yield(parser: &mut Parser) -> Result<Expr, JsError> {
+fn parse_yield(parser: &mut Parser, allow_in: bool) -> Result<Expr, JsError> {
     let start = parser.next()?.span.start; // `yield`
     if parser.peek()?.line_break_before {
         return Ok(Expr {
@@ -286,7 +312,9 @@ fn parse_yield(parser: &mut Parser) -> Result<Expr, JsError> {
         });
     }
     if parser.eat_punct(TokenKind::Star)? {
-        let argument = parse_assignment(parser, true)?;
+        // The `*` operand is an AssignmentExpression[?In, +Yield]: the [~In]
+        // of a for-head propagates, so `for (yield * x in y; …)` is an error.
+        let argument = parse_assignment(parser, allow_in)?;
         let end = argument.span.end;
         return Ok(Expr {
             span: Span::new(start, end),
@@ -297,7 +325,7 @@ fn parse_yield(parser: &mut Parser) -> Result<Expr, JsError> {
         });
     }
     if can_start_expression(parser.peek()?.kind.clone()) {
-        let argument = parse_assignment(parser, true)?;
+        let argument = parse_assignment(parser, allow_in)?;
         let end = argument.span.end;
         return Ok(Expr {
             span: Span::new(start, end),
@@ -398,11 +426,24 @@ fn parse_binary(parser: &mut Parser, allow_in: bool, min_prec: u8) -> Result<Exp
         if parser.private_names.is_empty() {
             return Err(parser.error_at(start, "Private field access is only valid inside a class"));
         }
-        if !allow_in || !parser.at_keyword(Keyword::In)? {
-            return Err(parser.error_at(start, "Private field access is only valid inside a class"));
+        // The production is `PrivateIdentifier in ShiftExpression`, so the
+        // `in` must bind at this precedence level. A bare PrivateIdentifier
+        // is not an expression; this also rejects `#a in #b in this`, whose
+        // right operand would have to be a ShiftExpression.
+        if min_prec > PREC_RELATIONAL || !allow_in || !parser.at_keyword(Keyword::In)? {
+            return Err(parser.error_at(
+                start,
+                "A private identifier is only valid as the left operand of 'in'",
+            ));
         }
         parser.next()?; // `in`
-        let right = parse_binary(parser, allow_in, PREC_RELATIONAL + 1)?;
+        // The right operand is a ShiftExpression: it may not contain `in`,
+        // and an arrow function (an AssignmentExpression) at this level is
+        // never a ShiftExpression (spec 13.11).
+        let saved_arrow = parser.reject_arrow;
+        parser.reject_arrow = true;
+        let right = parse_binary(parser, false, PREC_SHIFT)?;
+        parser.reject_arrow = saved_arrow;
         let end = right.span.end;
         Expr {
             span: Span::new(start, end),
@@ -592,6 +633,9 @@ fn parse_unary(parser: &mut Parser) -> Result<Expr, JsError> {
         };
         parser.next()?;
         let operand = parse_unary(parser)?;
+        // `++x` requires x to be a valid update target (spec 13.5.2); this
+        // also rejects `++import('')`, `++a?.b`, and `++(++y)`.
+        parser.check_update_target(&operand)?;
         let end = operand.span.end;
         return Ok(Expr {
             span: Span::new(start, end),
@@ -629,11 +673,32 @@ fn parse_unary(parser: &mut Parser) -> Result<Expr, JsError> {
     if let Some(op) = unary {
         parser.next()?;
         let operand = parse_unary(parser)?;
-        if op == UnaryOp::Delete && matches!(operand.kind, ExprKind::Ident(_)) && parser.strict {
-            return Err(parser.error_at(
-                start,
-                "Deleting an unqualified identifier is not allowed in strict mode",
-            ));
+        if op == UnaryOp::Delete {
+            // Parentheses do not hide the derived UnaryExpression for the
+            // delete early errors (spec 13.6.2).
+            let mut derived = &operand;
+            while let ExprKind::Paren(inner) = &derived.kind {
+                derived = inner;
+            }
+            if parser.strict && matches!(derived.kind, ExprKind::Ident(_)) {
+                return Err(parser.error_at(
+                    start,
+                    "Deleting an unqualified identifier is not allowed in strict mode",
+                ));
+            }
+            // `delete x.#p` — a MemberExpression.PrivateName operand is an
+            // early error in strict mode (class bodies are always strict).
+            if matches!(
+                derived.kind,
+                ExprKind::Member(syntax::MemberExpr {
+                    property: MemberProperty::Private(_),
+                    ..
+                })
+            ) {
+                return Err(
+                    parser.error_at(start, "Delete of a private field or method is not allowed")
+                );
+            }
         }
         let end = operand.span.end;
         return Ok(Expr {
@@ -652,7 +717,7 @@ fn parse_unary(parser: &mut Parser) -> Result<Expr, JsError> {
 fn parse_update(parser: &mut Parser) -> Result<Expr, JsError> {
     let expr = parse_lhs(parser)?;
     if parser.at_punct(TokenKind::PlusPlus)? && !parser.peek()?.line_break_before {
-        parser.check_assignment_target(&expr, AssignOp::Assign)?;
+        parser.check_update_target(&expr)?;
         let end = parser.peek()?.span.end;
         parser.next()?;
         return Ok(Expr {
@@ -665,7 +730,7 @@ fn parse_update(parser: &mut Parser) -> Result<Expr, JsError> {
         });
     }
     if parser.at_punct(TokenKind::MinusMinus)? && !parser.peek()?.line_break_before {
-        parser.check_assignment_target(&expr, AssignOp::Assign)?;
+        parser.check_update_target(&expr)?;
         let end = parser.peek()?.span.end;
         parser.next()?;
         return Ok(Expr {
@@ -702,14 +767,18 @@ pub(crate) fn parse_lhs(parser: &mut Parser) -> Result<Expr, JsError> {
 fn parse_new(parser: &mut Parser) -> Result<Expr, JsError> {
     let start = parser.next()?.span.start; // `new`
     if parser.eat_punct(TokenKind::Dot)? {
-        // `new . target`
+        // `new . target` — the MetaProperty requires the exact code units
+        // `target`; an escaped form is not a MetaProperty (spec 13.3.4).
+        if parser.peek()?.escaped {
+            return Err(parser.error_at(start, "Expected new.target"));
+        }
         let (atom, _) = parser.parse_identifier()?;
         if atom != intern_utf8("target") {
             return Err(parser.error_at(start, "Expected new.target"));
         }
         // `new.target` is an early error outside functions (spec 13.3.4,
         // 15.2.2) except inside class field initializers and static blocks.
-        if !parser.in_function && !parser.in_field_initializer {
+        if !parser.nt_context && !parser.in_field_initializer {
             return Err(parser.error_at(start, "new.target is not allowed here"));
         }
         let end = parser.prev.as_ref().unwrap().span.end;
@@ -734,6 +803,11 @@ fn parse_new(parser: &mut Parser) -> Result<Expr, JsError> {
             callee.span.start,
             "Optional chaining cannot appear in a new expression",
         ));
+    }
+    // ImportCall is a CallExpression, never a MemberExpression, so it cannot
+    // be the callee of `new` (spec 13.3.4).
+    if import_call_base(&callee) {
+        return Err(parser.error_at(callee.span.start, "import() cannot be used with new"));
     }
     let args = if parser.at_punct(TokenKind::LeftParen)? {
         parse_arguments(parser)?
@@ -763,6 +837,14 @@ fn parse_super(parser: &mut Parser) -> Result<Expr, JsError> {
     match parser.peek()?.kind.clone() {
         TokenKind::Dot => {
             parser.next()?;
+            // `super.#p` is not a valid SuperProperty (spec 15.7.10).
+            if matches!(parser.peek()?.kind, TokenKind::PrivateIdentifier(_)) {
+                let tok = parser.peek()?.clone();
+                return Err(parser.error_at(
+                    tok.span.start,
+                    "super property may not be a private identifier",
+                ));
+            }
             let property = parse_member_property(parser)?;
             let end = parser.prev.as_ref().unwrap().span.end;
             Ok(Expr {
@@ -791,8 +873,13 @@ fn parse_super(parser: &mut Parser) -> Result<Expr, JsError> {
             })
         }
         TokenKind::LeftParen => {
-            if !parser.in_constructor {
-                return Err(parser.error_at(start, "super() is only valid inside a constructor"));
+            // `super()` requires a constructor of a derived class (spec
+            // 15.7.11 early errors: no heritage and HasDirectSuper).
+            if !parser.in_constructor || !parser.in_derived_class {
+                return Err(parser.error_at(
+                    start,
+                    "super() is only valid inside the constructor of a derived class",
+                ));
             }
             let args = parse_arguments(parser)?;
             let end = parser.prev.as_ref().unwrap().span.end;
@@ -961,8 +1048,11 @@ fn parse_optional_link(parser: &mut Parser, expr: Expr) -> Result<Expr, JsError>
                 }),
             })
         }
+        // A template after `?.` is never valid: the OptionalChain grammar has
+        // no template link (spec 13.4.1), so `a?.`x`` is an early error even
+        // across a line break.
         TokenKind::NoSubstitutionTemplate { .. } | TokenKind::TemplateHead { .. } => {
-            parse_tagged_template(parser, expr)
+            Err(parser.error_at(start, "Template literals are not allowed after ?."))
         }
         _ => {
             let tok = parser.peek()?.clone();
@@ -983,8 +1073,32 @@ pub(crate) fn contains_optional(expr: &Expr) -> bool {
     }
 }
 
+/// Whether the leftmost base of an expression chain is an ImportCall (used
+/// for the `new import(…)` early error, spec 13.3.4). Parenthesized
+/// expressions do not unwrap: `new (import(…))` is a valid NewExpression
+/// whose callee is a PrimaryExpression, only the direct `new import(…)` form
+/// is excluded.
+fn import_call_base(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Member(m) => import_call_base(&m.object),
+        ExprKind::Call(c) => import_call_base(&c.callee),
+        ExprKind::ImportCall { .. } => true,
+        _ => false,
+    }
+}
+
 /// `( args )` for calls and `new`.
-fn parse_arguments(parser: &mut Parser) -> Result<Vec<Argument>, JsError> {
+pub(crate) fn parse_arguments(parser: &mut Parser) -> Result<Vec<Argument>, JsError> {
+    // Arguments are a fresh expression level: arrows inside them are
+    // unconstrained even in a private-in right operand.
+    let saved_arrow = parser.reject_arrow;
+    parser.reject_arrow = false;
+    let result = parse_arguments_inner(parser);
+    parser.reject_arrow = saved_arrow;
+    result
+}
+
+fn parse_arguments_inner(parser: &mut Parser) -> Result<Vec<Argument>, JsError> {
     parser.expect_punct(TokenKind::LeftParen)?;
     let mut args = Vec::new();
     if parser.eat_punct(TokenKind::RightParen)? {
@@ -1024,6 +1138,16 @@ fn is_legacy_octal_literal(raw: Vec<u16>) -> bool {
 fn parse_primary(parser: &mut Parser) -> Result<Expr, JsError> {
     let tok = parser.peek()?.clone();
     match tok.kind {
+        TokenKind::Identifier(_) if tok.escaped => {
+            // An escaped keyword is an IdentifierName, never the keyword
+            // itself (spec 5.1.5); as an expression it must be a valid
+            // IdentifierReference, so reserved words are SyntaxErrors here.
+            let (name, start) = parser.parse_identifier()?;
+            Ok(Expr {
+                span: Span::new(start, tok.span.end),
+                kind: ExprKind::Ident(name),
+            })
+        }
         TokenKind::Identifier(atom) => match from_identifier(atom) {
             Some(Keyword::This) => {
                 parser.next()?;
@@ -1057,23 +1181,56 @@ fn parse_primary(parser: &mut Parser) -> Result<Expr, JsError> {
             Some(Keyword::Import) => {
                 parser.next()?;
                 if parser.eat_punct(TokenKind::Dot)? {
-                    let (meta_atom, _) = parser.parse_identifier()?;
-                    if meta_atom != intern_utf8("meta") {
-                        return Err(parser.error_at(tok.span.start, "Expected import.meta"));
+                    let (import_prop, _) = parser.parse_identifier()?;
+                    if import_prop == intern_utf8("meta") {
+                        // `import.meta` is an early error in Script code
+                        // (spec 13.3.7).
+                        if !parser.in_module {
+                            return Err(parser.error_at(
+                                tok.span.start,
+                                "import.meta is not allowed in script code",
+                            ));
+                        }
+                        let end = parser.prev.as_ref().unwrap().span.end;
+                        Ok(Expr {
+                            span: Span::new(tok.span.start, end),
+                            kind: ExprKind::MetaProperty {
+                                meta: intern_utf8("import"),
+                                property: import_prop,
+                            },
+                        })
+                    } else if import_prop == intern_utf8("source")
+                        || import_prop == intern_utf8("defer")
+                    {
+                        // Source-phase imports (`import.source(x)`) and
+                        // deferred imports (`import.defer(x)`) have the same
+                        // call shape as `import(x)`; without a host module
+                        // loader they reject at runtime.
+                        parser.expect_punct(TokenKind::LeftParen)?;
+                        let specifier = parse_assignment(parser, true)?;
+                        parser.expect_punct(TokenKind::RightParen)?;
+                        let end = parser.prev.as_ref().unwrap().span.end;
+                        Ok(Expr {
+                            span: Span::new(tok.span.start, end),
+                            kind: ExprKind::ImportCall {
+                                specifier: Box::new(specifier),
+                                options: None,
+                            },
+                        })
+                    } else {
+                        Err(parser.error_at(tok.span.start, "Expected import.meta"))
                     }
-                    let end = parser.prev.as_ref().unwrap().span.end;
-                    Ok(Expr {
-                        span: Span::new(tok.span.start, end),
-                        kind: ExprKind::MetaProperty {
-                            meta: intern_utf8("import"),
-                            property: meta_atom,
-                        },
-                    })
                 } else {
                     parser.expect_punct(TokenKind::LeftParen)?;
                     let specifier = parse_assignment(parser, true)?;
                     let options = if parser.eat_punct(TokenKind::Comma)? {
-                        Some(Box::new(parse_assignment(parser, true)?))
+                        if parser.at_punct(TokenKind::RightParen)? {
+                            None // trailing comma: `import(x,)`
+                        } else {
+                            let expr = parse_assignment(parser, true)?;
+                            parser.eat_punct(TokenKind::Comma)?; // `import(x, y,)`
+                            Some(Box::new(expr))
+                        }
                     } else {
                         None
                     };
@@ -1170,6 +1327,14 @@ fn parse_primary(parser: &mut Parser) -> Result<Expr, JsError> {
         }
         TokenKind::NoSubstitutionTemplate { cooked, raw } => {
             parser.next()?;
+            // spec 13.2.8.1: an untagged template whose TV is undefined (it
+            // contains an invalid escape sequence) is a SyntaxError.
+            if cooked.is_none() {
+                return Err(parser.error_at(
+                    tok.span.start,
+                    "Invalid escape sequence in untagged template literal",
+                ));
+            }
             let element = TemplateElement {
                 cooked,
                 raw,
@@ -1185,18 +1350,38 @@ fn parse_primary(parser: &mut Parser) -> Result<Expr, JsError> {
             })
         }
         TokenKind::TemplateHead { cooked, raw } => {
+            let saved_arrow = parser.reject_arrow;
+            parser.reject_arrow = false;
             parser.next()?;
-            parse_template_rest(parser, cooked, raw, tok.span)
+            let result = parse_template_rest(parser, cooked, raw, tok.span);
+            parser.reject_arrow = saved_arrow;
+            result
         }
         TokenKind::LeftParen => {
+            let saved_arrow = parser.reject_arrow;
+            // The contents of a parenthesized expression are a fresh
+            // expression level, so arrows inside are unconstrained.
+            parser.reject_arrow = false;
             parser.next()?;
-            match parse_paren_contents(parser)? {
+            let result = parse_paren_contents(parser)?;
+            parser.reject_arrow = saved_arrow;
+            match result {
                 ParenResult::Empty => Err(parser.error_at(tok.span.start, "Unexpected token ')'")),
                 ParenResult::Expr(inner) => Ok(Expr {
                     span: tok.span,
                     kind: ExprKind::Paren(Box::new(inner)),
                 }),
                 ParenResult::ArrowParams(params) => {
+                    // An arrow-function parameter list is only a valid
+                    // expression when the enclosing production allows an
+                    // AssignmentExpression; the private-in right operand is
+                    // a ShiftExpression (spec 13.11).
+                    if saved_arrow {
+                        return Err(parser.error_at(
+                            tok.span.start,
+                            "Arrow function is not allowed in a private-in expression",
+                        ));
+                    }
                     parser.expect_punct(TokenKind::Arrow)?;
                     let body = parse_arrow_body(parser, false, &params)?;
                     let end = parser.prev.as_ref().unwrap().span.end;
@@ -1211,8 +1396,20 @@ fn parse_primary(parser: &mut Parser) -> Result<Expr, JsError> {
                 }
             }
         }
-        TokenKind::LeftBracket => parse_array_literal(parser),
-        TokenKind::LeftBrace => parse_object_literal(parser),
+        TokenKind::LeftBracket => {
+            let saved_arrow = parser.reject_arrow;
+            parser.reject_arrow = false;
+            let result = parse_array_literal(parser);
+            parser.reject_arrow = saved_arrow;
+            result
+        }
+        TokenKind::LeftBrace => {
+            let saved_arrow = parser.reject_arrow;
+            parser.reject_arrow = false;
+            let result = parse_object_literal(parser);
+            parser.reject_arrow = saved_arrow;
+            result
+        }
         _ => {
             let tok = parser.peek()?.clone();
             Err(parser.unexpected(&tok))
@@ -1229,6 +1426,12 @@ fn parse_template_rest(
     head_span: Span,
 ) -> Result<Expr, JsError> {
     let start = head_span.start;
+    if head_cooked.is_none() {
+        return Err(parser.error_at(
+            start,
+            "Invalid escape sequence in untagged template literal",
+        ));
+    }
     let mut quasis = vec![TemplateElement {
         cooked: head_cooked,
         raw: head_raw,
@@ -1241,6 +1444,12 @@ fn parse_template_rest(
         let tail = parser.next_with_goal(syntax::LexGoal::TemplateTail)?;
         match tail.kind {
             TokenKind::TemplateMiddle { cooked, raw } => {
+                if cooked.is_none() {
+                    return Err(parser.error_at(
+                        tail.span.start,
+                        "Invalid escape sequence in untagged template literal",
+                    ));
+                }
                 quasis.push(TemplateElement {
                     cooked,
                     raw,
@@ -1248,6 +1457,12 @@ fn parse_template_rest(
                 });
             }
             TokenKind::TemplateTail { cooked, raw } => {
+                if cooked.is_none() {
+                    return Err(parser.error_at(
+                        tail.span.start,
+                        "Invalid escape sequence in untagged template literal",
+                    ));
+                }
                 quasis.push(TemplateElement {
                     cooked,
                     raw,
@@ -1382,7 +1597,20 @@ pub(crate) fn parse_paren_contents(parser: &mut Parser) -> Result<ParenResult, J
 
     let is_arrow = parser.at_punct(TokenKind::Arrow)? && !parser.peek()?.line_break_before;
     if is_arrow {
+        // `(…, ...rest,)` — a trailing comma after a rest parameter is never
+        // part of the ArrowFormalParameters grammar (spec 15.4.1).
+        if trailing_comma
+            && items
+                .last()
+                .is_some_and(|item| matches!(item, ParenItem::Spread(_)))
+        {
+            return Err(parser.error_at(
+                parser.prev.as_ref().unwrap().span.start,
+                "Trailing comma is not allowed after a rest parameter",
+            ));
+        }
         let params = items_to_params(parser, items)?;
+        check_arrow_params(parser, &params)?;
         parser.cover_error = saved_error;
         parser.in_arrow_cover = saved_cover;
         return Ok(ParenResult::ArrowParams(params));
@@ -1460,6 +1688,37 @@ fn items_to_params(
     // Arrow parameters are always unique.
     check_duplicate_params(parser, &params, true)?;
     Ok(params)
+}
+
+/// spec 15.4.1 ArrowFunction early errors: ArrowParameters must not contain
+/// a YieldExpression or an AwaitExpression, and in strict mode may not bind
+/// `eval` or `arguments`.
+fn check_arrow_params(parser: &mut Parser, params: &[BindingElement]) -> Result<(), JsError> {
+    for p in params {
+        if let Some(init) = &p.init {
+            let mut found = false;
+            crate::early_errors::walk_exprs(init, &mut |e| {
+                if matches!(e.kind, ExprKind::Yield { .. } | ExprKind::Await(_)) {
+                    found = true;
+                }
+            });
+            if found {
+                return Err(parser.error_at(
+                    init.span.start,
+                    "Await or yield is not allowed in arrow-function parameters",
+                ));
+            }
+        }
+        if parser.strict {
+            for name in crate::stmt::bound_names(&p.pattern) {
+                if name == intern_utf8("eval") || name == intern_utf8("arguments") {
+                    return Err(parser
+                        .error_at(p.span.start, "Unexpected eval or arguments in strict mode"));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Converts a cover expression to a binding element (arrow param).
@@ -1710,8 +1969,8 @@ fn parse_object_literal_inner(parser: &mut Parser) -> Result<Expr, JsError> {
             let key = parser.parse_property_name()?;
             parser.expect_punct(TokenKind::LeftParen)?;
             parser.expect_punct(TokenKind::RightParen)?;
-            let body = parse_function_body_block(parser, false, false, &[], true, false)?;
-            props.push(ObjectProperty::Get { key, body });
+            let body = parse_function_body_block(parser, false, false, &[], true, false, false)?;
+            props.push(ObjectProperty::Get { key, body: body.0 });
             if !parser.eat_punct(TokenKind::Comma)? {
                 break;
             }
@@ -1721,10 +1980,32 @@ fn parse_object_literal_inner(parser: &mut Parser) -> Result<Expr, JsError> {
             parser.next()?; // `set`
             let key = parser.parse_property_name()?;
             parser.expect_punct(TokenKind::LeftParen)?;
-            let param = parser.parse_binding_pattern()?;
+            // A setter takes a single FormalParameter, which may carry a
+            // default initializer (`set x(v = 1) {}`, spec 13.3.5). Its
+            // params and body parse with [~Yield, ~Await]: a static block's
+            // [+Await] does not leak in (`set accessor(await) {}` is valid).
+            let saved = (parser.in_generator, parser.in_async, parser.allow_super);
+            parser.in_generator = false;
+            parser.in_async = false;
+            parser.allow_super = true;
+            let param_element = parser.parse_binding_element()?;
+            (parser.in_generator, parser.in_async, parser.allow_super) = saved;
             parser.expect_punct(TokenKind::RightParen)?;
-            let body = parse_function_body_block(parser, false, false, &[], true, false)?;
-            props.push(ObjectProperty::Set { key, param, body });
+            let body = parse_function_body_block(
+                parser,
+                false,
+                false,
+                std::slice::from_ref(&param_element),
+                true,
+                false,
+                false,
+            )?;
+            props.push(ObjectProperty::Set {
+                key,
+                param: param_element.pattern,
+                init: param_element.init,
+                body: body.0,
+            });
             if !parser.eat_punct(TokenKind::Comma)? {
                 break;
             }
@@ -1827,14 +2108,20 @@ fn parse_method_tail(
 ) -> Result<Function, JsError> {
     let start = parser.prev.as_ref().unwrap().span.start;
     parser.expect_punct(TokenKind::LeftParen)?;
-    let saved_generator = parser.in_generator;
+    // Methods have a [[HomeObject]], so `super` is available in the formal
+    // parameters as well as the body (spec 13.3.5).
+    let saved = (parser.in_generator, parser.in_async, parser.allow_super);
     parser.in_generator = is_generator;
+    parser.in_async = is_async;
+    parser.allow_super = true;
     let params = parse_parameter_list(parser)?;
-    parser.in_generator = saved_generator;
-    check_duplicate_params(parser, &params, false)?;
-    check_generator_params_no_yield(parser, &params)?;
-    // Methods have a [[HomeObject]], so `super` is available.
-    let body = parse_function_body_block(parser, is_async, is_generator, &params, true, false)?;
+    (parser.in_generator, parser.in_async, parser.allow_super) = saved;
+    // Method definitions are always strict mode code, so duplicate parameter
+    // names are an early error even in sloppy code (spec 13.3.5).
+    check_duplicate_params(parser, &params, true)?;
+    check_function_params(parser, &params, is_async, is_generator)?;
+    let (body, _) =
+        parse_function_body_block(parser, is_async, is_generator, &params, true, false, false)?;
     let end = body.span.end;
     Ok(Function {
         span: Span::new(start, end),
@@ -1855,22 +2142,24 @@ pub(crate) fn parse_function_expression(
 ) -> Result<Expr, JsError> {
     let start = parser.next()?.span.start; // `function`
     let is_generator = parser.eat_punct(TokenKind::Star)?;
-    let name = if parser.at_identifier()? {
-        let (name, _) = parser.parse_identifier()?;
-        Some(name)
-    } else {
-        None
-    };
+    let name = parse_function_expression_name(parser, is_generator, is_async)?;
     parser.expect_punct(TokenKind::LeftParen)?;
-    // Generator params parse with the [Yield] grammar (spec 15.2.2.1), so
-    // `yield` is reserved in them.
-    let saved_generator = parser.in_generator;
+    // Params parse with the function's own [Yield, Await] grammar (spec
+    // 15.4.1): generator params reserve `yield`, async params reserve
+    // `await`, and a plain function's params reset both regardless of the
+    // enclosing context (a static block's [+Await] does not leak in).
+    let saved = (parser.in_generator, parser.in_async);
     parser.in_generator = is_generator;
+    parser.in_async = is_async;
     let params = parse_parameter_list(parser)?;
-    parser.in_generator = saved_generator;
+    (parser.in_generator, parser.in_async) = saved;
     check_duplicate_params(parser, &params, false)?;
-    check_generator_params_no_yield(parser, &params)?;
-    let body = parse_function_body_block(parser, is_async, is_generator, &params, false, false)?;
+    check_function_params(parser, &params, is_async, is_generator)?;
+    let (body, strict) =
+        parse_function_body_block(parser, is_async, is_generator, &params, false, false, false)?;
+    if strict {
+        check_function_name_strict(parser, name, start)?;
+    }
     let end = body.span.end;
     Ok(Expr {
         span: Span::new(start, end),
@@ -1884,6 +2173,68 @@ pub(crate) fn parse_function_expression(
             statement_position: false,
         }),
     })
+}
+
+/// The optional name of a function expression, with the per-form `yield`/
+/// `await` rules (spec 15.4.1): a FunctionExpression's name is
+/// `BindingIdentifier[~Yield, ~Await]` (so `yield` and `await` are ordinary
+/// names even in resumable code), a GeneratorExpression's name rejects
+/// `yield` in all contexts, and an AsyncGeneratorExpression's name rejects
+/// both. The strict-mode name checks (`eval`/`arguments` and the strict
+/// reserved words) are deferred until the body's strictness is known.
+fn parse_function_expression_name(
+    parser: &mut Parser,
+    is_generator: bool,
+    is_async: bool,
+) -> Result<Option<AtomId>, JsError> {
+    if !matches!(parser.peek()?.kind, TokenKind::Identifier(_)) {
+        return Ok(None);
+    }
+    let saved = (parser.in_generator, parser.in_async, parser.strict);
+    match (is_generator, is_async) {
+        (false, false) => {
+            parser.in_generator = false;
+            parser.in_async = false;
+        }
+        (true, false) => {
+            parser.in_generator = true;
+            parser.in_async = false;
+        }
+        (false, true) => {}
+        (true, true) => {
+            parser.in_generator = true;
+            parser.in_async = true;
+        }
+    }
+    parser.strict = false;
+    let name = if parser.at_identifier()? {
+        Some(parser.parse_identifier()?.0)
+    } else {
+        None
+    };
+    (parser.in_generator, parser.in_async, parser.strict) = saved;
+    Ok(name)
+}
+
+/// The strict-mode BindingIdentifier restrictions for a function-expression
+/// or function-declaration name (spec 15.4.1): `eval`/`arguments` and the
+/// strict reserved words are forbidden when the name is contained in strict
+/// mode code.
+pub(crate) fn check_function_name_strict(
+    parser: &Parser,
+    name: Option<AtomId>,
+    start: u32,
+) -> Result<(), JsError> {
+    let Some(name) = name else {
+        return Ok(());
+    };
+    if name == intern_utf8("eval") || name == intern_utf8("arguments") {
+        return Err(parser.error_at(start, "Unexpected eval or arguments in strict mode"));
+    }
+    if syntax::keywords::is_future_reserved_word(name) {
+        return Err(parser.error_at(start, "Unexpected reserved word"));
+    }
+    Ok(())
 }
 
 /// Parses `( params )` — the caller has consumed `(`.
@@ -1927,7 +2278,9 @@ pub(crate) fn parse_parameter_list(parser: &mut Parser) -> Result<Vec<BindingEle
 /// Parses `{ FunctionBody }` with the directive prologue and the function
 /// context flags. `params` are declared in the function scope and checked
 /// against the body's lexical declarations. `allow_super`/`in_constructor`
-/// govern the `super` forms legal in the body.
+/// govern the `super` forms legal in the body. Returns the body and whether
+/// the function's code is strict (enclosing strictness or a `"use strict"`
+/// directive in the prologue).
 pub(crate) fn parse_function_body_block(
     parser: &mut Parser,
     is_async: bool,
@@ -1935,7 +2288,8 @@ pub(crate) fn parse_function_body_block(
     params: &[BindingElement],
     allow_super: bool,
     in_constructor: bool,
-) -> Result<Block, JsError> {
+    is_arrow: bool,
+) -> Result<(Block, bool), JsError> {
     parser.expect_punct(TokenKind::LeftBrace)?;
     let body_start = parser.prev.as_ref().unwrap().span.start;
     let directive_strict = scan_directive_prologue(parser)?;
@@ -1955,6 +2309,7 @@ pub(crate) fn parse_function_body_block(
         parser.allow_super,
         parser.in_constructor,
         parser.top_level_await,
+        parser.nt_context,
     );
     parser.strict = strict;
     parser.in_function = true;
@@ -1963,6 +2318,9 @@ pub(crate) fn parse_function_body_block(
     parser.allow_super = allow_super;
     parser.in_constructor = in_constructor;
     parser.top_level_await = false;
+    // Arrows do not establish a new.target context of their own: they
+    // inherit from the enclosing function (spec 13.3.4).
+    parser.nt_context = !is_arrow || parser.nt_context;
     if directive_strict {
         // A `"use strict"` directive makes the already-parsed parameter
         // list strict: `eval`/`arguments` bindings and duplicates become
@@ -1996,11 +2354,15 @@ pub(crate) fn parse_function_body_block(
         parser.allow_super,
         parser.in_constructor,
         parser.top_level_await,
+        parser.nt_context,
     ) = saved;
-    Ok(Block {
-        stmts,
-        span: Span::new(body_start, end),
-    })
+    Ok((
+        Block {
+            stmts,
+            span: Span::new(body_start, end),
+        },
+        strict,
+    ))
 }
 
 /// Whether a parameter list is simple (all plain binding identifiers).
@@ -2011,27 +2373,43 @@ fn is_simple_params(params: &[BindingElement]) -> bool {
 }
 
 /// spec 15.2.2.1: a generator function's FormalParameters must not contain a
-/// YieldExpression. The params parse with the function's own [Yield] grammar
-/// (the callers set `parser.in_generator` first), so `yield` in a default
-/// initializer is a YieldExpression node to walk (instance-yield-expr-in-param).
-pub(crate) fn check_generator_params_no_yield(
+/// YieldExpression, and an async or async-generator function's FormalParameters
+/// must not contain an AwaitExpression. The params parse with the function's
+/// own [Yield]/[Await] grammar (the callers set `parser.in_generator` and
+/// `parser.in_async` first), so `yield`/`await` in a default initializer is a
+/// YieldExpression/AwaitExpression node to walk (instance-yield-expr-in-param,
+/// instance-await-expr-in-param).
+pub(crate) fn check_function_params(
     parser: &mut Parser,
     params: &[BindingElement],
+    is_async: bool,
+    is_generator: bool,
 ) -> Result<(), JsError> {
     for p in params {
-        if let Some(init) = &p.init {
-            let mut found = false;
-            crate::early_errors::walk_exprs(init, &mut |e| {
-                if matches!(e.kind, ExprKind::Yield { .. }) {
-                    found = true;
-                }
-            });
-            if found {
-                return Err(parser.error_at(
-                    init.span.start,
-                    "Yield expression not allowed in generator parameters",
-                ));
+        let Some(init) = &p.init else {
+            continue;
+        };
+        let mut found_yield = false;
+        let mut found_await = false;
+        crate::early_errors::walk_exprs(init, &mut |e| {
+            if matches!(e.kind, ExprKind::Yield { .. }) {
+                found_yield = true;
             }
+            if matches!(e.kind, ExprKind::Await(_)) {
+                found_await = true;
+            }
+        });
+        if is_generator && found_yield {
+            return Err(parser.error_at(
+                init.span.start,
+                "Yield expression not allowed in generator parameters",
+            ));
+        }
+        if is_async && found_await {
+            return Err(parser.error_at(
+                init.span.start,
+                "Await expression not allowed in async function parameters",
+            ));
         }
     }
     Ok(())
@@ -2074,12 +2452,11 @@ pub(crate) fn scan_directive_prologue(parser: &mut Parser) -> Result<bool, JsErr
         let TokenKind::StringLiteral { value, .. } = tok.kind else {
             break;
         };
-        // A directive must not contain escapes (spec 14.1.1).
+        // A Use Strict Directive must not contain escapes (spec 14.1.1), but
+        // an escaped string is still a directive: the prologue continues past
+        // it (`"\x41"; "use strict"` is strict).
         let raw = parser.source_slice(tok.span);
-        if raw.contains(&0x5C_u16) {
-            break;
-        }
-        if value.to_string_lossy() == "use strict" {
+        if !raw.contains(&0x5C_u16) && value.to_string_lossy() == "use strict" {
             saw_strict = true;
         }
         let next = parser.next()?;
@@ -2106,13 +2483,14 @@ fn parse_arrow_body(
 ) -> Result<ArrowBody, JsError> {
     // `=>` consumed by the caller.
     if parser.at_punct(TokenKind::LeftBrace)? {
-        let body = parse_function_body_block(
+        let (body, _) = parse_function_body_block(
             parser,
             is_async,
             false,
             params,
             parser.allow_super,
             parser.in_constructor,
+            true,
         )?;
         Ok(ArrowBody::Block(body))
     } else {

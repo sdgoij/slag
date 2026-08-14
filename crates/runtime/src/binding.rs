@@ -18,7 +18,7 @@ use syntax::ast::{
 };
 
 use crate::agent::Agent;
-use crate::context::{get_property_key, put_value, resolve_binding};
+use crate::context::{Reference, get_property_key, put_value, resolve_binding};
 use crate::env::EnvRef;
 use crate::expr::{eval_expr, eval_reference, get_iterator, iterator_close, iterator_step};
 
@@ -162,10 +162,38 @@ fn keyed_binding_initialization(
     env: Option<&EnvRef>,
     strict: bool,
 ) -> Result<(), JsError> {
-    let mut value = get_property_key(agent, value, key, value.clone())?;
+    // SingleNameBinding resolves its target before GetV (spec 13.2.3.7
+    // steps 1-3): the binding's observable resolution (a `with` object's
+    // HasBinding, a Proxy `has` trap) precedes the property read.
+    // A nested pattern has no lhs of its own; the bind happens inside it.
+    let resolved = match &element.pattern {
+        BindingPattern::Ident(atom) => {
+            let name = crux::lookup(*atom);
+            match env {
+                Some(env) => Some(ResolvedTarget::Initialize(env.clone(), name)),
+                None => Some(ResolvedTarget::Reference(resolve_binding(
+                    agent, &name, strict,
+                )?)),
+            }
+        }
+        _ => None,
+    };
+    let value = get_property_key(agent, value, key, value.clone())?;
     let name = binding_ident_name(&element.pattern);
-    value = apply_element_default(agent, value, element.init.as_ref(), name.as_ref(), strict)?;
-    binding_initialization(agent, &element.pattern, value, env, strict)
+    let value = apply_element_default(agent, value, element.init.as_ref(), name.as_ref(), strict)?;
+    match resolved {
+        Some(ResolvedTarget::Initialize(env, name)) => env.initialize_binding(&name, value),
+        Some(ResolvedTarget::Reference(reference)) => put_value(agent, &reference, value),
+        None => binding_initialization(agent, &element.pattern, value, env, strict),
+    }
+}
+
+/// The pre-resolved write target of a keyed SingleNameBinding.
+enum ResolvedTarget {
+    /// InitializeReferencedBinding of a pre-created lexical binding.
+    Initialize(EnvRef, JsString),
+    /// PutValue of the resolved `var`/assignment reference.
+    Reference(Reference),
 }
 
 /// RestBindingInitialization (spec 13.2.3.6): the remaining enumerable own
@@ -303,9 +331,9 @@ pub(crate) fn rest_object(agent: &Agent) -> Result<crux::handle::Handle<JsObject
 }
 
 /// CopyDataProperties (spec 14.1.16) with an excluded-name list: copy the
-/// enumerable own properties of `from` to `to`, skipping excluded keys and
-/// keys `to` already has. `null`/`undefined` contribute nothing; other
-/// primitives are boxed first (a String contributes its index properties).
+/// enumerable own properties of `from` to `to`, skipping excluded keys.
+/// `null`/`undefined` contribute nothing; other primitives are boxed first
+/// (a String contributes its index properties).
 pub fn copy_data_properties_excluding(
     agent: &mut Agent,
     to: &crux::object::JsObject,
@@ -319,7 +347,7 @@ pub fn copy_data_properties_excluding(
         return Ok(());
     };
     for key in from_obj.own_property_keys()? {
-        if excluded.contains(&key) || to.has_own_property_key(&key)? {
+        if excluded.contains(&key) {
             continue;
         }
         let property = from_obj.get_own_property_key(&key)?;
@@ -360,33 +388,9 @@ pub fn destructuring_assignment(
     }
 }
 
-/// Assign `value` to one element target of an assignment pattern: `expr` may
-/// carry a default (`target = init`), a nested pattern, or a plain
-/// identifier/member target (spec 13.15.4.1 AssignmentElement).
-fn assign_element(
-    agent: &mut Agent,
-    expr: &Expr,
-    value: Value,
-    strict: bool,
-) -> Result<(), JsError> {
-    let (inner, init) = match &expr.kind {
-        ExprKind::Assign {
-            op: AssignOp::Assign,
-            target,
-            value: initializer,
-        } => (target.as_ref(), Some(initializer.as_ref())),
-        _ => (expr, None),
-    };
-    let name = match &inner.kind {
-        ExprKind::Ident(id) => Some(crux::lookup(*id)),
-        _ => None,
-    };
-    let value = apply_element_default(agent, value, init, name.as_ref(), strict)?;
-    assign_target(agent, inner, value, strict)
-}
-
 /// Write `value` to a single assignment target: a nested Array/Object pattern
-/// recurses, anything else is a reference.
+/// recurses, anything else is a reference (with a lazily-converted computed
+/// key, spec 13.15.4.2).
 fn assign_target(
     agent: &mut Agent,
     target: &Expr,
@@ -398,8 +402,8 @@ fn assign_target(
         ExprKind::Object(lit) => object_assignment(agent, lit, value, strict),
         ExprKind::Paren(inner) => assign_target(agent, inner, value, strict),
         _ => {
-            let reference = eval_reference(agent, target, strict)?;
-            put_value(agent, &reference, value)
+            let reference = crate::expr::eval_assignment_target(agent, target, strict)?;
+            reference.put(agent, value)
         }
     }
 }
@@ -446,7 +450,7 @@ fn array_assignment(
                     let reference = if nested {
                         None
                     } else {
-                        Some(eval_reference(agent, inner, strict)?)
+                        Some(crate::expr::eval_assignment_target(agent, inner, strict)?)
                     };
                     let next = match iterator_step(agent, &iterator) {
                         Ok(Some(next)) => next,
@@ -465,7 +469,7 @@ fn array_assignment(
                     };
                     let next = apply_element_default(agent, next, init, name.as_ref(), strict)?;
                     match reference {
-                        Some(reference) => put_value(agent, &reference, next)?,
+                        Some(reference) => reference.put(agent, next)?,
                         None => assign_target(agent, inner, next, strict)?,
                     }
                 }
@@ -477,7 +481,7 @@ fn array_assignment(
                     let reference = if nested {
                         None
                     } else {
-                        Some(eval_reference(agent, expr, strict)?)
+                        Some(crate::expr::eval_assignment_target(agent, expr, strict)?)
                     };
                     let mut collected = Vec::new();
                     loop {
@@ -495,7 +499,7 @@ fn array_assignment(
                     }
                     let array = crate::builtins::array::array_from_values(agent, &collected)?;
                     match reference {
-                        Some(reference) => put_value(agent, &reference, array)?,
+                        Some(reference) => reference.put(agent, array)?,
                         None => assign_target(agent, expr, array, strict)?,
                     }
                 }
@@ -547,8 +551,34 @@ fn object_assignment(
                 key, value: target, ..
             } => {
                 let key = property_name_to_key(agent, key, strict)?;
+                // KeyedDestructuringAssignmentEvaluation (spec 13.15.4.2):
+                // the target reference is evaluated before the property value
+                // is read, with its computed key conversion deferred to
+                // PutValue.
+                let (inner, init) = match &target.kind {
+                    ExprKind::Assign {
+                        op: AssignOp::Assign,
+                        target,
+                        value: initializer,
+                    } => (target.as_ref(), Some(initializer.as_ref())),
+                    _ => (target, None),
+                };
+                let nested = matches!(&inner.kind, ExprKind::Array(_) | ExprKind::Object(_));
+                let lazy = if nested {
+                    None
+                } else {
+                    Some(crate::expr::eval_assignment_target(agent, inner, strict)?)
+                };
                 let prop_value = get_property_key(agent, &value, &key, value.clone())?;
-                assign_element(agent, target, prop_value, strict)?;
+                let name = match &inner.kind {
+                    ExprKind::Ident(id) => Some(crux::lookup(*id)),
+                    _ => None,
+                };
+                let rhs = apply_element_default(agent, prop_value, init, name.as_ref(), strict)?;
+                match lazy {
+                    Some(lazy) => lazy.put(agent, rhs)?,
+                    None => assign_target(agent, inner, rhs, strict)?,
+                }
                 excluded.push(key);
             }
             ObjectProperty::Spread(expr) => {

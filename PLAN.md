@@ -2056,8 +2056,9 @@ phase therefore delivers:
 or are explicitly deferred in `docs/perf.md`; embedding API documented with examples.
 
 **Status (in progress):** the embedding API and CLI workstreams are delivered and documented
-with doc-tests/examples; the conformance and perf docs exist; the GC and performance
-milestones are explicitly deferred (gates and rationale in `docs/perf.md`).
+with doc-tests/examples; the conformance target is certified at **100% of runnable** across
+all three sweep areas (see `docs/conformance.md`); the GC and performance milestones are
+explicitly deferred (gates and rationale in `docs/perf.md`).
 
 Delivered:
 - **Embedding API** (`crates/runtime/src/embed.rs`, exported as `runtime::Context`):
@@ -2076,10 +2077,15 @@ Delivered:
   skip taxonomy, and the expected non-runnable categories (Intl, `dynamic import` without a
   loader, host-dependent behavior). `docs/perf.md` documents the benchmark gate and the
   deferred milestones.
+- **Conformance certification**: the full ~49k-fixture release sweep (`test262-sweep`, all
+  three areas, long config) measures **100% of runnable** — language 18,052 / built-ins
+  17,179 / annexB 956 pass, 0 fail, 0 crash, 0 hang of 48,622 fixtures (module/async,
+  host-dependent, and out-of-scope Temporal/ShadowRealm/await-dictionary fixtures
+  skipped). The language area closed via the direct-eval caller-context rules, the
+  field-initializer evaluation context, and the Annex B restorations; `docs/conformance.md`
+  records the full triage.
 
 Remaining before exit criteria:
-- Certify the ≥ 95%-of-runnable conformance target by running the full ~49k-fixture sweep
-  (unbounded run is ~10 min; `SWEEP_SAMPLE` bounds it) and recording the triage.
 - GC milestone (arena heap + mark-sweep, `--gc-stress`, leak harness) and the performance
   milestones (NaN-boxed `Value`, bytecode VM, shapes/ICs, string ropes) stay deferred per
   `docs/perf.md`.
@@ -2108,7 +2114,7 @@ Remaining before exit criteria:
 | 15 | Iterator/async/promise/dispose | ch. 26 | 85% |
 | 16 | Proxy, Reflect | ch. 27 | 90–92% |
 | 17 | Memory model (feature-gated) | ch. 28 | unchanged |
-| 18 | Hardening, GC, perf, embedder | all | ≥ 95% (vendored: 3317 pass; full sweep pending) |
+| 18 | Hardening, GC, perf, embedder | all | 100% of runnable (36,187 pass / 0 fail of 48,622 fixtures) |
 
 Percentages are planning estimates; the exit criteria in each phase are authoritative.
 
@@ -2142,11 +2148,12 @@ Percentages are planning estimates; the exit criteria in each phase are authorit
 
 ## 10. Definition of done
 
-- [ ] `cargo build --workspace` and `cargo test --workspace` green on stable Rust; clippy clean.
+- [x] `cargo build --workspace` and `cargo test --workspace` green on stable Rust; clippy clean.
 - [ ] Every `pub` item in every crate has inline unit tests (§5); the coverage gate passes at 100%
       `pub`-item coverage.
-- [ ] `jsrt file.js` and the REPL execute ES2026 scripts; `--dump-ast`/`--dump-tokens` work.
-- [ ] test262 at **≥ 95%** of runnable tests; all failures triaged in `docs/conformance.md`.
+- [x] `jsrt file.js` and the REPL execute ES2026 scripts; `--dump-ast`/`--dump-tokens` work.
+- [x] test262 at **≥ 95%** of runnable tests; all failures triaged in `docs/conformance.md`
+      (100% of runnable measured across language/built-ins/annexB).
 - [ ] GC milestone active (no unbounded leaks on long-running programs; `WeakRef`/`FinalizationRegistry`
       semantics verified).
 - [ ] Embedding API (`jsrt::Context`, host hooks) documented with working examples.

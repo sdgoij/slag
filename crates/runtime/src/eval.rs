@@ -35,31 +35,48 @@ pub(crate) fn eval_statement_list(
     stmts: &[Stmt],
     strict: bool,
 ) -> Result<Completion, JsError> {
+    // The list runs in the current lexical environment, whose `using`
+    // resources are disposed when the list completes (spec 14.2.3 step 6:
+    // DisposeResources of the block/function/eval environment).
+    let env = agent.running_context()?.lexical_environment.clone();
+    let completion = eval_statement_list_inner(agent, stmts, strict);
+    dispose_env_resources(agent, &env, completion)
+}
+
+fn eval_statement_list_inner(
+    agent: &mut Agent,
+    stmts: &[Stmt],
+    strict: bool,
+) -> Result<Completion, JsError> {
+    // The running value of the list so far: ~empty~ until a value-producing
+    // statement runs (spec 14.2.1: UpdateEmpty(s, sl)).
     let mut list_value = Value::Undefined;
-    let mut completion = Completion::normal();
+    let mut list_is_empty = true;
+    let mut completion = Completion::Empty;
     for (index, stmt) in stmts.iter().enumerate() {
         completion = eval_statement(agent, stmt, strict)?;
         match &mut completion {
-            Completion::Normal(value) => list_value = value.clone(),
-            // UpdateEmpty (spec 14.2.2 step 5): an abrupt statement inherits
-            // the preceding statement list's value.
+            Completion::Normal(value) => {
+                list_value = value.clone();
+                list_is_empty = false;
+            }
             Completion::Break { value, .. } | Completion::Continue { value, .. }
-                if index > 0 && value.is_none() =>
+                if index > 0 && value.is_none() && !list_is_empty =>
             {
                 *value = Some(list_value.clone());
             }
-            // A declaration/empty statement has an ~empty~ value; the list
-            // fills it from the preceding statements.
-            Completion::Empty => {
-                completion = Completion::Normal(list_value.clone());
-            }
             _ => {}
         }
-        if !matches!(completion, Completion::Normal(_)) {
+        if !matches!(completion, Completion::Normal(_) | Completion::Empty) {
             break;
         }
     }
-    Ok(completion)
+    // UpdateEmpty (spec 14.2.1 step 3): an ~empty~ trailing completion
+    // inherits the value of the preceding statement list.
+    match completion {
+        Completion::Empty if !list_is_empty => Ok(Completion::Normal(list_value)),
+        other => Ok(other),
+    }
 }
 
 /// Evaluate a single statement (spec 14.x runtime semantics). Shared with the
@@ -75,17 +92,29 @@ pub(crate) fn eval_statement(
         StmtKind::VarDecl { kind, decls } => {
             match kind {
                 VarDeclKind::Var => eval_var_declarations(agent, decls, strict)?,
-                VarDeclKind::Let
-                | VarDeclKind::Const
-                | VarDeclKind::Using
-                | VarDeclKind::AwaitUsing => {
+                VarDeclKind::Using => {
+                    eval_using_declarations(agent, decls, strict, DisposalKind::Sync)?
+                }
+                VarDeclKind::AwaitUsing => {
+                    eval_using_declarations(agent, decls, strict, DisposalKind::Async)?
+                }
+                VarDeclKind::Let | VarDeclKind::Const => {
                     eval_lexical_declarations(agent, decls, strict)?;
                 }
             }
             Ok(Completion::Empty)
         }
-        StmtKind::UsingDecl { decls, .. } => {
-            eval_lexical_declarations(agent, decls, strict)?;
+        StmtKind::UsingDecl { is_await, decls } => {
+            eval_using_declarations(
+                agent,
+                decls,
+                strict,
+                if *is_await {
+                    DisposalKind::Async
+                } else {
+                    DisposalKind::Sync
+                },
+            )?;
             Ok(Completion::Empty)
         }
         StmtKind::FunctionDecl(f) if f.statement_position && !strict => {
@@ -188,16 +217,31 @@ fn eval_var_declarations(
 ) -> Result<(), JsError> {
     for decl in decls {
         if let Some(init) = &decl.init {
-            let value = eval_expr(agent, init, strict)?;
-            // BindingInitialization with no environment: resolve and PutValue
-            // the hoisted var binding (spec 14.3.2 step 2.b).
-            if let BindingPattern::Ident(name) = &decl.pattern
-                && crate::function::is_anonymous_function_definition(init)
-            {
-                // spec 14.3.2 step 2.b: SetFunctionName from the identifier.
-                crate::function::set_function_name(&value, &crux::lookup(*name), None)?;
+            // spec 14.3.2 step 2: ResolveBinding runs before the initializer,
+            // so a `with` binding object's property is the assignment target
+            // even when the initializer mutates the object.
+            let reference = match &decl.pattern {
+                BindingPattern::Ident(name) => Some(crate::context::resolve_binding(
+                    agent,
+                    &crux::lookup(*name),
+                    strict,
+                )?),
+                _ => None,
+            };
+            let value = eval_named_initializer(agent, init, pattern_ident(&decl.pattern), strict)?;
+            match reference {
+                // spec 14.3.2 step 2.e: PutValue the pre-resolved reference.
+                Some(reference) => crate::context::put_value(agent, &reference, value)?,
+                // BindingInitialization with no environment resolves and
+                // PutValue's the hoisted var binding (spec 14.3.2 step 3).
+                None => crate::binding::binding_initialization(
+                    agent,
+                    &decl.pattern,
+                    value,
+                    None,
+                    strict,
+                )?,
             }
-            crate::binding::binding_initialization(agent, &decl.pattern, value, None, strict)?;
         }
     }
     Ok(())
@@ -211,6 +255,37 @@ fn eval_lexical_declarations(
     decls: &[syntax::ast::VarDeclarator],
     strict: bool,
 ) -> Result<(), JsError> {
+    eval_lexical_binding_list(agent, decls, strict, DisposalKind::Normal)
+}
+
+/// One `using`/`await using` binding list (spec 15.14.4 BindingEvaluation):
+/// like a lexical declaration, but each initialized value is registered with
+/// AddDisposableResource before its binding is initialized.
+fn eval_using_declarations(
+    agent: &mut Agent,
+    decls: &[syntax::ast::VarDeclarator],
+    strict: bool,
+    kind: DisposalKind,
+) -> Result<(), JsError> {
+    eval_lexical_binding_list(agent, decls, strict, kind)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum DisposalKind {
+    Normal,
+    Sync,
+    Async,
+}
+
+/// Evaluate a lexical declaration's BindingList against the running lexical
+/// environment (spec 14.2.2 step 2): evaluate each initializer, register
+/// `using` resources, then InitializeReferencedBinding.
+fn eval_lexical_binding_list(
+    agent: &mut Agent,
+    decls: &[syntax::ast::VarDeclarator],
+    strict: bool,
+    kind: DisposalKind,
+) -> Result<(), JsError> {
     // BindingInitialization against the running LexicalEnvironment: the
     // bindings were created uninitialized by declaration instantiation and
     // are filled with InitializeBinding (spec 14.2.2 step 2.c).
@@ -218,20 +293,148 @@ fn eval_lexical_declarations(
     for decl in decls {
         let value = match &decl.init {
             Some(init) => {
-                let value = eval_expr(agent, init, strict)?;
-                if let BindingPattern::Ident(name) = &decl.pattern
-                    && crate::function::is_anonymous_function_definition(init)
-                {
-                    // spec 14.2.2 step 2.d: SetFunctionName from the binding.
-                    crate::function::set_function_name(&value, &crux::lookup(*name), None)?;
-                }
-                value
+                eval_named_initializer(agent, init, pattern_ident(&decl.pattern), strict)?
             }
             None => Value::Undefined,
         };
+        if kind != DisposalKind::Normal {
+            let resource = create_disposable_resource(agent, &value, kind)?;
+            env.add_disposable_resource(resource);
+        }
         crate::binding::binding_initialization(agent, &decl.pattern, value, Some(&env), strict)?;
     }
     Ok(())
+}
+
+/// The identifier of a simple binding pattern, if any.
+fn pattern_ident(pattern: &BindingPattern) -> Option<crux::string::AtomId> {
+    match pattern {
+        BindingPattern::Ident(name) => Some(*name),
+        _ => None,
+    }
+}
+
+/// Evaluate a binding initializer, applying the inferred name of an
+/// anonymous function/class definition (spec 14.2.2 step 2.d / 14.3.2 step
+/// 2.b). An anonymous class expression receives the name through the
+/// definition itself so its static field initializers observe it.
+fn eval_named_initializer(
+    agent: &mut Agent,
+    init: &syntax::ast::Expr,
+    binding: Option<crux::string::AtomId>,
+    strict: bool,
+) -> Result<Value, JsError> {
+    if let (ExprKind::Class(class), Some(binding)) = (&init.kind, binding)
+        && class.name.is_none()
+    {
+        return crate::class::class_definition_evaluation(agent, class, Some(binding), strict);
+    }
+    let value = eval_expr(agent, init, strict)?;
+    if let Some(binding) = binding
+        && crate::function::is_anonymous_function_definition(init)
+    {
+        crate::function::set_function_name(&value, &crux::lookup(binding), None)?;
+    }
+    Ok(value)
+}
+
+/// CreateDisposableResource (spec 9.3.1): capture the @@dispose method of an
+/// initialized `using` value; *null*/*undefined* values register nothing, and
+/// non-objects, missing, and non-callable dispose methods are TypeErrors.
+fn create_disposable_resource(
+    agent: &mut Agent,
+    value: &Value,
+    kind: DisposalKind,
+) -> Result<crate::env::DisposableResource, JsError> {
+    if matches!(value, Value::Null | Value::Undefined) {
+        return Ok(crate::env::DisposableResource {
+            value: Value::Undefined,
+            method: Value::Undefined,
+        });
+    }
+    if crate::context::as_object(value).is_none() {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "using declarations may only initialize objects".into(),
+        ));
+    }
+    let symbol = if kind == DisposalKind::Async {
+        "@@asyncDispose"
+    } else {
+        "@@dispose"
+    };
+    // spec 9.3.1 GetDisposeMethod: an async context falls back to the sync
+    // @@dispose method.
+    let mut method = crate::expr::get_method(agent, value, symbol)?;
+    if kind == DisposalKind::Async && method.is_none() {
+        method = crate::expr::get_method(agent, value, "@@dispose")?;
+    }
+    let method = method.unwrap_or(Value::Undefined);
+    if matches!(method, Value::Undefined) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Object is not disposable".into(),
+        ));
+    }
+    Ok(crate::env::DisposableResource {
+        value: value.clone(),
+        method,
+    })
+}
+
+/// DisposeResources (spec 9.4.3): run an environment's registered dispose
+/// methods in reverse order, folding a throwing disposal into the completion
+/// — a SuppressedError when the completion is itself a throw, otherwise the
+/// disposal error replaces it.
+pub(crate) fn dispose_env_resources(
+    agent: &mut Agent,
+    env: &EnvRef,
+    completion: Result<Completion, JsError>,
+) -> Result<Completion, JsError> {
+    let resources = env.drain_disposable_resources();
+    if resources.is_empty() {
+        return completion;
+    }
+    let mut completion = completion;
+    for resource in resources.iter().rev() {
+        if matches!(resource.method, Value::Undefined) {
+            continue;
+        }
+        match crate::function::call(agent, &resource.method, resource.value.clone(), &[]) {
+            Ok(_) => {}
+            Err(disposal_error) => {
+                let disposal_value = crate::promise::error_value(agent, &disposal_error);
+                match &mut completion {
+                    Ok(Completion::Throw(original)) => {
+                        let suppressed = std::mem::replace(original, Value::Undefined);
+                        *original = crate::builtins::disposable::make_suppressed_error(
+                            agent,
+                            disposal_value,
+                            suppressed,
+                        )?;
+                    }
+                    Err(original) if original.value.is_some() => {
+                        let suppressed = crate::promise::error_value(agent, original);
+                        completion = Ok(Completion::Throw(
+                            crate::builtins::disposable::make_suppressed_error(
+                                agent,
+                                disposal_value,
+                                suppressed,
+                            )?,
+                        ));
+                    }
+                    _ => {
+                        completion = Err(JsError::new(
+                            ErrorKind::TypeError,
+                            "Uncaught disposal error".into(),
+                        )
+                        .with_value(disposal_value));
+                    }
+                }
+            }
+        }
+    }
+    completion
 }
 
 /// Annex B: a statement-position function declaration (`if (x) function
@@ -299,15 +502,10 @@ fn eval_function_declaration(
         return Ok(());
     }
 
-    // A top-level function declaration: the binding was created and
-    // initialized by declaration instantiation; evaluation is empty. Only
-    // the Annex B statement-position forms (if/while bodies) create the
-    // binding at evaluation time.
-    if variable_env.has_binding(&name)? {
-        return Ok(());
-    }
-    let func_obj = crate::function::instantiate_function(agent, f, lexical_env.clone(), strict)?;
-    variable_env.set_mutable_binding(&name, func_obj, false)?;
+    // A top-level function declaration: declaration instantiation created
+    // and initialized the binding; evaluation is empty (spec 15.2.6). A
+    // binding deleted at runtime stays deleted — the declaration must not
+    // re-create it.
     Ok(())
 }
 
@@ -386,7 +584,15 @@ pub(crate) fn block_declaration_instantiation_iter<'a>(
                     let mut names = Vec::new();
                     bound_names(&decl.pattern, &mut names);
                     for name in names {
-                        block_env.create_mutable_binding(&name, false)?;
+                        if *kind == VarDeclKind::Const
+                            || matches!(*kind, VarDeclKind::Using | VarDeclKind::AwaitUsing)
+                        {
+                            // `using` bindings are immutable like `const`
+                            // (spec 15.14.2).
+                            block_env.create_immutable_binding(&name, true)?;
+                        } else {
+                            block_env.create_mutable_binding(&name, false)?;
+                        }
                     }
                 }
             }
@@ -395,7 +601,7 @@ pub(crate) fn block_declaration_instantiation_iter<'a>(
                     let mut names = Vec::new();
                     bound_names(&decl.pattern, &mut names);
                     for name in names {
-                        block_env.create_mutable_binding(&name, false)?;
+                        block_env.create_immutable_binding(&name, true)?;
                     }
                 }
             }
@@ -415,8 +621,10 @@ pub(crate) fn block_declaration_instantiation_iter<'a>(
                     // already binds the name. The binding itself was created
                     // (or deliberately not created) by the enclosing
                     // declaration instantiation (B.3.3.x), which applied the
-                    // early-error checks; only set it here.
-                    if !strict && !already_bound {
+                    // early-error checks; only set it here. The hoist covers
+                    // plain FunctionDeclarations only — generator and async
+                    // declarations stay block-scoped.
+                    if !strict && !already_bound && !f.is_async && !f.is_generator {
                         let variable_env = agent.running_context()?.variable_environment.clone();
                         // Only names whose hoist B.3.3.x deemed applicable
                         // (no enclosing lexical conflict) are marked; the
@@ -606,43 +814,63 @@ fn eval_for(
     let old_env = agent.running_context()?.lexical_environment.clone();
     let mut fresh_env: Option<EnvRef> = None;
     let mut per_iteration: Vec<crux::string::JsString> = Vec::new();
-    match init {
-        None => {}
-        Some(ForInit::Expr(expr)) => {
-            eval_expr(agent, expr, strict)?;
-        }
+    let head_result = match init {
+        None => Ok(()),
+        Some(ForInit::Expr(expr)) => eval_expr(agent, expr, strict).map(|_| ()),
         Some(ForInit::VarDecl { kind, decls }) => {
             if *kind == VarDeclKind::Var {
-                eval_var_declarations(agent, decls, strict)?;
+                eval_var_declarations(agent, decls, strict)
             } else {
+                // spec 14.7.4.2 steps 2-8: the loop environment is the running
+                // environment while the lexical declaration's initializers
+                // run (closures capture it), and `const` heads share one
+                // binding while `let`/`using` heads get per-iteration copies.
                 let env = new_declarative_environment(Some(old_env.clone()));
                 for decl in decls {
                     let mut names = Vec::new();
                     crate::script::bound_names(&decl.pattern, &mut names);
                     for name in &names {
-                        if *kind == VarDeclKind::Const {
+                        if *kind == VarDeclKind::Const
+                            || matches!(*kind, VarDeclKind::Using | VarDeclKind::AwaitUsing)
+                        {
+                            // `using` heads bind immutably like `const` and,
+                            // like `const`, get no per-iteration copies.
                             env.create_immutable_binding(name, true)?;
                         } else {
                             env.create_mutable_binding(name, false)?;
                         }
                     }
-                    let value = match &decl.init {
-                        Some(init) => eval_expr(agent, init, strict)?,
-                        None => Value::Undefined,
-                    };
-                    crate::binding::binding_initialization(
-                        agent,
-                        &decl.pattern,
-                        value,
-                        Some(&env),
-                        strict,
-                    )?;
-                    crate::script::bound_names(&decl.pattern, &mut per_iteration);
+                    if *kind != VarDeclKind::Const
+                        && !matches!(*kind, VarDeclKind::Using | VarDeclKind::AwaitUsing)
+                    {
+                        crate::script::bound_names(&decl.pattern, &mut per_iteration);
+                    }
                 }
                 agent.running_context_mut()?.lexical_environment = env.clone();
-                fresh_env = Some(env);
+                fresh_env = Some(env.clone());
+                let kind = match *kind {
+                    VarDeclKind::Using => DisposalKind::Sync,
+                    VarDeclKind::AwaitUsing => DisposalKind::Async,
+                    _ => DisposalKind::Normal,
+                };
+                let result = eval_lexical_binding_list(agent, decls, strict, kind);
+                if let Err(error) = result {
+                    // spec 14.7.4.2 step 9: an abrupt head disposes the loop
+                    // environment's resources before propagating.
+                    let env = agent.running_context()?.lexical_environment.clone();
+                    let disposed = dispose_env_resources(agent, &env, Err(error));
+                    agent.running_context_mut()?.lexical_environment = old_env;
+                    return disposed;
+                }
+                Ok(())
             }
         }
+    };
+    if let Err(error) = head_result {
+        if fresh_env.is_some() {
+            agent.running_context_mut()?.lexical_environment = old_env;
+        }
+        return Err(error);
     }
     // spec 14.7.4.2 step 2: the first per-iteration environment is created
     // before the first test; the loop installs a fresh copy each iteration.
@@ -698,22 +926,42 @@ fn eval_for(
             eval_expr(agent, update, strict)?;
         }
     };
-    if fresh_env.is_some() {
+    if let Some(fresh_env) = fresh_env {
+        // spec 14.7.4.2 step 13: the loop environment's `using` resources are
+        // disposed when the loop completes.
+        let result = dispose_env_resources(agent, &fresh_env, result);
         agent.running_context_mut()?.lexical_environment = old_env;
+        result
+    } else {
+        result
     }
-    result
 }
 
 /// ForIn/ForOfBodyEvaluation: the enumerable string keys of `rhs` and its
 /// prototype chain, in walk order (spec 14.7.5.6 steps 2-6). Shared with the
 /// resumable-function IR's `ForInBegin` step.
 pub(crate) fn for_in_keys(_agent: &mut Agent, rhs: &Value) -> Result<Vec<Value>, JsError> {
+    Ok(for_in_key_levels_inner(rhs)?
+        .into_iter()
+        .map(|(_, key)| key)
+        .collect())
+}
+
+/// Like `for_in_keys`, but tagging each key with the prototype-chain level it
+/// was found at, so a key deleted during enumeration can be re-checked against
+/// its own level at visit time (spec EnumerateObjectProperties).
+fn for_in_key_levels(rhs: &Value) -> Result<Vec<(usize, Value)>, JsError> {
+    for_in_key_levels_inner(rhs)
+}
+
+fn for_in_key_levels_inner(rhs: &Value) -> Result<Vec<(usize, Value)>, JsError> {
     let mut seen: HashSet<PropertyKey> = HashSet::new();
-    let mut keys: Vec<Value> = Vec::new();
+    let mut keys: Vec<(usize, Value)> = Vec::new();
     // ToObject of the enumerated value (spec step 2): functions box to
     // themselves, so a callable receiver enumerates its own properties too.
     if let Some(obj) = crate::context::as_object(rhs) {
         let mut current = Some(obj);
+        let mut level = 0;
         while let Some(obj) = current {
             for key in obj.own_property_keys()? {
                 let PropertyKey::String(_) = key else {
@@ -725,22 +973,83 @@ pub(crate) fn for_in_keys(_agent: &mut Agent, rhs: &Value) -> Result<Vec<Value>,
                 if let Some(property) = obj.get_own_property_key(&key)?
                     && property.enumerable
                 {
-                    keys.push(key_value(&key));
+                    keys.push((level, key_value(&key)));
                 }
             }
             current = obj.get_prototype_of()?;
+            level += 1;
         }
     } else if let Value::String(text) = rhs {
         // ToObject of a primitive string: its own enumerable index keys.
         for index in 0..text.len() {
-            keys.push(Value::String(Handle::new(JsString::from_utf8(
-                &index.to_string(),
-            ))));
+            keys.push((
+                0,
+                Value::String(Handle::new(JsString::from_utf8(&index.to_string()))),
+            ));
         }
     } else if matches!(rhs, Value::Undefined | Value::Null) {
         return Ok(Vec::new());
     }
     Ok(keys)
+}
+
+/// Whether `key` (a string value) is still an enumerable own property of the
+/// `level`-th object in `obj`'s prototype chain (a key deleted during
+/// enumeration is skipped — spec EnumerateObjectProperties step 5.a.v).
+fn key_enumerable_at_level(
+    obj: &Handle<crux::object::JsObject>,
+    level: usize,
+    key: &Value,
+) -> Result<bool, JsError> {
+    let Value::String(key) = key else {
+        return Ok(false);
+    };
+    let key = PropertyKey::from_js_string(key);
+    let mut current = Some(obj.clone());
+    for _ in 0..level {
+        let Some(next) = current else {
+            return Ok(false);
+        };
+        current = next.get_prototype_of()?;
+    }
+    let Some(obj) = current else {
+        return Ok(false);
+    };
+    match obj.get_own_property_key(&key)? {
+        Some(property) => Ok(property.enumerable),
+        None => Ok(false),
+    }
+}
+
+/// ForIn/OfHeadEvaluation (spec 14.7.5.5): the RHS runs in a TDZ environment
+/// that uninitializedly binds the lexical head names, so a reference to them
+/// from the head expression throws.
+fn eval_for_head(
+    agent: &mut Agent,
+    left: &ForBinding,
+    right: &syntax::ast::Expr,
+    strict: bool,
+) -> Result<Value, JsError> {
+    let tdz_names = match left {
+        ForBinding::VarDecl { kind, pattern, .. } if *kind != VarDeclKind::Var => {
+            let mut names = Vec::new();
+            crate::script::bound_names(pattern, &mut names);
+            names
+        }
+        _ => Vec::new(),
+    };
+    if tdz_names.is_empty() {
+        return eval_expr(agent, right, strict);
+    }
+    let old_env = agent.running_context()?.lexical_environment.clone();
+    let tdz_env = new_declarative_environment(Some(old_env.clone()));
+    for name in &tdz_names {
+        tdz_env.create_mutable_binding(name, false)?;
+    }
+    agent.running_context_mut()?.lexical_environment = tdz_env;
+    let result = eval_expr(agent, right, strict);
+    agent.running_context_mut()?.lexical_environment = old_env;
+    result
 }
 
 /// ForInStatement evaluation (spec 14.7.5): enumerate the enumerable string
@@ -765,16 +1074,28 @@ fn eval_for_in(
         let init_value = eval_expr(agent, init_expr, strict)?;
         crate::binding::binding_initialization(agent, pattern, init_value, None, strict)?;
     }
-    let rhs = eval_expr(agent, right, strict)?;
-    let keys = for_in_keys(agent, &rhs)?;
+    let rhs = eval_for_head(agent, left, right, strict)?;
+    let base_object = crate::context::as_object(&rhs);
+    let keys = for_in_key_levels(&rhs)?;
     let mut iteration_result = Value::Undefined;
-    for key in keys {
-        let restore = for_binding_put(agent, left, key, strict)?;
-        let result = eval_statement(agent, body, strict);
-        if let Some(outer) = restore {
-            agent.running_context_mut()?.lexical_environment = outer;
+    for (level, key) in keys {
+        if let Some(base) = &base_object
+            && !key_enumerable_at_level(base, level, &key)?
+        {
+            continue;
         }
-        match result? {
+        let (restore, iteration_env) = for_binding_put(agent, left, key, strict)?;
+        let result = eval_statement(agent, body, strict);
+        let completion = if let Some(iteration_env) = iteration_env {
+            let result = dispose_env_resources(agent, &iteration_env, result);
+            if let Some(outer) = restore {
+                agent.running_context_mut()?.lexical_environment = outer;
+            }
+            result?
+        } else {
+            result?
+        };
+        match completion {
             Completion::Normal(value) => iteration_result = value,
             Completion::Empty => {}
             Completion::Continue { target, value }
@@ -814,47 +1135,65 @@ fn key_value(key: &PropertyKey) -> Value {
 
 /// ForIn/ForOfBodyEvaluation left-hand side: put the value into the
 /// expression reference or the (per-iteration) binding. A fresh per-iteration
-/// environment is installed for `let`/`const` heads; the caller restores it
-/// after the body.
+/// environment is installed for `let`/`const`/`using` heads; the caller
+/// restores it and disposes its resources after the body. Returns the outer
+/// environment to restore and the iteration environment to dispose.
 fn for_binding_put(
     agent: &mut Agent,
     left: &ForBinding,
     value: Value,
     strict: bool,
-) -> Result<Option<EnvRef>, JsError> {
+) -> Result<(Option<EnvRef>, Option<EnvRef>), JsError> {
     match left {
         ForBinding::Expr(expr) => {
             // Destructuring heads (`for ([a, b] of …)`) are assignment
             // patterns, not references (spec 14.7.6 step 6.b).
             if matches!(&expr.kind, ExprKind::Array(_) | ExprKind::Object(_)) {
                 crate::binding::destructuring_assignment(agent, expr, value, strict)?;
-                return Ok(None);
+                return Ok((None, None));
             }
             let reference = eval_reference(agent, expr, strict)?;
             put_value(agent, &reference, value)?;
-            Ok(None)
+            Ok((None, None))
         }
         ForBinding::VarDecl { kind, pattern, .. } => {
             if *kind == VarDeclKind::Var {
                 // BindingInitialization with no environment: the hoisted var
                 // binding is resolved and PutValue'd (spec 14.7.5.6 step 5.b).
                 crate::binding::binding_initialization(agent, pattern, value, None, strict)?;
-                Ok(None)
+                Ok((None, None))
             } else {
                 let outer = agent.running_context()?.lexical_environment.clone();
                 let env = new_declarative_environment(Some(outer.clone()));
                 let mut names = Vec::new();
                 crate::script::bound_names(pattern, &mut names);
                 for name in &names {
-                    if *kind == VarDeclKind::Const {
+                    if *kind == VarDeclKind::Const
+                        || matches!(*kind, VarDeclKind::Using | VarDeclKind::AwaitUsing)
+                    {
                         env.create_immutable_binding(name, true)?;
                     } else {
                         env.create_mutable_binding(name, false)?;
                     }
                 }
+                // spec 14.7.5.6 step 5.e: the iteration environment is the
+                // running environment while BindingInitialization runs, so a
+                // default initializer's closure captures the per-iteration
+                // binding.
+                agent.running_context_mut()?.lexical_environment = env.clone();
+                if matches!(*kind, VarDeclKind::Using | VarDeclKind::AwaitUsing) {
+                    // ForIn/OfBodyEvaluation: AddDisposableResource runs before
+                    // InitializeReferencedBinding (spec 14.7.5.6 step 5.g).
+                    let kind = if *kind == VarDeclKind::AwaitUsing {
+                        DisposalKind::Async
+                    } else {
+                        DisposalKind::Sync
+                    };
+                    let resource = create_disposable_resource(agent, &value, kind)?;
+                    env.add_disposable_resource(resource);
+                }
                 crate::binding::binding_initialization(agent, pattern, value, Some(&env), strict)?;
-                agent.running_context_mut()?.lexical_environment = env;
-                Ok(Some(outer))
+                Ok((Some(outer), Some(env)))
             }
         }
     }
@@ -870,7 +1209,7 @@ fn eval_for_of(
     strict: bool,
     labels: &[crux::string::AtomId],
 ) -> Result<Completion, JsError> {
-    let rhs = eval_expr(agent, right, strict)?;
+    let rhs = eval_for_head(agent, left, right, strict)?;
     let iterator = get_iterator(agent, &rhs)?;
     let mut iteration_result = Value::Undefined;
     loop {
@@ -880,7 +1219,7 @@ fn eval_for_of(
         // A destructuring-assignment error in the head closes the iterator
         // (ForIn/OfBodyEvaluation: abrupt status → IteratorClose); only a
         // throwing `return` replaces the error (spec 7.4.11).
-        let restore = match for_binding_put(agent, left, value, strict) {
+        let (restore, iteration_env) = match for_binding_put(agent, left, value, strict) {
             Ok(restore) => restore,
             Err(error) => {
                 crate::expr::iterator_close_throw(agent, &iterator)?;
@@ -888,10 +1227,29 @@ fn eval_for_of(
             }
         };
         let result = eval_statement(agent, body, strict);
-        if let Some(outer) = restore {
-            agent.running_context_mut()?.lexical_environment = outer;
-        }
-        match result? {
+        let completion = match result {
+            Ok(completion) => completion,
+            Err(error) => {
+                if let Some(iteration_env) = iteration_env {
+                    let _ = dispose_env_resources(agent, &iteration_env, Err(error.clone()));
+                }
+                if let Some(outer) = restore {
+                    agent.running_context_mut()?.lexical_environment = outer;
+                }
+                crate::expr::iterator_close_throw(agent, &iterator)?;
+                return Err(error);
+            }
+        };
+        let completion = if let Some(iteration_env) = iteration_env {
+            let result = dispose_env_resources(agent, &iteration_env, Ok(completion));
+            if let Some(outer) = restore {
+                agent.running_context_mut()?.lexical_environment = outer;
+            }
+            result?
+        } else {
+            completion
+        };
+        match completion {
             Completion::Normal(value) => iteration_result = value,
             Completion::Empty => {}
             Completion::Continue { target, value }
@@ -917,6 +1275,13 @@ fn eval_for_of(
                     target: Some(l),
                     value: Some(value.unwrap_or(iteration_result)),
                 });
+            }
+            Completion::Throw(value) => {
+                // A throwing body closes the iterator with the throw
+                // completion: the original error wins over a throwing `return`
+                // method or `return` lookup (spec 7.4.11 steps 6-7).
+                crate::expr::iterator_close_throw(agent, &iterator)?;
+                return Ok(Completion::Throw(value));
             }
             other => {
                 iterator_close(agent, &iterator)?;
@@ -1010,7 +1375,7 @@ fn eval_labeled(
     }
 }
 
-/// SwitchStatement evaluation (spec 14.12): case tests run in order until a
+/// SwitchStatement evaluation (spec 14.13.2): case tests run in order until a
 /// match; consequents fall through until `break`.
 fn eval_switch(
     agent: &mut Agent,
@@ -1018,26 +1383,11 @@ fn eval_switch(
     cases: &[syntax::ast::SwitchCase],
     strict: bool,
 ) -> Result<Completion, JsError> {
+    // spec 14.13.2 steps 1-5: the discriminant is evaluated in the enclosing
+    // environment, then a fresh CaseBlock scope is created and installed
+    // before the selectors run, so selectors and consequents see the case
+    // block's lexical declarations.
     let discriminant = eval_expr(agent, discriminant, strict)?;
-    let mut start = cases.len();
-    let mut default_index = cases.len();
-    for (index, case) in cases.iter().enumerate() {
-        match &case.test {
-            None => default_index = index,
-            Some(test) => {
-                let test_value = eval_expr(agent, test, strict)?;
-                if crux::ops::is_strictly_equal(&discriminant, &test_value) {
-                    start = index;
-                    break;
-                }
-            }
-        }
-    }
-    if start == cases.len() {
-        start = default_index;
-    }
-    // spec 14.13.2: the CaseBlock is a single lexical scope, so its
-    // function declarations get the Annex B treatment like a block's.
     let old_env = agent.running_context()?.lexical_environment.clone();
     let case_env = new_declarative_environment(Some(old_env.clone()));
     block_declaration_instantiation_iter(
@@ -1048,21 +1398,48 @@ fn eval_switch(
     )?;
     agent.running_context_mut()?.lexical_environment = case_env;
     let result = (|| -> Result<Completion, JsError> {
+        // Find the matching case, evaluating selectors in order (spec
+        // 14.13.3 CaseClauseIsSelected).
+        let mut start = cases.len();
+        let mut default_index = cases.len();
+        for (index, case) in cases.iter().enumerate() {
+            match &case.test {
+                None => default_index = index,
+                Some(test) => {
+                    let test_value = eval_expr(agent, test, strict)?;
+                    if crux::ops::is_strictly_equal(&discriminant, &test_value) {
+                        start = index;
+                        break;
+                    }
+                }
+            }
+        }
+        if start == cases.len() {
+            start = default_index;
+        }
+        // CaseBlockEvaluation (spec 14.13.3): a running result value V is
+        // carried across the executed case clauses; each clause's value
+        // replaces it when non-empty, and an abrupt completion is UpdateEmpty'd
+        // with V before it propagates.
+        let mut result_value = Value::Undefined;
         for case in &cases[start..] {
-            match eval_statement_list(agent, &case.consequent, strict)? {
-                Completion::Normal(_) | Completion::Empty => {}
-                // An unlabeled break exits the switch as a normal completion
-                // carrying the case list's value (spec 14.14.2 step 2).
+            let completion = eval_statement_list(agent, &case.consequent, strict)?;
+            match completion {
+                Completion::Empty => {}
+                Completion::Normal(value) => result_value = value,
                 Completion::Break {
                     target: None,
                     value,
                 } => {
-                    return Ok(Completion::Normal(value.unwrap_or(Value::Undefined)));
+                    // The switch consumes an unlabeled break, carrying the
+                    // running V when the break's own value is empty
+                    // (LabelledEvaluation of BreakableStatement).
+                    return Ok(Completion::Normal(value.unwrap_or(result_value)));
                 }
-                other => return Ok(other),
+                other => return Ok(other.update_empty(result_value.clone())),
             }
         }
-        Ok(Completion::normal())
+        Ok(Completion::Normal(result_value))
     })();
     agent.running_context_mut()?.lexical_environment = old_env;
     result
@@ -1103,11 +1480,17 @@ fn run_finalizer(
     strict: bool,
 ) -> Result<Completion, JsError> {
     let Some(finalizer) = finalizer else {
-        return result;
+        // spec 14.15.2/14.15.3: TryStatement returns ? UpdateEmpty(C,
+        // *undefined*) even without a finalizer.
+        return result.map(|completion| completion.update_empty(Value::Undefined));
     };
     match eval_block_stmts(agent, &finalizer.stmts, strict)? {
-        Completion::Normal(_) | Completion::Empty => result,
-        other => Ok(other),
+        Completion::Normal(_) | Completion::Empty => {
+            // F is normal: the try's result (block/catch) is the answer,
+            // still UpdateEmpty'd with *undefined* (spec 14.15.2 step 4).
+            result.map(|completion| completion.update_empty(Value::Undefined))
+        }
+        other => Ok(other.update_empty(Value::Undefined)),
     }
 }
 
@@ -1123,10 +1506,13 @@ fn eval_catch(
     // named like the parameter gets its own block binding (Annex B).
     let param_env = new_declarative_environment(Some(old_env.clone()));
     param_env.mark_catch_param_env();
+    agent.running_context_mut()?.lexical_environment = param_env.clone();
     if let Some(param) = &handler.param {
         // The catch parameter's bound names are created uninitialized, then
         // BindingInitialization fills them (the parameter may be a
-        // destructuring pattern).
+        // destructuring pattern). The running env is the parameter env so
+        // closures created by default initializers capture it (spec
+        // 15.1.7 step 7).
         let mut names = Vec::new();
         crate::script::bound_names(param, &mut names);
         for name in &names {
@@ -1142,8 +1528,9 @@ fn eval_catch(
     result
 }
 
-/// WithStatement evaluation (Annex B 13.11): an object environment whose
-/// bindings are the with-object's properties.
+/// WithStatement evaluation (spec 14.15.4): an object environment whose
+/// bindings are the with-object's properties; primitives are boxed (step 2:
+/// ToObject).
 fn eval_with(
     agent: &mut Agent,
     object: &syntax::ast::Expr,
@@ -1151,18 +1538,20 @@ fn eval_with(
     strict: bool,
 ) -> Result<Completion, JsError> {
     let object_value = eval_expr(agent, object, strict)?;
-    let Value::Object(obj) = object_value else {
-        return Err(JsError::new(
+    let object_value = crate::context::to_object(agent, &object_value)?;
+    let obj = crate::context::as_object(&object_value).ok_or_else(|| {
+        JsError::new(
             ErrorKind::TypeError,
             "Cannot use 'with' on a non-object value".into(),
-        ));
-    };
+        )
+    })?;
     let old_env = agent.running_context()?.lexical_environment.clone();
     let with_env = new_object_environment(obj, true, Some(old_env.clone()));
     agent.running_context_mut()?.lexical_environment = with_env;
     let result = eval_statement(agent, body, strict);
     agent.running_context_mut()?.lexical_environment = old_env;
-    result
+    // spec 14.15.4 step 8: UpdateEmpty(C, *undefined*).
+    result.map(|completion| completion.update_empty(Value::Undefined))
 }
 
 fn not_implemented(what: &str) -> JsError {
@@ -1478,10 +1867,22 @@ mod tests {
             run("let o = { __proto__: null, q: 5 }; o.q").unwrap(),
             Value::Number(5.0)
         );
-        // Non-object __proto__ values become plain data properties.
+        // Non-object, non-null __proto__ values set neither the prototype nor
+        // an own property (B.3.1 step 6): the definition is a no-op, so
+        // `__proto__` reads the %Object.prototype% accessor (the prototype).
         assert_eq!(
-            run("let o = { __proto__: 5 }; o.__proto__").unwrap(),
-            Value::Number(5.0)
+            run("let o = { __proto__: 5 }; o.__proto__ === Object.prototype && !o.hasOwnProperty('__proto__')")
+                .unwrap(),
+            Value::Boolean(true)
+        );
+        // Shorthand __proto__ is an ordinary data property, and a duplicate
+        // shorthand is permitted (Annex B.3.1); the second one wins.
+        assert_eq!(
+            run("var __proto__ = 2; \
+                 var obj = { __proto__, __proto__ }; \
+                 obj.hasOwnProperty('__proto__') + ',' + obj.__proto__")
+            .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("true,2")))
         );
     }
 
@@ -2143,5 +2544,247 @@ mod tests {
             run("for (let z of [1]) {} 'z' in globalThis").unwrap(),
             Value::Boolean(false)
         );
+    }
+
+    #[test]
+    fn statement_lists_preserve_empty_completions() {
+        // A list of only empty/declaration statements is ~empty~ (spec
+        // 14.2.1), so an enclosing UpdateEmpty fills it with the preceding
+        // value instead of overwriting it with *undefined*.
+        assert_eq!(run("1; {}").unwrap(), Value::Number(1.0));
+        assert_eq!(
+            run("6; switch ('a') { case 'a': 7; default: }").unwrap(),
+            Value::Number(7.0)
+        );
+        assert_eq!(run("1;;;;;").unwrap(), Value::Number(1.0));
+        assert_eq!(run("var x = 1; x;").unwrap(), Value::Number(1.0));
+    }
+
+    #[test]
+    fn switch_completion_values_carry_across_cases() {
+        // CaseBlockEvaluation carries a running V across the executed case
+        // clauses (spec 14.13.3); empty clauses keep it, and abrupt
+        // completions are UpdateEmpty'd with it.
+        assert_eq!(
+            run("1; switch ('a') { case 'a': 2; default: 3; }").unwrap(),
+            Value::Number(3.0)
+        );
+        assert_eq!(
+            run("6; switch ('a') { case 'a': 7; case 'b': break; default: }").unwrap(),
+            Value::Number(7.0)
+        );
+        assert_eq!(
+            run("1; switch ('a') { case 'a': 2; case 'b': 3; break; }").unwrap(),
+            Value::Number(3.0)
+        );
+        assert_eq!(
+            run("13; do { switch ('a') { case 'a': 14; case 'b': continue; } } while (false)")
+                .unwrap(),
+            Value::Number(14.0)
+        );
+        assert_eq!(
+            run("5; switch ('b') { case 'a': 8; default: }").unwrap(),
+            Value::Undefined
+        );
+    }
+
+    #[test]
+    fn try_finally_completion_values_fill_empty_abrupts() {
+        // TryStatement returns UpdateEmpty(F, undefined): an empty `break` in
+        // the finalizer is filled with *undefined*, not the enclosing list's
+        // value (spec 14.15.2 step 4).
+        assert_eq!(
+            run("99; do { -99; try { 39 } finally { 42; break; -2 }; } while (false);").unwrap(),
+            Value::Number(42.0)
+        );
+        assert_eq!(
+            run("99; do { -99; try { 39 } finally { break; -2 }; } while (false);").unwrap(),
+            Value::Undefined
+        );
+        assert_eq!(
+            run("99; do { -99; try { [].x.x } catch (e) { -1 } finally { break; -3 }; } while (false);")
+                .unwrap(),
+            Value::Undefined
+        );
+    }
+
+    #[test]
+    fn with_statement_boxes_primitives_and_fills_empty() {
+        // WithStatement boxes non-objects (spec 14.15.4 step 2) and returns
+        // UpdateEmpty(C, undefined) (step 8).
+        assert_eq!(
+            run("var o = 2; var foo = 1; with (o) { foo = 42; } foo").unwrap(),
+            Value::Number(42.0)
+        );
+        assert_eq!(
+            run("8; do { 9; with ({}) { break; } 7; } while (false)").unwrap(),
+            Value::Undefined
+        );
+        assert_eq!(
+            run("1; do { 2; with ({}) { 3; break; } 4; } while (false);").unwrap(),
+            Value::Number(3.0)
+        );
+        assert_eq!(
+            run("8; do { 9; with ({}) { 10; continue; } 11; } while (false)").unwrap(),
+            Value::Number(10.0)
+        );
+    }
+
+    #[test]
+    fn var_declaration_resolves_before_initializer() {
+        // spec 14.3.2: ResolveBinding runs before the initializer, so a
+        // `with` binding object's property is the assignment target even when
+        // the initializer deletes it.
+        assert_eq!(
+            run("var obj = { test262id: 1 }; with (obj) { var test262id = delete obj.test262id; } JSON.stringify([obj.test262id, test262id])")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("[true,null]")))
+        );
+    }
+
+    #[test]
+    fn catch_param_env_hosts_default_initializer_closures() {
+        // CatchClauseEvaluation installs the parameter environment before
+        // BindingInitialization, so a default initializer's closure captures
+        // the parameter bindings (spec 15.1.7 step 7).
+        assert_eq!(
+            run("let x = 'outside'; try { throw ['inside'] } catch ([x, _ = function () { return x; }]) {} ")
+                .unwrap(),
+            Value::Undefined
+        );
+        assert_eq!(
+            run("var p; try { throw ['in'] } catch ([x, _ = (p = function () { return x; })]) {} p()")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("in")))
+        );
+    }
+
+    #[test]
+    fn for_of_head_names_are_in_tdz_during_rhs_evaluation() {
+        assert!(matches!(
+            run("let x = 1; for (let x of [x]) {}"),
+            Err(error) if error.kind == crux::ErrorKind::ReferenceError
+        ));
+        assert!(matches!(
+            run("let x = 1; for (const x in { x }) {}"),
+            Err(error) if error.kind == crux::ErrorKind::ReferenceError
+        ));
+        // A closure created in the head captures the TDZ environment.
+        assert!(matches!(
+            run("let x = 'outside'; var probe; for (let x of (probe = () => x, [])) ; probe()"),
+            Err(error) if error.kind == crux::ErrorKind::ReferenceError
+        ));
+    }
+
+    #[test]
+    fn for_in_skips_keys_deleted_during_enumeration() {
+        assert_eq!(
+            run("var o = { aa: 1, ba: 2, ca: 3 }; var acc = ''; for (var k in o) { delete o.ba; acc += k; } acc")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("aaca")))
+        );
+    }
+
+    #[test]
+    fn eval_function_binding_stays_deleted() {
+        // A top-level eval function declaration evaluates to ~empty~, so a
+        // runtime `delete` is not undone by the declaration's evaluation
+        // (spec 15.2.6).
+        assert_eq!(
+            run("(function () { eval('function f() {} delete f;'); return typeof f; })()").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("undefined")))
+        );
+    }
+
+    #[test]
+    fn using_declarations_dispose_at_block_exit() {
+        assert_eq!(
+            run("var d = []; var r1 = { [Symbol.dispose]() { d.push(1); } }; var r2 = { [Symbol.dispose]() { d.push(2); } }; { using a = r1, b = r2; } JSON.stringify(d)")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("[2,1]")))
+        );
+        // Disposed when a subsequent initializer throws.
+        assert_eq!(
+            run("var disposed = false; var r = { [Symbol.dispose]() { disposed = true; } }; function boom() { throw new Error('x'); } try { using a = r, b = boom(); } catch (e) {} disposed")
+                .unwrap(),
+            Value::Boolean(true)
+        );
+        // Disposed on an abrupt completion of the block.
+        assert_eq!(
+            run("var disposed = false; var r = { [Symbol.dispose]() { disposed = true; } }; { using a = r; throw new Error('x'); }")
+                .unwrap_err()
+                .kind,
+            crux::ErrorKind::TypeError
+        );
+        // `using x = null` registers nothing and disposes nothing.
+        assert_eq!(run("4; { using x = null; }").unwrap(), Value::Number(4.0));
+    }
+
+    #[test]
+    fn using_in_for_of_head_disposes_per_iteration() {
+        assert_eq!(
+            run("var d = []; var r = { [Symbol.dispose]() { d.push(1); } }; for (using x of [r]) {} d.length")
+                .unwrap(),
+            Value::Number(1.0)
+        );
+        assert!(matches!(
+            run("let x = 1; for (using x of [x]) {}"),
+            Err(error) if error.kind == crux::ErrorKind::ReferenceError
+        ));
+    }
+
+    #[test]
+    fn indirect_eval_is_always_sloppy() {
+        // strictCaller only applies to direct eval (spec 19.2.1.1 step 10);
+        // an indirect eval's `with` and unresolvable assignments are sloppy.
+        assert_eq!(
+            run("var count = 0; (0, eval)('unresolvable_assignment = 7; count += 1;'); JSON.stringify([count, unresolvable_assignment])")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("[1,7]")))
+        );
+        assert_eq!(
+            run("(0, eval)('with ({}) {} 5')").unwrap(),
+            Value::Number(5.0)
+        );
+    }
+
+    #[test]
+    fn strict_eval_rejects_reserved_word_bindings() {
+        assert!(matches!(
+            run("'use strict'; eval('var public = 1;')"),
+            Err(error) if error.kind == crux::ErrorKind::SyntaxError
+        ));
+        assert!(matches!(
+            run("function f() { 'use strict'; eval('var arguments;'); } f()"),
+            Err(error) if error.kind == crux::ErrorKind::SyntaxError
+        ));
+        // `with` in a strict eval is a SyntaxError.
+        assert!(matches!(
+            run("'use strict'; eval('with ({}) {}')"),
+            Err(error) if error.kind == crux::ErrorKind::SyntaxError
+        ));
+    }
+
+    #[test]
+    fn top_level_using_in_eval_is_a_syntax_error() {
+        assert!(matches!(
+            run("eval('using x = null;')"),
+            Err(error) if error.kind == crux::ErrorKind::SyntaxError
+        ));
+        // Nested in a block it is fine.
+        assert_eq!(
+            run("eval('{ using x = null; } 5')").unwrap(),
+            Value::Number(5.0)
+        );
+    }
+
+    #[test]
+    fn block_level_generator_declarations_stay_block_scoped() {
+        // The Annex B var hoist covers plain function declarations only;
+        // generator and async declarations remain block-scoped.
+        assert!(matches!(
+            run("switch (0) { default: function * x() {} } x"),
+            Err(error) if error.kind == crux::ErrorKind::ReferenceError
+        ));
     }
 }

@@ -48,7 +48,7 @@ Two harnesses live in `crates/test262`:
 
 ## Current results
 
-Workspace-wide: **4099 tests pass, 0 failures** (`cargo test --workspace`),
+Workspace-wide: **4158 tests pass, 0 failures** (`cargo test --workspace`),
 of which the test262 crate contributes **3317 passing fixtures** (44
 language-area + 3275 built-ins fixtures); the remaining registered test is
 the ignored `scan_builtins_directories` directory scanner. The `workers`
@@ -1400,14 +1400,15 @@ across the VM, the parser, and the built-ins:
 
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
-Beyond the vendored fixtures, ~134 edge-case unit tests were added across
+Beyond the vendored fixtures, ~136 edge-case unit tests were added across
 the crates (lexer, parser, runtime core, and the built-ins), targeting the
 plan's per-phase test lists: numeric-literal/escape/ASI lexing, the ASI ×
 statement matrix and cover grammar, TDZ/hoisting/redeclaration/eval
 scoping, `-0`/`NaN`/`2^53` conversion boundaries, case-mapping expansion,
 split/replace substitution patterns, holes/length-mutation/species/sort,
-and buffer resize/transfer/detach semantics. `array_buffer.rs` and
-`dataview.rs` received their first unit tests.
+buffer resize/transfer/detach semantics, and the Annex B
+`-->`/catch-parameter/duplicate-function regressions. `array_buffer.rs`
+and `dataview.rs` received their first unit tests.
 
 The campaign surfaced and fixed the following conformance bugs (each now
 has a regression test):
@@ -1501,19 +1502,19 @@ against the runnable pass-rate target:
 ## Full-suite sweep (post-hardening)
 
 `test262-sweep` over all three areas in a release build (48,622 fixtures, 8
-jobs, 20s batch timeout): **0 crashes, 0 hangs**. The built-ins and annexB
-rows below are re-measured with the long config (`--jobs 8 --batch 32
---timeout 120 --recheck-timeout 120`); the language row is from the earlier
-run and has not changed since.
+jobs, 20s batch timeout): **0 crashes, 0 hangs**. All three rows are
+re-measured with the long config (`--jobs 8 --batch 32 --timeout 120
+--recheck-timeout 120`); the language row closed the last remaining
+failures (2,048 → 0) since the earlier run.
 
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
-| language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
+| language | 23,724 | 18,052 | 0 | 5,672 | 0 | 100.0% |
 | built-ins | 23,812 | 17,179 | 0 | 6,633 | 0 | 100.0% |
 | annexB | 1,086 | 956 | 0 | 130 | 0 | 100.0% |
-| **Total** | **48,622** | **34,139** | **2,048** | **12,435** | **0** | **94.3%** |
+| **Total** | **48,622** | **36,187** | **0** | **12,435** | **0** | **100.0%** |
 
-(Runnable = pass + fail; the 9,268 skips are module/async fixtures,
+(Runnable = pass + fail; the 12,435 skips are module/async fixtures,
 unsupported harness includes, the host-dependent `CanBlockIsTrue` waits,
 and the out-of-scope Temporal, await-dictionary, and ShadowRealm proposal
 fixtures.) The built-ins row reflects every cluster closure through the
@@ -1539,6 +1540,26 @@ making up the rest.
 allocations that pass with the long (`--timeout 120`) config, not a bug
 (see the TypedArray cluster section). The final sweep reports 0 hangs.
 
+The language row closed its last 2,048 failures in two passes. First, the
+direct-eval caller-context rules were finished (spec 19.2.1.1 steps 5-7):
+the Script early errors for eval code now depend on the caller's position,
+so a direct eval inside function/method/field-initializer code may use
+`new.target` (resolving through the caller's environment) and `super.x`
+(resolving through the caller's home object), and PrivateIdentifiers parse
+and resolve against the caller's inherited private environment. Field
+initializers now evaluate in a function context of their own (`new.target`
+is *undefined* there, `this` is the instance), CreateDynamicFunction's
+assembled source drives its `"use strict"` detection (so Function-constructor
+functions bind `this` as *undefined* and expose the restricted
+`caller`/`arguments` throwers), a non-object `__proto__` value is a no-op
+(B.3.1), and a tagged template with an invalid escape sequence yields
+*undefined* cooked values (spec 12.2.9.3). Second, Annex B regressions from
+the in-flight changeset were restored: `-->` HTMLCloseComments accept
+leading whitespace and comments at line start, a statement-position
+function (`if (x) function f(){}`) may share a catch parameter's name
+(B.3.5/B.3.3), and duplicate plain block-level FunctionDeclarations are
+allowed in sloppy mode (B.3.3.4).
+
 The first sweep in a debug build reported 27 hangs and 92 crashes. Both are
 resolved:
 
@@ -1558,7 +1579,8 @@ resolved:
 - **Crashes** were debug-build stack overflows from deep recursion; a release
   build runs them cleanly.
 
-The 7,314 failures triage into:
+The original 7,314 failures triaged into (the language area has since
+closed to 0 fail — see the language-row note above):
 
 - **Missing built-ins (excluded from runnable):** Temporal (~3,100
   fixtures across `Temporal/*` — not implemented), ShadowRealm (47, now
@@ -1595,7 +1617,9 @@ The 7,314 failures triage into:
   - `Iterator/prototype` (278)
   - `dynamic-import/syntax/valid` (137), class-element `delete` early
     errors (192), `eval-code/direct` (103), `identifiers` (58),
-    `arguments-object`
+    `arguments-object` — all closed by the eval-caller-context and
+    field-initializer work above (the direct-eval cluster was the last to
+    fall, via the `new.target`/`super`/PrivateIdentifier eval rules)
   - Annex B: the sloppy `eval`/`function`/`global` function-declaration
     semantics (410), `RegExp` (57), `escape`/`unescape` (35), and the
     assignment-target and `for-in` initializer clusters are all closed now —
@@ -1664,14 +1688,14 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 
 ## Open items
 
-- The built-ins and Annex B areas now measure **100% of runnable**:
-  17,179 + 956 pass / 0 fail / 0 crash / 0 hang of 23,812 + 1,086
-  fixtures (out-of-scope Temporal, await-dictionary, and ShadowRealm
-  fixtures and the host-dependent `$262.createRealm`/`CanBlockIsTrue`
-  waits skipped, `--timeout 120 --recheck-timeout 120`, release build).
-  The remaining gap to the plan's ≥95% target is the language area
-  (2,048 fails, 88.6% of runnable): the systematic bug clusters triaged
-  above. Fix the next cluster, re-run the sweep, and record the delta.
+- All three areas now measure **100% of runnable**: 18,052 + 17,179 + 956
+  pass / 0 fail / 0 crash / 0 hang of 23,724 + 23,812 + 1,086 fixtures
+  (out-of-scope Temporal, await-dictionary, and ShadowRealm fixtures and
+  the host-dependent `$262.createRealm`/`CanBlockIsTrue` waits skipped,
+  `--timeout 120 --recheck-timeout 120`, release build) — the plan's ≥95%
+  runnable-pass-rate target is met. The language area closed last (2,048 →
+  0 fails) via the eval-caller-context, field-initializer, and Annex B
+  work described in the Full-suite sweep section.
   Note: the TypedArray sweep should be run with the long deadline
   (`--timeout 120 --recheck-timeout 120`) — the O(n²) property store
   makes the 10,000-element crash-test fixtures take ~45s, which the

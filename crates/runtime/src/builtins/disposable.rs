@@ -857,7 +857,7 @@ pub fn dispatch_continuation(
 }
 
 /// Build a `SuppressedError` object with the given `error` and `suppressed`.
-fn make_suppressed_error(
+pub fn make_suppressed_error(
     agent: &mut Agent,
     error: Value,
     suppressed: Value,

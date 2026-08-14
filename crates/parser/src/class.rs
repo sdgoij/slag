@@ -5,8 +5,8 @@ use syntax::keywords::Keyword;
 use syntax::{Block, Class, ClassElement, ClassElementName, Function, TokenKind};
 
 use crate::expr::{
-    check_duplicate_params, is_property_name_start, parse_assignment, parse_function_body_block,
-    parse_lhs, parse_parameter_list,
+    check_duplicate_params, is_property_name_start, parse_assignment, parse_expression,
+    parse_function_body_block, parse_lhs, parse_parameter_list,
 };
 use crate::parser::{Parser, PrivateNameKind};
 
@@ -17,6 +17,15 @@ pub(crate) fn parse_class(
     start: u32,
     is_declaration: bool,
 ) -> Result<Class, JsError> {
+    // A class definition is always strict mode code (spec 15.7.3), so the
+    // name is parsed under the strict reserved-word rules (`class let {}`,
+    // escaped or not, is a SyntaxError).
+    let saved_strict = parser.strict;
+    let saved_private = std::mem::take(&mut parser.private_names);
+    let saved_derived = parser.in_derived_class;
+    parser.strict = true;
+    parser.private_names.push(std::collections::HashMap::new());
+
     // The class name: required for declarations, optional for expressions.
     let name = if parser.at_identifier()? {
         let (name, name_start) = parser.parse_identifier()?;
@@ -32,22 +41,32 @@ pub(crate) fn parse_class(
         }
         None
     };
-
-    // A class definition is always strict mode code (spec 15.7.3).
-    let saved_strict = parser.strict;
-    let saved_private = std::mem::take(&mut parser.private_names);
-    parser.private_names.push(std::collections::HashMap::new());
-    parser.strict = true;
     parser.push_scope();
     if let Some(name) = name {
         parser.scopes.last_mut().unwrap().lexical.insert(name);
     }
 
     let heritage = if parser.eat_keyword(Keyword::Extends)? {
-        Some(parse_lhs(parser)?)
+        // The heritage is evaluated with the class's own PrivateEnvironment
+        // not yet in scope (spec 15.7.11), so the class's own private names
+        // are not visible to it (enclosing classes' names still are).
+        let own = parser.private_names.pop().expect("class private map");
+        let result = parse_lhs(parser);
+        parser.private_names.push(own);
+        let heritage = result?;
+        // ClassHeritage is a LeftHandSideExpression; an unparenthesized
+        // arrow is not one (spec 15.7.4).
+        if matches!(heritage.kind, syntax::ExprKind::Arrow { .. }) {
+            return Err(parser.error_at(
+                heritage.span.start,
+                "Class heritage must be a left-hand-side expression",
+            ));
+        }
+        Some(heritage)
     } else {
         None
     };
+    parser.in_derived_class = heritage.is_some();
 
     parser.expect_punct(TokenKind::LeftBrace)?;
     let mut elements: Vec<ClassElement> = Vec::new();
@@ -118,6 +137,7 @@ pub(crate) fn parse_class(
     parser.pop_scope();
     parser.strict = saved_strict;
     parser.private_names = saved_private;
+    parser.in_derived_class = saved_derived;
 
     Ok(Class {
         span: Span::new(start, end),
@@ -127,17 +147,44 @@ pub(crate) fn parse_class(
     })
 }
 
+/// Consumes a decorator list (`@expr @expr …`) before a class or class
+/// element. The decorator grammar is a stage-3 proposal; each decorator is
+/// validated syntactically and the results are discarded (no evaluation).
+pub(crate) fn parse_decorators(parser: &mut Parser) -> Result<(), JsError> {
+    while parser.eat_punct(TokenKind::At)? {
+        if parser.at_punct(TokenKind::LeftParen)? {
+            // `@( Expression )`
+            parser.next()?;
+            parse_expression(parser, true)?;
+            parser.expect_punct(TokenKind::RightParen)?;
+        } else {
+            // `@ MemberExpression …` with optional `( args )`.
+            let expr = parse_lhs(parser)?;
+            if parser.at_punct(TokenKind::LeftParen)? {
+                crate::expr::parse_arguments(parser)?;
+            }
+            let _ = expr;
+        }
+    }
+    Ok(())
+}
+
 /// Whether a plain method is the constructor: an instance method named
 /// `constructor` that is not a special method.
 fn is_plain_constructor(name: &ClassElementName, function: &Function) -> bool {
     is_name(name, "constructor") && !function.is_async && !function.is_generator
 }
 
+/// Whether an element name's PropName equals `text` — the identifier form or
+/// a string literal of the same value (spec 15.7.5 PropName).
 fn is_name(name: &ClassElementName, text: &str) -> bool {
-    matches!(
-        name,
-        ClassElementName::Property(syntax::PropertyName::Ident(atom)) if atom == &intern_utf8(text)
-    )
+    match name {
+        ClassElementName::Property(syntax::PropertyName::Ident(atom)) => atom == &intern_utf8(text),
+        ClassElementName::Property(syntax::PropertyName::Str(value)) => {
+            value == &crux::JsString::from_utf8(text)
+        }
+        _ => false,
+    }
 }
 
 /// Whether `static` at the current position is the class-element prefix
@@ -155,11 +202,23 @@ fn static_is_prefix(parser: &mut Parser) -> Result<bool, JsError> {
     ))
 }
 
+/// Whether `accessor` at the current position is the field-accessor prefix
+/// (`accessor ClassElementName …`) rather than an element named `accessor`.
+fn accessor_is_prefix(parser: &mut Parser) -> Result<bool, JsError> {
+    // The `[no LineTerminator here]` separates `accessor` from the name.
+    Ok(!parser.peek2()?.line_break_before && is_class_name_start(parser.peek2()?.kind.clone()))
+}
+
 fn parse_class_element(parser: &mut Parser) -> Result<Option<ClassElement>, JsError> {
     if parser.eat_punct(TokenKind::Semicolon)? {
         return Ok(None);
     }
-    let is_static = if parser.at_contextual("static")? && static_is_prefix(parser)? {
+    // Decorators may precede any element (stage-3 proposal); they are
+    // validated syntactically and discarded.
+    if parser.at_punct(TokenKind::At)? {
+        parse_decorators(parser)?;
+    }
+    let is_static = if parser.at_contextual_unescaped("static")? && static_is_prefix(parser)? {
         parser.next()?;
         true
     } else {
@@ -172,11 +231,19 @@ fn parse_class_element(parser: &mut Parser) -> Result<Option<ClassElement>, JsEr
         return Ok(Some(ClassElement::StaticBlock(body)));
     }
 
+    // `accessor name …` — an auto-accessor field (decorators proposal); the
+    // accessor semantics are not implemented, so the element parses as a
+    // plain field.
+    if parser.at_contextual_unescaped("accessor")? && accessor_is_prefix(parser)? {
+        parser.next()?;
+    }
+
     // `*name() {}` — generator method.
     if parser.eat_punct(TokenKind::Star)? {
         let name = parse_class_element_name(parser)?;
         check_special_constructor(parser, &name, is_static)?;
         let function = parse_class_method_tail(parser, false, true)?;
+        declare_private_name(parser, &name, PrivateNameKind::Other, is_static)?;
         return Ok(Some(ClassElement::Method {
             is_static,
             name,
@@ -184,7 +251,7 @@ fn parse_class_element(parser: &mut Parser) -> Result<Option<ClassElement>, JsEr
         }));
     }
     // `async name() {}` / `async *name() {}`.
-    if parser.at_contextual("async")?
+    if parser.at_contextual_unescaped("async")?
         && !parser.peek2()?.line_break_before
         && (is_class_name_start(parser.peek2()?.kind.clone())
             || matches!(parser.peek2()?.kind, TokenKind::Star))
@@ -194,6 +261,7 @@ fn parse_class_element(parser: &mut Parser) -> Result<Option<ClassElement>, JsEr
         let name = parse_class_element_name(parser)?;
         check_special_constructor(parser, &name, is_static)?;
         let function = parse_class_method_tail(parser, true, is_generator)?;
+        declare_private_name(parser, &name, PrivateNameKind::Other, is_static)?;
         return Ok(Some(ClassElement::Method {
             is_static,
             name,
@@ -201,13 +269,13 @@ fn parse_class_element(parser: &mut Parser) -> Result<Option<ClassElement>, JsEr
         }));
     }
     // `get name() {}` / `set name(p) {}`.
-    if parser.at_contextual("get")? && is_class_name_start(parser.peek2()?.kind.clone()) {
+    if parser.at_contextual_unescaped("get")? && is_class_name_start(parser.peek2()?.kind.clone()) {
         parser.next()?; // `get`
         let name = parse_class_element_name(parser)?;
         check_special_constructor(parser, &name, is_static)?;
         parser.expect_punct(TokenKind::LeftParen)?;
         parser.expect_punct(TokenKind::RightParen)?;
-        let body = parse_function_body_block(parser, false, false, &[], true, false)?;
+        let (body, _) = parse_function_body_block(parser, false, false, &[], true, false, false)?;
         declare_private_name(parser, &name, PrivateNameKind::Getter(is_static), is_static)?;
         return Ok(Some(ClassElement::Get {
             is_static,
@@ -215,19 +283,24 @@ fn parse_class_element(parser: &mut Parser) -> Result<Option<ClassElement>, JsEr
             body,
         }));
     }
-    if parser.at_contextual("set")? && is_class_name_start(parser.peek2()?.kind.clone()) {
+    if parser.at_contextual_unescaped("set")? && is_class_name_start(parser.peek2()?.kind.clone()) {
         parser.next()?; // `set`
         let name = parse_class_element_name(parser)?;
         check_special_constructor(parser, &name, is_static)?;
         parser.expect_punct(TokenKind::LeftParen)?;
-        let param = parser.parse_binding_pattern()?;
+        // A setter takes a single FormalParameter, which may carry an
+        // initializer (`set x(v = 1) {}`, spec 15.7.8).
+        let element = parser.parse_binding_element()?;
+        let param = element.pattern;
+        let init = element.init;
         parser.expect_punct(TokenKind::RightParen)?;
-        let body = parse_function_body_block(parser, false, false, &[], true, false)?;
+        let (body, _) = parse_function_body_block(parser, false, false, &[], true, false, false)?;
         declare_private_name(parser, &name, PrivateNameKind::Setter(is_static), is_static)?;
         return Ok(Some(ClassElement::Set {
             is_static,
             name,
             param,
+            init,
             body,
         }));
     }
@@ -246,7 +319,8 @@ fn parse_class_element(parser: &mut Parser) -> Result<Option<ClassElement>, JsEr
         }));
     }
 
-    // Field: `name Initializer? ;`
+    // Field: `name Initializer? ;` (an `accessor` field is still a field for
+    // parsing purposes; the accessor semantics are not implemented).
     declare_private_name(parser, &name, PrivateNameKind::Other, is_static)?;
     let init = if parser.eat_punct(TokenKind::Equal)? {
         // Field initializers may use `super` and `new.target` (the latter
@@ -305,6 +379,8 @@ fn parse_static_block(parser: &mut Parser) -> Result<Block, JsError> {
         parser.in_async,
         parser.allow_super,
         parser.in_constructor,
+        parser.in_static_block,
+        parser.nt_context,
     );
     parser.strict = true;
     parser.in_function = true;
@@ -314,6 +390,9 @@ fn parse_static_block(parser: &mut Parser) -> Result<Block, JsError> {
     parser.in_async = true;
     parser.allow_super = true;
     parser.in_constructor = false;
+    parser.in_static_block = true;
+    // Static blocks are a function-like context for `new.target`.
+    parser.nt_context = true;
     let saved_vars = std::mem::take(&mut parser.list_vars);
     parser.push_scope();
     let stmts = crate::stmt::parse_statement_list(parser, TokenKind::RightBrace)?;
@@ -328,6 +407,8 @@ fn parse_static_block(parser: &mut Parser) -> Result<Block, JsError> {
         parser.in_async,
         parser.allow_super,
         parser.in_constructor,
+        parser.in_static_block,
+        parser.nt_context,
     ) = saved;
     Ok(Block {
         stmts,
@@ -418,19 +499,24 @@ fn parse_class_method_tail_with(
 ) -> Result<Function, JsError> {
     let start = parser.prev.as_ref().unwrap().span.start;
     parser.expect_punct(TokenKind::LeftParen)?;
-    let saved_generator = parser.in_generator;
+    // Params parse with the method's own [Yield, Await] grammar: an async
+    // method's formal parameters reserve `await` (spec 15.8.1), and a plain
+    // method's params reset both regardless of the enclosing context.
+    let saved = (parser.in_generator, parser.in_async);
     parser.in_generator = is_generator;
+    parser.in_async = is_async;
     let params = parse_parameter_list(parser)?;
-    parser.in_generator = saved_generator;
+    (parser.in_generator, parser.in_async) = saved;
     check_duplicate_params(parser, &params, false)?;
-    crate::expr::check_generator_params_no_yield(parser, &params)?;
-    let body = parse_function_body_block(
+    crate::expr::check_function_params(parser, &params, is_async, is_generator)?;
+    let (body, _) = parse_function_body_block(
         parser,
         is_async,
         is_generator,
         &params,
         true,
         in_constructor,
+        false,
     )?;
     let end = body.span.end;
     Ok(Function {
