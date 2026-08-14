@@ -1501,17 +1501,17 @@ against the runnable pass-rate target:
 ## Full-suite sweep (post-hardening)
 
 `test262-sweep` over all three areas in a release build (48,622 fixtures, 8
-jobs, 20s batch timeout): **0 crashes, 0 hangs**. The built-ins row below
-is re-measured with the long config (`--jobs 8 --batch 32 --timeout 120
---recheck-timeout 120`); the language and annexB rows are from the earlier
-run and have not changed since.
+jobs, 20s batch timeout): **0 crashes, 0 hangs**. The built-ins and annexB
+rows below are re-measured with the long config (`--jobs 8 --batch 32
+--timeout 120 --recheck-timeout 120`); the language row is from the earlier
+run and has not changed since.
 
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 16,004 | 2,048 | 5,672 | 0 | 88.6% |
 | built-ins | 23,812 | 17,179 | 0 | 6,633 | 0 | 100.0% |
-| annexB | 1,086 | 439 | 558 | 89 | 0 | 44.0% |
-| **Total** | **48,622** | **33,622** | **2,606** | **12,394** | **0** | **92.8%** |
+| annexB | 1,086 | 956 | 0 | 130 | 0 | 100.0% |
+| **Total** | **48,622** | **34,139** | **2,048** | **12,435** | **0** | **94.3%** |
 
 (Runnable = pass + fail; the 9,268 skips are module/async fixtures,
 unsupported harness includes, the host-dependent `CanBlockIsTrue` waits,
@@ -1596,8 +1596,10 @@ The 7,314 failures triage into:
   - `dynamic-import/syntax/valid` (137), class-element `delete` early
     errors (192), `eval-code/direct` (103), `identifiers` (58),
     `arguments-object`
-  - Annex B: sloppy `eval`/`function`/`global` function-declaration
-    semantics (410), `RegExp` (57), `escape`/`unescape` (35)
+  - Annex B: the sloppy `eval`/`function`/`global` function-declaration
+    semantics (410), `RegExp` (57), `escape`/`unescape` (35), and the
+    assignment-target and `for-in` initializer clusters are all closed now —
+    see the Annex B section below (0 fail).
 
 ## Annex B
 
@@ -1606,6 +1608,51 @@ the parser implements Annex B HTML comments, legacy octal literals, the
 `for-in` initializer extension, and the Annex B `RegExp` legacy features,
 each with unit tests. The full `annexB/` sweep is available via the sweep
 tool above.
+
+The full sweep now measures **100% of runnable**: **956 pass, 0 fail, 130
+skip** of 1,086 fixtures (`--timeout 120 --recheck-timeout 120`, release
+build; the skips are the module/async flags, the `$262.createRealm`/
+`$262.IsHTMLDDA` host-dependent fixtures, and `fnGlobalObject.js`
+includes). This closed the area from 327 pass / 663 fail. The clusters:
+
+- **Sloppy block-level function declarations (B.3.2 / B.3.3)** — the ~410
+  `eval-code`/`function-code`/`global-code` fixtures. A block-level
+  FunctionDeclaration in sloppy code now hoists a var-scoped binding
+  (initialized to *undefined*) at declaration instantiation
+  (FunctionDeclarationInstantiation / GlobalDeclarationInstantiation /
+  EvalDeclarationInstantiation), resets it at block entry
+  (BlockDeclarationInstantiation), and copies the block-scoped binding
+  into the variable environment when the declaration statement is
+  evaluated — unless the hoist would produce an early error (a lexical
+  conflict in an enclosing scope, a formal parameter/`arguments`, or a
+  non-simple catch parameter). Statement-position forms (`if (x)
+  function f(){}`) behave as if wrapped in a block, and direct evals
+  inside catch blocks may re-declare the catch parameter (B.3.5).
+  The parser now accepts `let f; { function f(){} }`-style shadowing and
+  `catch (f) { function f(){} }` in sloppy mode, with the Annex B
+  relaxations tracked per scope.
+- **RegExp legacy escapes (B.1.4)** — `\c` + non-ASCII letter is a literal
+  `\c`; inside a class, `\c` + digit/`_` is a control escape and decimal
+  escapes are legacy octal (`[\12-\14]` = `\n`-`\f`); `\8`/`\9` are
+  identity escapes; the octal grammar caps at two digits for `\4`-`\7`
+  (`\400` = `\40` + `0`). Lone surrogates survive the regexp source
+  getter and the `eval` path (eval now parses UTF-16 source directly).
+- **`escape`/`unescape` and `Date.prototype.setYear`** — implemented per
+  B.2.1.1/B.2.1.2 and B.2.5, plus `toGMTString`/`trimLeft`/`trimRight` as
+  same-function aliases.
+- **`RegExp` legacy statics and `compile` (B.2.5)** — the `$1`-`$9` and
+  `input`/`$_`/`lastMatch`/`$&`/`lastParen`/`$+`/`leftContext`/
+  `rightContext` accessors with the `%RegExp%`-receiver TypeError, and
+  `RegExp.prototype.compile` (returns the receiver, brand-checks
+  `[[RegExpConstructor]]`, resets `lastIndex`).
+- **Assignment targets and `for-in` initializers** — a call-expression
+  assignment target (`f() = g()`, postfix `++`, `for (f() in …)`) parses
+  in sloppy mode and throws a ReferenceError at runtime with the callee
+  and arguments evaluated first (B.3.x web-compat); `for (var a = init in
+  …)` evaluates `init` once before the RHS.
+- **Harness** — `$262.evalScript` now evaluates as a Script (global
+  declaration instantiation) via a new `%evalScript%` runtime intrinsic,
+  and JS-thrown negative values are matched by `constructor.name`.
 
 ## Error messages and stack traces
 
@@ -1617,15 +1664,15 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 
 ## Open items
 
-- The built-ins area now measures **100% of runnable**: 17,179 pass / 0
-  fail / 0 crash / 0 hang of 23,812 fixtures (out-of-scope Temporal,
-  await-dictionary, and ShadowRealm fixtures and the host-dependent
-  `$262.createRealm`/`CanBlockIsTrue` waits skipped, `--timeout 120
-  --recheck-timeout 120`, release build). The remaining gap to the
-  plan's ≥95% target is the language area (2,048 fails, 88.6% of
-  runnable) and Annex B (558 fails, 44.0%): the systematic bug clusters
-  triaged above. Fix the next cluster, re-run the sweep, and record the
-  delta. Note: the TypedArray sweep should be run with the long deadline
+- The built-ins and Annex B areas now measure **100% of runnable**:
+  17,179 + 956 pass / 0 fail / 0 crash / 0 hang of 23,812 + 1,086
+  fixtures (out-of-scope Temporal, await-dictionary, and ShadowRealm
+  fixtures and the host-dependent `$262.createRealm`/`CanBlockIsTrue`
+  waits skipped, `--timeout 120 --recheck-timeout 120`, release build).
+  The remaining gap to the plan's ≥95% target is the language area
+  (2,048 fails, 88.6% of runnable): the systematic bug clusters triaged
+  above. Fix the next cluster, re-run the sweep, and record the delta.
+  Note: the TypedArray sweep should be run with the long deadline
   (`--timeout 120 --recheck-timeout 120`) — the O(n²) property store
   makes the 10,000-element crash-test fixtures take ~45s, which the
   default 5s recheck misclassifies as hangs.

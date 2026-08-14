@@ -375,6 +375,7 @@ impl Agent {
             variable_environment: global_env,
             private_environment: None,
             source: None,
+            annex_b_hoistable: Default::default(),
         });
     }
 

@@ -99,6 +99,7 @@ pub fn call_async_function(
             .running_context()
             .ok()
             .and_then(|context| context.source.clone()),
+        annex_b_hoistable: Default::default(),
     };
     agent.execution_context_stack.push(context.clone());
     let result = (|| -> Result<Value, JsError> {

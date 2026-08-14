@@ -811,12 +811,21 @@ fn call_inner(
                 if agent.current_realm()?.intrinsics.get("%eval%").as_ref() == Some(callee) {
                     let source = args.first().cloned().unwrap_or(Value::Undefined);
                     let text = crate::context::to_string(agent, &source)?;
-                    return crate::script::perform_eval(
-                        agent,
-                        &text.to_string_lossy(),
-                        false,
-                        false,
-                    );
+                    return crate::script::perform_eval(agent, &text, false, false);
+                }
+                // `%evalScript%` (test262's `$262.evalScript` host operation):
+                // evaluate as a Script — global declaration instantiation
+                // rather than eval semantics.
+                if agent
+                    .current_realm()?
+                    .intrinsics
+                    .get("%evalScript%")
+                    .as_ref()
+                    == Some(callee)
+                {
+                    let source = args.first().cloned().unwrap_or(Value::Undefined);
+                    let text = crate::context::to_string(agent, &source)?;
+                    return agent.run_script(&text.to_string_lossy());
                 }
                 let id = function.id();
                 let cached = agent.builtin_dispatch_cache.get(&id).copied();
@@ -1123,6 +1132,7 @@ fn ordinary_call(
             .running_context()
             .ok()
             .and_then(|context| context.source.clone()),
+        annex_b_hoistable: Default::default(),
     });
     let result = (|| -> Result<Value, JsError> {
         // OrdinaryCallBindThis: strict keeps `this` as-is; sloppy coerces
@@ -1251,6 +1261,7 @@ fn ordinary_construct(
             .running_context()
             .ok()
             .and_then(|context| context.source.clone()),
+        annex_b_hoistable: Default::default(),
     });
     let result = (|| -> Result<Value, JsError> {
         if data.default_derived {
@@ -1432,6 +1443,7 @@ pub(crate) fn function_declaration_instantiation(
             if !param_env.has_binding(&name)? {
                 param_env.create_mutable_binding(&name, false)?;
             }
+            param_env.mark_parameter(&name);
         }
     }
 
@@ -1507,6 +1519,7 @@ pub(crate) fn function_declaration_instantiation(
         } else {
             param_env.create_mutable_binding(&JsString::from_utf8("arguments"), false)?;
         }
+        param_env.mark_parameter(&JsString::from_utf8("arguments"));
         // spec 10.4.4.7/10.4.4.9: the arguments object's @@iterator is
         // %Array.prototype.values% (a Phase 8 join the crux creation sites
         // cannot make).
@@ -1637,6 +1650,30 @@ pub(crate) fn function_declaration_instantiation(
         let name = crux::lookup(f.name.unwrap());
         let func_obj = instantiate_function(agent, f, lexical_env.clone(), strict)?;
         variable_env.set_mutable_binding(&name, func_obj, false)?;
+    }
+
+    // Annex B.3.3.1: sloppy block-level function declarations hoist a var
+    // binding (initialized to *undefined*) unless the name is already
+    // var-declared, a parameter/`arguments`, or the hoist would produce an
+    // early error (a lexical conflict in an enclosing scope). The decision is
+    // recorded so block instantiation (B.3.2.1) can repeat it.
+    if !strict {
+        for (name, span, hoistable) in crate::script::annex_b_function_hoists(&data.body.stmts) {
+            if param_bindings.contains(&name) || !hoistable {
+                continue;
+            }
+            agent
+                .running_context()?
+                .annex_b_hoistable
+                .borrow_mut()
+                .insert((span.start, span.end));
+            if instantiated.contains(&name) || func_names.contains(&name) {
+                continue;
+            }
+            variable_env.create_mutable_binding(&name, false)?;
+            variable_env.initialize_binding(&name, Value::Undefined)?;
+            instantiated.push(name);
+        }
     }
     Ok(())
 }

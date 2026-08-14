@@ -18,7 +18,7 @@ use syntax::ast::{
 
 use crate::agent::Agent;
 use crate::context::{initialize_referenced_binding, put_value, resolve_binding};
-use crate::env::{EnvRef, new_declarative_environment, new_object_environment};
+use crate::env::{EnvRecord, EnvRef, new_declarative_environment, new_object_environment};
 use crate::expr::{eval_expr, eval_reference, get_iterator, iterator_close, iterator_step};
 use crate::flow::{Completion, completion_to_result};
 use crate::script::bound_names;
@@ -86,6 +86,10 @@ pub(crate) fn eval_statement(
         }
         StmtKind::UsingDecl { decls, .. } => {
             eval_lexical_declarations(agent, decls, strict)?;
+            Ok(Completion::Empty)
+        }
+        StmtKind::FunctionDecl(f) if f.statement_position && !strict => {
+            eval_statement_position_function(agent, f, stmt, strict)?;
             Ok(Completion::Empty)
         }
         StmtKind::FunctionDecl(f) => {
@@ -230,6 +234,25 @@ fn eval_lexical_declarations(
     Ok(())
 }
 
+/// Annex B: a statement-position function declaration (`if (x) function
+/// f(){}` in sloppy code) behaves as if the declaration were wrapped in a
+/// block — a block-scoped binding for the function's own scope plus the
+/// var-scoped hoist, copied into the variable environment at evaluation.
+fn eval_statement_position_function(
+    agent: &mut Agent,
+    f: &syntax::ast::Function,
+    stmt: &Stmt,
+    strict: bool,
+) -> Result<(), JsError> {
+    let old_env = agent.running_context()?.lexical_environment.clone();
+    let block_env = new_declarative_environment(Some(old_env.clone()));
+    block_declaration_instantiation(agent, std::slice::from_ref(stmt), &block_env, strict)?;
+    agent.running_context_mut()?.lexical_environment = block_env.clone();
+    eval_function_declaration(agent, f, strict)?;
+    agent.running_context_mut()?.lexical_environment = old_env;
+    Ok(())
+}
+
 /// FunctionDeclaration evaluation (spec 15.2.6): instantiate the function
 /// object against the current lexical environment and bind it in the
 /// VariableEnvironment.
@@ -242,19 +265,48 @@ fn eval_function_declaration(
         return Ok(());
     };
     let name = crux::lookup(name);
-    let variable_env = agent.running_context()?.variable_environment.clone();
-    // Var-scoped function declarations were already instantiated and bound
-    // by declaration instantiation (global/function/eval/block); the
-    // FunctionDeclaration statement itself evaluates to empty (spec 15.2.6).
-    // Re-creating the function here would replace the hoisted binding and
-    // discard properties set on it before the declaration statement. Only
+    let running = agent.running_context()?;
+    let variable_env = running.variable_environment.clone();
+    let lexical_env = running.lexical_environment.clone();
+
+    // Annex B.3.2.2 / B.3.3.3: a block-level function declaration in sloppy
+    // code copies its (block-scoped) binding into the variable environment
+    // when it is evaluated. When the innermost environment binds the name but
+    // the block did not hoist it (a strict block, or a let/const that
+    // suppressed the hoist), the declaration is dead: evaluation is empty.
+    if let EnvRecord::Declarative(block_env) = &*lexical_env {
+        if block_env.annex_b_hoists(&name) {
+            let fobj = lexical_env.get_binding_value(&name, false)?;
+            variable_env.set_mutable_binding(&name, fobj, false)?;
+            return Ok(());
+        }
+        if lexical_env.has_binding(&name)? {
+            return Ok(());
+        }
+    }
+
+    // Annex B statement-position form: `if (x) function f(){}` binds the
+    // variable environment at evaluation. The binding was created (or
+    // deliberately not created) by FunctionDeclarationInstantiation; a
+    // parameter binding is never overwritten.
+    if !strict && f.statement_position {
+        if !variable_env.has_binding(&name)? || variable_env.is_parameter_binding(&name) {
+            return Ok(());
+        }
+        let func_obj =
+            crate::function::instantiate_function(agent, f, lexical_env.clone(), strict)?;
+        variable_env.set_mutable_binding(&name, func_obj, false)?;
+        return Ok(());
+    }
+
+    // A top-level function declaration: the binding was created and
+    // initialized by declaration instantiation; evaluation is empty. Only
     // the Annex B statement-position forms (if/while bodies) create the
     // binding at evaluation time.
     if variable_env.has_binding(&name)? {
         return Ok(());
     }
-    let env = agent.running_context()?.lexical_environment.clone();
-    let func_obj = crate::function::instantiate_function(agent, f, env, strict)?;
+    let func_obj = crate::function::instantiate_function(agent, f, lexical_env.clone(), strict)?;
     variable_env.set_mutable_binding(&name, func_obj, false)?;
     Ok(())
 }
@@ -288,11 +340,21 @@ fn eval_block(
     block: &syntax::ast::Block,
     strict: bool,
 ) -> Result<Completion, JsError> {
+    eval_block_stmts(agent, &block.stmts, strict)
+}
+
+/// The shared body of `eval_block` and the block-like statement lists of
+/// try/finally/switch-case: instantiate in a fresh declarative env and run.
+fn eval_block_stmts(
+    agent: &mut Agent,
+    stmts: &[Stmt],
+    strict: bool,
+) -> Result<Completion, JsError> {
     let old_env = agent.running_context()?.lexical_environment.clone();
     let block_env = new_declarative_environment(Some(old_env.clone()));
-    block_declaration_instantiation(agent, &block.stmts, &block_env, strict)?;
+    block_declaration_instantiation(agent, stmts, &block_env, strict)?;
     agent.running_context_mut()?.lexical_environment = block_env.clone();
-    let result = eval_statement_list(agent, &block.stmts, strict);
+    let result = eval_statement_list(agent, stmts, strict);
     agent.running_context_mut()?.lexical_environment = old_env;
     result
 }
@@ -303,6 +365,17 @@ fn eval_block(
 pub(crate) fn block_declaration_instantiation(
     agent: &mut Agent,
     stmts: &[Stmt],
+    block_env: &EnvRef,
+    strict: bool,
+) -> Result<(), JsError> {
+    block_declaration_instantiation_iter(agent, stmts.iter(), block_env, strict)
+}
+
+/// Like `block_declaration_instantiation`, over an arbitrary statement
+/// iterator (a switch's case consequents share one block scope).
+pub(crate) fn block_declaration_instantiation_iter<'a>(
+    agent: &mut Agent,
+    stmts: impl Iterator<Item = &'a Stmt>,
     block_env: &EnvRef,
     strict: bool,
 ) -> Result<(), JsError> {
@@ -335,10 +408,67 @@ pub(crate) fn block_declaration_instantiation(
             StmtKind::FunctionDecl(f) => {
                 if let Some(name) = f.name {
                     let name = crux::lookup(name);
-                    block_env.create_mutable_binding(&name, false)?;
-                    let func_obj =
-                        crate::function::instantiate_function(agent, f, block_env.clone(), strict)?;
-                    block_env.initialize_binding(&name, func_obj)?;
+                    let already_bound = block_env.has_binding(&name)?;
+                    // Annex B.3.2.1: a sloppy block hoists its function
+                    // declarations to the variable environment — resetting an
+                    // existing binding to *undefined* — unless the block
+                    // already binds the name. The binding itself was created
+                    // (or deliberately not created) by the enclosing
+                    // declaration instantiation (B.3.3.x), which applied the
+                    // early-error checks; only set it here.
+                    if !strict && !already_bound {
+                        let variable_env = agent.running_context()?.variable_environment.clone();
+                        // Only names whose hoist B.3.3.x deemed applicable
+                        // (no enclosing lexical conflict) are marked; the
+                        // binding exists when the hoist applies.
+                        let hoistable = agent
+                            .running_context()?
+                            .annex_b_hoistable
+                            .borrow()
+                            .contains(&(f.span.start, f.span.end));
+                        let hoisted = if !hoistable {
+                            false
+                        } else {
+                            match &*variable_env {
+                                EnvRecord::Global(_) => {
+                                    if variable_env.has_binding(&name)?
+                                        && !variable_env.has_lexical_declaration(&name)
+                                    {
+                                        variable_env.set_mutable_binding(
+                                            &name,
+                                            Value::Undefined,
+                                            false,
+                                        )?;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
+                                _ if variable_env.has_binding(&name)? => {
+                                    variable_env.set_mutable_binding(
+                                        &name,
+                                        Value::Undefined,
+                                        false,
+                                    )?;
+                                    true
+                                }
+                                _ => false,
+                            }
+                        };
+                        if hoisted {
+                            block_env.add_annex_b_function(name.clone());
+                        }
+                    }
+                    if !already_bound {
+                        block_env.create_mutable_binding(&name, false)?;
+                        let func_obj = crate::function::instantiate_function(
+                            agent,
+                            f,
+                            block_env.clone(),
+                            strict,
+                        )?;
+                        block_env.initialize_binding(&name, func_obj)?;
+                    }
                 }
             }
             _ => {}
@@ -623,6 +753,18 @@ fn eval_for_in(
     strict: bool,
     labels: &[crux::string::AtomId],
 ) -> Result<Completion, JsError> {
+    // Annex B.2.6: `for (var a = init in expr)` — the initializer runs once
+    // and binds `a` before the RHS is evaluated (sloppy mode only).
+    if let ForBinding::VarDecl {
+        kind: VarDeclKind::Var,
+        pattern,
+        init: Some(init_expr),
+        ..
+    } = left
+    {
+        let init_value = eval_expr(agent, init_expr, strict)?;
+        crate::binding::binding_initialization(agent, pattern, init_value, None, strict)?;
+    }
     let rhs = eval_expr(agent, right, strict)?;
     let keys = for_in_keys(agent, &rhs)?;
     let mut iteration_result = Value::Undefined;
@@ -894,21 +1036,36 @@ fn eval_switch(
     if start == cases.len() {
         start = default_index;
     }
-    for case in &cases[start..] {
-        match eval_statement_list(agent, &case.consequent, strict)? {
-            Completion::Normal(_) | Completion::Empty => {}
-            // An unlabeled break exits the switch as a normal completion
-            // carrying the case list's value (spec 14.14.2 step 2).
-            Completion::Break {
-                target: None,
-                value,
-            } => {
-                return Ok(Completion::Normal(value.unwrap_or(Value::Undefined)));
+    // spec 14.13.2: the CaseBlock is a single lexical scope, so its
+    // function declarations get the Annex B treatment like a block's.
+    let old_env = agent.running_context()?.lexical_environment.clone();
+    let case_env = new_declarative_environment(Some(old_env.clone()));
+    block_declaration_instantiation_iter(
+        agent,
+        cases.iter().flat_map(|c| c.consequent.iter()),
+        &case_env,
+        strict,
+    )?;
+    agent.running_context_mut()?.lexical_environment = case_env;
+    let result = (|| -> Result<Completion, JsError> {
+        for case in &cases[start..] {
+            match eval_statement_list(agent, &case.consequent, strict)? {
+                Completion::Normal(_) | Completion::Empty => {}
+                // An unlabeled break exits the switch as a normal completion
+                // carrying the case list's value (spec 14.14.2 step 2).
+                Completion::Break {
+                    target: None,
+                    value,
+                } => {
+                    return Ok(Completion::Normal(value.unwrap_or(Value::Undefined)));
+                }
+                other => return Ok(other),
             }
-            other => return Ok(other),
         }
-    }
-    Ok(Completion::normal())
+        Ok(Completion::normal())
+    })();
+    agent.running_context_mut()?.lexical_environment = old_env;
+    result
 }
 
 /// TryStatement evaluation (spec 14.15): internal errors are caught too, and
@@ -920,7 +1077,7 @@ fn eval_try(
     finalizer: Option<&syntax::ast::Block>,
     strict: bool,
 ) -> Result<Completion, JsError> {
-    let result = eval_statement_list(agent, &block.stmts, strict);
+    let result = eval_block_stmts(agent, &block.stmts, strict);
     let handled = match result {
         Ok(Completion::Throw(value)) => match handler {
             Some(handler) => eval_catch(agent, handler, value, strict)?,
@@ -948,7 +1105,7 @@ fn run_finalizer(
     let Some(finalizer) = finalizer else {
         return result;
     };
-    match eval_statement_list(agent, &finalizer.stmts, strict)? {
+    match eval_block_stmts(agent, &finalizer.stmts, strict)? {
         Completion::Normal(_) | Completion::Empty => result,
         other => Ok(other),
     }
@@ -961,20 +1118,25 @@ fn eval_catch(
     strict: bool,
 ) -> Result<Completion, JsError> {
     let old_env = agent.running_context()?.lexical_environment.clone();
-    let catch_env = new_declarative_environment(Some(old_env.clone()));
+    // spec 18.2.3: the catch parameter binds in its own declarative
+    // environment; the body is a fresh block env over it, so a body function
+    // named like the parameter gets its own block binding (Annex B).
+    let param_env = new_declarative_environment(Some(old_env.clone()));
+    param_env.mark_catch_param_env();
     if let Some(param) = &handler.param {
-        // spec 18.2.3: the catch parameter's bound names are created
-        // uninitialized in a fresh declarative environment, then
+        // The catch parameter's bound names are created uninitialized, then
         // BindingInitialization fills them (the parameter may be a
         // destructuring pattern).
         let mut names = Vec::new();
         crate::script::bound_names(param, &mut names);
         for name in &names {
-            catch_env.create_mutable_binding(name, false)?;
+            param_env.create_mutable_binding(name, false)?;
         }
-        crate::binding::binding_initialization(agent, param, thrown, Some(&catch_env), strict)?;
+        crate::binding::binding_initialization(agent, param, thrown, Some(&param_env), strict)?;
     }
-    agent.running_context_mut()?.lexical_environment = catch_env;
+    let body_env = new_declarative_environment(Some(param_env.clone()));
+    block_declaration_instantiation(agent, &handler.body.stmts, &body_env, strict)?;
+    agent.running_context_mut()?.lexical_environment = body_env;
     let result = eval_statement_list(agent, &handler.body.stmts, strict);
     agent.running_context_mut()?.lexical_environment = old_env;
     result

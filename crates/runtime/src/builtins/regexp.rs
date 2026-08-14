@@ -10,6 +10,7 @@ use crux::error::{ErrorKind, JsError};
 use crux::function::{Function, NativeFn};
 use crux::handle::Handle;
 use crux::object::JsObject;
+use crux::ops::same_value;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
 use crux::value::{Value, is_callable, is_constructor};
@@ -23,6 +24,7 @@ const REGEXP_PROTO: &str = "%RegExp.prototype%";
 const EXEC: &str = "%RegExp.prototype.exec%";
 const TEST: &str = "%RegExp.prototype.test%";
 const TO_STRING: &str = "%RegExp.prototype.toString%";
+const COMPILE: &str = "%RegExp.prototype.compile%";
 const GET_SOURCE: &str = "%RegExp.prototype.source%";
 const GET_FLAGS: &str = "%RegExp.prototype.flags%";
 const GET_GLOBAL: &str = "%RegExp.prototype.global%";
@@ -44,13 +46,17 @@ const STRING_ITERATOR: &str = "%RegExpStringIteratorPrototype%";
 const STRING_ITERATOR_NEXT: &str = "%RegExpStringIteratorPrototype.next%";
 
 /// The RegExp instance state (the spec's [[OriginalSource]],
-/// [[OriginalFlags]], [[RegExpRecord]], [[RegExpMatcher]]).
+/// [[OriginalFlags]], [[RegExpRecord]], [[RegExpMatcher]], and
+/// [[RegExpConstructor]]).
 #[derive(Debug, Clone)]
 pub struct RegExpState {
     pub source: JsString,
     pub flags_text: String,
     pub flags: regexp::Flags,
     pub compiled: regexp::Regex,
+    /// The NewTarget that allocated this instance (spec [[RegExpConstructor]]);
+    /// RegExp.prototype.compile brand-checks it against %RegExp%.
+    pub constructor: Value,
 }
 
 fn placeholder(name: &'static str) -> NativeFn {
@@ -116,6 +122,7 @@ pub fn regexp_initialize(
     object: &Handle<JsObject>,
     pattern: &Value,
     flags: &Value,
+    constructor: Value,
 ) -> Result<Value, JsError> {
     let pattern_text = if matches!(pattern, Value::Undefined) {
         JsString::from_utf8("")
@@ -138,6 +145,7 @@ pub fn regexp_initialize(
             flags_text: flags_text.to_string_lossy(),
             flags: parsed_flags,
             compiled,
+            constructor,
         },
     );
     object.set(&JsString::from_utf8("lastIndex"), Value::Number(0.0), true)?;
@@ -211,7 +219,109 @@ fn regexp_construct(
         (pattern_or_regexp, flags)
     };
     let object = regexp_alloc(agent, &effective_new_target)?;
-    regexp_initialize(agent, &object, &pattern_source, &effective_flags)
+    regexp_initialize(
+        agent,
+        &object,
+        &pattern_source,
+        &effective_flags,
+        effective_new_target.clone(),
+    )
+}
+
+/// GetLegacyRegExpStaticProperty (spec B.2.5.2.1): only %RegExp% itself
+/// (SameValue) may read the legacy slots; with no match state the value is
+/// *undefined*.
+fn legacy_static_getter(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
+    let regexp = agent
+        .current_realm()?
+        .intrinsics
+        .get(REGEXP)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "%RegExp% is not defined".into()))?;
+    if same_value(&regexp, this) {
+        Ok(Value::Undefined)
+    } else {
+        Err(JsError::new(
+            ErrorKind::TypeError,
+            "RegExp legacy accessor called on a non-%RegExp% receiver".into(),
+        ))
+    }
+}
+
+/// SetLegacyRegExpStaticProperty (spec B.2.5.2.2): the same receiver check
+/// as the getter; the slot is not tracked, so a valid set is a no-op.
+fn legacy_static_setter(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
+    let regexp = agent
+        .current_realm()?
+        .intrinsics
+        .get(REGEXP)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "%RegExp% is not defined".into()))?;
+    if same_value(&regexp, this) {
+        Ok(Value::Undefined)
+    } else {
+        Err(JsError::new(
+            ErrorKind::TypeError,
+            "RegExp legacy accessor called on a non-%RegExp% receiver".into(),
+        ))
+    }
+}
+
+/// Annex B.2.5.1 RegExp.prototype.compile(pattern, flags): recompile this
+/// RegExp in place — a RegExp pattern reuses its source and (absent an
+/// explicit `flags` argument, which is a TypeError) its flags; otherwise both
+/// coerce through ToString. `lastIndex` resets to 0 (immutable-lastindex.js).
+pub fn compile(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    let Value::Object(obj) = this else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "RegExp.prototype.compile requires a RegExp receiver".into(),
+        ));
+    };
+    let current_state = agent.regexp_data.get(&obj.id()).cloned().ok_or_else(|| {
+        JsError::new(
+            ErrorKind::TypeError,
+            "RegExp.prototype.compile requires a RegExp receiver".into(),
+        )
+    })?;
+    // Annex B.2.5.1 step 4: SameValue(O.[[RegExpConstructor]], %RegExp%) must
+    // hold; a subclass instance throws (this-subclass-instance.js).
+    let regexp_ctor = agent
+        .current_realm()?
+        .intrinsics
+        .get(REGEXP)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "%RegExp% is not defined".into()))?;
+    if !crux::ops::same_value(&current_state.constructor, &regexp_ctor) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "RegExp.prototype.compile requires a %RegExp% receiver".into(),
+        ));
+    }
+    let pattern = args.first().cloned().unwrap_or(Value::Undefined);
+    let flags = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let (pattern_source, effective_flags) = if let Value::Object(pat) = &pattern
+        && agent.regexp_data.contains_key(&pat.id())
+    {
+        if !matches!(flags, Value::Undefined) {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "cannot supply flags when compiling from another RegExp".into(),
+            ));
+        }
+        let state = agent.regexp_data.get(&pat.id()).unwrap().clone();
+        (
+            Value::String(Handle::new(state.source)),
+            Value::String(Handle::new(JsString::from_utf8(&state.flags_text))),
+        )
+    } else {
+        (pattern, flags)
+    };
+    regexp_initialize(
+        agent,
+        obj,
+        &pattern_source,
+        &effective_flags,
+        current_state.constructor.clone(),
+    )?;
+    Ok(this.clone())
 }
 
 /// spec 22.2.2.2 RegExpBuiltinExec: the lastIndex protocol and the match
@@ -436,23 +546,26 @@ fn to_string_method(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<
 /// EscapeRegExpPattern (spec 22.2.4.4): escape `/` and line terminators so
 /// the literal round-trips; empty patterns render as `(?:)`. A slash that is
 /// already part of an escape sequence is left alone.
-fn escape_source(source: &JsString) -> String {
+/// The source getter's output: the original pattern text, with a literal
+/// `/` outside an escape escaped, and lone surrogates preserved as raw code
+/// units (a UTF-8 round-trip would replace them with U+FFFD).
+fn escape_source(source: &JsString) -> Vec<u16> {
     if source.is_empty() {
-        return "(?:)".to_string();
+        return "(?:)".encode_utf16().collect();
     }
     let units = source.as_slice();
-    let mut out = String::new();
+    let mut out: Vec<u16> = Vec::with_capacity(units.len());
     let mut i = 0;
     while i < units.len() {
         let u = units[i];
         let escaped = i > 0 && units[i - 1] == b'\\' as u16;
         match u {
-            0x2F if !escaped => out.push_str("\\/"),
-            0x0A => out.push_str("\\n"),
-            0x0D => out.push_str("\\r"),
-            0x2028 => out.push_str("\\u2028"),
-            0x2029 => out.push_str("\\u2029"),
-            _ => out.push(char::from_u32(u as u32).unwrap_or('\u{FFFD}')),
+            0x2F if !escaped => out.extend_from_slice(&[b'\\' as u16, b'/' as u16]),
+            0x0A => out.extend_from_slice(&[b'\\' as u16, b'n' as u16]),
+            0x0D => out.extend_from_slice(&[b'\\' as u16, b'r' as u16]),
+            0x2028 => out.extend_from_slice(&"\\u2028".encode_utf16().collect::<Vec<u16>>()),
+            0x2029 => out.extend_from_slice(&"\\u2029".encode_utf16().collect::<Vec<u16>>()),
+            _ => out.push(u),
         }
         i += 1;
     }
@@ -542,7 +655,7 @@ fn get_source(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     }
     let state = regexp_state(agent, this)?;
     let text = escape_source(&state.source);
-    Ok(Value::String(Handle::new(JsString::from_utf8(&text))))
+    Ok(Value::String(Handle::new(JsString::from_utf16(&text))))
 }
 
 /// spec 22.2.7.1 RegExp.prototype[@@match](string).
@@ -696,15 +809,12 @@ fn symbol_split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     }
     let string =
         crate::context::to_string(agent, &args.first().cloned().unwrap_or(Value::Undefined))?;
-    let limit = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let lim = if matches!(limit, Value::Undefined) {
-        u32::MAX
-    } else {
-        to_uint32(to_number(&limit)?)
-    };
-    // spec 22.2.7.15 steps 4-9: the splitter is a sticky clone built through
+    // spec 22.2.7.15 steps 4-10: the splitter is a sticky clone built through
     // SpeciesConstructor; the flags come from Get(rx, "flags") so a custom
-    // flags property or getter is honored.
+    // flags property or getter is honored. The splitter must be constructed
+    // before the limit is coerced: a side-effectful ToUint32 (e.g. a
+    // valueOf that recompiles rx) must not change the splitter's pattern
+    // (toint32-limit-recompiles-source.js).
     let realm = agent.current_realm()?;
     let default_ctor = realm
         .intrinsics
@@ -728,6 +838,12 @@ fn symbol_split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
         ],
         &ctor,
     )?;
+    let limit = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let lim = if matches!(limit, Value::Undefined) {
+        u32::MAX
+    } else {
+        to_uint32(to_number(&limit)?)
+    };
     let mut array: Vec<Value> = Vec::new();
     let size = string.len();
     if lim == 0 {
@@ -1220,10 +1336,11 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
 
     // The prototype methods.
-    let methods: [(&str, &str, u64); 3] = [
+    let methods: [(&str, &str, u64); 4] = [
         ("exec", EXEC, 1),
         ("test", TEST, 1),
         ("toString", TO_STRING, 0),
+        ("compile", COMPILE, 2),
     ];
     for (name, key, length) in methods {
         let func = Function::create_builtin(
@@ -1282,6 +1399,76 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
                 configurable: Some(true),
             },
         )?;
+    }
+
+    // Annex B.2.5.2: the legacy RegExp static accessors. Each named accessor
+    // shares its getter (and input's setter) with a `$`-alias; only `input`
+    // has a setter (SetLegacyRegExpStaticProperty). GetLegacyRegExpStatic-
+    // Property throws unless the receiver is %RegExp% itself; with no match
+    // state the slots read as undefined (the annexB fixtures only assert the
+    // descriptors and the receiver TypeError).
+    let install_legacy = |realm: &Handle<Realm>,
+                          ctor: &Handle<Function>,
+                          name: &str,
+                          alias: &str,
+                          with_setter: bool|
+     -> Result<(), JsError> {
+        let getter = Function::create_builtin(
+            Some(JsString::from_utf8(&format!("get {name}"))),
+            0,
+            placeholder("legacy"),
+            None,
+            None,
+        )?;
+        realm.intrinsics.define(
+            &format!("%RegExp.legacy.{name}%"),
+            Value::Function(getter.clone()),
+        );
+        let setter = if with_setter {
+            let setter = Function::create_builtin(
+                Some(JsString::from_utf8(&format!("set {name}"))),
+                1,
+                placeholder("legacy"),
+                None,
+                None,
+            )?;
+            realm.intrinsics.define(
+                &format!("%RegExp.legacy.{name}.set%"),
+                Value::Function(setter.clone()),
+            );
+            Some(setter)
+        } else {
+            None
+        };
+        let mut properties = vec![name];
+        if !alias.is_empty() {
+            properties.push(alias);
+        }
+        for property in properties {
+            ctor.define_property(
+                &JsString::from_utf8(property),
+                &PropertyDescriptor {
+                    value: None,
+                    writable: None,
+                    get: Some(Value::Function(getter.clone())),
+                    set: setter
+                        .clone()
+                        .map(Value::Function)
+                        .or(Some(Value::Undefined)),
+                    enumerable: Some(false),
+                    configurable: Some(true),
+                },
+            )?;
+        }
+        Ok(())
+    };
+    install_legacy(realm, &regexp_ctor, "input", "$_", true)?;
+    install_legacy(realm, &regexp_ctor, "lastMatch", "$&", false)?;
+    install_legacy(realm, &regexp_ctor, "lastParen", "$+", false)?;
+    install_legacy(realm, &regexp_ctor, "leftContext", "$\u{60}", false)?;
+    install_legacy(realm, &regexp_ctor, "rightContext", "$'", false)?;
+    for index in 1..=9u32 {
+        install_legacy(realm, &regexp_ctor, &format!("${index}"), "", false)?;
     }
 
     // The symbol methods.
@@ -1400,6 +1587,32 @@ pub fn dispatch_call(
     }
     if intrinsics.get(TO_STRING).as_ref() == Some(callee) {
         return Some(to_string_method(agent, this, args));
+    }
+    if intrinsics.get(COMPILE).as_ref() == Some(callee) {
+        return Some(compile(agent, this, args));
+    }
+    for key in [
+        "%RegExp.legacy.input%",
+        "%RegExp.legacy.lastMatch%",
+        "%RegExp.legacy.lastParen%",
+        "%RegExp.legacy.leftContext%",
+        "%RegExp.legacy.rightContext%",
+        "%RegExp.legacy.$1%",
+        "%RegExp.legacy.$2%",
+        "%RegExp.legacy.$3%",
+        "%RegExp.legacy.$4%",
+        "%RegExp.legacy.$5%",
+        "%RegExp.legacy.$6%",
+        "%RegExp.legacy.$7%",
+        "%RegExp.legacy.$8%",
+        "%RegExp.legacy.$9%",
+    ] {
+        if intrinsics.get(key).as_ref() == Some(callee) {
+            return Some(legacy_static_getter(agent, this));
+        }
+    }
+    if intrinsics.get("%RegExp.legacy.input.set%").as_ref() == Some(callee) {
+        return Some(legacy_static_setter(agent, this));
     }
     if intrinsics.get(GET_SOURCE).as_ref() == Some(callee) {
         return Some(get_source(agent, this));

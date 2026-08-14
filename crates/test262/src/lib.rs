@@ -157,9 +157,7 @@ $262.detachArrayBuffer = function (buffer) {
   }
   buffer.transfer();
 };
-$262.evalScript = function (code) {
-  return eval(code);
-};
+// `$262.evalScript` is installed natively (it must run as a Script).
 
 function $DETACHBUFFER(buffer) {
   $262.detachArrayBuffer(buffer);
@@ -10859,6 +10857,41 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
             .run_script(ASSERT_THROWS_PRELUDE)
             .map_err(|e| e.message)?;
         agent.run_script(HARNESS_PRELUDE).map_err(|e| e.message)?;
+        // `$262.evalScript` evaluates its source as a Script (test262 host
+        // spec) — global declaration instantiation, not direct eval. The
+        // native closure cannot reach the agent, so it is dispatched by
+        // intrinsic identity (the `%eval%` pattern) in the runtime.
+        let realm = agent.current_realm().map_err(|e| e.message)?;
+        let eval_script = Function::create_builtin(
+            Some(JsString::from_utf8("evalScript")),
+            1,
+            Box::new(|_, _| {
+                Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "evalScript must be called through the agent".into(),
+                ))
+            }),
+            None,
+            None,
+        )
+        .map_err(|e| e.message)?;
+        realm
+            .intrinsics
+            .define("%evalScript%", Value::Function(eval_script.clone()));
+        let dollar_two_six_two = realm
+            .global_object
+            .get(&JsString::from_utf8("$262"))
+            .map_err(|e| e.message)?;
+        let Value::Object(dollar_two_six_two_obj) = dollar_two_six_two else {
+            return Err("$262 is not an object".into());
+        };
+        dollar_two_six_two_obj
+            .set(
+                &JsString::from_utf8("evalScript"),
+                Value::Function(eval_script),
+                true,
+            )
+            .map_err(|e| e.message)?;
         // The real harness include files (testTypedArray.js, propertyHelper.js,
         // testAtomics.js, …) are plain JS built on the globals above; load
         // them from the submodule so the vendored fixtures get their exact
@@ -10876,14 +10909,42 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
             }
             (Ok(_), Some(phase)) => Err(format!("unexpected negative phase {phase}")),
             (Err(e), Some("runtime")) => {
-                let kind = expected_kind(fm)?;
-                if e.kind == kind {
-                    Ok(())
+                let ty = fm.negative_type.as_deref().unwrap_or("");
+                if ty == "Test262Error" {
+                    // The fixture deliberately throws the harness's
+                    // Test262Error (a plain object whose `constructor` is the
+                    // Test262Error function); the wrapped JsError's kind is
+                    // always TypeError, so the constructor name decides.
+                    let is_test262 = e
+                        .value
+                        .as_ref()
+                        .is_some_and(|v| thrown_constructor_is(&mut agent, v, "Test262Error"));
+                    if is_test262 {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "runtime {:?} != expected Test262Error: {}",
+                            e.kind, e.message
+                        ))
+                    }
                 } else {
-                    Err(format!(
-                        "runtime {:?} != expected {kind:?}: {}",
-                        e.kind, e.message
-                    ))
+                    let kind = expected_kind(fm)?;
+                    // A JS `throw new RangeError()` wraps in a TypeError-kind
+                    // JsError that carries the thrown value; the value's
+                    // constructor decides the negative type. Engine-thrown
+                    // errors have no value and match by kind.
+                    let matched = match &e.value {
+                        Some(value) => thrown_constructor_is(&mut agent, value, ty),
+                        None => e.kind == kind,
+                    };
+                    if matched {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "runtime {:?} != expected {ty}: {}",
+                            e.kind, e.message
+                        ))
+                    }
                 }
             }
             (Err(e), None) => Err(format!("unexpected runtime error: {}", e.message)),
@@ -10893,6 +10954,27 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
 
     fn assertion_error(message: String) -> JsError {
         JsError::new(ErrorKind::TypeError, message)
+    }
+
+    /// Whether the thrown value's `constructor.name` reads as `expected` (the
+    /// negative type of a JS-thrown error; `run_script` wraps every thrown
+    /// value in a TypeError-kind JsError carrying the value).
+    fn thrown_constructor_is(agent: &mut Agent, value: &Value, expected: &str) -> bool {
+        let ctor = runtime::context::get_property(
+            agent,
+            value,
+            &JsString::from_utf8("constructor"),
+            value.clone(),
+        )
+        .ok();
+        let name = ctor.and_then(|ctor| {
+            runtime::context::get_property(agent, &ctor, &JsString::from_utf8("name"), ctor.clone())
+                .ok()
+        });
+        match name {
+            Some(Value::String(text)) => text.to_string_lossy() == expected,
+            _ => false,
+        }
     }
 
     /// The source of a harness include file, read from the pinned submodule.
@@ -11161,6 +11243,11 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
             // Atomics.wait fixtures that assume [[CanBlock]] = true: the
             // engine's main agent cannot suspend (host-dependent).
             return FixtureResult::Skip("host-dependent: can_block is false".into());
+        }
+        if fm.features.iter().any(|f| f == "IsHTMLDDA") {
+            // The [[IsHTMLDDA]] host object (`$262.IsHTMLDDA`, Annex B.3.7)
+            // is not provided by this host (host-dependent).
+            return FixtureResult::Skip("host-dependent: $262.IsHTMLDDA is not provided".into());
         }
         let unsupported: Vec<&str> = fm
             .includes

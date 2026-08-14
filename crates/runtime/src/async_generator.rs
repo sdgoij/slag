@@ -226,6 +226,7 @@ pub fn call_async_generator(
             .running_context()
             .ok()
             .and_then(|context| context.source.clone()),
+        annex_b_hoistable: Default::default(),
     };
     // EvaluateAsyncGeneratorBody runs FunctionDeclarationInstantiation at
     // call time, so parameter binding errors (e.g. a throwing @@iterator in a

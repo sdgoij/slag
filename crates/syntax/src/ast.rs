@@ -596,6 +596,9 @@ pub struct Function {
     pub body: Block,
     pub is_async: bool,
     pub is_generator: bool,
+    /// Annex B: this FunctionDeclaration appeared in statement position
+    /// (`if (x) function f(){}`) rather than as a StatementListItem.
+    pub statement_position: bool,
 }
 
 /// A class declaration or expression (spec 15.7).

@@ -103,7 +103,13 @@ mod tests {
     fn default_hooks_permit_eval() {
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
-        let value = perform_eval(&mut agent, "var permitted = 1; permitted", false, true).unwrap();
+        let value = perform_eval(
+            &mut agent,
+            &crux::string::JsString::from_utf8("var permitted = 1; permitted"),
+            false,
+            true,
+        )
+        .unwrap();
         assert_eq!(value, crux::Value::Number(1.0));
     }
 
@@ -112,7 +118,13 @@ mod tests {
         let mut agent = Agent::new();
         agent.host_hooks = Some(Box::new(BlockingHooks));
         agent.initialize_host_defined_realm().unwrap();
-        let err = perform_eval(&mut agent, "1;", false, true).unwrap_err();
+        let err = perform_eval(
+            &mut agent,
+            &crux::string::JsString::from_utf8("1;"),
+            false,
+            true,
+        )
+        .unwrap_err();
         assert_eq!(err.kind, crux::ErrorKind::EvalError);
         // The hook receives the body text; verify it saw the source by
         // recording it through a cell in a second test.
@@ -139,7 +151,13 @@ mod tests {
             seen: observed.clone(),
         }));
         agent.initialize_host_defined_realm().unwrap();
-        perform_eval(&mut agent, "var x = 1;", false, false).unwrap();
+        perform_eval(
+            &mut agent,
+            &crux::string::JsString::from_utf8("var x = 1;"),
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(observed.borrow().as_deref(), Some("var x = 1;"));
     }
 }

@@ -6,7 +6,7 @@
 //! plumbing is documented follow-up work); every other spec algorithm is
 //! exact.
 
-use crux::convert::{to_integer_or_infinity, to_number};
+use crux::convert::to_integer_or_infinity;
 use crux::error::{ErrorKind, JsError};
 use crux::function::{Function, NativeFn};
 use crux::handle::Handle;
@@ -1029,6 +1029,22 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             },
         )?;
     }
+    // Annex B.2.6: Date.prototype.toGMTString is the *same function object*
+    // as toUTCString (value.js checks the identity; the dispatch above routes
+    // calls through the toUTCString intrinsic).
+    if let Some(utc) = realm.intrinsics.get("%Date.prototype.toUTCString%") {
+        date_proto.define_property(
+            &JsString::from_utf8("toGMTString"),
+            &PropertyDescriptor {
+                value: Some(utc),
+                writable: Some(true),
+                get: None,
+                set: None,
+                enumerable: Some(false),
+                configurable: Some(true),
+            },
+        )?;
+    }
 
     // The Date tag comes from the [[DateValue]] slot in
     // Object.prototype.toString; there is no @@toStringTag on the prototype.
@@ -1391,17 +1407,26 @@ fn set_year(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
             ));
         }
     };
-    let mut y = match args.first() {
-        Some(v) => to_number(v)?,
+    // spec B.2.4.2: the stored time value is read *before* the argument
+    // coerces (a valueOf that mutates the date must not affect the read), a
+    // NaN stored value becomes +0, and the year is ToInteger'd before the
+    // 0-99 → 1900+ offset (setYear(50.999999) is 1950, setYear(-0.9999999)
+    // is 1900).
+    let y = match args.first() {
+        Some(v) => crate::context::to_number(agent, v)?,
         None => f64::NAN,
     };
     if y.is_nan() {
         agent.date_data.insert(obj.id(), f64::NAN);
         return Ok(Value::Number(f64::NAN));
     }
-    if (0.0..=99.0).contains(&y) {
-        y += 1900.0;
-    }
+    let y = to_integer_or_infinity(y);
+    let y = if (0.0..=99.0).contains(&y) {
+        y + 1900.0
+    } else {
+        y
+    };
+    let t = if t.is_nan() { 0.0 } else { t };
     let local = local_time(t);
     let day = make_day(y, month_from_time(local) as f64, date_from_time(local));
     let composed = utc_time(make_date(day, time_within_day(local)));

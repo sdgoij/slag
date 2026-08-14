@@ -56,90 +56,123 @@ pub(crate) fn parse_assignment(parser: &mut Parser, allow_in: bool) -> Result<Ex
 
     // `async function …`, `async x => …`, `async (…) => …` — `async` is
     // contextual, so only treat it as a header when the next token allows.
-    if parser.at_contextual("async")? && !parser.peek2()?.line_break_before {
-        let next_kind = parser.peek2()?.kind.clone();
-        match next_kind {
-            TokenKind::Identifier(atom) if from_identifier(atom) == Some(Keyword::Function) => {
-                parser.next()?; // `async`
-                // FunctionExpression is a PrimaryExpression, so the member/
-                // call chain continues (`async function () {}.constructor`).
-                let function = parse_function_expression(parser, true)?;
-                return parse_subscripts(parser, function, false);
-            }
-            TokenKind::Identifier(atom) if is_binding_identifier(parser, atom) => {
-                // `async x => …`
-                parser.next()?; // `async`
-                let params = parse_single_arrow_param(parser)?;
-                parser.expect_punct(TokenKind::Arrow)?;
-                let body = parse_arrow_body(parser, true, &params)?;
-                let end = parser.prev.as_ref().unwrap().span.end;
-                return Ok(Expr {
-                    span: Span::new(start, end),
-                    kind: ExprKind::Arrow {
-                        is_async: true,
-                        params,
-                        body,
-                    },
-                });
-            }
-            TokenKind::LeftParen => {
-                // `async (…) => …` or `async(…)` call.
-                parser.next()?; // `async`
-                parser.expect_punct(TokenKind::LeftParen)?;
-                let result = parse_paren_contents(parser)?;
-                match result {
-                    ParenResult::ArrowParams(params) => {
-                        parser.expect_punct(TokenKind::Arrow)?;
-                        let body = parse_arrow_body(parser, true, &params)?;
-                        let end = parser.prev.as_ref().unwrap().span.end;
-                        return Ok(Expr {
-                            span: Span::new(start, end),
-                            kind: ExprKind::Arrow {
-                                is_async: true,
-                                params,
-                                body,
-                            },
-                        });
-                    }
-                    ParenResult::Empty => {
-                        let end = parser.prev.as_ref().unwrap().span.end;
-                        return Ok(Expr {
-                            span: Span::new(start, end),
-                            kind: ExprKind::Call(CallExpr {
-                                callee: Box::new(Expr {
-                                    span: Span::new(start, start),
-                                    kind: ExprKind::Ident(intern_utf8("async")),
-                                }),
-                                args: Vec::new(),
-                                optional: false,
+    // A call form (`async()`) falls through to the arrow/assignment handling
+    // below so `async() = 1` parses as an assignment target (Annex B).
+    let left: Expr = 'parsed: {
+        if parser.at_contextual("async")? && !parser.peek2()?.line_break_before {
+            let next_kind = parser.peek2()?.kind.clone();
+            match next_kind {
+                TokenKind::Identifier(atom) if from_identifier(atom) == Some(Keyword::Function) => {
+                    parser.next()?; // `async`
+                    // FunctionExpression is a PrimaryExpression, so the member/
+                    // call chain continues (`async function () {}.constructor`).
+                    let function = parse_function_expression(parser, true)?;
+                    return parse_subscripts(parser, function, false);
+                }
+                TokenKind::Identifier(atom) if is_binding_identifier(parser, atom) => {
+                    // `async x => …`
+                    parser.next()?; // `async`
+                    let params = parse_single_arrow_param(parser)?;
+                    parser.expect_punct(TokenKind::Arrow)?;
+                    let body = parse_arrow_body(parser, true, &params)?;
+                    let end = parser.prev.as_ref().unwrap().span.end;
+                    return Ok(Expr {
+                        span: Span::new(start, end),
+                        kind: ExprKind::Arrow {
+                            is_async: true,
+                            params,
+                            body,
+                        },
+                    });
+                }
+                TokenKind::LeftParen => {
+                    // `async (…) => …` or `async(…)` call.
+                    parser.next()?; // `async`
+                    parser.expect_punct(TokenKind::LeftParen)?;
+                    let result = parse_paren_contents(parser)?;
+                    match result {
+                        ParenResult::ArrowParams(params) => {
+                            parser.expect_punct(TokenKind::Arrow)?;
+                            let body = parse_arrow_body(parser, true, &params)?;
+                            let end = parser.prev.as_ref().unwrap().span.end;
+                            return Ok(Expr {
                                 span: Span::new(start, end),
-                            }),
-                        });
-                    }
-                    ParenResult::Expr(inner) => {
-                        // `async(expr)` — rebuild the call from the paren list.
-                        let end = parser.prev.as_ref().unwrap().span.end;
-                        let args = split_sequence_into_args(inner);
-                        return Ok(Expr {
-                            span: Span::new(start, end),
-                            kind: ExprKind::Call(CallExpr {
-                                callee: Box::new(Expr {
-                                    span: Span::new(start, start),
-                                    kind: ExprKind::Ident(intern_utf8("async")),
-                                }),
-                                args,
-                                optional: false,
+                                kind: ExprKind::Arrow {
+                                    is_async: true,
+                                    params,
+                                    body,
+                                },
+                            });
+                        }
+                        ParenResult::Empty => {
+                            let end = parser.prev.as_ref().unwrap().span.end;
+                            break 'parsed Expr {
                                 span: Span::new(start, end),
-                            }),
-                        });
+                                kind: ExprKind::Call(CallExpr {
+                                    callee: Box::new(Expr {
+                                        span: Span::new(start, start),
+                                        kind: ExprKind::Ident(intern_utf8("async")),
+                                    }),
+                                    args: Vec::new(),
+                                    optional: false,
+                                    span: Span::new(start, end),
+                                }),
+                            };
+                        }
+                        ParenResult::Expr(inner) => {
+                            // `async(expr)` — rebuild the call from the paren list.
+                            let end = parser.prev.as_ref().unwrap().span.end;
+                            let args = split_sequence_into_args(inner);
+                            break 'parsed Expr {
+                                span: Span::new(start, end),
+                                kind: ExprKind::Call(CallExpr {
+                                    callee: Box::new(Expr {
+                                        span: Span::new(start, start),
+                                        kind: ExprKind::Ident(intern_utf8("async")),
+                                    }),
+                                    args,
+                                    optional: false,
+                                    span: Span::new(start, end),
+                                }),
+                            };
+                        }
                     }
                 }
+                _ => {}
             }
-            _ => {}
         }
-    }
+        parse_conditional(parser, allow_in)?
+    };
 
-    let left = parse_conditional(parser, allow_in)?;
+    // Postfix `++`/`--` on the async-call form (`async()++`): the async
+    // special-case above skipped parse_conditional, which normally consumes
+    // the update operator.
+    if parser.at_punct(TokenKind::PlusPlus)? && !parser.peek()?.line_break_before {
+        parser.check_assignment_target(&left, AssignOp::Assign)?;
+        let end = parser.peek()?.span.end;
+        parser.next()?;
+        return Ok(Expr {
+            span: Span::new(left.span.start, end),
+            kind: ExprKind::Update {
+                op: UpdateOp::Increment,
+                prefix: false,
+                target: Box::new(left),
+            },
+        });
+    }
+    if parser.at_punct(TokenKind::MinusMinus)? && !parser.peek()?.line_break_before {
+        parser.check_assignment_target(&left, AssignOp::Assign)?;
+        let end = parser.peek()?.span.end;
+        parser.next()?;
+        return Ok(Expr {
+            span: Span::new(left.span.start, end),
+            kind: ExprKind::Update {
+                op: UpdateOp::Decrement,
+                prefix: false,
+                target: Box::new(left),
+            },
+        });
+    }
 
     // `x => body` — single-parameter arrow.
     if parser.at_punct(TokenKind::Arrow)? && !parser.peek()?.line_break_before {
@@ -1810,6 +1843,7 @@ fn parse_method_tail(
         body,
         is_async,
         is_generator,
+        statement_position: false,
     })
 }
 
@@ -1847,6 +1881,7 @@ pub(crate) fn parse_function_expression(
             body,
             is_async,
             is_generator,
+            statement_position: false,
         }),
     })
 }

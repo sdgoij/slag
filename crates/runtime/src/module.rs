@@ -734,6 +734,7 @@ pub fn module_evaluation(
         variable_environment: env.clone(),
         private_environment: None,
         source: Some(module.source.clone()),
+        annex_b_hoistable: Default::default(),
     };
     agent.execution_context_stack.push(context.clone());
     let strict = true;

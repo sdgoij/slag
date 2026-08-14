@@ -574,6 +574,10 @@ impl<'a> Parser<'a> {
                     })
                 } else if self.unicode() {
                     Err(self.error("Invalid decimal escape"))
+                } else if matches!(atom, 0x38 | 0x39) {
+                    // `\8`/`\9` have no octal reading and no matching
+                    // group: identity escapes (B.1.4 identity-escape).
+                    Ok(self.char_node(atom))
                 } else {
                     // Legacy octal escape.
                     let value = octal_escape(self, atom - 0x30)?;
@@ -631,9 +635,12 @@ impl<'a> Parser<'a> {
                 } else if self.unicode() {
                     Err(self.error("Invalid control escape"))
                 } else {
-                    // Annex B: `\c` without a control letter matches `\` then
-                    // the letter `c` is a literal; the following char (if
-                    // any) is consumed by the caller's normal flow.
+                    // Annex B: `\c` followed by a non-ControlLetter is not an
+                    // escape at all — the backslash and the `c` are separate
+                    // atoms. Rewind the cursor so the caller re-parses `c` as
+                    // a PatternCharacter (a following quantifier applies only
+                    // to it, e.g. `/\cа+/`).
+                    self.pos -= 1;
                     Ok(self.char_node(b'\\' as Atom))
                 }
             }
@@ -1206,14 +1213,27 @@ impl<'a> Parser<'a> {
                 }
             }
             0x63 => {
+                // A control letter is valid in both modes; Annex B adds
+                // ClassControlLetter `DecimalDigit`/`_` (non-unicode only);
+                // anything else re-parses as the two atoms `\` and `c`.
                 if let Some(letter) = self.peek()
                     && is_control_letter(letter)
+                {
+                    self.next();
+                    Ok(ClassAtom::Char(letter % 32))
+                } else if let Some(letter) = self.peek()
+                    && !self.unicode()
+                    && ((0x30..=0x39).contains(&letter) || letter == 0x5F)
                 {
                     self.next();
                     Ok(ClassAtom::Char(letter % 32))
                 } else if self.unicode() {
                     Err(self.error("Invalid control escape"))
                 } else {
+                    // Annex B: `[\cX]` with a non-ClassControlLetter X is the
+                    // two atoms `\` and `c` (plus X); rewind so the caller
+                    // re-parses `c` as its own ClassAtom.
+                    self.pos -= 1;
                     Ok(ClassAtom::Char(b'\\' as Atom))
                 }
             }
@@ -1223,6 +1243,28 @@ impl<'a> Parser<'a> {
             0x76 => Ok(ClassAtom::Char(0x0B)),
             0x66 => Ok(ClassAtom::Char(0x0C)),
             0x72 => Ok(ClassAtom::Char(0x0D)),
+            // Annex B decimal escapes: classes have no backreferences, so a
+            // digit escape is the legacy octal character (B.1.4 ClassAtomNoDash
+            // :: \ DecimalEscape). `\8`/`\9` have no octal reading and stay
+            // identity escapes.
+            0x30 => {
+                if self.peek().is_some_and(|a| (0x30..=0x39).contains(&a)) {
+                    if self.unicode() {
+                        return Err(self.error("Invalid decimal escape"));
+                    }
+                    return Ok(ClassAtom::Char(octal_escape(self, 0)?));
+                }
+                Ok(ClassAtom::Char(0))
+            }
+            0x31..=0x39 => {
+                if self.unicode() {
+                    return Err(self.error("Invalid decimal escape"));
+                }
+                if matches!(atom, 0x38 | 0x39) {
+                    return Ok(ClassAtom::Char(atom));
+                }
+                Ok(ClassAtom::Char(octal_escape(self, atom - 0x30)?))
+            }
             _ => {
                 if self.unicode() && !is_identity_escape_allowed(atom) && atom != 0x2D {
                     // `-` is its own ClassEscape production (a literal dash);
@@ -1655,24 +1697,20 @@ fn merge_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
     merged
 }
 
-/// Legacy octal escapes (Annex B): up to 3 octal digits, value capped at 0xFF.
+/// Legacy octal escapes (Annex B LegacyOctalEscapeSequence): `\0`-`\3` take
+/// up to two more octal digits; `\4`-`\7` take exactly one more. Values never
+/// exceed 0xFF under this grammar.
 fn octal_escape(parser: &mut Parser<'_>, first: u32) -> Result<u32, Error> {
     let mut value = first;
-    let mut count = 1;
-    while count < 3 {
+    let mut remaining = if first <= 3 { 2 } else { 1 };
+    while remaining > 0 {
         let Some(d) = parser.peek() else { break };
         if !(0x30..=0x37).contains(&d) {
             break;
         }
         parser.next();
         value = value * 8 + (d - 0x30);
-        if value > 0xFF {
-            value -= 0x100;
-        }
-        count += 1;
-    }
-    if value > 0xFF {
-        value %= 0x100;
+        remaining -= 1;
     }
     Ok(value)
 }

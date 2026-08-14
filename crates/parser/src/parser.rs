@@ -47,6 +47,9 @@ pub(crate) struct Scope {
     pub(crate) functions: HashSet<AtomId>,
     /// Formal-parameter names (clash with body `let`/`const` only).
     pub(crate) params: HashSet<AtomId>,
+    /// Catch-parameter names: a block-level function declaration may share a
+    /// catch parameter's name (Annex B), though `let`/`const` may not.
+    pub(crate) catch_params: HashSet<AtomId>,
     /// True for the scope of a function body: `var` names do not escape it.
     pub(crate) is_function: bool,
     /// True for the scope of a catch block: the catch parameter is a lexical
@@ -363,6 +366,7 @@ impl<'s> Parser<'s> {
             return Err(self.error_at(start, "Identifier has already been declared"));
         }
         scope.lexical.insert(name);
+        scope.catch_params.insert(name);
         Ok(())
     }
 
@@ -388,10 +392,23 @@ impl<'s> Parser<'s> {
 
     /// Declares a function-declaration name: it coexists with `var`, clashes
     /// with `let`/`const`, and may repeat (function declarations are
-    /// var-scoped in both modes, spec 16.1.2).
-    pub(crate) fn declare_function(&mut self, name: AtomId, start: u32) -> Result<(), JsError> {
+    /// var-scoped in both modes, spec 16.1.2). A block-level function may
+    /// share a catch parameter's name (Annex B); a statement-position
+    /// function (`if (x) function f(){}`) may share an enclosing lexical
+    /// name (its hoist is simply suppressed).
+    pub(crate) fn declare_function(
+        &mut self,
+        name: AtomId,
+        start: u32,
+        relaxed: bool,
+    ) -> Result<(), JsError> {
         let scope = self.scopes.last_mut().unwrap();
-        if scope.lexical.contains(&name) && !scope.functions.contains(&name) {
+        let is_catch_param = scope.is_catch && scope.catch_params.contains(&name);
+        if scope.lexical.contains(&name)
+            && !scope.functions.contains(&name)
+            && !is_catch_param
+            && !relaxed
+        {
             return Err(self.error_at(start, "Identifier has already been declared"));
         }
         scope.lexical.insert(name);
@@ -444,6 +461,11 @@ impl<'s> Parser<'s> {
             ExprKind::Array(_) | ExprKind::Object(_) if allow_pattern => {
                 self.check_rest_position(expr)
             }
+            // Annex B web-compat: a CallExpression assignment target parses in
+            // sloppy code and throws a ReferenceError at runtime (spec
+            // "Runtime Errors for Function Call Assignment Targets"); strict
+            // code keeps the early error.
+            ExprKind::Call(_) if !self.strict => Ok(()),
             _ => Err(self.error_at(expr.span.start, "Invalid assignment target")),
         }
     }

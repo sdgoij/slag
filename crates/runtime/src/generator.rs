@@ -190,6 +190,7 @@ pub fn call_generator(
             .running_context()
             .ok()
             .and_then(|context| context.source.clone()),
+        annex_b_hoistable: Default::default(),
     };
     agent.execution_context_stack.push(context);
     let instantiate = (|| -> Result<(), JsError> {

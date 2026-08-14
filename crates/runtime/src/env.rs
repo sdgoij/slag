@@ -40,6 +40,45 @@ impl EnvRecord {
         }
     }
 
+    /// Annex B (B.3.2.1): record a block-level function hoisted from this
+    /// block into the variable environment. No-op for non-declarative envs.
+    pub fn add_annex_b_function(&self, name: JsString) {
+        if let EnvRecord::Declarative(e) = self {
+            e.add_annex_b_function(name);
+        }
+    }
+
+    /// Mark this declarative environment as a catch parameter's scope.
+    pub fn mark_catch_param_env(&self) {
+        if let EnvRecord::Declarative(e) = self {
+            e.is_catch_param.set(true);
+        }
+    }
+
+    pub fn is_catch_param_env(&self) -> bool {
+        matches!(self, EnvRecord::Declarative(e) if e.is_catch_param.get())
+    }
+
+    /// True when the binding is a formal parameter or `arguments` (the Annex
+    /// B block-function hoist must not overwrite it).
+    pub fn is_parameter_binding(&self, name: &JsString) -> bool {
+        match self {
+            EnvRecord::Declarative(e) => e.is_parameter(name),
+            EnvRecord::Function(e) => e.declarative.is_parameter(name),
+            _ => false,
+        }
+    }
+
+    /// Mark a binding as a formal parameter or `arguments` (declarative and
+    /// function records only).
+    pub fn mark_parameter(&self, name: &JsString) {
+        match self {
+            EnvRecord::Declarative(e) => e.mark_parameter(name),
+            EnvRecord::Function(e) => e.declarative.mark_parameter(name),
+            _ => {}
+        }
+    }
+
     /// spec 9.2.1.4 HasBinding.
     pub fn has_binding(&self, name: &JsString) -> Result<bool, JsError> {
         match self {
@@ -255,6 +294,9 @@ pub struct Binding {
     /// Module import indirection (spec 9.2.5 CreateImportBinding): reads
     /// resolve through to the target binding.
     pub indirect: Option<(EnvRef, JsString)>,
+    /// A formal parameter or `arguments` binding: the Annex B block-function
+    /// hoist (B.3.2.1) must not overwrite it.
+    pub parameter: bool,
 }
 
 /// A Declarative Environment Record (spec 9.2.2), also the base of the
@@ -266,6 +308,14 @@ pub struct DeclarativeEnv {
     /// [[DisposableResourceStack]] (spec 9.2.2): populated by `using`
     /// evaluation in Phase 15.
     pub disposable_resources: RefCell<Vec<Value>>,
+    /// Annex B (B.3.2.1): the block-level FunctionDeclarations this block
+    /// hoisted into the variable environment. FunctionDeclaration evaluation
+    /// copies the block binding into the var binding for these names.
+    pub annex_b_functions: RefCell<Vec<JsString>>,
+    /// The environment of a catch parameter: direct-eval vars may share the
+    /// catch parameter's name (Annex B.3.5), so the eval var-vs-lexical walk
+    /// skips it.
+    pub is_catch_param: std::cell::Cell<bool>,
 }
 
 impl DeclarativeEnv {
@@ -274,7 +324,38 @@ impl DeclarativeEnv {
             outer,
             bindings: RefCell::new(Vec::new()),
             disposable_resources: RefCell::new(Vec::new()),
+            annex_b_functions: RefCell::new(Vec::new()),
+            is_catch_param: std::cell::Cell::new(false),
         }
+    }
+
+    /// Record an Annex B (B.3.2.1) var hoist performed from this block.
+    pub fn add_annex_b_function(&self, name: JsString) {
+        self.annex_b_functions.borrow_mut().push(name);
+    }
+
+    pub fn annex_b_hoists(&self, name: &JsString) -> bool {
+        self.annex_b_functions.borrow().contains(name)
+    }
+
+    /// Mark a binding as a formal parameter or `arguments` (the Annex B
+    /// block-function hoist must not overwrite it).
+    pub fn mark_parameter(&self, name: &JsString) {
+        if let Some((_, binding)) = self
+            .bindings
+            .borrow_mut()
+            .iter_mut()
+            .find(|(n, _)| n == name)
+        {
+            binding.parameter = true;
+        }
+    }
+
+    pub fn is_parameter(&self, name: &JsString) -> bool {
+        self.bindings
+            .borrow()
+            .iter()
+            .any(|(n, b)| n == name && b.parameter)
     }
 
     fn has_binding(&self, name: &JsString) -> bool {
@@ -296,6 +377,7 @@ impl DeclarativeEnv {
                 strict: false,
                 deletable,
                 indirect: None,
+                parameter: false,
             },
         ));
         Ok(())
@@ -316,6 +398,7 @@ impl DeclarativeEnv {
                 strict,
                 deletable: false,
                 indirect: None,
+                parameter: false,
             },
         ));
         Ok(())
@@ -437,6 +520,7 @@ impl DeclarativeEnv {
                 strict: true,
                 deletable: false,
                 indirect: Some((target, target_name.clone())),
+                parameter: false,
             },
         ));
         Ok(())

@@ -78,6 +78,8 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         ("encodeURIComponent", 1, |_, args| encode(args, true)),
         ("decodeURI", 1, |_, args| decode(args, false)),
         ("decodeURIComponent", 1, |_, args| decode(args, true)),
+        ("escape", 1, escape),
+        ("unescape", 1, unescape),
     ] {
         let function = Function::create_builtin(
             Some(JsString::from_utf8(name)),
@@ -104,6 +106,77 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         )?;
     }
     Ok(())
+}
+
+/// escape (spec B.2.1.1): keep the URL-safe set verbatim, percent-encode
+/// code units below 256 as `%XX` and the rest as `%uXXXX` (uppercase hex).
+fn escape(_this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    let text = to_string_agent(&arg(args, 0))?;
+    let mut out = String::new();
+    for &unit in text.as_slice() {
+        match unit {
+            0x41..=0x5A
+            | 0x61..=0x7A
+            | 0x30..=0x39
+            | 0x40
+            | 0x2A
+            | 0x5F
+            | 0x2B
+            | 0x2D
+            | 0x2E
+            | 0x2F => {
+                out.push(char::from_u32(unit as u32).unwrap());
+            }
+            0..=0xFF => out.push_str(&format!("%{unit:02X}")),
+            _ => out.push_str(&format!("%u{unit:04X}")),
+        }
+    }
+    Ok(str(&out))
+}
+
+/// unescape (spec B.2.1.2): decode `%uXXXX` (four hex digits, case
+/// insensitive) and `%XX` (two); a `%` that does not start a valid escape is
+/// kept literally and the scan continues after it.
+fn unescape(_this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    let text = to_string_agent(&arg(args, 0))?;
+    let units = text.as_slice();
+    let mut out: Vec<u16> = Vec::with_capacity(units.len());
+    let mut index = 0;
+    while index < units.len() {
+        if units[index] == b'%' as u16 {
+            if index + 5 < units.len()
+                && units[index + 1] == b'u' as u16
+                && let Some(value) = hex4(&units[index + 2..index + 6])
+            {
+                out.push(value);
+                index += 6;
+                continue;
+            }
+            if index + 2 < units.len()
+                && let Some(value) = hex2(&units[index + 1..index + 3])
+            {
+                out.push(value);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(units[index]);
+        index += 1;
+    }
+    Ok(Value::String(Handle::new(JsString::from_utf16(&out))))
+}
+
+fn hex2(units: &[u16]) -> Option<u16> {
+    Some(hex_value(units[0])? as u16 * 16 + hex_value(units[1])? as u16)
+}
+
+fn hex4(units: &[u16]) -> Option<u16> {
+    Some(
+        hex_value(units[0])? as u16 * 4096
+            + hex_value(units[1])? as u16 * 256
+            + hex_value(units[2])? as u16 * 16
+            + hex_value(units[3])? as u16,
+    )
 }
 
 /// isFinite (spec 19.2.2): ToNumber (abrupt completions propagate), then

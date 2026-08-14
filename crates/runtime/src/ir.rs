@@ -1927,12 +1927,7 @@ impl Vm {
         if is_eval_function(agent, &callee)? {
             let source = args.first().cloned().unwrap_or(Value::Undefined);
             let source = crux::convert::to_string(&source)?;
-            let result = crate::script::perform_eval(
-                agent,
-                &source.to_string_lossy(),
-                self.strict,
-                direct_eval,
-            )?;
+            let result = crate::script::perform_eval(agent, &source, self.strict, direct_eval)?;
             self.stack.push(result);
             return Ok(());
         }
@@ -3540,6 +3535,24 @@ impl Compiler {
         right: &Expr,
         body: &Stmt,
     ) -> Result<(), JsError> {
+        // Annex B.2.6: `for (var a = init in expr)` — the initializer runs
+        // once and binds `a` before the RHS is evaluated (sloppy mode only).
+        if let ForBinding::VarDecl {
+            kind: VarDeclKind::Var,
+            pattern,
+            init: Some(init_expr),
+            ..
+        } = left
+        {
+            self.compile_expr(init_expr)?;
+            self.emit(Step::ForInBind {
+                left: ForBinding::VarDecl {
+                    kind: VarDeclKind::Var,
+                    pattern: pattern.clone(),
+                    init: None,
+                },
+            });
+        }
         self.compile_expr(right)?;
         self.emit(Step::ForInBegin);
         let top_label = self.new_label();

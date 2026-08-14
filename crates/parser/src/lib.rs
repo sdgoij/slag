@@ -20,7 +20,17 @@ pub use parser::Parser;
 /// Parses a Script (spec 16.1): a statement list with Annex B HTML comments
 /// enabled.
 pub fn parse_script(source: &str) -> Result<Program, JsError> {
-    let source = SourceText::from_utf8(source);
+    parse_script_units(&source.encode_utf16().collect::<Vec<u16>>())
+}
+
+/// Like `parse_script`, for UTF-16 source text (the `eval` path, where the
+/// code is a `JsString` and lone surrogates must survive intact).
+pub fn parse_script_utf16(units: &[u16]) -> Result<Program, JsError> {
+    parse_script_units(units)
+}
+
+fn parse_script_units(units: &[u16]) -> Result<Program, JsError> {
+    let source = SourceText::from_utf16(units.to_vec());
     let mut parser = Parser::new(&source, true);
     let strict = expr::scan_directive_prologue(&mut parser)?;
     parser.strict = strict;
@@ -1315,14 +1325,15 @@ mod tests {
     #[test]
     fn catch_parameter_redeclaration_rules() {
         // spec 15.1.8: CatchParameter names clash with the block's
-        // LexicallyDeclaredNames (let/class/function), but the var rule was
-        // relaxed — `var` in the catch body and outer vars may share the name.
+        // LexicallyDeclaredNames (let/class), but the var rule was relaxed —
+        // `var` and block-level function declarations in the catch body may
+        // share the name (Annex B).
         ok("try {} catch (e) { var e; }");
         ok("var e; try {} catch (e) {}");
         ok("try {} catch (e) { var e; } var e;");
+        ok("try {} catch (e) { function e() {} }");
         err("try {} catch (e) { let e; }");
         err("try {} catch (e) { const e = 1; }");
-        err("try {} catch (e) { function e() {} }");
         err("try {} catch (e) { { let e; } }");
         err("try {} catch ([x, x]) {}");
     }

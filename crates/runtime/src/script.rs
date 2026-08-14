@@ -4,6 +4,8 @@
 //! VarScopedDeclarations, LexicallyScopedDeclarations, BoundNames,
 //! IsConstantDeclaration, ScriptIsStrict).
 
+use std::collections::HashSet;
+
 use crux::error::{ErrorKind, JsError};
 use crux::handle::Handle;
 use crux::string::{JsString, lookup};
@@ -55,6 +57,7 @@ pub fn script_evaluation(
         variable_environment: global_env.clone(),
         private_environment: None,
         source: Some(script.source.clone()),
+        annex_b_hoistable: Default::default(),
     };
     agent.execution_context_stack.push(context);
 
@@ -284,6 +287,170 @@ pub fn top_level_var_scoped_declarations<'a>(stmts: &'a [Stmt]) -> Vec<VarScoped
     decls
 }
 
+// ---- Annex B block-level function declarations (B.3.2 / B.3.3) ----
+
+/// Annex B (B.3.3.x / B.3.2.1): for each FunctionDeclaration that is not a
+/// top-level StatementListItem — block-level (in a Block, switch case, or
+/// try/catch/finally list) or statement-position (`if (x) function f(){}`) —
+/// in source order, the name, the declaration's span, and whether its Annex B
+/// var hoist is applicable. A hoist is suppressed when the name is lexically
+/// bound in an enclosing scope: a let/const/class/using declaration, a
+/// block-level function declaration, or a non-simple catch parameter.
+/// Top-level function declarations are var-scoped and do not suppress.
+pub fn annex_b_function_hoists(stmts: &[Stmt]) -> Vec<(JsString, crux::Span, bool)> {
+    let mut out = Vec::new();
+    let mut stack: Vec<HashSet<JsString>> = Vec::new();
+    walk_annex_b_list(stmts, &mut stack, &mut out, false);
+    out
+}
+
+/// `stack` holds the lexical names of every enclosing statement list.
+fn walk_annex_b_list(
+    stmts: &[Stmt],
+    stack: &mut Vec<HashSet<JsString>>,
+    out: &mut Vec<(JsString, crux::Span, bool)>,
+    nested: bool,
+) {
+    let mut current: HashSet<JsString> = HashSet::new();
+    for stmt in stmts {
+        match &stmt.kind {
+            StmtKind::VarDecl { kind, decls, .. } if *kind != VarDeclKind::Var => {
+                for decl in decls {
+                    let mut names = Vec::new();
+                    bound_names(&decl.pattern, &mut names);
+                    current.extend(names);
+                }
+            }
+            StmtKind::UsingDecl { decls, .. } => {
+                for decl in decls {
+                    let mut names = Vec::new();
+                    bound_names(&decl.pattern, &mut names);
+                    current.extend(names);
+                }
+            }
+            StmtKind::ClassDecl(class) => {
+                if let Some(name) = class.name {
+                    current.insert(lookup(name));
+                }
+            }
+            _ => {}
+        }
+    }
+    stack.push(current.clone());
+    for stmt in stmts {
+        match &stmt.kind {
+            StmtKind::FunctionDecl(f) => {
+                if let Some(name) = f.name {
+                    let name = lookup(name);
+                    if nested {
+                        let conflict = stack.iter().any(|s| s.contains(&name));
+                        out.push((name.clone(), f.span, !conflict));
+                        current.insert(name.clone());
+                        if let Some(top) = stack.last_mut() {
+                            top.insert(name);
+                        }
+                    }
+                }
+            }
+            _ => walk_annex_b_stmt(stmt, stack, out, &current),
+        }
+    }
+    stack.pop();
+}
+
+fn walk_annex_b_stmt(
+    stmt: &Stmt,
+    stack: &mut Vec<HashSet<JsString>>,
+    out: &mut Vec<(JsString, crux::Span, bool)>,
+    _current: &HashSet<JsString>,
+) {
+    match &stmt.kind {
+        StmtKind::FunctionDecl(f) => {
+            // Statement-position function: check all enclosing scopes.
+            if let Some(name) = f.name {
+                let name = lookup(name);
+                let conflict = stack.iter().any(|s| s.contains(&name));
+                out.push((name, f.span, !conflict));
+            }
+        }
+        StmtKind::Block(block) => walk_annex_b_list(&block.stmts, stack, out, true),
+        StmtKind::If {
+            consequent,
+            alternate,
+            ..
+        } => {
+            walk_annex_b_stmt(consequent, stack, out, _current);
+            if let Some(alt) = alternate {
+                walk_annex_b_stmt(alt, stack, out, _current);
+            }
+        }
+        StmtKind::While { body, .. }
+        | StmtKind::DoWhile { body, .. }
+        | StmtKind::With { body, .. }
+        | StmtKind::Labeled { body, .. } => walk_annex_b_stmt(body, stack, out, _current),
+        StmtKind::For { init, body, .. } => {
+            // For-head lexical declarations (`for (let f; …)`) are enclosing
+            // names for the body's functions.
+            if let Some(ForInit::VarDecl { kind, decls, .. }) = init
+                && *kind != VarDeclKind::Var
+                && let Some(top) = stack.last_mut()
+            {
+                for decl in decls {
+                    let mut names = Vec::new();
+                    bound_names(&decl.pattern, &mut names);
+                    top.extend(names);
+                }
+            }
+            walk_annex_b_stmt(body, stack, out, _current);
+        }
+        StmtKind::ForIn { left, body, .. } | StmtKind::ForOf { left, body, .. } => {
+            if let ForBinding::VarDecl { kind, pattern, .. } = left
+                && *kind != VarDeclKind::Var
+                && let Some(top) = stack.last_mut()
+            {
+                let mut names = Vec::new();
+                bound_names(pattern, &mut names);
+                top.extend(names);
+            }
+            walk_annex_b_stmt(body, stack, out, _current);
+        }
+        StmtKind::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            walk_annex_b_list(&block.stmts, stack, out, true);
+            if let Some(handler) = handler {
+                // The catch body is a list whose scope includes the
+                // parameter (a non-simple one conflicts with a var).
+                stack.push(HashSet::new());
+                if let Some(param) = &handler.param
+                    && !matches!(param, BindingPattern::Ident(_))
+                {
+                    let mut names = Vec::new();
+                    bound_names(param, &mut names);
+                    if let Some(top) = stack.last_mut() {
+                        top.extend(names);
+                    }
+                }
+                walk_annex_b_list(&handler.body.stmts, stack, out, true);
+                stack.pop();
+            }
+            if let Some(finalizer) = finalizer {
+                walk_annex_b_list(&finalizer.stmts, stack, out, true);
+            }
+        }
+        StmtKind::Switch { cases, .. } => {
+            stack.push(HashSet::new());
+            for case in cases {
+                walk_annex_b_list(&case.consequent, stack, out, true);
+            }
+            stack.pop();
+        }
+        _ => {}
+    }
+}
+
 // ---- GlobalDeclarationInstantiation (spec 16.1.7) ----
 
 /// GlobalDeclarationInstantiation (spec 16.1.7): create the script's global
@@ -404,8 +571,29 @@ pub fn global_declaration_instantiation(
         global_env.create_global_function_binding(&name, func_obj, false)?;
     }
 
-    for name in declared_variable_names {
-        global_env.create_global_var_binding(&name, false)?;
+    for name in &declared_variable_names {
+        global_env.create_global_var_binding(name, false)?;
+    }
+
+    // Annex B.3.3.2: sloppy block-level function declarations hoist a global
+    // binding (undefined) when the hoist would not produce an early error.
+    if !strict {
+        for (name, span, hoistable) in annex_b_function_hoists(&program.body) {
+            if !hoistable {
+                continue;
+            }
+            if global_env.has_lexical_declaration(&name) {
+                continue;
+            }
+            if !declared_func_names.contains(&name) && !declared_variable_names.contains(&name) {
+                global_env.create_global_function_binding(&name, Value::Undefined, false)?;
+            }
+            agent
+                .running_context()?
+                .annex_b_hoistable
+                .borrow_mut()
+                .insert((span.start, span.end));
+        }
     }
 
     Ok(())
@@ -420,7 +608,7 @@ pub fn global_declaration_instantiation(
 /// variable environment (unless the eval code is strict).
 pub fn perform_eval(
     agent: &mut Agent,
-    source: &str,
+    source: &JsString,
     strict_caller: bool,
     direct: bool,
 ) -> Result<Value, JsError> {
@@ -432,12 +620,12 @@ pub fn perform_eval(
     // scripts. Phase 7 wires the function-environment flags.
 
     // HostEnsureCanCompileStrings (spec 19.2.1.1 step 4).
-    let body_string = JsString::from_utf8(source);
+    let body_string = source.clone();
     if let Some(hooks) = &agent.host_hooks {
         hooks.ensure_can_compile_strings(&eval_realm, &[], &body_string, direct)?;
     }
 
-    let program = parser::parse_script(source)?;
+    let program = parser::parse_script_utf16(source.as_slice())?;
     // A script with no body evaluates to undefined.
     if program.body.is_empty() {
         return Ok(Value::Undefined);
@@ -471,7 +659,7 @@ pub fn perform_eval(
     };
 
     let script_or_module = running.script_or_module.clone();
-    let eval_source = JsString::from_utf8(source);
+    let eval_source = source.clone();
     let eval_context = ExecutionContext {
         function: None,
         realm: eval_realm,
@@ -480,6 +668,7 @@ pub fn perform_eval(
         variable_environment: variable_env.clone(),
         private_environment: private_env,
         source: Some(eval_source),
+        annex_b_hoistable: Default::default(),
     };
     agent.execution_context_stack.push(eval_context);
     let result = (|| -> Result<Value, JsError> {
@@ -512,16 +701,26 @@ fn eval_declaration_instantiation(
                     return Err(duplicate_declaration_error(name));
                 }
             }
+            // spec 19.2.1.4 step 6: an eval lexical declaration must not
+            // collide with a restricted (non-configurable) global var/function
+            // binding (script-decl-lex-collision); eval-introduced globals are
+            // configurable and do not collide (script-decl-lex-no-collision).
+            for name in top_level_lexically_declared_names(&program.body) {
+                if variable_env.has_restricted_global_property(&name)? {
+                    return Err(duplicate_declaration_error(&name));
+                }
+            }
         }
         // Walk from the eval's lexical env up to (but not including) the
         // variable environment, rejecting vars that would hoist over a
-        // lexical binding (spec 19.2.1.4 steps 3-10).
+        // lexical binding (spec 19.2.1.4 steps 3-10). A catch parameter's
+        // environment is exempt (Annex B.3.5).
         let mut this_env = Some(lexical_env.clone());
         while let Some(env) = this_env {
             if Handle::ptr_eq(&env, variable_env) {
                 break;
             }
-            if !matches!(&*env, EnvRecord::Object(_)) {
+            if !matches!(&*env, EnvRecord::Object(_)) && !env.is_catch_param_env() {
                 for name in &variable_names {
                     if env.has_binding(name)? {
                         return Err(duplicate_declaration_error(name));
@@ -612,13 +811,41 @@ fn eval_declaration_instantiation(
         }
     }
 
-    for name in declared_variable_names {
+    for name in &declared_variable_names {
         if variable_env_is_global {
             // Eval-created global vars are deletable.
-            variable_env.create_global_var_binding(&name, true)?;
-        } else if !variable_env.has_binding(&name)? {
-            variable_env.create_mutable_binding(&name, true)?;
-            variable_env.initialize_binding(&name, Value::Undefined)?;
+            variable_env.create_global_var_binding(name, true)?;
+        } else if !variable_env.has_binding(name)? {
+            variable_env.create_mutable_binding(name, true)?;
+            variable_env.initialize_binding(name, Value::Undefined)?;
+        }
+    }
+
+    // Annex B.3.3.3: sloppy block-level function declarations in eval code
+    // hoist a var binding in the eval's variable environment (skipped when
+    // the hoist would produce an early error).
+    if !strict {
+        for (name, span, hoistable) in annex_b_function_hoists(&program.body) {
+            if !hoistable {
+                continue;
+            }
+            if !declared_func_names.contains(&name)
+                && !declared_variable_names.contains(&name)
+                && !variable_env.has_binding(&name)?
+            {
+                if variable_env_is_global {
+                    // Eval-created global bindings are deletable.
+                    variable_env.create_global_var_binding(&name, true)?;
+                } else {
+                    variable_env.create_mutable_binding(&name, true)?;
+                }
+                variable_env.initialize_binding(&name, Value::Undefined)?;
+            }
+            agent
+                .running_context()?
+                .annex_b_hoistable
+                .borrow_mut()
+                .insert((span.start, span.end));
         }
     }
 
@@ -737,7 +964,7 @@ mod tests {
     fn evaluated(source: &str) -> Result<Value, JsError> {
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
-        perform_eval(&mut agent, source, false, true)
+        perform_eval(&mut agent, &JsString::from_utf8(source), false, true)
     }
 
     #[test]
@@ -749,7 +976,13 @@ mod tests {
     fn direct_eval_binds_vars_in_the_caller_variable_environment() {
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
-        let result = perform_eval(&mut agent, "var ev = 5; ev", false, true).unwrap();
+        let result = perform_eval(
+            &mut agent,
+            &JsString::from_utf8("var ev = 5; ev"),
+            false,
+            true,
+        )
+        .unwrap();
         assert_eq!(result, Value::Number(5.0));
         // The var landed on the global object, deletable (eval-created).
         let global = agent.running_context().unwrap().realm.global_object.clone();
@@ -768,7 +1001,13 @@ mod tests {
     fn indirect_eval_uses_the_global_environment() {
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
-        let result = perform_eval(&mut agent, "var gv = 7; gv", false, false).unwrap();
+        let result = perform_eval(
+            &mut agent,
+            &JsString::from_utf8("var gv = 7; gv"),
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(result, Value::Number(7.0));
         let global = agent.running_context().unwrap().realm.global_object.clone();
         assert_eq!(
@@ -781,7 +1020,13 @@ mod tests {
     fn strict_eval_isolates_var_declarations() {
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
-        let result = perform_eval(&mut agent, "'use strict'; var s = 1; s", false, false).unwrap();
+        let result = perform_eval(
+            &mut agent,
+            &JsString::from_utf8("'use strict'; var s = 1; s"),
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(result, Value::Number(1.0));
         // Strict eval's vars go to the fresh lexical env, not the global.
         let global = agent.running_context().unwrap().realm.global_object.clone();
@@ -792,7 +1037,13 @@ mod tests {
     fn eval_lexical_declarations_stay_local() {
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
-        let result = perform_eval(&mut agent, "let lx = 3; lx", false, false).unwrap();
+        let result = perform_eval(
+            &mut agent,
+            &JsString::from_utf8("let lx = 3; lx"),
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(result, Value::Number(3.0));
         let realm = agent.running_context().unwrap().realm.clone();
         assert!(
@@ -808,9 +1059,17 @@ mod tests {
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
         agent.run_script("let x;").unwrap();
-        assert!(perform_eval(&mut agent, "var x;", false, true).is_err());
+        assert!(perform_eval(&mut agent, &JsString::from_utf8("var x;"), false, true).is_err());
         // And a like-named var in a *strict* eval is fine (separate env).
-        assert!(perform_eval(&mut agent, "'use strict'; var x;", false, true).is_ok());
+        assert!(
+            perform_eval(
+                &mut agent,
+                &JsString::from_utf8("'use strict'; var x;"),
+                false,
+                true
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -818,7 +1077,13 @@ mod tests {
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
         assert_eq!(agent.execution_context_stack.len(), 1);
-        let result = perform_eval(&mut agent, "var nested = 1; nested", false, true).unwrap();
+        let result = perform_eval(
+            &mut agent,
+            &JsString::from_utf8("var nested = 1; nested"),
+            false,
+            true,
+        )
+        .unwrap();
         assert_eq!(result, Value::Number(1.0));
         // The eval context was pushed and popped.
         assert_eq!(agent.execution_context_stack.len(), 1);
@@ -829,7 +1094,12 @@ mod tests {
         let mut agent = Agent::new();
         let realm = agent.initialize_host_defined_realm().unwrap();
         agent.enqueue_generic_job(Some(realm), move |agent| {
-            let result = perform_eval(agent, "var from_job = 2; from_job", false, true)?;
+            let result = perform_eval(
+                agent,
+                &JsString::from_utf8("var from_job = 2; from_job"),
+                false,
+                true,
+            )?;
             assert_eq!(result, Value::Number(2.0));
             assert_eq!(agent.execution_context_stack.len(), 1);
             Ok(Value::Undefined)
@@ -846,7 +1116,13 @@ mod tests {
     fn eval_function_declarations_bind_to_the_variable_environment() {
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
-        perform_eval(&mut agent, "function ef() {}", false, true).unwrap();
+        perform_eval(
+            &mut agent,
+            &JsString::from_utf8("function ef() {}"),
+            false,
+            true,
+        )
+        .unwrap();
         let global = agent.running_context().unwrap().realm.global_object.clone();
         assert!(matches!(
             global.get(&JsString::from_utf8("ef")).unwrap(),

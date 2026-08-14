@@ -1580,6 +1580,23 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             },
         )?;
     }
+    // Annex B.3.1: trimLeft/trimRight are the *same function objects* as
+    // trimStart/trimEnd (reference-trimStart.js checks the identities).
+    for (alias, target) in [("trimLeft", TRIM_START), ("trimRight", TRIM_END)] {
+        if let Some(shared) = realm.intrinsics.get(target) {
+            string_proto.define_property(
+                &JsString::from_utf8(alias),
+                &PropertyDescriptor {
+                    value: Some(shared),
+                    writable: Some(true),
+                    get: None,
+                    set: None,
+                    enumerable: Some(false),
+                    configurable: Some(true),
+                },
+            )?;
+        }
+    }
     let html_wrappers: [(&str, &str, u64); 8] = [
         ("fontcolor", "%String.prototype.fontcolor%", 1),
         ("fontsize", "%String.prototype.fontsize%", 1),

@@ -70,7 +70,9 @@ pub(crate) fn parse_statement(
                 parser.expect_semicolon()?;
                 StmtKind::Debugger
             }
-            Some(Keyword::Function) => return parse_function_declaration(parser, false),
+            Some(Keyword::Function) => {
+                return parse_function_declaration(parser, false, !allow_declaration);
+            }
             Some(Keyword::Class) => {
                 if !allow_declaration {
                     return Err(parser.error_at(
@@ -139,7 +141,7 @@ pub(crate) fn parse_statement(
                 && !parser.peek2()?.line_break_before =>
             {
                 parser.next()?; // `async`
-                return parse_function_declaration(parser, true);
+                return parse_function_declaration(parser, true, !allow_declaration);
             }
             _ => {
                 if is_label_start(parser)? {
@@ -920,7 +922,7 @@ fn parse_try(parser: &mut Parser) -> Result<Stmt, JsError> {
         // `function` declarations anywhere inside the block).
         if let Some(pattern) = &param {
             let mut declared = Vec::new();
-            lexically_declared_names(&body.stmts, &mut declared);
+            lexically_declared_names(&body.stmts, &mut declared, false);
             for name in bound_names(pattern) {
                 if declared.contains(&name) {
                     return Err(
@@ -953,9 +955,10 @@ fn parse_try(parser: &mut Parser) -> Result<Stmt, JsError> {
 }
 
 /// LexicallyDeclaredNames of a statement list (spec 15.2.1): `let`/`const`/
-/// `class`/`using` declarations and function declarations, recursively
-/// through nested statement lists. Used by the catch-parameter early error.
-fn lexically_declared_names(stmts: &[Stmt], out: &mut Vec<AtomId>) {
+/// `class`/`using` declarations and (optionally) function declarations,
+/// recursively through nested statement lists. Used by the catch-parameter
+/// early error, which exempts block-level function declarations (Annex B).
+fn lexically_declared_names(stmts: &[Stmt], out: &mut Vec<AtomId>, include_functions: bool) {
     for stmt in stmts {
         match &stmt.kind {
             StmtKind::VarDecl { kind, decls, .. } if *kind != VarDeclKind::Var => {
@@ -969,7 +972,7 @@ fn lexically_declared_names(stmts: &[Stmt], out: &mut Vec<AtomId>) {
                 }
             }
             StmtKind::FunctionDecl(function) => {
-                if let Some(name) = function.name {
+                if include_functions && let Some(name) = function.name {
                     out.push(name);
                 }
             }
@@ -978,22 +981,28 @@ fn lexically_declared_names(stmts: &[Stmt], out: &mut Vec<AtomId>) {
                     out.push(name);
                 }
             }
-            StmtKind::Block(block) => lexically_declared_names(&block.stmts, out),
+            StmtKind::Block(block) => {
+                lexically_declared_names(&block.stmts, out, include_functions)
+            }
             StmtKind::If {
                 consequent,
                 alternate,
                 ..
             } => {
-                lexically_declared_names(std::slice::from_ref(consequent), out);
+                lexically_declared_names(std::slice::from_ref(consequent), out, include_functions);
                 if let Some(alternate) = alternate {
-                    lexically_declared_names(std::slice::from_ref(alternate), out);
+                    lexically_declared_names(
+                        std::slice::from_ref(alternate),
+                        out,
+                        include_functions,
+                    );
                 }
             }
             StmtKind::While { body, .. }
             | StmtKind::DoWhile { body, .. }
             | StmtKind::Labeled { body, .. }
             | StmtKind::With { body, .. } => {
-                lexically_declared_names(std::slice::from_ref(body), out);
+                lexically_declared_names(std::slice::from_ref(body), out, include_functions);
             }
             StmtKind::For { init, body, .. } => {
                 if let Some(ForInit::VarDecl { kind, decls, .. }) = init
@@ -1003,7 +1012,7 @@ fn lexically_declared_names(stmts: &[Stmt], out: &mut Vec<AtomId>) {
                         out.extend(bound_names(&decl.pattern));
                     }
                 }
-                lexically_declared_names(std::slice::from_ref(body), out);
+                lexically_declared_names(std::slice::from_ref(body), out, include_functions);
             }
             StmtKind::ForIn { left, body, .. } | StmtKind::ForOf { left, body, .. } => {
                 if let ForBinding::VarDecl { kind, pattern, .. } = left
@@ -1011,24 +1020,24 @@ fn lexically_declared_names(stmts: &[Stmt], out: &mut Vec<AtomId>) {
                 {
                     out.extend(bound_names(pattern));
                 }
-                lexically_declared_names(std::slice::from_ref(body), out);
+                lexically_declared_names(std::slice::from_ref(body), out, include_functions);
             }
             StmtKind::Try {
                 block,
                 handler,
                 finalizer,
             } => {
-                lexically_declared_names(&block.stmts, out);
+                lexically_declared_names(&block.stmts, out, include_functions);
                 if let Some(catch) = handler {
-                    lexically_declared_names(&catch.body.stmts, out);
+                    lexically_declared_names(&catch.body.stmts, out, include_functions);
                 }
                 if let Some(finalizer) = finalizer {
-                    lexically_declared_names(&finalizer.stmts, out);
+                    lexically_declared_names(&finalizer.stmts, out, include_functions);
                 }
             }
             StmtKind::Switch { cases, .. } => {
                 for case in cases {
-                    lexically_declared_names(&case.consequent, out);
+                    lexically_declared_names(&case.consequent, out, include_functions);
                 }
             }
             _ => {}
@@ -1038,7 +1047,11 @@ fn lexically_declared_names(stmts: &[Stmt], out: &mut Vec<AtomId>) {
 
 /// `function name ( params ) { body }` — the name is required for
 /// declarations.
-fn parse_function_declaration(parser: &mut Parser, is_async: bool) -> Result<Stmt, JsError> {
+fn parse_function_declaration(
+    parser: &mut Parser,
+    is_async: bool,
+    statement_position: bool,
+) -> Result<Stmt, JsError> {
     let start = parser.next()?.span.start; // `function`
     let is_generator = parser.eat_punct(TokenKind::Star)?;
     if !parser.at_identifier()? {
@@ -1047,7 +1060,7 @@ fn parse_function_declaration(parser: &mut Parser, is_async: bool) -> Result<Stm
     }
     let (name, name_start) = parser.parse_identifier()?;
     parser.check_binding_name(name, name_start)?;
-    parser.declare_function(name, name_start)?;
+    parser.declare_function(name, name_start, statement_position)?;
     parser.expect_punct(TokenKind::LeftParen)?;
     let saved_generator = parser.in_generator;
     parser.in_generator = is_generator;
@@ -1073,6 +1086,7 @@ fn parse_function_declaration(parser: &mut Parser, is_async: bool) -> Result<Stm
             body,
             is_async,
             is_generator,
+            statement_position,
         }),
     })
 }

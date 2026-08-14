@@ -440,5 +440,6 @@ fn parse_class_method_tail_with(
         body,
         is_async,
         is_generator,
+        statement_position: false,
     })
 }

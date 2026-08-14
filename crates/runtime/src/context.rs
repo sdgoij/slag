@@ -258,6 +258,10 @@ pub struct ExecutionContext {
     /// The source text of the code currently running, when known — used to
     /// capture exact function sources for `Function.prototype.toString`.
     pub source: Option<JsString>,
+    /// Annex B: the declarations whose block-level function hoist (B.3.3.x)
+    /// is applicable in this execution, keyed by function span, consulted by
+    /// B.3.2.1 at block entry.
+    pub annex_b_hoistable: std::cell::RefCell<std::collections::HashSet<(u32, u32)>>,
 }
 
 /// A PrivateEnvironment Record (spec 9.2.1): the Private Names declared by

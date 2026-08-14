@@ -294,7 +294,7 @@ fn eval_call_chain(
             call.callee.kind,
             ExprKind::Ident(id) if crux::lookup(id) == crux::string::JsString::from_utf8("eval")
         );
-        let result = crate::script::perform_eval(agent, &source.to_string_lossy(), strict, direct)?;
+        let result = crate::script::perform_eval(agent, &source, strict, direct)?;
         return Ok(Some(ChainResult::Value(result)));
     }
     let result = crate::function::call(agent, &callee_value, this, &args)?;

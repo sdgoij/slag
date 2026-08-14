@@ -694,6 +694,7 @@ fn evaluate_static_block(
         body: block.clone(),
         is_async: false,
         is_generator: false,
+        statement_position: false,
     };
     let closure = instantiate_method(agent, &function, class_env.clone(), true)?;
     set_private_environment(agent, &closure, class_private_env)?;
@@ -727,6 +728,7 @@ fn evaluate_with_this(
         variable_environment: function_env.clone(),
         private_environment: None,
         source,
+        annex_b_hoistable: Default::default(),
     });
     let result = f(agent);
     agent.execution_context_stack.pop();
