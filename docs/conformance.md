@@ -48,7 +48,7 @@ Two harnesses live in `crates/test262`:
 
 ## Current results
 
-Workspace-wide: **4158 tests pass, 0 failures** (`cargo test --workspace`),
+Workspace-wide: **4159 tests pass, 0 failures** (`cargo test --workspace`),
 of which the test262 crate contributes **3317 passing fixtures** (44
 language-area + 3275 built-ins fixtures); the remaining registered test is
 the ignored `scan_builtins_directories` directory scanner. The `workers`
@@ -1511,18 +1511,22 @@ failures (2,048 → 0) since the earlier run.
 
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
-| language | 23,724 | 18,072 | 0 | 5,652 | 0 | 100.0% |
-| built-ins | 23,812 | 17,455 | 0 | 6,357 | 0 | 100.0% |
-| annexB | 1,086 | 997 | 0 | 89 | 0 | 100.0% |
-| **Total** | **48,622** | **36,524** | **0** | **12,098** | **0** | **100.0%** |
+| language | 23,724 | 18,079 | 0 | 5,645 | 0 | 100.0% |
+| built-ins | 23,812 | 17,487 | 0 | 6,325 | 0 | 100.0% |
+| annexB | 1,086 | 1,085 | 0 | 1 | 0 | 100.0% |
+| **Total** | **48,622** | **36,651** | **0** | **11,971** | **0** | **100.0%** |
 
-(Runnable = pass + fail; the 12,098 skips are module/async fixtures,
+(Runnable = pass + fail; the 11,971 skips are module/async fixtures,
 unsupported harness includes, the host-dependent `CanBlockIsTrue` waits,
 and the out-of-scope Temporal, await-dictionary, and ShadowRealm proposal
 fixtures — the 190 cross-realm `$262.createRealm`, 34 `$262.IsHTMLDDA`, and
-113 newly-enabled harness-include fixtures (decimalToHexString, nans,
+now 240 newly-enabled harness-include fixtures (decimalToHexString, nans,
 compareIterator, assertRelativeDateMs, iteratorZipUtils, dateConstants,
-deepEqual) now run and pass.) The built-ins row reflects every cluster closure through the
+deepEqual, promiseHelper, proxyTrapsHelper, fnGlobalObject) run and pass,
+and the annexB row's fnGlobalObject/propertyHelper global-decl fixtures
+went from 8 fails to 88 passes with the B.3.3.3 `CreateGlobalVarBinding`
+fix (the hoist leaves a pre-existing own property in place instead of
+redefining it as enumerable).) The built-ins row reflects every cluster closure through the
 final cleanup: the Error/BigInt/RegExp/Object-descriptor hardening,
 String/prototype, Object/create, DisposableStack, AsyncDisposableStack,
 ArrayBuffer/SharedArrayBuffer, Date, global-functions, Function,
@@ -1534,7 +1538,7 @@ Object.fromEntries, JSON.stringify, DataView, Object statics/
 constructor, Promise, Atomics, and the final Array/generator, Throw-
 TypeError, WeakRef/FinalizationRegistry, Uint8Array base64/hex, Set
 set-methods, JSON/parse, TypedArray BigInt, String, and SuppressedError
-closures (all 0 fail). The 6,633 built-ins skips are dominated by the
+closures (all 0 fail). The 6,325 built-ins skips are dominated by the
 out-of-scope Temporal proposal (4,611), await-dictionary (33), and
 ShadowRealm (60), with the async/module flags, host-dependent
 `CanBlockIsTrue` waits, and unsupported harness includes making up the
@@ -1638,11 +1642,11 @@ the parser implements Annex B HTML comments, legacy octal literals, the
 each with unit tests. The full `annexB/` sweep is available via the sweep
 tool above.
 
-The full sweep now measures **100% of runnable**: **997 pass, 0 fail, 89
+The full sweep now measures **100% of runnable**: **1,085 pass, 0 fail, 1
 skip** of 1,086 fixtures (`--timeout 120 --recheck-timeout 120`, release
-build; the skips are the module/async flags and `fnGlobalObject.js`
-includes — the cross-realm `$262.createRealm` and `$262.IsHTMLDDA`
-fixtures now run and pass). This closed the
+build; the single skip is the async-flagged `$DONE` fixture — the
+cross-realm `$262.createRealm`, `$262.IsHTMLDDA`, and `fnGlobalObject.js`/
+`propertyHelper.js` global-decl fixtures now run and pass). This closed the
 area from 327 pass / 663 fail. The clusters:
 
 - **Sloppy block-level function declarations (B.3.2 / B.3.3)** — the ~410
@@ -1694,7 +1698,7 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 
 ## Open items
 
-- All three areas now measure **100% of runnable**: 18,072 + 17,455 + 997
+- All three areas now measure **100% of runnable**: 18,079 + 17,487 + 1,085
   pass / 0 fail / 0 crash / 0 hang of 23,724 + 23,812 + 1,086 fixtures
   (out-of-scope Temporal, await-dictionary, and ShadowRealm fixtures and
   the host-dependent `CanBlockIsTrue` waits skipped, `--timeout 120

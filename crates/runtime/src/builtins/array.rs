@@ -1327,8 +1327,12 @@ fn reverse(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, Js
             set_property(&object, &lower_name, upper_value.unwrap())?;
             set_property(&object, &upper_name, lower_value.unwrap())?;
         } else if lower_exists {
-            set_property(&object, &upper_name, lower_value.unwrap())?;
+            // spec 23.1.3.25 step 5.10: DeletePropertyOrThrow of the lower
+            // index runs before Set of the upper (delete-first ordering is
+            // observable through proxies, see
+            // length-exceeding-integer-limit-with-proxy.js).
             delete_property_or_throw(&object, &lower_name)?;
+            set_property(&object, &upper_name, lower_value.unwrap())?;
         } else if upper_exists {
             set_property(&object, &lower_name, upper_value.unwrap())?;
             delete_property_or_throw(&object, &upper_name)?;

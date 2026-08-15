@@ -599,7 +599,11 @@ pub fn global_declaration_instantiation(
                 continue;
             }
             if !declared_func_names.contains(&name) && !declared_variable_names.contains(&name) {
-                global_env.create_global_function_binding(&name, Value::Undefined, false)?;
+                // spec 16.1.7 step 9.e (B.3.3.3): the hoist is a var
+                // binding, so a pre-existing own property (e.g. a
+                // non-enumerable one) is left in place; only missing
+                // bindings are created.
+                global_env.create_global_var_binding(&name, false)?;
             }
             agent
                 .running_context()?

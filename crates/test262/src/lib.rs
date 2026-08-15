@@ -11329,6 +11329,9 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
                         | "iteratorZipUtils.js"
                         | "dateConstants.js"
                         | "deepEqual.js"
+                        | "promiseHelper.js"
+                        | "proxyTrapsHelper.js"
+                        | "fnGlobalObject.js"
                 )
             })
             .collect();

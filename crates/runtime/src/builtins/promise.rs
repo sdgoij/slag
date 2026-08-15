@@ -62,13 +62,13 @@ pub enum CompoundState {
         index: usize,
         called: bool,
     },
-    /// An `any` element handler; `fulfilled` selects resolve-vs-collect.
+    /// An `any` element rejected handler: collects the error and rejects
+    /// the result once all elements have rejected.
     Any {
         errors: Rc<RefCell<Vec<Value>>>,
         remaining: Rc<RefCell<usize>>,
         resolve: Value,
         reject: Value,
-        fulfilled: bool,
         index: usize,
         called: bool,
     },
@@ -1021,31 +1021,29 @@ fn promise_any(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
                     return Ok(capability.promise);
                 }
             };
-        let mut handlers = Vec::new();
-        for fulfilled in [true, false] {
-            let closure = Function::create_builtin(
-                Some(JsString::from_utf8("")),
-                1,
-                Box::new(placeholder("any handler")),
-                None,
-                fn_proto.clone(),
-            )?;
-            agent.promise_compound.insert(
-                closure.id(),
-                Rc::new(RefCell::new(CompoundState::Any {
-                    errors: errors.clone(),
-                    remaining: remaining.clone(),
-                    resolve: resolve.clone(),
-                    reject: reject.clone(),
-                    fulfilled,
-                    index,
-                    called: false,
-                })),
-            );
-            handlers.push((fulfilled, Value::Function(closure)));
-        }
-        let on_fulfilled = handlers.iter().find(|(f, _)| *f).map(|(_, v)| v.clone());
-        let on_rejected = handlers.iter().find(|(f, _)| !*f).map(|(_, v)| v.clone());
+        let closure = Function::create_builtin(
+            Some(JsString::from_utf8("")),
+            1,
+            Box::new(placeholder("any handler")),
+            None,
+            fn_proto.clone(),
+        )?;
+        agent.promise_compound.insert(
+            closure.id(),
+            Rc::new(RefCell::new(CompoundState::Any {
+                errors: errors.clone(),
+                remaining: remaining.clone(),
+                resolve: resolve.clone(),
+                reject: reject.clone(),
+                index,
+                called: false,
+            })),
+        );
+        // spec 27.2.4.4: the on-fulfilled passed to each element's `then` is
+        // the result capability's resolve itself (no [[AlreadyCalled]]
+        // guard); only the rejected handler carries the per-element guard.
+        let on_fulfilled = Some(resolve.clone());
+        let on_rejected = Some(Value::Function(closure));
         if let Err(error) = invoke_then(agent, &next_promise, on_fulfilled, on_rejected) {
             let _ = crate::expr::iterator_close_throw(agent, &iterator);
             let rejection = error_value(agent, &error);
@@ -1054,27 +1052,6 @@ fn promise_any(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
         }
         index += 1;
     }
-}
-
-/// The `any` per-element handlers.
-fn any_fulfilled(
-    agent: &mut Agent,
-    state: Rc<RefCell<CompoundState>>,
-    args: &[Value],
-) -> Result<Value, JsError> {
-    if state.borrow_mut().already_called() {
-        return Ok(Value::Undefined);
-    }
-    let resolve = {
-        let state = state.borrow();
-        let CompoundState::Any { resolve, .. } = &*state else {
-            unreachable!()
-        };
-        resolve.clone()
-    };
-    let value = args.first().cloned().unwrap_or(Value::Undefined);
-    crate::function::call(agent, &resolve, Value::Undefined, &[value])?;
-    Ok(Value::Undefined)
 }
 
 fn any_rejected(
@@ -1235,24 +1212,16 @@ fn dispatch_compound(
     enum Which {
         All,
         AllSettled,
-        AnyFulfilled,
         AnyRejected,
     }
     let which = match &*state.borrow() {
         CompoundState::All { .. } => Which::All,
         CompoundState::AllSettled { .. } => Which::AllSettled,
-        CompoundState::Any { fulfilled, .. } => {
-            if *fulfilled {
-                Which::AnyFulfilled
-            } else {
-                Which::AnyRejected
-            }
-        }
+        CompoundState::Any { .. } => Which::AnyRejected,
     };
     match which {
         Which::All => all_fulfilled(agent, state, args),
         Which::AllSettled => all_settled_handler(agent, state, args),
-        Which::AnyFulfilled => any_fulfilled(agent, state, args),
         Which::AnyRejected => any_rejected(agent, state, args),
     }
 }

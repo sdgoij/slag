@@ -415,12 +415,14 @@ fn error_construct(
     agent.error_data.insert(object.id());
 
     if aggregate {
-        // AggregateError(errors, message, options) (spec 20.5.7.1).
+        // AggregateError(errors, message, options) (spec 20.5.7.1): the
+        // message ToString and InstallErrorCause run *before* the errors
+        // iteration.
+        define_message(&object, args.get(1))?;
+        install_cause(agent, &object, args.get(2))?;
         let errors = args.first().cloned().unwrap_or(Value::Undefined);
         let errors_value = list_to_array(agent, &errors)?;
         object.create_data_property(&JsString::from_utf8("errors"), errors_value)?;
-        define_message(&object, args.get(1))?;
-        install_cause(agent, &object, args.get(2))?;
     } else if suppressed {
         // SuppressedError(error, suppressed, message) (spec 20.5.8.1): own
         // properties are created message, then error, then suppressed
