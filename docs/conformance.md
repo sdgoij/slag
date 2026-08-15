@@ -1511,16 +1511,18 @@ failures (2,048 → 0) since the earlier run.
 
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
-| language | 23,724 | 18,071 | 0 | 5,653 | 0 | 100.0% |
-| built-ins | 23,812 | 17,343 | 0 | 6,469 | 0 | 100.0% |
+| language | 23,724 | 18,072 | 0 | 5,652 | 0 | 100.0% |
+| built-ins | 23,812 | 17,455 | 0 | 6,357 | 0 | 100.0% |
 | annexB | 1,086 | 997 | 0 | 89 | 0 | 100.0% |
-| **Total** | **48,622** | **36,411** | **0** | **12,211** | **0** | **100.0%** |
+| **Total** | **48,622** | **36,524** | **0** | **12,098** | **0** | **100.0%** |
 
-(Runnable = pass + fail; the 12,211 skips are module/async fixtures,
+(Runnable = pass + fail; the 12,098 skips are module/async fixtures,
 unsupported harness includes, the host-dependent `CanBlockIsTrue` waits,
 and the out-of-scope Temporal, await-dictionary, and ShadowRealm proposal
-fixtures — the 190 cross-realm `$262.createRealm` and 34 `$262.IsHTMLDDA`
-fixtures now run and pass.) The built-ins row reflects every cluster closure through the
+fixtures — the 190 cross-realm `$262.createRealm`, 34 `$262.IsHTMLDDA`, and
+113 newly-enabled harness-include fixtures (decimalToHexString, nans,
+compareIterator, assertRelativeDateMs, iteratorZipUtils, dateConstants,
+deepEqual) now run and pass.) The built-ins row reflects every cluster closure through the
 final cleanup: the Error/BigInt/RegExp/Object-descriptor hardening,
 String/prototype, Object/create, DisposableStack, AsyncDisposableStack,
 ArrayBuffer/SharedArrayBuffer, Date, global-functions, Function,
@@ -1692,7 +1694,7 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 
 ## Open items
 
-- All three areas now measure **100% of runnable**: 18,071 + 17,343 + 997
+- All three areas now measure **100% of runnable**: 18,072 + 17,455 + 997
   pass / 0 fail / 0 crash / 0 hang of 23,724 + 23,812 + 1,086 fixtures
   (out-of-scope Temporal, await-dictionary, and ShadowRealm fixtures and
   the host-dependent `CanBlockIsTrue` waits skipped, `--timeout 120

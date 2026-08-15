@@ -11041,14 +11041,14 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
     }
 
     /// The source of a harness include file, read from the pinned submodule.
-    /// The large helper files the preludes cannot replicate are loaded; the
-    /// rest (isConstructor.js needs Reflect, detachArrayBuffer.js is
-    /// replicated by $262.detachArrayBuffer) are provided by the preludes
-    /// instead.
+    /// The helpers the preludes replicate (assert.js, compareArray.js,
+    /// detachArrayBuffer.js, isConstructor.js) return empty source (the
+    /// preludes define them natively); every other include is loaded as-is
+    /// from `test262/harness/`.
     fn harness_include_source(name: &str) -> Result<String, String> {
-        if !matches!(
+        if matches!(
             name,
-            "testAtomics.js" | "testTypedArray.js" | "nativeErrors.js" | "propertyHelper.js"
+            "assert.js" | "compareArray.js" | "detachArrayBuffer.js" | "isConstructor.js"
         ) {
             return Ok(String::new());
         }
@@ -11322,6 +11322,13 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
                         | "testAtomics.js"
                         | "testTypedArray.js"
                         | "nativeErrors.js"
+                        | "decimalToHexString.js"
+                        | "nans.js"
+                        | "compareIterator.js"
+                        | "assertRelativeDateMs.js"
+                        | "iteratorZipUtils.js"
+                        | "dateConstants.js"
+                        | "deepEqual.js"
                 )
             })
             .collect();

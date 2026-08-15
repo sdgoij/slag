@@ -1472,7 +1472,14 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         },
     )?;
 
-    // spec 22.1.2: the pure statics run as native closures.
+    // spec 22.1.2: the pure statics run as native closures. They are not
+    // registered as intrinsics, so the realm post-pass cannot link their
+    // [[Prototype]]; set %Function.prototype% here (CreateBuiltinFunction,
+    // spec 10.2.3 step 1) so `.call`/`.apply`/`.bind` resolve.
+    let function_proto = realm
+        .intrinsics
+        .get("%Function.prototype%")
+        .and_then(|value| as_object(&value));
     let statics: [(&str, u64, StringFn); 2] = [
         ("fromCharCode", 1, from_char_code),
         ("fromCodePoint", 1, from_code_point),
@@ -1483,7 +1490,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             length,
             Box::new(body),
             None,
-            None,
+            function_proto.clone(),
         )?;
         string_ctor.define_property(
             &JsString::from_utf8(name),
