@@ -413,7 +413,10 @@ fn run_batch(batch: Vec<Fixture>, options: &std::sync::Arc<Options>, tx: Sender<
     let _ = tx.send(Msg::BatchDone(results));
 }
 
-fn run_batch_inner(batch: &[Fixture], options: &Options) -> Vec<(String, SweepResult)> {
+fn run_batch_inner(
+    batch: &[Fixture],
+    options: &std::sync::Arc<Options>,
+) -> Vec<(String, SweepResult)> {
     let mut child = spawn_worker(batch);
     let stdout = child.stdout.take().expect("worker stdout");
     let (line_tx, line_rx) = mpsc::channel();
@@ -457,8 +460,25 @@ fn run_batch_inner(batch: &[Fixture], options: &Options) -> Vec<(String, SweepRe
             ));
         }
     }
-    for fixture in hangs {
-        results.push((fixture.relative.clone(), run_single(&fixture, options)));
+    // Re-run the un-reported fixtures individually, in parallel: a batch
+    // that times out on one slow fixture would otherwise serialize up to
+    // `batch` rechecks of the recheck deadline each (a batch with a ~45s
+    // TypedArray fixture can look like a hang for many minutes).
+    let rechecks: Vec<_> = hangs
+        .iter()
+        .map(|fixture| {
+            let fixture = fixture.clone();
+            let options = options.clone();
+            std::thread::spawn(move || run_single(&fixture, &options))
+        })
+        .collect();
+    for (fixture, handle) in hangs.iter().zip(rechecks) {
+        results.push((
+            fixture.relative.clone(),
+            handle
+                .join()
+                .unwrap_or(SweepResult::Crash("recheck thread panicked".into())),
+        ));
     }
     results
 }

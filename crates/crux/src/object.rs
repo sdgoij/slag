@@ -824,6 +824,25 @@ impl JsObject {
     }
 
     fn ordinary_get_own_property(&self, key: &PropertyKey) -> Result<Option<Property>, JsError> {
+        // Array fast paths on the linear property store: `length` is always
+        // the first entry (created at ArrayCreate, never moved), and no own
+        // index property can exceed the current length (every index define
+        // bumps it), so an index at or beyond the length is absent without a
+        // scan. Both make sequential element fills O(1) instead of O(n²).
+        if matches!(self.kind, ObjectKind::Array) {
+            if key == &PropertyKey::from_utf8("length") {
+                let props = self.properties.borrow();
+                return Ok(props.first().map(|(_, p)| p.clone()));
+            }
+            if let Some(index) = array_index_of(key)
+                && let Some((_, length_prop)) = self.properties.borrow().first()
+                && let PropertyKind::Data { value, .. } = &length_prop.kind
+                && let Value::Number(length) = value
+                && (index as f64) >= *length
+            {
+                return Ok(None);
+            }
+        }
         Ok(self
             .properties
             .borrow()
@@ -1658,6 +1677,50 @@ fn array_define_own_property(
         };
         if (index as f64) >= length && !writable {
             return Ok(false);
+        }
+        // Fast path: appending a new element at `length` (own index
+        // properties never exceed the length, so the key cannot exist) pushes
+        // the property and bumps `length` in place — the generic define
+        // re-scans the linear property store, making sequential fills
+        // quadratic (the property-escape fixtures build 10k-element arrays
+        // via `codePoints[length++] = …`). The last-entry check verifies the
+        // dense-append shape; any deviation falls back to the generic path.
+        if (index as f64) >= length
+            && array.extensible.get()
+            && desc.value.is_some()
+            && desc.writable.is_some()
+            && desc.enumerable.is_some()
+            && desc.configurable.is_some()
+            && !desc.is_accessor_descriptor()
+            && match array.properties.borrow().last() {
+                Some((last_key, last_prop)) => {
+                    (length == 0.0 && array_index_of(last_key).is_none())
+                        || (length > 0.0
+                            && array_index_of(last_key) == Some(length as u64 - 1)
+                            && last_prop.is_data())
+                }
+                None => false,
+            }
+        {
+            let mut props = array.properties.borrow_mut();
+            props.push((
+                key.clone(),
+                Property {
+                    kind: PropertyKind::Data {
+                        value: desc.value.clone().expect("checked above"),
+                        writable: desc.writable.unwrap_or(true),
+                    },
+                    enumerable: desc.enumerable.unwrap_or(true),
+                    configurable: desc.configurable.unwrap_or(true),
+                },
+            ));
+            // `length` is always the first entry; update it in place.
+            if let Some((_, length_prop)) = props.first_mut()
+                && let PropertyKind::Data { value: slot, .. } = &mut length_prop.kind
+            {
+                *slot = Value::Number(index as f64 + 1.0);
+            }
+            return Ok(true);
         }
         if !array.ordinary_define_own_property(key, desc)? {
             return Ok(false);
@@ -2659,6 +2722,22 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(array.get(&key("1")).unwrap(), Value::Number(5.0));
+    }
+
+    #[test]
+    fn array_prevent_extensions_blocks_index_append() {
+        // The dense-append fast path must not bypass the extensibility check:
+        // a new index on a non-extensible array fails silently ([[Set]])
+        // instead of being written (15.2.3.10-3-4, Proxy set null-target).
+        let array = JsObject::array_create(None, 0.0).unwrap();
+        array.prevent_extensions().unwrap();
+        assert!(
+            !array
+                .create_data_property(&key("0"), Value::Number(1.0))
+                .unwrap()
+        );
+        assert_eq!(array.get(&key("length")).unwrap(), Value::Number(0.0));
+        assert!(!array.has_own_property(&key("0")).unwrap());
     }
 
     #[test]

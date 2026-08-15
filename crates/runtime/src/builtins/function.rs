@@ -528,6 +528,40 @@ fn create_list_from_array_like(agent: &mut Agent, value: &Value) -> Result<Vec<V
         value.clone(),
     )?;
     let length = to_length(to_number(&length)?);
+    // Fast path: a dense Array's elements are own data properties in the
+    // linear property store, so per-index [[Get]] would be O(n²) (the
+    // property-escape fixtures call `String.fromCodePoint.apply(null, …)`
+    // on 10k-element arrays). Read the store once; any accessor or hole
+    // falls back to the spec [[Get]] loop.
+    if let Value::Object(obj) = value
+        && matches!(obj.kind, crux::object::ObjectKind::Array)
+    {
+        let props = obj.properties.borrow();
+        if (length as usize) <= props.len() {
+            let mut values: Vec<Option<Value>> = vec![None; length as usize];
+            let mut dense = true;
+            for (key, prop) in props.iter() {
+                let Some(index) = crux::object::array_index_of(key) else {
+                    continue;
+                };
+                if index >= length {
+                    continue;
+                }
+                match &prop.kind {
+                    crux::object::PropertyKind::Data { value: item, .. } => {
+                        values[index as usize] = Some(item.clone());
+                    }
+                    crux::object::PropertyKind::Accessor { .. } => {
+                        dense = false;
+                        break;
+                    }
+                }
+            }
+            if dense && values.iter().all(Option::is_some) {
+                return Ok(values.into_iter().map(Option::unwrap).collect());
+            }
+        }
+    }
     let mut list = Vec::new();
     for index in 0..length {
         let item = get_property_key(

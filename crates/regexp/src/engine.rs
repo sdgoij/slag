@@ -409,6 +409,49 @@ fn repeat_loop<'i>(
     count: u32,
     cont: &mut dyn FnMut(&mut Caps, usize) -> MatchResult,
 ) -> MatchResult {
+    // Fast path: a greedy repeat of a single-character atom (literal, dot,
+    // or string-free character class) with no captures. The recursive path
+    // consumes one character per stack frame, which overflows on
+    // multi-megabyte inputs (the generated property-escape fixtures build
+    // ~2M-unit match strings); consume iteratively instead, then try the
+    // continuation from the furthest position backward, backtracking one
+    // character at a time (spec RepeatMatcher).
+    if greedy
+        && owned.is_empty()
+        && match node {
+            Node::Char { .. } | Node::Any { .. } => true,
+            Node::Class(class) => class.strings.is_empty(),
+            _ => false,
+        }
+    {
+        let mark = caps.mark();
+        let mut cur = pos;
+        let mut cnt = count;
+        let mut starts: Vec<usize> = Vec::new();
+        while max.is_none_or(|m| cnt < m) {
+            let Some(next) = single_atom_match(ctx, node, cur, dir) else {
+                break;
+            };
+            starts.push(cur);
+            cur = next;
+            cnt += 1;
+        }
+        loop {
+            if cnt >= min {
+                caps.rollback(mark);
+                if let Ok(end) = cont(caps, cur) {
+                    return Ok(end);
+                }
+            }
+            match starts.pop() {
+                Some(prev) => {
+                    cur = prev;
+                    cnt -= 1;
+                }
+                None => return Err(()),
+            }
+        }
+    }
     // Each iteration re-matches the atom from scratch, so captures owned by
     // the atom from earlier iterations must not leak into this one (spec
     // RepeatMatcher clears the atom's captures on the copy before matching).
@@ -574,6 +617,33 @@ fn class_matches(ctx: &Ctx<'_>, class: &CharClass, pos: usize, c: u32, dir: i32)
         .iter()
         .any(|s| string_at_dir(ctx, pos, s, dir));
     in_set != class.negated
+}
+
+/// Match a single-character atom (literal, dot, or string-free class) at
+/// `pos`, returning the advanced position; `None` when it cannot match. Only
+/// called from the iterative repeat fast path, where the atom consumes
+/// exactly one character (never zero-width, never multi-character).
+fn single_atom_match(ctx: &Ctx<'_>, node: &Node, pos: usize, dir: i32) -> Option<usize> {
+    match node {
+        Node::Char { cp, fold } => {
+            let (c, len) = read_char_dir(ctx, pos, dir)?;
+            let c = if *fold {
+                canonicalize(ctx.unicode, c)
+            } else {
+                c
+            };
+            (c == *cp).then(|| advance(pos, dir, len))
+        }
+        Node::Any { dot_all } => {
+            let (c, len) = read_char_dir(ctx, pos, dir)?;
+            (*dot_all || !unicode::is_line_terminator(c)).then(|| advance(pos, dir, len))
+        }
+        Node::Class(class) => {
+            let (c, len) = read_char_dir(ctx, pos, dir)?;
+            class_matches(ctx, class, pos, c, dir).then(|| advance(pos, dir, len))
+        }
+        _ => None,
+    }
 }
 
 /// A `\q{…}` string atom: the code points adjacent to `pos` equal the string,

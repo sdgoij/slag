@@ -404,6 +404,45 @@ mod tests {
     }
 
     #[test]
+    fn greedy_single_char_repeat_backtracks_iteratively() {
+        // The iterative fast path must keep greedy semantics: consume as
+        // much as possible, then backtrack one character at a time.
+        let re = compile(
+            "[ab]+b".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f(""),
+        )
+        .unwrap();
+        let m = re
+            .exec(&"ab".encode_utf16().collect::<Vec<u16>>(), 0)
+            .unwrap();
+        assert_eq!(m[0], Some((0, 2)));
+        let re = compile(
+            "a{2,3}a".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f(""),
+        )
+        .unwrap();
+        let m = re
+            .exec(&"aaa".encode_utf16().collect::<Vec<u16>>(), 0)
+            .unwrap();
+        assert_eq!(m[0], Some((0, 3)));
+    }
+
+    #[test]
+    fn greedy_single_char_repeat_large_input_does_not_overflow() {
+        // A multi-megabyte `X+` match used to recurse once per character and
+        // overflow the stack (the generated property-escape fixtures build
+        // ~2M-unit strings); the fast path consumes iteratively.
+        let re = compile(
+            "[a]+".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f(""),
+        )
+        .unwrap();
+        let input = vec![b'a' as u16; 1_000_000];
+        let m = re.exec(&input, 0).unwrap();
+        assert_eq!(m[0], Some((0, 1_000_000)));
+    }
+
+    #[test]
     fn capture_spans() {
         let re = compile(
             "(a)(b)?c".encode_utf16().collect::<Vec<u16>>().as_slice(),
