@@ -3,7 +3,8 @@
 //! A [`Context`] wraps an [`Agent`] with an initialized realm plus the
 //! host-defined globals the spec leaves to the host: `console`, the timer
 //! functions (`setTimeout`/`setInterval`/`clearTimeout`/`clearInterval`), a
-//! `Math.random` override point, and (for the CLI) `process.argv`. The host
+//! `Math.random` override point, and (for the CLI) `process.argv` and a
+//! minimal `fs`. The host
 //! configures these through [`HostCallbacks`]; [`JsValue`] and [`JsObject`]
 //! are the host-facing handle types for values and objects.
 //!
@@ -216,6 +217,117 @@ impl Context {
         Ok(())
     }
 
+    /// Install an `fs` global with a minimal Node-style subset —
+    /// `readFileSync`, `readdirSync`, `statSync` — backed by the host
+    /// filesystem. Not a full Node `fs`; enough for host tools written in
+    /// Slag (the test262 fixture tally is one). Only compiled with the
+    /// `fs` feature.
+    #[cfg(feature = "fs")]
+    pub fn install_fs(&mut self) -> Result<(), JsError> {
+        let realm = self.agent.current_realm()?;
+        let object_proto = realm
+            .intrinsics
+            .get("%Object.prototype%")
+            .and_then(|value| value.as_object());
+        let fs = CruxObject::ordinary_object_create(object_proto);
+
+        let read_file = Function::create_builtin(
+            Some(JsString::from_utf8("readFileSync")),
+            1,
+            Box::new(|_, args| {
+                let path = string_arg(args, 0, "readFileSync")?;
+                let bytes = std::fs::read(&path).map_err(|e| {
+                    JsError::new(ErrorKind::TypeError, format!("readFileSync: {path}: {e}"))
+                })?;
+                let text = String::from_utf8_lossy(&bytes);
+                Ok(Value::String(Handle::new(JsString::from_utf8(&text))))
+            }),
+            None,
+            None,
+        )?;
+        fs.create_data_property_or_throw(
+            &JsString::from_utf8("readFileSync"),
+            Value::Function(read_file),
+        )?;
+
+        let read_dir = Function::create_builtin(
+            Some(JsString::from_utf8("readdirSync")),
+            1,
+            Box::new(|_, args| {
+                let path = string_arg(args, 0, "readdirSync")?;
+                let agent = current_agent_mut()?;
+                let mut names = Vec::new();
+                for entry in std::fs::read_dir(&path).map_err(|e| {
+                    JsError::new(ErrorKind::TypeError, format!("readdirSync: {path}: {e}"))
+                })? {
+                    let entry = entry.map_err(|e| {
+                        JsError::new(ErrorKind::TypeError, format!("readdirSync: {path}: {e}"))
+                    })?;
+                    names.push(entry.file_name().to_string_lossy().into_owned());
+                }
+                let values: Vec<Value> = names
+                    .iter()
+                    .map(|name| Value::String(Handle::new(JsString::from_utf8(name))))
+                    .collect();
+                crate::builtins::array::array_from_values(agent, &values)
+            }),
+            None,
+            None,
+        )?;
+        fs.create_data_property_or_throw(
+            &JsString::from_utf8("readdirSync"),
+            Value::Function(read_dir),
+        )?;
+
+        let stat = Function::create_builtin(
+            Some(JsString::from_utf8("statSync")),
+            1,
+            Box::new(|_, args| {
+                let path = string_arg(args, 0, "statSync")?;
+                let meta = std::fs::metadata(&path).map_err(|e| {
+                    JsError::new(ErrorKind::TypeError, format!("statSync: {path}: {e}"))
+                })?;
+                let object = CruxObject::ordinary_object_create(None);
+                object.create_data_property_or_throw(
+                    &JsString::from_utf8("size"),
+                    Value::Number(meta.len() as f64),
+                )?;
+                let is_directory = meta.is_dir();
+                let is_file = meta.is_file();
+                let dir_check = Function::create_builtin(
+                    Some(JsString::from_utf8("isDirectory")),
+                    0,
+                    Box::new(move |_, _| Ok(Value::Boolean(is_directory))),
+                    None,
+                    None,
+                )?;
+                object.create_data_property_or_throw(
+                    &JsString::from_utf8("isDirectory"),
+                    Value::Function(dir_check),
+                )?;
+                let file_check = Function::create_builtin(
+                    Some(JsString::from_utf8("isFile")),
+                    0,
+                    Box::new(move |_, _| Ok(Value::Boolean(is_file))),
+                    None,
+                    None,
+                )?;
+                object.create_data_property_or_throw(
+                    &JsString::from_utf8("isFile"),
+                    Value::Function(file_check),
+                )?;
+                Ok(Value::Object(object))
+            }),
+            None,
+            None,
+        )?;
+        fs.create_data_property_or_throw(&JsString::from_utf8("statSync"), Value::Function(stat))?;
+
+        let global = realm.global_object.clone();
+        global.create_data_property_or_throw(&JsString::from_utf8("fs"), Value::Object(fs))?;
+        Ok(())
+    }
+
     /// Install the `console` global backed by the host callbacks.
     fn install_console(&mut self) -> Result<(), JsError> {
         let realm = self.agent.current_realm()?;
@@ -409,6 +521,19 @@ fn current_agent_mut() -> Result<&'static mut Agent, JsError> {
 
 /// `console.*`: stringify each argument with ToString (so objects run their
 /// `toString`/`valueOf` through the agent) and dispatch to the callback.
+/// The `index`-th argument as a UTF-8 string, or a TypeError naming the
+/// host function that expected it.
+#[cfg(feature = "fs")]
+fn string_arg(args: &[Value], index: usize, name: &str) -> Result<String, JsError> {
+    match args.get(index) {
+        Some(Value::String(s)) => Ok(s.to_string_lossy()),
+        _ => Err(JsError::new(
+            ErrorKind::TypeError,
+            format!("{name}: expected a string path"),
+        )),
+    }
+}
+
 fn console_output(
     callbacks: &Rc<RefCell<HostCallbacks>>,
     slot: ConsoleSlot,
@@ -808,6 +933,31 @@ mod tests {
         context.run_jobs().unwrap();
         let result = context.eval("globalThis.result").unwrap();
         assert_eq!(result.as_number(), Some(0.0));
+    }
+
+    #[test]
+    #[cfg(feature = "fs")]
+    fn fs_reads_files_and_directories() {
+        let mut context = Context::new().unwrap();
+        context.install_fs().unwrap();
+        let dir = std::env::temp_dir().join(format!("slag_fs_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("hello.txt");
+        std::fs::write(&file, "hello slag").unwrap();
+        let js_path = |path: &std::path::Path| path.to_str().unwrap().replace('\\', "\\\\");
+        let content = context
+            .eval(&format!("fs.readFileSync('{}')", js_path(&file)))
+            .unwrap();
+        assert_eq!(content.as_string().as_deref(), Some("hello slag"));
+        let is_file = context
+            .eval(&format!("fs.statSync('{}').isFile()", js_path(&file)))
+            .unwrap();
+        assert_eq!(is_file.as_boolean(), Some(true));
+        let listing = context
+            .eval(&format!("fs.readdirSync('{}').join(',')", js_path(&dir)))
+            .unwrap();
+        assert_eq!(listing.as_string().as_deref(), Some("hello.txt"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -36,7 +36,8 @@ target/release/slag script.js [args...]   # run a script
 target/release/slag                       # REPL
 ```
 
-The CLI exposes `process.argv` to scripts, and accepts `--dump-ast`,
+The CLI exposes `process.argv` and a minimal `fs` (`readFileSync`/
+`readdirSync`/`statSync`) to scripts, and accepts `--dump-ast`,
 `--dump-tokens`, and `--bench`; the `--print-bytecode`, `--stack-size`,
 `--max-old-space`, and `--harmony-*` knobs are accepted for compatibility
 (no-ops for now).

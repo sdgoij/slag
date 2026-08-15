@@ -17,3 +17,6 @@ unicode = { path = "../unicode" }
 # with the main agent; Atomics.wait blocks and notify wakes via a global
 # waiter registry.
 workers = ["crux/workers"]
+# Host-filesystem globals (`fs.readFileSync`/`readdirSync`/`statSync`) on
+# `Context`; I/O surface the embeddable core leaves off by default.
+fs = []

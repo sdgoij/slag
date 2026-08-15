@@ -13,5 +13,5 @@ path = "src/main.rs"
 [dependencies]
 lexer = { path = "../lexer" }
 parser = { path = "../parser" }
-runtime = { path = "../runtime" }
+runtime = { path = "../runtime", features = ["fs"] }
 syntax = { path = "../syntax" }

@@ -145,6 +145,7 @@ fn run_file(file: &str, args: &[String], options: &Options) -> Result<(), u8> {
         dump_ast(&source)?;
     }
     let mut context = Context::new().map_err(report)?;
+    context.install_fs().map_err(report)?;
     if !args.is_empty() {
         let mut argv = vec![
             std::env::current_exe()
