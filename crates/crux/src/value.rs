@@ -40,6 +40,7 @@ pub fn type_of(value: &Value) -> &'static str {
         Value::String(_) => "string",
         Value::Symbol(_) => "symbol",
         Value::Object(obj) => match &obj.kind {
+            crate::object::ObjectKind::IsHTMLDDA => "undefined",
             crate::object::ObjectKind::Proxy(slots)
                 if slots
                     .target
@@ -63,6 +64,7 @@ pub fn is_callable(value: &Value) -> bool {
     match value {
         Value::Function(_) => true,
         Value::Object(obj) => match &obj.kind {
+            crate::object::ObjectKind::IsHTMLDDA => true,
             crate::object::ObjectKind::Proxy(slots) => slots.callable.get(),
             _ => false,
         },

@@ -1513,14 +1513,14 @@ failures (2,048 → 0) since the earlier run.
 |---|---|---|---|---|---|---|
 | language | 23,724 | 18,071 | 0 | 5,653 | 0 | 100.0% |
 | built-ins | 23,812 | 17,343 | 0 | 6,469 | 0 | 100.0% |
-| annexB | 1,086 | 963 | 0 | 123 | 0 | 100.0% |
-| **Total** | **48,622** | **36,377** | **0** | **12,245** | **0** | **100.0%** |
+| annexB | 1,086 | 997 | 0 | 89 | 0 | 100.0% |
+| **Total** | **48,622** | **36,411** | **0** | **12,211** | **0** | **100.0%** |
 
-(Runnable = pass + fail; the 12,245 skips are module/async fixtures,
+(Runnable = pass + fail; the 12,211 skips are module/async fixtures,
 unsupported harness includes, the host-dependent `CanBlockIsTrue` waits,
 and the out-of-scope Temporal, await-dictionary, and ShadowRealm proposal
-fixtures — the 190 cross-realm `$262.createRealm` fixtures now run and
-pass.) The built-ins row reflects every cluster closure through the
+fixtures — the 190 cross-realm `$262.createRealm` and 34 `$262.IsHTMLDDA`
+fixtures now run and pass.) The built-ins row reflects every cluster closure through the
 final cleanup: the Error/BigInt/RegExp/Object-descriptor hardening,
 String/prototype, Object/create, DisposableStack, AsyncDisposableStack,
 ArrayBuffer/SharedArrayBuffer, Date, global-functions, Function,
@@ -1636,11 +1636,11 @@ the parser implements Annex B HTML comments, legacy octal literals, the
 each with unit tests. The full `annexB/` sweep is available via the sweep
 tool above.
 
-The full sweep now measures **100% of runnable**: **963 pass, 0 fail, 123
+The full sweep now measures **100% of runnable**: **997 pass, 0 fail, 89
 skip** of 1,086 fixtures (`--timeout 120 --recheck-timeout 120`, release
-build; the skips are the module/async flags, the host-dependent
-`$262.IsHTMLDDA` fixtures, and `fnGlobalObject.js` includes — the 7
-cross-realm `$262.createRealm` fixtures now run and pass). This closed the
+build; the skips are the module/async flags and `fnGlobalObject.js`
+includes — the cross-realm `$262.createRealm` and `$262.IsHTMLDDA`
+fixtures now run and pass). This closed the
 area from 327 pass / 663 fail. The clusters:
 
 - **Sloppy block-level function declarations (B.3.2 / B.3.3)** — the ~410
@@ -1692,7 +1692,7 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 
 ## Open items
 
-- All three areas now measure **100% of runnable**: 18,071 + 17,343 + 963
+- All three areas now measure **100% of runnable**: 18,071 + 17,343 + 997
   pass / 0 fail / 0 crash / 0 hang of 23,724 + 23,812 + 1,086 fixtures
   (out-of-scope Temporal, await-dictionary, and ShadowRealm fixtures and
   the host-dependent `CanBlockIsTrue` waits skipped, `--timeout 120

@@ -10943,6 +10943,18 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
                 true,
             )
             .map_err(|e| e.message)?;
+        // `$262.IsHTMLDDA` (Annex B.3.7): the host object with an
+        // [[IsHTMLDDA]] internal slot — `typeof` "undefined", falsy,
+        // callable (returns null), and loosely equal to null/undefined.
+        let is_htmldda = Value::Object(JsObject::is_htmldda_object_create(
+            realm
+                .intrinsics
+                .get("%Object.prototype%")
+                .and_then(|value| value.as_object()),
+        ));
+        dollar_two_six_two_obj
+            .set(&JsString::from_utf8("IsHTMLDDA"), is_htmldda, true)
+            .map_err(|e| e.message)?;
         // The real harness include files (testTypedArray.js, propertyHelper.js,
         // testAtomics.js, …) are plain JS built on the globals above; load
         // them from the submodule so the vendored fixtures get their exact
@@ -11294,11 +11306,6 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
             // Atomics.wait fixtures that assume [[CanBlock]] = true: the
             // engine's main agent cannot suspend (host-dependent).
             return FixtureResult::Skip("host-dependent: can_block is false".into());
-        }
-        if fm.features.iter().any(|f| f == "IsHTMLDDA") {
-            // The [[IsHTMLDDA]] host object (`$262.IsHTMLDDA`, Annex B.3.7)
-            // is not provided by this host (host-dependent).
-            return FixtureResult::Skip("host-dependent: $262.IsHTMLDDA is not provided".into());
         }
         let unsupported: Vec<&str> = fm
             .includes

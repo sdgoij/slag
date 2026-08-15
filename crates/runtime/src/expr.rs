@@ -1619,6 +1619,13 @@ fn abstract_relational(
 /// mixed comparison (step 12) — the crux `is_loosely_equal` cannot dispatch
 /// valueOf/toString.
 fn abstract_loosely_equal(agent: &mut Agent, left: &Value, right: &Value) -> Result<bool, JsError> {
+    // spec 7.2.15 steps 1-2: an [[IsHTMLDDA]] object is loosely equal to
+    // null/undefined before any ToPrimitive runs.
+    if is_htmldda(left) && matches!(right, Value::Null | Value::Undefined)
+        || is_htmldda(right) && matches!(left, Value::Null | Value::Undefined)
+    {
+        return Ok(true);
+    }
     let left_obj = matches!(left, Value::Object(_) | Value::Function(_));
     let right_obj = matches!(right, Value::Object(_) | Value::Function(_));
     if left_obj && right_obj {
@@ -1648,6 +1655,14 @@ fn abstract_loosely_equal(agent: &mut Agent, left: &Value, right: &Value) -> Res
         }));
     }
     crux::ops::is_loosely_equal(&left_prim, &right_prim)
+}
+
+/// Whether the value is the host's `$262.IsHTMLDDA` (Annex B.3.7).
+fn is_htmldda(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Object(obj) if matches!(obj.kind, crux::object::ObjectKind::IsHTMLDDA)
+    )
 }
 
 /// Compare a BigInt with a finite or infinite Number; `None` for NaN.

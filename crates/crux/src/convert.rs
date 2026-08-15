@@ -163,7 +163,8 @@ pub fn to_boolean(value: &Value) -> bool {
         Value::String(s) => !s.is_empty(),
         Value::BigInt(b) => !b.is_zero(),
         Value::Symbol(_) => true,
-        Value::Object(_) | Value::Function(_) => true,
+        Value::Object(obj) => !matches!(obj.kind, crate::object::ObjectKind::IsHTMLDDA),
+        Value::Function(_) => true,
     }
 }
 

@@ -417,6 +417,7 @@ pub fn call(callee: &Value, this: Value, args: &[Value]) -> Result<Value, JsErro
             }
         },
         Value::Object(obj) => match &obj.kind {
+            crate::object::ObjectKind::IsHTMLDDA => Ok(Value::Null),
             crate::object::ObjectKind::Proxy(slots) => crate::proxy::apply(slots, this, args),
             _ => Err(JsError::new(
                 ErrorKind::TypeError,

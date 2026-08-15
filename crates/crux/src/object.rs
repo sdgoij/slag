@@ -179,6 +179,10 @@ pub enum ObjectKind {
     IntegerIndexed(Handle<TypedArraySlots>),
     /// Module namespace exotic (spec 10.4.6).
     ModuleNamespace(Handle<ModuleNamespaceSlots>),
+    /// The host's `$262.IsHTMLDDA` (Annex B.3.7): an object with an
+    /// [[IsHTMLDDA]] internal slot — `typeof` "undefined", falsy, callable
+    /// (returns null), and loosely equal to null/undefined.
+    IsHTMLDDA,
 }
 
 /// The [[ParameterMap]] of an arguments exotic object (spec 10.4.4): an
@@ -228,6 +232,7 @@ impl ObjectKind {
             ObjectKind::Array => "Array",
             ObjectKind::String(_) => "String",
             ObjectKind::Arguments(_) => "Arguments",
+            ObjectKind::IsHTMLDDA => "HTMLDDA",
             ObjectKind::Proxy(_) => "Proxy",
             ObjectKind::IntegerIndexed(_) => "TypedArray",
             ObjectKind::ModuleNamespace(_) => "Module",
@@ -373,6 +378,25 @@ impl JsObject {
     /// OrdinaryObjectCreate (spec 10.1.13).
     pub fn ordinary_object_create(prototype: Option<Handle<JsObject>>) -> Handle<JsObject> {
         let object = Handle::new(Self::basic_object_create(prototype));
+        Self::link_self_handle(&object);
+        object
+    }
+
+    /// The host's `$262.IsHTMLDDA` (Annex B.3.7): an object with the
+    /// [[IsHTMLDDA]] internal slot.
+    pub fn is_htmldda_object_create(prototype: Option<Handle<JsObject>>) -> Handle<JsObject> {
+        let object = Handle::new(Self {
+            id: NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
+            kind: ObjectKind::IsHTMLDDA,
+            prototype: RefCell::new(prototype),
+            extensible: Cell::new(true),
+            immutable_prototype: Cell::new(false),
+            properties: RefCell::new(Vec::new()),
+            private_elements: RefCell::new(Vec::new()),
+            self_handle: RefCell::new(None),
+            function_self: RefCell::new(None),
+            boxed: RefCell::new(None),
+        });
         Self::link_self_handle(&object);
         object
     }

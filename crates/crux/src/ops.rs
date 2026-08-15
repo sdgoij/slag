@@ -64,6 +64,22 @@ pub fn is_integral_number(number: f64) -> bool {
 /// (spec steps 1-2, 11); bare Phase 4 objects throw a TypeError, which is
 /// OrdinaryToPrimitive's result for an object with no callable methods.
 pub fn is_loosely_equal(x: &Value, y: &Value) -> Result<bool, JsError> {
+    // spec 7.2.15 steps 1-2: an [[IsHTMLDDA]] object (Annex B.3.7) is
+    // loosely equal to null/undefined.
+    if matches!(
+        x,
+        Value::Object(obj) if matches!(obj.kind, crate::object::ObjectKind::IsHTMLDDA)
+    ) && matches!(y, Value::Null | Value::Undefined)
+    {
+        return Ok(true);
+    }
+    if matches!(
+        y,
+        Value::Object(obj) if matches!(obj.kind, crate::object::ObjectKind::IsHTMLDDA)
+    ) && matches!(x, Value::Null | Value::Undefined)
+    {
+        return Ok(true);
+    }
     if matches!(x, Value::Null) && matches!(y, Value::Undefined)
         || matches!(x, Value::Undefined) && matches!(y, Value::Null)
     {
