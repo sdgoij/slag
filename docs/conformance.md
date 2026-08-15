@@ -1511,22 +1511,30 @@ failures (2,048 → 0) since the earlier run.
 
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
-| language | 23,724 | 18,079 | 0 | 5,645 | 0 | 100.0% |
-| built-ins | 23,812 | 17,487 | 0 | 6,325 | 0 | 100.0% |
+| language | 23,724 | 18,080 | 0 | 5,644 | 0 | 100.0% |
+| built-ins | 23,812 | 17,562 | 0 | 6,250 | 0 | 100.0% |
 | annexB | 1,086 | 1,085 | 0 | 1 | 0 | 100.0% |
-| **Total** | **48,622** | **36,651** | **0** | **11,971** | **0** | **100.0%** |
+| **Total** | **48,622** | **36,727** | **0** | **11,895** | **0** | **100.0%** |
 
-(Runnable = pass + fail; the 11,971 skips are module/async fixtures,
+(Runnable = pass + fail; the 11,895 skips are module/async fixtures,
 unsupported harness includes, the host-dependent `CanBlockIsTrue` waits,
 and the out-of-scope Temporal, await-dictionary, and ShadowRealm proposal
 fixtures — the 190 cross-realm `$262.createRealm`, 34 `$262.IsHTMLDDA`, and
-now 240 newly-enabled harness-include fixtures (decimalToHexString, nans,
+now 316 newly-enabled harness-include fixtures (decimalToHexString, nans,
 compareIterator, assertRelativeDateMs, iteratorZipUtils, dateConstants,
-deepEqual, promiseHelper, proxyTrapsHelper, fnGlobalObject) run and pass,
+deepEqual, promiseHelper, proxyTrapsHelper, fnGlobalObject,
+nativeFunctionMatcher, wellKnownIntrinsicObjects) run and pass,
 and the annexB row's fnGlobalObject/propertyHelper global-decl fixtures
 went from 8 fails to 88 passes with the B.3.3.3 `CreateGlobalVarBinding`
 fix (the hoist leaves a pre-existing own property in place instead of
-redefining it as enumerable).) The built-ins row reflects every cluster closure through the
+redefining it as enumerable). The nativeFunctionMatcher/wellKnownIntrinsicObjects
+cluster closed with two fixes: the parser's function/method spans now start
+at the `async`/`*`/computed-name prefix (so `Function.prototype.toString`
+renders the exact source incl. those prefixes), and builtins created
+outside the intrinsics table (typed-array species getters, Number statics,
+the Map/Set/Generator iterator `@@iterator` self-returners, and the
+`Math.random` host override) now get `%Function.prototype%` per
+CreateBuiltinFunction instead of a null prototype.) The built-ins row reflects every cluster closure through the
 final cleanup: the Error/BigInt/RegExp/Object-descriptor hardening,
 String/prototype, Object/create, DisposableStack, AsyncDisposableStack,
 ArrayBuffer/SharedArrayBuffer, Date, global-functions, Function,
@@ -1538,7 +1546,7 @@ Object.fromEntries, JSON.stringify, DataView, Object statics/
 constructor, Promise, Atomics, and the final Array/generator, Throw-
 TypeError, WeakRef/FinalizationRegistry, Uint8Array base64/hex, Set
 set-methods, JSON/parse, TypedArray BigInt, String, and SuppressedError
-closures (all 0 fail). The 6,325 built-ins skips are dominated by the
+closures (all 0 fail). The 6,250 built-ins skips are dominated by the
 out-of-scope Temporal proposal (4,611), await-dictionary (33), and
 ShadowRealm (60), with the async/module flags, host-dependent
 `CanBlockIsTrue` waits, and unsupported harness includes making up the
@@ -1698,7 +1706,7 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 
 ## Open items
 
-- All three areas now measure **100% of runnable**: 18,079 + 17,487 + 1,085
+- All three areas now measure **100% of runnable**: 18,080 + 17,562 + 1,085
   pass / 0 fail / 0 crash / 0 hang of 23,724 + 23,812 + 1,086 fixtures
   (out-of-scope Temporal, await-dictionary, and ShadowRealm fixtures and
   the host-dependent `CanBlockIsTrue` waits skipped, `--timeout 120

@@ -702,7 +702,8 @@ pub(crate) fn capture_source(agent: &Agent, span: crux::Span) -> Option<JsString
     if start >= end || end > source.len() {
         return None;
     }
-    Some(JsString::from_utf16(&source.as_slice()[start..end]))
+    let slice = &source.as_slice()[start..end];
+    Some(JsString::from_utf16(slice))
 }
 
 /// OrdinaryFunctionCreate step: `F.[[Prototype]]` is the intrinsic prototype

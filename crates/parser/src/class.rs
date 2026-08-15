@@ -240,9 +240,10 @@ fn parse_class_element(parser: &mut Parser) -> Result<Option<ClassElement>, JsEr
 
     // `*name() {}` — generator method.
     if parser.eat_punct(TokenKind::Star)? {
+        let method_start = parser.prev.as_ref().unwrap().span.start; // `*`
         let name = parse_class_element_name(parser)?;
         check_special_constructor(parser, &name, is_static)?;
-        let function = parse_class_method_tail(parser, false, true)?;
+        let function = parse_class_method_tail(parser, method_start, false, true)?;
         declare_private_name(parser, &name, PrivateNameKind::Other, is_static)?;
         return Ok(Some(ClassElement::Method {
             is_static,
@@ -256,11 +257,12 @@ fn parse_class_element(parser: &mut Parser) -> Result<Option<ClassElement>, JsEr
         && (is_class_name_start(parser.peek2()?.kind.clone())
             || matches!(parser.peek2()?.kind, TokenKind::Star))
     {
+        let method_start = parser.peek()?.span.start; // `async`
         parser.next()?; // `async`
         let is_generator = parser.eat_punct(TokenKind::Star)?;
         let name = parse_class_element_name(parser)?;
         check_special_constructor(parser, &name, is_static)?;
-        let function = parse_class_method_tail(parser, true, is_generator)?;
+        let function = parse_class_method_tail(parser, method_start, true, is_generator)?;
         declare_private_name(parser, &name, PrivateNameKind::Other, is_static)?;
         return Ok(Some(ClassElement::Method {
             is_static,
@@ -310,7 +312,8 @@ fn parse_class_element(parser: &mut Parser) -> Result<Option<ClassElement>, JsEr
     let name = parse_class_element_name(parser)?;
     if parser.at_punct(TokenKind::LeftParen)? {
         let in_constructor = !is_static && is_name(&name, "constructor");
-        let function = parse_class_method_tail_with(parser, false, false, in_constructor)?;
+        let function =
+            parse_class_method_tail_with(parser, name_start, false, false, in_constructor)?;
         declare_private_name(parser, &name, PrivateNameKind::Other, is_static)?;
         return Ok(Some(ClassElement::Method {
             is_static,
@@ -485,19 +488,20 @@ fn declare_private_name(
 /// method is the constructor from its name.
 fn parse_class_method_tail(
     parser: &mut Parser,
+    start: u32,
     is_async: bool,
     is_generator: bool,
 ) -> Result<Function, JsError> {
-    parse_class_method_tail_with(parser, is_async, is_generator, false)
+    parse_class_method_tail_with(parser, start, is_async, is_generator, false)
 }
 
 fn parse_class_method_tail_with(
     parser: &mut Parser,
+    start: u32,
     is_async: bool,
     is_generator: bool,
     in_constructor: bool,
 ) -> Result<Function, JsError> {
-    let start = parser.prev.as_ref().unwrap().span.start;
     parser.expect_punct(TokenKind::LeftParen)?;
     // Params parse with the method's own [Yield, Await] grammar: an async
     // method's formal parameters reserve `await` (spec 15.8.1), and a plain

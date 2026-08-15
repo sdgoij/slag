@@ -444,19 +444,30 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     }
 
     // spec 21.1.2: function statics have { W: true, E: false, C: true }.
+    // CreateBuiltinFunction (spec 10.2.3 step 1): the [[Prototype]] is
+    // %Function.prototype% — these statics are not intrinsic-registered, so
+    // the realm post-pass cannot link them; set it here.
     let statics: [(&str, u64, StaticFn); 4] = [
         ("isFinite", 1, is_finite),
         ("isInteger", 1, is_integer),
         ("isNaN", 1, is_nan),
         ("isSafeInteger", 1, is_safe_integer),
     ];
+    let function_proto =
+        realm
+            .intrinsics
+            .get("%Function.prototype%")
+            .and_then(|value| match value {
+                Value::Function(function) => function.object.handle(),
+                _ => None,
+            });
     for (name, length, body) in statics {
         let func = Function::create_builtin(
             Some(JsString::from_utf8(name)),
             length,
             Box::new(body),
             None,
-            None,
+            function_proto.clone(),
         )?;
         number_ctor.define_property(
             &JsString::from_utf8(name),

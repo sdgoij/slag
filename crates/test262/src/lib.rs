@@ -11332,6 +11332,8 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
                         | "promiseHelper.js"
                         | "proxyTrapsHelper.js"
                         | "fnGlobalObject.js"
+                        | "nativeFunctionMatcher.js"
+                        | "wellKnownIntrinsicObjects.js"
                 )
             })
             .collect();

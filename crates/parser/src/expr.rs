@@ -1940,7 +1940,7 @@ fn parse_object_literal_inner(parser: &mut Parser) -> Result<Expr, JsError> {
         if parser.at_punct(TokenKind::Star)? {
             parser.next()?;
             let key = parser.parse_property_name()?;
-            let function = parse_method_tail(parser, false, true)?;
+            let function = parse_method_tail(parser, prop_start, false, true)?;
             props.push(ObjectProperty::Method { key, function });
             if !parser.eat_punct(TokenKind::Comma)? {
                 break;
@@ -1956,7 +1956,7 @@ fn parse_object_literal_inner(parser: &mut Parser) -> Result<Expr, JsError> {
             parser.next()?; // `async`
             let is_generator = parser.eat_punct(TokenKind::Star)?;
             let key = parser.parse_property_name()?;
-            let function = parse_method_tail(parser, true, is_generator)?;
+            let function = parse_method_tail(parser, prop_start, true, is_generator)?;
             props.push(ObjectProperty::Method { key, function });
             if !parser.eat_punct(TokenKind::Comma)? {
                 break;
@@ -2015,7 +2015,7 @@ fn parse_object_literal_inner(parser: &mut Parser) -> Result<Expr, JsError> {
         let key = parser.parse_property_name()?;
         if parser.at_punct(TokenKind::LeftParen)? {
             // Plain method: `name() {}`.
-            let function = parse_method_tail(parser, false, false)?;
+            let function = parse_method_tail(parser, prop_start, false, false)?;
             props.push(ObjectProperty::Method { key, function });
         } else if parser.eat_punct(TokenKind::Colon)? {
             let value = parse_assignment(parser, true)?;
@@ -2103,10 +2103,10 @@ pub(crate) fn is_property_name_start(kind: TokenKind) -> bool {
 /// After the method name, parses `( params ) { body }`.
 fn parse_method_tail(
     parser: &mut Parser,
+    start: u32,
     is_async: bool,
     is_generator: bool,
 ) -> Result<Function, JsError> {
-    let start = parser.prev.as_ref().unwrap().span.start;
     parser.expect_punct(TokenKind::LeftParen)?;
     // Methods have a [[HomeObject]], so `super` is available in the formal
     // parameters as well as the body (spec 13.3.5).
@@ -2140,7 +2140,14 @@ pub(crate) fn parse_function_expression(
     parser: &mut Parser,
     is_async: bool,
 ) -> Result<Expr, JsError> {
-    let start = parser.next()?.span.start; // `function`
+    // The span covers the whole definition; an async function's caller has
+    // already consumed the `async` keyword, so it is `parser.prev` there.
+    let start = if is_async {
+        parser.prev.as_ref().unwrap().span.start
+    } else {
+        parser.peek()?.span.start
+    };
+    parser.next()?; // `function`
     let is_generator = parser.eat_punct(TokenKind::Star)?;
     let name = parse_function_expression_name(parser, is_generator, is_async)?;
     parser.expect_punct(TokenKind::LeftParen)?;

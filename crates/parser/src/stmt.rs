@@ -1203,7 +1203,14 @@ fn parse_function_declaration(
     statement_position: bool,
     annex_b: bool,
 ) -> Result<Stmt, JsError> {
-    let start = parser.next()?.span.start; // `function`
+    // The span covers the whole declaration; an async declaration's caller
+    // has already consumed the `async` keyword, so it is `parser.prev` there.
+    let start = if is_async {
+        parser.prev.as_ref().unwrap().span.start
+    } else {
+        parser.peek()?.span.start
+    };
+    parser.next()?; // `function`
     let is_generator = parser.eat_punct(TokenKind::Star)?;
     if statement_position && !(annex_b && !parser.strict && !is_generator && !is_async) {
         return Err(parser.error_at(

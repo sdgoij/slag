@@ -1510,6 +1510,14 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .intrinsics
         .get("%Object.prototype%")
         .and_then(|value| as_object(&value));
+    let function_proto =
+        realm
+            .intrinsics
+            .get("%Function.prototype%")
+            .and_then(|value| match value {
+                Value::Function(function) => function.object.handle(),
+                _ => None,
+            });
 
     // ---- Map ----
     let map_proto = JsObject::ordinary_object_create(object_proto.clone());
@@ -1723,7 +1731,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         0,
         Box::new(|this, _| Ok(this.clone())),
         None,
-        None,
+        function_proto.clone(),
     )?;
     map_iterator_proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
@@ -1951,7 +1959,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         0,
         Box::new(|this, _| Ok(this.clone())),
         None,
-        None,
+        function_proto.clone(),
     )?;
     set_iterator_proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),

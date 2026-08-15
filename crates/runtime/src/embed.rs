@@ -472,6 +472,16 @@ impl Context {
             return Ok(());
         };
         let callbacks = self.callbacks.clone();
+        // CreateBuiltinFunction (spec 10.2.3): the [[Prototype]] is
+        // %Function.prototype% — the override must keep the same shape as the
+        // Math.random it replaces.
+        let function_proto = realm
+            .intrinsics
+            .get("%Function.prototype%")
+            .and_then(|value| match value {
+                Value::Function(function) => function.object.handle(),
+                _ => None,
+            });
         let random = Function::create_builtin(
             Some(JsString::from_utf8("random")),
             0,
@@ -486,7 +496,7 @@ impl Context {
                 Ok(Value::Number(value))
             }),
             None,
-            None,
+            function_proto,
         )?;
         math.define_property_or_throw(
             &JsString::from_utf8("random"),

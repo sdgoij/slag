@@ -2815,6 +2815,21 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
+        // CreateBuiltinFunction (spec 10.2.3): the [[Prototype]] is
+        // %Function.prototype%. The realm post-pass only links intrinsics-table
+        // functions; this getter lives on the kind prototype alone, so link it
+        // here (spec 10.2.3 step 1).
+        if let Some(function_proto) =
+            realm
+                .intrinsics
+                .get("%Function.prototype%")
+                .and_then(|value| match value {
+                    Value::Function(function) => function.object.handle(),
+                    _ => None,
+                })
+        {
+            species_func.object.set_prototype_of(Some(function_proto))?;
+        }
         kind_proto.define_property_key(
             &PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone()),
             &PropertyDescriptor {

@@ -92,12 +92,17 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     }
     // %Generator.prototype%[@@iterator] = %Generator.prototype%.next's
     // iterator contract: the generator is its own iterator (spec 27.4.1).
+    let function_proto = realm
+        .intrinsics
+        .get("%Function.prototype%")
+        .and_then(|value| crate::context::as_object(&value))
+        .and_then(|object| object.handle());
     let iterator_method = Function::create_builtin(
         Some(JsString::from_utf8("[Symbol.iterator]")),
         0,
         Box::new(|this, _| Ok(this.clone())),
         None,
-        None,
+        function_proto,
     )?;
     proto.define_property_key(
         &crux::property::PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
