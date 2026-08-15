@@ -174,12 +174,23 @@ pub fn dispatch_construct(
                 &JsString::from_utf8("prototype"),
                 new_target.clone(),
             )?;
-            let proto = as_object(&proto).ok_or_else(|| {
-                JsError::new(
-                    ErrorKind::TypeError,
-                    "new.target.prototype is not an object".into(),
-                )
-            })?;
+            let proto = match as_object(&proto) {
+                Some(object) => object,
+                None => {
+                    // GetPrototypeFromConstructor fallback (spec 10.1.14):
+                    // the newTarget's realm's %Boolean.prototype%.
+                    crate::context::get_function_realm(agent, new_target)?
+                        .intrinsics
+                        .get(BOOLEAN_PROTO)
+                        .and_then(|value| as_object(&value))
+                        .ok_or_else(|| {
+                            JsError::new(
+                                ErrorKind::TypeError,
+                                "%Boolean.prototype% is not defined".into(),
+                            )
+                        })?
+                }
+            };
             let object = JsObject::ordinary_object_create(Some(proto));
             *object.boxed.borrow_mut() =
                 Some(crux::object::BoxedPrimitive::Boolean(to_boolean(&value)));

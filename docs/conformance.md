@@ -71,8 +71,8 @@ A dedicated sweep of the whole TypedArray fixture tree (`sweep.exe built-ins
 --filter '*TypedArray*' --jobs 8 --batch 32 --timeout 120 --recheck-timeout
 90`) currently reports **2043 pass, 0 fail, 141 skip, 0 crash, 0 hang** of
 2184 fixtures: every runnable TypedArray fixture passes. The 141 skips are
-the standard taxonomy (module/async flags, unsupported harness includes,
-`$262.createRealm`). This closed the cluster from 891 pass / 202 fail. The
+the standard taxonomy (module/async flags and unsupported harness
+includes). This closed the cluster from 891 pass / 202 fail. The
 work also removed the `TypedArray/prototype/copyWithin/coerced-values-*`
 "hangs" seen with short timeouts — those fixtures allocate 10,000-element
 arrays and need the long timeout config, not a bug.
@@ -114,8 +114,8 @@ The fixes clustered into spec-order and feature work:
 
 A follow-up sweep of the `Array/from` fixture tree (`sweep.exe built-ins
 --filter 'Array/from*'`) reports **51 pass, 0 fail, 91 skip** of 142
-fixtures: every runnable `Array.from` fixture passes. The 91 skips are the
-standard taxonomy (90 `flags: async` fromAsync tests, 1 `$262.createRealm`).
+fixtures: every runnable `Array.from` fixture passes. The 90 skips are the
+standard taxonomy (`flags: async` fromAsync tests).
 `Array.from` previously passed the mapfn a third `array` argument and
 constructed the custom constructor with « 0 » before iterating; it now
 follows spec 23.1.2.2 exactly: the constructor is invoked with no arguments
@@ -125,9 +125,10 @@ iterator (`IteratorClose`) before propagating.
 
 ### AggregateError cluster sweep (Phase 18 conformance)
 
-A sweep of `AggregateError*` reports **23 pass, 0 fail, 2 skip** of 25
-fixtures (the 2 skips are `$262.createRealm` and the `promiseHelper.js`
-include). Fixes in `crates/runtime/src/builtins/error.rs`:
+A sweep of `AggregateError*` reports **24 pass, 0 fail, 1 skip** of 25
+fixtures (the skip is the `promiseHelper.js` include; the cross-realm
+fixture now runs and passes). Fixes in
+`crates/runtime/src/builtins/error.rs`:
 
 - The `errors` argument is `IterableToList`-ed: it iterates when the value
   has `@@iterator` and falls back to the array-like copy.
@@ -144,8 +145,9 @@ include). Fixes in `crates/runtime/src/builtins/error.rs`:
 
 A sweep of `Error*` (93 fixtures) reports **85 pass, 0 fail, 8 skip**: every
 runnable fixture passes, including the `Error/prototype/stack*` cluster (30
-runnable of 35). The 8 skips are the standard taxonomy (5
-`$262.createRealm`, 3 `proxyTrapsHelper.js` includes). Fixes:
+runnable of 35). The 3 remaining skips are the standard taxonomy
+(`proxyTrapsHelper.js` includes); the 5 cross-realm fixtures now run and
+pass. Fixes:
 
 - **`%Error.prototype.stack%` accessor (ES2026, spec 20.5.3.4-5):** the stack
   is a per-instance string captured at construction and served through the
@@ -231,7 +233,7 @@ A sweep of the entire RegExp built-ins tree (`sweep.exe built-ins --filter
 'RegExp/*'`) reports **1283 pass, 0 fail, 596 skip, 0 hang** of 1879
 fixtures: **every runnable RegExp fixture passes**, up from 1079 pass / 218
 fail at the start of the session. The 596 skips are the standard taxonomy
-(`regExpUtils.js` includes, module/async flags, `$262.createRealm`), not
+(`regExpUtils.js` includes, module/async flags), not
 engine gaps. Per-cluster gains: `RegExp/S15.10.2*` (Sputnik) 239→291 pass,
 `lookBehind*` 3→17, `named-groups*` 12→35, `regexp-modifiers*` 19→45,
 `prototype/unicodeSets` 9→27, and the Symbol.species / match-indices /
@@ -331,8 +333,7 @@ Fixes across `crates/crux` and `crates/runtime`:
 A sweep of the entire `String/prototype*` tree (`sweep.exe built-ins --filter
 'String/prototype*'`) reports **1069 pass, 0 fail, 4 skip** of 1073 fixtures:
 **every runnable fixture passes**, up from 1003 pass / 66 fail at the start
-of the session. The 4 skips are the standard taxonomy (`$262.createRealm`,
-`compareIterator.js`/`regExpUtils.js` includes). `Object/create*` also closed
+of the session. The 4 skips are the standard taxonomy (`compareIterator.js`/`regExpUtils.js` includes). `Object/create*` also closed
 (320 pass, 0 fail, from 3 fail). Fixes:
 
 - **UTF-16-unit string `+` concatenation (`expr.rs`):** the string branch of
@@ -384,8 +385,8 @@ Sweeps of both explicit-resource-management trees (`sweep.exe built-ins
 --filter 'DisposableStack*'` and `'AsyncDisposableStack*'`) report **91
 pass, 0 fail, 2 skip** of 93 and **74 pass, 0 fail, 30 skip** of 104:
 every runnable fixture passes (up from 82 pass / 9 fail and 72 pass /
-2 fail). The skips are the standard taxonomy (async-flag fixtures,
-`$262.createRealm`, `deepEqual.js` includes). Fixes in
+2 fail). The skips are the standard taxonomy (async-flag fixtures and
+`deepEqual.js` includes). Fixes in
 `crates/runtime/src/builtins/disposable.rs`:
 
 - **adopt/defer closures:** resources stored the raw `onDispose` and were
@@ -418,8 +419,9 @@ every runnable fixture passes (up from 82 pass / 9 fail and 72 pass /
 
 Sweeps of both buffer trees (`sweep.exe built-ins --filter 'ArrayBuffer*'`
 and `'SharedArrayBuffer*'`) report **220 pass, 0 fail, 1 skip** of 221 and
-**103 pass, 0 fail, 1 skip** of 104: every runnable fixture passes
-(ArrayBuffer up from 196 pass / 24 fail). The skips are `$262.createRealm`.
+**103 pass, 0 fail, 0 skip** of 104: every fixture passes
+(ArrayBuffer up from 196 pass / 24 fail; the single cross-realm
+`$262.createRealm` fixture in each tree now runs and passes).
 Fixes in `crates/runtime/src/builtins/array_buffer.rs`:
 
 - **`immutable` getter (ES2026):** `ArrayBuffer.prototype.immutable` was
@@ -509,9 +511,9 @@ a stage-3 proposal, out of scope like Intl. Fixes in
 Sweeps of the six global-function trees (`isFinite*`, `isNaN*`,
 `parseFloat*`, `parseInt*`, `encodeURI*`, `decodeURI*`) report **231 pass,
 0 fail, 81 skip** of 312 fixtures: every runnable fixture passes (up from
-200 pass / 31 fail). The skips are the standard taxonomy (unsupported
-includes `decimalToHexString.js`/`nans.js`, host-dependent
-`$262.createRealm`). Fixes in `crates/runtime/src/builtins/global.rs`:
+0 pass, 31 fail). The skips are the standard taxonomy (unsupported
+includes `decimalToHexString.js`/`nans.js`, plus the host-dependent
+cross-realm fixtures, which now run and pass). Fixes in `crates/runtime/src/builtins/global.rs`:
 
 - **The global functions had a null [[Prototype]]** — `create_builtin` is
   called with `None` and the realm's post-pass only re-parents
@@ -537,8 +539,8 @@ includes `decimalToHexString.js`/`nans.js`, host-dependent
 
 A sweep of the whole `BigInt/*` tree (`sweep.exe built-ins --filter
 'BigInt/*'`) reports **76 pass, 0 fail, 1 skip** of 77 fixtures: every
-runnable fixture passes (up from 55 pass / 21 fail). The skip is the
-standard `$262.createRealm` host-dependency taxonomy. Fixes in
+runnable fixture passes (up from 55 pass / 21 fail). The single skip was
+the cross-realm fixture, which now runs and passes. Fixes in
 `crates/runtime/src/builtins/bigint.rs`, `crates/runtime/src/builtins/number.rs`,
 `crates/runtime/src/expr.rs`, `crates/crux/src/convert.rs`, and
 `crates/parser/src/stmt.rs`:
@@ -587,7 +589,7 @@ A sweep of the whole `Function/*` tree (`sweep.exe built-ins --filter
 'Function*'`) reports **425 pass, 0 fail, 84 skip** of 509 fixtures:
 every runnable fixture passes (up from 377 pass / 49 fail). The skips are
 the standard taxonomy (unsupported includes `nativeFunctionMatcher.js`,
-host-dependent `$262.createRealm`). Fixes in
+plus the host-dependent cross-realm fixtures, which now run and pass). Fixes in
 `crates/runtime/src/function.rs`, `crates/runtime/src/builtins/function.rs`,
 `crates/runtime/src/expr.rs`, `crates/parser/src/expr.rs`, and the test262
 harness:
@@ -849,8 +851,8 @@ Validation: `cargo test --workspace` **4085 pass, 0 failures**;
 A sweep of the whole `Proxy/*` tree (311 fixtures) reports **268 pass, 0
 fail, 43 skip, 0 crash, 0 hang** of 311 fixtures: every runnable fixture
 passes (up from 252 pass / 16 fail). The skips are the standard taxonomy
-(37 host-dependent `$262.createRealm`, 5 unsupported `proxyTrapsHelper.js`
-includes, 1 module-flag fixture). Fixes in `crates/crux/src/{function,
+(5 unsupported `proxyTrapsHelper.js` includes and 1 module-flag fixture);
+the 37 host-dependent cross-realm fixtures now run and pass. Fixes in `crates/crux/src/{function,
 object,proxy,value}.rs`, `crates/runtime/src/{function,builtins/object,
 builtins/proxy}.rs`:
 
@@ -1140,9 +1142,9 @@ Validation: `cargo test --workspace` **4085 pass, 0 failures**;
 
 A sweep of the entire DataView tree (`sweep.exe built-ins --filter
 'DataView*'`) reports **549 pass, 0 fail, 12 skip** of 561 fixtures: every
-runnable fixture passes (up from 463 pass / 86 fail). The skips are the
-standard taxonomy (`$262.createRealm` × 2 and the `byteConversionValues.js`
-harness includes). Fixes in `crates/runtime/src/builtins/dataview.rs`:
+runnable fixture passes (up from 463 pass / 86 fail). The remaining skips
+are the `byteConversionValues.js` harness includes; the 2 cross-realm
+fixtures now run and pass. Fixes in `crates/runtime/src/builtins/dataview.rs`:
 
 - **Check ordering in the get/set paths** — `GetViewValue`/`SetViewValue`
   ran the detached and bounds checks before coercing the arguments. The
@@ -1509,15 +1511,16 @@ failures (2,048 → 0) since the earlier run.
 
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
-| language | 23,724 | 18,052 | 0 | 5,672 | 0 | 100.0% |
-| built-ins | 23,812 | 17,179 | 0 | 6,633 | 0 | 100.0% |
-| annexB | 1,086 | 956 | 0 | 130 | 0 | 100.0% |
-| **Total** | **48,622** | **36,187** | **0** | **12,435** | **0** | **100.0%** |
+| language | 23,724 | 18,071 | 0 | 5,653 | 0 | 100.0% |
+| built-ins | 23,812 | 17,343 | 0 | 6,469 | 0 | 100.0% |
+| annexB | 1,086 | 963 | 0 | 123 | 0 | 100.0% |
+| **Total** | **48,622** | **36,377** | **0** | **12,245** | **0** | **100.0%** |
 
-(Runnable = pass + fail; the 12,435 skips are module/async fixtures,
+(Runnable = pass + fail; the 12,245 skips are module/async fixtures,
 unsupported harness includes, the host-dependent `CanBlockIsTrue` waits,
 and the out-of-scope Temporal, await-dictionary, and ShadowRealm proposal
-fixtures.) The built-ins row reflects every cluster closure through the
+fixtures — the 190 cross-realm `$262.createRealm` fixtures now run and
+pass.) The built-ins row reflects every cluster closure through the
 final cleanup: the Error/BigInt/RegExp/Object-descriptor hardening,
 String/prototype, Object/create, DisposableStack, AsyncDisposableStack,
 ArrayBuffer/SharedArrayBuffer, Date, global-functions, Function,
@@ -1532,8 +1535,8 @@ set-methods, JSON/parse, TypedArray BigInt, String, and SuppressedError
 closures (all 0 fail). The 6,633 built-ins skips are dominated by the
 out-of-scope Temporal proposal (4,611), await-dictionary (33), and
 ShadowRealm (60), with the async/module flags, host-dependent
-`$262.createRealm`/`CanBlockIsTrue`, and unsupported harness includes
-making up the rest.
+`CanBlockIsTrue` waits, and unsupported harness includes making up the
+rest.
 
 ¹ The 3 built-ins hangs recorded earlier were the
 `TypedArray/prototype/copyWithin` coerced-values fixtures — 10,000-element
@@ -1609,10 +1612,10 @@ closed to 0 fail — see the language-row note above):
     prototype chain for canonical index keys; `[[OwnPropertyKeys]]` orders
     strings before symbols; and a set coerces the value before the index
     check. The harness also gained the `assert.js` helpers (`isPrimitive`,
-    the bare `compareArray`) and skips `$262.createRealm` fixtures. The
+    the bare `compareArray`). The
     remaining TypedArray failures are resizable/auto-length views (5) and
-    cross-crate coercion of wrapper objects (2); the `-realm` fixtures are
-    skipped as host-dependent
+    cross-crate coercion of wrapper objects (2); the `-realm` fixtures run
+    via `$262.createRealm` now and pass
   - `String/prototype` (290), `Array/prototype` (187)
   - `Iterator/prototype` (278)
   - `dynamic-import/syntax/valid` (137), class-element `delete` early
@@ -1633,11 +1636,12 @@ the parser implements Annex B HTML comments, legacy octal literals, the
 each with unit tests. The full `annexB/` sweep is available via the sweep
 tool above.
 
-The full sweep now measures **100% of runnable**: **956 pass, 0 fail, 130
+The full sweep now measures **100% of runnable**: **963 pass, 0 fail, 123
 skip** of 1,086 fixtures (`--timeout 120 --recheck-timeout 120`, release
-build; the skips are the module/async flags, the `$262.createRealm`/
-`$262.IsHTMLDDA` host-dependent fixtures, and `fnGlobalObject.js`
-includes). This closed the area from 327 pass / 663 fail. The clusters:
+build; the skips are the module/async flags, the host-dependent
+`$262.IsHTMLDDA` fixtures, and `fnGlobalObject.js` includes — the 7
+cross-realm `$262.createRealm` fixtures now run and pass). This closed the
+area from 327 pass / 663 fail. The clusters:
 
 - **Sloppy block-level function declarations (B.3.2 / B.3.3)** — the ~410
   `eval-code`/`function-code`/`global-code` fixtures. A block-level
@@ -1688,11 +1692,11 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 
 ## Open items
 
-- All three areas now measure **100% of runnable**: 18,052 + 17,179 + 956
+- All three areas now measure **100% of runnable**: 18,071 + 17,343 + 963
   pass / 0 fail / 0 crash / 0 hang of 23,724 + 23,812 + 1,086 fixtures
   (out-of-scope Temporal, await-dictionary, and ShadowRealm fixtures and
-  the host-dependent `$262.createRealm`/`CanBlockIsTrue` waits skipped,
-  `--timeout 120 --recheck-timeout 120`, release build) — the plan's ≥95%
+  the host-dependent `CanBlockIsTrue` waits skipped, `--timeout 120
+  --recheck-timeout 120`, release build) — the plan's ≥95%
   runnable-pass-rate target is met. The language area closed last (2,048 →
   0 fails) via the eval-caller-context, field-initializer, and Annex B
   work described in the Full-suite sweep section.

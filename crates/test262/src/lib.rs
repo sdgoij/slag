@@ -10895,6 +10895,54 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
                 true,
             )
             .map_err(|e| e.message)?;
+        // `$262.createRealm` (test262 host spec): a fresh realm with its own
+        // intrinsics and global object, returned as `{ global, evalScript }`.
+        // The record's `evalScript` evaluates as a Script in that realm (the
+        // closure captures the realm; the agent comes from the enclosing
+        // `with_agent` window).
+        let create_realm = Function::create_builtin(
+            Some(JsString::from_utf8("createRealm")),
+            0,
+            Box::new(|_, _| {
+                let agent = runtime::context::current_agent_mut()?;
+                let new_realm = runtime::realm::initialize_host_defined_realm(agent)?;
+                let record = JsObject::ordinary_object_create(None);
+                record.create_data_property_or_throw(
+                    &JsString::from_utf8("global"),
+                    Value::Object(new_realm.global_object.clone()),
+                )?;
+                let eval_script = Function::create_builtin(
+                    Some(JsString::from_utf8("evalScript")),
+                    1,
+                    Box::new(move |_, args| {
+                        let agent = runtime::context::current_agent_mut()?;
+                        let source = args.first().cloned().unwrap_or(Value::Undefined);
+                        let text = runtime::context::to_string(agent, &source)?;
+                        agent.push_bootstrap_context(new_realm.clone());
+                        let result = agent.run_script(&text.to_string_lossy());
+                        agent.execution_context_stack.pop();
+                        result
+                    }),
+                    None,
+                    None,
+                )?;
+                record.create_data_property_or_throw(
+                    &JsString::from_utf8("evalScript"),
+                    Value::Function(eval_script),
+                )?;
+                Ok(Value::Object(record))
+            }),
+            None,
+            None,
+        )
+        .map_err(|e| e.message)?;
+        dollar_two_six_two_obj
+            .set(
+                &JsString::from_utf8("createRealm"),
+                Value::Function(create_realm),
+                true,
+            )
+            .map_err(|e| e.message)?;
         // The real harness include files (testTypedArray.js, propertyHelper.js,
         // testAtomics.js, …) are plain JS built on the globals above; load
         // them from the submodule so the vendored fixtures get their exact
@@ -11275,11 +11323,6 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
                 "unsupported includes: {}",
                 unsupported.join(", ")
             ));
-        }
-        // Cross-realm fixtures need the `$262.createRealm` host hook, which is
-        // not provided (host-dependent behavior).
-        if body.contains("$262.createRealm") {
-            return FixtureResult::Skip("host-dependent: $262.createRealm is not provided".into());
         }
         // Raw fixtures are executed as-is: the whole file, header and all, is
         // the program (test262-harness convention). This is what makes the

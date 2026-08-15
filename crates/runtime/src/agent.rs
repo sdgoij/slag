@@ -256,6 +256,13 @@ pub struct Agent {
     /// A direct eval inside one applies the "Eval Inside Initializer" early
     /// errors (spec 19.2.1.1): `arguments` is a SyntaxError there.
     pub field_initializer_depth: usize,
+    /// Every realm created in this agent (the bootstrap realm plus any the
+    /// host creates via `$262.createRealm`), so a realm's builtin called
+    /// from another realm can dispatch with its own realm current.
+    pub realms: RefCell<Vec<Handle<Realm>>>,
+    /// Memoized owning-realm lookup: function id → the realm whose
+    /// intrinsic table holds it (`None` for non-intrinsic functions).
+    pub function_realms: RefCell<std::collections::HashMap<u64, Option<Handle<Realm>>>>,
 }
 
 impl Agent {
@@ -327,6 +334,8 @@ impl Agent {
             map_iter_data: std::collections::HashMap::new(),
             set_iter_data: std::collections::HashMap::new(),
             field_initializer_depth: 0,
+            realms: RefCell::new(Vec::new()),
+            function_realms: RefCell::new(std::collections::HashMap::new()),
         }
     }
 

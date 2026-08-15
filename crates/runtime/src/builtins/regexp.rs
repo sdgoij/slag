@@ -94,12 +94,23 @@ fn regexp_alloc(agent: &mut Agent, new_target: &Value) -> Result<Handle<JsObject
         &JsString::from_utf8("prototype"),
         new_target.clone(),
     )?;
-    let proto = as_object(&proto).ok_or_else(|| {
-        JsError::new(
-            ErrorKind::TypeError,
-            "new.target.prototype is not an object".into(),
-        )
-    })?;
+    let proto = match as_object(&proto) {
+        Some(object) => object,
+        None => {
+            // GetPrototypeFromConstructor fallback (spec 22.2.4.2): the
+            // newTarget's realm's %RegExp.prototype%.
+            crate::context::get_function_realm(agent, new_target)?
+                .intrinsics
+                .get("%RegExp.prototype%")
+                .and_then(|value| as_object(&value))
+                .ok_or_else(|| {
+                    JsError::new(
+                        ErrorKind::TypeError,
+                        "%RegExp.prototype% is not defined".into(),
+                    )
+                })?
+        }
+    };
     let object = JsObject::ordinary_object_create(Some(proto));
     object.define_property(
         &JsString::from_utf8("lastIndex"),

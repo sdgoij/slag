@@ -15,6 +15,73 @@ use crate::env::{EnvRecord, EnvRef};
 use crate::realm::Realm;
 use crate::script::ScriptRecord;
 
+/// The agent of the innermost enclosing [`crux::function::with_agent`]
+/// window — the script/eval/call currently running. Native host closures
+/// (the embedding API, the test262 harness) use this to reach the agent,
+/// which their call signature does not receive. Errors when called outside
+/// such a window.
+pub fn current_agent_mut() -> Result<&'static mut Agent, JsError> {
+    let agent = crux::function::current_agent();
+    if agent.is_null() {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "host global called outside an agent window".into(),
+        ));
+    }
+    // SAFETY: `with_agent` guarantees a live `&mut Agent` for the duration of
+    // the enclosing call; host closures only run inside those windows.
+    Ok(unsafe { &mut *(agent as *mut Agent) })
+}
+
+/// GetFunctionRealm (spec 10.2.6): the realm the function object was
+/// created in — the creation realm for ECMAScript functions, the owning
+/// realm for builtins, recursing through bound functions and proxy targets
+/// (a revoked proxy throws).
+pub fn get_function_realm(agent: &mut Agent, value: &Value) -> Result<Handle<Realm>, JsError> {
+    match value {
+        Value::Function(function) => match &function.kind {
+            crux::function::FunctionKind::EcmaScript => agent
+                .ecma_functions
+                .get(&function.id())
+                .map(|data| data.realm.clone())
+                .ok_or_else(|| {
+                    JsError::new(
+                        ErrorKind::TypeError,
+                        "GetFunctionRealm: no realm for the ECMAScript function".into(),
+                    )
+                }),
+            crux::function::FunctionKind::Bound { target, .. } => get_function_realm(agent, target),
+            crux::function::FunctionKind::Builtin { .. } => {
+                crate::function::owning_realm(agent, function).ok_or_else(|| {
+                    JsError::new(
+                        ErrorKind::TypeError,
+                        "GetFunctionRealm: no realm for the builtin".into(),
+                    )
+                })
+            }
+        },
+        Value::Object(obj) => match &obj.kind {
+            crux::object::ObjectKind::Proxy(slots) => {
+                let Some(target) = slots.target.borrow().clone() else {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "GetFunctionRealm: revoked proxy".into(),
+                    ));
+                };
+                get_function_realm(agent, &target)
+            }
+            _ => Err(JsError::new(
+                ErrorKind::TypeError,
+                "GetFunctionRealm: not a function".into(),
+            )),
+        },
+        _ => Err(JsError::new(
+            ErrorKind::TypeError,
+            "GetFunctionRealm: not a function".into(),
+        )),
+    }
+}
+
 /// The object side of a language value: ordinary objects directly, functions
 /// through their embedded object part (functions are values distinct from
 /// objects in this engine, but both carry a `Handle<JsObject>`).

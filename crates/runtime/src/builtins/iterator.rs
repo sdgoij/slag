@@ -721,10 +721,14 @@ pub fn dispatch_construct(
                 Err(e) => return Err(e),
             };
             let prototype = prototype.or_else(|| {
-                realm
-                    .intrinsics
-                    .get(ITERATOR_PROTO)
-                    .and_then(|value| as_object(&value))
+                crate::context::get_function_realm(agent, new_target)
+                    .ok()
+                    .and_then(|realm| {
+                        realm
+                            .intrinsics
+                            .get(ITERATOR_PROTO)
+                            .and_then(|value| as_object(&value))
+                    })
             });
             Ok(Value::Object(JsObject::ordinary_object_create(prototype)))
         })());

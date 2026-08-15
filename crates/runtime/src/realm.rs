@@ -61,6 +61,12 @@ impl Intrinsics {
         self.entries.borrow().is_empty()
     }
 
+    /// Whether the registry holds `value` — the owning-realm lookup for
+    /// cross-realm builtin calls (`$262.createRealm` fixtures).
+    pub fn contains(&self, value: &Value) -> bool {
+        self.entries.borrow().values().any(|entry| entry == value)
+    }
+
     /// Every registered intrinsic value, for post-install linking.
     pub fn entries(&self) -> Vec<Value> {
         self.entries.borrow().values().cloned().collect()
@@ -95,6 +101,7 @@ pub fn initialize_host_defined_realm(agent: &Agent) -> Result<Handle<Realm>, JsE
         loaded_modules: RefCell::new(std::collections::HashMap::new()),
     });
     set_default_global_bindings(&realm)?;
+    agent.realms.borrow_mut().push(realm.clone());
     Ok(realm)
 }
 

@@ -102,6 +102,12 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
+        // Registered as an intrinsic so a method of one realm called from
+        // another dispatches with its own realm current.
+        realm.intrinsics.define(
+            &format!("%AsyncGenerator.prototype.{name}%"),
+            Value::Function(method.clone()),
+        );
         proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {

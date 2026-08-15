@@ -370,8 +370,7 @@ fn get_prototype_from_constructor(
     )?;
     match as_object(&proto) {
         Some(handle) => Ok(handle),
-        None => agent
-            .current_realm()?
+        None => crate::context::get_function_realm(agent, constructor)?
             .intrinsics
             .get(FUNCTION_PROTO)
             .and_then(|value| as_object(&value))

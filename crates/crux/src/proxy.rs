@@ -25,6 +25,19 @@ use crate::property::{
 use crate::string::JsString;
 use crate::value::{Value, is_constructor};
 
+/// Creates the `argumentsList` array passed to a proxy trap (spec 7.3.15
+/// CreateArrayFromList): the runtime provides the current realm's
+/// `%Array.prototype%` through this hook; the null-prototype fallback covers
+/// crux-only contexts (unit tests).
+type ArrayFromListHook = fn(agent: *mut (), list: &[Value]) -> Result<Value, JsError>;
+static ARRAY_FROM_LIST_HOOK: std::sync::OnceLock<ArrayFromListHook> = std::sync::OnceLock::new();
+
+/// Install the CreateArrayFromList provider (the runtime does this once at
+/// startup, like the ECMAScript executor hook).
+pub fn install_array_from_list_hook(hook: ArrayFromListHook) {
+    let _ = ARRAY_FROM_LIST_HOOK.set(hook);
+}
+
 /// The [[ProxyTarget]] and [[ProxyHandler]] internal slots. Both are `None`
 /// once the proxy has been revoked (spec 10.5). `callable`/`constructible`
 /// record the target's callability at creation (ProxyCreate, spec 10.5.15
@@ -613,6 +626,13 @@ fn length_of_array_like(value: &Value) -> Result<u64, JsError> {
 
 /// CreateArrayFromList (spec 7.3.17).
 fn create_array_from_list(list: &[Value]) -> Result<Value, JsError> {
+    let agent = crate::function::current_agent();
+    if let Some(hook) = ARRAY_FROM_LIST_HOOK.get().copied()
+        && !agent.is_null()
+        && let Ok(array) = hook(agent, list)
+    {
+        return Ok(array);
+    }
     let array = JsObject::array_create(None, list.len() as f64)?;
     for (index, element) in list.iter().enumerate() {
         array.create_data_property(&JsString::from_utf8(&index.to_string()), element.clone())?;

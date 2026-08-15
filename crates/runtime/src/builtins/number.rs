@@ -78,12 +78,18 @@ fn instance_proto(
         &JsString::from_utf8("prototype"),
         new_target.clone(),
     )?;
-    as_object(&proto).map(Some).ok_or_else(|| {
-        JsError::new(
-            ErrorKind::TypeError,
-            "new.target.prototype is not an object".into(),
-        )
-    })
+    let proto = match as_object(&proto) {
+        Some(object) => Some(object),
+        None => {
+            // GetPrototypeFromConstructor fallback (spec 10.1.14): the
+            // newTarget's realm's %Number.prototype%.
+            crate::context::get_function_realm(agent, new_target)?
+                .intrinsics
+                .get(NUMBER_PROTO)
+                .and_then(|value| as_object(&value))
+        }
+    };
+    Ok(proto)
 }
 
 /// `Number(value)` / `new Number(value)` (spec 21.1.1.1): convert the

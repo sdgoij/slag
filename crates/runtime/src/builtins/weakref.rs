@@ -266,8 +266,7 @@ fn instance_proto(
     )?;
     match as_object(&proto) {
         Some(object) => Ok(object),
-        None => agent
-            .current_realm()?
+        None => crate::context::get_function_realm(agent, new_target)?
             .intrinsics
             .get(intrinsic)
             .and_then(|value| as_object(&value))

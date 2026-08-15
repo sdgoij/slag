@@ -52,6 +52,25 @@ static INSTALL_ECMA_HOOK: std::sync::Once = std::sync::Once::new();
 pub fn ensure_ecma_hook() {
     INSTALL_ECMA_HOOK.call_once(|| {
         crux::function::install_ecma_hook(crux_ecma_executor);
+        // Proxy trap `argumentsList` arrays carry the current realm's
+        // `%Array.prototype%` (CreateArrayFromList, spec 7.3.15).
+        crux::proxy::install_array_from_list_hook(|agent, list| {
+            // SAFETY: the hook only runs inside a `with_agent` window, where
+            // the pointer is a live `&mut Agent`.
+            let agent = unsafe { &mut *(agent as *mut crate::agent::Agent) };
+            crate::builtins::array::array_from_values(agent, list)
+        });
+        crux::property::install_object_proto_hook(|agent| {
+            // SAFETY: the hook only runs inside a `with_agent` window, where
+            // the pointer is a live `&mut Agent`.
+            let agent = unsafe { &mut *(agent as *mut crate::agent::Agent) };
+            agent.current_realm().ok().and_then(|realm| {
+                realm
+                    .intrinsics
+                    .get("%Object.prototype%")
+                    .and_then(|value| crate::context::as_object(&value))
+            })
+        });
     });
 }
 
@@ -902,26 +921,98 @@ pub fn call(
     })
 }
 
+/// The realm whose intrinsic table holds `function`, memoized per function
+/// id. Realm builtins identify themselves by intrinsic identity (the
+/// `%eval%` dispatch pattern), so a builtin of one realm called from
+/// another must run with its own realm current.
+pub(crate) fn owning_realm(
+    agent: &mut Agent,
+    function: &Handle<Function>,
+) -> Option<Handle<Realm>> {
+    if let Some(cached) = agent.function_realms.borrow().get(&function.id()).cloned() {
+        return cached;
+    }
+    let found = agent
+        .realms
+        .borrow()
+        .iter()
+        .find(|realm| {
+            realm
+                .intrinsics
+                .contains(&Value::Function(function.clone()))
+        })
+        .cloned();
+    agent
+        .function_realms
+        .borrow_mut()
+        .insert(function.id(), found.clone());
+    found
+}
+
+/// Attach a realm-specific throwable value to a kind-only engine error: the
+/// error object is created from `realm`'s intrinsics while it is current
+/// (the cross-realm fixtures assert the realm of e.g. a class-constructor
+/// TypeError).
+fn realm_throwable(
+    agent: &mut Agent,
+    error: JsError,
+    realm: Handle<Realm>,
+) -> Result<JsError, JsError> {
+    if realm.global_object.id() == agent.current_realm()?.global_object.id() {
+        return Ok(error);
+    }
+    agent.push_bootstrap_context(realm);
+    let converted = crate::builtins::error::to_throwable(agent, &error);
+    agent.execution_context_stack.pop();
+    match converted {
+        Ok(value) => Ok(error.with_value(value)),
+        Err(conversion) => Err(conversion),
+    }
+}
+
 fn call_inner(
     agent: &mut Agent,
     callee: &Value,
     this: Value,
     args: &[Value],
 ) -> Result<Value, JsError> {
+    // A realm's builtin called while another realm is current (the
+    // `$262.createRealm` fixtures) must dispatch with its own realm current:
+    // push it, re-enter, and restore.
+    if let Value::Function(function) = callee
+        && let Some(owning) = owning_realm(agent, function)
+        && owning.global_object.id() != agent.current_realm()?.global_object.id()
+    {
+        agent.push_bootstrap_context(owning);
+        let result = call_inner(agent, callee, this, args);
+        let result = match result {
+            // A kind-only engine error from the other realm's builtin must
+            // surface as that realm's error object (`assert.throws` checks
+            // `thrown.constructor`); build it while the realm is current.
+            Err(e) if e.value.is_none() => match crate::builtins::error::to_throwable(agent, &e) {
+                Ok(value) => Err(e.with_value(value)),
+                Err(conversion) => Err(conversion),
+            },
+            other => other,
+        };
+        agent.execution_context_stack.pop();
+        return result;
+    }
     match callee {
         Value::Function(function) => match &function.kind {
             crux::function::FunctionKind::EcmaScript => {
-                if agent
-                    .ecma_functions
-                    .get(&function.id())
-                    .is_some_and(|data| data.is_class_constructor)
+                if let Some(data) = agent.ecma_functions.get(&function.id())
+                    && data.is_class_constructor
                 {
                     // spec 10.2.1: [[IsClassConstructor]] is true, so the
-                    // function must be called with `new` (step 5).
-                    return Err(JsError::new(
+                    // function must be called with `new` (step 5). The error
+                    // is the class's realm TypeError (the cross-realm
+                    // fixtures assert `realm.global.TypeError`).
+                    let error = JsError::new(
                         ErrorKind::TypeError,
                         "Class constructor cannot be invoked without 'new'".into(),
-                    ));
+                    );
+                    return Err(realm_throwable(agent, error, data.realm.clone())?);
                 }
                 let data = agent.ecma_functions.get(&function.id());
                 // A function created inside a class field initializer runs
@@ -1100,6 +1191,26 @@ fn construct_inner(
     args: &[Value],
     new_target: &Value,
 ) -> Result<Value, JsError> {
+    // Cross-realm builtin constructors (`new $262.createRealm().global.Array`)
+    // dispatch with their own realm current, like `call_inner`.
+    if let Value::Function(function) = callee
+        && let Some(owning) = owning_realm(agent, function)
+        && owning.global_object.id() != agent.current_realm()?.global_object.id()
+    {
+        agent.push_bootstrap_context(owning);
+        let result = construct_inner(agent, callee, args, new_target);
+        let result = match result {
+            // Surface a kind-only engine error as the callee realm's error
+            // object before the realm context pops (like `call_inner`).
+            Err(e) if e.value.is_none() => match crate::builtins::error::to_throwable(agent, &e) {
+                Ok(value) => Err(e.with_value(value)),
+                Err(conversion) => Err(conversion),
+            },
+            other => other,
+        };
+        agent.execution_context_stack.pop();
+        return result;
+    }
     match callee {
         Value::Function(function) => match &function.kind {
             crux::function::FunctionKind::EcmaScript => {
@@ -1350,6 +1461,16 @@ fn ordinary_call(
         function_declaration_instantiation(agent, &function_value, &data, args, &function_env)?;
         evaluate_body(agent, &data)
     })();
+    // A kind-only engine error escapes the body with the function's realm
+    // context still current; surface it as that realm's error object now, so
+    // a caller from another realm sees the right constructor.
+    let result = match result {
+        Err(e) if e.value.is_none() => match crate::builtins::error::to_throwable(agent, &e) {
+            Ok(value) => Err(e.with_value(value)),
+            Err(conversion) => Err(conversion),
+        },
+        other => other,
+    };
     agent.execution_context_stack.pop();
     result
 }
@@ -1431,8 +1552,7 @@ fn ordinary_construct(
                         "Cannot perform operation on a revoked Proxy".into(),
                     ));
                 }
-                agent
-                    .current_realm()?
+                crate::context::get_function_realm(agent, new_target)?
                     .intrinsics
                     .get("%Object.prototype%")
                     .and_then(|value| crate::context::as_object(&value))

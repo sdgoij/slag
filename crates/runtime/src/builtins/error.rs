@@ -458,8 +458,7 @@ fn instance_proto(
     }
     // spec 10.1.14 steps 3-4: a non-object `prototype` falls back to the
     // constructor's intrinsic default prototype.
-    Ok(agent
-        .current_realm()?
+    Ok(crate::context::get_function_realm(agent, new_target)?
         .intrinsics
         .get(default_proto_key)
         .and_then(|value| as_object(&value)))

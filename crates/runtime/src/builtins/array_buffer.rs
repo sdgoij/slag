@@ -1063,8 +1063,7 @@ fn get_prototype_from_constructor(
     match as_object(&proto) {
         Some(object) => Ok(object),
         None => {
-            let default = agent
-                .current_realm()?
+            let default = crate::context::get_function_realm(agent, constructor)?
                 .intrinsics
                 .get(default_name)
                 .and_then(|value| as_object(&value))

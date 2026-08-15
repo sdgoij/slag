@@ -196,12 +196,17 @@ fn instance_proto(
         &JsString::from_utf8("prototype"),
         new_target.clone(),
     )?;
-    as_object(&proto).map(Some).ok_or_else(|| {
-        JsError::new(
-            ErrorKind::TypeError,
-            "new.target.prototype is not an object".into(),
-        )
-    })
+    match as_object(&proto) {
+        Some(object) => Ok(Some(object)),
+        None => {
+            // GetPrototypeFromConstructor fallback (spec 10.1.14): the
+            // newTarget's realm's %String.prototype%.
+            Ok(crate::context::get_function_realm(agent, new_target)?
+                .intrinsics
+                .get("%String.prototype%")
+                .and_then(|value| as_object(&value)))
+        }
+    }
 }
 
 fn string_call(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {

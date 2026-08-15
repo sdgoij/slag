@@ -197,11 +197,36 @@ pub fn to_property_descriptor(value: &Value) -> Result<PropertyDescriptor, JsErr
 
 /// FromPropertyDescriptor (spec 6.2.5.5): build the descriptor object from a
 /// Property Descriptor, copying only the present fields.
+/// Returns the current realm's `%Object.prototype%` inside a proxy/descriptor
+/// window: the runtime installs this so trap descriptor objects get the
+/// realm's prototype (FromPropertyDescriptor, spec 6.2.4.4).
+type ObjectProtoHook = fn(agent: *mut ()) -> Option<Handle<JsObject>>;
+static OBJECT_PROTO_HOOK: std::sync::OnceLock<ObjectProtoHook> = std::sync::OnceLock::new();
+
+/// Install the `%Object.prototype%` provider (the runtime does this once at
+/// startup, like the ECMAScript executor hook).
+pub fn install_object_proto_hook(hook: ObjectProtoHook) {
+    let _ = OBJECT_PROTO_HOOK.set(hook);
+}
+
+/// The current realm's `%Object.prototype%` when the hook is installed and
+/// an agent window is active.
+pub fn current_object_proto() -> Option<Handle<JsObject>> {
+    let agent = crate::function::current_agent();
+    if agent.is_null() {
+        return None;
+    }
+    OBJECT_PROTO_HOOK
+        .get()
+        .copied()
+        .and_then(|hook| hook(agent))
+}
+
 pub fn from_property_descriptor(
     desc: &PropertyDescriptor,
     prototype: Option<Handle<JsObject>>,
 ) -> Result<Value, JsError> {
-    let obj = JsObject::ordinary_object_create(prototype);
+    let obj = JsObject::ordinary_object_create(prototype.or_else(current_object_proto));
     if let Some(value) = &desc.value {
         obj.create_data_property_or_throw(&JsString::from_utf8("value"), value.clone())?;
     }

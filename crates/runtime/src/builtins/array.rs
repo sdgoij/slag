@@ -257,8 +257,7 @@ fn get_prototype_from_constructor(
     match as_object(&proto) {
         Some(object) => Ok(object),
         None => {
-            let default = agent
-                .current_realm()?
+            let default = crate::context::get_function_realm(agent, constructor)?
                 .intrinsics
                 .get(ARRAY_PROTO)
                 .and_then(|value| as_object(&value))
@@ -286,7 +285,27 @@ fn array_species_create(
     if !is_array(original_array) {
         return array_create(agent, length);
     }
-    let c = get(agent, original_array, &JsString::from_utf8("constructor"))?;
+    let mut c = get(agent, original_array, &JsString::from_utf8("constructor"))?;
+    // spec 9.4.2.3 steps 6-7: a constructor from another realm that *is*
+    // that realm's %Array% collapses to undefined — the foreign species
+    // getter is skipped and the result uses this realm's prototype.
+    if is_constructor(&c) {
+        let realm_c = crate::context::get_function_realm(agent, &c).ok();
+        let this_realm = agent.current_realm().ok();
+        let different_realm = match (&this_realm, &realm_c) {
+            (Some(this_realm), Some(realm_c)) => {
+                this_realm.global_object.id() != realm_c.global_object.id()
+            }
+            _ => false,
+        };
+        let foreign_array = realm_c
+            .as_ref()
+            .and_then(|realm| realm.intrinsics.get(ARRAY))
+            .is_some_and(|array| crux::ops::same_value(&array, &c));
+        if different_realm && foreign_array {
+            c = Value::Undefined;
+        }
+    }
     let species = match c {
         Value::Undefined => return array_create(agent, length),
         Value::Object(_) | Value::Function(_) => {

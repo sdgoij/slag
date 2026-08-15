@@ -298,9 +298,8 @@ fn instance_proto(agent: &mut Agent, new_target: &Value) -> Result<Handle<JsObje
         return Ok(obj);
     }
     // GetPrototypeFromConstructor (spec 10.1.8): a non-object prototype
-    // falls back to %Date.prototype%.
-    agent
-        .current_realm()?
+    // falls back to the newTarget's realm's %Date.prototype%.
+    crate::context::get_function_realm(agent, new_target)?
         .intrinsics
         .get(DATE_PROTO)
         .and_then(|value| as_object(&value))

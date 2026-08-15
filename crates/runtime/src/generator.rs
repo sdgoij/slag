@@ -72,6 +72,12 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
+        // Registered as an intrinsic so a method of one realm called from
+        // another dispatches with its own realm current.
+        realm.intrinsics.define(
+            &format!("%Generator.prototype.{name}%"),
+            Value::Function(method.clone()),
+        );
         proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -235,9 +241,10 @@ pub fn call_generator(
         &JsString::from_utf8("prototype"),
         Value::Function(function.clone()),
     )?;
-    // GetPrototypeFromConstructor (spec 9.1.14): a non-object `prototype`
-    // (e.g. `g.prototype = null`) falls back to the realm's intrinsic
-    // generator prototype.
+    // GetPrototypeFromConstructor (spec 9.1.14): a non-object
+    // `prototype` (e.g. `g.prototype = null`) falls back to the
+    // function's realm's intrinsic generator prototype (the
+    // cross-realm fixture asserts the creation realm's).
     let proto = match crate::context::as_object(&proto_value) {
         Some(proto) => proto,
         None => {
@@ -246,8 +253,7 @@ pub fn call_generator(
             } else {
                 "%Generator.prototype%"
             };
-            agent
-                .current_realm()?
+            data.realm
                 .intrinsics
                 .get(intrinsic)
                 .and_then(|value| crate::context::as_object(&value))
