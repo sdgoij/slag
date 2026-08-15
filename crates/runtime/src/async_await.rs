@@ -117,7 +117,10 @@ pub fn call_async_function(
         crate::function::function_declaration_instantiation(
             agent,
             &function_value,
-            &data,
+            &data.params,
+            &data.body,
+            data.this_mode,
+            data.strict,
             args,
             &function_env,
         )?;

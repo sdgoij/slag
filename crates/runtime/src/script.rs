@@ -1012,6 +1012,33 @@ fn contains_arguments(program: &Program) -> bool {
     found
 }
 
+/// Whether a function body can observe the `arguments` binding: it
+/// references the identifier (through nested arrows, which inherit it;
+/// nested functions have their own) or contains a direct `eval` (which
+/// could introduce a reference). When neither, the arguments object is
+/// unobservable and function instantiation may bind `undefined` instead of
+/// building it (the Sputnik decodeURI fixtures call tiny sloppy helpers
+/// millions of times).
+pub(crate) fn body_observes_arguments(body: &syntax::ast::Block) -> bool {
+    let arguments_atom = crux::intern_utf8("arguments");
+    let eval_atom = crux::intern_utf8("eval");
+    let mut found = false;
+    walk_stmts(&body.stmts, &mut |expr| {
+        if found {
+            return;
+        }
+        match &expr.kind {
+            ExprKind::Ident(atom) if *atom == arguments_atom => found = true,
+            ExprKind::Call(call) if matches!(&call.callee.kind, ExprKind::Ident(atom) if *atom == eval_atom) =>
+            {
+                found = true;
+            }
+            _ => {}
+        }
+    });
+    found
+}
+
 fn walk_stmts(stmts: &[Stmt], visit: &mut impl FnMut(&Expr)) {
     for stmt in stmts {
         match &stmt.kind {

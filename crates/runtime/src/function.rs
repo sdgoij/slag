@@ -979,8 +979,11 @@ fn call_inner(
 ) -> Result<Value, JsError> {
     // A realm's builtin called while another realm is current (the
     // `$262.createRealm` fixtures) must dispatch with its own realm current:
-    // push it, re-enter, and restore.
-    if let Value::Function(function) = callee
+    // push it, re-enter, and restore. With a single realm the current realm
+    // is always the owning one, so the (cached) owning-realm lookup is
+    // skipped on every call.
+    if agent.realms.borrow().len() > 1
+        && let Value::Function(function) = callee
         && let Some(owning) = owning_realm(agent, function)
         && owning.global_object.id() != agent.current_realm()?.global_object.id()
     {
@@ -1056,33 +1059,35 @@ fn call_inner(
                 // per function object, so the linear chain is memoized in
                 // `agent.builtin_dispatch_cache` — plain closure builtins
                 // (index 0) skip the chain entirely on warm calls.
-                // %eval% reached as a value (indirect eval, or forwarded
-                // through a proxy) is dispatched before the chain.
-                if agent.current_realm()?.intrinsics.get("%eval%").as_ref() == Some(callee) {
-                    let source = args.first().cloned().unwrap_or(Value::Undefined);
-                    let text = crate::context::to_string(agent, &source)?;
-                    return crate::script::perform_eval(agent, &text, false, false);
-                }
-                // `%evalScript%` (test262's `$262.evalScript` host operation):
-                // evaluate as a Script — global declaration instantiation
-                // rather than eval semantics.
-                if agent
-                    .current_realm()?
-                    .intrinsics
-                    .get("%evalScript%")
-                    .as_ref()
-                    == Some(callee)
-                {
-                    let source = args.first().cloned().unwrap_or(Value::Undefined);
-                    let text = crate::context::to_string(agent, &source)?;
-                    return agent.run_script(&text.to_string_lossy());
-                }
                 let id = function.id();
                 let cached = agent.builtin_dispatch_cache.get(&id).copied();
                 let dispatched = match cached {
                     Some(0) => None,
                     Some(index) => builtin_dispatch_at(agent, index, callee, &this, args),
                     None => {
+                        // First call: %eval% and %evalScript% are host
+                        // operations outside the module dispatch chain, then
+                        // the chain itself is resolved and memoized.
+                        if agent.current_realm()?.intrinsics.get("%eval%").as_ref() == Some(callee)
+                        {
+                            let source = args.first().cloned().unwrap_or(Value::Undefined);
+                            let text = crate::context::to_string(agent, &source)?;
+                            return crate::script::perform_eval(agent, &text, false, false);
+                        }
+                        // `%evalScript%` (test262's `$262.evalScript` host
+                        // operation): evaluate as a Script — global
+                        // declaration instantiation rather than eval semantics.
+                        if agent
+                            .current_realm()?
+                            .intrinsics
+                            .get("%evalScript%")
+                            .as_ref()
+                            == Some(callee)
+                        {
+                            let source = args.first().cloned().unwrap_or(Value::Undefined);
+                            let text = crate::context::to_string(agent, &source)?;
+                            return agent.run_script(&text.to_string_lossy());
+                        }
                         let (index, result) = resolve_builtin_dispatch(agent, callee, &this, args);
                         agent.builtin_dispatch_cache.insert(id, index);
                         result
@@ -1409,31 +1414,40 @@ fn ordinary_call(
     this: Value,
     args: &[Value],
 ) -> Result<Value, JsError> {
-    let data = agent
-        .ecma_functions
-        .get(&function.id())
-        .cloned()
-        .ok_or_else(|| {
+    // Copy only the slots a call reads; the record also holds per-function
+    // data (source text, compiled IR, class fields) whose clones would
+    // re-allocate on every call.
+    let (old_env, this_mode, realm, private_environment, strict, params, body) = {
+        let record = agent.ecma_functions.get(&function.id()).ok_or_else(|| {
             JsError::new(
                 ErrorKind::TypeError,
                 "Function body is not registered".into(),
             )
         })?;
+        (
+            record.environment.clone(),
+            record.this_mode,
+            record.realm.clone(),
+            record.private_environment.clone(),
+            record.strict,
+            record.params.clone(),
+            record.body.clone(),
+        )
+    };
     let function_value = function.self_value();
-    let old_env = data.environment.clone();
     let function_env = new_function_environment(
         Some(old_env),
         function_value.clone(),
         Value::Undefined,
-        data.this_mode == ThisMode::Lexical,
+        this_mode == ThisMode::Lexical,
     );
     agent.execution_context_stack.push(ExecutionContext {
         function: Some(function_value.clone()),
-        realm: data.realm.clone(),
+        realm,
         script_or_module: None,
         lexical_environment: function_env.clone(),
         variable_environment: function_env.clone(),
-        private_environment: data.private_environment.clone(),
+        private_environment,
         source: agent
             .running_context()
             .ok()
@@ -1444,8 +1458,8 @@ fn ordinary_call(
         // OrdinaryCallBindThis: strict keeps `this` as-is; sloppy coerces
         // undefined/null to the global object and boxes primitives; lexical
         // binds nothing.
-        if data.this_mode != ThisMode::Lexical {
-            let this = if data.this_mode == ThisMode::Sloppy {
+        if this_mode != ThisMode::Lexical {
+            let this = if this_mode == ThisMode::Sloppy {
                 match this {
                     Value::Undefined | Value::Null => {
                         let global = agent.running_context()?.realm.global_object.clone();
@@ -1459,8 +1473,17 @@ fn ordinary_call(
             };
             function_env.bind_this_value(this)?;
         }
-        function_declaration_instantiation(agent, &function_value, &data, args, &function_env)?;
-        evaluate_body(agent, &data)
+        function_declaration_instantiation(
+            agent,
+            &function_value,
+            &params,
+            &body,
+            this_mode,
+            strict,
+            args,
+            &function_env,
+        )?;
+        evaluate_body(agent, &body, strict)
     })();
     // A kind-only engine error escapes the body with the function's realm
     // context still current; surface it as that realm's error object now, so
@@ -1478,8 +1501,8 @@ fn ordinary_call(
 
 /// OrdinaryCallEvaluateBody: evaluate the body; a `return` completion is the
 /// result, any other normal completion yields *undefined* (spec 15.2.2).
-fn evaluate_body(agent: &mut Agent, data: &EcmaFunction) -> Result<Value, JsError> {
-    match eval_statement_list(agent, &data.body.stmts, data.strict)? {
+fn evaluate_body(agent: &mut Agent, body: &Block, strict: bool) -> Result<Value, JsError> {
+    match eval_statement_list(agent, &body.stmts, strict)? {
         Completion::Return(value) => Ok(value),
         Completion::Normal(_) | Completion::Empty => Ok(Value::Undefined),
         Completion::Throw(value) => {
@@ -1607,7 +1630,16 @@ fn ordinary_construct(
             // constructor body runs.
             initialize_instance_elements(agent, &this, &function_value)?;
         }
-        function_declaration_instantiation(agent, &function_value, &data, args, &function_env)?;
+        function_declaration_instantiation(
+            agent,
+            &function_value,
+            &data.params,
+            &data.body,
+            data.this_mode,
+            data.strict,
+            args,
+            &function_env,
+        )?;
         let completed = eval_statement_list(agent, &data.body.stmts, data.strict)?;
         // spec 10.2.1 [[Construct]] steps 15-21: an object return wins; a base
         // constructor falls back to `this`; a derived constructor returns the
@@ -1742,15 +1774,22 @@ fn private_add_extensible_error() -> JsError {
 /// FunctionDeclarationInstantiation (spec 16.1.8): bind formals, arguments,
 /// vars, and functions into the function environment. Shared with the
 /// async-function machinery.
+///
+/// Takes the call-relevant slots rather than the whole record: the record
+/// also holds the function's source text and compiled IR, whose clones would
+/// re-allocate on every call.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn function_declaration_instantiation(
     agent: &mut Agent,
     function_value: &Value,
-    data: &EcmaFunction,
+    params: &[BindingElement],
+    body: &Block,
+    this_mode: ThisMode,
+    strict: bool,
     args: &[Value],
     function_env: &EnvRef,
 ) -> Result<(), JsError> {
-    let strict = data.strict;
-    let simple = is_simple_parameter_list(&data.params);
+    let simple = is_simple_parameter_list(params);
 
     // Per spec 10.4.4.2/10.4.4.7 the arguments object is an ordinary object
     // with %Object.prototype% as its prototype.
@@ -1762,14 +1801,13 @@ pub(crate) fn function_declaration_instantiation(
 
     // BoundNames of the formal parameters.
     let mut param_names: Vec<JsString> = Vec::new();
-    for param in &data.params {
+    for param in params {
         bound_names(&param.pattern, &mut param_names);
     }
 
     // The arguments object (spec 16.1.8 steps 20-23).
-    let lexical_names = top_level_lexically_declared_names(&data.body.stmts);
-    let func_names: Vec<JsString> = data
-        .body
+    let lexical_names = top_level_lexically_declared_names(&body.stmts);
+    let func_names: Vec<JsString> = body
         .stmts
         .iter()
         .filter_map(|s| match &s.kind {
@@ -1777,7 +1815,7 @@ pub(crate) fn function_declaration_instantiation(
             _ => None,
         })
         .collect();
-    let arguments_obj_needed = !(data.this_mode == ThisMode::Lexical
+    let arguments_obj_needed = !(this_mode == ThisMode::Lexical
         || param_names.contains(&JsString::from_utf8("arguments"))
         || (simple
             && (func_names.contains(&JsString::from_utf8("arguments"))
@@ -1796,7 +1834,7 @@ pub(crate) fn function_declaration_instantiation(
 
     // Parameter bindings are created up front (uninitialized), so a default
     // initializer referencing an earlier parameter hits its TDZ correctly.
-    for param in &data.params {
+    for param in params {
         let mut names = Vec::new();
         bound_names(&param.pattern, &mut names);
         for name in names {
@@ -1811,68 +1849,77 @@ pub(crate) fn function_declaration_instantiation(
     // formals bind, so a default initializer can reference `arguments`.
     let mut param_bindings = param_names.clone();
     if arguments_obj_needed {
-        let arguments_obj = if strict || !simple {
-            // spec 10.4.4.9: the `callee` accessor's get/set is the shared
-            // %ThrowTypeError% — the same object as Function.prototype's
-            // caller/arguments throwers (ThrowTypeError/unique-per-realm-*).
-            let thrower = agent
-                .current_realm()?
-                .intrinsics
-                .get("%ThrowTypeError%")
-                .ok_or_else(|| {
-                    JsError::new(
-                        ErrorKind::TypeError,
-                        "%ThrowTypeError% intrinsic missing".into(),
+        // When the body cannot observe `arguments` (no identifier reference
+        // and no direct eval that could introduce one), nothing can read the
+        // object, so bind the name to undefined instead of building it. The
+        // binding is still created: var/Annex-B instantiation keys off
+        // `param_bindings`, and a sloppy `var arguments` must collide with it.
+        let arguments_obj = if !simple || crate::script::body_observes_arguments(body) {
+            if strict || !simple {
+                // spec 10.4.4.9: the `callee` accessor's get/set is the shared
+                // %ThrowTypeError% — the same object as Function.prototype's
+                // caller/arguments throwers (ThrowTypeError/unique-per-realm-*).
+                let thrower = agent
+                    .current_realm()?
+                    .intrinsics
+                    .get("%ThrowTypeError%")
+                    .ok_or_else(|| {
+                        JsError::new(
+                            ErrorKind::TypeError,
+                            "%ThrowTypeError% intrinsic missing".into(),
+                        )
+                    })?;
+                Value::Object(JsObject::unmapped_arguments_object_create(
+                    arguments_prototype.clone(),
+                    args,
+                    thrower,
+                )?)
+            } else {
+                let env = function_env.clone();
+                let make_getter = move |name: &JsString| -> Value {
+                    let env = env.clone();
+                    let name = name.clone();
+                    Value::Function(
+                        Function::create_builtin(
+                            None,
+                            0,
+                            Box::new(move |_, _| env.get_binding_value(&name, false)),
+                            None,
+                            None,
+                        )
+                        .unwrap_or_else(|_| Function::new(None)),
                     )
-                })?;
-            Value::Object(JsObject::unmapped_arguments_object_create(
-                arguments_prototype.clone(),
-                args,
-                thrower,
-            )?)
+                };
+                let env = function_env.clone();
+                let make_setter = move |name: &JsString| -> Value {
+                    let env = env.clone();
+                    let name = name.clone();
+                    Value::Function(
+                        Function::create_builtin(
+                            None,
+                            0,
+                            Box::new(move |_, value| {
+                                let value = value.first().cloned().unwrap_or(Value::Undefined);
+                                env.set_mutable_binding(&name, value, false)?;
+                                Ok(Value::Undefined)
+                            }),
+                            None,
+                            None,
+                        )
+                        .unwrap_or_else(|_| Function::new(None)),
+                    )
+                };
+                Value::Object(JsObject::mapped_arguments_object_create(
+                    arguments_prototype.clone(),
+                    function_value.clone(),
+                    &param_names,
+                    args,
+                    make_getter,
+                    make_setter,
+                )?)
+            }
         } else {
-            let env = function_env.clone();
-            let make_getter = move |name: &JsString| -> Value {
-                let env = env.clone();
-                let name = name.clone();
-                Value::Function(
-                    Function::create_builtin(
-                        None,
-                        0,
-                        Box::new(move |_, _| env.get_binding_value(&name, false)),
-                        None,
-                        None,
-                    )
-                    .unwrap_or_else(|_| Function::new(None)),
-                )
-            };
-            let env = function_env.clone();
-            let make_setter = move |name: &JsString| -> Value {
-                let env = env.clone();
-                let name = name.clone();
-                Value::Function(
-                    Function::create_builtin(
-                        None,
-                        0,
-                        Box::new(move |_, value| {
-                            let value = value.first().cloned().unwrap_or(Value::Undefined);
-                            env.set_mutable_binding(&name, value, false)?;
-                            Ok(Value::Undefined)
-                        }),
-                        None,
-                        None,
-                    )
-                    .unwrap_or_else(|_| Function::new(None)),
-                )
-            };
-            Value::Object(JsObject::mapped_arguments_object_create(
-                arguments_prototype.clone(),
-                function_value.clone(),
-                &param_names,
-                args,
-                make_getter,
-                make_setter,
-            )?)
+            Value::Undefined
         };
         if strict {
             param_env.create_immutable_binding(&JsString::from_utf8("arguments"), false)?;
@@ -1910,7 +1957,7 @@ pub(crate) fn function_declaration_instantiation(
     // IteratorBindingInitialization of the formals (spec 16.1.8 step 79):
     // positional for simple lists, full binding for non-simple ones.
     if simple {
-        for (index, param) in data.params.iter().enumerate() {
+        for (index, param) in params.iter().enumerate() {
             let BindingPattern::Ident(name) = &param.pattern else {
                 unreachable!("simple parameter lists are identifiers")
             };
@@ -1922,7 +1969,7 @@ pub(crate) fn function_declaration_instantiation(
         agent.running_context_mut()?.lexical_environment = param_env.clone();
         crate::binding::iterator_binding_initialization(
             agent,
-            &data.params,
+            params,
             args,
             Some(&param_env),
             strict,
@@ -1943,7 +1990,7 @@ pub(crate) fn function_declaration_instantiation(
     } else {
         Vec::new()
     };
-    for decl in top_level_var_scoped_declarations(&data.body.stmts) {
+    for decl in top_level_var_scoped_declarations(&body.stmts) {
         match decl {
             crate::script::VarScopedDecl::Variable(names) => {
                 for name in names {
@@ -1996,7 +2043,7 @@ pub(crate) fn function_declaration_instantiation(
 
     // Lexically declared names: instantiated but not initialized (spec
     // 16.1.8 steps 43-48).
-    for decl in top_level_lexically_scoped_declarations(&data.body.stmts) {
+    for decl in top_level_lexically_scoped_declarations(&body.stmts) {
         let constant = is_constant_declaration(decl);
         let mut names = Vec::new();
         bound_names_of_decl(decl, &mut names);
@@ -2013,7 +2060,7 @@ pub(crate) fn function_declaration_instantiation(
     // and bound in the variable env; the last declaration of a name wins
     // (spec 16.1.8 steps 49-52).
     let mut funcs: Vec<&syntax::ast::Function> = Vec::new();
-    for stmt in &data.body.stmts {
+    for stmt in &body.stmts {
         if let StmtKind::FunctionDecl(f) = &stmt.kind
             && let Some(name) = f.name
         {
@@ -2036,7 +2083,7 @@ pub(crate) fn function_declaration_instantiation(
     // early error (a lexical conflict in an enclosing scope). The decision is
     // recorded so block instantiation (B.3.2.1) can repeat it.
     if !strict {
-        for (name, span, hoistable) in crate::script::annex_b_function_hoists(&data.body.stmts) {
+        for (name, span, hoistable) in crate::script::annex_b_function_hoists(&body.stmts) {
             if param_bindings.contains(&name) || !hoistable {
                 continue;
             }

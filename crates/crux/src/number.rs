@@ -521,6 +521,13 @@ pub fn to_string_radix(x: f64, radix: u32) -> String {
     if radix == 10 {
         return to_string(x).to_string_lossy();
     }
+    // Fast path: an integral value below 2^53 converts by plain division —
+    // the general radix paths allocate big integers even for byte-sized
+    // values (the Sputnik decodeURI fixtures call `toString(16)` millions
+    // of times).
+    if x.fract() == 0.0 && x.abs() < 9007199254740992.0 {
+        return integer_radix(x as i64, radix);
+    }
     if radix.is_power_of_two() {
         return radix_power_of_two(x, radix);
     }
@@ -530,6 +537,25 @@ pub fn to_string_radix(x: f64, radix: u32) -> String {
         return radix_exact(x, radix);
     }
     radix_round_trip(x, radix)
+}
+
+/// The radix digits for the integer fast path.
+const RADIX_DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+
+/// Convert a non-negative integral value to `radix` by repeated division;
+/// the caller has already handled the sign (the `x < 0` branch recurses).
+fn integer_radix(mut x: i64, radix: u32) -> String {
+    let mut buf = [0u8; 64];
+    let mut i = buf.len();
+    while x > 0 {
+        i -= 1;
+        buf[i] = RADIX_DIGITS[(x % radix as i64) as usize];
+        x /= radix as i64;
+    }
+    if i == buf.len() {
+        return "0".into();
+    }
+    String::from_utf8_lossy(&buf[i..]).into_owned()
 }
 
 /// Exact conversion for radix = 2^p (p ∈ 1..5): group the binary digits of

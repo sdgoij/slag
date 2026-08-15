@@ -1252,6 +1252,15 @@ pub(crate) fn apply_binary(
 ) -> Result<Value, JsError> {
     match op {
         BinaryOp::Add => {
+            // Fast path: both operands are already strings — skip the
+            // ToPrimitive/ToString round-trips (the Sputnik decodeURI
+            // fixtures concatenate millions of small strings).
+            if let (Value::String(left_text), Value::String(right_text)) = (left, right) {
+                let mut units = Vec::with_capacity(left_text.len() + right_text.len());
+                units.extend_from_slice(left_text.as_slice());
+                units.extend_from_slice(right_text.as_slice());
+                return Ok(Value::String(Handle::new(JsString::from_utf16(&units))));
+            }
             let left_prim = crate::context::to_primitive(agent, left, ToPrimitiveHint::Default)?;
             let right_prim = crate::context::to_primitive(agent, right, ToPrimitiveHint::Default)?;
             if matches!(left_prim, Value::String(_)) || matches!(right_prim, Value::String(_)) {
