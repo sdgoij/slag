@@ -176,8 +176,26 @@ pub struct Agent {
         RefCell<std::collections::HashMap<crux::string::JsString, crate::module::HostModuleSource>>,
     /// The module behind each namespace object, keyed by object identity.
     pub module_namespaces: std::collections::HashMap<u64, Handle<crate::module::SourceTextModule>>,
+    /// The module behind each deferred namespace object ([[Deferred]] =
+    /// true), keyed by object identity.
+    pub deferred_namespaces:
+        std::collections::HashMap<u64, Handle<crate::module::SourceTextModule>>,
+    /// The module behind each `%AbstractModuleSource%` instance, keyed by
+    /// object identity.
+    pub module_sources: std::collections::HashMap<u64, Handle<crate::module::SourceTextModule>>,
     /// The dynamic-import namespace resolvers, keyed by function identity.
     pub import_namespace_resolvers: std::collections::HashMap<u64, (Value, Value)>,
+    /// DeferredModule `.then` continuations (import-defer): each waiter
+    /// function id maps to (wait id, is-rejection); the wait state holds the
+    /// remaining async-dependency countdown and the capability.
+    pub deferred_module_waiter_fns: std::collections::HashMap<u64, (u64, bool)>,
+    /// The wait state of an `import.defer(...).then(...)` promise: (remaining,
+    /// capability resolve, capability reject, module).
+    pub deferred_module_waits: std::collections::HashMap<u64, crate::module::DeferredWait>,
+    /// The module behind each DeferredModule `.then` method (import-defer),
+    /// keyed by function identity.
+    pub deferred_module_thens:
+        std::collections::HashMap<u64, Handle<crate::module::SourceTextModule>>,
     /// [[BooleanData]] of Boolean wrapper objects, keyed by object identity
     /// (spec 20.3.1: `new Boolean(v)` boxes the ToBoolean result).
     pub boolean_data: std::collections::HashMap<u64, bool>,
@@ -331,7 +349,12 @@ impl Agent {
             builtin_dispatch_cache: std::collections::HashMap::new(),
             host_modules: RefCell::new(std::collections::HashMap::new()),
             module_namespaces: std::collections::HashMap::new(),
+            deferred_namespaces: std::collections::HashMap::new(),
+            module_sources: std::collections::HashMap::new(),
             import_namespace_resolvers: std::collections::HashMap::new(),
+            deferred_module_waiter_fns: std::collections::HashMap::new(),
+            deferred_module_waits: std::collections::HashMap::new(),
+            deferred_module_thens: std::collections::HashMap::new(),
             boolean_data: std::collections::HashMap::new(),
             symbol_data: std::collections::HashMap::new(),
             number_data: std::collections::HashMap::new(),

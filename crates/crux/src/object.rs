@@ -219,10 +219,14 @@ pub struct TypedArraySlots {
 
 /// The [[Exports]] of a module namespace exotic object (spec 10.4.6). Phase
 /// 7 populates it from the module's export list; until then a namespace
-/// exposes no properties and rejects every mutation.
+/// exposes no properties and rejects every mutation. `deferred` marks the
+/// import-defer namespace form ([[Deferred]] = true): property access
+/// triggers the module's synchronous evaluation (the runtime dispatches the
+/// trigger — crux cannot reach the agent).
 #[derive(Debug, Clone, Default)]
 pub struct ModuleNamespaceSlots {
     pub exports: Vec<PropertyKey>,
+    pub deferred: bool,
 }
 
 impl ObjectKind {
@@ -516,6 +520,17 @@ impl JsObject {
         PropertyKey::Symbol(well_known("toStringTag").as_ref().clone())
     }
 
+    /// The module namespace's `@@toStringTag` value: "Module", or
+    /// "Deferred Module" for the import-defer form (spec 26.3.1).
+    fn namespace_tag_value(slots: &ModuleNamespaceSlots) -> JsString {
+        let tag = if slots.deferred {
+            "Deferred Module"
+        } else {
+            "Module"
+        };
+        crate::string::JsString::from_utf8(tag)
+    }
+
     /// ModuleNamespace [[DefineOwnProperty]] (spec 10.4.6.5): only no-change
     /// defines of the non-configurable exports/@@toStringTag succeed; any other
     /// key is rejected (the object is not extensible).
@@ -528,7 +543,7 @@ impl JsObject {
             Some(Property::data(Value::Undefined, true, true, false))
         } else if key == &Self::namespace_to_string_tag_key() {
             Some(Property::data(
-                Value::String(Handle::new(crate::string::JsString::from_utf8("Module"))),
+                Value::String(Handle::new(Self::namespace_tag_value(slots))),
                 false,
                 false,
                 false,
@@ -579,13 +594,18 @@ impl JsObject {
     }
 
     /// ModuleNamespaceObjectCreate (spec 10.4.6.2): a non-extensible object
-    /// with *null* prototype exposing only the (Phase 7) exports.
+    /// with *null* prototype exposing only the (Phase 7) exports. `deferred`
+    /// creates the import-defer form ([[Deferred]] = true).
     pub fn module_namespace_object_create(
         exports: Vec<PropertyKey>,
+        deferred: bool,
     ) -> Result<Handle<JsObject>, JsError> {
         let object = Handle::new(Self {
             id: NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
-            kind: ObjectKind::ModuleNamespace(Handle::new(ModuleNamespaceSlots { exports })),
+            kind: ObjectKind::ModuleNamespace(Handle::new(ModuleNamespaceSlots {
+                exports,
+                deferred,
+            })),
             prototype: RefCell::new(None),
             extensible: Cell::new(false),
             immutable_prototype: Cell::new(false),
@@ -596,13 +616,18 @@ impl JsObject {
             boxed: RefCell::new(None),
         });
         Self::link_self_handle(&object);
-        // spec 26.3.1: `@@toStringTag` is an own data property ("Module",
-        // non-writable, non-enumerable, non-configurable); it is not part of
-        // [[Exports]], so it is stored as an ordinary property.
+        // spec 26.3.1: `@@toStringTag` is an own data property ("Module", or
+        // "Deferred Module" for the deferred form, non-writable,
+        // non-enumerable, non-configurable); it is not part of [[Exports]],
+        // so it is stored as an ordinary property.
+        let slots = match &object.kind {
+            ObjectKind::ModuleNamespace(slots) => slots,
+            _ => unreachable!(),
+        };
         object.properties.borrow_mut().push((
             PropertyKey::Symbol(well_known("toStringTag").as_ref().clone()),
             Property::data(
-                Value::String(Handle::new(crate::string::JsString::from_utf8("Module"))),
+                Value::String(Handle::new(Self::namespace_tag_value(slots))),
                 false,
                 false,
                 false,
@@ -817,7 +842,10 @@ impl JsObject {
     pub fn set_prototype_of(&self, proto: Option<Handle<JsObject>>) -> Result<bool, JsError> {
         match &self.kind {
             ObjectKind::Proxy(slots) => return crate::proxy::set_prototype_of(slots, proto),
-            ObjectKind::ModuleNamespace(_) => return Ok(false),
+            // A module namespace never changes its prototype, but a
+            // same-value `null` assignment succeeds (spec 10.4.6.2 + 9.4.7.1
+            // SetImmutablePrototype: true when V is SameValue(current)).
+            ObjectKind::ModuleNamespace(_) => return Ok(proto.is_none()),
             _ => {}
         }
         let current = self.get_prototype_of()?;
@@ -883,7 +911,7 @@ impl JsObject {
                 }
                 if key == &Self::namespace_to_string_tag_key() {
                     return Ok(Some(Property::data(
-                        Value::String(Handle::new(crate::string::JsString::from_utf8("Module"))),
+                        Value::String(Handle::new(Self::namespace_tag_value(slots))),
                         false,
                         false,
                         false,
@@ -1024,13 +1052,11 @@ impl JsObject {
             ObjectKind::IntegerIndexed(slots) => {
                 return typed_array_get(self, slots, key, receiver);
             }
-            ObjectKind::ModuleNamespace(slots) => {
-                if slots.exports.contains(key) {
-                    return Err(JsError::new(
-                        ErrorKind::TypeError,
-                        "Module namespace exports are not implemented until Phase 7".into(),
-                    ));
-                }
+            ObjectKind::ModuleNamespace(_) => {
+                // Exported bindings read their live value through the runtime
+                // (get_property_key dispatches direct namespace gets); a
+                // namespace reached through a prototype chain returns the
+                // stored placeholder (*undefined*).
                 return Ok(Value::Undefined);
             }
             ObjectKind::Arguments(slots) => {
@@ -3151,11 +3177,17 @@ mod tests {
 
     #[test]
     fn module_namespace_shell_is_frozen_with_null_prototype() {
-        let ns = JsObject::module_namespace_object_create(Vec::new()).unwrap();
+        let ns = JsObject::module_namespace_object_create(Vec::new(), false).unwrap();
         assert!(ns.get_prototype_of().unwrap().is_none());
         assert!(!ns.is_extensible().unwrap());
         assert!(ns.prevent_extensions().unwrap());
-        assert!(!ns.set_prototype_of(None).unwrap());
+        // SetImmutablePrototype (spec 9.4.7.1): a same-value null assignment
+        // succeeds, any other prototype is rejected.
+        assert!(ns.set_prototype_of(None).unwrap());
+        assert!(
+            !ns.set_prototype_of(Some(JsObject::ordinary_object_create(None)))
+                .unwrap()
+        );
         // The only own key is @@toStringTag (spec 26.3.1), which reads
         // "Module" and cannot be changed.
         assert_eq!(

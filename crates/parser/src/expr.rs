@@ -5,9 +5,9 @@ use crux::{AtomId, JsError, Span, intern_utf8};
 use syntax::keywords::{Keyword, from_identifier, is_future_reserved_word};
 use syntax::{
     Argument, ArrayBindingElement, ArrayElement, ArrayLiteral, ArrowBody, AssignOp, BinaryOp,
-    BindingElement, BindingPattern, Block, CallExpr, Expr, ExprKind, Function, Literal, LogicalOp,
-    MemberExpr, MemberProperty, NewExpr, ObjectBindingProperty, ObjectLiteral, ObjectProperty,
-    PropertyName, TemplateElement, TemplateLiteral, TokenKind, UnaryOp, UpdateOp,
+    BindingElement, BindingPattern, Block, CallExpr, Expr, ExprKind, Function, ImportPhase,
+    Literal, LogicalOp, MemberExpr, MemberProperty, NewExpr, ObjectBindingProperty, ObjectLiteral,
+    ObjectProperty, PropertyName, TemplateElement, TemplateLiteral, TokenKind, UnaryOp, UpdateOp,
 };
 
 use crate::parser::{ParenItem, ParenResult, Parser};
@@ -1218,17 +1218,23 @@ fn parse_primary(parser: &mut Parser) -> Result<Expr, JsError> {
                     {
                         // Source-phase imports (`import.source(x)`) and
                         // deferred imports (`import.defer(x)`) have the same
-                        // call shape as `import(x)`; without a host module
-                        // loader they reject at runtime.
+                        // call shape as `import(x)`; the phase is carried on
+                        // the ImportCall for the runtime to dispatch.
                         parser.expect_punct(TokenKind::LeftParen)?;
                         let specifier = parse_assignment(parser, true)?;
                         parser.expect_punct(TokenKind::RightParen)?;
                         let end = parser.prev.as_ref().unwrap().span.end;
+                        let phase = if import_prop == intern_utf8("source") {
+                            ImportPhase::Source
+                        } else {
+                            ImportPhase::Defer
+                        };
                         Ok(Expr {
                             span: Span::new(tok.span.start, end),
                             kind: ExprKind::ImportCall {
                                 specifier: Box::new(specifier),
                                 options: None,
+                                phase,
                             },
                         })
                     } else {
@@ -1255,6 +1261,7 @@ fn parse_primary(parser: &mut Parser) -> Result<Expr, JsError> {
                         kind: ExprKind::ImportCall {
                             specifier: Box::new(specifier),
                             options,
+                            phase: ImportPhase::Import,
                         },
                     })
                 }

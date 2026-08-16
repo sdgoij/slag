@@ -347,6 +347,7 @@ pub enum Step {
     // ----- modules -----
     ImportCall {
         has_options: bool,
+        phase: syntax::ast::ImportPhase,
     },
     ImportMeta,
 }
@@ -1123,7 +1124,7 @@ impl Vm {
                 Step::DeleteIdent { name } => {
                     let reference =
                         crate::context::resolve_binding(agent, &crux::lookup(name), self.strict)?;
-                    let deleted = crate::context::delete_property_or_throw(&reference)?;
+                    let deleted = crate::context::delete_property_or_throw(agent, &reference)?;
                     self.stack.push(Value::Boolean(deleted));
                 }
                 Step::DeleteMemberName { name } => {
@@ -1135,7 +1136,7 @@ impl Vm {
                         this_value: None,
                         private_name: None,
                     };
-                    let deleted = crate::context::delete_property_or_throw(&reference)?;
+                    let deleted = crate::context::delete_property_or_throw(agent, &reference)?;
                     self.stack.push(Value::Boolean(deleted));
                 }
                 Step::DeleteMemberComputed => {
@@ -1149,7 +1150,7 @@ impl Vm {
                         this_value: None,
                         private_name: None,
                     };
-                    let deleted = crate::context::delete_property_or_throw(&reference)?;
+                    let deleted = crate::context::delete_property_or_throw(agent, &reference)?;
                     self.stack.push(Value::Boolean(deleted));
                 }
                 Step::TypeofTop => {
@@ -2282,11 +2283,11 @@ impl Vm {
                         }
                     }
                 }
-                Step::ImportCall { has_options } => {
+                Step::ImportCall { has_options, phase } => {
                     let options = if has_options { Some(self.pop()) } else { None };
                     let specifier = self.pop();
                     let promise =
-                        crate::module::dynamic_import(agent, &specifier, options.as_ref())?;
+                        crate::module::dynamic_import(agent, &specifier, options.as_ref(), phase)?;
                     self.stack.push(promise);
                 }
                 Step::ImportMeta => {
@@ -4968,13 +4969,20 @@ impl Compiler {
                 self.emit(Step::Await);
                 Ok(())
             }
-            ExprKind::ImportCall { specifier, options } => {
+            ExprKind::ImportCall {
+                specifier,
+                options,
+                phase,
+            } => {
                 self.compile_expr(specifier)?;
                 let has_options = options.is_some();
                 if let Some(options) = options {
                     self.compile_expr(options)?;
                 }
-                self.emit(Step::ImportCall { has_options });
+                self.emit(Step::ImportCall {
+                    has_options,
+                    phase: *phase,
+                });
                 Ok(())
             }
             ExprKind::MetaProperty { meta, property } => {

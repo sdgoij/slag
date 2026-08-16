@@ -8,3 +8,4 @@ license.workspace = true
 crux = { path = "../crux" }
 parser = { path = "../parser" }
 runtime = { path = "../runtime" }
+syntax = { path = "../syntax" }

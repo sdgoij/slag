@@ -36,6 +36,9 @@ pub struct ImportDecl {
     pub specifier: JsString,
     pub entries: Vec<ImportEntry>,
     pub attributes: Vec<(AttributeKey, JsString)>,
+    /// The import phase: the plain `import`, or the source (`import source
+    /// x from …`) / deferred (`import defer … from …`) forms.
+    pub phase: ImportPhase,
 }
 
 /// One binding of an import declaration.
@@ -360,11 +363,23 @@ pub enum ExprKind {
     Await(Box<Expr>),
     /// `new.target`, `import.meta`.
     MetaProperty { meta: AtomId, property: AtomId },
-    /// `import ( specifier )` / `import ( specifier , options )`.
+    /// `import ( specifier )` / `import ( specifier , options )`, and the
+    /// `import.source(...)` / `import.defer(...)` phase forms.
     ImportCall {
         specifier: Box<Expr>,
         options: Option<Box<Expr>>,
+        phase: ImportPhase,
     },
+}
+
+/// The phase of a module request (spec ModuleRequest Record [[Phase]]): the
+/// plain `import`, the source phase (`import.source` / `import source`), or
+/// the deferred phase (`import.defer` / `import defer`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportPhase {
+    Import,
+    Source,
+    Defer,
 }
 
 /// Literal values (spec 13.2.4). Strings are cooked values; regexps carry the

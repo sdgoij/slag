@@ -4,8 +4,10 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::Ordering;
 
 use crux::error::{ErrorKind, JsError};
+use crux::function::Function;
 use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::PropertyKey;
@@ -13,8 +15,10 @@ use crux::string::JsString;
 use crux::value::Value;
 
 use syntax::ast::{
-    AttributeKey, BindingPattern, ExportDecl, ExportDefault, ExportName, ExportSpecifier,
-    ImportEntry, Module, ModuleItem, Stmt, StmtKind, VarDeclKind, VarDeclarator,
+    Argument, ArrayElement, AttributeKey, BindingPattern, Class, ClassElement, ClassElementName,
+    ExportDecl, ExportDefault, ExportName, ExportSpecifier, Expr, ExprKind, ForBinding, ForInit,
+    ImportEntry, ImportPhase, MemberProperty, Module, ModuleItem, ObjectProperty, PropertyName,
+    Stmt, StmtKind, VarDeclKind, VarDeclarator,
 };
 
 use crate::agent::Agent;
@@ -24,6 +28,17 @@ use crate::env::{EnvRef, create_import_binding, new_module_environment};
 use crate::flow::Completion;
 use crate::ir::{Suspension, Vm, VmOutcome};
 use crate::realm::Realm;
+
+/// The wait state of an `import.defer(...).then(...)` promise: (remaining,
+/// capability resolve, capability reject, module).
+pub type DeferredWait = (
+    std::rc::Rc<std::cell::RefCell<u32>>,
+    Value,
+    Value,
+    Handle<crate::module::SourceTextModule>,
+    Value,
+    Value,
+);
 
 /// The status of a Source Text Module Record (spec 16.2.1.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +67,9 @@ pub struct SourceTextModule {
     pub code: Module,
     /// The exact source text, for `Function.prototype.toString`.
     pub source: JsString,
+    /// The module kind (JavaScript/JSON/text/bytes) selected at resolution
+    /// by the import attributes.
+    pub(crate) kind: ModuleKind,
     pub status: RefCell<ModuleStatus>,
     pub environment: RefCell<Option<EnvRef>>,
     pub namespace: RefCell<Option<Value>>,
@@ -66,10 +84,9 @@ pub struct SourceTextModule {
     /// [[PendingAsyncDependencies]]: the async dependency modules still being
     /// evaluated before this module's body can run.
     pub pending_async: RefCell<u32>,
-    /// (specifier, attributes) of each `import`/`export ... from` clause.
-    pub requested_modules: Vec<(JsString, Vec<(AttributeKey, JsString)>)>,
-    /// (module specifier, entry) of each import.
-    pub import_entries: Vec<(JsString, ImportEntry)>,
+    pub requested_modules: Vec<ModuleRequest>,
+    /// (module specifier, entry, phase) of each import.
+    pub import_entries: Vec<ModuleImport>,
     pub local_export_entries: Vec<ExportEntry>,
     pub indirect_export_entries: Vec<ExportEntry>,
     pub star_export_entries: Vec<ExportEntry>,
@@ -77,13 +94,23 @@ pub struct SourceTextModule {
     pub evaluation_error: RefCell<Option<Value>>,
     /// [[ImportMeta]] (spec 16.2.1.8): created on first access and cached.
     pub import_meta: RefCell<Option<Value>>,
+    /// [[ModuleSource]] (source-phase-imports): the `%AbstractModuleSource%`
+    /// object wrapping this module's source, created on first access.
+    pub module_source: RefCell<Option<Value>>,
+    /// [[DeferredNamespace]] (import-defer): the deferred module namespace
+    /// object, created on first access.
+    pub deferred_namespace: RefCell<Option<Value>>,
 }
 
-/// A host-provided module source (HostResolveImportedModule).
+/// A host-provided module source (HostResolveImportedModule): the raw
+/// bytes of the module file. The module kind (JavaScript, JSON, text, or
+/// bytes) is derived from the requested import attributes at resolution,
+/// falling back to the registered kind (test262's `<module source>` host
+/// artifact is a text module) and then the `.json` extension.
 #[derive(Debug, Clone)]
 pub struct HostModuleSource {
-    pub source: JsString,
-    pub json: bool,
+    pub bytes: Vec<u8>,
+    pub(crate) kind: ModuleKind,
 }
 
 impl Agent {
@@ -92,58 +119,126 @@ impl Agent {
         self.host_modules.borrow_mut().insert(
             JsString::from_utf8(specifier),
             HostModuleSource {
-                source: JsString::from_utf8(source),
-                json: false,
+                bytes: source.as_bytes().to_vec(),
+                kind: ModuleKind::Js,
             },
         );
     }
 
-    /// Test/CLI hook: register a JSON module.
-    pub fn add_json_module(&mut self, specifier: &str, json: &str) {
+    /// Test/CLI hook: register a raw-bytes module (text/bytes modules).
+    pub fn add_bytes_module(&mut self, specifier: &str, bytes: &[u8]) {
         self.host_modules.borrow_mut().insert(
             JsString::from_utf8(specifier),
             HostModuleSource {
-                source: JsString::from_utf8(json),
-                json: true,
+                bytes: bytes.to_vec(),
+                kind: ModuleKind::Js,
             },
         );
+    }
+
+    /// Test/CLI hook: register a source-capable module (the test262
+    /// `<module source>` host artifact): a text module whose source is
+    /// available to the source phase.
+    pub fn add_source_module(&mut self, specifier: &str, source: &str) {
+        self.host_modules.borrow_mut().insert(
+            JsString::from_utf8(specifier),
+            HostModuleSource {
+                bytes: source.as_bytes().to_vec(),
+                kind: ModuleKind::Text,
+            },
+        );
+    }
+
+    /// Test/CLI hook: register a JSON module (the `.json` extension selects
+    /// the JSON kind at resolution; kept for callers that pass non-`.json`
+    /// specifiers).
+    pub fn add_json_module(&mut self, specifier: &str, json: &str) {
+        self.add_bytes_module(specifier, json.as_bytes());
     }
 }
 
 /// The import/export records of a module, collected from its AST
 /// (spec 16.2.1.7-16.2.1.10). Built before the module handle is shared so the
-/// entries can be populated without interior mutability.
+/// entries can be populated without interior mutability. Each request carries
+/// its phase (the plain `import`, or the source/deferred phases of
+/// `import source`/`import defer`).
+/// A module request: (specifier, import attributes, import phase).
+pub type ModuleRequest = (JsString, Vec<(AttributeKey, JsString)>, ImportPhase);
+/// An import entry: (specifier, entry, import phase).
+pub type ModuleImport = (JsString, ImportEntry, ImportPhase);
 struct ModuleRecords {
-    requested_modules: Vec<(JsString, Vec<(AttributeKey, JsString)>)>,
-    import_entries: Vec<(JsString, ImportEntry)>,
+    requested_modules: Vec<ModuleRequest>,
+    import_entries: Vec<ModuleImport>,
     local_export_entries: Vec<ExportEntry>,
     indirect_export_entries: Vec<ExportEntry>,
     star_export_entries: Vec<ExportEntry>,
 }
 
-/// Parse a module source into a Source Text Module Record.
+/// Parse a module source into a Source Text Module Record. The module kind
+/// comes from the requested import attributes (`type: json|text|bytes|js`),
+/// falling back to the `.json` extension for attribute-less imports.
 pub fn parse_module(
     agent: &mut Agent,
     specifier: &JsString,
     source: &JsString,
+    attributes: &[(AttributeKey, JsString)],
 ) -> Result<Handle<SourceTextModule>, JsError> {
     let realm = agent.current_realm()?;
     crate::expr::bump_template_parse_generation();
+    let kind = module_kind(agent, specifier, attributes);
     let code = {
-        let host = agent.host_modules.borrow().get(specifier).cloned();
-        match host {
-            Some(entry) if entry.json => {
+        let text = || {
+            agent
+                .host_modules
+                .borrow()
+                .get(specifier)
+                .map(|entry| String::from_utf8_lossy(&entry.bytes).into_owned())
+                .unwrap_or_else(|| source.to_string_lossy())
+        };
+        match kind {
+            ModuleKind::Json => {
                 // A JSON module is a module whose default export is the JSON
                 // value: `export default <json>`. The source must be
                 // well-formed JSON first (spec 16.2.1.7.1 ParseModule): an
                 // invalid source is a SyntaxError at resolution, even though
                 // the wrapped text would parse as JavaScript.
-                let text = entry.source.to_string_lossy();
+                let text = text();
                 crate::builtins::json::validate_json(agent, &text)?;
                 let wrapped = format!("export default {text}");
                 parser::parse_module(&wrapped)?
             }
-            _ => parser::parse_module(&source.to_string_lossy())?,
+            ModuleKind::Text => {
+                // A text module is a Synthetic Module whose default export
+                // is the raw source text as a string (CreateTextModule /
+                // CreateDefaultExportSyntheticModule); the source is not
+                // parsed as JavaScript.
+                let text = text();
+                let wrapped = format!("export default {:?}", text);
+                parser::parse_module(&wrapped)?
+            }
+            ModuleKind::Bytes => {
+                // A bytes module is a Synthetic Module whose default export
+                // is an immutable Uint8Array of the raw file bytes
+                // (CreateBytesModule / the immutable-arraybuffer proposal):
+                // `buffer.immutable` is true and resize/transfer throw. The
+                // buffer is created immutable via transferToImmutable.
+                let bytes = agent
+                    .host_modules
+                    .borrow()
+                    .get(specifier)
+                    .map(|entry| entry.bytes.clone())
+                    .unwrap_or_default();
+                let values = bytes
+                    .iter()
+                    .map(|b| b.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let wrapped = format!(
+                    "export default new Uint8Array(Uint8Array.from([{values}]).buffer.transferToImmutable())"
+                );
+                parser::parse_module(&wrapped)?
+            }
+            ModuleKind::Js => parser::parse_module(&source.to_string_lossy())?,
         }
     };
     let records = collect_module_records(&code);
@@ -151,6 +246,7 @@ pub fn parse_module(
         realm,
         code,
         source: source.clone(),
+        kind,
         status: RefCell::new(ModuleStatus::Unlinked),
         environment: RefCell::new(None),
         namespace: RefCell::new(None),
@@ -162,6 +258,8 @@ pub fn parse_module(
         top_level_capability: RefCell::new(None),
         evaluation_error: RefCell::new(None),
         import_meta: RefCell::new(None),
+        module_source: RefCell::new(None),
+        deferred_namespace: RefCell::new(None),
         cycle_root: RefCell::new(None),
         async_parents: RefCell::new(Vec::new()),
         pending_async: RefCell::new(0),
@@ -169,11 +267,104 @@ pub fn parse_module(
     Ok(module)
 }
 
+/// The module kind requested by import attributes, or the `.json` extension
+/// fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModuleKind {
+    Js,
+    Json,
+    Text,
+    Bytes,
+}
+
+fn module_kind(
+    agent: &Agent,
+    specifier: &JsString,
+    attributes: &[(AttributeKey, JsString)],
+) -> ModuleKind {
+    if let Some((_, value)) = attributes.iter().find(|(key, _)| key_string(key) == "type") {
+        return match value.to_string_lossy().as_str() {
+            "json" => ModuleKind::Json,
+            "text" => ModuleKind::Text,
+            "bytes" => ModuleKind::Bytes,
+            _ => ModuleKind::Js,
+        };
+    }
+    if let Some(entry) = agent.host_modules.borrow().get(specifier)
+        && entry.kind != ModuleKind::Js
+    {
+        return entry.kind;
+    }
+    if specifier.to_string_lossy().ends_with(".json") {
+        ModuleKind::Json
+    } else {
+        ModuleKind::Js
+    }
+}
+
+fn key_string(key: &AttributeKey) -> String {
+    match key {
+        AttributeKey::Ident(atom) => crux::lookup(*atom).to_string_lossy(),
+        AttributeKey::Str(text) => text.to_string_lossy(),
+    }
+}
+
+/// The kind of an already-resolved module record.
+pub(crate) fn module_kind_of(module: &Handle<SourceTextModule>) -> ModuleKind {
+    module.kind
+}
+
+/// CreateModuleSourceObject (source-phase-imports): an `%AbstractModuleSource%`
+/// instance wrapping the module. Cached on the module record; the source text
+/// comes from the host module bytes at `toString` time.
+pub(crate) fn module_source_object(
+    agent: &mut Agent,
+    module: &Handle<SourceTextModule>,
+) -> Result<Value, JsError> {
+    if let Some(source) = module.module_source.borrow().clone() {
+        return Ok(source);
+    }
+    let realm = agent.current_realm()?;
+    let prototype = realm
+        .intrinsics
+        .get("%AbstractModuleSource.prototype%")
+        .and_then(|value| value.as_object());
+    let object = JsObject::ordinary_object_create(prototype);
+    let value = Value::Object(object.clone());
+    agent.module_sources.insert(object.id(), module.clone());
+    module.module_source.replace(Some(value.clone()));
+    Ok(value)
+}
+
+/// The raw source text of a module, for the source-phase import of a
+/// synthetic (JSON/text/bytes) module.
+pub(crate) fn module_source_text(
+    agent: &Agent,
+    module: &Handle<SourceTextModule>,
+) -> Result<Value, JsError> {
+    let realm = agent.current_realm()?;
+    let specifier = realm
+        .loaded_modules
+        .borrow()
+        .iter()
+        .find(|(_, m)| std::rc::Rc::ptr_eq(m, module))
+        .map(|(specifier, _)| specifier.clone());
+    let bytes = specifier
+        .and_then(|specifier| agent.host_modules.borrow().get(&specifier).cloned())
+        .map(|entry| entry.bytes)
+        .unwrap_or_default();
+    Ok(Value::String(Handle::new(JsString::from_utf8(
+        &String::from_utf8_lossy(&bytes),
+    ))))
+}
+
 /// HostResolveImportedModule (spec 16.6.1.1.2): the agent's registered module
-/// map, cached in the realm's [[LoadedModules]].
+/// map, cached in the realm's [[LoadedModules]]. `attributes` are the import
+/// attributes of the requesting import (they select the module kind).
 pub fn host_resolve_imported_module(
     agent: &mut Agent,
     specifier: &JsString,
+    attributes: &[(AttributeKey, JsString)],
 ) -> Result<Handle<SourceTextModule>, JsError> {
     let realm = agent.current_realm()?;
     if let Some(module) = realm.loaded_modules.borrow().get(specifier) {
@@ -190,7 +381,9 @@ pub fn host_resolve_imported_module(
                 format!("Cannot find module {}", specifier.to_string_lossy()),
             )
         })?;
-    let module = parse_module(agent, specifier, &source.source)?;
+    let text = String::from_utf8_lossy(&source.bytes).into_owned();
+    let source_text = JsString::from_utf8(&text);
+    let module = parse_module(agent, specifier, &source_text, attributes)?;
     realm
         .loaded_modules
         .borrow_mut()
@@ -209,9 +402,13 @@ fn collect_module_records(code: &Module) -> ModuleRecords {
         match item {
             ModuleItem::Import(import) => {
                 for entry in &import.entries {
-                    import_entries.push((import.specifier.clone(), entry.clone()));
+                    import_entries.push((import.specifier.clone(), entry.clone(), import.phase));
                 }
-                requested_modules.push((import.specifier.clone(), import.attributes.clone()));
+                requested_modules.push((
+                    import.specifier.clone(),
+                    import.attributes.clone(),
+                    import.phase,
+                ));
             }
             ModuleItem::Export(export) => match export {
                 ExportDecl::Named { specifiers, .. } => {
@@ -230,10 +427,41 @@ fn collect_module_records(code: &Module) -> ModuleRecords {
                         // becomes an indirect namespace export (both star
                         // resolutions then agree on the namespace), and a
                         // named import an indirect single-name export.
-                        if let Some((specifier, entry)) = import_entries
+                        if let Some((specifier, entry, phase)) = import_entries
                             .iter()
-                            .find(|(_, entry)| matches!(entry, ImportEntry::Namespace { local, .. } | ImportEntry::Named { local, .. } | ImportEntry::Default { local, .. } if crux::lookup(*local) == crux::lookup(local_id)))
+                            .find(|(_, entry, _)| matches!(entry, ImportEntry::Namespace { local, .. } | ImportEntry::Named { local, .. } | ImportEntry::Default { local, .. } if crux::lookup(*local) == crux::lookup(local_id)))
                         {
+                            if *phase == ImportPhase::Source {
+                                // A re-export of a source-phase import
+                                // (`import source x from …; export { x }`) is
+                                // reclassified to an indirect export whose
+                                // [[ImportName]] is ~source~: ResolveExport
+                                // resolves it to the target module's
+                                // ModuleSource object.
+                                indirect_export_entries.push(ExportEntry {
+                                    export_name: Some(exported),
+                                    module_request: Some(specifier.clone()),
+                                    import_name: Some(ExportName::Str(source_marker())),
+                                    local_name: None,
+                                });
+                                continue;
+                            }
+                            if *phase == ImportPhase::Defer
+                                && matches!(entry, ImportEntry::Namespace { .. })
+                            {
+                                // A re-export of a deferred namespace import
+                                // (`import defer * as ns from …;
+                                // export { ns }`) is reclassified to an
+                                // indirect export resolving to the module's
+                                // deferred namespace object (import-defer).
+                                indirect_export_entries.push(ExportEntry {
+                                    export_name: Some(exported),
+                                    module_request: Some(specifier.clone()),
+                                    import_name: Some(ExportName::Str(defer_marker())),
+                                    local_name: None,
+                                });
+                                continue;
+                            }
                             match entry {
                                 ImportEntry::Namespace { .. } => {
                                     indirect_export_entries.push(ExportEntry {
@@ -322,7 +550,11 @@ fn collect_module_records(code: &Module) -> ModuleRecords {
                             });
                         }
                     }
-                    requested_modules.push((specifier.clone(), attributes.clone()));
+                    requested_modules.push((
+                        specifier.clone(),
+                        attributes.clone(),
+                        ImportPhase::Import,
+                    ));
                 }
                 ExportDecl::Declaration(stmt) => {
                     for name in declared_names(&stmt.kind) {
@@ -440,21 +672,65 @@ pub fn module_declaration_instantiation(
     module.environment.replace(Some(env.clone()));
 
     // spec 16.2.1.6.1.2.1 step 8: every requested module — including those
-    // referenced only by `export *`/`export {} from` — must resolve and link
-    // before this module's own bindings are created. Resolving an import can
+    // referenced only by `export *`/`export {} from` — must resolve before
+    // this module's own bindings are created. Resolving an import can
     // land on a star-reached module, whose environment must exist already;
-    // instantiation is idempotent through the status check.
+    // instantiation is idempotent through the status check. All requested
+    // modules resolve first (in source order): a resolution failure is a
+    // host error that aborts before any export resolution runs, so an
+    // unresolvable specifier surfaces ahead of a transitive linking error
+    // (`source-phase-import/import-source.js`).
     let requested = module.requested_modules.clone();
-    for (specifier, _) in requested {
-        let imported = host_resolve_imported_module(agent, &specifier)?;
-        module_declaration_instantiation(agent, &imported)?;
+    let mut resolved: Vec<Handle<SourceTextModule>> = Vec::with_capacity(requested.len());
+    for (specifier, attributes, _) in &requested {
+        let imported = host_resolve_imported_module(agent, specifier, attributes)?;
+        resolved.push(imported);
+    }
+    for imported in &resolved {
+        module_declaration_instantiation(agent, imported)?;
     }
 
-    // Import bindings (live, through the imported module's environment).
+    // Import bindings (live, through the imported module's environment). A
+    // source-phase import binds the imported module's ModuleSource object
+    // (spec 16.2.2.4 step 28); a deferred import binds the deferred namespace
+    // (lazily evaluated on access).
     let imports = module.import_entries.clone();
-    for (specifier, entry) in imports {
-        let imported = host_resolve_imported_module(agent, &specifier)?;
+    for (specifier, entry, phase) in imports {
+        let imported = host_resolve_imported_module(agent, &specifier, &[])?;
         module_declaration_instantiation(agent, &imported)?;
+        match phase {
+            ImportPhase::Source => {
+                let ImportEntry::Default { local, .. } = entry else {
+                    return Err(JsError::new(
+                        ErrorKind::SyntaxError,
+                        "source-phase import must have a single binding".into(),
+                    ));
+                };
+                let source = module_source_object(agent, &imported)?;
+                let name = crux::lookup(local);
+                env.create_immutable_binding(&name, true)?;
+                env.initialize_binding(&name, source)?;
+                continue;
+            }
+            ImportPhase::Defer => {
+                // The deferred form is a namespace import only; the binding is
+                // the deferred namespace object (module namespace exotic
+                // object with [[Deferred]] = true), evaluated lazily on
+                // access.
+                let ImportEntry::Namespace { local, .. } = entry else {
+                    return Err(JsError::new(
+                        ErrorKind::SyntaxError,
+                        "deferred import must be a namespace import".into(),
+                    ));
+                };
+                let namespace = deferred_namespace(agent, &imported)?;
+                let name = crux::lookup(local);
+                env.create_immutable_binding(&name, true)?;
+                env.initialize_binding(&name, namespace)?;
+                continue;
+            }
+            ImportPhase::Import => {}
+        }
         let (local, import_name) = match entry {
             ImportEntry::Namespace { local, .. } => {
                 // A namespace import binds to the imported module's namespace.
@@ -497,6 +773,22 @@ pub fn module_declaration_instantiation(
                 env.create_immutable_binding(&local, true)?;
                 env.initialize_binding(&local, namespace)?;
             }
+            // A named import of a re-exported deferred-namespace binding binds
+            // the underlying module's deferred namespace object.
+            Some(ResolvedBinding::DeferredNamespace(target)) => {
+                let namespace = deferred_namespace(agent, &target)?;
+                env.create_immutable_binding(&local, true)?;
+                env.initialize_binding(&local, namespace)?;
+            }
+            // A named import of a re-exported source-phase binding binds the
+            // underlying module's ModuleSource object (spec
+            // InitializeEnvironment step: resolution.[[BindingName]] is
+            // ~source~).
+            Some(ResolvedBinding::Source(target)) => {
+                let source = module_source_object(agent, &target)?;
+                env.create_immutable_binding(&local, true)?;
+                env.initialize_binding(&local, source)?;
+            }
             None => {
                 return Err(JsError::new(
                     ErrorKind::SyntaxError,
@@ -524,7 +816,7 @@ pub fn module_declaration_instantiation(
         if let Some(module_request) = &export.module_request {
             // `export * as ns from ...`: bind the imported module's namespace
             // (spec 16.2.2.4 step 28) at instantiation time.
-            let imported = host_resolve_imported_module(agent, module_request)?;
+            let imported = host_resolve_imported_module(agent, module_request, &[])?;
             module_declaration_instantiation(agent, &imported)?;
             let namespace = module_namespace(agent, &imported)?;
             let name = export_name_string(export.export_name.as_ref())?;
@@ -551,7 +843,7 @@ pub fn module_declaration_instantiation(
         let specifier = export.module_request.as_ref().ok_or_else(|| {
             JsError::new(ErrorKind::TypeError, "indirect export has no module".into())
         })?;
-        let imported = host_resolve_imported_module(agent, specifier)?;
+        let imported = host_resolve_imported_module(agent, specifier, &[])?;
         module_declaration_instantiation(agent, &imported)?;
         // A namespace re-export (`import * as ns; export { ns }`) has no
         // import name: the binding is the imported module's namespace.
@@ -560,6 +852,12 @@ pub fn module_declaration_instantiation(
             continue;
         }
         let import_name = export_name_string(export.import_name.as_ref())?;
+        // A reclassified source/deferred marker resolves to the imported
+        // module itself (the ModuleSource / deferred namespace object), not
+        // to an export name — no further validation is needed.
+        if import_name == source_marker() || import_name == defer_marker() {
+            continue;
+        }
         let mut resolve_set = Vec::new();
         if resolve_export(agent, &imported, &import_name, &mut resolve_set)?.is_none() {
             return Err(JsError::new(
@@ -904,8 +1202,46 @@ pub fn module_evaluation(
     // body finishes on the current evaluation stack, so it is skipped here.
     let dependencies = module.requested_modules.clone();
     let dependencies_result = (|| -> Result<(), JsError> {
-        for (specifier, _) in dependencies {
-            let imported = host_resolve_imported_module(agent, &specifier)?;
+        // A source- or deferred-phase request is not evaluated by the wave
+        // (`import source`/`import defer` do not evaluate their target). A
+        // deferred request still forces its asynchronous transitive
+        // dependencies to evaluate, and this module waits on them
+        // (InnerModuleEvaluation step 12 + GatherAsynchronousTransitiveDependencies):
+        // `import defer` of a top-level-await module runs that module's
+        // async evaluation.
+        for (specifier, _, phase) in dependencies {
+            let imported = host_resolve_imported_module(agent, &specifier, &[])?;
+            if phase == ImportPhase::Defer {
+                let async_deps =
+                    gather_async_transitive_dependencies(agent, &imported, &mut Vec::new())?;
+                for dep in async_deps {
+                    let dep_status = *dep.status.borrow();
+                    match dep_status {
+                        ModuleStatus::Evaluated => {
+                            if let Some(error) = dep.evaluation_error.borrow().clone() {
+                                return Err(JsError::new(
+                                    ErrorKind::TypeError,
+                                    "dependency module errored".into(),
+                                )
+                                .with_value(error));
+                            }
+                        }
+                        ModuleStatus::EvaluatingAsync => {
+                            register_async_parent(agent, module, &dep)?;
+                        }
+                        _ => {
+                            module_evaluation(agent, &dep)?;
+                            if *dep.status.borrow() == ModuleStatus::EvaluatingAsync {
+                                register_async_parent(agent, module, &dep)?;
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            if phase != ImportPhase::Import {
+                continue;
+            }
             let status = *imported.status.borrow();
             match status {
                 ModuleStatus::Evaluating => {
@@ -1238,7 +1574,7 @@ fn notify_async_parents_fulfilled(
     Ok(())
 }
 
-/// GetModuleNamespace / the module namespace exotic object (spec 16.2.2.6).
+/// GetModuleNamespace (spec 16.2.2.6): the module namespace exotic object.
 pub fn module_namespace(
     agent: &mut Agent,
     module: &Handle<SourceTextModule>,
@@ -1246,6 +1582,279 @@ pub fn module_namespace(
     if let Some(namespace) = module.namespace.borrow().clone() {
         return Ok(namespace);
     }
+    let value = create_namespace(agent, module, false)?;
+    module.namespace.replace(Some(value.clone()));
+    Ok(value)
+}
+
+/// GetModuleNamespace(module, ~defer~) (import-defer): the deferred namespace
+/// — the same exotic object with [[Deferred]] = true, evaluated lazily on
+/// property access. Cached per module, distinct from the eager namespace.
+pub fn deferred_namespace(
+    agent: &mut Agent,
+    module: &Handle<SourceTextModule>,
+) -> Result<Value, JsError> {
+    if let Some(namespace) = module.deferred_namespace.borrow().clone() {
+        return Ok(namespace);
+    }
+    let value = create_namespace(agent, module, true)?;
+    module.deferred_namespace.replace(Some(value.clone()));
+    Ok(value)
+}
+
+/// `import.defer(...)` (import-defer): the DeferredModule object returned by
+/// the dynamic form — an ordinary object whose `.then` method resolves with
+/// the module's deferred namespace after its asynchronous transitive
+/// dependencies settle. The module itself is not evaluated.
+pub(crate) fn deferred_module_object(
+    agent: &mut Agent,
+    module: &Handle<SourceTextModule>,
+) -> Result<Value, JsError> {
+    let realm = agent.current_realm()?;
+    let prototype = realm
+        .intrinsics
+        .get("%Object.prototype%")
+        .and_then(|value| value.as_object());
+    let object = JsObject::ordinary_object_create(prototype);
+    let then = Function::create_builtin(
+        Some(JsString::from_utf8("then")),
+        2,
+        Box::new(|_, _| {
+            Err(JsError::new(
+                ErrorKind::TypeError,
+                "DeferredModule.then must be called through the agent".into(),
+            ))
+        }),
+        None,
+        None,
+    )?;
+    agent
+        .deferred_module_thens
+        .insert(then.id(), module.clone());
+    object.create_data_property_or_throw(&JsString::from_utf8("then"), Value::Function(then))?;
+    Ok(Value::Object(object))
+}
+
+/// Dispatch the DeferredModule `.then` method (import-defer): returns a
+/// promise that settles with the module's deferred namespace once its
+/// asynchronous transitive dependencies have evaluated (the module itself is
+/// not evaluated). The user's onFulfilled/onRejected run per the thenable
+/// protocol (a `then` getter on the namespace is never consulted).
+pub fn dispatch_deferred_module_then(
+    agent: &mut Agent,
+    callee: &Value,
+    _this: &Value,
+    args: &[Value],
+) -> Option<Result<Value, JsError>> {
+    let Value::Function(function) = callee else {
+        return None;
+    };
+    let module = agent.deferred_module_thens.get(&function.id()).cloned()?;
+    let on_fulfilled = args.first().cloned().unwrap_or(Value::Undefined);
+    let on_rejected = args.get(1).cloned().unwrap_or(Value::Undefined);
+    Some(deferred_module_then(
+        agent,
+        &module,
+        on_fulfilled,
+        on_rejected,
+    ))
+}
+
+fn deferred_module_then(
+    agent: &mut Agent,
+    module: &Handle<SourceTextModule>,
+    on_fulfilled: Value,
+    on_rejected: Value,
+) -> Result<Value, JsError> {
+    let promise_ctor = agent
+        .current_realm()?
+        .intrinsics
+        .get("%Promise%")
+        .unwrap_or(Value::Undefined);
+    let capability = crate::promise::new_promise_capability(agent, &promise_ctor)?;
+    let resolve = capability.resolve.clone();
+    let reject = capability.reject.clone();
+    // The load completes asynchronously (the host's FinishLoadingImportedModule
+    // with phase ~defer~): gather and evaluate the module's asynchronous
+    // transitive dependencies, then settle with the deferred namespace — the
+    // module itself is left unevaluated for lazy access.
+    let realm = agent.current_realm()?;
+    let module = module.clone();
+    agent.enqueue_generic_job(Some(realm), move |agent| {
+        let result = (|| -> Result<(), JsError> {
+            let async_deps = gather_async_transitive_dependencies(agent, &module, &mut Vec::new())?;
+            if async_deps.is_empty() {
+                return settle_deferred_then(
+                    agent,
+                    &module,
+                    &on_fulfilled,
+                    &on_rejected,
+                    &resolve,
+                    &reject,
+                );
+            }
+            // Wait for every async dependency's evaluation promise before
+            // settling (spec FinishLoadingImportedModule step 4: Perform
+            // PromiseAll over the evaluation promises).
+            let remaining = Rc::new(RefCell::new(async_deps.len() as u32));
+            let wait_id = NEXT_DEFERRED_WAIT.fetch_add(1, Ordering::Relaxed);
+            agent.deferred_module_waits.insert(
+                wait_id,
+                (
+                    remaining.clone(),
+                    on_fulfilled.clone(),
+                    on_rejected.clone(),
+                    module.clone(),
+                    resolve.clone(),
+                    reject.clone(),
+                ),
+            );
+            let fulfill = make_deferred_waiter(agent, wait_id, false)?;
+            let on_rejected_wait = make_deferred_waiter(agent, wait_id, true)?;
+            for dep in async_deps {
+                let evaluation = module_evaluation(agent, &dep)?;
+                // SafePerformPromiseAll (spec 16.2.1.6.2.1): the evaluation
+                // promises are aggregated with PerformPromiseThen, which
+                // attaches reactions directly — a patched
+                // `Promise.prototype.then` is never consulted.
+                crate::promise::perform_promise_then(
+                    agent,
+                    &evaluation,
+                    Some(fulfill.clone()),
+                    Some(on_rejected_wait.clone()),
+                    None,
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let rejection = crate::promise::error_value(agent, &error);
+            crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
+        }
+        Ok(Value::Undefined)
+    });
+    Ok(capability.promise)
+}
+
+/// Settle the DeferredModule `.then` promise: create the deferred namespace,
+/// run the user's onFulfilled (per the thenable protocol), and resolve the
+/// returned promise with its result.
+fn settle_deferred_then(
+    agent: &mut Agent,
+    module: &Handle<SourceTextModule>,
+    on_fulfilled: &Value,
+    on_rejected: &Value,
+    resolve: &Value,
+    reject: &Value,
+) -> Result<(), JsError> {
+    let namespace = deferred_namespace(agent, module)?;
+    let result = if crux::value::is_callable(on_fulfilled) {
+        crate::function::call(
+            agent,
+            on_fulfilled,
+            Value::Undefined,
+            std::slice::from_ref(&namespace),
+        )
+    } else {
+        Ok(namespace.clone())
+    };
+    match result {
+        Ok(value) => crate::function::call(agent, resolve, Value::Undefined, &[value]).map(|_| ()),
+        Err(error) => {
+            if crux::value::is_callable(on_rejected) {
+                let rejection = crate::promise::error_value(agent, &error);
+                crate::function::call(agent, on_rejected, Value::Undefined, &[rejection])?;
+            }
+            crate::function::call(agent, reject, Value::Undefined, &[namespace]).map(|_| ())
+        }
+    }
+}
+
+static NEXT_DEFERRED_WAIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn make_deferred_waiter(
+    agent: &mut Agent,
+    wait_id: u64,
+    is_reject: bool,
+) -> Result<Value, JsError> {
+    let closure = Function::create_builtin(
+        Some(JsString::from_utf8("")),
+        1,
+        Box::new(|_, _| {
+            Err(JsError::new(
+                ErrorKind::TypeError,
+                "deferred waiter must be called through the agent".into(),
+            ))
+        }),
+        None,
+        None,
+    )?;
+    agent
+        .deferred_module_waiter_fns
+        .insert(closure.id(), (wait_id, is_reject));
+    Ok(Value::Function(closure))
+}
+
+/// Dispatch the DeferredModule wait continuations (import-defer): the
+/// countdown closures attached to each async dependency's evaluation promise.
+pub fn dispatch_deferred_module_wait(
+    agent: &mut Agent,
+    callee: &Value,
+    args: &[Value],
+) -> Option<Result<Value, JsError>> {
+    let Value::Function(function) = callee else {
+        return None;
+    };
+    let (wait_id, is_reject) = agent
+        .deferred_module_waiter_fns
+        .get(&function.id())
+        .copied()?;
+    Some((|| -> Result<Value, JsError> {
+        let Some((remaining, on_fulfilled, on_rejected, module, resolve, reject)) =
+            agent.deferred_module_waits.get(&wait_id).cloned()
+        else {
+            return Ok(Value::Undefined);
+        };
+        if is_reject {
+            // The rejection reason is the awaited dependency's error.
+            let reason = args.first().cloned().unwrap_or(Value::Undefined);
+            if crux::value::is_callable(&on_rejected) {
+                crate::function::call(
+                    agent,
+                    &on_rejected,
+                    Value::Undefined,
+                    std::slice::from_ref(&reason),
+                )?;
+            }
+            crate::function::call(agent, &reject, Value::Undefined, &[reason])?;
+            *remaining.borrow_mut() = 0;
+            return Ok(Value::Undefined);
+        }
+        let mut remaining = remaining.borrow_mut();
+        *remaining = remaining.saturating_sub(1);
+        if *remaining == 0 {
+            // All async dependencies settled; settle with the deferred
+            // namespace (created lazily — the module itself is not evaluated
+            // yet).
+            settle_deferred_then(
+                agent,
+                &module,
+                &on_fulfilled,
+                &on_rejected,
+                &resolve,
+                &reject,
+            )?;
+        }
+        Ok(Value::Undefined)
+    })())
+}
+
+/// ModuleNamespaceCreate (spec 10.4.6.2): the shared namespace construction.
+fn create_namespace(
+    agent: &mut Agent,
+    module: &Handle<SourceTextModule>,
+    deferred: bool,
+) -> Result<Value, JsError> {
     // GetExportedNames (spec 16.2.1.7.1.1): local + indirect names, then the
     // names of every star export, with a cycle guard so a self- or mutually
     // star-exporting module (`export * from` itself) terminates. The namespace
@@ -1266,13 +1875,480 @@ pub fn module_namespace(
         .into_iter()
         .map(|name| PropertyKey::from_js_string(&name))
         .collect();
-    let namespace = JsObject::module_namespace_object_create(exports)?;
+    let namespace = JsObject::module_namespace_object_create(exports, deferred)?;
     let namespace_value = Value::Object(namespace.clone());
-    agent
-        .module_namespaces
-        .insert(namespace.id(), module.clone());
-    module.namespace.replace(Some(namespace_value.clone()));
+    if deferred {
+        agent
+            .deferred_namespaces
+            .insert(namespace.id(), module.clone());
+    } else {
+        agent
+            .module_namespaces
+            .insert(namespace.id(), module.clone());
+    }
     Ok(namespace_value)
+}
+
+/// Whether the object is a deferred module namespace. The runtime dispatches
+/// the import-defer evaluation trigger here; crux itself cannot reach the
+/// agent.
+pub fn deferred_namespace_module(
+    agent: &Agent,
+    obj: &JsObject,
+) -> Option<Handle<SourceTextModule>> {
+    if !matches!(
+        obj.kind,
+        crux::object::ObjectKind::ModuleNamespace(ref slots) if slots.deferred
+    ) {
+        return None;
+    }
+    agent.deferred_namespaces.get(&obj.id()).cloned()
+}
+
+/// EnsureDeferredNamespaceEvaluation, keyed by the accessed property
+/// (IsSymbolLikeNamespaceKey, import-defer): symbols and `then` bypass the
+/// evaluation trigger; other keys force it.
+pub fn ensure_deferred_namespace_evaluation_key(
+    agent: &mut Agent,
+    obj: &JsObject,
+    key: &crux::property::PropertyKey,
+) -> Result<(), JsError> {
+    match key {
+        crux::property::PropertyKey::Symbol(_) => return Ok(()),
+        crux::property::PropertyKey::String(id) => {
+            if crux::lookup(*id).to_string_lossy() == "then" {
+                return Ok(());
+            }
+        }
+    }
+    ensure_deferred_namespace_evaluation(agent, obj)
+}
+
+/// [[HasProperty]] with the import-defer evaluation trigger (spec 10.4.6.4):
+/// walks the prototype chain from `obj`, dispatching
+/// EnsureDeferredNamespaceEvaluation when a deferred namespace is reached, so
+/// `key in obj` triggers even when the namespace is only in the chain. A
+/// proxy or typed-array base intercepts the walk before the chain is
+/// consulted and delegates to the crux [[HasProperty]] (the `has` trap / the
+/// integer-indexed interception).
+pub fn has_property_with_deferred_trigger(
+    agent: &mut Agent,
+    object: &crux::object::JsObject,
+    key: &crux::property::PropertyKey,
+) -> Result<bool, JsError> {
+    let mut prototype: Option<crux::handle::Handle<crux::object::JsObject>> = None;
+    loop {
+        let obj = match &prototype {
+            None => object,
+            Some(handle) => handle,
+        };
+        // A proxy's [[HasProperty]] runs its `has` trap (or forwards to the
+        // target); the typed-array exotic intercepts canonical index keys.
+        // Delegate the rest of the walk to the crux HasProperty, which
+        // handles both and continues through the chain.
+        if matches!(
+            obj.kind,
+            crux::object::ObjectKind::Proxy(_) | crux::object::ObjectKind::IntegerIndexed(_)
+        ) {
+            return obj.has_property_key(key);
+        }
+        crate::module::ensure_deferred_namespace_evaluation_key(agent, obj, key)?;
+        if obj.has_own_property_key(key)? {
+            return Ok(true);
+        }
+        match obj.get_prototype_of()? {
+            Some(proto) => prototype = Some(proto),
+            None => return Ok(false),
+        }
+    }
+}
+
+/// EnsureDeferredNamespaceEvaluation / GetModuleExportsList (import-defer):
+/// accessing a deferred namespace's exports evaluates the module
+/// synchronously — unless it is already evaluated, or is not ready for
+/// synchronous execution (mid-evaluation, top-level await, or an async
+/// dependency), in which case a TypeError is thrown.
+pub fn ensure_deferred_namespace_evaluation(
+    agent: &mut Agent,
+    obj: &JsObject,
+) -> Result<(), JsError> {
+    let Some(module) = deferred_namespace_module(agent, obj) else {
+        return Ok(());
+    };
+    // EvaluateSync (import-defer): a module whose evaluation already rejected
+    // throws the recorded error on every export access — an errored module is
+    // evaluated for the purposes of this check.
+    let recorded = module.evaluation_error.borrow().clone().or_else(|| {
+        module
+            .cycle_root
+            .borrow()
+            .as_ref()
+            .and_then(|root| root.evaluation_error.borrow().clone())
+    });
+    if let Some(error) = recorded {
+        return Err(
+            JsError::new(ErrorKind::TypeError, "module evaluation failed".into()).with_value(error),
+        );
+    }
+    let status = *module.status.borrow();
+    match status {
+        ModuleStatus::Evaluated => Ok(()),
+        ModuleStatus::Evaluating | ModuleStatus::EvaluatingAsync => Err(JsError::new(
+            ErrorKind::TypeError,
+            "module is not ready for synchronous evaluation".into(),
+        )),
+        _ => {
+            // ReadyForSyncExecution: a top-level-await module, or one with an
+            // async transitive dependency, cannot be evaluated synchronously.
+            if module_has_tla(agent, &module)?
+                || !module_sync_ready(agent, &module, &mut Vec::new())?
+            {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "module is not ready for synchronous evaluation".into(),
+                ));
+            }
+            // EvaluateSync: the DFS evaluation completes synchronously for a
+            // sync module; a rejecting evaluation throws its result.
+            module_evaluation(agent, &module)?;
+            let recorded = module.evaluation_error.borrow().clone().or_else(|| {
+                module
+                    .cycle_root
+                    .borrow()
+                    .as_ref()
+                    .and_then(|root| root.evaluation_error.borrow().clone())
+            });
+            if let Some(error) = recorded {
+                return Err(
+                    JsError::new(ErrorKind::TypeError, "module evaluation failed".into())
+                        .with_value(error),
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// ReadyForSyncExecution (import-defer): the module and its (transitive)
+/// dependencies are all either evaluated or synchronously evaluable.
+fn module_sync_ready(
+    agent: &mut Agent,
+    module: &Handle<SourceTextModule>,
+    seen: &mut Vec<Handle<SourceTextModule>>,
+) -> Result<bool, JsError> {
+    if seen.iter().any(|m| Rc::ptr_eq(m, module)) {
+        return Ok(true);
+    }
+    seen.push(module.clone());
+    // ReadyForSyncExecution step 5: a fully-evaluated SCC is ready, even
+    // when individual members' statuses are EVALUATED (spec
+    // 16.2.1.5.2.1). A member of a cycle whose root is still evaluating is
+    // not.
+    if is_module_scc_evaluated(module) {
+        return Ok(true);
+    }
+    let status = *module.status.borrow();
+    match status {
+        ModuleStatus::Evaluating | ModuleStatus::EvaluatingAsync => return Ok(false),
+        _ => {}
+    }
+    if module_has_tla(agent, module)? {
+        return Ok(false);
+    }
+    let requested = module.requested_modules.clone();
+    for (specifier, _, _) in &requested {
+        let imported = host_resolve_imported_module(agent, specifier, &[])?;
+        if !module_sync_ready(agent, &imported, seen)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// [[HasTLA]] (spec 16.2.1.5.1): whether the module's top-level code contains
+/// a top-level `await` (outside any function body).
+fn module_has_tla(agent: &Agent, module: &Handle<SourceTextModule>) -> Result<bool, JsError> {
+    let _ = agent;
+    let stmts = module_statements(module);
+    Ok(stmts.iter().any(stmt_has_top_level_await))
+}
+
+fn stmt_has_top_level_await(stmt: &Stmt) -> bool {
+    match &stmt.kind {
+        StmtKind::Block(block) => block.stmts.iter().any(stmt_has_top_level_await),
+        StmtKind::Expr(expr) | StmtKind::Throw(expr) => expr_has_top_level_await(expr),
+        StmtKind::Return(Some(expr)) => expr_has_top_level_await(expr),
+        StmtKind::If {
+            test,
+            consequent,
+            alternate,
+        } => {
+            expr_has_top_level_await(test)
+                || stmt_has_top_level_await(consequent)
+                || alternate.as_deref().is_some_and(stmt_has_top_level_await)
+        }
+        StmtKind::VarDecl { decls, .. } | StmtKind::UsingDecl { decls, .. } => decls
+            .iter()
+            .any(|decl| decl.init.as_ref().is_some_and(expr_has_top_level_await)),
+        StmtKind::Labeled { body, .. } => stmt_has_top_level_await(body),
+        StmtKind::While { test, body } => {
+            expr_has_top_level_await(test) || stmt_has_top_level_await(body)
+        }
+        StmtKind::DoWhile { body, test } => {
+            stmt_has_top_level_await(body) || expr_has_top_level_await(test)
+        }
+        StmtKind::For {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            init.as_ref().is_some_and(for_init_has_top_level_await)
+                || test.as_ref().is_some_and(expr_has_top_level_await)
+                || update.as_ref().is_some_and(expr_has_top_level_await)
+                || stmt_has_top_level_await(body)
+        }
+        StmtKind::ForIn {
+            left, right, body, ..
+        }
+        | StmtKind::ForOf {
+            left, right, body, ..
+        } => {
+            for_binding_has_top_level_await(left)
+                || expr_has_top_level_await(right)
+                || stmt_has_top_level_await(body)
+        }
+        StmtKind::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            block.stmts.iter().any(stmt_has_top_level_await)
+                || handler
+                    .as_ref()
+                    .is_some_and(|h| h.body.stmts.iter().any(stmt_has_top_level_await))
+                || finalizer
+                    .as_ref()
+                    .is_some_and(|f| f.stmts.iter().any(stmt_has_top_level_await))
+        }
+        StmtKind::Switch {
+            discriminant,
+            cases,
+        } => {
+            expr_has_top_level_await(discriminant)
+                || cases.iter().any(|case| {
+                    case.test.as_ref().is_some_and(expr_has_top_level_await)
+                        || case.consequent.iter().any(stmt_has_top_level_await)
+                })
+        }
+        StmtKind::With { object, body } => {
+            expr_has_top_level_await(object) || stmt_has_top_level_await(body)
+        }
+        _ => false,
+    }
+}
+
+fn for_init_has_top_level_await(init: &ForInit) -> bool {
+    match init {
+        ForInit::VarDecl { decls, .. } => decls
+            .iter()
+            .any(|decl| decl.init.as_ref().is_some_and(expr_has_top_level_await)),
+        ForInit::Expr(expr) => expr_has_top_level_await(expr),
+    }
+}
+
+fn for_binding_has_top_level_await(binding: &ForBinding) -> bool {
+    match binding {
+        ForBinding::Expr(expr) => expr_has_top_level_await(expr),
+        ForBinding::VarDecl { init, pattern, .. } => {
+            init.as_ref().is_some_and(expr_has_top_level_await)
+                || pattern_element_has_await(pattern)
+        }
+    }
+}
+
+fn pattern_element_has_await(element: &BindingPattern) -> bool {
+    match element {
+        BindingPattern::Ident(_) => false,
+        BindingPattern::Object(props) => props.iter().any(|prop| match prop {
+            syntax::ast::ObjectBindingProperty::Property { key, element, .. } => {
+                matches!(key, PropertyName::Computed(e) if expr_has_top_level_await(e))
+                    || element.init.as_ref().is_some_and(expr_has_top_level_await)
+                    || pattern_element_has_await(&element.pattern)
+            }
+            syntax::ast::ObjectBindingProperty::Rest(element) => {
+                element.init.as_ref().is_some_and(expr_has_top_level_await)
+                    || pattern_element_has_await(&element.pattern)
+            }
+        }),
+        BindingPattern::Array(elements) => elements.iter().any(|element| match element {
+            syntax::ast::ArrayBindingElement::Element(element)
+            | syntax::ast::ArrayBindingElement::Rest(element) => {
+                element.init.as_ref().is_some_and(expr_has_top_level_await)
+                    || pattern_element_has_await(&element.pattern)
+            }
+            syntax::ast::ArrayBindingElement::Hole => false,
+        }),
+    }
+}
+
+fn expr_has_top_level_await(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Await(_) => true,
+        ExprKind::Function(_) | ExprKind::Arrow { .. } => false,
+        ExprKind::Class(class) => class_has_top_level_await(class),
+        ExprKind::Unary { operand, .. } => expr_has_top_level_await(operand),
+        ExprKind::Update { target, .. } => expr_has_top_level_await(target),
+        ExprKind::Binary { left, right, .. } => {
+            expr_has_top_level_await(left) || expr_has_top_level_await(right)
+        }
+        ExprKind::Logical { left, right, .. } => {
+            expr_has_top_level_await(left) || expr_has_top_level_await(right)
+        }
+        ExprKind::Assign { target, value, .. } => {
+            expr_has_top_level_await(target) || expr_has_top_level_await(value)
+        }
+        ExprKind::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            expr_has_top_level_await(test)
+                || expr_has_top_level_await(consequent)
+                || expr_has_top_level_await(alternate)
+        }
+        ExprKind::PrivateIn { object, .. } => expr_has_top_level_await(object),
+        ExprKind::Call(call) => {
+            expr_has_top_level_await(&call.callee)
+                || call.args.iter().any(|arg| match arg {
+                    Argument::Expr(expr) => expr_has_top_level_await(expr),
+                    Argument::Spread(expr) => expr_has_top_level_await(expr),
+                })
+        }
+        ExprKind::New(new) => {
+            expr_has_top_level_await(&new.callee)
+                || new.args.iter().any(|arg| match arg {
+                    Argument::Expr(expr) => expr_has_top_level_await(expr),
+                    Argument::Spread(expr) => expr_has_top_level_await(expr),
+                })
+        }
+        ExprKind::Member(member) => {
+            expr_has_top_level_await(&member.object)
+                || matches!(&member.property, MemberProperty::Computed(e) if expr_has_top_level_await(e))
+        }
+        ExprKind::TaggedTemplate { tag, quasi } => {
+            expr_has_top_level_await(tag) || quasi.exprs.iter().any(expr_has_top_level_await)
+        }
+        ExprKind::Template(template) => template.exprs.iter().any(expr_has_top_level_await),
+        ExprKind::Paren(inner) => expr_has_top_level_await(inner),
+        ExprKind::Sequence(exprs) => exprs.iter().any(expr_has_top_level_await),
+        ExprKind::Array(literal) => literal.elements.iter().any(|element| match element {
+            ArrayElement::Expr(expr) | ArrayElement::Spread(expr) => expr_has_top_level_await(expr),
+            ArrayElement::Hole => false,
+        }),
+        ExprKind::Object(literal) => literal.props.iter().any(|prop| match prop {
+            ObjectProperty::Init { key, value, .. } => {
+                property_name_has_top_level_await(key) || expr_has_top_level_await(value)
+            }
+            ObjectProperty::Method { key, .. } => property_name_has_top_level_await(key),
+            ObjectProperty::Get { key, body, .. } | ObjectProperty::Set { key, body, .. } => {
+                property_name_has_top_level_await(key)
+                    || body.stmts.iter().any(stmt_has_top_level_await)
+            }
+            ObjectProperty::Spread(expr) => expr_has_top_level_await(expr),
+        }),
+        ExprKind::ImportCall {
+            specifier, options, ..
+        } => {
+            expr_has_top_level_await(specifier)
+                || options.as_deref().is_some_and(expr_has_top_level_await)
+        }
+        ExprKind::MetaProperty { .. }
+        | ExprKind::Ident(_)
+        | ExprKind::This
+        | ExprKind::Literal(_)
+        | ExprKind::Yield { .. }
+        | ExprKind::Super => false,
+    }
+}
+
+fn property_name_has_top_level_await(key: &PropertyName) -> bool {
+    match key {
+        PropertyName::Computed(expr) => expr_has_top_level_await(expr),
+        _ => false,
+    }
+}
+
+fn class_has_top_level_await(class: &Class) -> bool {
+    class
+        .heritage
+        .as_ref()
+        .is_some_and(expr_has_top_level_await)
+        || class.elements.iter().any(|element| {
+            let name = match element {
+                ClassElement::Method { name, .. }
+                | ClassElement::Get { name, .. }
+                | ClassElement::Set { name, .. }
+                | ClassElement::Field { name, .. } => name,
+                ClassElement::StaticBlock(_) => return false,
+            };
+            matches!(
+                name,
+                ClassElementName::Property(PropertyName::Computed(expr))
+                    if expr_has_top_level_await(expr)
+            )
+        })
+}
+
+/// IsModuleSCCEvaluated (import-defer, spec 16.2.1.5.4.1): whether the
+/// strongly connected component containing the module is fully evaluated — a
+/// module whose cycle root is still evaluating is not, even when its own
+/// status is EVALUATED.
+fn is_module_scc_evaluated(module: &Handle<SourceTextModule>) -> bool {
+    if let Some(root) = module.cycle_root.borrow().clone() {
+        return *root.status.borrow() == ModuleStatus::Evaluated;
+    }
+    *module.status.borrow() == ModuleStatus::Evaluated
+}
+
+/// GatherAsynchronousTransitiveDependencies (import-defer): the modules a
+/// deferred request still forces to evaluate — the transitive closure of its
+/// top-level-await modules (spec 16.2.1.5.3.1 step 12).
+fn gather_async_transitive_dependencies(
+    agent: &mut Agent,
+    module: &Handle<SourceTextModule>,
+    seen: &mut Vec<Handle<SourceTextModule>>,
+) -> Result<Vec<Handle<SourceTextModule>>, JsError> {
+    let mut result = Vec::new();
+    if seen.iter().any(|m| Rc::ptr_eq(m, module)) {
+        return Ok(result);
+    }
+    seen.push(module.clone());
+    // spec step 6: an evaluating module — or one whose SCC is already fully
+    // evaluated — contributes nothing. A member of a cycle whose root is
+    // still evaluating is NOT SCC-evaluated: the walk continues into it so
+    // the root's top-level await is gathered.
+    if *module.status.borrow() == ModuleStatus::Evaluating {
+        return Ok(result);
+    }
+    if is_module_scc_evaluated(module) {
+        return Ok(result);
+    }
+    if module_has_tla(agent, module)? {
+        result.push(module.clone());
+        return Ok(result);
+    }
+    let requested = module.requested_modules.clone();
+    for (specifier, _, _) in &requested {
+        let imported = host_resolve_imported_module(agent, specifier, &[])?;
+        let additional = gather_async_transitive_dependencies(agent, &imported, seen)?;
+        for m in additional {
+            if !result.iter().any(|existing| Rc::ptr_eq(existing, &m)) {
+                result.push(m);
+            }
+        }
+    }
+    Ok(result)
 }
 
 /// GetExportedNames (spec 16.2.1.7.1.1): the module's export names, including
@@ -1307,7 +2383,7 @@ fn collect_exported_names(
         let specifier = export.module_request.as_ref().ok_or_else(|| {
             JsError::new(ErrorKind::TypeError, "star export has no module".into())
         })?;
-        let imported = host_resolve_imported_module(agent, specifier)?;
+        let imported = host_resolve_imported_module(agent, specifier, &[])?;
         collect_exported_names(agent, &imported, stack, out)?;
     }
     stack.pop();
@@ -1320,6 +2396,27 @@ enum ResolvedBinding {
     Local(Handle<SourceTextModule>, JsString),
     /// The binding is the module namespace object of `module`.
     Namespace(Handle<SourceTextModule>),
+    /// The binding is the deferred namespace object of `module` (a
+    /// re-exported deferred namespace import, import-defer).
+    DeferredNamespace(Handle<SourceTextModule>),
+    /// The binding is the ModuleSource object of `module` (a re-exported
+    /// source-phase import, spec ResolveExport step: [[BindingName]] is
+    /// ~source~).
+    Source(Handle<SourceTextModule>),
+}
+
+/// The sentinel import name of a reclassified source-phase re-export: an
+/// atom that cannot collide with a real identifier (the spec's ~source~
+/// marker).
+fn source_marker() -> JsString {
+    JsString::from_utf8("\u{1}source")
+}
+
+/// The sentinel import name of a reclassified deferred-namespace re-export
+/// (`import defer * as ns from …; export { ns }`): resolves to the module's
+/// deferred namespace object (import-defer).
+fn defer_marker() -> JsString {
+    JsString::from_utf8("\u{1}defer")
 }
 
 /// ResolveExport (spec 16.2.1.7.2.2): find the defining module and local
@@ -1355,7 +2452,7 @@ fn resolve_export(
             let specifier = export.module_request.as_ref().ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "local export has no module".into())
             })?;
-            let imported = host_resolve_imported_module(agent, specifier)?;
+            let imported = host_resolve_imported_module(agent, specifier, &[])?;
             return Ok(Some(ResolvedBinding::Namespace(imported)));
         }
     }
@@ -1368,7 +2465,7 @@ fn resolve_export(
             let specifier = export.module_request.as_ref().ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "indirect export has no module".into())
             })?;
-            let imported = host_resolve_imported_module(agent, specifier)?;
+            let imported = host_resolve_imported_module(agent, specifier, &[])?;
             // An `import * as ns; export { ns }` re-export has no import name:
             // the binding is the imported module's namespace itself (spec
             // 16.2.1.7.1 step 10.1.ii.2.b).
@@ -1376,6 +2473,17 @@ fn resolve_export(
                 return Ok(Some(ResolvedBinding::Namespace(imported)));
             };
             let import_name = export_name_string(Some(import_name))?;
+            // A reclassified source-phase re-export (`import source x from …;
+            // export { x }`) resolves to the imported module's ModuleSource
+            // object (spec ResolveExport step: [[ImportName]] is ~source~).
+            if import_name == source_marker() {
+                return Ok(Some(ResolvedBinding::Source(imported)));
+            }
+            // A reclassified deferred-namespace re-export resolves to the
+            // module's deferred namespace object.
+            if import_name == defer_marker() {
+                return Ok(Some(ResolvedBinding::DeferredNamespace(imported)));
+            }
             return resolve_export(agent, &imported, &import_name, resolve_set);
         }
     }
@@ -1388,7 +2496,7 @@ fn resolve_export(
         let specifier = export.module_request.as_ref().ok_or_else(|| {
             JsError::new(ErrorKind::TypeError, "star export has no module".into())
         })?;
-        let imported = host_resolve_imported_module(agent, specifier)?;
+        let imported = host_resolve_imported_module(agent, specifier, &[])?;
         let Some(resolution) = resolve_export(agent, &imported, name, resolve_set)? else {
             continue;
         };
@@ -1403,6 +2511,11 @@ fn resolve_export(
                     (ResolvedBinding::Namespace(pm), ResolvedBinding::Namespace(m)) => {
                         Rc::ptr_eq(pm, m)
                     }
+                    (
+                        ResolvedBinding::DeferredNamespace(pm),
+                        ResolvedBinding::DeferredNamespace(m),
+                    ) => Rc::ptr_eq(pm, m),
+                    (ResolvedBinding::Source(pm), ResolvedBinding::Source(m)) => Rc::ptr_eq(pm, m),
                     _ => false,
                 };
                 if !same {
@@ -1432,16 +2545,20 @@ pub fn namespace_get(
             env.get_binding_value(&local, true)
         }
         Some(ResolvedBinding::Namespace(target)) => module_namespace(agent, &target),
+        Some(ResolvedBinding::DeferredNamespace(target)) => deferred_namespace(agent, &target),
+        Some(ResolvedBinding::Source(target)) => module_source_object(agent, &target),
         None => Ok(Value::Undefined),
     }
 }
 
 /// `import()` (spec 16.6.1.4): load, link, evaluate, and resolve with the
-/// module namespace.
+/// module namespace. `phase` selects the `import.source(...)` (source phase)
+/// and `import.defer(...)` (deferred phase) forms of the ImportCall.
 pub fn dynamic_import(
     agent: &mut Agent,
     specifier: &Value,
     options: Option<&Value>,
+    phase: ImportPhase,
 ) -> Result<Value, JsError> {
     let promise_ctor = agent
         .current_realm()?
@@ -1461,10 +2578,12 @@ pub fn dynamic_import(
             return Ok(capability.promise);
         }
     };
-    // Import attributes: only `type: "json"` is supported; *undefined*
-    // options (including the evaluation of an options expression that yields
-    // undefined) skip the attribute validation entirely (spec 13.3.10.2
-    // step 4: "If options is not undefined").
+    // Import attributes: `type: "json" | "text" | "bytes" | "js"` selects
+    // the module kind; *undefined* options (including the evaluation of an
+    // options expression that yields undefined) skip the attribute
+    // validation entirely (spec 13.3.10.2 step 4: "If options is not
+    // undefined").
+    let mut parsed_attributes: Vec<(AttributeKey, JsString)> = Vec::new();
     if let Some(options) = options
         && !matches!(options, Value::Undefined)
     {
@@ -1477,9 +2596,11 @@ pub fn dynamic_import(
             }
         };
         for (key, value) in attributes {
-            let key = key.to_string_lossy();
-            let value = value.to_string_lossy();
-            if key != "type" || value != "json" {
+            let key_text = key.to_string_lossy();
+            let value_text = value.to_string_lossy();
+            if key_text != "type"
+                || !matches!(value_text.as_str(), "json" | "text" | "bytes" | "js")
+            {
                 crate::function::call(
                     agent,
                     &reject,
@@ -1490,6 +2611,7 @@ pub fn dynamic_import(
                 )?;
                 return Ok(capability.promise);
             }
+            parsed_attributes.push((AttributeKey::Str(key), value));
         }
     }
     // The load is asynchronous: the host completes it in a job, so the
@@ -1502,7 +2624,39 @@ pub fn dynamic_import(
     let realm = agent.current_realm()?;
     agent.enqueue_generic_job(Some(realm), move |agent| {
         let result = (|| -> Result<(), JsError> {
-            let module = host_resolve_imported_module(agent, &specifier_text)?;
+            let module = host_resolve_imported_module(agent, &specifier_text, &parsed_attributes)?;
+            match phase {
+                ImportPhase::Source => {
+                    // GetModuleSource of a Source Text Module Record always
+                    // throws a SyntaxError (spec 16.2.1.7.2): a source-phase
+                    // import of a JavaScript module is unavailable. Synthetic
+                    // modules (JSON/text/bytes) expose their source text.
+                    if module_kind_of(&module) == ModuleKind::Js {
+                        let error = JsError::new(
+                            ErrorKind::SyntaxError,
+                            "source phase import is not available for this module".into(),
+                        );
+                        let rejection = crate::promise::error_value(agent, &error);
+                        crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
+                    } else {
+                        let source = module_source_text(agent, &module)?;
+                        crate::function::call(agent, &resolve, Value::Undefined, &[source])?;
+                    }
+                    return Ok(());
+                }
+                ImportPhase::Defer => {
+                    // `import.defer(...)` returns a DeferredModule object (not
+                    // a promise): a thenable whose `.then` resolves with the
+                    // module's deferred namespace after its asynchronous
+                    // transitive dependencies settle — the module itself is
+                    // not evaluated until the namespace is accessed.
+                    module_declaration_instantiation(agent, &module)?;
+                    let deferred_module = deferred_module_object(agent, &module)?;
+                    crate::function::call(agent, &resolve, Value::Undefined, &[deferred_module])?;
+                    return Ok(());
+                }
+                ImportPhase::Import => {}
+            }
             module_declaration_instantiation(agent, &module)?;
             let namespace = module_namespace(agent, &module)?;
             let evaluation = module_evaluation(agent, &module)?;
@@ -1694,7 +2848,7 @@ mod tests {
         for (specifier, source) in modules {
             agent.add_module(specifier, source);
         }
-        let module = host_resolve_imported_module(&mut agent, &JsString::from_utf8(entry))?;
+        let module = host_resolve_imported_module(&mut agent, &JsString::from_utf8(entry), &[])?;
         module_declaration_instantiation(&mut agent, &module)?;
         module_evaluation(&mut agent, &module)?;
         agent.run_jobs()?;
@@ -1941,7 +3095,7 @@ mod tests {
             "import data from './data.json' with { type: 'json' }; export var a = data.a; export var len = data.b.length;",
         );
         let module =
-            host_resolve_imported_module(&mut agent, &JsString::from_utf8("m.js")).unwrap();
+            host_resolve_imported_module(&mut agent, &JsString::from_utf8("m.js"), &[]).unwrap();
         module_declaration_instantiation(&mut agent, &module).unwrap();
         module_evaluation(&mut agent, &module).unwrap();
         agent.run_jobs().unwrap();
@@ -2049,8 +3203,8 @@ mod tests {
         agent.add_module("./c.js", "import './a.js'; await Promise.resolve(0);");
         agent.add_module("./a.js", "import './b.js'; await Promise.resolve(0);");
         agent.add_module("./x.js", "import './a.js'; await Promise.resolve(0);");
-        let main =
-            host_resolve_imported_module(&mut agent, &JsString::from_utf8("./main.js")).unwrap();
+        let main = host_resolve_imported_module(&mut agent, &JsString::from_utf8("./main.js"), &[])
+            .unwrap();
         module_declaration_instantiation(&mut agent, &main).unwrap();
         let main_promise = module_evaluation(&mut agent, &main).unwrap();
         agent.run_jobs().unwrap();
@@ -2066,7 +3220,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(message, js_str("async error in B"));
-        let c = host_resolve_imported_module(&mut agent, &JsString::from_utf8("./c.js")).unwrap();
+        let c =
+            host_resolve_imported_module(&mut agent, &JsString::from_utf8("./c.js"), &[]).unwrap();
         let c_promise = module_evaluation(&mut agent, &c).unwrap();
         agent.run_jobs().unwrap();
         let c_error = match settled(&agent, &c_promise) {
@@ -2084,11 +3239,13 @@ mod tests {
         agent.initialize_host_defined_realm().unwrap();
         agent.add_module("./m.js", "import './b.js'; export var done = 1;");
         agent.add_module("./b.js", "await Promise.resolve(0); export var x = 1;");
-        let m = host_resolve_imported_module(&mut agent, &JsString::from_utf8("./m.js")).unwrap();
+        let m =
+            host_resolve_imported_module(&mut agent, &JsString::from_utf8("./m.js"), &[]).unwrap();
         module_declaration_instantiation(&mut agent, &m).unwrap();
         let m_promise = module_evaluation(&mut agent, &m).unwrap();
         agent.run_jobs().unwrap();
-        let b = host_resolve_imported_module(&mut agent, &JsString::from_utf8("./b.js")).unwrap();
+        let b =
+            host_resolve_imported_module(&mut agent, &JsString::from_utf8("./b.js"), &[]).unwrap();
         assert_eq!(*b.status.borrow(), ModuleStatus::Evaluated);
         assert_eq!(*m.status.borrow(), ModuleStatus::Evaluated);
         let settled = settled(&agent, &m_promise);

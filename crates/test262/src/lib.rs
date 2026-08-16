@@ -10911,7 +10911,13 @@ var $DONE = function (error) {
         }
         // Dynamic-import fixtures load real sibling support files from the
         // submodule; register them (transitively) before the fixture runs.
-        if body.contains("import(") || body.contains("import (") {
+        // The phase forms (`import.source(...)`, `import.defer(...)`) do not
+        // contain the literal `import(` and are matched separately.
+        if body.contains("import(")
+            || body.contains("import (")
+            || body.contains("import.source(")
+            || body.contains("import.defer(")
+        {
             register_fixture_modules(&mut agent, fixture_dir, body)?;
         }
         let result = agent.run_script(&wrapped);
@@ -11045,22 +11051,43 @@ var $DONE = function (error) {
             &mut agent,
             &JsString::from_utf8(entry_key),
             &JsString::from_utf8(body),
+            &[],
         )
         .map_err(|e| e.message)?;
-        for (specifier, _) in &parsed.requested_modules {
+        for (specifier, _, _) in &parsed.requested_modules {
             register_module_recursive(&mut agent, fixture_dir, &specifier.to_string_lossy())?;
         }
         register_fixture_modules(&mut agent, fixture_dir, body)?;
         let entry = runtime::module::host_resolve_imported_module(
             &mut agent,
             &JsString::from_utf8(entry_key),
+            &[],
         )
         .map_err(|e| e.message)?;
         // A fixture that imports itself (`import './<name>.js'`) must resolve
         // to this same module record, not a second instance of the source:
         // alias the entry under its own specifier so self- and circular
-        // imports share one evaluation.
-        if !fixture_specifier.is_empty() {
+        // imports share one evaluation. A self-import carrying a `type:
+        // "text"`/`type: "bytes"` attribute resolves to a synthetic module
+        // of the fixture's own source, which has no imports and needs no
+        // cycle alias — and must not be preempted by the JS entry record
+        // (`import-attributes/text-self.js`).
+        let self_is_synthetic =
+            parsed
+                .requested_modules
+                .iter()
+                .any(|(specifier, attributes, _)| {
+                    specifier.to_string_lossy() == fixture_specifier
+                        && attributes.iter().any(|(key, value)| {
+                            let key_text = match key {
+                                syntax::AttributeKey::Ident(atom) => crux::lookup(*atom),
+                                syntax::AttributeKey::Str(text) => text.clone(),
+                            };
+                            key_text.to_string_lossy() == "type"
+                                && matches!(value.to_string_lossy().as_str(), "text" | "bytes")
+                        })
+                });
+        if !fixture_specifier.is_empty() && !self_is_synthetic {
             let realm = agent.current_realm().map_err(|e| e.message)?;
             realm
                 .loaded_modules
@@ -11358,30 +11385,31 @@ var $DONE = function (error) {
         if agent.host_modules.borrow().contains_key(&key) {
             return Ok(());
         }
+        // The test262 `<module source>` host artifact: a source-phase target
+        // whose source is available (an %AbstractModuleSource% instance).
+        if specifier == "<module source>" {
+            agent.add_source_module(specifier, "<module source>");
+            return Ok(());
+        }
         let path = dir.join(specifier);
-        let source = match std::fs::read_to_string(&path) {
-            Ok(source) => source,
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
             // Negative fixtures import files that must not resolve.
             Err(_) => return Ok(()),
         };
-        if path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("json"))
-        {
-            agent.add_json_module(specifier, &source);
-        } else {
-            agent.add_module(specifier, &source);
-        }
+        agent.add_bytes_module(specifier, &bytes);
         let next_dir = path.parent().unwrap_or(dir).to_path_buf();
         // A dependency whose source fails to parse is registered anyway: its
         // parse error surfaces as a SyntaxError when the importing module
         // resolves it (test262 `phase: resolution` negative fixtures depend
         // on this). Only a successful parse reveals the transitive imports.
-        let Ok(module) = runtime::module::parse_module(agent, &key, &JsString::from_utf8(&source))
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let Ok(module) =
+            runtime::module::parse_module(agent, &key, &JsString::from_utf8(&text), &[])
         else {
             return Ok(());
         };
-        for (dep, _) in &module.requested_modules {
+        for (dep, _, _) in &module.requested_modules {
             register_module_recursive(agent, &next_dir, &dep.to_string_lossy())?;
         }
         Ok(())
@@ -11490,6 +11518,18 @@ var $DONE = function (error) {
         dollar_two_six_two_obj
             .set(&JsString::from_utf8("IsHTMLDDA"), is_htmldda, true)
             .map_err(|e| e.message)?;
+        // `$262.AbstractModuleSource` (source-phase-imports): the
+        // `%AbstractModuleSource%` constructor, for the `instanceof` checks in
+        // the source-phase fixtures.
+        if let Some(abstract_module_source) = realm.intrinsics.get("%AbstractModuleSource%") {
+            dollar_two_six_two_obj
+                .set(
+                    &JsString::from_utf8("AbstractModuleSource"),
+                    abstract_module_source,
+                    true,
+                )
+                .map_err(|e| e.message)?;
+        }
         Ok(())
     }
 
@@ -11727,26 +11767,6 @@ var $DONE = function (error) {
             // ShadowRealm is a stage-3 proposal, not part of ECMA-262 ES2026.
             return FixtureResult::Skip("ShadowRealm is out of scope".into());
         }
-        if fm.features.iter().any(|f| f == "source-phase-imports") {
-            // `import.source()` is a stage-3 proposal, not part of ECMA-262
-            // ES2026.
-            return FixtureResult::Skip("source-phase-imports is out of scope".into());
-        }
-        if fm.features.iter().any(|f| f == "import-text") {
-            // `import(..., { with: { type: "text" } })` is a stage-3
-            // proposal, not part of ECMA-262 ES2026.
-            return FixtureResult::Skip("import-text is out of scope".into());
-        }
-        if fm.features.iter().any(|f| f == "import-defer") {
-            // `import.defer(...)` is a stage-3 proposal, not part of
-            // ECMA-262 ES2026.
-            return FixtureResult::Skip("import-defer is out of scope".into());
-        }
-        if fm.features.iter().any(|f| f == "import-bytes") {
-            // `import x from ... with { type: "bytes" }` is a stage-3
-            // proposal, not part of ECMA-262 ES2026.
-            return FixtureResult::Skip("import-bytes is out of scope".into());
-        }
         if fm.flags.iter().any(|f| f == "CanBlockIsTrue") {
             // Atomics.wait fixtures that assume [[CanBlock]] = true: the
             // engine's main agent cannot suspend (host-dependent).
@@ -11840,7 +11860,9 @@ var $DONE = function (error) {
     fn debug_module_fixture() {
         let base =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test262/test/language");
-        let path = base.join("module-code/verify-dfs.js");
+        let path = base.join(
+            "import/import-defer/evaluation-top-level-await/async-cycle-dependency-of-deferred-module/main.js",
+        );
         let source = std::fs::read_to_string(&path).unwrap();
         let (fm, body) = parse_fixture(&source).unwrap();
         let specifier = format!("./{}", path.file_name().unwrap().to_string_lossy());

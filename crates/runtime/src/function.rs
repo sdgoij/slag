@@ -1184,6 +1184,9 @@ fn builtin_dispatch_at(
         33 => crate::module::dispatch_import_resolver(agent, callee, args),
         34 => crate::async_await::dispatch_async_from_sync_continuation(agent, callee, args),
         35 => crate::builtins::disposable::dispatch_async_body_disposal(agent, callee, args),
+        36 => crate::builtins::module_source::dispatch_call(agent, callee, this, args),
+        37 => crate::module::dispatch_deferred_module_then(agent, callee, this, args),
+        38 => crate::module::dispatch_deferred_module_wait(agent, callee, args),
         _ => None,
     }
 }
@@ -1196,7 +1199,7 @@ fn resolve_builtin_dispatch(
     this: &Value,
     args: &[Value],
 ) -> (u8, Option<Result<Value, JsError>>) {
-    for index in 1..=35 {
+    for index in 1..=38 {
         let result = builtin_dispatch_at(agent, index, callee, this, args);
         if result.is_some() {
             return (index, result);
@@ -1801,6 +1804,10 @@ pub fn initialize_instance_elements(
                 kind: crux::object::PrivateElementKind::Field(value),
             })?;
         } else {
+            // DefineField on a deferred namespace: the receiver descriptor
+            // read triggers the module's evaluation (import-defer
+            // [[DefineOwnProperty]] step 2 — the [[GetOwnProperty]] probe).
+            crate::module::ensure_deferred_namespace_evaluation_key(agent, obj, &field.name)?;
             obj.create_data_property_or_throw_key(&field.name, value)?;
         }
     }

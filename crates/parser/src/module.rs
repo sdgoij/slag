@@ -4,7 +4,7 @@ use crux::{AtomId, JsError, JsString, Span, intern_utf8};
 use syntax::keywords::{Keyword, from_identifier};
 use syntax::{
     AttributeKey, Class, ExportDecl, ExportDefault, ExportName, ExportSpecifier, ImportDecl,
-    ImportEntry, ModuleItem, TokenKind,
+    ImportEntry, ImportPhase, ModuleItem, TokenKind,
 };
 
 use crate::expr::parse_function_expression;
@@ -36,6 +36,29 @@ fn parse_module_item(parser: &mut Parser) -> Result<ModuleItem, JsError> {
 fn parse_import_declaration(parser: &mut Parser) -> Result<ImportDecl, JsError> {
     let start = parser.next()?.span.start; // `import`
     let mut entries: Vec<ImportEntry> = Vec::new();
+    let mut phase = ImportPhase::Import;
+
+    // `import source <ImportedBinding> FromClause` (source phase) and
+    // `import defer <ImportClause> FromClause` (deferred phase) prefix the
+    // clause with a phase keyword. `source`/`defer` are ordinary identifiers,
+    // so the phase form is only recognized when the keyword is not the
+    // binding of a plain default import: `import source from 'x'` is a plain
+    // import named `source`, while `import source source from 'x'` and
+    // `import source from from 'x'` are phase imports.
+    if let TokenKind::Identifier(atom) = parser.peek()?.kind.clone() {
+        let text = crux::lookup(atom).to_string_lossy();
+        if (text == "source" || text == "defer")
+            && !(parser.peek2()?.kind == TokenKind::Identifier(intern_utf8("from"))
+                && matches!(parser.peek3()?.kind, TokenKind::StringLiteral { .. }))
+        {
+            parser.next()?; // consume the phase keyword
+            phase = if text == "source" {
+                ImportPhase::Source
+            } else {
+                ImportPhase::Defer
+            };
+        }
+    }
 
     // `import "mod" with { … };` — a side-effect-only import.
     if matches!(parser.peek()?.kind, TokenKind::StringLiteral { .. }) {
@@ -49,22 +72,48 @@ fn parse_import_declaration(parser: &mut Parser) -> Result<ImportDecl, JsError> 
             specifier,
             entries,
             attributes,
+            phase,
         });
     }
 
-    if parser.eat_punct(TokenKind::Star)? {
-        // `import * as ns from …`.
+    if phase == ImportPhase::Source {
+        // The source phase takes exactly one ImportedBinding (no clause).
+        let local = parse_imported_binding(parser)?;
+        entries.push(ImportEntry::Default {
+            local: local.0,
+            span: local.1,
+        });
+        if parser.eat_punct(TokenKind::Comma)? {
+            let tok = parser.peek()?.clone();
+            return Err(parser.unexpected(&tok));
+        }
+    } else if parser.eat_punct(TokenKind::Star)? {
+        // `import * as ns from …` / `import defer * as ns from …`: the
+        // deferred form takes a namespace import only (spec ImportDeclaration:
+        // `import defer NameSpaceImport FromClause`).
         parser.expect_contextual("as")?;
         let local = parse_imported_binding(parser)?;
         entries.push(ImportEntry::Namespace {
             local: local.0,
             span: local.1,
         });
+        if phase == ImportPhase::Defer && parser.eat_punct(TokenKind::Comma)? {
+            let tok = parser.peek()?.clone();
+            return Err(parser.unexpected(&tok));
+        }
     } else if parser.at_punct(TokenKind::LeftBrace)? {
         // `import { … } from …`.
+        if phase == ImportPhase::Defer {
+            let tok = parser.peek()?.clone();
+            return Err(parser.unexpected(&tok));
+        }
         entries.extend(parse_named_imports(parser)?);
     } else {
         // `import default from …` with optional `, {…}` / `, * as ns`.
+        if phase == ImportPhase::Defer {
+            let tok = parser.peek()?.clone();
+            return Err(parser.unexpected(&tok));
+        }
         let local = parse_imported_binding(parser)?;
         entries.push(ImportEntry::Default {
             local: local.0,
@@ -94,6 +143,7 @@ fn parse_import_declaration(parser: &mut Parser) -> Result<ImportDecl, JsError> 
         specifier,
         entries,
         attributes,
+        phase,
     })
 }
 

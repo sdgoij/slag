@@ -1239,7 +1239,9 @@ fn walk_exprs(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
             }
         }
         ExprKind::Await(operand) => walk_exprs(operand, visit),
-        ExprKind::ImportCall { specifier, options } => {
+        ExprKind::ImportCall {
+            specifier, options, ..
+        } => {
             walk_exprs(specifier, visit);
             if let Some(options) = options {
                 walk_exprs(options, visit);

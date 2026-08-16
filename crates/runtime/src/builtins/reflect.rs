@@ -224,15 +224,21 @@ fn reflect_method(agent: &mut Agent, name: &str, args: &[Value]) -> Result<Value
         "getOwnPropertyDescriptor" => {
             let obj = object_of(&arg(0))?;
             let key = crate::context::to_property_key(agent, &arg(1))?;
+            // A deferred namespace's [[GetOwnProperty]] triggers its module's
+            // evaluation for non-symbol-like keys, and the descriptor reads
+            // the live binding (import-defer).
+            crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, &key)?;
             let Some(property) = obj.get_own_property_key(&key)? else {
                 return Ok(Value::Undefined);
             };
+            let desc =
+                crate::builtins::object::namespace_live_descriptor(agent, &obj, &key, &property)?;
             let prototype = agent
                 .current_realm()?
                 .intrinsics
                 .get("%Object.prototype%")
                 .and_then(|v| crate::context::as_object(&v));
-            crux::property::from_property_descriptor(&property.to_descriptor(), prototype)
+            crux::property::from_property_descriptor(&desc, prototype)
         }
         "getPrototypeOf" => {
             let obj = object_of(&arg(0))?;
@@ -254,6 +260,9 @@ fn reflect_method(agent: &mut Agent, name: &str, args: &[Value]) -> Result<Value
         }
         "ownKeys" => {
             let obj = object_of(&arg(0))?;
+            // A deferred namespace's [[OwnPropertyKeys]] triggers its module's
+            // evaluation (import-defer).
+            crate::module::ensure_deferred_namespace_evaluation(agent, &obj)?;
             let keys = obj.own_property_keys()?;
             let values: Vec<Value> = keys
                 .iter()

@@ -48,9 +48,9 @@ Two harnesses live in `crates/test262`:
 
 ## Current results
 
-Workspace-wide: **4162 tests pass, 0 failures** (`cargo test --workspace`),
-of which the test262 crate contributes **3317 passing fixtures** (44
-language-area + 3275 built-ins fixtures); the remaining registered test is
+Workspace-wide: **4173 tests pass, 0 failures** (`cargo test --workspace`),
+of which the test262 crate contributes **3318 passing fixtures** (45
+language-area + 3275 built-ins); the remaining registered test is
 the ignored `scan_builtins_directories` directory scanner. The `workers`
 feature build adds 452 runtime tests (`cargo test -p runtime --features
 workers`).
@@ -1515,22 +1515,27 @@ closed last.
 
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
-| language | 23,724 | 23,184 | 0 | 540 | 0 | 100.0% |
-| built-ins | 23,812 | 18,323 | 0 | 5,489 | 0 | 100.0% |
+| language | 23,724 | 23,690 | 0 | 34 | 0 | 100.0% |
+| built-ins | 23,812 | 18,331 | 0 | 5,481 | 0 | 100.0% |
 | annexB | 1,086 | 1,086 | 0 | 0 | 0 | 100.0% |
-| **Total** | **48,622** | **42,593** | **0** | **6,029** | **0** | **100.0%** |
+| **Total** | **48,622** | **43,107** | **0** | **5,515** | **0** | **100.0%** |
 
-(Runnable = pass + fail + hang; the 6,029 skips are the unsupported harness
+(Runnable = pass + fail + hang; the 5,515 skips are the unsupported harness
 includes, the host-dependent `CanBlockIsTrue` waits, the TCO (`tcoHelper`)
-fixtures, and the out-of-scope Temporal, await-dictionary, ShadowRealm,
-source-phase-imports (`import.source()`), import-defer (`import.defer()`),
-import-bytes (`import(..., { with: { type: "bytes" } })`), and import-text
-(`import(..., { with: { type: "text" } })`) proposal fixtures.) The module
-loader was un-skipped last (the `flags: [module]` fixtures now run through
-the real source-text-module machinery — parse, link, DFS evaluation,
-top-level await, dynamic import, and `import.meta`), taking the totals from
-42,042 to 42,593 pass: the language row went from 22,634/1,090 to
-23,184/540. The `byteConversionValues` (19: Float16) and
+fixtures, and the out-of-scope Temporal, await-dictionary, and ShadowRealm
+proposal fixtures.) The module loader was un-skipped (the `flags: [module]`
+fixtures now run through the real source-text-module machinery — parse,
+link, DFS evaluation, top-level await, dynamic import, and `import.meta`),
+then the source-phase-imports (`import.source()`), import-defer
+(`import.defer()`), import-bytes, and import-text proposal clusters were
+un-skipped too: the language row went from 23,184/540 to 23,690/34, and the
+built-ins row from 18,323/5,489 to 18,331/5,481, with the only language
+skips now the 34 TCO fixtures (proper tail calls — V8 and JSC skip them
+too). The import-defer work closed last (114/114 in the cluster): deferred
+namespaces trigger synchronous evaluation on export access with
+`PerformPromiseThen`-based async dependency aggregation,
+`IsModuleSCCEvaluated`-aware readiness, and full evaluation-error
+propagation. The `byteConversionValues` (19: Float16) and
 `resizableArrayBufferUtils`
 (185: resizable-buffer TypedArray semantics) clusters were un-skipped
 before that, taking the totals from 41,838 to 42,042 pass. The last 39
@@ -1796,11 +1801,10 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 
 ## Open items
 
-- All three areas now measure **100% of runnable**: 23,184 + 18,323 + 1,086
+- All three areas now measure **100% of runnable**: 23,690 + 18,331 + 1,086
   pass / 0 fail / 0 crash / 0 hang of 23,724 + 23,812 + 1,086 fixtures
-  (out-of-scope Temporal, await-dictionary, ShadowRealm,
-  source-phase-imports, import-defer, import-bytes, and import-text
-  proposal fixtures, the `tcoHelper` includes, and the host-dependent
+  (out-of-scope Temporal, await-dictionary, and ShadowRealm proposal
+  fixtures, the `tcoHelper` includes, and the host-dependent
   `CanBlockIsTrue` waits skipped, `--timeout 120
   --recheck-timeout 120`, release build) — the plan's ≥95%
   runnable-pass-rate target is met. The language area closed its 2,048
@@ -1813,7 +1817,10 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
   language + 13 built-ins `flags: [module]` fixtures now run through the
   source-text-module machinery (parse, link, DFS evaluation, top-level
   await, dynamic import, `import.meta`), with `verify-dfs.js` closing the
-  final failure via the async dynamic-import load (42,593 pass / 6,029
+  final failure via the async dynamic-import load. The source-phase,
+  import-defer, import-bytes, and import-text proposal clusters were then
+  un-skipped too (the import-defer cluster closed last, 114/114), leaving
+  the 34 language skips as the TCO fixtures only (43,107 pass / 5,515
   skip total).
   Note: the TypedArray sweep should be run with the long deadline
   (`--timeout 120 --recheck-timeout 120`) — the O(n²) property store

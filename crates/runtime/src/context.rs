@@ -527,16 +527,30 @@ pub fn get_property_key(
     receiver: Value,
 ) -> Result<Value, JsError> {
     // Module namespace objects read their exported bindings through the
-    // module environment (spec 10.4.6.1).
+    // module environment (spec 10.4.6.1). A deferred namespace triggers its
+    // module's synchronous evaluation first (import-defer).
     if let Value::Object(obj) = base
         && matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_))
-        && let Some(module) = agent.module_namespaces.get(&obj.id()).cloned()
     {
+        crate::module::ensure_deferred_namespace_evaluation_key(agent, obj, key)?;
+        let Some(module) = agent
+            .module_namespaces
+            .get(&obj.id())
+            .cloned()
+            .or_else(|| agent.deferred_namespaces.get(&obj.id()).cloned())
+        else {
+            return Ok(Value::Undefined);
+        };
         // Symbol.toStringTag (spec 28.3.1): a data property on the namespace.
         if let crux::property::PropertyKey::Symbol(symbol) = key
             && symbol.id == crux::symbol::well_known("toStringTag").id
         {
-            return Ok(Value::String(Handle::new(JsString::from_utf8("Module"))));
+            let tag = if agent.deferred_namespaces.contains_key(&obj.id()) {
+                "Deferred Module"
+            } else {
+                "Module"
+            };
+            return Ok(Value::String(Handle::new(JsString::from_utf8(tag))));
         }
         let crux::property::PropertyKey::String(id) = key else {
             return Ok(Value::Undefined);
@@ -558,14 +572,14 @@ pub fn get_property_key(
             let typed_array_index = matches!(obj.kind, crux::object::ObjectKind::IntegerIndexed(_))
                 && crux::object::is_canonical_index_key(key);
             if !typed_array_index
-                && let Some(getter) = find_ecma_accessor(obj, key, AccessorKind::Get)?
+                && let Some(getter) = find_ecma_accessor(agent, obj, key, AccessorKind::Get)?
             {
                 return crate::function::call(agent, &getter, receiver, &[]);
             }
             obj.get_with_receiver_key(key, receiver)
         }
         Value::Function(f) => {
-            if let Some(getter) = find_ecma_accessor(&f.object, key, AccessorKind::Get)? {
+            if let Some(getter) = find_ecma_accessor(agent, &f.object, key, AccessorKind::Get)? {
                 return crate::function::call(agent, &getter, receiver, &[]);
             }
             f.object.get_with_receiver_key(key, receiver)
@@ -597,6 +611,7 @@ enum AccessorKind {
 /// and agent-dispatched builtins are returned; the caller runs them through
 /// `runtime::function::call`, which handles either kind.
 fn find_ecma_accessor(
+    agent: &mut Agent,
     object: &crux::object::JsObject,
     key: &crux::property::PropertyKey,
     which: AccessorKind,
@@ -609,6 +624,9 @@ fn find_ecma_accessor(
             None => object,
             Some(handle) => handle,
         };
+        // A deferred namespace in the chain triggers its module's evaluation
+        // on a non-symbol-like access (import-defer [[GetOwnProperty]]).
+        crate::module::ensure_deferred_namespace_evaluation_key(agent, obj, key)?;
         // A proxy forwards [[Get]]/[[Set]] to its target when the handler
         // has no get/set trap (spec 10.5.8 step 5 / 10.5.9 step 5): the
         // target's own descriptor and prototype chain are then probed with
@@ -702,6 +720,32 @@ pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Resu
         }
         ReferenceBase::Value(base) => {
             let key = &reference.name;
+            // ModuleNamespace [[Set]] (spec 10.4.6.5): a direct write returns
+            // false without consulting the exports or the prototype chain —
+            // a (deferred) namespace never triggers evaluation on `[[Set]]`,
+            // and the write fails (TypeError in strict mode).
+            let base_is_namespace = match base {
+                Value::Object(obj) => {
+                    matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_))
+                }
+                Value::Function(f) => {
+                    matches!(f.object.kind, crux::object::ObjectKind::ModuleNamespace(_))
+                }
+                _ => false,
+            };
+            if base_is_namespace {
+                return if reference.strict {
+                    Err(JsError::new(
+                        ErrorKind::TypeError,
+                        format!(
+                            "Cannot assign to read only property {:?}",
+                            key.display_string()
+                        ),
+                    ))
+                } else {
+                    Ok(())
+                };
+            }
             // OrdinarySetWithOwnDescriptor (spec 7.3.3 step 2.c) reads the
             // receiver's own descriptor when the property is a data descriptor
             // or absent from the chain. A module-namespace receiver's
@@ -711,8 +755,15 @@ pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Resu
             if let Value::Object(obj) = get_this_value(reference)
                 && matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_))
                 && let PropertyKey::String(id) = key
-                && let Some(module) = agent.module_namespaces.get(&obj.id()).cloned()
+                && let Some(module) = agent
+                    .module_namespaces
+                    .get(&obj.id())
+                    .cloned()
+                    .or_else(|| agent.deferred_namespaces.get(&obj.id()).cloned())
             {
+                // A deferred namespace's [[Set]] returns false without
+                // consulting the exports (import-defer): a direct write does
+                // not trigger evaluation.
                 let mut probe = if matches!(base, Value::Object(_) | Value::Function(_)) {
                     Some(base.clone())
                 } else {
@@ -733,6 +784,11 @@ pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Resu
                     }
                 }
                 if !accessor_in_chain {
+                    // The receiver's own-descriptor read
+                    // (OrdinarySetWithOwnDescriptor step 2.c.vii) triggers a
+                    // deferred namespace's evaluation for non-symbol-like keys
+                    // (import-defer [[GetOwnProperty]]).
+                    crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, key)?;
                     crate::module::namespace_get(agent, &module, &crux::lookup(*id))?;
                 }
             }
@@ -753,7 +809,8 @@ pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Resu
                         matches!(obj.kind, crux::object::ObjectKind::IntegerIndexed(_))
                             && crux::object::is_canonical_index_key(key);
                     if !typed_array_index
-                        && let Some(setter) = find_ecma_accessor(obj, key, AccessorKind::Set)?
+                        && let Some(setter) =
+                            find_ecma_accessor(agent, obj, key, AccessorKind::Set)?
                     {
                         crate::function::call(agent, &setter, receiver.clone(), &[value])?;
                         return Ok(());
@@ -761,7 +818,9 @@ pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Resu
                     obj.set_with_receiver_key(key, value, receiver.clone(), reference.strict)
                 }
                 Value::Function(f) => {
-                    if let Some(setter) = find_ecma_accessor(&f.object, key, AccessorKind::Set)? {
+                    if let Some(setter) =
+                        find_ecma_accessor(agent, &f.object, key, AccessorKind::Set)?
+                    {
                         crate::function::call(agent, &setter, receiver.clone(), &[value])?;
                         return Ok(());
                     }
@@ -799,13 +858,18 @@ pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Resu
 }
 
 /// spec 7.3.8 DeletePropertyOrThrow.
-pub fn delete_property_or_throw(reference: &Reference) -> Result<bool, JsError> {
+pub fn delete_property_or_throw(agent: &mut Agent, reference: &Reference) -> Result<bool, JsError> {
     match &reference.base {
         ReferenceBase::Environment(env) => env.delete_binding(&string_name(&reference.name)),
         ReferenceBase::Value(base) => {
             let key = &reference.name;
             let deleted = match base {
-                Value::Object(obj) => obj.delete_key(key)?,
+                Value::Object(obj) => {
+                    // A deferred namespace triggers its module's evaluation on
+                    // a non-symbol-like delete (import-defer).
+                    crate::module::ensure_deferred_namespace_evaluation_key(agent, obj, key)?;
+                    obj.delete_key(key)?
+                }
                 Value::Function(f) => f.object.delete_key(key)?,
                 _ => true,
             };

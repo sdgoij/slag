@@ -665,7 +665,9 @@ pub(crate) fn walk_exprs(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
             }
         }
         ExprKind::Await(operand) => walk_exprs(operand, visit),
-        ExprKind::ImportCall { specifier, options } => {
+        ExprKind::ImportCall {
+            specifier, options, ..
+        } => {
             walk_exprs(specifier, visit);
             if let Some(options) = options {
                 walk_exprs(options, visit);
@@ -856,7 +858,9 @@ fn walk_contained_exprs(expr: &Expr, visit: &mut impl FnMut(&Expr), through_arro
             }
         }
         ExprKind::Await(operand) => walk_contained_exprs(operand, visit, through_arrows),
-        ExprKind::ImportCall { specifier, options } => {
+        ExprKind::ImportCall {
+            specifier, options, ..
+        } => {
             walk_contained_exprs(specifier, visit, through_arrows);
             if let Some(options) = options {
                 walk_contained_exprs(options, visit, through_arrows);
@@ -1331,7 +1335,9 @@ fn check_expr_with(expr: &Expr, labels: &mut LabelState, pattern: bool) -> Resul
             Ok(())
         }
         ExprKind::Await(operand) => check_expr(operand, labels),
-        ExprKind::ImportCall { specifier, options } => {
+        ExprKind::ImportCall {
+            specifier, options, ..
+        } => {
             check_expr(specifier, labels)?;
             if let Some(options) = options {
                 check_expr(options, labels)?;
@@ -1889,7 +1895,9 @@ fn check_private_expr(
             Ok(())
         }
         ExprKind::Await(operand) => check_private_expr(operand, env),
-        ExprKind::ImportCall { specifier, options } => {
+        ExprKind::ImportCall {
+            specifier, options, ..
+        } => {
             check_private_expr(specifier, env)?;
             if let Some(options) = options {
                 check_private_expr(options, env)?;

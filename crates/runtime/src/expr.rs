@@ -137,13 +137,17 @@ pub fn eval_expr(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Value, 
                 crate::module::import_meta(agent)
             }
         }
-        ExprKind::ImportCall { specifier, options } => {
+        ExprKind::ImportCall {
+            specifier,
+            options,
+            phase,
+        } => {
             let specifier = eval_expr(agent, specifier, strict)?;
             let options = match options {
                 Some(expr) => Some(eval_expr(agent, expr, strict)?),
                 None => None,
             };
-            crate::module::dynamic_import(agent, &specifier, options.as_ref())
+            crate::module::dynamic_import(agent, &specifier, options.as_ref(), *phase)
         }
     }
 }
@@ -899,7 +903,7 @@ fn eval_unary(
                     "Unsupported reference to 'super'".into(),
                 ));
             }
-            let deleted = delete_property_or_throw(&reference)?;
+            let deleted = delete_property_or_throw(agent, &reference)?;
             Ok(Value::Boolean(deleted))
         }
         UnaryOp::Void => {
@@ -1275,8 +1279,12 @@ pub(crate) fn apply_binary(
         BinaryOp::In => {
             let key = crate::context::to_property_key(agent, left)?;
             match right {
-                Value::Object(obj) => Ok(Value::Boolean(obj.has_property_key(&key)?)),
-                Value::Function(f) => Ok(Value::Boolean(f.object.has_property_key(&key)?)),
+                Value::Object(obj) => Ok(Value::Boolean(
+                    crate::module::has_property_with_deferred_trigger(agent, obj, &key)?,
+                )),
+                Value::Function(f) => Ok(Value::Boolean(
+                    crate::module::has_property_with_deferred_trigger(agent, &f.object, &key)?,
+                )),
                 _ => Err(JsError::new(
                     ErrorKind::TypeError,
                     "Cannot use 'in' operator to search for a property in a non-object".into(),

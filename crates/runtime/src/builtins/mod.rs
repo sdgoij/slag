@@ -21,6 +21,7 @@ pub mod iterator;
 pub mod json;
 pub mod keyed;
 pub mod math;
+pub mod module_source;
 pub mod number;
 pub mod object;
 pub mod promise;

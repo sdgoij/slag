@@ -198,6 +198,7 @@ fn set_default_global_bindings(realm: &Handle<Realm>) -> Result<(), JsError> {
     crate::builtins::atomics::install(realm)?;
     crate::builtins::json::install(realm)?;
     crate::builtins::promise::install(realm)?;
+    crate::builtins::module_source::install(realm)?;
     crate::generator::install(realm)?;
     crate::builtins::async_iterator::install(realm)?;
     crate::async_generator::install(realm)?;

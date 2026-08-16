@@ -268,7 +268,7 @@ fn str(value: &str) -> Value {
 /// The own-property descriptor of a module namespace export: crux returns a
 /// placeholder value (the live binding lives in the runtime), so substitute
 /// the binding value through the module machinery (spec 10.4.6.8 step 4).
-fn namespace_live_descriptor(
+pub(crate) fn namespace_live_descriptor(
     agent: &mut Agent,
     obj: &Handle<JsObject>,
     key: &PropertyKey,
@@ -280,7 +280,15 @@ fn namespace_live_descriptor(
     if !matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_)) {
         return Ok(prop.to_descriptor());
     }
-    let Some(module) = agent.module_namespaces.get(&obj.id()).cloned() else {
+    // A deferred namespace triggers its module's evaluation on a
+    // non-symbol-like descriptor read (import-defer).
+    crate::module::ensure_deferred_namespace_evaluation_key(agent, obj, key)?;
+    let Some(module) = agent
+        .module_namespaces
+        .get(&obj.id())
+        .cloned()
+        .or_else(|| agent.deferred_namespaces.get(&obj.id()).cloned())
+    else {
         return Ok(prop.to_descriptor());
     };
     let name = crux::lookup(*id);
@@ -425,6 +433,9 @@ fn own_keys_of(agent: &mut Agent, value: &Value, want_symbols: bool) -> Result<V
     let object = to_object(agent, value)?;
     let obj = as_object(&object)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
+    // A deferred namespace's ownKeys triggers its module's evaluation
+    // (import-defer [[OwnPropertyKeys]]).
+    crate::module::ensure_deferred_namespace_evaluation(agent, &obj)?;
     let mut keys = Vec::new();
     for key in obj.own_property_keys()? {
         let matches = matches!(
@@ -621,6 +632,9 @@ pub fn dispatch_call(
             let obj = as_object(&object).ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "value is not an object".into())
             })?;
+            // A deferred namespace's [[HasProperty]] triggers its module's
+            // evaluation for non-symbol-like keys (import-defer).
+            crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, &key)?;
             let present = if matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_)) {
                 // [[HasProperty]] reads the descriptor, whose value comes
                 // from the live binding: an uninitialized export throws a
@@ -665,6 +679,9 @@ pub fn dispatch_call(
             let obj = as_object(&object).ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "value is not an object".into())
             })?;
+            // A deferred namespace's [[GetOwnProperty]] triggers for
+            // non-symbol-like keys (import-defer).
+            crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, &key)?;
             let enumerable = match obj.get_own_property_key(&key)? {
                 Some(prop) => {
                     // A module namespace descriptor reads the live binding
@@ -747,6 +764,9 @@ pub fn dispatch_call(
                 )
             })?;
             let key = crate::context::to_property_key(agent, arg(args, 1))?;
+            // A deferred namespace's [[DefineOwnProperty]] triggers its
+            // module's evaluation for non-symbol-like keys (import-defer).
+            crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, &key)?;
             let mut desc = crux::property::to_property_descriptor(arg(args, 2))?;
             // ArraySetLength coerces an object [[Value]] twice (ToUint32 and
             // ToNumber, spec 10.4.2.4 steps 3-4) before the descriptor
@@ -862,6 +882,9 @@ pub fn dispatch_call(
             let obj = as_object(&object).ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "value is not an object".into())
             })?;
+            // A deferred namespace's [[GetOwnProperty]] triggers for
+            // non-symbol-like keys (import-defer).
+            crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, &key)?;
             let Some(prop) = obj.get_own_property_key(&key)? else {
                 return Ok(Value::Undefined);
             };

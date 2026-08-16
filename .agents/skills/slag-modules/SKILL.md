@@ -1,6 +1,6 @@
 ---
 name: slag-modules
-description: Load when working on Slag's module system (crates/runtime/src/module.rs), dynamic import, top-level await, import.meta, or the test262 flags:[module] fixtures. Documents the non-obvious traps: dynamic import must load asynchronously (DFS evaluation order), self-import aliasing, parse-tolerant _FIXTURE registration, and frontmatter/sweep conventions.
+description: "Load when working on Slag's module system (crates/runtime/src/module.rs), dynamic import, top-level await, import.meta, or the test262 flags:[module] fixtures. Documents the non-obvious traps: dynamic import must load asynchronously (DFS evaluation order), self-import aliasing, parse-tolerant _FIXTURE registration, and frontmatter/sweep conventions."
 ---
 
 # Slag module system traps
@@ -84,11 +84,14 @@ must too.
 - `--filter GLOB`'s `*` matches across `/`.
 - `*_FIXTURE.js` files are never fixtures (both `collect_js_files` and
   the sweep skip them).
-- Keep the `run_fixture` skip taxonomy (stage-3 proposals: Temporal,
-  import-defer, import-bytes, import-text, source-phase-imports,
-  await-dictionary, ShadowRealm; host-dependent: CanBlockIsTrue;
-  unsupported `includes:`) in sync with `tools/skip_tally.js` — the
-  tally tool mirrors it exactly and is dogfooded with the engine.
+- Keep the `run_fixture` skip taxonomy in sync with `tools/skip_tally.js`
+  (the tally tool mirrors it exactly and is dogfooded with the engine).
+  The only skips left are: stage-3 proposals Temporal, await-dictionary,
+  ShadowRealm; host-dependent `CanBlockIsTrue`; and unsupported
+  `includes:` (`tcoHelper`, `regExpUtils`, `atomicsHelper`,
+  `temporalHelpers`). The import-defer / import-bytes / import-text /
+  source-phase-imports proposal clusters are IMPLEMENTED and un-skipped
+  — never re-add them as skips.
 
 ## 8. Negative phases map to module lifecycle stages
 
@@ -98,6 +101,66 @@ must too.
 evaluation error carrying the thrown value). A parse that succeeds when a
 parse-phase negative was expected, or a module that completes when a
 runtime-phase negative was expected, is a failure.
+
+## 9. import-defer: the deferred namespace trigger rules
+
+A deferred namespace (`import defer * as ns from …`) is a ModuleNamespace
+with `[[Deferred]] = true`; property access evaluates the module
+synchronously (EnsureDeferredNamespaceEvaluation / GetModuleExportsList).
+The trigger rules are exact — get them from the fixtures, not intuition:
+
+- **Triggers** (non-symbol-like keys only): `[[Get]]`, `[[HasProperty]]`,
+  `[[GetOwnProperty]]`, `[[DefineOwnProperty]]` (via the `[[GetOwnProperty]]`
+  probe), `[[OwnPropertyKeys]]`. `Symbol` keys and the string `"then"`
+  never trigger (IsSymbolLikeNamespaceKey).
+- **Never triggers**: `[[Set]]` (ANY key — a direct `ns.x = v` returns
+  false immediately, `ignore-set-string-*` fixtures), `[[IsExtensible]]`,
+  `[[PreventExtensions]]`, `[[GetPrototypeOf]]`, `[[SetPrototypeOf]]`.
+  `[[SetPrototypeOf]]` follows SetImmutablePrototype: a same-value `null`
+  assignment returns **true**.
+- The trigger fires when the namespace is in the PROTOTYPE CHAIN too
+  (`key in Object.create(ns)`, `super.x = v` with the namespace as the
+  receiver's descriptor source) — the `in` operator walks the chain
+  dispatching the trigger, and `put_value` dispatches on the receiver
+  descriptor read, not on a direct namespace write.
+- `[[Set]]` on the namespace itself must not run `find_ecma_accessor` on
+  it — the accessor probe is itself a trigger site.
+- After evaluation the export VALUES are live: `getOwnPropertyDescriptor`
+  / `Reflect.getOwnPropertyDescriptor` must read the live binding
+  (`namespace_live_descriptor`), not the crux `undefined` placeholder.
+
+## 10. import-defer: aggregation, cycles, and errors
+
+- `DeferredModule.then` aggregates the async transitive dependencies'
+  evaluation promises with **`perform_promise_then`** — never
+  `Promise.prototype.then`. The fixture patches the prototype method and
+  asserts `thenCallCount === 0` (`promise-prototype-then-not-called.js`).
+- `GatherAsynchronousTransitiveDependencies` and `ReadyForSyncExecution`
+  are **`IsModuleSCCEvaluated`-aware**: a module whose status is
+  `EVALUATED` but whose cycle root is still `EVALUATING-ASYNC` is NOT
+  evaluated — the walk continues into it (the deferred import of a module
+  in an in-flight async cycle waits for the whole SCC;
+  `async-cycle-dependency-of-deferred-module/main.js`).
+- An errored deferred module throws its recorded `evaluation_error` on
+  every export access (EvaluateSync), and a synchronous evaluation whose
+  body rejected must be detected AFTER `module_evaluation` returns Ok
+  (the body error settles the capability and records the error, it does
+  not abort `module_evaluation`) — check `evaluation_error` (with the
+  `cycle_root` fallback) at the top of
+  `ensure_deferred_namespace_evaluation` and after the sync evaluation.
+
+## 11. Debugging traps
+
+- **A rejected `flags: [module, async]` fixture reports as "async test
+  never called $DONE"** — the harness reads `asyncTestPassed` before it
+  checks the module's rejection. When a "hang" has no obvious stall,
+  check the entry module's top-level capability state: it may be
+  REJECTED (the body threw before `$DONE()`). Dump `globalThis.evaluations`
+  and the entry promise state to see where the body actually went.
+- **Never `match *module.status.borrow()` with the borrow held across
+  match arms** — each arm's body borrows again and panics (RefCell
+  already borrowed). Bind `let status = *module.status.borrow();` first,
+  then match on the copied value.
 
 ## Validation loop
 

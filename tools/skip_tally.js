@@ -68,9 +68,6 @@ function classify(source) {
   if (features.has("Temporal")) return "Temporal";
   if (features.has("await-dictionary")) return "await-dictionary";
   if (features.has("ShadowRealm")) return "ShadowRealm";
-  if (features.has("source-phase-imports")) return "source-phase-imports";
-  if (features.has("import-text")) return "import-text";
-  if (features.has("import-defer")) return "import-defer";
   if (flags.has("CanBlockIsTrue")) return "CanBlockIsTrue";
   const unsupported = includes.filter((item) => !ALLOWED_INCLUDES.has(item)).sort();
   if (unsupported.length > 0) return "includes:" + unsupported.join(",");
