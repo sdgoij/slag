@@ -26,6 +26,7 @@ const ALLOWED_INCLUDES = new Set([
   "wellKnownIntrinsicObjects.js",
   "asyncHelpers.js",
   "byteConversionValues.js",
+  "resizableArrayBufferUtils.js",
 ]);
 
 const AREAS = [

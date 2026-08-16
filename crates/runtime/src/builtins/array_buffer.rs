@@ -190,6 +190,12 @@ fn allocate_array_buffer(
             immutable: false,
         }),
     );
+    if is_resizable {
+        // Mirror the flag on the crux SharedBuffer (spec 10.4.5.1: a
+        // resizable-backed TypedArray cannot be frozen).
+        let cell = agent.buffer_data.get(&object.id()).expect("inserted");
+        cell.borrow().shared.mark_resizable();
+    }
     Ok(())
 }
 
@@ -222,6 +228,8 @@ fn allocate_shared_array_buffer(
             immutable: false,
         }),
     );
+    let cell = agent.buffer_data.get(&object.id()).expect("inserted");
+    cell.borrow().shared.mark_shared();
     Ok(())
 }
 

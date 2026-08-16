@@ -1512,16 +1512,19 @@ closed last.
 
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
-| language | 23,724 | 22,627 | 0 | 1,097 | 0 | 100.0% |
-| built-ins | 23,812 | 18,125 | 0 | 5,687 | 0 | 100.0% |
+| language | 23,724 | 22,634 | 0 | 1,090 | 0 | 100.0% |
+| built-ins | 23,812 | 18,322 | 0 | 5,490 | 0 | 100.0% |
 | annexB | 1,086 | 1,086 | 0 | 0 | 0 | 100.0% |
-| **Total** | **48,622** | **41,838** | **0** | **6,784** | **0** | **100.0%** |
+| **Total** | **48,622** | **42,042** | **0** | **6,580** | **0** | **100.0%** |
 
-(Runnable = pass + fail + hang; the 6,784 skips are the module flag,
+(Runnable = pass + fail + hang; the 6,580 skips are the module flag,
 unsupported harness includes, the host-dependent `CanBlockIsTrue` waits,
 and the out-of-scope Temporal, await-dictionary, ShadowRealm,
 source-phase-imports (`import.source()`), and import-text
-(`import(..., { with: { type: "text" } })`) proposal fixtures.) The last 39
+(`import(..., { with: { type: "text" } })`) proposal fixtures.) The
+`byteConversionValues` (19: Float16) and `resizableArrayBufferUtils`
+(185: resizable-buffer TypedArray semantics) clusters were un-skipped
+last, taking the totals from 41,838 to 42,042 pass. The last 39
 failures closed with the async-test engine work: `Array.fromAsync` was
 rewritten to spec 23.1.2.4.1 — 0-length array-likes skip the loop
 entirely, array-like elements are awaited before the mapper runs, the
@@ -1784,7 +1787,7 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 
 ## Open items
 
-- All three areas now measure **100% of runnable**: 22,627 + 18,125 + 1,086
+- All three areas now measure **100% of runnable**: 22,634 + 18,322 + 1,086
   pass / 0 fail / 0 crash / 0 hang of 23,724 + 23,812 + 1,086 fixtures
   (out-of-scope Temporal, await-dictionary, and ShadowRealm fixtures and
   the host-dependent `CanBlockIsTrue` waits skipped, `--timeout 120
@@ -1793,7 +1796,9 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
   failures via the eval-caller-context, field-initializer, and Annex B
   work described in the Full-suite sweep section; the final async-test
   gaps (`Array.fromAsync`, `for await`, and the dynamic-import cycle)
-  closed last.
+  closed last; the `byteConversionValues` (Float16) and
+  `resizableArrayBufferUtils` (resizable-buffer TypedArray) clusters
+  un-skipped after them (42,042 pass / 6,580 skip total).
   Note: the TypedArray sweep should be run with the long deadline
   (`--timeout 120 --recheck-timeout 120`) — the O(n²) property store
   makes the 10,000-element crash-test fixtures take ~45s, which the

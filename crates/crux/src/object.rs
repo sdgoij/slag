@@ -779,12 +779,23 @@ impl JsObject {
         }
     }
 
-    /// OrdinaryPreventExtensions (spec 10.1.5.2) with the proxy trap.
+    /// OrdinaryPreventExtensions (spec 10.1.5.2) with the proxy trap and the
+    /// TypedArray override (spec 10.4.5.1).
     pub fn prevent_extensions(&self) -> Result<bool, JsError> {
         match &self.kind {
             ObjectKind::Proxy(slots) => return crate::proxy::prevent_extensions(slots),
-            // TypedArrays are fixed-length here (the resizable-buffer check
-            // joins with Phase 12): OrdinaryPreventExtensions applies.
+            // A TypedArray backed by a resizable buffer can gain or lose
+            // integer-indexed properties when the buffer is resized, and a
+            // length-tracking view's indices move with the buffer, so
+            // preventing extensions would violate the extensibility
+            // invariants; only a fixed-length view of a fixed-length (or
+            // shared) buffer is freezable (spec 10.4.5.1 +
+            // IsTypedArrayFixedLength 10.4.5.15).
+            ObjectKind::IntegerIndexed(slots) => {
+                if slots.auto_length || (slots.buffer.is_resizable() && !slots.buffer.is_shared()) {
+                    return Ok(false);
+                }
+            }
             ObjectKind::ModuleNamespace(_) => return Ok(true),
             _ => {}
         }

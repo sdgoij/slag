@@ -118,98 +118,11 @@ fn hypot(values: &[f64]) -> f64 {
 }
 
 /// Binary16 (IEEE 754 half precision) round-trip, used by Math.f16round
-/// (spec 21.3.2.15). Rounds directly from the f64 mantissa (53 bits → 11
-/// bits), so the spec's double-rounding trap (going through binary32 first)
-/// cannot occur.
+/// (spec 21.3.2.15). The encode side rounds directly from the full 53-bit
+/// f64 mantissa (see `crux::typed_array::f16_from_f64`), so the spec's
+/// double-rounding trap (going through binary32 first) cannot occur.
 fn f16_from_f64(x: f64) -> u16 {
-    if x.is_nan() {
-        return 0x7E00;
-    }
-    if x == 0.0 {
-        return if x.is_sign_negative() { 0x8000 } else { 0 };
-    }
-    if x.is_infinite() {
-        return if x.is_sign_negative() { 0xFC00 } else { 0x7C00 };
-    }
-    let bits = x.to_bits();
-    let sign = ((bits >> 63) as u16) << 15;
-    let biased = ((bits >> 52) & 0x7FF) as i32;
-    let fraction = bits & 0xF_FFFF_FFFF_FFFF;
-    let (mantissa, exponent) = if biased == 0 {
-        // Subnormal input: fraction × 2^-1074.
-        (fraction, -1074)
-    } else {
-        // Normal: (2^52 + fraction) × 2^(biased - 1075).
-        (fraction | (1 << 52), biased - 1075)
-    };
-    // Round the 53-bit mantissa to 11 bits (drop 42), ties-to-even.
-    let dropped = 42;
-    let half = (mantissa >> (dropped - 1)) & 1;
-    let sticky = mantissa & ((1u64 << (dropped - 1)) - 1) != 0;
-    let mut mantissa = mantissa >> dropped;
-    // Dropping bits scales the value up: mantissa × 2^(exponent + dropped).
-    let mut exponent = exponent + dropped;
-    if half == 1 && (sticky || mantissa & 1 == 1) {
-        mantissa += 1;
-        if mantissa == 1 << 11 {
-            mantissa >>= 1;
-            exponent += 1;
-        }
-    }
-    // The 11-bit mantissa's leading bit sits at 2^10, so the f16 biased
-    // exponent is (exponent + 10) + 15.
-    let biased = exponent + 25;
-    if biased >= 31 {
-        return sign | 0x7C00;
-    }
-    if biased >= 1 {
-        return sign | ((biased as u16) << 10) | (mantissa as u16 & 0x3FF);
-    }
-    // Subnormal or zero: value = mantissa × 2^exponent, in units of the
-    // smallest subnormal 2^-24: significand = mantissa × 2^(exponent + 24).
-    let shift = exponent + 24;
-    let significand = if shift >= 0 {
-        mantissa << shift
-    } else {
-        let lost = mantissa & ((1u64 << (-shift)) - 1);
-        let rounded = (mantissa >> -shift)
-            + if lost > (1u64 << (-shift - 1))
-                || (lost == 1u64 << (-shift - 1) && (mantissa >> -shift) & 1 == 1)
-            {
-                1
-            } else {
-                0
-            };
-        return if rounded == 0 {
-            sign
-        } else if rounded >= 1 << 10 {
-            sign | (1 << 10)
-        } else {
-            sign | rounded as u16
-        };
-    };
-    // significand has up to 2^11 << 9 = 2^20 bits; round to 10.
-    let bits = 64 - significand.leading_zeros() as i32;
-    if bits <= 10 {
-        return if significand == 0 {
-            sign
-        } else {
-            sign | significand as u16
-        };
-    }
-    let dropped = (bits - 10) as u32;
-    let half = (significand >> (dropped - 1)) & 1;
-    let sticky = significand & ((1u64 << (dropped - 1)) - 1) != 0;
-    let mut rounded = significand >> dropped;
-    if half == 1 && (sticky || rounded & 1 == 1) {
-        rounded += 1;
-    }
-    if rounded >= 1 << 10 {
-        // Rounded up to the smallest normal 2^-14.
-        sign | (1 << 10)
-    } else {
-        sign | rounded as u16
-    }
+    crux::typed_array::f16_from_f64(x)
 }
 
 /// Convert the half-precision bit pattern back to f64.
@@ -227,8 +140,10 @@ fn f16_to_f64(bits: u16) -> f64 {
         return f64::NAN;
     }
     if biased == 0 {
-        // Subnormal: fraction × 2^-24, exactly representable in f64.
-        return f64::from_bits(sign | (fraction << 42));
+        // Subnormal: fraction × 2^-24, exactly representable in f64 (a
+        // power-of-two scaling of a small integer).
+        let magnitude = (fraction as f64) * 2f64.powi(-24);
+        return if sign != 0 { -magnitude } else { magnitude };
     }
     // Normal: (1024 + fraction) × 2^(biased - 25).
     let biased64 = (biased as u64) + (1023 - 15);
@@ -866,7 +781,32 @@ mod tests {
         assert_eq!(number("Math.f16round(65504)"), 65504.0);
         assert_eq!(number("Math.f16round(65520)"), f64::INFINITY);
         assert_eq!(number("1 / Math.f16round(-1e-10)"), f64::NEG_INFINITY);
-        assert_eq!(number("Math.f16round(6.1e-5)"), 0.00006103515625);
+        assert_eq!(number("Math.f16round(6.1e-5)"), 0.00006097555160522461);
+        // Subnormal boundary: the f64 one ULP above 2^-25 rounds up to the
+        // smallest subnormal, not to 0 (a via-f32 conversion or premature
+        // 11-bit rounding flattens it onto the tie); the tie itself rounds
+        // to even (0), and the largest subnormal round-trips exactly.
+        assert_eq!(
+            number("Math.f16round(2.980232238769532e-8)"),
+            5.960464477539063e-8
+        );
+        assert_eq!(number("Math.f16round(2.9802322387695312e-8)"), 0.0);
+        assert_eq!(
+            number("Math.f16round(5.960464477539063e-8)"),
+            5.960464477539063e-8
+        );
+        assert_eq!(
+            number("Math.f16round(0.00006097555160522461)"),
+            0.00006097555160522461
+        );
+        assert_eq!(
+            number("Math.f16round(0.000061005353927612305)"),
+            0.00006103515625
+        );
+        assert_eq!(
+            number("Math.f16round(0.0000610053539276123)"),
+            0.00006097555160522461
+        );
     }
 
     #[test]

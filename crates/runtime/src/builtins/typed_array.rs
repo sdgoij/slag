@@ -194,6 +194,14 @@ fn typed_array_out_of_bounds(agent: &Agent, slots: &TypedArraySlots) -> bool {
     if typed_array_buffer_detached(agent, slots) {
         return false;
     }
+    view_out_of_bounds(slots)
+}
+
+/// IsTypedArrayOutOfBounds (spec 10.4.5.14) without the agent: a fixed view
+/// whose byte range exceeds the buffer, or an auto view whose byte offset
+/// exceeds the buffer. Callers that need the detached half of the check
+/// combine it with `slots.buffer.is_detached()`.
+pub(crate) fn view_out_of_bounds(slots: &TypedArraySlots) -> bool {
     if slots.auto_length {
         slots.byte_offset > slots.buffer.byte_length()
     } else {
@@ -670,9 +678,12 @@ fn copy_typed_array(
     let source_length = typed_array_effective_length(&source_slots);
     let dst = allocate_typed_array_buffer(agent, prototype, element_type, source_length)?;
     if source_slots.element_type == element_type {
-        // Same element type: copy the byte range directly.
+        // Same element type: copy the live byte range directly (the source
+        // length of an auto view follows the resized buffer).
         let start = source_slots.byte_offset;
-        let data = source_slots.buffer.read(start, source_slots.byte_length)?;
+        let data = source_slots
+            .buffer
+            .read(start, source_length * source_slots.element_type.size())?;
         let dst_slots = typed_array_slots(&dst).expect("fresh typed array");
         dst_slots.buffer.write(0, &data)?;
     } else {
@@ -910,6 +921,15 @@ fn copy_within(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
         .saturating_sub(from)
         .min(length.saturating_sub(to));
     if count > 0 {
+        // A target/start/end coercion may have resized a fixed-length view
+        // out of bounds; the spec's copy step (count > 0) re-checks before
+        // touching bytes (25.2.3.6 step 10.a).
+        if typed_array_out_of_bounds(agent, &slots) {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "TypedArray view is out of bounds".into(),
+            ));
+        }
         let mut from = from;
         let mut to = to;
         let direction = if from < to && to < from + count {
@@ -919,9 +939,16 @@ fn copy_within(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
         } else {
             1i64
         };
+        // The copy is bounded by the current (post-coercion) length: elements
+        // whose source or destination fell off the resized buffer are
+        // skipped, so a shrunk length-tracking view copies only the live
+        // tail (25.2.3.6 with resizable buffers).
+        let current = typed_array_effective_length(&slots) as u64;
         for _ in 0..count {
-            let value = get(agent, this, &key(from))?;
-            set_property(this, &key(to), value)?;
+            if from < current && to < current {
+                let value = get(agent, this, &key(from))?;
+                set_property(this, &key(to), value)?;
+            }
             from = (from as i64 + direction) as u64;
             to = (to as i64 + direction) as u64;
         }
@@ -988,6 +1015,14 @@ fn fill(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         return Err(JsError::new(
             ErrorKind::TypeError,
             "TypedArray buffer is detached".into(),
+        ));
+    }
+    // A coercion may have resized a fixed-length view out of bounds; the
+    // spec's step 13 re-validates after the argument coercions.
+    if typed_array_out_of_bounds(agent, &slots) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "TypedArray view is out of bounds".into(),
         ));
     }
     for k in k..final_index {
@@ -1286,8 +1321,12 @@ fn map(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
         ));
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let result = typed_array_species_create(agent, this, typed_array_effective_length(&slots))?;
-    for k in 0..typed_array_effective_length(&slots) as u64 {
+    // The length is captured before TypedArraySpeciesCreate: a species
+    // constructor that resizes the source buffer must not change how many
+    // elements are visited (out-of-bounds elements read as undefined).
+    let length = typed_array_effective_length(&slots) as u64;
+    let result = typed_array_species_create(agent, this, length as usize)?;
+    for k in 0..length {
         let k_value = get(agent, this, &key(k))?;
         let mapped = crate::function::call(
             agent,
@@ -1428,10 +1467,14 @@ fn set(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
         }
         if target_slots.element_type == source_slots.element_type {
             // Same type: byte copy (aliasing is handled by the copy). The
-            // destination space is clamped to the live buffer bytes so a
-            // resized-shrunk buffer fails cleanly instead of panicking.
+            // byte count follows the source's current effective length (an
+            // auto view tracks the resized buffer), and the destination
+            // space is clamped to the live buffer bytes so a resized-shrunk
+            // buffer fails cleanly instead of panicking.
             let start = source_slots.byte_offset;
-            let end = (start + source_slots.byte_length).min(source_slots.buffer.byte_length());
+            let byte_count =
+                typed_array_effective_length(&source_slots) * source_slots.element_type.size();
+            let end = (start + byte_count).min(source_slots.buffer.byte_length());
             let data = source_slots.buffer.read(start, end - start)?;
             let dst_start = target_slots.byte_offset + offset * target_slots.element_type.size();
             let count = data
@@ -1495,9 +1538,18 @@ fn slice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
             "TypedArray buffer is detached".into(),
         ));
     }
-    // A resize during the start/end coercion may have shrunk the buffer: the
-    // result keeps its length but only the elements still in bounds are
-    // copied (spec 25.2.3.26 with resizable buffers).
+    // A resize during the start/end coercion or by the species constructor
+    // may push a fixed-length view out of bounds; the copy step re-checks
+    // and throws (25.2.3.27 with resizable buffers).
+    if count > 0 && typed_array_out_of_bounds(agent, &slots) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "TypedArray view is out of bounds".into(),
+        ));
+    }
+    // The result keeps the full count; elements whose source fell off the
+    // resized buffer keep the fresh allocation's zero value (a float view
+    // reads +0, not NaN — spec 25.2.3.27 with resizable buffers).
     let current = typed_array_effective_length(&slots) as u64;
     let copy_count = count.min(current.saturating_sub(k));
     for i in 0..copy_count {

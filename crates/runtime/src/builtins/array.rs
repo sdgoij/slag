@@ -1057,11 +1057,14 @@ fn index_of(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
 fn join(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
     let object = crate::context::to_object(agent, this)?;
+    // spec 23.1.3.18: the length is read before the separator is coerced, so
+    // a separator ToString that resizes a backing resizable buffer (shrinking
+    // a fixed-length view out of bounds) does not change the iteration count.
+    let length = length_of_array_like(agent, &object)?;
     let separator = match args.first() {
         Some(Value::Undefined) | None => ",".to_string(),
         Some(value) => crate::context::to_string(agent, value)?.to_string_lossy(),
     };
-    let length = length_of_array_like(agent, &object)?;
     let mut result = String::new();
     for k in 0..length {
         if k > 0 {
@@ -1860,15 +1863,16 @@ fn array_iterator_next(agent: &mut Agent, this: &Value, _args: &[Value]) -> Resu
     if matches!(array, Value::Undefined) {
         return iter_result(agent, Value::Undefined, true);
     }
-    // spec %ArrayIteratorPrototype%.next step 8: a TypedArray whose buffer
-    // was detached mid-iteration throws (detach-typedarray-in-progress.js).
+    // spec %ArrayIteratorPrototype%.next step 5.a: iterating a TypedArray
+    // whose view is out of bounds (detached, or resized past the view's
+    // bounds) throws (resizable-buffer iterator fixtures).
     if let Value::Object(iter_obj) = &array
         && let crux::object::ObjectKind::IntegerIndexed(slots) = &iter_obj.kind
-        && slots.buffer.is_detached()
+        && (slots.buffer.is_detached() || crate::builtins::typed_array::view_out_of_bounds(slots))
     {
         return Err(JsError::new(
             ErrorKind::TypeError,
-            "TypedArray buffer is detached".into(),
+            "TypedArray view is out of bounds".into(),
         ));
     }
     let length = length_of_array_like(agent, &array)?;

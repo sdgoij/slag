@@ -113,6 +113,22 @@ pub struct SharedBuffer {
     immutable: Rc<Cell<bool>>,
     #[cfg(feature = "workers")]
     immutable: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the owning ArrayBuffer is resizable (spec 25.1.2.4: a
+    /// `maxByteLength` was supplied). Mirrored from the runtime's
+    /// `BufferState.resizable` so crux's TypedArray [[PreventExtensions]] can
+    /// reject views that could gain or lose integer-indexed properties when
+    /// the buffer is resized (spec 10.4.5.1).
+    #[cfg(not(feature = "workers"))]
+    resizable: Rc<Cell<bool>>,
+    #[cfg(feature = "workers")]
+    resizable: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the owning buffer is a SharedArrayBuffer (spec 25.1.3.4).
+    /// Mirrored from `BufferState.is_shared`; a shared buffer's views are
+    /// fixed-length for [[PreventExtensions]] purposes.
+    #[cfg(not(feature = "workers"))]
+    is_shared: Rc<Cell<bool>>,
+    #[cfg(feature = "workers")]
+    is_shared: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The read-modify-write operations of the Atomics built-ins.
@@ -140,6 +156,8 @@ impl SharedBuffer {
                 block: Rc::new(RefCell::new(vec![0u8; byte_length])),
                 detached: Rc::new(Cell::new(false)),
                 immutable: Rc::new(Cell::new(false)),
+                resizable: Rc::new(Cell::new(false)),
+                is_shared: Rc::new(Cell::new(false)),
             }
         }
         #[cfg(feature = "workers")]
@@ -152,6 +170,8 @@ impl SharedBuffer {
                 byte_length: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(byte_length)),
                 detached: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 immutable: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                resizable: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                is_shared: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         }
     }
@@ -203,6 +223,57 @@ impl SharedBuffer {
         #[cfg(feature = "workers")]
         {
             self.immutable.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Mark the owning buffer resizable (mirrors `BufferState.resizable`).
+    pub fn mark_resizable(&self) {
+        #[cfg(not(feature = "workers"))]
+        {
+            self.resizable.set(true);
+        }
+        #[cfg(feature = "workers")]
+        {
+            self.resizable
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Whether the owning buffer is a resizable ArrayBuffer.
+    pub fn is_resizable(&self) -> bool {
+        #[cfg(not(feature = "workers"))]
+        {
+            self.resizable.get()
+        }
+        #[cfg(feature = "workers")]
+        {
+            self.resizable.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Mark the owning buffer as a SharedArrayBuffer (mirrors
+    /// `BufferState.is_shared`).
+    pub fn mark_shared(&self) {
+        #[cfg(not(feature = "workers"))]
+        {
+            self.is_shared.set(true);
+        }
+        #[cfg(feature = "workers")]
+        {
+            self.is_shared
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Whether the owning buffer is a SharedArrayBuffer.
+    pub fn is_shared(&self) -> bool {
+        #[cfg(not(feature = "workers"))]
+        {
+            self.is_shared.get()
+        }
+        #[cfg(feature = "workers")]
+        {
+            self.is_shared.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -578,6 +649,89 @@ fn wrap_signed(number: f64, bits: u32) -> i64 {
     }
 }
 
+/// The IEEE 754 binary16 bit pattern nearest to `x` (round-half-to-even),
+/// used by the Float16 element conversion and `Math.f16round` (spec
+/// 25.2.4.2 / 21.3.2.15). Rounds directly from the full 53-bit f64
+/// mantissa: an intermediate binary32 step (the `half` crate's x86 F16C
+/// path) or a premature 11-bit rounding would lose the sticky bits that
+/// decide the subnormal boundary (e.g. the f64 one ULP above 2^-25 must
+/// round up to the smallest subnormal, not to 0).
+pub fn f16_from_f64(x: f64) -> u16 {
+    if x.is_nan() {
+        return 0x7E00;
+    }
+    if x == 0.0 {
+        return if x.is_sign_negative() { 0x8000 } else { 0 };
+    }
+    if x.is_infinite() {
+        return if x.is_sign_negative() { 0xFC00 } else { 0x7C00 };
+    }
+    let bits = x.to_bits();
+    let sign = ((bits >> 63) as u16) << 15;
+    let biased = ((bits >> 52) & 0x7FF) as i32;
+    let fraction = bits & 0xF_FFFF_FFFF_FFFF;
+    let (mantissa, exponent) = if biased == 0 {
+        // Subnormal f64 input: value = fraction × 2^-1074; normalize so the
+        // leading bit sits at 2^52.
+        let shift = fraction.leading_zeros() as i32 - 11;
+        (fraction << shift, -1074 - shift)
+    } else {
+        (fraction | (1 << 52), biased - 1075)
+    };
+    // value = mantissa × 2^exponent, mantissa ∈ [2^52, 2^53), so the
+    // unbiased exponent of the value is exponent + 52. The normal/subnormal
+    // decision must use the full precision: the smallest normal f16 is 2^-14.
+    if exponent + 52 >= -14 {
+        // Normal f16: round the 53-bit mantissa to 11 bits (drop 42),
+        // ties-to-even.
+        let dropped = 42;
+        let half = (mantissa >> (dropped - 1)) & 1;
+        let sticky = mantissa & ((1u64 << (dropped - 1)) - 1) != 0;
+        let mut mantissa = mantissa >> dropped;
+        let mut exponent = exponent + dropped;
+        if half == 1 && (sticky || mantissa & 1 == 1) {
+            mantissa += 1;
+            if mantissa == 1 << 11 {
+                mantissa >>= 1;
+                exponent += 1;
+            }
+        }
+        // The 11-bit mantissa's leading bit sits at 2^10, so the f16 biased
+        // exponent is (exponent + 10) + 15.
+        let biased = exponent + 25;
+        if biased >= 31 {
+            return sign | 0x7C00;
+        }
+        return sign | ((biased as u16) << 10) | (mantissa as u16 & 0x3FF);
+    }
+    // Subnormal f16: value = mantissa × 2^exponent in units of the smallest
+    // subnormal 2^-24: significand = mantissa × 2^(exponent + 24), rounded
+    // to the nearest integer (10 bits, ties-to-even).
+    let shift = exponent + 24;
+    let right = -shift;
+    if right >= 54 {
+        // mantissa < 2^53, so the significand fraction is < 2^-1 → 0.
+        return sign;
+    }
+    let lost = mantissa & ((1u64 << right) - 1);
+    let rounded = (mantissa >> right)
+        + if lost > (1u64 << (right - 1))
+            || (lost == 1u64 << (right - 1) && (mantissa >> right) & 1 == 1)
+        {
+            1
+        } else {
+            0
+        };
+    if rounded == 0 {
+        sign
+    } else if rounded >= 1 << 10 {
+        // Rounded up to the smallest normal 2^-14.
+        sign | (1 << 10)
+    } else {
+        sign | rounded as u16
+    }
+}
+
 /// Convert a Number value into the element bytes of `element_type`
 /// (spec SetValueInBuffer with ToNumber + the element conversion, 25.2.4.2).
 fn encode_number(element_type: ElementType, number: f64) -> Result<Vec<u8>, JsError> {
@@ -589,10 +743,7 @@ fn encode_number(element_type: ElementType, number: f64) -> Result<Vec<u8>, JsEr
         ElementType::Uint16 => (wrap_signed(number, 16) as u16).to_ne_bytes().to_vec(),
         ElementType::Int32 => (wrap_signed(number, 32) as i32).to_ne_bytes().to_vec(),
         ElementType::Uint32 => (wrap_signed(number, 32) as u32).to_ne_bytes().to_vec(),
-        ElementType::Float16 => {
-            let half = half::f16::from_f64(number);
-            half.to_bits().to_ne_bytes().to_vec()
-        }
+        ElementType::Float16 => f16_from_f64(number).to_ne_bytes().to_vec(),
         ElementType::Float32 => (number as f32).to_ne_bytes().to_vec(),
         ElementType::Float64 => number.to_ne_bytes().to_vec(),
         ElementType::BigInt64 | ElementType::BigUint64 => {

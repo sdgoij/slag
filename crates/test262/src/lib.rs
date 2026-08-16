@@ -11534,6 +11534,8 @@ var $DONE = function (error) {
                         | "nativeFunctionMatcher.js"
                         | "wellKnownIntrinsicObjects.js"
                         | "asyncHelpers.js"
+                        | "byteConversionValues.js"
+                        | "resizableArrayBufferUtils.js"
                 )
             })
             .collect();
