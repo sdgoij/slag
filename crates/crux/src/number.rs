@@ -677,8 +677,12 @@ fn rounding_bounds(mantissa: u64, exp: i32) -> (BigU, BigU, bool) {
 /// `n` such that b^(n-1) ≤ x < b^n (the decimal-point position), for a
 /// positive finite x = mantissa × 2^exp.
 fn floor_log_base(mantissa: u64, exp: i32, b: u32) -> i32 {
-    let x = mantissa as f64 * 2f64.powi(exp);
-    let mut n = (x.ln() / (b as f64).ln()).floor() as i32 + 1;
+    // ln(x) = ln(mantissa) + exp·ln(2): the equivalent `mantissa as f64 *
+    // 2f64.powi(exp)` returns 0 for subnormal exponents — powi(2, -1074)
+    // overflows 2^1074 to inf and 1/inf flushes to zero — turning ln(x)
+    // into -inf and the estimate into i32::MIN + 1.
+    let ln_x = (mantissa as f64).ln() + (exp as f64) * std::f64::consts::LN_2;
+    let mut n = (ln_x / (b as f64).ln()).floor() as i32 + 1;
     // Adjust with exact comparisons: x ≥ b^n? (in units of 2^-1074).
     let x_scaled = BigU::from_u64(mantissa).shl((exp + 1074) as u32);
     loop {
