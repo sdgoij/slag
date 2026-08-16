@@ -71,7 +71,10 @@ impl<'s> TokenStream<'s> {
 
     /// Peeks one token past the current one. The second token is lexed with
     /// the goal implied by the first token (division vs regexp), matching
-    /// `Parser::next`.
+    /// `Parser::next`. `set_goal` (not the bare lexer goal) is used so the
+    /// goal bookkeeping stays consistent: a later context-aware `peek` (an
+    /// `await`/`yield` token does not end an expression) re-lexes the cached
+    /// token when the goal differs.
     pub fn peek2(&mut self) -> Result<&Token, JsError> {
         self.peek()?;
         if self.buffer.len() < 2 {
@@ -80,7 +83,11 @@ impl<'s> TokenStream<'s> {
             } else {
                 LexGoal::RegExp
             };
-            self.lexer.set_goal(goal);
+            self.set_goal(goal);
+            // A goal change clears the buffer; refill the first token.
+            if self.buffer.is_empty() {
+                self.lex_one()?;
+            }
             self.lex_one()?;
         }
         Ok(&self.buffer[1])
@@ -96,7 +103,11 @@ impl<'s> TokenStream<'s> {
             } else {
                 LexGoal::RegExp
             };
-            self.lexer.set_goal(goal);
+            self.set_goal(goal);
+            // A goal change clears the buffer; refill up to the second token.
+            while self.buffer.len() < 2 {
+                self.lex_one()?;
+            }
             self.lex_one()?;
         }
         Ok(&self.buffer[2])

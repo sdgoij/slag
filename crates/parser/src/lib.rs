@@ -1316,8 +1316,8 @@ mod tests {
     #[test]
     fn parses_export_declarations() {
         // Named exports of local bindings.
-        let m = mod_ok("export { a, b as c };");
-        let ModuleItem::Export(ExportDecl::Named { specifiers, .. }) = &m.body[0] else {
+        let m = mod_ok("var a, b; export { a, b as c };");
+        let ModuleItem::Export(ExportDecl::Named { specifiers, .. }) = &m.body[1] else {
             panic!("expected an export declaration");
         };
         assert_eq!(specifiers.len(), 2);
@@ -1515,11 +1515,15 @@ mod tests {
         mod_err("export { default };");
         mod_err("export { \"str\" };");
         mod_err("export { if };");
-        mod_ok("export { x as default };");
+        mod_ok("var x; export { x as default };");
         mod_ok("export { default } from 'm';");
         mod_ok("export { \"str\" as x } from 'm';");
+        // An exported local name must be a declared binding.
+        mod_err("export { x };");
+        mod_err("export { x as y };");
+        mod_ok("var x; export { x };");
         // ExportedNames must be unique across the module.
-        mod_err("export { a }; export { a };");
+        mod_err("var a; export { a }; export { a };");
         mod_err("export { a } from 'm'; export { a } from 'n';");
         mod_err("export { a as default }; export default 1;");
         mod_err("export default 1; export default 2;");
@@ -1528,7 +1532,7 @@ mod tests {
         mod_ok("export * as ns from 'm'; export * as ns2 from 'n';");
         mod_err("export * as ns from 'm'; export { ns };");
         mod_ok("export { a as b } from 'm'; export { a as c } from 'm';");
-        mod_ok("export { a }; export { a as b };");
+        mod_ok("var a; export { a }; export { a as b };");
     }
 
     #[test]

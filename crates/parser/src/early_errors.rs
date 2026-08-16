@@ -19,8 +19,8 @@ use syntax::keywords::is_reserved_word;
 use syntax::{
     Argument, ArrayBindingElement, ArrayElement, ArrowBody, BindingElement, BindingPattern, Block,
     Class, ClassElement, ClassElementName, ExportDecl, ExportName, ExportSpecifier, Expr, ExprKind,
-    Function, Module, ModuleItem, ObjectBindingProperty, ObjectLiteral, ObjectProperty, Program,
-    PropertyName, Stmt, StmtKind, SwitchCase,
+    Function, ImportEntry, Module, ModuleItem, ObjectBindingProperty, ObjectLiteral,
+    ObjectProperty, Program, PropertyName, Stmt, StmtKind, SwitchCase, VarDeclKind,
 };
 
 /// The label state threaded through a statement tree.
@@ -76,8 +76,140 @@ pub(crate) fn check_module(module: &Module) -> Result<(), JsError> {
             ModuleItem::Export(decl) => check_export(decl, &mut labels)?,
         }
     }
+    check_module_declarations(module)?;
     check_exported_names(module)?;
     check_private_names_module(module)
+}
+
+/// The ModuleItemList/Module early errors (spec 16.2.1.1, 16.2.2.1): at the
+/// module top level, function/class declarations are lexical, so duplicate
+/// lexical names are errors, a lexical name may not collide with a var name,
+/// and an `export { local }` name must be a declared binding.
+fn check_module_declarations(module: &Module) -> Result<(), JsError> {
+    let mut lexical: HashSet<JsString> = HashSet::new();
+    let mut vars: HashSet<JsString> = HashSet::new();
+    let mut exported_bindings: Vec<(JsString, Span)> = Vec::new();
+    for item in &module.body {
+        match item {
+            ModuleItem::Import(import) => {
+                for entry in &import.entries {
+                    let local = match entry {
+                        ImportEntry::Namespace { local, .. }
+                        | ImportEntry::Default { local, .. }
+                        | ImportEntry::Named { local, .. } => crux::lookup(*local),
+                    };
+                    if !lexical.insert(local) {
+                        return Err(error_at(import.span, "Duplicate declaration"));
+                    }
+                }
+            }
+            ModuleItem::Stmt(stmt) => {
+                register_module_statement_names(stmt, &mut lexical, &mut vars, stmt.span)?;
+            }
+            ModuleItem::Export(decl) => match decl {
+                ExportDecl::Declaration(stmt) => {
+                    register_module_statement_names(stmt, &mut lexical, &mut vars, stmt.span)?;
+                    for name in declaration_bound_names(stmt) {
+                        exported_bindings.push((name, stmt.span));
+                    }
+                }
+                ExportDecl::Default(inner) => match &**inner {
+                    syntax::ExportDefault::Function(f) => {
+                        if let Some(name) = f.name {
+                            register_lexical_name(&mut lexical, &vars, crux::lookup(name), f.span)?;
+                        }
+                    }
+                    syntax::ExportDefault::Class(c) => {
+                        if let Some(name) = c.name {
+                            register_lexical_name(&mut lexical, &vars, crux::lookup(name), c.span)?;
+                        }
+                    }
+                    syntax::ExportDefault::Expr(_) => {}
+                },
+                ExportDecl::Named { specifiers, span } => {
+                    // A local export name must be a declared binding (spec
+                    // 16.2.2.1 step 3); `export … from 'm'` re-exports and is
+                    // exempt.
+                    for spec in specifiers {
+                        let local = export_specifier_local(spec);
+                        let ExportName::Ident(atom) = local else {
+                            continue;
+                        };
+                        exported_bindings.push((crux::lookup(*atom), *span));
+                    }
+                }
+                ExportDecl::From { .. } => {}
+            },
+        }
+    }
+    for (name, span) in exported_bindings {
+        if !lexical.contains(&name) && !vars.contains(&name) {
+            return Err(error_at(span, "Export of an undeclared name"));
+        }
+    }
+    Ok(())
+}
+
+fn register_module_statement_names(
+    stmt: &Stmt,
+    lexical: &mut HashSet<JsString>,
+    vars: &mut HashSet<JsString>,
+    span: Span,
+) -> Result<(), JsError> {
+    match &stmt.kind {
+        StmtKind::VarDecl { kind, decls, .. } => {
+            for decl in decls {
+                let mut names = Vec::new();
+                collect_pattern_names(&decl.pattern, &mut names);
+                if *kind == VarDeclKind::Var {
+                    for name in names {
+                        if lexical.contains(&name) {
+                            return Err(error_at(span, "Duplicate declaration"));
+                        }
+                        vars.insert(name);
+                    }
+                } else {
+                    for name in names {
+                        register_lexical_name(lexical, vars, name, span)?;
+                    }
+                }
+            }
+        }
+        StmtKind::UsingDecl { decls, .. } => {
+            for decl in decls {
+                let mut names = Vec::new();
+                collect_pattern_names(&decl.pattern, &mut names);
+                for name in names {
+                    register_lexical_name(lexical, vars, name, span)?;
+                }
+            }
+        }
+        StmtKind::FunctionDecl(f) => {
+            if let Some(name) = f.name {
+                register_lexical_name(lexical, vars, crux::lookup(name), span)?;
+            }
+        }
+        StmtKind::ClassDecl(c) => {
+            if let Some(name) = c.name {
+                register_lexical_name(lexical, vars, crux::lookup(name), span)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn register_lexical_name(
+    lexical: &mut HashSet<JsString>,
+    vars: &HashSet<JsString>,
+    name: JsString,
+    span: Span,
+) -> Result<(), JsError> {
+    if lexical.contains(&name) || vars.contains(&name) {
+        return Err(error_at(span, "Duplicate declaration"));
+    }
+    lexical.insert(name);
+    Ok(())
 }
 
 fn check_stmts(stmts: &[Stmt], labels: &mut LabelState) -> Result<(), JsError> {
@@ -1007,8 +1139,30 @@ fn register_export_name(
 ) -> Result<(), JsError> {
     match name {
         ExportName::Ident(atom) => register_export_string(seen, crux::lookup(atom), span),
-        ExportName::Str(value) => register_export_string(seen, value, span),
+        ExportName::Str(value) => {
+            // A string export name must be well-formed UTF-16: an unpaired
+            // surrogate in an ExportedName is a Syntax Error (spec 16.2.3).
+            if !is_well_formed_utf16(value.as_slice()) {
+                return Err(error_at(span, "Export name contains an unpaired surrogate"));
+            }
+            register_export_string(seen, value, span)
+        }
     }
+}
+
+fn is_well_formed_utf16(units: &[u16]) -> bool {
+    let mut iter = units.iter();
+    while let Some(&unit) = iter.next() {
+        if (0xD800..=0xDBFF).contains(&unit) {
+            match iter.next() {
+                Some(&low) if (0xDC00..=0xDFFF).contains(&low) => {}
+                _ => return false,
+            }
+        } else if (0xDC00..=0xDFFF).contains(&unit) {
+            return false;
+        }
+    }
+    true
 }
 
 fn register_export_string(

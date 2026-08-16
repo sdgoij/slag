@@ -19,8 +19,8 @@ use crate::context::{get_property, new_private_environment, new_private_name};
 use crate::env::{EnvRef, new_declarative_environment};
 use crate::expr::eval_expr;
 use crate::function::{
-    ConstructorKind, instantiate_accessor, instantiate_class_constructor, instantiate_method,
-    make_method, set_function_name,
+    ConstructorKind, default_binding_display_name, instantiate_accessor,
+    instantiate_class_constructor, instantiate_method, make_method, set_function_name,
 };
 
 /// ClassDefinitionEvaluation (spec 15.7.14). `class_binding` is the class
@@ -261,8 +261,10 @@ fn build_class(
     make_method(agent, &ctor, Value::Object(proto.clone()))?;
 
     // SetFunctionName(ctor, className): the empty string for anonymous
-    // class expressions (the enclosing binding renames it later).
-    let class_name = binding.clone().unwrap_or_else(|| JsString::from_utf8(""));
+    // class expressions (the enclosing binding renames it later); a default
+    // export's `*default*` binding is renamed to "default" (spec 15.2.3.11).
+    let class_name =
+        default_binding_display_name(binding.clone()).unwrap_or_else(|| JsString::from_utf8(""));
     set_function_name(&ctor, &class_name, None)?;
 
     // MakeConstructor(ctor, false, proto) (spec steps 26-27): the class

@@ -18,10 +18,10 @@ use crux::property::PropertyKey;
 use crux::string::JsString;
 use crux::value::{Value, is_callable};
 use syntax::ast::{
-    Argument, ArrayElement, AssignOp, BinaryOp, BindingElement, BindingPattern, Class,
-    ClassElement, ClassElementName, Expr, ExprKind, ForBinding, ForInit, Function, LogicalOp,
-    MemberProperty, ObjectLiteral, ObjectProperty, PropertyName, Stmt, StmtKind, SwitchCase,
-    UnaryOp, UpdateOp, VarDeclKind, VarDeclarator,
+    Argument, ArrayBindingElement, ArrayElement, AssignOp, BinaryOp, BindingElement,
+    BindingPattern, Class, ClassElement, ClassElementName, Expr, ExprKind, ForBinding, ForInit,
+    Function, LogicalOp, MemberProperty, ObjectLiteral, ObjectProperty, PropertyName, Stmt,
+    StmtKind, SwitchCase, UnaryOp, UpdateOp, VarDeclKind, VarDeclarator,
 };
 
 use crate::agent::Agent;
@@ -1041,7 +1041,10 @@ impl Vm {
                 }
                 Step::SetFunctionName { name } => {
                     let value = self.pop();
-                    crate::function::set_function_name(&value, &crux::lookup(name), None)?;
+                    let display =
+                        crate::function::default_binding_display_name(Some(crux::lookup(name)))
+                            .unwrap_or_else(|| crux::lookup(name));
+                    crate::function::set_function_name(&value, &display, None)?;
                     self.stack.push(value);
                 }
                 Step::SetChainShort => {
@@ -2512,7 +2515,10 @@ impl Vm {
             AssignOp::Assign => {
                 let value = self.pop();
                 if set_name {
-                    crate::function::set_function_name(&value, &crux::lookup(name), None)?;
+                    let display =
+                        crate::function::default_binding_display_name(Some(crux::lookup(name)))
+                            .unwrap_or_else(|| crux::lookup(name));
+                    crate::function::set_function_name(&value, &display, None)?;
                 }
                 crate::context::put_value(agent, &reference, value.clone())?;
                 self.stack.push(value);
@@ -2894,6 +2900,40 @@ fn unwrap_default(expr: &Expr) -> (&Expr, Option<&Expr>) {
         } => (target.as_ref(), Some(initializer.as_ref())),
         _ => (expr, None),
     }
+}
+
+/// Whether a binding pattern or a declaration initializer contains a
+/// suspension point: a default initializer, computed key, or nested pattern
+/// with `yield`/`await`. Such declarations must be compiled to steps (the
+/// runtime `binding_initialization` evaluates defaults through the
+/// synchronous tree-walker, which cannot suspend).
+fn binding_pattern_contains_suspension_any(pattern: &BindingPattern, init: Option<&Expr>) -> bool {
+    init.is_some_and(expr_contains_suspension)
+        || match pattern {
+            BindingPattern::Ident(_) => false,
+            BindingPattern::Object(props) => props.iter().any(|prop| match prop {
+                syntax::ast::ObjectBindingProperty::Property { key, element, .. } => {
+                    pattern_element_contains_suspension(element)
+                        || matches!(key, PropertyName::Computed(e) if expr_contains_suspension(e))
+                }
+                syntax::ast::ObjectBindingProperty::Rest(element) => {
+                    pattern_element_contains_suspension(element)
+                }
+            }),
+            BindingPattern::Array(elements) => elements.iter().any(|element| match element {
+                ArrayBindingElement::Hole => false,
+                ArrayBindingElement::Element(e) | ArrayBindingElement::Rest(e) => {
+                    pattern_element_contains_suspension(e)
+                }
+            }),
+        }
+}
+
+/// Whether a binding element (pattern + optional default) contains a
+/// suspension point, either in the default initializer or in a nested
+/// pattern's defaults/computed keys.
+fn pattern_element_contains_suspension(element: &BindingElement) -> bool {
+    binding_pattern_contains_suspension_any(&element.pattern, element.init.as_ref())
 }
 
 fn nullish_error(what: &str) -> JsError {
@@ -3623,7 +3663,7 @@ pub fn stmt_contains_suspension(stmt: &Stmt) -> bool {
         StmtKind::ClassDecl(class) => class_contains_suspension(class),
         StmtKind::VarDecl { decls, .. } => decls
             .iter()
-            .any(|d| d.init.as_ref().is_some_and(expr_contains_suspension)),
+            .any(|d| binding_pattern_contains_suspension_any(&d.pattern, d.init.as_ref())),
         // An `await using` statement always implies an await (even with a
         // null initializer, spec 9.4.4), and its scope's async disposal must
         // suspend: compile it (and any enclosing scope) instead of batching
@@ -3631,7 +3671,7 @@ pub fn stmt_contains_suspension(stmt: &Stmt) -> bool {
         StmtKind::UsingDecl { is_await: true, .. } => true,
         StmtKind::UsingDecl { decls, .. } => decls
             .iter()
-            .any(|d| d.init.as_ref().is_some_and(expr_contains_suspension)),
+            .any(|d| binding_pattern_contains_suspension_any(&d.pattern, d.init.as_ref())),
         StmtKind::With { object, body } => {
             expr_contains_suspension(object) || stmt_contains_suspension(body)
         }
@@ -4194,16 +4234,30 @@ impl Compiler {
                 for decl in decls {
                     if let Some(init) = &decl.init {
                         self.compile_expr(init)?;
-                        let step = if declaration {
-                            Step::DeclInit {
-                                pattern: decl.pattern.clone(),
-                            }
+                        if let BindingPattern::Ident(name) = &decl.pattern
+                            && crate::function::is_anonymous_function_definition(init)
+                        {
+                            // NamedEvaluation (spec 14.2.2 step 2.d): an
+                            // anonymous function/class initializer is named
+                            // after its binding.
+                            self.emit(Step::SetFunctionName { name: *name });
+                        }
+                        if self.binding_pattern_contains_suspension(&decl.pattern) {
+                            // Defaults/computed keys with `yield`/`await`
+                            // compile inline so they can suspend.
+                            self.compile_destructure_binding(&decl.pattern, declaration)?;
                         } else {
-                            Step::Destructure {
-                                pattern: decl.pattern.clone(),
-                            }
-                        };
-                        self.emit(step);
+                            let step = if declaration {
+                                Step::DeclInit {
+                                    pattern: decl.pattern.clone(),
+                                }
+                            } else {
+                                Step::Destructure {
+                                    pattern: decl.pattern.clone(),
+                                }
+                            };
+                            self.emit(step);
+                        }
                     }
                 }
             }
@@ -5130,6 +5184,164 @@ impl Compiler {
             }
         }
         member_in(target) || expr_contains_suspension(target)
+    }
+
+    /// Whether a binding pattern contains a suspension point in any default
+    /// initializer or computed key. Such patterns must be compiled to steps
+    /// (the runtime `binding_initialization` evaluates defaults through the
+    /// synchronous tree-walker, which cannot suspend).
+    fn binding_pattern_contains_suspension(&self, pattern: &BindingPattern) -> bool {
+        match pattern {
+            BindingPattern::Ident(_) => false,
+            BindingPattern::Object(props) => props.iter().any(|prop| match prop {
+                syntax::ast::ObjectBindingProperty::Property { key, element, .. } => {
+                    pattern_element_contains_suspension(element)
+                        || matches!(key, PropertyName::Computed(e) if expr_contains_suspension(e))
+                }
+                syntax::ast::ObjectBindingProperty::Rest(element) => {
+                    pattern_element_contains_suspension(element)
+                }
+            }),
+            BindingPattern::Array(elements) => elements.iter().any(|element| match element {
+                ArrayBindingElement::Hole => false,
+                ArrayBindingElement::Element(e) | ArrayBindingElement::Rest(e) => {
+                    pattern_element_contains_suspension(e)
+                }
+            }),
+        }
+    }
+
+    /// Compile a destructuring binding pattern into steps (spec 13.13.11):
+    /// the value is on top of the stack; defaults and computed keys compile
+    /// inline so `yield`/`await` in them suspends the resumable body, and
+    /// each element binds into the lexical (`DeclInit`) or var (`Destructure`)
+    /// environment. Only used when `binding_pattern_contains_suspension` is
+    /// true — otherwise the single-step wholesale binding is faster.
+    fn compile_destructure_binding(
+        &mut self,
+        pattern: &BindingPattern,
+        lexical: bool,
+    ) -> Result<(), JsError> {
+        let bind = |compiler: &mut Self, element: &BindingElement| -> Result<(), JsError> {
+            // A default initializer compiles inline so it can suspend; a
+            // nested pattern with suspension recurses step-wise; otherwise
+            // the whole element binds in one step. The value is on top of
+            // the stack either way (spec 13.13.11 step 5.d).
+            let bind_element = |compiler: &mut Self| -> Result<(), JsError> {
+                if compiler.binding_pattern_contains_suspension(&element.pattern) {
+                    compiler.compile_destructure_binding(&element.pattern, lexical)
+                } else {
+                    compiler.emit(if lexical {
+                        Step::DeclInit {
+                            pattern: element.pattern.clone(),
+                        }
+                    } else {
+                        Step::Destructure {
+                            pattern: element.pattern.clone(),
+                        }
+                    });
+                    compiler.emit(Step::Pop);
+                    Ok(())
+                }
+            };
+            if let Some(init) = &element.init {
+                let use_default = compiler.new_label();
+                let after = compiler.new_label();
+                compiler.emit_destructure_undef(use_default);
+                bind_element(compiler)?;
+                compiler.jump(after);
+                compiler.place(use_default);
+                compiler.compile_expr(init)?;
+                bind_element(compiler)?;
+                compiler.place(after);
+            } else {
+                bind_element(compiler)?;
+            }
+            Ok(())
+        };
+        match pattern {
+            BindingPattern::Ident(_) => {
+                // A plain identifier with a suspension default cannot occur
+                // (the default belongs to the declaration's init, not the
+                // pattern); treat as a plain binding.
+                self.emit(if lexical {
+                    Step::DeclInit {
+                        pattern: pattern.clone(),
+                    }
+                } else {
+                    Step::Destructure {
+                        pattern: pattern.clone(),
+                    }
+                });
+                self.emit(Step::Pop);
+            }
+            BindingPattern::Array(elements) => {
+                self.emit(Step::DestructureBegin);
+                let end_label = self.new_label();
+                for element in elements {
+                    match element {
+                        ArrayBindingElement::Hole => {
+                            self.emit_destructure_next();
+                            self.emit(Step::Pop);
+                        }
+                        ArrayBindingElement::Element(element) => {
+                            self.emit_destructure_next();
+                            bind(self, element)?;
+                        }
+                        ArrayBindingElement::Rest(element) => {
+                            self.emit(Step::DestructureRest);
+                            bind(self, element)?;
+                            self.place(end_label);
+                            return Ok(());
+                        }
+                    }
+                }
+                self.emit(Step::DestructureClose);
+                self.place(end_label);
+            }
+            BindingPattern::Object(props) => {
+                let mut excluded: Vec<crux::property::PropertyKey> = Vec::new();
+                self.emit(Step::DestructureObjCoercible);
+                for prop in props {
+                    match prop {
+                        syntax::ast::ObjectBindingProperty::Property { key, element, .. } => {
+                            match key {
+                                PropertyName::Ident(id) => {
+                                    let key = crux::property::PropertyKey::String(*id);
+                                    self.emit(Step::DestructureObjKey { key: key.clone() });
+                                    excluded.push(key);
+                                }
+                                PropertyName::Str(text) => {
+                                    let key = crux::property::PropertyKey::from_js_string(text);
+                                    self.emit(Step::DestructureObjKey { key: key.clone() });
+                                    excluded.push(key);
+                                }
+                                PropertyName::Number(n) => {
+                                    let key = crux::property::PropertyKey::from_js_string(
+                                        &crux::convert::to_string(&Value::Number(*n))?,
+                                    );
+                                    self.emit(Step::DestructureObjKey { key: key.clone() });
+                                    excluded.push(key);
+                                }
+                                PropertyName::Computed(expr) => {
+                                    self.compile_expr(expr)?;
+                                    self.emit(Step::DestructureObjKeyComputed);
+                                }
+                            }
+                            bind(self, element)?;
+                        }
+                        syntax::ast::ObjectBindingProperty::Rest(element) => {
+                            self.emit(Step::DestructureObjRest {
+                                excluded: excluded.clone(),
+                            });
+                            bind(self, element)?;
+                        }
+                    }
+                }
+                self.emit(Step::DestructureObjEnd);
+            }
+        }
+        Ok(())
     }
 
     /// Compile a destructuring assignment pattern into steps (spec 13.15.5):

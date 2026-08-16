@@ -406,6 +406,24 @@ fn to_string_arg(agent: &mut Agent, value: &Value) -> Result<JsString, JsError> 
     )?)
 }
 
+/// Validate that `text` is well-formed JSON (used by JSON modules, which
+/// must reject invalid sources at resolution time with a SyntaxError, spec
+/// 16.2.1.7.1 ParseModule for JSON modules). The parsed value is discarded.
+pub(crate) fn validate_json(agent: &mut Agent, text: &str) -> Result<(), JsError> {
+    let bytes = text.as_bytes();
+    let mut parser = JsonParser {
+        agent,
+        text: bytes,
+        pos: 0,
+    };
+    parser.parse_value()?;
+    parser.skip_ws();
+    if parser.pos != parser.text.len() {
+        return Err(parser.syntax_error());
+    }
+    Ok(())
+}
+
 /// JSON.parse (spec 26.6.2): parse the text, then internalize through the
 /// reviver with the ES2026 parse-record context.
 fn json_parse(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {

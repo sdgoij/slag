@@ -552,7 +552,9 @@ impl DeclarativeEnv {
     }
 
     /// CreateImportBinding (spec 9.2.5.2): an initialized immutable indirect
-    /// binding that reads through to `target_name` in `target`.
+    /// binding that reads through to `target_name` in `target`. The value slot
+    /// is marked initialized so writes report the immutable TypeError rather
+    /// than a TDZ ReferenceError; reads always go through `indirect`.
     fn create_import_binding(
         &self,
         name: &JsString,
@@ -568,7 +570,7 @@ impl DeclarativeEnv {
         self.bindings.borrow_mut().push((
             name.clone(),
             Binding {
-                value: None,
+                value: Some(Value::Undefined),
                 mutable: false,
                 strict: true,
                 deletable: false,

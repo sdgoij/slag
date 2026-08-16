@@ -152,6 +152,9 @@ pub struct EcmaFunction {
     /// The exact source text of the definition (Function.prototype.toString,
     /// spec 20.2.3.5); `None` for synthesized/native callables.
     pub source: Option<JsString>,
+    /// The module this function's source text appears in (import.meta resolves
+    /// lexically to it, spec 13.3.7.1); `None` for script and builtin code.
+    pub declaring_module: Option<Handle<crate::module::SourceTextModule>>,
     /// The compiled resumable body (PLAN §4.5) for generator/async
     /// functions; ordinary functions evaluate the AST directly.
     pub ir: Option<crate::ir::CompiledBody>,
@@ -232,6 +235,20 @@ pub fn is_anonymous_function_definition(expr: &syntax::ast::Expr) -> bool {
         ExprKind::Paren(inner) => is_anonymous_function_definition(inner),
         _ => false,
     }
+}
+
+/// The name property of a `export default function/class`: the synthesized
+/// `*default*` binding name is renamed to "default" (spec 15.2.3.11
+/// InitializeBoundName renames via SetFunctionName). Other names pass
+/// through unchanged.
+pub(crate) fn default_binding_display_name(name: Option<JsString>) -> Option<JsString> {
+    name.map(|text| {
+        if text == JsString::from_utf8("*default*") {
+            JsString::from_utf8("default")
+        } else {
+            text
+        }
+    })
 }
 
 /// SetFunctionName (spec 10.2.11): redefine the `name` own data property of
@@ -388,7 +405,7 @@ pub fn instantiate_function_with_source(
     let body = shared_function_body(agent, f, source.as_ref());
     register_function(
         agent,
-        f.name.map(crux::lookup),
+        default_binding_display_name(f.name.map(crux::lookup)),
         f.params.clone(),
         body,
         environment,
@@ -607,6 +624,14 @@ fn register_function(
     };
     let realm = agent.current_realm()?;
     let private_environment = agent.running_context()?.private_environment.clone();
+    let declaring_module =
+        agent
+            .running_context()
+            .ok()
+            .and_then(|context| match &context.script_or_module {
+                Some(crate::context::ScriptOrModule::Module(module)) => Some(module.clone()),
+                _ => None,
+            });
     let mut data = EcmaFunction {
         name: name.clone(),
         params: params.clone(),
@@ -628,6 +653,7 @@ fn register_function(
         is_generator: kind.is_generator,
         class_field_initializer: false,
         source,
+        declaring_module,
         ir: None,
     };
     if kind.is_generator || kind.is_async {
@@ -894,6 +920,7 @@ pub fn instantiate_arrow(
         is_generator: false,
         class_field_initializer,
         source: None,
+        declaring_module: None,
         ir: None,
     };
     if is_async {
@@ -1418,7 +1445,7 @@ fn ordinary_call(
     // Copy only the slots a call reads; the record also holds per-function
     // data (source text, compiled IR, class fields) whose clones would
     // re-allocate on every call.
-    let (old_env, this_mode, realm, private_environment, strict, params, body) = {
+    let (old_env, this_mode, realm, private_environment, strict, params, body, declaring_module) = {
         let record = agent.ecma_functions.get(&function.id()).ok_or_else(|| {
             JsError::new(
                 ErrorKind::TypeError,
@@ -1433,6 +1460,7 @@ fn ordinary_call(
             record.strict,
             record.params.clone(),
             record.body.clone(),
+            record.declaring_module.clone(),
         )
     };
     let function_value = function.self_value();
@@ -1442,10 +1470,21 @@ fn ordinary_call(
         Value::Undefined,
         this_mode == ThisMode::Lexical,
     );
+    // PrepareForOrdinaryCall (spec 10.2.1 step 3): the callee context's
+    // [[ScriptOrModule]] is the caller's — but `import.meta` resolves
+    // lexically to the module a function is declared in (spec 13.3.7.1), so
+    // a function's declaring module wins over the caller's.
+    let caller_script_or_module = agent
+        .running_context()
+        .ok()
+        .and_then(|context| context.script_or_module.clone());
+    let script_or_module = declaring_module
+        .map(crate::context::ScriptOrModule::Module)
+        .or(caller_script_or_module);
     agent.execution_context_stack.push(ExecutionContext {
         function: Some(function_value.clone()),
         realm,
-        script_or_module: None,
+        script_or_module,
         lexical_environment: function_env.clone(),
         variable_environment: function_env.clone(),
         private_environment,
@@ -1593,10 +1632,19 @@ fn ordinary_construct(
         new_target.clone(),
         false,
     );
+    let caller_script_or_module = agent
+        .running_context()
+        .ok()
+        .and_then(|context| context.script_or_module.clone());
+    let script_or_module = data
+        .declaring_module
+        .clone()
+        .map(crate::context::ScriptOrModule::Module)
+        .or(caller_script_or_module);
     agent.execution_context_stack.push(ExecutionContext {
         function: Some(function_value.clone()),
         realm: data.realm.clone(),
-        script_or_module: None,
+        script_or_module,
         lexical_environment: function_env.clone(),
         variable_environment: function_env.clone(),
         private_environment: data.private_environment.clone(),

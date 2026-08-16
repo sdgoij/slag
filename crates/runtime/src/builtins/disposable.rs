@@ -1018,6 +1018,11 @@ pub enum AsyncBodySettlement {
     Function { resolve: Value, reject: Value },
     /// Async generator: complete the current request and drain the queue.
     Generator { object_id: u64 },
+    /// Module body: settle the module record with the final completion.
+    Module {
+        module: std::rc::Rc<crate::module::SourceTextModule>,
+        state: std::rc::Rc<std::cell::RefCell<crate::async_await::AsyncFunctionState>>,
+    },
 }
 
 /// The driver of an in-flight awaited disposal of an async body's `using`
@@ -1219,6 +1224,9 @@ fn settle_async_body_completion(
         },
         AsyncBodySettlement::Generator { object_id } => {
             crate::async_generator::complete_current_request(agent, *object_id, completion)?;
+        }
+        AsyncBodySettlement::Module { module, state } => {
+            crate::module::finish_module_evaluation(agent, module, state, completion)?;
         }
     }
     Ok(())

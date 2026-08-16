@@ -13,8 +13,8 @@ use crux::string::JsString;
 use crux::value::Value;
 
 use syntax::ast::{
-    AssignOp, AttributeKey, ExportDecl, ExportDefault, ExportName, ExportSpecifier, Expr, ExprKind,
-    ImportEntry, Module, ModuleItem, Stmt, StmtKind, VarDeclKind,
+    AttributeKey, BindingPattern, ExportDecl, ExportDefault, ExportName, ExportSpecifier,
+    ImportEntry, Module, ModuleItem, Stmt, StmtKind, VarDeclKind, VarDeclarator,
 };
 
 use crate::agent::Agent;
@@ -75,6 +75,8 @@ pub struct SourceTextModule {
     pub star_export_entries: Vec<ExportEntry>,
     pub top_level_capability: RefCell<Option<crate::promise::PromiseCapability>>,
     pub evaluation_error: RefCell<Option<Value>>,
+    /// [[ImportMeta]] (spec 16.2.1.8): created on first access and cached.
+    pub import_meta: RefCell<Option<Value>>,
 }
 
 /// A host-provided module source (HostResolveImportedModule).
@@ -121,7 +123,7 @@ struct ModuleRecords {
 
 /// Parse a module source into a Source Text Module Record.
 pub fn parse_module(
-    agent: &Agent,
+    agent: &mut Agent,
     specifier: &JsString,
     source: &JsString,
 ) -> Result<Handle<SourceTextModule>, JsError> {
@@ -132,8 +134,13 @@ pub fn parse_module(
         match host {
             Some(entry) if entry.json => {
                 // A JSON module is a module whose default export is the JSON
-                // value: `export default <json>`.
-                let wrapped = format!("export default {}", entry.source.to_string_lossy());
+                // value: `export default <json>`. The source must be
+                // well-formed JSON first (spec 16.2.1.7.1 ParseModule): an
+                // invalid source is a SyntaxError at resolution, even though
+                // the wrapped text would parse as JavaScript.
+                let text = entry.source.to_string_lossy();
+                crate::builtins::json::validate_json(agent, &text)?;
+                let wrapped = format!("export default {text}");
                 parser::parse_module(&wrapped)?
             }
             _ => parser::parse_module(&source.to_string_lossy())?,
@@ -154,6 +161,7 @@ pub fn parse_module(
         star_export_entries: records.star_export_entries,
         top_level_capability: RefCell::new(None),
         evaluation_error: RefCell::new(None),
+        import_meta: RefCell::new(None),
         cycle_root: RefCell::new(None),
         async_parents: RefCell::new(Vec::new()),
         pending_async: RefCell::new(0),
@@ -217,6 +225,49 @@ fn collect_module_records(code: &Module) -> ModuleRecords {
                         let ExportName::Ident(local_id) = local else {
                             continue;
                         };
+                        // A re-export of an imported name resolves through the
+                        // import (spec 16.2.1.7.1 step 10): a namespace import
+                        // becomes an indirect namespace export (both star
+                        // resolutions then agree on the namespace), and a
+                        // named import an indirect single-name export.
+                        if let Some((specifier, entry)) = import_entries
+                            .iter()
+                            .find(|(_, entry)| matches!(entry, ImportEntry::Namespace { local, .. } | ImportEntry::Named { local, .. } | ImportEntry::Default { local, .. } if crux::lookup(*local) == crux::lookup(local_id)))
+                        {
+                            match entry {
+                                ImportEntry::Namespace { .. } => {
+                                    indirect_export_entries.push(ExportEntry {
+                                        export_name: Some(exported),
+                                        module_request: Some(specifier.clone()),
+                                        import_name: None,
+                                        local_name: None,
+                                    });
+                                }
+                                ImportEntry::Named { imported, .. } => {
+                                    let import_name = match imported {
+                                        ExportName::Ident(id) => ExportName::Ident(*id),
+                                        ExportName::Str(text) => ExportName::Str(text.clone()),
+                                    };
+                                    indirect_export_entries.push(ExportEntry {
+                                        export_name: Some(exported),
+                                        module_request: Some(specifier.clone()),
+                                        import_name: Some(import_name),
+                                        local_name: None,
+                                    });
+                                }
+                                ImportEntry::Default { .. } => {
+                                    indirect_export_entries.push(ExportEntry {
+                                        export_name: Some(exported),
+                                        module_request: Some(specifier.clone()),
+                                        import_name: Some(ExportName::Ident(crux::intern(
+                                            "default".encode_utf16().collect::<Vec<u16>>().as_slice(),
+                                        ))),
+                                        local_name: None,
+                                    });
+                                }
+                            }
+                            continue;
+                        }
                         local_export_entries.push(ExportEntry {
                             export_name: Some(exported),
                             module_request: None,
@@ -234,13 +285,15 @@ fn collect_module_records(code: &Module) -> ModuleRecords {
                 } => {
                     if let Some(namespace) = namespace {
                         // `export * as ns from ...`: a local namespace binding
-                        // whose value is the imported module's namespace.
+                        // whose value is the imported module's namespace. The
+                        // export name may be a string (arbitrary module
+                        // namespace names).
                         let local = match namespace {
-                            ExportName::Ident(id) => *id,
-                            ExportName::Str(_) => continue,
+                            ExportName::Ident(id) => ExportName::Ident(*id),
+                            ExportName::Str(text) => ExportName::Str(text.clone()),
                         };
                         local_export_entries.push(ExportEntry {
-                            export_name: Some(ExportName::Ident(local)),
+                            export_name: Some(local),
                             module_request: Some(specifier.clone()),
                             import_name: None,
                             local_name: None,
@@ -386,6 +439,17 @@ pub fn module_declaration_instantiation(
     let env = new_module_environment(Some(module.realm.global_env.clone()));
     module.environment.replace(Some(env.clone()));
 
+    // spec 16.2.1.6.1.2.1 step 8: every requested module — including those
+    // referenced only by `export *`/`export {} from` — must resolve and link
+    // before this module's own bindings are created. Resolving an import can
+    // land on a star-reached module, whose environment must exist already;
+    // instantiation is idempotent through the status check.
+    let requested = module.requested_modules.clone();
+    for (specifier, _) in requested {
+        let imported = host_resolve_imported_module(agent, &specifier)?;
+        module_declaration_instantiation(agent, &imported)?;
+    }
+
     // Import bindings (live, through the imported module's environment).
     let imports = module.import_entries.clone();
     for (specifier, entry) in imports {
@@ -446,6 +510,7 @@ pub fn module_declaration_instantiation(
         }
     }
 
+    // Local export bindings.
     // Instantiate the module's top-level declarations first: the export loop
     // below must not pre-create bindings for names the declarations bind
     // (spec 16.2.1.6.1.2.1 step 7 creates an export binding only when the
@@ -488,6 +553,12 @@ pub fn module_declaration_instantiation(
         })?;
         let imported = host_resolve_imported_module(agent, specifier)?;
         module_declaration_instantiation(agent, &imported)?;
+        // A namespace re-export (`import * as ns; export { ns }`) has no
+        // import name: the binding is the imported module's namespace.
+        if export.import_name.is_none() {
+            module_namespace(agent, &imported)?;
+            continue;
+        }
         let import_name = export_name_string(export.import_name.as_ref())?;
         let mut resolve_set = Vec::new();
         if resolve_export(agent, &imported, &import_name, &mut resolve_set)?.is_none() {
@@ -506,6 +577,94 @@ pub fn module_declaration_instantiation(
     Ok(())
 }
 
+/// The var-declared names of a statement, descending into statement bodies
+/// (VarDeclaredNames semantics, spec 16.2.1.7.1.5): a `var` in a for head, an
+/// if branch, or a nested block hoists to the module. Function and class
+/// bodies are separate units and contribute nothing.
+fn collect_module_var_names(stmt: &Stmt, out: &mut Vec<JsString>) {
+    match &stmt.kind {
+        StmtKind::VarDecl {
+            kind: VarDeclKind::Var,
+            decls,
+            ..
+        } => {
+            for decl in decls {
+                crate::script::bound_names(&decl.pattern, out);
+            }
+        }
+        StmtKind::Block(block) => {
+            for inner in &block.stmts {
+                collect_module_var_names(inner, out);
+            }
+        }
+        StmtKind::If {
+            consequent,
+            alternate,
+            ..
+        } => {
+            collect_module_var_names(consequent, out);
+            if let Some(alternate) = alternate {
+                collect_module_var_names(alternate, out);
+            }
+        }
+        StmtKind::While { body, .. } | StmtKind::DoWhile { body, .. } => {
+            collect_module_var_names(body, out);
+        }
+        StmtKind::For { init, body, .. } => {
+            if let Some(syntax::ForInit::VarDecl {
+                kind: VarDeclKind::Var,
+                decls,
+            }) = init
+            {
+                for decl in decls {
+                    crate::script::bound_names(&decl.pattern, out);
+                }
+            }
+            collect_module_var_names(body, out);
+        }
+        StmtKind::ForIn { left, body, .. } | StmtKind::ForOf { left, body, .. } => {
+            if let syntax::ForBinding::VarDecl {
+                kind: VarDeclKind::Var,
+                pattern,
+                ..
+            } = left
+            {
+                crate::script::bound_names(pattern, out);
+            }
+            collect_module_var_names(body, out);
+        }
+        StmtKind::Labeled { body, .. } => collect_module_var_names(body, out),
+        StmtKind::With { body, .. } => collect_module_var_names(body, out),
+        StmtKind::Switch { cases, .. } => {
+            for case in cases {
+                for inner in &case.consequent {
+                    collect_module_var_names(inner, out);
+                }
+            }
+        }
+        StmtKind::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            for inner in &block.stmts {
+                collect_module_var_names(inner, out);
+            }
+            if let Some(handler) = handler {
+                for inner in &handler.body.stmts {
+                    collect_module_var_names(inner, out);
+                }
+            }
+            if let Some(finalizer) = finalizer {
+                for inner in &finalizer.stmts {
+                    collect_module_var_names(inner, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The module's top-level var/function/lexical declarations bind into the
 /// module environment (spec 16.2.2.4 steps 22-27).
 fn instantiate_module_declarations(
@@ -515,29 +674,22 @@ fn instantiate_module_declarations(
 ) -> Result<(), JsError> {
     let stmts = module_statements(module);
     // Var declarations first (hoisted), then functions, then lexical.
+    // VarDeclaredNames descends into statement bodies (for heads, if
+    // branches, blocks), so the hoisted bindings exist for every `var`
+    // anywhere in the module body (spec 16.2.2.4 steps 22-27).
+    let mut var_names: Vec<JsString> = Vec::new();
     for stmt in &stmts {
-        let StmtKind::VarDecl {
-            kind: VarDeclKind::Var,
-            decls,
-            ..
-        } = &stmt.kind
-        else {
-            continue;
-        };
-        for decl in decls {
-            let mut names = Vec::new();
-            crate::script::bound_names(&decl.pattern, &mut names);
-            for name in names {
-                if !env.has_binding(&name)? {
-                    env.create_mutable_binding(&name, false)?;
-                }
-                // spec 16.2.1.7.3.1 step 6: var bindings start
-                // initialized to *undefined* (a pre-existing binding is a
-                // declaration the pre-pass created, or a function/import
-                // name the parser forbids from colliding with a var).
-                env.initialize_binding(&name, Value::Undefined)?;
-            }
+        collect_module_var_names(stmt, &mut var_names);
+    }
+    for name in var_names {
+        if !env.has_binding(&name)? {
+            env.create_mutable_binding(&name, false)?;
         }
+        // spec 16.2.1.7.3.1 step 6: var bindings start initialized to
+        // *undefined* (a pre-existing binding is a declaration the pre-pass
+        // created, or a function/import name the parser forbids from
+        // colliding with a var).
+        env.initialize_binding(&name, Value::Undefined)?;
     }
     for stmt in &stmts {
         let StmtKind::FunctionDecl(function) = &stmt.kind else {
@@ -561,6 +713,14 @@ fn instantiate_module_declarations(
                 true,
                 source,
             )?;
+            // The function's `import.meta` resolves lexically to this module
+            // (spec 13.3.7.1); instantiation runs in the harness context, so
+            // record the declaring module explicitly.
+            if let Value::Function(handle) = &func
+                && let Some(record) = agent.ecma_functions.get_mut(&handle.id())
+            {
+                record.declaring_module = Some(module.clone());
+            }
             env.initialize_binding(&name, func)?;
         }
     }
@@ -579,6 +739,15 @@ fn instantiate_module_declarations(
                     }
                 }
             }
+            StmtKind::UsingDecl { decls, .. } => {
+                for decl in decls {
+                    let mut names = Vec::new();
+                    crate::script::bound_names(&decl.pattern, &mut names);
+                    for name in names {
+                        env.create_mutable_binding(&name, false)?;
+                    }
+                }
+            }
             StmtKind::ClassDecl(class) => {
                 if let Some(name) = class.name {
                     let name = crux::lookup(name);
@@ -590,18 +759,12 @@ fn instantiate_module_declarations(
             _ => {}
         }
     }
-    // The synthesized `*default*` binding for `export default expr`. Only an
-    // expression default needs the undefined initial value: a default
-    // function/class declaration was already instantiated and bound above.
-    let default_declared = stmts.iter().any(|stmt| match &stmt.kind {
-        StmtKind::FunctionDecl(f) => f
-            .name
-            .is_some_and(|n| crux::lookup(n) == JsString::from_utf8("*default*")),
-        StmtKind::ClassDecl(c) => c
-            .name
-            .is_some_and(|n| crux::lookup(n) == JsString::from_utf8("*default*")),
-        _ => false,
-    });
+    // The synthesized `*default*` binding for `export default expr` is
+    // created uninitialized by the lexical-declaration loop above and
+    // initialized by the body's `let *default* = <expr>` statement: it is in
+    // the temporal dead zone until the module body evaluates it (spec
+    // 15.2.3.11 InitializeBoundName). A default function/class declaration
+    // was already instantiated and bound by the earlier loops.
     for export in &module.local_export_entries {
         if let Some(local) = export.local_name
             && crux::lookup(local) == JsString::from_utf8("*default*")
@@ -609,9 +772,6 @@ fn instantiate_module_declarations(
             let name = JsString::from_utf8("*default*");
             if !env.has_binding(&name)? {
                 env.create_mutable_binding(&name, false)?;
-            }
-            if !default_declared {
-                env.initialize_binding(&name, Value::Undefined)?;
             }
         }
     }
@@ -651,24 +811,22 @@ fn module_statements(module: &Handle<SourceTextModule>) -> Vec<Stmt> {
                     });
                 }
                 ExportDefault::Expr(expr) => {
-                    // `export default <expr>`: evaluate and bind `*default*`.
+                    // `export default <expr>`: a lexical binding that the
+                    // body's InitializeBoundName (spec 15.2.3.11 step 5)
+                    // initializes at evaluation time — the binding is TDZ
+                    // until then, like any other lexical declaration.
                     let atom =
                         crux::intern("*default*".encode_utf16().collect::<Vec<u16>>().as_slice());
-                    let target = Expr {
-                        span: expr.span,
-                        kind: ExprKind::Ident(atom),
-                    };
-                    let assign = Expr {
-                        span: expr.span,
-                        kind: ExprKind::Assign {
-                            op: AssignOp::Assign,
-                            target: Box::new(target),
-                            value: Box::new(expr.clone()),
-                        },
-                    };
                     stmts.push(Stmt {
                         span: expr.span,
-                        kind: StmtKind::Expr(assign),
+                        kind: StmtKind::VarDecl {
+                            kind: VarDeclKind::Let,
+                            decls: vec![VarDeclarator {
+                                pattern: BindingPattern::Ident(atom),
+                                init: Some(expr.clone()),
+                                span: expr.span,
+                            }],
+                        },
                     });
                 }
             },
@@ -768,8 +926,17 @@ pub fn module_evaluation(
                     }
                 }
                 ModuleStatus::Evaluated => {
-                    // Already settled (a direct error was recorded); nothing
-                    // to wait on.
+                    // Already settled: an errored dependency aborts this
+                    // module's evaluation with the recorded error (spec
+                    // 16.2.2.5 InnerModuleEvaluation step 6 — the abrupt
+                    // completion propagates).
+                    if let Some(error) = imported.evaluation_error.borrow().clone() {
+                        return Err(JsError::new(
+                            ErrorKind::TypeError,
+                            "dependency module errored".into(),
+                        )
+                        .with_value(error));
+                    }
                 }
                 ModuleStatus::EvaluatingAsync => {
                     // An async dependency still being evaluated: wait on it
@@ -778,6 +945,16 @@ pub fn module_evaluation(
                 }
                 _ => {
                     module_evaluation(agent, &imported)?;
+                    // A synchronously-errored dependency aborts this module's
+                    // evaluation with the dependency's error (spec 16.2.2.5
+                    // InnerModuleEvaluation step 6).
+                    if let Some(error) = imported.evaluation_error.borrow().clone() {
+                        return Err(JsError::new(
+                            ErrorKind::TypeError,
+                            "dependency module errored".into(),
+                        )
+                        .with_value(error));
+                    }
                     if *imported.status.borrow() == ModuleStatus::EvaluatingAsync {
                         register_async_parent(agent, module, &imported)?;
                     }
@@ -810,25 +987,27 @@ pub fn module_evaluation(
     Ok(capability.promise)
 }
 
-/// Record `module` as waiting on `dep`'s evaluation (through `dep`'s cycle
-/// root, so a whole errored cycle rejects its importers) — spec 16.2.2.5
-/// [[AsyncParentModules]]. Cycle members never register: a cycle is a single
-/// evaluation unit.
+/// Record `module` as waiting on `dep`'s evaluation — spec 16.2.2.5
+/// [[AsyncParentModules]]. A non-cycle importer of a cycle member waits on
+/// the cycle's root, so its body runs only after the whole cycle finishes
+/// (pending-async-dep-from-cycle). A cycle member waits on the dependency
+/// itself: its body must not run until the async cycle-member dependency
+/// settles.
 fn register_async_parent(
     agent: &mut Agent,
     module: &Handle<SourceTextModule>,
     dep: &Handle<SourceTextModule>,
 ) -> Result<(), JsError> {
     let _ = agent;
-    if module.cycle_root.borrow().is_some() {
-        return Ok(());
-    }
-    let root = dep
-        .cycle_root
-        .borrow()
-        .clone()
-        .unwrap_or_else(|| dep.clone());
-    root.async_parents.borrow_mut().push(module.clone());
+    let target = if module.cycle_root.borrow().is_some() {
+        dep.clone()
+    } else {
+        dep.cycle_root
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| dep.clone())
+    };
+    target.async_parents.borrow_mut().push(module.clone());
     *module.pending_async.borrow_mut() += 1;
     Ok(())
 }
@@ -894,7 +1073,23 @@ fn execute_module_body(
     match outcome {
         Ok(VmOutcome::Completed(completion)) => {
             agent.execution_context_stack.pop();
-            finish_module_evaluation(agent, module, &state, completion)?;
+            // The module body's `using` resources are disposed at completion
+            // in reverse registration order, like an async body (spec 9.4.3
+            // + 16.2.2.5): drain and dispose before settling the capability.
+            let resources = state.borrow().vm.lexical_env.drain_disposable_resources();
+            if resources.is_empty() {
+                finish_module_evaluation(agent, module, &state, completion)?;
+            } else {
+                crate::builtins::disposable::dispose_async_body_resources(
+                    agent,
+                    resources,
+                    completion,
+                    crate::builtins::disposable::AsyncBodySettlement::Module {
+                        module: module.clone(),
+                        state: state.clone(),
+                    },
+                )?;
+            }
         }
         Ok(VmOutcome::Suspended(Suspension::Await(value))) => {
             agent.execution_context_stack.pop();
@@ -938,8 +1133,12 @@ pub(crate) fn finish_module_evaluation(
     }
     module.status.replace(ModuleStatus::Evaluated);
     match completion {
-        Completion::Return(value) | Completion::Normal(value) => {
-            crate::function::call(agent, &resolve, Value::Undefined, &[value])?;
+        Completion::Return(_) | Completion::Normal(_) => {
+            // AsyncModuleExecutionFulfilled (spec 16.2.2.5 step 2): the
+            // capability resolves with *undefined* — never with the body's
+            // completion value, which could be a pending promise (e.g. the
+            // value of a trailing dynamic-import statement) and deadlock.
+            crate::function::call(agent, &resolve, Value::Undefined, &[Value::Undefined])?;
             notify_async_parents_fulfilled(agent, module)?;
         }
         Completion::Empty => {
@@ -1023,7 +1222,17 @@ fn notify_async_parents_fulfilled(
             *pending
         };
         if pending == 0 {
-            execute_module_body(agent, &parent)?;
+            // Defer the parent's body through the job queue: the parents of
+            // a fulfilled module run breadth-first, so a parent's own
+            // fulfillment does not cascade into its parents' parents before
+            // the remaining siblings execute (spec 16.2.2.5 — the DFS visit
+            // order is preserved).
+            let parent = parent.clone();
+            let realm = agent.current_realm().ok();
+            agent.enqueue_promise_job(realm, move |agent| {
+                execute_module_body(agent, &parent)?;
+                Ok(Value::Undefined)
+            });
         }
     }
     Ok(())
@@ -1037,41 +1246,21 @@ pub fn module_namespace(
     if let Some(namespace) = module.namespace.borrow().clone() {
         return Ok(namespace);
     }
-    // The export names: local + resolved indirect + star-resolved, sorted in
-    // code-unit order (spec 10.4.6.2 step 7: sortedExports).
+    // GetExportedNames (spec 16.2.1.7.1.1): local + indirect names, then the
+    // names of every star export, with a cycle guard so a self- or mutually
+    // star-exporting module (`export * from` itself) terminates. The namespace
+    // object is created only after the full list is known — the guard must
+    // not rely on the cached namespace, which is set at the end.
     let mut names: Vec<JsString> = Vec::new();
-    for export in &module.local_export_entries {
-        if let Ok(name) = export_name_string(export.export_name.as_ref())
-            && !names.contains(&name)
-        {
-            names.push(name);
-        }
-    }
-    for export in &module.indirect_export_entries {
-        if let Ok(name) = export_name_string(export.export_name.as_ref())
-            && !names.contains(&name)
-        {
-            names.push(name);
-        }
-    }
-    for export in &module.star_export_entries {
-        let specifier = export.module_request.as_ref().ok_or_else(|| {
-            JsError::new(ErrorKind::TypeError, "star export has no module".into())
-        })?;
-        let imported = host_resolve_imported_module(agent, specifier)?;
-        let imported_namespace = module_namespace(agent, &imported)?;
-        if let Value::Object(obj) = &imported_namespace {
-            for key in obj.own_property_keys()? {
-                let PropertyKey::String(id) = key else {
-                    continue;
-                };
-                let name = crux::lookup(id);
-                if !names.contains(&name) {
-                    names.push(name);
-                }
-            }
-        }
-    }
+    let mut stack: Vec<Handle<SourceTextModule>> = Vec::new();
+    collect_exported_names(agent, module, &mut stack, &mut names)?;
+    // GetModuleNamespace (spec 10.4.6.6 step 4): only names that resolve
+    // unambiguously appear on the namespace. A name that does not resolve
+    // (or resolves ambiguously through multiple star exports) is omitted.
+    names.retain(|name| {
+        let mut resolve_set = Vec::new();
+        resolve_export(agent, module, name, &mut resolve_set).is_ok_and(|r| r.is_some())
+    });
     names.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
     let exports: Vec<PropertyKey> = names
         .into_iter()
@@ -1084,6 +1273,45 @@ pub fn module_namespace(
         .insert(namespace.id(), module.clone());
     module.namespace.replace(Some(namespace_value.clone()));
     Ok(namespace_value)
+}
+
+/// GetExportedNames (spec 16.2.1.7.1.1): the module's export names, including
+/// those re-exported through `export *`. A module already on `stack` is a
+/// star-export cycle; its own names were collected by the enclosing frame, so
+/// it contributes nothing further.
+fn collect_exported_names(
+    agent: &mut Agent,
+    module: &Handle<SourceTextModule>,
+    stack: &mut Vec<Handle<SourceTextModule>>,
+    out: &mut Vec<JsString>,
+) -> Result<(), JsError> {
+    if stack.iter().any(|m| Rc::ptr_eq(m, module)) {
+        return Ok(());
+    }
+    stack.push(module.clone());
+    for export in &module.local_export_entries {
+        if let Ok(name) = export_name_string(export.export_name.as_ref())
+            && !out.contains(&name)
+        {
+            out.push(name);
+        }
+    }
+    for export in &module.indirect_export_entries {
+        if let Ok(name) = export_name_string(export.export_name.as_ref())
+            && !out.contains(&name)
+        {
+            out.push(name);
+        }
+    }
+    for export in &module.star_export_entries {
+        let specifier = export.module_request.as_ref().ok_or_else(|| {
+            JsError::new(ErrorKind::TypeError, "star export has no module".into())
+        })?;
+        let imported = host_resolve_imported_module(agent, specifier)?;
+        collect_exported_names(agent, &imported, stack, out)?;
+    }
+    stack.pop();
+    Ok(())
 }
 
 /// A resolved export binding (spec 16.2.1.7.2.2 ResolveExport).
@@ -1141,7 +1369,13 @@ fn resolve_export(
                 JsError::new(ErrorKind::TypeError, "indirect export has no module".into())
             })?;
             let imported = host_resolve_imported_module(agent, specifier)?;
-            let import_name = export_name_string(export.import_name.as_ref())?;
+            // An `import * as ns; export { ns }` re-export has no import name:
+            // the binding is the imported module's namespace itself (spec
+            // 16.2.1.7.1 step 10.1.ii.2.b).
+            let Some(import_name) = export.import_name.as_ref() else {
+                return Ok(Some(ResolvedBinding::Namespace(imported)));
+            };
+            let import_name = export_name_string(Some(import_name))?;
             return resolve_export(agent, &imported, &import_name, resolve_set);
         }
     }
@@ -1258,30 +1492,41 @@ pub fn dynamic_import(
             }
         }
     }
-    let result = (|| -> Result<(), JsError> {
-        let module = host_resolve_imported_module(agent, &specifier_text)?;
-        module_declaration_instantiation(agent, &module)?;
-        let namespace = module_namespace(agent, &module)?;
-        let evaluation = module_evaluation(agent, &module)?;
-        if is_promise_value(agent, &evaluation) {
-            // Top-level await: resolve when the module finishes.
-            let method = crate::context::get_property(
-                agent,
-                &evaluation,
-                &JsString::from_utf8("then"),
-                evaluation.clone(),
-            )?;
-            let then_resolve = make_namespace_resolver(agent, &resolve, &namespace)?;
-            crate::function::call(agent, &method, evaluation, &[then_resolve, reject.clone()])?;
-        } else {
-            crate::function::call(agent, &resolve, Value::Undefined, &[namespace])?;
+    // The load is asynchronous: the host completes it in a job, so the
+    // module's evaluation never runs concurrently with the evaluation already
+    // in progress (sec-moduleevaluation Evaluate step 1 asserts exactly that;
+    // `verify-dfs.js` checks that a dynamic import cannot preempt the DFS
+    // evaluation order). By the time this job runs, the current synchronous
+    // execution — the ongoing evaluation wave — has finished, and a target
+    // that is also a static dependency of the wave is already evaluated.
+    let realm = agent.current_realm()?;
+    agent.enqueue_generic_job(Some(realm), move |agent| {
+        let result = (|| -> Result<(), JsError> {
+            let module = host_resolve_imported_module(agent, &specifier_text)?;
+            module_declaration_instantiation(agent, &module)?;
+            let namespace = module_namespace(agent, &module)?;
+            let evaluation = module_evaluation(agent, &module)?;
+            if is_promise_value(agent, &evaluation) {
+                // Top-level await: resolve when the module finishes.
+                let method = crate::context::get_property(
+                    agent,
+                    &evaluation,
+                    &JsString::from_utf8("then"),
+                    evaluation.clone(),
+                )?;
+                let then_resolve = make_namespace_resolver(agent, &resolve, &namespace)?;
+                crate::function::call(agent, &method, evaluation, &[then_resolve, reject.clone()])?;
+            } else {
+                crate::function::call(agent, &resolve, Value::Undefined, &[namespace])?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let rejection = crate::promise::error_value(agent, &error);
+            crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
         }
-        Ok(())
-    })();
-    if let Err(error) = result {
-        let rejection = crate::promise::error_value(agent, &error);
-        crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
-    }
+        Ok(Value::Undefined)
+    });
     Ok(capability.promise)
 }
 
@@ -1337,6 +1582,23 @@ pub fn dispatch_import_resolver(
 
 /// `import.meta` (spec 16.6.2): a fresh host-defined metadata object.
 pub fn import_meta(agent: &mut Agent) -> Result<Value, JsError> {
+    // [[ImportMeta]] (spec 16.2.1.8): one ordinary object per module record,
+    // created on first access and cached — `import.meta` is the same object
+    // for every access within a module and distinct across modules.
+    let context = agent.running_context()?;
+    if let Some(crate::context::ScriptOrModule::Module(module)) = &context.script_or_module {
+        if let Some(meta) = module.import_meta.borrow().clone() {
+            return Ok(meta);
+        }
+        let proto = agent
+            .current_realm()?
+            .intrinsics
+            .get("%Object.prototype%")
+            .and_then(|value| crate::context::as_object(&value));
+        let meta = Value::Object(JsObject::ordinary_object_create(proto));
+        module.import_meta.replace(Some(meta.clone()));
+        return Ok(meta);
+    }
     let proto = agent
         .current_realm()?
         .intrinsics

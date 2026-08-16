@@ -400,9 +400,14 @@ fn enumerable_string_keys(agent: &mut Agent, value: &Value) -> Result<Vec<JsStri
         let PropertyKey::String(id) = key else {
             continue;
         };
-        if let Some(prop) = obj.get_own_property_key(&PropertyKey::String(id))?
-            && prop.enumerable
-        {
+        let Some(prop) = obj.get_own_property_key(&PropertyKey::String(id))? else {
+            continue;
+        };
+        // A module namespace's descriptor reads the live binding (throwing
+        // on an uninitialized one), so `Object.keys(ns)` surfaces the
+        // ReferenceError (spec 9.4.6.4 step 4).
+        let desc = namespace_live_descriptor(agent, &obj, &key, &prop)?;
+        if desc.enumerable.unwrap_or(false) {
             out.push(crux::lookup(id));
         }
     }
@@ -616,7 +621,21 @@ pub fn dispatch_call(
             let obj = as_object(&object).ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "value is not an object".into())
             })?;
-            Ok(Value::Boolean(obj.has_own_property_key(&key)?))
+            let present = if matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_)) {
+                // [[HasProperty]] reads the descriptor, whose value comes
+                // from the live binding: an uninitialized export throws a
+                // ReferenceError (spec 9.4.6.4 step 4).
+                match obj.get_own_property_key(&key)? {
+                    Some(prop) => {
+                        namespace_live_descriptor(agent, &obj, &key, &prop)?;
+                        true
+                    }
+                    None => false,
+                }
+            } else {
+                obj.has_own_property_key(&key)?
+            };
+            Ok(Value::Boolean(present))
         })());
     }
     if intrinsics.get(PROTO_IS_PROTO_OF).as_ref() == Some(callee) {
@@ -646,10 +665,16 @@ pub fn dispatch_call(
             let obj = as_object(&object).ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "value is not an object".into())
             })?;
-            let enumerable = obj
-                .get_own_property_key(&key)?
-                .map(|prop| prop.enumerable)
-                .unwrap_or(false);
+            let enumerable = match obj.get_own_property_key(&key)? {
+                Some(prop) => {
+                    // A module namespace descriptor reads the live binding
+                    // (throwing on uninitialized exports, spec 9.4.6.4
+                    // step 4).
+                    let desc = namespace_live_descriptor(agent, &obj, &key, &prop)?;
+                    desc.enumerable.unwrap_or(false)
+                }
+                None => false,
+            };
             Ok(Value::Boolean(enumerable))
         })());
     }
@@ -890,7 +915,20 @@ pub fn dispatch_call(
             let obj = as_object(&object).ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "value is not an object".into())
             })?;
-            Ok(Value::Boolean(obj.has_own_property_key(&key)?))
+            let present = if matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_)) {
+                // The descriptor reads the live binding: an uninitialized
+                // export throws a ReferenceError (spec 9.4.6.4 step 4).
+                match obj.get_own_property_key(&key)? {
+                    Some(prop) => {
+                        namespace_live_descriptor(agent, &obj, &key, &prop)?;
+                        true
+                    }
+                    None => false,
+                }
+            } else {
+                obj.has_own_property_key(&key)?
+            };
+            Ok(Value::Boolean(present))
         })());
     }
     if intrinsics.get(IS).as_ref() == Some(callee) {

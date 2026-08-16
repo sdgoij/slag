@@ -1479,11 +1479,13 @@ The harness's skip taxonomy (also used by the sweep):
 
 | Skip category | Reason |
 |---|---|
-| `flags: module` | No module loader: `import`/`export` parse, but linking, `dynamic import`, and `import.meta` are host-dependent (see below). |
-| `flags: [CanBlockIsTrue]` | `Atomics.wait` fixtures assuming `[[CanBlock]] = true`; the engine's main agent cannot suspend (host-dependent). |
 | `features: [Temporal]` | Temporal is a stage-3 proposal, not part of ECMA-262 ES2026 (out of scope like Intl). |
 | `features: [await-dictionary]` | `Promise.allKeyed`/`allSettledKeyed` (the await-dictionary stage-3 proposal) are not part of ECMA-262 ES2026. |
 | `features: [ShadowRealm]` | ShadowRealm is a stage-3 proposal, not part of ECMA-262 ES2026. |
+| `features: [source-phase-imports]` | `import.source()` is a stage-3 proposal, not part of ECMA-262 ES2026. |
+| `features: [import-defer]` / `[import-bytes]` / `[import-text]` | `import.defer(...)` / `import(..., { with: { type: "bytes" } })` / `import(..., { with: { type: "text" } })` are stage-3 proposals, not part of ECMA-262 ES2026. |
+| `flags: [CanBlockIsTrue]` | `Atomics.wait` fixtures assuming `[[CanBlock]] = true`; the engine's main agent cannot suspend (host-dependent). |
+| `includes: [tcoHelper]` | TCO fixtures require proper tail calls; skipped even by V8/JSC. |
 | Unsupported `includes:` | Fixtures needing harness helpers beyond `assert.js`, `compareArray.js`, `detachArrayBuffer.js`, `isConstructor.js`, `propertyHelper.js`, `testAtomics.js`, `testTypedArray.js` are not run. |
 | Intl directories | `Intl` (ECMA-402) is out of scope for this runtime (PLAN scope decision). |
 
@@ -1493,9 +1495,10 @@ These categories are expected to stay non-runnable and are not counted
 against the runnable pass-rate target:
 
 - **Intl-required features** — ECMA-402 is a separate specification.
-- **`dynamic import` without a module loader** — `import(specifier)`
-  resolves through host hooks; no loader is shipped, matching the plan's
-  "no module loader" carve-out.
+- **`dynamic import` specifier resolution** — `import(specifier)` resolves
+  through host hooks (`HostResolveImportedModule`); the test262 harness
+  registers the `_FIXTURE` siblings, so fixtures run, but no general
+  filesystem loader ships with the CLI.
 - **Host-dependent behavior** — e.g. `Atomics.wait` on the main thread
   (throws, per spec `[[CanBlock]] = false`), timers (host globals, provided
   by the embedding API), `SharedArrayBuffer` worker creation (host hook).
@@ -1512,19 +1515,25 @@ closed last.
 
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
-| language | 23,724 | 22,634 | 0 | 1,090 | 0 | 100.0% |
-| built-ins | 23,812 | 18,322 | 0 | 5,490 | 0 | 100.0% |
+| language | 23,724 | 23,184 | 0 | 540 | 0 | 100.0% |
+| built-ins | 23,812 | 18,323 | 0 | 5,489 | 0 | 100.0% |
 | annexB | 1,086 | 1,086 | 0 | 0 | 0 | 100.0% |
-| **Total** | **48,622** | **42,042** | **0** | **6,580** | **0** | **100.0%** |
+| **Total** | **48,622** | **42,593** | **0** | **6,029** | **0** | **100.0%** |
 
-(Runnable = pass + fail + hang; the 6,580 skips are the module flag,
-unsupported harness includes, the host-dependent `CanBlockIsTrue` waits,
-and the out-of-scope Temporal, await-dictionary, ShadowRealm,
-source-phase-imports (`import.source()`), and import-text
-(`import(..., { with: { type: "text" } })`) proposal fixtures.) The
-`byteConversionValues` (19: Float16) and `resizableArrayBufferUtils`
+(Runnable = pass + fail + hang; the 6,029 skips are the unsupported harness
+includes, the host-dependent `CanBlockIsTrue` waits, the TCO (`tcoHelper`)
+fixtures, and the out-of-scope Temporal, await-dictionary, ShadowRealm,
+source-phase-imports (`import.source()`), import-defer (`import.defer()`),
+import-bytes (`import(..., { with: { type: "bytes" } })`), and import-text
+(`import(..., { with: { type: "text" } })`) proposal fixtures.) The module
+loader was un-skipped last (the `flags: [module]` fixtures now run through
+the real source-text-module machinery — parse, link, DFS evaluation,
+top-level await, dynamic import, and `import.meta`), taking the totals from
+42,042 to 42,593 pass: the language row went from 22,634/1,090 to
+23,184/540. The `byteConversionValues` (19: Float16) and
+`resizableArrayBufferUtils`
 (185: resizable-buffer TypedArray semantics) clusters were un-skipped
-last, taking the totals from 41,838 to 42,042 pass. The last 39
+before that, taking the totals from 41,838 to 42,042 pass. The last 39
 failures closed with the async-test engine work: `Array.fromAsync` was
 rewritten to spec 23.1.2.4.1 — 0-length array-likes skip the loop
 entirely, array-like elements are awaited before the mapper runs, the
@@ -1628,11 +1637,11 @@ Object.fromEntries, JSON.stringify, DataView, Object statics/
 constructor, Promise, Atomics, and the final Array/generator, Throw-
 TypeError, WeakRef/FinalizationRegistry, Uint8Array base64/hex, Set
 set-methods, JSON/parse, TypedArray BigInt, String, and SuppressedError
-closures (all 0 fail). The 5,687 built-ins skips are dominated by the
-out-of-scope Temporal proposal (4,611), await-dictionary (33), and
-ShadowRealm (60), with the module flag, host-dependent
-`CanBlockIsTrue` waits, and unsupported harness includes making up the
-rest.
+closures (all 0 fail). The 5,489 built-ins skips are dominated by the
+out-of-scope Temporal proposal (4,611), await-dictionary (89), and
+ShadowRealm (64), with source-phase-imports (8), the harness-include
+fixtures (regExpUtils 586, atomicsHelper 112, temporalHelpers 12), and
+host-dependent `CanBlockIsTrue` waits (7) making up the rest.
 
 ¹ The 3 built-ins hangs recorded earlier were the
 `TypedArray/prototype/copyWithin` coerced-values fixtures — 10,000-element
@@ -1787,10 +1796,12 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 
 ## Open items
 
-- All three areas now measure **100% of runnable**: 22,634 + 18,322 + 1,086
+- All three areas now measure **100% of runnable**: 23,184 + 18,323 + 1,086
   pass / 0 fail / 0 crash / 0 hang of 23,724 + 23,812 + 1,086 fixtures
-  (out-of-scope Temporal, await-dictionary, and ShadowRealm fixtures and
-  the host-dependent `CanBlockIsTrue` waits skipped, `--timeout 120
+  (out-of-scope Temporal, await-dictionary, ShadowRealm,
+  source-phase-imports, import-defer, import-bytes, and import-text
+  proposal fixtures, the `tcoHelper` includes, and the host-dependent
+  `CanBlockIsTrue` waits skipped, `--timeout 120
   --recheck-timeout 120`, release build) — the plan's ≥95%
   runnable-pass-rate target is met. The language area closed its 2,048
   failures via the eval-caller-context, field-initializer, and Annex B
@@ -1798,7 +1809,12 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
   gaps (`Array.fromAsync`, `for await`, and the dynamic-import cycle)
   closed last; the `byteConversionValues` (Float16) and
   `resizableArrayBufferUtils` (resizable-buffer TypedArray) clusters
-  un-skipped after them (42,042 pass / 6,580 skip total).
+  un-skipped after them; and the module loader un-skipped last — the 817
+  language + 13 built-ins `flags: [module]` fixtures now run through the
+  source-text-module machinery (parse, link, DFS evaluation, top-level
+  await, dynamic import, `import.meta`), with `verify-dfs.js` closing the
+  final failure via the async dynamic-import load (42,593 pass / 6,029
+  skip total).
   Note: the TypedArray sweep should be run with the long deadline
   (`--timeout 120 --recheck-timeout 120`) — the O(n²) property store
   makes the 10,000-element crash-test fixtures take ~45s, which the

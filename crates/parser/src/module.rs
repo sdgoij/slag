@@ -171,11 +171,35 @@ fn parse_module_export_name(parser: &mut Parser) -> Result<ExportName, JsError> 
             Ok(ExportName::Ident(atom))
         }
         TokenKind::StringLiteral { value, .. } => {
+            // A string module export name must be well-formed UTF-16: an
+            // unpaired surrogate is a Syntax Error (spec 16.2.3).
+            if !is_well_formed_utf16(value.as_slice()) {
+                return Err(parser.error_at(
+                    tok.span.start,
+                    "Module export name contains an unpaired surrogate",
+                ));
+            }
             parser.next()?;
             Ok(ExportName::Str(value))
         }
         _ => Err(parser.unexpected(&tok)),
     }
+}
+
+/// Whether a UTF-16 unit sequence is well-formed (no unpaired surrogates).
+fn is_well_formed_utf16(units: &[u16]) -> bool {
+    let mut iter = units.iter();
+    while let Some(&unit) = iter.next() {
+        if (0xD800..=0xDBFF).contains(&unit) {
+            match iter.next() {
+                Some(&low) if (0xDC00..=0xDFFF).contains(&low) => {}
+                _ => return false,
+            }
+        } else if (0xDC00..=0xDFFF).contains(&unit) {
+            return false;
+        }
+    }
+    true
 }
 
 /// `with { "type": "json" }` — import attributes (spec 16.2.4).
@@ -185,7 +209,9 @@ fn parse_with_clause(parser: &mut Parser) -> Result<Vec<(AttributeKey, JsString)
     }
     parser.expect_punct(TokenKind::LeftBrace)?;
     let mut out = Vec::new();
+    let mut seen: Vec<JsString> = Vec::new();
     while !parser.at_punct(TokenKind::RightBrace)? {
+        let key_start = parser.peek()?.span.start;
         let key = match parser.peek()?.kind.clone() {
             TokenKind::Identifier(atom) => {
                 parser.next()?;
@@ -200,6 +226,16 @@ fn parse_with_clause(parser: &mut Parser) -> Result<Vec<(AttributeKey, JsString)
                 return Err(parser.unexpected(&tok));
             }
         };
+        // Duplicate keys collide on their StringValue, even across the
+        // identifier/string forms (spec 16.2.4: WithEntries keys are distinct).
+        let key_string = match &key {
+            AttributeKey::Ident(atom) => crux::lookup(*atom),
+            AttributeKey::Str(value) => value.clone(),
+        };
+        if seen.contains(&key_string) {
+            return Err(parser.error_at(key_start, "Duplicate import attribute key"));
+        }
+        seen.push(key_string);
         parser.expect_punct(TokenKind::Colon)?;
         let value = parse_module_specifier(parser)?;
         out.push((key, value));

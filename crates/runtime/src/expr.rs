@@ -132,10 +132,9 @@ pub fn eval_expr(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Value, 
                 // *undefined* at the script level.
                 crate::context::get_new_target(agent)
             } else {
-                Err(JsError::new(
-                    ErrorKind::TypeError,
-                    "import.meta is not implemented until Phase 7".into(),
-                ))
+                // import.meta (spec 13.3.7): a fresh ordinary object per
+                // module evaluation.
+                crate::module::import_meta(agent)
             }
         }
         ExprKind::ImportCall { specifier, options } => {
@@ -422,42 +421,10 @@ fn put_reference_value(
     reference: &Reference,
     value: Value,
 ) -> Result<(), JsError> {
-    let Some(receiver) = &reference.this_value else {
-        return put_value(agent, reference, value);
-    };
-    let ReferenceBase::Value(base) = &reference.base else {
-        return put_value(agent, reference, value);
-    };
-    let object = if matches!(base, Value::Object(_) | Value::Function(_)) {
-        base.clone()
-    } else {
-        crate::context::to_object(agent, base)?
-    };
-    let succeeded = match &object {
-        Value::Object(obj) => obj.set_with_receiver_key(
-            &reference.name,
-            value.clone(),
-            receiver.clone(),
-            reference.strict,
-        )?,
-        Value::Function(f) => f.object.set_with_receiver_key(
-            &reference.name,
-            value.clone(),
-            receiver.clone(),
-            reference.strict,
-        )?,
-        _ => false,
-    };
-    if !succeeded && reference.strict {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            format!(
-                "Cannot assign to read only property {:?}",
-                reference.name.display_string()
-            ),
-        ));
-    }
-    Ok(())
+    // `put_value` resolves the receiver from [[ThisValue]] (super references)
+    // and applies the module-namespace live-binding check; this super-set
+    // path is just PutValue (spec 13.3.6.2).
+    put_value(agent, reference, value)
 }
 
 /// An assignment target whose computed property key is converted lazily.
@@ -1189,7 +1156,9 @@ fn named_eval_rhs(
     if let ExprKind::Ident(name) = &target.kind
         && crate::function::is_anonymous_function_definition(value_expr)
     {
-        crate::function::set_function_name(&value, &crux::lookup(*name), None)?;
+        let display = crate::function::default_binding_display_name(Some(crux::lookup(*name)))
+            .unwrap_or_else(|| crux::lookup(*name));
+        crate::function::set_function_name(&value, &display, None)?;
     }
     Ok(value)
 }

@@ -1186,8 +1186,17 @@ fn parse_primary(parser: &mut Parser) -> Result<Expr, JsError> {
             Some(Keyword::Import) => {
                 parser.next()?;
                 if parser.eat_punct(TokenKind::Dot)? {
+                    let meta_tok = parser.peek()?.clone();
                     let (import_prop, _) = parser.parse_identifier()?;
                     if import_prop == intern_utf8("meta") {
+                        // `import.met\u0061` — an escape sequence in the
+                        // `meta` identifier is a Syntax Error (spec 13.3.7).
+                        if meta_tok.escaped {
+                            return Err(parser.error_at(
+                                meta_tok.span.start,
+                                "Escaped 'meta' in import.meta is not allowed",
+                            ));
+                        }
                         // `import.meta` is an early error in Script code
                         // (spec 13.3.7).
                         if !parser.in_module {
@@ -2115,12 +2124,23 @@ fn parse_method_tail(
     parser.expect_punct(TokenKind::LeftParen)?;
     // Methods have a [[HomeObject]], so `super` is available in the formal
     // parameters as well as the body (spec 13.3.5).
-    let saved = (parser.in_generator, parser.in_async, parser.allow_super);
+    let saved = (
+        parser.in_generator,
+        parser.in_async,
+        parser.allow_super,
+        parser.top_level_await,
+    );
     parser.in_generator = is_generator;
     parser.in_async = is_async;
     parser.allow_super = true;
+    parser.top_level_await = false;
     let params = parse_parameter_list(parser)?;
-    (parser.in_generator, parser.in_async, parser.allow_super) = saved;
+    (
+        parser.in_generator,
+        parser.in_async,
+        parser.allow_super,
+        parser.top_level_await,
+    ) = saved;
     // Method definitions are always strict mode code, so duplicate parameter
     // names are an early error even in sloppy code (spec 13.3.5).
     check_duplicate_params(parser, &params, true)?;
@@ -2160,11 +2180,12 @@ pub(crate) fn parse_function_expression(
     // 15.4.1): generator params reserve `yield`, async params reserve
     // `await`, and a plain function's params reset both regardless of the
     // enclosing context (a static block's [+Await] does not leak in).
-    let saved = (parser.in_generator, parser.in_async);
+    let saved = (parser.in_generator, parser.in_async, parser.top_level_await);
     parser.in_generator = is_generator;
     parser.in_async = is_async;
+    parser.top_level_await = false;
     let params = parse_parameter_list(parser)?;
-    (parser.in_generator, parser.in_async) = saved;
+    (parser.in_generator, parser.in_async, parser.top_level_await) = saved;
     check_duplicate_params(parser, &params, false)?;
     check_function_params(parser, &params, is_async, is_generator)?;
     let (body, strict) =

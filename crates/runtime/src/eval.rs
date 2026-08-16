@@ -333,7 +333,9 @@ fn eval_named_initializer(
     if let Some(binding) = binding
         && crate::function::is_anonymous_function_definition(init)
     {
-        crate::function::set_function_name(&value, &crux::lookup(binding), None)?;
+        let display = crate::function::default_binding_display_name(Some(crux::lookup(binding)))
+            .unwrap_or_else(|| crux::lookup(binding));
+        crate::function::set_function_name(&value, &display, None)?;
     }
     Ok(value)
 }
@@ -950,8 +952,8 @@ fn eval_for(
 /// ForIn/ForOfBodyEvaluation: the enumerable string keys of `rhs` and its
 /// prototype chain, in walk order (spec 14.7.5.6 steps 2-6). Shared with the
 /// resumable-function IR's `ForInBegin` step.
-pub(crate) fn for_in_keys(_agent: &mut Agent, rhs: &Value) -> Result<Vec<Value>, JsError> {
-    Ok(for_in_key_levels_inner(rhs)?
+pub(crate) fn for_in_keys(agent: &mut Agent, rhs: &Value) -> Result<Vec<Value>, JsError> {
+    Ok(for_in_key_levels_inner(agent, rhs)?
         .into_iter()
         .map(|(_, key)| key)
         .collect())
@@ -960,11 +962,11 @@ pub(crate) fn for_in_keys(_agent: &mut Agent, rhs: &Value) -> Result<Vec<Value>,
 /// Like `for_in_keys`, but tagging each key with the prototype-chain level it
 /// was found at, so a key deleted during enumeration can be re-checked against
 /// its own level at visit time (spec EnumerateObjectProperties).
-fn for_in_key_levels(rhs: &Value) -> Result<Vec<(usize, Value)>, JsError> {
-    for_in_key_levels_inner(rhs)
+fn for_in_key_levels(agent: &mut Agent, rhs: &Value) -> Result<Vec<(usize, Value)>, JsError> {
+    for_in_key_levels_inner(agent, rhs)
 }
 
-fn for_in_key_levels_inner(rhs: &Value) -> Result<Vec<(usize, Value)>, JsError> {
+fn for_in_key_levels_inner(agent: &mut Agent, rhs: &Value) -> Result<Vec<(usize, Value)>, JsError> {
     let mut seen: HashSet<PropertyKey> = HashSet::new();
     let mut keys: Vec<(usize, Value)> = Vec::new();
     // ToObject of the enumerated value (spec step 2): functions box to
@@ -980,10 +982,20 @@ fn for_in_key_levels_inner(rhs: &Value) -> Result<Vec<(usize, Value)>, JsError> 
                 if !seen.insert(key.clone()) {
                     continue;
                 }
-                if let Some(property) = obj.get_own_property_key(&key)?
-                    && property.enumerable
-                {
-                    keys.push((level, key_value(&key)));
+                if let Some(property) = obj.get_own_property_key(&key)? {
+                    // EnumerateObjectProperties reads each descriptor
+                    // (spec 9.4.6.4 step 4): a module namespace descriptor
+                    // reads the live binding, throwing a ReferenceError for
+                    // an uninitialized export.
+                    if matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_))
+                        && let Some(module) = agent.module_namespaces.get(&obj.id()).cloned()
+                        && let PropertyKey::String(id) = &key
+                    {
+                        crate::module::namespace_get(agent, &module, &crux::lookup(*id))?;
+                    }
+                    if property.enumerable {
+                        keys.push((level, key_value(&key)));
+                    }
                 }
             }
             current = obj.get_prototype_of()?;
@@ -1086,7 +1098,7 @@ fn eval_for_in(
     }
     let rhs = eval_for_head(agent, left, right, strict)?;
     let base_object = crate::context::as_object(&rhs);
-    let keys = for_in_key_levels(&rhs)?;
+    let keys = for_in_key_levels(agent, &rhs)?;
     let mut iteration_result = Value::Undefined;
     for (level, key) in keys {
         if let Some(base) = &base_object

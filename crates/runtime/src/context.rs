@@ -480,7 +480,12 @@ pub fn get_value(agent: &mut Agent, reference: &Reference) -> Result<Value, JsEr
         ReferenceBase::Environment(env) => {
             env.get_binding_value(&string_name(&reference.name), reference.strict)
         }
-        ReferenceBase::Value(base) => get_property_key(agent, base, &reference.name, base.clone()),
+        ReferenceBase::Value(base) => {
+            // super references carry the receiver in [[ThisValue]] (spec
+            // 13.3.6.2): a getter sees the current `this`, not the super
+            // base.
+            get_property_key(agent, base, &reference.name, get_this_value(reference))
+        }
         ReferenceBase::Unresolvable => Err(undefined_error(&string_name(&reference.name))),
     }
 }
@@ -697,12 +702,46 @@ pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Resu
         }
         ReferenceBase::Value(base) => {
             let key = &reference.name;
+            // OrdinarySetWithOwnDescriptor (spec 7.3.3 step 2.c) reads the
+            // receiver's own descriptor when the property is a data descriptor
+            // or absent from the chain. A module-namespace receiver's
+            // descriptor reads the live binding: an uninitialized export
+            // throws a ReferenceError. An accessor in the chain runs its
+            // setter instead (no receiver read), so it is not pre-empted.
+            if let Value::Object(obj) = get_this_value(reference)
+                && matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_))
+                && let PropertyKey::String(id) = key
+                && let Some(module) = agent.module_namespaces.get(&obj.id()).cloned()
+            {
+                let mut probe = if matches!(base, Value::Object(_) | Value::Function(_)) {
+                    Some(base.clone())
+                } else {
+                    to_object(agent, base).ok()
+                };
+                let mut accessor_in_chain = false;
+                while let Some(obj) = probe
+                    && let Value::Object(obj) = &obj
+                {
+                    match obj.get_own_property_key(key)? {
+                        Some(prop) if prop.is_accessor() => {
+                            accessor_in_chain = true;
+                            break;
+                        }
+                        Some(_) | None => {
+                            probe = obj.get_prototype_of()?.map(Value::Object);
+                        }
+                    }
+                }
+                if !accessor_in_chain {
+                    crate::module::namespace_get(agent, &module, &crux::lookup(*id))?;
+                }
+            }
             // Primitive bases are boxed for the write (spec 7.3.6 step 5.b),
             // but the receiver stays the primitive: an inherited accessor
             // setter sees `this` as the primitive, and a write that reaches
             // the end of the chain fails (strict) instead of landing on the
             // ephemeral wrapper.
-            let receiver = base.clone();
+            let receiver = get_this_value(reference);
             let base = if matches!(base, Value::Object(_) | Value::Function(_)) {
                 base.clone()
             } else {

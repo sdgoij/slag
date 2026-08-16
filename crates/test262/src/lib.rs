@@ -10815,6 +10815,10 @@ var $DONE = function (error) {
     }
 
     fn modes(fm: &Frontmatter) -> Vec<Mode> {
+        // A module is always strict and runs once (no sloppy/strict split).
+        if fm.flags.iter().any(|f| f == "module") {
+            return vec![Mode::Sloppy];
+        }
         if fm.flags.iter().any(|f| f == "raw" || f == "noStrict") {
             vec![Mode::Sloppy]
         } else if fm.flags.iter().any(|f| f == "onlyStrict") {
@@ -10848,7 +10852,16 @@ var $DONE = function (error) {
     }
 
     /// Run one fixture in one mode; `Err` carries a human-readable failure.
-    fn run_one(body: &str, mode: Mode, fm: &Frontmatter, fixture_dir: &Path) -> Result<(), String> {
+    fn run_one(
+        body: &str,
+        mode: Mode,
+        fm: &Frontmatter,
+        fixture_dir: &Path,
+        fixture_specifier: &str,
+    ) -> Result<(), String> {
+        if fm.flags.iter().any(|f| f == "module") {
+            return run_one_module(body, fm, fixture_dir, fixture_specifier);
+        }
         let wrapped = wrap(body, mode);
         if matches!(fm.negative_phase.as_deref(), Some("parse" | "early")) {
             let kind = expected_kind(fm)?;
@@ -10881,6 +10894,507 @@ var $DONE = function (error) {
         if !skip_harness {
             agent.run_script(HARNESS_PRELUDE).map_err(|e| e.message)?;
         }
+        install_realm_host_hooks(&mut agent)?;
+        // The real harness include files (testTypedArray.js, propertyHelper.js,
+        // testAtomics.js, …) are plain JS built on the globals above; load
+        // them from the submodule so the vendored fixtures get their exact
+        // helper surface.
+        for include in &fm.includes {
+            let source = harness_include_source(include)?;
+            agent.run_script(&source).map_err(|e| e.message)?;
+        }
+        // Async fixtures (test262 async protocol) complete via `$DONE`; the
+        // prelude records the call (and any failure value) in globals the
+        // runner reads after the job queue drains.
+        if fm.flags.iter().any(|f| f == "async") {
+            agent.run_script(ASYNC_PRELUDE).map_err(|e| e.message)?;
+        }
+        // Dynamic-import fixtures load real sibling support files from the
+        // submodule; register them (transitively) before the fixture runs.
+        if body.contains("import(") || body.contains("import (") {
+            register_fixture_modules(&mut agent, fixture_dir, body)?;
+        }
+        let result = agent.run_script(&wrapped);
+        agent.run_jobs().map_err(|e| e.message)?;
+        let realm = agent.current_realm().map_err(|e| e.message)?;
+        let async_failure = if fm.flags.iter().any(|f| f == "async") {
+            read_async_completion(&mut agent, &Value::Object(realm.global_object.clone()))?
+        } else {
+            None
+        };
+        match (result, async_failure, fm.negative_phase.as_deref()) {
+            (Ok(_), None, None) => Ok(()),
+            (Ok(_), Some(value), None) => Err(format!(
+                "async test failed: {}",
+                describe_thrown(&mut agent, &value)?
+            )),
+            (Ok(_), None, Some("runtime")) => {
+                Err("expected a runtime error but the script completed".into())
+            }
+            (Ok(_), Some(value), Some("runtime")) => {
+                let ty = fm.negative_type.as_deref().unwrap_or("");
+                if thrown_constructor_is(&mut agent, &value, ty) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "async runtime error != expected {ty}: {}",
+                        describe_thrown(&mut agent, &value)?
+                    ))
+                }
+            }
+            (Ok(_), _, Some(phase)) => Err(format!("unexpected negative phase {phase}")),
+            (Err(e), _, Some("runtime")) => {
+                let ty = fm.negative_type.as_deref().unwrap_or("");
+                if ty == "Test262Error" {
+                    // The fixture deliberately throws the harness's
+                    // Test262Error (a plain object whose `constructor` is the
+                    // Test262Error function); the wrapped JsError's kind is
+                    // always TypeError, so the constructor name decides.
+                    let is_test262 = e
+                        .value
+                        .as_ref()
+                        .is_some_and(|v| thrown_constructor_is(&mut agent, v, "Test262Error"));
+                    if is_test262 {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "runtime {:?} != expected Test262Error: {}",
+                            e.kind, e.message
+                        ))
+                    }
+                } else {
+                    let kind = expected_kind(fm)?;
+                    // A JS `throw new RangeError()` wraps in a TypeError-kind
+                    // JsError that carries the thrown value; the value's
+                    // constructor decides the negative type. Engine-thrown
+                    // errors have no value and match by kind.
+                    let matched = match &e.value {
+                        Some(value) => thrown_constructor_is(&mut agent, value, ty),
+                        None => e.kind == kind,
+                    };
+                    if matched {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "runtime {:?} != expected {ty}: {}",
+                            e.kind, e.message
+                        ))
+                    }
+                }
+            }
+            (Err(e), _, None) => Err(format!("unexpected runtime error: {}", e.message)),
+            (Err(_), _, Some(_)) => Err("unexpected error on a parse-phase negative test".into()),
+        }
+    }
+
+    fn assertion_error(message: String) -> JsError {
+        JsError::new(ErrorKind::TypeError, message)
+    }
+
+    /// Run a `flags: [module]` fixture: parse/register the module and its
+    /// dependencies, link, evaluate, drain the job queue, and check the
+    /// settled outcome against the negative/async expectations. Modules are
+    /// always strict and run once (the test262 module harness).
+    fn run_one_module(
+        body: &str,
+        fm: &Frontmatter,
+        fixture_dir: &Path,
+        fixture_specifier: &str,
+    ) -> Result<(), String> {
+        // Negative parse/early tests fail at the module parse.
+        if matches!(fm.negative_phase.as_deref(), Some("parse" | "early")) {
+            let kind = expected_kind(fm)?;
+            return match parser::parse_module(body) {
+                Err(e) if e.kind == kind => Ok(()),
+                Err(e) => Err(format!(
+                    "parse {:?} != expected {kind:?}: {}",
+                    e.kind, e.message
+                )),
+                Ok(_) => Err("expected a parse error but the module parsed".into()),
+            };
+        }
+        if let Err(e) = parser::parse_module(body) {
+            return Err(format!("parse error: {}", e.message));
+        }
+        let skip_harness = fm.flags.iter().any(|f| f == "__debug_skip_harness");
+        let mut agent = Agent::new();
+        agent
+            .initialize_host_defined_realm()
+            .map_err(|e| e.message)?;
+        install_harness_globals(&agent)?;
+        agent
+            .run_script(ASSERT_THROWS_PRELUDE)
+            .map_err(|e| e.message)?;
+        if !skip_harness {
+            agent.run_script(HARNESS_PRELUDE).map_err(|e| e.message)?;
+        }
+        install_realm_host_hooks(&mut agent)?;
+        for include in &fm.includes {
+            let source = harness_include_source(include)?;
+            agent.run_script(&source).map_err(|e| e.message)?;
+        }
+        if fm.flags.iter().any(|f| f == "async") {
+            agent.run_script(ASYNC_PRELUDE).map_err(|e| e.message)?;
+        }
+        // Register the fixture as a module plus every dependency its static
+        // imports/exports request (resolved against the fixture's directory),
+        // and the `_FIXTURE` siblings its dynamic `import()`s use.
+        let entry_key = "<test262-fixture>";
+        agent.add_module(entry_key, body);
+        let parsed = runtime::module::parse_module(
+            &mut agent,
+            &JsString::from_utf8(entry_key),
+            &JsString::from_utf8(body),
+        )
+        .map_err(|e| e.message)?;
+        for (specifier, _) in &parsed.requested_modules {
+            register_module_recursive(&mut agent, fixture_dir, &specifier.to_string_lossy())?;
+        }
+        register_fixture_modules(&mut agent, fixture_dir, body)?;
+        let entry = runtime::module::host_resolve_imported_module(
+            &mut agent,
+            &JsString::from_utf8(entry_key),
+        )
+        .map_err(|e| e.message)?;
+        // A fixture that imports itself (`import './<name>.js'`) must resolve
+        // to this same module record, not a second instance of the source:
+        // alias the entry under its own specifier so self- and circular
+        // imports share one evaluation.
+        if !fixture_specifier.is_empty() {
+            let realm = agent.current_realm().map_err(|e| e.message)?;
+            realm
+                .loaded_modules
+                .borrow_mut()
+                .insert(JsString::from_utf8(fixture_specifier), entry.clone());
+        }
+        // Negative resolution tests: the error surfaces when the module graph
+        // links — a dependency that fails to parse, an import that does not
+        // resolve, a `phase: resolution` SyntaxError/TypeError.
+        if matches!(fm.negative_phase.as_deref(), Some("resolution")) {
+            let kind = expected_kind(fm)?;
+            return match runtime::module::module_declaration_instantiation(&mut agent, &entry) {
+                Err(e) if e.kind == kind => Ok(()),
+                Err(e) => Err(format!(
+                    "resolution {:?} != expected {kind:?}: {}",
+                    e.kind, e.message
+                )),
+                Ok(_) => Err("expected a resolution error but the module instantiated".into()),
+            };
+        }
+        runtime::module::module_declaration_instantiation(&mut agent, &entry)
+            .map_err(|e| e.message)?;
+        let promise = match runtime::module::module_evaluation(&mut agent, &entry) {
+            Ok(promise) => promise,
+            Err(e) => {
+                // A synchronous evaluation error (an errored dependency
+                // aborting this module) carries the thrown value; check it
+                // against a runtime-phase negative expectation like a
+                // rejection.
+                if matches!(fm.negative_phase.as_deref(), Some("runtime"))
+                    && let Some(value) = e.value
+                {
+                    let ty = fm.negative_type.as_deref().unwrap_or("");
+                    if thrown_constructor_is(&mut agent, &value, ty) {
+                        return Ok(());
+                    }
+                    return Err(format!(
+                        "runtime {:?} != expected {ty}: {}",
+                        thrown_kind(&value),
+                        describe_thrown(&mut agent, &value)?
+                    ));
+                }
+                return Err(e.message);
+            }
+        };
+        agent.run_jobs().map_err(|e| e.message)?;
+        let rejection = module_settled(&agent, &promise)?;
+        let realm = agent.current_realm().map_err(|e| e.message)?;
+        let async_failure = if fm.flags.iter().any(|f| f == "async") {
+            read_async_completion(&mut agent, &Value::Object(realm.global_object.clone()))?
+        } else {
+            None
+        };
+        match (rejection, async_failure, fm.negative_phase.as_deref()) {
+            (None, None, None) => Ok(()),
+            (None, Some(value), None) => Err(format!(
+                "async test failed: {}",
+                describe_thrown(&mut agent, &value)?
+            )),
+            (None, None, Some("runtime")) => {
+                Err("expected a runtime error but the module completed".into())
+            }
+            (None, Some(value), Some("runtime")) => {
+                let ty = fm.negative_type.as_deref().unwrap_or("");
+                if thrown_constructor_is(&mut agent, &value, ty) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "async runtime error != expected {ty}: {}",
+                        describe_thrown(&mut agent, &value)?
+                    ))
+                }
+            }
+            (None, _, Some(phase)) => Err(format!("unexpected negative phase {phase}")),
+            (Some(value), _, Some("runtime")) => {
+                let ty = fm.negative_type.as_deref().unwrap_or("");
+                if thrown_constructor_is(&mut agent, &value, ty) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "runtime {:?} != expected {ty}: {}",
+                        thrown_kind(&value),
+                        describe_thrown(&mut agent, &value)?
+                    ))
+                }
+            }
+            (Some(value), _, None) => Err(format!(
+                "unexpected runtime error: {}",
+                describe_thrown(&mut agent, &value)?
+            )),
+            (Some(_), _, Some(_)) => Err("unexpected error on a parse-phase negative test".into()),
+        }
+    }
+
+    /// The settled outcome of the module's top-level capability promise:
+    /// `None` on fulfillment, `Some(reason)` on rejection.
+    fn module_settled(agent: &Agent, promise: &Value) -> Result<Option<Value>, String> {
+        let Value::Object(obj) = promise else {
+            return Ok(None);
+        };
+        let Some(data) = agent.promises.get(&obj.id()) else {
+            return Ok(None);
+        };
+        match &data.borrow().state {
+            runtime::promise::PromiseState::Fulfilled(_) => Ok(None),
+            runtime::promise::PromiseState::Rejected(value) => Ok(Some(value.clone())),
+            runtime::promise::PromiseState::Pending { .. } => {
+                Err("module evaluation did not settle".into())
+            }
+        }
+    }
+
+    /// The thrown value's constructor name, or "unknown" when it has none.
+    fn thrown_kind(value: &Value) -> String {
+        match value {
+            Value::Object(obj) => obj.kind.name().to_string(),
+            Value::String(_) => "String".into(),
+            Value::Number(_) => "Number".into(),
+            _ => "unknown".into(),
+        }
+    }
+
+    /// The thrown value's `constructor.name` (the negative type of a
+    /// JS-thrown error; `run_script` wraps every thrown value in a
+    /// TypeError-kind JsError carrying the value, and async `$DONE(error)`
+    /// passes the raw error object).
+    fn thrown_name(agent: &mut Agent, value: &Value) -> Option<String> {
+        let ctor = runtime::context::get_property(
+            agent,
+            value,
+            &JsString::from_utf8("constructor"),
+            value.clone(),
+        )
+        .ok()?;
+        let name = runtime::context::get_property(
+            agent,
+            &ctor,
+            &JsString::from_utf8("name"),
+            ctor.clone(),
+        )
+        .ok()?;
+        match name {
+            Value::String(text) => Some(text.to_string_lossy()),
+            _ => None,
+        }
+    }
+
+    fn thrown_constructor_is(agent: &mut Agent, value: &Value, expected: &str) -> bool {
+        thrown_name(agent, value).as_deref() == Some(expected)
+    }
+
+    /// A readable description of a thrown value for failure messages: its
+    /// constructor name plus the message when the value carries one (the
+    /// harness Test262Error instances are plain objects with a message), else
+    /// the value's debug form.
+    fn describe_thrown(agent: &mut Agent, value: &Value) -> Result<String, String> {
+        if let Some(name) = thrown_name(agent, value) {
+            let message = runtime::context::get_property(
+                agent,
+                value,
+                &JsString::from_utf8("message"),
+                value.clone(),
+            )
+            .ok()
+            .filter(|message| matches!(message, Value::String(_)));
+            return match message {
+                Some(Value::String(text)) if !text.to_string_lossy().is_empty() => {
+                    Ok(format!("{name}: {}", text.to_string_lossy()))
+                }
+                _ => Ok(name),
+            };
+        }
+        Ok(format!("{value:?}"))
+    }
+
+    /// Read the async-completion globals after the job queue drains: `None`
+    /// means `$DONE` was called without an argument (success), `Some(value)`
+    /// carries the failure value, and an error means `$DONE` was never called
+    /// (a hung test).
+    fn read_async_completion(agent: &mut Agent, global: &Value) -> Result<Option<Value>, String> {
+        let passed = runtime::context::get_property(
+            agent,
+            global,
+            &JsString::from_utf8("asyncTestPassed"),
+            global.clone(),
+        )
+        .map_err(|e| e.message)?;
+        if !to_boolean(&passed) {
+            return Err("async test never called $DONE".into());
+        }
+        let error = runtime::context::get_property(
+            agent,
+            global,
+            &JsString::from_utf8("asyncTestError"),
+            global.clone(),
+        )
+        .map_err(|e| e.message)?;
+        if matches!(error, Value::Undefined | Value::Null) {
+            Ok(None)
+        } else {
+            Ok(Some(error))
+        }
+    }
+
+    /// The source of a harness include file, read from the pinned submodule.
+    /// The helpers the preludes replicate (assert.js, compareArray.js,
+    /// detachArrayBuffer.js, isConstructor.js) return empty source (the
+    /// preludes define them natively); every other include is loaded as-is
+    /// from `test262/harness/`.
+    fn harness_include_source(name: &str) -> Result<String, String> {
+        if matches!(
+            name,
+            "assert.js" | "compareArray.js" | "detachArrayBuffer.js" | "isConstructor.js"
+        ) {
+            return Ok(String::new());
+        }
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test262/harness")
+            .join(name);
+        std::fs::read_to_string(&path).map_err(|e| format!("{name}: {e}"))
+    }
+
+    /// Register the support modules a dynamic-import fixture loads, from the
+    /// pinned submodule (the fixtures `import('./name_FIXTURE.js')` real
+    /// sibling files; `HostResolveImportedModule` resolves only against the
+    /// agent's registered map). Literal specifiers are scanned from the
+    /// source; the computed-specifier cluster (`assignment-expression/*`)
+    /// all resolve to `*_FIXTURE` siblings per the corpus convention, so
+    /// those are registered by directory scan. Missing files stay
+    /// unregistered and reject (the negative `THIS_FILE_DOES_NOT_EXIST`
+    /// fixtures).
+    fn register_fixture_modules(
+        agent: &mut Agent,
+        fixture_dir: &Path,
+        fixture_source: &str,
+    ) -> Result<(), String> {
+        let mut specifiers: Vec<String> = Vec::new();
+        scan_literal_imports(fixture_source, &mut specifiers);
+        scan_fixture_siblings(fixture_dir, &mut specifiers);
+        for specifier in specifiers {
+            register_module_recursive(agent, fixture_dir, &specifier)?;
+        }
+        Ok(())
+    }
+
+    /// The string-literal `import('…')`/`import("…")` specifiers in a
+    /// source text (dynamic-import fixtures use literal specifiers; the
+    /// computed ones are covered by the `_FIXTURE` sibling scan).
+    fn scan_literal_imports(source: &str, out: &mut Vec<String>) {
+        let mut rest = source;
+        while let Some(start) = rest.find("import(") {
+            rest = &rest[start + "import(".len()..];
+            let trimmed = rest.trim_start();
+            let Some(quote) = trimmed.chars().next().filter(|c| *c == '\'' || *c == '"') else {
+                continue;
+            };
+            if let Some(end) = trimmed[1..].find(quote) {
+                out.push(trimmed[1..=end].to_string());
+                rest = &trimmed[end + 1..];
+            }
+        }
+    }
+
+    /// The `*_FIXTURE.js`/`*_FIXTURE.json` siblings of a directory: the
+    /// test262 support-file convention for dynamic-import fixtures. Every
+    /// sibling is registered — a fixture may reference a shared support file
+    /// (e.g. `script-code_FIXTURE.js`) — but registration is parse-tolerant,
+    /// so intentionally-invalid negative-test siblings do not poison the
+    /// directory.
+    fn scan_fixture_siblings(dir: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.contains("_FIXTURE.") {
+                out.push(format!("./{name}"));
+            }
+        }
+    }
+
+    /// Register one module (keyed by its raw specifier, which is what
+    /// `HostResolveImportedModule` looks up) and its transitive imports,
+    /// each resolved against its own directory. Cycle-safe via the
+    /// already-registered guard.
+    fn register_module_recursive(
+        agent: &mut Agent,
+        dir: &Path,
+        specifier: &str,
+    ) -> Result<(), String> {
+        if specifier.is_empty() || specifier.starts_with('#') {
+            return Ok(());
+        }
+        let key = JsString::from_utf8(specifier);
+        if agent.host_modules.borrow().contains_key(&key) {
+            return Ok(());
+        }
+        let path = dir.join(specifier);
+        let source = match std::fs::read_to_string(&path) {
+            Ok(source) => source,
+            // Negative fixtures import files that must not resolve.
+            Err(_) => return Ok(()),
+        };
+        if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("json"))
+        {
+            agent.add_json_module(specifier, &source);
+        } else {
+            agent.add_module(specifier, &source);
+        }
+        let next_dir = path.parent().unwrap_or(dir).to_path_buf();
+        // A dependency whose source fails to parse is registered anyway: its
+        // parse error surfaces as a SyntaxError when the importing module
+        // resolves it (test262 `phase: resolution` negative fixtures depend
+        // on this). Only a successful parse reveals the transitive imports.
+        let Ok(module) = runtime::module::parse_module(agent, &key, &JsString::from_utf8(&source))
+        else {
+            return Ok(());
+        };
+        for (dep, _) in &module.requested_modules {
+            register_module_recursive(agent, &next_dir, &dep.to_string_lossy())?;
+        }
+        Ok(())
+    }
+
+    fn arity_error(name: &str) -> JsError {
+        assertion_error(format!("{name} called with the wrong number of arguments"))
+    }
+
+    /// Install the `$262` host hooks shared by the script and module paths:
+    /// `evalScript` (evaluates as a Script via intrinsic dispatch), `createRealm`
+    /// (a fresh realm), and `IsHTMLDDA` (the Annex B.3.7 host object).
+    fn install_realm_host_hooks(agent: &mut Agent) -> Result<(), String> {
         // `$262.evalScript` evaluates its source as a Script (test262 host
         // spec) — global declaration instantiation, not direct eval. The
         // native closure cannot reach the agent, so it is dispatched by
@@ -10976,282 +11490,7 @@ var $DONE = function (error) {
         dollar_two_six_two_obj
             .set(&JsString::from_utf8("IsHTMLDDA"), is_htmldda, true)
             .map_err(|e| e.message)?;
-        // The real harness include files (testTypedArray.js, propertyHelper.js,
-        // testAtomics.js, …) are plain JS built on the globals above; load
-        // them from the submodule so the vendored fixtures get their exact
-        // helper surface.
-        for include in &fm.includes {
-            let source = harness_include_source(include)?;
-            agent.run_script(&source).map_err(|e| e.message)?;
-        }
-        // Async fixtures (test262 async protocol) complete via `$DONE`; the
-        // prelude records the call (and any failure value) in globals the
-        // runner reads after the job queue drains.
-        if fm.flags.iter().any(|f| f == "async") {
-            agent.run_script(ASYNC_PRELUDE).map_err(|e| e.message)?;
-        }
-        // Dynamic-import fixtures load real sibling support files from the
-        // submodule; register them (transitively) before the fixture runs.
-        if body.contains("import(") || body.contains("import (") {
-            register_fixture_modules(&mut agent, fixture_dir, body)?;
-        }
-        let result = agent.run_script(&wrapped);
-        agent.run_jobs().map_err(|e| e.message)?;
-        let async_failure = if fm.flags.iter().any(|f| f == "async") {
-            read_async_completion(&mut agent, &Value::Object(realm.global_object.clone()))?
-        } else {
-            None
-        };
-        match (result, async_failure, fm.negative_phase.as_deref()) {
-            (Ok(_), None, None) => Ok(()),
-            (Ok(_), Some(value), None) => Err(format!(
-                "async test failed: {}",
-                describe_thrown(&mut agent, &value)?
-            )),
-            (Ok(_), None, Some("runtime")) => {
-                Err("expected a runtime error but the script completed".into())
-            }
-            (Ok(_), Some(value), Some("runtime")) => {
-                let ty = fm.negative_type.as_deref().unwrap_or("");
-                if thrown_constructor_is(&mut agent, &value, ty) {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "async runtime error != expected {ty}: {}",
-                        describe_thrown(&mut agent, &value)?
-                    ))
-                }
-            }
-            (Ok(_), _, Some(phase)) => Err(format!("unexpected negative phase {phase}")),
-            (Err(e), _, Some("runtime")) => {
-                let ty = fm.negative_type.as_deref().unwrap_or("");
-                if ty == "Test262Error" {
-                    // The fixture deliberately throws the harness's
-                    // Test262Error (a plain object whose `constructor` is the
-                    // Test262Error function); the wrapped JsError's kind is
-                    // always TypeError, so the constructor name decides.
-                    let is_test262 = e
-                        .value
-                        .as_ref()
-                        .is_some_and(|v| thrown_constructor_is(&mut agent, v, "Test262Error"));
-                    if is_test262 {
-                        Ok(())
-                    } else {
-                        Err(format!(
-                            "runtime {:?} != expected Test262Error: {}",
-                            e.kind, e.message
-                        ))
-                    }
-                } else {
-                    let kind = expected_kind(fm)?;
-                    // A JS `throw new RangeError()` wraps in a TypeError-kind
-                    // JsError that carries the thrown value; the value's
-                    // constructor decides the negative type. Engine-thrown
-                    // errors have no value and match by kind.
-                    let matched = match &e.value {
-                        Some(value) => thrown_constructor_is(&mut agent, value, ty),
-                        None => e.kind == kind,
-                    };
-                    if matched {
-                        Ok(())
-                    } else {
-                        Err(format!(
-                            "runtime {:?} != expected {ty}: {}",
-                            e.kind, e.message
-                        ))
-                    }
-                }
-            }
-            (Err(e), _, None) => Err(format!("unexpected runtime error: {}", e.message)),
-            (Err(_), _, Some(_)) => Err("unexpected error on a parse-phase negative test".into()),
-        }
-    }
-
-    fn assertion_error(message: String) -> JsError {
-        JsError::new(ErrorKind::TypeError, message)
-    }
-
-    /// The thrown value's `constructor.name` (the negative type of a
-    /// JS-thrown error; `run_script` wraps every thrown value in a
-    /// TypeError-kind JsError carrying the value, and async `$DONE(error)`
-    /// passes the raw error object).
-    fn thrown_name(agent: &mut Agent, value: &Value) -> Option<String> {
-        let ctor = runtime::context::get_property(
-            agent,
-            value,
-            &JsString::from_utf8("constructor"),
-            value.clone(),
-        )
-        .ok()?;
-        let name = runtime::context::get_property(
-            agent,
-            &ctor,
-            &JsString::from_utf8("name"),
-            ctor.clone(),
-        )
-        .ok()?;
-        match name {
-            Value::String(text) => Some(text.to_string_lossy()),
-            _ => None,
-        }
-    }
-
-    fn thrown_constructor_is(agent: &mut Agent, value: &Value, expected: &str) -> bool {
-        thrown_name(agent, value).as_deref() == Some(expected)
-    }
-
-    /// A readable description of a thrown value for failure messages: its
-    /// constructor name when available, else the value's debug form.
-    fn describe_thrown(agent: &mut Agent, value: &Value) -> Result<String, String> {
-        if let Some(name) = thrown_name(agent, value) {
-            return Ok(name);
-        }
-        Ok(format!("{value:?}"))
-    }
-
-    /// Read the async-completion globals after the job queue drains: `None`
-    /// means `$DONE` was called without an argument (success), `Some(value)`
-    /// carries the failure value, and an error means `$DONE` was never called
-    /// (a hung test).
-    fn read_async_completion(agent: &mut Agent, global: &Value) -> Result<Option<Value>, String> {
-        let passed = runtime::context::get_property(
-            agent,
-            global,
-            &JsString::from_utf8("asyncTestPassed"),
-            global.clone(),
-        )
-        .map_err(|e| e.message)?;
-        if !to_boolean(&passed) {
-            return Err("async test never called $DONE".into());
-        }
-        let error = runtime::context::get_property(
-            agent,
-            global,
-            &JsString::from_utf8("asyncTestError"),
-            global.clone(),
-        )
-        .map_err(|e| e.message)?;
-        if matches!(error, Value::Undefined | Value::Null) {
-            Ok(None)
-        } else {
-            Ok(Some(error))
-        }
-    }
-
-    /// The source of a harness include file, read from the pinned submodule.
-    /// The helpers the preludes replicate (assert.js, compareArray.js,
-    /// detachArrayBuffer.js, isConstructor.js) return empty source (the
-    /// preludes define them natively); every other include is loaded as-is
-    /// from `test262/harness/`.
-    fn harness_include_source(name: &str) -> Result<String, String> {
-        if matches!(
-            name,
-            "assert.js" | "compareArray.js" | "detachArrayBuffer.js" | "isConstructor.js"
-        ) {
-            return Ok(String::new());
-        }
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../test262/harness")
-            .join(name);
-        std::fs::read_to_string(&path).map_err(|e| format!("{name}: {e}"))
-    }
-
-    /// Register the support modules a dynamic-import fixture loads, from the
-    /// pinned submodule (the fixtures `import('./name_FIXTURE.js')` real
-    /// sibling files; `HostResolveImportedModule` resolves only against the
-    /// agent's registered map). Literal specifiers are scanned from the
-    /// source; the computed-specifier cluster (`assignment-expression/*`)
-    /// all resolve to `*_FIXTURE` siblings per the corpus convention, so
-    /// those are registered by directory scan. Missing files stay
-    /// unregistered and reject (the negative `THIS_FILE_DOES_NOT_EXIST`
-    /// fixtures).
-    fn register_fixture_modules(
-        agent: &mut Agent,
-        fixture_dir: &Path,
-        fixture_source: &str,
-    ) -> Result<(), String> {
-        let mut specifiers: Vec<String> = Vec::new();
-        scan_literal_imports(fixture_source, &mut specifiers);
-        scan_fixture_siblings(fixture_dir, &mut specifiers);
-        for specifier in specifiers {
-            register_module_recursive(agent, fixture_dir, &specifier)?;
-        }
         Ok(())
-    }
-
-    /// The string-literal `import('…')`/`import("…")` specifiers in a
-    /// source text (dynamic-import fixtures use literal specifiers; the
-    /// computed ones are covered by the `_FIXTURE` sibling scan).
-    fn scan_literal_imports(source: &str, out: &mut Vec<String>) {
-        let mut rest = source;
-        while let Some(start) = rest.find("import(") {
-            rest = &rest[start + "import(".len()..];
-            let trimmed = rest.trim_start();
-            let Some(quote) = trimmed.chars().next().filter(|c| *c == '\'' || *c == '"') else {
-                continue;
-            };
-            if let Some(end) = trimmed[1..].find(quote) {
-                out.push(trimmed[1..=end].to_string());
-                rest = &trimmed[end + 1..];
-            }
-        }
-    }
-
-    /// The `*_FIXTURE.js`/`*_FIXTURE.json` siblings of a directory: the
-    /// test262 support-file convention for dynamic-import fixtures.
-    fn scan_fixture_siblings(dir: &Path, out: &mut Vec<String>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.contains("_FIXTURE.") {
-                out.push(format!("./{name}"));
-            }
-        }
-    }
-
-    /// Register one module (keyed by its raw specifier, which is what
-    /// `HostResolveImportedModule` looks up) and its transitive imports,
-    /// each resolved against its own directory. Cycle-safe via the
-    /// already-registered guard.
-    fn register_module_recursive(
-        agent: &mut Agent,
-        dir: &Path,
-        specifier: &str,
-    ) -> Result<(), String> {
-        if specifier.is_empty() || specifier.starts_with('#') {
-            return Ok(());
-        }
-        let key = JsString::from_utf8(specifier);
-        if agent.host_modules.borrow().contains_key(&key) {
-            return Ok(());
-        }
-        let path = dir.join(specifier);
-        let source = match std::fs::read_to_string(&path) {
-            Ok(source) => source,
-            // Negative fixtures import files that must not resolve.
-            Err(_) => return Ok(()),
-        };
-        if path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("json"))
-        {
-            agent.add_json_module(specifier, &source);
-        } else {
-            agent.add_module(specifier, &source);
-        }
-        let next_dir = path.parent().unwrap_or(dir).to_path_buf();
-        let module = runtime::module::parse_module(agent, &key, &JsString::from_utf8(&source))
-            .map_err(|e| e.message)?;
-        for (dep, _) in &module.requested_modules {
-            register_module_recursive(agent, &next_dir, &dep.to_string_lossy())?;
-        }
-        Ok(())
-    }
-
-    fn arity_error(name: &str) -> JsError {
-        assertion_error(format!("{name} called with the wrong number of arguments"))
     }
 
     /// Minimal native `assert` helper: the surface the vendored fixtures use.
@@ -11474,9 +11713,6 @@ var $DONE = function (error) {
             Some(pair) => pair,
             None => return FixtureResult::Fail(format!("{relative}: missing frontmatter")),
         };
-        if fm.flags.iter().any(|f| f == "module") {
-            return FixtureResult::Skip("module tests are Phase 7".into());
-        }
         if fm.features.iter().any(|f| f == "Temporal") {
             // Temporal is a stage-3 proposal, not part of ECMA-262 ES2026
             // (out of scope like Intl/ECMA-402).
@@ -11500,6 +11736,16 @@ var $DONE = function (error) {
             // `import(..., { with: { type: "text" } })` is a stage-3
             // proposal, not part of ECMA-262 ES2026.
             return FixtureResult::Skip("import-text is out of scope".into());
+        }
+        if fm.features.iter().any(|f| f == "import-defer") {
+            // `import.defer(...)` is a stage-3 proposal, not part of
+            // ECMA-262 ES2026.
+            return FixtureResult::Skip("import-defer is out of scope".into());
+        }
+        if fm.features.iter().any(|f| f == "import-bytes") {
+            // `import x from ... with { type: "bytes" }` is a stage-3
+            // proposal, not part of ECMA-262 ES2026.
+            return FixtureResult::Skip("import-bytes is out of scope".into());
         }
         if fm.flags.iter().any(|f| f == "CanBlockIsTrue") {
             // Atomics.wait fixtures that assume [[CanBlock]] = true: the
@@ -11554,8 +11800,18 @@ var $DONE = function (error) {
         } else {
             body
         };
+        let fixture_specifier = path
+            .file_name()
+            .map(|s| format!("./{}", s.to_string_lossy()))
+            .unwrap_or_default();
         for mode in modes(&fm) {
-            if let Err(e) = run_one(program, mode, &fm, path.parent().unwrap_or(&path)) {
+            if let Err(e) = run_one(
+                program,
+                mode,
+                &fm,
+                path.parent().unwrap_or(&path),
+                &fixture_specifier,
+            ) {
                 return FixtureResult::Fail(format!("{relative} ({mode:?}): {e}"));
             }
         }
@@ -11578,6 +11834,19 @@ var $DONE = function (error) {
             FixtureResult::Skip(reason) => eprintln!("SKIP {relative}: {reason}"),
             FixtureResult::Fail(reason) => panic!("FAIL {relative}: {reason}"),
         }
+    }
+
+    #[test]
+    fn debug_module_fixture() {
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test262/test/language");
+        let path = base.join("module-code/verify-dfs.js");
+        let source = std::fs::read_to_string(&path).unwrap();
+        let (fm, body) = parse_fixture(&source).unwrap();
+        let specifier = format!("./{}", path.file_name().unwrap().to_string_lossy());
+        let result = run_one_module(body, &fm, path.parent().unwrap(), &specifier);
+        eprintln!("RESULT: {result:?}");
+        assert!(result.is_ok());
     }
 
     /// Directory pass-rate scanner: `cargo test -p test262 -- --ignored

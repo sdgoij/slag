@@ -560,10 +560,11 @@ fn parse_do_while(parser: &mut Parser) -> Result<Stmt, JsError> {
 
 fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
     let start = parser.next()?.span.start; // `for`
-    // `for await ( … of … )` — only in async functions.
+    // `for await ( … of … )` — only in async functions and at module top
+    // level (top-level await).
     let mut is_await = false;
     if parser.at_contextual("await")? && parser.peek2()?.kind == TokenKind::LeftParen {
-        if !parser.in_async {
+        if !parser.in_async && !parser.top_level_await {
             let at = parser.peek()?.span.start;
             return Err(parser.error_at(at, "for await is only allowed in async functions"));
         }
@@ -1257,12 +1258,15 @@ fn parse_function_declaration(
     parser.declare_function(name, name_start, statement_position, is_async, is_generator)?;
     parser.expect_punct(TokenKind::LeftParen)?;
     // Params parse with the function's own [Yield, Await] grammar: async
-    // declarations reserve `await` in their formal parameters (spec 15.8.1).
-    let saved = (parser.in_generator, parser.in_async);
+    // declarations reserve `await` in their formal parameters (spec 15.8.1),
+    // and a module's top-level `await` never leaks into them (spec
+    // 15.2.1.1: FormalParameters are [~Await]).
+    let saved = (parser.in_generator, parser.in_async, parser.top_level_await);
     parser.in_generator = is_generator;
     parser.in_async = is_async;
+    parser.top_level_await = false;
     let params = crate::expr::parse_parameter_list(parser)?;
-    (parser.in_generator, parser.in_async) = saved;
+    (parser.in_generator, parser.in_async, parser.top_level_await) = saved;
     crate::expr::check_duplicate_params(parser, &params, false)?;
     crate::expr::check_function_params(parser, &params, is_async, is_generator)?;
     let (body, strict) = crate::expr::parse_function_body_block(
