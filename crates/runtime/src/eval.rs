@@ -271,7 +271,7 @@ fn eval_using_declarations(
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum DisposalKind {
+pub(crate) enum DisposalKind {
     Normal,
     Sync,
     Async,
@@ -341,7 +341,7 @@ fn eval_named_initializer(
 /// CreateDisposableResource (spec 9.3.1): capture the @@dispose method of an
 /// initialized `using` value; *null*/*undefined* values register nothing, and
 /// non-objects, missing, and non-callable dispose methods are TypeErrors.
-fn create_disposable_resource(
+pub(crate) fn create_disposable_resource(
     agent: &mut Agent,
     value: &Value,
     kind: DisposalKind,
@@ -350,6 +350,11 @@ fn create_disposable_resource(
         return Ok(crate::env::DisposableResource {
             value: Value::Undefined,
             method: Value::Undefined,
+            hint: if kind == DisposalKind::Async {
+                crate::env::DisposalHint::Async
+            } else {
+                crate::env::DisposalHint::Sync
+            },
         });
     }
     if crate::context::as_object(value).is_none() {
@@ -379,6 +384,11 @@ fn create_disposable_resource(
     Ok(crate::env::DisposableResource {
         value: value.clone(),
         method,
+        hint: if kind == DisposalKind::Async {
+            crate::env::DisposalHint::Async
+        } else {
+            crate::env::DisposalHint::Sync
+        },
     })
 }
 

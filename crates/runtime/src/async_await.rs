@@ -17,9 +17,14 @@ use crate::context::ExecutionContext;
 use crate::expr::IteratorRecord;
 use crate::flow::Completion;
 use crate::ir::{CompiledBody, Resume, Suspension, Vm, VmOutcome};
+use crate::promise::{
+    PromiseCapability, new_promise_capability, perform_promise_then, promise_resolve,
+};
 
 /// The resumable state of a running async function body: the VM, the saved
 /// execution context (re-pushed on each resume), and the promise to settle.
+/// A module body also records its SourceTextModule so completion settles the
+/// module record (status, evaluation error, async-parent propagation).
 #[derive(Debug)]
 pub struct AsyncFunctionState {
     pub vm: Vm,
@@ -28,6 +33,7 @@ pub struct AsyncFunctionState {
     pub promise: Value,
     pub resolve: Value,
     pub reject: Value,
+    pub module: Option<crux::handle::Handle<crate::module::SourceTextModule>>,
 }
 
 /// The method of the AsyncFromSyncIterator (spec 27.1.4.3-5).
@@ -102,77 +108,93 @@ pub fn call_async_function(
         annex_b_hoistable: Default::default(),
     };
     agent.execution_context_stack.push(context.clone());
-    let result = (|| -> Result<Value, JsError> {
-        if data.this_mode != crate::function::ThisMode::Lexical {
-            let this = if data.this_mode == crate::function::ThisMode::Sloppy
-                && matches!(this, Value::Undefined | Value::Null)
-            {
-                let global = agent.running_context()?.realm.global_object.clone();
-                Value::Object(global)
-            } else {
-                this
-            };
-            function_env.bind_this_value(this)?;
+    let promise_ctor = agent
+        .current_realm()?
+        .intrinsics
+        .get("%Promise%")
+        .unwrap_or(Value::Undefined);
+    let capability = crate::promise::new_promise_capability(agent, &promise_ctor)?;
+    (|| -> Result<Value, JsError> {
+        // Any failure — parameter binding (defaults may eval), the VM's
+        // initial run, or a settle/attach hook — rejects the promise: an
+        // async function never throws synchronously (spec 27.7.4.1).
+        let run = || -> Result<Value, JsError> {
+            if data.this_mode != crate::function::ThisMode::Lexical {
+                // OrdinaryCallBindThis (spec 10.2.1): sloppy functions coerce
+                // undefined/null to the global object and box primitives.
+                let this = if data.this_mode == crate::function::ThisMode::Sloppy {
+                    match this {
+                        Value::Undefined | Value::Null => {
+                            let global = agent.running_context()?.realm.global_object.clone();
+                            Value::Object(global)
+                        }
+                        Value::Object(_) | Value::Function(_) => this,
+                        other => crate::context::to_object(agent, &other)?,
+                    }
+                } else {
+                    this
+                };
+                function_env.bind_this_value(this)?;
+            }
+            crate::function::function_declaration_instantiation(
+                agent,
+                &function_value,
+                &data.params,
+                &data.body,
+                data.this_mode,
+                data.strict,
+                args,
+                &function_env,
+            )?;
+            // The VM drives the body's lexical environment (the one
+            // function_declaration_instantiation installed on the running
+            // context), not the outer function env, so body-level let/const
+            // bindings are reachable.
+            let body_env = agent.running_context()?.lexical_environment.clone();
+            let body = data.ir.clone().ok_or_else(|| {
+                JsError::new(ErrorKind::TypeError, "async body was not compiled".into())
+            })?;
+            let state = Rc::new(RefCell::new(AsyncFunctionState {
+                vm: Vm::new(body_env, data.strict),
+                body,
+                context,
+                promise: capability.promise.clone(),
+                resolve: capability.resolve.clone(),
+                reject: capability.reject.clone(),
+                module: None,
+            }));
+            let mut state_ref = state.borrow_mut();
+            let body = state_ref.body.clone();
+            let outcome = state_ref.vm.start(agent, &body)?;
+            drop(state_ref);
+            match outcome {
+                VmOutcome::Completed(completion) => {
+                    agent.execution_context_stack.pop();
+                    settle_async_completion(agent, &state, completion)?;
+                }
+                VmOutcome::Suspended(Suspension::Await(value)) => {
+                    agent.execution_context_stack.pop();
+                    attach_await(agent, &state, value)?;
+                }
+                VmOutcome::Suspended(_) => {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "async function suspended on a non-await point".into(),
+                    ));
+                }
+            }
+            Ok(capability.promise.clone())
+        };
+        match run() {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                agent.execution_context_stack.pop();
+                let rejection = crate::promise::error_value(agent, &error);
+                crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
+                Ok(capability.promise)
+            }
         }
-        crate::function::function_declaration_instantiation(
-            agent,
-            &function_value,
-            &data.params,
-            &data.body,
-            data.this_mode,
-            data.strict,
-            args,
-            &function_env,
-        )?;
-        // The VM drives the body's lexical environment (the one
-        // function_declaration_instantiation installed on the running
-        // context), not the outer function env, so body-level let/const
-        // bindings are reachable.
-        let body_env = agent.running_context()?.lexical_environment.clone();
-        let body = data.ir.clone().ok_or_else(|| {
-            JsError::new(ErrorKind::TypeError, "async body was not compiled".into())
-        })?;
-        let promise_ctor = agent
-            .current_realm()?
-            .intrinsics
-            .get("%Promise%")
-            .unwrap_or(Value::Undefined);
-        let capability = crate::promise::new_promise_capability(agent, &promise_ctor)?;
-        let state = Rc::new(RefCell::new(AsyncFunctionState {
-            vm: Vm::new(body_env, data.strict),
-            body,
-            context,
-            promise: capability.promise.clone(),
-            resolve: capability.resolve.clone(),
-            reject: capability.reject.clone(),
-        }));
-        let mut state_ref = state.borrow_mut();
-        let body = state_ref.body.clone();
-        let outcome = state_ref.vm.start(agent, &body)?;
-        drop(state_ref);
-        match outcome {
-            VmOutcome::Completed(completion) => {
-                agent.execution_context_stack.pop();
-                settle_async(agent, &state, completion)?;
-            }
-            VmOutcome::Suspended(Suspension::Await(value)) => {
-                agent.execution_context_stack.pop();
-                attach_await(agent, &state, value)?;
-            }
-            VmOutcome::Suspended(_) => {
-                agent.execution_context_stack.pop();
-                return Err(JsError::new(
-                    ErrorKind::TypeError,
-                    "async function suspended on a non-await point".into(),
-                ));
-            }
-        }
-        Ok(capability.promise)
-    })();
-    if result.is_err() {
-        agent.execution_context_stack.pop();
-    }
-    result
+    })()
 }
 
 /// Attach the Await reactions (spec 27.6.3.1): resume the VM on fulfillment
@@ -257,7 +279,21 @@ fn resume_async(
         state.vm.run_abrupt(agent, &body, resume)
     };
     agent.execution_context_stack.pop();
-    match outcome? {
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        // A step error in a resumed body rejects the function's promise — the
+        // await reaction must not surface a synchronous throw.
+        Err(error) => {
+            let (reject, promise) = {
+                let state = state.borrow();
+                (state.reject.clone(), state.promise.clone())
+            };
+            let rejection = crate::promise::error_value(agent, &error);
+            crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
+            return Ok(promise);
+        }
+    };
+    match outcome {
         VmOutcome::Suspended(Suspension::Await(value)) => {
             attach_await(agent, &state, value)?;
         }
@@ -268,10 +304,39 @@ fn resume_async(
             ));
         }
         VmOutcome::Completed(completion) => {
-            settle_async(agent, &state, completion)?;
+            settle_async_completion(agent, &state, completion)?;
         }
     }
     Ok(Value::Undefined)
+}
+
+/// Settle the async function's promise with the body completion, disposing
+/// the body's `using` resources first (spec 15.8.5.2 steps 9-11). Async
+/// resources suspend through the job queue: the driver folds each disposal
+/// into the completion and settles the promise when the stack drains.
+fn settle_async_completion(
+    agent: &mut Agent,
+    state: &Rc<RefCell<AsyncFunctionState>>,
+    completion: Completion,
+) -> Result<(), JsError> {
+    let resources = {
+        let state = state.borrow();
+        state.vm.lexical_env.drain_disposable_resources()
+    };
+    if resources.is_empty() {
+        settle_async(agent, state, completion)?;
+        return Ok(());
+    }
+    let (resolve, reject) = {
+        let state = state.borrow();
+        (state.resolve.clone(), state.reject.clone())
+    };
+    crate::builtins::disposable::dispose_async_body_resources(
+        agent,
+        resources,
+        completion,
+        crate::builtins::disposable::AsyncBodySettlement::Function { resolve, reject },
+    )
 }
 
 /// Resolve or reject the async function's promise with the body completion.
@@ -280,6 +345,12 @@ fn settle_async(
     state: &Rc<RefCell<AsyncFunctionState>>,
     completion: Completion,
 ) -> Result<Value, JsError> {
+    // A module body's completion settles the module record too (status,
+    // evaluation error, and async-parent propagation, spec 16.2.2.5).
+    if let Some(module) = state.borrow().module.clone() {
+        crate::module::finish_module_evaluation(agent, &module, state, completion)?;
+        return Ok(Value::Undefined);
+    }
     let (resolve, reject) = {
         let state = state.borrow();
         (state.resolve.clone(), state.reject.clone())
@@ -370,17 +441,40 @@ pub fn dispatch_async_from_sync(
     Some(run_async_from_sync(agent, entry, args))
 }
 
+/// The continuation state of an AsyncFromSyncIterator value-unwrap (spec
+/// 27.1.5.4): `done` was already read from the sync result, and the closure
+/// settles the wrapper's capability once the value's promise settles.
+#[derive(Debug, Clone)]
+pub struct AsyncFromSyncContinuationEntry {
+    pub capability: PromiseCapability,
+    pub sync: IteratorRecord,
+    pub done: bool,
+    pub is_reject: bool,
+    pub close_on_rejection: bool,
+}
+
+/// Run one AsyncFromSyncIterator method (spec 27.1.5.2): call the sync
+/// method, then AsyncFromSyncIteratorContinuation — the wrapper's promise
+/// resolves with `{ value, done }` where `value` is promise-unwrapped (and,
+/// on rejection, the sync iterator is closed when the result was not done).
 fn run_async_from_sync(
     agent: &mut Agent,
     entry: Rc<AsyncFromSyncEntry>,
     args: &[Value],
 ) -> Result<Value, JsError> {
+    let promise_ctor = agent
+        .current_realm()?
+        .intrinsics
+        .get("%Promise%")
+        .unwrap_or(Value::Undefined);
+    let capability = new_promise_capability(agent, &promise_ctor)?;
+    let promise = capability.promise.clone();
     let sync = entry.sync.clone();
     let method = entry.method;
     let result = match method {
         AsyncFromSyncMethod::Next => {
             let next = crate::expr::iterator_next_method(agent, &sync)?;
-            crate::function::call(agent, &next, sync.iterator.clone(), args)?
+            crate::function::call(agent, &next, sync.iterator.clone(), args)
         }
         AsyncFromSyncMethod::Return => {
             let return_method = crate::context::get_property(
@@ -390,15 +484,23 @@ fn run_async_from_sync(
                 sync.iterator.clone(),
             )?;
             if is_callable(&return_method) {
-                crate::function::call(agent, &return_method, sync.iterator.clone(), args)?
+                crate::function::call(agent, &return_method, sync.iterator.clone(), args)
             } else {
+                // spec 27.1.5.2.2 steps 8-9: no return method resolves with
+                // `{ value: (the argument), done: true }` directly.
                 let result = JsObject::ordinary_object_create(None);
                 result.create_data_property(
                     &JsString::from_utf8("value"),
                     args.first().cloned().unwrap_or(Value::Undefined),
                 )?;
                 result.create_data_property(&JsString::from_utf8("done"), Value::Boolean(true))?;
-                Value::Object(result)
+                crate::function::call(
+                    agent,
+                    &capability.resolve,
+                    Value::Undefined,
+                    &[Value::Object(result)],
+                )?;
+                return Ok(promise);
             }
         }
         AsyncFromSyncMethod::Throw => {
@@ -409,23 +511,176 @@ fn run_async_from_sync(
                 sync.iterator.clone(),
             )?;
             if is_callable(&throw_method) {
-                crate::function::call(agent, &throw_method, sync.iterator.clone(), args)?
+                crate::function::call(agent, &throw_method, sync.iterator.clone(), args)
             } else {
-                let reason = args.first().cloned().unwrap_or(Value::Undefined);
-                return Err(JsError::new(
-                    ErrorKind::TypeError,
-                    "iterator has no throw method".into(),
-                )
-                .with_value(reason));
+                // spec 27.1.5.2.3 steps 8-9: no throw method closes the
+                // iterator (for finally blocks) and rejects with a TypeError.
+                if let Err(error) = crate::expr::iterator_close(agent, &sync) {
+                    let rejection = crate::promise::error_value(agent, &error);
+                    crate::function::call(
+                        agent,
+                        &capability.reject,
+                        Value::Undefined,
+                        &[rejection],
+                    )?;
+                    return Ok(promise);
+                }
+                let error =
+                    JsError::new(ErrorKind::TypeError, "iterator has no throw method".into());
+                let rejection = crate::promise::error_value(agent, &error);
+                crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
+                return Ok(promise);
             }
         }
     };
-    let promise_ctor = agent
-        .current_realm()?
-        .intrinsics
-        .get("%Promise%")
-        .unwrap_or(Value::Undefined);
-    crate::promise::promise_resolve(agent, &promise_ctor, result)
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            // IfAbruptRejectPromise (spec 27.1.5.2.1 step 6): the wrapper's
+            // promise rejects instead of throwing.
+            let rejection = crate::promise::error_value(agent, &error);
+            crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
+            return Ok(promise);
+        }
+    };
+    if !matches!(result, Value::Object(_) | Value::Function(_)) {
+        // spec 27.1.5.2.2/3: a non-object result rejects with a fresh
+        // TypeError.
+        let error = JsError::new(
+            ErrorKind::TypeError,
+            "iterator result is not an object".into(),
+        );
+        let rejection = crate::promise::error_value(agent, &error);
+        crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
+        return Ok(promise);
+    }
+    // AsyncFromSyncIteratorContinuation (spec 27.1.5.4) steps 2-5.
+    let done = match crate::context::get_property(
+        agent,
+        &result,
+        &JsString::from_utf8("done"),
+        result.clone(),
+    ) {
+        Ok(done) => crux::convert::to_boolean(&done),
+        Err(error) => {
+            let rejection = crate::promise::error_value(agent, &error);
+            crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
+            return Ok(promise);
+        }
+    };
+    let value = match crate::context::get_property(
+        agent,
+        &result,
+        &JsString::from_utf8("value"),
+        result.clone(),
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            let rejection = crate::promise::error_value(agent, &error);
+            crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
+            return Ok(promise);
+        }
+    };
+    // Steps 6-7: a throwing PromiseResolve (e.g. a broken promise) closes
+    // the sync iterator when the result was not done. AsyncIteratorClose
+    // with the throw completion: the original error wins, so a throwing
+    // `return` (or a non-object `return` result) is swallowed (spec
+    // 27.1.5.4 steps 5-6).
+    let close_on_rejection = method != AsyncFromSyncMethod::Return;
+    let value_wrapper = match promise_resolve(agent, &promise_ctor, value.clone()) {
+        Ok(promise) => promise,
+        Err(error) => {
+            if !done && close_on_rejection {
+                let _ = crate::expr::iterator_close_throw(agent, &sync);
+            }
+            let rejection = crate::promise::error_value(agent, &error);
+            crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
+            return Ok(promise);
+        }
+    };
+    // Steps 8-11: unwrap the value; on rejection, close the sync iterator
+    // (spec 27.1.5.4 steps 10-11) when the result was not done.
+    for is_reject in [false, true] {
+        if is_reject && (done || !close_on_rejection) {
+            continue;
+        }
+        let closure = Function::create_builtin(
+            Some(JsString::from_utf8("")),
+            1,
+            Box::new(|_, _| {
+                Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "async-from-sync continuation must be called through the agent".into(),
+                ))
+            }),
+            None,
+            None,
+        )?;
+        agent.async_from_sync_continuations.insert(
+            closure.id(),
+            Rc::new(AsyncFromSyncContinuationEntry {
+                capability: capability.clone(),
+                sync: sync.clone(),
+                done,
+                is_reject,
+                close_on_rejection,
+            }),
+        );
+        let handler = Value::Function(closure);
+        let (on_fulfilled, on_rejected) = if is_reject {
+            (None, Some(handler))
+        } else {
+            (Some(handler), None)
+        };
+        perform_promise_then(agent, &value_wrapper, on_fulfilled, on_rejected, None)?;
+    }
+    Ok(promise)
+}
+
+/// Dispatch an AsyncFromSyncIterator value-unwrap continuation by identity.
+pub fn dispatch_async_from_sync_continuation(
+    agent: &mut Agent,
+    callee: &Value,
+    args: &[Value],
+) -> Option<Result<Value, JsError>> {
+    let Value::Function(function) = callee else {
+        return None;
+    };
+    let entry = agent
+        .async_from_sync_continuations
+        .get(&function.id())
+        .cloned()?;
+    Some(resume_async_from_sync_continuation(agent, entry, args))
+}
+
+fn resume_async_from_sync_continuation(
+    agent: &mut Agent,
+    entry: Rc<AsyncFromSyncContinuationEntry>,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    if entry.is_reject {
+        // The yielded value rejected: close the sync iterator when the
+        // result was not done, then reject the wrapper's promise.
+        // AsyncIteratorClose with a throw completion (spec 27.1.5.4 steps
+        // 13-14): the original rejection wins, so a throwing or non-object
+        // `return` result is swallowed.
+        if !entry.done && entry.close_on_rejection {
+            let _ = crate::expr::iterator_close_throw(agent, &entry.sync);
+        }
+        crate::function::call(agent, &entry.capability.reject, Value::Undefined, &[value])?;
+        return Ok(Value::Undefined);
+    }
+    let result = JsObject::ordinary_object_create(None);
+    result.create_data_property(&JsString::from_utf8("value"), value)?;
+    result.create_data_property(&JsString::from_utf8("done"), Value::Boolean(entry.done))?;
+    crate::function::call(
+        agent,
+        &entry.capability.resolve,
+        Value::Undefined,
+        &[Value::Object(result)],
+    )?;
+    Ok(Value::Undefined)
 }
 
 #[cfg(test)]

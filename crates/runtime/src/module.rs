@@ -55,6 +55,17 @@ pub struct SourceTextModule {
     pub status: RefCell<ModuleStatus>,
     pub environment: RefCell<Option<EnvRef>>,
     pub namespace: RefCell<Option<Value>>,
+    /// The cycle root of this module's strongly connected component (spec
+    /// 16.2.2.5 [[CycleRoot]]): set when a dependency cycle is closed during
+    /// evaluation; an errored cycle's members re-import through it.
+    pub cycle_root: RefCell<Option<Handle<SourceTextModule>>>,
+    /// The modules (outside this module's cycle) waiting on this module's
+    /// evaluation — [[AsyncParentModules]]: errors and fulfillments
+    /// propagate to them.
+    pub async_parents: RefCell<Vec<Handle<SourceTextModule>>>,
+    /// [[PendingAsyncDependencies]]: the async dependency modules still being
+    /// evaluated before this module's body can run.
+    pub pending_async: RefCell<u32>,
     /// (specifier, attributes) of each `import`/`export ... from` clause.
     pub requested_modules: Vec<(JsString, Vec<(AttributeKey, JsString)>)>,
     /// (module specifier, entry) of each import.
@@ -115,6 +126,7 @@ pub fn parse_module(
     source: &JsString,
 ) -> Result<Handle<SourceTextModule>, JsError> {
     let realm = agent.current_realm()?;
+    crate::expr::bump_template_parse_generation();
     let code = {
         let host = agent.host_modules.borrow().get(specifier).cloned();
         match host {
@@ -142,6 +154,9 @@ pub fn parse_module(
         star_export_entries: records.star_export_entries,
         top_level_capability: RefCell::new(None),
         evaluation_error: RefCell::new(None),
+        cycle_root: RefCell::new(None),
+        async_parents: RefCell::new(Vec::new()),
+        pending_async: RefCell::new(0),
     });
     Ok(module)
 }
@@ -365,7 +380,10 @@ pub fn module_declaration_instantiation(
         _ => return Ok(()),
     }
     module.status.replace(ModuleStatus::Linking);
-    let env = new_module_environment(None);
+    // NewModuleEnvironment(module.[[Realm]].[[GlobalEnv]]) (spec
+    // 16.2.1.6.1.2.1 step 4): the module env chains to the global env so
+    // module bodies resolve realm globals (URIError, assert, …).
+    let env = new_module_environment(Some(module.realm.global_env.clone()));
     module.environment.replace(Some(env.clone()));
 
     // Import bindings (live, through the imported module's environment).
@@ -428,6 +446,13 @@ pub fn module_declaration_instantiation(
         }
     }
 
+    // Instantiate the module's top-level declarations first: the export loop
+    // below must not pre-create bindings for names the declarations bind
+    // (spec 16.2.1.6.1.2.1 step 7 creates an export binding only when the
+    // local name is not declared — `const x; export { x }` collides
+    // otherwise).
+    instantiate_module_declarations(agent, module, &env)?;
+
     // Local export bindings.
     let local_exports = module.local_export_entries.clone();
     for export in &local_exports {
@@ -451,9 +476,6 @@ pub fn module_declaration_instantiation(
             }
         }
     }
-
-    // Instantiate the module's top-level declarations.
-    instantiate_module_declarations(agent, module, &env)?;
 
     // Indirect export bindings (re-exports). InitializeEnvironment only
     // validates that each re-export resolves; the binding itself is read
@@ -657,16 +679,37 @@ fn module_statements(module: &Handle<SourceTextModule>) -> Vec<Stmt> {
 }
 
 /// ModuleEvaluation (spec 16.2.2.5): create the namespace and execute the
-/// body through the resumable VM, returning the (possibly pending) promise
-/// that settles when the module finishes. Every module evaluates to a
-/// promise — synchronous bodies settle it before returning.
+/// module's body, deferring it until any async dependencies settle and
+/// recording the cycle root when a dependency cycle is detected.
 pub fn module_evaluation(
     agent: &mut Agent,
     module: &Handle<SourceTextModule>,
 ) -> Result<Value, JsError> {
+    let promise_ctor = || {
+        module
+            .realm
+            .intrinsics
+            .get("%Promise%")
+            .unwrap_or(Value::Undefined)
+    };
     let status = *module.status.borrow();
     match status {
         ModuleStatus::Evaluated => {
+            // spec Evaluate steps 2-3: an errored module — or a fulfilled
+            // member of an errored cycle, redirected through its cycle root —
+            // rejects a fresh capability with the recorded error.
+            let recorded = module.evaluation_error.borrow().clone().or_else(|| {
+                module
+                    .cycle_root
+                    .borrow()
+                    .as_ref()
+                    .and_then(|root| root.evaluation_error.borrow().clone())
+            });
+            if let Some(error) = recorded {
+                let capability = crate::promise::new_promise_capability(agent, &promise_ctor())?;
+                crate::function::call(agent, &capability.reject, Value::Undefined, &[error])?;
+                return Ok(capability.promise);
+            }
             return Ok(module
                 .top_level_capability
                 .borrow()
@@ -697,6 +740,7 @@ pub fn module_evaluation(
     }
     module.status.replace(ModuleStatus::Evaluating);
     module_namespace(agent, module)?;
+    agent.module_eval_stack.push(module.clone());
     // Evaluate the module's dependencies depth-first (spec 16.2.1.6.1.3.1
     // steps 11-12). A dependency that is already evaluating is a cycle: its
     // body finishes on the current evaluation stack, so it is skipped here.
@@ -706,11 +750,37 @@ pub fn module_evaluation(
             let imported = host_resolve_imported_module(agent, &specifier)?;
             let status = *imported.status.borrow();
             match status {
-                ModuleStatus::Evaluated
-                | ModuleStatus::Evaluating
-                | ModuleStatus::EvaluatingAsync => {}
+                ModuleStatus::Evaluating => {
+                    // A dependency cycle: the imported module is the first
+                    // member of the cycle on the evaluation stack, hence the
+                    // [[CycleRoot]]; record it on every member above it.
+                    if let Some(index) = agent
+                        .module_eval_stack
+                        .iter()
+                        .position(|m| std::rc::Rc::ptr_eq(m, &imported))
+                    {
+                        let root = imported.clone();
+                        for member in &agent.module_eval_stack[index..] {
+                            if member.cycle_root.borrow().is_none() {
+                                *member.cycle_root.borrow_mut() = Some(root.clone());
+                            }
+                        }
+                    }
+                }
+                ModuleStatus::Evaluated => {
+                    // Already settled (a direct error was recorded); nothing
+                    // to wait on.
+                }
+                ModuleStatus::EvaluatingAsync => {
+                    // An async dependency still being evaluated: wait on it
+                    // (through its cycle root) before running this body.
+                    register_async_parent(agent, module, &imported)?;
+                }
                 _ => {
                     module_evaluation(agent, &imported)?;
+                    if *imported.status.borrow() == ModuleStatus::EvaluatingAsync {
+                        register_async_parent(agent, module, &imported)?;
+                    }
                 }
             }
         }
@@ -718,7 +788,63 @@ pub fn module_evaluation(
     })();
     if let Err(error) = dependencies_result {
         module.status.replace(ModuleStatus::Evaluated);
+        agent.module_eval_stack.pop();
         return Err(error);
+    }
+    let capability = crate::promise::new_promise_capability(agent, &promise_ctor())?;
+    module
+        .top_level_capability
+        .replace(Some(capability.clone()));
+    // The body may suspend on top-level await, so it always runs in the
+    // resumable driver; synchronous modules complete on the first pass.
+    module.status.replace(ModuleStatus::EvaluatingAsync);
+    if *module.pending_async.borrow() > 0 {
+        // spec 16.2.2.5 steps 13-14: the body is deferred until the async
+        // dependencies settle (AsyncModuleExecutionFulfilled/Rejected).
+        agent.module_eval_stack.pop();
+        return Ok(capability.promise);
+    }
+    let body_result = execute_module_body(agent, module);
+    agent.module_eval_stack.pop();
+    body_result?;
+    Ok(capability.promise)
+}
+
+/// Record `module` as waiting on `dep`'s evaluation (through `dep`'s cycle
+/// root, so a whole errored cycle rejects its importers) — spec 16.2.2.5
+/// [[AsyncParentModules]]. Cycle members never register: a cycle is a single
+/// evaluation unit.
+fn register_async_parent(
+    agent: &mut Agent,
+    module: &Handle<SourceTextModule>,
+    dep: &Handle<SourceTextModule>,
+) -> Result<(), JsError> {
+    let _ = agent;
+    if module.cycle_root.borrow().is_some() {
+        return Ok(());
+    }
+    let root = dep
+        .cycle_root
+        .borrow()
+        .clone()
+        .unwrap_or_else(|| dep.clone());
+    root.async_parents.borrow_mut().push(module.clone());
+    *module.pending_async.borrow_mut() += 1;
+    Ok(())
+}
+
+/// Run a module's body in the resumable driver (spec 16.2.2.5 steps 12+):
+/// the module must already be EVALUATING-ASYNC with a top-level capability
+/// installed. Used for immediate execution and when a deferred module's
+/// pending async dependencies settle.
+fn execute_module_body(
+    agent: &mut Agent,
+    module: &Handle<SourceTextModule>,
+) -> Result<(), JsError> {
+    // An errored cycle may already have settled this module (the rejection
+    // propagates before its deferred body runs); the body is a no-op then.
+    if module.evaluation_error.borrow().is_some() {
+        return Ok(());
     }
     let env = module
         .environment
@@ -739,25 +865,27 @@ pub fn module_evaluation(
     agent.execution_context_stack.push(context.clone());
     let strict = true;
     let body = crate::ir::compile_statements(&stmts, strict)?;
-    let promise_ctor = module
-        .realm
-        .intrinsics
-        .get("%Promise%")
-        .unwrap_or(Value::Undefined);
-    let capability = crate::promise::new_promise_capability(agent, &promise_ctor)?;
-    module
-        .top_level_capability
-        .replace(Some(capability.clone()));
-    // The body may suspend on top-level await, so it always runs in the
-    // resumable driver; synchronous modules complete on the first pass.
-    module.status.replace(ModuleStatus::EvaluatingAsync);
+    let (promise, resolve, reject) = {
+        let capability = module
+            .top_level_capability
+            .borrow()
+            .clone()
+            .ok_or_else(|| {
+                JsError::new(
+                    ErrorKind::TypeError,
+                    "module body executed without a capability".into(),
+                )
+            })?;
+        (capability.promise, capability.resolve, capability.reject)
+    };
     let state = Rc::new(RefCell::new(AsyncFunctionState {
         vm: Vm::new(env, strict),
         body,
         context,
-        promise: capability.promise.clone(),
-        resolve: capability.resolve.clone(),
-        reject: capability.reject.clone(),
+        promise,
+        resolve,
+        reject,
+        module: Some(module.clone()),
     }));
     let mut state_ref = state.borrow_mut();
     let body = state_ref.body.clone();
@@ -786,11 +914,13 @@ pub fn module_evaluation(
             return Err(error);
         }
     }
-    Ok(capability.promise)
+    Ok(())
 }
 
-/// The tail of an async module evaluation: settle the top-level capability.
-fn finish_module_evaluation(
+/// The tail of an async module evaluation: settle the top-level capability,
+/// then propagate the completion to the async parents (spec 16.2.2.5
+/// AsyncModuleExecutionFulfilled/Rejected).
+pub(crate) fn finish_module_evaluation(
     agent: &mut Agent,
     module: &Handle<SourceTextModule>,
     state: &Rc<RefCell<AsyncFunctionState>>,
@@ -800,27 +930,100 @@ fn finish_module_evaluation(
         let state = state.borrow();
         (state.resolve.clone(), state.reject.clone())
     };
+    // An errored cycle's rejection may already have settled this module (a
+    // deferred body is a no-op after the propagation); the later completion
+    // must not re-settle it.
+    if module.evaluation_error.borrow().is_some() {
+        return Ok(());
+    }
     module.status.replace(ModuleStatus::Evaluated);
     match completion {
         Completion::Return(value) | Completion::Normal(value) => {
             crate::function::call(agent, &resolve, Value::Undefined, &[value])?;
+            notify_async_parents_fulfilled(agent, module)?;
         }
         Completion::Empty => {
             crate::function::call(agent, &resolve, Value::Undefined, &[Value::Undefined])?;
+            notify_async_parents_fulfilled(agent, module)?;
         }
         Completion::Throw(value) => {
             module.evaluation_error.replace(Some(value.clone()));
-            crate::function::call(agent, &reject, Value::Undefined, &[value])?;
-        }
-        Completion::Break { .. } | Completion::Continue { .. } => {
             crate::function::call(
                 agent,
                 &reject,
                 Value::Undefined,
-                &[Value::String(Handle::new(JsString::from_utf8(
-                    "Illegal control flow in a module body",
-                )))],
+                std::slice::from_ref(&value),
             )?;
+            propagate_module_error(agent, module, value)?;
+        }
+        Completion::Break { .. } | Completion::Continue { .. } => {
+            let error = Value::String(Handle::new(JsString::from_utf8(
+                "Illegal control flow in a module body",
+            )));
+            module.evaluation_error.replace(Some(error.clone()));
+            crate::function::call(
+                agent,
+                &reject,
+                Value::Undefined,
+                std::slice::from_ref(&error),
+            )?;
+            propagate_module_error(agent, module, error)?;
+        }
+    }
+    Ok(())
+}
+
+/// AsyncModuleExecutionRejected (spec 16.2.2.5): record the error on every
+/// still-pending async parent and reject its capability with the same error,
+/// chaining up the parent tree.
+fn propagate_module_error(
+    agent: &mut Agent,
+    module: &Handle<SourceTextModule>,
+    error: Value,
+) -> Result<(), JsError> {
+    let parents = std::mem::take(&mut *module.async_parents.borrow_mut());
+    for parent in parents {
+        if *parent.status.borrow() != ModuleStatus::EvaluatingAsync {
+            continue;
+        }
+        parent.status.replace(ModuleStatus::Evaluated);
+        parent.evaluation_error.replace(Some(error.clone()));
+        let reject = parent
+            .top_level_capability
+            .borrow()
+            .as_ref()
+            .map(|c| c.reject.clone());
+        if let Some(reject) = reject {
+            crate::function::call(
+                agent,
+                &reject,
+                Value::Undefined,
+                std::slice::from_ref(&error),
+            )?;
+        }
+        propagate_module_error(agent, &parent, error.clone())?;
+    }
+    Ok(())
+}
+
+/// AsyncModuleExecutionFulfilled (spec 16.2.2.5): notify the async parents;
+/// a parent whose pending count reaches zero runs its deferred body.
+fn notify_async_parents_fulfilled(
+    agent: &mut Agent,
+    module: &Handle<SourceTextModule>,
+) -> Result<(), JsError> {
+    let parents = std::mem::take(&mut *module.async_parents.borrow_mut());
+    for parent in parents {
+        if *parent.status.borrow() != ModuleStatus::EvaluatingAsync {
+            continue;
+        }
+        let pending = {
+            let mut pending = parent.pending_async.borrow_mut();
+            *pending = pending.saturating_sub(1);
+            *pending
+        };
+        if pending == 0 {
+            execute_module_body(agent, &parent)?;
         }
     }
     Ok(())
@@ -834,16 +1037,21 @@ pub fn module_namespace(
     if let Some(namespace) = module.namespace.borrow().clone() {
         return Ok(namespace);
     }
-    // The export names: local + resolved indirect + star-resolved.
-    let mut exports: Vec<PropertyKey> = Vec::new();
+    // The export names: local + resolved indirect + star-resolved, sorted in
+    // code-unit order (spec 10.4.6.2 step 7: sortedExports).
+    let mut names: Vec<JsString> = Vec::new();
     for export in &module.local_export_entries {
-        if let Ok(name) = export_name_string(export.export_name.as_ref()) {
-            exports.push(PropertyKey::from_js_string(&name));
+        if let Ok(name) = export_name_string(export.export_name.as_ref())
+            && !names.contains(&name)
+        {
+            names.push(name);
         }
     }
     for export in &module.indirect_export_entries {
-        if let Ok(name) = export_name_string(export.export_name.as_ref()) {
-            exports.push(PropertyKey::from_js_string(&name));
+        if let Ok(name) = export_name_string(export.export_name.as_ref())
+            && !names.contains(&name)
+        {
+            names.push(name);
         }
     }
     for export in &module.star_export_entries {
@@ -854,15 +1062,21 @@ pub fn module_namespace(
         let imported_namespace = module_namespace(agent, &imported)?;
         if let Value::Object(obj) = &imported_namespace {
             for key in obj.own_property_keys()? {
-                let PropertyKey::String(_) = key else {
+                let PropertyKey::String(id) = key else {
                     continue;
                 };
-                if !exports.contains(&key) {
-                    exports.push(key);
+                let name = crux::lookup(id);
+                if !names.contains(&name) {
+                    names.push(name);
                 }
             }
         }
     }
+    names.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+    let exports: Vec<PropertyKey> = names
+        .into_iter()
+        .map(|name| PropertyKey::from_js_string(&name))
+        .collect();
     let namespace = JsObject::module_namespace_object_create(exports)?;
     let namespace_value = Value::Object(namespace.clone());
     agent
@@ -1001,7 +1215,18 @@ pub fn dynamic_import(
         .get("%Promise%")
         .unwrap_or(Value::Undefined);
     let capability = crate::promise::new_promise_capability(agent, &promise_ctor)?;
-    let specifier_text = crux::convert::to_string(specifier)?;
+    let resolve = capability.resolve.clone();
+    let reject = capability.reject.clone();
+    // ToString(specifier) abrupts reject the capability (spec 13.3.10.1
+    // steps 6-7) — the import expression must not throw synchronously.
+    let specifier_text = match crux::convert::to_string(specifier) {
+        Ok(text) => text,
+        Err(error) => {
+            let rejection = crate::promise::error_value(agent, &error);
+            crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
+            return Ok(capability.promise);
+        }
+    };
     // Import attributes: only `type: "json"` is supported; *undefined*
     // options (including the evaluation of an options expression that yields
     // undefined) skip the attribute validation entirely (spec 13.3.10.2
@@ -1009,14 +1234,21 @@ pub fn dynamic_import(
     if let Some(options) = options
         && !matches!(options, Value::Undefined)
     {
-        let attributes = import_attributes(options)?;
+        let attributes = match import_attributes(agent, options) {
+            Ok(attributes) => attributes,
+            Err(error) => {
+                let rejection = crate::promise::error_value(agent, &error);
+                crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
+                return Ok(capability.promise);
+            }
+        };
         for (key, value) in attributes {
             let key = key.to_string_lossy();
             let value = value.to_string_lossy();
             if key != "type" || value != "json" {
                 crate::function::call(
                     agent,
-                    &capability.reject,
+                    &reject,
                     Value::Undefined,
                     &[Value::String(Handle::new(JsString::from_utf8(
                         "Unsupported import attribute",
@@ -1026,8 +1258,6 @@ pub fn dynamic_import(
             }
         }
     }
-    let resolve = capability.resolve.clone();
-    let reject = capability.reject.clone();
     let result = (|| -> Result<(), JsError> {
         let module = host_resolve_imported_module(agent, &specifier_text)?;
         module_declaration_instantiation(agent, &module)?;
@@ -1116,22 +1346,55 @@ pub fn import_meta(agent: &mut Agent) -> Result<Value, JsError> {
 }
 
 /// The `with { ... }` attributes of an import.
-fn import_attributes(options: &Value) -> Result<Vec<(JsString, JsString)>, JsError> {
-    let Value::Object(obj) = options else {
+fn import_attributes(
+    agent: &mut Agent,
+    options: &Value,
+) -> Result<Vec<(JsString, JsString)>, JsError> {
+    // The attributes are the `with` property's own enumerable string keys
+    // (spec 13.3.10.2 / import-attributes): the options object itself is the
+    // envelope, not the attribute map.
+    let Value::Object(_) = options else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "import options must be an object".into(),
+        ));
+    };
+    let with = crate::context::get_property(
+        agent,
+        options,
+        &JsString::from_utf8("with"),
+        options.clone(),
+    )?;
+    if matches!(with, Value::Undefined) {
+        return Ok(Vec::new());
+    }
+    let Value::Object(with_obj) = with else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "import attributes must be an object".into(),
         ));
     };
     let mut out = Vec::new();
-    for key in obj.own_property_keys()? {
+    for key in with_obj.own_property_keys()? {
         let PropertyKey::String(id) = key else {
             continue;
         };
+        let Some(prop) = with_obj.get_own_property_key(&PropertyKey::String(id))? else {
+            continue;
+        };
+        if !prop.enumerable {
+            continue;
+        }
         let name = crux::lookup(id);
-        let value = obj.get(&name)?;
-        let value = crux::convert::to_string(&value)?;
-        out.push((name, value));
+        let value = with_obj.get(&name)?;
+        // spec: attribute values must already be strings — no coercion.
+        let Value::String(text) = value else {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "import attribute value must be a string".into(),
+            ));
+        };
+        out.push((name, text.as_ref().clone()));
     }
     Ok(out)
 }
@@ -1506,5 +1769,67 @@ mod tests {
             rendered,
             js_str("function greet(name) { return 'hi ' + name; }")
         );
+    }
+
+    #[test]
+    fn errored_async_cycle_rejects_importers_and_members() {
+        // A top-level-await cycle {a, b, c} where b throws after its await:
+        // the importer (main) rejects with b's error, and re-importing a
+        // fulfilled cycle member (c) rejects with the same recorded error
+        // (spec 16.2.2.5 Evaluate steps 2-3 / AsyncModuleExecutionRejected).
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.add_module("./main.js", "import './b.js'; import './x.js';");
+        agent.add_module(
+            "./b.js",
+            "import './c.js'; await Promise.resolve(0); throw new Error('async error in B');",
+        );
+        agent.add_module("./c.js", "import './a.js'; await Promise.resolve(0);");
+        agent.add_module("./a.js", "import './b.js'; await Promise.resolve(0);");
+        agent.add_module("./x.js", "import './a.js'; await Promise.resolve(0);");
+        let main =
+            host_resolve_imported_module(&mut agent, &JsString::from_utf8("./main.js")).unwrap();
+        module_declaration_instantiation(&mut agent, &main).unwrap();
+        let main_promise = module_evaluation(&mut agent, &main).unwrap();
+        agent.run_jobs().unwrap();
+        let main_error = match settled(&agent, &main_promise) {
+            Err(_) => panic!("main promise did not reject"),
+            Ok(value) => value,
+        };
+        let message = crate::context::get_property(
+            &mut agent,
+            &main_error,
+            &JsString::from_utf8("message"),
+            main_error.clone(),
+        )
+        .unwrap();
+        assert_eq!(message, js_str("async error in B"));
+        let c = host_resolve_imported_module(&mut agent, &JsString::from_utf8("./c.js")).unwrap();
+        let c_promise = module_evaluation(&mut agent, &c).unwrap();
+        agent.run_jobs().unwrap();
+        let c_error = match settled(&agent, &c_promise) {
+            Err(_) => panic!("c promise did not reject"),
+            Ok(value) => value,
+        };
+        assert_eq!(c_error, main_error);
+    }
+
+    #[test]
+    fn async_dependency_defers_the_importing_body() {
+        // A module with a top-level-await dependency does not run its own
+        // body until the dependency settles (spec 16.2.2.5 steps 13-14).
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.add_module("./m.js", "import './b.js'; export var done = 1;");
+        agent.add_module("./b.js", "await Promise.resolve(0); export var x = 1;");
+        let m = host_resolve_imported_module(&mut agent, &JsString::from_utf8("./m.js")).unwrap();
+        module_declaration_instantiation(&mut agent, &m).unwrap();
+        let m_promise = module_evaluation(&mut agent, &m).unwrap();
+        agent.run_jobs().unwrap();
+        let b = host_resolve_imported_module(&mut agent, &JsString::from_utf8("./b.js")).unwrap();
+        assert_eq!(*b.status.borrow(), ModuleStatus::Evaluated);
+        assert_eq!(*m.status.borrow(), ModuleStatus::Evaluated);
+        let settled = settled(&agent, &m_promise);
+        assert!(matches!(settled, Ok(Value::Undefined)));
     }
 }

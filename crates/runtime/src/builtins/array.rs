@@ -1900,6 +1900,8 @@ fn array_iterator_next(agent: &mut Agent, this: &Value, _args: &[Value]) -> Resu
 pub(crate) enum FromAsyncPhase {
     /// Awaiting the IteratorStep result.
     Step,
+    /// Awaiting a raw array-like element value (before mapping).
+    Element,
     /// Awaiting the mapped value.
     Mapped,
 }
@@ -1920,18 +1922,11 @@ pub struct FromAsyncState {
     pub(crate) phase: FromAsyncPhase,
 }
 
-/// AsyncIteratorClose (spec 27.1.4.1), best-effort: invoke the `return`
-/// method; a throwing `return` replaces the original error.
-fn async_iterator_close(agent: &mut Agent, iterator: &IteratorRecord, error: &JsError) -> JsError {
-    let return_method =
-        get(agent, &iterator.iterator, &JsString::from_utf8("return")).unwrap_or(Value::Undefined);
-    if is_callable(&return_method)
-        && let Err(close_error) =
-            crate::function::call(agent, &return_method, iterator.iterator.clone(), &[])
-    {
-        return close_error;
-    }
-    error.clone()
+/// AsyncIteratorClose with a throw completion (spec 27.1.4.1 steps 6-7),
+/// best-effort: the original error always wins, so a throwing `return` (or a
+/// non-object `return` result) is swallowed.
+fn from_async_iterator_close(agent: &mut Agent, iterator: &IteratorRecord) {
+    let _ = crate::expr::iterator_close_throw(agent, iterator);
 }
 
 /// Attach the next Await of the fromAsync loop: `value` becomes a promise,
@@ -1978,7 +1973,8 @@ fn make_from_async_handler(
 }
 
 /// Reject the fromAsync capability with `error`, closing the iterator first
-/// when it is being driven.
+/// when it is being driven (IfAbruptCloseAsyncIterator with a throw
+/// completion: the original error wins, a throwing `return` is swallowed).
 fn from_async_reject(
     agent: &mut Agent,
     state: &Rc<RefCell<FromAsyncState>>,
@@ -1988,13 +1984,95 @@ fn from_async_reject(
         let state = state.borrow();
         (state.capability.reject.clone(), state.iterator.clone())
     };
-    let error = match iterator {
-        Some(record) => async_iterator_close(agent, &record, &error),
-        None => error,
-    };
+    if let Some(record) = iterator {
+        from_async_iterator_close(agent, &record);
+    }
     let rejection = crate::promise::error_value(agent, &error);
     crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
     Ok(())
+}
+
+/// Set the result's `length` (spec 23.1.2.4.1 steps 13.d.i / 14.j) and
+/// resolve the capability. A failing Set (e.g. a read-only length or a
+/// throwing setter) rejects instead.
+fn from_async_finish(
+    agent: &mut Agent,
+    state: &Rc<RefCell<FromAsyncState>>,
+    len: u64,
+) -> Result<Value, JsError> {
+    let (array, resolve) = {
+        let state = state.borrow();
+        (state.array.clone(), state.capability.resolve.clone())
+    };
+    if let Err(error) = object_of(&array)?.set(
+        &JsString::from_utf8("length"),
+        Value::Number(len as f64),
+        true,
+    ) {
+        from_async_reject(agent, state, error)?;
+        return Ok(Value::Undefined);
+    }
+    crate::function::call(agent, &resolve, Value::Undefined, &[array])?;
+    Ok(Value::Undefined)
+}
+
+/// Define `array[k] = value`, advance k, and continue the loop: the
+/// array-like path awaits the next raw element, the iterator path takes the
+/// next IteratorStep (spec 23.1.2.4.1 steps 13.g-i / 14.h-i).
+fn from_async_define_and_advance(
+    agent: &mut Agent,
+    state: &Rc<RefCell<FromAsyncState>>,
+    value: Value,
+) -> Result<Value, JsError> {
+    let k = state.borrow().k;
+    let array = state.borrow().array.clone();
+    if let Err(error) = object_of(&array)?.create_data_property_or_throw(&key(k), value.clone()) {
+        from_async_reject(agent, state, error)?;
+        return Ok(Value::Undefined);
+    }
+    state.borrow_mut().k = k + 1;
+    let (is_array_like, len, items) = {
+        let state = state.borrow();
+        (state.is_array_like, state.len, state.items.clone())
+    };
+    if is_array_like {
+        let k = state.borrow().k;
+        if k >= len {
+            return from_async_finish(agent, state, len);
+        }
+        let next = match get(agent, &items, &key(k)) {
+            Ok(next) => next,
+            Err(error) => {
+                from_async_reject(agent, state, error)?;
+                return Ok(Value::Undefined);
+            }
+        };
+        state.borrow_mut().phase = FromAsyncPhase::Element;
+        if let Err(error) = attach_from_async_await(agent, state.clone(), next) {
+            from_async_reject(agent, state, error)?;
+        }
+        return Ok(Value::Undefined);
+    }
+    // Iterator path: Await(IteratorStep(iteratorRecord)).
+    let (iterator, next) = {
+        let state = state.borrow();
+        let record = state.iterator.as_ref().ok_or_else(|| {
+            JsError::new(ErrorKind::TypeError, "fromAsync iterator missing".into())
+        })?;
+        (record.iterator.clone(), record.next.clone())
+    };
+    let step_promise = match crate::function::call(agent, &next, iterator, &[]) {
+        Ok(promise) => promise,
+        Err(error) => {
+            from_async_reject(agent, state, error)?;
+            return Ok(Value::Undefined);
+        }
+    };
+    state.borrow_mut().phase = FromAsyncPhase::Step;
+    if let Err(error) = attach_from_async_await(agent, state.clone(), step_promise) {
+        from_async_reject(agent, state, error)?;
+    }
+    Ok(Value::Undefined)
 }
 
 /// Resume the fromAsync loop with the resolved await value.
@@ -2014,77 +2092,40 @@ fn from_async_resume(
                 value.clone(),
             )?);
             if done {
-                let (resolve, array) = {
-                    let state = state.borrow();
-                    (state.capability.resolve.clone(), state.array.clone())
-                };
-                crate::function::call(agent, &resolve, Value::Undefined, &[array])?;
-                return Ok(Value::Undefined);
+                // spec step 13.d: Set(A, "length", k, true) before returning.
+                let k = state.borrow().k;
+                return from_async_finish(agent, &state, k);
             }
             let step_value =
                 get_property(agent, &value, &JsString::from_utf8("value"), value.clone())?;
-            from_async_map_and_await(agent, &state, step_value)
+            let mapping = !matches!(state.borrow().mapfn, Value::Undefined);
+            if mapping {
+                from_async_map_and_await(agent, &state, step_value)
+            } else {
+                // spec steps 13.f-g: without a mapper the iterator value is
+                // defined directly — it must not be awaited.
+                from_async_define_and_advance(agent, &state, step_value)
+            }
         }
-        FromAsyncPhase::Mapped => {
-            let k = state.borrow().k;
-            let array = state.borrow().array.clone();
-            if let Err(error) =
-                object_of(&array)?.create_data_property_or_throw(&key(k), value.clone())
-            {
-                from_async_reject(agent, &state, error)?;
-                return Ok(Value::Undefined);
+        FromAsyncPhase::Element => {
+            // `value` is the resolved array-like element (spec step 14.e);
+            // map it when a mapper is present, else define it directly.
+            let mapping = !matches!(state.borrow().mapfn, Value::Undefined);
+            if mapping {
+                from_async_map_and_await(agent, &state, value)
+            } else {
+                from_async_define_and_advance(agent, &state, value)
             }
-            state.borrow_mut().k = k + 1;
-            let is_array_like = state.borrow().is_array_like;
-            if is_array_like {
-                let (len, items) = {
-                    let state = state.borrow();
-                    (state.len, state.items.clone())
-                };
-                let k = state.borrow().k;
-                if k >= len {
-                    let (resolve, array) = {
-                        let state = state.borrow();
-                        (state.capability.resolve.clone(), state.array.clone())
-                    };
-                    crate::function::call(agent, &resolve, Value::Undefined, &[array])?;
-                    return Ok(Value::Undefined);
-                }
-                let next = match get(agent, &items, &key(k)) {
-                    Ok(next) => next,
-                    Err(error) => {
-                        from_async_reject(agent, &state, error)?;
-                        return Ok(Value::Undefined);
-                    }
-                };
-                let result = from_async_map_and_await(agent, &state, next);
-                return result;
-            }
-            // Iterator path: Await(IteratorStep(iteratorRecord)).
-            let (iterator, next) = {
-                let state = state.borrow();
-                let record = state.iterator.as_ref().ok_or_else(|| {
-                    JsError::new(ErrorKind::TypeError, "fromAsync iterator missing".into())
-                })?;
-                (record.iterator.clone(), record.next.clone())
-            };
-            let step_promise = match crate::function::call(agent, &next, iterator, &[]) {
-                Ok(promise) => promise,
-                Err(error) => {
-                    from_async_reject(agent, &state, error)?;
-                    return Ok(Value::Undefined);
-                }
-            };
-            state.borrow_mut().phase = FromAsyncPhase::Step;
-            if let Err(error) = attach_from_async_await(agent, state.clone(), step_promise) {
-                from_async_reject(agent, &state, error)?;
-            }
-            Ok(Value::Undefined)
         }
+        FromAsyncPhase::Mapped => from_async_define_and_advance(agent, &state, value),
     }
 }
 
-/// Map the step/element value (when a mapper is present) and await it.
+/// Map the step/element value (when a mapper is present) and await it. The
+/// array-like path defines its element directly after the raw-element await
+/// (spec 23.1.2.4.1 steps 14.e-h), and the iterator path without a mapper
+/// defines its value without awaiting at all (steps 13.f-g); both skip this
+/// when no mapper is present, so the mapfn here is always defined.
 fn from_async_map_and_await(
     agent: &mut Agent,
     state: &Rc<RefCell<FromAsyncState>>,
@@ -2122,7 +2163,8 @@ fn from_async_map_and_await(
     Ok(Value::Undefined)
 }
 
-/// spec 23.1.2.4 Array.fromAsync.
+/// spec 23.1.2.4 Array.fromAsync. Any failure rejects the capability — the
+/// call never throws synchronously (an async-test harness asserts that).
 fn from_async(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let promise_ctor = agent
         .current_realm()?
@@ -2130,100 +2172,107 @@ fn from_async(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
         .get("%Promise%")
         .unwrap_or(Value::Undefined);
     let capability = crate::promise::new_promise_capability(agent, &promise_ctor)?;
-    let items = args.first().cloned().unwrap_or(Value::Undefined);
-    let mapfn = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let this_arg = args.get(2).cloned().unwrap_or(Value::Undefined);
-    let mapping = !matches!(mapfn, Value::Undefined);
-    if mapping && !is_callable(&mapfn) {
-        let rejection = crate::promise::error_value(
-            agent,
-            &JsError::new(
+    let reject = capability.reject.clone();
+    let promise = capability.promise.clone();
+    let result = (|| -> Result<(), JsError> {
+        let items = args.first().cloned().unwrap_or(Value::Undefined);
+        let mapfn = args.get(1).cloned().unwrap_or(Value::Undefined);
+        let this_arg = args.get(2).cloned().unwrap_or(Value::Undefined);
+        let mapping = !matches!(mapfn, Value::Undefined);
+        if mapping && !is_callable(&mapfn) {
+            return Err(JsError::new(
                 ErrorKind::TypeError,
                 "Array.fromAsync: mapfn is not a function".into(),
-            ),
-        );
-        crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
-        return Ok(capability.promise);
-    }
-    let array = match array_species_create(agent, this, 0.0) {
-        Ok(array) => Value::Object(array),
-        Err(error) => {
-            let rejection = crate::promise::error_value(agent, &error);
-            crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
-            return Ok(capability.promise);
+            ));
         }
-    };
-    let is_array_like = is_array(&items);
-    let mut iterator = None;
-    let len = if is_array_like {
-        match length_of_array_like(agent, &items) {
-            Ok(len) => len,
-            Err(error) => {
-                let rejection = crate::promise::error_value(agent, &error);
-                crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
-                return Ok(capability.promise);
+        // spec 23.1.2.4 steps 3-7: @@asyncIterator, then @@iterator (wrapped
+        // in an AsyncFromSyncIterator), then the array-like path over
+        // ToObject(items).
+        let using_async = get_method(agent, &items, "@@asyncIterator")?;
+        let using_sync = if using_async.is_some() {
+            None
+        } else {
+            get_method(agent, &items, "@@iterator")?
+        };
+        let mut iterator = None;
+        let (is_array_like, len, items, array) = if using_async.is_some() || using_sync.is_some() {
+            iterator = Some(async_iterator_from(agent, &items)?);
+            // spec step 4: Construct(C) with no arguments (no @@species).
+            let array = if is_constructor(this) {
+                crate::function::construct(agent, this, &[], this)?
+            } else {
+                Value::Object(array_create(agent, 0.0)?)
+            };
+            (false, 0, items, array)
+        } else {
+            // Array-like path: ToObject, then LengthOfArrayLike (primitives
+            // get their wrapper, so Number.prototype[0] etc. are visible),
+            // then Construct(C, « len ») or ArrayCreate(len).
+            let array_like = crate::context::to_object(agent, &items)?;
+            let len = length_of_array_like(agent, &array_like)?;
+            let array = if is_constructor(this) {
+                crate::function::construct(agent, this, &[Value::Number(len as f64)], this)?
+            } else {
+                Value::Object(array_create(agent, len as f64)?)
+            };
+            (true, len, array_like, array)
+        };
+        let state = Rc::new(RefCell::new(FromAsyncState {
+            array,
+            items,
+            mapfn,
+            this_arg,
+            is_array_like,
+            len,
+            iterator,
+            k: 0,
+            capability,
+            phase: FromAsyncPhase::Mapped,
+        }));
+        // Kick the loop: the first Await is on the raw element 0
+        // (array-like) or on the first IteratorStep (iterator path).
+        if is_array_like {
+            if len == 0 {
+                // spec step 14.j: no elements are read for a 0-length
+                // array-like; the length is set and the loop resolves.
+                let (array, resolve) = {
+                    let state = state.borrow();
+                    (state.array.clone(), state.capability.resolve.clone())
+                };
+                if let Err(error) =
+                    object_of(&array)?.set(&JsString::from_utf8("length"), Value::Number(0.0), true)
+                {
+                    from_async_reject(agent, &state, error)?;
+                } else {
+                    crate::function::call(agent, &resolve, Value::Undefined, &[array])?;
+                }
+                return Ok(());
             }
-        }
-    } else {
-        match async_iterator_from(agent, &items) {
-            Ok(record) => {
-                iterator = Some(record);
-                0
-            }
-            Err(error) => {
-                let rejection = crate::promise::error_value(agent, &error);
-                crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
-                return Ok(capability.promise);
-            }
-        }
-    };
-    let state = Rc::new(RefCell::new(FromAsyncState {
-        array,
-        items,
-        mapfn,
-        this_arg,
-        is_array_like,
-        len,
-        iterator,
-        k: 0,
-        capability,
-        phase: FromAsyncPhase::Mapped,
-    }));
-    // Kick the loop: the first Await is on the mapped value of element 0
-    // (array-like) or on the first IteratorStep (iterator path).
-    if is_array_like {
-        let items = state.borrow().items.clone();
-        let next = match get(agent, &items, &key(0)) {
-            Ok(next) => next,
-            Err(error) => {
+            let items = state.borrow().items.clone();
+            let next = get(agent, &items, &key(0))?;
+            state.borrow_mut().phase = FromAsyncPhase::Element;
+            if let Err(error) = attach_from_async_await(agent, state.clone(), next) {
                 from_async_reject(agent, &state, error)?;
-                return Ok(state.borrow().capability.promise.clone());
             }
-        };
-        if let Err(error) = from_async_map_and_await(agent, &state, next) {
-            from_async_reject(agent, &state, error)?;
+        } else {
+            state.borrow_mut().phase = FromAsyncPhase::Step;
+            let (iterator, next) = {
+                let state = state.borrow();
+                let record = state.iterator.as_ref().ok_or_else(|| {
+                    JsError::new(ErrorKind::TypeError, "fromAsync iterator missing".into())
+                })?;
+                (record.iterator.clone(), record.next.clone())
+            };
+            let step_promise = crate::function::call(agent, &next, iterator, &[])?;
+            attach_from_async_await(agent, state.clone(), step_promise)?;
         }
-    } else {
-        state.borrow_mut().phase = FromAsyncPhase::Step;
-        let (iterator, next) = {
-            let state = state.borrow();
-            let record = state.iterator.as_ref().ok_or_else(|| {
-                JsError::new(ErrorKind::TypeError, "fromAsync iterator missing".into())
-            })?;
-            (record.iterator.clone(), record.next.clone())
-        };
-        let step_promise = match crate::function::call(agent, &next, iterator, &[]) {
-            Ok(promise) => promise,
-            Err(error) => {
-                from_async_reject(agent, &state, error)?;
-                return Ok(state.borrow().capability.promise.clone());
-            }
-        };
-        if let Err(error) = attach_from_async_await(agent, state.clone(), step_promise) {
-            from_async_reject(agent, &state, error)?;
-        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let rejection = crate::promise::error_value(agent, &error);
+        crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
     }
-    Ok(state.borrow().capability.promise.clone())
+    Ok(promise)
 }
 
 /// GetIterator for fromAsync: prefer @@asyncIterator, fall back to a
@@ -2765,12 +2814,12 @@ pub fn dispatch_call(
         && let Some((state, is_reject)) = agent.array_from_async.get(&function.id()).cloned()
     {
         if is_reject {
+            // Reject the capability with the awaited value, closing the
+            // iterator first (IfAbruptCloseAsyncIterator, spec 23.1.2.4.1).
             let rejection = args.first().cloned().unwrap_or(Value::Undefined);
-            let reject = state.borrow().capability.reject.clone();
-            return Some(
-                crate::function::call(agent, &reject, Value::Undefined, &[rejection])
-                    .map(|_| Value::Undefined),
-            );
+            let error = JsError::new(ErrorKind::TypeError, "fromAsync rejected".into())
+                .with_value(rejection);
+            return Some(from_async_reject(agent, &state, error).map(|_| Value::Undefined));
         }
         let value = args.first().cloned().unwrap_or(Value::Undefined);
         return Some(from_async_resume(agent, state, value));

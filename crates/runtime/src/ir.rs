@@ -134,6 +134,24 @@ pub enum Step {
     DeclInit {
         pattern: BindingPattern,
     },
+    /// Evaluate a `using`/`await using` initializer: register the value as a
+    /// disposable resource on the current lexical environment, then bind it
+    /// (spec 9.3.1 / 14.2.2).
+    UsingInit {
+        pattern: BindingPattern,
+        is_await: bool,
+    },
+    /// Set the `name` property of the value on top of the stack (NamedEvaluation,
+    /// spec 14.2.2 step 2.d): pop, set, push.
+    SetFunctionName {
+        name: crux::AtomId,
+    },
+    /// An upstream `?.` short-circuited: the rest of the chain is skipped
+    /// (spec 13.4.3 optional chains propagate undefined without evaluating
+    /// the remaining links).
+    SetChainShort,
+    ClearChainShort,
+    JumpIfChainShort(usize),
     UpdateIdent {
         name: crux::AtomId,
         op: UpdateOp,
@@ -282,6 +300,7 @@ pub enum Step {
         left: ForBinding,
     },
     AsyncForOfRestore,
+    AsyncForOfClose,
     SwitchDisc,
     SwitchTest {
         case: usize,
@@ -397,8 +416,16 @@ pub enum PendingControl {
 /// How the VM suspended, for the driver (generator/async machinery).
 #[derive(Debug, Clone)]
 pub enum Suspension {
-    Yield { value: Value, delegate: bool },
+    Yield {
+        value: Value,
+        delegate: bool,
+    },
     Await(Value),
+    /// The `yield*` delegation has no `return` method: the received value is
+    /// awaited and the body is resumed with a return completion of it (spec
+    /// 15.5.5 return case step b.ii). The driver resumes with
+    /// `Resume::Return` instead of `Resume::Normal`.
+    AwaitReturn(Value),
 }
 
 /// What a resume hands to the VM.
@@ -471,6 +498,18 @@ pub struct Vm {
     /// Pending class definitions whose heritage/computed names suspend.
     pub class_stack: Vec<ClassEvalState>,
     pub switch_disc: Option<Value>,
+    /// An upstream `?.` short-circuited: the rest of the chain (keys, args,
+    /// further links) must not evaluate, and the chain is `undefined` (spec
+    /// 13.4.3). Cleared when the outermost chain node finishes.
+    pub chain_short: bool,
+    /// The in-flight disposal of a scope's `using` resources at an
+    /// async-disposal suspension: the VM suspends with `Suspension::Await`
+    /// per async dispose, and `run_abrupt` resumes the driver.
+    pub pending_disposal: Option<PendingDisposal>,
+    /// A caught throw that discarded the try block's envs: `CatchBind`
+    /// disposes them (folding into the thrown value, spec 9.4.3) before
+    /// binding the parameter. `(saved_env, env_depth)` of the try frame.
+    pub pending_catch_disposal: Option<(EnvRef, usize)>,
     pub strict: bool,
 }
 
@@ -490,6 +529,34 @@ pub struct ClassEvalState {
 pub struct YieldStarState {
     pub iterator: crate::expr::IteratorRecord,
     pub received: Value,
+    /// Whether the current delegation pass was resumed with a return
+    /// completion: a done result then completes the body with a return
+    /// completion of its value instead of continuing (spec 15.5.5 return
+    /// case step viii).
+    pub resumed_return: bool,
+}
+
+/// An in-flight scope disposal (spec 9.4.3 DisposeResources): the remaining
+/// resources in disposal order, the completion being folded, and how to
+/// resume once the stack drains.
+#[derive(Debug)]
+pub struct PendingDisposal {
+    pub resources: Vec<crate::env::DisposableResource>,
+    pub index: usize,
+    pub completion: Completion,
+    pub resume: DisposalResume,
+}
+
+/// How a finished scope disposal delivers its folded completion.
+#[derive(Debug)]
+pub enum DisposalResume {
+    /// Scope-exit style: a normal completion continues at the current ip; a
+    /// throw propagates through the handler table.
+    ApplyCompletion,
+    /// The try-catch path: the folded value is delivered to the catch (the
+    /// `CatchBind` step re-runs with `self.thrown` set and the env stack
+    /// restored).
+    DeliverCatch { saved_env: EnvRef, env_depth: usize },
 }
 
 impl Vm {
@@ -514,6 +581,9 @@ impl Vm {
             yield_star_stack: Vec::new(),
             class_stack: Vec::new(),
             switch_disc: None,
+            chain_short: false,
+            pending_disposal: None,
+            pending_catch_disposal: None,
             strict,
         }
     }
@@ -567,10 +637,21 @@ impl Vm {
     ) -> Result<VmOutcome, JsError> {
         match resume {
             Resume::Normal(value) => {
+                if self.pending_disposal.is_some() {
+                    // The awaited async-dispose settled: keep driving the
+                    // scope disposal.
+                    return self.resume_pending_disposal(agent, body, Ok(value));
+                }
                 self.stack.push(value);
                 self.run_inner(agent, body)
             }
             Resume::Throw(value) => {
+                if self.pending_disposal.is_some() {
+                    // A rejected async-dispose is a throwing disposal, folded
+                    // into the disposal completion — never routed through the
+                    // body's handler table.
+                    return self.resume_pending_disposal(agent, body, Err(value));
+                }
                 // A resumed `yield`/`await` inside a destructure propagates
                 // the abrupt completion through the pattern, closing its
                 // iterators (spec 13.15.5.2 step 5 + 7.4.11).
@@ -939,6 +1020,40 @@ impl Vm {
                         self.strict,
                     )?;
                     self.stack.push(value);
+                }
+                Step::UsingInit { pattern, is_await } => {
+                    let value = self.pop();
+                    let kind = if is_await {
+                        crate::eval::DisposalKind::Async
+                    } else {
+                        crate::eval::DisposalKind::Sync
+                    };
+                    let resource = crate::eval::create_disposable_resource(agent, &value, kind)?;
+                    self.lexical_env.add_disposable_resource(resource);
+                    crate::binding::binding_initialization(
+                        agent,
+                        &pattern,
+                        value.clone(),
+                        Some(&self.lexical_env),
+                        self.strict,
+                    )?;
+                    self.stack.push(value);
+                }
+                Step::SetFunctionName { name } => {
+                    let value = self.pop();
+                    crate::function::set_function_name(&value, &crux::lookup(name), None)?;
+                    self.stack.push(value);
+                }
+                Step::SetChainShort => {
+                    self.chain_short = true;
+                }
+                Step::ClearChainShort => {
+                    self.chain_short = false;
+                }
+                Step::JumpIfChainShort(target) => {
+                    if self.chain_short {
+                        self.ip = target;
+                    }
                 }
                 Step::UpdateIdent { name, op, prefix } => {
                     let old = self.pop();
@@ -1315,10 +1430,28 @@ impl Vm {
                     let popped = self.env_stack.pop().ok_or_else(|| {
                         JsError::new(ErrorKind::SyntaxError, "Environment stack underflow".into())
                     })?;
+                    // spec 9.4.3: the scope's `using` resources are disposed
+                    // when it exits, in reverse registration order;
+                    // async-dispose hints suspend the VM through the job
+                    // queue.
+                    let mut resources = popped.drain_disposable_resources();
+                    resources.reverse();
                     // Restore to the popped environment's outer, which may
                     // differ from the stack's previous entry (per-iteration
                     // environments live outside the stack).
                     self.lexical_env = popped.outer().unwrap_or(popped);
+                    if !resources.is_empty() {
+                        let completion = Completion::Normal(self.completion.clone());
+                        if let Some(outcome) = self.start_scope_disposal(
+                            agent,
+                            body,
+                            resources,
+                            completion,
+                            DisposalResume::ApplyCompletion,
+                        )? {
+                            return Ok(outcome);
+                        }
+                    }
                 }
                 Step::EnterTry { handler } => {
                     self.try_stack.push(TryFrame {
@@ -1334,6 +1467,41 @@ impl Vm {
                     }
                 }
                 Step::CatchBind { param, stmts } => {
+                    // A caught throw discarded the try block's envs: dispose
+                    // their `using` resources first, folding into the thrown
+                    // value (spec 9.4.3 on the try block's abrupt
+                    // completion), so the catch observes the folded error.
+                    if let Some((saved_env, depth)) = self.pending_catch_disposal.take() {
+                        let resources: Vec<crate::env::DisposableResource> = self
+                            .env_stack
+                            .drain(depth..)
+                            .rev()
+                            .flat_map(|env| env.drain_disposable_resources().into_iter().rev())
+                            .collect();
+                        if !resources.is_empty() {
+                            let thrown = self.thrown.take().unwrap_or(Value::Undefined);
+                            let completion = Completion::Throw(thrown);
+                            if let Some(outcome) = self.start_scope_disposal(
+                                agent,
+                                body,
+                                resources,
+                                completion,
+                                DisposalResume::DeliverCatch {
+                                    saved_env,
+                                    env_depth: depth,
+                                },
+                            )? {
+                                // The disposal suspended: the ip was already
+                                // advanced past this step, so re-enter the
+                                // CatchBind step on resume to bind the
+                                // parameter with the folded value.
+                                self.ip -= 1;
+                                return Ok(outcome);
+                            }
+                        } else {
+                            self.restore_env(saved_env, depth);
+                        }
+                    }
                     let thrown = self.thrown.take().unwrap_or(Value::Undefined);
                     let old_env = self.lexical_env.clone();
                     let env = new_declarative_environment(Some(old_env));
@@ -1510,6 +1678,16 @@ impl Vm {
                         iterator_close(agent, &iterator)?;
                     }
                 }
+                Step::AsyncForOfClose => {
+                    // AsyncIteratorClose with a normal completion (spec
+                    // 14.7.5.7 step 8.b): the `return` method is invoked when
+                    // present; its errors propagate. The exhausted path pops
+                    // the stack at AsyncForOfTest, so only a break (or other
+                    // early exit reaching the end label) closes here.
+                    if let Some(iterator) = self.async_for_of_stack.pop() {
+                        iterator_close(agent, &iterator)?;
+                    }
+                }
                 Step::AsyncForOfBegin => {
                     let rhs = self.pop();
                     let iterator = async_from_sync_or_async(agent, &rhs)?;
@@ -1534,11 +1712,19 @@ impl Vm {
                 Step::AsyncForOfTest { done } => {
                     // Resumed with the awaited iterator result object.
                     let result = self.pop();
-                    if iterator_result_done(agent, &result)? {
+                    let is_done = iterator_result_done(agent, &result)?;
+                    if is_done {
                         self.async_for_of_stack.pop();
                         self.ip = done;
                     } else {
                         let value = iterator_result_value(agent, &result)?;
+                        // The element value is already unwrapped upstream —
+                        // AsyncFromSyncIteratorContinuation awaits a sync
+                        // iterable's value and an async generator's yield
+                        // awaits its own — so the loop body consumes it
+                        // directly (spec 14.7.5.7 awaits only the next()
+                        // result). An extra await here costs a microtask and
+                        // breaks the promise interleaving.
                         self.stack.push(value);
                     }
                 }
@@ -1647,6 +1833,7 @@ impl Vm {
                     self.yield_star_stack.push(YieldStarState {
                         iterator,
                         received: Value::Undefined,
+                        resumed_return: false,
                     });
                 }
                 Step::YieldStarNext { done } => {
@@ -1915,6 +2102,7 @@ impl Vm {
                     self.yield_star_stack.push(YieldStarState {
                         iterator,
                         received: Value::Undefined,
+                        resumed_return: false,
                     });
                 }
                 Step::AsyncYieldStarNext { done: _ } => {
@@ -1938,19 +2126,69 @@ impl Vm {
                 }
                 Step::AsyncYieldStarInspect { done } => {
                     let result = self.pop();
-                    if iterator_result_done(agent, &result)? {
-                        let value = iterator_result_value(agent, &result)?;
+                    if !matches!(result, Value::Object(_) | Value::Function(_)) {
+                        // spec 15.5.5: the awaited inner result must be an
+                        // object (the check runs after the await, so a
+                        // non-object value's `then` is never consulted).
+                        let error = JsError::new(
+                            ErrorKind::TypeError,
+                            "yield*: iterator result is not an object".into(),
+                        );
+                        match self.throw_js_error(agent, body, error)? {
+                            CtlResult::Continue => continue,
+                            CtlResult::Done(outcome) => return Ok(outcome),
+                        }
+                    }
+                    let done_flag = match iterator_result_done(agent, &result) {
+                        Ok(done_flag) => done_flag,
+                        Err(error) => match self.throw_js_error(agent, body, error)? {
+                            CtlResult::Continue => continue,
+                            CtlResult::Done(outcome) => return Ok(outcome),
+                        },
+                    };
+                    if done_flag {
+                        // Getter errors are catchable by the body (spec
+                        // 15.5.5 uses `?` on IteratorValue).
+                        let value = match iterator_result_value(agent, &result) {
+                            Ok(value) => value,
+                            Err(error) => match self.throw_js_error(agent, body, error)? {
+                                CtlResult::Continue => continue,
+                                CtlResult::Done(outcome) => return Ok(outcome),
+                            },
+                        };
+                        let resumed_return = self
+                            .yield_star_stack
+                            .last()
+                            .is_some_and(|state| state.resumed_return);
                         self.yield_star_stack.pop();
-                        self.stack.push(value);
-                        self.ip = done;
+                        if resumed_return {
+                            // spec 15.5.5 return case: a done return result
+                            // completes the body with a return completion of
+                            // its value.
+                            match self.control_transfer(body, Ctl::Return { value })? {
+                                CtlResult::Continue => continue,
+                                CtlResult::Done(outcome) => return Ok(outcome),
+                            }
+                        } else {
+                            // The loop's done case: the yield* expression
+                            // completes with the value and the body continues.
+                            self.stack.push(value);
+                            self.ip = done;
+                        }
                     } else {
-                        let value = iterator_result_value(agent, &result)?;
+                        let value = match iterator_result_value(agent, &result) {
+                            Ok(value) => value,
+                            Err(error) => match self.throw_js_error(agent, body, error)? {
+                                CtlResult::Continue => continue,
+                                CtlResult::Done(outcome) => return Ok(outcome),
+                            },
+                        };
                         self.stack.push(value);
                     }
                 }
                 Step::AsyncYieldStarResume {
                     loop_top,
-                    done,
+                    done: _,
                     inspect,
                 } => {
                     let received = self.pop();
@@ -1958,17 +2196,23 @@ impl Vm {
                         None => {
                             if let Some(state) = self.yield_star_stack.last_mut() {
                                 state.received = received;
+                                state.resumed_return = false;
                             }
                             self.ip = loop_top;
                         }
                         Some(ResumeAbrupt::Throw(value)) => {
-                            let Some(state) = self.yield_star_stack.last() else {
-                                return Err(JsError::new(
-                                    ErrorKind::SyntaxError,
-                                    "AsyncYieldStarResume without a delegation".into(),
-                                ));
+                            let (iterator,) = {
+                                let Some(state) = self.yield_star_stack.last() else {
+                                    return Err(JsError::new(
+                                        ErrorKind::SyntaxError,
+                                        "AsyncYieldStarResume without a delegation".into(),
+                                    ));
+                                };
+                                (state.iterator.clone(),)
                             };
-                            let iterator = state.iterator.clone();
+                            if let Some(state) = self.yield_star_stack.last_mut() {
+                                state.resumed_return = false;
+                            }
                             let throw_method = crate::context::get_property(
                                 agent,
                                 &iterator.iterator,
@@ -1987,19 +2231,30 @@ impl Vm {
                             }
                             iterator_close(agent, &iterator)?;
                             self.yield_star_stack.pop();
-                            match self.throw_machinery(body, value)? {
+                            // spec 15.5.5 throw case, no-throw branch: after
+                            // closing, the protocol violation is a TypeError.
+                            let violation = JsError::new(
+                                ErrorKind::TypeError,
+                                "yield* protocol violation: iterator has no throw method".into(),
+                            );
+                            match self.throw_js_error(agent, body, violation)? {
                                 CtlResult::Continue => continue,
                                 CtlResult::Done(outcome) => return Ok(outcome),
                             }
                         }
                         Some(ResumeAbrupt::Return(value)) => {
-                            let Some(state) = self.yield_star_stack.last() else {
-                                return Err(JsError::new(
-                                    ErrorKind::SyntaxError,
-                                    "AsyncYieldStarResume without a delegation".into(),
-                                ));
+                            let iterator = {
+                                let Some(state) = self.yield_star_stack.last() else {
+                                    return Err(JsError::new(
+                                        ErrorKind::SyntaxError,
+                                        "AsyncYieldStarResume without a delegation".into(),
+                                    ));
+                                };
+                                state.iterator.clone()
                             };
-                            let iterator = state.iterator.clone();
+                            if let Some(state) = self.yield_star_stack.last_mut() {
+                                state.resumed_return = true;
+                            }
                             let return_method = crate::context::get_property(
                                 agent,
                                 &iterator.iterator,
@@ -2017,8 +2272,10 @@ impl Vm {
                                 return Ok(VmOutcome::Suspended(Suspension::Await(inner)));
                             }
                             self.yield_star_stack.pop();
-                            self.stack.push(value);
-                            self.ip = done;
+                            // spec 15.5.5 return case step b: no return
+                            // method — await the received value, then return
+                            // it (the driver resumes with `Resume::Return`).
+                            return Ok(VmOutcome::Suspended(Suspension::AwaitReturn(value)));
                         }
                     }
                 }
@@ -2088,6 +2345,156 @@ impl Vm {
             }
         }
         Ok(None)
+    }
+
+    /// Begin disposing a scope's `using` resources in reverse order, folding
+    /// each result into the completion (spec 9.4.3). When an async-dispose
+    /// awaits, the driver suspends with `Suspension::Await`; `run_abrupt`
+    /// resumes it with the settled value. Returns `Some(outcome)` when the
+    /// VM run finished (the folded completion ended the body), `None` when
+    /// the run continues from the current ip.
+    fn start_scope_disposal(
+        &mut self,
+        agent: &mut Agent,
+        body: &CompiledBody,
+        resources: Vec<crate::env::DisposableResource>,
+        completion: Completion,
+        resume: DisposalResume,
+    ) -> Result<Option<VmOutcome>, JsError> {
+        self.pending_disposal = Some(PendingDisposal {
+            resources,
+            index: 0,
+            completion,
+            resume,
+        });
+        self.drive_pending_disposal(agent, body)
+    }
+
+    /// Drive the pending scope disposal: dispose the next resource, awaiting
+    /// async-dispose results through the suspension machinery.
+    fn drive_pending_disposal(
+        &mut self,
+        agent: &mut Agent,
+        body: &CompiledBody,
+    ) -> Result<Option<VmOutcome>, JsError> {
+        loop {
+            let Some(pending) = self.pending_disposal.as_ref() else {
+                return Ok(None);
+            };
+            if pending.index >= pending.resources.len() {
+                let pending = self.pending_disposal.take().unwrap();
+                let completion = pending.completion;
+                return Ok(match pending.resume {
+                    DisposalResume::ApplyCompletion => match completion {
+                        Completion::Normal(value) => {
+                            self.completion = value;
+                            None
+                        }
+                        Completion::Empty => None,
+                        Completion::Throw(value) => match self.throw_machinery(body, value)? {
+                            CtlResult::Continue => None,
+                            CtlResult::Done(outcome) => Some(outcome),
+                        },
+                        _ => {
+                            return Err(JsError::new(
+                                ErrorKind::SyntaxError,
+                                "Illegal disposal completion".into(),
+                            ));
+                        }
+                    },
+                    DisposalResume::DeliverCatch {
+                        saved_env,
+                        env_depth,
+                    } => {
+                        // The disposal started from a throw, so the folded
+                        // completion stays a throw; deliver it to the catch.
+                        let value = match completion {
+                            Completion::Throw(value) => value,
+                            Completion::Normal(value) => value,
+                            Completion::Empty => Value::Undefined,
+                            _ => Value::Undefined,
+                        };
+                        self.thrown = Some(value);
+                        self.restore_env(saved_env, env_depth);
+                        None
+                    }
+                });
+            }
+            let resource = pending.resources[pending.index].clone();
+            let method_result = if matches!(resource.method, Value::Undefined) {
+                if resource.hint == crate::env::DisposalHint::Sync {
+                    // Dispose with an undefined method and sync hint: no call
+                    // and no await (spec 9.4.4 steps 1-4).
+                    self.pending_disposal.as_mut().unwrap().index += 1;
+                    continue;
+                }
+                // Async hint: Dispose returns undefined but still
+                // Await(undefined) — a microtask boundary (spec 9.4.4 step
+                // 3.a).
+                Ok(Value::Undefined)
+            } else {
+                crate::function::call(agent, &resource.method, resource.value.clone(), &[])
+            };
+            match method_result {
+                Err(error) => {
+                    let value = crate::promise::error_value(agent, &error);
+                    self.fold_disposal_error(agent, value)?;
+                    self.pending_disposal.as_mut().unwrap().index += 1;
+                }
+                Ok(value) => {
+                    if resource.hint == crate::env::DisposalHint::Sync {
+                        self.pending_disposal.as_mut().unwrap().index += 1;
+                        continue;
+                    }
+                    let promise_ctor = agent
+                        .current_realm()?
+                        .intrinsics
+                        .get("%Promise%")
+                        .unwrap_or(Value::Undefined);
+                    let promise = crate::promise::promise_resolve(agent, &promise_ctor, value)?;
+                    return Ok(Some(VmOutcome::Suspended(Suspension::Await(promise))));
+                }
+            }
+        }
+    }
+
+    /// The await of an async dispose settled: fold the result into the
+    /// pending disposal and keep driving. A rejected dispose is a throwing
+    /// disposal — it never routes through the body's handler table.
+    fn resume_pending_disposal(
+        &mut self,
+        agent: &mut Agent,
+        body: &CompiledBody,
+        result: Result<Value, Value>,
+    ) -> Result<VmOutcome, JsError> {
+        if let Err(value) = result {
+            self.fold_disposal_error(agent, value)?;
+        }
+        let Some(pending) = self.pending_disposal.as_mut() else {
+            return self.run_inner(agent, body);
+        };
+        pending.index += 1;
+        match self.drive_pending_disposal(agent, body)? {
+            Some(outcome) => Ok(outcome),
+            None => self.run_inner(agent, body),
+        }
+    }
+
+    /// Fold a throwing disposal into the pending completion: a normal
+    /// completion becomes the throw; a second throw nests a SuppressedError
+    /// (spec 9.4.3 step 1.b).
+    fn fold_disposal_error(&mut self, agent: &mut Agent, new_error: Value) -> Result<(), JsError> {
+        let pending = self
+            .pending_disposal
+            .as_mut()
+            .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no disposal in flight".into()))?;
+        pending.completion = match std::mem::replace(&mut pending.completion, Completion::Empty) {
+            Completion::Throw(original) => Completion::Throw(
+                crate::builtins::disposable::make_suppressed_error(agent, new_error, original)?,
+            ),
+            _ => Completion::Throw(new_error),
+        };
+        Ok(())
     }
 
     /// The Await algorithm (spec 27.6.3.1) is driven by the async-function
@@ -2402,7 +2809,10 @@ impl Vm {
             match decision {
                 Some((index, ThrowAction::Catch)) => {
                     let frame = self.try_stack.remove(index);
-                    self.restore_env(frame.saved_env, frame.env_depth);
+                    // Leave the try block's envs on the stack: `CatchBind`
+                    // disposes their `using` resources (folding into the
+                    // thrown value) before restoring the saved environment.
+                    self.pending_catch_disposal = Some((frame.saved_env, frame.env_depth));
                     self.thrown = Some(value);
                     let catch_start = body
                         .handlers
@@ -3211,11 +3621,57 @@ pub fn stmt_contains_suspension(stmt: &Stmt) -> bool {
                     .is_some_and(|f| f.stmts.iter().any(stmt_contains_suspension))
         }
         StmtKind::ClassDecl(class) => class_contains_suspension(class),
-        StmtKind::VarDecl { decls, .. } | StmtKind::UsingDecl { decls, .. } => decls
+        StmtKind::VarDecl { decls, .. } => decls
+            .iter()
+            .any(|d| d.init.as_ref().is_some_and(expr_contains_suspension)),
+        // An `await using` statement always implies an await (even with a
+        // null initializer, spec 9.4.4), and its scope's async disposal must
+        // suspend: compile it (and any enclosing scope) instead of batching
+        // it to the tree walker.
+        StmtKind::UsingDecl { is_await: true, .. } => true,
+        StmtKind::UsingDecl { decls, .. } => decls
             .iter()
             .any(|d| d.init.as_ref().is_some_and(expr_contains_suspension)),
         StmtKind::With { object, body } => {
             expr_contains_suspension(object) || stmt_contains_suspension(body)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a statement contains a `break`/`continue` that targets a point
+/// outside the statement: batched to the tree walker, such exits cannot
+/// cross the `Step::Stmt` boundary, so the statement is compiled and the
+/// exit routes through the VM's control machinery instead.
+fn stmt_contains_exit(stmt: &Stmt) -> bool {
+    match &stmt.kind {
+        StmtKind::Break(_) | StmtKind::Continue(_) => true,
+        StmtKind::Block(block) => block.stmts.iter().any(stmt_contains_exit),
+        StmtKind::If {
+            consequent,
+            alternate,
+            ..
+        } => stmt_contains_exit(consequent) || alternate.as_deref().is_some_and(stmt_contains_exit),
+        StmtKind::While { body, .. } | StmtKind::DoWhile { body, .. } => stmt_contains_exit(body),
+        StmtKind::For { body, .. }
+        | StmtKind::ForIn { body, .. }
+        | StmtKind::ForOf { body, .. } => stmt_contains_exit(body),
+        StmtKind::Labeled { body, .. } => stmt_contains_exit(body),
+        StmtKind::Switch { cases, .. } => cases
+            .iter()
+            .any(|case| case.consequent.iter().any(stmt_contains_exit)),
+        StmtKind::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            block.stmts.iter().any(stmt_contains_exit)
+                || handler
+                    .as_ref()
+                    .is_some_and(|h| h.body.stmts.iter().any(stmt_contains_exit))
+                || finalizer
+                    .as_ref()
+                    .is_some_and(|f| f.stmts.iter().any(stmt_contains_exit))
         }
         _ => false,
     }
@@ -3227,6 +3683,20 @@ fn for_init_contains_suspension(init: &ForInit) -> bool {
         ForInit::VarDecl { decls, .. } => decls
             .iter()
             .any(|d| d.init.as_ref().is_some_and(expr_contains_suspension)),
+    }
+}
+
+/// Whether an expression contains a `?.` link anywhere: a short-circuit then
+/// propagates through the whole chain, so compiled member/call steps after
+/// the link must be guarded (spec 13.4.3).
+fn expr_may_short_circuit(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Member(member) => member.optional || expr_may_short_circuit(&member.object),
+        ExprKind::Call(call) => call.optional || expr_may_short_circuit(&call.callee),
+        ExprKind::Paren(inner) => expr_may_short_circuit(inner),
+        ExprKind::New(new) => expr_may_short_circuit(&new.callee),
+        ExprKind::TaggedTemplate { tag, .. } => expr_may_short_circuit(tag),
+        _ => false,
     }
 }
 
@@ -3250,6 +3720,7 @@ enum Fixup {
     JumpIfTrueKeep(usize, usize),
     JumpIfNullishKeep(usize, usize),
     JumpIfNotNullishKeep(usize, usize),
+    JumpIfChainShort(usize, usize),
     Exit(usize, usize),
     ForInNext(usize, usize),
     ForOfNext(usize, usize),
@@ -3301,6 +3772,9 @@ struct Compiler {
     /// Whether the enclosing function is an async generator: `yield*` then
     /// delegates through the async-iterator protocol with awaited results.
     is_async_generator: bool,
+    /// The nesting depth of optional chains being compiled: the outermost
+    /// chain node clears the runtime short-circuit flag when it finishes.
+    chain_depth: usize,
 }
 
 impl Compiler {
@@ -3354,6 +3828,101 @@ impl Compiler {
         self.fixups.push(Fixup::JumpIfNullishKeep(index, target));
     }
 
+    fn jump_if_chain_short(&mut self, target: usize) {
+        let index = self.steps.len();
+        self.steps.push(Step::JumpIfChainShort(0));
+        self.fixups.push(Fixup::JumpIfChainShort(index, target));
+    }
+
+    /// Enter an optional-chain node: the outermost node of a chain that may
+    /// short-circuit emits the runtime clear when it finishes.
+    fn enter_chain(&mut self, expr: &Expr) {
+        if expr_may_short_circuit(expr) {
+            self.chain_depth += 1;
+        }
+    }
+
+    fn leave_chain(&mut self) {
+        if self.chain_depth > 0 {
+            self.chain_depth -= 1;
+            if self.chain_depth == 0 {
+                self.emit(Step::ClearChainShort);
+            }
+        }
+    }
+
+    /// Compile a member property access, skipping it when an upstream `?.`
+    /// short-circuited (the chain value is already `undefined` on the stack,
+    /// spec 13.4.3).
+    fn compile_member_property_guarded(
+        &mut self,
+        member: &syntax::ast::MemberExpr,
+    ) -> Result<(), JsError> {
+        if expr_may_short_circuit(&member.object) {
+            let end = self.new_label();
+            self.jump_if_chain_short(end);
+            self.compile_member_property(member)?;
+            self.place(end);
+        } else {
+            self.compile_member_property(member)?;
+        }
+        Ok(())
+    }
+
+    /// Compile a chain base (member object / call callee): an expression
+    /// that may short-circuit must run as steps so its `?.` sets the VM's
+    /// chain-short flag — the tree walker cannot signal the flag.
+    fn compile_chain_base(&mut self, expr: &Expr) -> Result<(), JsError> {
+        if expr_may_short_circuit(expr) {
+            self.compile_expr_force(expr)
+        } else {
+            self.compile_expr(expr)
+        }
+    }
+
+    /// Compile an expression even when it has no suspension, so `?.` links
+    /// inside it set the chain-short flag.
+    fn compile_expr_force(&mut self, expr: &Expr) -> Result<(), JsError> {
+        match &expr.kind {
+            ExprKind::Member(member) => {
+                self.enter_chain(expr);
+                self.compile_member(member)?;
+                self.leave_chain();
+                Ok(())
+            }
+            ExprKind::Call(call) => {
+                self.enter_chain(expr);
+                self.compile_call(call)?;
+                self.leave_chain();
+                Ok(())
+            }
+            ExprKind::Paren(inner) => self.compile_expr_force(inner),
+            _ => self.compile_expr(expr),
+        }
+    }
+
+    /// Compile a call's arguments and the call step, skipping both when an
+    /// upstream `?.` short-circuited: the whole chain is `undefined` (spec
+    /// 13.4.3).
+    fn compile_call_args_guarded(
+        &mut self,
+        args: &[Argument],
+        direct_eval: bool,
+    ) -> Result<(), JsError> {
+        let short = self.new_label();
+        let end = self.new_label();
+        self.jump_if_chain_short(short);
+        self.compile_arguments(args)?;
+        self.emit(Step::Call { direct_eval });
+        self.jump(end);
+        self.place(short);
+        self.emit(Step::Pop);
+        self.emit(Step::Pop);
+        self.emit(Step::Push(Value::Undefined));
+        self.place(end);
+        Ok(())
+    }
+
     fn jump_if_not_nullish_keep(&mut self, target: usize) {
         let index = self.steps.len();
         self.steps.push(Step::JumpIfNotNullishKeep(0));
@@ -3400,6 +3969,9 @@ impl Compiler {
                 }
                 Fixup::JumpIfNotNullishKeep(index, label) => {
                     self.steps[index] = Step::JumpIfNotNullishKeep(self.labels[&label]);
+                }
+                Fixup::JumpIfChainShort(index, label) => {
+                    self.steps[index] = Step::JumpIfChainShort(self.labels[&label]);
                 }
                 Fixup::Exit(index, label) => {
                     self.steps[index] = Step::Exit {
@@ -3585,7 +4157,15 @@ impl Compiler {
 impl Compiler {
     fn compile_statements(&mut self, stmts: &[Stmt]) -> Result<(), JsError> {
         for stmt in stmts {
-            if !stmt_contains_suspension(stmt) {
+            // `return expr` in an async generator awaits the value, so it is
+            // not batched to the tree walker (spec ReturnStatement
+            // evaluation). A statement containing a `break`/`continue` is
+            // compiled too: the tree walker cannot deliver an exit across
+            // the `Step::Stmt` boundary.
+            if !(stmt_contains_suspension(stmt)
+                || stmt_contains_exit(stmt)
+                || self.is_async_generator && matches!(stmt.kind, StmtKind::Return(Some(_))))
+            {
                 self.emit(Step::Stmt(stmt.clone()));
                 continue;
             }
@@ -3627,12 +4207,21 @@ impl Compiler {
                     }
                 }
             }
-            StmtKind::UsingDecl { decls, .. } => {
+            StmtKind::UsingDecl { is_await, decls } => {
                 for decl in decls {
                     if let Some(init) = &decl.init {
                         self.compile_expr(init)?;
-                        self.emit(Step::DeclInit {
+                        if let BindingPattern::Ident(name) = &decl.pattern
+                            && crate::function::is_anonymous_function_definition(init)
+                        {
+                            // NamedEvaluation (spec 14.2.2 step 2.d): an
+                            // anonymous function/class initializer is named
+                            // after its binding.
+                            self.emit(Step::SetFunctionName { name: *name });
+                        }
+                        self.emit(Step::UsingInit {
                             pattern: decl.pattern.clone(),
+                            is_await: *is_await,
                         });
                     }
                 }
@@ -3643,6 +4232,12 @@ impl Compiler {
                     None => self.emit(Step::Push(Value::Undefined)),
                 }
                 self.leave_scopes(self.scope_count);
+                if self.is_async_generator {
+                    // spec ReturnStatement evaluation: `return expr` in an
+                    // async generator awaits the value before completing
+                    // (AsyncGeneratorCompleteStep does not unwrap).
+                    self.emit(Step::Await);
+                }
                 self.emit(Step::Return);
             }
             StmtKind::Throw(expr) => {
@@ -3961,6 +4556,7 @@ impl Compiler {
         self.place(continue_label);
         self.jump(top_label);
         self.place(end_label);
+        self.emit(Step::ForOfClose);
         self.scope_stack.pop();
         Ok(())
     }
@@ -3989,12 +4585,23 @@ impl Compiler {
         self.emit(Step::AsyncForOfTest { done: 0 });
         self.fixups
             .push(Fixup::AsyncForOfNext(step_index, end_label));
-        self.emit(Step::AsyncForOfBind { left: left.clone() });
+        // A destructuring head is compiled as steps (member targets and
+        // defaults with `await` need the resumable machinery), mirroring the
+        // sync for-of compiler.
+        match left {
+            ForBinding::Expr(expr)
+                if matches!(expr.kind, ExprKind::Array(_) | ExprKind::Object(_)) =>
+            {
+                self.compile_destructure_assign(expr)?;
+            }
+            _ => self.emit(Step::AsyncForOfBind { left: left.clone() }),
+        }
         self.compile_statement(body)?;
         self.emit(Step::AsyncForOfRestore);
         self.place(continue_label);
         self.jump(top_label);
         self.place(end_label);
+        self.emit(Step::AsyncForOfClose);
         self.scope_stack.pop();
         Ok(())
     }
@@ -4104,7 +4711,10 @@ impl Compiler {
     }
 
     fn compile_expr(&mut self, expr: &Expr) -> Result<(), JsError> {
-        if !expr_contains_suspension(expr) {
+        // A chain containing `?.` is compiled (not batched to the tree
+        // walker): a short-circuited link sets the VM's flag that guards the
+        // rest of the chain (spec 13.4.3).
+        if !expr_contains_suspension(expr) && !expr_may_short_circuit(expr) {
             self.emit(Step::Expr(expr.clone()));
             return Ok(());
         }
@@ -4180,7 +4790,12 @@ impl Compiler {
                 self.emit(Step::PrivateIn { atom: *name });
                 Ok(())
             }
-            ExprKind::Call(call) => self.compile_call(call),
+            ExprKind::Call(call) => {
+                self.enter_chain(expr);
+                self.compile_call(call)?;
+                self.leave_chain();
+                Ok(())
+            }
             ExprKind::New(new) => {
                 if matches!(new.callee.kind, ExprKind::Super) {
                     return Err(JsError::new(
@@ -4193,7 +4808,12 @@ impl Compiler {
                 self.emit(Step::Construct);
                 Ok(())
             }
-            ExprKind::Member(member) => self.compile_member(member),
+            ExprKind::Member(member) => {
+                self.enter_chain(expr);
+                self.compile_member(member)?;
+                self.leave_chain();
+                Ok(())
+            }
             ExprKind::TaggedTemplate { tag, quasi } => {
                 self.compile_expr(tag)?;
                 for expr in &quasi.exprs {
@@ -4595,6 +5215,14 @@ impl Compiler {
                             self.compile_assign_value(inner, init)?;
                         }
                         ObjectProperty::Spread(expr) => {
+                            // The rest target's reference is evaluated before
+                            // the rest object is collected (mirroring the
+                            // array-pattern case above; the tree-walker
+                            // evaluates it after CopyDataProperties, but the
+                            // stack protocol needs the base below the value).
+                            if let ExprKind::Member(member) = &expr.kind {
+                                self.compile_member_reference(member)?;
+                            }
                             self.emit(Step::DestructureObjRest {
                                 excluded: excluded.clone(),
                             });
@@ -4877,19 +5505,21 @@ impl Compiler {
         if member.optional {
             let short = self.new_label();
             let end = self.new_label();
-            self.compile_expr(&member.object)?;
+            self.compile_chain_base(&member.object)?;
             self.emit(Step::Dup);
             self.jump_if_nullish_keep(short);
-            self.compile_member_property(member)?;
+            self.compile_member_property_guarded(member)?;
             self.jump(end);
             self.place(short);
             self.emit(Step::Pop);
             self.emit(Step::Pop);
             self.emit(Step::Push(Value::Undefined));
+            // The rest of the chain (keys, args, links) is skipped.
+            self.emit(Step::SetChainShort);
             self.place(end);
         } else {
-            self.compile_expr(&member.object)?;
-            self.compile_member_property(member)?;
+            self.compile_chain_base(&member.object)?;
+            self.compile_member_property_guarded(member)?;
         }
         Ok(())
     }
@@ -4961,26 +5591,38 @@ impl Compiler {
                 return Ok(());
             }
             // obj.m(args)
-            self.compile_expr(&member.object)?;
+            self.compile_chain_base(&member.object)?;
             self.emit(Step::Dup);
-            self.compile_member_property(member)?;
-            if call.optional {
-                // The callee is on top: nullish → undefined.
+            if member.optional {
+                // `?.` on the member: a nullish object short-circuits the
+                // whole chain — the property access and the call are skipped.
                 let short = self.new_label();
                 let end = self.new_label();
-                self.emit(Step::Dup);
                 self.jump_if_nullish_keep(short);
-                self.compile_arguments(&call.args)?;
-                self.emit(Step::Call { direct_eval: false });
+                self.compile_member_property_guarded(member)?;
+                if call.optional {
+                    self.compile_optional_call_tail(&call.args)?;
+                } else {
+                    self.compile_call_args_guarded(&call.args, false)?;
+                }
                 self.jump(end);
                 self.place(short);
                 self.emit(Step::Pop);
                 self.emit(Step::Pop);
                 self.emit(Step::Push(Value::Undefined));
+                self.emit(Step::SetChainShort);
                 self.place(end);
             } else {
-                self.compile_arguments(&call.args)?;
-                self.emit(Step::Call { direct_eval: false });
+                self.compile_member_property_guarded(member)?;
+                if call.optional {
+                    // The callee is on top: nullish → undefined.
+                    self.compile_optional_call_tail(&call.args)?;
+                } else {
+                    // The member chain may still have short-circuited
+                    // upstream (`a?.b.m(args)`): skip the argument
+                    // evaluation and call.
+                    self.compile_call_args_guarded(&call.args, false)?;
+                }
             }
             return Ok(());
         }
@@ -4990,12 +5632,12 @@ impl Compiler {
             ExprKind::Ident(id) if crux::lookup(id) == JsString::from_utf8("eval")
         );
         self.emit(Step::Push(Value::Undefined));
-        self.compile_expr(&call.callee)?;
+        self.compile_chain_base(&call.callee)?;
         if call.optional {
             self.compile_optional_call_tail(&call.args)?;
         } else {
-            self.compile_arguments(&call.args)?;
-            self.emit(Step::Call { direct_eval });
+            // An upstream `?.` in the callee (`(a?.b)()`) skips the arguments.
+            self.compile_call_args_guarded(&call.args, direct_eval)?;
         }
         Ok(())
     }
@@ -5007,13 +5649,13 @@ impl Compiler {
         let end = self.new_label();
         self.emit(Step::Dup);
         self.jump_if_nullish_keep(short);
-        self.compile_arguments(args)?;
-        self.emit(Step::Call { direct_eval: false });
+        self.compile_call_args_guarded(args, false)?;
         self.jump(end);
         self.place(short);
         self.emit(Step::Pop);
         self.emit(Step::Pop);
         self.emit(Step::Push(Value::Undefined));
+        self.emit(Step::SetChainShort);
         self.place(end);
         Ok(())
     }

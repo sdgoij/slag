@@ -12,6 +12,20 @@ const ALLOWED_INCLUDES = new Set([
   "testAtomics.js",
   "testTypedArray.js",
   "nativeErrors.js",
+  "decimalToHexString.js",
+  "nans.js",
+  "compareIterator.js",
+  "assertRelativeDateMs.js",
+  "iteratorZipUtils.js",
+  "dateConstants.js",
+  "deepEqual.js",
+  "promiseHelper.js",
+  "proxyTrapsHelper.js",
+  "fnGlobalObject.js",
+  "nativeFunctionMatcher.js",
+  "wellKnownIntrinsicObjects.js",
+  "asyncHelpers.js",
+  "byteConversionValues.js",
 ]);
 
 const AREAS = [
@@ -22,13 +36,10 @@ const AREAS = [
 
 function classify(source) {
   let frontmatter = "";
-  let body = source;
   const start = source.indexOf("/*---");
   if (start >= 0) {
     const end = source.indexOf("---*/", start);
-    const close = end >= 0 ? end + 5 : source.length;
     frontmatter = source.slice(start, end >= 0 ? end : source.length);
-    body = source.slice(close);
   }
   const flags = new Set();
   const features = new Set();
@@ -54,15 +65,14 @@ function classify(source) {
     }
   }
   if (flags.has("module")) return "module";
-  if (flags.has("async")) return "async";
   if (features.has("Temporal")) return "Temporal";
   if (features.has("await-dictionary")) return "await-dictionary";
   if (features.has("ShadowRealm")) return "ShadowRealm";
+  if (features.has("source-phase-imports")) return "source-phase-imports";
+  if (features.has("import-text")) return "import-text";
   if (flags.has("CanBlockIsTrue")) return "CanBlockIsTrue";
-  if (features.has("IsHTMLDDA")) return "IsHTMLDDA";
   const unsupported = includes.filter((item) => !ALLOWED_INCLUDES.has(item)).sort();
   if (unsupported.length > 0) return "includes:" + unsupported.join(",");
-  if (body.includes("$262.createRealm")) return "createRealm";
   return null;
 }
 

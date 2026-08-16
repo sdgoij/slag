@@ -324,10 +324,20 @@ pub struct Binding {
 
 /// One `using` declaration's resource (spec 9.3.1): the value and the
 /// dispose method captured when the declaration was evaluated.
+/// Whether a `using` resource's dispose method returns a promise that must
+/// be awaited (spec 9.3.1: the `await using` hint).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisposalHint {
+    Sync,
+    Async,
+}
+
+/// A `using` resource on an environment's disposal stack (spec 9.3.1).
 #[derive(Debug, Clone)]
 pub struct DisposableResource {
     pub value: Value,
     pub method: Value,
+    pub hint: DisposalHint,
 }
 
 /// A Declarative Environment Record (spec 9.2.2), also the base of the

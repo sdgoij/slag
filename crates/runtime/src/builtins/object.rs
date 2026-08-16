@@ -265,6 +265,36 @@ fn str(value: &str) -> Value {
     Value::String(Handle::new(JsString::from_utf8(value)))
 }
 
+/// The own-property descriptor of a module namespace export: crux returns a
+/// placeholder value (the live binding lives in the runtime), so substitute
+/// the binding value through the module machinery (spec 10.4.6.8 step 4).
+fn namespace_live_descriptor(
+    agent: &mut Agent,
+    obj: &Handle<JsObject>,
+    key: &PropertyKey,
+    prop: &crux::object::Property,
+) -> Result<crux::property::PropertyDescriptor, JsError> {
+    let PropertyKey::String(id) = key else {
+        return Ok(prop.to_descriptor());
+    };
+    if !matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_)) {
+        return Ok(prop.to_descriptor());
+    }
+    let Some(module) = agent.module_namespaces.get(&obj.id()).cloned() else {
+        return Ok(prop.to_descriptor());
+    };
+    let name = crux::lookup(*id);
+    let value = crate::module::namespace_get(agent, &module, &name)?;
+    Ok(crux::property::PropertyDescriptor {
+        value: Some(value),
+        writable: Some(true),
+        get: None,
+        set: None,
+        enumerable: Some(true),
+        configurable: Some(false),
+    })
+}
+
 /// Object.prototype.toString (spec 20.1.3.6): `[object Tag]` from the
 /// value's kind, honoring the `@@toStringTag` override. Every value is
 /// ToObject'd first; the built-in tag (steps 4-14) comes from IsArray, the
@@ -810,7 +840,7 @@ pub fn dispatch_call(
             let Some(prop) = obj.get_own_property_key(&key)? else {
                 return Ok(Value::Undefined);
             };
-            let desc = prop.to_descriptor();
+            let desc = namespace_live_descriptor(agent, &obj, &key, &prop)?;
             crux::property::from_property_descriptor(
                 &desc,
                 realm
@@ -835,7 +865,7 @@ pub fn dispatch_call(
             for key in obj.own_property_keys()? {
                 if let Some(prop) = obj.get_own_property_key(&key)? {
                     let desc = crux::property::from_property_descriptor(
-                        &prop.to_descriptor(),
+                        &namespace_live_descriptor(agent, &obj, &key, &prop)?,
                         realm
                             .intrinsics
                             .get(OBJECT_PROTO)

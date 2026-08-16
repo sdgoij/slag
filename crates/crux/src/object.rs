@@ -511,6 +511,73 @@ impl JsObject {
         Ok(object)
     }
 
+    /// The module namespace's `@@toStringTag` property key (spec 26.3.1).
+    fn namespace_to_string_tag_key() -> PropertyKey {
+        PropertyKey::Symbol(well_known("toStringTag").as_ref().clone())
+    }
+
+    /// ModuleNamespace [[DefineOwnProperty]] (spec 10.4.6.5): only no-change
+    /// defines of the non-configurable exports/@@toStringTag succeed; any other
+    /// key is rejected (the object is not extensible).
+    fn namespace_define_own_property(
+        slots: &ModuleNamespaceSlots,
+        key: &PropertyKey,
+        desc: &PropertyDescriptor,
+    ) -> Result<bool, JsError> {
+        let current = if slots.exports.contains(key) {
+            Some(Property::data(Value::Undefined, true, true, false))
+        } else if key == &Self::namespace_to_string_tag_key() {
+            Some(Property::data(
+                Value::String(Handle::new(crate::string::JsString::from_utf8("Module"))),
+                false,
+                false,
+                false,
+            ))
+        } else {
+            None
+        };
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        if desc.configurable == Some(true) {
+            return Ok(false);
+        }
+        if let Some(enumerable) = desc.enumerable
+            && enumerable != current.enumerable
+        {
+            return Ok(false);
+        }
+        if desc.is_generic_descriptor() {
+            return Ok(true);
+        }
+        if desc.is_accessor_descriptor() != current.is_accessor() {
+            return Ok(false);
+        }
+        if current.is_accessor() {
+            if let Some(get) = &desc.get
+                && !same_value(get, &current.getter().unwrap_or(Value::Undefined))
+            {
+                return Ok(false);
+            }
+            if let Some(set) = &desc.set
+                && !same_value(set, &current.setter().unwrap_or(Value::Undefined))
+            {
+                return Ok(false);
+            }
+        } else if let Some(writable) = desc.writable
+            && writable != current.writable().unwrap_or(true)
+        {
+            return Ok(false);
+        } else if let Some(value) = &desc.value
+            && !same_value(value, &current.value().unwrap_or(Value::Undefined))
+        {
+            // The stored export value is a placeholder (the live binding is read
+            // through the runtime); any explicit value differs from it.
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     /// ModuleNamespaceObjectCreate (spec 10.4.6.2): a non-extensible object
     /// with *null* prototype exposing only the (Phase 7) exports.
     pub fn module_namespace_object_create(
@@ -529,6 +596,18 @@ impl JsObject {
             boxed: RefCell::new(None),
         });
         Self::link_self_handle(&object);
+        // spec 26.3.1: `@@toStringTag` is an own data property ("Module",
+        // non-writable, non-enumerable, non-configurable); it is not part of
+        // [[Exports]], so it is stored as an ordinary property.
+        object.properties.borrow_mut().push((
+            PropertyKey::Symbol(well_known("toStringTag").as_ref().clone()),
+            Property::data(
+                Value::String(Handle::new(crate::string::JsString::from_utf8("Module"))),
+                false,
+                false,
+                false,
+            ),
+        ));
         Ok(object)
     }
 
@@ -791,6 +870,14 @@ impl JsObject {
                     // the runtime reads the live binding value.
                     return Ok(Some(Property::data(Value::Undefined, true, true, false)));
                 }
+                if key == &Self::namespace_to_string_tag_key() {
+                    return Ok(Some(Property::data(
+                        Value::String(Handle::new(crate::string::JsString::from_utf8("Module"))),
+                        false,
+                        false,
+                        false,
+                    )));
+                }
                 self.ordinary_get_own_property(key)
             }
             ObjectKind::String(string) => match self.ordinary_get_own_property(key)? {
@@ -866,7 +953,11 @@ impl JsObject {
                     return Ok(typed_array_valid_index(slots, index));
                 }
             }
-            ObjectKind::ModuleNamespace(slots) => return Ok(slots.exports.contains(key)),
+            ObjectKind::ModuleNamespace(slots) => {
+                return Ok(
+                    slots.exports.contains(key) || key == &Self::namespace_to_string_tag_key()
+                );
+            }
             _ => {}
         }
         Ok(self.get_own_property_key(key)?.is_some())
@@ -1018,9 +1109,12 @@ impl JsObject {
             ObjectKind::IntegerIndexed(slots) => {
                 return typed_array_define_own_property(self, slots, key, desc);
             }
-            // A module namespace rejects every define (its properties are
-            // non-configurable and it is not extensible).
-            ObjectKind::ModuleNamespace(_) => return Ok(false),
+            // A module namespace accepts only no-change defines of its
+            // non-configurable exports/@@toStringTag; new keys are rejected
+            // (non-extensible) (spec 10.4.6.5).
+            ObjectKind::ModuleNamespace(slots) => {
+                return Self::namespace_define_own_property(slots, key, desc);
+            }
             ObjectKind::Array => return array_define_own_property(self, key, desc),
             ObjectKind::String(string) => {
                 if let Some(current) = string_get_own_property(string, key) {
@@ -1156,9 +1250,14 @@ impl JsObject {
         match &self.kind {
             ObjectKind::Proxy(slots) => return crate::proxy::delete(slots, key),
             ObjectKind::IntegerIndexed(slots) => return typed_array_delete(self, slots, key),
-            // A module namespace never deletes (its properties are
-            // non-configurable).
-            ObjectKind::ModuleNamespace(_) => return Ok(false),
+            // A module namespace never deletes an export or @@toStringTag
+            // (non-configurable); deleting anything else succeeds (spec
+            // 10.4.6.6).
+            ObjectKind::ModuleNamespace(slots) => {
+                return Ok(
+                    !slots.exports.contains(key) && key != &Self::namespace_to_string_tag_key()
+                );
+            }
             ObjectKind::String(string) => {
                 // spec 10.4.3.7: the virtual code-unit index properties are
                 // non-configurable; deleting an in-range index fails, out of
@@ -1226,7 +1325,13 @@ impl JsObject {
         match &self.kind {
             ObjectKind::Proxy(slots) => crate::proxy::own_property_keys(slots),
             ObjectKind::IntegerIndexed(slots) => Ok(typed_array_own_property_keys(slots, self)),
-            ObjectKind::ModuleNamespace(slots) => Ok(slots.exports.clone()),
+            ObjectKind::ModuleNamespace(slots) => {
+                let mut keys = slots.exports.clone();
+                keys.push(PropertyKey::Symbol(
+                    well_known("toStringTag").as_ref().clone(),
+                ));
+                Ok(keys)
+            }
             ObjectKind::Array => Ok(array_own_property_keys(self)),
             ObjectKind::String(string) => Ok(string_own_property_keys(string, self)),
             _ => Ok(ordinary_own_property_keys(self)),
@@ -3040,7 +3145,25 @@ mod tests {
         assert!(!ns.is_extensible().unwrap());
         assert!(ns.prevent_extensions().unwrap());
         assert!(!ns.set_prototype_of(None).unwrap());
-        assert!(ns.own_property_keys().unwrap().is_empty());
+        // The only own key is @@toStringTag (spec 26.3.1), which reads
+        // "Module" and cannot be changed.
+        assert_eq!(
+            ns.own_property_keys().unwrap(),
+            vec![PropertyKey::Symbol(
+                well_known("toStringTag").as_ref().clone()
+            )]
+        );
+        let tag_key = PropertyKey::Symbol(well_known("toStringTag").as_ref().clone());
+        let tag = ns.get_own_property_key(&tag_key).unwrap().unwrap();
+        assert_eq!(
+            tag.value(),
+            Some(Value::String(Handle::new(JsString::from_utf8("Module"))))
+        );
+        assert!(ns.has_own_property_key(&tag_key).unwrap());
+        assert!(
+            !ns.define_property_key(&tag_key, &PropertyDescriptor::data(Value::Undefined))
+                .unwrap()
+        );
         assert_eq!(ns.get(&key("x")).unwrap(), Value::Undefined);
         assert!(!ns.has_property(&key("x")).unwrap());
         assert!(
@@ -3048,7 +3171,9 @@ mod tests {
                 .unwrap()
         );
         assert!(!ns.set(&key("x"), Value::Undefined, false).unwrap());
-        assert!(!ns.delete(&key("x")).unwrap());
+        // spec 10.4.6.6: deleting a non-exported key succeeds (nothing to
+        // delete).
+        assert!(ns.delete(&key("x")).unwrap());
     }
 
     #[test]

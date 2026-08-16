@@ -51,7 +51,9 @@ pub struct PromiseData {
 #[derive(Debug)]
 pub struct ResolverData {
     pub promise: Value,
-    pub already_resolved: bool,
+    /// The [[AlreadyResolved]] flag, shared by the resolve and reject
+    /// functions of one capability (spec 27.2.1.3.1).
+    pub already_resolved: std::rc::Rc<std::cell::Cell<bool>>,
     pub is_reject: bool,
 }
 
@@ -178,6 +180,10 @@ pub fn create_resolving_functions(agent: &mut Agent, promise: &Value) -> (Value,
         .ok()
         .and_then(|realm| realm.intrinsics.get("%Function.prototype%"))
         .and_then(|v| crate::context::as_object(&v));
+    // The promise resolving functions are anonymous (spec 27.2.1.3.1): the
+    // `name` property is the empty string. The two share one [[AlreadyResolved]]
+    // flag, so resolve-then-throw or reject-then-resolve is a no-op.
+    let already_resolved = std::rc::Rc::new(std::cell::Cell::new(false));
     let mut make = |is_reject: bool, name: &str| -> Value {
         let resolver = Function::create_builtin(
             Some(JsString::from_utf8(name)),
@@ -196,14 +202,12 @@ pub fn create_resolving_functions(agent: &mut Agent, promise: &Value) -> (Value,
             resolver.id(),
             Rc::new(RefCell::new(ResolverData {
                 promise: promise.clone(),
-                already_resolved: false,
+                already_resolved: already_resolved.clone(),
                 is_reject,
             })),
         );
         Value::Function(resolver)
     };
-    // The promise resolving functions are anonymous (spec 27.2.1.3.1): the
-    // `name` property is the empty string.
     (make(false, ""), make(true, ""))
 }
 
@@ -215,13 +219,17 @@ pub fn resolve_promise(
     resolution: Value,
 ) -> Result<(), JsError> {
     if crux::ops::same_value(&resolution, promise) {
-        return reject_promise(
+        // spec 27.2.1.3.2 step 6: reject with a fresh TypeError object (the
+        // constructor check in the resolve-*-self fixtures needs a real
+        // TypeError, not a string).
+        let error = crate::builtins::error::to_throwable(
             agent,
-            promise,
-            Value::String(Handle::new(JsString::from_utf8(
-                "Chaining cycle detected for promise",
-            ))),
-        );
+            &JsError::new(
+                ErrorKind::TypeError,
+                "Chaining cycle detected for promise".into(),
+            ),
+        )?;
+        return reject_promise(agent, promise, error);
     }
     let object = match &resolution {
         Value::Object(obj) => Some(obj.clone()),

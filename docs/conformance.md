@@ -48,7 +48,7 @@ Two harnesses live in `crates/test262`:
 
 ## Current results
 
-Workspace-wide: **4159 tests pass, 0 failures** (`cargo test --workspace`),
+Workspace-wide: **4162 tests pass, 0 failures** (`cargo test --workspace`),
 of which the test262 crate contributes **3317 passing fixtures** (44
 language-area + 3275 built-ins fixtures); the remaining registered test is
 the ignored `scan_builtins_directories` directory scanner. The `workers`
@@ -1480,7 +1480,6 @@ The harness's skip taxonomy (also used by the sweep):
 | Skip category | Reason |
 |---|---|
 | `flags: module` | No module loader: `import`/`export` parse, but linking, `dynamic import`, and `import.meta` are host-dependent (see below). |
-| `flags: async` | The `$DONE` async harness is not provided; async semantics are covered by the runtime's own async test suites. |
 | `flags: [CanBlockIsTrue]` | `Atomics.wait` fixtures assuming `[[CanBlock]] = true`; the engine's main agent cannot suspend (host-dependent). |
 | `features: [Temporal]` | Temporal is a stage-3 proposal, not part of ECMA-262 ES2026 (out of scope like Intl). |
 | `features: [await-dictionary]` | `Promise.allKeyed`/`allSettledKeyed` (the await-dictionary stage-3 proposal) are not part of ECMA-262 ES2026. |
@@ -1506,21 +1505,75 @@ against the runnable pass-rate target:
 `test262-sweep` over all three areas in a release build (48,622 fixtures, 8
 jobs, 20s batch timeout): **0 crashes, 0 hangs**. All three rows are
 re-measured with the long config (`--jobs 8 --batch 32 --timeout 120
---recheck-timeout 120`); the language row closed the last remaining
-failures (2,048 → 0) since the earlier run.
+--recheck-timeout 120`) and now report **0 fail**: the language row closed
+its 2,048 failures first (the eval-caller-context, field-initializer, and
+Annex B work below), and the final 39 async-test gaps described below
+closed last.
 
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
-| language | 23,724 | 18,080 | 0 | 5,644 | 0 | 100.0% |
-| built-ins | 23,812 | 17,562 | 0 | 6,250 | 0 | 100.0% |
-| annexB | 1,086 | 1,085 | 0 | 1 | 0 | 100.0% |
-| **Total** | **48,622** | **36,727** | **0** | **11,895** | **0** | **100.0%** |
+| language | 23,724 | 22,627 | 0 | 1,097 | 0 | 100.0% |
+| built-ins | 23,812 | 18,125 | 0 | 5,687 | 0 | 100.0% |
+| annexB | 1,086 | 1,086 | 0 | 0 | 0 | 100.0% |
+| **Total** | **48,622** | **41,838** | **0** | **6,784** | **0** | **100.0%** |
 
-(Runnable = pass + fail; the 11,895 skips are module/async fixtures,
+(Runnable = pass + fail + hang; the 6,784 skips are the module flag,
 unsupported harness includes, the host-dependent `CanBlockIsTrue` waits,
-and the out-of-scope Temporal, await-dictionary, and ShadowRealm proposal
-fixtures — the 190 cross-realm `$262.createRealm`, 34 `$262.IsHTMLDDA`, and
-now 316 newly-enabled harness-include fixtures (decimalToHexString, nans,
+and the out-of-scope Temporal, await-dictionary, ShadowRealm,
+source-phase-imports (`import.source()`), and import-text
+(`import(..., { with: { type: "text" } })`) proposal fixtures.) The last 39
+failures closed with the async-test engine work: `Array.fromAsync` was
+rewritten to spec 23.1.2.4.1 — 0-length array-likes skip the loop
+entirely, array-like elements are awaited before the mapper runs, the
+result's `length` is set on completion (a read-only length or throwing
+setter rejects), mapper rejections close the iterator, unmapped iterator
+values are defined without awaiting, and sloppy-mode async-function /
+generator / async-generator `this` binding boxes primitives;
+`for await` closes its iterator on `break` (a new `AsyncForOfClose` VM
+step) and object-pattern rest-to-property heads compile their member
+reference; AsyncFromSyncIterator close-on-rejection uses throw-completion
+semantics (the original error wins over a non-object `return` result), and
+`AsyncIterator.prototype[Symbol.asyncDispose]` rejects its promise when the
+`return` getter throws; `Atomics.waitAsync` registers with the wait
+registry so `Atomics.notify` resolves the promise with "ok" (NaN timeouts
+are +∞ and an omitted `notify` count is +∞); dynamic import of a fulfilled
+member of an errored top-level-await cycle rejects with the cycle root's
+recorded error ([[CycleRoot]] / [[AsyncParentModules]] tracking with
+deferred bodies); and `for (async of …)` is rejected by the spec's
+`[lookahead ∉ { let, async of }]` early error. The async
+`using`/`await using` disposal at end-of-body cluster (11 fixtures) closed
+with the async-body disposal driver: an async function/generator body's
+`using` resources are drained at completion and disposed in reverse
+registration order (spec 9.4.3 DisposeResources), awaiting async-dispose
+hints through the job queue and folding a throwing disposal into the
+completion — a second throw nests a `SuppressedError`, and the body's
+promise (or generator request) settles only after the disposals finish.
+Scopes inside resumable bodies dispose the same way: `await using`
+statements and their enclosing blocks compile to VM steps
+(`UsingInit`/`SetFunctionName`), `LeaveBlock` folds sync disposals and
+suspends on async ones, and a caught throw disposes the discarded try-block
+envs at `CatchBind` (delivering the folded value to the catch) — the
+`await using _ = null` microtask semantics and the `break`-before-`await
+using` case included. A statement containing a `break`/`continue` is
+compiled (not batched to the tree walker) so exits resolve across the
+compiled-block boundary. The `AsyncDisposableStack` cluster closed next
+(11 fixtures): `disposeAsync` now runs the stack in reverse order, folds a
+rejected async-dispose promise as a throwing disposal (single errors
+reject as-is, multiple nest `SuppressedError`), awaits once for a stack of
+only null/undefined `use`d resources (spec 27.4.1.3 steps 3.f-4), and
+`RequireInternalSlot` failures reject the returned promise instead of
+throwing synchronously; `AsyncDisposableStack.prototype.use(null|undefined)`
+registers the no-method async-hint resource per AddDisposableResource. The
+Promise cluster closed next (5 fixtures): the resolve and reject functions
+of one capability now share a single `[[AlreadyResolved]]` flag (a
+resolve-then-executor-throw or reject-after-resolve is a no-op, even when
+resolving a thenable), and the harness `Test262Error` gained a real
+prototype so `error instanceof Test262Error` holds for thrown harness
+errors (the `Promise.any` poisoned-iterable/iterator-value rejections). The `$DONE` async
+harness runs all async fixtures; the pre-async rows closed every
+previously-runnable fixture (0 fail / 0 hang): the 190
+cross-realm `$262.createRealm`, 34 `$262.IsHTMLDDA`, and now 316
+newly-enabled harness-include fixtures (decimalToHexString, nans,
 compareIterator, assertRelativeDateMs, iteratorZipUtils, dateConstants,
 deepEqual, promiseHelper, proxyTrapsHelper, fnGlobalObject,
 nativeFunctionMatcher, wellKnownIntrinsicObjects) run and pass,
@@ -1534,7 +1587,33 @@ renders the exact source incl. those prefixes), and builtins created
 outside the intrinsics table (typed-array species getters, Number statics,
 the Map/Set/Generator iterator `@@iterator` self-returners, and the
 `Math.random` host override) now get `%Function.prototype%` per
-CreateBuiltinFunction instead of a null prototype.) The built-ins row reflects every cluster closure through the
+CreateBuiltinFunction instead of a null prototype.) The async-generator
+driver was rewritten to the current spec (the `draining-queue` model,
+27.9.3): the prototype methods create the capability before validating
+`this`, so a bad generator rejects the returned promise instead of
+throwing synchronously; `yield` awaits its value with the state staying
+`executing` (queued requests wait); AsyncGeneratorYield completes the
+current request and continues without suspending when more requests are
+queued; `return()` values are awaited before reaching the body
+(AsyncGeneratorUnwrapYieldResumption) and on suspended-start/completed
+via AsyncGeneratorAwaitReturn; and completed generators drain the queue
+(AsyncGeneratorDrainQueue). The async `yield*` delegation was completed
+in the VM: a done return result completes the body with a return
+completion of its value (`resumed_return`), a done next/throw result
+continues the body with the value; the awaited inner result must be an
+object (post-await check, so a non-object's `then` is never consulted);
+iterator-result getter errors are catchable by the body; a delegation
+with no `return` method awaits the received value (new `AwaitReturn`
+suspension) and one with no `throw` method closes and throws the
+protocol-violation TypeError; and `return expr` in an async generator
+a waits its value before completing (the return statement is no longer
+batched to the tree walker). `AsyncFromSyncIteratorContinuation` was also
+completed: the wrapper's promise resolves with the promise-unwrapped
+`value` (and closes the sync iterator when a non-done value rejects),
+fixing the `yield*`-over-sync-iterable and `for await` close semantics.
+This closed the AsyncGeneratorPrototype cluster (48/48 built-ins) and the
+whole async-generator language cluster (83 language + 32 built-ins async
+fixtures fixed in total, with zero regressions). The built-ins row reflects every cluster closure through the
 final cleanup: the Error/BigInt/RegExp/Object-descriptor hardening,
 String/prototype, Object/create, DisposableStack, AsyncDisposableStack,
 ArrayBuffer/SharedArrayBuffer, Date, global-functions, Function,
@@ -1546,9 +1625,9 @@ Object.fromEntries, JSON.stringify, DataView, Object statics/
 constructor, Promise, Atomics, and the final Array/generator, Throw-
 TypeError, WeakRef/FinalizationRegistry, Uint8Array base64/hex, Set
 set-methods, JSON/parse, TypedArray BigInt, String, and SuppressedError
-closures (all 0 fail). The 6,250 built-ins skips are dominated by the
+closures (all 0 fail). The 5,687 built-ins skips are dominated by the
 out-of-scope Temporal proposal (4,611), await-dictionary (33), and
-ShadowRealm (60), with the async/module flags, host-dependent
+ShadowRealm (60), with the module flag, host-dependent
 `CanBlockIsTrue` waits, and unsupported harness includes making up the
 rest.
 
@@ -1650,11 +1729,10 @@ the parser implements Annex B HTML comments, legacy octal literals, the
 each with unit tests. The full `annexB/` sweep is available via the sweep
 tool above.
 
-The full sweep now measures **100% of runnable**: **1,085 pass, 0 fail, 1
+The full sweep now measures **100% of runnable**: **1,086 pass, 0 fail, 0
 skip** of 1,086 fixtures (`--timeout 120 --recheck-timeout 120`, release
-build; the single skip is the async-flagged `$DONE` fixture — the
-cross-realm `$262.createRealm`, `$262.IsHTMLDDA`, and `fnGlobalObject.js`/
-`propertyHelper.js` global-decl fixtures now run and pass). This closed the
+build; the previously-skipped async-flagged `$DONE` fixture runs now that
+the async harness is provided). This closed the
 area from 327 pass / 663 fail. The clusters:
 
 - **Sloppy block-level function declarations (B.3.2 / B.3.3)** — the ~410
@@ -1706,14 +1784,16 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 
 ## Open items
 
-- All three areas now measure **100% of runnable**: 18,080 + 17,562 + 1,085
+- All three areas now measure **100% of runnable**: 22,627 + 18,125 + 1,086
   pass / 0 fail / 0 crash / 0 hang of 23,724 + 23,812 + 1,086 fixtures
   (out-of-scope Temporal, await-dictionary, and ShadowRealm fixtures and
   the host-dependent `CanBlockIsTrue` waits skipped, `--timeout 120
   --recheck-timeout 120`, release build) — the plan's ≥95%
-  runnable-pass-rate target is met. The language area closed last (2,048 →
-  0 fails) via the eval-caller-context, field-initializer, and Annex B
-  work described in the Full-suite sweep section.
+  runnable-pass-rate target is met. The language area closed its 2,048
+  failures via the eval-caller-context, field-initializer, and Annex B
+  work described in the Full-suite sweep section; the final async-test
+  gaps (`Array.fromAsync`, `for await`, and the dynamic-import cycle)
+  closed last.
   Note: the TypedArray sweep should be run with the long deadline
   (`--timeout 120 --recheck-timeout 120`) — the O(n²) property store
   makes the 10,000-element crash-test fixtures take ~45s, which the

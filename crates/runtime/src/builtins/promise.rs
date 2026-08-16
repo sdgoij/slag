@@ -386,10 +386,10 @@ fn dispatch_resolver(
         let data = resolver.borrow();
         (data.promise.clone(), data.is_reject)
     };
-    if resolver.borrow().already_resolved {
+    if resolver.borrow().already_resolved.get() {
         return Ok(Value::Undefined);
     }
-    resolver.borrow_mut().already_resolved = true;
+    resolver.borrow().already_resolved.set(true);
     let value = args.first().cloned().unwrap_or(Value::Undefined);
     if is_reject {
         reject_promise(agent, &promise, value)?;
@@ -660,16 +660,47 @@ fn function_prototype(agent: &Agent) -> Option<Handle<JsObject>> {
 }
 
 /// Promise.all (spec 27.2.4.2.1).
+/// GetPromiseResolve (spec 27.2.4.1.1 step 3): get `resolve` off the
+/// constructor and require it callable. An abrupt Get or a non-callable
+/// value rejects `reject` and yields `None` (the caller returns the
+/// capability's promise); `Some(resolve)` continues the compound operation.
+fn get_promise_resolve(
+    agent: &mut Agent,
+    constructor: &Value,
+    reject: &Value,
+) -> Result<Option<Value>, JsError> {
+    let resolve = match crate::context::get_property(
+        agent,
+        constructor,
+        &JsString::from_utf8(RESOLVE),
+        constructor.clone(),
+    ) {
+        Ok(resolve) => resolve,
+        Err(error) => {
+            let rejection = error_value(agent, &error);
+            crate::function::call(agent, reject, Value::Undefined, &[rejection])?;
+            return Ok(None);
+        }
+    };
+    if !is_callable(&resolve) {
+        let rejection = error_value(
+            agent,
+            &JsError::new(
+                ErrorKind::TypeError,
+                "Promise.resolve is not a function".into(),
+            ),
+        );
+        crate::function::call(agent, reject, Value::Undefined, &[rejection])?;
+        return Ok(None);
+    }
+    Ok(Some(resolve))
+}
+
 fn promise_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let capability = new_promise_capability(agent, this)?;
-    let promise_resolve_fn =
-        crate::context::get_property(agent, this, &JsString::from_utf8(RESOLVE), this.clone())?;
-    if !is_callable(&promise_resolve_fn) {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "Promise.resolve is not a function".into(),
-        ));
-    }
+    let Some(promise_resolve_fn) = get_promise_resolve(agent, this, &capability.reject)? else {
+        return Ok(capability.promise);
+    };
     let iterable = args.first().cloned().unwrap_or(Value::Undefined);
     let iterator = match crate::expr::get_iterator(agent, &iterable) {
         Ok(iterator) => iterator,
@@ -806,14 +837,9 @@ fn all_fulfilled(
 /// Promise.allSettled (spec 27.2.4.3.1).
 fn promise_all_settled(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let capability = new_promise_capability(agent, this)?;
-    let promise_resolve_fn =
-        crate::context::get_property(agent, this, &JsString::from_utf8(RESOLVE), this.clone())?;
-    if !is_callable(&promise_resolve_fn) {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "Promise.resolve is not a function".into(),
-        ));
-    }
+    let Some(promise_resolve_fn) = get_promise_resolve(agent, this, &capability.reject)? else {
+        return Ok(capability.promise);
+    };
     let iterable = args.first().cloned().unwrap_or(Value::Undefined);
     let iterator = match crate::expr::get_iterator(agent, &iterable) {
         Ok(iterator) => iterator,
@@ -962,14 +988,9 @@ fn all_settled_handler(
 /// Promise.any (spec 27.2.4.1.1).
 fn promise_any(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let capability = new_promise_capability(agent, this)?;
-    let promise_resolve_fn =
-        crate::context::get_property(agent, this, &JsString::from_utf8(RESOLVE), this.clone())?;
-    if !is_callable(&promise_resolve_fn) {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "Promise.resolve is not a function".into(),
-        ));
-    }
+    let Some(promise_resolve_fn) = get_promise_resolve(agent, this, &capability.reject)? else {
+        return Ok(capability.promise);
+    };
     let iterable = args.first().cloned().unwrap_or(Value::Undefined);
     let iterator = match crate::expr::get_iterator(agent, &iterable) {
         Ok(iterator) => iterator,
@@ -1098,14 +1119,9 @@ fn any_rejected(
 /// Promise.race (spec 27.2.4.3.1).
 fn promise_race(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let capability = new_promise_capability(agent, this)?;
-    let promise_resolve_fn =
-        crate::context::get_property(agent, this, &JsString::from_utf8(RESOLVE), this.clone())?;
-    if !is_callable(&promise_resolve_fn) {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "Promise.resolve is not a function".into(),
-        ));
-    }
+    let Some(promise_resolve_fn) = get_promise_resolve(agent, this, &capability.reject)? else {
+        return Ok(capability.promise);
+    };
     let iterable = args.first().cloned().unwrap_or(Value::Undefined);
     let iterator = match crate::expr::get_iterator(agent, &iterable) {
         Ok(iterator) => iterator,
@@ -1455,6 +1471,35 @@ mod tests {
         // A throwing executor rejects the promise with the thrown value.
         let result = settle("new Promise(function () { throw 'bad'; })").unwrap();
         assert!(matches!(result, Value::String(_)));
+    }
+
+    #[test]
+    fn resolve_then_executor_throw_is_ignored() {
+        // spec 27.2.4.1 step 10: the resolve and reject functions share one
+        // [[AlreadyResolved]] flag, so a throw after resolve is a no-op —
+        // even when the resolution was a thenable (the promise fulfills with
+        // the thenable's settled value, never with the thrown error).
+        assert_eq!(
+            settle(concat!(
+                "var thenable = { then: function (resolve) { resolve(); } };",
+                "function executor(resolve, reject) {",
+                "  resolve(thenable);",
+                "  throw new Error('ignored');",
+                "}",
+                "new Promise(executor).then(function () { return 'fulfilled'; }, function () { return 'rejected'; });"
+            ))
+            .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("fulfilled")))
+        );
+        // A reject after resolve is equally a no-op.
+        assert_eq!(
+            settle(concat!(
+                "new Promise(function (res, rej) { res(1); rej('nope'); })",
+                "  .then(function (v) { return v; }, function () { return 'rejected'; });"
+            ))
+            .unwrap(),
+            Value::Number(1.0)
+        );
     }
 
     #[test]

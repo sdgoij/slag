@@ -57,6 +57,9 @@ pub struct Agent {
     pub global_symbol_registry: RefCell<Vec<(JsString, Symbol)>>,
     /// [[ModuleAsyncEvaluationCount]]: module linking (Phase 7).
     pub module_async_evaluation_count: u32,
+    /// The in-flight module evaluations (spec 16.2.2.5 InnerModuleEvaluation
+    /// stack): used to detect dependency cycles and find the cycle root.
+    pub module_eval_stack: Vec<crux::handle::Handle<crate::module::SourceTextModule>>,
     /// The ECMAScript-function bodies keyed by function identity (the spec
     /// 10.2.1 slots [[Environment]], [[FormalParameters]], [[ECMAScriptCode]],
     /// [[ThisMode]], [[HomeObject]] live here, Phase 7).
@@ -86,6 +89,12 @@ pub struct Agent {
     /// The AsyncFromSyncIterator methods, keyed by function identity.
     pub async_from_sync:
         std::collections::HashMap<u64, std::rc::Rc<crate::async_await::AsyncFromSyncEntry>>,
+    /// The AsyncFromSyncIterator value-unwrap continuations, keyed by
+    /// function identity (spec 27.1.5.4).
+    pub async_from_sync_continuations: std::collections::HashMap<
+        u64,
+        std::rc::Rc<crate::async_await::AsyncFromSyncContinuationEntry>,
+    >,
     /// The generator objects' states, keyed by object identity (spec 27.4.3).
     pub generators:
         std::collections::HashMap<u64, std::rc::Rc<RefCell<crate::generator::GeneratorState>>>,
@@ -101,10 +110,6 @@ pub struct Agent {
         u64,
         std::rc::Rc<crate::async_generator::AsyncGeneratorAwaitEntry>,
     >,
-    /// The thenable-unwrap handlers of AsyncGeneratorResolve, keyed by
-    /// function identity; the bool is the `done` flag of the result.
-    pub async_generator_resolvers:
-        std::collections::HashMap<u64, (crate::promise::PromiseCapability, bool)>,
     /// The iterator-helper objects' states, keyed by object identity (spec
     /// 27.1.3).
     pub iterator_helpers: std::collections::HashMap<
@@ -148,8 +153,18 @@ pub struct Agent {
     /// The capability of each in-flight `disposeAsync`, keyed by driver
     /// identity.
     pub disposable_async_caps: std::collections::HashMap<u64, crate::promise::PromiseCapability>,
-    /// The `disposeAsync` continuations, keyed by function identity.
-    pub disposable_async_cont: std::collections::HashMap<u64, u64>,
+    /// The `disposeAsync` continuations, keyed by function identity: the
+    /// driver id and whether the awaited disposal promise rejected.
+    pub disposable_async_cont: std::collections::HashMap<u64, (u64, bool)>,
+    /// The in-flight disposal drivers of async bodies (`using` resources
+    /// drained at body completion), keyed by driver-object identity.
+    pub async_body_disposal: std::collections::HashMap<
+        u64,
+        std::rc::Rc<RefCell<crate::builtins::disposable::AsyncBodyDisposalDriver>>,
+    >,
+    /// The async-body disposal continuations, keyed by function identity:
+    /// the driver id and whether the awaited disposal promise rejected.
+    pub async_body_disposal_cont: std::collections::HashMap<u64, (u64, bool)>,
     /// Agent-dependent built-ins (`%eval%`-pattern functions that cannot run
     /// inside crux closures) dispatch by intrinsic identity in
     /// `function::call_inner`. The result of that linear chain is memoized
@@ -218,6 +233,10 @@ pub struct Agent {
             bool,
         ),
     >,
+    /// The resolve functions of pending `Atomics.waitAsync` waits, keyed by
+    /// the registered waiter-event id: `Atomics.notify` pops the event and
+    /// resolves the promise with *"ok"* (spec 26.4.15 DoWait step 20).
+    pub wait_async: std::collections::HashMap<u64, Value>,
     /// The internal state of ArrayBuffer/SharedArrayBuffer objects, keyed by
     /// object identity (spec 25.1.1: [[ArrayBufferData]], [[ArrayBufferByteLength]],
     /// [[ArrayBufferMaxByteLength]], and the resizable/growable + shared flags).
@@ -285,6 +304,7 @@ impl Agent {
             kept_alive: Vec::new(),
             global_symbol_registry: RefCell::new(Vec::new()),
             module_async_evaluation_count: 0,
+            module_eval_stack: Vec::new(),
             ecma_functions: std::collections::HashMap::new(),
             promises: std::collections::HashMap::new(),
             promise_resolvers: std::collections::HashMap::new(),
@@ -292,10 +312,10 @@ impl Agent {
             promise_finally: std::collections::HashMap::new(),
             async_resume: std::collections::HashMap::new(),
             async_from_sync: std::collections::HashMap::new(),
+            async_from_sync_continuations: std::collections::HashMap::new(),
             generators: std::collections::HashMap::new(),
             async_generators: std::collections::HashMap::new(),
             async_generator_awaits: std::collections::HashMap::new(),
-            async_generator_resolvers: std::collections::HashMap::new(),
             iterator_helpers: std::collections::HashMap::new(),
             wrapped_iterators: std::collections::HashMap::new(),
             async_iterator_helpers: std::collections::HashMap::new(),
@@ -306,6 +326,8 @@ impl Agent {
             disposable_async_drivers: std::collections::HashMap::new(),
             disposable_async_caps: std::collections::HashMap::new(),
             disposable_async_cont: std::collections::HashMap::new(),
+            async_body_disposal: std::collections::HashMap::new(),
+            async_body_disposal_cont: std::collections::HashMap::new(),
             builtin_dispatch_cache: std::collections::HashMap::new(),
             host_modules: RefCell::new(std::collections::HashMap::new()),
             module_namespaces: std::collections::HashMap::new(),
@@ -324,6 +346,7 @@ impl Agent {
             finalization_registries: std::collections::HashMap::new(),
             array_iter_data: std::collections::HashMap::new(),
             array_from_async: std::collections::HashMap::new(),
+            wait_async: std::collections::HashMap::new(),
             buffer_data: std::collections::HashMap::new(),
             dataview_data: std::collections::HashMap::new(),
             raw_json_data: std::collections::HashMap::new(),

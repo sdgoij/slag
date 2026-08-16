@@ -505,12 +505,15 @@ fn parse_class_method_tail_with(
     parser.expect_punct(TokenKind::LeftParen)?;
     // Params parse with the method's own [Yield, Await] grammar: an async
     // method's formal parameters reserve `await` (spec 15.8.1), and a plain
-    // method's params reset both regardless of the enclosing context.
-    let saved = (parser.in_generator, parser.in_async);
+    // method's params reset both regardless of the enclosing context. `super`
+    // is valid in a method's parameter list too (the initializers evaluate
+    // with the method's home object, spec 15.7.5).
+    let saved = (parser.in_generator, parser.in_async, parser.allow_super);
     parser.in_generator = is_generator;
     parser.in_async = is_async;
+    parser.allow_super = true;
     let params = parse_parameter_list(parser)?;
-    (parser.in_generator, parser.in_async) = saved;
+    (parser.in_generator, parser.in_async, parser.allow_super) = saved;
     check_duplicate_params(parser, &params, false)?;
     crate::expr::check_function_params(parser, &params, is_async, is_generator)?;
     let (body, _) = parse_function_body_block(

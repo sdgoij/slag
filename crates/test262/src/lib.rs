@@ -64,10 +64,13 @@ assert.throws = function (expectedErrorConstructor, func) {
 // echoes the argument is enough for the vendored fixtures.
 print = function (s) { return s; };
 Test262Error = function (message) {
-  var err = { name: "Test262Error", message: message };
+  var err = Object.create(Test262Error.prototype);
+  err.name = "Test262Error";
+  err.message = message;
   err.constructor = Test262Error;
   return err;
 };
+Test262Error.prototype = { constructor: Test262Error };
 // The sta.js helper: a function that always throws (used as the reject
 // function in the Promise capability fixtures).
 Test262Error.thrower = function (message) {
@@ -242,6 +245,24 @@ function verifyAccessorProperty(obj, name, desc, options) {
   if ("configurable" in desc) assert.sameValue(original.configurable, desc.configurable, label + " configurable");
 }
 var verifyPrimordialAccessorProperty = verifyAccessorProperty;
+"#;
+
+    /// The async test protocol (test262 async harness): fixtures with
+    /// `flags: [async]` signal completion via `$DONE()` (success) or
+    /// `$DONE(error)` (failure). The runner drains the job queue, then reads
+    /// the two globals below — `asyncTestPassed` guards against double calls
+    /// (the canonical harness flag), `asyncTestError` carries the failure
+    /// value (a non-undefined/null `$DONE` argument).
+    const ASYNC_PRELUDE: &str = r#"
+var asyncTestPassed = false;
+var asyncTestError;
+var $DONE = function (error) {
+  if (asyncTestPassed) return;
+  asyncTestPassed = true;
+  if (error !== undefined && error !== null) {
+    asyncTestError = error;
+  }
+};
 "#;
 
     /// Where a fixture lives under the pinned submodule.
@@ -10827,7 +10848,7 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
     }
 
     /// Run one fixture in one mode; `Err` carries a human-readable failure.
-    fn run_one(body: &str, mode: Mode, fm: &Frontmatter) -> Result<(), String> {
+    fn run_one(body: &str, mode: Mode, fm: &Frontmatter, fixture_dir: &Path) -> Result<(), String> {
         let wrapped = wrap(body, mode);
         if matches!(fm.negative_phase.as_deref(), Some("parse" | "early")) {
             let kind = expected_kind(fm)?;
@@ -10963,15 +10984,46 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
             let source = harness_include_source(include)?;
             agent.run_script(&source).map_err(|e| e.message)?;
         }
+        // Async fixtures (test262 async protocol) complete via `$DONE`; the
+        // prelude records the call (and any failure value) in globals the
+        // runner reads after the job queue drains.
+        if fm.flags.iter().any(|f| f == "async") {
+            agent.run_script(ASYNC_PRELUDE).map_err(|e| e.message)?;
+        }
+        // Dynamic-import fixtures load real sibling support files from the
+        // submodule; register them (transitively) before the fixture runs.
+        if body.contains("import(") || body.contains("import (") {
+            register_fixture_modules(&mut agent, fixture_dir, body)?;
+        }
         let result = agent.run_script(&wrapped);
         agent.run_jobs().map_err(|e| e.message)?;
-        match (result, fm.negative_phase.as_deref()) {
-            (Ok(_), None) => Ok(()),
-            (Ok(_), Some("runtime")) => {
+        let async_failure = if fm.flags.iter().any(|f| f == "async") {
+            read_async_completion(&mut agent, &Value::Object(realm.global_object.clone()))?
+        } else {
+            None
+        };
+        match (result, async_failure, fm.negative_phase.as_deref()) {
+            (Ok(_), None, None) => Ok(()),
+            (Ok(_), Some(value), None) => Err(format!(
+                "async test failed: {}",
+                describe_thrown(&mut agent, &value)?
+            )),
+            (Ok(_), None, Some("runtime")) => {
                 Err("expected a runtime error but the script completed".into())
             }
-            (Ok(_), Some(phase)) => Err(format!("unexpected negative phase {phase}")),
-            (Err(e), Some("runtime")) => {
+            (Ok(_), Some(value), Some("runtime")) => {
+                let ty = fm.negative_type.as_deref().unwrap_or("");
+                if thrown_constructor_is(&mut agent, &value, ty) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "async runtime error != expected {ty}: {}",
+                        describe_thrown(&mut agent, &value)?
+                    ))
+                }
+            }
+            (Ok(_), _, Some(phase)) => Err(format!("unexpected negative phase {phase}")),
+            (Err(e), _, Some("runtime")) => {
                 let ty = fm.negative_type.as_deref().unwrap_or("");
                 if ty == "Test262Error" {
                     // The fixture deliberately throws the harness's
@@ -11010,8 +11062,8 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
                     }
                 }
             }
-            (Err(e), None) => Err(format!("unexpected runtime error: {}", e.message)),
-            (Err(_), Some(_)) => Err("unexpected error on a parse-phase negative test".into()),
+            (Err(e), _, None) => Err(format!("unexpected runtime error: {}", e.message)),
+            (Err(_), _, Some(_)) => Err("unexpected error on a parse-phase negative test".into()),
         }
     }
 
@@ -11019,24 +11071,70 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
         JsError::new(ErrorKind::TypeError, message)
     }
 
-    /// Whether the thrown value's `constructor.name` reads as `expected` (the
-    /// negative type of a JS-thrown error; `run_script` wraps every thrown
-    /// value in a TypeError-kind JsError carrying the value).
-    fn thrown_constructor_is(agent: &mut Agent, value: &Value, expected: &str) -> bool {
+    /// The thrown value's `constructor.name` (the negative type of a
+    /// JS-thrown error; `run_script` wraps every thrown value in a
+    /// TypeError-kind JsError carrying the value, and async `$DONE(error)`
+    /// passes the raw error object).
+    fn thrown_name(agent: &mut Agent, value: &Value) -> Option<String> {
         let ctor = runtime::context::get_property(
             agent,
             value,
             &JsString::from_utf8("constructor"),
             value.clone(),
         )
-        .ok();
-        let name = ctor.and_then(|ctor| {
-            runtime::context::get_property(agent, &ctor, &JsString::from_utf8("name"), ctor.clone())
-                .ok()
-        });
+        .ok()?;
+        let name = runtime::context::get_property(
+            agent,
+            &ctor,
+            &JsString::from_utf8("name"),
+            ctor.clone(),
+        )
+        .ok()?;
         match name {
-            Some(Value::String(text)) => text.to_string_lossy() == expected,
-            _ => false,
+            Value::String(text) => Some(text.to_string_lossy()),
+            _ => None,
+        }
+    }
+
+    fn thrown_constructor_is(agent: &mut Agent, value: &Value, expected: &str) -> bool {
+        thrown_name(agent, value).as_deref() == Some(expected)
+    }
+
+    /// A readable description of a thrown value for failure messages: its
+    /// constructor name when available, else the value's debug form.
+    fn describe_thrown(agent: &mut Agent, value: &Value) -> Result<String, String> {
+        if let Some(name) = thrown_name(agent, value) {
+            return Ok(name);
+        }
+        Ok(format!("{value:?}"))
+    }
+
+    /// Read the async-completion globals after the job queue drains: `None`
+    /// means `$DONE` was called without an argument (success), `Some(value)`
+    /// carries the failure value, and an error means `$DONE` was never called
+    /// (a hung test).
+    fn read_async_completion(agent: &mut Agent, global: &Value) -> Result<Option<Value>, String> {
+        let passed = runtime::context::get_property(
+            agent,
+            global,
+            &JsString::from_utf8("asyncTestPassed"),
+            global.clone(),
+        )
+        .map_err(|e| e.message)?;
+        if !to_boolean(&passed) {
+            return Err("async test never called $DONE".into());
+        }
+        let error = runtime::context::get_property(
+            agent,
+            global,
+            &JsString::from_utf8("asyncTestError"),
+            global.clone(),
+        )
+        .map_err(|e| e.message)?;
+        if matches!(error, Value::Undefined | Value::Null) {
+            Ok(None)
+        } else {
+            Ok(Some(error))
         }
     }
 
@@ -11056,6 +11154,100 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
             .join("../../test262/harness")
             .join(name);
         std::fs::read_to_string(&path).map_err(|e| format!("{name}: {e}"))
+    }
+
+    /// Register the support modules a dynamic-import fixture loads, from the
+    /// pinned submodule (the fixtures `import('./name_FIXTURE.js')` real
+    /// sibling files; `HostResolveImportedModule` resolves only against the
+    /// agent's registered map). Literal specifiers are scanned from the
+    /// source; the computed-specifier cluster (`assignment-expression/*`)
+    /// all resolve to `*_FIXTURE` siblings per the corpus convention, so
+    /// those are registered by directory scan. Missing files stay
+    /// unregistered and reject (the negative `THIS_FILE_DOES_NOT_EXIST`
+    /// fixtures).
+    fn register_fixture_modules(
+        agent: &mut Agent,
+        fixture_dir: &Path,
+        fixture_source: &str,
+    ) -> Result<(), String> {
+        let mut specifiers: Vec<String> = Vec::new();
+        scan_literal_imports(fixture_source, &mut specifiers);
+        scan_fixture_siblings(fixture_dir, &mut specifiers);
+        for specifier in specifiers {
+            register_module_recursive(agent, fixture_dir, &specifier)?;
+        }
+        Ok(())
+    }
+
+    /// The string-literal `import('…')`/`import("…")` specifiers in a
+    /// source text (dynamic-import fixtures use literal specifiers; the
+    /// computed ones are covered by the `_FIXTURE` sibling scan).
+    fn scan_literal_imports(source: &str, out: &mut Vec<String>) {
+        let mut rest = source;
+        while let Some(start) = rest.find("import(") {
+            rest = &rest[start + "import(".len()..];
+            let trimmed = rest.trim_start();
+            let Some(quote) = trimmed.chars().next().filter(|c| *c == '\'' || *c == '"') else {
+                continue;
+            };
+            if let Some(end) = trimmed[1..].find(quote) {
+                out.push(trimmed[1..=end].to_string());
+                rest = &trimmed[end + 1..];
+            }
+        }
+    }
+
+    /// The `*_FIXTURE.js`/`*_FIXTURE.json` siblings of a directory: the
+    /// test262 support-file convention for dynamic-import fixtures.
+    fn scan_fixture_siblings(dir: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.contains("_FIXTURE.") {
+                out.push(format!("./{name}"));
+            }
+        }
+    }
+
+    /// Register one module (keyed by its raw specifier, which is what
+    /// `HostResolveImportedModule` looks up) and its transitive imports,
+    /// each resolved against its own directory. Cycle-safe via the
+    /// already-registered guard.
+    fn register_module_recursive(
+        agent: &mut Agent,
+        dir: &Path,
+        specifier: &str,
+    ) -> Result<(), String> {
+        if specifier.is_empty() || specifier.starts_with('#') {
+            return Ok(());
+        }
+        let key = JsString::from_utf8(specifier);
+        if agent.host_modules.borrow().contains_key(&key) {
+            return Ok(());
+        }
+        let path = dir.join(specifier);
+        let source = match std::fs::read_to_string(&path) {
+            Ok(source) => source,
+            // Negative fixtures import files that must not resolve.
+            Err(_) => return Ok(()),
+        };
+        if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("json"))
+        {
+            agent.add_json_module(specifier, &source);
+        } else {
+            agent.add_module(specifier, &source);
+        }
+        let next_dir = path.parent().unwrap_or(dir).to_path_buf();
+        let module = runtime::module::parse_module(agent, &key, &JsString::from_utf8(&source))
+            .map_err(|e| e.message)?;
+        for (dep, _) in &module.requested_modules {
+            register_module_recursive(agent, &next_dir, &dep.to_string_lossy())?;
+        }
+        Ok(())
     }
 
     fn arity_error(name: &str) -> JsError {
@@ -11285,9 +11477,6 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
         if fm.flags.iter().any(|f| f == "module") {
             return FixtureResult::Skip("module tests are Phase 7".into());
         }
-        if fm.flags.iter().any(|f| f == "async") {
-            return FixtureResult::Skip("async tests are Phase 7".into());
-        }
         if fm.features.iter().any(|f| f == "Temporal") {
             // Temporal is a stage-3 proposal, not part of ECMA-262 ES2026
             // (out of scope like Intl/ECMA-402).
@@ -11301,6 +11490,16 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
         if fm.features.iter().any(|f| f == "ShadowRealm") {
             // ShadowRealm is a stage-3 proposal, not part of ECMA-262 ES2026.
             return FixtureResult::Skip("ShadowRealm is out of scope".into());
+        }
+        if fm.features.iter().any(|f| f == "source-phase-imports") {
+            // `import.source()` is a stage-3 proposal, not part of ECMA-262
+            // ES2026.
+            return FixtureResult::Skip("source-phase-imports is out of scope".into());
+        }
+        if fm.features.iter().any(|f| f == "import-text") {
+            // `import(..., { with: { type: "text" } })` is a stage-3
+            // proposal, not part of ECMA-262 ES2026.
+            return FixtureResult::Skip("import-text is out of scope".into());
         }
         if fm.flags.iter().any(|f| f == "CanBlockIsTrue") {
             // Atomics.wait fixtures that assume [[CanBlock]] = true: the
@@ -11334,6 +11533,7 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
                         | "fnGlobalObject.js"
                         | "nativeFunctionMatcher.js"
                         | "wellKnownIntrinsicObjects.js"
+                        | "asyncHelpers.js"
                 )
             })
             .collect();
@@ -11353,7 +11553,7 @@ var verifyPrimordialAccessorProperty = verifyAccessorProperty;
             body
         };
         for mode in modes(&fm) {
-            if let Err(e) = run_one(program, mode, &fm) {
+            if let Err(e) = run_one(program, mode, &fm, path.parent().unwrap_or(&path)) {
                 return FixtureResult::Fail(format!("{relative} ({mode:?}): {e}"));
             }
         }

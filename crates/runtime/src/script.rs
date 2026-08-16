@@ -35,6 +35,7 @@ pub struct ScriptRecord {
 /// ParseScript (spec 16.1.5): parse `source` as a Script and wrap it in a
 /// Script Record. Early errors surface here as a SyntaxError.
 pub fn parse_script(source: &str, realm: Handle<Realm>) -> Result<Handle<ScriptRecord>, JsError> {
+    crate::expr::bump_template_parse_generation();
     let code = parser::parse_script(source)?;
     Ok(Handle::new(ScriptRecord {
         realm,
@@ -700,6 +701,8 @@ pub fn perform_eval(
 
     let program =
         parser::parse_script_utf16_eval(source.as_slice(), &eval_context, &caller_private_names)?;
+    // A fresh eval parse is a distinct site space for the template cache.
+    crate::expr::bump_template_parse_generation();
     // A script with no body evaluates to undefined.
     if program.body.is_empty() {
         return Ok(Value::Undefined);

@@ -1776,12 +1776,22 @@ fn eval_template(
 
 // The per-realm template-object cache (spec 12.2.9.3 GetTemplateObject):
 // template objects are keyed by the parse node of the site. Within one parse
-// the same site shares a node pointer, so a (realm, node) key gives the
-// spec's same-site identity; each `eval` re-parses and gets a fresh site.
+// the same site shares a node pointer, so a (parse, realm, node) key gives
+// the spec's same-site identity. Node addresses can be reused across parses
+// (a freed AST reallocated for the next `eval`), so each parse also gets a
+// fresh generation: the node pointer alone would falsely cache across evals.
+type TemplateCacheKey = (usize, usize, usize);
 thread_local! {
-    static TEMPLATE_OBJECT_CACHE: std::cell::RefCell<
-        Vec<((usize, usize), Value)>,
-    > = const { std::cell::RefCell::new(Vec::new()) };
+    static TEMPLATE_OBJECT_CACHE: std::cell::RefCell<Vec<(TemplateCacheKey, Value)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static TEMPLATE_PARSE_GENERATION: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Bump the parse generation: every fresh `parse_script`/`parse_module` is a
+/// distinct site space for the template cache (each `eval` re-parses and gets
+/// a fresh site).
+pub fn bump_template_parse_generation() {
+    TEMPLATE_PARSE_GENERATION.set(TEMPLATE_PARSE_GENERATION.get() + 1);
 }
 
 fn eval_tagged_template(
@@ -1808,7 +1818,9 @@ fn eval_tagged_template(
         ));
     }
     let realm = agent.current_realm()?;
+    let generation = TEMPLATE_PARSE_GENERATION.get();
     let key = (
+        generation,
         crux::handle::Handle::as_ptr(&realm) as usize,
         template as *const TemplateLiteral as usize,
     );

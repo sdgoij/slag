@@ -1781,6 +1781,19 @@ mod tests {
         ok("async function f() { for (await using x of arr) {} }");
         ok("async function f() { for await (using x of arr) {} }");
         ok("async function f() { for await (await using x of arr) {} }");
+        // `async` is a plain identifier head, not an async arrow, when no
+        // `=>` follows (spec ForInOfStatement: `for await (async of …)`).
+        ok("let async; async function f() { for await (async of [7]); }");
+        // An async arrow still parses.
+        ok("async function f() { var g = async x => x; }");
+        // `for (async of …)` is a SyntaxError: the expression-headed for-of
+        // production has the lookahead `[lookahead ∉ { let, async of }]`
+        // (spec 14.7.5), so `async` cannot be the LHS. An escaped `async` is
+        // an ordinary identifier, and `async of => …` is an arrow init, so
+        // both stay valid.
+        err("let async; for (async of [1]);");
+        ok(r"let async; for (\u0061sync of [1]);");
+        ok("for (async of => {}; false; ) {}");
         // `for (using of y)` is an expression-headed for-of.
         assert!(matches!(
             stmt("for (using of arr) {}").kind,

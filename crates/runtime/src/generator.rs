@@ -206,11 +206,17 @@ pub fn call_generator(
     agent.execution_context_stack.push(context);
     let instantiate = (|| -> Result<(), JsError> {
         if data.this_mode != ThisMode::Lexical {
-            let this = if data.this_mode == ThisMode::Sloppy
-                && matches!(this, Value::Undefined | Value::Null)
-            {
-                let global = agent.running_context()?.realm.global_object.clone();
-                Value::Object(global)
+            // OrdinaryCallBindThis (spec 10.2.1): sloppy functions coerce
+            // undefined/null to the global object and box primitives.
+            let this = if data.this_mode == ThisMode::Sloppy {
+                match this {
+                    Value::Undefined | Value::Null => {
+                        let global = agent.running_context()?.realm.global_object.clone();
+                        Value::Object(global)
+                    }
+                    Value::Object(_) | Value::Function(_) => this,
+                    other => crate::context::to_object(agent, &other)?,
+                }
             } else {
                 this
             };
@@ -554,6 +560,14 @@ fn finish_resume(
             }
         }
         VmOutcome::Suspended(Suspension::Await(_)) => {
+            agent.execution_context_stack.pop();
+            state.flag = GeneratorFlag::Completed;
+            Err(JsError::new(
+                ErrorKind::TypeError,
+                "generator body awaited without being async".into(),
+            ))
+        }
+        VmOutcome::Suspended(Suspension::AwaitReturn(_)) => {
             agent.execution_context_stack.pop();
             state.flag = GeneratorFlag::Completed;
             Err(JsError::new(

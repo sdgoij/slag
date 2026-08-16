@@ -17,7 +17,7 @@ use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::PropertyDescriptor;
 use crux::string::JsString;
-use crux::value::{Value, is_callable};
+use crux::value::Value;
 
 use crate::agent::Agent;
 use crate::context::ExecutionContext;
@@ -74,11 +74,26 @@ pub struct AsyncGeneratorState {
     pub body_env: Option<EnvRef>,
 }
 
+/// What an await-resume closure of an async generator body does when the
+/// promise settles (spec 27.9.3): resume the body from its own `await`
+/// (`Body`), run the AsyncGeneratorYield continuation after a `yield`
+/// (`Yield`), deliver a `return()` value into a suspended yield
+/// (`ReturnResume`), or complete the request of a `return()` on a
+/// suspended-start/completed generator (`AwaitReturn`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AwaitKind {
+    Body,
+    Yield,
+    ReturnResume,
+    AwaitReturn,
+}
+
 /// The state of an await-resume closure of an async generator body.
 #[derive(Debug, Clone)]
 pub struct AsyncGeneratorAwaitEntry {
     pub object_id: u64,
     pub is_reject: bool,
+    pub kind: AwaitKind,
 }
 
 pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
@@ -240,11 +255,17 @@ pub fn call_async_generator(
     agent.execution_context_stack.push(context);
     let instantiate = (|| -> Result<(), JsError> {
         if data.this_mode != ThisMode::Lexical {
-            let this = if data.this_mode == ThisMode::Sloppy
-                && matches!(this, Value::Undefined | Value::Null)
-            {
-                let global = agent.running_context()?.realm.global_object.clone();
-                Value::Object(global)
+            // OrdinaryCallBindThis (spec 10.2.1): sloppy functions coerce
+            // undefined/null to the global object and box primitives.
+            let this = if data.this_mode == ThisMode::Sloppy {
+                match this {
+                    Value::Undefined | Value::Null => {
+                        let global = agent.running_context()?.realm.global_object.clone();
+                        Value::Object(global)
+                    }
+                    Value::Object(_) | Value::Function(_) => this,
+                    other => crate::context::to_object(agent, &other)?,
+                }
             } else {
                 this
             };
@@ -338,174 +359,277 @@ fn validate(agent: &Agent, this: &Value) -> Result<u64, JsError> {
     Ok(obj.id())
 }
 
-fn async_generator_next(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let object_id = validate(agent, this)?;
-    let value = args.first().cloned().unwrap_or(Value::Undefined);
-    enqueue(agent, object_id, Resume::Normal(value))
-}
-
-fn async_generator_return(
-    agent: &mut Agent,
-    this: &Value,
-    args: &[Value],
-) -> Result<Value, JsError> {
-    let object_id = validate(agent, this)?;
-    let value = args.first().cloned().unwrap_or(Value::Undefined);
-    // spec 27.6.3.5: while the body is executing, `return` marks the state so
-    // the current await settles into the queued return (AsyncGeneratorAwaitReturn).
-    let state = agent
-        .async_generators
-        .get(&object_id)
-        .cloned()
-        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async generator".into()))?;
-    if state.borrow().flag == AsyncGeneratorFlag::Executing {
-        state.borrow_mut().flag = AsyncGeneratorFlag::AwaitingReturn;
-    }
-    enqueue(agent, object_id, Resume::Return(value))
-}
-
-fn async_generator_throw(
-    agent: &mut Agent,
-    this: &Value,
-    args: &[Value],
-) -> Result<Value, JsError> {
-    let object_id = validate(agent, this)?;
-    let value = args.first().cloned().unwrap_or(Value::Undefined);
-    enqueue(agent, object_id, Resume::Throw(value))
-}
-
-/// AsyncGeneratorEnqueue (spec 27.6.1.3): append the request and, when the
-/// generator is idle, start processing the queue.
-fn enqueue(agent: &mut Agent, object_id: u64, completion: Resume) -> Result<Value, JsError> {
+/// NewPromiseCapability(%Promise%) of the current realm (spec 27.9.1.2
+/// step 2): every request promise comes from the realm that called the
+/// method.
+fn new_capability(agent: &mut Agent) -> Result<PromiseCapability, JsError> {
     let promise_ctor = agent
         .current_realm()?
         .intrinsics
         .get("%Promise%")
         .unwrap_or(Value::Undefined);
-    let capability = new_promise_capability(agent, &promise_ctor)?;
+    new_promise_capability(agent, &promise_ctor)
+}
+
+fn state(agent: &Agent, object_id: u64) -> Result<AsyncGeneratorFlag, JsError> {
+    let state = agent
+        .async_generators
+        .get(&object_id)
+        .cloned()
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async generator".into()))?;
+    Ok(state.borrow().flag)
+}
+
+fn set_flag(agent: &Agent, object_id: u64, flag: AsyncGeneratorFlag) -> Result<(), JsError> {
+    let state = agent
+        .async_generators
+        .get(&object_id)
+        .cloned()
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async generator".into()))?;
+    state.borrow_mut().flag = flag;
+    Ok(())
+}
+
+fn set_current(
+    agent: &Agent,
+    object_id: u64,
+    request: AsyncGeneratorRequest,
+) -> Result<(), JsError> {
+    let state = agent
+        .async_generators
+        .get(&object_id)
+        .cloned()
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async generator".into()))?;
+    state.borrow_mut().current = Some(request);
+    Ok(())
+}
+
+fn take_current(agent: &Agent, object_id: u64) -> Result<Option<AsyncGeneratorRequest>, JsError> {
+    let state = agent
+        .async_generators
+        .get(&object_id)
+        .cloned()
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async generator".into()))?;
+    Ok(state.borrow_mut().current.take())
+}
+
+fn save_context(agent: &Agent, object_id: u64, context: ExecutionContext) -> Result<(), JsError> {
+    let state = agent
+        .async_generators
+        .get(&object_id)
+        .cloned()
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async generator".into()))?;
+    state.borrow_mut().context = Some(context);
+    Ok(())
+}
+
+/// AsyncGeneratorEnqueue (spec 27.9.3.4): append the request. The prototype
+/// methods decide whether the generator is resumed.
+fn push_request(
+    agent: &Agent,
+    object_id: u64,
+    request: AsyncGeneratorRequest,
+) -> Result<(), JsError> {
+    let state = agent
+        .async_generators
+        .get(&object_id)
+        .cloned()
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async generator".into()))?;
+    state.borrow_mut().queue.push_back(request);
+    Ok(())
+}
+
+fn pop_front(
+    agent: &Agent,
+    object_id: u64,
+) -> Result<Option<(AsyncGeneratorRequest, Resume)>, JsError> {
+    let state = agent
+        .async_generators
+        .get(&object_id)
+        .cloned()
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async generator".into()))?;
+    let mut state = state.borrow_mut();
+    let Some(request) = state.queue.pop_front() else {
+        return Ok(None);
+    };
+    let completion = request.completion.clone();
+    Ok(Some((request, completion)))
+}
+
+/// %AsyncGeneratorPrototype%.next (spec 27.9.1.2): the capability is created
+/// before the `this` check, so a bad generator rejects the promise instead of
+/// throwing synchronously.
+fn async_generator_next(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    let capability = new_capability(agent)?;
     let promise = capability.promise.clone();
-    let request = AsyncGeneratorRequest {
-        completion,
-        capability,
+    let object_id = match validate(agent, this) {
+        Ok(id) => id,
+        Err(error) => {
+            // spec 27.9.1.2 step 4: IfAbruptRejectPromise.
+            let rejection = crate::promise::error_value(agent, &error);
+            crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
+            return Ok(promise);
+        }
     };
-    let flag = {
-        let state = agent
-            .async_generators
-            .get(&object_id)
-            .cloned()
-            .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async generator".into()))?;
-        let mut state = state.borrow_mut();
-        state.queue.push_back(request);
-        state.flag
-    };
-    if !matches!(
+    let flag = state(agent, object_id)?;
+    if flag == AsyncGeneratorFlag::Completed {
+        // spec 27.9.1.2 steps 6-7: a completed generator resolves with
+        // { value: undefined, done: true } without enqueueing.
+        let result = iterator_result(agent, Value::Undefined, true)?;
+        crate::function::call(agent, &capability.resolve, Value::Undefined, &[result])?;
+        return Ok(promise);
+    }
+    push_request(
+        agent,
+        object_id,
+        AsyncGeneratorRequest {
+            completion: Resume::Normal(args.first().cloned().unwrap_or(Value::Undefined)),
+            capability,
+        },
+    )?;
+    if matches!(
         flag,
-        AsyncGeneratorFlag::Executing | AsyncGeneratorFlag::AwaitingReturn
+        AsyncGeneratorFlag::SuspendedStart | AsyncGeneratorFlag::SuspendedYield
     ) {
         async_generator_resume_next(agent, object_id)?;
     }
     Ok(promise)
 }
 
-/// AsyncGeneratorResumeNext (spec 27.6.3.1): process the queue while the
-/// generator is idle.
+/// %AsyncGeneratorPrototype%.return (spec 27.9.1.3).
+fn async_generator_return(
+    agent: &mut Agent,
+    this: &Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    let capability = new_capability(agent)?;
+    let promise = capability.promise.clone();
+    let object_id = match validate(agent, this) {
+        Ok(id) => id,
+        Err(error) => {
+            let rejection = crate::promise::error_value(agent, &error);
+            crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
+            return Ok(promise);
+        }
+    };
+    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    let flag = state(agent, object_id)?;
+    push_request(
+        agent,
+        object_id,
+        AsyncGeneratorRequest {
+            completion: Resume::Return(value.clone()),
+            capability,
+        },
+    )?;
+    if matches!(
+        flag,
+        AsyncGeneratorFlag::SuspendedStart | AsyncGeneratorFlag::Completed
+    ) {
+        // spec 27.9.1.3 steps 8-9: the generator never resumes; the return
+        // value is awaited and the request completed from the continuation.
+        let request = pop_front(agent, object_id)?.map(|(request, _)| request);
+        if let Some(request) = request {
+            set_current(agent, object_id, request)?;
+        }
+        set_flag(agent, object_id, AsyncGeneratorFlag::AwaitingReturn)?;
+        await_return(agent, object_id, value)?;
+    } else if flag == AsyncGeneratorFlag::SuspendedYield {
+        async_generator_resume_next(agent, object_id)?;
+    }
+    Ok(promise)
+}
+
+/// %AsyncGeneratorPrototype%.throw (spec 27.9.1.4): throw values are never
+/// unwrapped (the fixtures reject with the exception itself).
+fn async_generator_throw(
+    agent: &mut Agent,
+    this: &Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    let capability = new_capability(agent)?;
+    let promise = capability.promise.clone();
+    let object_id = match validate(agent, this) {
+        Ok(id) => id,
+        Err(error) => {
+            let rejection = crate::promise::error_value(agent, &error);
+            crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
+            return Ok(promise);
+        }
+    };
+    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    let flag = state(agent, object_id)?;
+    if flag == AsyncGeneratorFlag::SuspendedStart {
+        set_flag(agent, object_id, AsyncGeneratorFlag::Completed)?;
+    }
+    if state(agent, object_id)? == AsyncGeneratorFlag::Completed {
+        // spec 27.9.1.4 steps 7-8: completed generators reject directly.
+        crate::function::call(agent, &capability.reject, Value::Undefined, &[value])?;
+        return Ok(promise);
+    }
+    push_request(
+        agent,
+        object_id,
+        AsyncGeneratorRequest {
+            completion: Resume::Throw(value),
+            capability,
+        },
+    )?;
+    if flag == AsyncGeneratorFlag::SuspendedYield {
+        async_generator_resume_next(agent, object_id)?;
+    }
+    Ok(promise)
+}
+
+/// AsyncGeneratorResumeNext (spec 27.9.3.6): while the generator is idle,
+/// run the next queued request; once the body has completed, resolve the
+/// remaining requests without resuming (spec 27.9.3.10 drain).
 fn async_generator_resume_next(agent: &mut Agent, object_id: u64) -> Result<(), JsError> {
     loop {
-        let flag = agent
-            .async_generators
-            .get(&object_id)
-            .map(|state| state.borrow().flag);
+        let flag = state(agent, object_id)?;
         match flag {
-            Some(AsyncGeneratorFlag::Executing)
-            | Some(AsyncGeneratorFlag::AwaitingReturn)
-            | None => {
+            AsyncGeneratorFlag::Executing | AsyncGeneratorFlag::AwaitingReturn => {
                 return Ok(());
             }
-            Some(AsyncGeneratorFlag::Completed) => {
-                let request = {
-                    let state =
-                        agent
-                            .async_generators
-                            .get(&object_id)
-                            .cloned()
-                            .ok_or_else(|| {
-                                JsError::new(ErrorKind::TypeError, "not an async generator".into())
-                            })?;
-                    state.borrow_mut().queue.pop_front()
-                };
-                let Some(request) = request else {
+            AsyncGeneratorFlag::Completed => {
+                let Some((request, completion)) = pop_front(agent, object_id)? else {
                     return Ok(());
                 };
-                resolve_request(agent, &request, Value::Undefined, true)?;
-            }
-            Some(AsyncGeneratorFlag::SuspendedStart) | Some(AsyncGeneratorFlag::SuspendedYield) => {
-                let (request, completion, was_start) = {
-                    let state =
-                        agent
-                            .async_generators
-                            .get(&object_id)
-                            .cloned()
-                            .ok_or_else(|| {
-                                JsError::new(ErrorKind::TypeError, "not an async generator".into())
-                            })?;
-                    let mut state = state.borrow_mut();
-                    let Some(request) = state.queue.pop_front() else {
-                        return Ok(());
-                    };
-                    let was_start = state.flag == AsyncGeneratorFlag::SuspendedStart;
-                    let completion = request.completion.clone();
-                    state.flag = AsyncGeneratorFlag::Executing;
-                    state.current = Some(request.clone());
-                    (request, completion, was_start)
-                };
                 match completion {
-                    Resume::Return(value) if was_start => {
-                        // A suspendedStart generator closes without resuming
-                        // (spec 27.6.3.1 step 11: AsyncGeneratorResolve).
-                        let state =
-                            agent
-                                .async_generators
-                                .get(&object_id)
-                                .cloned()
-                                .ok_or_else(|| {
-                                    JsError::new(
-                                        ErrorKind::TypeError,
-                                        "not an async generator".into(),
-                                    )
-                                })?;
-                        let mut state = state.borrow_mut();
-                        state.flag = AsyncGeneratorFlag::Completed;
-                        state.current = None;
-                        drop(state);
-                        resolve_request(agent, &request, value, true)?;
-                    }
-                    Resume::Throw(value) if was_start => {
-                        // A suspendedStart generator rejects without resuming.
-                        let state =
-                            agent
-                                .async_generators
-                                .get(&object_id)
-                                .cloned()
-                                .ok_or_else(|| {
-                                    JsError::new(
-                                        ErrorKind::TypeError,
-                                        "not an async generator".into(),
-                                    )
-                                })?;
-                        {
-                            let mut state = state.borrow_mut();
-                            state.flag = AsyncGeneratorFlag::Completed;
-                            state.current = None;
-                        }
-                        reject_request(agent, &request, value)?;
-                    }
                     Resume::Return(value) => {
-                        let outcome = resume_body(agent, object_id, Resume::Return(value));
-                        drive(agent, object_id, outcome)?;
+                        // spec 27.9.3.10: a queued return sets awaiting-return
+                        // and awaits the value (AsyncGeneratorAwaitReturn).
+                        set_flag(agent, object_id, AsyncGeneratorFlag::AwaitingReturn)?;
+                        set_current(agent, object_id, request)?;
+                        await_return(agent, object_id, value)?;
+                        return Ok(());
                     }
                     Resume::Throw(value) => {
-                        let outcome = resume_body(agent, object_id, Resume::Throw(value));
-                        drive(agent, object_id, outcome)?;
+                        complete_step(agent, &request, Completion::Throw(value), true)?;
+                    }
+                    Resume::Normal(_) => {
+                        complete_step(agent, &request, Completion::Normal(Value::Undefined), true)?;
+                    }
+                }
+            }
+            AsyncGeneratorFlag::SuspendedStart | AsyncGeneratorFlag::SuspendedYield => {
+                let was_start = flag == AsyncGeneratorFlag::SuspendedStart;
+                let Some((request, completion)) = pop_front(agent, object_id)? else {
+                    return Ok(());
+                };
+                set_current(agent, object_id, request.clone())?;
+                set_flag(agent, object_id, AsyncGeneratorFlag::Executing)?;
+                match completion {
+                    // A suspended-start generator closes without resuming
+                    // (spec 27.9.1.4 steps 6-7 handle this before enqueueing,
+                    // so these branches are defensive).
+                    Resume::Return(value) if was_start => {
+                        set_flag(agent, object_id, AsyncGeneratorFlag::Completed)?;
+                        complete_step(agent, &request, Completion::Normal(value), true)?;
+                    }
+                    Resume::Throw(value) if was_start => {
+                        set_flag(agent, object_id, AsyncGeneratorFlag::Completed)?;
+                        complete_step(agent, &request, Completion::Throw(value), true)?;
                     }
                     Resume::Normal(value) => {
                         let outcome = if was_start {
@@ -515,14 +639,25 @@ fn async_generator_resume_next(agent: &mut Agent, object_id: u64) -> Result<(), 
                         };
                         drive(agent, object_id, outcome)?;
                     }
+                    Resume::Return(value) => {
+                        // AsyncGeneratorUnwrapYieldResumption (spec
+                        // 27.9.3.7): a return resumption awaits its value
+                        // before the body sees it.
+                        resume_with_return(agent, object_id, value)?;
+                    }
+                    Resume::Throw(value) => {
+                        let outcome = resume_body(agent, object_id, Resume::Throw(value));
+                        drive(agent, object_id, outcome)?;
+                    }
                 }
             }
         }
     }
 }
 
-/// The tail of a drive: save the suspension or settle the current request,
-/// then keep processing the queue.
+/// The tail of a drive: save the suspension (awaiting the yield value or a
+/// body await) or settle the current request when the body completes, then
+/// keep processing the queue.
 fn drive(
     agent: &mut Agent,
     object_id: u64,
@@ -532,110 +667,120 @@ fn drive(
         Ok(outcome) => outcome,
         Err(error) => {
             agent.execution_context_stack.pop();
-            let state = agent
-                .async_generators
-                .get(&object_id)
-                .cloned()
-                .ok_or_else(|| {
-                    JsError::new(ErrorKind::TypeError, "not an async generator".into())
-                })?;
-            let request = {
-                let mut state = state.borrow_mut();
-                state.flag = AsyncGeneratorFlag::Completed;
-                state.vm = None;
-                state.current.take()
-            };
+            let request = take_current(agent, object_id)?;
+            set_flag(agent, object_id, AsyncGeneratorFlag::Completed)?;
             if let Some(request) = request {
                 let rejection = crate::promise::error_value(agent, &error);
-                crate::function::call(
-                    agent,
-                    &request.capability.reject,
-                    Value::Undefined,
-                    &[rejection],
-                )?;
+                complete_step(agent, &request, Completion::Throw(rejection), true)?;
             }
             return async_generator_resume_next(agent, object_id);
         }
     };
     match outcome {
+        VmOutcome::Suspended(Suspension::Yield {
+            value,
+            delegate: true,
+        }) => {
+            // A delegated `yield`: the value came from the inner iterator's
+            // already-awaited result, so AsyncGeneratorYield completes the
+            // current request with it directly — it is not awaited again
+            // (spec 15.5.5 normal case: AsyncGeneratorYield(IteratorValue)).
+            let context = agent
+                .execution_context_stack
+                .pop()
+                .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no context to pop".into()))?;
+            save_context(agent, object_id, context)?;
+            resume_from_yield(agent, object_id, value)?;
+            Ok(())
+        }
         VmOutcome::Suspended(Suspension::Yield { value, .. }) => {
             let context = agent
                 .execution_context_stack
                 .pop()
                 .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no context to pop".into()))?;
-            let request = {
-                let state = agent
-                    .async_generators
-                    .get(&object_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        JsError::new(ErrorKind::TypeError, "not an async generator".into())
-                    })?;
-                let mut state = state.borrow_mut();
-                state.context = Some(context);
-                state.flag = AsyncGeneratorFlag::SuspendedYield;
-                state.current.take().ok_or_else(|| {
-                    JsError::new(ErrorKind::TypeError, "no current request".into())
-                })?
-            };
-            resolve_request(agent, &request, value, false)?;
+            save_context(agent, object_id, context)?;
+            // spec 27.8.3.7: `yield arg` awaits arg first, so the value
+            // reaches AsyncGeneratorYield unwrapped. The state stays
+            // executing while that await is pending, so queued requests wait.
+            attach_await(agent, object_id, value, AwaitKind::Yield)?;
+            Ok(())
         }
         VmOutcome::Suspended(Suspension::Await(value)) => {
             let context = agent
                 .execution_context_stack
                 .pop()
                 .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no context to pop".into()))?;
-            let state = agent
-                .async_generators
-                .get(&object_id)
-                .cloned()
-                .ok_or_else(|| {
-                    JsError::new(ErrorKind::TypeError, "not an async generator".into())
-                })?;
-            state.borrow_mut().context = Some(context);
-            attach_await(agent, object_id, value)?;
-            return Ok(());
+            save_context(agent, object_id, context)?;
+            attach_await(agent, object_id, value, AwaitKind::Body)?;
+            Ok(())
+        }
+        VmOutcome::Suspended(Suspension::AwaitReturn(value)) => {
+            // The `yield*` delegation has no `return` method: the received
+            // value is awaited and the body is resumed with a return
+            // completion of it (spec 15.5.5 return case step b).
+            let context = agent
+                .execution_context_stack
+                .pop()
+                .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no context to pop".into()))?;
+            save_context(agent, object_id, context)?;
+            attach_await(agent, object_id, value, AwaitKind::ReturnResume)?;
+            Ok(())
         }
         VmOutcome::Completed(completion) => {
             agent.execution_context_stack.pop();
-            let request = {
-                let state = agent
-                    .async_generators
-                    .get(&object_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        JsError::new(ErrorKind::TypeError, "not an async generator".into())
-                    })?;
-                let mut state = state.borrow_mut();
-                state.flag = AsyncGeneratorFlag::Completed;
-                state.vm = None;
-                state.current.take().ok_or_else(|| {
-                    JsError::new(ErrorKind::TypeError, "no current request".into())
-                })?
+            // spec 27.6.3.2 steps 6-7: normal and empty completions become
+            // undefined; a return completion keeps its value.
+            let completion = match completion {
+                Completion::Normal(_) | Completion::Empty => Completion::Normal(Value::Undefined),
+                other => other,
             };
-            match completion {
-                // Only a `return` completion carries a value; a normal
-                // completion resolves the request with *undefined*.
-                Completion::Return(value) => resolve_request(agent, &request, value, true)?,
-                Completion::Normal(_) | Completion::Empty => {
-                    resolve_request(agent, &request, Value::Undefined, true)?
-                }
-                Completion::Throw(value) => reject_request(agent, &request, value)?,
-                Completion::Break { .. } | Completion::Continue { .. } => {
-                    let error = JsError::new(
-                        ErrorKind::SyntaxError,
-                        "Illegal control flow in an async generator body".into(),
-                    );
-                    let rejection = crate::promise::error_value(agent, &error);
-                    crate::function::call(
-                        agent,
-                        &request.capability.reject,
-                        Value::Undefined,
-                        &[rejection],
-                    )?;
-                }
+            // spec 9.4.3: the body's `using` resources are disposed when the
+            // body completes; async-dispose hints suspend through the job
+            // queue, so `complete_current_request` runs from the driver once
+            // the disposals settle.
+            let body_env = agent
+                .async_generators
+                .get(&object_id)
+                .cloned()
+                .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async generator".into()))?
+                .borrow()
+                .body_env
+                .clone();
+            let resources = match body_env {
+                Some(env) => env.drain_disposable_resources(),
+                None => Vec::new(),
+            };
+            if resources
+                .iter()
+                .any(|resource| !matches!(resource.method, Value::Undefined))
+            {
+                crate::builtins::disposable::dispose_async_body_resources(
+                    agent,
+                    resources,
+                    completion,
+                    crate::builtins::disposable::AsyncBodySettlement::Generator { object_id },
+                )?;
+            } else {
+                complete_current_request(agent, object_id, completion)?;
             }
+            Ok(())
         }
+    }
+}
+
+/// Complete the current request with a body completion (spec 27.6.3.2 steps
+/// 6-7): mark the generator completed, settle the current request, then drain
+/// the queue. Called directly on completion or by the async-body disposal
+/// driver after the awaited disposals settle.
+pub fn complete_current_request(
+    agent: &mut Agent,
+    object_id: u64,
+    completion: Completion,
+) -> Result<(), JsError> {
+    let request = take_current(agent, object_id)?;
+    set_flag(agent, object_id, AsyncGeneratorFlag::Completed)?;
+    if let Some(request) = request {
+        complete_step(agent, &request, completion, true)?;
     }
     async_generator_resume_next(agent, object_id)
 }
@@ -748,9 +893,15 @@ fn resume_body(
     outcome
 }
 
-/// Attach the Await reactions (spec 27.6.3.6): resume the VM on fulfillment
-/// or rejection of the awaited value.
-fn attach_await(agent: &mut Agent, object_id: u64, value: Value) -> Result<(), JsError> {
+/// Attach the Await reactions for a body `await`, a `yield` value, or a
+/// `return()` value (spec 27.6.3.6 / 27.9.3.7 / 27.9.3.9): the continuation
+/// resumes the VM or completes the queued request.
+fn attach_await(
+    agent: &mut Agent,
+    object_id: u64,
+    value: Value,
+    kind: AwaitKind,
+) -> Result<(), JsError> {
     let promise_ctor = agent
         .current_realm()?
         .intrinsics
@@ -775,6 +926,7 @@ fn attach_await(agent: &mut Agent, object_id: u64, value: Value) -> Result<(), J
             Rc::new(AsyncGeneratorAwaitEntry {
                 object_id,
                 is_reject,
+                kind,
             }),
         );
         let handler = Value::Function(closure);
@@ -801,143 +953,190 @@ pub fn dispatch_await(
     Some(resume_from_await(agent, entry, args))
 }
 
-/// The await continuation: resume the body with the awaited value (or
-/// rejection), or — when `return()` was called while awaiting — with the
-/// queued return completion.
+/// The await continuation: dispatch by what the await was for.
 fn resume_from_await(
     agent: &mut Agent,
     entry: Rc<AsyncGeneratorAwaitEntry>,
     args: &[Value],
 ) -> Result<Value, JsError> {
     let value = args.first().cloned().unwrap_or(Value::Undefined);
-    let completion = {
-        let state = agent
-            .async_generators
-            .get(&entry.object_id)
-            .cloned()
-            .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async generator".into()))?;
-        let mut state = state.borrow_mut();
-        if state.flag == AsyncGeneratorFlag::AwaitingReturn {
-            let request = state.queue.pop_front().ok_or_else(|| {
-                JsError::new(ErrorKind::TypeError, "no queued return request".into())
-            })?;
-            state.current = Some(request.clone());
-            let completion = request.completion;
-            state.flag = AsyncGeneratorFlag::Executing;
-            completion
-        } else {
-            state.flag = AsyncGeneratorFlag::Executing;
-            if entry.is_reject {
+    match entry.kind {
+        AwaitKind::Body => {
+            let completion = if entry.is_reject {
                 Resume::Throw(value)
             } else {
                 Resume::Normal(value)
+            };
+            let outcome = resume_body(agent, entry.object_id, completion);
+            drive(agent, entry.object_id, outcome)?;
+        }
+        AwaitKind::Yield => {
+            if entry.is_reject {
+                // The awaited yield value rejected (spec 27.8.3.7: `yield`
+                // awaits its value first); resume the body with the
+                // rejection so a try/catch around the yield can observe it.
+                let outcome = resume_body(agent, entry.object_id, Resume::Throw(value));
+                drive(agent, entry.object_id, outcome)?;
+            } else {
+                resume_from_yield(agent, entry.object_id, value)?;
             }
         }
-    };
-    let outcome = resume_body(agent, entry.object_id, completion);
-    drive(agent, entry.object_id, outcome)?;
+        AwaitKind::ReturnResume => {
+            let completion = if entry.is_reject {
+                Resume::Throw(value)
+            } else {
+                Resume::Return(value)
+            };
+            let outcome = resume_body(agent, entry.object_id, completion);
+            drive(agent, entry.object_id, outcome)?;
+        }
+        AwaitKind::AwaitReturn => {
+            let request = take_current(agent, entry.object_id)?;
+            set_flag(agent, entry.object_id, AsyncGeneratorFlag::Completed)?;
+            if let Some(request) = request {
+                let completion = if entry.is_reject {
+                    Completion::Throw(value)
+                } else {
+                    Completion::Normal(value)
+                };
+                complete_step(agent, &request, completion, true)?;
+            }
+            async_generator_resume_next(agent, entry.object_id)?;
+        }
+    }
     Ok(Value::Undefined)
 }
 
-/// Reject the request's capability with `value`.
-fn reject_request(
-    agent: &mut Agent,
-    request: &AsyncGeneratorRequest,
-    value: Value,
-) -> Result<(), JsError> {
-    let error = JsError::new(
-        ErrorKind::TypeError,
-        "Uncaught async generator throw".into(),
-    )
-    .with_value(value);
-    let rejection = crate::promise::error_value(agent, &error);
-    crate::function::call(
-        agent,
-        &request.capability.reject,
-        Value::Undefined,
-        &[rejection],
-    )?;
+/// AsyncGeneratorYield (spec 27.9.3.8), reached from the `yield`-await
+/// continuation: complete the current request with the awaited value, then
+/// either keep executing the body with the next queued request's completion
+/// or suspend at the yield.
+fn resume_from_yield(agent: &mut Agent, object_id: u64, value: Value) -> Result<(), JsError> {
+    let request = take_current(agent, object_id)?;
+    if let Some(request) = request {
+        complete_step(agent, &request, Completion::Normal(value), false)?;
+    }
+    let Some((next, completion)) = pop_front(agent, object_id)? else {
+        set_flag(agent, object_id, AsyncGeneratorFlag::SuspendedYield)?;
+        return Ok(());
+    };
+    set_current(agent, object_id, next)?;
+    match completion {
+        Resume::Normal(value) => {
+            let outcome = resume_body(agent, object_id, Resume::Normal(value));
+            drive(agent, object_id, outcome)?;
+        }
+        Resume::Throw(value) => {
+            let outcome = resume_body(agent, object_id, Resume::Throw(value));
+            drive(agent, object_id, outcome)?;
+        }
+        Resume::Return(value) => {
+            resume_with_return(agent, object_id, value)?;
+        }
+    }
     Ok(())
 }
 
-/// AsyncGeneratorResolve (spec 27.6.3.7): resolve the request's capability
-/// with `{ value, done }`, promise-unwrapping thenable values.
-fn resolve_request(
-    agent: &mut Agent,
-    request: &AsyncGeneratorRequest,
-    value: Value,
-    done: bool,
-) -> Result<(), JsError> {
-    let thenable = matches!(value, Value::Object(_) | Value::Function(_))
-        && crate::context::get_property(agent, &value, &JsString::from_utf8("then"), value.clone())
-            .is_ok_and(|then| is_callable(&then));
-    if !thenable {
-        let result = iterator_result(agent, value, done)?;
-        crate::function::call(
-            agent,
-            &request.capability.resolve,
-            Value::Undefined,
-            &[result],
-        )?;
-        return Ok(());
-    }
+/// AsyncGeneratorUnwrapYieldResumption (spec 27.9.3.7): a `return()`
+/// delivered into the suspended body first awaits its value, so a throwing
+/// PromiseResolve (e.g. a broken promise) surfaces inside the body's
+/// try/catch — including before a `yield*` delegation sees it (the
+/// delegation then awaits it again when it has no `return` method).
+fn resume_with_return(agent: &mut Agent, object_id: u64, value: Value) -> Result<(), JsError> {
     let promise_ctor = agent
         .current_realm()?
         .intrinsics
         .get("%Promise%")
         .unwrap_or(Value::Undefined);
-    let promise = promise_resolve(agent, &promise_ctor, value)?;
-    let capability = request.capability.clone();
-    let resolve_closure = Function::create_builtin(
-        Some(JsString::from_utf8("")),
-        1,
-        Box::new(|_, _| {
-            Err(JsError::new(
-                ErrorKind::TypeError,
-                "async generator resolve handler must be called through the agent".into(),
-            ))
-        }),
-        None,
-        None,
-    )?;
-    agent
-        .async_generator_resolvers
-        .insert(resolve_closure.id(), (capability, done));
-    perform_promise_then(
-        agent,
-        &promise,
-        Some(Value::Function(resolve_closure)),
-        Some(request.capability.reject.clone()),
-        None,
-    )?;
+    let promise = match promise_resolve(agent, &promise_ctor, value.clone()) {
+        Ok(promise) => promise,
+        Err(error) => {
+            let rejection = crate::promise::error_value(agent, &error);
+            let outcome = resume_body(agent, object_id, Resume::Throw(rejection));
+            return drive(agent, object_id, outcome);
+        }
+    };
+    attach_await(agent, object_id, promise, AwaitKind::ReturnResume)?;
     Ok(())
 }
 
-/// The thenable-unwrap continuation: resolve the capability with the settled
-/// value.
-pub fn dispatch_resolver(
+/// AsyncGeneratorAwaitReturn (spec 27.9.3.9): a `return()` on a
+/// suspended-start or completed generator awaits the return value; a
+/// throwing PromiseResolve rejects the request immediately.
+fn await_return(agent: &mut Agent, object_id: u64, value: Value) -> Result<(), JsError> {
+    let promise_ctor = agent
+        .current_realm()?
+        .intrinsics
+        .get("%Promise%")
+        .unwrap_or(Value::Undefined);
+    let promise = match promise_resolve(agent, &promise_ctor, value.clone()) {
+        Ok(promise) => promise,
+        Err(error) => {
+            let request = take_current(agent, object_id)?;
+            set_flag(agent, object_id, AsyncGeneratorFlag::Completed)?;
+            if let Some(request) = request {
+                let rejection = crate::promise::error_value(agent, &error);
+                complete_step(agent, &request, Completion::Throw(rejection), true)?;
+            }
+            return async_generator_resume_next(agent, object_id);
+        }
+    };
+    attach_await(agent, object_id, promise, AwaitKind::AwaitReturn)?;
+    Ok(())
+}
+
+/// AsyncGeneratorCompleteStep (spec 27.9.3.5): resolve the request's
+/// capability with `{ value, done }` or reject it with a throw completion's
+/// value. Values are not promise-unwrapped here: a `yield`'s value was
+/// already awaited before AsyncGeneratorYield ran.
+fn complete_step(
     agent: &mut Agent,
-    callee: &Value,
-    args: &[Value],
-) -> Option<Result<Value, JsError>> {
-    let Value::Function(function) = callee else {
-        return None;
-    };
-    let (capability, done) = agent
-        .async_generator_resolvers
-        .get(&function.id())
-        .cloned()?;
-    let value = args.first().cloned().unwrap_or(Value::Undefined);
-    let result = match iterator_result(agent, value, done) {
-        Ok(result) => result,
-        Err(error) => return Some(Err(error)),
-    };
-    Some(crate::function::call(
-        agent,
-        &capability.resolve,
-        Value::Undefined,
-        &[result],
-    ))
+    request: &AsyncGeneratorRequest,
+    completion: Completion,
+    done: bool,
+) -> Result<(), JsError> {
+    match completion {
+        Completion::Throw(value) => {
+            crate::function::call(
+                agent,
+                &request.capability.reject,
+                Value::Undefined,
+                &[value],
+            )?;
+        }
+        Completion::Normal(value) | Completion::Return(value) => {
+            let result = iterator_result(agent, value, done)?;
+            crate::function::call(
+                agent,
+                &request.capability.resolve,
+                Value::Undefined,
+                &[result],
+            )?;
+        }
+        Completion::Empty => {
+            let result = iterator_result(agent, Value::Undefined, done)?;
+            crate::function::call(
+                agent,
+                &request.capability.resolve,
+                Value::Undefined,
+                &[result],
+            )?;
+        }
+        Completion::Break { .. } | Completion::Continue { .. } => {
+            let error = JsError::new(
+                ErrorKind::SyntaxError,
+                "Illegal control flow in an async generator body".into(),
+            );
+            let rejection = crate::promise::error_value(agent, &error);
+            crate::function::call(
+                agent,
+                &request.capability.reject,
+                Value::Undefined,
+                &[rejection],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// CreateIterResultObject (spec 8.4.11): `{ value, done }` with

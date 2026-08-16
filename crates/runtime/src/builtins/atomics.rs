@@ -309,6 +309,10 @@ fn compare_exchange(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
 struct WaiterEvent {
     condvar: Condvar,
     notified: Mutex<bool>,
+    /// For `waitAsync` waiters: the `agent.wait_async` key of the resolve
+    /// function, resolved to *"ok"* by `notify` (a blocking `wait` event has
+    /// `None`).
+    async_key: Option<u64>,
 }
 
 type WaitQueue = VecDeque<Arc<WaiterEvent>>;
@@ -319,6 +323,7 @@ impl WaiterEvent {
         WaiterEvent {
             condvar: Condvar::new(),
             notified: Mutex::new(false),
+            async_key: None,
         }
     }
 }
@@ -337,8 +342,13 @@ fn notify(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
     let slots = validate_integer_typed_array(agent, args, true, false)?;
     let offset = atomic_offset(&slots, args)?;
     let count_arg = args.get(2).cloned().unwrap_or(Value::Undefined);
-    let count =
-        crux::convert::to_integer_or_infinity(crate::context::to_number(agent, &count_arg)?);
+    // spec 26.4.13 step 3: an undefined count is +∞ (wakes all waiters);
+    // otherwise ToIntegerOrInfinity, whose NaN maps to 0.
+    let count = if matches!(count_arg, Value::Undefined) {
+        f64::INFINITY
+    } else {
+        crux::convert::to_integer_or_infinity(crate::context::to_number(agent, &count_arg)?)
+    };
     let count = if count.is_infinite() {
         usize::MAX
     } else {
@@ -363,6 +373,13 @@ fn notify(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
         }
     }
     for event in &events {
+        // A waitAsync waiter's promise resolves *"ok"* (spec 26.4.15 DoWait
+        // step 20); the blocking `wait` path below is woken by the flag.
+        if let Some(key) = event.async_key
+            && let Some(resolve) = agent.wait_async.remove(&key)
+        {
+            crate::function::call(agent, &resolve, Value::Undefined, &[str("ok")])?;
+        }
         let mut notified = event
             .notified
             .lock()
@@ -408,6 +425,13 @@ fn wait(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     let requested_raw = wait_expected_raw(&slots, &requested)?;
     let timeout_arg = args.get(3).cloned().unwrap_or(Value::Number(f64::INFINITY));
     let timeout_ms = crate::context::to_number(agent, &timeout_arg)?;
+    // DoWait step 5: a NaN timeout is +∞ (spec: "If q is NaN, let t be +∞,
+    // else let t be max(q, 0)").
+    let timeout_ms = if timeout_ms.is_nan() {
+        f64::INFINITY
+    } else {
+        timeout_ms.max(0.0)
+    };
     let size = slots.element_type.size();
     let key = (slots.buffer.block_id(), offset);
     // spec steps 13-14: a value mismatch is "not-equal".
@@ -424,7 +448,7 @@ fn wait(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         ));
     }
     // spec step 15: a zero timeout returns "timed-out" without suspending.
-    if timeout_ms.max(0.0) == 0.0 {
+    if timeout_ms == 0.0 {
         return Ok(str("timed-out"));
     }
     let deadline = if timeout_ms.is_infinite() {
@@ -509,6 +533,12 @@ fn wait_async(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
     };
     let timeout_arg = args.get(3).cloned().unwrap_or(Value::Number(f64::INFINITY));
     let timeout_ms = crate::context::to_number(agent, &timeout_arg)?;
+    // DoWait step 5: a NaN timeout is +∞.
+    let timeout_ms = if timeout_ms.is_nan() {
+        f64::INFINITY
+    } else {
+        timeout_ms.max(0.0)
+    };
     let object_proto = agent
         .current_realm()?
         .intrinsics
@@ -516,7 +546,7 @@ fn wait_async(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
         .and_then(|value| as_object(&value));
     // spec DoWait steps 15-17: a mismatch is "not-equal"; a match with a
     // zero timeout is "timed-out"; both are immediate (async: false).
-    if !same_value_zero(&current, &requested_value) || timeout_ms.max(0.0) == 0.0 {
+    if !same_value_zero(&current, &requested_value) || timeout_ms == 0.0 {
         let status = if same_value_zero(&current, &requested_value) {
             "timed-out"
         } else {
@@ -528,14 +558,57 @@ fn wait_async(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
         result.create_data_property_or_throw(&JsString::from_utf8("value"), str(status))?;
         return Ok(Value::Object(result));
     }
-    // A match with a positive timeout: the promise stays pending (no agent
-    // can notify it), reported as async: true.
+    // A match with a positive timeout: register with the wait registry so a
+    // later `Atomics.notify` resolves the promise with *"ok"* (spec 26.4.15
+    // DoWait step 20); a finite timeout also schedules a "timed-out"
+    // resolution. Reported as async: true.
     let promise_ctor = agent
         .current_realm()?
         .intrinsics
         .get("%Promise%")
         .unwrap_or(Value::Undefined);
     let capability = crate::promise::new_promise_capability(agent, &promise_ctor)?;
+    let resolve_id = match &capability.resolve {
+        Value::Function(function) => function.id(),
+        _ => {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "waitAsync resolve is not a function".into(),
+            ));
+        }
+    };
+    agent
+        .wait_async
+        .insert(resolve_id, capability.resolve.clone());
+    let key = (slots.buffer.block_id(), offset);
+    let event = Arc::new(WaiterEvent {
+        condvar: Condvar::new(),
+        notified: Mutex::new(false),
+        async_key: Some(resolve_id),
+    });
+    registry()
+        .lock()
+        .map_err(|_| JsError::new(ErrorKind::TypeError, "wait registry poisoned".into()))?
+        .entry(key)
+        .or_default()
+        .push_back(event.clone());
+    if timeout_ms.is_finite() {
+        let realm = agent.current_realm().ok();
+        let event = event.clone();
+        agent.enqueue_timeout_job(realm, timeout_ms as u64, move |agent| {
+            // A notify may already have resolved the wait and removed the
+            // entry; the timeout is then a no-op.
+            if let Some(resolve) = agent.wait_async.remove(&resolve_id) {
+                crate::function::call(agent, &resolve, Value::Undefined, &[str("timed-out")])?;
+            }
+            if let Ok(mut registry) = registry().lock()
+                && let Some(queue) = registry.get_mut(&key)
+            {
+                queue.retain(|e| !Arc::ptr_eq(e, &event));
+            }
+            Ok(Value::Undefined)
+        });
+    }
     let result = JsObject::ordinary_object_create(object_proto);
     result.create_data_property_or_throw(&JsString::from_utf8("async"), Value::Boolean(true))?;
     result.create_data_property_or_throw(&JsString::from_utf8("value"), capability.promise)?;

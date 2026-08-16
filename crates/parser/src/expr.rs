@@ -87,7 +87,12 @@ pub(crate) fn parse_assignment(parser: &mut Parser, allow_in: bool) -> Result<Ex
                 }
                 TokenKind::Identifier(atom) if is_binding_identifier(parser, atom) => {
                     // `async x => …` — the single parameter is a
-                    // `BindingIdentifier[~Yield, +Await]` (spec 15.8.1).
+                    // `BindingIdentifier[~Yield, +Await]` (spec 15.8.1). Only
+                    // commit when an arrow follows: `async of [7]` in a
+                    // for-await-of head is an identifier, not an arrow.
+                    if parser.peek3()?.kind != TokenKind::Arrow {
+                        break 'parsed parse_conditional(parser, allow_in)?;
+                    }
                     parser.next()?; // `async`
                     let saved_async = parser.in_async;
                     parser.in_async = true;

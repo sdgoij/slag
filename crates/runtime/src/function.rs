@@ -1147,15 +1147,16 @@ fn builtin_dispatch_at(
         23 => crate::generator::dispatch_call(agent, callee, this, args),
         24 => crate::async_generator::dispatch_call(agent, callee, this, args),
         25 => crate::async_generator::dispatch_await(agent, callee, args),
-        26 => crate::async_generator::dispatch_resolver(agent, callee, args),
-        27 => crate::builtins::async_function::dispatch_call(agent, callee, this, args),
-        28 => crate::builtins::iterator::dispatch_call(agent, callee, this, args),
-        29 => crate::builtins::async_iterator::dispatch_call(agent, callee, this, args),
-        30 => crate::builtins::disposable::dispatch_call(agent, callee, this, args),
-        31 => crate::builtins::disposable::dispatch_continuation(agent, callee, args),
-        32 => crate::builtins::proxy::dispatch_call(agent, callee, this, args),
-        33 => crate::builtins::reflect::dispatch_call(agent, callee, this, args),
-        34 => crate::module::dispatch_import_resolver(agent, callee, args),
+        26 => crate::builtins::async_function::dispatch_call(agent, callee, this, args),
+        27 => crate::builtins::iterator::dispatch_call(agent, callee, this, args),
+        28 => crate::builtins::async_iterator::dispatch_call(agent, callee, this, args),
+        29 => crate::builtins::disposable::dispatch_call(agent, callee, this, args),
+        30 => crate::builtins::disposable::dispatch_continuation(agent, callee, args),
+        31 => crate::builtins::proxy::dispatch_call(agent, callee, this, args),
+        32 => crate::builtins::reflect::dispatch_call(agent, callee, this, args),
+        33 => crate::module::dispatch_import_resolver(agent, callee, args),
+        34 => crate::async_await::dispatch_async_from_sync_continuation(agent, callee, args),
+        35 => crate::builtins::disposable::dispatch_async_body_disposal(agent, callee, args),
         _ => None,
     }
 }
@@ -1168,7 +1169,7 @@ fn resolve_builtin_dispatch(
     this: &Value,
     args: &[Value],
 ) -> (u8, Option<Result<Value, JsError>>) {
-    for index in 1..=34 {
+    for index in 1..=35 {
         let result = builtin_dispatch_at(agent, index, callee, this, args);
         if result.is_some() {
             return (index, result);

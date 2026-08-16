@@ -400,8 +400,21 @@ fn async_dispose(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Val
         .unwrap_or(Value::Undefined);
     let capability = new_promise_capability(agent, &promise_ctor)?;
     let promise = capability.promise.clone();
-    let return_method =
-        crate::context::get_property(agent, this, &JsString::from_utf8("return"), this.clone())?;
+    // spec 27.1.4.6 step 3: GetMethod(return) — a throwing `return` getter
+    // rejects the promise (IfAbruptRejectPromise), never throws synchronously.
+    let return_method = match crate::context::get_property(
+        agent,
+        this,
+        &JsString::from_utf8("return"),
+        this.clone(),
+    ) {
+        Ok(method) => method,
+        Err(error) => {
+            let rejection = crate::promise::error_value(agent, &error);
+            crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
+            return Ok(promise);
+        }
+    };
     let return_method = match return_method {
         Value::Undefined | Value::Null => None,
         value if is_callable(&value) => Some(value),

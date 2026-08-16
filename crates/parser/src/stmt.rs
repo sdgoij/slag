@@ -631,20 +631,41 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
     };
 
     let init = match head_kind {
-        Some(kind) => Some(ForInit::VarDecl {
-            kind,
-            decls: parse_for_declarators(parser, kind)?,
-        }),
-        None if init_empty => None,
+        Some(kind) => (
+            Some(ForInit::VarDecl {
+                kind,
+                decls: parse_for_declarators(parser, kind)?,
+            }),
+            false,
+        ),
+        None if init_empty => (None, false),
         None => {
+            // The expression-headed for-of production has the lookahead
+            // restriction `[lookahead ∉ { let, async of }]` (spec 14.7.5):
+            // an unescaped `async` immediately followed by `of` cannot be
+            // the LHS of a non-await for-of. The for-await form has no such
+            // restriction (`for await (async of …)` stays valid), an escaped
+            // `async` is an ordinary identifier (spec 5.1.5.1), and
+            // `async of => …` is an async-arrow init, not a for-of head.
+            let mut async_of_head = !is_await
+                && parser.at_contextual_unescaped("async")?
+                && parser.peek2()?.kind == TokenKind::Identifier(intern_utf8("of"))
+                && !parser.peek2()?.escaped;
             // The head may be a for-in/of pattern, so a cover form inside it is
             // deferred until the `in`/`of`/`;` decision is known.
             parser.suppress_cover_raise += 1;
             let init = parse_expression(parser, false)?;
             parser.suppress_cover_raise -= 1;
-            Some(ForInit::Expr(init))
+            // An async arrow init (`async of => …`) has already consumed the
+            // `of`; the loop is then a classic for, so the restriction does
+            // not apply.
+            if matches!(init.kind, syntax::ExprKind::Arrow { .. }) {
+                async_of_head = false;
+            }
+            (Some(ForInit::Expr(init)), async_of_head)
         }
     };
+    let (init, async_of_head) = init;
 
     let stmt = if parser.at_keyword(Keyword::In)? {
         // `for await ( … in … )` and `using` heads have no for-in form.
@@ -678,6 +699,15 @@ fn parse_for(parser: &mut Parser) -> Result<Stmt, JsError> {
     } else if parser.at_contextual("of")? {
         if is_await && parser.peek()?.line_break_before {
             return Err(parser.error_at(start, "Unexpected line break after for await"));
+        }
+        // spec 14.7.5: `for (async of …)` is a SyntaxError — the lookahead
+        // `[lookahead ∉ { let, async of }]` rejects an unescaped `async`
+        // immediately followed by `of` as the LHS.
+        if async_of_head {
+            return Err(parser.error_at(
+                start,
+                "async cannot be the left-hand side of a for-of statement",
+            ));
         }
         parser.next()?;
         parser.cover_error = None;
