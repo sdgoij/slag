@@ -150,8 +150,18 @@ fn out_of_bounds() -> JsError {
 impl SharedBuffer {
     /// Allocate a zero-filled buffer of `byte_length` bytes.
     pub fn new(byte_length: usize) -> Self {
+        Self::new_with_capacity(byte_length, byte_length)
+    }
+
+    /// Allocate a zero-filled buffer with storage for up to `capacity` bytes.
+    /// Resizable/growable buffers pre-allocate their maximum so views created
+    /// before a resize keep a live block — under `workers` the block is a
+    /// fixed `Arc`, so a resize only updates the shared byte length in place
+    /// (the single-agent path resizes its `Vec` in place and shares it).
+    pub fn new_with_capacity(byte_length: usize, capacity: usize) -> Self {
         #[cfg(not(feature = "workers"))]
         {
+            let _ = capacity;
             SharedBuffer {
                 block: Rc::new(RefCell::new(vec![0u8; byte_length])),
                 detached: Rc::new(Cell::new(false)),
@@ -162,7 +172,7 @@ impl SharedBuffer {
         }
         #[cfg(feature = "workers")]
         {
-            let words = byte_length.div_ceil(8);
+            let words = byte_length.max(capacity).div_ceil(8);
             SharedBuffer {
                 block: (0..words)
                     .map(|_| std::sync::atomic::AtomicU64::new(0))
@@ -352,9 +362,11 @@ impl SharedBuffer {
         }
     }
 
-    /// Grow/shrink the block to `new_length` (single-agent buffers; growable
-    /// SharedArrayBuffers are not shared while growing). Views created before
-    /// the resize keep the old block and their captured lengths.
+    /// Grow/shrink the block to `new_length`. Under `workers` the block is
+    /// pre-allocated to its capacity (resizable/growable buffers), so a
+    /// resize only updates the shared byte length — visible to every view
+    /// clone — and zero-fills the newly exposed region on a grow. The
+    /// single-agent path resizes the shared `Vec` in place.
     pub fn resize(&mut self, new_length: usize) -> Result<(), JsError> {
         #[cfg(not(feature = "workers"))]
         {
@@ -363,21 +375,21 @@ impl SharedBuffer {
         }
         #[cfg(feature = "workers")]
         {
-            let old = self.read(0, self.byte_length())?;
-            let words = new_length.div_ceil(8);
-            let new_block = (0..words)
-                .map(|_| AtomicU64::new(0))
-                .collect::<std::sync::Arc<[_]>>();
-            let base = new_block.as_ptr() as *const AtomicU64 as *const u8;
-            // SAFETY: `new_block` is unique (freshly built), so writing
-            // through its data pointer is sound.
-            unsafe {
-                std::ptr::copy_nonoverlapping(old.as_ptr(), base as *mut u8, old.len());
+            let capacity = self.block.len().saturating_mul(8);
+            if new_length > capacity {
+                return Err(out_of_bounds());
             }
-            // Replace both the block and its length: views created before the
-            // resize keep the old (block, length) pair.
-            self.block = new_block;
-            self.byte_length = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(new_length));
+            let old_length = self.byte_length.load(std::sync::atomic::Ordering::Relaxed);
+            if new_length > old_length {
+                let base = self.block.as_ptr() as *const AtomicU64 as *mut u8;
+                // SAFETY: `new_length <= capacity` and the Arc keeps the
+                // block alive.
+                unsafe {
+                    std::ptr::write_bytes(base.add(old_length), 0, new_length - old_length);
+                }
+            }
+            self.byte_length
+                .store(new_length, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         }
     }

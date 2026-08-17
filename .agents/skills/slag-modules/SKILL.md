@@ -87,11 +87,12 @@ must too.
 - Keep the `run_fixture` skip taxonomy in sync with `tools/skip_tally.js`
   (the tally tool mirrors it exactly and is dogfooded with the engine).
   The only skips left are: stage-3 proposals Temporal, await-dictionary,
-  ShadowRealm; host-dependent `CanBlockIsTrue`; and unsupported
-  `includes:` (`tcoHelper`, `regExpUtils`, `atomicsHelper`,
+  ShadowRealm; and unsupported `includes:` (`tcoHelper`,
   `temporalHelpers`). The import-defer / import-bytes / import-text /
-  source-phase-imports proposal clusters are IMPLEMENTED and un-skipped
-  — never re-add them as skips.
+  source-phase-imports, regExpUtils, and atomicsHelper / `CanBlockIsTrue`
+  clusters are IMPLEMENTED and un-skipped — never re-add them as skips.
+  (4,810 skips: 4,611 Temporal, 89 await-dictionary, 64 ShadowRealm,
+  34 `tcoHelper`, 12 `temporalHelpers`.)
 
 ## 8. Negative phases map to module lifecycle stages
 

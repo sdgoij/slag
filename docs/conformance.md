@@ -1324,9 +1324,12 @@ every runnable fixture passes (up from ~208 pass / 35 fail). Fixes in
 - **`pause.length` is 0 and `waitAsync.length` is 4** (`pause/length.js`,
   `waitAsync/length.js`).
 
-Harness gates: `flags: [CanBlockIsTrue]` fixtures are skipped (the main
-agent cannot suspend — host-dependent), and the `ShadowRealm` stage-3
-proposal fixtures (55) are now skipped like Temporal and await-dictionary.
+Harness gates: the `$262.agent` host API now runs the `atomicsHelper`
+fixtures on real worker threads (the 112-fixture cluster) and the
+`CanBlockIsTrue` fixtures run with the main agent's `[[CanBlock]]` set
+(the 7 timeout-coercion waits) — both are un-skipped. The `ShadowRealm`
+stage-3 proposal fixtures (64) are skipped like Temporal and
+await-dictionary.
 
 Validation: `cargo test --workspace` **4099 pass, 0 failures**;
 `cargo clippy --workspace --all-targets -- -D warnings` and
@@ -1484,7 +1487,6 @@ The harness's skip taxonomy (also used by the sweep):
 | `features: [ShadowRealm]` | ShadowRealm is a stage-3 proposal, not part of ECMA-262 ES2026. |
 | `features: [source-phase-imports]` | `import.source()` is a stage-3 proposal, not part of ECMA-262 ES2026. |
 | `features: [import-defer]` / `[import-bytes]` / `[import-text]` | `import.defer(...)` / `import(..., { with: { type: "bytes" } })` / `import(..., { with: { type: "text" } })` are stage-3 proposals, not part of ECMA-262 ES2026. |
-| `flags: [CanBlockIsTrue]` | `Atomics.wait` fixtures assuming `[[CanBlock]] = true`; the engine's main agent cannot suspend (host-dependent). |
 | `includes: [tcoHelper]` | TCO fixtures require proper tail calls; skipped even by V8/JSC. |
 | Unsupported `includes:` | Fixtures needing harness helpers beyond `assert.js`, `compareArray.js`, `detachArrayBuffer.js`, `isConstructor.js`, `propertyHelper.js`, `testAtomics.js`, `testTypedArray.js` are not run. |
 | Intl directories | `Intl` (ECMA-402) is out of scope for this runtime (PLAN scope decision). |
@@ -1516,14 +1518,14 @@ closed last.
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 23,690 | 0 | 34 | 0 | 100.0% |
-| built-ins | 23,812 | 18,917 | 0 | 4,895 | 0 | 100.0% |
+| built-ins | 23,812 | 19,036 | 0 | 4,776 | 0 | 100.0% |
 | annexB | 1,086 | 1,086 | 0 | 0 | 0 | 100.0% |
-| **Total** | **48,622** | **43,693** | **0** | **4,929** | **0** | **100.0%** |
+| **Total** | **48,622** | **43,812** | **0** | **4,810** | **0** | **100.0%** |
 
-(Runnable = pass + fail + hang; the 4,929 skips are the unsupported harness
-includes, the host-dependent `CanBlockIsTrue` waits, the TCO (`tcoHelper`)
-fixtures, and the out-of-scope Temporal, await-dictionary, and ShadowRealm
-proposal fixtures.) The module loader was un-skipped (the `flags: [module]`
+(Runnable = pass + fail + hang; the 4,810 skips are the unsupported harness
+includes, the TCO (`tcoHelper`) fixtures, the `temporalHelpers` includes, and
+the out-of-scope Temporal, await-dictionary, and ShadowRealm proposal
+fixtures.) The module loader was un-skipped (the `flags: [module]`
 fixtures now run through the real source-text-module machinery — parse,
 link, DFS evaluation, top-level await, dynamic import, and `import.meta`),
 then the source-phase-imports (`import.source()`), import-defer
@@ -1552,7 +1554,21 @@ class-set ranges (`[0-9]`) and `\q{…}` string disjunctions parse and match
 with full backtracking across the string alternatives, single-char strings
 survive class-set intersections with char sets, and
 `RegExp.prototype[@@matchAll]` caches the regexp's `lastIndex` at call time
-(`this-lastindex-cached.js`). The last 39
+(`this-lastindex-cached.js`). The atomics cluster closed after that
+(119/119, taking the totals from 43,693 to 43,812): the `$262.agent` host
+API (`start`/`broadcast`/`getReport`/`sleep`/`monotonicNow`) now runs the
+`atomicsHelper` fixtures on real worker threads with shared `SharedArrayBuffer`
+blocks and the global wait registry, `Atomics.wait` on a woken waiter
+returns *"ok"* (a notify never re-checks the value; the entry check alone
+decides *"not-equal"*), a cross-thread `Atomics.notify` of a `waitAsync`
+waiter marks the event and the owning agent resolves it from its own thread
+(`service_wait_async`), the `CanBlockIsTrue` timeout-coercion waits run with
+the main agent's `[[CanBlock]]` set, and the harness installs a real
+`setTimeout` (the atomicsHelper busy-microtask fallback starved the
+`waitAsync` timeout jobs). The `workers`-feature `SharedBuffer` resize UB
+(an `old.len()`-byte copy into a possibly-smaller block on shrink, and
+stale view blocks) was fixed by pre-allocating resizable/growable buffers
+at their capacity and updating the shared byte length in place. The last 39
 failures closed with the async-test engine work: `Array.fromAsync` was
 rewritten to spec 23.1.2.4.1 — 0-length array-likes skip the loop
 entirely, array-like elements are awaited before the mapper runs, the
@@ -1656,11 +1672,11 @@ Object.fromEntries, JSON.stringify, DataView, Object statics/
 constructor, Promise, Atomics, and the final Array/generator, Throw-
 TypeError, WeakRef/FinalizationRegistry, Uint8Array base64/hex, Set
 set-methods, JSON/parse, TypedArray BigInt, String, and SuppressedError
-closures (all 0 fail). The 4,895 built-ins skips are dominated by the
+closures (all 0 fail). The 4,776 built-ins skips are dominated by the
 out-of-scope Temporal proposal (4,611), await-dictionary (89), and
-ShadowRealm (64), with the harness-include
-fixtures (atomicsHelper 112, temporalHelpers 12), and
-host-dependent `CanBlockIsTrue` waits (7) making up the rest.
+ShadowRealm (64), with the `tcoHelper` (34), `temporalHelpers` (12)
+includes making up the rest — the atomicsHelper (112) and CanBlockIsTrue
+(7) clusters now run.
 
 ¹ The 3 built-ins hangs recorded earlier were the
 `TypedArray/prototype/copyWithin` coerced-values fixtures — 10,000-element
@@ -1815,11 +1831,11 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 
 ## Open items
 
-- All three areas now measure **100% of runnable**: 23,690 + 18,917 + 1,086
+- All three areas now measure **100% of runnable**: 23,690 + 19,036 + 1,086
   pass / 0 fail / 0 crash / 0 hang of 23,724 + 23,812 + 1,086 fixtures
   (out-of-scope Temporal, await-dictionary, and ShadowRealm proposal
-  fixtures, the `tcoHelper` includes, and the host-dependent
-  `CanBlockIsTrue` waits skipped, `--timeout 120
+  fixtures and the `tcoHelper`/`temporalHelpers` includes skipped,
+  `--timeout 120
   --recheck-timeout 120`, release build) — the plan's ≥95%
   runnable-pass-rate target is met. The language area closed its 2,048
   failures via the eval-caller-context, field-initializer, and Annex B
@@ -1833,10 +1849,13 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
   await, dynamic import, `import.meta`), with `verify-dfs.js` closing the
   final failure via the async dynamic-import load. The source-phase,
   import-defer, import-bytes, and import-text proposal clusters were then
-  un-skipped too (the import-defer cluster closed last, 114/114), and the
+  un-skipped too (the import-defer cluster closed last, 114/114), the
   regExpUtils cluster closed after them (586/586 — the full /v unicodeSets
-  machinery, see the Full-suite sweep section), leaving the 34 language
-  skips as the TCO fixtures only (43,693 pass / 4,929 skip total).
+  machinery, see the Full-suite sweep section), and the atomics cluster
+  closed last (119/119 — the `$262.agent` worker-thread host API, the
+  *"ok"* notify semantics for `Atomics.wait`, and the cross-thread
+  `waitAsync` resolution), leaving the 34 language skips as the TCO
+  fixtures only (43,812 pass / 4,810 skip total).
   Note: the TypedArray sweep should be run with the long deadline
   (`--timeout 120 --recheck-timeout 120`) — the O(n²) property store
   makes the 10,000-element crash-test fixtures take ~45s, which the

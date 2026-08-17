@@ -252,9 +252,13 @@ pub struct Agent {
         ),
     >,
     /// The resolve functions of pending `Atomics.waitAsync` waits, keyed by
-    /// the registered waiter-event id: `Atomics.notify` pops the event and
-    /// resolves the promise with *"ok"* (spec 26.4.15 DoWait step 20).
-    pub wait_async: std::collections::HashMap<u64, Value>,
+    /// the registered waiter-event id, with the (block id, byte offset) the
+    /// event sits at in the global wait registry. A same-agent `Atomics.notify`
+    /// resolves the promise directly with *"ok"* (spec 26.4.15 DoWait step
+    /// 20); a cross-thread notify only marks the event, and the owning agent
+    /// resolves it from its own thread (`service_wait_async` or the timeout
+    /// job, whichever fires first).
+    pub wait_async: std::collections::HashMap<u64, (Value, usize, usize)>,
     /// The internal state of ArrayBuffer/SharedArrayBuffer objects, keyed by
     /// object identity (spec 25.1.1: [[ArrayBufferData]], [[ArrayBufferByteLength]],
     /// [[ArrayBufferMaxByteLength]], and the resizable/growable + shared flags).

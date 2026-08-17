@@ -176,7 +176,14 @@ fn allocate_array_buffer(
             "ArrayBuffer length exceeds the host limit".into(),
         ));
     }
-    let shared = SharedBuffer::new(byte_length);
+    // A resizable buffer pre-allocates its maximum so views created before a
+    // resize keep a live block (the shared byte length is the only state that
+    // changes on resize).
+    let shared = if is_resizable {
+        SharedBuffer::new_with_capacity(byte_length, max_byte_length.unwrap_or(byte_length))
+    } else {
+        SharedBuffer::new(byte_length)
+    };
     agent.buffer_data.insert(
         object.id(),
         std::cell::RefCell::new(BufferState {
@@ -214,7 +221,13 @@ fn allocate_shared_array_buffer(
             "SharedArrayBuffer length exceeds the host limit".into(),
         ));
     }
-    let shared = SharedBuffer::new(byte_length);
+    // A growable SharedArrayBuffer pre-allocates its maximum (see
+    // `allocate_array_buffer`).
+    let shared = if is_growable {
+        SharedBuffer::new_with_capacity(byte_length, max_byte_length.unwrap_or(byte_length))
+    } else {
+        SharedBuffer::new(byte_length)
+    };
     agent.buffer_data.insert(
         object.id(),
         std::cell::RefCell::new(BufferState {

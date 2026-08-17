@@ -313,6 +313,12 @@ struct WaiterEvent {
     /// function, resolved to *"ok"* by `notify` (a blocking `wait` event has
     /// `None`).
     async_key: Option<u64>,
+    /// For `waitAsync` waiters: the settled outcome ("ok" / "timed-out"),
+    /// decided first-wins by the cross-thread `notify` (which can only mark
+    /// the event — it does not run on the agent that owns the promise) or the
+    /// owning agent's timeout job. A same-thread notify resolves directly and
+    /// never sets this.
+    status: Arc<Mutex<Option<&'static str>>>,
 }
 
 type WaitQueue = VecDeque<Arc<WaiterEvent>>;
@@ -324,6 +330,7 @@ impl WaiterEvent {
             condvar: Condvar::new(),
             notified: Mutex::new(false),
             async_key: None,
+            status: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -358,37 +365,65 @@ fn notify(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
         return Ok(Value::Number(0.0));
     }
     let key = (slots.buffer.block_id(), offset);
-    let mut events = Vec::new();
+    let mut woken = 0usize;
+    let mut same_thread: Vec<(u64, Value)> = Vec::new();
     {
         let mut registry = registry()
             .lock()
             .map_err(|_| JsError::new(ErrorKind::TypeError, "wait registry poisoned".into()))?;
         if let Some(queue) = registry.get_mut(&key) {
-            for _ in 0..count {
-                let Some(event) = queue.pop_front() else {
-                    break;
-                };
-                events.push(event);
+            let mut i = 0;
+            while i < queue.len() && woken < count {
+                let event = queue[i].clone();
+                // An async event whose status is already decided (a timeout
+                // won the race with this notify) is no longer a waiter.
+                let mut status = event.status.lock().map_err(|_| {
+                    JsError::new(ErrorKind::TypeError, "wait registry poisoned".into())
+                })?;
+                if status.is_some() {
+                    drop(status);
+                    i += 1;
+                    continue;
+                }
+                match event.async_key {
+                    Some(async_key) => {
+                        if let Some((resolve, _, _)) = agent.wait_async.remove(&async_key) {
+                            // Same-thread waiter: resolve the promise right
+                            // here (spec 26.4.15 DoWait step 20) and drop the
+                            // event.
+                            drop(status);
+                            queue.remove(i);
+                            same_thread.push((async_key, resolve));
+                        } else {
+                            // A cross-thread waiter: the promise belongs to
+                            // another agent, so this thread can only mark the
+                            // event; the owner resolves it (its timeout job
+                            // or service_wait_async). The event stays queued
+                            // until then.
+                            *status = Some("ok");
+                            drop(status);
+                            i += 1;
+                        }
+                    }
+                    None => {
+                        drop(status);
+                        queue.remove(i);
+                        let mut notified = event.notified.lock().map_err(|_| {
+                            JsError::new(ErrorKind::TypeError, "wait registry poisoned".into())
+                        })?;
+                        *notified = true;
+                        drop(notified);
+                        event.condvar.notify_one();
+                    }
+                }
+                woken += 1;
             }
         }
     }
-    for event in &events {
-        // A waitAsync waiter's promise resolves *"ok"* (spec 26.4.15 DoWait
-        // step 20); the blocking `wait` path below is woken by the flag.
-        if let Some(key) = event.async_key
-            && let Some(resolve) = agent.wait_async.remove(&key)
-        {
-            crate::function::call(agent, &resolve, Value::Undefined, &[str("ok")])?;
-        }
-        let mut notified = event
-            .notified
-            .lock()
-            .map_err(|_| JsError::new(ErrorKind::TypeError, "wait registry poisoned".into()))?;
-        *notified = true;
-        drop(notified);
-        event.condvar.notify_one();
+    for (_, resolve) in same_thread {
+        crate::function::call(agent, &resolve, Value::Undefined, &[str("ok")])?;
     }
-    Ok(Value::Number(events.len() as f64))
+    Ok(Value::Number(woken as f64))
 }
 
 /// The raw expected value of a wait/waitAsync: the Int32/BigInt64 element
@@ -434,7 +469,9 @@ fn wait(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     };
     let size = slots.element_type.size();
     let key = (slots.buffer.block_id(), offset);
-    // spec steps 13-14: a value mismatch is "not-equal".
+    // spec steps 13-14: a value mismatch is "not-equal" — checked once, at
+    // entry; the value changing while this agent is suspended only decides
+    // the outcome of a later notify, never this wait (no-spurious-wakeup-*).
     let current = slots.buffer.atomic_load(offset, size)?;
     if current != requested_raw {
         return Ok(str("not-equal"));
@@ -457,15 +494,13 @@ fn wait(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         Some(Instant::now() + Duration::from_millis(timeout_ms.max(0.0) as u64))
     };
     let status = loop {
-        let current = slots.buffer.atomic_load(offset, size)?;
-        if current != requested_raw {
-            break "not-equal";
-        }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             break "timed-out";
         }
-        // Register for this suspension; notify may pop the event before we
-        // start waiting, in which case the flag lets us re-check the value.
+        // Register for this suspension; a notify pops the event and sets the
+        // flag, waking us with *"ok"* (spec 26.4.15 DoWait step 24: a woken
+        // waiter never re-checks the value). A timeout expiry wakes us with
+        // the flag clear and loops to the deadline check above.
         let event = Arc::new(WaiterEvent::new());
         registry()
             .lock()
@@ -484,15 +519,16 @@ fn wait(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
                     .max(Duration::from_millis(0)),
                 None => Duration::MAX,
             };
-            let (guard, _) = event
+            let (guard, result) = event
                 .condvar
                 .wait_timeout(notified, remaining)
                 .map_err(|_| JsError::new(ErrorKind::TypeError, "wait registry poisoned".into()))?;
             notified = guard;
-            if *notified || deadline.is_some_and(|d| Instant::now() >= d) {
+            if result.timed_out() {
                 break;
             }
         }
+        let woken = *notified;
         *notified = false;
         drop(notified);
         // Remove this suspension's event (already popped by notify, or self).
@@ -500,6 +536,9 @@ fn wait(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
             && let Some(queue) = registry.get_mut(&key)
         {
             queue.retain(|e| !Arc::ptr_eq(e, &event));
+        }
+        if woken {
+            break "ok";
         }
     };
     Ok(str(status))
@@ -577,14 +616,16 @@ fn wait_async(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
             ));
         }
     };
+    let block_id = slots.buffer.block_id();
+    let key = (block_id, offset);
     agent
         .wait_async
-        .insert(resolve_id, capability.resolve.clone());
-    let key = (slots.buffer.block_id(), offset);
+        .insert(resolve_id, (capability.resolve.clone(), block_id, offset));
     let event = Arc::new(WaiterEvent {
         condvar: Condvar::new(),
         notified: Mutex::new(false),
         async_key: Some(resolve_id),
+        status: Arc::new(Mutex::new(None)),
     });
     registry()
         .lock()
@@ -596,10 +637,28 @@ fn wait_async(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
         let realm = agent.current_realm().ok();
         let event = event.clone();
         agent.enqueue_timeout_job(realm, timeout_ms as u64, move |agent| {
-            // A notify may already have resolved the wait and removed the
-            // entry; the timeout is then a no-op.
-            if let Some(resolve) = agent.wait_async.remove(&resolve_id) {
-                crate::function::call(agent, &resolve, Value::Undefined, &[str("timed-out")])?;
+            // The outcome is first-wins: a notify that landed before the
+            // timeout set "ok" on the event, so the timeout resolves the
+            // promise with whichever decided. The resolution always runs
+            // here, on the agent that owns the promise — a cross-thread
+            // notify can only mark the event (`service_wait_async` drains
+            // the infinite-timeout remainder).
+            let outcome = {
+                let mut status = event.status.lock().map_err(|_| {
+                    JsError::new(ErrorKind::TypeError, "wait registry poisoned".into())
+                })?;
+                if status.is_none() {
+                    *status = Some("timed-out");
+                }
+                *status
+            }
+            .unwrap_or("timed-out");
+            let resolve = agent
+                .wait_async
+                .remove(&resolve_id)
+                .map(|(resolve, _, _)| resolve);
+            if let Some(resolve) = resolve {
+                crate::function::call(agent, &resolve, Value::Undefined, &[str(outcome)])?;
             }
             if let Ok(mut registry) = registry().lock()
                 && let Some(queue) = registry.get_mut(&key)
@@ -613,6 +672,46 @@ fn wait_async(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
     result.create_data_property_or_throw(&JsString::from_utf8("async"), Value::Boolean(true))?;
     result.create_data_property_or_throw(&JsString::from_utf8("value"), capability.promise)?;
     Ok(Value::Object(result))
+}
+
+/// Resolve the `waitAsync` promises whose notify landed on another thread: a
+/// cross-thread `Atomics.notify` can only mark the event's status (it does
+/// not run on the agent that owns the promise), so the owning agent's driver
+/// loop calls this while servicing its job queue. Entries are only present
+/// while unresolved, and the timeout job also removes them, so an entry can
+/// never be resolved twice.
+pub fn service_wait_async(agent: &mut Agent) -> Result<(), JsError> {
+    let mut resolved: Vec<(u64, Value, usize, usize, &'static str)> = Vec::new();
+    {
+        let registry = registry()
+            .lock()
+            .map_err(|_| JsError::new(ErrorKind::TypeError, "wait registry poisoned".into()))?;
+        for (resolve_id, (resolve, block_id, offset)) in agent.wait_async.iter() {
+            let Some(queue) = registry.get(&(*block_id, *offset)) else {
+                continue;
+            };
+            let Some(event) = queue.iter().find(|e| e.async_key == Some(*resolve_id)) else {
+                continue;
+            };
+            let status = event
+                .status
+                .lock()
+                .map_err(|_| JsError::new(ErrorKind::TypeError, "wait registry poisoned".into()))?;
+            if let Some(outcome) = *status {
+                resolved.push((*resolve_id, resolve.clone(), *block_id, *offset, outcome));
+            }
+        }
+    }
+    for (resolve_id, resolve, block_id, offset, outcome) in resolved {
+        agent.wait_async.remove(&resolve_id);
+        crate::function::call(agent, &resolve, Value::Undefined, &[str(outcome)])?;
+        if let Ok(mut registry) = registry().lock()
+            && let Some(queue) = registry.get_mut(&(block_id, offset))
+        {
+            queue.retain(|e| e.async_key != Some(resolve_id));
+        }
+    }
+    Ok(())
 }
 
 /// Atomics.pause (spec 26.4.12): a hint that yields CPU; a no-op here.

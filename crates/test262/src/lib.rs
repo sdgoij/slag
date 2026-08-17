@@ -12,13 +12,17 @@
 /// the vendored `#[test]` fixtures share the same code path; the fixture
 /// tests themselves are `#[test]`-gated below.
 pub mod harness {
+    use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Condvar, Mutex};
 
     use crux::convert::to_boolean;
     use crux::error::{ErrorKind, JsError};
     use crux::function::Function;
+    use crux::handle::Handle;
     use crux::object::JsObject;
     use crux::string::JsString;
+    use crux::typed_array::SharedBuffer;
     use crux::value::Value;
     use runtime::Agent;
 
@@ -10879,6 +10883,14 @@ var $DONE = function (error) {
         }
         let skip_harness = fm.flags.iter().any(|f| f == "__debug_skip_harness");
         let mut agent = Agent::new();
+        // `CanBlockIsTrue` fixtures (and the atomicsHelper ones, whose
+        // safeBroadcast exercises `Atomics.wait` on the main thread) assume
+        // [[CanBlock]] = true: the main agent may suspend.
+        if fm.flags.iter().any(|f| f == "CanBlockIsTrue")
+            || fm.includes.iter().any(|i| i == "atomicsHelper.js")
+        {
+            agent.can_block = true;
+        }
         agent
             .initialize_host_defined_realm()
             .map_err(|e| e.message)?;
@@ -10895,6 +10907,15 @@ var $DONE = function (error) {
             agent.run_script(HARNESS_PRELUDE).map_err(|e| e.message)?;
         }
         install_realm_host_hooks(&mut agent)?;
+        // The atomicsHelper fixtures drive `$262.agent`: install the host
+        // API (start/broadcast/getReport/sleep/monotonicNow) backed by a
+        // per-fixture hub shared with the worker threads before the include
+        // loads (atomicsHelper.js binds `$262.agent.getReport` at load time).
+        if fm.includes.iter().any(|i| i == "atomicsHelper.js") {
+            let hub = Arc::new(AgentHub::new());
+            install_agent_api(&mut agent, hub)?;
+            install_harness_set_timeout(&mut agent)?;
+        }
         // The real harness include files (testTypedArray.js, propertyHelper.js,
         // testAtomics.js, …) are plain JS built on the globals above; load
         // them from the submodule so the vendored fixtures get their exact
@@ -10921,7 +10942,16 @@ var $DONE = function (error) {
             register_fixture_modules(&mut agent, fixture_dir, body)?;
         }
         let result = agent.run_script(&wrapped);
-        agent.run_jobs().map_err(|e| e.message)?;
+        // The async atomics fixtures complete on worker reports delivered by
+        // 1 s timer polls; a single run_jobs returns before those timers
+        // fire, so drain until `$DONE` settles.
+        if fm.flags.iter().any(|f| f == "async")
+            && fm.includes.iter().any(|i| i == "atomicsHelper.js")
+        {
+            drain_jobs_until_done(&mut agent)?;
+        } else {
+            agent.run_jobs().map_err(|e| e.message)?;
+        }
         let realm = agent.current_realm().map_err(|e| e.message)?;
         let async_failure = if fm.flags.iter().any(|f| f == "async") {
             read_async_completion(&mut agent, &Value::Object(realm.global_object.clone()))?
@@ -11024,6 +11054,11 @@ var $DONE = function (error) {
         }
         let skip_harness = fm.flags.iter().any(|f| f == "__debug_skip_harness");
         let mut agent = Agent::new();
+        if fm.flags.iter().any(|f| f == "CanBlockIsTrue")
+            || fm.includes.iter().any(|i| i == "atomicsHelper.js")
+        {
+            agent.can_block = true;
+        }
         agent
             .initialize_host_defined_realm()
             .map_err(|e| e.message)?;
@@ -11035,6 +11070,11 @@ var $DONE = function (error) {
             agent.run_script(HARNESS_PRELUDE).map_err(|e| e.message)?;
         }
         install_realm_host_hooks(&mut agent)?;
+        if fm.includes.iter().any(|i| i == "atomicsHelper.js") {
+            let hub = Arc::new(AgentHub::new());
+            install_agent_api(&mut agent, hub)?;
+            install_harness_set_timeout(&mut agent)?;
+        }
         for include in &fm.includes {
             let source = harness_include_source(include)?;
             agent.run_script(&source).map_err(|e| e.message)?;
@@ -11419,6 +11459,30 @@ var $DONE = function (error) {
         assertion_error(format!("{name} called with the wrong number of arguments"))
     }
 
+    /// Drain the job queue until the async fixture's `$DONE` fires (or the
+    /// deadline). A single `run_jobs` returns as soon as the queue empties,
+    /// which for the atomics fixtures is before the worker reports arrive on
+    /// their 1 s timer polls; looping with a short sleep lets those timers
+    /// fire and the completion settle.
+    fn drain_jobs_until_done(agent: &mut Agent) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            agent.run_jobs().map_err(|e| e.message)?;
+            let realm = agent.current_realm().map_err(|e| e.message)?;
+            let passed = runtime::context::get_property(
+                agent,
+                &Value::Object(realm.global_object.clone()),
+                &JsString::from_utf8("asyncTestPassed"),
+                Value::Object(realm.global_object.clone()),
+            )
+            .map_err(|e| e.message)?;
+            if to_boolean(&passed) || std::time::Instant::now() >= deadline {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     /// Install the `$262` host hooks shared by the script and module paths:
     /// `evalScript` (evaluates as a Script via intrinsic dispatch), `createRealm`
     /// (a fresh realm), and `IsHTMLDDA` (the Annex B.3.7 host object).
@@ -11530,6 +11594,572 @@ var $DONE = function (error) {
                 )
                 .map_err(|e| e.message)?;
         }
+        Ok(())
+    }
+
+    /// The per-fixture hub the `$262.agent` host API (`atomicsHelper.js`)
+    /// runs on: worker threads report, sleep, and receive broadcasts through
+    /// it, and the main thread starts them and drains their reports. The
+    /// control protocol is Rust-side (mutex + condvar) rather than a shared
+    /// control buffer, because the workers are real OS threads with their own
+    /// agents.
+    struct AgentHub {
+        /// Worker reports in arrival order, drained by `getReport`.
+        reports: Mutex<VecDeque<String>>,
+        /// The broadcast to deliver to the workers.
+        broadcast: Mutex<BroadcastSlot>,
+        /// Per-worker state, index-aligned with the spawned threads.
+        workers: Mutex<Vec<WorkerState>>,
+        /// Signalled when a new broadcast is ready or a worker consumes one.
+        broadcast_cv: Condvar,
+        /// Signalled when a worker thread is running (`start` blocks on it).
+        ready_cv: Condvar,
+        /// The monotonic clock epoch backing `monotonicNow`.
+        epoch: std::time::Instant,
+    }
+
+    struct BroadcastSlot {
+        /// Increments per `broadcast` call; each worker delivers a new
+        /// generation exactly once.
+        generation: u64,
+        /// The shared byte block and its length to deliver.
+        block: Option<(SharedBuffer, usize)>,
+        /// The broadcast id (an Int32/BigInt value as a number).
+        id: f64,
+    }
+
+    #[derive(Default)]
+    struct WorkerState {
+        /// Set once the worker thread has installed its globals and is
+        /// running the script (spec: `start` blocks until the agent is
+        /// running).
+        ready: bool,
+        /// The highest broadcast generation this worker has delivered.
+        consumed_gen: u64,
+        /// `$262.agent.leaving()` was called (or the worker errored).
+        done: bool,
+        /// The worker's script error, surfaced by `getReport` when the report
+        /// queue is empty so a fixture spinning on getReport fails with a
+        /// message instead of hanging.
+        error: Option<String>,
+    }
+
+    impl AgentHub {
+        fn new() -> Self {
+            AgentHub {
+                reports: Mutex::new(VecDeque::new()),
+                broadcast: Mutex::new(BroadcastSlot {
+                    generation: 0,
+                    block: None,
+                    id: 0.0,
+                }),
+                workers: Mutex::new(Vec::new()),
+                broadcast_cv: Condvar::new(),
+                ready_cv: Condvar::new(),
+                epoch: std::time::Instant::now(),
+            }
+        }
+    }
+
+    /// The `$262.agent.sleep` duration (main and worker share the builtin):
+    /// ToNumber, NaN → 0, clamped to ≥ 0.
+    fn sleep_ms(agent: &mut Agent, value: &Value) -> Result<u64, JsError> {
+        let ms = runtime::context::to_number(agent, value)?;
+        Ok(if ms.is_nan() || ms <= 0.0 { 0.0 } else { ms } as u64)
+    }
+
+    /// The host `sleep` builtin (shared by the main and worker agents).
+    fn agent_sleep_builtin(agent: &Agent) -> Result<Handle<Function>, JsError> {
+        create_host_builtin(
+            agent,
+            "sleep",
+            1,
+            Box::new(|_, args| {
+                let agent = runtime::context::current_agent_mut()?;
+                let ms = sleep_ms(agent, &args.first().cloned().unwrap_or(Value::Undefined))?;
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                Ok(Value::Undefined)
+            }),
+        )
+    }
+
+    /// The `monotonicNow` builtin: the hub epoch as a DOMHighResTimeStamp
+    /// (sub-millisecond monotonic milliseconds).
+    fn monotonic_now_builtin(
+        agent: &Agent,
+        hub: &Arc<AgentHub>,
+    ) -> Result<Handle<Function>, JsError> {
+        let hub = hub.clone();
+        create_host_builtin(
+            agent,
+            "monotonicNow",
+            0,
+            Box::new(move |_, _| Ok(Value::Number(hub.epoch.elapsed().as_secs_f64() * 1000.0))),
+        )
+    }
+
+    /// Create a native host closure with `%Function.prototype%` as its
+    /// prototype (CreateBuiltinFunction, spec 10.2.4): off-table host
+    /// functions otherwise get no prototype and lack `bind`/`call`/`apply`/
+    /// `toString` (the atomicsHelper getReport wrapper binds `getReport`).
+    fn create_host_builtin(
+        agent: &Agent,
+        name: &str,
+        length: u64,
+        call: crux::function::NativeFn,
+    ) -> Result<Handle<Function>, JsError> {
+        let realm = agent.current_realm()?;
+        let function_proto = realm
+            .intrinsics
+            .get("%Function.prototype%")
+            .and_then(|value| runtime::context::as_object(&value));
+        Function::create_builtin(
+            Some(JsString::from_utf8(name)),
+            length,
+            call,
+            None,
+            function_proto,
+        )
+    }
+
+    /// Install `$262.agent` on the main agent: `start` spawns a worker
+    /// thread, `broadcast` delivers a SharedArrayBuffer block to every worker
+    /// and blocks until all have received it, `getReport` drains the shared
+    /// report queue (null when empty), plus `sleep`/`monotonicNow`. The
+    /// atomicsHelper fixtures build `safeBroadcast`, `waitUntil`, and the
+    /// `getReport` polling wrapper on top of this surface.
+    fn install_agent_api(agent: &mut Agent, hub: Arc<AgentHub>) -> Result<(), String> {
+        let realm = agent.current_realm().map_err(|e| e.message)?;
+        let dollar_two_six_two = realm
+            .global_object
+            .get(&JsString::from_utf8("$262"))
+            .map_err(|e| e.message)?;
+        let Value::Object(dollar_two_six_two_obj) = dollar_two_six_two else {
+            return Err("$262 is not an object".into());
+        };
+        let agent_obj = JsObject::ordinary_object_create(None);
+
+        // `start(script)` (test262 host spec): run the script in a concurrent
+        // agent and block until that agent is running. The worker runs a
+        // fresh agent with `$262.agent` installed, then a delivery loop that
+        // hands broadcasts to its receiver and drains its jobs until
+        // `leaving()`.
+        let start_hub = hub.clone();
+        let start = create_host_builtin(
+            agent,
+            "start",
+            1,
+            Box::new(move |_, args| {
+                let agent = runtime::context::current_agent_mut()?;
+                let source = args.first().cloned().unwrap_or(Value::Undefined);
+                let text = runtime::context::to_string(agent, &source)?.to_string_lossy();
+                let index = {
+                    let mut workers = start_hub.workers.lock().map_err(|_| {
+                        JsError::new(ErrorKind::TypeError, "agent hub poisoned".into())
+                    })?;
+                    let index = workers.len();
+                    workers.push(WorkerState::default());
+                    index
+                };
+                let worker_hub = start_hub.clone();
+                std::thread::spawn(move || worker_main(worker_hub, index, text));
+                let mut workers = start_hub
+                    .workers
+                    .lock()
+                    .map_err(|_| JsError::new(ErrorKind::TypeError, "agent hub poisoned".into()))?;
+                while !workers[index].ready {
+                    workers = start_hub.ready_cv.wait(workers).map_err(|_| {
+                        JsError::new(ErrorKind::TypeError, "agent hub poisoned".into())
+                    })?;
+                }
+                Ok(Value::Undefined)
+            }),
+        )
+        .map_err(|e| e.message)?;
+
+        // `broadcast(sab, id)` (test262 host spec): deliver the block to all
+        // concurrent agents and block until every one has retrieved the
+        // message (a worker that already left is excused, so a dead agent
+        // does not hang the fixture forever).
+        let broadcast_hub = hub.clone();
+        let broadcast = create_host_builtin(
+            agent,
+            "broadcast",
+            2,
+            Box::new(move |_, args| {
+                let agent = runtime::context::current_agent_mut()?;
+                let Some(sab) = args.first() else {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "broadcast requires a SharedArrayBuffer".into(),
+                    ));
+                };
+                let Value::Object(sab_obj) = sab else {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "broadcast requires a SharedArrayBuffer".into(),
+                    ));
+                };
+                let state = agent.buffer_data.get(&sab_obj.id()).ok_or_else(|| {
+                    JsError::new(
+                        ErrorKind::TypeError,
+                        "broadcast requires a SharedArrayBuffer".into(),
+                    )
+                })?;
+                let state = state.borrow();
+                if !state.is_shared {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "broadcast requires a SharedArrayBuffer".into(),
+                    ));
+                }
+                let block = state.shared.clone();
+                let byte_length = state.byte_length;
+                drop(state);
+                let id_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+                let id = runtime::context::to_number(agent, &id_arg)?;
+                let id = if id.is_nan() { 0.0 } else { id };
+                let generation = {
+                    let mut slot = broadcast_hub.broadcast.lock().map_err(|_| {
+                        JsError::new(ErrorKind::TypeError, "agent hub poisoned".into())
+                    })?;
+                    slot.generation += 1;
+                    slot.block = Some((block, byte_length));
+                    slot.id = id;
+                    slot.generation
+                };
+                broadcast_hub.broadcast_cv.notify_all();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                loop {
+                    {
+                        let workers = broadcast_hub.workers.lock().map_err(|_| {
+                            JsError::new(ErrorKind::TypeError, "agent hub poisoned".into())
+                        })?;
+                        if workers
+                            .iter()
+                            .all(|worker| worker.consumed_gen >= generation || worker.done)
+                        {
+                            break;
+                        }
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(JsError::new(
+                            ErrorKind::TypeError,
+                            "broadcast timed out waiting for agents".into(),
+                        ));
+                    }
+                    let workers = broadcast_hub.workers.lock().map_err(|_| {
+                        JsError::new(ErrorKind::TypeError, "agent hub poisoned".into())
+                    })?;
+                    let (guard, _) = broadcast_hub
+                        .broadcast_cv
+                        .wait_timeout(workers, std::time::Duration::from_millis(100))
+                        .map_err(|_| {
+                            JsError::new(ErrorKind::TypeError, "agent hub poisoned".into())
+                        })?;
+                    drop(guard);
+                }
+                Ok(Value::Undefined)
+            }),
+        )
+        .map_err(|e| e.message)?;
+
+        // `getReport()`: the next worker report, or null when none is
+        // pending. A dead worker's error is returned once so the fixture's
+        // polling wrapper terminates with a descriptive failure.
+        let get_report_hub = hub.clone();
+        let get_report =
+            create_host_builtin(
+                agent,
+                "getReport",
+                0,
+                Box::new(move |_, _| {
+                    let mut reports = get_report_hub.reports.lock().map_err(|_| {
+                        JsError::new(ErrorKind::TypeError, "agent hub poisoned".into())
+                    })?;
+                    if let Some(report) = reports.pop_front() {
+                        return Ok(Value::String(Handle::new(JsString::from_utf8(&report))));
+                    }
+                    let mut workers = get_report_hub.workers.lock().map_err(|_| {
+                        JsError::new(ErrorKind::TypeError, "agent hub poisoned".into())
+                    })?;
+                    for worker in workers.iter_mut() {
+                        if let Some(error) = worker.error.take() {
+                            return Ok(Value::String(Handle::new(JsString::from_utf8(&format!(
+                                "[agent error] {error}"
+                            )))));
+                        }
+                    }
+                    Ok(Value::Null)
+                }),
+            )
+            .map_err(|e| e.message)?;
+
+        let sleep = agent_sleep_builtin(agent).map_err(|e| e.message)?;
+        let monotonic_now = monotonic_now_builtin(agent, &hub).map_err(|e| e.message)?;
+        for (name, func) in [
+            ("start", start),
+            ("broadcast", broadcast),
+            ("getReport", get_report),
+            ("sleep", sleep),
+            ("monotonicNow", monotonic_now),
+        ] {
+            agent_obj
+                .create_data_property(&JsString::from_utf8(name), Value::Function(func))
+                .map_err(|e| e.message)?;
+        }
+        dollar_two_six_two_obj
+            .set(
+                &JsString::from_utf8("agent"),
+                Value::Object(agent_obj),
+                true,
+            )
+            .map_err(|e| e.message)?;
+        Ok(())
+    }
+
+    /// The worker-side `$262.agent`: `receiveBroadcast` stores the receiver
+    /// on the realm's `$262` object (the delivery loop reads it back),
+    /// `report` pushes into the shared queue, and `leaving` marks the worker
+    /// done so its thread can exit.
+    fn install_worker_agent_api(
+        agent: &mut Agent,
+        hub: &Arc<AgentHub>,
+        index: usize,
+    ) -> Result<(), JsError> {
+        let realm = agent.current_realm()?;
+        let global = realm.global_object.clone();
+        let d262 = JsObject::ordinary_object_create(None);
+        let agent_obj = JsObject::ordinary_object_create(None);
+
+        let receive_broadcast = create_host_builtin(
+            agent,
+            "receiveBroadcast",
+            1,
+            Box::new(|_, args| {
+                let agent = runtime::context::current_agent_mut()?;
+                let receiver = args.first().cloned().unwrap_or(Value::Undefined);
+                let realm = agent.current_realm()?;
+                let d262 = realm.global_object.get(&JsString::from_utf8("$262"))?;
+                let Value::Object(d262_obj) = d262 else {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "worker $262 is not an object".into(),
+                    ));
+                };
+                d262_obj.set(&JsString::from_utf8("__receiver"), receiver, true)?;
+                Ok(Value::Undefined)
+            }),
+        )?;
+
+        let report_hub = hub.clone();
+        let report = create_host_builtin(
+            agent,
+            "report",
+            1,
+            Box::new(move |_, args| {
+                let agent = runtime::context::current_agent_mut()?;
+                let message = args.first().cloned().unwrap_or(Value::Undefined);
+                let text = runtime::context::to_string(agent, &message)?.to_string_lossy();
+                report_hub
+                    .reports
+                    .lock()
+                    .map_err(|_| JsError::new(ErrorKind::TypeError, "agent hub poisoned".into()))?
+                    .push_back(text);
+                Ok(Value::Undefined)
+            }),
+        )?;
+
+        let leaving_hub = hub.clone();
+        let leaving = create_host_builtin(
+            agent,
+            "leaving",
+            0,
+            Box::new(move |_, _| {
+                let mut workers = leaving_hub
+                    .workers
+                    .lock()
+                    .map_err(|_| JsError::new(ErrorKind::TypeError, "agent hub poisoned".into()))?;
+                workers[index].done = true;
+                leaving_hub.broadcast_cv.notify_all();
+                Ok(Value::Undefined)
+            }),
+        )?;
+
+        let sleep = agent_sleep_builtin(agent)?;
+        let monotonic_now = monotonic_now_builtin(agent, hub)?;
+        for (name, func) in [
+            ("receiveBroadcast", receive_broadcast),
+            ("report", report),
+            ("sleep", sleep),
+            ("leaving", leaving),
+            ("monotonicNow", monotonic_now),
+        ] {
+            agent_obj.create_data_property(&JsString::from_utf8(name), Value::Function(func))?;
+        }
+        d262.create_data_property(&JsString::from_utf8("agent"), Value::Object(agent_obj))?;
+        global.create_data_property(&JsString::from_utf8("$262"), Value::Object(d262))?;
+        Ok(())
+    }
+
+    /// One worker thread: a fresh agent with `$262.agent` installed, running
+    /// the fixture's script, then a loop that delivers each broadcast to the
+    /// registered receiver and services the agent's job queue (async
+    /// receivers and cross-thread `waitAsync` resolutions) until `leaving()`.
+    fn worker_main(hub: Arc<AgentHub>, index: usize, source: String) {
+        let result =
+            (|| -> Result<(), JsError> {
+                let mut agent = Agent::new();
+                agent.can_block = true;
+                agent.initialize_host_defined_realm()?;
+                install_worker_agent_api(&mut agent, &hub, index)?;
+                {
+                    let mut workers = hub.workers.lock().map_err(|_| {
+                        JsError::new(ErrorKind::TypeError, "agent hub poisoned".into())
+                    })?;
+                    workers[index].ready = true;
+                }
+                hub.ready_cv.notify_all();
+                agent.run_script(&source)?;
+                agent.run_jobs()?;
+                let mut last_delivered = 0u64;
+                loop {
+                    if hub.workers.lock().map_err(|_| {
+                        JsError::new(ErrorKind::TypeError, "agent hub poisoned".into())
+                    })?[index]
+                        .done
+                    {
+                        break;
+                    }
+                    // A cross-thread waitAsync notify (from the main thread) and
+                    // the agent's own jobs (timeouts, promise continuations).
+                    runtime::builtins::atomics::service_wait_async(&mut agent)?;
+                    agent.run_jobs()?;
+                    let delivery = {
+                        let slot = hub.broadcast.lock().map_err(|_| {
+                            JsError::new(ErrorKind::TypeError, "agent hub poisoned".into())
+                        })?;
+                        if slot.generation > last_delivered {
+                            Some((
+                                slot.generation,
+                                slot.block.clone().map(|(block, len)| (block, len, slot.id)),
+                            ))
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some((generation, Some((block, len, id)))) = delivery {
+                        // Mark the broadcast consumed before the receiver runs:
+                        // the receiver may block in Atomics.wait, and the main
+                        // thread's broadcast wait is about delivery, not
+                        // completion.
+                        last_delivered = generation;
+                        {
+                            let mut workers = hub.workers.lock().map_err(|_| {
+                                JsError::new(ErrorKind::TypeError, "agent hub poisoned".into())
+                            })?;
+                            workers[index].consumed_gen = generation;
+                        }
+                        hub.broadcast_cv.notify_all();
+                        let sab = runtime::builtins::array_buffer::shared_array_buffer_from_block(
+                            &mut agent, block, len,
+                        )?;
+                        let receiver = {
+                            let realm = agent.current_realm()?;
+                            let d262 = realm.global_object.get(&JsString::from_utf8("$262"))?;
+                            let Value::Object(d262_obj) = d262 else {
+                                return Err(JsError::new(
+                                    ErrorKind::TypeError,
+                                    "worker $262 is not an object".into(),
+                                ));
+                            };
+                            d262_obj.get(&JsString::from_utf8("__receiver"))?
+                        };
+                        if crux::value::is_callable(&receiver) {
+                            runtime::function::call(
+                                &mut agent,
+                                &receiver,
+                                Value::Undefined,
+                                &[sab, Value::Number(id)],
+                            )?;
+                            agent.run_jobs()?;
+                        }
+                    }
+                    // Wait for the next broadcast or leaving; the 5 ms poll
+                    // bounds latency while the condvar wakes early on events.
+                    let workers = hub.workers.lock().map_err(|_| {
+                        JsError::new(ErrorKind::TypeError, "agent hub poisoned".into())
+                    })?;
+                    if !workers[index].done
+                        && hub
+                            .broadcast
+                            .lock()
+                            .map_err(|_| {
+                                JsError::new(ErrorKind::TypeError, "agent hub poisoned".into())
+                            })?
+                            .generation
+                            <= last_delivered
+                    {
+                        let (guard, _) = hub
+                            .broadcast_cv
+                            .wait_timeout(workers, std::time::Duration::from_millis(5))
+                            .map_err(|_| {
+                                JsError::new(ErrorKind::TypeError, "agent hub poisoned".into())
+                            })?;
+                        drop(guard);
+                    }
+                }
+                Ok(())
+            })();
+        if let Err(error) = result {
+            let mut workers = hub
+                .workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            workers[index].error = Some(error.message);
+            workers[index].done = true;
+            hub.broadcast_cv.notify_all();
+        }
+    }
+
+    /// Install a real global `setTimeout` on the harness agent (the CLI
+    /// embedding has one; the bare test262 agent does not). The atomicsHelper
+    /// include falls back to a busy microtask loop when `setTimeout` is
+    /// undefined, which starves the job queue's timeout jobs (the 1 ms
+    /// `waitAsync` timeouts never fire) — a timer-backing `setTimeout` keeps
+    /// the async fixtures' polling loops cooperative.
+    fn install_harness_set_timeout(agent: &mut Agent) -> Result<(), String> {
+        let realm = agent.current_realm().map_err(|e| e.message)?;
+        let global = realm.global_object.clone();
+        let set_timeout = create_host_builtin(
+            agent,
+            "setTimeout",
+            1,
+            Box::new(|_, args| {
+                let agent = runtime::context::current_agent_mut()?;
+                let callback = args.first().cloned().unwrap_or(Value::Undefined);
+                if !crux::value::is_callable(&callback) {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "setTimeout: the callback is not callable".into(),
+                    ));
+                }
+                let delay = args.get(1).cloned().unwrap_or(Value::Undefined);
+                let delay_ms = sleep_ms(agent, &delay)?;
+                let realm = agent.current_realm().ok();
+                agent.enqueue_timeout_job(realm, delay_ms, move |agent| {
+                    runtime::function::call(agent, &callback, Value::Undefined, &[])
+                });
+                Ok(Value::Undefined)
+            }),
+        )
+        .map_err(|e| e.message)?;
+        global
+            .create_data_property(
+                &JsString::from_utf8("setTimeout"),
+                Value::Function(set_timeout),
+            )
+            .map_err(|e| e.message)?;
         Ok(())
     }
 
@@ -11767,11 +12397,6 @@ var $DONE = function (error) {
             // ShadowRealm is a stage-3 proposal, not part of ECMA-262 ES2026.
             return FixtureResult::Skip("ShadowRealm is out of scope".into());
         }
-        if fm.flags.iter().any(|f| f == "CanBlockIsTrue") {
-            // Atomics.wait fixtures that assume [[CanBlock]] = true: the
-            // engine's main agent cannot suspend (host-dependent).
-            return FixtureResult::Skip("host-dependent: can_block is false".into());
-        }
         let unsupported: Vec<&str> = fm
             .includes
             .iter()
@@ -11803,6 +12428,7 @@ var $DONE = function (error) {
                         | "byteConversionValues.js"
                         | "resizableArrayBufferUtils.js"
                         | "regExpUtils.js"
+                        | "atomicsHelper.js"
                 )
             })
             .collect();
@@ -11855,6 +12481,34 @@ var $DONE = function (error) {
             FixtureResult::Skip(reason) => eprintln!("SKIP {relative}: {reason}"),
             FixtureResult::Fail(reason) => panic!("FAIL {relative}: {reason}"),
         }
+    }
+
+    #[test]
+    fn debug_copywithin_fixture() {
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test262/test/built-ins");
+        let path = base.join(
+            "TypedArray/prototype/copyWithin/BigInt/return-abrupt-from-this-out-of-bounds.js",
+        );
+        let source = std::fs::read_to_string(&path).unwrap();
+        let (fm, body) = parse_fixture(&source).unwrap();
+        let specifier = format!("./{}", path.file_name().unwrap().to_string_lossy());
+        let result = run_one(body, Mode::Sloppy, &fm, path.parent().unwrap(), &specifier);
+        eprintln!("RESULT: {result:?}");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn debug_atomics_fixture() {
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test262/test/built-ins");
+        let path = base.join("Atomics/notify/notify-one.js");
+        let source = std::fs::read_to_string(&path).unwrap();
+        let (fm, body) = parse_fixture(&source).unwrap();
+        let specifier = format!("./{}", path.file_name().unwrap().to_string_lossy());
+        let result = run_one(body, Mode::Sloppy, &fm, path.parent().unwrap(), &specifier);
+        eprintln!("RESULT: {result:?}");
+        assert!(result.is_ok());
     }
 
     #[test]

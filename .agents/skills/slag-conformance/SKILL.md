@@ -102,7 +102,12 @@ three areas, not just your cluster.
   for anything `flags: [module]`.
 - `git-commit-messages` — commit message format.
 - Keep the skip taxonomy (what `run_fixture` skips) in sync with
-  `tools/skip_tally.js`; as of the regExpUtils closure the only skips are
-  Temporal, await-dictionary, ShadowRealm, `CanBlockIsTrue`, and the
-  unsupported-include fixtures (`tcoHelper`, `atomicsHelper`,
-  `temporalHelpers`).
+  `tools/skip_tally.js`; as of the atomics closure the only skips are
+  Temporal, await-dictionary, ShadowRealm, and the unsupported-include
+  fixtures (`tcoHelper`, `temporalHelpers`). The `atomicsHelper` (112) and
+  `CanBlockIsTrue` (7) clusters run: the harness installs the `$262.agent`
+  host API (`start`/`broadcast`/`getReport`/`sleep`/`monotonicNow`), spawns
+  worker threads with their own agents, and resolves cross-thread
+  `waitAsync` notifies on the owning agent (`service_wait_async`). The
+  release `sweep.exe` must be rebuilt after touching the harness or
+  runtime.
