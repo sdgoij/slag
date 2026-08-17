@@ -12392,9 +12392,9 @@ var $DONE = function (error) {
         if fm.features.iter().any(|f| f == "Temporal") {
             // Implemented clusters: Duration, Instant, Now, the root-level
             // namespace fixtures, the toStringTag fixtures, and the Plain*
-            // clusters (PlainDate, PlainTime, PlainDateTime). The ZonedDateTime
-            // and remaining PlainYearMonth/PlainMonthDay clusters stay skipped
-            // until implemented.
+            // clusters (PlainDate, PlainTime, PlainDateTime, PlainYearMonth,
+            // PlainMonthDay). The ZonedDateTime cluster stays skipped until
+            // implemented.
             let implemented = relative.starts_with("Temporal/Duration/")
                 || relative.starts_with("Temporal/Instant/")
                 || relative.starts_with("Temporal/Now/")
@@ -12402,6 +12402,8 @@ var $DONE = function (error) {
                 || relative.starts_with("Temporal/PlainDate/")
                 || relative.starts_with("Temporal/PlainTime/")
                 || relative.starts_with("Temporal/PlainDateTime/")
+                || relative.starts_with("Temporal/PlainYearMonth/")
+                || relative.starts_with("Temporal/PlainMonthDay/")
                 || !relative["Temporal/".len()..].contains('/');
             if !implemented {
                 return FixtureResult::Skip("Temporal type not yet implemented".into());
@@ -12411,6 +12413,8 @@ var $DONE = function (error) {
             if relative.starts_with("Temporal/PlainDate/prototype/toLocaleString/")
                 || relative.starts_with("Temporal/PlainTime/prototype/toLocaleString/")
                 || relative.starts_with("Temporal/PlainDateTime/prototype/toLocaleString/")
+                || relative.starts_with("Temporal/PlainYearMonth/prototype/toLocaleString/")
+                || relative.starts_with("Temporal/PlainMonthDay/prototype/toLocaleString/")
             {
                 return FixtureResult::Skip("Intl is out of scope".into());
             }

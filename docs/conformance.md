@@ -1407,18 +1407,18 @@ across the VM, the parser, and the built-ins:
 
 Temporal is a stage-4 proposal being implemented cluster by cluster. A
 sweep of the `Temporal/*` tree (`sweep.exe built-ins --filter
-'Temporal/*'`) reports **2,957 pass, 0 fail, 1,646 skip** of 4,603
+'Temporal/*'`) reports **3,651 pass, 0 fail, 952 skip** of 4,603
 fixtures (the whole namespace previously sat behind the
 `features: [Temporal]` gate). Implemented and passing: **Duration,
 Instant, Now, the root-level namespace, the `toStringTag` fixtures,
-and the PlainDate / PlainTime / PlainDateTime clusters** (PlainDate
-645 pass / 7 toLocaleString skip, PlainTime 486 pass / 7 skip,
-PlainDateTime 766 pass / 7 skip). Skipped: the **PlainYearMonth
-methods, PlainMonthDay methods, and ZonedDateTime** clusters, the
-`toLocaleString` fixtures (Intl, out of scope), plus 16 Duration
-fixtures that rely on ZonedDateTime arithmetic (or the full namespace)
-beyond what the shell implements. Fixes in
-`crates/runtime/src/builtins/temporal/`:
+and the PlainDate / PlainTime / PlainDateTime / PlainYearMonth /
+PlainMonthDay clusters** (PlainDate 645 pass / 7 toLocaleString skip,
+PlainTime 486 pass / 7 skip, PlainDateTime 766 pass / 7 skip,
+PlainYearMonth 502 pass / 7 skip, PlainMonthDay 192 pass / 7 skip).
+Skipped: the **ZonedDateTime** cluster, the `toLocaleString` fixtures
+(Intl, out of scope), plus 16 Duration fixtures that rely on
+ZonedDateTime arithmetic (or the full namespace) beyond what the
+shell implements. Fixes in `crates/runtime/src/builtins/temporal/`:
 
 - **PlainDateTime (`shell.rs`)** — the full cluster: `with` (the
   ten-field partial read in ascending code point order, then
@@ -1434,12 +1434,28 @@ beyond what the shell implements. Fixes in
   `toZonedDateTime` (fixed-offset/UTC `GetEpochNanosecondsFor`), and
   `from`/`equals` with property-bag support. Calendar getters reuse the
   PlainDate date-part helpers.
+- **PlainYearMonth / PlainMonthDay (`shell.rs`)** — the remaining
+  methods: `with` (the partial month/monthCode/day/year reads in code-point
+  order, then CalendarMergeFields and CalendarYearMonthFromFields /
+  CalendarMonthDayFromFields), `add`/`subtract` (AddDurationToYearMonth:
+  only years and months — weeks/days/time throw; the first-of-month
+  reference date passes RejectDateRange), `until`/`since`
+  (DifferenceTemporalPlainYearMonth: week/day disallowed, smallestUnit
+  defaults to month, the day fields zeroed, rounding at midnight),
+  `toPlainDate` (CalendarDateFromFields over the stored fields plus the
+  provided day/year), and `equals`/`compare` (CompareISODate over the
+  stored reference day/year). The constructors now store and validate the
+  optional reference day/year (RejectISODate + RejectYearMonthRange /
+  RejectDateRange), and `from` gains the property-bag branch with the
+  calendar read first.
 - **String parsing (`iso.rs`, `shell.rs`)** — the `MonthDayString`
   format now accepts all RFC 9557 short forms (`MM-DD`, `MMDD`,
   `--MM-DD`, `--MMDD`); the previous branch was unreachable (a leading
   digit parsed as a year and a leading `-` as a sign).
   `ToTemporalDateTime` validates the calendar annotation and the
-  DateTime range on the string path.
+  DateTime range on the string path; the year-month form rejects months
+  outside 01-12 at the parser, and the YearMonth/MonthDay conversions
+  reject the Z designator and check the year-month range.
 
 - **ISO parsing (`iso.rs`)** — duplicate `u-ca` annotations are allowed
   (first wins) unless any is critical; lowercase duration designators
@@ -1552,7 +1568,7 @@ The harness's skip taxonomy (also used by the sweep):
 
 | Skip category | Reason |
 |---|---|
-| `features: [Temporal]` (unimplemented clusters) | Temporal is a stage-4 proposal under implementation: the Duration/Instant/Now/namespace/toStringTag/PlainDate/PlainTime/PlainDateTime clusters run; the ZonedDateTime and remaining PlainYearMonth/PlainMonthDay method clusters, the `toLocaleString` fixtures (Intl), and 16 Duration fixtures are skipped until implemented. |
+| `features: [Temporal]` (unimplemented clusters) | Temporal is a stage-4 proposal under implementation: the Duration/Instant/Now/namespace/toStringTag and all five Plain* clusters run; the ZonedDateTime cluster, the `toLocaleString` fixtures (Intl), and 16 Duration fixtures are skipped until implemented. |
 | `features: [await-dictionary]` | `Promise.allKeyed`/`allSettledKeyed` (the await-dictionary stage-3 proposal) are not part of ECMA-262 ES2026. |
 | `features: [ShadowRealm]` | ShadowRealm is a stage-3 proposal, not part of ECMA-262 ES2026. |
 | `features: [source-phase-imports]` | `import.source()` is a stage-3 proposal, not part of ECMA-262 ES2026. |
@@ -1588,28 +1604,27 @@ closed last.
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 23,690 | 0 | 34 | 0 | 100.0% |
-| built-ins | 23,812 | 21,795 | 0 | 1,807 | ~210 | ~99.05% |
+| built-ins | 23,812 | 22,489 | 0 | 1,113 | ~210 | ~99.08% |
 | annexB | 1,086 | 1,086 | 0 | 0 | 0 | 100.0% |
-| **Total** | **48,622** | **46,571** | **0** | **1,841** | **~210** | **~99.55%** |
+| **Total** | **48,622** | **47,265** | **0** | **1,147** | **~210** | **~99.56%** |
 
 (The built-ins row is the measured release-build state (`--jobs 8 --timeout
-120 --recheck-timeout 120`) with the PlainDateTime cluster un-skipped and
-two follow-up engine fixes: `Array.fromAsync` now passes its obtained
-iterator method into GetIterator instead of re-reading `@@asyncIterator`
-(the asyncitems fixtures expose the double read), and the `/v` parser
-rejects string members (`\q{…}` or a strings property escape) inside a
-negated character class as a SyntaxError (the `*-negative-CharacterClass`
-fixtures). The ~210 hangs are all `RegExp/property-escapes/generated/*`
-fixtures — slow-but-correct (each runs a ~1.1M-code-point `regex.test`
-loop, measured ~4.5s core on both the pre-/v and current engines), so
-batches containing several of them exceed the 120s deadline under 8-job
-load and the recheck misclassifies them; none are Temporal (the
-`Temporal/*` filter sweep is 0 fail / 0 hang). The Temporal clusters
-implemented so far — Duration, Instant, Now, the root-level namespace,
-toStringTag, and PlainDate / PlainTime / PlainDateTime — moved 2,957 of
-the 4,603 fixtures from skip to pass; the remaining 1,646 skips are the
-ZonedDateTime and PlainYearMonth/PlainMonthDay method clusters, the
-`toLocaleString` (Intl) fixtures, and 16 Duration fixtures.)
+120 --recheck-timeout 120`) with the PlainDateTime / PlainYearMonth /
+PlainMonthDay clusters un-skipped and the follow-up engine fixes:
+`Array.fromAsync` passes its obtained iterator method into GetIterator
+instead of re-reading `@@asyncIterator`, and the `/v` parser rejects string
+members (`\q{…}` or a strings property escape) inside a negated character
+class as a SyntaxError. The ~210 hangs are all
+`RegExp/property-escapes/generated/*` fixtures — slow-but-correct (each runs
+a ~1.1M-code-point `regex.test` loop, measured ~4.5s core on both the
+pre-/v and current engines), so batches containing several of them exceed
+the 120s deadline under 8-job load and the recheck misclassifies them; none
+are Temporal (the `Temporal/*` filter sweep is 0 fail / 0 hang). The
+Temporal clusters implemented so far — Duration, Instant, Now, the
+root-level namespace, toStringTag, and the five Plain clusters — moved
+3,651 of the 4,603 fixtures from skip to pass; the remaining 952 skips are
+the ZonedDateTime cluster, the `toLocaleString` (Intl) fixtures, and 16
+Duration fixtures.)
 
 (Runnable = pass + fail + hang; the 3,750 skips are the unimplemented
 Temporal clusters (3,543 in `Temporal/*` plus the 8 `Date/toTemporalInstant`
@@ -1950,9 +1965,8 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
   `waitAsync` resolution), leaving the 34 language skips as the TCO
   fixtures only (44,872 pass / 3,750 skip total; the Temporal
   clusters — Duration, Instant, Now, the namespace, toStringTag, and
-  PlainDate / PlainTime / PlainDateTime — moved 2,957 fixtures from
-  skip to pass since, leaving the ZonedDateTime and remaining
-  PlainYearMonth/PlainMonthDay method clusters plus the `toLocaleString`
+  the five Plain clusters — moved 3,651 fixtures from skip to pass
+  since, leaving the ZonedDateTime cluster plus the `toLocaleString`
   (Intl) fixtures skipped).
   Note: the TypedArray sweep should be run with the long deadline
   (`--timeout 120 --recheck-timeout 120`) — the O(n²) property store

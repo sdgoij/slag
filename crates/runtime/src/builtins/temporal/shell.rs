@@ -288,7 +288,21 @@ fn install_plain_year_month(
         realm,
         &proto,
         &[
+            ("with", "%Temporal.PlainYearMonth.prototype.with%", 1),
+            ("add", "%Temporal.PlainYearMonth.prototype.add%", 1),
+            (
+                "subtract",
+                "%Temporal.PlainYearMonth.prototype.subtract%",
+                1,
+            ),
+            ("until", "%Temporal.PlainYearMonth.prototype.until%", 1),
+            ("since", "%Temporal.PlainYearMonth.prototype.since%", 1),
             ("equals", "%Temporal.PlainYearMonth.prototype.equals%", 1),
+            (
+                "toPlainDate",
+                "%Temporal.PlainYearMonth.prototype.toPlainDate%",
+                1,
+            ),
             (
                 "toString",
                 "%Temporal.PlainYearMonth.prototype.toString%",
@@ -338,7 +352,13 @@ fn install_plain_month_day(
         realm,
         &proto,
         &[
+            ("with", "%Temporal.PlainMonthDay.prototype.with%", 1),
             ("equals", "%Temporal.PlainMonthDay.prototype.equals%", 1),
+            (
+                "toPlainDate",
+                "%Temporal.PlainMonthDay.prototype.toPlainDate%",
+                1,
+            ),
             ("toString", "%Temporal.PlainMonthDay.prototype.toString%", 0),
             ("toJSON", "%Temporal.PlainMonthDay.prototype.toJSON%", 0),
             ("valueOf", "%Temporal.PlainMonthDay.prototype.valueOf%", 0),
@@ -881,11 +901,13 @@ pub fn dispatch_call(
     }
     if intrinsics.get("%Temporal.PlainYearMonth.from%").as_ref() == Some(callee) {
         let item = args.first().cloned().unwrap_or(Value::Undefined);
-        return Some(year_month_from(agent, &item));
+        let options = args.get(1).cloned().unwrap_or(Value::Undefined);
+        return Some(to_plain_year_month(agent, &item, &options));
     }
     if intrinsics.get("%Temporal.PlainMonthDay.from%").as_ref() == Some(callee) {
         let item = args.first().cloned().unwrap_or(Value::Undefined);
-        return Some(month_day_from(agent, &item));
+        let options = args.get(1).cloned().unwrap_or(Value::Undefined);
+        return Some(to_plain_month_day(agent, &item, &options));
     }
     if intrinsics.get("%Temporal.PlainDate.compare%").as_ref() == Some(callee) {
         return Some(compare_records(
@@ -917,6 +939,22 @@ pub fn dispatch_call(
             args,
             RecordKind::ZonedDateTime,
             zoned_compare_key,
+        ));
+    }
+    if intrinsics.get("%Temporal.PlainYearMonth.compare%").as_ref() == Some(callee) {
+        return Some(compare_records(
+            agent,
+            args,
+            RecordKind::YearMonth,
+            year_month_compare_key,
+        ));
+    }
+    if intrinsics.get("%Temporal.PlainMonthDay.compare%").as_ref() == Some(callee) {
+        return Some(compare_records(
+            agent,
+            args,
+            RecordKind::MonthDay,
+            month_day_compare_key,
         ));
     }
     // Prototype methods.
@@ -1100,6 +1138,54 @@ pub fn dispatch_call(
     }
     if field("%Temporal.PlainYearMonth.prototype.toJSON%") {
         return Some(year_month_to_string_impl(agent, this, Value::Undefined));
+    }
+    if field("%Temporal.PlainYearMonth.prototype.with%") {
+        return Some(plain_year_month_with(
+            agent,
+            this,
+            args.first().cloned().unwrap_or(Value::Undefined),
+            args.get(1).cloned().unwrap_or(Value::Undefined),
+        ));
+    }
+    if field("%Temporal.PlainYearMonth.prototype.add%") {
+        return Some(plain_year_month_add_subtract(agent, this, args, false));
+    }
+    if field("%Temporal.PlainYearMonth.prototype.subtract%") {
+        return Some(plain_year_month_add_subtract(agent, this, args, true));
+    }
+    if field("%Temporal.PlainYearMonth.prototype.until%") {
+        return Some(plain_year_month_until_since(agent, this, args, false));
+    }
+    if field("%Temporal.PlainYearMonth.prototype.since%") {
+        return Some(plain_year_month_until_since(agent, this, args, true));
+    }
+    if field("%Temporal.PlainYearMonth.prototype.equals%") {
+        return Some(plain_year_month_equals(agent, this, args));
+    }
+    if field("%Temporal.PlainYearMonth.prototype.toPlainDate%") {
+        return Some(plain_year_month_to_plain_date(
+            agent,
+            this,
+            args.first().cloned().unwrap_or(Value::Undefined),
+        ));
+    }
+    if field("%Temporal.PlainMonthDay.prototype.with%") {
+        return Some(plain_month_day_with(
+            agent,
+            this,
+            args.first().cloned().unwrap_or(Value::Undefined),
+            args.get(1).cloned().unwrap_or(Value::Undefined),
+        ));
+    }
+    if field("%Temporal.PlainMonthDay.prototype.equals%") {
+        return Some(plain_month_day_equals(agent, this, args));
+    }
+    if field("%Temporal.PlainMonthDay.prototype.toPlainDate%") {
+        return Some(plain_month_day_to_plain_date(
+            agent,
+            this,
+            args.first().cloned().unwrap_or(Value::Undefined),
+        ));
     }
     if field("%Temporal.PlainMonthDay.prototype.toString%") {
         return Some(month_day_to_string_impl(
@@ -1886,6 +1972,20 @@ fn zoned_compare_key(record: &TemporalRecord) -> Option<i128> {
     }
 }
 
+fn year_month_compare_key(record: &TemporalRecord) -> Option<[i64; 3]> {
+    match record {
+        TemporalRecord::YearMonth(ym) => Some(*ym),
+        _ => None,
+    }
+}
+
+fn month_day_compare_key(record: &TemporalRecord) -> Option<[i64; 3]> {
+    match record {
+        TemporalRecord::MonthDay(md) => Some(*md),
+        _ => None,
+    }
+}
+
 fn compare_records<T: Ord>(
     agent: &mut Agent,
     args: &[Value],
@@ -1936,6 +2036,22 @@ fn to_compare_value(
             _ => unreachable!(),
         },
         RecordKind::PlainDateTime => match to_plain_date_time(agent, &item, &Value::Undefined)? {
+            Value::Object(obj) => agent
+                .temporal_data
+                .get(&obj.id())
+                .cloned()
+                .ok_or_else(|| JsError::new(ErrorKind::TypeError, "brand check failed".into())),
+            _ => unreachable!(),
+        },
+        RecordKind::YearMonth => match to_plain_year_month(agent, &item, &Value::Undefined)? {
+            Value::Object(obj) => agent
+                .temporal_data
+                .get(&obj.id())
+                .cloned()
+                .ok_or_else(|| JsError::new(ErrorKind::TypeError, "brand check failed".into())),
+            _ => unreachable!(),
+        },
+        RecordKind::MonthDay => match to_plain_month_day(agent, &item, &Value::Undefined)? {
             Value::Object(obj) => agent
                 .temporal_data
                 .get(&obj.id())
@@ -3691,7 +3807,520 @@ fn month_day_to_string_impl(
     Ok(Value::String(Handle::new(JsString::from_utf8(&result))))
 }
 
-/// spec 6.3.1 Temporal.PlainYearMonth.
+// ---------------------------------------------------------------------------
+// PlainYearMonth / PlainMonthDay clusters (spec 6.3-6.4)
+// ---------------------------------------------------------------------------
+
+/// PrepareCalendarFields(iso8601, bag, «year, month, monthCode», [],
+/// partial): read in ascending code point order, at least one required.
+#[allow(clippy::type_complexity)]
+fn read_year_month_fields(
+    agent: &mut Agent,
+    bag: &Value,
+    partial: bool,
+) -> Result<(Option<i64>, Option<String>, Option<i64>), JsError> {
+    let mut any = false;
+    let mut month = None;
+    let mut month_code = None;
+    let mut year = None;
+    for key in ["month", "monthCode", "year"] {
+        let value =
+            crate::context::get_property(agent, bag, &JsString::from_utf8(key), bag.clone())?;
+        if matches!(value, Value::Undefined) {
+            continue;
+        }
+        any = true;
+        match key {
+            "month" => month = Some(super::to_positive_integer_with_truncation(agent, &value)?),
+            "monthCode" => month_code = Some(read_month_code(agent, &value)?),
+            _ => year = Some(super::to_integer_with_truncation(agent, &value)?),
+        }
+    }
+    if partial && !any {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "no supported properties found".into(),
+        ));
+    }
+    Ok((month, month_code, year))
+}
+
+/// PrepareCalendarFields(iso8601, bag, «year, month, monthCode, day», [],
+/// partial): read in ascending code point order, at least one required.
+#[allow(clippy::type_complexity)]
+fn read_month_day_fields(
+    agent: &mut Agent,
+    bag: &Value,
+    partial: bool,
+) -> Result<(Option<i64>, Option<i64>, Option<String>, Option<i64>), JsError> {
+    let mut any = false;
+    let mut day = None;
+    let mut month = None;
+    let mut month_code = None;
+    let mut year = None;
+    for key in ["day", "month", "monthCode", "year"] {
+        let value =
+            crate::context::get_property(agent, bag, &JsString::from_utf8(key), bag.clone())?;
+        if matches!(value, Value::Undefined) {
+            continue;
+        }
+        any = true;
+        match key {
+            "day" => day = Some(super::to_positive_integer_with_truncation(agent, &value)?),
+            "month" => month = Some(super::to_positive_integer_with_truncation(agent, &value)?),
+            "monthCode" => month_code = Some(read_month_code(agent, &value)?),
+            _ => year = Some(super::to_integer_with_truncation(agent, &value)?),
+        }
+    }
+    if partial && !any {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "no supported properties found".into(),
+        ));
+    }
+    Ok((day, month, month_code, year))
+}
+
+/// RejectDateRange for a YearMonth's first-of-month reference date (spec
+/// 12.3.6 CalendarDateFromFields): the PlainDate epoch-day bounds.
+fn check_reference_date(y: i64, m: i64) -> Result<(), JsError> {
+    let days = iso::iso_date_to_epoch_days(y, m - 1, 1);
+    if !(-100_000_001..=100_000_000).contains(&days) {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "date out of range".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// CalendarYearMonthFromFields (spec 12.3.7) for iso8601: year is required,
+/// month/monthCode resolve to one month, the reference day is 1, and the
+/// result is bounded by RejectYearMonthRange.
+fn resolve_year_month(
+    year: Option<i64>,
+    month: Option<i64>,
+    month_code: Option<String>,
+    constrain: bool,
+) -> Result<(i64, i64), JsError> {
+    let Some(year) = year else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "year is required".into(),
+        ));
+    };
+    let month = super::resolve_iso_month(month, month_code)?;
+    let Some(month) = month else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "month or monthCode is required".into(),
+        ));
+    };
+    let (year, month, _) = iso::regulate_iso_date(year, month, 1, constrain);
+    if !iso::is_valid_iso_date(year, month, 1)
+        || !(-271_821..=275_760).contains(&year)
+        || (year == -271_821 && month < 4)
+        || (year == 275_760 && month > 9)
+    {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "invalid year-month".into(),
+        ));
+    }
+    Ok((year, month))
+}
+
+/// CalendarMonthDayFromFields (spec 12.3.8) for iso8601: day is required,
+/// month/monthCode resolve to one month, and the reference year (a provided
+/// one or 1972) participates only in the overflow regulation.
+fn resolve_month_day(
+    year: Option<i64>,
+    month: Option<i64>,
+    month_code: Option<String>,
+    day: Option<i64>,
+    constrain: bool,
+) -> Result<(i64, i64), JsError> {
+    let Some(day) = day else {
+        return Err(JsError::new(ErrorKind::TypeError, "day is required".into()));
+    };
+    let month = super::resolve_iso_month(month, month_code)?;
+    let Some(month) = month else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "month or monthCode is required".into(),
+        ));
+    };
+    // monthDayToISOReferenceDate: RegulateISODate with the provided reference
+    // year (1972 by default), so reject validates the day against that year
+    // and constrain clamps it; the result is stored with the 1972 reference.
+    let ref_year = year.unwrap_or(1972);
+    let (_, month, day) = iso::regulate_iso_date(ref_year, month, day, constrain);
+    if !iso::is_valid_iso_date(ref_year, month, day) {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "invalid month-day".into(),
+        ));
+    }
+    Ok((month, day))
+}
+
+/// spec 6.3.3 `with` (CalendarMergeFields over {monthCode, year}).
+fn plain_year_month_with(
+    agent: &mut Agent,
+    this: &Value,
+    item: Value,
+    options: Value,
+) -> Result<Value, JsError> {
+    let ym = match require_record(agent, this, RecordKind::YearMonth)? {
+        TemporalRecord::YearMonth(ym) => ym,
+        _ => unreachable!(),
+    };
+    if !matches!(item, Value::Object(_) | Value::Function(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "invalid argument".into(),
+        ));
+    }
+    reject_temporal_like_object(agent, &item)?;
+    let (pm, pmc, py) = read_year_month_fields(agent, &item, true)?;
+    let options = super::get_options_object(&options)?;
+    let constrain = super::get_temporal_overflow_option(agent, &options)? == Overflow::Constrain;
+    // CalendarMergeFields for iso8601: the partial month/monthCode dedup over
+    // the existing {monthCode, year}.
+    let year = py.or(Some(ym[0]));
+    let month = pm;
+    let month_code = pmc.or(if pm.is_some() {
+        None
+    } else {
+        Some(format!("M{:02}", ym[1]))
+    });
+    let (y, m) = resolve_year_month(year, month, month_code, constrain)?;
+    create_temporal_object(
+        agent,
+        &Value::Undefined,
+        PLAIN_YEAR_MONTH_PROTO,
+        TemporalRecord::YearMonth([y, m, 1]),
+    )
+}
+
+/// spec 6.3.5 `add` / 6.3.6 `subtract` (AddDurationToYearMonth: only years
+/// and months; weeks, days, and the time fields throw).
+fn plain_year_month_add_subtract(
+    agent: &mut Agent,
+    this: &Value,
+    args: &[Value],
+    subtract: bool,
+) -> Result<Value, JsError> {
+    let ym = match require_record(agent, this, RecordKind::YearMonth)? {
+        TemporalRecord::YearMonth(ym) => ym,
+        _ => unreachable!(),
+    };
+    let duration_like = args.first().cloned().unwrap_or(Value::Undefined);
+    let mut duration = super::to_temporal_duration(agent, &duration_like)?;
+    if subtract {
+        duration = super::negate_duration(&duration);
+    }
+    let options = super::get_options_object(args.get(1).unwrap_or(&Value::Undefined))?;
+    let constrain = super::get_temporal_overflow_option(agent, &options)? == Overflow::Constrain;
+    if duration[2] != 0.0 || duration[3] != 0.0 || duration[4..].iter().any(|v| *v != 0.0) {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "only years and months can be added to Temporal.PlainYearMonth".into(),
+        ));
+    }
+    // CalendarDateFromFields over the first-of-month reference date
+    // (RejectDateRange: the YearMonth edges sit outside the PlainDate range).
+    check_reference_date(ym[0], ym[1])?;
+    // The reference day is 1; CalendarDateAdd with years+months, then
+    // CalendarYearMonthFromFields over the result.
+    let date = iso::calendar_date_add(
+        ym[0],
+        ym[1],
+        1,
+        duration[0] as i64,
+        duration[1] as i64,
+        0,
+        0,
+        constrain,
+    )
+    .ok_or_else(|| JsError::new(ErrorKind::RangeError, "date out of range".into()))?;
+    let (y, m) = resolve_year_month(Some(date.0), Some(date.1), None, constrain)?;
+    create_temporal_object(
+        agent,
+        &Value::Undefined,
+        PLAIN_YEAR_MONTH_PROTO,
+        TemporalRecord::YearMonth([y, m, 1]),
+    )
+}
+
+/// spec 6.3.10 `until` / 6.3.11 `since` (DifferenceTemporalPlainYearMonth:
+/// week and day are disallowed units, smallestUnit defaults to month).
+fn plain_year_month_until_since(
+    agent: &mut Agent,
+    this: &Value,
+    args: &[Value],
+    since: bool,
+) -> Result<Value, JsError> {
+    let ym = match require_record(agent, this, RecordKind::YearMonth)? {
+        TemporalRecord::YearMonth(ym) => ym,
+        _ => unreachable!(),
+    };
+    let other = to_plain_year_month(
+        agent,
+        &args.first().cloned().unwrap_or(Value::Undefined),
+        &Value::Undefined,
+    )?;
+    let o = match require_record(agent, &other, RecordKind::YearMonth)? {
+        TemporalRecord::YearMonth(ym) => ym,
+        _ => unreachable!(),
+    };
+    let options = super::get_options_object(args.get(1).unwrap_or(&Value::Undefined))?;
+    // GetDifferenceSettings(operation, options, "date", ["week", "day"],
+    // "month", "year").
+    let largest_option = super::get_temporal_unit(agent, &options, "largestUnit", None)?;
+    let rounding_increment = super::get_rounding_increment(agent, &options)?;
+    let mut rounding_mode = super::get_rounding_mode(agent, &options, RoundingMode::Trunc)?;
+    let smallest_option = super::get_temporal_unit(agent, &options, "smallestUnit", None)?;
+    let disallowed = |u: Unit| matches!(u, Unit::Week | Unit::Day);
+    if let UnitOption::Unit(u) = largest_option {
+        super::validate_unit_group(u, UnitGroup::Date)?;
+        if disallowed(u) {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "week and day are not allowed as units".into(),
+            ));
+        }
+    }
+    let smallest = match smallest_option {
+        UnitOption::Unit(u) => {
+            super::validate_unit_group(u, UnitGroup::Date)?;
+            if disallowed(u) {
+                return Err(JsError::new(
+                    ErrorKind::RangeError,
+                    "week and day are not allowed as units".into(),
+                ));
+            }
+            u
+        }
+        UnitOption::Auto => {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "smallestUnit cannot be auto".into(),
+            ));
+        }
+        UnitOption::Unset => Unit::Month,
+    };
+    if since {
+        rounding_mode = iso::negate_rounding_mode(rounding_mode);
+    }
+    let default_largest = iso::larger_of_two_units(Unit::Year, smallest);
+    let largest = match largest_option {
+        UnitOption::Unset | UnitOption::Auto => default_largest,
+        UnitOption::Unit(u) => u,
+    };
+    if iso::larger_of_two_units(largest, smallest) != largest {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "largestUnit cannot be smaller than smallestUnit".into(),
+        ));
+    }
+    if ym == o {
+        let zero = [0.0f64; 10];
+        return super::create_temporal_duration(agent, &zero, &Value::Undefined);
+    }
+    // CalendarDateFromFields on both first-of-month reference dates
+    // (RejectDateRange; the YearMonth edges can be outside the PlainDate
+    // range).
+    check_reference_date(ym[0], ym[1])?;
+    check_reference_date(o[0], o[1])?;
+    // CalendarDateUntil at the first-of-month reference days, with the day
+    // (and week) fields zeroed; rounding runs at midnight when needed.
+    let date_diff = iso::calendar_date_until((ym[0], ym[1], 1), (o[0], o[1], 1), largest);
+    let mut duration = super::InternalDuration {
+        date: [date_diff.0 as f64, date_diff.1 as f64, 0.0, 0.0],
+        time: 0,
+    };
+    if smallest != Unit::Month || rounding_increment != 1 {
+        let origin = iso::get_utc_epoch_nanoseconds(ym[0], ym[1], 1, 0, 0, 0, 0, 0, 0);
+        let dest = iso::get_utc_epoch_nanoseconds(o[0], o[1], 1, 0, 0, 0, 0, 0, 0);
+        super::duration::round_relative_duration(
+            &mut duration,
+            origin,
+            dest,
+            (ym[0], ym[1], 1, 0, 0, 0, 0, 0, 0),
+            None,
+            largest,
+            rounding_increment,
+            smallest,
+            rounding_mode,
+        )?;
+    }
+    let mut fields =
+        super::temporal_duration_from_internal(duration.date, duration.time, Unit::Day)?;
+    if since {
+        fields = super::negate_duration(&fields);
+    }
+    super::create_temporal_duration(agent, &fields, &Value::Undefined)
+}
+
+/// spec 6.3.4 `equals`.
+fn plain_year_month_equals(
+    agent: &mut Agent,
+    this: &Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    let ym = match require_record(agent, this, RecordKind::YearMonth)? {
+        TemporalRecord::YearMonth(ym) => ym,
+        _ => unreachable!(),
+    };
+    let other = to_plain_year_month(
+        agent,
+        &args.first().cloned().unwrap_or(Value::Undefined),
+        &Value::Undefined,
+    )?;
+    let o = match require_record(agent, &other, RecordKind::YearMonth)? {
+        TemporalRecord::YearMonth(ym) => ym,
+        _ => unreachable!(),
+    };
+    Ok(Value::Boolean(o == ym))
+}
+
+/// spec 6.3.9 `toPlainDate` (CalendarDateFromFields over {monthCode, year}
+/// plus the provided day, constrained).
+fn plain_year_month_to_plain_date(
+    agent: &mut Agent,
+    this: &Value,
+    item: Value,
+) -> Result<Value, JsError> {
+    let ym = match require_record(agent, this, RecordKind::YearMonth)? {
+        TemporalRecord::YearMonth(ym) => ym,
+        _ => unreachable!(),
+    };
+    if !matches!(item, Value::Object(_) | Value::Function(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "argument should be an object".into(),
+        ));
+    }
+    let value =
+        crate::context::get_property(agent, &item, &JsString::from_utf8("day"), item.clone())?;
+    let day = match value {
+        Value::Undefined => {
+            return Err(JsError::new(ErrorKind::TypeError, "day is required".into()));
+        }
+        v => super::to_positive_integer_with_truncation(agent, &v)?,
+    };
+    let (y, m, d) = resolve_date_fields(
+        Some(ym[0]),
+        None,
+        Some(format!("M{:02}", ym[1])),
+        Some(day),
+        true,
+    )?;
+    create_plain_date(agent, (y, m, d), &Value::Undefined)
+}
+
+/// spec 6.4.3 `with` (CalendarMergeFields over {monthCode, day}).
+fn plain_month_day_with(
+    agent: &mut Agent,
+    this: &Value,
+    item: Value,
+    options: Value,
+) -> Result<Value, JsError> {
+    let md = match require_record(agent, this, RecordKind::MonthDay)? {
+        TemporalRecord::MonthDay(md) => md,
+        _ => unreachable!(),
+    };
+    if !matches!(item, Value::Object(_) | Value::Function(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "invalid argument".into(),
+        ));
+    }
+    reject_temporal_like_object(agent, &item)?;
+    let (pd, pm, pmc, py) = read_month_day_fields(agent, &item, true)?;
+    let options = super::get_options_object(&options)?;
+    let constrain = super::get_temporal_overflow_option(agent, &options)? == Overflow::Constrain;
+    // CalendarMergeFields for iso8601 over {monthCode, day}; the reference
+    // year from the partial participates only in the overflow regulation.
+    let month = pm;
+    let month_code = pmc.or(if pm.is_some() {
+        None
+    } else {
+        Some(format!("M{:02}", md[1]))
+    });
+    let day = pd.or(Some(md[2]));
+    let (m, d) = resolve_month_day(py, month, month_code, day, constrain)?;
+    create_temporal_object(
+        agent,
+        &Value::Undefined,
+        PLAIN_MONTH_DAY_PROTO,
+        TemporalRecord::MonthDay([1972, m, d]),
+    )
+}
+
+/// spec 6.4.4 `equals`.
+fn plain_month_day_equals(
+    agent: &mut Agent,
+    this: &Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    let md = match require_record(agent, this, RecordKind::MonthDay)? {
+        TemporalRecord::MonthDay(md) => md,
+        _ => unreachable!(),
+    };
+    let other = to_plain_month_day(
+        agent,
+        &args.first().cloned().unwrap_or(Value::Undefined),
+        &Value::Undefined,
+    )?;
+    let o = match require_record(agent, &other, RecordKind::MonthDay)? {
+        TemporalRecord::MonthDay(md) => md,
+        _ => unreachable!(),
+    };
+    Ok(Value::Boolean(o == md))
+}
+
+/// spec 6.4.6 `toPlainDate` (CalendarDateFromFields over {monthCode, day}
+/// plus the provided year, constrained).
+fn plain_month_day_to_plain_date(
+    agent: &mut Agent,
+    this: &Value,
+    item: Value,
+) -> Result<Value, JsError> {
+    let md = match require_record(agent, this, RecordKind::MonthDay)? {
+        TemporalRecord::MonthDay(md) => md,
+        _ => unreachable!(),
+    };
+    if !matches!(item, Value::Object(_) | Value::Function(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "argument should be an object".into(),
+        ));
+    }
+    let value =
+        crate::context::get_property(agent, &item, &JsString::from_utf8("year"), item.clone())?;
+    let year = match value {
+        Value::Undefined => {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "year is required".into(),
+            ));
+        }
+        v => super::to_integer_with_truncation(agent, &v)?,
+    };
+    let (y, m, d) = resolve_date_fields(
+        Some(year),
+        None,
+        Some(format!("M{:02}", md[1])),
+        Some(md[2]),
+        true,
+    )?;
+    create_plain_date(agent, (y, m, d), &Value::Undefined)
+}
+
+/// spec 6.3.1 Temporal.PlainYearMonth (the optional referenceISODay is
+/// stored; RejectISODate then RejectYearMonthRange bound the result).
 fn construct_year_month(
     agent: &mut Agent,
     args: &[Value],
@@ -3700,7 +4329,15 @@ fn construct_year_month(
     let y = super::to_integer_with_truncation(agent, args.first().unwrap_or(&Value::Undefined))?;
     let m = super::to_integer_with_truncation(agent, args.get(1).unwrap_or(&Value::Undefined))?;
     check_calendar(agent, args.get(2).unwrap_or(&Value::Undefined))?;
-    if !iso::is_valid_iso_date(y, m, 1) || (y == -271_821 && m < 4) || (y == 275_760 && m > 9) {
+    let d = match args.get(3) {
+        Some(v) if !matches!(v, Value::Undefined) => super::to_integer_with_truncation(agent, v)?,
+        _ => 1,
+    };
+    if !iso::is_valid_iso_date(y, m, d)
+        || !(-271_821..=275_760).contains(&y)
+        || (y == -271_821 && m < 4)
+        || (y == 275_760 && m > 9)
+    {
         return Err(JsError::new(
             ErrorKind::RangeError,
             "invalid year-month".into(),
@@ -3710,11 +4347,12 @@ fn construct_year_month(
         agent,
         new_target,
         PLAIN_YEAR_MONTH_PROTO,
-        TemporalRecord::YearMonth([y, m, 1]),
+        TemporalRecord::YearMonth([y, m, d]),
     )
 }
 
-/// spec 6.4.1 Temporal.PlainMonthDay.
+/// spec 6.4.1 Temporal.PlainMonthDay (the optional referenceISOYear defaults
+/// to 1972; RejectISODate then RejectDateRange bound the result).
 fn construct_month_day(
     agent: &mut Agent,
     args: &[Value],
@@ -3723,17 +4361,29 @@ fn construct_month_day(
     let m = super::to_integer_with_truncation(agent, args.first().unwrap_or(&Value::Undefined))?;
     let d = super::to_integer_with_truncation(agent, args.get(1).unwrap_or(&Value::Undefined))?;
     check_calendar(agent, args.get(2).unwrap_or(&Value::Undefined))?;
-    if !iso::is_valid_iso_date(1972, m, d) {
+    let y = match args.get(3) {
+        Some(v) if !matches!(v, Value::Undefined) => super::to_integer_with_truncation(agent, v)?,
+        _ => 1972,
+    };
+    if !iso::is_valid_iso_date(y, m, d) {
         return Err(JsError::new(
             ErrorKind::RangeError,
             "invalid month-day".into(),
+        ));
+    }
+    // CreateTemporalMonthDaySlots: RejectDateRange on the reference date.
+    let days = iso::iso_date_to_epoch_days(y, m - 1, d);
+    if !(-100_000_001..=100_000_000).contains(&days) {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "date out of range".into(),
         ));
     }
     create_temporal_object(
         agent,
         new_target,
         PLAIN_MONTH_DAY_PROTO,
-        TemporalRecord::MonthDay([1972, m, d]),
+        TemporalRecord::MonthDay([y, m, d]),
     )
 }
 
@@ -3773,12 +4423,19 @@ fn zoned_equals(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     Ok(Value::Boolean(ns == ons && tz.eq_ignore_ascii_case(&otz)))
 }
 
-/// spec 6.3.2 `from` (minimal: YearMonth records and date/year-month
-/// strings).
-pub fn year_month_from(agent: &mut Agent, item: &Value) -> Result<Value, JsError> {
+/// spec 6.3.2 ToTemporalYearMonth: records, strings (TemporalYearMonthString),
+/// and property bags (the calendar, then month/monthCode/year, resolved with
+/// the overflow option).
+pub fn to_plain_year_month(
+    agent: &mut Agent,
+    item: &Value,
+    options: &Value,
+) -> Result<Value, JsError> {
     if let Value::Object(obj) = item
         && let Some(record) = agent.temporal_data.get(&obj.id()).cloned()
     {
+        let opts = super::get_options_object(options)?;
+        super::get_temporal_overflow_option(agent, &opts)?;
         return match record {
             TemporalRecord::YearMonth(ym) => create_temporal_object(
                 agent,
@@ -3804,30 +4461,71 @@ pub fn year_month_from(agent: &mut Agent, item: &Value) -> Result<Value, JsError
             )),
         };
     }
-    if !matches!(item, Value::String(_)) {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "value must be a string or object".into(),
-        ));
+    if matches!(item, Value::String(_)) {
+        let text = crate::context::to_string(agent, item)?;
+        let parsed = iso::parse_iso_date_time(text.as_slice(), iso::Format::DateTimePlain)
+            .or_else(|_| iso::parse_iso_date_time(text.as_slice(), iso::Format::YearMonthString))
+            .map_err(|_| JsError::new(ErrorKind::RangeError, "invalid year-month string".into()))?;
+        if parsed.tz.z {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "Z designator not supported for PlainYearMonth".into(),
+            ));
+        }
+        if let Some(calendar) = &parsed.calendar
+            && !calendar.eq_ignore_ascii_case("iso8601")
+        {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "only the iso8601 calendar is supported".into(),
+            ));
+        }
+        let opts = super::get_options_object(options)?;
+        super::get_temporal_overflow_option(agent, &opts)?;
+        // RejectYearMonthRange, then re-resolve with constrain (iso8601 is
+        // the identity).
+        let (y, m) = resolve_year_month(Some(parsed.year), Some(parsed.month), None, true)?;
+        return create_temporal_object(
+            agent,
+            &Value::Undefined,
+            PLAIN_YEAR_MONTH_PROTO,
+            TemporalRecord::YearMonth([y, m, 1]),
+        );
     }
-    let text = crate::context::to_string(agent, item)?;
-    let parsed = iso::parse_iso_date_time(text.as_slice(), iso::Format::DateTimePlain)
-        .or_else(|_| iso::parse_iso_date_time(text.as_slice(), iso::Format::YearMonthString))
-        .map_err(|_| JsError::new(ErrorKind::RangeError, "invalid year-month string".into()))?;
-    create_temporal_object(
-        agent,
-        &Value::Undefined,
-        PLAIN_YEAR_MONTH_PROTO,
-        TemporalRecord::YearMonth([parsed.year, parsed.month, 1]),
-    )
+    if let Value::Object(_) = item {
+        // Property bag: the calendar, then the fields in ascending code point
+        // order (PrepareCalendarFields complete).
+        read_bag_calendar(agent, item)?;
+        let (month, month_code, year) = read_year_month_fields(agent, item, false)?;
+        let opts = super::get_options_object(options)?;
+        let constrain = super::get_temporal_overflow_option(agent, &opts)? == Overflow::Constrain;
+        let (y, m) = resolve_year_month(year, month, month_code, constrain)?;
+        return create_temporal_object(
+            agent,
+            &Value::Undefined,
+            PLAIN_YEAR_MONTH_PROTO,
+            TemporalRecord::YearMonth([y, m, 1]),
+        );
+    }
+    Err(JsError::new(
+        ErrorKind::TypeError,
+        "value must be a string or object".into(),
+    ))
 }
 
-/// spec 6.4.2 `from` (minimal: MonthDay records and date/month-day
-/// strings).
-pub fn month_day_from(agent: &mut Agent, item: &Value) -> Result<Value, JsError> {
+/// spec 6.4.2 ToTemporalMonthDay: records, strings (TemporalMonthDayString),
+/// and property bags (the calendar, then day/month/monthCode/year, resolved
+/// with the overflow option).
+pub fn to_plain_month_day(
+    agent: &mut Agent,
+    item: &Value,
+    options: &Value,
+) -> Result<Value, JsError> {
     if let Value::Object(obj) = item
         && let Some(record) = agent.temporal_data.get(&obj.id()).cloned()
     {
+        let opts = super::get_options_object(options)?;
+        super::get_temporal_overflow_option(agent, &opts)?;
         return match record {
             TemporalRecord::MonthDay(md) => create_temporal_object(
                 agent,
@@ -3853,20 +4551,51 @@ pub fn month_day_from(agent: &mut Agent, item: &Value) -> Result<Value, JsError>
             )),
         };
     }
-    if !matches!(item, Value::String(_)) {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "value must be a string or object".into(),
-        ));
+    if matches!(item, Value::String(_)) {
+        let text = crate::context::to_string(agent, item)?;
+        let parsed = iso::parse_iso_date_time(text.as_slice(), iso::Format::DateTimePlain)
+            .or_else(|_| iso::parse_iso_date_time(text.as_slice(), iso::Format::MonthDayString))
+            .map_err(|_| JsError::new(ErrorKind::RangeError, "invalid month-day string".into()))?;
+        if parsed.tz.z {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "Z designator not supported for PlainMonthDay".into(),
+            ));
+        }
+        if let Some(calendar) = &parsed.calendar
+            && !calendar.eq_ignore_ascii_case("iso8601")
+        {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "only the iso8601 calendar is supported".into(),
+            ));
+        }
+        let opts = super::get_options_object(options)?;
+        super::get_temporal_overflow_option(agent, &opts)?;
+        return create_temporal_object(
+            agent,
+            &Value::Undefined,
+            PLAIN_MONTH_DAY_PROTO,
+            TemporalRecord::MonthDay([1972, parsed.month, parsed.day]),
+        );
     }
-    let text = crate::context::to_string(agent, item)?;
-    let parsed = iso::parse_iso_date_time(text.as_slice(), iso::Format::DateTimePlain)
-        .or_else(|_| iso::parse_iso_date_time(text.as_slice(), iso::Format::MonthDayString))
-        .map_err(|_| JsError::new(ErrorKind::RangeError, "invalid month-day string".into()))?;
-    create_temporal_object(
-        agent,
-        &Value::Undefined,
-        PLAIN_MONTH_DAY_PROTO,
-        TemporalRecord::MonthDay([1972, parsed.month, parsed.day]),
-    )
+    if let Value::Object(_) = item {
+        // Property bag: the calendar, then the fields in ascending code point
+        // order (PrepareCalendarFields complete).
+        read_bag_calendar(agent, item)?;
+        let (day, month, month_code, year) = read_month_day_fields(agent, item, false)?;
+        let opts = super::get_options_object(options)?;
+        let constrain = super::get_temporal_overflow_option(agent, &opts)? == Overflow::Constrain;
+        let (m, d) = resolve_month_day(year, month, month_code, day, constrain)?;
+        return create_temporal_object(
+            agent,
+            &Value::Undefined,
+            PLAIN_MONTH_DAY_PROTO,
+            TemporalRecord::MonthDay([1972, m, d]),
+        );
+    }
+    Err(JsError::new(
+        ErrorKind::TypeError,
+        "value must be a string or object".into(),
+    ))
 }

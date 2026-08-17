@@ -625,6 +625,12 @@ fn finish_parse(
     day: i64,
     time: Option<[i64; 6]>,
 ) -> Result<ParsedDateTime, ParseError> {
+    // The RFC 9557 year-month form requires a 01-12 month (the polyfill's
+    // yearmonth regex monthpart); the DateTimePlain fallback already checks
+    // the full date.
+    if format == Format::YearMonthString && !(1..=12).contains(&month) {
+        return Err(ParseError::Invalid);
+    }
     let mut tz = ParsedTz::default();
     let mut calendar = None;
     // Offset: `Z`/`z`, or `±HH[:MM[:SS[.f]]]` / `±HHMM[SS[.f]]`.

@@ -82,12 +82,16 @@ function classify(file, source) {
       rest.startsWith("PlainDate/") ||
       rest.startsWith("PlainTime/") ||
       rest.startsWith("PlainDateTime/") ||
+      rest.startsWith("PlainYearMonth/") ||
+      rest.startsWith("PlainMonthDay/") ||
       !rest.includes("/");
     if (!implemented) return "Temporal type not yet implemented";
     if (
       rest.startsWith("PlainDate/prototype/toLocaleString/") ||
       rest.startsWith("PlainTime/prototype/toLocaleString/") ||
-      rest.startsWith("PlainDateTime/prototype/toLocaleString/")
+      rest.startsWith("PlainDateTime/prototype/toLocaleString/") ||
+      rest.startsWith("PlainYearMonth/prototype/toLocaleString/") ||
+      rest.startsWith("PlainMonthDay/prototype/toLocaleString/")
     ) {
       return "Intl is out of scope";
     }
