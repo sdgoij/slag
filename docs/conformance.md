@@ -1516,11 +1516,11 @@ closed last.
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 23,690 | 0 | 34 | 0 | 100.0% |
-| built-ins | 23,812 | 18,331 | 0 | 5,481 | 0 | 100.0% |
+| built-ins | 23,812 | 18,917 | 0 | 4,895 | 0 | 100.0% |
 | annexB | 1,086 | 1,086 | 0 | 0 | 0 | 100.0% |
-| **Total** | **48,622** | **43,107** | **0** | **5,515** | **0** | **100.0%** |
+| **Total** | **48,622** | **43,693** | **0** | **4,929** | **0** | **100.0%** |
 
-(Runnable = pass + fail + hang; the 5,515 skips are the unsupported harness
+(Runnable = pass + fail + hang; the 4,929 skips are the unsupported harness
 includes, the host-dependent `CanBlockIsTrue` waits, the TCO (`tcoHelper`)
 fixtures, and the out-of-scope Temporal, await-dictionary, and ShadowRealm
 proposal fixtures.) The module loader was un-skipped (the `flags: [module]`
@@ -1538,7 +1538,21 @@ namespaces trigger synchronous evaluation on export access with
 propagation. The `byteConversionValues` (19: Float16) and
 `resizableArrayBufferUtils`
 (185: resizable-buffer TypedArray semantics) clusters were un-skipped
-before that, taking the totals from 41,838 to 42,042 pass. The last 39
+before that, taking the totals from 41,838 to 42,042 pass. The regExpUtils
+cluster closed next (586/586, taking the totals from 43,107 to 43,693):
+the `/v`-flag unicodeSets machinery was completed — the full binary-property
+and property-of-strings tables are now derived from the pinned test262
+fixtures (`tools/gen_regexp_unicode_tables.py` →
+`crates/unicode/src/derived_regexp_tables.rs`), the `gc=`/binary/script
+aliases (`AHex`, `Alpha`, `IDC`, `Qaac`, …) and the `LC`/`Cased_Letter`
+cased-letter union were added, Common/Inherited/Unknown scripts and lone
+surrogates are returned by `script()`/`script_extensions()` (so
+`\p{Script=Common}`, `\p{scx=Unknown}`, and `\p{gc=Surrogate}` match),
+class-set ranges (`[0-9]`) and `\q{…}` string disjunctions parse and match
+with full backtracking across the string alternatives, single-char strings
+survive class-set intersections with char sets, and
+`RegExp.prototype[@@matchAll]` caches the regexp's `lastIndex` at call time
+(`this-lastindex-cached.js`). The last 39
 failures closed with the async-test engine work: `Array.fromAsync` was
 rewritten to spec 23.1.2.4.1 — 0-length array-likes skip the loop
 entirely, array-like elements are awaited before the mapper runs, the
@@ -1642,10 +1656,10 @@ Object.fromEntries, JSON.stringify, DataView, Object statics/
 constructor, Promise, Atomics, and the final Array/generator, Throw-
 TypeError, WeakRef/FinalizationRegistry, Uint8Array base64/hex, Set
 set-methods, JSON/parse, TypedArray BigInt, String, and SuppressedError
-closures (all 0 fail). The 5,489 built-ins skips are dominated by the
+closures (all 0 fail). The 4,895 built-ins skips are dominated by the
 out-of-scope Temporal proposal (4,611), await-dictionary (89), and
-ShadowRealm (64), with source-phase-imports (8), the harness-include
-fixtures (regExpUtils 586, atomicsHelper 112, temporalHelpers 12), and
+ShadowRealm (64), with the harness-include
+fixtures (atomicsHelper 112, temporalHelpers 12), and
 host-dependent `CanBlockIsTrue` waits (7) making up the rest.
 
 ¹ The 3 built-ins hangs recorded earlier were the
@@ -1801,7 +1815,7 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 
 ## Open items
 
-- All three areas now measure **100% of runnable**: 23,690 + 18,331 + 1,086
+- All three areas now measure **100% of runnable**: 23,690 + 18,917 + 1,086
   pass / 0 fail / 0 crash / 0 hang of 23,724 + 23,812 + 1,086 fixtures
   (out-of-scope Temporal, await-dictionary, and ShadowRealm proposal
   fixtures, the `tcoHelper` includes, and the host-dependent
@@ -1819,9 +1833,10 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
   await, dynamic import, `import.meta`), with `verify-dfs.js` closing the
   final failure via the async dynamic-import load. The source-phase,
   import-defer, import-bytes, and import-text proposal clusters were then
-  un-skipped too (the import-defer cluster closed last, 114/114), leaving
-  the 34 language skips as the TCO fixtures only (43,107 pass / 5,515
-  skip total).
+  un-skipped too (the import-defer cluster closed last, 114/114), and the
+  regExpUtils cluster closed after them (586/586 — the full /v unicodeSets
+  machinery, see the Full-suite sweep section), leaving the 34 language
+  skips as the TCO fixtures only (43,693 pass / 4,929 skip total).
   Note: the TypedArray sweep should be run with the long deadline
   (`--timeout 120 --recheck-timeout 120`) — the O(n²) property store
   makes the 10,000-element crash-test fixtures take ~45s, which the

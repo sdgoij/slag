@@ -102,7 +102,7 @@ three areas, not just your cluster.
   for anything `flags: [module]`.
 - `git-commit-messages` — commit message format.
 - Keep the skip taxonomy (what `run_fixture` skips) in sync with
-  `tools/skip_tally.js`; as of the import-defer closure the only skips are
+  `tools/skip_tally.js`; as of the regExpUtils closure the only skips are
   Temporal, await-dictionary, ShadowRealm, `CanBlockIsTrue`, and the
-  unsupported-include fixtures (`tcoHelper`, `regExpUtils`, `atomicsHelper`,
+  unsupported-include fixtures (`tcoHelper`, `atomicsHelper`,
   `temporalHelpers`).

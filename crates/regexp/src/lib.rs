@@ -863,4 +863,58 @@ mod tests {
             .is_ok()
         );
     }
+
+    /// /v mode: class-set ranges (`[0-9]`), `\q{…}` string disjunctions, and
+    /// their interactions (spec 22.2.2 ClassSetExpression).
+    #[test]
+    fn v_flag_class_sets() {
+        let v = |_pattern: &str| f("v");
+        let m = |pattern: &str, input: &str| {
+            let re = compile(
+                pattern.encode_utf16().collect::<Vec<u16>>().as_slice(),
+                v(pattern),
+            )
+            .unwrap();
+            re.exec(&input.encode_utf16().collect::<Vec<u16>>(), 0)
+                .is_some()
+        };
+        // ClassSetRange.
+        assert!(m("^[0-9]+$", "123"));
+        assert!(!m("^[0-9]+$", "1a3"));
+        assert!(m("^[a-z]+$", "abc"));
+        // Nested class operands and difference: the empty set matches nothing.
+        assert!(!m("^[[0-9]--[0-9]]+$", "5"));
+        // `\\q{…}` string disjunction: a multi-char string matches whole.
+        assert!(m("^[\\q{9\\uFE0F\\u20E3}]+$", "9\u{FE0F}\u{20E3}"));
+        assert!(!m("^[\\q{9\\uFE0F\\u20E3}]+$", "9"));
+        // Union of a string disjunction and a char.
+        assert!(m("^[\\q{0|2|4|9\\uFE0F\\u20E3}_]+$", "9\u{FE0F}\u{20E3}"));
+        assert!(m("^[\\q{0|2|4|9\\uFE0F\\u20E3}_]+$", "0"));
+        assert!(!m("^[\\q{0|2|4|9\\uFE0F\\u20E3}_]+$", "6\u{FE0F}\u{20E3}"));
+        // The greedy repeat backtracks across the string alternatives: "ab"
+        // is one member even when "a" is tried first.
+        assert!(m("^[\\q{a|ab}]+$", "ab"));
+        assert!(m("^[\\q{ab|a}]+$", "ab"));
+        // Single-char strings survive an intersection with a char class; a
+        // multi-char string does not (spec ClassSetExpression semantics).
+        assert!(m("^[\\d&&\\q{0|2|4|9\\uFE0F\\u20E3}]+$", "2"));
+        assert!(!m(
+            "^[\\d&&\\q{0|2|4|9\\uFE0F\\u20E3}]+$",
+            "9\u{FE0F}\u{20E3}"
+        ));
+        assert!(!m("^[\\d&&\\q{0|2|4|9\\uFE0F\\u20E3}]+$", "x"));
+        assert!(!m(
+            "^[\\d&&\\q{0|2|4|9\\uFE0F\\u20E3}]+$",
+            "9\\uFE0F\\u20E3"
+        ));
+        assert!(!m("^[\\d&&\\q{0|2|4|9\\uFE0F\\u20E3}]+$", "x"));
+        // A range over a class escape is an early error (V8 behavior).
+        assert!(
+            compile(
+                "[\\d-a]".encode_utf16().collect::<Vec<u16>>().as_slice(),
+                v("v")
+            )
+            .is_err()
+        );
+    }
 }

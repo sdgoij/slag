@@ -764,9 +764,18 @@ fn symbol_match_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
     )?;
     // The pinned fixtures keep the 2018 MatchAllIterator step: the initial
     // lastIndex is read and length-coerced here (a throwing valueOf
-    // propagates from matchAll itself).
+    // propagates from matchAll itself) and cached onto the matcher, so later
+    // writes to the original regexp's lastIndex do not move the iterator
+    // (`this-lastindex-cached.js`).
     let last_index = get_property(agent, this, &JsString::from_utf8("lastIndex"), this.clone())?;
-    let _ = to_length(to_number(&last_index)?);
+    let last_index = to_length(to_number(&last_index)?);
+    as_object(&matcher)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "matcher is not an object".into()))?
+        .set(
+            &JsString::from_utf8("lastIndex"),
+            Value::Number(last_index as f64),
+            true,
+        )?;
     let proto = realm
         .intrinsics
         .get(STRING_ITERATOR)

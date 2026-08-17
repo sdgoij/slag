@@ -8,6 +8,8 @@
 
 use unicode_normalization::UnicodeNormalization;
 
+mod derived_regexp_tables;
+
 /// `WhiteSpace` (spec 11.2): TAB, VT, FF, SP, NBSP, ZWNBSP, and the
 /// Space_Separator (Zs) category.
 pub fn is_white_space(cp: u32) -> bool {
@@ -180,6 +182,13 @@ pub fn is_ascii_word_char(cp: u32) -> bool {
 /// The two-letter `General_Category` abbreviation of `cp` (for `\p{…}`).
 pub fn general_category(cp: u32) -> &'static str {
     use unicode_properties::UnicodeGeneralCategory;
+    // Lone surrogates are Cs (Surrogate), not Cn: they are not valid scalar
+    // values, so `char_of` fails and the fallback below must not claim them
+    // unassigned (`\p{gc=Surrogate}` / `\p{Script=Unknown}` fixtures cover
+    // exactly the D800-DFFF range).
+    if (0xD800..=0xDFFF).contains(&cp) {
+        return "Cs";
+    }
     match char_of(cp).map(|c| c.general_category()) {
         Some(unicode_properties::GeneralCategory::UppercaseLetter) => "Lu",
         Some(unicode_properties::GeneralCategory::LowercaseLetter) => "Ll",
@@ -214,50 +223,74 @@ pub fn general_category(cp: u32) -> &'static str {
     }
 }
 
-/// The script full name of `cp`, or `None` outside any script (for
-/// `\p{Script=…}`).
+/// The script full name of `cp` (for `\p{Script=…}`), or `None` outside any
+/// script. Common, Inherited, and Unknown ARE returned — `\p{Script=Common}`
+/// and friends are valid escapes whose members are exactly those code points
+/// (the spec's Script=Common/Inherited/Unknown value sets). Lone surrogates
+/// are Script=Unknown (the fixture ranges cover D800-DFFF).
 pub fn script(cp: u32) -> Option<&'static str> {
     use unicode_script::UnicodeScript;
-    let script = char_of(cp)?.script();
-    let name = script.full_name();
-    if name == "Unknown" || name == "Common" || name == "Inherited" {
-        return None;
+    if (0xD800..=0xDFFF).contains(&cp) {
+        return Some("Unknown");
     }
-    Some(name)
+    Some(char_of(cp)?.script().full_name())
 }
 
 /// The `Script_Extensions` of `cp` as full names (spec `\p{Script_Extensions=…}`).
 pub fn script_extensions(cp: u32) -> Vec<&'static str> {
     use unicode_script::UnicodeScript;
     let Some(c) = char_of(cp) else {
-        return Vec::new();
+        // Lone surrogates are Script_Extensions=Unknown.
+        return if (0xD800..=0xDFFF).contains(&cp) {
+            vec!["Unknown"]
+        } else {
+            Vec::new()
+        };
     };
     let ext = c.script_extension();
-    ext.iter()
-        .map(|s| s.full_name())
-        .filter(|n| *n != "Common" && *n != "Inherited" && *n != "Unknown")
-        .collect()
+    let mut names: Vec<&'static str> = ext.iter().map(|s| s.full_name()).collect();
+    // A code point with no Script_Extensions (an unassigned / Unknown-script
+    // character) has Script_Extensions=Unknown: `\p{scx=Unknown}` matches
+    // exactly those (`Script_Extensions_-_Unknown.js`).
+    if names.is_empty() && c.script().full_name() == "Unknown" {
+        names.push("Unknown");
+    }
+    names
 }
 
 /// Canonicalize a script name (full or ISO 15924 short form) to the full
 /// name used by `script()`/`script_extensions()`; `None` for unknown names.
+/// The deprecated ISO 15924 aliases the fixtures use (`Qaac` = Coptic,
+/// `Qaai` = Inherited) are mapped by hand — the unicode-script crate knows
+/// only the current codes (`Copt`/`Zinh`).
 pub fn canonical_script_name(name: &str) -> Option<&'static str> {
     use unicode_script::Script;
+    match name {
+        "Qaac" => return Some("Coptic"),
+        "Qaai" => return Some("Inherited"),
+        _ => {}
+    }
     Script::from_full_name(name)
         .or_else(|| Script::from_short_name(name))
         .map(|s| s.full_name())
 }
 
 /// The curated binary-property predicates for `\p{…}` (spec 22.2.3.13
-/// Table 65 subset): `None` for unsupported names.
+/// Table 65): the crate-based predicates for the common properties, and the
+/// full derived tables (from the pinned test262 fixtures) for the rest.
+/// `None` for unsupported names.
 pub fn binary_property(cp: u32, name: &str) -> Option<bool> {
+    // The full binary-property tables from the test262 fixtures (Unicode v17),
+    // for every property the corpus tests. These are exact; the crate-based
+    // predicates below are the fast paths for the common ones.
+    if let Some(ranges) = derived_regexp_tables::binary_property_table(name) {
+        return Some(ranges_contain(ranges, cp));
+    }
     Some(match name {
         "ASCII" => cp <= 0x7F,
-        "ASCII_Hex_Digit" => matches!(cp, 0x30..=0x39 | 0x41..=0x46 | 0x61..=0x66),
         "Alphabetic" => char_of(cp).is_some_and(char::is_alphabetic),
         "Any" => true,
         "Assigned" => general_category(cp) != "Cn",
-        "Hex_Digit" => matches!(cp, 0x30..=0x39 | 0x41..=0x46 | 0x61..=0x66),
         "ID_Continue" => char_of(cp).is_some_and(|c| {
             use unicode_id::UnicodeID;
             c.is_id_continue()
@@ -281,6 +314,28 @@ pub fn binary_property(cp: u32, name: &str) -> Option<bool> {
         }),
         _ => return None,
     })
+}
+
+/// Whether `cp` is in a sorted inclusive range list.
+fn ranges_contain(ranges: &[(u32, u32)], cp: u32) -> bool {
+    ranges
+        .binary_search_by(|&(s, e)| {
+            if cp < s {
+                std::cmp::Ordering::Greater
+            } else if cp > e {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
+}
+
+/// The string set of a property-of-strings escape (`\p{RGI_Emoji}` etc.),
+/// from the pinned test262 fixtures (Unicode v17): each element is a code
+/// point sequence. `None` for names that are not property-of-strings.
+pub fn property_of_strings(name: &str) -> Option<&'static [&'static [u32]]> {
+    derived_regexp_tables::property_of_strings(name)
 }
 
 #[cfg(test)]

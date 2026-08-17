@@ -486,7 +486,7 @@ impl<'a> Parser<'a> {
         };
         let prop_text = code_points_to_string(&prop);
         let predicate = match prop_text.as_str() {
-            "General_Category" => {
+            "General_Category" | "gc" => {
                 let Some(value) = value else {
                     return Err(self.error("Invalid property escape"));
                 };
@@ -519,6 +519,21 @@ impl<'a> Parser<'a> {
             _ => {
                 if value.is_some() {
                     return Err(self.error("Invalid property escape"));
+                }
+                // Property-of-strings (`\\p{RGI_Emoji}` etc., spec
+                // 22.2.3.13 + the /v UnicodeSets proposal): a set of strings,
+                // only meaningful in /v mode. Match the string set directly
+                // when the name is one.
+                if let Some(strings) = unicode::property_of_strings(&prop_text) {
+                    if !self.flags.v {
+                        return Err(self.error("Invalid property escape"));
+                    }
+                    if negated {
+                        return Err(self.error("Invalid property escape"));
+                    }
+                    let mut class = CharClass::new(false);
+                    class.strings = strings.iter().map(|s| s.to_vec()).collect();
+                    return Ok(class);
                 }
                 // Binary properties use canonical names; also accept the
                 // general-category long names as aliases.
@@ -1320,6 +1335,25 @@ impl<'a> Parser<'a> {
                     let right = self.parse_class_set_operand()?;
                     class = difference_classes(class, right);
                 }
+                Some(0x2D) if self.peek_at(1) != Some(0x5D) => {
+                    // ClassSetRange (spec 22.2.1): two ClassSetCharacters
+                    // separated by `-`. Both endpoints must be literal single
+                    // characters (a char or a char escape like `\x41`); a
+                    // range over a class escape (`[\d-a]`) is an early error.
+                    let (Some((start, _)),) = (class_ranges_singleton(&class),) else {
+                        return Err(self.error("Invalid class set character"));
+                    };
+                    self.next(); // -
+                    let right = self.parse_class_set_operand()?;
+                    let Some((_, end)) = class_ranges_singleton(&right) else {
+                        return Err(self.error("Invalid class set character"));
+                    };
+                    if start > end {
+                        return Err(self.error("Range out of order in character class"));
+                    }
+                    class = CharClass::new(false);
+                    class.add_range(start, end);
+                }
                 Some(0x5D) => {
                     self.next();
                     break;
@@ -1408,15 +1442,21 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `\q{…}` in /v mode: a string atom (one or more characters).
+    /// `\q{…}` in /v mode: a string disjunction (one or more `|`-separated
+    /// strings, each one or more characters — spec ClassStringDisjunction).
     fn parse_q_string(&mut self) -> Result<CharClass, Error> {
-        let mut string = Vec::new();
+        let mut strings: Vec<Vec<u32>> = vec![Vec::new()];
         loop {
             match self.peek() {
                 None => return Err(self.error("Unterminated \\q escape")),
                 Some(0x7D) => {
                     self.next();
                     break;
+                }
+                Some(0x7C) => {
+                    // `|` separates the alternative strings.
+                    self.next();
+                    strings.push(Vec::new());
                 }
                 Some(0x5C) => {
                     self.next();
@@ -1435,7 +1475,7 @@ impl<'a> Parser<'a> {
                             };
                             self.next();
                             self.next();
-                            string.push((h << 4) | l);
+                            strings.last_mut().unwrap().push((h << 4) | l);
                         }
                         0x75 => {
                             let Some(hi) = self.peek() else {
@@ -1457,23 +1497,25 @@ impl<'a> Parser<'a> {
                                 self.next();
                                 value |= (h2 << 4) | l2;
                             }
-                            string.push(value);
+                            strings.last_mut().unwrap().push(value);
                         }
-                        other => string.push(other),
+                        other => strings.last_mut().unwrap().push(other),
                     }
                 }
                 Some(atom) => {
                     self.next();
-                    string.push(atom);
+                    strings.last_mut().unwrap().push(atom);
                 }
             }
         }
-        if string.is_empty() {
+        // A ClassStringDisjunction member is one or more characters; drop any
+        // empty alternatives (`\q{9|}` / `\q{|9}` / `\q{}` are errors).
+        if strings.iter().any(|s| s.is_empty()) {
             return Err(self.error("Invalid \\q escape"));
         }
         Ok(CharClass {
             ranges: Vec::new(),
-            strings: vec![string],
+            strings,
             negated: false,
             predicate: None,
             fold: self.ignore_case,
@@ -1799,11 +1841,12 @@ fn category_abbreviation(name: &str) -> Option<&'static str> {
         "Lm" | "Modifier_Letter" => "Lm",
         "Lo" | "Other_Letter" => "Lo",
         "L" | "Letter" => "L",
+        "LC" | "Cased_Letter" => "LC",
         "Mn" | "Nonspacing_Mark" => "Mn",
         "Mc" | "Spacing_Mark" => "Mc",
         "Me" | "Enclosing_Mark" => "Me",
-        "M" | "Mark" => "M",
-        "Nd" | "Decimal_Number" => "Nd",
+        "M" | "Mark" | "Combining_Mark" => "M",
+        "Nd" | "Decimal_Number" | "digit" => "Nd",
         "Nl" | "Letter_Number" => "Nl",
         "No" | "Other_Number" => "No",
         "N" | "Number" => "N",
@@ -1814,7 +1857,7 @@ fn category_abbreviation(name: &str) -> Option<&'static str> {
         "Pi" | "Initial_Punctuation" => "Pi",
         "Pf" | "Final_Punctuation" => "Pf",
         "Po" | "Other_Punctuation" => "Po",
-        "P" | "Punctuation" => "P",
+        "P" | "Punctuation" | "punct" => "P",
         "Sm" | "Math_Symbol" => "Sm",
         "Sc" | "Currency_Symbol" => "Sc",
         "Sk" | "Modifier_Symbol" => "Sk",
@@ -1824,7 +1867,7 @@ fn category_abbreviation(name: &str) -> Option<&'static str> {
         "Zl" | "Line_Separator" => "Zl",
         "Zp" | "Paragraph_Separator" => "Zp",
         "Z" | "Separator" => "Z",
-        "Cc" | "Control" => "Cc",
+        "Cc" | "Control" | "cntrl" => "Cc",
         "Cf" | "Format" => "Cf",
         "Cs" | "Surrogate" => "Cs",
         "Co" | "Private_Use" => "Co",
@@ -1842,20 +1885,91 @@ fn canonical_script_name(name: &str) -> Option<&'static str> {
 fn binary_property_name(name: &str) -> Option<&'static str> {
     Some(match name {
         "ASCII" => "ASCII",
-        "ASCII_Hex_Digit" => "ASCII_Hex_Digit",
-        "Alphabetic" => "Alphabetic",
+        "AHex" | "ASCII_Hex_Digit" => "ASCII_Hex_Digit",
+        "Alpha" | "Alphabetic" => "Alphabetic",
         "Any" => "Any",
         "Assigned" => "Assigned",
+        "Bidi_C" | "Bidi_Control" => "Bidi_Control",
+        "Bidi_M" | "Bidi_Mirrored" => "Bidi_Mirrored",
+        "CI" | "Case_Ignorable" => "Case_Ignorable",
+        "Cased" => "Cased",
+        "CWCF" | "Changes_When_Casefolded" => "Changes_When_Casefolded",
+        "CWCM" | "Changes_When_Casemapped" => "Changes_When_Casemapped",
+        "CWKCF" | "Changes_When_NFKC_Casefolded" => "Changes_When_NFKC_Casefolded",
+        "CWL" | "Changes_When_Lowercased" => "Changes_When_Lowercased",
+        "CWT" | "Changes_When_Titlecased" => "Changes_When_Titlecased",
+        "CWU" | "Changes_When_Uppercased" => "Changes_When_Uppercased",
+        "Dash" => "Dash",
+        "DI" | "Default_Ignorable_Code_Point" => "Default_Ignorable_Code_Point",
+        "Dep" | "Deprecated" => "Deprecated",
+        "Dia" | "Diacritic" => "Diacritic",
+        "EBase" | "Emoji_Modifier_Base" => "Emoji_Modifier_Base",
+        "EComp" | "Emoji_Component" => "Emoji_Component",
+        "EMod" | "Emoji_Modifier" => "Emoji_Modifier",
+        "EPres" | "Emoji_Presentation" => "Emoji_Presentation",
+        "Emoji" => "Emoji",
+        "Ext" | "Extender" => "Extender",
+        "ExtPict" | "Extended_Pictographic" => "Extended_Pictographic",
+        "Gr_Base" | "Grapheme_Base" => "Grapheme_Base",
+        "Gr_Ext" | "Grapheme_Extend" => "Grapheme_Extend",
         "Hex" | "Hex_Digit" => "Hex_Digit",
-        "ID_Continue" => "ID_Continue",
-        "ID_Start" => "ID_Start",
-        "Lowercase" => "Lowercase",
-        "Uppercase" => "Uppercase",
-        "White_Space" => "White_Space",
-        "XID_Continue" => "XID_Continue",
-        "XID_Start" => "XID_Start",
+        "IDC" | "ID_Continue" => "ID_Continue",
+        "IDS" | "ID_Start" => "ID_Start",
+        "IDSB" | "IDS_Binary_Operator" => "IDS_Binary_Operator",
+        "IDST" | "IDS_Trinary_Operator" => "IDS_Trinary_Operator",
+        "Ideo" | "Ideographic" => "Ideographic",
+        "Join_C" | "Join_Control" => "Join_Control",
+        "LOE" | "Logical_Order_Exception" => "Logical_Order_Exception",
+        "Lower" | "Lowercase" => "Lowercase",
+        "Math" => "Math",
+        "NChar" | "Noncharacter_Code_Point" => "Noncharacter_Code_Point",
+        "Pat_Syn" | "Pattern_Syntax" => "Pattern_Syntax",
+        "Pat_WS" | "Pattern_White_Space" => "Pattern_White_Space",
+        "QMark" | "Quotation_Mark" => "Quotation_Mark",
+        "Radical" => "Radical",
+        "RI" | "Regional_Indicator" => "Regional_Indicator",
+        "SD" | "Soft_Dotted" => "Soft_Dotted",
+        "STerm" | "Sentence_Terminal" => "Sentence_Terminal",
+        "Term" | "Terminal_Punctuation" => "Terminal_Punctuation",
+        "UIdeo" | "Unified_Ideograph" => "Unified_Ideograph",
+        "Upper" | "Uppercase" => "Uppercase",
+        "VS" | "Variation_Selector" => "Variation_Selector",
+        "space" | "WSpace" | "White_Space" => "White_Space",
+        "XIDC" | "XID_Continue" => "XID_Continue",
+        "XIDS" | "XID_Start" => "XID_Start",
         _ => return None,
     })
+}
+
+/// The single (start, end) pair of a class that is exactly one character
+/// (no strings, no predicate) — the ClassSetRange endpoint case. `None` for
+/// anything else (a range over `\d`, `\q{…}`, or a nested class is an
+/// early error in /v mode).
+fn class_ranges_singleton(class: &CharClass) -> Option<(u32, u32)> {
+    if class.predicate.is_none()
+        && class.strings.is_empty()
+        && class.ranges.len() == 1
+        && class.ranges[0].0 == class.ranges[0].1
+    {
+        Some((class.ranges[0].0, class.ranges[0].1))
+    } else {
+        None
+    }
+}
+
+/// Whether `cp` is in a sorted inclusive range list (binary search).
+fn ranges_contain_sorted(ranges: &[(u32, u32)], cp: u32) -> bool {
+    ranges
+        .binary_search_by(|&(s, e)| {
+            if cp < s {
+                std::cmp::Ordering::Greater
+            } else if cp > e {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
 }
 
 /// Union of two classes (both explicit after /v scanning).
@@ -1887,9 +2001,21 @@ fn intersect_classes(a: CharClass, b: CharClass) -> CharClass {
             }
         }
     }
+    // A single-character string in one set whose character is in the other
+    // set's ranges survives the intersection as that character (spec
+    // ClassSetExpression semantics: `[\d&&\q{0|2|4|9\uFE0F\u20E3}]` keeps
+    // "0"/"2"/"4" and drops the multi-char "9\uFE0F\u20E3").
     for sa in &a.strings {
+        if sa.len() == 1 && ranges_contain_sorted(&b.ranges, sa[0]) {
+            out.add_range(sa[0], sa[0]);
+        }
         if b.strings.iter().any(|sb| sb == sa) {
             out.strings.push(sa.clone());
+        }
+    }
+    for sb in &b.strings {
+        if sb.len() == 1 && ranges_contain_sorted(&a.ranges, sb[0]) {
+            out.add_range(sb[0], sb[0]);
         }
     }
     out

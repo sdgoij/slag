@@ -11802,6 +11802,7 @@ var $DONE = function (error) {
                         | "asyncHelpers.js"
                         | "byteConversionValues.js"
                         | "resizableArrayBufferUtils.js"
+                        | "regExpUtils.js"
                 )
             })
             .collect();

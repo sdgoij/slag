@@ -39,10 +39,12 @@ pub(crate) fn predicate_matches(pred: &Predicate, cp: u32) -> bool {
         Predicate::Space => unicode::is_white_space(cp) || unicode::is_line_terminator(cp),
         Predicate::GeneralCategory(abbr) => {
             let gc = unicode::general_category(cp);
-            if abbr.len() == 1 {
-                gc.starts_with(abbr)
-            } else {
-                gc == *abbr
+            match *abbr {
+                // LC / Cased_Letter: the union of the cased letters (spec
+                // 22.2.3.13 Table 65).
+                "LC" => matches!(gc, "Lu" | "Ll" | "Lt"),
+                abbr if abbr.len() == 1 => gc.starts_with(abbr),
+                _ => gc == *abbr,
             }
         }
         Predicate::Script(name) => unicode::script(cp) == Some(*name),
@@ -249,16 +251,30 @@ fn match_node<'i>(
                 Err(())
             }
         }
-        Node::Class(class) => match read_char_dir(ctx, pos, dir) {
-            Some((c, len)) => {
-                if class_matches(ctx, class, pos, c, dir) {
-                    cont(caps, advance(pos, dir, len))
-                } else {
-                    Err(())
+        Node::Class(class) => {
+            // A string member (`\q{…}`, spec ClassStringDisjunction) consumes
+            // its full code-unit length, not one character: try the strings
+            // first (a non-negated class), then fall back to the single-char
+            // membership test. Negated classes never consume strings (the
+            // complement of a set containing a string has no string members).
+            if !class.negated {
+                for string in &class.strings {
+                    if string_at_dir(ctx, pos, string, dir) {
+                        return cont(caps, advance(pos, dir, string_units(ctx, string)));
+                    }
                 }
             }
-            None => Err(()),
-        },
+            match read_char_dir(ctx, pos, dir) {
+                Some((c, len)) => {
+                    if class_matches(ctx, class, pos, c, dir) {
+                        cont(caps, advance(pos, dir, len))
+                    } else {
+                        Err(())
+                    }
+                }
+                None => Err(()),
+            }
+        }
         Node::Sequence(nodes) => match_sequence(nodes, 0, ctx, caps, pos, dir, cont),
         Node::Alternate(alts) => {
             for alt in alts {
@@ -409,30 +425,32 @@ fn repeat_loop<'i>(
     count: u32,
     cont: &mut dyn FnMut(&mut Caps, usize) -> MatchResult,
 ) -> MatchResult {
-    // Fast path: a greedy repeat of a single-character atom (literal, dot,
-    // or string-free character class) with no captures. The recursive path
-    // consumes one character per stack frame, which overflows on
+    // Fast path: a greedy repeat of a single-atom (literal, dot, or character
+    // class — with or without `\q{…}` string members) with no captures. The
+    // recursive path consumes one atom per stack frame, which overflows on
     // multi-megabyte inputs (the generated property-escape fixtures build
     // ~2M-unit match strings); consume iteratively instead, then try the
-    // continuation from the furthest position backward, backtracking one
-    // character at a time (spec RepeatMatcher).
+    // continuation from the furthest position backward, backtracking one atom
+    // at a time (spec RepeatMatcher). A class with string members may match
+    // several alternatives at one position (`[\q{a|ab}]+` on "ab"), so each
+    // consumed position records the untried alternatives to explore on
+    // backtrack.
     if greedy
         && owned.is_empty()
-        && match node {
-            Node::Char { .. } | Node::Any { .. } => true,
-            Node::Class(class) => class.strings.is_empty(),
-            _ => false,
-        }
+        && matches!(node, Node::Char { .. } | Node::Any { .. } | Node::Class(_))
     {
         let mark = caps.mark();
         let mut cur = pos;
         let mut cnt = count;
-        let mut starts: Vec<usize> = Vec::new();
+        // Each consumed atom: (position, remaining alternative end positions).
+        let mut consumed: Vec<(usize, Vec<usize>)> = Vec::new();
         while max.is_none_or(|m| cnt < m) {
-            let Some(next) = single_atom_match(ctx, node, cur, dir) else {
+            let alternatives = atom_match_ends(ctx, node, cur, dir);
+            if alternatives.is_empty() {
                 break;
-            };
-            starts.push(cur);
+            }
+            let next = alternatives[0];
+            consumed.push((cur, alternatives[1..].to_vec()));
             cur = next;
             cnt += 1;
         }
@@ -443,12 +461,33 @@ fn repeat_loop<'i>(
                     return Ok(end);
                 }
             }
-            match starts.pop() {
-                Some(prev) => {
-                    cur = prev;
-                    cnt -= 1;
-                }
+            // Backtrack one step: try the next alternative at the most recent
+            // consumed position, or (when its alternatives are exhausted) undo
+            // that atom and move back to its start. Either way the loop tries
+            // the continuation again at the new `cur`.
+            match consumed.last_mut() {
                 None => return Err(()),
+                Some((_, remaining)) => {
+                    if let Some(alt) = remaining.pop() {
+                        // The atom is still consumed (it matched, just to a
+                        // different endpoint); re-consume greedily from there.
+                        cur = alt;
+                        while max.is_none_or(|m| cnt < m) {
+                            let alternatives = atom_match_ends(ctx, node, cur, dir);
+                            if alternatives.is_empty() {
+                                break;
+                            }
+                            let next = alternatives[0];
+                            consumed.push((cur, alternatives[1..].to_vec()));
+                            cur = next;
+                            cnt += 1;
+                        }
+                    } else {
+                        let (start, _) = consumed.pop().unwrap();
+                        cur = start;
+                        cnt -= 1;
+                    }
+                }
             }
         }
     }
@@ -619,30 +658,61 @@ fn class_matches(ctx: &Ctx<'_>, class: &CharClass, pos: usize, c: u32, dir: i32)
     in_set != class.negated
 }
 
-/// Match a single-character atom (literal, dot, or string-free class) at
-/// `pos`, returning the advanced position; `None` when it cannot match. Only
-/// called from the iterative repeat fast path, where the atom consumes
-/// exactly one character (never zero-width, never multi-character).
-fn single_atom_match(ctx: &Ctx<'_>, node: &Node, pos: usize, dir: i32) -> Option<usize> {
+/// All the ways a single atom (literal, dot, or character class — including
+/// its `\q{…}` string members) matches at `pos`: every endpoint the atom
+/// can advance to, in priority order (the matching alternative first, then
+/// the rest). A string class may match several alternatives at one position
+/// (`[\q{a|ab}]` at "ab" matches both "a" and "ab"), and the repeat fast
+/// path explores them in order on backtrack. Returns an empty vector when
+/// the atom cannot match here.
+fn atom_match_ends(ctx: &Ctx<'_>, node: &Node, pos: usize, dir: i32) -> Vec<usize> {
     match node {
         Node::Char { cp, fold } => {
-            let (c, len) = read_char_dir(ctx, pos, dir)?;
+            let Some((c, len)) = read_char_dir(ctx, pos, dir) else {
+                return Vec::new();
+            };
             let c = if *fold {
                 canonicalize(ctx.unicode, c)
             } else {
                 c
             };
-            (c == *cp).then(|| advance(pos, dir, len))
+            if c == *cp {
+                vec![advance(pos, dir, len)]
+            } else {
+                Vec::new()
+            }
         }
         Node::Any { dot_all } => {
-            let (c, len) = read_char_dir(ctx, pos, dir)?;
-            (*dot_all || !unicode::is_line_terminator(c)).then(|| advance(pos, dir, len))
+            let Some((c, len)) = read_char_dir(ctx, pos, dir) else {
+                return Vec::new();
+            };
+            if *dot_all || !unicode::is_line_terminator(c) {
+                vec![advance(pos, dir, len)]
+            } else {
+                Vec::new()
+            }
         }
         Node::Class(class) => {
-            let (c, len) = read_char_dir(ctx, pos, dir)?;
-            class_matches(ctx, class, pos, c, dir).then(|| advance(pos, dir, len))
+            let mut ends = Vec::new();
+            // A string member (`\q{…}`) consumes its full code-unit length;
+            // a non-negated class tries the strings first, then the
+            // single-char membership test (negated classes never consume
+            // strings).
+            if !class.negated {
+                for string in &class.strings {
+                    if string_at_dir(ctx, pos, string, dir) {
+                        ends.push(advance(pos, dir, string_units(ctx, string)));
+                    }
+                }
+            }
+            if let Some((c, len)) = read_char_dir(ctx, pos, dir)
+                && class_matches(ctx, class, pos, c, dir)
+            {
+                ends.push(advance(pos, dir, len));
+            }
+            ends
         }
-        _ => None,
+        _ => Vec::new(),
     }
 }
 
@@ -653,6 +723,20 @@ fn string_at_dir(ctx: &Ctx<'_>, pos: usize, string: &[u32], dir: i32) -> bool {
         string_at(ctx, pos, string)
     } else {
         string_at_back(ctx, pos, string)
+    }
+}
+
+/// The code-unit length of a `\q{…}` string at match time: a non-BMP code
+/// point is two UTF-16 units in unicode mode, one in legacy mode (strings
+/// only arise under `/v`, which is unicode, but keep the legacy path total).
+fn string_units(ctx: &Ctx<'_>, string: &[u32]) -> usize {
+    if ctx.unicode {
+        string
+            .iter()
+            .map(|&cp| if cp > 0xFFFF { 2 } else { 1 })
+            .sum()
+    } else {
+        string.len()
     }
 }
 
