@@ -211,6 +211,9 @@ pub struct Agent {
     /// [[DateValue]] of Date instances, keyed by object identity (spec
     /// 21.4.3: ms since the epoch).
     pub date_data: std::collections::HashMap<u64, f64>,
+    /// The [[InitializedTemporal*]] records of Temporal instances, keyed by
+    /// object identity (the proposal-temporal internal slots).
+    pub temporal_data: std::collections::HashMap<u64, crate::builtins::temporal::TemporalRecord>,
     /// The RegExp internal state ([[OriginalSource]], [[OriginalFlags]],
     /// [[RegExpRecord]], [[RegExpMatcher]]) of RegExp instances, keyed by
     /// object identity (spec 22.2.5).
@@ -364,6 +367,7 @@ impl Agent {
             number_data: std::collections::HashMap::new(),
             bigint_data: std::collections::HashMap::new(),
             date_data: std::collections::HashMap::new(),
+            temporal_data: std::collections::HashMap::new(),
             regexp_data: std::collections::HashMap::new(),
             regexp_string_iter_data: std::collections::HashMap::new(),
             string_iter_data: std::collections::HashMap::new(),

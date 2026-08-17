@@ -461,9 +461,9 @@ and remain open.
 A sweep of the entire Date tree (`sweep.exe built-ins --filter 'Date*'`)
 reports **573 pass, 0 fail, 21 skip** of 594 fixtures: every runnable
 fixture passes (up from 507 pass / 74 fail). The skips are the standard
-taxonomy plus a new one: fixtures declaring `features: [Temporal]` (the
-`Date/prototype/toTemporalInstant` cluster) are skipped because Temporal is
-a stage-3 proposal, out of scope like Intl. Fixes in
+taxonomy plus the `Date/prototype/toTemporalInstant` cluster (8 fixtures
+declaring `features: [Temporal]`), skipped until the Temporal namespace
+completes — see the Temporal cluster sweep below. Fixes in
 `crates/runtime/src/builtins/date.rs` and the harness:
 
 - **`Date.prototype[@@toPrimitive]` was missing** — unary `+`/binary `+`/
@@ -1403,6 +1403,52 @@ across the VM, the parser, and the built-ins:
 - **SuppressedError** — own properties are created in the spec order
   (message, error, suppressed).
 
+### Temporal cluster sweep (Phase 18 conformance)
+
+Temporal is a stage-4 proposal being implemented cluster by cluster. A
+sweep of the `Temporal/*` tree (`sweep.exe built-ins --filter
+'Temporal/*'`) reports **1,060 pass, 0 fail, 3,543 skip** of 4,603
+fixtures (the whole namespace previously sat behind the
+`features: [Temporal]` gate). Implemented and passing: **Duration,
+Instant, Now, the root-level namespace, and the `toStringTag`
+fixtures**. Skipped: the **PlainDate, PlainTime, PlainDateTime,
+YearMonth, MonthDay, and ZonedDateTime** clusters, plus 16 Duration
+fixtures that rely on Plain*/ZonedDateTime arithmetic (or the full
+namespace) beyond what the shell implements. Fixes in
+`crates/runtime/src/builtins/temporal/`:
+
+- **ISO parsing (`iso.rs`)** — duplicate `u-ca` annotations are allowed
+  (first wins) unless any is critical; lowercase duration designators
+  (`p1y1m1dt1h1m1s`) parse; fractions are only valid after seconds in
+  date-times (`05:07.123` is a RangeError); `[+Zoned]` requires an
+  annotation while `[~Zoned]` rejects a `Z` offset; the raw offset text
+  is preserved (`-07:00:00` stays invalid as a time zone);
+  `parse_time_zone_identifier` IANA names must start with an
+  alpha/`.`/`_` character; and 1000-digit duration strings use checked
+  arithmetic.
+- **Options and units (`mod.rs`)** — `GetOptionsObject` rejects every
+  non-object; `get_temporal_unit` accepts all units plus `auto` with the
+  unit-group validation moved to call sites *after* all options are
+  read, fixing the order-of-operations fixtures (including the double
+  `largestUnit` read in `GetDifferenceSettings`).
+- **Instant/duration math (`instant.rs`, `duration.rs`)** —
+  `ToTemporalInstant` handles functions via ToPrimitive;
+  `Instant.prototype.equals` brand-checks `this`; `is_valid_duration`
+  uses saturating u128; `divide_rounded` normalizes to 54 bits and
+  rounds half-even with a sticky bit (4 precision fixtures); and the
+  nudge-to-calendar-unit total is a single correctly-rounded integer
+  division with the sign as num XOR den.
+- **relativeTo limits** — `Duration.compare` resolves relativeTo before
+  the equal-durations early return; the plain relativeTo checks
+  ISODateWithinLimits at noon and the zoned path CheckISODaysRange on
+  the wall date + instant epoch range; `total()` validates its plain
+  date-time and the ±1-day zoned day-total boundary; the relativeTo
+  offset converts via ToPrimitive (non-string TypeError).
+- **Harness** — failure messages name the thrown value (was "Uncaught
+  Object(Object#N)"); `temporalHelpers.js` is an allowed include; and
+  the 16 content-skips above are mirrored exactly in
+  `tools/skip_tally.js`.
+
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
 Beyond the vendored fixtures, ~136 edge-case unit tests were added across
@@ -1482,7 +1528,7 @@ The harness's skip taxonomy (also used by the sweep):
 
 | Skip category | Reason |
 |---|---|
-| `features: [Temporal]` | Temporal is a stage-3 proposal, not part of ECMA-262 ES2026 (out of scope like Intl). |
+| `features: [Temporal]` (unimplemented clusters) | Temporal is a stage-4 proposal under implementation: the Duration/Instant/Now/namespace/toStringTag clusters run; the Plain*/ZonedDateTime/YearMonth/MonthDay clusters and 16 Duration fixtures are skipped until implemented. |
 | `features: [await-dictionary]` | `Promise.allKeyed`/`allSettledKeyed` (the await-dictionary stage-3 proposal) are not part of ECMA-262 ES2026. |
 | `features: [ShadowRealm]` | ShadowRealm is a stage-3 proposal, not part of ECMA-262 ES2026. |
 | `features: [source-phase-imports]` | `import.source()` is a stage-3 proposal, not part of ECMA-262 ES2026. |
@@ -1518,14 +1564,17 @@ closed last.
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 23,690 | 0 | 34 | 0 | 100.0% |
-| built-ins | 23,812 | 19,036 | 0 | 4,776 | 0 | 100.0% |
+| built-ins | 23,812 | 20,096 | 0 | 3,716 | 0 | 100.0% |
 | annexB | 1,086 | 1,086 | 0 | 0 | 0 | 100.0% |
-| **Total** | **48,622** | **43,812** | **0** | **4,810** | **0** | **100.0%** |
+| **Total** | **48,622** | **44,872** | **0** | **3,750** | **0** | **100.0%** |
 
-(Runnable = pass + fail + hang; the 4,810 skips are the unsupported harness
-includes, the TCO (`tcoHelper`) fixtures, the `temporalHelpers` includes, and
-the out-of-scope Temporal, await-dictionary, and ShadowRealm proposal
-fixtures.) The module loader was un-skipped (the `flags: [module]`
+(Runnable = pass + fail + hang; the 3,750 skips are the unimplemented
+Temporal clusters (3,543 in `Temporal/*` plus the 8 `Date/toTemporalInstant`
+fixtures), the out-of-scope await-dictionary and ShadowRealm proposal
+fixtures, the TCO (`tcoHelper`) fixtures, and the `temporalHelpers` includes.
+The implemented Temporal clusters — Duration, Instant, Now, the root-level
+namespace, and toStringTag — moved 1,060 fixtures from skip to pass.) The
+module loader was un-skipped (the `flags: [module]`
 fixtures now run through the real source-text-module machinery — parse,
 link, DFS evaluation, top-level await, dynamic import, and `import.meta`),
 then the source-phase-imports (`import.source()`), import-defer
@@ -1672,11 +1721,13 @@ Object.fromEntries, JSON.stringify, DataView, Object statics/
 constructor, Promise, Atomics, and the final Array/generator, Throw-
 TypeError, WeakRef/FinalizationRegistry, Uint8Array base64/hex, Set
 set-methods, JSON/parse, TypedArray BigInt, String, and SuppressedError
-closures (all 0 fail). The 4,776 built-ins skips are dominated by the
-out-of-scope Temporal proposal (4,611), await-dictionary (89), and
-ShadowRealm (64), with the `tcoHelper` (34), `temporalHelpers` (12)
-includes making up the rest — the atomicsHelper (112) and CanBlockIsTrue
-(7) clusters now run.
+closures (all 0 fail). The 3,716 built-ins skips are the unimplemented
+Temporal clusters (3,543 in `Temporal/*` plus 8 `Date/toTemporalInstant`
+fixtures; the Duration/Instant/Now/namespace/toStringTag clusters now
+run and pass — 1,060 fixtures), await-dictionary (89), and ShadowRealm
+(64), with the `tcoHelper` (34) and `temporalHelpers` (12) includes
+making up the rest — the atomicsHelper (112) and CanBlockIsTrue (7)
+clusters now run.
 
 ¹ The 3 built-ins hangs recorded earlier were the
 `TypedArray/prototype/copyWithin` coerced-values fixtures — 10,000-element
@@ -1831,13 +1882,12 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 
 ## Open items
 
-- All three areas now measure **100% of runnable**: 23,690 + 19,036 + 1,086
+- All three areas now measure **100% of runnable**: 23,690 + 20,096 + 1,086
   pass / 0 fail / 0 crash / 0 hang of 23,724 + 23,812 + 1,086 fixtures
-  (out-of-scope Temporal, await-dictionary, and ShadowRealm proposal
-  fixtures and the `tcoHelper`/`temporalHelpers` includes skipped,
-  `--timeout 120
-  --recheck-timeout 120`, release build) — the plan's ≥95%
-  runnable-pass-rate target is met. The language area closed its 2,048
+  (the unimplemented Temporal clusters, the await-dictionary and
+  ShadowRealm proposal fixtures, and the `tcoHelper`/`temporalHelpers`
+  includes skipped, `--timeout 120 --recheck-timeout 120`, release
+  build) — the plan's ≥95% runnable-pass-rate target is met. The language area closed its 2,048
   failures via the eval-caller-context, field-initializer, and Annex B
   work described in the Full-suite sweep section; the final async-test
   gaps (`Array.fromAsync`, `for await`, and the dynamic-import cycle)
@@ -1855,7 +1905,9 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
   closed last (119/119 — the `$262.agent` worker-thread host API, the
   *"ok"* notify semantics for `Atomics.wait`, and the cross-thread
   `waitAsync` resolution), leaving the 34 language skips as the TCO
-  fixtures only (43,812 pass / 4,810 skip total).
+  fixtures only (44,872 pass / 3,750 skip total; the Temporal core
+  clusters — Duration, Instant, Now, the namespace, toStringTag —
+  moved 1,060 fixtures from skip to pass since).
   Note: the TypedArray sweep should be run with the long deadline
   (`--timeout 120 --recheck-timeout 120`) — the O(n²) property store
   makes the 10,000-element crash-test fixtures take ~45s, which the

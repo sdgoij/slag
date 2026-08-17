@@ -1187,6 +1187,7 @@ fn builtin_dispatch_at(
         36 => crate::builtins::module_source::dispatch_call(agent, callee, this, args),
         37 => crate::module::dispatch_deferred_module_then(agent, callee, this, args),
         38 => crate::module::dispatch_deferred_module_wait(agent, callee, args),
+        39 => crate::builtins::temporal::dispatch_call(agent, callee, this, args),
         _ => None,
     }
 }
@@ -1199,7 +1200,7 @@ fn resolve_builtin_dispatch(
     this: &Value,
     args: &[Value],
 ) -> (u8, Option<Result<Value, JsError>>) {
-    for index in 1..=38 {
+    for index in 1..=39 {
         let result = builtin_dispatch_at(agent, index, callee, this, args);
         if result.is_some() {
             return (index, result);
@@ -1391,6 +1392,11 @@ fn construct_inner(
                 }
                 if let Some(result) =
                     crate::builtins::proxy::dispatch_construct(agent, callee, args, new_target)
+                {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::builtins::temporal::dispatch_construct(agent, callee, args, new_target)
                 {
                     return result;
                 }

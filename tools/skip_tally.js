@@ -29,6 +29,7 @@ const ALLOWED_INCLUDES = new Set([
   "resizableArrayBufferUtils.js",
   "regExpUtils.js",
   "atomicsHelper.js",
+  "temporalHelpers.js",
 ]);
 
 const AREAS = [
@@ -37,7 +38,7 @@ const AREAS = [
   ["annexB", "test262/test/annexB"],
 ];
 
-function classify(source) {
+function classify(file, source) {
   let frontmatter = "";
   const start = source.indexOf("/*---");
   if (start >= 0) {
@@ -67,7 +68,39 @@ function classify(source) {
       for (const item of list("includes:")) includes.push(item);
     }
   }
-  if (features.has("Temporal")) return "Temporal";
+  if (features.has("Temporal")) {
+    // Mirrors run_fixture: only the implemented clusters run; the rest of
+    // the Temporal namespace stays skipped, along with the Duration
+    // fixtures that rely on Plain*/ZonedDateTime arithmetic (or the full
+    // namespace) beyond what the shell implements.
+    const rest = file.split("/Temporal/")[1] ?? "";
+    const implemented =
+      rest.startsWith("Duration/") ||
+      rest.startsWith("Instant/") ||
+      rest.startsWith("Now/") ||
+      rest.startsWith("toStringTag/") ||
+      !rest.includes("/");
+    if (!implemented) return "Temporal type not yet implemented";
+    const skipped = [
+      "getOwnPropertyNames.js",
+      "Duration/compare/calendar-temporal-object.js",
+      "Duration/prototype/round/calendar-temporal-object.js",
+      "Duration/prototype/total/calendar-temporal-object.js",
+      "Duration/prototype/round/exact-multiple-of-larger-unit-plaindate.js",
+      "Duration/prototype/round/exact-multiple-of-larger-unit-zoned.js",
+      "Duration/prototype/round/next-day-out-of-range.js",
+      "Duration/prototype/round/relativeto-rounding-date.js",
+      "Duration/prototype/round/roundingincrement-days-large.js",
+      "Duration/prototype/round/roundingincrement-non-integer.js",
+      "Duration/prototype/total/relativeto-duration-out-of-range-added-to-relative-date.js",
+      "Duration/prototype/total/relativeto-plaindate-add24hourdaystonormalizedtimeduration-out-of-range.js",
+      "Duration/prototype/total/relativeto-plaindate-large-time-component-out-of-range.js",
+      "Duration/prototype/total/relativeto-total-of-each-unit.js",
+      "Duration/prototype/total/throws-if-date-time-invalid-with-plaindate-relative.js",
+      "Duration/prototype/total/throws-if-date-time-invalid-with-zoneddatetime-relative.js",
+    ];
+    if (skipped.includes(rest)) return "requires Plain*/ZonedDateTime beyond the shell";
+  }
   if (features.has("await-dictionary")) return "await-dictionary";
   if (features.has("ShadowRealm")) return "ShadowRealm";
   const unsupported = includes.filter((item) => !ALLOWED_INCLUDES.has(item)).sort();
@@ -100,7 +133,7 @@ for (const [area, root] of AREAS) {
   const files = walk(root, []);
   const tally = new Map();
   for (const file of files) {
-    const reason = classify(fs.readFileSync(file));
+    const reason = classify(file, fs.readFileSync(file, "utf8"));
     tally.set(reason, (tally.get(reason) ?? 0) + 1);
   }
   console.log(`== ${area}: ${files.length} fixtures`);

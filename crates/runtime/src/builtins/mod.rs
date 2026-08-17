@@ -30,5 +30,6 @@ pub mod reflect;
 pub mod regexp;
 pub mod string;
 pub mod symbol;
+pub mod temporal;
 pub mod typed_array;
 pub mod weakref;

@@ -208,6 +208,7 @@ fn set_default_global_bindings(realm: &Handle<Realm>) -> Result<(), JsError> {
     crate::builtins::disposable::install(realm)?;
     crate::builtins::proxy::install(realm)?;
     crate::builtins::reflect::install(realm)?;
+    crate::builtins::temporal::install(realm)?;
     // ES2022+: every built-in iterator prototype object inherits
     // %Iterator.prototype%, which installs after them. Re-parent them now
     // that the whole table is populated.
