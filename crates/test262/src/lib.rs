@@ -12391,15 +12391,28 @@ var $DONE = function (error) {
         };
         if fm.features.iter().any(|f| f == "Temporal") {
             // Implemented clusters: Duration, Instant, Now, the root-level
-            // namespace fixtures, and the toStringTag fixtures. The Plain*
-            // and ZonedDateTime clusters stay skipped until implemented.
+            // namespace fixtures, the toStringTag fixtures, and the Plain*
+            // clusters (PlainDate, PlainTime, PlainDateTime). The ZonedDateTime
+            // and remaining PlainYearMonth/PlainMonthDay clusters stay skipped
+            // until implemented.
             let implemented = relative.starts_with("Temporal/Duration/")
                 || relative.starts_with("Temporal/Instant/")
                 || relative.starts_with("Temporal/Now/")
                 || relative.starts_with("Temporal/toStringTag/")
+                || relative.starts_with("Temporal/PlainDate/")
+                || relative.starts_with("Temporal/PlainTime/")
+                || relative.starts_with("Temporal/PlainDateTime/")
                 || !relative["Temporal/".len()..].contains('/');
             if !implemented {
                 return FixtureResult::Skip("Temporal type not yet implemented".into());
+            }
+            // The PlainDate/PlainTime/PlainDateTime toLocaleString clusters
+            // need Intl.DateTimeFormat (ECMA-402, out of scope like Intl).
+            if relative.starts_with("Temporal/PlainDate/prototype/toLocaleString/")
+                || relative.starts_with("Temporal/PlainTime/prototype/toLocaleString/")
+                || relative.starts_with("Temporal/PlainDateTime/prototype/toLocaleString/")
+            {
+                return FixtureResult::Skip("Intl is out of scope".into());
             }
             // A handful of Duration fixtures rely on Plain*/ZonedDateTime
             // arithmetic (or the full namespace) beyond what the shell

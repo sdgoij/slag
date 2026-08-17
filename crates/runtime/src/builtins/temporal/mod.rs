@@ -41,6 +41,8 @@ pub enum TemporalRecord {
     PlainDate([i64; 3]),
     PlainTime([i64; 6]),
     PlainDateTime([i64; 9]),
+    YearMonth([i64; 3]),
+    MonthDay([i64; 3]),
 }
 
 pub fn placeholder(name: &'static str) -> NativeFn {
@@ -215,6 +217,8 @@ pub enum RecordKind {
     PlainDate,
     PlainTime,
     PlainDateTime,
+    YearMonth,
+    MonthDay,
 }
 
 fn record_kind(record: &TemporalRecord) -> RecordKind {
@@ -225,6 +229,8 @@ fn record_kind(record: &TemporalRecord) -> RecordKind {
         TemporalRecord::PlainDate(_) => RecordKind::PlainDate,
         TemporalRecord::PlainTime(_) => RecordKind::PlainTime,
         TemporalRecord::PlainDateTime(_) => RecordKind::PlainDateTime,
+        TemporalRecord::YearMonth(_) => RecordKind::YearMonth,
+        TemporalRecord::MonthDay(_) => RecordKind::MonthDay,
     }
 }
 
@@ -246,6 +252,8 @@ pub fn kind_name(kind: RecordKind) -> &'static str {
         RecordKind::PlainDate => "PlainDate",
         RecordKind::PlainTime => "PlainTime",
         RecordKind::PlainDateTime => "PlainDateTime",
+        RecordKind::YearMonth => "PlainYearMonth",
+        RecordKind::MonthDay => "PlainMonthDay",
     }
 }
 
@@ -328,7 +336,7 @@ pub fn get_rounding_mode(
     Ok(RoundingMode::parse(&value.unwrap()).unwrap())
 }
 
-/// GetRoundingIncrementOption (spec 14.5.2.3).
+/// GetTemporalRoundingIncrementOption (spec 14.5.2.3).
 pub fn get_rounding_increment(agent: &mut Agent, options: &Value) -> Result<i64, JsError> {
     let value = crate::context::get_property(
         agent,
@@ -347,6 +355,86 @@ pub fn get_rounding_increment(agent: &mut Agent, options: &Value) -> Result<i64,
         ));
     }
     Ok(integer)
+}
+
+/// GetTemporalOverflowOption (spec 13.18): "constrain" (default) or "reject".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overflow {
+    Constrain,
+    Reject,
+}
+
+pub fn get_temporal_overflow_option(
+    agent: &mut Agent,
+    options: &Value,
+) -> Result<Overflow, JsError> {
+    let value = get_option(
+        agent,
+        options,
+        "overflow",
+        &["constrain", "reject"],
+        Some("constrain"),
+    )?;
+    Ok(if value.as_deref() == Some("reject") {
+        Overflow::Reject
+    } else {
+        Overflow::Constrain
+    })
+}
+
+/// spec 13.18 GetTemporalDisambiguationOption. The value is validated and
+/// discarded: only UTC and fixed-offset time zones are supported, which never
+/// have multiple possible instants.
+pub fn get_temporal_disambiguation_option(
+    agent: &mut Agent,
+    options: &Value,
+) -> Result<(), JsError> {
+    get_option(
+        agent,
+        options,
+        "disambiguation",
+        &["compatible", "earlier", "later", "reject"],
+        Some("compatible"),
+    )?;
+    Ok(())
+}
+
+/// The unit groups of ValidateTemporalUnitValue (spec 13.21).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnitGroup {
+    Date,
+    Time,
+    DateTime,
+}
+
+/// ValidateTemporalUnitValue (spec 13.21) at the call sites, after all options
+/// are read (the read-before-validate order of the fixtures).
+pub fn validate_unit_group(unit: Unit, group: UnitGroup) -> Result<(), JsError> {
+    let allowed = match group {
+        UnitGroup::Date => matches!(unit, Unit::Year | Unit::Month | Unit::Week | Unit::Day),
+        UnitGroup::Time => matches!(
+            unit,
+            Unit::Hour
+                | Unit::Minute
+                | Unit::Second
+                | Unit::Millisecond
+                | Unit::Microsecond
+                | Unit::Nanosecond
+        ),
+        UnitGroup::DateTime => true,
+    };
+    if allowed {
+        return Ok(());
+    }
+    let group = match group {
+        UnitGroup::Date => "date",
+        UnitGroup::Time => "time",
+        UnitGroup::DateTime => "datetime",
+    };
+    Err(JsError::new(
+        ErrorKind::RangeError,
+        format!("{} is not allowed as a {group} unit", unit_to_string(unit)),
+    ))
 }
 
 /// GetTemporalFractionalSecondDigitsOption (spec 13.15).
@@ -1264,7 +1352,11 @@ fn relative_to_object(agent: &mut Agent, item: &Value) -> Result<RelativeTo, JsE
     Ok(RelativeTo::Zoned(epoch, time_zone))
 }
 
-fn resolve_iso_month(
+/// Resolve an ISO month number from an optional `month` and `monthCode`
+/// (the resolveNonLunisolarMonth step for iso8601): a monthCode is validated
+/// against the `M01`-`M12` forms (no leap months) and checked against a
+/// concurrent `month`.
+pub fn resolve_iso_month(
     month: Option<i64>,
     month_code: Option<String>,
 ) -> Result<Option<i64>, JsError> {

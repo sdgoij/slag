@@ -768,9 +768,14 @@ fn total(agent: &mut Agent, this: &Value, total_of: &Value) -> Result<Value, JsE
                 ));
             }
             if iso::is_calendar_unit(unit) {
+                // DifferencePlainDateTimeWithTotal (spec 5.5.14): balance the
+                // origin → target difference with the calendar first, then
+                // total the balanced duration — nudging the raw duration can
+                // straddle a window boundary and produce a spurious fraction.
+                let diff = difference_iso_date_time(origin, target, unit);
                 nudge_to_calendar_unit_total(
-                    internal_duration_sign(&internal24),
-                    internal24,
+                    internal_duration_sign(&diff),
+                    diff,
                     origin_ns,
                     dest_ns,
                     origin,
@@ -1128,7 +1133,7 @@ pub fn round_relative_duration(
     Ok(())
 }
 
-fn internal_duration_sign(d: &super::InternalDuration) -> i64 {
+pub fn internal_duration_sign(d: &super::InternalDuration) -> i64 {
     for v in d.date {
         if v < 0.0 {
             return -1;
@@ -1157,13 +1162,8 @@ fn nudge_to_day_or_time(
 ) -> Result<(super::InternalDuration, bool, i128), JsError> {
     let time_duration =
         super::add_24_hour_days_to_time_duration(duration.time, duration.date[3] as i128)?;
-    let unit_length = smallest_unit.length_ns().unwrap();
-    let rounded_time = super::round_time_duration(
-        time_duration,
-        increment * unit_length as i64,
-        Unit::Nanosecond,
-        rounding_mode,
-    )?;
+    let rounded_time =
+        super::round_time_duration(time_duration, increment, smallest_unit, rounding_mode)?;
     let diff_time = super::add_time_duration(rounded_time, -time_duration)?;
     let whole_days = time_duration / iso::NS_PER_DAY;
     let rounded_whole_days = rounded_time / iso::NS_PER_DAY;
@@ -1186,6 +1186,31 @@ fn nudge_to_day_or_time(
         did_expand,
         nudged_ns,
     ))
+}
+
+/// CalendarDateAdd with the spec's RejectDateRange on the result (the nudge
+/// machinery applies it to every intermediate window boundary).
+#[allow(clippy::too_many_arguments)]
+fn calendar_date_add_checked(
+    year: i64,
+    month: i64,
+    day: i64,
+    years: i64,
+    months: i64,
+    weeks: i64,
+    days: i64,
+    constrain: bool,
+) -> Result<(i64, i64, i64), JsError> {
+    let result = iso::calendar_date_add(year, month, day, years, months, weeks, days, constrain)
+        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "date out of range".into()))?;
+    let epoch_days = iso::iso_date_to_epoch_days(result.0, result.1 - 1, result.2);
+    if !(-100_000_001..=100_000_000).contains(&epoch_days) {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "date out of range".into(),
+        ));
+    }
+    Ok(result)
 }
 
 /// spec 7.5.33 ComputeNudgeWindow.
@@ -1241,7 +1266,7 @@ fn compute_nudge_window(
         }
         Unit::Week => {
             let years_months = [duration.date[0], duration.date[1], 0.0, 0.0];
-            let weeks_start = iso::calendar_date_add(
+            let weeks_start = calendar_date_add_checked(
                 iso_date_time.0,
                 iso_date_time.1,
                 iso_date_time.2,
@@ -1250,8 +1275,7 @@ fn compute_nudge_window(
                 0,
                 0,
                 true,
-            )
-            .ok_or_else(|| JsError::new(ErrorKind::RangeError, "date out of range".into()))?;
+            )?;
             let weeks_end = iso::add_days_to_iso_date(
                 weeks_start.0,
                 weeks_start.1,
@@ -1299,10 +1323,10 @@ fn compute_nudge_window(
             )
         }
     };
-    let start_epoch_ns = if r1 == 0 {
+    let start_epoch_ns = if start_date.iter().all(|&v| v == 0.0) {
         origin_epoch_ns
     } else {
-        let start = iso::calendar_date_add(
+        let start = calendar_date_add_checked(
             iso_date_time.0,
             iso_date_time.1,
             iso_date_time.2,
@@ -1311,8 +1335,7 @@ fn compute_nudge_window(
             start_date[2] as i64,
             start_date[3] as i64,
             true,
-        )
-        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "date out of range".into()))?;
+        )?;
         let dt = (
             start.0,
             start.1,
@@ -1326,7 +1349,7 @@ fn compute_nudge_window(
         );
         date_time_epoch(dt, time_zone)?
     };
-    let end = iso::calendar_date_add(
+    let end = calendar_date_add_checked(
         iso_date_time.0,
         iso_date_time.1,
         iso_date_time.2,
@@ -1335,8 +1358,7 @@ fn compute_nudge_window(
         end_date[2] as i64,
         end_date[3] as i64,
         true,
-    )
-    .ok_or_else(|| JsError::new(ErrorKind::RangeError, "date out of range".into()))?;
+    )?;
     let end_dt = (
         end.0,
         end.1,
@@ -1455,20 +1477,25 @@ fn nudge_to_calendar_unit(
     // roundedUnit = |total| rounded to |r1| or |r2|.
     let (abs_r1, abs_r2) = (r1.abs(), r2.abs());
     let total_abs_num = total_num.abs();
-    let total_abs_den = total_den;
+    let total_abs_den = total_den.abs();
     let cmp = total_abs_num.cmp(&(abs_r2 * total_abs_den));
     let progress_cmp = match cmp {
         std::cmp::Ordering::Equal => 0,
         std::cmp::Ordering::Greater => 1,
         std::cmp::Ordering::Less => -1,
     };
-    let rounded_unit = if progress_cmp == 0 {
+    let rounded_unit = if num == 0 {
+        // Exactly at the window start: r1 wins for every mode (the polyfill's
+        // numerator.isZero() check precedes ApplyUnsignedRoundingMode).
+        abs_r1
+    } else if progress_cmp == 0 {
         abs_r2
     } else {
+        let even = (abs_r1 / increment as i128) % 2 == 0;
         let (d1_num, d1_den) = diff_frac(total_abs_num, total_abs_den, abs_r1);
         let (d2_num, d2_den) = diff_frac2(abs_r2, total_abs_num, total_abs_den);
         // apply_unsigned_frac returns 1 when r2 wins, 0 when r1 wins.
-        if apply_unsigned_frac(d1_num, d1_den, d2_num, d2_den, unsigned) == 1 {
+        if apply_unsigned_frac(d1_num, d1_den, d2_num, d2_den, unsigned, even) == 1 {
             abs_r2
         } else {
             abs_r1
@@ -1499,6 +1526,7 @@ fn apply_unsigned_frac(
     d2_num: i128,
     d2_den: i128,
     mode: Unsigned,
+    even: bool,
 ) -> i128 {
     // Returns 1 when r2 wins, 0 when r1 wins.
     match mode {
@@ -1514,6 +1542,14 @@ fn apply_unsigned_frac(
             } else {
                 match mode {
                     Unsigned::HalfInfinity => 1,
+                    // Half-even breaks the tie on the cardinality of r1.
+                    Unsigned::HalfEven => {
+                        if even {
+                            0
+                        } else {
+                            1
+                        }
+                    }
                     _ => 0,
                 }
             }
@@ -1579,7 +1615,7 @@ fn nudge_to_zoned_time(
 ) -> Result<(super::InternalDuration, bool, i128), JsError> {
     let offset = super::offset_time_zone_offset_ns(tz)
         .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
-    let start = iso::calendar_date_add(
+    let start = calendar_date_add_checked(
         iso_date_time.0,
         iso_date_time.1,
         iso_date_time.2,
@@ -1588,8 +1624,7 @@ fn nudge_to_zoned_time(
         duration.date[2] as i64,
         duration.date[3] as i64,
         true,
-    )
-    .ok_or_else(|| JsError::new(ErrorKind::RangeError, "date out of range".into()))?;
+    )?;
     let start_epoch_ns = iso::get_utc_epoch_nanoseconds(
         start.0,
         start.1,
@@ -1614,22 +1649,11 @@ fn nudge_to_zoned_time(
         iso_date_time.8,
     ) - offset;
     let day_span = end_epoch_ns - start_epoch_ns;
-    let unit_length = unit.length_ns().unwrap();
-    let mut rounded = super::round_time_duration(
-        duration.time,
-        increment * unit_length as i64,
-        Unit::Nanosecond,
-        rounding_mode,
-    )?;
+    let mut rounded = super::round_time_duration(duration.time, increment, unit, rounding_mode)?;
     let beyond = rounded - day_span;
     let (did_round_beyond_day, day_delta, nudged) = if beyond.signum() != -(sign as i128) {
         let day_delta = sign;
-        rounded = super::round_time_duration(
-            beyond,
-            increment * unit_length as i64,
-            Unit::Nanosecond,
-            rounding_mode,
-        )?;
+        rounded = super::round_time_duration(beyond, increment, unit, rounding_mode)?;
         (true, day_delta, end_epoch_ns + rounded)
     } else {
         (false, 0, start_epoch_ns + rounded)
@@ -1684,7 +1708,7 @@ fn bubble_relative_duration(
                     0.0,
                 ],
             };
-            let end = iso::calendar_date_add(
+            let end = calendar_date_add_checked(
                 iso_date_time.0,
                 iso_date_time.1,
                 iso_date_time.2,
@@ -1693,8 +1717,7 @@ fn bubble_relative_duration(
                 end_duration[2] as i64,
                 end_duration[3] as i64,
                 true,
-            )
-            .ok_or_else(|| JsError::new(ErrorKind::RangeError, "date out of range".into()))?;
+            )?;
             let end_epoch = date_time_epoch(
                 (
                     end.0,

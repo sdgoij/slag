@@ -2200,7 +2200,12 @@ fn from_async(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
         };
         let mut iterator = None;
         let (is_array_like, len, items, array) = if using_async.is_some() || using_sync.is_some() {
-            iterator = Some(async_iterator_from(agent, &items)?);
+            // GetIterator with the already-obtained method: the spec reads
+            // @@asyncIterator / @@iterator once (Array.fromAsync step 3.b/
+            // 4.b) and passes the method into GetIterator, which must not
+            // re-read the property (the observer fixtures assert the exact
+            // read count).
+            iterator = Some(async_iterator_from(agent, &items, using_async, using_sync)?);
             // spec step 4: Construct(C) with no arguments (no @@species).
             let array = if is_constructor(this) {
                 crate::function::construct(agent, this, &[], this)?
@@ -2279,11 +2284,16 @@ fn from_async(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
     Ok(promise)
 }
 
-/// GetIterator for fromAsync: prefer @@asyncIterator, fall back to a
-/// @@iterator wrapped in an AsyncFromSyncIterator (spec 23.1.2.4.1 steps
-/// 10-11).
-fn async_iterator_from(agent: &mut Agent, items: &Value) -> Result<IteratorRecord, JsError> {
-    let async_method = get_method(agent, items, "@@asyncIterator")?;
+/// GetIterator for fromAsync: prefer the obtained @@asyncIterator, fall back
+/// to the obtained @@iterator wrapped in an AsyncFromSyncIterator (spec
+/// 23.1.2.4.1 steps 3-4; the methods come from the caller so the properties
+/// are read exactly once).
+fn async_iterator_from(
+    agent: &mut Agent,
+    items: &Value,
+    async_method: Option<Value>,
+    sync_method: Option<Value>,
+) -> Result<IteratorRecord, JsError> {
     if let Some(method) = async_method {
         let iterator = crate::function::call(agent, &method, items.clone(), &[])?;
         let next = get_property(
@@ -2300,7 +2310,6 @@ fn async_iterator_from(agent: &mut Agent, items: &Value) -> Result<IteratorRecor
         }
         return Ok(IteratorRecord { iterator, next });
     }
-    let sync_method = get_method(agent, items, "@@iterator")?;
     let Some(sync_method) = sync_method else {
         return Err(JsError::new(
             ErrorKind::TypeError,

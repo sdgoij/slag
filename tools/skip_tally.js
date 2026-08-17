@@ -79,8 +79,18 @@ function classify(file, source) {
       rest.startsWith("Instant/") ||
       rest.startsWith("Now/") ||
       rest.startsWith("toStringTag/") ||
+      rest.startsWith("PlainDate/") ||
+      rest.startsWith("PlainTime/") ||
+      rest.startsWith("PlainDateTime/") ||
       !rest.includes("/");
     if (!implemented) return "Temporal type not yet implemented";
+    if (
+      rest.startsWith("PlainDate/prototype/toLocaleString/") ||
+      rest.startsWith("PlainTime/prototype/toLocaleString/") ||
+      rest.startsWith("PlainDateTime/prototype/toLocaleString/")
+    ) {
+      return "Intl is out of scope";
+    }
     const skipped = [
       "getOwnPropertyNames.js",
       "Duration/compare/calendar-temporal-object.js",

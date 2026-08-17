@@ -1366,6 +1366,13 @@ impl<'a> Parser<'a> {
             }
         }
         if negated {
+            // spec 22.2.2: a negated /v class cannot contain string members
+            // (`\q{…}` or a strings property escape) — the complement of a
+            // set containing strings is a SyntaxError (the `*-negative-
+            // CharacterClass` property-of-strings fixtures).
+            if !class.strings.is_empty() {
+                return Err(self.error("Invalid character class"));
+            }
             class.negate();
         }
         if self.ignore_case {

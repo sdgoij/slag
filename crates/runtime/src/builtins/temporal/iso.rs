@@ -535,6 +535,33 @@ pub fn parse_iso_date_time(text: &[u16], format: Format) -> Result<ParsedDateTim
     let month;
     let day;
 
+    // Time-only form for TemporalTimeString: an optional T/t prefix, then
+    // HH:MM[:SS[.f]] / HHMM[SS[.f]], with trailing offset/annotations. The Z
+    // designator is rejected in finish_parse (spec 13.34).
+    if format == Format::TimeString {
+        if matches!(cur.peek(), Some(CU_T) | Some(CU_T_LOWER)) {
+            cur.bump();
+        }
+        let t = parse_time(&mut cur)?;
+        return finish_parse(&mut cur, format, 1972, 1, 1, Some(t));
+    }
+
+    // Month-day forms `--MM-DD` / `--MMDD` / `MM-DD` / `MMDD` for
+    // TemporalMonthDayString (spec 13.33; the RFC 9557 short form, checked
+    // before the year forms because a leading digit would otherwise parse as a
+    // year).
+    if format == Format::MonthDayString {
+        cur.eat(CU_MINUS);
+        cur.eat(CU_MINUS);
+        month = cur.digits(2)?;
+        cur.eat(CU_MINUS);
+        day = cur.digits(2)?;
+        if !is_valid_month_day(month, day) {
+            return Err(ParseError::Invalid);
+        }
+        return finish_parse(&mut cur, format, 1972, month, day, None);
+    }
+
     // DateYear: 4 digits, or sign + 6 digits ("-000000" is an early error).
     match cur.peek() {
         Some(CU_PLUS) | Some(CU_MINUS) => {
@@ -549,18 +576,6 @@ pub fn parse_iso_date_time(text: &[u16], format: Format) -> Result<ParsedDateTim
         }
         Some(c) if is_digit(c) => {
             year = cur.digits(4)?;
-        }
-        // Month-day form: `--MM-DD` (or `MM-DD`) for TemporalMonthDayString.
-        _ if format == Format::MonthDayString => {
-            cur.eat(CU_MINUS);
-            cur.eat(CU_MINUS);
-            month = cur.digits(2)?;
-            cur.expect(CU_MINUS)?;
-            day = cur.digits(2)?;
-            if !is_valid_month_day(month, day) {
-                return Err(ParseError::Invalid);
-            }
-            return finish_parse(&mut cur, format, 1972, month, day, None);
         }
         _ => return Err(ParseError::Invalid),
     }
@@ -678,6 +693,10 @@ fn finish_parse(
     if format == Format::DateTimePlain && tz.z {
         return Err(ParseError::Invalid);
     }
+    // TemporalTimeString never accepts the Z designator (spec 13.34).
+    if format == Format::TimeString && tz.z {
+        return Err(ParseError::Invalid);
+    }
     Ok(ParsedDateTime {
         year,
         month,
@@ -726,12 +745,10 @@ fn parse_time(cur: &mut Cursor) -> Result<[i64; 6], ParseError> {
     if minute > 59 {
         return Err(ParseError::Invalid);
     }
-    // Leap second: `60` is valid only when the minute is 59, and clamps to
-    // 59 (spec 13.35 ParseISODateTime: "If secondMV = 60, set secondMV to 59").
+    // Leap second: `60` clamps to 59 regardless of the minute (spec 13.35
+    // ParseISODateTime: "If secondMV = 60, set secondMV to 59"; the
+    // PlainTime/from leap-second fixtures use e.g. 12:30:60).
     if second == 60 {
-        if minute != 59 {
-            return Err(ParseError::Invalid);
-        }
         second = 59;
     } else if second > 59 {
         return Err(ParseError::Invalid);
