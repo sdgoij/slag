@@ -447,6 +447,15 @@ pub enum Step {
     JumpIfTrueKeep(usize),
     JumpIfNullishKeep(usize),
     JumpIfNotNullishKeep(usize),
+    /// A `break` statement: route through any pending finallys, then jump to
+    /// `target` (spec 14.14.4).
+    Break {
+        target: usize,
+    },
+    /// A `continue` statement, routed through pending finallys.
+    Continue {
+        target: usize,
+    },
     Return,
     Throw,
     // ----- suspension -----
@@ -624,6 +633,10 @@ pub struct Vm {
     pub pending: Option<PendingControl>,
     pub thrown: Option<Value>,
     pub resume_abrupt: Option<ResumeAbrupt>,
+    /// Whether the innermost for-of is stepping its iterator (`ForOfNext`):
+    /// a `next()` error propagates without closing the iterator (spec
+    /// 14.7.6.2 uses `?`), unlike a body or head-binding error.
+    pub for_of_stepping: bool,
     /// In-progress for-in enumerations: the (prototype-level, key) pairs and
     /// the enumerated base object, so a key deleted during enumeration can be
     /// re-checked against its own level at visit time (spec
@@ -733,6 +746,7 @@ impl Vm {
             pending: None,
             thrown: None,
             resume_abrupt: None,
+            for_of_stepping: false,
             for_in_stack: Vec::new(),
             for_of_stack: Vec::new(),
             async_for_of_stack: Vec::new(),
@@ -832,14 +846,14 @@ impl Vm {
                 // the abrupt completion through the pattern, closing its
                 // iterators (spec 13.15.5.2 step 5 + 7.4.11).
                 self.close_destructures_abrupt(agent, false)?;
-                match self.throw_machinery(body, value)? {
+                match self.throw_machinery(agent, body, value)? {
                     CtlResult::Continue => self.run_inner(agent, body),
                     CtlResult::Done(outcome) => Ok(outcome),
                 }
             }
             Resume::Return(value) => {
                 match self.close_destructures_abrupt(agent, true) {
-                    Ok(()) => match self.control_transfer(body, Ctl::Return { value })? {
+                    Ok(()) => match self.control_transfer(agent, body, Ctl::Return { value })? {
                         CtlResult::Continue => self.run_inner(agent, body),
                         CtlResult::Done(outcome) => Ok(outcome),
                     },
@@ -886,6 +900,35 @@ impl Vm {
         }
     }
 
+    /// Close the active for-of iterators with a throw completion: the
+    /// original error wins, a throwing `return` (or `return` lookup) is
+    /// swallowed (spec 7.4.11 steps 6-7, mirroring the tree-walker's
+    /// eval_for_of error paths).
+    fn close_for_of_throw(&mut self, agent: &mut Agent) {
+        while let Some(iterator) = self.for_of_stack.pop() {
+            let _ = crate::expr::iterator_close_throw(agent, &iterator);
+        }
+    }
+
+    /// Close the active for-of iterators with a return completion: a throwing
+    /// `return` replaces the return (spec 7.4.6), later closes swallow.
+    fn close_for_of_return(&mut self, agent: &mut Agent) -> Result<(), JsError> {
+        let mut first_error: Option<JsError> = None;
+        while let Some(iterator) = self.for_of_stack.pop() {
+            if first_error.is_none() {
+                if let Err(e) = crate::expr::iterator_close(agent, &iterator) {
+                    first_error = Some(e);
+                }
+            } else {
+                let _ = crate::expr::iterator_close_throw(agent, &iterator);
+            }
+        }
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     fn run_inner(&mut self, agent: &mut Agent, body: &CompiledBody) -> Result<VmOutcome, JsError> {
         // Record the agent for the duration so crux-side ECMAScript calls
         // (proxy traps reached through property access) can find the runtime.
@@ -898,6 +941,38 @@ impl Vm {
                 // table so `catch` sees it, like the interpreter path. Without
                 // a covering handler the original error propagates untouched.
                 Err(error) => {
+                    // An error escaping a step while a destructuring pattern is
+                    // in progress closes the not-done iterators (spec
+                    // 13.15.5.2 step 5): the first throwing `return` replaces
+                    // the error (spec 7.4.11). The tree-walker's
+                    // array_assignment does the same on its error path.
+                    let mut error = error;
+                    if !self.destructure_stack.is_empty() {
+                        let mut close_error: Option<JsError> = None;
+                        while let Some(index) = self.destructure_stack.len().checked_sub(1) {
+                            let iterator = self.destructure_stack[index].clone();
+                            let done = self.destructure_done.get(index).copied().unwrap_or(false);
+                            if !done
+                                && let Err(e) = crate::expr::iterator_close_throw(agent, &iterator)
+                                && close_error.is_none()
+                            {
+                                close_error = Some(e);
+                            }
+                            self.destructure_stack.pop();
+                            self.destructure_done.pop();
+                        }
+                        self.destructure_obj_stack.clear();
+                        if let Some(e) = close_error {
+                            error = e;
+                        }
+                    }
+                    // An error escaping a for-of body or head closes the
+                    // active iterators (spec 14.7.6.2: a head-binding error or
+                    // abrupt body completion returns IteratorClose). A `next()`
+                    // error is exempt: it propagates with the iterator open.
+                    if !self.for_of_stepping {
+                        self.close_for_of_throw(agent);
+                    }
                     let covered = self.try_stack.iter().any(|frame| {
                         body.handlers.get(frame.handler).is_some_and(|handler| {
                             self.ip >= handler.start && self.ip < handler.try_end
@@ -1054,19 +1129,17 @@ impl Vm {
                     self.stack.push(value);
                 }
                 Step::GetSuperName { name } => {
-                    self.pop(); // base
+                    let base = self.pop();
                     let this = resolve_this_binding(agent)?;
-                    let base = get_super_base(agent)?;
                     let value =
                         crate::context::get_property(agent, &base, &crux::lookup(*name), this)?;
                     self.stack.push(value);
                 }
                 Step::GetSuperComputed => {
                     let key = self.pop();
-                    self.pop(); // base
+                    let base = self.pop();
                     let key = crate::context::to_property_key(agent, &key)?;
                     let this = resolve_this_binding(agent)?;
-                    let base = get_super_base(agent)?;
                     let value = crate::context::get_property_key(agent, &base, &key, this)?;
                     self.stack.push(value);
                 }
@@ -1141,8 +1214,8 @@ impl Vm {
                     } else {
                         None
                     };
-                    self.pop(); // base
-                    self.assign_super(agent, PropertyKeyName::Name(*name), old, value, *op)?;
+                    let base = self.pop();
+                    self.assign_super(agent, base, PropertyKeyName::Name(*name), old, value, *op)?;
                 }
                 Step::AssignSuperComputed { op } => {
                     let value = self.pop();
@@ -1152,9 +1225,9 @@ impl Vm {
                         None
                     };
                     let key = self.pop();
-                    self.pop(); // base
+                    let base = self.pop();
                     let key = crate::context::to_property_key(agent, &key)?;
-                    self.assign_super(agent, PropertyKeyName::Key(key.clone()), old, value, *op)?;
+                    self.assign_super(agent, base, PropertyKeyName::Key(key), old, value, *op)?;
                 }
                 Step::AssignPrivate { atom, op } => {
                     let value = self.pop();
@@ -1370,10 +1443,9 @@ impl Vm {
                 }
                 Step::ResolveSuperRefComputed => {
                     let key = self.pop();
-                    self.pop(); // base copy (recomputed from the environment)
+                    let base = self.pop();
                     let key = crate::context::to_property_key(agent, &key)?;
                     let this = resolve_this_binding(agent)?;
-                    let base = get_super_base(agent)?;
                     self.var_ref_stack.push(crate::context::Reference {
                         base: crate::context::ReferenceBase::Value(base),
                         name: key,
@@ -1494,18 +1566,18 @@ impl Vm {
                 }
                 Step::UpdateSuperName { name, op, prefix } => {
                     let old = self.pop();
-                    self.pop(); // base
+                    let base = self.pop();
                     let new = update_value(agent, op, &old)?;
-                    self.put_super(agent, PropertyKeyName::Name(*name), new.clone())?;
+                    self.put_super(agent, base, PropertyKeyName::Name(*name), new.clone())?;
                     self.stack.push(if *prefix { new } else { old });
                 }
                 Step::UpdateSuperComputed { op, prefix } => {
                     let old = self.pop();
                     let key = self.pop();
-                    self.pop(); // base
+                    let base = self.pop();
                     let new = update_value(agent, op, &old)?;
                     let key = crate::context::to_property_key(agent, &key)?;
-                    self.put_super(agent, PropertyKeyName::Key(key), new.clone())?;
+                    self.put_super(agent, base, PropertyKeyName::Key(key), new.clone())?;
                     self.stack.push(if *prefix { new } else { old });
                 }
                 Step::UpdatePrivate { atom, op, prefix } => {
@@ -1947,7 +2019,7 @@ impl Vm {
                     });
                 }
                 Step::Exit { after } => {
-                    match self.control_transfer(body, Ctl::Normal { after: *after })? {
+                    match self.control_transfer(agent, body, Ctl::Normal { after: *after })? {
                         CtlResult::Continue => continue,
                         CtlResult::Done(outcome) => return Ok(outcome),
                     }
@@ -1993,10 +2065,14 @@ impl Vm {
                     let env = new_declarative_environment(Some(old_env));
                     // The catch parameter binds in its own environment, so a
                     // default initializer's closure captures the parameter
-                    // (spec 15.1.7 step 7).
+                    // (spec 15.1.7 step 7). All the created environments go on
+                    // the stack so the body's LeaveBlock(s) unwind back to
+                    // `old_env` — otherwise the parameter environment would
+                    // stay active after the catch, leaking its bindings.
                     let body_env = match &param {
                         Some(param) => {
-                            let param_env = new_declarative_environment(Some(env));
+                            let param_env = new_declarative_environment(Some(env.clone()));
+                            self.env_stack.push(env);
                             let mut names = Vec::new();
                             crate::script::bound_names(param, &mut names);
                             for name in &names {
@@ -2016,6 +2092,7 @@ impl Vm {
                                 Some(&param_env),
                                 self.strict,
                             )?;
+                            self.env_stack.push(param_env.clone());
                             new_declarative_environment(Some(param_env))
                         }
                         None => env,
@@ -2053,7 +2130,7 @@ impl Vm {
                             Ctl::Throw { value }
                         }
                     };
-                    match self.control_transfer(body, ctl)? {
+                    match self.control_transfer(agent, body, ctl)? {
                         CtlResult::Continue => {}
                         CtlResult::Done(outcome) => return Ok(outcome),
                     }
@@ -2194,7 +2271,13 @@ impl Vm {
                         ));
                     };
                     let iterator = iterator.clone();
-                    match iterator_step(agent, &iterator)? {
+                    // A `next()` error propagates without closing the iterator
+                    // (spec 14.7.6.2 uses `?`): the flag suppresses the
+                    // error-path close in `run_inner`.
+                    self.for_of_stepping = true;
+                    let stepped = iterator_step(agent, &iterator);
+                    self.for_of_stepping = false;
+                    match stepped? {
                         Some(value) => self.stack.push(value),
                         None => {
                             self.for_of_stack.pop();
@@ -2375,16 +2458,28 @@ impl Vm {
                         self.stack.push(value);
                     }
                 }
+                Step::Break { target } => {
+                    match self.control_transfer(agent, body, Ctl::Break { target: *target })? {
+                        CtlResult::Continue => continue,
+                        CtlResult::Done(outcome) => return Ok(outcome),
+                    }
+                }
+                Step::Continue { target } => {
+                    match self.control_transfer(agent, body, Ctl::Continue { target: *target })? {
+                        CtlResult::Continue => continue,
+                        CtlResult::Done(outcome) => return Ok(outcome),
+                    }
+                }
                 Step::Return => {
                     let value = self.pop();
-                    match self.control_transfer(body, Ctl::Return { value })? {
+                    match self.control_transfer(agent, body, Ctl::Return { value })? {
                         CtlResult::Continue => continue,
                         CtlResult::Done(outcome) => return Ok(outcome),
                     }
                 }
                 Step::Throw => {
                     let value = self.pop();
-                    match self.throw_machinery(body, value)? {
+                    match self.throw_machinery(agent, body, value)? {
                         CtlResult::Continue => continue,
                         CtlResult::Done(outcome) => return Ok(outcome),
                     }
@@ -2657,7 +2752,11 @@ impl Vm {
                                         }
                                     };
                                     self.yield_star_stack.pop();
-                                    match self.control_transfer(body, Ctl::Return { value })? {
+                                    match self.control_transfer(
+                                        agent,
+                                        body,
+                                        Ctl::Return { value },
+                                    )? {
                                         CtlResult::Continue => continue,
                                         CtlResult::Done(outcome) => return Ok(outcome),
                                     }
@@ -2670,7 +2769,7 @@ impl Vm {
                                 // with the return completion carrying the
                                 // received value (spec 15.5.5 return case).
                                 self.yield_star_stack.pop();
-                                match self.control_transfer(body, Ctl::Return { value })? {
+                                match self.control_transfer(agent, body, Ctl::Return { value })? {
                                     CtlResult::Continue => continue,
                                     CtlResult::Done(outcome) => return Ok(outcome),
                                 }
@@ -2747,7 +2846,7 @@ impl Vm {
                             // spec 15.5.5 return case: a done return result
                             // completes the body with a return completion of
                             // its value.
-                            match self.control_transfer(body, Ctl::Return { value })? {
+                            match self.control_transfer(agent, body, Ctl::Return { value })? {
                                 CtlResult::Continue => continue,
                                 CtlResult::Done(outcome) => return Ok(outcome),
                             }
@@ -2891,7 +2990,7 @@ impl Vm {
             Ok(value) => value,
             Err(_) => error_message_value(&error),
         };
-        match self.throw_machinery(body, value)? {
+        match self.throw_machinery(agent, body, value)? {
             CtlResult::Continue => self.run_inner(agent, body),
             CtlResult::Done(outcome) => Ok(outcome),
         }
@@ -2941,10 +3040,12 @@ impl Vm {
                             None
                         }
                         Completion::Empty => None,
-                        Completion::Throw(value) => match self.throw_machinery(body, value)? {
-                            CtlResult::Continue => None,
-                            CtlResult::Done(outcome) => Some(outcome),
-                        },
+                        Completion::Throw(value) => {
+                            match self.throw_machinery(agent, body, value)? {
+                                CtlResult::Continue => None,
+                                CtlResult::Done(outcome) => Some(outcome),
+                            }
+                        }
                         _ => {
                             return Err(JsError::new(
                                 ErrorKind::SyntaxError,
@@ -3124,12 +3225,12 @@ impl Vm {
     fn assign_super(
         &mut self,
         agent: &mut Agent,
+        base: Value,
         key: PropertyKeyName,
         old: Option<Value>,
         value: Value,
         op: AssignOp,
     ) -> Result<(), JsError> {
-        let base = get_super_base(agent)?;
         let this = resolve_this_binding(agent)?;
         match op {
             AssignOp::Assign
@@ -3159,10 +3260,10 @@ impl Vm {
     fn put_super(
         &mut self,
         agent: &mut Agent,
+        base: Value,
         key: PropertyKeyName,
         value: Value,
     ) -> Result<(), JsError> {
-        let base = get_super_base(agent)?;
         let this = resolve_this_binding(agent)?;
         let reference = super_reference(&base, &key, self.strict, &this);
         crate::context::put_value(agent, &reference, value)
@@ -3280,7 +3381,12 @@ impl Vm {
 
     /// The control-transfer machinery: route through pending finallys, then
     /// apply the control.
-    fn control_transfer(&mut self, body: &CompiledBody, ctl: Ctl) -> Result<CtlResult, JsError> {
+    fn control_transfer(
+        &mut self,
+        agent: &mut Agent,
+        body: &CompiledBody,
+        ctl: Ctl,
+    ) -> Result<CtlResult, JsError> {
         let ctl = ctl;
         loop {
             let decision = self.find_finally_frame(body, &ctl);
@@ -3324,6 +3430,15 @@ impl Vm {
                     self.try_stack.remove(index);
                 }
                 None => {
+                    // A return (or throw re-applied after a finally) leaving
+                    // the body closes the active for-of iterators, inner
+                    // first; a throwing `return` replaces the completion
+                    // (spec 7.4.6).
+                    if let Ctl::Return { .. } = ctl {
+                        self.close_for_of_return(agent)?;
+                    } else if let Ctl::Throw { .. } = ctl {
+                        self.close_for_of_throw(agent);
+                    }
                     return Ok(match ctl {
                         Ctl::Normal { after } => {
                             self.ip = after;
@@ -3378,7 +3493,12 @@ impl Vm {
     }
 
     /// The throw machinery: dispatch to a catch or route through finallys.
-    fn throw_machinery(&mut self, body: &CompiledBody, value: Value) -> Result<CtlResult, JsError> {
+    fn throw_machinery(
+        &mut self,
+        agent: &mut Agent,
+        body: &CompiledBody,
+        value: Value,
+    ) -> Result<CtlResult, JsError> {
         let value = value;
         loop {
             let decision = {
@@ -3387,12 +3507,19 @@ impl Vm {
                     let Some(handler) = body.handlers.get(frame.handler) else {
                         continue;
                     };
-                    if self.ip < handler.start || self.ip >= handler.try_end {
+                    // The frame covers the try region and its catch body (a
+                    // throw from the catch must still run the finally); only a
+                    // throw inside the try region itself dispatches to the
+                    // catch. The `+1` mirrors find_finally_frame: the Exit
+                    // step's ip is covered_end + 1.
+                    let covered_end = handler.catch.map(|c| c.end).unwrap_or(handler.try_end);
+                    if self.ip < handler.start || self.ip > covered_end + 1 {
                         continue;
                     }
+                    let in_try = self.ip < handler.try_end;
                     found = Some((
                         i,
-                        if handler.catch.is_some() {
+                        if in_try && handler.catch.is_some() {
                             ThrowAction::Catch
                         } else if handler.finally.is_some() {
                             ThrowAction::Finally
@@ -3451,6 +3578,7 @@ impl Vm {
                     self.try_stack.remove(index);
                 }
                 None => {
+                    self.close_for_of_throw(agent);
                     return Ok(CtlResult::Done(VmOutcome::Completed(Completion::Throw(
                         value,
                     ))));
@@ -3470,7 +3598,7 @@ impl Vm {
         error: JsError,
     ) -> Result<CtlResult, JsError> {
         let thrown = crate::promise::error_value(agent, &error);
-        self.throw_machinery(body, thrown)
+        self.throw_machinery(agent, body, thrown)
     }
 }
 
@@ -4255,6 +4383,8 @@ enum Fixup {
     JumpIfTrueKeep(usize, usize),
     JumpIfNullishKeep(usize, usize),
     JumpIfNotNullishKeep(usize, usize),
+    Break(usize, usize),
+    Continue(usize, usize),
     JumpIfChainShort(usize, usize),
     Exit(usize, usize),
     ForInNext(usize, usize),
@@ -4519,6 +4649,16 @@ impl Compiler {
                 }
                 Fixup::JumpIfNotNullishKeep(index, label) => {
                     self.steps[index] = Step::JumpIfNotNullishKeep(self.labels[&label]);
+                }
+                Fixup::Break(index, label) => {
+                    self.steps[index] = Step::Break {
+                        target: self.labels[&label],
+                    };
+                }
+                Fixup::Continue(index, label) => {
+                    self.steps[index] = Step::Continue {
+                        target: self.labels[&label],
+                    };
                 }
                 Fixup::JumpIfChainShort(index, label) => {
                     self.steps[index] = Step::JumpIfChainShort(self.labels[&label]);
@@ -4935,12 +5075,16 @@ impl Compiler {
             StmtKind::Break(label) => {
                 let (target, count) = self.break_target(label.as_ref())?;
                 self.leave_scopes(self.scope_count.saturating_sub(count));
-                self.jump(target);
+                let index = self.steps.len();
+                self.emit(Step::Break { target: 0 });
+                self.fixups.push(Fixup::Break(index, target));
             }
             StmtKind::Continue(label) => {
                 let (target, count) = self.continue_target(label.as_ref())?;
                 self.leave_scopes(self.scope_count.saturating_sub(count));
-                self.jump(target);
+                let index = self.steps.len();
+                self.emit(Step::Continue { target: 0 });
+                self.fixups.push(Fixup::Continue(index, target));
             }
             StmtKind::Switch {
                 discriminant,
@@ -5330,6 +5474,14 @@ impl Compiler {
             self.scope_count += 1;
             self.compile_statements(&handler.body.stmts)?;
             self.scope_count -= 1;
+            if handler.param.is_some() {
+                // CatchBind pushed the block env and the parameter env in
+                // addition to the body env: unwind the parameter chain before
+                // the body's own LeaveBlock restores the pre-catch
+                // environment.
+                self.emit(Step::LeaveBlock);
+                self.emit(Step::LeaveBlock);
+            }
             self.emit(Step::LeaveBlock);
             self.emit(Step::ListEnd);
             let exit_index = self.steps.len();
