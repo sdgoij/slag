@@ -320,38 +320,41 @@ fn input_complete(source: &str) -> bool {
 }
 
 /// Run the micro-benchmark suite: each snippet is evaluated once to warm up
-/// (interning, hooks), then timed. The timings are only comparable within a
-/// build profile; see `docs/perf.md` for the benchmark gates.
+/// (interning, hooks), then timed. The sources use `var` (not `let`) so a
+/// second evaluation in the same realm is legal and the timed run measures
+/// the real loop rather than a re-declaration error. The timings are only
+/// comparable within a build profile; see `docs/perf.md` for the benchmark
+/// gates.
 fn run_benchmarks(context: &mut Context) -> Result<(), u8> {
     let benchmarks: &[(&str, &str)] = &[
         (
             "arithmetic",
-            "let n = 0; for (let i = 0; i < 1_000_000; i++) { n += i * 2; } n",
+            "var n = 0; for (var i = 0; i < 1_000_000; i++) { n += i * 2; } n",
         ),
         (
             "property access",
-            "const o = { a: 1, b: 2 }; let n = 0; for (let i = 0; i < 1_000_000; i++) { n += o.a + o.b; } n",
+            "var o = { a: 1, b: 2 }; var n = 0; for (var i = 0; i < 1_000_000; i++) { n += o.a + o.b; } n",
         ),
         (
             "string concat",
-            "let s = ''; for (let i = 0; i < 100_000; i++) { s += 'x'; } s.length",
+            "var s = ''; for (var i = 0; i < 100_000; i++) { s += 'x'; } s.length",
         ),
         (
             "array iteration",
-            "const a = [1,2,3,4,5,6,7,8,9,10]; let n = 0; for (let i = 0; i < 100_000; i++) { for (const v of a) { n += v; } } n",
+            "var a = [1,2,3,4,5,6,7,8,9,10]; var n = 0; for (var i = 0; i < 100_000; i++) { for (var v of a) { n += v; } } n",
         ),
         (
             "function calls",
-            "function f(x) { return x + 1; } let n = 0; for (let i = 0; i < 1_000_000; i++) { n = f(n); } n",
+            "function f(x) { return x + 1; } var n = 0; for (var i = 0; i < 1_000_000; i++) { n = f(n); } n",
         ),
     ];
     println!("slag {VERSION} micro-benchmarks");
     for (name, source) in benchmarks {
         let _ = context.eval(source);
         let start = Instant::now();
-        let _ = context.eval(source);
+        let timed_ok = context.eval(source).is_ok();
         let elapsed = start.elapsed();
-        println!("{name:18} {elapsed:?}");
+        println!("{name:18} {elapsed:?} ok={timed_ok}");
     }
     Ok(())
 }

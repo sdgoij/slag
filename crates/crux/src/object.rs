@@ -280,6 +280,11 @@ pub struct JsObject {
     /// Own properties in insertion order (the [[OwnPropertyKeys]] string
     /// order for ordinary objects).
     pub properties: RefCell<Vec<(PropertyKey, Property)>>,
+    /// Lazy key→position index over `properties`, built on the first lookup
+    /// once the vector is large enough and invalidated by structural changes
+    /// (insert/delete). Value updates in place keep it valid. The property
+    /// order vector stays authoritative.
+    property_index: RefCell<Option<std::collections::HashMap<PropertyKey, usize>>>,
     /// [[PrivateElements]] (spec 10.1.4): private fields and methods added
     /// by InitializeInstanceElements.
     pub private_elements: RefCell<Vec<PrivateElement>>,
@@ -343,6 +348,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             properties: RefCell::new(Vec::new()),
+            property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
             function_self: RefCell::new(None),
@@ -396,6 +402,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             properties: RefCell::new(Vec::new()),
+            property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
             function_self: RefCell::new(None),
@@ -424,6 +431,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             properties: RefCell::new(Vec::new()),
+            property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
             function_self: RefCell::new(None),
@@ -456,6 +464,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             properties: RefCell::new(Vec::new()),
+            property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
             function_self: RefCell::new(None),
@@ -484,6 +493,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             properties: RefCell::new(Vec::new()),
+            property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
             function_self: RefCell::new(None),
@@ -506,6 +516,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             properties: RefCell::new(Vec::new()),
+            property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
             function_self: RefCell::new(None),
@@ -610,6 +621,7 @@ impl JsObject {
             extensible: Cell::new(false),
             immutable_prototype: Cell::new(false),
             properties: RefCell::new(Vec::new()),
+            property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
             function_self: RefCell::new(None),
@@ -658,6 +670,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             properties: RefCell::new(Vec::new()),
+            property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
             function_self: RefCell::new(None),
@@ -750,6 +763,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             properties: RefCell::new(Vec::new()),
+            property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
             function_self: RefCell::new(None),
@@ -969,12 +983,42 @@ impl JsObject {
                 return Ok(None);
             }
         }
-        Ok(self
-            .properties
-            .borrow()
+        Ok(self.ordinary_property_lookup(key))
+    }
+
+    /// Find the property slot for `key` — a lazy hash index for objects with
+    /// enough properties, a linear scan otherwise. The index is rebuilt on
+    /// the first lookup after a structural change (insert/delete); in-place
+    /// value updates keep it valid.
+    fn ordinary_property_lookup(&self, key: &PropertyKey) -> Option<Property> {
+        const INDEX_THRESHOLD: usize = 16;
+        let props = self.properties.borrow();
+        let index = self.property_index.borrow();
+        if props.len() >= INDEX_THRESHOLD {
+            if index.is_none() {
+                drop(index);
+                let mut slot = self.property_index.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(
+                        props
+                            .iter()
+                            .enumerate()
+                            .map(|(position, (name, _))| (name.clone(), position))
+                            .collect(),
+                    );
+                }
+                return props
+                    .get(*slot.as_ref().unwrap().get(key)?)
+                    .map(|(_, p)| p.clone());
+            }
+            return props
+                .get(*index.as_ref().unwrap().get(key)?)
+                .map(|(_, p)| p.clone());
+        }
+        props
             .iter()
             .find(|(name, _)| name == key)
-            .map(|(_, p)| p.clone()))
+            .map(|(_, p)| p.clone())
     }
 
     /// spec 7.3.12 HasOwnProperty.
@@ -1322,6 +1366,7 @@ impl JsObject {
                     if let Some(index) = props.iter().position(|(name, _)| name == key) {
                         if props[index].1.configurable {
                             props.remove(index);
+                            *self.property_index.borrow_mut() = None;
                             true
                         } else {
                             false
@@ -1345,6 +1390,7 @@ impl JsObject {
             if let Some(index) = props.iter().position(|(name, _)| name == key) {
                 if props[index].1.configurable {
                     props.remove(index);
+                    *self.property_index.borrow_mut() = None;
                     true
                 } else {
                     false
@@ -1518,6 +1564,7 @@ fn validate_and_apply(
             return Ok(false);
         };
         obj.properties.borrow_mut().push((key.clone(), property));
+        *obj.property_index.borrow_mut() = None;
         return Ok(true);
     };
     // spec step 3: an empty descriptor leaves the property untouched.
@@ -1602,8 +1649,30 @@ fn validate_and_apply(
         *slot = Some(set.clone()).filter(|v| !v.is_undefined());
     }
     let mut props = obj.properties.borrow_mut();
-    if let Some((_, slot)) = props.iter_mut().find(|(name, _)| name == key) {
-        *slot = next;
+    let position = if props.len() >= 16 {
+        let index = obj.property_index.borrow();
+        match index.as_ref() {
+            Some(map) => map.get(key).copied(),
+            None => {
+                drop(index);
+                let mut slot = obj.property_index.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(
+                        props
+                            .iter()
+                            .enumerate()
+                            .map(|(position, (name, _))| (name.clone(), position))
+                            .collect(),
+                    );
+                }
+                slot.as_ref().unwrap().get(key).copied()
+            }
+        }
+    } else {
+        props.iter().position(|(name, _)| name == key)
+    };
+    if let Some(position) = position {
+        props[position].1 = next;
     }
     Ok(true)
 }
@@ -1864,6 +1933,7 @@ fn array_define_own_property(
                     configurable: desc.configurable.unwrap_or(true),
                 },
             ));
+            *array.property_index.borrow_mut() = None;
             // `length` is always the first entry; update it in place.
             if let Some((_, length_prop)) = props.first_mut()
                 && let PropertyKind::Data { value: slot, .. } = &mut length_prop.kind
@@ -2262,6 +2332,7 @@ fn typed_array_delete(
     if let Some(position) = props.iter().position(|(name, _)| name == key) {
         if props[position].1.configurable {
             props.remove(position);
+            *obj.property_index.borrow_mut() = None;
             return Ok(true);
         }
         return Ok(false);
@@ -2504,6 +2575,62 @@ mod tests {
             crate::function::Function::create_builtin(Some(key(name)), 0, Box::new(f), None, None)
                 .unwrap(),
         )
+    }
+
+    /// The lazy property index must stay consistent across inserts, in-place
+    /// value updates, and deletes.
+    #[test]
+    fn property_index_tracks_structural_changes() {
+        let obj = JsObject::ordinary_object_create(None);
+        // Fill past the index threshold (16).
+        for i in 0..24 {
+            obj.create_data_property(
+                &JsString::from_utf8(&format!("k{i}")),
+                Value::Number(i as f64),
+            )
+            .unwrap();
+        }
+        for i in 0..24 {
+            let value = obj
+                .get_key(&PropertyKey::from_utf8(&format!("k{i}")))
+                .unwrap();
+            assert_eq!(value.as_number(), Some(i as f64));
+        }
+        assert!(obj.property_index.borrow().is_some());
+        // An in-place value update keeps the index valid.
+        obj.set_key(&PropertyKey::from_utf8("k5"), Value::Number(500.0), false)
+            .unwrap();
+        assert!(obj.property_index.borrow().is_some());
+        assert_eq!(
+            obj.get_key(&PropertyKey::from_utf8("k5"))
+                .unwrap()
+                .as_number(),
+            Some(500.0)
+        );
+        // An insert invalidates; the next lookup rebuilds.
+        obj.create_data_property(&JsString::from_utf8("k24"), Value::Number(24.0))
+            .unwrap();
+        assert!(obj.property_index.borrow().is_none());
+        assert_eq!(
+            obj.get_key(&PropertyKey::from_utf8("k24"))
+                .unwrap()
+                .as_number(),
+            Some(24.0)
+        );
+        assert!(obj.property_index.borrow().is_some());
+        // A delete invalidates; the removed key is gone, the rest remain.
+        obj.delete(&JsString::from_utf8("k10")).unwrap();
+        assert!(obj.property_index.borrow().is_none());
+        assert_eq!(
+            obj.get_key(&PropertyKey::from_utf8("k10")).unwrap().kind(),
+            ValueKind::Undefined
+        );
+        assert_eq!(
+            obj.get_key(&PropertyKey::from_utf8("k11"))
+                .unwrap()
+                .as_number(),
+            Some(11.0)
+        );
     }
 
     #[test]

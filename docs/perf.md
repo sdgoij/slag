@@ -6,14 +6,19 @@ correctness gate.
 
 ## Current architecture
 
-- **Value representation**: an `enum Value` with nine variants (`Undefined`,
-  `Null`, `Boolean`, `Number`, `String`, `Symbol`, `BigInt`, `Object`,
-  `Function`). Handles are `Rc`-based; values are cheap to clone.
+- **Value representation**: a NaN-boxed `u64` (PLAN Phase 18): a quiet-NaN
+  tag region (top 16 bits `0x7FF8`) holds a 4-bit tag plus a 44-bit `Rc`
+  payload for the heap variants; every other bit pattern is a double stored
+  exactly. Heap values own one strong `Rc` ref; `Clone`/`Drop` reconstruct
+  the `Rc` from the payload. `match value.kind()` keeps the old enum arm
+  shapes via a `ValueKind` mirror.
 - **Interpreter**: a tree-walker over the parser's AST (the resumable
   function IR from Phase 7); there is no bytecode.
 - **Objects**: ordinary Rust structs with a property vector and a prototype
   `RefCell`; per-object state (promises, generators, buffers, ...) lives in
-  agent-side tables keyed by object id. There is no shape/IC machinery.
+  agent-side tables keyed by object id. There is no shape/IC machinery; a
+  lazy key→slot hash index accelerates lookups on objects with many
+  properties (the global object), invalidated by structural changes only.
 - **Strings**: UTF-16 code-unit arrays; no ropes.
 - **Memory**: `Rc`/`RefCell`-based ownership; there is no tracing GC.
   `WeakRef`/`FinalizationRegistry` are implemented with kept-alive
@@ -30,26 +35,32 @@ cargo run -p cli --release -- --bench
 
 Current benchmarks: arithmetic loops, property access, string concatenation,
 array iteration, and function calls. Each snippet is evaluated once to warm
-up (interning, hook installation), then timed. Numbers are only comparable
-within a build profile; record an early snapshot (debug and release) and
-compare against it after each milestone below.
+up (interning, hook installation), then timed. The sources use `var` (not
+`let`) declarations: a second evaluation in the same realm re-declaring
+`let` bindings is a SyntaxError, so the original `let`-based snippets made
+the timed run measure that error path (the pre-migration "57µs arithmetic"
+snapshot below was such a measurement, not the real loop). Numbers are only
+comparable within a build profile; record an early snapshot (debug and
+release) and compare against it after each milestone below.
 
 ### Baseline snapshot (2026-08-18)
 
-Recorded before the NaN-boxing work began (the gate baseline for the
-milestones below):
+The original snapshot was recorded with `let`-based snippets whose second
+evaluation errored; it is kept here for the record but is not a valid loop
+time. The corrected `var`-based methodology measured the real pre-migration
+loops in release on the same machine:
 
-| Benchmark | debug | release |
+| Benchmark | release (original snapshot, error path) | release (corrected, real loop) |
 |---|---|---|
-| arithmetic | 226µs | 57µs |
-| property access | 109µs | 20µs |
-| string concat | 148µs | 51µs |
-| array iteration | 143µs | 28µs |
-| function calls | 103µs | 18µs |
+| arithmetic | 57µs | 2.52s |
+| property access | 20µs | 3.22s |
+| string concat | 51µs | 0.88s |
+| array iteration | 28µs | 15.42s |
+| function calls | 18µs | 5.73s |
 
-(`cargo run -p cli -- --bench` for debug, `cargo run -p cli --release --
---bench` for release; release numbers are the median of three runs. The
-arithmetic benchmark is a 1M-iteration `n += i * 2` loop.)
+(The arithmetic benchmark is a 1M-iteration `n += i * 2` loop; the real
+numbers are dominated by the tree-walker's identifier resolution and
+environment machinery, not by value representation.)
 
 ## Deferred milestones
 
@@ -58,13 +69,13 @@ Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
 
 | Milestone | Gate | Status |
 |---|---|---|
-| NaN-boxed `Value` (u64 with tag fast paths) | arithmetic micro-benchmark ≥ 2x vs snapshot | In progress: design below; the value/object model is `Rc`-based, so the box stays `Clone` (manual refcount) rather than `Copy`. |
+| NaN-boxed `Value` (u64 with tag fast paths) | arithmetic micro-benchmark ≥ 2x vs snapshot | Correctness landed (migration below); the 2x gate is not yet met — see the benchmark analysis at the end of the section. |
 | Bytecode VM replacing the tree-walker | `--print-bytecode` dumps real bytecode; hot-path bench ≥ 5x | Deferred: the Phase 7 IR would need to grow a full instruction set (property load/store, call/construct with ICs, closures, control flow). |
 | Object shapes / hidden classes + inline caches | property-access micro-benchmark ≥ 2x | Deferred. |
 | String rope representation | string-concat micro-benchmark ≥ 2x | Deferred. |
 | `--gc-stress` + leak-detection harness | stress runs clean, no leaks | Deferred: requires the arena heap + mark-sweep GC milestone (below). |
 
-## NaN-boxed `Value` milestone (in progress)
+## NaN-boxed `Value` milestone (landed — gate not yet met)
 
 The enum representation (`enum Value { Undefined, Null, Boolean(bool),
 Number(f64), BigInt, String, Symbol, Object, Function }`, ~16 bytes with
@@ -111,9 +122,46 @@ lands as one change: crux → runtime → test262, then gates):
 3. Gates: `cargo clippy --workspace --all-targets -- -D warnings`, `cargo
    test --workspace`, and the full release sweep (48,622 fixtures) — the
    NaN canonicalization and `PartialEq` semantics are the regression risk.
+   **All three are green** (sweep: 0 fail, 229 skip — the standard
+   taxonomy, 0 crash).
 4. Re-run `--bench` and compare against the snapshot; arithmetic ≥ 2x
    marks the milestone done. (The `Copy` win and the refcount-free moves
    arrive with the GC milestone, which replaces `Rc` with an arena heap.)
+
+**One correctness trap surfaced during the migration**: the `is_*`/`as_*`
+accessors must reject doubles before reading the tag — a double's bits
+47-44 can collide with a heap tag (e.g. `65.0` is `0x4050_4000_0000_0000`,
+whose bits 47-44 read as the BigInt tag), and an unguarded `as_bigint()`
+would reconstruct an `Rc` from the double's low bits and crash. Every tag
+accessor now checks `!is_double()` first.
+
+### Benchmark analysis (why the 2x gate is not yet met)
+
+The tag fast paths from the design landed (direct-double arithmetic in
+`apply_binary`/`numeric_binary`/`abstract_relational`, plus a lazy
+key→slot property index on objects with many properties), and the real
+release loop times moved as follows:
+
+| Benchmark | pre-migration (real) | post-migration (real) |
+|---|---|---|
+| arithmetic | 2.52s | 2.18s |
+| property access | 3.22s | 2.86s |
+| string concat | 0.88s | 0.55s |
+| function calls | 5.73s | 5.51s |
+
+(The pre-migration column is the `var`-methodology measurement of the
+last green mainline build; the post-migration column is the current tree,
+same machine, median of runs.)
+
+The arithmetic loop is dominated by the tree-walker's per-iteration work
+— identifier resolution (an env-chain walk with linear binding scans),
+statement/expression dispatch, and per-iteration loop environments — not
+by value representation. An empty 1M-iteration `var` loop measures ~1.1s
+(≈ 1.1µs/iteration) before any arithmetic, and the direct-double fast
+paths contribute roughly a 1.1x total speedup. Reaching the 2x gate needs
+the interpreter work deferred to the shapes/inline-cache and bytecode
+milestones (which carry their own gates); the NaN-boxed representation is
+the prerequisite they build on. The gate stays open until then.
 
 ## GC milestone (PLAN Phase 18 item 2)
 
