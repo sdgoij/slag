@@ -12393,8 +12393,7 @@ var $DONE = function (error) {
             // Implemented clusters: Duration, Instant, Now, the root-level
             // namespace fixtures, the toStringTag fixtures, and the Plain*
             // clusters (PlainDate, PlainTime, PlainDateTime, PlainYearMonth,
-            // PlainMonthDay). The ZonedDateTime cluster stays skipped until
-            // implemented.
+            // PlainMonthDay) plus ZonedDateTime (UTC + fixed-offset zones).
             let implemented = relative.starts_with("Temporal/Duration/")
                 || relative.starts_with("Temporal/Instant/")
                 || relative.starts_with("Temporal/Now/")
@@ -12404,17 +12403,19 @@ var $DONE = function (error) {
                 || relative.starts_with("Temporal/PlainDateTime/")
                 || relative.starts_with("Temporal/PlainYearMonth/")
                 || relative.starts_with("Temporal/PlainMonthDay/")
+                || relative.starts_with("Temporal/ZonedDateTime/")
                 || !relative["Temporal/".len()..].contains('/');
             if !implemented {
                 return FixtureResult::Skip("Temporal type not yet implemented".into());
             }
-            // The PlainDate/PlainTime/PlainDateTime toLocaleString clusters
+            // The Plain*/ZonedDateTime toLocaleString clusters
             // need Intl.DateTimeFormat (ECMA-402, out of scope like Intl).
             if relative.starts_with("Temporal/PlainDate/prototype/toLocaleString/")
                 || relative.starts_with("Temporal/PlainTime/prototype/toLocaleString/")
                 || relative.starts_with("Temporal/PlainDateTime/prototype/toLocaleString/")
                 || relative.starts_with("Temporal/PlainYearMonth/prototype/toLocaleString/")
                 || relative.starts_with("Temporal/PlainMonthDay/prototype/toLocaleString/")
+                || relative.starts_with("Temporal/ZonedDateTime/prototype/toLocaleString/")
             {
                 return FixtureResult::Skip("Intl is out of scope".into());
             }

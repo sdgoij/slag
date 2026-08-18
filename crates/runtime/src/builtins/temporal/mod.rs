@@ -399,6 +399,23 @@ pub fn get_temporal_disambiguation_option(
     Ok(())
 }
 
+/// spec 13.19 GetTemporalOffsetOption: prefer/use/ignore/reject with the
+/// given fallback.
+pub fn get_temporal_offset_option(
+    agent: &mut Agent,
+    options: &Value,
+    fallback: &str,
+) -> Result<String, JsError> {
+    let value = get_option(
+        agent,
+        options,
+        "offset",
+        &["prefer", "use", "ignore", "reject"],
+        Some(fallback),
+    )?;
+    Ok(value.unwrap_or_else(|| fallback.to_string()))
+}
+
 /// The unit groups of ValidateTemporalUnitValue (spec 13.21).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnitGroup {

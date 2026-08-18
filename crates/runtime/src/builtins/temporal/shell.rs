@@ -609,6 +609,43 @@ fn install_zoned_date_time(
                 "offsetNanoseconds",
                 "%Temporal.ZonedDateTime.prototype.offsetNanoseconds%",
             ),
+            ("monthCode", "%Temporal.ZonedDateTime.prototype.monthCode%"),
+            ("era", "%Temporal.ZonedDateTime.prototype.era%"),
+            ("eraYear", "%Temporal.ZonedDateTime.prototype.eraYear%"),
+            ("dayOfWeek", "%Temporal.ZonedDateTime.prototype.dayOfWeek%"),
+            ("dayOfYear", "%Temporal.ZonedDateTime.prototype.dayOfYear%"),
+            (
+                "weekOfYear",
+                "%Temporal.ZonedDateTime.prototype.weekOfYear%",
+            ),
+            (
+                "yearOfWeek",
+                "%Temporal.ZonedDateTime.prototype.yearOfWeek%",
+            ),
+            (
+                "hoursInDay",
+                "%Temporal.ZonedDateTime.prototype.hoursInDay%",
+            ),
+            (
+                "daysInWeek",
+                "%Temporal.ZonedDateTime.prototype.daysInWeek%",
+            ),
+            (
+                "daysInMonth",
+                "%Temporal.ZonedDateTime.prototype.daysInMonth%",
+            ),
+            (
+                "daysInYear",
+                "%Temporal.ZonedDateTime.prototype.daysInYear%",
+            ),
+            (
+                "monthsInYear",
+                "%Temporal.ZonedDateTime.prototype.monthsInYear%",
+            ),
+            (
+                "inLeapYear",
+                "%Temporal.ZonedDateTime.prototype.inLeapYear%",
+            ),
         ],
     )?;
     proto_methods(
@@ -624,6 +661,52 @@ fn install_zoned_date_time(
             ("toString", "%Temporal.ZonedDateTime.prototype.toString%", 0),
             ("toJSON", "%Temporal.ZonedDateTime.prototype.toJSON%", 0),
             ("valueOf", "%Temporal.ZonedDateTime.prototype.valueOf%", 0),
+            ("with", "%Temporal.ZonedDateTime.prototype.with%", 1),
+            (
+                "withPlainTime",
+                "%Temporal.ZonedDateTime.prototype.withPlainTime%",
+                0,
+            ),
+            (
+                "withTimeZone",
+                "%Temporal.ZonedDateTime.prototype.withTimeZone%",
+                1,
+            ),
+            (
+                "withCalendar",
+                "%Temporal.ZonedDateTime.prototype.withCalendar%",
+                1,
+            ),
+            ("add", "%Temporal.ZonedDateTime.prototype.add%", 1),
+            ("subtract", "%Temporal.ZonedDateTime.prototype.subtract%", 1),
+            ("round", "%Temporal.ZonedDateTime.prototype.round%", 1),
+            ("until", "%Temporal.ZonedDateTime.prototype.until%", 1),
+            ("since", "%Temporal.ZonedDateTime.prototype.since%", 1),
+            (
+                "startOfDay",
+                "%Temporal.ZonedDateTime.prototype.startOfDay%",
+                0,
+            ),
+            (
+                "getTimeZoneTransition",
+                "%Temporal.ZonedDateTime.prototype.getTimeZoneTransition%",
+                1,
+            ),
+            (
+                "toPlainDate",
+                "%Temporal.ZonedDateTime.prototype.toPlainDate%",
+                0,
+            ),
+            (
+                "toPlainTime",
+                "%Temporal.ZonedDateTime.prototype.toPlainTime%",
+                0,
+            ),
+            (
+                "toPlainDateTime",
+                "%Temporal.ZonedDateTime.prototype.toPlainDateTime%",
+                0,
+            ),
         ],
     )?;
     Ok(())
@@ -754,6 +837,52 @@ pub fn dispatch_call(
     }
     if field("%Temporal.ZonedDateTime.prototype.offsetNanoseconds%") {
         return Some(zoned_offset_ns(agent, this));
+    }
+    if field("%Temporal.ZonedDateTime.prototype.monthCode%") {
+        return Some(zoned_month_code(agent, this));
+    }
+    // ZonedDateTime calendar getters (computed from the local date part).
+    for (name, key) in [
+        ("era", "%Temporal.ZonedDateTime.prototype.era%"),
+        ("eraYear", "%Temporal.ZonedDateTime.prototype.eraYear%"),
+        ("dayOfWeek", "%Temporal.ZonedDateTime.prototype.dayOfWeek%"),
+        ("dayOfYear", "%Temporal.ZonedDateTime.prototype.dayOfYear%"),
+        (
+            "weekOfYear",
+            "%Temporal.ZonedDateTime.prototype.weekOfYear%",
+        ),
+        (
+            "yearOfWeek",
+            "%Temporal.ZonedDateTime.prototype.yearOfWeek%",
+        ),
+        (
+            "hoursInDay",
+            "%Temporal.ZonedDateTime.prototype.hoursInDay%",
+        ),
+        (
+            "daysInWeek",
+            "%Temporal.ZonedDateTime.prototype.daysInWeek%",
+        ),
+        (
+            "daysInMonth",
+            "%Temporal.ZonedDateTime.prototype.daysInMonth%",
+        ),
+        (
+            "daysInYear",
+            "%Temporal.ZonedDateTime.prototype.daysInYear%",
+        ),
+        (
+            "monthsInYear",
+            "%Temporal.ZonedDateTime.prototype.monthsInYear%",
+        ),
+        (
+            "inLeapYear",
+            "%Temporal.ZonedDateTime.prototype.inLeapYear%",
+        ),
+    ] {
+        if field(key) {
+            return Some(zoned_calendar_field(agent, this, name));
+        }
     }
     for (idx, name) in [
         (0, "year"),
@@ -897,7 +1026,8 @@ pub fn dispatch_call(
     }
     if intrinsics.get("%Temporal.ZonedDateTime.from%").as_ref() == Some(callee) {
         let item = args.first().cloned().unwrap_or(Value::Undefined);
-        return Some(to_zoned(agent, &item));
+        let options = args.get(1).cloned().unwrap_or(Value::Undefined);
+        return Some(to_zoned(agent, &item, &options));
     }
     if intrinsics.get("%Temporal.PlainYearMonth.from%").as_ref() == Some(callee) {
         let item = args.first().cloned().unwrap_or(Value::Undefined);
@@ -1118,7 +1248,11 @@ pub fn dispatch_call(
         return Some(plain_date_time_to_zoned_date_time(agent, this, args));
     }
     if field("%Temporal.ZonedDateTime.prototype.toString%") {
-        return Some(zoned_to_string(agent, this));
+        return Some(zoned_to_string_impl(
+            agent,
+            this,
+            args.first().cloned().unwrap_or(Value::Undefined),
+        ));
     }
     if field("%Temporal.ZonedDateTime.prototype.toJSON%") {
         return Some(zoned_to_string(agent, this));
@@ -1128,6 +1262,69 @@ pub fn dispatch_call(
     }
     if field("%Temporal.ZonedDateTime.prototype.equals%") {
         return Some(zoned_equals(agent, this, args));
+    }
+    if field("%Temporal.ZonedDateTime.prototype.with%") {
+        return Some(zoned_with(
+            agent,
+            this,
+            args.first().cloned().unwrap_or(Value::Undefined),
+            args.get(1).cloned().unwrap_or(Value::Undefined),
+        ));
+    }
+    if field("%Temporal.ZonedDateTime.prototype.withPlainTime%") {
+        return Some(zoned_with_plain_time(
+            agent,
+            this,
+            args.first().cloned().unwrap_or(Value::Undefined),
+        ));
+    }
+    if field("%Temporal.ZonedDateTime.prototype.withTimeZone%") {
+        return Some(zoned_with_time_zone(
+            agent,
+            this,
+            args.first().cloned().unwrap_or(Value::Undefined),
+        ));
+    }
+    if field("%Temporal.ZonedDateTime.prototype.withCalendar%") {
+        return Some(zoned_with_calendar(
+            agent,
+            this,
+            args.first().cloned().unwrap_or(Value::Undefined),
+        ));
+    }
+    if field("%Temporal.ZonedDateTime.prototype.add%") {
+        return Some(zoned_add_subtract(agent, this, args, false));
+    }
+    if field("%Temporal.ZonedDateTime.prototype.subtract%") {
+        return Some(zoned_add_subtract(agent, this, args, true));
+    }
+    if field("%Temporal.ZonedDateTime.prototype.round%") {
+        return Some(zoned_round(agent, this, args));
+    }
+    if field("%Temporal.ZonedDateTime.prototype.until%") {
+        return Some(zoned_until_since(agent, this, args, false));
+    }
+    if field("%Temporal.ZonedDateTime.prototype.since%") {
+        return Some(zoned_until_since(agent, this, args, true));
+    }
+    if field("%Temporal.ZonedDateTime.prototype.startOfDay%") {
+        return Some(zoned_start_of_day(agent, this));
+    }
+    if field("%Temporal.ZonedDateTime.prototype.getTimeZoneTransition%") {
+        return Some(zoned_get_time_zone_transition(
+            agent,
+            this,
+            args.first().cloned().unwrap_or(Value::Undefined),
+        ));
+    }
+    if field("%Temporal.ZonedDateTime.prototype.toPlainDate%") {
+        return Some(zoned_to_plain_date(agent, this));
+    }
+    if field("%Temporal.ZonedDateTime.prototype.toPlainTime%") {
+        return Some(zoned_to_plain_time(agent, this));
+    }
+    if field("%Temporal.ZonedDateTime.prototype.toPlainDateTime%") {
+        return Some(zoned_to_plain_date_time(agent, this));
     }
     if field("%Temporal.PlainYearMonth.prototype.toString%") {
         return Some(year_month_to_string_impl(
@@ -1409,7 +1606,7 @@ fn construct_zoned(
             )
         })?;
     let tz_value = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let tz = super::instant::to_temporal_time_zone_identifier(agent, &tz_value)?;
+    let tz = super::instant::to_constructor_time_zone_identifier(agent, &tz_value)?;
     check_calendar(agent, args.get(2).unwrap_or(&Value::Undefined))?;
     create_temporal_object(
         agent,
@@ -1552,6 +1749,44 @@ fn zoned_offset_ns(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     };
     let offset = super::offset_time_zone_offset_ns(&tz).unwrap_or(0);
     Ok(Value::Number(offset as f64))
+}
+
+/// The local monthCode getter.
+fn zoned_month_code(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
+    let (ns, tz) = zoned_parts(agent, this)?;
+    let local = zoned_local(agent, ns, &tz)?;
+    Ok(Value::String(Handle::new(JsString::from_utf8(&format!(
+        "M{:02}",
+        local.1
+    )))))
+}
+
+/// The ISO calendar's derived ZonedDateTime getters (computed from the local
+/// date part; hoursInDay diffs the two GetStartOfDay instants).
+fn zoned_calendar_field(agent: &mut Agent, this: &Value, name: &str) -> Result<Value, JsError> {
+    let (ns, tz) = zoned_parts(agent, this)?;
+    let local = zoned_local(agent, ns, &tz)?;
+    if name == "hoursInDay" {
+        let offset = super::offset_time_zone_offset_ns(&tz)
+            .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
+        let today =
+            iso::get_utc_epoch_nanoseconds(local.0, local.1, local.2, 0, 0, 0, 0, 0, 0) - offset;
+        let next = iso::add_days_to_iso_date(local.0, local.1, local.2, 1);
+        let tomorrow =
+            iso::get_utc_epoch_nanoseconds(next.0, next.1, next.2, 0, 0, 0, 0, 0, 0) - offset;
+        if !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&today)
+            || !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&tomorrow)
+        {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "day boundary is out of range".into(),
+            ));
+        }
+        return Ok(Value::Number(
+            (tomorrow - today) as f64 / iso::NS_PER_HOUR as f64,
+        ));
+    }
+    calendar_field_value(local.0, local.1, local.2, name)
 }
 
 fn zoned_to_instant(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
@@ -1879,69 +2114,391 @@ pub fn to_plain_date_time(
 }
 
 /// spec 6.5.2 ToTemporalZonedDateTime (minimal: records, strings).
-fn to_zoned(agent: &mut Agent, item: &Value) -> Result<Value, JsError> {
+/// PrepareCalendarFields(iso8601, bag, «year, month, monthCode, day», «hour,
+/// minute, second, millisecond, microsecond, nanosecond, offset, timeZone»,
+/// «timeZone»): read in ascending code point order with the casts; the time
+/// zone is required.
+struct ZonedFields {
+    year: Option<i64>,
+    month: Option<i64>,
+    month_code: Option<String>,
+    day: Option<i64>,
+    time: [Option<i64>; 6],
+    offset: Option<String>,
+    time_zone: Option<String>,
+}
+
+fn read_zoned_fields(agent: &mut Agent, bag: &Value) -> Result<ZonedFields, JsError> {
+    let mut fields = ZonedFields {
+        year: None,
+        month: None,
+        month_code: None,
+        day: None,
+        time: [None; 6],
+        offset: None,
+        time_zone: None,
+    };
+    for key in [
+        "day",
+        "hour",
+        "microsecond",
+        "millisecond",
+        "minute",
+        "month",
+        "monthCode",
+        "nanosecond",
+        "offset",
+        "second",
+        "timeZone",
+        "year",
+    ] {
+        let value =
+            crate::context::get_property(agent, bag, &JsString::from_utf8(key), bag.clone())?;
+        if matches!(value, Value::Undefined) {
+            continue;
+        }
+        match key {
+            "day" => fields.day = Some(super::to_positive_integer_with_truncation(agent, &value)?),
+            "hour" => fields.time[0] = Some(super::to_integer_with_truncation(agent, &value)?),
+            "microsecond" => {
+                fields.time[4] = Some(super::to_integer_with_truncation(agent, &value)?)
+            }
+            "millisecond" => {
+                fields.time[3] = Some(super::to_integer_with_truncation(agent, &value)?)
+            }
+            "minute" => fields.time[1] = Some(super::to_integer_with_truncation(agent, &value)?),
+            "month" => {
+                fields.month = Some(super::to_positive_integer_with_truncation(agent, &value)?)
+            }
+            "monthCode" => fields.month_code = Some(read_month_code(agent, &value)?),
+            "nanosecond" => {
+                fields.time[5] = Some(super::to_integer_with_truncation(agent, &value)?)
+            }
+            "offset" => {
+                let prim = crate::context::to_primitive(
+                    agent,
+                    &value,
+                    crux::convert::ToPrimitiveHint::String,
+                )?;
+                let Value::String(text) = prim else {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "offset must be a string".into(),
+                    ));
+                };
+                let text = text.to_string_lossy();
+                iso::parse_date_time_utc_offset(&text)
+                    .map_err(|_| JsError::new(ErrorKind::RangeError, "invalid offset".into()))?;
+                fields.offset = Some(text);
+            }
+            "second" => fields.time[2] = Some(super::to_integer_with_truncation(agent, &value)?),
+            "timeZone" => {
+                fields.time_zone = Some(super::instant::to_temporal_time_zone_identifier(
+                    agent, &value,
+                )?)
+            }
+            _ => fields.year = Some(super::to_integer_with_truncation(agent, &value)?),
+        }
+    }
+    Ok(fields)
+}
+
+/// PrepareCalendarFields(iso8601, like, «year, month, monthCode, day», «hour,
+/// minute, second, millisecond, microsecond, nanosecond, offset», partial):
+/// the `with` field read in ascending code point order (no timeZone/calendar).
+#[allow(clippy::type_complexity)]
+fn read_zoned_with_fields(
+    agent: &mut Agent,
+    bag: &Value,
+) -> Result<
+    (
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        Option<i64>,
+        [Option<i64>; 6],
+        Option<String>,
+    ),
+    JsError,
+> {
+    let mut any = false;
+    let mut year = None;
+    let mut month = None;
+    let mut month_code = None;
+    let mut day = None;
+    let mut t = [None; 6];
+    let mut offset = None;
+    for key in [
+        "day",
+        "hour",
+        "microsecond",
+        "millisecond",
+        "minute",
+        "month",
+        "monthCode",
+        "nanosecond",
+        "offset",
+        "second",
+        "year",
+    ] {
+        let value =
+            crate::context::get_property(agent, bag, &JsString::from_utf8(key), bag.clone())?;
+        if matches!(value, Value::Undefined) {
+            continue;
+        }
+        any = true;
+        match key {
+            "day" => day = Some(super::to_positive_integer_with_truncation(agent, &value)?),
+            "hour" => t[0] = Some(super::to_integer_with_truncation(agent, &value)?),
+            "microsecond" => t[4] = Some(super::to_integer_with_truncation(agent, &value)?),
+            "millisecond" => t[3] = Some(super::to_integer_with_truncation(agent, &value)?),
+            "minute" => t[1] = Some(super::to_integer_with_truncation(agent, &value)?),
+            "month" => month = Some(super::to_positive_integer_with_truncation(agent, &value)?),
+            "monthCode" => month_code = Some(read_month_code(agent, &value)?),
+            "nanosecond" => t[5] = Some(super::to_integer_with_truncation(agent, &value)?),
+            "offset" => {
+                let prim = crate::context::to_primitive(
+                    agent,
+                    &value,
+                    crux::convert::ToPrimitiveHint::String,
+                )?;
+                let Value::String(text) = prim else {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "offset must be a string".into(),
+                    ));
+                };
+                let text = text.to_string_lossy();
+                iso::parse_date_time_utc_offset(&text)
+                    .map_err(|_| JsError::new(ErrorKind::RangeError, "invalid offset".into()))?;
+                offset = Some(text);
+            }
+            "second" => t[2] = Some(super::to_integer_with_truncation(agent, &value)?),
+            _ => year = Some(super::to_integer_with_truncation(agent, &value)?),
+        }
+    }
+    if !any {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "no supported properties found".into(),
+        ));
+    }
+    Ok((year, month, month_code, day, t, offset))
+}
+
+/// InterpretISODateTimeOffset (spec 6.5.10) for UTC/fixed-offset zones: the
+/// wall date-time plus the offset behaviour resolve to an epoch nanosecond.
+/// Named zones never have multiple possible instants here, so disambiguation
+/// has no effect; `match_minute` is irrelevant because both the string offset
+/// (minute precision) and the zone offset are minute multiples.
+#[allow(clippy::too_many_arguments)]
+fn interpret_iso_date_time_offset(
+    dt: [i64; 9],
+    tz: &str,
+    offset_ns: Option<i128>,
+    has_z: bool,
+    offset_opt: &str,
+) -> Result<i128, JsError> {
+    let zone_offset = super::offset_time_zone_offset_ns(tz)
+        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
+    let utc_wall = iso::get_utc_epoch_nanoseconds(
+        dt[0], dt[1], dt[2], dt[3], dt[4], dt[5], dt[6], dt[7], dt[8],
+    );
+    // offsetBehaviour: exact (Z), wall (no offset), or option (offset given).
+    let exact = has_z;
+    let wall = !has_z && offset_ns.is_none();
+    let option = !has_z && offset_ns.is_some();
+    if wall || (option && offset_opt == "ignore") {
+        // GetEpochNanosecondsFor: the single possible instant for the zone.
+        let epoch = utc_wall - zone_offset;
+        check_balanced_range(epoch)?;
+        return Ok(epoch);
+    }
+    if exact || (option && offset_opt == "use") {
+        // BalanceISODateTime(wall - offset), CheckISODaysRange, then the
+        // epoch range check.
+        let given = if exact { 0 } else { offset_ns.unwrap() };
+        let epoch = utc_wall - given;
+        check_balanced_range(epoch)?;
+        return Ok(epoch);
+    }
+    // offsetBehaviour option with prefer/reject: the WALL date must be
+    // strictly within the ±10^8-day range, the possible instant is computed
+    // and validated, the given offset is matched, and a mismatch rejects.
+    check_iso_days_range(iso::iso_date_to_epoch_days(dt[0], dt[1] - 1, dt[2]))?;
+    let given = offset_ns.unwrap();
+    let possible = utc_wall - zone_offset;
+    check_balanced_range(possible)?;
+    if zone_offset == given {
+        return Ok(possible);
+    }
+    if offset_opt == "reject" {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "offset does not match the time zone".into(),
+        ));
+    }
+    // prefer: DisambiguatePossibleEpochNanoseconds on the single instant.
+    Ok(possible)
+}
+
+/// CheckISODaysRange (spec): the ISO date must be strictly within ±10^8 days
+/// of the epoch.
+fn check_iso_days_range(days: i64) -> Result<(), JsError> {
+    if days.abs() > 100_000_000 {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "date is outside the representable range".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The CheckISODaysRange + IsValidEpochNanoseconds pair over a balanced
+/// wall-minus-offset instant (spec GetPossibleEpochNanoseconds).
+fn check_balanced_range(epoch: i128) -> Result<(), JsError> {
+    let (y, m, d, _, _, _, _, _, _) = iso::iso_parts_from_epoch(epoch);
+    check_iso_days_range(iso::iso_date_to_epoch_days(y, m - 1, d))?;
+    if !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&epoch) {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "result is out of range".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// spec 6.5.2 ToTemporalZonedDateTime: records, strings (ZonedDateTimeString),
+/// and property bags (the calendar, the date/time/offset/timeZone fields, and
+/// the disambiguation/offset/overflow options). Only UTC and fixed-offset
+/// zones are supported.
+pub fn to_zoned(agent: &mut Agent, item: &Value, options: &Value) -> Result<Value, JsError> {
     if let Value::Object(obj) = item
-        && let Some(TemporalRecord::ZonedDateTime(ns, tz)) = agent.temporal_data.get(&obj.id())
+        && let Some(TemporalRecord::ZonedDateTime(ns, tz)) =
+            agent.temporal_data.get(&obj.id()).cloned()
     {
+        let opts = super::get_options_object(options)?;
+        super::get_temporal_disambiguation_option(agent, &opts)?;
+        super::get_temporal_offset_option(agent, &opts, "reject")?;
+        super::get_temporal_overflow_option(agent, &opts)?;
         return create_temporal_object(
             agent,
             &Value::Undefined,
             ZONED_PROTO,
-            TemporalRecord::ZonedDateTime(*ns, tz.clone()),
+            TemporalRecord::ZonedDateTime(ns, tz),
         );
     }
-    if !matches!(item, Value::String(_)) {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "value must be a string or ZonedDateTime".into(),
-        ));
-    }
-    let text = crate::context::to_string(agent, item)?;
-    let parsed =
-        iso::parse_iso_date_time(text.as_slice(), iso::Format::DateTimeZoned).map_err(|_| {
-            JsError::new(
-                ErrorKind::RangeError,
-                "invalid zoned date-time string".into(),
-            )
-        })?;
-    let tz = super::instant::to_temporal_time_zone_identifier(
-        agent,
-        &Value::String(Handle::new(JsString::from_utf8(&parsed.tz.annotation))),
-    )?;
-    let offset = super::offset_time_zone_offset_ns(&tz).unwrap_or(0);
-    let [h, min, s, ms, us, ns] = parsed.time.unwrap_or([0, 0, 0, 0, 0, 0]);
-    let utc = iso::get_utc_epoch_nanoseconds(
-        parsed.year,
-        parsed.month,
-        parsed.day,
-        h,
-        min,
-        s,
-        ms,
-        us,
-        ns,
-    );
-    let epoch = if parsed.tz.z {
-        utc
-    } else if !parsed.tz.offset_string.is_empty() {
-        let given = iso::parse_date_time_utc_offset(&parsed.tz.offset_string)
-            .map_err(|_| JsError::new(ErrorKind::RangeError, "invalid offset".into()))?;
-        if given != offset {
+    if matches!(item, Value::String(_)) {
+        let text = crate::context::to_string(agent, item)?;
+        let parsed = iso::parse_iso_date_time(text.as_slice(), iso::Format::DateTimeZoned)
+            .map_err(|_| {
+                JsError::new(
+                    ErrorKind::RangeError,
+                    "invalid zoned date-time string".into(),
+                )
+            })?;
+        if let Some(calendar) = &parsed.calendar
+            && !calendar.eq_ignore_ascii_case("iso8601")
+        {
             return Err(JsError::new(
                 ErrorKind::RangeError,
-                "offset does not match the time zone".into(),
+                "only the iso8601 calendar is supported".into(),
             ));
         }
-        utc - given
-    } else {
-        utc - offset
-    };
-    create_temporal_object(
-        agent,
-        &Value::Undefined,
-        ZONED_PROTO,
-        TemporalRecord::ZonedDateTime(epoch, JsString::from_utf8(&tz)),
-    )
+        let tz = super::instant::to_temporal_time_zone_identifier(
+            agent,
+            &Value::String(Handle::new(JsString::from_utf8(&parsed.tz.annotation))),
+        )?;
+        let opts = super::get_options_object(options)?;
+        super::get_temporal_disambiguation_option(agent, &opts)?;
+        let offset_opt = super::get_temporal_offset_option(agent, &opts, "reject")?;
+        super::get_temporal_overflow_option(agent, &opts)?;
+        let t = parsed.time.unwrap_or([0, 0, 0, 0, 0, 0]);
+        let dt = [
+            parsed.year,
+            parsed.month,
+            parsed.day,
+            t[0],
+            t[1],
+            t[2],
+            t[3],
+            t[4],
+            t[5],
+        ];
+        let offset_ns = if parsed.tz.z {
+            None
+        } else if !parsed.tz.offset_string.is_empty() {
+            Some(
+                iso::parse_date_time_utc_offset(&parsed.tz.offset_string)
+                    .map_err(|_| JsError::new(ErrorKind::RangeError, "invalid offset".into()))?,
+            )
+        } else {
+            None
+        };
+        let epoch = interpret_iso_date_time_offset(dt, &tz, offset_ns, parsed.tz.z, &offset_opt)?;
+        return create_temporal_object(
+            agent,
+            &Value::Undefined,
+            ZONED_PROTO,
+            TemporalRecord::ZonedDateTime(epoch, JsString::from_utf8(&tz)),
+        );
+    }
+    if let Value::Object(_) = item {
+        // Property bag: the calendar, then the fields in ascending code point
+        // order (the time zone is required), then the options.
+        read_bag_calendar(agent, item)?;
+        let fields = read_zoned_fields(agent, item)?;
+        let Some(tz) = fields.time_zone else {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "timeZone is required".into(),
+            ));
+        };
+        let opts = super::get_options_object(options)?;
+        super::get_temporal_disambiguation_option(agent, &opts)?;
+        let offset_opt = super::get_temporal_offset_option(agent, &opts, "reject")?;
+        let constrain = super::get_temporal_overflow_option(agent, &opts)? == Overflow::Constrain;
+        // InterpretTemporalDateTimeFields: resolve the date and regulate the
+        // time with the overflow option.
+        let (y, m, d) = resolve_date_fields(
+            fields.year,
+            fields.month,
+            fields.month_code,
+            fields.day,
+            constrain,
+        )?;
+        let mut time = fields.time.map(|v| v.unwrap_or(0));
+        regulate_time(&mut time, constrain)?;
+        if !iso::iso_date_time_within_limits(
+            y, m, d, time[0], time[1], time[2], time[3], time[4], time[5],
+        ) {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "date-time out of range".into(),
+            ));
+        }
+        let dt = [
+            y, m, d, time[0], time[1], time[2], time[3], time[4], time[5],
+        ];
+        let offset_ns = match &fields.offset {
+            Some(text) => Some(
+                iso::parse_date_time_utc_offset(text)
+                    .map_err(|_| JsError::new(ErrorKind::RangeError, "invalid offset".into()))?,
+            ),
+            None => None,
+        };
+        let epoch = interpret_iso_date_time_offset(dt, &tz, offset_ns, false, &offset_opt)?;
+        return create_temporal_object(
+            agent,
+            &Value::Undefined,
+            ZONED_PROTO,
+            TemporalRecord::ZonedDateTime(epoch, JsString::from_utf8(&tz)),
+        );
+    }
+    Err(JsError::new(
+        ErrorKind::TypeError,
+        "value must be a string or object".into(),
+    ))
 }
 
 fn plain_compare_key(record: &TemporalRecord) -> Option<(i64, i64, i64)> {
@@ -2059,7 +2616,7 @@ fn to_compare_value(
                 .ok_or_else(|| JsError::new(ErrorKind::TypeError, "brand check failed".into())),
             _ => unreachable!(),
         },
-        _ => match to_zoned(agent, &item)? {
+        _ => match to_zoned(agent, &item, &Value::Undefined)? {
             Value::Object(obj) => agent
                 .temporal_data
                 .get(&obj.id())
@@ -2982,14 +3539,63 @@ fn plain_date_time_to_zoned_date_time(
     )
 }
 
-/// spec 6.5.4 TemporalZonedDateTimeToString (auto precision, showOffset auto,
-/// showTimeZone auto, showCalendar auto).
-fn zoned_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
+/// spec 6.5.3 `toString`: reads calendarName, fractionalSecondDigits, offset,
+/// roundingMode, smallestUnit, and timeZoneName (in that order), rounds the
+/// instant, then formats via TemporalZonedDateTimeToString.
+fn zoned_to_string_impl(agent: &mut Agent, this: &Value, options: Value) -> Result<Value, JsError> {
     let (ns, tz) = match require_record(agent, this, RecordKind::ZonedDateTime)? {
         TemporalRecord::ZonedDateTime(ns, tz) => (ns, tz.to_string_lossy()),
         _ => unreachable!(),
     };
-    let offset = super::offset_time_zone_offset_ns(&tz).unwrap_or(0);
+    let options = super::get_options_object(&options)?;
+    let show = get_temporal_show_calendar_name_option(agent, &options)?;
+    let digits = super::get_fractional_second_digits(agent, &options)?;
+    let show_offset = get_temporal_show_offset_option(agent, &options)?;
+    let rounding_mode = super::get_rounding_mode(agent, &options, RoundingMode::Trunc)?;
+    let smallest = super::get_temporal_unit(agent, &options, "smallestUnit", None)?;
+    let show_time_zone = get_temporal_show_time_zone_name_option(agent, &options)?;
+    let smallest = match smallest {
+        UnitOption::Unit(u) => {
+            super::validate_unit_group(u, UnitGroup::Time)?;
+            if u == Unit::Hour {
+                return Err(JsError::new(
+                    ErrorKind::RangeError,
+                    "smallestUnit must be a time unit other than hour".into(),
+                ));
+            }
+            Some(u)
+        }
+        UnitOption::Auto => {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "smallestUnit cannot be auto".into(),
+            ));
+        }
+        UnitOption::Unset => None,
+    };
+    let (precision, unit, increment) = super::to_seconds_string_precision(smallest, digits);
+    // RoundTemporalInstant, then format the rounded instant.
+    let rounded = iso::round_number_to_increment_as_if_positive(
+        ns,
+        unit.length_ns().unwrap() * increment as i128,
+        rounding_mode,
+    );
+    zoned_format_string(rounded, &tz, precision, show, show_offset, show_time_zone)
+}
+
+/// spec 6.5.4 TemporalZonedDateTimeToString: the local date-time in the zone,
+/// the offset (unless never), the `[zone]` annotation (unless never), and the
+/// calendar annotation (auto hides iso8601).
+#[allow(clippy::too_many_arguments)]
+fn zoned_format_string(
+    ns: i128,
+    tz: &str,
+    precision: FracPrecision,
+    show: &str,
+    show_offset: &str,
+    show_time_zone: &str,
+) -> Result<Value, JsError> {
+    let offset = super::offset_time_zone_offset_ns(tz).unwrap_or(0);
     let (y, m, d, h, min, s, ms, us, n) = iso::iso_parts_from_epoch(ns);
     let balanced = super::instant::balance_iso_date_time(
         y,
@@ -3003,18 +3609,455 @@ fn zoned_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
         (n as i128 + offset) as i64,
     );
     let sub = balanced.6 * 1_000_000 + balanced.7 * 1_000 + balanced.8;
-    let time =
-        iso::format_time_string(balanced.3, balanced.4, balanced.5, sub, FracPrecision::Auto);
-    let offset_str = iso::format_date_time_utc_offset_rounded(offset);
-    Ok(Value::String(Handle::new(JsString::from_utf8(&format!(
-        "{}-{:02}-{:02}T{}{}[{}]",
+    let time = iso::format_time_string(balanced.3, balanced.4, balanced.5, sub, precision);
+    let mut result = format!(
+        "{}-{:02}-{:02}T{}",
         iso::pad_iso_year(balanced.0),
         balanced.1,
         balanced.2,
-        time,
-        offset_str,
-        tz
-    )))))
+        time
+    );
+    if show_offset != "never" {
+        result.push_str(&iso::format_date_time_utc_offset_rounded(offset));
+    }
+    if show_time_zone != "never" {
+        let flag = if show_time_zone == "critical" {
+            "!"
+        } else {
+            ""
+        };
+        result.push_str(&format!("[{flag}{tz}]"));
+    }
+    if matches!(show, "always" | "critical") {
+        let flag = if show == "critical" { "!" } else { "" };
+        result.push_str(&format!("[{flag}u-ca=iso8601]"));
+    }
+    Ok(Value::String(Handle::new(JsString::from_utf8(&result))))
+}
+
+/// spec 6.5.11 `toJSON` (TemporalZonedDateTimeToString with auto precision and
+/// all auto show options).
+fn zoned_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
+    zoned_to_string_impl(agent, this, Value::Undefined)
+}
+
+/// The (epoch ns, time zone identifier) of a ZonedDateTime.
+fn zoned_parts(agent: &Agent, this: &Value) -> Result<(i128, String), JsError> {
+    match require_record(agent, this, RecordKind::ZonedDateTime)? {
+        TemporalRecord::ZonedDateTime(ns, tz) => Ok((ns, tz.to_string_lossy())),
+        _ => unreachable!(),
+    }
+}
+
+/// Create a ZonedDateTime record with the epoch-nanosecond range check
+/// (spec 6.5.1 CreateTemporalZonedDateTime).
+fn create_zoned(agent: &mut Agent, ns: i128, tz: &str) -> Result<Value, JsError> {
+    if !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&ns) {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "result is out of range".into(),
+        ));
+    }
+    create_temporal_object(
+        agent,
+        &Value::Undefined,
+        ZONED_PROTO,
+        TemporalRecord::ZonedDateTime(ns, JsString::from_utf8(tz)),
+    )
+}
+
+/// spec 6.5.5 `with` (CalendarMergeFields over the existing local fields,
+/// then InterpretISODateTimeOffset with the disambiguation/offset/overflow
+/// options).
+fn zoned_with(
+    agent: &mut Agent,
+    this: &Value,
+    item: Value,
+    options: Value,
+) -> Result<Value, JsError> {
+    let (ns, tz) = zoned_parts(agent, this)?;
+    if !matches!(item, Value::Object(_) | Value::Function(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "invalid argument".into(),
+        ));
+    }
+    reject_temporal_like_object(agent, &item)?;
+    let (py, pm, pmc, pd, pt, poffset) = read_zoned_with_fields(agent, &item)?;
+    let local = zoned_local(agent, ns, &tz)?;
+    let offset_ns = super::offset_time_zone_offset_ns(&tz)
+        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
+    let options = super::get_options_object(&options)?;
+    super::get_temporal_disambiguation_option(agent, &options)?;
+    let offset_opt = super::get_temporal_offset_option(agent, &options, "prefer")?;
+    let constrain = super::get_temporal_overflow_option(agent, &options)? == Overflow::Constrain;
+    // CalendarMergeFields for iso8601: the partial month/monthCode dedup of
+    // PlainDateTime.with over the existing date, time, and offset fields.
+    let year = py.or(Some(local.0));
+    let month = pm;
+    let month_code = pmc.or(if pm.is_some() {
+        None
+    } else {
+        Some(format!("M{:02}", local.1))
+    });
+    let day = pd.or(Some(local.2));
+    let mut t = [local.3, local.4, local.5, local.6, local.7, local.8];
+    for (i, value) in pt.iter().enumerate() {
+        if let Some(v) = value {
+            t[i] = *v;
+        }
+    }
+    let offset_text = poffset
+        .clone()
+        .unwrap_or_else(|| iso::format_offset_nanoseconds(offset_ns));
+    let (y, m, d) = resolve_date_fields(year, month, month_code, day, constrain)?;
+    regulate_time(&mut t, constrain)?;
+    let dt = [y, m, d, t[0], t[1], t[2], t[3], t[4], t[5]];
+    let new_offset_ns = iso::parse_date_time_utc_offset(&offset_text)
+        .map_err(|_| JsError::new(ErrorKind::RangeError, "invalid offset".into()))?;
+    let epoch = interpret_iso_date_time_offset(dt, &tz, Some(new_offset_ns), false, &offset_opt)?;
+    create_zoned(agent, epoch, &tz)
+}
+
+/// spec 6.5.6 `withPlainTime` (ToTemporalTimeRecord over the instance's local
+/// date; midnight when the argument is undefined).
+fn zoned_with_plain_time(
+    agent: &mut Agent,
+    this: &Value,
+    temporal_time: Value,
+) -> Result<Value, JsError> {
+    let (ns, tz) = zoned_parts(agent, this)?;
+    let local = zoned_local(agent, ns, &tz)?;
+    let t = if matches!(temporal_time, Value::Undefined) {
+        [0i64; 6]
+    } else {
+        let time_value = to_plain_time(agent, &temporal_time)?;
+        match require_record(agent, &time_value, RecordKind::PlainTime)? {
+            TemporalRecord::PlainTime(t) => t,
+            _ => unreachable!(),
+        }
+    };
+    // GetEpochNanosecondsFor: the single instant for the local date-time.
+    let offset = super::offset_time_zone_offset_ns(&tz)
+        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
+    let epoch = iso::get_utc_epoch_nanoseconds(
+        local.0, local.1, local.2, t[0], t[1], t[2], t[3], t[4], t[5],
+    ) - offset;
+    create_zoned(agent, epoch, &tz)
+}
+
+/// spec 6.5.7 `withTimeZone` (keeps the instant, changes the zone).
+fn zoned_with_time_zone(
+    agent: &mut Agent,
+    this: &Value,
+    time_zone: Value,
+) -> Result<Value, JsError> {
+    let (ns, _) = zoned_parts(agent, this)?;
+    let tz = super::instant::to_temporal_time_zone_identifier(agent, &time_zone)?;
+    create_zoned(agent, ns, &tz)
+}
+
+/// spec 6.5.8 `withCalendar` (only the iso8601 calendar is available).
+fn zoned_with_calendar(agent: &mut Agent, this: &Value, calendar: Value) -> Result<Value, JsError> {
+    let (ns, tz) = zoned_parts(agent, this)?;
+    to_temporal_calendar_identifier(agent, &calendar)?;
+    create_zoned(agent, ns, &tz)
+}
+
+/// spec 6.5.9 `add` / 6.5.10 `subtract` (AddDurationToZonedDateTime via
+/// AddZonedDateTime: the date part adds to the local date first, then the
+/// time part adds to the resulting instant).
+fn zoned_add_subtract(
+    agent: &mut Agent,
+    this: &Value,
+    args: &[Value],
+    subtract: bool,
+) -> Result<Value, JsError> {
+    let (ns, tz) = zoned_parts(agent, this)?;
+    let duration_like = args.first().cloned().unwrap_or(Value::Undefined);
+    let mut duration = super::to_temporal_duration(agent, &duration_like)?;
+    if subtract {
+        duration = super::negate_duration(&duration);
+    }
+    let options = super::get_options_object(args.get(1).unwrap_or(&Value::Undefined))?;
+    let constrain = super::get_temporal_overflow_option(agent, &options)? == Overflow::Constrain;
+    let internal = super::to_internal_duration_record_with_24_hour_days(&duration)?;
+    // AddZonedDateTime: CalendarDateAdd on the local date (the days fold into
+    // the calendar add), then AddInstant with the time part.
+    let local = zoned_local(agent, ns, &tz)?;
+    let date = iso::calendar_date_add(
+        local.0,
+        local.1,
+        local.2,
+        internal.date[0] as i64,
+        internal.date[1] as i64,
+        internal.date[2] as i64,
+        internal.date[3] as i64,
+        constrain,
+    )
+    .ok_or_else(|| JsError::new(ErrorKind::RangeError, "date out of range".into()))?;
+    let offset = super::offset_time_zone_offset_ns(&tz)
+        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
+    let intermediate_ns = iso::get_utc_epoch_nanoseconds(
+        date.0, date.1, date.2, local.3, local.4, local.5, local.6, local.7, local.8,
+    ) - offset;
+    // AddInstant: the result must be a valid instant.
+    let end_ns = intermediate_ns + internal.time;
+    if !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&end_ns) {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "result is out of range".into(),
+        ));
+    }
+    create_zoned(agent, end_ns, &tz)
+}
+
+/// spec 6.5.12 `round` (day or time units; the day case rounds the progress
+/// through the 24-hour day, the time case rounds the local fields and keeps
+/// the current offset via InterpretISODateTimeOffset).
+fn zoned_round(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    let (ns, tz) = zoned_parts(agent, this)?;
+    let round_to = args.first().cloned().unwrap_or(Value::Undefined);
+    if matches!(round_to, Value::Undefined) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "roundTo is required".into(),
+        ));
+    }
+    let round_to = if let Value::String(text) = &round_to {
+        let obj = crux::object::JsObject::ordinary_object_create(None);
+        obj.create_data_property_or_throw(
+            &JsString::from_utf8("smallestUnit"),
+            Value::String(text.clone()),
+        )?;
+        Value::Object(obj)
+    } else {
+        super::get_options_object(&round_to)?
+    };
+    let rounding_increment = super::get_rounding_increment(agent, &round_to)?;
+    let rounding_mode = super::get_rounding_mode(agent, &round_to, RoundingMode::HalfExpand)?;
+    let smallest = match super::get_temporal_unit(agent, &round_to, "smallestUnit", None)? {
+        UnitOption::Unit(Unit::Year)
+        | UnitOption::Unit(Unit::Month)
+        | UnitOption::Unit(Unit::Week) => {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "smallestUnit must be a time unit or day".into(),
+            ));
+        }
+        UnitOption::Unit(u) => u,
+        UnitOption::Auto | UnitOption::Unset => {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "smallestUnit is required".into(),
+            ));
+        }
+    };
+    let (maximum, inclusive) = match smallest {
+        Unit::Day => (1, true),
+        Unit::Hour => (24, false),
+        Unit::Minute => (60, false),
+        Unit::Second => (60, false),
+        Unit::Millisecond => (1000, false),
+        Unit::Microsecond => (1000, false),
+        Unit::Nanosecond => (1000, false),
+        _ => unreachable!(),
+    };
+    super::duration::validate_rounding_increment(rounding_increment, maximum, inclusive)?;
+    if rounding_increment == 1 && smallest == Unit::Nanosecond {
+        return create_zoned(agent, ns, &tz);
+    }
+    let offset = super::offset_time_zone_offset_ns(&tz)
+        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
+    let epoch = if smallest == Unit::Day {
+        // Day rounding: the progress through the local 24-hour day, rounded to
+        // the day length (the offset never changes the day length). Both day
+        // boundaries go through GetStartOfDay (range-checked).
+        let local = zoned_local(agent, ns, &tz)?;
+        let start_ns =
+            iso::get_utc_epoch_nanoseconds(local.0, local.1, local.2, 0, 0, 0, 0, 0, 0) - offset;
+        let next = iso::add_days_to_iso_date(local.0, local.1, local.2, 1);
+        let end_ns =
+            iso::get_utc_epoch_nanoseconds(next.0, next.1, next.2, 0, 0, 0, 0, 0, 0) - offset;
+        if !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&start_ns)
+            || !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&end_ns)
+        {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "day boundary is out of range".into(),
+            ));
+        }
+        let day_length = end_ns - start_ns;
+        let rounded = iso::round_number_to_increment_as_if_positive(
+            ns - start_ns,
+            day_length * rounding_increment as i128,
+            rounding_mode,
+        );
+        start_ns + rounded
+    } else {
+        // Time-unit rounding of the local fields; the current offset is
+        // retained (offset option prefer, compatible disambiguation).
+        let local = zoned_local(agent, ns, &tz)?;
+        let dt = [
+            local.0, local.1, local.2, local.3, local.4, local.5, local.6, local.7, local.8,
+        ];
+        let rounded = round_iso_date_time(dt, rounding_increment, smallest, rounding_mode)?;
+        interpret_iso_date_time_offset(rounded, &tz, Some(offset), false, "prefer")?
+    };
+    create_zoned(agent, epoch, &tz)
+}
+
+/// spec 6.5.13 `until` / 6.5.14 `since` (DifferenceTemporalZonedDateTime;
+/// the time zones must be equal, then DifferenceZonedDateTimeWithRounding).
+fn zoned_until_since(
+    agent: &mut Agent,
+    this: &Value,
+    args: &[Value],
+    since: bool,
+) -> Result<Value, JsError> {
+    let (ns, tz) = zoned_parts(agent, this)?;
+    let other = to_zoned(
+        agent,
+        &args.first().cloned().unwrap_or(Value::Undefined),
+        &Value::Undefined,
+    )?;
+    let (ons, _) = match require_record(agent, &other, RecordKind::ZonedDateTime)? {
+        TemporalRecord::ZonedDateTime(ns, tz) => (ns, tz.to_string_lossy()),
+        _ => unreachable!(),
+    };
+    let options = super::get_options_object(args.get(1).unwrap_or(&Value::Undefined))?;
+    // GetDifferenceSettings(operation, options, "datetime", [], "nanosecond",
+    // "hour").
+    let largest_option = super::get_temporal_unit(agent, &options, "largestUnit", None)?;
+    let rounding_increment = super::get_rounding_increment(agent, &options)?;
+    let mut rounding_mode = super::get_rounding_mode(agent, &options, RoundingMode::Trunc)?;
+    let smallest_option = super::get_temporal_unit(agent, &options, "smallestUnit", None)?;
+    if let UnitOption::Unit(u) = largest_option {
+        super::validate_unit_group(u, UnitGroup::DateTime)?;
+    }
+    let smallest = match smallest_option {
+        UnitOption::Unit(u) => {
+            super::validate_unit_group(u, UnitGroup::DateTime)?;
+            u
+        }
+        UnitOption::Auto => {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "smallestUnit cannot be auto".into(),
+            ));
+        }
+        UnitOption::Unset => Unit::Nanosecond,
+    };
+    if since {
+        rounding_mode = iso::negate_rounding_mode(rounding_mode);
+    }
+    let default_largest = iso::larger_of_two_units(Unit::Hour, smallest);
+    let largest = match largest_option {
+        UnitOption::Unset | UnitOption::Auto => default_largest,
+        UnitOption::Unit(u) => u,
+    };
+    if iso::larger_of_two_units(largest, smallest) != largest {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "largestUnit cannot be smaller than smallestUnit".into(),
+        ));
+    }
+    if let Some(maximum) = smallest.max_rounding_increment() {
+        super::duration::validate_rounding_increment(rounding_increment, maximum, false)?;
+    }
+    let diff = super::duration::difference_zoned_date_time_with_rounding(
+        ns,
+        ons,
+        &tz,
+        largest,
+        rounding_increment,
+        smallest,
+        rounding_mode,
+    )?;
+    let mut fields = super::temporal_duration_from_internal(diff.date, diff.time, largest)?;
+    if since {
+        fields = super::negate_duration(&fields);
+    }
+    super::create_temporal_duration(agent, &fields, &Value::Undefined)
+}
+
+/// spec 6.5.15 `startOfDay` (GetStartOfDay on the local date).
+fn zoned_start_of_day(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
+    let (ns, tz) = zoned_parts(agent, this)?;
+    let local = zoned_local(agent, ns, &tz)?;
+    let offset = super::offset_time_zone_offset_ns(&tz)
+        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
+    let start =
+        iso::get_utc_epoch_nanoseconds(local.0, local.1, local.2, 0, 0, 0, 0, 0, 0) - offset;
+    create_zoned(agent, start, &tz)
+}
+
+/// spec 6.5.16 `getTimeZoneTransition` (offset zones and UTC have no
+/// transitions: always null after validating the direction option).
+fn zoned_get_time_zone_transition(
+    agent: &mut Agent,
+    this: &Value,
+    direction: Value,
+) -> Result<Value, JsError> {
+    let (_, tz) = zoned_parts(agent, this)?;
+    if matches!(direction, Value::Undefined) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "options parameter is required".into(),
+        ));
+    }
+    let direction = if let Value::String(text) = &direction {
+        let obj = crux::object::JsObject::ordinary_object_create(None);
+        obj.create_data_property_or_throw(
+            &JsString::from_utf8("direction"),
+            Value::String(text.clone()),
+        )?;
+        Value::Object(obj)
+    } else {
+        super::get_options_object(&direction)?
+    };
+    let value = super::get_option(agent, &direction, "direction", &["next", "previous"], None)?;
+    if value.is_none() {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "direction is required".into(),
+        ));
+    }
+    // UTC and offset time zones have no transitions.
+    let _ = tz;
+    Ok(Value::Null)
+}
+
+/// spec 6.5.17 `toPlainDate`.
+fn zoned_to_plain_date(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
+    let (ns, tz) = zoned_parts(agent, this)?;
+    let local = zoned_local(agent, ns, &tz)?;
+    create_plain_date(agent, (local.0, local.1, local.2), &Value::Undefined)
+}
+
+/// spec 6.5.18 `toPlainTime`.
+fn zoned_to_plain_time(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
+    let (ns, tz) = zoned_parts(agent, this)?;
+    let local = zoned_local(agent, ns, &tz)?;
+    create_plain_time(
+        agent,
+        [local.3, local.4, local.5, local.6, local.7, local.8],
+        &Value::Undefined,
+    )
+}
+
+/// spec 6.5.19 `toPlainDateTime`.
+fn zoned_to_plain_date_time(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
+    let (ns, tz) = zoned_parts(agent, this)?;
+    let local = zoned_local(agent, ns, &tz)?;
+    create_temporal_object(
+        agent,
+        &Value::Undefined,
+        PLAIN_DATE_TIME_PROTO,
+        TemporalRecord::PlainDateTime([
+            local.0, local.1, local.2, local.3, local.4, local.5, local.6, local.7, local.8,
+        ]),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3042,6 +4085,38 @@ fn get_temporal_show_calendar_name_option(
     )?;
     Ok(match value.as_deref() {
         Some("always") => "always",
+        Some("never") => "never",
+        Some("critical") => "critical",
+        _ => "auto",
+    })
+}
+
+/// GetTemporalShowOffsetOption (spec 13.27): "auto" or "never".
+fn get_temporal_show_offset_option(
+    agent: &mut Agent,
+    options: &Value,
+) -> Result<&'static str, JsError> {
+    let value = super::get_option(agent, options, "offset", &["auto", "never"], Some("auto"))?;
+    Ok(match value.as_deref() {
+        Some("never") => "never",
+        _ => "auto",
+    })
+}
+
+/// GetTemporalShowTimeZoneNameOption (spec 13.28): "auto", "never", or
+/// "critical".
+fn get_temporal_show_time_zone_name_option(
+    agent: &mut Agent,
+    options: &Value,
+) -> Result<&'static str, JsError> {
+    let value = super::get_option(
+        agent,
+        options,
+        "timeZoneName",
+        &["auto", "never", "critical"],
+        Some("auto"),
+    )?;
+    Ok(match value.as_deref() {
         Some("never") => "never",
         Some("critical") => "critical",
         _ => "auto",
@@ -4415,7 +5490,11 @@ fn zoned_equals(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
         TemporalRecord::ZonedDateTime(ns, tz) => (ns, tz.to_string_lossy()),
         _ => unreachable!(),
     };
-    let other = to_zoned(agent, &args.first().cloned().unwrap_or(Value::Undefined))?;
+    let other = to_zoned(
+        agent,
+        &args.first().cloned().unwrap_or(Value::Undefined),
+        &Value::Undefined,
+    )?;
     let (ons, otz) = match require_record(agent, &other, RecordKind::ZonedDateTime)? {
         TemporalRecord::ZonedDateTime(ns, tz) => (ns, tz.to_string_lossy()),
         _ => unreachable!(),

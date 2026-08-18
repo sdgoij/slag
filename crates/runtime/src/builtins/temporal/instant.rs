@@ -841,6 +841,34 @@ fn lookup_named_time_zone(text: &str) -> Result<String, JsError> {
     ))
 }
 
+/// spec 6.5.1 step 5: the constructor accepts only a TimeZoneIdentifier (an
+/// offset or a named zone), never an ISO date-time string, and only a String.
+pub fn to_constructor_time_zone_identifier(
+    agent: &mut Agent,
+    value: &Value,
+) -> Result<String, JsError> {
+    if !matches!(value, Value::String(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "time zone must be a string".into(),
+        ));
+    }
+    let text = crate::context::to_string(agent, value)?;
+    let text = text.to_string_lossy();
+    let parsed = iso::parse_time_zone_identifier(&text).map_err(|_| {
+        JsError::new(
+            ErrorKind::RangeError,
+            format!("invalid time zone identifier: {text}"),
+        )
+    })?;
+    match parsed {
+        Some(offset_ns) => Ok(iso::format_offset_time_zone_identifier(
+            (offset_ns / iso::NS_PER_MINUTE) as i64,
+        )),
+        None => lookup_named_time_zone(&text),
+    }
+}
+
 /// spec 8.3.15 toZonedDateTimeISO.
 fn to_zoned_date_time_iso(
     agent: &mut Agent,

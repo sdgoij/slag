@@ -74,6 +74,10 @@ function classify(file, source) {
     // fixtures that rely on Plain*/ZonedDateTime arithmetic (or the full
     // namespace) beyond what the shell implements.
     const rest = file.split("/Temporal/")[1] ?? "";
+    // The root-level catch-all (`!rest.includes("/")`) applies only to files
+    // actually under the Temporal/ directory: a non-Temporal file whose path
+    // merely contains "Temporal" (Date/prototype/toTemporalInstant) stays
+    // skipped, mirroring the harness's byte-slice check.
     const implemented =
       rest.startsWith("Duration/") ||
       rest.startsWith("Instant/") ||
@@ -84,14 +88,16 @@ function classify(file, source) {
       rest.startsWith("PlainDateTime/") ||
       rest.startsWith("PlainYearMonth/") ||
       rest.startsWith("PlainMonthDay/") ||
-      !rest.includes("/");
+      rest.startsWith("ZonedDateTime/") ||
+      (!rest.includes("/") && file.includes("/Temporal/"));
     if (!implemented) return "Temporal type not yet implemented";
     if (
       rest.startsWith("PlainDate/prototype/toLocaleString/") ||
       rest.startsWith("PlainTime/prototype/toLocaleString/") ||
       rest.startsWith("PlainDateTime/prototype/toLocaleString/") ||
       rest.startsWith("PlainYearMonth/prototype/toLocaleString/") ||
-      rest.startsWith("PlainMonthDay/prototype/toLocaleString/")
+      rest.startsWith("PlainMonthDay/prototype/toLocaleString/") ||
+      rest.startsWith("ZonedDateTime/prototype/toLocaleString/")
     ) {
       return "Intl is out of scope";
     }

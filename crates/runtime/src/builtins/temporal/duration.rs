@@ -690,9 +690,23 @@ fn total(agent: &mut Agent, this: &Value, total_of: &Value) -> Result<Value, JsE
             if iso::is_calendar_unit(unit) {
                 let offset = super::offset_time_zone_offset_ns(&tz).unwrap_or(0);
                 let dt = iso::iso_parts_from_epoch(ns + offset);
+                // DifferenceZonedDateTime (spec 6.5.7): re-derive the calendar
+                // difference between the origin and the added instant, then
+                // total it — the raw hour-based duration's progress through
+                // the unit window spans the wrong number of days otherwise
+                // (test262 roundingmode-half-boundary).
+                let diff = difference_zoned_date_time_with_rounding(
+                    ns,
+                    target,
+                    &tz,
+                    unit,
+                    1,
+                    Unit::Nanosecond,
+                    RoundingMode::Trunc,
+                )?;
                 nudge_to_calendar_unit_total(
-                    internal_duration_sign(&internal),
-                    internal,
+                    internal_duration_sign(&diff),
+                    diff,
                     ns,
                     target,
                     dt,
@@ -1371,6 +1385,18 @@ fn compute_nudge_window(
         iso_date_time.8,
     );
     let end_epoch_ns = date_time_epoch(end_dt, time_zone)?;
+    // A zoned day window's end boundary is an exact instant: it must stay
+    // within the Instant range even when the wall date is one day past the
+    // PlainDate limit (test262 roundingincrement-addition-out-of-range).
+    if unit == Unit::Day
+        && time_zone.is_some()
+        && !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&end_epoch_ns)
+    {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "day boundary is out of range".into(),
+        ));
+    }
     Ok(Window {
         r1,
         r2,
