@@ -29,16 +29,19 @@ static void assert_utf8(JSStringRef s, const char* expected) {
 }
 
 void test_strings(void) {
-    JSStringRef s = str("h\u00e9llo");
+    // \xC3\xA9 is 'é' as explicit UTF-8 bytes: a `\u` escape in a narrow
+    // literal is codepage-encoded on MSVC (Windows), which would break the
+    // UTF-8 contract (the macOS build never saw this).
+    JSStringRef s = str("h\xC3\xA9llo");
     assert(JSStringGetLength(s) == 5);
     const JSChar* units = JSStringGetCharactersPtr(s);
     assert(units[0] == 'h');
     assert(units[1] == 0xE9);
-    assert_utf8(s, "h\u00e9llo");
+    assert_utf8(s, "h\xC3\xA9llo");
 
-    JSStringRef same = JSStringCreateWithUTF8CString("h\u00e9llo");
+    JSStringRef same = JSStringCreateWithUTF8CString("h\xC3\xA9llo");
     assert(JSStringIsEqual(s, same));
-    assert(JSStringIsEqualToUTF8CString(s, "h\u00e9llo"));
+    assert(JSStringIsEqualToUTF8CString(s, "h\xC3\xA9llo"));
     assert(!JSStringIsEqualToUTF8CString(s, "nope"));
 
     // UTF-16 entry point keeps lone surrogates exactly.

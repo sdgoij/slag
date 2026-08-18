@@ -21,13 +21,13 @@ impl External {
     /// The wrapped pointer (v8::External::Value); null when the value is
     /// not an External.
     pub fn value(&self) -> *mut std::ffi::c_void {
-        match &self.0 {
-            crux::value::Value::Object(object) => match &object.kind {
-                ObjectKind::External(pointer) => *pointer as *mut std::ffi::c_void,
-                _ => std::ptr::null_mut(),
-            },
-            _ => std::ptr::null_mut(),
-        }
+        self.0
+            .as_object()
+            .and_then(|object| match &object.kind {
+                ObjectKind::External(pointer) => Some(*pointer as *mut std::ffi::c_void),
+                _ => None,
+            })
+            .unwrap_or(std::ptr::null_mut())
     }
 
     /// The External as a language value.

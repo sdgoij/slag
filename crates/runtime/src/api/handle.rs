@@ -48,35 +48,35 @@ impl Local {
     }
 
     pub fn is_undefined(&self) -> bool {
-        matches!(self.0, Value::Undefined)
+        self.0.is_undefined()
     }
 
     pub fn is_null(&self) -> bool {
-        matches!(self.0, Value::Null)
+        self.0.is_null()
     }
 
     pub fn is_boolean(&self) -> bool {
-        matches!(self.0, Value::Boolean(_))
+        self.0.is_boolean()
     }
 
     pub fn is_number(&self) -> bool {
-        matches!(self.0, Value::Number(_))
+        self.0.is_number()
     }
 
     pub fn is_string(&self) -> bool {
-        matches!(self.0, Value::String(_))
+        self.0.is_string()
     }
 
     pub fn is_symbol(&self) -> bool {
-        matches!(self.0, Value::Symbol(_))
+        self.0.is_symbol()
     }
 
     pub fn is_bigint(&self) -> bool {
-        matches!(self.0, Value::BigInt(_))
+        self.0.is_bigint()
     }
 
     pub fn is_object(&self) -> bool {
-        matches!(self.0, Value::Object(_))
+        self.0.is_object()
     }
 
     /// Whether the value is callable (spec 7.2.3).
@@ -90,25 +90,16 @@ impl Local {
     }
 
     pub fn as_boolean(&self) -> Option<bool> {
-        match self.0 {
-            Value::Boolean(value) => Some(value),
-            _ => None,
-        }
+        self.0.as_boolean()
     }
 
     pub fn as_number(&self) -> Option<f64> {
-        match self.0 {
-            Value::Number(value) => Some(value),
-            _ => None,
-        }
+        self.0.as_number()
     }
 
     /// The string's lossy UTF-8 rendering when the value is a String.
     pub fn as_string(&self) -> Option<String> {
-        match &self.0 {
-            Value::String(s) => Some(s.to_string_lossy()),
-            _ => None,
-        }
+        self.0.as_string().map(|s| s.to_string_lossy())
     }
 
     pub fn as_object(&self) -> Option<Handle<JsObject>> {
@@ -156,7 +147,7 @@ impl Global {
     }
 
     pub fn is_empty(&self) -> bool {
-        matches!(self.0, Value::Undefined)
+        self.0.is_undefined()
     }
 
     pub fn get(&self) -> Local {

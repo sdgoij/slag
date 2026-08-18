@@ -242,10 +242,16 @@ pub unsafe extern "C" fn JSObjectSetPrototype(
         let Some(object) = object_of(ctx, object) else {
             return;
         };
-        let prototype = match refs::ref_to_value(value) {
-            Some(Value::Object(object)) => Some(object),
-            Some(Value::Null) => None,
-            _ => return,
+        let Some(value) = refs::ref_to_value(value) else {
+            return;
+        };
+        let prototype = if value.is_null() {
+            None
+        } else {
+            match value.as_object() {
+                Some(object) => Some(object),
+                None => return,
+            }
         };
         let _ = ctx.api.with_agent(|_| object.set_prototype_of(prototype));
     })

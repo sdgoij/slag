@@ -45,11 +45,13 @@ fn untag(r: JSValueRef) -> u64 {
 
 /// The object half of a value (objects and functions), for ref encoding.
 fn object_handle(value: &Value) -> Option<Handle<JsObject>> {
-    match value {
-        Value::Object(object) => Some(object.clone()),
-        Value::Function(function) => function.object.handle(),
-        _ => None,
+    if let Some(object) = value.as_object() {
+        return Some(object);
     }
+    if let Some(function) = value.as_function() {
+        return function.object.handle();
+    }
+    None
 }
 
 /// Pin `value` under its object's id so its tagged ref resolves later.

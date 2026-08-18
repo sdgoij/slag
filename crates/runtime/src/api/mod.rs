@@ -276,7 +276,7 @@ mod tests {
         assert_eq!(result.as_string().as_deref(), Some("arg"));
         // `this` inside the callback is the `call` receiver, an object.
         let this = observed_this.borrow().clone().unwrap();
-        assert!(matches!(this, Value::Object(_)));
+        assert!(this.is_object());
         let this_object = crate::context::as_object(&this).unwrap();
         let y = this_object
             .get(&crux::string::JsString::from_utf8("y"))

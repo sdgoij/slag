@@ -12,55 +12,51 @@ use crate::{JSClassRef, JSContextRef, JSObjectRef, JSStringRef, JSType, JSValueR
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn JSValueGetType(_ctx: JSContextRef, value: JSValueRef) -> JSType {
     crate::guard(|| match refs::ref_to_value(value) {
-        Some(Value::Undefined) | None => JSType::Undefined,
-        Some(Value::Null) => JSType::Null,
-        Some(Value::Boolean(_)) => JSType::Boolean,
-        Some(Value::Number(_)) => JSType::Number,
-        Some(Value::String(_)) => JSType::String,
-        Some(Value::Symbol(_)) => JSType::Symbol,
-        Some(Value::BigInt(_)) => JSType::BigInt,
-        Some(Value::Object(_)) | Some(Value::Function(_)) => JSType::Object,
+        None => JSType::Undefined,
+        Some(v) if v.is_undefined() => JSType::Undefined,
+        Some(v) if v.is_null() => JSType::Null,
+        Some(v) if v.is_boolean() => JSType::Boolean,
+        Some(v) if v.is_number() => JSType::Number,
+        Some(v) if v.is_string() => JSType::String,
+        Some(v) if v.is_symbol() => JSType::Symbol,
+        Some(v) if v.is_bigint() => JSType::BigInt,
+        Some(_) => JSType::Object,
     })
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn JSValueIsUndefined(_ctx: JSContextRef, value: JSValueRef) -> bool {
-    crate::guard(|| matches!(refs::ref_to_value(value), Some(Value::Undefined)))
+    crate::guard(|| refs::ref_to_value(value).is_some_and(|v| v.is_undefined()))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn JSValueIsNull(_ctx: JSContextRef, value: JSValueRef) -> bool {
-    crate::guard(|| matches!(refs::ref_to_value(value), Some(Value::Null)))
+    crate::guard(|| refs::ref_to_value(value).is_some_and(|v| v.is_null()))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn JSValueIsBoolean(_ctx: JSContextRef, value: JSValueRef) -> bool {
-    crate::guard(|| matches!(refs::ref_to_value(value), Some(Value::Boolean(_))))
+    crate::guard(|| refs::ref_to_value(value).is_some_and(|v| v.is_boolean()))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn JSValueIsNumber(_ctx: JSContextRef, value: JSValueRef) -> bool {
-    crate::guard(|| matches!(refs::ref_to_value(value), Some(Value::Number(_))))
+    crate::guard(|| refs::ref_to_value(value).is_some_and(|v| v.is_number()))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn JSValueIsString(_ctx: JSContextRef, value: JSValueRef) -> bool {
-    crate::guard(|| matches!(refs::ref_to_value(value), Some(Value::String(_))))
+    crate::guard(|| refs::ref_to_value(value).is_some_and(|v| v.is_string()))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn JSValueIsSymbol(_ctx: JSContextRef, value: JSValueRef) -> bool {
-    crate::guard(|| matches!(refs::ref_to_value(value), Some(Value::Symbol(_))))
+    crate::guard(|| refs::ref_to_value(value).is_some_and(|v| v.is_symbol()))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn JSValueIsObject(_ctx: JSContextRef, value: JSValueRef) -> bool {
-    crate::guard(|| {
-        matches!(
-            refs::ref_to_value(value),
-            Some(Value::Object(_)) | Some(Value::Function(_))
-        )
-    })
+    crate::guard(|| refs::ref_to_value(value).is_some_and(|v| v.is_object() || v.is_function()))
 }
 
 #[unsafe(no_mangle)]
@@ -69,10 +65,9 @@ pub unsafe extern "C" fn JSValueIsArray(_ctx: JSContextRef, value: JSValueRef) -
         let Some(value) = refs::ref_to_value(value) else {
             return false;
         };
-        match &value {
-            Value::Object(object) => matches!(object.kind, crux::object::ObjectKind::Array),
-            _ => false,
-        }
+        value
+            .as_object()
+            .is_some_and(|object| matches!(object.kind, crux::object::ObjectKind::Array))
     })
 }
 
@@ -179,7 +174,7 @@ pub unsafe extern "C" fn JSValueIsInstanceOfConstructor(
         ctx.with_current(|| {
             let result = ctx.api.with_agent(|agent| {
                 runtime::expr::ordinary_has_instance(agent, &constructor, &value)
-                    .map(|value| matches!(value, Value::Boolean(true)))
+                    .map(|value| value.as_boolean() == Some(true))
             });
             match result {
                 Ok(is_instance) => is_instance,

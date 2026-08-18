@@ -220,9 +220,10 @@ impl FunctionTemplate {
                 Some(ref callback) => run_callback(callback, &info)?,
                 None => Value::Undefined,
             };
-            match result {
-                Value::Object(_) => Ok(result),
-                _ => Ok(Value::Object(instance)),
+            if result.is_object() {
+                Ok(result)
+            } else {
+                Ok(Value::Object(instance))
             }
         });
 
@@ -488,12 +489,7 @@ fn host_function(
 
 /// The `.prototype` property of the `newTarget` — the instance's prototype.
 fn prototype_object_of(new_target: &Value) -> Option<Handle<JsObject>> {
-    let function = match new_target {
-        Value::Function(function) => function,
-        _ => return None,
-    };
-    match function.get(&JsString::from_utf8("prototype")).ok()? {
-        Value::Object(object) => Some(object),
-        _ => None,
-    }
+    let function = new_target.as_function()?;
+    let value = function.get(&JsString::from_utf8("prototype")).ok()?;
+    value.as_object()
 }

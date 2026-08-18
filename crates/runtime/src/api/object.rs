@@ -4,7 +4,7 @@ use crux::error::{ErrorKind, JsError};
 use crux::object::JsObject;
 use crux::property::PropertyDescriptor;
 use crux::string::JsString;
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 
 use super::context::Context;
 use super::handle::Local;
@@ -111,9 +111,9 @@ impl Object {
         prototype: &Local,
     ) -> Result<bool, JsError> {
         let object = Self::handle(object)?;
-        let prototype = match prototype.value() {
-            Value::Object(object) => Some(object.clone()),
-            Value::Null => None,
+        let prototype = match prototype.value().kind() {
+            ValueKind::Object(_) => prototype.value().as_object(),
+            ValueKind::Null => None,
             _ => {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
