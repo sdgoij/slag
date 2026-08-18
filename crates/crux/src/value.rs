@@ -134,7 +134,10 @@ impl Value {
     /// Reconstruct the box's leaked ref, clone it for the caller, and leak
     /// the box's ref back.
     unsafe fn take_ref<T>(&self, tag: u64) -> Option<Handle<T>> {
-        if self.tag() == tag {
+        // A double's bits 47-44 can collide with a heap tag (e.g. 65.0 reads
+        // as TAG_BIGINT), so the tag check alone is not enough: only tagged
+        // (non-double) bit patterns hold a valid payload pointer.
+        if !self.is_double() && self.tag() == tag {
             // SAFETY: the payload holds a ref leaked by `box_heap`'s
             // `Rc::into_raw`; `forget` below leaks it back.
             let rc = unsafe { Rc::from_raw(self.payload() as usize as *const T) };
@@ -169,15 +172,15 @@ impl Value {
     }
 
     pub fn is_undefined(&self) -> bool {
-        self.tag() == TAG_UNDEFINED && !self.is_double()
+        !self.is_double() && self.tag() == TAG_UNDEFINED
     }
 
     pub fn is_null(&self) -> bool {
-        self.tag() == TAG_NULL
+        !self.is_double() && self.tag() == TAG_NULL
     }
 
     pub fn is_boolean(&self) -> bool {
-        matches!(self.tag(), TAG_FALSE | TAG_TRUE)
+        !self.is_double() && matches!(self.tag(), TAG_FALSE | TAG_TRUE)
     }
 
     pub fn is_number(&self) -> bool {
@@ -185,23 +188,23 @@ impl Value {
     }
 
     pub fn is_bigint(&self) -> bool {
-        self.tag() == TAG_BIGINT
+        !self.is_double() && self.tag() == TAG_BIGINT
     }
 
     pub fn is_string(&self) -> bool {
-        self.tag() == TAG_STRING
+        !self.is_double() && self.tag() == TAG_STRING
     }
 
     pub fn is_symbol(&self) -> bool {
-        self.tag() == TAG_SYMBOL
+        !self.is_double() && self.tag() == TAG_SYMBOL
     }
 
     pub fn is_object(&self) -> bool {
-        self.tag() == TAG_OBJECT
+        !self.is_double() && self.tag() == TAG_OBJECT
     }
 
     pub fn is_function(&self) -> bool {
-        self.tag() == TAG_FUNCTION
+        !self.is_double() && self.tag() == TAG_FUNCTION
     }
 
     pub fn as_number(&self) -> Option<f64> {
@@ -213,6 +216,9 @@ impl Value {
     }
 
     pub fn as_boolean(&self) -> Option<bool> {
+        if self.is_double() {
+            return None;
+        }
         match self.tag() {
             TAG_FALSE => Some(false),
             TAG_TRUE => Some(true),
@@ -494,6 +500,33 @@ mod tests {
         assert!(n.is_number());
         assert!(n.as_number().unwrap().is_nan());
         assert_ne!(n.as_number().unwrap().to_bits(), f64::NAN.to_bits());
+    }
+
+    #[test]
+    fn doubles_whose_bits_collide_with_a_tag_are_not_heap_values() {
+        // A double's bits 47-44 can match a tag even though the value is a
+        // plain number: 65.0 (0x4050_4000_0000_0000) reads as TAG_BIGINT, and
+        // 100.0 (0x4059_0000_0000_0000) as TAG_STRING. The is_*/as_* tag
+        // accessors must reject these — an unguarded as_bigint() would build
+        // an Rc from the double's low 44 bits and crash on drop.
+        for n in [65.0f64, 100.0, 64.0, 128.0, 2.0_f64.powi(52)] {
+            let v = Value::Number(n);
+            assert!(v.is_number(), "{n} must be a number");
+            assert!(!v.is_null());
+            assert!(!v.is_boolean());
+            assert!(!v.is_bigint());
+            assert!(!v.is_string());
+            assert!(!v.is_symbol());
+            assert!(!v.is_object());
+            assert!(!v.is_function());
+            assert!(v.as_boolean().is_none());
+            assert!(v.as_bigint().is_none());
+            assert!(v.as_string().is_none());
+            assert!(v.as_symbol().is_none());
+            assert!(v.as_object().is_none());
+            assert!(v.as_function().is_none());
+            assert_eq!(v.as_number(), Some(n));
+        }
     }
 
     #[test]
