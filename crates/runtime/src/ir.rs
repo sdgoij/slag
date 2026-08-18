@@ -49,6 +49,13 @@ pub enum Step {
     // ----- expression continuation steps -----
     Unary(UnaryOp),
     Binary(BinaryOp),
+    /// A binary op whose right operand is a compile-time `Number` literal:
+    /// the constant stays in the step, skipping the `Push`/`Pop` round-trip
+    /// (Ignition's `LdaSmi`-style small-int immediates).
+    BinaryImm {
+        op: BinaryOp,
+        imm: f64,
+    },
     GetMemberName {
         name: crux::AtomId,
     },
@@ -263,6 +270,14 @@ pub enum Step {
     /// Call with `[this, callee]` on the stack and the arguments in the
     /// VM's argument slot.
     Call {
+        direct_eval: bool,
+    },
+    /// Call with `[this, callee, arg1..argN]` on the stack (0-2 plain
+    /// arguments, no spreads): the VM reads the arguments in place and skips
+    /// the argument-vector build (V8 `CallProperty0/1/2` +
+    /// `CallUndefinedReceiver0/1/2`).
+    CallFast {
+        argc: u8,
         direct_eval: bool,
     },
     SuperCall,
@@ -1113,6 +1128,12 @@ impl Vm {
                     let value = crate::expr::apply_binary(agent, *op, &left, &right)?;
                     self.stack.push(value);
                 }
+                Step::BinaryImm { op, imm } => {
+                    let left = self.pop();
+                    let right = Value::Number(*imm);
+                    let value = crate::expr::apply_binary(agent, *op, &left, &right)?;
+                    self.stack.push(value);
+                }
                 Step::GetMemberName { name } => {
                     let object = self.pop();
                     if is_nullish(&object) {
@@ -1749,6 +1770,9 @@ impl Vm {
                 }
                 Step::Call { direct_eval } => {
                     self.do_call(agent, *direct_eval)?;
+                }
+                Step::CallFast { argc, direct_eval } => {
+                    self.do_call_fast(agent, *argc as usize, *direct_eval)?;
                 }
                 Step::SuperCall => {
                     let base = self.args_base_stack.pop().ok_or_else(|| {
@@ -3424,6 +3448,42 @@ impl Vm {
         Ok(())
     }
 
+    /// The fast-call path (`CallFast`): the 0-2 arguments are already on the
+    /// value stack above `[this, callee]`. The arguments slice is read in
+    /// place — no argument-vector build, no per-call `Vec` allocation — and
+    /// the frame is popped after the call. Stack: `[..., this, callee,
+    /// arg1..argN]`.
+    fn do_call_fast(
+        &mut self,
+        agent: &mut Agent,
+        argc: usize,
+        direct_eval: bool,
+    ) -> Result<(), JsError> {
+        let n = self.stack.len();
+        let arg_start = n - argc;
+        let callee = self.stack[arg_start - 1].clone();
+        let this = self.stack[arg_start - 2].clone();
+        let args = &self.stack[arg_start..n];
+        if is_eval_function(agent, &callee)? {
+            let source = args.first().cloned().unwrap_or(Value::Undefined);
+            let source = crux::convert::to_string(&source)?;
+            let result = crate::script::perform_eval(agent, &source, self.strict, direct_eval)?;
+            self.stack.truncate(arg_start - 2);
+            self.stack.push(result);
+            return Ok(());
+        }
+        if !is_callable(&callee) {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                format!("{} is not a function", crux::value::type_of(&callee)),
+            ));
+        }
+        let result = crate::function::call(agent, &callee, this, args)?;
+        self.stack.truncate(arg_start - 2);
+        self.stack.push(result);
+        Ok(())
+    }
+
     fn for_binding_put(
         &mut self,
         agent: &mut Agent,
@@ -4662,8 +4722,13 @@ impl Compiler {
         let short = self.new_label();
         let end = self.new_label();
         self.jump_if_chain_short(short);
-        self.compile_arguments(args)?;
-        self.emit(Step::Call { direct_eval });
+        match self.compile_arguments(args, true)? {
+            Some(argc) => self.emit(Step::CallFast {
+                argc: argc as u8,
+                direct_eval,
+            }),
+            None => self.emit(Step::Call { direct_eval }),
+        }
         self.jump(end);
         self.place(short);
         self.emit(Step::Pop);
@@ -5743,8 +5808,18 @@ impl Compiler {
             ExprKind::Update { op, prefix, target } => self.compile_update(op, *prefix, target),
             ExprKind::Binary { op, left, right } => {
                 self.compile_expr(left)?;
-                self.compile_expr(right)?;
-                self.emit(Step::Binary(*op));
+                // A `Number` literal right operand has no evaluation: fold it
+                // into the step (a `Push`/`Pop` round-trip saved per fused
+                // op; `i * 2`, `i < 1_000_000`, `x + 1` in the hot loops).
+                match &right.kind {
+                    ExprKind::Literal(syntax::ast::Literal::Number(n)) => {
+                        self.emit(Step::BinaryImm { op: *op, imm: *n });
+                    }
+                    _ => {
+                        self.compile_expr(right)?;
+                        self.emit(Step::Binary(*op));
+                    }
+                }
                 Ok(())
             }
             ExprKind::Logical { op, left, right } => {
@@ -5796,7 +5871,7 @@ impl Compiler {
                     ));
                 }
                 self.compile_expr(&new.callee)?;
-                self.compile_arguments(&new.args)?;
+                self.compile_arguments(&new.args, false)?;
                 self.emit(Step::Construct);
                 Ok(())
             }
@@ -6848,7 +6923,25 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_arguments(&mut self, args: &[Argument]) -> Result<(), JsError> {
+    /// Compile call arguments. Returns the argument layout: `Some(argc)` when
+    /// the 0-2 plain (non-spread) arguments were pushed onto the value stack
+    /// (the `CallFast` form), `None` when they went into the VM's argument
+    /// vector (`ArgsBase` + `ArgsPush`/`ArgsSpread`, the `Call`/`Construct`/
+    /// `SuperCall` form). `allow_fast` is false when the consumer needs the
+    /// vector form regardless (constructs and super calls).
+    fn compile_arguments(
+        &mut self,
+        args: &[Argument],
+        allow_fast: bool,
+    ) -> Result<Option<usize>, JsError> {
+        if allow_fast && args.len() <= 2 && args.iter().all(|a| matches!(a, Argument::Expr(_))) {
+            for argument in args {
+                if let Argument::Expr(expr) = argument {
+                    self.compile_expr(expr)?;
+                }
+            }
+            return Ok(Some(args.len()));
+        }
         self.emit(Step::ArgsBase);
         for argument in args {
             match argument {
@@ -6862,12 +6955,12 @@ impl Compiler {
                 }
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     fn compile_call(&mut self, call: &syntax::ast::CallExpr) -> Result<(), JsError> {
         if matches!(call.callee.kind, ExprKind::Super) {
-            self.compile_arguments(&call.args)?;
+            self.compile_arguments(&call.args, false)?;
             self.emit(Step::SuperCall);
             return Ok(());
         }
@@ -6894,8 +6987,13 @@ impl Compiler {
                 if call.optional {
                     self.compile_optional_call_tail(&call.args)?;
                 } else {
-                    self.compile_arguments(&call.args)?;
-                    self.emit(Step::Call { direct_eval: false });
+                    match self.compile_arguments(&call.args, true)? {
+                        Some(argc) => self.emit(Step::CallFast {
+                            argc: argc as u8,
+                            direct_eval: false,
+                        }),
+                        None => self.emit(Step::Call { direct_eval: false }),
+                    }
                 }
                 return Ok(());
             }
@@ -6952,7 +7050,11 @@ impl Compiler {
     }
 
     /// The optional-call tail: nullish callee → *undefined* (no argument
-    /// evaluation); otherwise call.
+    /// evaluation); otherwise call. The short path pops three values — the
+    /// receiver (the `this`/object pushed before the callee), the callee, and
+    /// the dup'd callee the nullish test pushed back — so the chain leaves
+    /// exactly `[undefined]` (a two-pop short leaked the receiver into the
+    /// enclosing expression, shifting every later stack read).
     fn compile_optional_call_tail(&mut self, args: &[Argument]) -> Result<(), JsError> {
         let short = self.new_label();
         let end = self.new_label();
@@ -6961,6 +7063,7 @@ impl Compiler {
         self.compile_call_args_guarded(args, false)?;
         self.jump(end);
         self.place(short);
+        self.emit(Step::Pop);
         self.emit(Step::Pop);
         self.emit(Step::Pop);
         self.emit(Step::Push(Value::Undefined));

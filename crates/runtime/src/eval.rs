@@ -2298,6 +2298,38 @@ mod tests {
     }
 
     #[test]
+    fn optional_call_nullish_callee_short_circuits() {
+        // A nullish callee short-circuits the whole chain to *undefined*
+        // without evaluating the arguments or calling (spec 13.3.7.1). The
+        // compiled path's optional-call tail must pop the receiver, the
+        // callee, and the dup'd callee: a leaked receiver shifts every later
+        // stack read (regression: `null?.(1) === undefined` threw).
+        assert_eq!(run("let f; f?.(1)").unwrap(), Value::Undefined);
+        assert_eq!(
+            run("let f; f?.(1) === undefined").unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            run("let o = { m: null }; o.m?.(1) === undefined").unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            run("let o = null; o?.m?.(1) === undefined").unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            run("let o = { m() { return 42; } }; o.m?.(1)").unwrap(),
+            Value::Number(42.0)
+        );
+        assert_eq!(
+            run("let o = { m() { return this.x; }, x: 5 }; o.m?.(1)").unwrap(),
+            Value::Number(5.0)
+        );
+        // The receiver must not leak into the surrounding statement either.
+        assert_eq!(run("let f; f?.(1); 7").unwrap(), Value::Number(7.0));
+    }
+
+    #[test]
     fn chained_member_and_method_this() {
         assert_eq!(
             run("let o = { a: { b: { c: 3 } } }; o.a.b.c").unwrap(),
