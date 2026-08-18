@@ -846,13 +846,18 @@ impl GlobalEnv {
         if self.declarative.has_binding(name) {
             return self.declarative.get_binding_value(name, strict);
         }
-        if !self.object.has_property(name)? && strict {
+        // Sloppy mode reads an absent global as *undefined*; strict mode
+        // needs to distinguish an actual `undefined` property from a missing
+        // binding. [[Get]] includes the prototype chain, so one lookup serves
+        // the found case (spec 9.2.6.4).
+        let value = self.object.get(name)?;
+        if strict && value.is_undefined() && !self.object.has_property(name)? {
             return Err(JsError::new(
                 ErrorKind::ReferenceError,
                 format!("{:?} is not defined", name.to_string_lossy()),
             ));
         }
-        self.object.get(name)
+        Ok(value)
     }
 
     fn delete_binding(&self, name: &JsString) -> Result<bool, JsError> {

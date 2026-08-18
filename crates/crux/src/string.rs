@@ -152,9 +152,36 @@ fn with_interner<R>(f: impl FnOnce(&mut Interner) -> R) -> R {
     f(&mut guard)
 }
 
+/// The identifier hot path converts `AtomId`→`JsString` (lookup) and
+/// `JsString`→`AtomId` (intern) several times per identifier read. Both take
+/// the global interner lock and re-hash/copy the units every call; the
+/// interpreter does this for the same handful of names in a loop, so a small
+/// per-thread memo turns those into linear scans over a few cached entries.
+/// The memo is a pure cache of the append-only interner: entries can never go
+/// stale, so eviction is just a size cap.
+const MEMO_CAP: usize = 64;
+
+thread_local! {
+    static LOOKUP_MEMO: std::cell::RefCell<Vec<(AtomId, JsString)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static INTERN_MEMO: std::cell::RefCell<Vec<(Box<[u16]>, AtomId)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Interns `units`, returning a stable id for it.
 pub fn intern(units: &[u16]) -> AtomId {
-    with_interner(|i| i.intern(units))
+    INTERN_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if let Some((_, id)) = memo.iter().rev().find(|(key, _)| key.as_ref() == units) {
+            return *id;
+        }
+        let id = with_interner(|i| i.intern(units));
+        memo.push((units.into(), id));
+        if memo.len() > MEMO_CAP {
+            memo.clear();
+        }
+        id
+    })
 }
 
 pub fn intern_utf8(text: &str) -> AtomId {
@@ -164,8 +191,21 @@ pub fn intern_utf8(text: &str) -> AtomId {
 
 /// Returns the interned text for `id`.
 pub fn lookup(id: AtomId) -> JsString {
-    let units = with_interner(|i| i.lookup(id).to_vec());
-    JsString::from_utf16(&units)
+    LOOKUP_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if let Some((_, text)) = memo.iter().rev().find(|(cached, _)| *cached == id) {
+            return text.clone();
+        }
+        let text = {
+            let units = with_interner(|i| i.lookup(id).to_vec());
+            JsString::from_utf16(&units)
+        };
+        memo.push((id, text.clone()));
+        if memo.len() > MEMO_CAP {
+            memo.clear();
+        }
+        text
+    })
 }
 
 #[cfg(test)]

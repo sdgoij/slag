@@ -1082,6 +1082,15 @@ impl JsObject {
     }
 
     pub fn get_key(&self, key: &PropertyKey) -> Result<Value, JsError> {
+        // Fast path: an own data property on a plain object — the receiver is
+        // only meaningful to accessors and the arguments mapping, so skip
+        // constructing it (and the exotic dispatch) entirely.
+        if matches!(self.kind, ObjectKind::Ordinary | ObjectKind::Array)
+            && let Some(property) = self.get_own_property_key(key)?
+            && let PropertyKind::Data { value, .. } = property.kind
+        {
+            return Ok(value);
+        }
         self.get_with_receiver_key(key, self.self_value())
     }
 
@@ -1123,6 +1132,49 @@ impl JsObject {
     }
 
     pub fn set_key(&self, key: &PropertyKey, value: Value, throw: bool) -> Result<bool, JsError> {
+        // Fast path: an existing writable data property on a plain object
+        // writes in place — no receiver, no descriptor machinery (spec
+        // 10.1.9.3 steps 3-4). Array `length` is excluded: its define
+        // intercept validates the new value (a non-uint32 length throws).
+        // Anything else falls through to the full path.
+        if matches!(self.kind, ObjectKind::Ordinary | ObjectKind::Array)
+            && !(matches!(self.kind, ObjectKind::Array) && key == &PropertyKey::from_utf8("length"))
+        {
+            let mut props = self.properties.borrow_mut();
+            let position = if props.len() >= 16 {
+                let index = self.property_index.borrow();
+                match index.as_ref() {
+                    Some(map) => map.get(key).copied(),
+                    None => {
+                        drop(index);
+                        let mut slot = self.property_index.borrow_mut();
+                        if slot.is_none() {
+                            *slot = Some(
+                                props
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(position, (name, _))| (name.clone(), position))
+                                    .collect(),
+                            );
+                        }
+                        slot.as_ref().unwrap().get(key).copied()
+                    }
+                }
+            } else {
+                props.iter().position(|(name, _)| name == key)
+            };
+            if let Some(position) = position
+                && let PropertyKind::Data {
+                    value: slot,
+                    writable,
+                } = &mut props[position].1.kind
+                && *writable
+            {
+                *slot = value;
+                return Ok(true);
+            }
+            drop(props);
+        }
         self.set_with_receiver_key(key, value, self.self_value(), throw)
     }
 

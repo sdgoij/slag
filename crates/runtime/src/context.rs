@@ -563,6 +563,18 @@ pub fn get_property_key(
     }
     match base.kind() {
         ValueKind::Object(obj) => {
+            // Fast path: an own data property on a plain object — nothing on
+            // the prototype chain can fire, so skip the accessor scan and the
+            // exotic dispatch. The receiver is only meaningful to accessors
+            // and the arguments mapping, both excluded here.
+            if matches!(
+                obj.kind,
+                crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array
+            ) && let Some(property) = obj.get_own_property_key(key)?
+                && let crux::object::PropertyKind::Data { value, .. } = property.kind
+            {
+                return Ok(value);
+            }
             // Accessors whose getter is an ECMAScript function cannot be
             // invoked by the crux layer (the body lives in the agent);
             // dispatch them through the evaluator (spec 8.12.2 step 6.b). The

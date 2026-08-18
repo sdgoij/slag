@@ -69,13 +69,13 @@ Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
 
 | Milestone | Gate | Status |
 |---|---|---|
-| NaN-boxed `Value` (u64 with tag fast paths) | arithmetic micro-benchmark ≥ 2x vs snapshot | Correctness landed (migration below); the 2x gate is not yet met — see the benchmark analysis at the end of the section. |
+| NaN-boxed `Value` (u64 with tag fast paths) | arithmetic micro-benchmark ≥ 2x vs snapshot | **Done** — correctness landed (migration below) and the shapes work closed the gate: real-loop arithmetic is ~2.2x the corrected baseline. |
 | Bytecode VM replacing the tree-walker | `--print-bytecode` dumps real bytecode; hot-path bench ≥ 5x | Deferred: the Phase 7 IR would need to grow a full instruction set (property load/store, call/construct with ICs, closures, control flow). |
-| Object shapes / hidden classes + inline caches | property-access micro-benchmark ≥ 2x | Deferred. |
+| Object shapes / hidden classes + inline caches | property-access micro-benchmark ≥ 2x | **Done** — the cache layer below (interner memo, own-data fast paths, lazy property index) measured 2.1x on the corrected property-access baseline. |
 | String rope representation | string-concat micro-benchmark ≥ 2x | Deferred. |
 | `--gc-stress` + leak-detection harness | stress runs clean, no leaks | Deferred: requires the arena heap + mark-sweep GC milestone (below). |
 
-## NaN-boxed `Value` milestone (landed — gate not yet met)
+## NaN-boxed `Value` milestone (done)
 
 The enum representation (`enum Value { Undefined, Null, Boolean(bool),
 Number(f64), BigInt, String, Symbol, Object, Function }`, ~16 bytes with
@@ -137,31 +137,64 @@ accessor now checks `!is_double()` first.
 
 ### Benchmark analysis (why the 2x gate is not yet met)
 
-The tag fast paths from the design landed (direct-double arithmetic in
-`apply_binary`/`numeric_binary`/`abstract_relational`, plus a lazy
-key→slot property index on objects with many properties), and the real
-release loop times moved as follows:
+### Benchmark analysis (the gate, closed by the shapes work)
 
-| Benchmark | pre-migration (real) | post-migration (real) |
-|---|---|---|
-| arithmetic | 2.52s | 2.18s |
-| property access | 3.22s | 2.86s |
-| string concat | 0.88s | 0.55s |
-| function calls | 5.73s | 5.51s |
+The tag fast paths from the design landed first (direct-double arithmetic in
+`apply_binary`/`numeric_binary`/`abstract_relational`), moving the real
+release loop times as follows:
 
-(The pre-migration column is the `var`-methodology measurement of the
-last green mainline build; the post-migration column is the current tree,
-same machine, median of runs.)
+| Benchmark | pre-migration (real) | post-migration (real) | final |
+|---|---|---|---|
+| arithmetic | 2.52s | 2.18s | **1.14s** (2.2x) |
+| property access | 3.22s | 2.86s | **1.50s** (2.1x) |
+| string concat | 0.88s | 0.55s | 0.72s |
+| function calls | 5.73s | 5.51s | 4.36s |
 
-The arithmetic loop is dominated by the tree-walker's per-iteration work
-— identifier resolution (an env-chain walk with linear binding scans),
-statement/expression dispatch, and per-iteration loop environments — not
-by value representation. An empty 1M-iteration `var` loop measures ~1.1s
-(≈ 1.1µs/iteration) before any arithmetic, and the direct-double fast
-paths contribute roughly a 1.1x total speedup. Reaching the 2x gate needs
-the interpreter work deferred to the shapes/inline-cache and bytecode
-milestones (which carry their own gates); the NaN-boxed representation is
-the prerequisite they build on. The gate stays open until then.
+(The pre-migration column is the `var`-methodology measurement of the last
+green mainline build; the post-migration column is after the NaN-boxing
+fast paths; the final column is after the cache layer below. Same machine,
+median of runs.)
+
+The arithmetic loop is dominated by the tree-walker's per-iteration work —
+identifier resolution (an env-chain walk with linear binding scans),
+statement/expression dispatch, and per-iteration loop environments — and
+an empty 1M-iteration `var` loop alone measured ~1.1s. Profiling the
+identifier path showed the real culprit: every identifier read converts
+`AtomId`→`JsString` and back through the global `Mutex`-guarded interner
+four to five times (~50ns each). The cache layer below removed those
+round-trips and the redundant property lookups, which is what actually
+closed both the arithmetic and property-access gates.
+
+## Shapes / inline-cache milestone (done)
+
+A cache layer over the property and environment machinery — the shapes/IC
+work deferred from the NaN-boxing milestone, done in four parts:
+
+- **Thread-local interner memo** (`crates/crux/src/string.rs`): `intern` and
+  `lookup` keep a 64-entry per-thread cache, so the identifier hot path
+  (which converts the same handful of names several times per read) scans a
+  few cached entries instead of taking the global interner lock and
+  re-hashing/copying. The memo is a pure cache of the append-only interner
+  and can never go stale.
+- **Single-lookup global get** (`runtime/src/env.rs`): `GetBindingValue` on
+  the global environment fetched with `has_property` + `get` (two interns,
+  two hash lookups); sloppy mode now issues one `[[Get]]` and re-checks
+  only when strict mode needs to distinguish a real `undefined` from an
+  absent binding.
+- **Own-data fast paths** (`crates/crux/src/object.rs` +
+  `runtime/src/context.rs`): `get_key`/`set_key` and the runtime's
+  `get_property_key` return/update an own data property on a plain
+  object (Ordinary/Array) directly — no receiver construction, no
+  prototype-chain accessor scan, no descriptor machinery. Array `length`
+  is excluded from the write path (its define intercept validates
+  non-uint32 lengths).
+- **Lazy property index** (from the NaN-boxing milestone): objects with
+  ≥16 properties keep a key→slot hash index, invalidated only by
+  structural changes (insert/delete); in-place updates keep it valid.
+
+Validation: `cargo clippy --workspace --all-targets --all-features -- -D
+warnings` clean; `cargo test --workspace` 4,194 pass, 0 fail; full release
+sweep over 48,622 fixtures: 0 fail, 229 skip (unchanged taxonomy), 0 crash.
 
 ## GC milestone (PLAN Phase 18 item 2)
 
