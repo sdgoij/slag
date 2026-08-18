@@ -80,13 +80,13 @@ fn trap_key(name: &str) -> JsString {
 /// ProxyCreate (spec 10.5.14). Callable targets make a callable (and, when
 /// the target is a constructor, constructible) proxy.
 pub fn proxy_create(target: Value, handler: Value) -> Result<Handle<JsObject>, JsError> {
-    if !matches!(target, Value::Object(_) | Value::Function(_)) {
+    if !target.is_object() && !target.is_function() {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Proxy target must be an object".into(),
         ));
     }
-    if !matches!(handler, Value::Object(_)) {
+    if !handler.is_object() {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Proxy handler must be an object".into(),
@@ -112,7 +112,7 @@ pub fn get_prototype_of(slots: &ProxySlots) -> Result<Option<Handle<JsObject>>, 
         return value_get_prototype_of(&target);
     };
     let handler_proto = value_call(&trap, handler, std::slice::from_ref(&target))?;
-    if !matches!(handler_proto, Value::Object(_) | Value::Null) {
+    if !handler_proto.is_object() && !handler_proto.is_null() {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "getPrototypeOf trap must return an object or null".into(),
@@ -214,14 +214,14 @@ pub fn get_own_property(
         return value_get_own_property(&target, key);
     };
     let trap_result = value_call(&trap, handler, &[target.clone(), key_value(key)])?;
-    if !matches!(trap_result, Value::Object(_) | Value::Undefined) {
+    if !trap_result.is_object() && !trap_result.is_undefined() {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "getOwnPropertyDescriptor trap must return an object or undefined".into(),
         ));
     }
     let target_desc = value_get_own_property(&target, key)?;
-    if matches!(trap_result, Value::Undefined) {
+    if trap_result.is_undefined() {
         if let Some(target_desc) = &target_desc {
             if !target_desc.configurable {
                 return Err(JsError::new(
@@ -394,7 +394,7 @@ pub fn get(slots: &ProxySlots, key: &PropertyKey, receiver: Value) -> Result<Val
             }
         } else if target_desc.is_accessor()
             && target_desc.getter().is_none()
-            && !matches!(trap_result, Value::Undefined)
+            && !trap_result.is_undefined()
         {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -569,7 +569,7 @@ pub fn construct(slots: &ProxySlots, args: &[Value], new_target: &Value) -> Resu
     };
     let arg_array = create_array_from_list(args)?;
     let new_obj = value_call(&trap, handler, &[target, arg_array, new_target.clone()])?;
-    if !matches!(new_obj, Value::Object(_)) {
+    if !new_obj.is_object() {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "construct trap must return an object".into(),
@@ -598,14 +598,13 @@ fn create_list_from_array_like(value: &Value) -> Result<Vec<PropertyKey>, JsErro
             &PropertyKey::from_utf8(&index.to_string()),
             value.clone(),
         )?;
-        let key = match &element {
-            Value::String(_) | Value::Symbol(_) => crate::convert::to_property_key(&element)?,
-            _ => {
-                return Err(JsError::new(
-                    ErrorKind::TypeError,
-                    "ownKeys trap must return a list of strings and symbols".into(),
-                ));
-            }
+        let key = if element.is_string() || element.is_symbol() {
+            crate::convert::to_property_key(&element)?
+        } else {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "ownKeys trap must return a list of strings and symbols".into(),
+            ));
         };
         list.push(key);
     }
@@ -613,7 +612,7 @@ fn create_list_from_array_like(value: &Value) -> Result<Vec<PropertyKey>, JsErro
 }
 
 fn length_of_array_like(value: &Value) -> Result<u64, JsError> {
-    if !matches!(value, Value::Object(_)) {
+    if !value.is_object() {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Value is not an object".into(),
@@ -741,10 +740,10 @@ mod tests {
         );
         let (this, trap_target, trap_key, trap_receiver) = &captured.borrow()[0];
         // The trap's `this` is the handler object.
-        assert!(matches!(this, Value::Object(_)));
+        assert!(this.is_object());
         assert_eq!(trap_key, &Value::String(Handle::new(key("x"))));
         assert!(same_value(trap_receiver, &receiver));
-        assert!(matches!(trap_target, Value::Object(_)));
+        assert!(trap_target.is_object());
     }
 
     #[test]
@@ -900,14 +899,13 @@ mod tests {
         // The trap received target, thisArg, and the args as an Array.
         let recorded = recorded.borrow();
         assert_eq!(recorded.len(), 1);
-        assert!(matches!(recorded[0][0], Value::Function(_)));
+        assert!(recorded[0][0].is_function());
         assert_eq!(recorded[0][1], Value::Undefined);
-        match &recorded[0][2] {
-            Value::Object(arr) => {
-                assert_eq!(arr.get(&key("0")).unwrap(), Value::Number(3.0));
-                assert_eq!(arr.get(&key("length")).unwrap(), Value::Number(1.0));
-            }
-            other => panic!("argArray must be an Array, got {other:?}"),
+        if let Some(arr) = recorded[0][2].as_object() {
+            assert_eq!(arr.get(&key("0")).unwrap(), Value::Number(3.0));
+            assert_eq!(arr.get(&key("length")).unwrap(), Value::Number(1.0));
+        } else {
+            panic!("argArray must be an Array, got {:?}", recorded[0][2]);
         }
     }
 
@@ -932,6 +930,6 @@ mod tests {
         assert!(is_constructor(&Value::Object(proxy.clone())));
         let proxy_value = Value::Object(proxy);
         let result = value_construct(&proxy_value, &[], &proxy_value).unwrap();
-        assert!(matches!(result, Value::Object(_)));
+        assert!(result.is_object());
     }
 }

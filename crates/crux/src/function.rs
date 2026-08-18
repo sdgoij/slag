@@ -21,7 +21,7 @@ use crate::object::JsObject;
 use crate::ops::same_value;
 use crate::property::{PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
-use crate::value::{Value, is_callable, is_constructor};
+use crate::value::{Value, ValueKind, is_callable, is_constructor};
 
 static NEXT_FUNCTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -396,8 +396,8 @@ impl Function {
 /// argument list. Proxies over callable targets dispatch through the apply
 /// trap (spec 10.5.12).
 pub fn call(callee: &Value, this: Value, args: &[Value]) -> Result<Value, JsError> {
-    match callee {
-        Value::Function(function) => match &function.kind {
+    match callee.kind() {
+        ValueKind::Function(function) => match &function.kind {
             FunctionKind::Builtin {
                 call: Some(native), ..
             } => call_with_hook(callee, this, args, native),
@@ -416,7 +416,7 @@ pub fn call(callee: &Value, this: Value, args: &[Value]) -> Result<Value, JsErro
                 call(target, bound_this.clone(), &all)
             }
         },
-        Value::Object(obj) => match &obj.kind {
+        ValueKind::Object(obj) => match &obj.kind {
             crate::object::ObjectKind::IsHTMLDDA => Ok(Value::Null),
             crate::object::ObjectKind::Proxy(slots) => crate::proxy::apply(slots, this, args),
             _ => Err(JsError::new(
@@ -435,8 +435,8 @@ pub fn call(callee: &Value, this: Value, args: &[Value]) -> Result<Value, JsErro
 /// `newTarget` (defaulting to `callee` itself). Proxies over constructible
 /// targets dispatch through the construct trap (spec 10.5.13).
 pub fn construct(callee: &Value, args: &[Value], new_target: &Value) -> Result<Value, JsError> {
-    match callee {
-        Value::Function(function) => match &function.kind {
+    match callee.kind() {
+        ValueKind::Function(function) => match &function.kind {
             FunctionKind::Builtin {
                 construct: Some(ctor),
                 ..
@@ -459,7 +459,7 @@ pub fn construct(callee: &Value, args: &[Value], new_target: &Value) -> Result<V
                 construct(target, &all, new_target)
             }
         },
-        Value::Object(obj) => match &obj.kind {
+        ValueKind::Object(obj) => match &obj.kind {
             crate::object::ObjectKind::Proxy(slots) => {
                 crate::proxy::construct(slots, args, new_target)
             }
@@ -538,8 +538,8 @@ mod tests {
             Box::new(|_, args| {
                 let a = args.first().cloned().unwrap_or(Value::Undefined);
                 let b = args.get(1).cloned().unwrap_or(Value::Undefined);
-                match (a, b) {
-                    (Value::Number(x), Value::Number(y)) => Ok(Value::Number(x + y)),
+                match (a.kind(), b.kind()) {
+                    (ValueKind::Number(x), ValueKind::Number(y)) => Ok(Value::Number(x + y)),
                     _ => Ok(Value::Undefined),
                 }
             }),
@@ -585,7 +585,7 @@ mod tests {
         let value = Value::Function(ctor);
         assert!(is_constructor(&value));
         let obj = construct(&value, &[], &value).unwrap();
-        assert!(matches!(obj, Value::Object(_)));
+        assert!(obj.is_object());
     }
 
     #[test]

@@ -130,15 +130,15 @@ impl PropertyDescriptor {
 /// descriptor object. A descriptor with both data and accessor fields is an
 /// error.
 pub fn to_property_descriptor(value: &Value) -> Result<PropertyDescriptor, JsError> {
-    let obj = match value {
-        Value::Object(obj) => obj.clone(),
-        Value::Function(function) => function.object.clone(),
-        _ => {
-            return Err(JsError::new(
-                ErrorKind::TypeError,
-                "Property description must be an object".into(),
-            ));
-        }
+    let obj = if let Some(obj) = value.as_object() {
+        obj
+    } else if let Some(function) = value.as_function() {
+        function.object.clone()
+    } else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Property description must be an object".into(),
+        ));
     };
     let mut desc = PropertyDescriptor {
         value: None,
@@ -170,7 +170,7 @@ pub fn to_property_descriptor(value: &Value) -> Result<PropertyDescriptor, JsErr
         let key = JsString::from_utf8(name);
         if obj.has_property(&key)? {
             let method = obj.get(&key)?;
-            if !matches!(method, Value::Undefined) && !is_callable(&method) {
+            if !method.is_undefined() && !is_callable(&method) {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
                     format!("{name} must be a function or undefined"),

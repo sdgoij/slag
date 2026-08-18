@@ -6,15 +6,15 @@ use crate::bigint::BigInt;
 use crate::convert::{ToPrimitiveHint, string_to_big_int, to_number, to_primitive};
 use crate::error::JsError;
 use crate::handle::Handle;
-use crate::value::Value;
+use crate::value::{Value, ValueKind};
 
 /// SameValue (spec 7.2.12).
 pub fn same_value(x: &Value, y: &Value) -> bool {
-    match (x, y) {
-        (Value::Number(a), Value::Number(b)) => {
+    match (x.kind(), y.kind()) {
+        (ValueKind::Number(a), ValueKind::Number(b)) => {
             if a.is_nan() && b.is_nan() {
                 true
-            } else if *a == 0.0 && *b == 0.0 {
+            } else if a == 0.0 && b == 0.0 {
                 a.is_sign_negative() == b.is_sign_negative()
             } else {
                 a == b
@@ -24,33 +24,33 @@ pub fn same_value(x: &Value, y: &Value) -> bool {
         // heap allocation (spec 7.2.12 step 7); a Function value and its
         // underlying object are the same allocation, so cross-kind compares
         // go through the function's object handle.
-        (Value::Object(a), Value::Object(b)) => Handle::ptr_eq(a, b),
-        (Value::Function(a), Value::Function(b)) => Handle::ptr_eq(a, b),
-        (Value::Object(a), Value::Function(b)) => b
+        (ValueKind::Object(a), ValueKind::Object(b)) => Handle::ptr_eq(&a, &b),
+        (ValueKind::Function(a), ValueKind::Function(b)) => Handle::ptr_eq(&a, &b),
+        (ValueKind::Object(a), ValueKind::Function(b)) => b
             .object
             .handle()
-            .is_some_and(|object| Handle::ptr_eq(a, &object)),
-        (Value::Function(a), Value::Object(b)) => a
+            .is_some_and(|object| Handle::ptr_eq(&a, &object)),
+        (ValueKind::Function(a), ValueKind::Object(b)) => a
             .object
             .handle()
-            .is_some_and(|object| Handle::ptr_eq(&object, b)),
+            .is_some_and(|object| Handle::ptr_eq(&object, &b)),
         _ => x == y,
     }
 }
 
 /// SameValueZero (spec 7.2.13): like SameValue, but +0 and -0 are equal.
 pub fn same_value_zero(x: &Value, y: &Value) -> bool {
-    match (x, y) {
-        (Value::Number(a), Value::Number(b)) => a == b || (a.is_nan() && b.is_nan()),
+    match (x.kind(), y.kind()) {
+        (ValueKind::Number(a), ValueKind::Number(b)) => a == b || (a.is_nan() && b.is_nan()),
         _ => same_value(x, y),
     }
 }
 
 /// IsStrictlyEqual (spec 7.2.16).
 pub fn is_strictly_equal(x: &Value, y: &Value) -> bool {
-    match (x, y) {
+    match (x.kind(), y.kind()) {
         // Number::equal: NaN ≠ NaN, +0 = -0.
-        (Value::Number(a), Value::Number(b)) => a == b,
+        (ValueKind::Number(a), ValueKind::Number(b)) => a == b,
         _ => same_value(x, y),
     }
 }
@@ -66,27 +66,19 @@ pub fn is_integral_number(number: f64) -> bool {
 pub fn is_loosely_equal(x: &Value, y: &Value) -> Result<bool, JsError> {
     // spec 7.2.15 steps 1-2: an [[IsHTMLDDA]] object (Annex B.3.7) is
     // loosely equal to null/undefined.
-    if matches!(
-        x,
-        Value::Object(obj) if matches!(obj.kind, crate::object::ObjectKind::IsHTMLDDA)
-    ) && matches!(y, Value::Null | Value::Undefined)
+    if is_htmldda(x) && matches!(y.kind(), ValueKind::Null | ValueKind::Undefined) {
+        return Ok(true);
+    }
+    if is_htmldda(y) && matches!(x.kind(), ValueKind::Null | ValueKind::Undefined) {
+        return Ok(true);
+    }
+    if matches!(x.kind(), ValueKind::Null) && matches!(y.kind(), ValueKind::Undefined)
+        || matches!(x.kind(), ValueKind::Undefined) && matches!(y.kind(), ValueKind::Null)
     {
         return Ok(true);
     }
-    if matches!(
-        y,
-        Value::Object(obj) if matches!(obj.kind, crate::object::ObjectKind::IsHTMLDDA)
-    ) && matches!(x, Value::Null | Value::Undefined)
-    {
-        return Ok(true);
-    }
-    if matches!(x, Value::Null) && matches!(y, Value::Undefined)
-        || matches!(x, Value::Undefined) && matches!(y, Value::Null)
-    {
-        return Ok(true);
-    }
-    let x_is_object = matches!(x, Value::Object(_) | Value::Function(_));
-    let y_is_object = matches!(y, Value::Object(_) | Value::Function(_));
+    let x_is_object = x.is_object() || x.is_function();
+    let y_is_object = y.is_object() || y.is_function();
     if x_is_object && !y_is_object {
         let x = to_primitive(x, ToPrimitiveHint::Default)?;
         return is_loosely_equal(&x, y);
@@ -98,40 +90,46 @@ pub fn is_loosely_equal(x: &Value, y: &Value) -> Result<bool, JsError> {
     if x_is_object && y_is_object {
         return Ok(same_value(x, y));
     }
-    if matches!(x, Value::Number(_)) && matches!(y, Value::String(_)) {
+    if matches!(x.kind(), ValueKind::Number(_)) && matches!(y.kind(), ValueKind::String(_)) {
         return is_loosely_equal(x, &Value::Number(to_number(y)?));
     }
-    if matches!(x, Value::String(_)) && matches!(y, Value::Number(_)) {
+    if matches!(x.kind(), ValueKind::String(_)) && matches!(y.kind(), ValueKind::Number(_)) {
         return is_loosely_equal(&Value::Number(to_number(x)?), y);
     }
-    if matches!(x, Value::BigInt(_))
-        && let Value::String(s) = y
+    if matches!(x.kind(), ValueKind::BigInt(_))
+        && let ValueKind::String(s) = y.kind()
     {
-        let Some(n) = string_to_big_int(s) else {
+        let Some(n) = string_to_big_int(&s) else {
             return Ok(false);
         };
         return is_loosely_equal(x, &Value::BigInt(Handle::new(n)));
     }
-    if matches!(x, Value::String(_)) && matches!(y, Value::BigInt(_)) {
+    if matches!(x.kind(), ValueKind::String(_)) && matches!(y.kind(), ValueKind::BigInt(_)) {
         return is_loosely_equal(y, x);
     }
-    if matches!(x, Value::Boolean(_)) {
+    if matches!(x.kind(), ValueKind::Boolean(_)) {
         return is_loosely_equal(&Value::Number(to_number(x)?), y);
     }
-    if matches!(y, Value::Boolean(_)) {
+    if matches!(y.kind(), ValueKind::Boolean(_)) {
         return is_loosely_equal(x, &Value::Number(to_number(y)?));
     }
-    if let (Value::BigInt(a), Value::Number(b)) = (x, y) {
-        return Ok(bigint_number_equal(a, *b));
+    if let (ValueKind::BigInt(a), ValueKind::Number(b)) = (x.kind(), y.kind()) {
+        return Ok(bigint_number_equal(&a, b));
     }
-    if let (Value::Number(a), Value::BigInt(b)) = (x, y) {
-        return Ok(bigint_number_equal(b, *a));
+    if let (ValueKind::Number(a), ValueKind::BigInt(b)) = (x.kind(), y.kind()) {
+        return Ok(bigint_number_equal(&b, a));
     }
-    match (x, y) {
+    match (x.kind(), y.kind()) {
         // Number::equal for the same-type case.
-        (Value::Number(a), Value::Number(b)) => Ok(a == b),
+        (ValueKind::Number(a), ValueKind::Number(b)) => Ok(a == b),
         _ => Ok(x == y),
     }
+}
+
+/// Whether a value is an [[IsHTMLDDA]] exotic object (Annex B.3.7).
+fn is_htmldda(v: &Value) -> bool {
+    v.as_object()
+        .is_some_and(|o| matches!(o.kind, crate::object::ObjectKind::IsHTMLDDA))
 }
 
 /// spec 7.2.15 step 12: loose equality between a BigInt and a Number.

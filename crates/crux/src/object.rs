@@ -21,7 +21,7 @@ use crate::ops::{same_value, same_value_zero};
 use crate::property::{PropertyDescriptor, PropertyKey};
 use crate::string::{JsString, lookup};
 use crate::symbol::well_known;
-use crate::value::{Value, is_callable};
+use crate::value::{Value, ValueKind, is_callable};
 
 static NEXT_OBJECT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -64,8 +64,8 @@ impl Property {
         // A completed accessor descriptor fills missing getter/setter fields
         // with *undefined*; storing those as absent keeps the stored form
         // canonical.
-        let get = get.filter(|v| !matches!(v, Value::Undefined));
-        let set = set.filter(|v| !matches!(v, Value::Undefined));
+        let get = get.filter(|v| !v.is_undefined());
+        let set = set.filter(|v| !v.is_undefined());
         Self {
             kind: PropertyKind::Accessor { get, set },
             enumerable,
@@ -150,8 +150,8 @@ impl Property {
                 configurable,
             })
         } else if desc.is_accessor_descriptor() {
-            let get = desc.get.clone().filter(|v| !matches!(v, Value::Undefined));
-            let set = desc.set.clone().filter(|v| !matches!(v, Value::Undefined));
+            let get = desc.get.clone().filter(|v| !v.is_undefined());
+            let set = desc.set.clone().filter(|v| !v.is_undefined());
             Some(Property {
                 kind: PropertyKind::Accessor { get, set },
                 enumerable,
@@ -963,8 +963,8 @@ impl JsObject {
             if let Some(index) = array_index_of(key)
                 && let Some((_, length_prop)) = self.properties.borrow().first()
                 && let PropertyKind::Data { value, .. } = &length_prop.kind
-                && let Value::Number(length) = value
-                && (index as f64) >= *length
+                && let Some(length) = value.as_number()
+                && (index as f64) >= length
             {
                 return Ok(None);
             }
@@ -1379,13 +1379,15 @@ impl JsObject {
     /// absent, a TypeError when it is present but not callable.
     pub fn get_method(&self, key: &JsString) -> Result<Option<Value>, JsError> {
         let value = self.get(key)?;
-        match value {
-            Value::Undefined | Value::Null => Ok(None),
-            v if is_callable(&v) => Ok(Some(v)),
-            _ => Err(JsError::new(
+        if value.is_undefined() || value.is_null() {
+            Ok(None)
+        } else if is_callable(&value) {
+            Ok(Some(value))
+        } else {
+            Err(JsError::new(
                 ErrorKind::TypeError,
                 format!("{:?} is not a function", key.to_string_lossy()),
-            )),
+            ))
         }
     }
 }
@@ -1594,10 +1596,10 @@ fn validate_and_apply(
         next.configurable = configurable;
     }
     if let (Some(get), PropertyKind::Accessor { get: slot, .. }) = (&desc.get, &mut next.kind) {
-        *slot = Some(get.clone()).filter(|v| !matches!(v, Value::Undefined));
+        *slot = Some(get.clone()).filter(|v| !v.is_undefined());
     }
     if let (Some(set), PropertyKind::Accessor { set: slot, .. }) = (&desc.set, &mut next.kind) {
-        *slot = Some(set.clone()).filter(|v| !matches!(v, Value::Undefined));
+        *slot = Some(set.clone()).filter(|v| !v.is_undefined());
     }
     let mut props = obj.properties.borrow_mut();
     if let Some((_, slot)) = props.iter_mut().find(|(name, _)| name == key) {
@@ -1696,7 +1698,7 @@ fn receiver_data_write(
     value: Value,
     throw: bool,
 ) -> Result<bool, JsError> {
-    if !matches!(receiver, Value::Object(_) | Value::Function(_)) {
+    if !receiver.is_object() && !receiver.is_function() {
         return Ok(false);
     }
     if let Some(existing) = receiver_get_own_property(receiver, key)? {
@@ -1737,10 +1739,12 @@ fn receiver_create_data_property(
     value: Value,
     throw: bool,
 ) -> Result<bool, JsError> {
-    let created = match receiver {
-        Value::Object(obj) => obj.create_data_property_key(key, value)?,
-        Value::Function(f) => f.object.create_data_property_key(key, value)?,
-        _ => false,
+    let created = if let Some(obj) = receiver.as_object() {
+        obj.create_data_property_key(key, value)?
+    } else if let Some(f) = receiver.as_function() {
+        f.object.create_data_property_key(key, value)?
+    } else {
+        false
     };
     if created {
         Ok(true)
@@ -1764,10 +1768,12 @@ fn receiver_get_own_property(
     receiver: &Value,
     key: &PropertyKey,
 ) -> Result<Option<Property>, JsError> {
-    match receiver {
-        Value::Object(obj) => obj.get_own_property_key(key),
-        Value::Function(f) => f.object.get_own_property_key(key),
-        _ => Ok(None),
+    if let Some(obj) = receiver.as_object() {
+        obj.get_own_property_key(key)
+    } else if let Some(f) = receiver.as_function() {
+        f.object.get_own_property_key(key)
+    } else {
+        Ok(None)
     }
 }
 
@@ -1777,10 +1783,12 @@ fn receiver_define_property(
     key: &PropertyKey,
     desc: &PropertyDescriptor,
 ) -> Result<bool, JsError> {
-    match receiver {
-        Value::Object(obj) => obj.define_property_key(key, desc),
-        Value::Function(f) => f.object.define_property_key(key, desc),
-        _ => Ok(false),
+    if let Some(obj) = receiver.as_object() {
+        obj.define_property_key(key, desc)
+    } else if let Some(f) = receiver.as_function() {
+        f.object.define_property_key(key, desc)
+    } else {
+        Ok(false)
     }
 }
 
@@ -1808,8 +1816,8 @@ fn array_define_own_property(
                 "array length is not a data property".into(),
             ));
         };
-        let length = match length_value {
-            Value::Number(n) => *n,
+        let length = match length_value.kind() {
+            ValueKind::Number(n) => n,
             _ => {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
@@ -1905,10 +1913,7 @@ fn array_set_length(array: &JsObject, desc: &PropertyDescriptor) -> Result<bool,
         .expect("arrays always have a length property");
     let old_length = old_length_desc
         .value()
-        .and_then(|v| match v {
-            Value::Number(n) => Some(n),
-            _ => None,
-        })
+        .and_then(|v| v.as_number())
         .unwrap_or(f64::NAN);
     if (new_length as f64) >= old_length {
         return array
@@ -2291,13 +2296,15 @@ fn typed_array_own_property_keys(slots: &TypedArraySlots, obj: &JsObject) -> Vec
 /// the proxy traps to forward to the target and by the receiver operations of
 /// [[Set]].
 pub(crate) fn value_get_prototype_of(value: &Value) -> Result<Option<Handle<JsObject>>, JsError> {
-    match value {
-        Value::Object(obj) => obj.get_prototype_of(),
-        Value::Function(f) => f.object.get_prototype_of(),
-        _ => Err(JsError::new(
+    if let Some(obj) = value.as_object() {
+        obj.get_prototype_of()
+    } else if let Some(f) = value.as_function() {
+        f.object.get_prototype_of()
+    } else {
+        Err(JsError::new(
             ErrorKind::TypeError,
             "value is not an object".into(),
-        )),
+        ))
     }
 }
 
@@ -2305,35 +2312,41 @@ pub(crate) fn value_set_prototype_of(
     value: &Value,
     proto: Option<Handle<JsObject>>,
 ) -> Result<bool, JsError> {
-    match value {
-        Value::Object(obj) => obj.set_prototype_of(proto),
-        Value::Function(f) => f.object.set_prototype_of(proto),
-        _ => Err(JsError::new(
+    if let Some(obj) = value.as_object() {
+        obj.set_prototype_of(proto)
+    } else if let Some(f) = value.as_function() {
+        f.object.set_prototype_of(proto)
+    } else {
+        Err(JsError::new(
             ErrorKind::TypeError,
             "value is not an object".into(),
-        )),
+        ))
     }
 }
 
 pub(crate) fn value_is_extensible(value: &Value) -> Result<bool, JsError> {
-    match value {
-        Value::Object(obj) => obj.is_extensible(),
-        Value::Function(f) => f.object.is_extensible(),
-        _ => Err(JsError::new(
+    if let Some(obj) = value.as_object() {
+        obj.is_extensible()
+    } else if let Some(f) = value.as_function() {
+        f.object.is_extensible()
+    } else {
+        Err(JsError::new(
             ErrorKind::TypeError,
             "value is not an object".into(),
-        )),
+        ))
     }
 }
 
 pub(crate) fn value_prevent_extensions(value: &Value) -> Result<bool, JsError> {
-    match value {
-        Value::Object(obj) => obj.prevent_extensions(),
-        Value::Function(f) => f.object.prevent_extensions(),
-        _ => Err(JsError::new(
+    if let Some(obj) = value.as_object() {
+        obj.prevent_extensions()
+    } else if let Some(f) = value.as_function() {
+        f.object.prevent_extensions()
+    } else {
+        Err(JsError::new(
             ErrorKind::TypeError,
             "value is not an object".into(),
-        )),
+        ))
     }
 }
 
@@ -2341,13 +2354,15 @@ pub(crate) fn value_get_own_property(
     value: &Value,
     key: &PropertyKey,
 ) -> Result<Option<Property>, JsError> {
-    match value {
-        Value::Object(obj) => obj.get_own_property_key(key),
-        Value::Function(f) => f.object.get_own_property_key(key),
-        _ => Err(JsError::new(
+    if let Some(obj) = value.as_object() {
+        obj.get_own_property_key(key)
+    } else if let Some(f) = value.as_function() {
+        f.object.get_own_property_key(key)
+    } else {
+        Err(JsError::new(
             ErrorKind::TypeError,
             "value is not an object".into(),
-        )),
+        ))
     }
 }
 
@@ -2356,24 +2371,28 @@ pub(crate) fn value_define_property(
     key: &PropertyKey,
     desc: &PropertyDescriptor,
 ) -> Result<bool, JsError> {
-    match value {
-        Value::Object(obj) => obj.define_property_key(key, desc),
-        Value::Function(f) => f.object.define_property_key(key, desc),
-        _ => Err(JsError::new(
+    if let Some(obj) = value.as_object() {
+        obj.define_property_key(key, desc)
+    } else if let Some(f) = value.as_function() {
+        f.object.define_property_key(key, desc)
+    } else {
+        Err(JsError::new(
             ErrorKind::TypeError,
             "value is not an object".into(),
-        )),
+        ))
     }
 }
 
 pub(crate) fn value_has_property(value: &Value, key: &PropertyKey) -> Result<bool, JsError> {
-    match value {
-        Value::Object(obj) => obj.has_property_key(key),
-        Value::Function(f) => f.object.has_property_key(key),
-        _ => Err(JsError::new(
+    if let Some(obj) = value.as_object() {
+        obj.has_property_key(key)
+    } else if let Some(f) = value.as_function() {
+        f.object.has_property_key(key)
+    } else {
+        Err(JsError::new(
             ErrorKind::TypeError,
             "value is not an object".into(),
-        )),
+        ))
     }
 }
 
@@ -2382,13 +2401,15 @@ pub(crate) fn value_get(
     key: &PropertyKey,
     receiver: Value,
 ) -> Result<Value, JsError> {
-    match value {
-        Value::Object(obj) => obj.get_with_receiver_key(key, receiver),
-        Value::Function(f) => f.object.get_with_receiver_key(key, receiver),
-        _ => Err(JsError::new(
+    if let Some(obj) = value.as_object() {
+        obj.get_with_receiver_key(key, receiver)
+    } else if let Some(f) = value.as_function() {
+        f.object.get_with_receiver_key(key, receiver)
+    } else {
+        Err(JsError::new(
             ErrorKind::TypeError,
             "value is not an object".into(),
-        )),
+        ))
     }
 }
 
@@ -2399,46 +2420,54 @@ pub(crate) fn value_set(
     receiver: Value,
     throw: bool,
 ) -> Result<bool, JsError> {
-    match value {
-        Value::Object(obj) => obj.set_with_receiver_key(key, v, receiver, throw),
-        Value::Function(f) => f.object.set_with_receiver_key(key, v, receiver, throw),
-        _ => Err(JsError::new(
+    if let Some(obj) = value.as_object() {
+        obj.set_with_receiver_key(key, v, receiver, throw)
+    } else if let Some(f) = value.as_function() {
+        f.object.set_with_receiver_key(key, v, receiver, throw)
+    } else {
+        Err(JsError::new(
             ErrorKind::TypeError,
             "value is not an object".into(),
-        )),
+        ))
     }
 }
 
 pub(crate) fn value_delete(value: &Value, key: &PropertyKey) -> Result<bool, JsError> {
-    match value {
-        Value::Object(obj) => obj.delete_key(key),
-        Value::Function(f) => f.object.delete_key(key),
-        _ => Err(JsError::new(
+    if let Some(obj) = value.as_object() {
+        obj.delete_key(key)
+    } else if let Some(f) = value.as_function() {
+        f.object.delete_key(key)
+    } else {
+        Err(JsError::new(
             ErrorKind::TypeError,
             "value is not an object".into(),
-        )),
+        ))
     }
 }
 
 pub(crate) fn value_own_property_keys(value: &Value) -> Result<Vec<PropertyKey>, JsError> {
-    match value {
-        Value::Object(obj) => obj.own_property_keys(),
-        Value::Function(f) => f.object.own_property_keys(),
-        _ => Err(JsError::new(
+    if let Some(obj) = value.as_object() {
+        obj.own_property_keys()
+    } else if let Some(f) = value.as_function() {
+        f.object.own_property_keys()
+    } else {
+        Err(JsError::new(
             ErrorKind::TypeError,
             "value is not an object".into(),
-        )),
+        ))
     }
 }
 
 pub(crate) fn value_get_method(value: &Value, key: &JsString) -> Result<Option<Value>, JsError> {
-    match value {
-        Value::Object(obj) => obj.get_method(key),
-        Value::Function(f) => f.object.get_method(key),
-        _ => Err(JsError::new(
+    if let Some(obj) = value.as_object() {
+        obj.get_method(key)
+    } else if let Some(f) = value.as_function() {
+        f.object.get_method(key)
+    } else {
+        Err(JsError::new(
             ErrorKind::TypeError,
             "value is not an object".into(),
-        )),
+        ))
     }
 }
 
@@ -2673,8 +2702,8 @@ mod tests {
             Box::new(|this, _| {
                 // `this` is the real receiver object, not a copy: the getter
                 // must see the receiver's own "_data".
-                match this {
-                    Value::Object(obj) => obj.get(&key("_data")),
+                match this.kind() {
+                    ValueKind::Object(obj) => obj.get(&key("_data")),
                     _ => Ok(Value::Undefined),
                 }
             }),
@@ -2704,8 +2733,8 @@ mod tests {
             1,
             Box::new(|this, args| {
                 let value = args.first().cloned().unwrap_or(Value::Undefined);
-                match this {
-                    Value::Object(obj) => {
+                match this.kind() {
+                    ValueKind::Object(obj) => {
                         // Writing a different property proves `this` is the
                         // receiver: the write lands on the receiver.
                         obj.set_key(&PropertyKey::from_utf8("_store"), value, true)?;

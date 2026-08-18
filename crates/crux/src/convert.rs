@@ -7,7 +7,7 @@ use crate::error::{ErrorKind, JsError};
 use crate::number;
 use crate::property::PropertyKey;
 use crate::string::{JsString, intern};
-use crate::value::{Value, is_callable};
+use crate::value::{Value, ValueKind, is_callable};
 use unicode::{is_line_terminator, is_white_space};
 
 /// The hint argument of `ToPrimitive` (spec 7.1.1).
@@ -42,13 +42,13 @@ fn trimmed(units: &[u16]) -> &[u16] {
 pub fn to_primitive(value: &Value, hint: ToPrimitiveHint) -> Result<Value, JsError> {
     // spec 7.1.1 step 1.a: the @@toPrimitive method runs before the
     // valueOf/toString loop, and its abrupt completion wins.
-    match value {
-        Value::Object(obj) => {
+    match value.kind() {
+        ValueKind::Object(obj) => {
             let key = crate::property::PropertyKey::Symbol(
                 crate::symbol::well_known("toPrimitive").as_ref().clone(),
             );
             let method = obj.get_key(&key)?;
-            if !matches!(method, Value::Undefined | Value::Null) {
+            if !matches!(method.kind(), ValueKind::Undefined | ValueKind::Null) {
                 if !is_callable(&method) {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
@@ -59,12 +59,12 @@ pub fn to_primitive(value: &Value, hint: ToPrimitiveHint) -> Result<Value, JsErr
             }
             ordinary_to_primitive(|name| obj.get(name), value.clone(), hint)
         }
-        Value::Function(function) => {
+        ValueKind::Function(function) => {
             let key = crate::property::PropertyKey::Symbol(
                 crate::symbol::well_known("toPrimitive").as_ref().clone(),
             );
             let method = function.get_key(&key)?;
-            if !matches!(method, Value::Undefined | Value::Null) {
+            if !matches!(method.kind(), ValueKind::Undefined | ValueKind::Null) {
                 if !is_callable(&method) {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
@@ -98,7 +98,7 @@ fn call_exotic_to_primitive(
             JsString::from_utf8(hint_text),
         ))],
     )?;
-    if matches!(result, Value::Object(_) | Value::Function(_)) {
+    if matches!(result.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert object to primitive value".into(),
@@ -115,7 +115,7 @@ fn ordinary_to_primitive(
     receiver: Value,
     hint: ToPrimitiveHint,
 ) -> Result<Value, JsError> {
-    if let Value::Object(obj) = &receiver {
+    if let ValueKind::Object(obj) = receiver.kind() {
         // A String exotic object converts directly through its wrapped
         // value (its toString/valueOf return [[StringData]]), like the
         // boxed Number/BigInt/Boolean wrappers below.
@@ -143,7 +143,7 @@ fn ordinary_to_primitive(
             // spec step 2.b.ii: a non-object result is the primitive; an
             // object result falls through to the next method name.
             let result = crate::function::call(&method, receiver.clone(), &[])?;
-            if !matches!(result, Value::Object(_) | Value::Function(_)) {
+            if !matches!(result.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
                 return Ok(result);
             }
         }
@@ -156,36 +156,36 @@ fn ordinary_to_primitive(
 
 /// ToBoolean (spec 7.1.2).
 pub fn to_boolean(value: &Value) -> bool {
-    match value {
-        Value::Undefined | Value::Null => false,
-        Value::Boolean(b) => *b,
-        Value::Number(n) => !n.is_nan() && *n != 0.0,
-        Value::String(s) => !s.is_empty(),
-        Value::BigInt(b) => !b.is_zero(),
-        Value::Symbol(_) => true,
-        Value::Object(obj) => !matches!(obj.kind, crate::object::ObjectKind::IsHTMLDDA),
-        Value::Function(_) => true,
+    match value.kind() {
+        ValueKind::Undefined | ValueKind::Null => false,
+        ValueKind::Boolean(b) => b,
+        ValueKind::Number(n) => !n.is_nan() && n != 0.0,
+        ValueKind::String(s) => !s.is_empty(),
+        ValueKind::BigInt(b) => !b.is_zero(),
+        ValueKind::Symbol(_) => true,
+        ValueKind::Object(obj) => !matches!(obj.kind, crate::object::ObjectKind::IsHTMLDDA),
+        ValueKind::Function(_) => true,
     }
 }
 
 /// ToNumber (spec 7.1.4) for the primitive types.
 pub fn to_number(value: &Value) -> Result<f64, JsError> {
-    match value {
-        Value::Number(n) => Ok(*n),
-        Value::Undefined => Ok(f64::NAN),
-        Value::Null => Ok(0.0),
-        Value::Boolean(true) => Ok(1.0),
-        Value::Boolean(false) => Ok(0.0),
-        Value::String(s) => Ok(string_numeric_literal(s.as_slice())),
-        Value::BigInt(_) => Err(JsError::new(
+    match value.kind() {
+        ValueKind::Number(n) => Ok(n),
+        ValueKind::Undefined => Ok(f64::NAN),
+        ValueKind::Null => Ok(0.0),
+        ValueKind::Boolean(true) => Ok(1.0),
+        ValueKind::Boolean(false) => Ok(0.0),
+        ValueKind::String(s) => Ok(string_numeric_literal(s.as_slice())),
+        ValueKind::BigInt(_) => Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert a BigInt value to a number".into(),
         )),
-        Value::Symbol(_) => Err(JsError::new(
+        ValueKind::Symbol(_) => Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert a Symbol value to a number".into(),
         )),
-        Value::Object(_) | Value::Function(_) => {
+        ValueKind::Object(_) | ValueKind::Function(_) => {
             let prim = to_primitive(value, ToPrimitiveHint::Number)?;
             to_number(&prim)
         }
@@ -492,7 +492,7 @@ fn digit_value(unit: u16, radix: i32) -> Option<u64> {
 /// ToNumeric (spec 7.1.3).
 pub fn to_numeric(value: &Value) -> Result<Value, JsError> {
     let prim = to_primitive(value, ToPrimitiveHint::Number)?;
-    if matches!(prim, Value::BigInt(_)) {
+    if matches!(prim.kind(), ValueKind::BigInt(_)) {
         Ok(prim)
     } else {
         Ok(Value::Number(to_number(&prim)?))
@@ -501,19 +501,19 @@ pub fn to_numeric(value: &Value) -> Result<Value, JsError> {
 
 /// ToString (spec 7.1.13) for the primitive types.
 pub fn to_string(value: &Value) -> Result<JsString, JsError> {
-    match value {
-        Value::String(s) => Ok(s.as_ref().clone()),
-        Value::Undefined => Ok(JsString::from_utf8("undefined")),
-        Value::Null => Ok(JsString::from_utf8("null")),
-        Value::Boolean(true) => Ok(JsString::from_utf8("true")),
-        Value::Boolean(false) => Ok(JsString::from_utf8("false")),
-        Value::Number(n) => Ok(number::to_string(*n)),
-        Value::BigInt(b) => Ok(JsString::from_utf8(&bigint::to_string(b, 10))),
-        Value::Symbol(_) => Err(JsError::new(
+    match value.kind() {
+        ValueKind::String(s) => Ok(s.as_ref().clone()),
+        ValueKind::Undefined => Ok(JsString::from_utf8("undefined")),
+        ValueKind::Null => Ok(JsString::from_utf8("null")),
+        ValueKind::Boolean(true) => Ok(JsString::from_utf8("true")),
+        ValueKind::Boolean(false) => Ok(JsString::from_utf8("false")),
+        ValueKind::Number(n) => Ok(number::to_string(n)),
+        ValueKind::BigInt(b) => Ok(JsString::from_utf8(&bigint::to_string(&b, 10))),
+        ValueKind::Symbol(_) => Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert a Symbol value to a string".into(),
         )),
-        Value::Object(_) | Value::Function(_) => {
+        ValueKind::Object(_) | ValueKind::Function(_) => {
             let prim = to_primitive(value, ToPrimitiveHint::String)?;
             to_string(&prim)
         }
@@ -523,15 +523,15 @@ pub fn to_string(value: &Value) -> Result<JsString, JsError> {
 /// ToBigInt (spec 7.1.16) for the primitive types.
 pub fn to_big_int(value: &Value) -> Result<BigInt, JsError> {
     let prim = to_primitive(value, ToPrimitiveHint::Number)?;
-    match prim {
-        Value::Undefined | Value::Null => Err(JsError::new(
+    match prim.kind() {
+        ValueKind::Undefined | ValueKind::Null => Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert undefined or null to a BigInt".into(),
         )),
-        Value::Boolean(true) => Ok(BigInt::from(1u64)),
-        Value::Boolean(false) => Ok(BigInt::from(0u64)),
-        Value::BigInt(b) => Ok(b.as_ref().clone()),
-        Value::String(s) => {
+        ValueKind::Boolean(true) => Ok(BigInt::from(1u64)),
+        ValueKind::Boolean(false) => Ok(BigInt::from(0u64)),
+        ValueKind::BigInt(b) => Ok(b.as_ref().clone()),
+        ValueKind::String(s) => {
             // ToBigInt('') is 0n (a whitespace-only StringIntegerLiteral);
             // anything else must be a strict decimal integer literal.
             if trimmed(s.as_slice()).is_empty() {
@@ -548,16 +548,16 @@ pub fn to_big_int(value: &Value) -> Result<BigInt, JsError> {
         // spec 7.1.17 ToBigInt: a Number throws a TypeError (NumberToBigInt,
         // which accepts integral Numbers, is the BigInt()/TypedArray
         // constructor's separate case).
-        Value::Number(_) => Err(JsError::new(
+        ValueKind::Number(_) => Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert a Number to a BigInt".into(),
         )),
-        Value::Symbol(_) => Err(JsError::new(
+        ValueKind::Symbol(_) => Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert a Symbol to a BigInt".into(),
         )),
         // to_primitive above rejects objects, but keep the match exhaustive.
-        Value::Object(_) | Value::Function(_) => Err(JsError::new(
+        ValueKind::Object(_) | ValueKind::Function(_) => Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert an object to a BigInt".into(),
         )),
@@ -644,7 +644,7 @@ pub fn to_length(number: f64) -> u64 {
 
 /// ToIndex (spec 7.1.18).
 pub fn to_index(value: &Value) -> Result<u64, JsError> {
-    if matches!(value, Value::Undefined) {
+    if value.is_undefined() {
         return Ok(0);
     }
     let number = to_number(value)?;
@@ -705,23 +705,23 @@ pub fn to_uint8_clamp(number: f64) -> u8 {
 /// ToPropertyKey (spec 7.1.14) — object handling joins in Phase 5.
 pub fn to_property_key(value: &Value) -> Result<PropertyKey, JsError> {
     let key = to_primitive(value, ToPrimitiveHint::String)?;
-    match key {
-        Value::Symbol(sym) => Ok(PropertyKey::Symbol(sym.as_ref().clone())),
-        other => {
-            let text = to_string(&other)?;
-            Ok(PropertyKey::String(intern(text.as_slice())))
-        }
+    if let ValueKind::Symbol(sym) = key.kind() {
+        Ok(PropertyKey::Symbol(sym.as_ref().clone()))
+    } else {
+        let text = to_string(&key)?;
+        Ok(PropertyKey::String(intern(text.as_slice())))
     }
 }
 
 /// RequireObjectCoercible (spec 7.1.10).
 pub fn require_object_coercible(value: &Value) -> Result<(), JsError> {
-    match value {
-        Value::Undefined | Value::Null => Err(JsError::new(
+    if value.is_undefined() || value.is_null() {
+        Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert undefined or null to object".into(),
-        )),
-        _ => Ok(()),
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -852,9 +852,9 @@ mod tests {
     #[test]
     fn to_numeric_selects_number_for_strings() {
         let n = to_numeric(&str("1.5")).unwrap();
-        assert!(matches!(n, Value::Number(v) if v == 1.5));
+        assert!(matches!(n.kind(), ValueKind::Number(v) if v == 1.5));
         let b = to_numeric(&big(7)).unwrap();
-        assert!(matches!(b, Value::BigInt(_)));
+        assert!(matches!(b.kind(), ValueKind::BigInt(_)));
     }
 
     #[test]
