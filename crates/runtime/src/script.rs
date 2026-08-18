@@ -319,6 +319,10 @@ pub fn annex_b_function_hoists(stmts: &[Stmt]) -> Vec<(JsString, crux::Span, boo
 }
 
 /// `stack` holds the lexical names of every enclosing statement list.
+// JsString hashes are content-stable (a rope's first hash materializes its
+// flat cache, which never changes the hash output), so the annex-B name sets
+// below are sound.
+#[allow(clippy::mutable_key_type)]
 fn walk_annex_b_list(
     stmts: &[Stmt],
     stack: &mut Vec<HashSet<JsString>>,
@@ -372,6 +376,7 @@ fn walk_annex_b_list(
     stack.pop();
 }
 
+#[allow(clippy::mutable_key_type)]
 fn walk_annex_b_stmt(
     stmt: &Stmt,
     stack: &mut Vec<HashSet<JsString>>,

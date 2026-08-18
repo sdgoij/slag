@@ -967,6 +967,9 @@ fn for_in_key_levels(agent: &mut Agent, rhs: &Value) -> Result<Vec<(usize, Value
 }
 
 fn for_in_key_levels_inner(agent: &mut Agent, rhs: &Value) -> Result<Vec<(usize, Value)>, JsError> {
+    // PropertyKey hashes are content-stable (a rope description's first hash
+    // materializes its flat cache, which never changes the hash output).
+    #[allow(clippy::mutable_key_type)]
     let mut seen: HashSet<PropertyKey> = HashSet::new();
     let mut keys: Vec<(usize, Value)> = Vec::new();
     // ToObject of the enumerated value (spec step 2): functions box to

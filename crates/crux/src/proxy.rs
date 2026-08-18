@@ -484,6 +484,10 @@ pub fn own_property_keys(slots: &ProxySlots) -> Result<Vec<PropertyKey>, JsError
     };
     let trap_result_array = value_call(&trap, handler, std::slice::from_ref(&target))?;
     let trap_result = create_list_from_array_like(&trap_result_array)?;
+    // A PropertyKey's hash is content-stable: a rope's first hash materializes
+    // its flat cache (OnceLock), but the cached form never changes the hash
+    // output, so using it as a set key is sound.
+    #[allow(clippy::mutable_key_type)]
     let mut seen = std::collections::HashSet::new();
     for item in &trap_result {
         if !seen.insert(item.clone()) {

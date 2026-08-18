@@ -19,7 +19,10 @@ correctness gate.
   agent-side tables keyed by object id. There is no shape/IC machinery; a
   lazy key→slot hash index accelerates lookups on objects with many
   properties (the global object), invalidated by structural changes only.
-- **Strings**: UTF-16 code-unit arrays; no ropes.
+- **Strings**: UTF-16 code units in a flat buffer or a depth-capped rope of
+  concatenation nodes (see the string-rope milestone below); `concat` appends
+  in O(1) once a string is large, and the flat form is materialized lazily
+  and cached.
 - **Memory**: `Rc`/`RefCell`-based ownership; there is no tracing GC.
   `WeakRef`/`FinalizationRegistry` are implemented with kept-alive
   semantics, but collection is not driven by a heap.
@@ -72,7 +75,7 @@ Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
 | NaN-boxed `Value` (u64 with tag fast paths) | arithmetic micro-benchmark ≥ 2x vs snapshot | **Done** — correctness landed (migration below) and the shapes work closed the gate: real-loop arithmetic is ~2.2x the corrected baseline. |
 | Bytecode VM replacing the tree-walker | `--print-bytecode` dumps real bytecode; hot-path bench ≥ 5x | Deferred: the Phase 7 IR would need to grow a full instruction set (property load/store, call/construct with ICs, closures, control flow). |
 | Object shapes / hidden classes + inline caches | property-access micro-benchmark ≥ 2x | **Done** — the cache layer below (interner memo, own-data fast paths, lazy property index) measured 2.1x on the corrected property-access baseline. |
-| String rope representation | string-concat micro-benchmark ≥ 2x | Deferred. |
+| String rope representation | string-concat micro-benchmark ≥ 2x | **Done** — the rope below measured ~5x on the corrected concat baseline (0.88s → ~0.15s). |
 | `--gc-stress` + leak-detection harness | stress runs clean, no leaks | Deferred: requires the arena heap + mark-sweep GC milestone (below). |
 
 ## NaN-boxed `Value` milestone (done)
@@ -195,6 +198,41 @@ work deferred from the NaN-boxing milestone, done in four parts:
 Validation: `cargo clippy --workspace --all-targets --all-features -- -D
 warnings` clean; `cargo test --workspace` 4,194 pass, 0 fail; full release
 sweep over 48,622 fixtures: 0 fail, 229 skip (unchanged taxonomy), 0 crash.
+
+## String rope milestone (done)
+
+`JsString` is now either a contiguous buffer or a rope — a binary tree of
+concatenation nodes (`crates/crux/src/string.rs`). `concat` appends in O(1)
+once the accumulated string is large enough, and the contiguous form is
+materialized lazily on first access and cached (strings are immutable):
+
+- **Flat threshold** — concatenations of ≤16 units stay flat (a Vec copy),
+  so ordinary small `+` operations never see the rope.
+- **Empty operands** — `s + ""` and `"" + s` return the other side directly.
+- **Depth cap** — a rope whose left side would exceed depth 64 is flattened
+  first, keeping the tree shallow: a chain of small appends cannot overflow
+  the stack on drop, and the amortized copy cost is one re-flatten of the
+  accumulated string per 64 appends (quadratic with a tiny constant).
+- **Lazy flatten** — `as_slice` materializes the concatenation once into a
+  `OnceLock<Box<[u16]>>` inside the shared node (thread-safe, so `JsString`
+  stays `Send` for the well-known-symbol table) and returns a stable
+  reference; `len` is O(1) cached. The flatten walk is iterative (an
+  explicit stack), so deep trees cannot overflow it.
+- **Accessors** — `code_unit`/`code_point_at`/`code_points`/
+  `to_string_lossy`/`PartialEq`/`Hash` all route through `as_slice`, so a
+  rope behaves exactly like its flattened content. `Debug` prints the text
+  (the derived rope Debug would recurse the tree).
+
+The `+` operator (both the both-strings fast path and the general string
+path in `apply_binary`) uses `JsString::concat`, so the O(n²) repeated copy
+in `s += 'x'` loops becomes ~O(1) appends. The concat benchmark dropped
+from 0.88s (pre-migration baseline) / 0.72s (post-shapes) to **~0.15s
+(~5x)**, closing the ≥2x gate. Validation: clippy clean; `cargo test
+--workspace` 4,199 pass, 0 fail (five new rope unit tests in crux); full
+release sweep over 48,622 fixtures: 0 fail, 229 skip (unchanged taxonomy),
+0 crash. (`HashSet`/`HashMap` keys that hold `JsString`/`PropertyKey` carry
+a documented `#[allow(clippy::mutable_key_type)]`: a rope's first hash
+materializes its flat cache, but the hash output is content-stable.)
 
 ## GC milestone (PLAN Phase 18 item 2)
 

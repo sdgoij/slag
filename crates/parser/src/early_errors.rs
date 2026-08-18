@@ -10,6 +10,12 @@
 //! - duplicate `__proto__` data properties in object literals (spec 13.2.5)
 //!
 //! Functions and classes reset the label scope: their bodies cannot see or
+//! continue/break a label declared outside.
+
+// The declaration-name sets below are keyed by JsString. A JsString hash is
+// content-stable: a rope's first hash materializes its flat cache (OnceLock),
+// but the cached form never changes the hash output, so these sets are sound.
+#![allow(clippy::mutable_key_type)]
 //! be seen by labels in the enclosing statement list.
 
 use std::collections::HashSet;
@@ -86,7 +92,12 @@ pub(crate) fn check_module(module: &Module) -> Result<(), JsError> {
 /// lexical names are errors, a lexical name may not collide with a var name,
 /// and an `export { local }` name must be a declared binding.
 fn check_module_declarations(module: &Module) -> Result<(), JsError> {
+    // JsString hashes are content-stable (a rope's first hash materializes its
+    // flat cache, but the cached form never changes the hash output), so the
+    // sets below are sound.
+    #[allow(clippy::mutable_key_type)]
     let mut lexical: HashSet<JsString> = HashSet::new();
+    #[allow(clippy::mutable_key_type)]
     let mut vars: HashSet<JsString> = HashSet::new();
     let mut exported_bindings: Vec<(JsString, Span)> = Vec::new();
     for item in &module.body {
@@ -150,6 +161,7 @@ fn check_module_declarations(module: &Module) -> Result<(), JsError> {
     Ok(())
 }
 
+#[allow(clippy::mutable_key_type)] // JsString hashes are content-stable
 fn register_module_statement_names(
     stmt: &Stmt,
     lexical: &mut HashSet<JsString>,

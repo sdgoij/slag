@@ -1232,12 +1232,13 @@ pub(crate) fn apply_binary(
             }
             // Fast path: both operands are already strings — skip the
             // ToPrimitive/ToString round-trips (the Sputnik decodeURI
-            // fixtures concatenate millions of small strings).
+            // fixtures concatenate millions of small strings). The rope
+            // concat appends without copying once the string is large.
             if let (Some(left_text), Some(right_text)) = (left.as_string(), right.as_string()) {
-                let mut units = Vec::with_capacity(left_text.len() + right_text.len());
-                units.extend_from_slice(left_text.as_slice());
-                units.extend_from_slice(right_text.as_slice());
-                return Ok(Value::String(Handle::new(JsString::from_utf16(&units))));
+                return Ok(Value::String(Handle::new(JsString::concat(
+                    &left_text,
+                    &right_text,
+                ))));
             }
             let left_prim = crate::context::to_primitive(agent, left, ToPrimitiveHint::Default)?;
             let right_prim = crate::context::to_primitive(agent, right, ToPrimitiveHint::Default)?;
@@ -1248,9 +1249,10 @@ pub(crate) fn apply_binary(
                 // would replace lone surrogates with U+FFFD.
                 let left_text = crate::context::to_string(agent, &left_prim)?;
                 let right_text = crate::context::to_string(agent, &right_prim)?;
-                let mut units = left_text.as_slice().to_vec();
-                units.extend_from_slice(right_text.as_slice());
-                return Ok(Value::String(Handle::new(JsString::from_utf16(&units))));
+                return Ok(Value::String(Handle::new(JsString::concat(
+                    &left_text,
+                    &right_text,
+                ))));
             }
             numeric_add(&left_prim, &right_prim)
         }
