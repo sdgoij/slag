@@ -9,6 +9,7 @@
 //! full evaluation, modules, and built-ins.
 
 pub mod agent;
+pub mod api;
 pub mod async_await;
 pub mod async_generator;
 pub mod binding;
