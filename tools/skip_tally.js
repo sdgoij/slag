@@ -70,14 +70,12 @@ function classify(file, source) {
   }
   if (features.has("Temporal")) {
     // Mirrors run_fixture: only the implemented clusters run; the rest of
-    // the Temporal namespace stays skipped, along with the Duration
-    // fixtures that rely on Plain*/ZonedDateTime arithmetic (or the full
-    // namespace) beyond what the shell implements.
+    // the Temporal namespace stays skipped.
     const rest = file.split("/Temporal/")[1] ?? "";
     // The root-level catch-all (`!rest.includes("/")`) applies only to files
-    // actually under the Temporal/ directory: a non-Temporal file whose path
-    // merely contains "Temporal" (Date/prototype/toTemporalInstant) stays
-    // skipped, mirroring the harness's byte-slice check.
+    // actually under the Temporal/ directory; Date/prototype/toTemporalInstant
+    // (an Instant-producing method, implemented) is let through by path,
+    // mirroring the harness's byte-slice check.
     const implemented =
       rest.startsWith("Duration/") ||
       rest.startsWith("Instant/") ||
@@ -89,7 +87,8 @@ function classify(file, source) {
       rest.startsWith("PlainYearMonth/") ||
       rest.startsWith("PlainMonthDay/") ||
       rest.startsWith("ZonedDateTime/") ||
-      (!rest.includes("/") && file.includes("/Temporal/"));
+      (!rest.includes("/") && file.includes("/Temporal/")) ||
+      file.includes("/Date/prototype/toTemporalInstant/");
     if (!implemented) return "Temporal type not yet implemented";
     if (
       rest.startsWith("PlainDate/prototype/toLocaleString/") ||
@@ -101,25 +100,7 @@ function classify(file, source) {
     ) {
       return "Intl is out of scope";
     }
-    const skipped = [
-      "getOwnPropertyNames.js",
-      "Duration/compare/calendar-temporal-object.js",
-      "Duration/prototype/round/calendar-temporal-object.js",
-      "Duration/prototype/total/calendar-temporal-object.js",
-      "Duration/prototype/round/exact-multiple-of-larger-unit-plaindate.js",
-      "Duration/prototype/round/exact-multiple-of-larger-unit-zoned.js",
-      "Duration/prototype/round/next-day-out-of-range.js",
-      "Duration/prototype/round/relativeto-rounding-date.js",
-      "Duration/prototype/round/roundingincrement-days-large.js",
-      "Duration/prototype/round/roundingincrement-non-integer.js",
-      "Duration/prototype/total/relativeto-duration-out-of-range-added-to-relative-date.js",
-      "Duration/prototype/total/relativeto-plaindate-add24hourdaystonormalizedtimeduration-out-of-range.js",
-      "Duration/prototype/total/relativeto-plaindate-large-time-component-out-of-range.js",
-      "Duration/prototype/total/relativeto-total-of-each-unit.js",
-      "Duration/prototype/total/throws-if-date-time-invalid-with-plaindate-relative.js",
-      "Duration/prototype/total/throws-if-date-time-invalid-with-zoneddatetime-relative.js",
-    ];
-    if (skipped.includes(rest)) return "requires Plain*/ZonedDateTime beyond the shell";
+    return null;
   }
   if (features.has("await-dictionary")) return "await-dictionary";
   if (features.has("ShadowRealm")) return "ShadowRealm";

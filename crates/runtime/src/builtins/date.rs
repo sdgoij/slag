@@ -16,6 +16,7 @@ use crux::string::JsString;
 use crux::value::{Value, is_callable};
 
 use crate::agent::Agent;
+use crate::builtins::temporal::instant::create_instant;
 use crate::context::as_object;
 use crate::realm::Realm;
 
@@ -941,7 +942,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     }
 
     // Prototype methods: every member dispatches by intrinsic identity.
-    let methods: [(&str, &str, u64); 45] = [
+    let methods: [(&str, &str, u64); 46] = [
         ("getDate", "%Date.prototype.getDate%", 0),
         ("getDay", "%Date.prototype.getDay%", 0),
         ("getFullYear", "%Date.prototype.getFullYear%", 0),
@@ -1000,6 +1001,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             0,
         ),
         ("toString", "%Date.prototype.toString%", 0),
+        ("toTemporalInstant", "%Date.prototype.toTemporalInstant%", 0),
         ("toTimeString", "%Date.prototype.toTimeString%", 0),
         ("toUTCString", "%Date.prototype.toUTCString%", 0),
         ("valueOf", "%Date.prototype.valueOf%", 0),
@@ -1319,6 +1321,24 @@ pub fn dispatch_call(
             )))),
             Err(e) => Err(e),
         });
+    }
+    if intrinsics
+        .get("%Date.prototype.toTemporalInstant%")
+        .as_ref()
+        == Some(callee)
+    {
+        // spec 21.4.3.28 (proposal-temporal): RequireInternalSlot
+        // ([[DateValue]]), then ns = NumberToBigInt(t) × 10⁶ — NaN is not an
+        // integral Number, so an invalid date throws RangeError — then
+        // CreateTemporalInstant.
+        return Some((|| {
+            let t = this_date_value(agent, this)?;
+            if t.is_nan() {
+                return Err(JsError::new(ErrorKind::RangeError, "invalid date".into()));
+            }
+            let ns = (t as i128) * 1_000_000;
+            create_instant(agent, ns, &Value::Undefined)
+        })());
     }
     if intrinsics.get(DATE_TO_PRIMITIVE).as_ref() == Some(callee) {
         return Some(date_to_primitive(agent, this, args));

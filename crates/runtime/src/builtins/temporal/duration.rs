@@ -1662,6 +1662,10 @@ fn nudge_to_zoned_time(
         iso_date_time.7,
         iso_date_time.8,
     ) - offset;
+    // The day-boundary direction for a zero-sign duration is +1 (the spec's
+    // GetDurationUnitLength adds one day); without it the boundary collapses
+    // to the origin date and an edge overflow goes undetected.
+    let sign = if sign == 0 { 1 } else { sign };
     let end_date = iso::add_days_to_iso_date(start.0, start.1, start.2, sign);
     let end_epoch_ns = iso::get_utc_epoch_nanoseconds(
         end_date.0,
@@ -1674,6 +1678,15 @@ fn nudge_to_zoned_time(
         iso_date_time.7,
         iso_date_time.8,
     ) - offset;
+    // The next-day boundary is an exact instant: it must stay within the
+    // Instant range even when the origin date is at the representable edge
+    // (test262 Duration/prototype/round/next-day-out-of-range).
+    if !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&end_epoch_ns) {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "next day boundary is out of range".into(),
+        ));
+    }
     let day_span = end_epoch_ns - start_epoch_ns;
     let mut rounded = super::round_time_duration(duration.time, increment, unit, rounding_mode)?;
     let beyond = rounded - day_span;

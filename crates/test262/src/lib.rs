@@ -1114,6 +1114,14 @@ var $DONE = function (error) {
         "BigInt/constructor-trailing-leading-spaces.js"
     );
     test262_builtin_fixture!(Date_S15_9_2_1_A1, "Date/S15.9.2.1_A1.js");
+    test262_builtin_fixture!(
+        Date_proto_toTemporalInstant_this_value_valid_date,
+        "Date/prototype/toTemporalInstant/this-value-valid-date.js"
+    );
+    test262_builtin_fixture!(
+        Date_proto_toTemporalInstant_this_value_invalid_date,
+        "Date/prototype/toTemporalInstant/this-value-invalid-date.js"
+    );
     test262_builtin_fixture!(Date_S15_9_3_1_A1_T1, "Date/S15.9.3.1_A1_T1.js");
     test262_builtin_fixture!(Date_S15_9_3_1_A1_T2, "Date/S15.9.3.1_A1_T2.js");
     test262_builtin_fixture!(Date_S15_9_3_1_A1_T3, "Date/S15.9.3.1_A1_T3.js");
@@ -12393,7 +12401,9 @@ var $DONE = function (error) {
             // Implemented clusters: Duration, Instant, Now, the root-level
             // namespace fixtures, the toStringTag fixtures, and the Plain*
             // clusters (PlainDate, PlainTime, PlainDateTime, PlainYearMonth,
-            // PlainMonthDay) plus ZonedDateTime (UTC + fixed-offset zones).
+            // PlainMonthDay) plus ZonedDateTime (UTC + fixed-offset zones)
+            // and Date.prototype.toTemporalInstant (an Instant, so it lives
+            // under Date/ and is let through by path below).
             let implemented = relative.starts_with("Temporal/Duration/")
                 || relative.starts_with("Temporal/Instant/")
                 || relative.starts_with("Temporal/Now/")
@@ -12404,7 +12414,8 @@ var $DONE = function (error) {
                 || relative.starts_with("Temporal/PlainYearMonth/")
                 || relative.starts_with("Temporal/PlainMonthDay/")
                 || relative.starts_with("Temporal/ZonedDateTime/")
-                || !relative["Temporal/".len()..].contains('/');
+                || !relative["Temporal/".len()..].contains('/')
+                || relative.starts_with("Date/prototype/toTemporalInstant/");
             if !implemented {
                 return FixtureResult::Skip("Temporal type not yet implemented".into());
             }
@@ -12419,32 +12430,10 @@ var $DONE = function (error) {
             {
                 return FixtureResult::Skip("Intl is out of scope".into());
             }
-            // A handful of Duration fixtures rely on Plain*/ZonedDateTime
-            // arithmetic (or the full namespace) beyond what the shell
-            // implements; skip them rather than fail.
-            if matches!(
-                relative,
-                "Temporal/getOwnPropertyNames.js"
-                    | "Temporal/Duration/compare/calendar-temporal-object.js"
-                    | "Temporal/Duration/prototype/round/calendar-temporal-object.js"
-                    | "Temporal/Duration/prototype/total/calendar-temporal-object.js"
-                    | "Temporal/Duration/prototype/round/exact-multiple-of-larger-unit-plaindate.js"
-                    | "Temporal/Duration/prototype/round/exact-multiple-of-larger-unit-zoned.js"
-                    | "Temporal/Duration/prototype/round/next-day-out-of-range.js"
-                    | "Temporal/Duration/prototype/round/relativeto-rounding-date.js"
-                    | "Temporal/Duration/prototype/round/roundingincrement-days-large.js"
-                    | "Temporal/Duration/prototype/round/roundingincrement-non-integer.js"
-                    | "Temporal/Duration/prototype/total/relativeto-duration-out-of-range-added-to-relative-date.js"
-                    | "Temporal/Duration/prototype/total/relativeto-plaindate-add24hourdaystonormalizedtimeduration-out-of-range.js"
-                    | "Temporal/Duration/prototype/total/relativeto-plaindate-large-time-component-out-of-range.js"
-                    | "Temporal/Duration/prototype/total/relativeto-total-of-each-unit.js"
-                    | "Temporal/Duration/prototype/total/throws-if-date-time-invalid-with-plaindate-relative.js"
-                    | "Temporal/Duration/prototype/total/throws-if-date-time-invalid-with-zoneddatetime-relative.js"
-            ) {
-                return FixtureResult::Skip(
-                    "requires Plain*/ZonedDateTime beyond the shell".into(),
-                );
-            }
+            // The Duration content-skips (round/total with relativeTo, the
+            // namespace key set) closed with the Plain*/ZonedDateTime
+            // arithmetic and the zoned day-boundary range check; nothing is
+            // left in this bucket.
         }
         if fm.features.iter().any(|f| f == "await-dictionary") {
             // Promise.allKeyed/allSettledKeyed (the await-dictionary stage-3
