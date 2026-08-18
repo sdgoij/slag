@@ -10,7 +10,7 @@ use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::PropertyDescriptor;
 use crux::string::JsString;
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
 use crate::context::ExecutionContext;
@@ -141,7 +141,7 @@ pub fn dispatch_call(
 ) -> Option<Result<Value, JsError>> {
     let realm = agent.current_realm().ok()?;
     let proto_value = realm.intrinsics.get(GENERATOR_PROTO)?;
-    let Value::Object(proto) = &proto_value else {
+    let ValueKind::Object(proto) = proto_value.kind() else {
         return None;
     };
     for (name, handler) in [
@@ -209,13 +209,13 @@ pub fn call_generator(
             // OrdinaryCallBindThis (spec 10.2.1): sloppy functions coerce
             // undefined/null to the global object and box primitives.
             let this = if data.this_mode == ThisMode::Sloppy {
-                match this {
-                    Value::Undefined | Value::Null => {
+                match this.kind() {
+                    ValueKind::Undefined | ValueKind::Null => {
                         let global = agent.running_context()?.realm.global_object.clone();
                         Value::Object(global)
                     }
-                    Value::Object(_) | Value::Function(_) => this,
-                    other => crate::context::to_object(agent, &other)?,
+                    ValueKind::Object(_) | ValueKind::Function(_) => this,
+                    _ => crate::context::to_object(agent, &this)?,
                 }
             } else {
                 this
@@ -313,7 +313,7 @@ fn generator_throw(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Va
 
 /// GeneratorResume (spec 27.4.3.2 steps 1-11) for a normal completion.
 fn generator_resume(agent: &mut Agent, this: &Value, completion: Resume) -> Result<Value, JsError> {
-    let Value::Object(obj) = this else {
+    let ValueKind::Object(obj) = this.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "GeneratorResume called on a non-object".into(),
@@ -377,7 +377,7 @@ fn generator_resume_abrupt(
     this: &Value,
     completion: Resume,
 ) -> Result<Value, JsError> {
-    let Value::Object(obj) = this else {
+    let ValueKind::Object(obj) = this.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "GeneratorResumeAbrupt called on a non-object".into(),
@@ -472,7 +472,7 @@ fn start_body(
         .clone()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no instantiated environment".into()))?;
     let function_value = state.function.clone();
-    let Value::Function(function_handle) = &function_value else {
+    let ValueKind::Function(function_handle) = function_value.kind() else {
         return Err(JsError::new(ErrorKind::TypeError, "not a function".into()));
     };
     let function_id = function_handle.id();

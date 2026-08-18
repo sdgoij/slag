@@ -16,7 +16,7 @@ use crux::error::{ErrorKind, JsError};
 use crux::handle::Handle;
 use crux::property::PropertyKey;
 use crux::string::JsString;
-use crux::value::{Value, is_callable};
+use crux::value::{Value, ValueKind, is_callable};
 use syntax::ast::{
     Argument, ArrayBindingElement, ArrayElement, AssignOp, BinaryOp, BindingElement,
     BindingPattern, Class, ClassElement, ClassElementName, Expr, ExprKind, ForBinding, ForInit,
@@ -928,7 +928,7 @@ impl Vm {
                 }
                 Step::DestructureUndef { use_default } => {
                     let value = self.pop();
-                    if matches!(value, Value::Undefined) {
+                    if matches!(value.kind(), ValueKind::Undefined) {
                         self.ip = use_default;
                     } else {
                         self.stack.push(value);
@@ -953,7 +953,7 @@ impl Vm {
                 }
                 Step::DestructureObjCoercible => {
                     let value = self.pop();
-                    if matches!(value, Value::Undefined | Value::Null) {
+                    if matches!(value.kind(), ValueKind::Undefined | ValueKind::Null) {
                         return Err(JsError::new(
                             ErrorKind::TypeError,
                             "Cannot destructure null or undefined".into(),
@@ -1288,10 +1288,10 @@ impl Vm {
                 Step::ObjectSpread => {
                     let from = self.pop();
                     let object = self.pop();
-                    let Value::Object(obj) = &object else {
+                    let ValueKind::Object(obj) = object.kind() else {
                         return Err(JsError::new(ErrorKind::TypeError, "not an object".into()));
                     };
-                    crate::expr::copy_data_properties(agent, obj, &from)?;
+                    crate::expr::copy_data_properties(agent, &obj, &from)?;
                     self.stack.push(object);
                 }
                 Step::ClassBegin {
@@ -1560,7 +1560,7 @@ impl Vm {
                 }
                 Step::EnterWith => {
                     let object = self.pop();
-                    let Value::Object(obj) = object else {
+                    let ValueKind::Object(obj) = object.kind() else {
                         return Err(JsError::new(
                             ErrorKind::TypeError,
                             "Cannot use 'with' on a non-object value".into(),
@@ -1868,7 +1868,7 @@ impl Vm {
                             CtlResult::Done(outcome) => return Ok(outcome),
                         },
                     };
-                    if !matches!(result, Value::Object(_)) {
+                    if !matches!(result.kind(), ValueKind::Object(_)) {
                         // Spec 15.5.5 normal case step a.iii.
                         let error = JsError::new(
                             ErrorKind::TypeError,
@@ -1953,7 +1953,7 @@ impl Vm {
                                         CtlResult::Done(outcome) => return Ok(outcome),
                                     },
                                 };
-                                if !matches!(inner, Value::Object(_)) {
+                                if !matches!(inner.kind(), ValueKind::Object(_)) {
                                     // Spec 15.5.5 throw case step b.iii.
                                     let error = JsError::new(
                                         ErrorKind::TypeError,
@@ -2047,7 +2047,7 @@ impl Vm {
                                         CtlResult::Done(outcome) => return Ok(outcome),
                                     },
                                 };
-                                if !matches!(inner, Value::Object(_)) {
+                                if !matches!(inner.kind(), ValueKind::Object(_)) {
                                     // Spec 15.5.5 return case step c.vi.
                                     let error = JsError::new(
                                         ErrorKind::TypeError,
@@ -2130,7 +2130,7 @@ impl Vm {
                 }
                 Step::AsyncYieldStarInspect { done } => {
                     let result = self.pop();
-                    if !matches!(result, Value::Object(_) | Value::Function(_)) {
+                    if !matches!(result.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
                         // spec 15.5.5: the awaited inner result must be an
                         // object (the check runs after the await, so a
                         // non-object value's `then` is never consulted).
@@ -2425,7 +2425,7 @@ impl Vm {
                 });
             }
             let resource = pending.resources[pending.index].clone();
-            let method_result = if matches!(resource.method, Value::Undefined) {
+            let method_result = if resource.method.is_undefined() {
                 if resource.hint == crate::env::DisposalHint::Sync {
                     // Dispose with an undefined method and sync hint: no call
                     // and no await (spec 9.4.4 steps 1-4).
@@ -2887,7 +2887,7 @@ enum ThrowAction {
 // ---------------------------------------------------------------------------
 
 fn is_nullish(value: &Value) -> bool {
-    matches!(value, Value::Undefined | Value::Null)
+    matches!(value.kind(), ValueKind::Undefined | ValueKind::Null)
 }
 
 /// Split an array/object element into its target and optional default
@@ -2945,9 +2945,9 @@ fn nullish_error(what: &str) -> JsError {
 /// concatenation steps, which must preserve lone surrogates (a lossy UTF-8
 /// round-trip would replace them with U+FFFD).
 fn string_units_of(value: &Value) -> Vec<u16> {
-    match value {
-        Value::String(s) => s.as_slice().to_vec(),
-        other => crux::convert::to_string(other)
+    match value.kind() {
+        ValueKind::String(s) => s.as_slice().to_vec(),
+        _ => crux::convert::to_string(value)
             .map(|s| s.as_slice().to_vec())
             .unwrap_or_else(|_| vec![]),
     }
@@ -2959,8 +2959,8 @@ fn error_message_value(error: &JsError) -> Value {
 
 fn update_value(_agent: &mut Agent, op: &UpdateOp, old: &Value) -> Result<Value, JsError> {
     let old_numeric = crux::convert::to_numeric(old)?;
-    match old_numeric {
-        Value::Number(n) => {
+    match old_numeric.kind() {
+        ValueKind::Number(n) => {
             let delta = if matches!(op, UpdateOp::Increment) {
                 1.0
             } else {
@@ -2968,7 +2968,7 @@ fn update_value(_agent: &mut Agent, op: &UpdateOp, old: &Value) -> Result<Value,
             };
             Ok(Value::Number(n + delta))
         }
-        Value::BigInt(b) => {
+        ValueKind::BigInt(b) => {
             let one = crux::BigInt::from(1i64);
             let delta = if matches!(op, UpdateOp::Increment) {
                 one
@@ -3041,7 +3041,7 @@ fn array_length(agent: &mut Agent, array: &Value) -> Result<f64, JsError> {
 }
 
 fn array_set(array: &Value, key: &str, value: Value) -> Result<(), JsError> {
-    let Value::Object(obj) = array else {
+    let ValueKind::Object(obj) = array.kind() else {
         return Err(JsError::new(ErrorKind::TypeError, "not an object".into()));
     };
     obj.create_data_property(&JsString::from_utf8(key), value)?;
@@ -3057,7 +3057,7 @@ fn object_init(
     value: Value,
     set_name: bool,
 ) -> Result<(), JsError> {
-    let Value::Object(obj) = object else {
+    let ValueKind::Object(obj) = object.kind() else {
         return Err(JsError::new(ErrorKind::TypeError, "not an object".into()));
     };
     let name = match key {
@@ -3067,7 +3067,7 @@ fn object_init(
         PropertyName::Computed(expr) => {
             let key = crate::expr::eval_expr(agent, expr, false)?;
             let key = crate::context::to_property_key(agent, &key)?;
-            return object_init_key(agent, obj, key, value, set_name);
+            return object_init_key(agent, &obj, key, value, set_name);
         }
     };
     if set_name {
@@ -3075,8 +3075,8 @@ fn object_init(
     }
     let name_text = name.to_string_lossy();
     if name_text == "__proto__" {
-        match value {
-            Value::Object(proto) => {
+        match value.kind() {
+            ValueKind::Object(proto) => {
                 if !obj.set_prototype_of(Some(proto))? {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
@@ -3084,7 +3084,7 @@ fn object_init(
                     ));
                 }
             }
-            Value::Null => {
+            ValueKind::Null => {
                 if !obj.set_prototype_of(None)? {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
@@ -3126,8 +3126,8 @@ fn object_init_key(
         PropertyKey::Symbol(_) => String::new(),
     };
     if name_text == "__proto__" {
-        match value {
-            Value::Object(proto) => {
+        match value.kind() {
+            ValueKind::Object(proto) => {
                 if !obj.set_prototype_of(Some(proto))? {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
@@ -3135,7 +3135,7 @@ fn object_init_key(
                     ));
                 }
             }
-            Value::Null => {
+            ValueKind::Null => {
                 if !obj.set_prototype_of(None)? {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
@@ -3160,7 +3160,7 @@ fn object_method(
     key: &PropertyName,
     function: &Function,
 ) -> Result<(), JsError> {
-    let Value::Object(obj) = object else {
+    let ValueKind::Object(obj) = object.kind() else {
         return Err(JsError::new(ErrorKind::TypeError, "not an object".into()));
     };
     let name = match key {
@@ -3197,7 +3197,7 @@ fn object_accessor(
     param: Option<&BindingElement>,
     body: &syntax::ast::Block,
 ) -> Result<(), JsError> {
-    let Value::Object(obj) = object else {
+    let ValueKind::Object(obj) = object.kind() else {
         return Err(JsError::new(ErrorKind::TypeError, "not an object".into()));
     };
     let name = match key {
@@ -3293,7 +3293,7 @@ fn get_async_iterator_record(
     let method = crate::expr::get_method(agent, value, "@@asyncIterator")?;
     if let Some(method) = method {
         let iterator = crate::function::call(agent, &method, value.clone(), &[])?;
-        if !matches!(iterator, Value::Object(_)) {
+        if !matches!(iterator.kind(), ValueKind::Object(_)) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "async iterator must be an object".into(),

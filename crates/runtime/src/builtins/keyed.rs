@@ -16,7 +16,7 @@ use crux::object::JsObject;
 use crux::ops::same_value;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
-use crux::value::{Value, is_callable};
+use crux::value::{Value, ValueKind, is_callable};
 
 use crate::agent::Agent;
 use crate::context::{as_object, get_property};
@@ -154,9 +154,11 @@ fn get_prototype_from_constructor(
 
 /// CanonicalizeKeyedCollectionKey (spec 24.1.1.1): -0𝔽 → +0𝔽.
 fn canonicalize_key(key: Value) -> Value {
-    match key {
-        Value::Number(number) if number == 0.0 && number.is_sign_negative() => Value::Number(0.0),
-        other => other,
+    match key.kind() {
+        ValueKind::Number(number) if number == 0.0 && number.is_sign_negative() => {
+            Value::Number(0.0)
+        }
+        _ => key,
     }
 }
 
@@ -182,7 +184,7 @@ fn live_count(map: &[Option<(Value, Value)>]) -> usize {
 
 /// RequireInternalSlot: `this` is an object registered in the map table.
 fn map_of(agent: &Agent, this: &Value) -> Result<Handle<JsObject>, JsError> {
-    let Value::Object(object) = this else {
+    let ValueKind::Object(object) = this.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Method called on an incompatible receiver".into(),
@@ -198,7 +200,7 @@ fn map_of(agent: &Agent, this: &Value) -> Result<Handle<JsObject>, JsError> {
 }
 
 fn set_of(agent: &Agent, this: &Value) -> Result<Handle<JsObject>, JsError> {
-    let Value::Object(object) = this else {
+    let ValueKind::Object(object) = this.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Method called on an incompatible receiver".into(),
@@ -242,7 +244,7 @@ fn set_data_contains(agent: &Agent, id: u64, value: &Value) -> bool {
 }
 
 fn weak_map_of(agent: &Agent, this: &Value) -> Result<Handle<JsObject>, JsError> {
-    let Value::Object(object) = this else {
+    let ValueKind::Object(object) = this.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Method called on an incompatible receiver".into(),
@@ -258,7 +260,7 @@ fn weak_map_of(agent: &Agent, this: &Value) -> Result<Handle<JsObject>, JsError>
 }
 
 fn weak_set_of(agent: &Agent, this: &Value) -> Result<Handle<JsObject>, JsError> {
-    let Value::Object(object) = this else {
+    let ValueKind::Object(object) = this.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Method called on an incompatible receiver".into(),
@@ -276,9 +278,9 @@ fn weak_set_of(agent: &Agent, this: &Value) -> Result<Handle<JsObject>, JsError>
 /// CanBeHeldWeakly (spec 26.1.1): Object, or a Symbol without a global
 /// registry entry (`Symbol.for` symbols lack language identity).
 pub(crate) fn can_be_held_weakly(agent: &Agent, value: &Value) -> bool {
-    match value {
-        Value::Object(_) | Value::Function(_) => true,
-        Value::Symbol(symbol) => {
+    match value.kind() {
+        ValueKind::Object(_) | ValueKind::Function(_) => true,
+        ValueKind::Symbol(symbol) => {
             let registry = agent.global_symbol_registry.borrow();
             !registry.iter().any(|(_, s)| s.id == symbol.id)
         }
@@ -493,7 +495,7 @@ fn create_map_iterator(
 /// index, skipping ~empty~ slots and wrapping within the current List length;
 /// a full pass without a live entry finishes the iterator.
 fn map_iterator_next(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
-    let Value::Object(iterator) = this else {
+    let ValueKind::Object(iterator) = this.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "%MapIteratorPrototype%.next called on an incompatible receiver".into(),
@@ -686,7 +688,7 @@ fn create_set_iterator(
 
 /// %SetIteratorPrototype%.next (spec 24.2.6.1).
 fn set_iterator_next(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
-    let Value::Object(iterator) = this else {
+    let ValueKind::Object(iterator) = this.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "%SetIteratorPrototype%.next called on an incompatible receiver".into(),
@@ -756,7 +758,7 @@ struct SetRecord {
 }
 
 fn get_set_record(agent: &mut Agent, other: &Value) -> Result<SetRecord, JsError> {
-    if !matches!(other, Value::Object(_) | Value::Function(_)) {
+    if !matches!(other.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Set method argument is not an object".into(),
@@ -811,7 +813,7 @@ fn get_iterator_from_method(
     method: &Value,
 ) -> Result<IteratorRecord, JsError> {
     let iterator = crate::function::call(agent, method, obj.clone(), &[])?;
-    if !matches!(iterator, Value::Object(_)) {
+    if !matches!(iterator.kind(), ValueKind::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Iterator must be an object".into(),
@@ -1268,7 +1270,7 @@ fn add_entries_from_iterable(
             Some(value) => value,
             None => return Ok(target.clone()),
         };
-        if !matches!(next, Value::Object(_)) {
+        if !matches!(next.kind(), ValueKind::Object(_)) {
             let error = JsError::new(
                 ErrorKind::TypeError,
                 "Iterator value is not an object".into(),
@@ -1398,7 +1400,7 @@ fn map_construct(agent: &mut Agent, args: &[Value], new_target: &Value) -> Resul
     agent.map_data.insert(map.id(), RefCell::new(Vec::new()));
     let map_value = Value::Object(map);
     let iterable = args.first().cloned().unwrap_or(Value::Undefined);
-    if matches!(iterable, Value::Undefined | Value::Null) {
+    if matches!(iterable.kind(), ValueKind::Undefined | ValueKind::Null) {
         return Ok(map_value);
     }
     let adder = get(agent, &map_value, &JsString::from_utf8("set"))?;
@@ -1418,7 +1420,7 @@ fn set_construct(agent: &mut Agent, args: &[Value], new_target: &Value) -> Resul
     agent.set_data.insert(set.id(), RefCell::new(Vec::new()));
     let set_value = Value::Object(set);
     let iterable = args.first().cloned().unwrap_or(Value::Undefined);
-    if matches!(iterable, Value::Undefined | Value::Null) {
+    if matches!(iterable.kind(), ValueKind::Undefined | ValueKind::Null) {
         return Ok(set_value);
     }
     let adder = get(agent, &set_value, &JsString::from_utf8("add"))?;
@@ -1454,7 +1456,7 @@ fn weak_map_construct(
         .insert(map.id(), RefCell::new(Vec::new()));
     let map_value = Value::Object(map);
     let iterable = args.first().cloned().unwrap_or(Value::Undefined);
-    if matches!(iterable, Value::Undefined | Value::Null) {
+    if matches!(iterable.kind(), ValueKind::Undefined | ValueKind::Null) {
         return Ok(map_value);
     }
     let adder = get(agent, &map_value, &JsString::from_utf8("set"))?;
@@ -1480,7 +1482,7 @@ fn weak_set_construct(
         .insert(set.id(), RefCell::new(Vec::new()));
     let set_value = Value::Object(set);
     let iterable = args.first().cloned().unwrap_or(Value::Undefined);
-    if matches!(iterable, Value::Undefined | Value::Null) {
+    if matches!(iterable.kind(), ValueKind::Undefined | ValueKind::Null) {
         return Ok(set_value);
     }
     let adder = get(agent, &set_value, &JsString::from_utf8("add"))?;
@@ -1510,14 +1512,13 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .intrinsics
         .get("%Object.prototype%")
         .and_then(|value| as_object(&value));
-    let function_proto =
-        realm
-            .intrinsics
-            .get("%Function.prototype%")
-            .and_then(|value| match value {
-                Value::Function(function) => function.object.handle(),
-                _ => None,
-            });
+    let function_proto = realm
+        .intrinsics
+        .get("%Function.prototype%")
+        .and_then(|value| match value.kind() {
+            ValueKind::Function(function) => function.object.handle(),
+            _ => None,
+        });
 
     // ---- Map ----
     let map_proto = JsObject::ordinary_object_create(object_proto.clone());
@@ -2362,15 +2363,15 @@ mod tests {
     }
 
     fn text(source: &str) -> String {
-        match run(source).unwrap() {
-            Value::String(s) => s.to_string_lossy(),
+        match run(source).unwrap().kind() {
+            ValueKind::String(s) => s.to_string_lossy(),
             other => panic!("expected a string, got {other:?}"),
         }
     }
 
     fn number(source: &str) -> f64 {
-        match run(source).unwrap() {
-            Value::Number(n) => n,
+        match run(source).unwrap().kind() {
+            ValueKind::Number(n) => n,
             other => panic!("expected a number, got {other:?}"),
         }
     }

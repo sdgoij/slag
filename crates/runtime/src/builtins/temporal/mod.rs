@@ -14,7 +14,7 @@ use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::PropertyDescriptor;
 use crux::string::JsString;
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
 use crate::context::as_object;
@@ -162,7 +162,7 @@ pub fn create_temporal_object(
     proto_intrinsic: &str,
     record: TemporalRecord,
 ) -> Result<Value, JsError> {
-    let proto = if matches!(new_target, Value::Undefined) {
+    let proto = if matches!(new_target.kind(), ValueKind::Undefined) {
         None
     } else {
         let proto = crate::context::get_property(
@@ -197,7 +197,7 @@ pub fn require_record(
     this: &Value,
     kind: RecordKind,
 ) -> Result<TemporalRecord, JsError> {
-    let Value::Object(obj) = this else {
+    let ValueKind::Object(obj) = this.kind() else {
         return Err(temporal_type_error(kind));
     };
     let Some(record) = agent.temporal_data.get(&obj.id()) else {
@@ -265,9 +265,9 @@ pub fn kind_name(kind: RecordKind) -> &'static str {
 /// ordinary object; objects pass through; every other value is a TypeError
 /// (never a ToObject box).
 pub fn get_options_object(options: &Value) -> Result<Value, JsError> {
-    match options {
-        Value::Undefined => Ok(Value::Object(JsObject::ordinary_object_create(None))),
-        Value::Object(_) | Value::Function(_) => Ok(options.clone()),
+    match options.kind() {
+        ValueKind::Undefined => Ok(Value::Object(JsObject::ordinary_object_create(None))),
+        ValueKind::Object(_) | ValueKind::Function(_) => Ok(options.clone()),
         _ => Err(JsError::new(
             ErrorKind::TypeError,
             "options must be an object".into(),
@@ -285,7 +285,7 @@ pub fn get_option(
 ) -> Result<Option<String>, JsError> {
     let value =
         crate::context::get_property(agent, options, &JsString::from_utf8(key), options.clone())?;
-    if matches!(value, Value::Undefined) {
+    if matches!(value.kind(), ValueKind::Undefined) {
         return Ok(default.map(str::to_string));
     }
     let text = crate::context::to_string(agent, &value)?;
@@ -344,7 +344,7 @@ pub fn get_rounding_increment(agent: &mut Agent, options: &Value) -> Result<i64,
         &JsString::from_utf8("roundingIncrement"),
         options.clone(),
     )?;
-    if matches!(value, Value::Undefined) {
+    if matches!(value.kind(), ValueKind::Undefined) {
         return Ok(1);
     }
     let integer = to_integer_with_truncation(agent, &value)?;
@@ -465,10 +465,10 @@ pub fn get_fractional_second_digits(
         &JsString::from_utf8("fractionalSecondDigits"),
         options.clone(),
     )?;
-    if matches!(value, Value::Undefined) {
+    if matches!(value.kind(), ValueKind::Undefined) {
         return Ok(FracPrecision::Auto);
     }
-    if let Value::Number(n) = value {
+    if let ValueKind::Number(n) = value.kind() {
         if n.is_nan() || n.is_infinite() {
             return Err(JsError::new(
                 ErrorKind::RangeError,
@@ -1023,13 +1023,13 @@ pub fn add_durations(
 
 /// spec 7.5.12 ToTemporalDuration.
 pub fn to_temporal_duration(agent: &mut Agent, item: &Value) -> Result<[f64; 10], JsError> {
-    if let Value::Object(obj) = item
+    if let ValueKind::Object(obj) = item.kind()
         && let Some(TemporalRecord::Duration(fields)) = agent.temporal_data.get(&obj.id())
     {
         return Ok(*fields);
     }
-    if !matches!(item, Value::Object(_) | Value::Function(_)) {
-        if !matches!(item, Value::String(_)) {
+    if !matches!(item.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
+        if !matches!(item.kind(), ValueKind::String(_)) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "value must be a Duration, string, or object".into(),
@@ -1078,7 +1078,7 @@ fn read_duration_fields(agent: &mut Agent, item: &Value) -> Result<[Option<f64>;
     for (key, idx) in keys {
         let value =
             crate::context::get_property(agent, item, &JsString::from_utf8(key), item.clone())?;
-        if !matches!(value, Value::Undefined) {
+        if !matches!(value.kind(), ValueKind::Undefined) {
             any = true;
             result[idx] = Some(to_integer_if_integral(agent, &value)?);
         }
@@ -1177,10 +1177,10 @@ pub fn get_temporal_relative_to(agent: &mut Agent, options: &Value) -> Result<Re
         &JsString::from_utf8("relativeTo"),
         options.clone(),
     )?;
-    if matches!(value, Value::Undefined) {
+    if matches!(value.kind(), ValueKind::Undefined) {
         return Ok(RelativeTo::None);
     }
-    if let Value::Object(obj) = &value {
+    if let ValueKind::Object(obj) = value.kind() {
         if let Some(record) = agent.temporal_data.get(&obj.id()) {
             return match record {
                 TemporalRecord::ZonedDateTime(ns, tz) => {
@@ -1200,7 +1200,7 @@ pub fn get_temporal_relative_to(agent: &mut Agent, options: &Value) -> Result<Re
         }
         return relative_to_object(agent, &value);
     }
-    if matches!(value, Value::String(_)) {
+    if matches!(value.kind(), ValueKind::String(_)) {
         return relative_to_string(agent, &value);
     }
     Err(JsError::new(
@@ -1217,12 +1217,12 @@ fn relative_to_object(agent: &mut Agent, item: &Value) -> Result<RelativeTo, JsE
     // String a RangeError.
     let calendar =
         crate::context::get_property(agent, item, &JsString::from_utf8("calendar"), item.clone())?;
-    if !matches!(calendar, Value::Undefined) {
-        if let Value::Object(obj) = &calendar
+    if !matches!(calendar.kind(), ValueKind::Undefined) {
+        if let ValueKind::Object(obj) = calendar.kind()
             && agent.temporal_data.contains_key(&obj.id())
         {
             // A Temporal object; its calendar is iso8601 in this engine.
-        } else if let Value::String(text) = &calendar {
+        } else if let ValueKind::String(text) = calendar.kind() {
             if !text.to_string_lossy().eq_ignore_ascii_case("iso8601") {
                 return Err(JsError::new(
                     ErrorKind::RangeError,
@@ -1260,7 +1260,7 @@ fn relative_to_object(agent: &mut Agent, item: &Value) -> Result<RelativeTo, JsE
     ] {
         let value =
             crate::context::get_property(agent, item, &JsString::from_utf8(key), item.clone())?;
-        if matches!(value, Value::Undefined) {
+        if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
         match key {
@@ -1284,7 +1284,7 @@ fn relative_to_object(agent: &mut Agent, item: &Value) -> Result<RelativeTo, JsE
                     &value,
                     crux::convert::ToPrimitiveHint::String,
                 )?;
-                let Value::String(text) = prim else {
+                let ValueKind::String(text) = prim.kind() else {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
                         "offset must be a string".into(),
@@ -1638,7 +1638,7 @@ fn now_dispatch(
     // SystemDateTime (spec 2.3.4): validate the time zone and return the
     // local wall-clock date-time.
     let tz_arg = args.first().cloned().unwrap_or(Value::Undefined);
-    let time_zone = if matches!(tz_arg, Value::Undefined) {
+    let time_zone = if matches!(tz_arg.kind(), ValueKind::Undefined) {
         "UTC".to_string()
     } else {
         match instant::to_temporal_time_zone_identifier(agent, &tz_arg) {

@@ -13,7 +13,7 @@ use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
 use crate::context::as_object;
@@ -38,9 +38,9 @@ fn placeholder(name: &'static str) -> NativeFn {
 
 /// spec 21.2.3.1 ThisBigIntValue: a BigInt or a BigInt wrapper object.
 fn this_bigint_value(agent: &Agent, this: &Value) -> Result<crux::BigInt, JsError> {
-    match this {
-        Value::BigInt(b) => Ok(b.as_ref().clone()),
-        Value::Object(obj) => match agent.bigint_data.get(&obj.id()) {
+    match this.kind() {
+        ValueKind::BigInt(b) => Ok(b.as_ref().clone()),
+        ValueKind::Object(obj) => match agent.bigint_data.get(&obj.id()) {
             Some(b) => Ok(b.clone()),
             None => Err(JsError::new(
                 ErrorKind::TypeError,
@@ -59,30 +59,30 @@ fn this_bigint_value(agent: &Agent, this: &Value) -> Result<crux::BigInt, JsErro
 /// (the constructor's integral-Number case is separate, 21.2.1.1).
 fn to_big_int(agent: &mut Agent, value: &Value) -> Result<crux::BigInt, JsError> {
     let prim = crate::context::to_primitive(agent, value, crux::convert::ToPrimitiveHint::Number)?;
-    match &prim {
-        Value::BigInt(b) => Ok(b.as_ref().clone()),
-        Value::Boolean(b) => Ok(crux::BigInt::from(*b as i64)),
-        Value::String(s) => match crux::convert::string_to_bigint(s) {
+    match prim.kind() {
+        ValueKind::BigInt(b) => Ok(b.as_ref().clone()),
+        ValueKind::Boolean(b) => Ok(crux::BigInt::from(b as i64)),
+        ValueKind::String(s) => match crux::convert::string_to_bigint(&s) {
             Some(b) => Ok(b),
             None => Err(JsError::new(
                 ErrorKind::SyntaxError,
                 "Cannot convert string to a BigInt".into(),
             )),
         },
-        Value::Undefined | Value::Null => Err(JsError::new(
+        ValueKind::Undefined | ValueKind::Null => Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert undefined or null to a BigInt".into(),
         )),
-        Value::Number(_) => Err(JsError::new(
+        ValueKind::Number(_) => Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert a Number to a BigInt".into(),
         )),
-        Value::Symbol(_) => Err(JsError::new(
+        ValueKind::Symbol(_) => Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert a Symbol to a BigInt".into(),
         )),
         // ToPrimitive never returns an object; keep the match exhaustive.
-        Value::Object(_) | Value::Function(_) => Err(JsError::new(
+        ValueKind::Object(_) | ValueKind::Function(_) => Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert an object to a BigInt".into(),
         )),
@@ -94,15 +94,15 @@ fn to_big_int(agent: &mut Agent, value: &Value) -> Result<crux::BigInt, JsError>
 fn bigint_construct(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
     let value = args.first().cloned().unwrap_or(Value::Undefined);
     let prim = crate::context::to_primitive(agent, &value, crux::convert::ToPrimitiveHint::Number)?;
-    match prim {
-        Value::Number(n) => match crux::BigInt::from_f64_exact(n) {
+    match prim.kind() {
+        ValueKind::Number(n) => match crux::BigInt::from_f64_exact(n) {
             Some(b) => Ok(Value::BigInt(Handle::new(b))),
             None => Err(JsError::new(
                 ErrorKind::RangeError,
                 "The number cannot be converted to a BigInt because it is not an integer".into(),
             )),
         },
-        other => Ok(Value::BigInt(Handle::new(to_big_int(agent, &other)?))),
+        _ => Ok(Value::BigInt(Handle::new(to_big_int(agent, &prim)?))),
     }
 }
 
@@ -128,7 +128,7 @@ fn as_uint_n(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
 fn to_string_method(agent: &Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let value = this_bigint_value(agent, this)?;
     let radix = args.first().cloned().unwrap_or(Value::Undefined);
-    let radix_value = if matches!(radix, Value::Undefined) {
+    let radix_value = if matches!(radix.kind(), ValueKind::Undefined) {
         10.0
     } else {
         to_integer_or_infinity(to_number(&radix)?)
@@ -331,15 +331,15 @@ mod tests {
     }
 
     fn text(source: &str) -> String {
-        match run(source).unwrap() {
-            Value::String(s) => s.to_string_lossy(),
+        match run(source).unwrap().kind() {
+            ValueKind::String(s) => s.to_string_lossy(),
             other => panic!("expected a string, got {other:?}"),
         }
     }
 
     fn big(source: &str) -> String {
-        match run(source).unwrap() {
-            Value::BigInt(b) => b.0.to_string(),
+        match run(source).unwrap().kind() {
+            ValueKind::BigInt(b) => b.0.to_string(),
             other => panic!("expected a BigInt, got {other:?}"),
         }
     }

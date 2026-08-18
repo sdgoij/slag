@@ -13,7 +13,7 @@ use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
-use crux::value::{Value, is_callable};
+use crux::value::{Value, ValueKind, is_callable};
 
 use crate::agent::Agent;
 use crate::context::as_object;
@@ -295,7 +295,7 @@ pub fn dispatch_call(
         let dispose_symbol = if is_async { "asyncDispose" } else { "dispose" };
         let method_key = |m: &str| format!("%{name}.prototype.{m}%");
         let proto_value = intrinsics.get(proto_key)?;
-        let Value::Object(proto_obj) = &proto_value else {
+        let ValueKind::Object(proto_obj) = proto_value.kind() else {
             continue;
         };
         for (method_name, handler) in [
@@ -392,7 +392,7 @@ fn stack_construct(
 
 /// RequireInternalSlot on the stack.
 fn stack_data(agent: &Agent, this: &Value, is_async: bool) -> Result<u64, JsError> {
-    let Value::Object(obj) = this else {
+    let ValueKind::Object(obj) = this.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Method called on a non-object".into(),
@@ -435,14 +435,14 @@ fn get_dispose_method(agent: &mut Agent, value: &Value, is_async: bool) -> Resul
         &PropertyKey::Symbol(crux::symbol::well_known(symbol).as_ref().clone()),
         value.clone(),
     )?;
-    if is_async && matches!(method, Value::Undefined | Value::Null) {
+    if is_async && matches!(method.kind(), ValueKind::Undefined | ValueKind::Null) {
         // async-dispose falls back to the sync @@dispose method (an async
         // context can dispose sync resources, spec 27.4.1.1).
         return get_dispose_method(agent, value, false);
     }
-    match method {
-        Value::Undefined | Value::Null => Ok(Value::Undefined),
-        value if is_callable(&value) => Ok(value),
+    match method.kind() {
+        ValueKind::Undefined | ValueKind::Null => Ok(Value::Undefined),
+        _ if is_callable(&method) => Ok(method),
         _ => Err(JsError::new(
             ErrorKind::TypeError,
             "dispose method is not callable".into(),
@@ -514,7 +514,7 @@ fn use_value(
     let id = stack_data(agent, this, is_async)?;
     check_not_disposed(agent, id)?;
     let value = args.first().cloned().unwrap_or(Value::Undefined);
-    if matches!(value, Value::Undefined | Value::Null) {
+    if matches!(value.kind(), ValueKind::Undefined | ValueKind::Null) {
         if is_async {
             // An async stack registers null/undefined as a no-method
             // async-hint resource: disposeAsync still awaits (spec 27.4.1.2
@@ -533,7 +533,7 @@ fn use_value(
     // GetDisposeMethod throws for a value with no (matching) dispose
     // method; primitives box during the property lookup and land here too.
     let method = get_dispose_method(agent, &value, is_async)?;
-    if matches!(method, Value::Undefined) {
+    if matches!(method.kind(), ValueKind::Undefined) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "value is not disposable".into(),
@@ -855,7 +855,7 @@ fn drive_async_disposal(agent: &mut Agent, driver_id: u64) -> Result<Value, JsEr
         return Ok(Value::Undefined);
     }
     let resource = resources[index].clone();
-    if matches!(resource.method, Value::Undefined) {
+    if matches!(resource.method.kind(), ValueKind::Undefined) {
         // Dispose with no method: a no-op, but an async hint still implies
         // the trailing await (spec 27.4.1.3 step 3.f).
         let driver = agent
@@ -954,7 +954,7 @@ pub fn dispatch_continuation(
     callee: &Value,
     args: &[Value],
 ) -> Option<Result<Value, JsError>> {
-    let Value::Function(function) = callee else {
+    let ValueKind::Function(function) = callee.kind() else {
         return None;
     };
     let (driver_id, is_reject) = agent.disposable_async_cont.get(&function.id()).cloned()?;
@@ -1085,7 +1085,7 @@ fn drive_async_body_disposal(agent: &mut Agent, driver_id: u64) -> Result<Value,
         return Ok(Value::Undefined);
     }
     let resource = resources[index].clone();
-    let method_result = if matches!(resource.method, Value::Undefined) {
+    let method_result = if matches!(resource.method.kind(), ValueKind::Undefined) {
         if resource.hint == crate::env::DisposalHint::Sync {
             // Dispose with an undefined method and sync hint: no call, no
             // await (spec 9.4.4 steps 1-4).
@@ -1180,7 +1180,7 @@ pub fn dispatch_async_body_disposal(
     callee: &Value,
     args: &[Value],
 ) -> Option<Result<Value, JsError>> {
-    let Value::Function(function) = callee else {
+    let ValueKind::Function(function) = callee.kind() else {
         return None;
     };
     let driver_id = agent
@@ -1249,7 +1249,7 @@ mod tests {
         agent.initialize_host_defined_realm().unwrap();
         let value = agent.run_script(source)?;
         agent.run_jobs()?;
-        let Value::Object(obj) = &value else {
+        let ValueKind::Object(obj) = value.kind() else {
             return Ok(value.clone());
         };
         let Some(data) = agent.promises.get(&obj.id()) else {

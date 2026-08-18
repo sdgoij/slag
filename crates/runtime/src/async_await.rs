@@ -10,7 +10,7 @@ use crux::function::Function;
 use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::string::JsString;
-use crux::value::{Value, is_callable};
+use crux::value::{Value, ValueKind, is_callable};
 
 use crate::agent::Agent;
 use crate::context::ExecutionContext;
@@ -123,13 +123,13 @@ pub fn call_async_function(
                 // OrdinaryCallBindThis (spec 10.2.1): sloppy functions coerce
                 // undefined/null to the global object and box primitives.
                 let this = if data.this_mode == crate::function::ThisMode::Sloppy {
-                    match this {
-                        Value::Undefined | Value::Null => {
+                    match this.kind() {
+                        ValueKind::Undefined | ValueKind::Null => {
                             let global = agent.running_context()?.realm.global_object.clone();
                             Value::Object(global)
                         }
-                        Value::Object(_) | Value::Function(_) => this,
-                        other => crate::context::to_object(agent, &other)?,
+                        ValueKind::Object(_) | ValueKind::Function(_) => this,
+                        _ => crate::context::to_object(agent, &this)?,
                     }
                 } else {
                     this
@@ -251,7 +251,7 @@ pub fn dispatch_resume(
     callee: &Value,
     args: &[Value],
 ) -> Option<Result<Value, JsError>> {
-    let Value::Function(function) = callee else {
+    let ValueKind::Function(function) = callee.kind() else {
         return None;
     };
     let entry = agent.async_resume.get(&function.id()).cloned()?;
@@ -434,7 +434,7 @@ pub fn dispatch_async_from_sync(
     callee: &Value,
     args: &[Value],
 ) -> Option<Result<Value, JsError>> {
-    let Value::Function(function) = callee else {
+    let ValueKind::Function(function) = callee.kind() else {
         return None;
     };
     let entry = agent.async_from_sync.get(&function.id()).cloned()?;
@@ -543,7 +543,7 @@ fn run_async_from_sync(
             return Ok(promise);
         }
     };
-    if !matches!(result, Value::Object(_) | Value::Function(_)) {
+    if !matches!(result.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         // spec 27.1.5.2.2/3: a non-object result rejects with a fresh
         // TypeError.
         let error = JsError::new(
@@ -643,7 +643,7 @@ pub fn dispatch_async_from_sync_continuation(
     callee: &Value,
     args: &[Value],
 ) -> Option<Result<Value, JsError>> {
-    let Value::Function(function) = callee else {
+    let ValueKind::Function(function) = callee.kind() else {
         return None;
     };
     let entry = agent
@@ -699,7 +699,7 @@ mod tests {
         agent.initialize_host_defined_realm().unwrap();
         let value = agent.run_script(source)?;
         agent.run_jobs()?;
-        let Value::Object(obj) = &value else {
+        let ValueKind::Object(obj) = value.kind() else {
             return Ok(value.clone());
         };
         let Some(data) = agent.promises.get(&obj.id()) else {
@@ -836,7 +836,7 @@ mod tests {
             )
             .unwrap();
         agent.run_jobs().unwrap();
-        let Value::Object(obj) = &value else {
+        let ValueKind::Object(obj) = value.kind() else {
             panic!("not a promise");
         };
         let data = agent.promises.get(&obj.id()).unwrap();
@@ -934,7 +934,7 @@ mod tests {
             )
             .unwrap();
         agent.run_jobs().unwrap();
-        let Value::Object(obj) = &value else {
+        let ValueKind::Object(obj) = value.kind() else {
             panic!("not a promise");
         };
         let data = agent.promises.get(&obj.id()).unwrap();

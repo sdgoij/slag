@@ -17,7 +17,7 @@ use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::PropertyDescriptor;
 use crux::string::JsString;
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
 use crate::context::ExecutionContext;
@@ -189,7 +189,7 @@ pub fn dispatch_call(
 ) -> Option<Result<Value, JsError>> {
     let realm = agent.current_realm().ok()?;
     let proto_value = realm.intrinsics.get(ASYNC_GENERATOR_PROTO)?;
-    let Value::Object(proto) = &proto_value else {
+    let ValueKind::Object(proto) = proto_value.kind() else {
         return None;
     };
     for (name, handler) in [
@@ -258,13 +258,13 @@ pub fn call_async_generator(
             // OrdinaryCallBindThis (spec 10.2.1): sloppy functions coerce
             // undefined/null to the global object and box primitives.
             let this = if data.this_mode == ThisMode::Sloppy {
-                match this {
-                    Value::Undefined | Value::Null => {
+                match this.kind() {
+                    ValueKind::Undefined | ValueKind::Null => {
                         let global = agent.running_context()?.realm.global_object.clone();
                         Value::Object(global)
                     }
-                    Value::Object(_) | Value::Function(_) => this,
-                    other => crate::context::to_object(agent, &other)?,
+                    ValueKind::Object(_) | ValueKind::Function(_) => this,
+                    _ => crate::context::to_object(agent, &this)?,
                 }
             } else {
                 this
@@ -344,7 +344,7 @@ pub fn call_async_generator(
 /// AsyncGeneratorValidate (spec 27.6.3.3): the `this` value must be an async
 /// generator object of this realm's agent.
 fn validate(agent: &Agent, this: &Value) -> Result<u64, JsError> {
-    let Value::Object(obj) = this else {
+    let ValueKind::Object(obj) = this.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "AsyncGeneratorResume called on a non-object".into(),
@@ -752,7 +752,7 @@ fn drive(
             };
             if resources
                 .iter()
-                .any(|resource| !matches!(resource.method, Value::Undefined))
+                .any(|resource| !resource.method.is_undefined())
             {
                 crate::builtins::disposable::dispose_async_body_resources(
                     agent,
@@ -811,7 +811,7 @@ fn start_body(agent: &mut Agent, object_id: u64) -> Result<VmOutcome, JsError> {
         .function
         .clone()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no function in context".into()))?;
-    let Value::Function(function_handle) = &function_value else {
+    let ValueKind::Function(function_handle) = function_value.kind() else {
         return Err(JsError::new(ErrorKind::TypeError, "not a function".into()));
     };
     let function_id = function_handle.id();
@@ -946,7 +946,7 @@ pub fn dispatch_await(
     callee: &Value,
     args: &[Value],
 ) -> Option<Result<Value, JsError>> {
-    let Value::Function(function) = callee else {
+    let ValueKind::Function(function) = callee.kind() else {
         return None;
     };
     let entry = agent.async_generator_awaits.get(&function.id()).cloned()?;
@@ -1165,7 +1165,7 @@ mod tests {
         agent.initialize_host_defined_realm()?;
         let value = agent.run_script(source)?;
         agent.run_jobs()?;
-        let Value::Object(obj) = &value else {
+        let ValueKind::Object(obj) = value.kind() else {
             return Ok(value.clone());
         };
         let Some(data) = agent.promises.get(&obj.id()) else {

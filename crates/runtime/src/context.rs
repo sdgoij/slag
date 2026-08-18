@@ -8,7 +8,7 @@ use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::PropertyKey;
 use crux::string::JsString;
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
 use crate::env::{EnvRecord, EnvRef};
@@ -38,8 +38,8 @@ pub fn current_agent_mut() -> Result<&'static mut Agent, JsError> {
 /// realm for builtins, recursing through bound functions and proxy targets
 /// (a revoked proxy throws).
 pub fn get_function_realm(agent: &mut Agent, value: &Value) -> Result<Handle<Realm>, JsError> {
-    match value {
-        Value::Function(function) => match &function.kind {
+    match value.kind() {
+        ValueKind::Function(function) => match &function.kind {
             crux::function::FunctionKind::EcmaScript => agent
                 .ecma_functions
                 .get(&function.id())
@@ -52,7 +52,7 @@ pub fn get_function_realm(agent: &mut Agent, value: &Value) -> Result<Handle<Rea
                 }),
             crux::function::FunctionKind::Bound { target, .. } => get_function_realm(agent, target),
             crux::function::FunctionKind::Builtin { .. } => {
-                crate::function::owning_realm(agent, function).ok_or_else(|| {
+                crate::function::owning_realm(agent, &function).ok_or_else(|| {
                     JsError::new(
                         ErrorKind::TypeError,
                         "GetFunctionRealm: no realm for the builtin".into(),
@@ -60,7 +60,7 @@ pub fn get_function_realm(agent: &mut Agent, value: &Value) -> Result<Handle<Rea
                 })
             }
         },
-        Value::Object(obj) => match &obj.kind {
+        ValueKind::Object(obj) => match &obj.kind {
             crux::object::ObjectKind::Proxy(slots) => {
                 let Some(target) = slots.target.borrow().clone() else {
                     return Err(JsError::new(
@@ -86,9 +86,9 @@ pub fn get_function_realm(agent: &mut Agent, value: &Value) -> Result<Handle<Rea
 /// through their embedded object part (functions are values distinct from
 /// objects in this engine, but both carry a `Handle<JsObject>`).
 pub fn as_object(value: &Value) -> Option<Handle<JsObject>> {
-    match value {
-        Value::Object(obj) => Some(obj.clone()),
-        Value::Function(f) => f.object.handle(),
+    match value.kind() {
+        ValueKind::Object(obj) => Some(obj.clone()),
+        ValueKind::Function(f) => f.object.handle(),
         _ => None,
     }
 }
@@ -102,7 +102,7 @@ pub fn to_primitive(
     value: &Value,
     hint: crux::convert::ToPrimitiveHint,
 ) -> Result<Value, JsError> {
-    if !matches!(value, Value::Object(_) | Value::Function(_)) {
+    if !matches!(value.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Ok(value.clone());
     }
     // spec 7.1.1 step 1.a: the @@toPrimitive method runs first, and its
@@ -114,7 +114,7 @@ pub fn to_primitive(
         &PropertyKey::Symbol(crux::symbol::well_known("toPrimitive").as_ref().clone()),
         value.clone(),
     )?;
-    if !matches!(exotic, Value::Undefined | Value::Null) {
+    if !matches!(exotic.kind(), ValueKind::Undefined | ValueKind::Null) {
         if !crux::value::is_callable(&exotic) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -132,7 +132,7 @@ pub fn to_primitive(
             value.clone(),
             &[Value::String(Handle::new(JsString::from_utf8(hint_text)))],
         )?;
-        if matches!(result, Value::Object(_) | Value::Function(_)) {
+        if matches!(result.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "Cannot convert object to primitive value".into(),
@@ -152,7 +152,7 @@ pub fn to_primitive(
         let method = get_property_key(agent, value, &PropertyKey::from_utf8(name), value.clone())?;
         if crux::value::is_callable(&method) {
             let result = crate::function::call(agent, &method, value.clone(), &[])?;
-            if !matches!(result, Value::Object(_) | Value::Function(_)) {
+            if !matches!(result.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
                 return Ok(result);
             }
         }
@@ -165,8 +165,8 @@ pub fn to_primitive(
 
 /// ToString (spec 7.1.17) with agent dispatch for object receivers.
 pub fn to_string(agent: &mut Agent, value: &Value) -> Result<JsString, JsError> {
-    match value {
-        Value::Object(_) | Value::Function(_) => {
+    match value.kind() {
+        ValueKind::Object(_) | ValueKind::Function(_) => {
             let prim = to_primitive(agent, value, crux::convert::ToPrimitiveHint::String)?;
             to_string(agent, &prim)
         }
@@ -176,8 +176,8 @@ pub fn to_string(agent: &mut Agent, value: &Value) -> Result<JsString, JsError> 
 
 /// ToNumber (spec 7.1.4) with agent dispatch for object receivers.
 pub fn to_number(agent: &mut Agent, value: &Value) -> Result<f64, JsError> {
-    match value {
-        Value::Object(_) | Value::Function(_) => {
+    match value.kind() {
+        ValueKind::Object(_) | ValueKind::Function(_) => {
             let prim = to_primitive(agent, value, crux::convert::ToPrimitiveHint::Number)?;
             to_number(agent, &prim)
         }
@@ -188,10 +188,10 @@ pub fn to_number(agent: &mut Agent, value: &Value) -> Result<f64, JsError> {
 /// ToPropertyKey (spec 7.1.20) with agent dispatch for object receivers.
 pub fn to_property_key(agent: &mut Agent, value: &Value) -> Result<PropertyKey, JsError> {
     let key = to_primitive(agent, value, crux::convert::ToPrimitiveHint::String)?;
-    match key {
-        Value::Symbol(sym) => Ok(PropertyKey::Symbol(sym.as_ref().clone())),
-        other => {
-            let text = to_string(agent, &other)?;
+    match key.kind() {
+        ValueKind::Symbol(sym) => Ok(PropertyKey::Symbol(sym.as_ref().clone())),
+        _ => {
+            let text = to_string(agent, &key)?;
             Ok(PropertyKey::String(crux::intern(text.as_slice())))
         }
     }
@@ -208,27 +208,27 @@ pub fn to_index(agent: &mut Agent, value: &Value) -> Result<u64, JsError> {
 /// ToBigInt (spec 7.1.16) with agent dispatch for object receivers.
 pub fn to_big_int(agent: &mut Agent, value: &Value) -> Result<crux::BigInt, JsError> {
     let prim = to_primitive(agent, value, crux::convert::ToPrimitiveHint::Number)?;
-    match prim {
-        Value::Undefined | Value::Null => Err(JsError::new(
+    match prim.kind() {
+        ValueKind::Undefined | ValueKind::Null => Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert undefined or null to a BigInt".into(),
         )),
-        Value::Boolean(true) => Ok(crux::BigInt::from(1u64)),
-        Value::Boolean(false) => Ok(crux::BigInt::from(0u64)),
-        Value::BigInt(b) => Ok(b.as_ref().clone()),
-        Value::String(_) => crux::convert::to_big_int(&prim),
+        ValueKind::Boolean(true) => Ok(crux::BigInt::from(1u64)),
+        ValueKind::Boolean(false) => Ok(crux::BigInt::from(0u64)),
+        ValueKind::BigInt(b) => Ok(b.as_ref().clone()),
+        ValueKind::String(_) => crux::convert::to_big_int(&prim),
         // spec 7.1.17 ToBigInt: a Number throws a TypeError (the integral
         // NumberToBigInt case belongs to the BigInt() constructor and the
         // TypedArray constructor paths, which special-case Numbers).
-        Value::Number(_) => Err(JsError::new(
+        ValueKind::Number(_) => Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert a Number to a BigInt".into(),
         )),
-        Value::Symbol(_) => Err(JsError::new(
+        ValueKind::Symbol(_) => Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert a Symbol to a BigInt".into(),
         )),
-        Value::Object(_) | Value::Function(_) => Err(JsError::new(
+        ValueKind::Object(_) | ValueKind::Function(_) => Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert an object to a BigInt".into(),
         )),
@@ -242,14 +242,14 @@ pub fn to_big_int(agent: &mut Agent, value: &Value) -> Result<crux::BigInt, JsEr
 /// %Object.prototype% object.
 pub fn to_object(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
     let realm = agent.current_realm()?;
-    match value {
-        Value::Object(obj) => Ok(Value::Object(obj.clone())),
-        Value::Function(function) => Ok(Value::Function(function.clone())),
-        Value::Null | Value::Undefined => Err(JsError::new(
+    match value.kind() {
+        ValueKind::Object(obj) => Ok(Value::Object(obj.clone())),
+        ValueKind::Function(function) => Ok(Value::Function(function.clone())),
+        ValueKind::Null | ValueKind::Undefined => Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert undefined or null to object".into(),
         )),
-        Value::String(s) => {
+        ValueKind::String(s) => {
             let proto = realm
                 .intrinsics
                 .get("%String.prototype%")
@@ -259,17 +259,17 @@ pub fn to_object(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
                 proto,
             )?))
         }
-        Value::Boolean(b) => {
+        ValueKind::Boolean(b) => {
             let proto = realm
                 .intrinsics
                 .get("%Boolean.prototype%")
                 .and_then(|v| as_object(&v));
             let object = JsObject::ordinary_object_create(proto);
-            *object.boxed.borrow_mut() = Some(crux::object::BoxedPrimitive::Boolean(*b));
-            agent.boolean_data.insert(object.id(), *b);
+            *object.boxed.borrow_mut() = Some(crux::object::BoxedPrimitive::Boolean(b));
+            agent.boolean_data.insert(object.id(), b);
             Ok(Value::Object(object))
         }
-        Value::Symbol(symbol) => {
+        ValueKind::Symbol(symbol) => {
             let proto = realm
                 .intrinsics
                 .get("%Symbol.prototype%")
@@ -280,17 +280,17 @@ pub fn to_object(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
                 .insert(object.id(), symbol.as_ref().clone());
             Ok(Value::Object(object))
         }
-        Value::Number(n) => {
+        ValueKind::Number(n) => {
             let proto = realm
                 .intrinsics
                 .get("%Number.prototype%")
                 .and_then(|v| as_object(&v));
             let object = JsObject::ordinary_object_create(proto);
-            *object.boxed.borrow_mut() = Some(crux::object::BoxedPrimitive::Number(*n));
-            agent.number_data.insert(object.id(), *n);
+            *object.boxed.borrow_mut() = Some(crux::object::BoxedPrimitive::Number(n));
+            agent.number_data.insert(object.id(), n);
             Ok(Value::Object(object))
         }
-        Value::BigInt(b) => {
+        ValueKind::BigInt(b) => {
             let proto = realm
                 .intrinsics
                 .get("%BigInt.prototype%")
@@ -529,10 +529,10 @@ pub fn get_property_key(
     // Module namespace objects read their exported bindings through the
     // module environment (spec 10.4.6.1). A deferred namespace triggers its
     // module's synchronous evaluation first (import-defer).
-    if let Value::Object(obj) = base
+    if let ValueKind::Object(obj) = base.kind()
         && matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_))
     {
-        crate::module::ensure_deferred_namespace_evaluation_key(agent, obj, key)?;
+        crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, key)?;
         let Some(module) = agent
             .module_namespaces
             .get(&obj.id())
@@ -561,8 +561,8 @@ pub fn get_property_key(
         }
         return crate::module::namespace_get(agent, &module, &name);
     }
-    match base {
-        Value::Object(obj) => {
+    match base.kind() {
+        ValueKind::Object(obj) => {
             // Accessors whose getter is an ECMAScript function cannot be
             // invoked by the crux layer (the body lives in the agent);
             // dispatch them through the evaluator (spec 8.12.2 step 6.b). The
@@ -572,13 +572,13 @@ pub fn get_property_key(
             let typed_array_index = matches!(obj.kind, crux::object::ObjectKind::IntegerIndexed(_))
                 && crux::object::is_canonical_index_key(key);
             if !typed_array_index
-                && let Some(getter) = find_ecma_accessor(agent, obj, key, AccessorKind::Get)?
+                && let Some(getter) = find_ecma_accessor(agent, &obj, key, AccessorKind::Get)?
             {
                 return crate::function::call(agent, &getter, receiver, &[]);
             }
             obj.get_with_receiver_key(key, receiver)
         }
-        Value::Function(f) => {
+        ValueKind::Function(f) => {
             if let Some(getter) = find_ecma_accessor(agent, &f.object, key, AccessorKind::Get)? {
                 return crate::function::call(agent, &getter, receiver, &[]);
             }
@@ -648,8 +648,8 @@ fn find_ecma_accessor(
                 AccessorKind::Set => "set",
             };
             // GetMethod on the handler (spec 10.5.8/10.5.9 step 2).
-            let trap = match &handler {
-                Value::Object(handler_obj) => {
+            let trap = match handler.kind() {
+                ValueKind::Object(handler_obj) => {
                     handler_obj.get_method(&JsString::from_utf8(trap_name))?
                 }
                 _ => None,
@@ -657,9 +657,9 @@ fn find_ecma_accessor(
             if trap.is_some() {
                 return Ok(None);
             }
-            let target_obj = match &target {
-                Value::Object(obj) => Some(obj.clone()),
-                Value::Function(f) => f.object.handle(),
+            let target_obj = match target.kind() {
+                ValueKind::Object(obj) => Some(obj),
+                ValueKind::Function(f) => f.object.handle(),
                 _ => None,
             };
             let Some(target_obj) = target_obj else {
@@ -724,11 +724,11 @@ pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Resu
             // false without consulting the exports or the prototype chain —
             // a (deferred) namespace never triggers evaluation on `[[Set]]`,
             // and the write fails (TypeError in strict mode).
-            let base_is_namespace = match base {
-                Value::Object(obj) => {
+            let base_is_namespace = match base.kind() {
+                ValueKind::Object(obj) => {
                     matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_))
                 }
-                Value::Function(f) => {
+                ValueKind::Function(f) => {
                     matches!(f.object.kind, crux::object::ObjectKind::ModuleNamespace(_))
                 }
                 _ => false,
@@ -752,7 +752,7 @@ pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Resu
             // descriptor reads the live binding: an uninitialized export
             // throws a ReferenceError. An accessor in the chain runs its
             // setter instead (no receiver read), so it is not pre-empted.
-            if let Value::Object(obj) = get_this_value(reference)
+            if let ValueKind::Object(obj) = get_this_value(reference).kind()
                 && matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_))
                 && let PropertyKey::String(id) = key
                 && let Some(module) = agent
@@ -764,14 +764,15 @@ pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Resu
                 // A deferred namespace's [[Set]] returns false without
                 // consulting the exports (import-defer): a direct write does
                 // not trigger evaluation.
-                let mut probe = if matches!(base, Value::Object(_) | Value::Function(_)) {
-                    Some(base.clone())
-                } else {
-                    to_object(agent, base).ok()
-                };
+                let mut probe =
+                    if matches!(base.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
+                        Some(base.clone())
+                    } else {
+                        to_object(agent, base).ok()
+                    };
                 let mut accessor_in_chain = false;
                 while let Some(obj) = probe
-                    && let Value::Object(obj) = &obj
+                    && let Some(obj) = obj.as_object()
                 {
                     match obj.get_own_property_key(key)? {
                         Some(prop) if prop.is_accessor() => {
@@ -798,26 +799,26 @@ pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Resu
             // the end of the chain fails (strict) instead of landing on the
             // ephemeral wrapper.
             let receiver = get_this_value(reference);
-            let base = if matches!(base, Value::Object(_) | Value::Function(_)) {
+            let base = if matches!(base.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
                 base.clone()
             } else {
                 to_object(agent, base)?
             };
-            let result = match &base {
-                Value::Object(obj) => {
+            let result = match base.kind() {
+                ValueKind::Object(obj) => {
                     let typed_array_index =
                         matches!(obj.kind, crux::object::ObjectKind::IntegerIndexed(_))
                             && crux::object::is_canonical_index_key(key);
                     if !typed_array_index
                         && let Some(setter) =
-                            find_ecma_accessor(agent, obj, key, AccessorKind::Set)?
+                            find_ecma_accessor(agent, &obj, key, AccessorKind::Set)?
                     {
                         crate::function::call(agent, &setter, receiver.clone(), &[value])?;
                         return Ok(());
                     }
                     obj.set_with_receiver_key(key, value, receiver.clone(), reference.strict)
                 }
-                Value::Function(f) => {
+                ValueKind::Function(f) => {
                     if let Some(setter) =
                         find_ecma_accessor(agent, &f.object, key, AccessorKind::Set)?
                     {
@@ -863,14 +864,14 @@ pub fn delete_property_or_throw(agent: &mut Agent, reference: &Reference) -> Res
         ReferenceBase::Environment(env) => env.delete_binding(&string_name(&reference.name)),
         ReferenceBase::Value(base) => {
             let key = &reference.name;
-            let deleted = match base {
-                Value::Object(obj) => {
+            let deleted = match base.kind() {
+                ValueKind::Object(obj) => {
                     // A deferred namespace triggers its module's evaluation on
                     // a non-symbol-like delete (import-defer).
-                    crate::module::ensure_deferred_namespace_evaluation_key(agent, obj, key)?;
+                    crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, key)?;
                     obj.delete_key(key)?
                 }
-                Value::Function(f) => f.object.delete_key(key)?,
+                ValueKind::Function(f) => f.object.delete_key(key)?,
                 _ => true,
             };
             if !deleted && reference.strict {
@@ -1060,19 +1061,19 @@ pub fn private_set(
 }
 
 /// The object part holding [[PrivateElements]] of a language value.
-fn private_object(obj: &Value) -> Option<&crux::object::JsObject> {
-    match obj {
-        Value::Object(obj) => Some(obj),
-        Value::Function(function) => Some(&function.object),
-        _ => None,
+fn private_object(obj: &Value) -> Option<Handle<crux::object::JsObject>> {
+    if let Some(obj) = obj.as_object() {
+        Some(obj)
+    } else {
+        obj.as_function().map(|f| f.object.clone())
     }
 }
 
 /// PrivateIn (spec 13.11.1): whether the object carries the private brand.
 pub fn private_in(obj: &Value, name_id: u64) -> Result<bool, JsError> {
-    match obj {
-        Value::Object(obj) => Ok(obj.has_private_element(name_id)),
-        Value::Function(function) => Ok(function.object.has_private_element(name_id)),
+    match obj.kind() {
+        ValueKind::Object(obj) => Ok(obj.has_private_element(name_id)),
+        ValueKind::Function(function) => Ok(function.object.has_private_element(name_id)),
         _ => Ok(false),
     }
 }
@@ -1098,7 +1099,7 @@ pub fn get_super_constructor(agent: &Agent) -> Result<Value, JsError> {
             "super() is only valid inside a derived constructor".into(),
         ));
     };
-    let Value::Function(function) = &function_env.function_object else {
+    let ValueKind::Function(function) = function_env.function_object.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "super() is only valid inside a derived constructor".into(),
@@ -1143,7 +1144,7 @@ pub fn get_super_base(agent: &Agent) -> Result<Value, JsError> {
             "super is only valid inside methods".into(),
         ));
     };
-    let Value::Function(function) = &function_env.function_object else {
+    let ValueKind::Function(function) = function_env.function_object.kind() else {
         return Ok(Value::Undefined);
     };
     let Some(home) = agent
@@ -1155,9 +1156,9 @@ pub fn get_super_base(agent: &Agent) -> Result<Value, JsError> {
     };
     // The home object of a static method/accessor/static-block is the class
     // constructor (a Function); instance members use the class prototype.
-    let home_object = match &home {
-        Value::Object(obj) => obj.clone(),
-        Value::Function(f) => f.object.clone(),
+    let home_object = match home.kind() {
+        ValueKind::Object(obj) => obj,
+        ValueKind::Function(f) => f.object.clone(),
         _ => return Ok(Value::Undefined),
     };
     Ok(home_object

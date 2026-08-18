@@ -16,7 +16,7 @@ use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
-use crux::value::{Value, is_callable};
+use crux::value::{Value, ValueKind, is_callable};
 
 use crate::agent::Agent;
 use crate::context::as_object;
@@ -335,7 +335,7 @@ pub fn dispatch_call(
     this: &Value,
     args: &[Value],
 ) -> Option<Result<Value, JsError>> {
-    let Value::Function(function) = callee else {
+    let ValueKind::Function(function) = callee.kind() else {
         return None;
     };
     let realm = agent.current_realm().ok()?;
@@ -354,7 +354,7 @@ pub fn dispatch_call(
         return Some(async_dispose(agent, this, args));
     }
     let proto_value = intrinsics.get(ASYNC_ITERATOR_PROTO)?;
-    let Value::Object(_proto_obj) = &proto_value else {
+    let ValueKind::Object(_proto_obj) = proto_value.kind() else {
         return None;
     };
     let lazy: &[(&str, MethodHandler)] = &[
@@ -415,9 +415,9 @@ fn async_dispose(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Val
             return Ok(promise);
         }
     };
-    let return_method = match return_method {
-        Value::Undefined | Value::Null => None,
-        value if is_callable(&value) => Some(value),
+    let return_method = match return_method.kind() {
+        ValueKind::Undefined | ValueKind::Null => None,
+        _ if is_callable(&return_method) => Some(return_method),
         _ => {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -470,7 +470,7 @@ fn get_async_iterator_direct(
     agent: &mut Agent,
     this: &Value,
 ) -> Result<AsyncIteratorRecord, JsError> {
-    if !matches!(this, Value::Object(_) | Value::Function(_)) {
+    if !matches!(this.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "AsyncIterator method called on a non-object".into(),
@@ -677,7 +677,7 @@ fn continue_filter(
 
 /// The continuation of a `flatMap` helper's inner-iterator step.
 fn continue_flat_inner(agent: &mut Agent, object_id: u64, result: Value) -> Result<Value, JsError> {
-    if !matches!(result, Value::Object(_)) {
+    if !matches!(result.kind(), ValueKind::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Iterator result is not an object".into(),
@@ -754,7 +754,7 @@ fn async_helper_method(
     this: &Value,
     args: &[Value],
 ) -> Result<Value, JsError> {
-    let Value::Object(obj) = this else {
+    let ValueKind::Object(obj) = this.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "AsyncIterator helper method called on a non-object".into(),
@@ -931,7 +931,7 @@ fn async_helper_method(
 
 /// Continue a lazy helper after the underlying result arrived.
 fn continue_lazy(agent: &mut Agent, object_id: u64, result: Value) -> Result<Value, JsError> {
-    if !matches!(result, Value::Object(_)) {
+    if !matches!(result.kind(), ValueKind::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Iterator result is not an object".into(),
@@ -1130,7 +1130,7 @@ fn continue_lazy(agent: &mut Agent, object_id: u64, result: Value) -> Result<Val
                     Some(method) => {
                         let inner_value =
                             crate::function::call(agent, &method, mapped.clone(), &[])?;
-                        if !matches!(inner_value, Value::Object(_)) {
+                        if !matches!(inner_value.kind(), ValueKind::Object(_)) {
                             return Err(JsError::new(
                                 ErrorKind::TypeError,
                                 "flatMap inner async iterator must be an object".into(),
@@ -1402,7 +1402,7 @@ fn eager_step(agent: &mut Agent, driver_id: u64) -> Result<Value, JsError> {
 
 /// Continue an eager helper after the underlying result arrived.
 fn continue_eager(agent: &mut Agent, driver_id: u64, result: Value) -> Result<Value, JsError> {
-    if !matches!(result, Value::Object(_)) {
+    if !matches!(result.kind(), ValueKind::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Iterator result is not an object".into(),
@@ -1657,7 +1657,7 @@ mod tests {
         agent.initialize_host_defined_realm()?;
         let value = agent.run_script(source)?;
         agent.run_jobs()?;
-        let Value::Object(obj) = &value else {
+        let ValueKind::Object(obj) = value.kind() else {
             return Ok(value.clone());
         };
         let Some(data) = agent.promises.get(&obj.id()) else {

@@ -1320,6 +1320,7 @@ fn walk_for_binding(binding: &ForBinding, visit: &mut impl FnMut(&Expr)) {
 mod tests {
     use super::*;
     use crux::string::intern_utf8;
+    use crux::value::ValueKind;
 
     fn parse(source: &str) -> Program {
         parser::parse_script(source).unwrap()
@@ -1610,8 +1611,8 @@ mod tests {
         .unwrap();
         let global = agent.running_context().unwrap().realm.global_object.clone();
         assert!(matches!(
-            global.get(&JsString::from_utf8("ef")).unwrap(),
-            Value::Function(_)
+            global.get(&JsString::from_utf8("ef")).unwrap().kind(),
+            ValueKind::Function(_)
         ));
     }
 

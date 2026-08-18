@@ -14,7 +14,7 @@ use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
 use crux::typed_array::SharedBuffer;
-use crux::value::{Value, is_callable, is_constructor};
+use crux::value::{Value, ValueKind, is_callable, is_constructor};
 
 use crate::agent::Agent;
 use crate::context::{as_object, get_property, get_property_key};
@@ -105,8 +105,8 @@ pub fn is_detached(agent: &Agent, id: u64) -> bool {
 
 /// IsSharedArrayBuffer (spec 25.1.2.6).
 pub fn is_shared(agent: &Agent, value: &Value) -> bool {
-    match value {
-        Value::Object(obj) => agent
+    match value.kind() {
+        ValueKind::Object(obj) => agent
             .buffer_data
             .get(&obj.id())
             .map(|cell| cell.borrow().is_shared)
@@ -143,7 +143,10 @@ fn state(agent: &Agent, id: u64) -> Option<std::cell::Ref<'_, BufferState>> {
 /// option as a ToIndex length, or `None` when the option is absent. A
 /// non-object option (null, a primitive, or undefined) means no maximum.
 fn max_byte_length_option(agent: &mut Agent, options: &Value) -> Result<Option<usize>, JsError> {
-    if !matches!(options, Value::Object(_) | Value::Function(_)) {
+    if !matches!(
+        options.kind(),
+        ValueKind::Object(_) | ValueKind::Function(_)
+    ) {
         return Ok(None);
     }
     let value = get_property(
@@ -152,7 +155,7 @@ fn max_byte_length_option(agent: &mut Agent, options: &Value) -> Result<Option<u
         &JsString::from_utf8("maxByteLength"),
         options.clone(),
     )?;
-    if matches!(value, Value::Undefined) {
+    if matches!(value.kind(), ValueKind::Undefined) {
         return Ok(None);
     }
     // ToIndex: ToPrimitive(Number) first so object values reach their
@@ -273,7 +276,8 @@ fn clamped_bounds(agent: &mut Agent, args: &[Value], len: u64) -> Result<(u64, u
         (relative_start as u64).min(len)
     };
     let relative_end = match args.get(1) {
-        None | Some(Value::Undefined) => len as f64,
+        None => len as f64,
+        Some(_v) if _v.is_undefined() => len as f64,
         Some(value) => to_integer_or_infinity(crate::context::to_number(agent, value)?),
     };
     let end = if relative_end < 0.0 {
@@ -297,10 +301,11 @@ fn species_constructor(
         &JsString::from_utf8("constructor"),
         exemplar.clone(),
     )?;
-    if matches!(ctor, Value::Undefined) {
+    if matches!(ctor.kind(), ValueKind::Undefined) {
         return Ok(default_ctor);
     }
-    if !is_constructor(&ctor) && !is_callable(&ctor) && !matches!(ctor, Value::Object(_)) {
+    if !is_constructor(&ctor) && !is_callable(&ctor) && !matches!(ctor.kind(), ValueKind::Object(_))
+    {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "constructor is not an object".into(),
@@ -308,9 +313,9 @@ fn species_constructor(
     }
     let species_key = PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone());
     let species = get_property_key(agent, &ctor, &species_key, ctor.clone())?;
-    match species {
-        Value::Null | Value::Undefined => Ok(default_ctor),
-        value if is_constructor(&value) => Ok(value),
+    match species.kind() {
+        ValueKind::Null | ValueKind::Undefined => Ok(default_ctor),
+        _ if is_constructor(&species) => Ok(species),
         _ => Err(JsError::new(
             ErrorKind::TypeError,
             "species is not a constructor".into(),
@@ -401,7 +406,7 @@ fn str(text: &str) -> Value {
 /// ToIndex (spec 7.1.20) with agent dispatch for object receivers; the crux
 /// `to_index` cannot run user `valueOf`/`toString`.
 fn to_index_agent(agent: &mut Agent, value: &Value) -> Result<u64, JsError> {
-    if matches!(value, Value::Undefined) {
+    if matches!(value.kind(), ValueKind::Undefined) {
         return Ok(0);
     }
     let number = crate::context::to_number(agent, value)?;
@@ -421,7 +426,7 @@ fn array_buffer_construct(
     args: &[Value],
     new_target: &Value,
 ) -> Result<Value, JsError> {
-    if matches!(new_target, Value::Undefined) {
+    if matches!(new_target.kind(), ValueKind::Undefined) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "ArrayBuffer must be called with 'new'".into(),
@@ -456,9 +461,10 @@ fn array_buffer_construct(
 /// ArrayBuffer.isView (spec 25.1.4.2).
 fn is_view(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let _ = this;
-    let arg = args.first().unwrap_or(&Value::Undefined);
-    match arg {
-        Value::Object(obj) => {
+    let binding = Value::Undefined;
+    let arg = args.first().unwrap_or(&binding);
+    match arg.kind() {
+        ValueKind::Object(obj) => {
             let has_viewed = matches!(obj.kind, crux::object::ObjectKind::IntegerIndexed(_))
                 || agent.dataview_data.contains_key(&obj.id());
             Ok(Value::Boolean(has_viewed))
@@ -766,7 +772,10 @@ fn transfer(
         ));
     }
     let new_length = match args.first() {
-        None | Some(Value::Undefined) => state(agent, object.id())
+        None => state(agent, object.id())
+            .map(|state| state.byte_length)
+            .unwrap_or(0),
+        Some(value) if value.is_undefined() => state(agent, object.id())
             .map(|state| state.byte_length)
             .unwrap_or(0),
         Some(value) => to_index_agent(agent, value)? as usize,
@@ -806,7 +815,10 @@ fn transfer_to_immutable(
     // ArrayBufferCopyAndDetach reads newLength before the detachability
     // checks (spec 25.1.2.2 steps 3-6).
     let new_length = match args.first() {
-        None | Some(Value::Undefined) => state(agent, object.id())
+        None => state(agent, object.id())
+            .map(|state| state.byte_length)
+            .unwrap_or(0),
+        Some(value) if value.is_undefined() => state(agent, object.id())
             .map(|state| state.byte_length)
             .unwrap_or(0),
         Some(value) => to_index_agent(agent, value)? as usize,
@@ -827,7 +839,7 @@ fn transfer_to_immutable(
         ));
     }
     let result = array_buffer_copy_and_detach(agent, object.id(), new_length, false)?;
-    if let Value::Object(obj) = &result
+    if let ValueKind::Object(obj) = result.kind()
         && let Some(cell) = agent.buffer_data.get(&obj.id())
     {
         let mut state = cell.borrow_mut();
@@ -843,7 +855,7 @@ fn shared_array_buffer_construct(
     args: &[Value],
     new_target: &Value,
 ) -> Result<Value, JsError> {
-    if matches!(new_target, Value::Undefined) {
+    if matches!(new_target.kind(), ValueKind::Undefined) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "SharedArrayBuffer must be called with 'new'".into(),
@@ -1523,22 +1535,22 @@ mod tests {
     }
 
     fn text(source: &str) -> String {
-        match run(source).unwrap() {
-            Value::String(s) => s.to_string_lossy(),
+        match run(source).unwrap().kind() {
+            ValueKind::String(s) => s.to_string_lossy(),
             other => panic!("expected a string, got {other:?}"),
         }
     }
 
     fn number(source: &str) -> f64 {
-        match run(source).unwrap() {
-            Value::Number(n) => n,
+        match run(source).unwrap().kind() {
+            ValueKind::Number(n) => n,
             other => panic!("expected a number, got {other:?}"),
         }
     }
 
     fn bool(source: &str) -> bool {
-        match run(source).unwrap() {
-            Value::Boolean(b) => b,
+        match run(source).unwrap().kind() {
+            ValueKind::Boolean(b) => b,
             other => panic!("expected a boolean, got {other:?}"),
         }
     }

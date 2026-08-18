@@ -11,7 +11,7 @@ use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::PropertyDescriptor;
 use crux::string::JsString;
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
 use crate::env::{EnvRef, new_global_environment};
@@ -74,10 +74,7 @@ impl Intrinsics {
 }
 
 fn as_object(value: &Value) -> Option<Handle<JsObject>> {
-    match value {
-        Value::Object(obj) => Some(obj.clone()),
-        _ => None,
-    }
+    value.as_object()
 }
 
 /// InitializeHostDefinedRealm (spec 9.3.4): CreateIntrinsics, the global
@@ -241,12 +238,15 @@ fn set_default_global_bindings(realm: &Handle<Realm>) -> Result<(), JsError> {
     // rejects), and installs that set a custom [[Prototype]] (the TypedArray
     // kind constructors inherit %TypedArray%) are left alone.
     let function_proto = match realm.intrinsics.get("%Function.prototype%") {
-        Some(Value::Function(function)) => function.object.handle(),
-        _ => None,
+        Some(value) => match value.kind() {
+            ValueKind::Function(function) => function.object.handle(),
+            _ => None,
+        },
+        None => None,
     };
     if let Some(function_proto) = function_proto {
         for value in realm.intrinsics.entries() {
-            if let Value::Function(function) = value
+            if let ValueKind::Function(function) = value.kind()
                 && let Some(object) = function.object.handle()
                 && object.get_prototype_of()?.is_none()
             {
@@ -288,8 +288,8 @@ mod tests {
             Value::Number(f64::INFINITY)
         );
         assert!(matches!(
-            global.get(&JsString::from_utf8("NaN")).unwrap(),
-            Value::Number(n) if n.is_nan()
+            global.get(&JsString::from_utf8("NaN")).unwrap().kind(),
+            ValueKind::Number(n) if n.is_nan()
         ));
         assert_eq!(
             global.get(&JsString::from_utf8("undefined")).unwrap(),

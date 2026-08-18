@@ -11,7 +11,7 @@ use crux::error::{ErrorKind, JsError};
 use crux::function::Function;
 use crux::handle::Handle;
 use crux::string::JsString;
-use crux::value::{Value, is_callable, is_constructor};
+use crux::value::{Value, ValueKind, is_callable, is_constructor};
 
 use crate::agent::Agent;
 use crate::job::{JobCallback, host_make_job_callback};
@@ -96,7 +96,7 @@ pub struct PromiseCapability {
 
 /// IsPromise (spec 27.2.1.4): the value is an object with a Promise Record.
 pub fn is_promise(agent: &Agent, value: &Value) -> bool {
-    let Value::Object(obj) = value else {
+    let ValueKind::Object(obj) = value.kind() else {
         return false;
     };
     agent.promises.contains_key(&obj.id())
@@ -131,7 +131,8 @@ pub fn new_promise_capability(
                 // second call throws once a resolve/reject was captured; a
                 // prior (undefined, undefined) call leaves the slot free.
                 if let Some((resolve, reject)) = &*slot
-                    && (!matches!(resolve, Value::Undefined) || !matches!(reject, Value::Undefined))
+                    && (!matches!(resolve.kind(), ValueKind::Undefined)
+                        || !matches!(reject.kind(), ValueKind::Undefined))
                 {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
@@ -231,9 +232,9 @@ pub fn resolve_promise(
         )?;
         return reject_promise(agent, promise, error);
     }
-    let object = match &resolution {
-        Value::Object(obj) => Some(obj.clone()),
-        Value::Function(fun) => fun.object.handle(),
+    let object = match resolution.kind() {
+        ValueKind::Object(obj) => Some(obj),
+        ValueKind::Function(fun) => fun.object.handle(),
         _ => None,
     };
     let Some(_object) = object else {
@@ -261,7 +262,7 @@ pub fn resolve_promise(
 
 /// The Promise Reject Function algorithm: reject `promise` with `reason`.
 pub fn reject_promise(agent: &mut Agent, promise: &Value, reason: Value) -> Result<(), JsError> {
-    let Value::Object(obj) = promise else {
+    let ValueKind::Object(obj) = promise.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "reject called on a non-object promise".into(),
@@ -296,7 +297,7 @@ pub fn reject_promise(agent: &mut Agent, promise: &Value, reason: Value) -> Resu
 /// FulfillPromise (spec 27.2.1.4): settle with a value and run the
 /// fulfill reactions.
 pub fn fulfill_promise(agent: &mut Agent, promise: &Value, value: Value) -> Result<(), JsError> {
-    let Value::Object(obj) = promise else {
+    let ValueKind::Object(obj) = promise.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "fulfill called on a non-object promise".into(),
@@ -348,7 +349,7 @@ pub fn perform_promise_then(
         kind: ReactionKind::Reject,
         handler: on_rejected.map(host_make_job_callback),
     };
-    let Value::Object(obj) = promise else {
+    let ValueKind::Object(obj) = promise.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "promise is not an object".into(),

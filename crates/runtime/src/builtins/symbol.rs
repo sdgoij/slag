@@ -11,7 +11,7 @@ use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
 use crux::symbol::{Symbol, descriptive_string, well_known};
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
 use crate::context::as_object;
@@ -248,9 +248,9 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
 }
 
 fn symbol_value(agent: &Agent, value: &Value) -> Result<Symbol, JsError> {
-    match value {
-        Value::Symbol(symbol) => Ok(symbol.as_ref().clone()),
-        Value::Object(obj) => agent.symbol_data.get(&obj.id()).cloned().ok_or_else(|| {
+    match value.kind() {
+        ValueKind::Symbol(symbol) => Ok(symbol.as_ref().clone()),
+        ValueKind::Object(obj) => agent.symbol_data.get(&obj.id()).cloned().ok_or_else(|| {
             JsError::new(
                 ErrorKind::TypeError,
                 "Symbol.prototype requires a Symbol".into(),
@@ -276,7 +276,8 @@ pub fn dispatch_call(
         // or *undefined* for no argument.
         return Some((|| {
             let description = match args.first() {
-                None | Some(Value::Undefined) => None,
+                None => None,
+                Some(value) if value.is_undefined() => None,
                 Some(value) => Some(to_string(value)?),
             };
             Ok(Value::Symbol(Handle::new(Symbol::new(description))))
@@ -337,7 +338,8 @@ pub fn dispatch_construct(
 /// creating it on first use.
 fn symbol_for(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
     let key = match args.first() {
-        None | Some(Value::Undefined) => JsString::from_utf8("undefined"),
+        None => JsString::from_utf8("undefined"),
+        Some(value) if value.is_undefined() => JsString::from_utf8("undefined"),
         Some(value) => to_string(value)?,
     };
     let mut registry = agent.global_symbol_registry.borrow_mut();
@@ -352,7 +354,7 @@ fn symbol_for(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
 /// Symbol.keyFor (spec 20.4.2.8): the registry key of a symbol, or
 /// *undefined* when it was not created by `Symbol.for`.
 fn symbol_key_for(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
-    let Value::Symbol(symbol) = args.first().cloned().unwrap_or(Value::Undefined) else {
+    let ValueKind::Symbol(symbol) = args.first().cloned().unwrap_or(Value::Undefined).kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Symbol.keyFor requires a symbol".into(),

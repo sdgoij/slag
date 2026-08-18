@@ -23,7 +23,7 @@ pub mod harness {
     use crux::object::JsObject;
     use crux::string::JsString;
     use crux::typed_array::SharedBuffer;
-    use crux::value::Value;
+    use crux::value::{Value, ValueKind};
     use runtime::Agent;
 
     /// Defines `assert.throws` (the real test262 assert.js checks
@@ -11239,7 +11239,7 @@ var $DONE = function (error) {
     /// The settled outcome of the module's top-level capability promise:
     /// `None` on fulfillment, `Some(reason)` on rejection.
     fn module_settled(agent: &Agent, promise: &Value) -> Result<Option<Value>, String> {
-        let Value::Object(obj) = promise else {
+        let ValueKind::Object(obj) = promise.kind() else {
             return Ok(None);
         };
         let Some(data) = agent.promises.get(&obj.id()) else {
@@ -11256,10 +11256,10 @@ var $DONE = function (error) {
 
     /// The thrown value's constructor name, or "unknown" when it has none.
     fn thrown_kind(value: &Value) -> String {
-        match value {
-            Value::Object(obj) => obj.kind.name().to_string(),
-            Value::String(_) => "String".into(),
-            Value::Number(_) => "Number".into(),
+        match value.kind() {
+            ValueKind::Object(obj) => obj.kind.name().to_string(),
+            ValueKind::String(_) => "String".into(),
+            ValueKind::Number(_) => "Number".into(),
             _ => "unknown".into(),
         }
     }
@@ -11283,8 +11283,8 @@ var $DONE = function (error) {
             ctor.clone(),
         )
         .ok()?;
-        match name {
-            Value::String(text) => Some(text.to_string_lossy()),
+        match name.kind() {
+            ValueKind::String(text) => Some(text.to_string_lossy()),
             _ => None,
         }
     }
@@ -11306,12 +11306,15 @@ var $DONE = function (error) {
                 value.clone(),
             )
             .ok()
-            .filter(|message| matches!(message, Value::String(_)));
+            .filter(|message| matches!(message.kind(), ValueKind::String(_)));
             return match message {
-                Some(Value::String(text)) if !text.to_string_lossy().is_empty() => {
-                    Ok(format!("{name}: {}", text.to_string_lossy()))
-                }
-                _ => Ok(name),
+                Some(text) => match text.kind() {
+                    ValueKind::String(s) if !s.to_string_lossy().is_empty() => {
+                        Ok(format!("{name}: {}", s.to_string_lossy()))
+                    }
+                    _ => Ok(name),
+                },
+                None => Ok(name),
             };
         }
         Ok(format!("{value:?}"))
@@ -11339,7 +11342,7 @@ var $DONE = function (error) {
             global.clone(),
         )
         .map_err(|e| e.message)?;
-        if matches!(error, Value::Undefined | Value::Null) {
+        if matches!(error.kind(), ValueKind::Undefined | ValueKind::Null) {
             Ok(None)
         } else {
             Ok(Some(error))
@@ -11526,7 +11529,7 @@ var $DONE = function (error) {
             .global_object
             .get(&JsString::from_utf8("$262"))
             .map_err(|e| e.message)?;
-        let Value::Object(dollar_two_six_two_obj) = dollar_two_six_two else {
+        let ValueKind::Object(dollar_two_six_two_obj) = dollar_two_six_two.kind() else {
             return Err("$262 is not an object".into());
         };
         dollar_two_six_two_obj
@@ -11748,7 +11751,7 @@ var $DONE = function (error) {
             .global_object
             .get(&JsString::from_utf8("$262"))
             .map_err(|e| e.message)?;
-        let Value::Object(dollar_two_six_two_obj) = dollar_two_six_two else {
+        let ValueKind::Object(dollar_two_six_two_obj) = dollar_two_six_two.kind() else {
             return Err("$262 is not an object".into());
         };
         let agent_obj = JsObject::ordinary_object_create(None);
@@ -11808,7 +11811,7 @@ var $DONE = function (error) {
                         "broadcast requires a SharedArrayBuffer".into(),
                     ));
                 };
-                let Value::Object(sab_obj) = sab else {
+                let ValueKind::Object(sab_obj) = sab.kind() else {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
                         "broadcast requires a SharedArrayBuffer".into(),
@@ -11955,7 +11958,7 @@ var $DONE = function (error) {
                 let receiver = args.first().cloned().unwrap_or(Value::Undefined);
                 let realm = agent.current_realm()?;
                 let d262 = realm.global_object.get(&JsString::from_utf8("$262"))?;
-                let Value::Object(d262_obj) = d262 else {
+                let ValueKind::Object(d262_obj) = d262.kind() else {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
                         "worker $262 is not an object".into(),
@@ -12081,7 +12084,7 @@ var $DONE = function (error) {
                         let receiver = {
                             let realm = agent.current_realm()?;
                             let d262 = realm.global_object.get(&JsString::from_utf8("$262"))?;
-                            let Value::Object(d262_obj) = d262 else {
+                            let ValueKind::Object(d262_obj) = d262.kind() else {
                                 return Err(JsError::new(
                                     ErrorKind::TypeError,
                                     "worker $262 is not an object".into(),

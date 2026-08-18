@@ -13,7 +13,7 @@ use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
-use crux::value::{Value, is_callable};
+use crux::value::{Value, ValueKind, is_callable};
 
 use crate::agent::Agent;
 use crate::context::{as_object, get_property, get_property_key, to_object};
@@ -73,7 +73,7 @@ fn placeholder(name: &'static str) -> NativeFn {
 /// spec 7.2.1 RequireObjectCoercible: the generic String methods reject
 /// `undefined`/`null` receivers but accept any other value.
 fn require_object_coercible(value: &Value) -> Result<(), JsError> {
-    if matches!(value, Value::Undefined | Value::Null) {
+    if matches!(value.kind(), ValueKind::Undefined | ValueKind::Null) {
         Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert undefined or null to object".into(),
@@ -86,9 +86,9 @@ fn require_object_coercible(value: &Value) -> Result<(), JsError> {
 /// spec 22.1.3.1 ThisStringValue: a String or a String wrapper object (the
 /// String exotic carries `[[StringData]]` in its kind).
 fn this_string_value(this: &Value) -> Result<JsString, JsError> {
-    match this {
-        Value::String(s) => Ok(s.as_ref().clone()),
-        Value::Object(obj) => match &obj.kind {
+    match this.kind() {
+        ValueKind::String(s) => Ok(s.as_ref().clone()),
+        ValueKind::Object(obj) => match &obj.kind {
             crux::object::ObjectKind::String(s) => Ok(s.as_ref().clone()),
             _ => Err(JsError::new(
                 ErrorKind::TypeError,
@@ -172,7 +172,7 @@ fn string_construct(
     let text = match args.first() {
         // spec 22.1.1.1 step 2: SymbolDescriptiveString applies only when
         // NewTarget is undefined (new String(Symbol) throws, symbol-wrapping).
-        Some(Value::Symbol(_)) => {
+        Some(value) if matches!(value.kind(), ValueKind::Symbol(_)) => {
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "Cannot convert a Symbol value to a string".into(),
@@ -211,10 +211,12 @@ fn instance_proto(
 
 fn string_call(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
     let text = match args.first() {
-        Some(Value::Symbol(symbol)) => {
-            JsString::from_utf8(&crux::symbol::descriptive_string(symbol))
-        }
-        Some(value) => crate::context::to_string(agent, value)?,
+        Some(value) => match value.kind() {
+            ValueKind::Symbol(symbol) => {
+                JsString::from_utf8(&crux::symbol::descriptive_string(&symbol))
+            }
+            _ => crate::context::to_string(agent, value)?,
+        },
         None => JsString::from_utf8(""),
     };
     Ok(Value::String(Handle::new(text)))
@@ -374,7 +376,7 @@ fn ends_with(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, J
     let search = crate::context::to_string(agent, &search_value)?;
     let len = s.len();
     let end = match args.get(1).cloned().unwrap_or(Value::Undefined) {
-        Value::Undefined => len,
+        v if v.is_undefined() => len,
         other => to_integer_or_infinity(crate::context::to_number(agent, &other)?)
             .clamp(0.0, len as f64) as usize,
     };
@@ -508,7 +510,7 @@ fn match_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     let regexp = args.first().cloned().unwrap_or(Value::Undefined);
     // spec 22.1.3.17 step 2: a non-Object regexp argument never consults
     // its @@match property; it is coerced by RegExpCreate instead.
-    if matches!(regexp, Value::Object(_) | Value::Function(_))
+    if matches!(regexp.kind(), ValueKind::Object(_) | ValueKind::Function(_))
         && let Some(matcher) = crate::expr::get_method(agent, &regexp, "@@match")?
     {
         return crate::function::call(agent, &matcher, regexp, std::slice::from_ref(this));
@@ -527,7 +529,7 @@ fn match_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, J
     let regexp = args.first().cloned().unwrap_or(Value::Undefined);
     // spec 22.1.3.13 step 2: a non-Object regexp argument never consults
     // its @@matchAll property; it is coerced by RegExpCreate instead.
-    if matches!(regexp, Value::Object(_) | Value::Function(_)) {
+    if matches!(regexp.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         if is_regexp(agent, &regexp)? {
             let flags = get_property(
                 agent,
@@ -560,7 +562,7 @@ fn normalize(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, J
     require_object_coercible(this)?;
     let s = crate::context::to_string(agent, this)?;
     let form = args.first().cloned().unwrap_or(Value::Undefined);
-    let form = if matches!(form, Value::Undefined) {
+    let form = if matches!(form.kind(), ValueKind::Undefined) {
         unicode::NormalizationForm::Nfc
     } else {
         let form_text = crate::context::to_string(agent, &form)?;
@@ -626,7 +628,7 @@ fn string_padding_impl(
     if int_max <= s.len() as u64 {
         return Ok((int_max, JsString::from_utf8("")));
     }
-    let fill_string = if matches!(fill, Value::Undefined) {
+    let fill_string = if matches!(fill.kind(), ValueKind::Undefined) {
         JsString::from_utf8(" ")
     } else {
         to_string(fill)?
@@ -694,8 +696,10 @@ fn replace(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsE
     require_object_coercible(this)?;
     let search_value = args.first().cloned().unwrap_or(Value::Undefined);
     let replace_value = args.get(1).cloned().unwrap_or(Value::Undefined);
-    if matches!(search_value, Value::Object(_) | Value::Function(_))
-        && let Some(replacer) = crate::expr::get_method(agent, &search_value, "@@replace")?
+    if matches!(
+        search_value.kind(),
+        ValueKind::Object(_) | ValueKind::Function(_)
+    ) && let Some(replacer) = crate::expr::get_method(agent, &search_value, "@@replace")?
     {
         return crate::function::call(
             agent,
@@ -753,7 +757,10 @@ fn replace_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
     require_object_coercible(this)?;
     let search_value = args.first().cloned().unwrap_or(Value::Undefined);
     let replace_value = args.get(1).cloned().unwrap_or(Value::Undefined);
-    if matches!(search_value, Value::Object(_) | Value::Function(_)) {
+    if matches!(
+        search_value.kind(),
+        ValueKind::Object(_) | ValueKind::Function(_)
+    ) {
         if is_regexp(agent, &search_value)? {
             let flags = get_property(
                 agent,
@@ -838,7 +845,7 @@ fn search(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
     let regexp = args.first().cloned().unwrap_or(Value::Undefined);
     // spec 22.1.3.24 step 2: a non-Object searchValue never consults its
     // @@search property; it is coerced by RegExpCreate instead.
-    if matches!(regexp, Value::Object(_) | Value::Function(_))
+    if matches!(regexp.kind(), ValueKind::Object(_) | ValueKind::Function(_))
         && let Some(searcher) = crate::expr::get_method(agent, &regexp, "@@search")?
     {
         return crate::function::call(agent, &searcher, regexp, std::slice::from_ref(this));
@@ -861,7 +868,7 @@ fn slice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
         len,
     )?;
     let to = match args.get(1).cloned().unwrap_or(Value::Undefined) {
-        Value::Undefined => len,
+        v if v.is_undefined() => len,
         other => to_clamped_index(agent, &other, len)?,
     };
     if from >= to {
@@ -876,13 +883,15 @@ fn split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
     require_object_coercible(this)?;
     let separator = args.first().cloned().unwrap_or(Value::Undefined);
     let limit = args.get(1).cloned().unwrap_or(Value::Undefined);
-    if matches!(separator, Value::Object(_) | Value::Function(_))
-        && let Some(splitter) = crate::expr::get_method(agent, &separator, "@@split")?
+    if matches!(
+        separator.kind(),
+        ValueKind::Object(_) | ValueKind::Function(_)
+    ) && let Some(splitter) = crate::expr::get_method(agent, &separator, "@@split")?
     {
         return crate::function::call(agent, &splitter, separator, &[this.clone(), limit]);
     }
     let string = crate::context::to_string(agent, this)?;
-    let lim = if matches!(limit, Value::Undefined) {
+    let lim = if matches!(limit.kind(), ValueKind::Undefined) {
         u32::MAX
     } else {
         to_uint32(crate::context::to_number(agent, &limit)?)
@@ -891,7 +900,7 @@ fn split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
     if lim == 0 {
         return array_from_list(agent, &[]);
     }
-    if matches!(separator, Value::Undefined) {
+    if matches!(separator.kind(), ValueKind::Undefined) {
         return array_from_list(agent, &[string]);
     }
     let separator_len = separator_string.len();
@@ -960,7 +969,7 @@ fn substr(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
         size,
     )?;
     let int_length = match args.get(1).cloned().unwrap_or(Value::Undefined) {
-        Value::Undefined => size,
+        v if v.is_undefined() => size,
         other => to_integer_or_infinity(crate::context::to_number(agent, &other)?)
             .clamp(0.0, size as f64) as usize,
     };
@@ -981,7 +990,7 @@ fn substring_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
     )?)
     .clamp(0.0, len as f64) as usize;
     let final_end = match args.get(1).cloned().unwrap_or(Value::Undefined) {
-        Value::Undefined => len,
+        v if v.is_undefined() => len,
         other => to_integer_or_infinity(crate::context::to_number(agent, &other)?)
             .clamp(0.0, len as f64) as usize,
     };
@@ -1182,7 +1191,7 @@ fn string_iterator_next(
     this: &Value,
     _args: &[Value],
 ) -> Result<Value, JsError> {
-    let Value::Object(obj) = this else {
+    let ValueKind::Object(obj) = this.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "%StringIteratorPrototype%.next called on an incompatible receiver".into(),
@@ -1320,7 +1329,7 @@ fn get_substitution(
                             &name,
                             Value::Object(named.clone()),
                         )?;
-                        if !matches!(capture, Value::Undefined) {
+                        if !matches!(capture.kind(), ValueKind::Undefined) {
                             result.extend_from_slice(to_string(&capture)?.as_slice());
                         }
                         q = gt_position + 1;
@@ -1339,15 +1348,15 @@ fn get_substitution(
 /// IsRegExp (spec 7.2.9): an object with a [[RegExpMatcher]] slot or a
 /// truthy `@@match` property.
 pub(crate) fn is_regexp(agent: &mut Agent, value: &Value) -> Result<bool, JsError> {
-    if !matches!(value, Value::Object(_) | Value::Function(_)) {
+    if !matches!(value.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Ok(false);
     }
     // spec IsRegExp: the @@match property takes precedence over the
     // [[RegExpMatcher]] slot (an explicit false makes the object a non-Regexp).
     let key = PropertyKey::Symbol(crux::symbol::well_known("match").as_ref().clone());
     let matcher = get_property_key(agent, value, &key, value.clone())?;
-    if matches!(matcher, Value::Undefined) {
-        if let Value::Object(obj) = value
+    if matches!(matcher.kind(), ValueKind::Undefined) {
+        if let ValueKind::Object(obj) = value.kind()
             && agent.regexp_data.contains_key(&obj.id())
         {
             return Ok(true);
@@ -1371,15 +1380,12 @@ pub(crate) fn get_substitution_public(
 ) -> Result<JsString, JsError> {
     let capture_strings: Vec<Option<JsString>> = captures
         .iter()
-        .map(|c| match c {
-            Value::Undefined => Ok(None),
-            other => Ok(Some(crate::context::to_string(agent, other)?)),
+        .map(|c| match c.kind() {
+            ValueKind::Undefined => Ok(None),
+            _ => Ok(Some(crate::context::to_string(agent, c)?)),
         })
         .collect::<Result<Vec<_>, JsError>>()?;
-    let named = match named_captures {
-        Some(Value::Object(obj)) => Some(obj),
-        _ => None,
-    };
+    let named = named_captures.and_then(|value| value.as_object());
     get_substitution(
         agent,
         matched,
@@ -1938,22 +1944,22 @@ mod tests {
     }
 
     fn text(source: &str) -> String {
-        match run(source).unwrap() {
-            Value::String(s) => s.to_string_lossy(),
+        match run(source).unwrap().kind() {
+            ValueKind::String(s) => s.to_string_lossy(),
             other => panic!("expected a string, got {other:?}"),
         }
     }
 
     fn number(source: &str) -> f64 {
-        match run(source).unwrap() {
-            Value::Number(n) => n,
+        match run(source).unwrap().kind() {
+            ValueKind::Number(n) => n,
             other => panic!("expected a number, got {other:?}"),
         }
     }
 
     fn bool(source: &str) -> bool {
-        match run(source).unwrap() {
-            Value::Boolean(b) => b,
+        match run(source).unwrap().kind() {
+            ValueKind::Boolean(b) => b,
             other => panic!("expected a boolean, got {other:?}"),
         }
     }
@@ -2042,11 +2048,14 @@ mod tests {
         assert_eq!(number("('a\u{1F600}b').codePointAt(2)"), 0xDE00 as f64);
         assert!(matches!(
             run("('abc').codePointAt(9)"),
-            Ok(Value::Undefined)
+            Ok(v) if v.is_undefined()
         ));
         assert_eq!(text("('hello').at(1)"), "e");
         assert_eq!(text("('hello').at(-1)"), "o");
-        assert!(matches!(run("('hello').at(99)"), Ok(Value::Undefined)));
+        assert!(matches!(
+            run("('hello').at(99)"),
+            Ok(v) if v.is_undefined()
+        ));
         assert_eq!(text("('hello').concat(' ', 'world')"), "hello world");
         assert_eq!(text("('abc').slice(1)"), "bc");
         assert_eq!(text("('abc').slice(1, 2)"), "b");

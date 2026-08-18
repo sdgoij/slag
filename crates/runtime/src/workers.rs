@@ -61,7 +61,7 @@ pub fn spawn_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crux::value::Value;
+    use crux::value::ValueKind;
 
     /// Extract the shared byte block of the SharedArrayBuffer `source`
     /// evaluates to.
@@ -69,7 +69,7 @@ mod tests {
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
         let sab = agent.run_script(source).unwrap();
-        let Value::Object(obj) = &sab else {
+        let ValueKind::Object(obj) = sab.kind() else {
             panic!("expected a SharedArrayBuffer object");
         };
         let state = agent.buffer_data.get(&obj.id()).unwrap();
@@ -128,7 +128,7 @@ mod tests {
             )
             .unwrap();
         assert!(
-            matches!(result, Value::Number(n) if n == 0.0 || n == 1.0),
+            matches!(result.kind(), ValueKind::Number(n) if n == 0.0 || n == 1.0),
             "notify must wake at most one waiter, got {result:?}"
         );
         let worker_result = worker.join().unwrap().unwrap();

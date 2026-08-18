@@ -27,7 +27,7 @@ use crux::handle::Handle;
 use crux::object::JsObject as CruxObject;
 use crux::property::PropertyDescriptor;
 use crux::string::JsString;
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
 use crate::context::to_string as js_to_string;
@@ -432,8 +432,8 @@ impl Context {
             Some(JsString::from_utf8("clearTimeout")),
             1,
             Box::new(move |_, args| {
-                if let Some(Value::Number(id)) = args.first() {
-                    timers_clear.borrow_mut().cancelled.insert(*id as u64, true);
+                if let Some(id) = args.first().and_then(|v| v.as_number()) {
+                    timers_clear.borrow_mut().cancelled.insert(id as u64, true);
                 }
                 Ok(Value::Undefined)
             }),
@@ -449,8 +449,8 @@ impl Context {
             Some(JsString::from_utf8("clearInterval")),
             1,
             Box::new(move |_, args| {
-                if let Some(Value::Number(id)) = args.first() {
-                    timers.borrow_mut().cancelled.insert(*id as u64, true);
+                if let Some(id) = args.first().and_then(|v| v.as_number()) {
+                    timers.borrow_mut().cancelled.insert(id as u64, true);
                 }
                 Ok(Value::Undefined)
             }),
@@ -478,8 +478,8 @@ impl Context {
         let function_proto = realm
             .intrinsics
             .get("%Function.prototype%")
-            .and_then(|value| match value {
-                Value::Function(function) => function.object.handle(),
+            .and_then(|value| match value.kind() {
+                ValueKind::Function(function) => function.object.handle(),
                 _ => None,
             });
         let random = Function::create_builtin(
@@ -535,8 +535,8 @@ fn current_agent_mut() -> Result<&'static mut Agent, JsError> {
 /// host function that expected it.
 #[cfg(feature = "fs")]
 fn string_arg(args: &[Value], index: usize, name: &str) -> Result<String, JsError> {
-    match args.get(index) {
-        Some(Value::String(s)) => Ok(s.to_string_lossy()),
+    match args.get(index).map(|v| v.kind()) {
+        Some(ValueKind::String(s)) => Ok(s.to_string_lossy()),
         _ => Err(JsError::new(
             ErrorKind::TypeError,
             format!("{name}: expected a string path"),
@@ -691,7 +691,7 @@ impl HostHooks for RejectionHooks {
 /// A best-effort description of a rejection reason: the `message` property
 /// for error objects, otherwise the value's diagnostic rendering.
 fn describe_value(value: &Value) -> String {
-    if let Value::Object(object) = value {
+    if let ValueKind::Object(object) = value.kind() {
         let message = object
             .get_own_property(&JsString::from_utf8("message"))
             .ok()
@@ -736,27 +736,27 @@ impl JsValue {
     }
 
     pub fn is_undefined(&self) -> bool {
-        matches!(self.0, Value::Undefined)
+        self.0.is_undefined()
     }
 
     pub fn is_null(&self) -> bool {
-        matches!(self.0, Value::Null)
+        self.0.is_null()
     }
 
     pub fn is_boolean(&self) -> bool {
-        matches!(self.0, Value::Boolean(_))
+        self.0.is_boolean()
     }
 
     pub fn is_number(&self) -> bool {
-        matches!(self.0, Value::Number(_))
+        self.0.is_number()
     }
 
     pub fn is_string(&self) -> bool {
-        matches!(self.0, Value::String(_))
+        self.0.is_string()
     }
 
     pub fn is_object(&self) -> bool {
-        matches!(self.0, Value::Object(_))
+        self.0.is_object()
     }
 
     /// Whether the value is callable (spec 7.2.3).
@@ -770,23 +770,23 @@ impl JsValue {
     }
 
     pub fn as_boolean(&self) -> Option<bool> {
-        match self.0 {
-            Value::Boolean(b) => Some(b),
+        match self.0.kind() {
+            ValueKind::Boolean(b) => Some(b),
             _ => None,
         }
     }
 
     pub fn as_number(&self) -> Option<f64> {
-        match self.0 {
-            Value::Number(n) => Some(n),
+        match self.0.kind() {
+            ValueKind::Number(n) => Some(n),
             _ => None,
         }
     }
 
     /// The string's lossy UTF-8 rendering when the value is a String.
     pub fn as_string(&self) -> Option<String> {
-        match &self.0 {
-            Value::String(s) => Some(s.to_string_lossy()),
+        match self.0.kind() {
+            ValueKind::String(s) => Some(s.to_string_lossy()),
             _ => None,
         }
     }

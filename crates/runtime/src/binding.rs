@@ -11,7 +11,7 @@ use crux::error::{ErrorKind, JsError};
 use crux::object::JsObject;
 use crux::property::PropertyKey;
 use crux::string::JsString;
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 use syntax::ast::{
     ArrayBindingElement, ArrayElement, ArrayLiteral, AssignOp, BindingElement, BindingPattern,
     Expr, ExprKind, ObjectBindingProperty, ObjectLiteral, ObjectProperty, PropertyName,
@@ -36,7 +36,7 @@ pub fn binding_initialization(
             initialize_bound_name(agent, &name, value, env, strict)
         }
         BindingPattern::Object(props) => {
-            if matches!(value, Value::Undefined | Value::Null) {
+            if matches!(value.kind(), ValueKind::Undefined | ValueKind::Null) {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
                     "Cannot destructure null or undefined".into(),
@@ -340,10 +340,10 @@ pub fn copy_data_properties_excluding(
     from: &Value,
     excluded: &[PropertyKey],
 ) -> Result<(), JsError> {
-    if matches!(from, Value::Null | Value::Undefined) {
+    if matches!(from.kind(), ValueKind::Null | ValueKind::Undefined) {
         return Ok(());
     }
-    let Value::Object(from_obj) = crate::context::to_object(agent, from)? else {
+    let ValueKind::Object(from_obj) = crate::context::to_object(agent, from)?.kind() else {
         return Ok(());
     };
     for key in from_obj.own_property_keys()? {
@@ -538,7 +538,7 @@ fn object_assignment(
     value: Value,
     strict: bool,
 ) -> Result<(), JsError> {
-    if matches!(value, Value::Undefined | Value::Null) {
+    if matches!(value.kind(), ValueKind::Undefined | ValueKind::Null) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot destructure null or undefined".into(),
@@ -608,7 +608,7 @@ fn apply_element_default(
     name: Option<&JsString>,
     strict: bool,
 ) -> Result<Value, JsError> {
-    let used_default = matches!(value, Value::Undefined) && init.is_some();
+    let used_default = matches!(value.kind(), ValueKind::Undefined) && init.is_some();
     let value = if used_default {
         eval_expr(agent, init.expect("checked"), strict)?
     } else {

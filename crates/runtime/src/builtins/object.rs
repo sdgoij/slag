@@ -11,7 +11,7 @@ use crux::object::JsObject;
 use crux::ops::same_value;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
 use crate::context::{as_object, get_property_key, to_object};
@@ -257,8 +257,8 @@ fn is_intrinsic(agent: &Agent, callee: &Value, key: &str) -> bool {
         == Some(callee)
 }
 
-fn arg(args: &[Value], index: usize) -> &Value {
-    args.get(index).unwrap_or(&Value::Undefined)
+fn arg(args: &[Value], index: usize) -> Value {
+    args.get(index).cloned().unwrap_or(Value::Undefined)
 }
 
 fn str(value: &str) -> Value {
@@ -309,9 +309,9 @@ pub(crate) fn namespace_live_descriptor(
 /// [[Call]]/[[ParameterMap]] slots, the boxed-primitive marker, the error/
 /// RegExp brands, or the object kind, and a string @@toStringTag overrides it.
 fn prototype_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
-    let tag = match this {
-        Value::Undefined => "Undefined".to_string(),
-        Value::Null => "Null".to_string(),
+    let tag = match this.kind() {
+        ValueKind::Undefined => "Undefined".to_string(),
+        ValueKind::Null => "Null".to_string(),
         _ => {
             // spec step 3: ToObject. Function values pass through unchanged.
             let object = crate::context::to_object(agent, this)?;
@@ -324,8 +324,8 @@ fn prototype_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsError
                 &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
                 object.clone(),
             )?;
-            match tag {
-                Value::String(text) => {
+            match tag.kind() {
+                ValueKind::String(text) => {
                     return Ok(str(&format!("[object {}]", text.to_string_lossy())));
                 }
                 _ => builtin_tag,
@@ -341,7 +341,7 @@ fn builtin_tag(agent: &mut Agent, object: &Value) -> Result<String, JsError> {
     if is_array_for_to_string(object)? {
         return Ok("Array".to_string());
     }
-    let Value::Object(obj) = object else {
+    let ValueKind::Object(obj) = object.kind() else {
         return Ok("Function".to_string());
     };
     if matches!(obj.kind, crux::object::ObjectKind::Arguments(_)) {
@@ -382,8 +382,8 @@ fn builtin_tag(agent: &mut Agent, object: &Value) -> Result<String, JsError> {
 /// IsArray (spec 7.2.2) for the built-in tag: proxies recurse to their
 /// target; a revoked proxy's target is empty.
 fn is_array_for_to_string(value: &Value) -> Result<bool, JsError> {
-    match value {
-        Value::Object(obj) => match &obj.kind {
+    match value.kind() {
+        ValueKind::Object(obj) => match &obj.kind {
             crux::object::ObjectKind::Array => Ok(true),
             crux::object::ObjectKind::Proxy(slots) => {
                 let Some(target) = slots.target.borrow().as_ref().cloned() else {
@@ -393,7 +393,7 @@ fn is_array_for_to_string(value: &Value) -> Result<bool, JsError> {
             }
             _ => Ok(false),
         },
-        Value::Function(f) => Ok(matches!(f.object.kind, crux::object::ObjectKind::Array)),
+        ValueKind::Function(f) => Ok(matches!(f.object.kind, crux::object::ObjectKind::Array)),
         _ => Ok(false),
     }
 }
@@ -460,7 +460,7 @@ fn own_keys_of(agent: &mut Agent, value: &Value, want_symbols: bool) -> Result<V
 /// receiver is returned as-is; SetIntegrityLevel failure throws a TypeError.
 fn freeze_or_seal(value: &Value, freeze: bool) -> Result<Value, JsError> {
     // spec step 1: Type(O) is not Object → return O unchanged.
-    if !matches!(value, Value::Object(_) | Value::Function(_)) {
+    if !matches!(value.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Ok(value.clone());
     }
     if !set_integrity_level(value, freeze)? {
@@ -530,7 +530,7 @@ fn set_integrity_level(value: &Value, freeze: bool) -> Result<bool, JsError> {
 fn test_integrity_level(agent: &mut Agent, value: &Value, freeze: bool) -> Result<bool, JsError> {
     // spec 20.1.2.12 step 1 / 20.1.2.14 step 1: a primitive is frozen and
     // sealed trivially (no own properties, not extensible).
-    if !matches!(value, Value::Object(_) | Value::Function(_)) {
+    if !matches!(value.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Ok(true);
     }
     let object = to_object(agent, value)?;
@@ -587,7 +587,10 @@ fn object_define_properties(
         if matches!(target.kind, crux::object::ObjectKind::Array)
             && key == PropertyKey::from_utf8("length")
             && let Some(length_value) = &desc.value
-            && matches!(length_value, Value::Object(_) | Value::Function(_))
+            && matches!(
+                length_value.kind(),
+                ValueKind::Object(_) | ValueKind::Function(_)
+            )
         {
             desc.value = Some(Value::Number(crate::context::to_number(
                 agent,
@@ -627,7 +630,7 @@ pub fn dispatch_call(
     }
     if intrinsics.get(PROTO_HAS_OWN).as_ref() == Some(callee) {
         return Some((|| {
-            let key = crate::context::to_property_key(agent, arg(args, 0))?;
+            let key = crate::context::to_property_key(agent, &arg(args, 0))?;
             let object = to_object(agent, this)?;
             let obj = as_object(&object).ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "value is not an object".into())
@@ -655,7 +658,7 @@ pub fn dispatch_call(
     if intrinsics.get(PROTO_IS_PROTO_OF).as_ref() == Some(callee) {
         return Some((|| {
             let candidate = arg(args, 0);
-            let Some(candidate_obj) = crate::context::as_object(candidate) else {
+            let Some(candidate_obj) = crate::context::as_object(&candidate) else {
                 return Ok(Value::Boolean(false));
             };
             let object = to_object(agent, this)?;
@@ -674,7 +677,7 @@ pub fn dispatch_call(
     }
     if intrinsics.get(PROTO_PROP_IS_ENUM).as_ref() == Some(callee) {
         return Some((|| {
-            let key = crate::context::to_property_key(agent, arg(args, 0))?;
+            let key = crate::context::to_property_key(agent, &arg(args, 0))?;
             let object = to_object(agent, this)?;
             let obj = as_object(&object).ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "value is not an object".into())
@@ -710,7 +713,7 @@ pub fn dispatch_call(
         return Some(get_prototype_of(agent, this));
     }
     if intrinsics.get(PROTO_SET_PROTO).as_ref() == Some(callee) {
-        return Some(proto_setter(this, arg(args, 0)));
+        return Some(proto_setter(this, &arg(args, 0)));
     }
     if intrinsics.get(PROTO_DEFINE_GETTER).as_ref() == Some(callee) {
         return Some(define_legacy_accessor(agent, this, args, true));
@@ -719,10 +722,10 @@ pub fn dispatch_call(
         return Some(define_legacy_accessor(agent, this, args, false));
     }
     if intrinsics.get(PROTO_LOOKUP_GETTER).as_ref() == Some(callee) {
-        return Some(lookup_legacy_accessor(agent, this, arg(args, 0), true));
+        return Some(lookup_legacy_accessor(agent, this, &arg(args, 0), true));
     }
     if intrinsics.get(PROTO_LOOKUP_SETTER).as_ref() == Some(callee) {
-        return Some(lookup_legacy_accessor(agent, this, arg(args, 0), false));
+        return Some(lookup_legacy_accessor(agent, this, &arg(args, 0), false));
     }
     if intrinsics.get(ASSIGN).as_ref() == Some(callee) {
         return Some(object_assign(agent, args));
@@ -730,9 +733,9 @@ pub fn dispatch_call(
     if intrinsics.get(CREATE).as_ref() == Some(callee) {
         return Some((|| {
             let proto_value = arg(args, 0);
-            let proto = match proto_value {
-                Value::Object(obj) => Some(obj.clone()),
-                Value::Null => None,
+            let proto = match proto_value.kind() {
+                ValueKind::Object(obj) => Some(obj.clone()),
+                ValueKind::Null => None,
                 _ => {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
@@ -745,8 +748,8 @@ pub fn dispatch_call(
             // spec 20.1.2.2 step 3: undefined Properties are skipped.
             if args.len() > 1 {
                 let properties = arg(args, 1);
-                if !matches!(properties, Value::Undefined) {
-                    object_define_properties(agent, &value, properties)?;
+                if !matches!(properties.kind(), ValueKind::Undefined) {
+                    object_define_properties(agent, &value, &properties)?;
                 }
             }
             Ok(value)
@@ -757,17 +760,17 @@ pub fn dispatch_call(
             // spec 20.1.2.4 step 1: a primitive receiver throws (functions
             // are objects, so `as_object` accepts them).
             let receiver = arg(args, 0);
-            let obj = as_object(receiver).ok_or_else(|| {
+            let obj = as_object(&receiver).ok_or_else(|| {
                 JsError::new(
                     ErrorKind::TypeError,
                     "Object.defineProperty called on non-object".into(),
                 )
             })?;
-            let key = crate::context::to_property_key(agent, arg(args, 1))?;
+            let key = crate::context::to_property_key(agent, &arg(args, 1))?;
             // A deferred namespace's [[DefineOwnProperty]] triggers its
             // module's evaluation for non-symbol-like keys (import-defer).
             crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, &key)?;
-            let mut desc = crux::property::to_property_descriptor(arg(args, 2))?;
+            let mut desc = crux::property::to_property_descriptor(&arg(args, 2))?;
             // ArraySetLength coerces an object [[Value]] twice (ToUint32 and
             // ToNumber, spec 10.4.2.4 steps 3-4) before the descriptor
             // validation; crux cannot invoke user valueOf, so both coercions
@@ -776,7 +779,7 @@ pub fn dispatch_call(
             if matches!(obj.kind, crux::object::ObjectKind::Array)
                 && key == PropertyKey::from_utf8("length")
                 && let Some(value) = &desc.value
-                && matches!(value, Value::Object(_) | Value::Function(_))
+                && matches!(value.kind(), ValueKind::Object(_) | ValueKind::Function(_))
             {
                 let number = crate::context::to_number(agent, value)?;
                 let _ = crate::context::to_number(agent, value)?;
@@ -795,11 +798,15 @@ pub fn dispatch_call(
         })());
     }
     if intrinsics.get(DEFINE_PROPERTIES).as_ref() == Some(callee) {
-        return Some(object_define_properties(agent, arg(args, 0), arg(args, 1)));
+        return Some(object_define_properties(
+            agent,
+            &arg(args, 0),
+            &arg(args, 1),
+        ));
     }
     if intrinsics.get(ENTRIES).as_ref() == Some(callee) {
         return Some((|| {
-            let object = to_object(agent, arg(args, 0))?;
+            let object = to_object(agent, &arg(args, 0))?;
             let obj = as_object(&object).ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "value is not an object".into())
             })?;
@@ -831,7 +838,7 @@ pub fn dispatch_call(
     }
     if intrinsics.get(VALUES).as_ref() == Some(callee) {
         return Some((|| {
-            let object = to_object(agent, arg(args, 0))?;
+            let object = to_object(agent, &arg(args, 0))?;
             let obj = as_object(&object).ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "value is not an object".into())
             })?;
@@ -858,7 +865,7 @@ pub fn dispatch_call(
     }
     if intrinsics.get(KEYS).as_ref() == Some(callee) {
         return Some((|| {
-            let keys = enumerable_string_keys(agent, arg(args, 0))?;
+            let keys = enumerable_string_keys(agent, &arg(args, 0))?;
             let values: Vec<Value> = keys
                 .into_iter()
                 .map(|key| str(&key.to_string_lossy()))
@@ -867,18 +874,18 @@ pub fn dispatch_call(
         })());
     }
     if intrinsics.get(GET_OWN_NAMES).as_ref() == Some(callee) {
-        return Some(own_keys_of(agent, arg(args, 0), false));
+        return Some(own_keys_of(agent, &arg(args, 0), false));
     }
     if intrinsics.get(GET_OWN_SYMBOLS).as_ref() == Some(callee) {
-        return Some(own_keys_of(agent, arg(args, 0), true));
+        return Some(own_keys_of(agent, &arg(args, 0), true));
     }
     if intrinsics.get(GROUP_BY).as_ref() == Some(callee) {
         return Some(object_group_by(agent, args));
     }
     if intrinsics.get(GET_OWN_DESC).as_ref() == Some(callee) {
         return Some((|| {
-            let object = to_object(agent, arg(args, 0))?;
-            let key = crate::context::to_property_key(agent, arg(args, 1))?;
+            let object = to_object(agent, &arg(args, 0))?;
+            let key = crate::context::to_property_key(agent, &arg(args, 1))?;
             let obj = as_object(&object).ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "value is not an object".into())
             })?;
@@ -900,7 +907,7 @@ pub fn dispatch_call(
     }
     if intrinsics.get(GET_OWN_DESCS).as_ref() == Some(callee) {
         return Some((|| {
-            let object = to_object(agent, arg(args, 0))?;
+            let object = to_object(agent, &arg(args, 0))?;
             let obj = as_object(&object).ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "value is not an object".into())
             })?;
@@ -926,15 +933,15 @@ pub fn dispatch_call(
         })());
     }
     if intrinsics.get(GET_PROTO).as_ref() == Some(callee) {
-        return Some(get_prototype_of(agent, arg(args, 0)));
+        return Some(get_prototype_of(agent, &arg(args, 0)));
     }
     if intrinsics.get(SET_PROTO).as_ref() == Some(callee) {
-        return Some(set_prototype_of(agent, arg(args, 0), arg(args, 1)));
+        return Some(set_prototype_of(agent, &arg(args, 0), &arg(args, 1)));
     }
     if intrinsics.get(HAS_OWN).as_ref() == Some(callee) {
         return Some((|| {
-            let object = to_object(agent, arg(args, 0))?;
-            let key = crate::context::to_property_key(agent, arg(args, 1))?;
+            let object = to_object(agent, &arg(args, 0))?;
+            let key = crate::context::to_property_key(agent, &arg(args, 1))?;
             let obj = as_object(&object).ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "value is not an object".into())
             })?;
@@ -955,13 +962,13 @@ pub fn dispatch_call(
         })());
     }
     if intrinsics.get(IS).as_ref() == Some(callee) {
-        return Some(Ok(Value::Boolean(same_value(arg(args, 0), arg(args, 1)))));
+        return Some(Ok(Value::Boolean(same_value(&arg(args, 0), &arg(args, 1)))));
     }
     if intrinsics.get(IS_EXTENSIBLE).as_ref() == Some(callee) {
         return Some((|| {
             // spec 20.1.2.13 step 1: a non-object is trivially not extensible
             // (undefined/null included — no RequireObjectCoercible).
-            let Some(obj) = as_object(arg(args, 0)) else {
+            let Some(obj) = as_object(&arg(args, 0)) else {
                 return Ok(Value::Boolean(false));
             };
             Ok(Value::Boolean(obj.is_extensible()?))
@@ -971,7 +978,7 @@ pub fn dispatch_call(
         return Some((|| {
             // spec 20.1.2.18 step 1: a non-object is returned unchanged.
             let value = arg(args, 0);
-            let Some(obj) = as_object(value) else {
+            let Some(obj) = as_object(&value) else {
                 return Ok(value.clone());
             };
             // spec step 4: a failed [[PreventExtensions]] (e.g. a proxy trap
@@ -986,16 +993,16 @@ pub fn dispatch_call(
         })());
     }
     if intrinsics.get(FREEZE).as_ref() == Some(callee) {
-        return Some(freeze_or_seal(arg(args, 0), true));
+        return Some(freeze_or_seal(&arg(args, 0), true));
     }
     if intrinsics.get(SEAL).as_ref() == Some(callee) {
-        return Some(freeze_or_seal(arg(args, 0), false));
+        return Some(freeze_or_seal(&arg(args, 0), false));
     }
     if intrinsics.get(IS_FROZEN).as_ref() == Some(callee) {
         return Some((|| {
             Ok(Value::Boolean(test_integrity_level(
                 agent,
-                arg(args, 0),
+                &arg(args, 0),
                 true,
             )?))
         })());
@@ -1004,13 +1011,13 @@ pub fn dispatch_call(
         return Some((|| {
             Ok(Value::Boolean(test_integrity_level(
                 agent,
-                arg(args, 0),
+                &arg(args, 0),
                 false,
             )?))
         })());
     }
     if intrinsics.get(FROM_ENTRIES).as_ref() == Some(callee) {
-        return Some(from_entries(agent, arg(args, 0)));
+        return Some(from_entries(agent, &arg(args, 0)));
     }
     None
 }
@@ -1046,12 +1053,19 @@ fn object_constructor(
     // constructor or Reflect.construct's target) builds an empty object with
     // its own prototype and ignores the value argument.
     let active = realm.intrinsics.get(OBJECT).as_ref() == Some(new_target);
-    if !matches!(new_target, Value::Undefined) && !active {
+    if !matches!(new_target.kind(), ValueKind::Undefined) && !active {
         let proto = get_prototype_from_constructor(agent, new_target, OBJECT_PROTO)?;
         return Ok(Value::Object(JsObject::ordinary_object_create(Some(proto))));
     }
     match args.first() {
-        None | Some(Value::Undefined | Value::Null) => {
+        None => {
+            let proto = realm
+                .intrinsics
+                .get(OBJECT_PROTO)
+                .and_then(|v| as_object(&v));
+            Ok(Value::Object(JsObject::ordinary_object_create(proto)))
+        }
+        Some(value) if value.is_undefined() || value.is_null() => {
             let proto = realm
                 .intrinsics
                 .get(OBJECT_PROTO)
@@ -1111,16 +1125,16 @@ fn set_prototype_of(
     proto_value: &Value,
 ) -> Result<Value, JsError> {
     // spec 20.1.2.22 step 1: RequireObjectCoercible (undefined/null throw).
-    if matches!(value, Value::Undefined | Value::Null) {
+    if matches!(value.kind(), ValueKind::Undefined | ValueKind::Null) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert undefined or null to object".into(),
         ));
     }
-    let proto = match proto_value {
-        Value::Object(obj) => Some(obj.clone()),
-        Value::Function(f) => Some(f.object.clone()),
-        Value::Null => None,
+    let proto = match proto_value.kind() {
+        ValueKind::Object(obj) => Some(obj),
+        ValueKind::Function(f) => Some(f.object.clone()),
+        ValueKind::Null => None,
         _ => {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -1150,16 +1164,16 @@ fn set_prototype_of(
 /// object's own [[SetPrototypeOf]] rejects the change.
 fn proto_setter(this: &Value, proto_value: &Value) -> Result<Value, JsError> {
     // step 1: RequireObjectCoercible(this value).
-    if matches!(this, Value::Undefined | Value::Null) {
+    if matches!(this.kind(), ValueKind::Undefined | ValueKind::Null) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert undefined or null to object".into(),
         ));
     }
     // step 2: a prototype that is neither an Object nor null is ignored.
-    let proto = match proto_value {
-        Value::Object(obj) => Some(obj.clone()),
-        Value::Null => None,
+    let proto = match proto_value.kind() {
+        ValueKind::Object(obj) => Some(obj),
+        ValueKind::Null => None,
         _ => return Ok(Value::Undefined),
     };
     // step 3: a non-object receiver is ignored.
@@ -1190,7 +1204,7 @@ fn define_legacy_accessor(
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
     // step 2: the accessor must be callable, checked before ToPropertyKey.
     let accessor = arg(args, 1);
-    if !crux::value::is_callable(accessor) {
+    if !crux::value::is_callable(&accessor) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             if getter {
@@ -1201,7 +1215,7 @@ fn define_legacy_accessor(
         ));
     }
     // steps 3-4: the descriptor and the property key.
-    let key = crate::context::to_property_key(agent, arg(args, 0))?;
+    let key = crate::context::to_property_key(agent, &arg(args, 0))?;
     let desc = if getter {
         PropertyDescriptor::accessor(Some(accessor.clone()), None)
     } else {
@@ -1273,9 +1287,9 @@ fn object_group_by(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> 
     let obj = JsObject::ordinary_object_create(None);
     for (key, elements) in groups {
         let array = crate::builtins::array::array_from_values(agent, &elements)?;
-        let key = match &key {
-            Value::String(text) => PropertyKey::String(crux::intern(text.as_slice())),
-            Value::Symbol(symbol) => PropertyKey::Symbol(symbol.as_ref().clone()),
+        let key = match key.kind() {
+            ValueKind::String(text) => PropertyKey::String(crux::intern(text.as_slice())),
+            ValueKind::Symbol(symbol) => PropertyKey::Symbol(symbol.as_ref().clone()),
             _ => continue,
         };
         obj.create_data_property_key(&key, array)?;
@@ -1286,16 +1300,16 @@ fn object_group_by(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> 
 /// Object.assign (spec 20.1.2.1): copy the own enumerable properties of each
 /// source onto the target, in source order.
 fn object_assign(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
-    let target = to_object(agent, arg(args, 0))?;
+    let target = to_object(agent, &arg(args, 0))?;
     for source_value in &args[1..] {
-        if matches!(source_value, Value::Null | Value::Undefined) {
+        if matches!(source_value.kind(), ValueKind::Null | ValueKind::Undefined) {
             continue;
         }
         let source = to_object(agent, source_value)?;
-        let Value::Object(source_obj) = source.clone() else {
+        let ValueKind::Object(source_obj) = source.kind() else {
             continue;
         };
-        let Value::Object(target_obj) = target.clone() else {
+        let ValueKind::Object(target_obj) = target.kind() else {
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "assign target is not an object".into(),
@@ -1326,7 +1340,7 @@ fn from_entries(agent: &mut Agent, iterable: &Value) -> Result<Value, JsError> {
     while let Some(entry) = crate::expr::iterator_step(agent, &iterator)? {
         // AddEntriesFromIterable (spec 10.1.4.3 step 4.d): a non-object
         // entry closes the iterator with a TypeError.
-        if !matches!(entry, Value::Object(_) | Value::Function(_)) {
+        if !matches!(entry.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
             let _ = crate::expr::iterator_close(agent, &iterator);
             return Err(JsError::new(
                 ErrorKind::TypeError,

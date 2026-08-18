@@ -10,7 +10,7 @@ use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::PropertyDescriptor;
 use crux::string::JsString;
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
 use crate::context::as_object;
@@ -206,9 +206,9 @@ pub fn dispatch_construct(
 /// spec; the agent tables are populated only by `new Boolean(v)`, so the
 /// prototype is special-cased here.
 fn this_boolean_value(agent: &Agent, this: &Value) -> Result<bool, JsError> {
-    match this {
-        Value::Boolean(b) => Ok(*b),
-        Value::Object(obj) => {
+    match this.kind() {
+        ValueKind::Boolean(b) => Ok(b),
+        ValueKind::Object(obj) => {
             let is_prototype = agent
                 .current_realm()
                 .ok()

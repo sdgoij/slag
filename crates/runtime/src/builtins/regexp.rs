@@ -13,7 +13,7 @@ use crux::object::JsObject;
 use crux::ops::same_value;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
-use crux::value::{Value, is_callable, is_constructor};
+use crux::value::{Value, ValueKind, is_callable, is_constructor};
 
 use crate::agent::Agent;
 use crate::context::{as_object, get_property, get_property_key};
@@ -70,8 +70,8 @@ fn placeholder(name: &'static str) -> NativeFn {
 
 /// The RegExp state of an instance; TypeError otherwise.
 fn regexp_state(agent: &Agent, value: &Value) -> Result<RegExpState, JsError> {
-    match value {
-        Value::Object(obj) => match agent.regexp_data.get(&obj.id()) {
+    match value.kind() {
+        ValueKind::Object(obj) => match agent.regexp_data.get(&obj.id()) {
             Some(state) => Ok(state.clone()),
             None => Err(JsError::new(
                 ErrorKind::TypeError,
@@ -135,12 +135,12 @@ pub fn regexp_initialize(
     flags: &Value,
     constructor: Value,
 ) -> Result<Value, JsError> {
-    let pattern_text = if matches!(pattern, Value::Undefined) {
+    let pattern_text = if matches!(pattern.kind(), ValueKind::Undefined) {
         JsString::from_utf8("")
     } else {
         crate::context::to_string(agent, pattern)?
     };
-    let flags_text = if matches!(flags, Value::Undefined) {
+    let flags_text = if matches!(flags.kind(), ValueKind::Undefined) {
         JsString::from_utf8("")
     } else {
         crate::context::to_string(agent, flags)?
@@ -173,9 +173,9 @@ fn regexp_construct(
     let pattern_or_regexp = args.first().cloned().unwrap_or(Value::Undefined);
     let flags = args.get(1).cloned().unwrap_or(Value::Undefined);
     let pattern_is_regexp = crate::builtins::string::is_regexp(agent, &pattern_or_regexp)?;
-    let is_construct = !matches!(new_target, Value::Undefined);
+    let is_construct = !matches!(new_target.kind(), ValueKind::Undefined);
     let realm = agent.current_realm()?;
-    if !is_construct && pattern_is_regexp && matches!(flags, Value::Undefined) {
+    if !is_construct && pattern_is_regexp && matches!(flags.kind(), ValueKind::Undefined) {
         // RegExp(regexp) as a call: the active function is %RegExp%; return
         // the same object when its constructor matches.
         let pattern_ctor = get_property(
@@ -197,12 +197,12 @@ fn regexp_construct(
             .get(REGEXP)
             .ok_or_else(|| JsError::new(ErrorKind::TypeError, "%RegExp% is not defined".into()))?
     };
-    let (pattern_source, effective_flags) = if let Value::Object(obj) = &pattern_or_regexp
+    let (pattern_source, effective_flags) = if let ValueKind::Object(obj) = pattern_or_regexp.kind()
         && agent.regexp_data.contains_key(&obj.id())
     {
         let state = agent.regexp_data.get(&obj.id()).unwrap().clone();
         let source = Value::String(Handle::new(state.source));
-        let flags_value = if matches!(flags, Value::Undefined) {
+        let flags_value = if matches!(flags.kind(), ValueKind::Undefined) {
             Value::String(Handle::new(JsString::from_utf8(&state.flags_text)))
         } else {
             flags
@@ -215,7 +215,7 @@ fn regexp_construct(
             &JsString::from_utf8("source"),
             pattern_or_regexp.clone(),
         )?;
-        let flags_value = if matches!(flags, Value::Undefined) {
+        let flags_value = if matches!(flags.kind(), ValueKind::Undefined) {
             get_property(
                 agent,
                 &pattern_or_regexp,
@@ -281,7 +281,7 @@ fn legacy_static_setter(agent: &mut Agent, this: &Value) -> Result<Value, JsErro
 /// explicit `flags` argument, which is a TypeError) its flags; otherwise both
 /// coerce through ToString. `lastIndex` resets to 0 (immutable-lastindex.js).
 pub fn compile(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let Value::Object(obj) = this else {
+    let ValueKind::Object(obj) = this.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "RegExp.prototype.compile requires a RegExp receiver".into(),
@@ -308,10 +308,10 @@ pub fn compile(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
     }
     let pattern = args.first().cloned().unwrap_or(Value::Undefined);
     let flags = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let (pattern_source, effective_flags) = if let Value::Object(pat) = &pattern
+    let (pattern_source, effective_flags) = if let ValueKind::Object(pat) = pattern.kind()
         && agent.regexp_data.contains_key(&pat.id())
     {
-        if !matches!(flags, Value::Undefined) {
+        if !matches!(flags.kind(), ValueKind::Undefined) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "cannot supply flags when compiling from another RegExp".into(),
@@ -327,7 +327,7 @@ pub fn compile(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
     };
     regexp_initialize(
         agent,
-        obj,
+        &obj,
         &pattern_source,
         &effective_flags,
         current_state.constructor.clone(),
@@ -342,7 +342,7 @@ fn regexp_builtin_exec(
     regexp: &Value,
     string: &JsString,
 ) -> Result<Option<Value>, JsError> {
-    let Value::Object(obj) = regexp else {
+    let ValueKind::Object(obj) = regexp.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "RegExp exec called on an incompatible receiver".into(),
@@ -616,7 +616,7 @@ fn get_flags(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     // via Get, in the spec order (hasIndices, global, ignoreCase, multiline,
     // dotAll, unicode, unicodeSets, sticky), so an overridden accessor or
     // own data property is honored.
-    if !matches!(this, Value::Object(_) | Value::Function(_)) {
+    if !matches!(this.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "RegExp.prototype.flags called on a non-object".into(),
@@ -671,7 +671,7 @@ fn get_source(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
 
 /// spec 22.2.7.1 RegExp.prototype[@@match](string).
 fn symbol_match(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    if !matches!(this, Value::Object(_)) {
+    if !matches!(this.kind(), ValueKind::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "RegExp.prototype[Symbol.match] called on non-object".into(),
@@ -733,7 +733,7 @@ fn symbol_match(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
 
 /// spec 22.2.7.6 RegExp.prototype[@@matchAll](string).
 fn symbol_match_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    if !matches!(this, Value::Object(_)) {
+    if !matches!(this.kind(), ValueKind::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "RegExp.prototype[Symbol.matchAll] called on non-object".into(),
@@ -790,7 +790,7 @@ fn symbol_match_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
 
 /// spec 22.2.7.4 RegExp.prototype[@@search](string).
 fn symbol_search(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    if !matches!(this, Value::Object(_)) {
+    if !matches!(this.kind(), ValueKind::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "RegExp.prototype[Symbol.search] called on non-object".into(),
@@ -821,7 +821,7 @@ fn symbol_search(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Valu
 
 /// spec 22.2.7.5 RegExp.prototype[@@split](string, limit).
 fn symbol_split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    if !matches!(this, Value::Object(_)) {
+    if !matches!(this.kind(), ValueKind::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "RegExp.prototype[Symbol.split] called on non-object".into(),
@@ -859,7 +859,7 @@ fn symbol_split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
         &ctor,
     )?;
     let limit = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let lim = if matches!(limit, Value::Undefined) {
+    let lim = if matches!(limit.kind(), ValueKind::Undefined) {
         u32::MAX
     } else {
         to_uint32(to_number(&limit)?)
@@ -953,9 +953,9 @@ fn regexp_exec(agent: &mut Agent, rx: &Value, string: &JsString) -> Result<Optio
             rx.clone(),
             &[Value::String(Handle::new(string.clone()))],
         )?;
-        return match result {
-            Value::Null => Ok(None),
-            Value::Object(_) | Value::Function(_) => Ok(Some(result)),
+        return match result.kind() {
+            ValueKind::Null => Ok(None),
+            ValueKind::Object(_) | ValueKind::Function(_) => Ok(Some(result)),
             _ => Err(JsError::new(
                 ErrorKind::TypeError,
                 "RegExp exec must return an object or null".into(),
@@ -979,10 +979,11 @@ fn species_constructor(
         &JsString::from_utf8("constructor"),
         exemplar.clone(),
     )?;
-    if matches!(ctor, Value::Undefined) {
+    if matches!(ctor.kind(), ValueKind::Undefined) {
         return Ok(default_ctor);
     }
-    if !is_constructor(&ctor) && !is_callable(&ctor) && !matches!(ctor, Value::Object(_)) {
+    if !is_constructor(&ctor) && !is_callable(&ctor) && !matches!(ctor.kind(), ValueKind::Object(_))
+    {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "constructor is not an object".into(),
@@ -990,12 +991,12 @@ fn species_constructor(
     }
     let species_key = PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone());
     let species = get_property_key(agent, &ctor, &species_key, ctor.clone())?;
-    match species {
+    match species.kind() {
         // The pinned fixtures follow the ES6 text: a null/undefined species
         // falls back to the default constructor (an inherited `constructor`
         // like %Object% must not become the splitter's constructor).
-        Value::Null | Value::Undefined => Ok(default_ctor),
-        value if is_constructor(&value) => Ok(value),
+        ValueKind::Null | ValueKind::Undefined => Ok(default_ctor),
+        _ if is_constructor(&species) => Ok(species),
         _ => Err(JsError::new(
             ErrorKind::TypeError,
             "species is not a constructor".into(),
@@ -1036,7 +1037,7 @@ fn array_from_values(agent: &Agent, values: &[Value]) -> Result<Value, JsError> 
 
 /// spec 22.2.7.3 RegExp.prototype[@@replace](string, replaceValue).
 fn symbol_replace(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    if !matches!(this, Value::Object(_)) {
+    if !matches!(this.kind(), ValueKind::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "RegExp.prototype[Symbol.replace] called on non-object".into(),
@@ -1137,14 +1138,14 @@ fn symbol_replace(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
             replacer_args.extend(captures);
             replacer_args.push(Value::Number(position as f64));
             replacer_args.push(Value::String(Handle::new(string.clone())));
-            if !matches!(named_captures, Value::Undefined) {
+            if !matches!(named_captures.kind(), ValueKind::Undefined) {
                 replacer_args.push(named_captures.clone());
             }
             let called =
                 crate::function::call(agent, &replace_value, Value::Undefined, &replacer_args)?;
             crate::context::to_string(agent, &called)?
         } else {
-            let named = if matches!(named_captures, Value::Undefined) {
+            let named = if matches!(named_captures.kind(), ValueKind::Undefined) {
                 None
             } else {
                 Some(crate::context::to_object(agent, &named_captures)?)
@@ -1184,7 +1185,7 @@ fn string_iterator_next(
     this: &Value,
     _args: &[Value],
 ) -> Result<Value, JsError> {
-    let Value::Object(obj) = this else {
+    let ValueKind::Object(obj) = this.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "%RegExpStringIteratorPrototype%.next called on an incompatible receiver".into(),
@@ -1251,7 +1252,7 @@ fn iter_result(value: Value, done: bool) -> Result<Value, JsError> {
 /// spec 22.2.4.3 RegExp.escape(string).
 fn escape(_agent: &mut Agent, _this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let value = args.first().cloned().unwrap_or(Value::Undefined);
-    if !matches!(value, Value::String(_)) {
+    if !matches!(value.kind(), ValueKind::String(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "RegExp.escape expects a string".into(),
@@ -1706,22 +1707,22 @@ mod tests {
     }
 
     fn text(source: &str) -> String {
-        match run(source).unwrap() {
-            Value::String(s) => s.to_string_lossy(),
+        match run(source).unwrap().kind() {
+            ValueKind::String(s) => s.to_string_lossy(),
             other => panic!("expected a string, got {other:?}"),
         }
     }
 
     fn number(source: &str) -> f64 {
-        match run(source).unwrap() {
-            Value::Number(n) => n,
+        match run(source).unwrap().kind() {
+            ValueKind::Number(n) => n,
             other => panic!("expected a number, got {other:?}"),
         }
     }
 
     fn bool(source: &str) -> bool {
-        match run(source).unwrap() {
-            Value::Boolean(b) => b,
+        match run(source).unwrap().kind() {
+            ValueKind::Boolean(b) => b,
             other => panic!("expected a boolean, got {other:?}"),
         }
     }

@@ -4,11 +4,12 @@
 
 use crux::convert::{to_property_key, to_string};
 use crux::error::{ErrorKind, JsError};
+use crux::handle::Handle;
 use crux::intern_utf8;
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 use syntax::ast::{
     BindingElement, Block, Class, ClassElement, ClassElementName, Expr, Function as FunctionAst,
     PropertyName,
@@ -153,8 +154,8 @@ fn resolve_heritage(agent: &mut Agent, superclass: Option<Value>) -> Result<Heri
             super_constructor: None,
         });
     };
-    match superclass {
-        Value::Null => {
+    match superclass.kind() {
+        ValueKind::Null => {
             // Spec 15.7.14: ctorParent is %Function.prototype% and the class
             // is still derived (step 31), so `this` stays uninitialized until
             // `super()` (which then throws — %Function.prototype% is not a
@@ -168,31 +169,31 @@ fn resolve_heritage(agent: &mut Agent, superclass: Option<Value>) -> Result<Heri
                 super_constructor: ctor_parent,
             })
         }
-        superclass if !crate::function::is_constructor(agent, &superclass) => Err(JsError::new(
+        _ if !crate::function::is_constructor(agent, &superclass) => Err(JsError::new(
             ErrorKind::TypeError,
             "Class extends value is not a constructor or null".into(),
         )),
-        superclass => {
+        _ => {
             let prototype = get_property(
                 agent,
                 &superclass,
                 &JsString::from_utf8("prototype"),
                 superclass.clone(),
             )?;
-            match prototype {
-                Value::Object(proto) => Ok(Heritage {
+            match prototype.kind() {
+                ValueKind::Object(proto) => Ok(Heritage {
                     proto_parent: Some(proto),
-                    super_constructor: Some(superclass),
+                    super_constructor: Some(superclass.clone()),
                 }),
                 // A callable prototype (Function.prototype) is still an
                 // ordinary object for prototype purposes.
-                Value::Function(proto) => Ok(Heritage {
+                ValueKind::Function(proto) => Ok(Heritage {
                     proto_parent: Some(proto.object.clone()),
-                    super_constructor: Some(superclass),
+                    super_constructor: Some(superclass.clone()),
                 }),
-                Value::Null => Ok(Heritage {
+                ValueKind::Null => Ok(Heritage {
                     proto_parent: None,
-                    super_constructor: Some(superclass),
+                    super_constructor: Some(superclass.clone()),
                 }),
                 _ => Err(JsError::new(
                     ErrorKind::TypeError,
@@ -270,7 +271,7 @@ fn build_class(
     // MakeConstructor(ctor, false, proto) (spec steps 26-27): the class
     // `prototype` is non-writable; the prototype's `constructor` is defined
     // separately below (non-enumerable, writable).
-    let Value::Function(ctor_handle) = &ctor else {
+    let ValueKind::Function(ctor_handle) = ctor.kind() else {
         return Ok(ctor);
     };
     ctor_handle.define_property(
@@ -296,9 +297,9 @@ fn build_class(
     // (and its own statics, e.g. `Uint8Array.fromBase64`) resolve on the
     // subclass constructor (spec ClassDefinitionEvaluation step 29).
     if let Some(super_ctor) = &super_constructor {
-        let super_object = match super_ctor {
-            Value::Object(object) => object.clone(),
-            Value::Function(function) => function.object.clone(),
+        let super_object = match super_ctor.kind() {
+            ValueKind::Object(object) => object,
+            ValueKind::Function(function) => function.object.clone(),
             _ => {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
@@ -688,7 +689,7 @@ fn set_private_environment(
     function: &Value,
     private_env: &crux::handle::Handle<crate::context::PrivateEnvironment>,
 ) -> Result<(), JsError> {
-    let Value::Function(function) = function else {
+    let ValueKind::Function(function) = function.kind() else {
         return Ok(());
     };
     let Some(data) = agent.ecma_functions.get_mut(&function.id()) else {
@@ -798,7 +799,7 @@ fn evaluate_static_field_initializer(
     // The synthetic initializer function carries [[ClassFieldInitializerName]]
     // (spec 15.7.10 step 8), so a direct eval in its body applies the "Eval
     // Inside Initializer" early errors (spec 19.2.1.1).
-    if let Value::Function(function) = &closure
+    if let ValueKind::Function(function) = closure.kind()
         && let Some(data) = agent.ecma_functions.get_mut(&function.id())
     {
         data.class_field_initializer = true;
@@ -904,11 +905,11 @@ fn define_accessor_property(
 
 /// The object part of a method home: the class prototype or the constructor
 /// (a function object).
-fn home_object(home: &Value) -> Option<&crux::object::JsObject> {
-    match home {
-        Value::Object(obj) => Some(obj),
-        Value::Function(function) => Some(&function.object),
-        _ => None,
+fn home_object(home: &Value) -> Option<Handle<crux::object::JsObject>> {
+    if let Some(obj) = home.as_object() {
+        Some(obj)
+    } else {
+        home.as_function().map(|f| f.object.clone())
     }
 }
 

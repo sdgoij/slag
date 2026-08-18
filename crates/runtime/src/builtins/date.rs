@@ -13,7 +13,7 @@ use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
-use crux::value::{Value, is_callable};
+use crux::value::{Value, ValueKind, is_callable};
 
 use crate::agent::Agent;
 use crate::builtins::temporal::instant::create_instant;
@@ -49,7 +49,7 @@ fn placeholder(name: &'static str) -> NativeFn {
 /// yields the time value. The hint is compared as a String value; any other
 /// value (undefined included) throws a TypeError.
 fn date_to_primitive(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    if !matches!(this, Value::Object(_) | Value::Function(_)) {
+    if !matches!(this.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Date.prototype[Symbol.toPrimitive] called on a non-object".into(),
@@ -59,10 +59,10 @@ fn date_to_primitive(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<
     let is_text = |s: &JsString, text: &str| {
         s.as_slice() == text.encode_utf16().collect::<Vec<u16>>().as_slice()
     };
-    let (first, second) = match hint {
-        Value::String(text) if is_text(&text, "string") => ("toString", "valueOf"),
-        Value::String(text) if is_text(&text, "default") => ("toString", "valueOf"),
-        Value::String(text) if is_text(&text, "number") => ("valueOf", "toString"),
+    let (first, second) = match hint.kind() {
+        ValueKind::String(text) if is_text(&text, "string") => ("toString", "valueOf"),
+        ValueKind::String(text) if is_text(&text, "default") => ("toString", "valueOf"),
+        ValueKind::String(text) if is_text(&text, "number") => ("valueOf", "toString"),
         _ => {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -79,7 +79,7 @@ fn date_to_primitive(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<
         )?;
         if is_callable(&method) {
             let result = crate::function::call(agent, &method, this.clone(), &[])?;
-            if !matches!(result, Value::Object(_) | Value::Function(_)) {
+            if !matches!(result.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
                 return Ok(result);
             }
         }
@@ -92,8 +92,8 @@ fn date_to_primitive(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<
 
 /// The [[DateValue]] time value of `this` (spec 21.4.3.1 RequireInternalSlot).
 fn this_date_value(agent: &Agent, this: &Value) -> Result<f64, JsError> {
-    match this {
-        Value::Object(obj) => match agent.date_data.get(&obj.id()) {
+    match this.kind() {
+        ValueKind::Object(obj) => match agent.date_data.get(&obj.id()) {
             Some(t) => Ok(*t),
             None => Err(JsError::new(
                 ErrorKind::TypeError,
@@ -316,14 +316,14 @@ fn date_value_from_args(agent: &mut Agent, args: &[Value]) -> Result<f64, JsErro
         let value = &args[0];
         // spec 21.4.3.1: an object with a [[DateValue]] slot clones it
         // directly (no ToPrimitive); other objects are ToPrimitive'd.
-        if let Value::Object(obj) = value
+        if let ValueKind::Object(obj) = value.kind()
             && let Some(t) = agent.date_data.get(&obj.id())
         {
             return Ok(*t);
         }
         let prim =
             crate::context::to_primitive(agent, value, crux::convert::ToPrimitiveHint::Default)?;
-        if let Value::String(text) = prim {
+        if let ValueKind::String(text) = prim.kind() {
             return Ok(date_parse(&text));
         }
         return Ok(time_clip(crate::context::to_number(agent, &prim)?));
@@ -754,7 +754,7 @@ fn set_components(
     present: &[bool; 7],
     nan_is_zero: bool,
 ) -> Result<Value, JsError> {
-    let Value::Object(obj) = this else {
+    let ValueKind::Object(obj) = this.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Date.prototype method called on an incompatible receiver".into(),
@@ -823,7 +823,7 @@ fn set_date(
     args: &[Value],
     local: bool,
 ) -> Result<Value, JsError> {
-    let Value::Object(obj) = this else {
+    let ValueKind::Object(obj) = this.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Date.prototype method called on an incompatible receiver".into(),
@@ -1251,7 +1251,7 @@ pub fn dispatch_call(
         return Some((|| {
             // thisTimeValue first: a non-Date receiver throws before the
             // argument is coerced (spec 21.4.4.44 step 1).
-            let Value::Object(obj) = this else {
+            let ValueKind::Object(obj) = this.kind() else {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
                     "Date.prototype method called on an incompatible receiver".into(),
@@ -1354,7 +1354,7 @@ pub fn dispatch_call(
                 &object,
                 crux::convert::ToPrimitiveHint::Number,
             )?;
-            if let Value::Number(n) = tv
+            if let ValueKind::Number(n) = tv.kind()
                 && !n.is_finite()
             {
                 return Ok(Value::Null);
@@ -1411,7 +1411,7 @@ fn get_year_f(t: f64) -> f64 {
 
 /// The legacy setYear (Annex B.4.5).
 fn set_year(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let Value::Object(obj) = this else {
+    let ValueKind::Object(obj) = this.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Date.prototype method called on an incompatible receiver".into(),
@@ -1483,15 +1483,15 @@ mod tests {
     }
 
     fn number(source: &str) -> f64 {
-        match run(source).unwrap() {
-            Value::Number(n) => n,
+        match run(source).unwrap().kind() {
+            ValueKind::Number(n) => n,
             other => panic!("expected a number, got {other:?}"),
         }
     }
 
     fn text(source: &str) -> String {
-        match run(source).unwrap() {
-            Value::String(s) => s.to_string_lossy(),
+        match run(source).unwrap().kind() {
+            ValueKind::String(s) => s.to_string_lossy(),
             other => panic!("expected a string, got {other:?}"),
         }
     }
@@ -1522,7 +1522,10 @@ mod tests {
         assert_eq!(run("typeof Date(0)").unwrap().to_string(), "string");
         assert_eq!(number("Date.UTC(2024, 0, 15)"), 1705276800000.0);
         assert_eq!(number("Date.UTC(1970, 0, 1)"), 0.0);
-        assert!(matches!(run("Date.now()"), Ok(Value::Number(n)) if n > 0.0));
+        assert!(matches!(
+            run("Date.now()"),
+            Ok(v) if matches!(v.kind(), ValueKind::Number(n) if n > 0.0)
+        ));
     }
 
     #[test]
@@ -1617,7 +1620,7 @@ mod tests {
         assert_eq!(text("new Date(0).toJSON()"), "1970-01-01T00:00:00.000Z");
         assert!(matches!(
             run("new Date(NaN).toJSON() === null"),
-            Ok(Value::Boolean(true))
+            Ok(v) if matches!(v.kind(), ValueKind::Boolean(true))
         ));
     }
 

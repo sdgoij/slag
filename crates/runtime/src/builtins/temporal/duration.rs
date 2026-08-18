@@ -7,7 +7,7 @@ use crux::function::Function;
 use crux::handle::Handle;
 use crux::property::PropertyDescriptor;
 use crux::string::JsString;
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
 use crate::realm::Realm;
@@ -301,7 +301,7 @@ fn require_duration(agent: &Agent, this: &Value) -> Result<[f64; 10], JsError> {
 fn construct(agent: &mut Agent, args: &[Value], new_target: &Value) -> Result<Value, JsError> {
     let mut fields = [0f64; 10];
     for (i, value) in args.iter().take(10).enumerate() {
-        if !matches!(value, Value::Undefined) {
+        if !matches!(value.kind(), ValueKind::Undefined) {
             fields[i] = to_integer_if_integral(agent, value)?;
         }
     }
@@ -327,7 +327,7 @@ fn blank(agent: &Agent, this: &Value) -> Result<Value, JsError> {
 /// spec 7.3.15 `with`.
 fn with(agent: &mut Agent, this: &Value, item: &Value) -> Result<Value, JsError> {
     let duration = require_duration(agent, this)?;
-    if !matches!(item, Value::Object(_) | Value::Function(_)) {
+    if !matches!(item.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "temporalDurationLike must be an object".into(),
@@ -466,13 +466,13 @@ pub fn add_zoned_date_time(
 /// spec 7.3.20 `round`.
 fn round(agent: &mut Agent, this: &Value, round_to: &Value) -> Result<Value, JsError> {
     let duration = require_duration(agent, this)?;
-    if matches!(round_to, Value::Undefined) {
+    if matches!(round_to.kind(), ValueKind::Undefined) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "roundTo is required".into(),
         ));
     }
-    let round_to = if let Value::String(text) = round_to {
+    let round_to = if let ValueKind::String(text) = round_to.kind() {
         let obj = crux::object::JsObject::ordinary_object_create(None);
         obj.create_data_property_or_throw(
             &JsString::from_utf8("smallestUnit"),
@@ -653,13 +653,13 @@ pub fn validate_rounding_increment(
 /// spec 7.3.21 `total`.
 fn total(agent: &mut Agent, this: &Value, total_of: &Value) -> Result<Value, JsError> {
     let duration = require_duration(agent, this)?;
-    if matches!(total_of, Value::Undefined) {
+    if matches!(total_of.kind(), ValueKind::Undefined) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "totalOf is required".into(),
         ));
     }
-    let total_of = if let Value::String(text) = total_of {
+    let total_of = if let ValueKind::String(text) = total_of.kind() {
         let obj = crux::object::JsObject::ordinary_object_create(None);
         obj.create_data_property_or_throw(
             &JsString::from_utf8("unit"),

@@ -13,7 +13,7 @@ use crux::ops::same_value_zero;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
 use crux::typed_array::{AtomicOp, ElementType, decode_element, encode_element};
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -58,7 +58,7 @@ fn is_wait_type(element_type: ElementType) -> bool {
 }
 
 fn typed_array_slots(value: &Value) -> Option<TypedArraySlots> {
-    let Value::Object(obj) = value else {
+    let ValueKind::Object(obj) = value.kind() else {
         return None;
     };
     let ObjectKind::IntegerIndexed(slots) = &obj.kind else {
@@ -265,13 +265,13 @@ fn store(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
     write_element(&slots, offset, &converted)?;
     // spec 26.4.11 step 8: the returned value is ToIntegerOrInfinity of the
     // input (normalizing -0 to +0, spec 26.4.1.6).
-    match converted {
-        Value::Number(_) => Ok(Value::Number(crux::convert::to_integer_or_infinity(
+    match converted.kind() {
+        ValueKind::Number(_) => Ok(Value::Number(crux::convert::to_integer_or_infinity(
             crate::context::to_number(agent, &value)?,
         ))),
         // spec 26.4.11 step 8: the returned value is ToBigInt (unwrapped,
         // unlike the stored element).
-        Value::BigInt(_) => Ok(Value::BigInt(Handle::new(crate::context::to_big_int(
+        ValueKind::BigInt(_) => Ok(Value::BigInt(Handle::new(crate::context::to_big_int(
             agent, &value,
         )?))),
         _ => unreachable!("store converts to Number or BigInt"),
@@ -351,7 +351,7 @@ fn notify(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
     let count_arg = args.get(2).cloned().unwrap_or(Value::Undefined);
     // spec 26.4.13 step 3: an undefined count is +∞ (wakes all waiters);
     // otherwise ToIntegerOrInfinity, whose NaN maps to 0.
-    let count = if matches!(count_arg, Value::Undefined) {
+    let count = if matches!(count_arg.kind(), ValueKind::Undefined) {
         f64::INFINITY
     } else {
         crux::convert::to_integer_or_infinity(crate::context::to_number(agent, &count_arg)?)
@@ -607,8 +607,8 @@ fn wait_async(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
         .get("%Promise%")
         .unwrap_or(Value::Undefined);
     let capability = crate::promise::new_promise_capability(agent, &promise_ctor)?;
-    let resolve_id = match &capability.resolve {
-        Value::Function(function) => function.id(),
+    let resolve_id = match capability.resolve.kind() {
+        ValueKind::Function(function) => function.id(),
         _ => {
             return Err(JsError::new(
                 ErrorKind::TypeError,

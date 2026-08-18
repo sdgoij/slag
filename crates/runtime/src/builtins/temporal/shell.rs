@@ -11,7 +11,7 @@ use crux::function::Function;
 use crux::handle::Handle;
 use crux::property::PropertyDescriptor;
 use crux::string::JsString;
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
 use crate::realm::Realm;
@@ -1454,12 +1454,12 @@ pub fn dispatch_construct(
 }
 
 fn check_calendar(_agent: &mut Agent, value: &Value) -> Result<(), JsError> {
-    if matches!(value, Value::Undefined) {
+    if matches!(value.kind(), ValueKind::Undefined) {
         return Ok(());
     }
     // The constructors take a bare calendar identifier (CanonicalizeCalendar),
     // not the ISO-string forms a property-bag calendar accepts.
-    let Value::String(text) = value else {
+    let ValueKind::String(text) = value.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "calendar must be a string".into(),
@@ -1524,7 +1524,7 @@ fn construct_plain_time(
 ) -> Result<Value, JsError> {
     let mut t = [0i64; 6];
     for (i, value) in args.iter().take(6).enumerate() {
-        if !matches!(value, Value::Undefined) {
+        if !matches!(value.kind(), ValueKind::Undefined) {
             t[i] = super::to_integer_with_truncation(agent, value)?;
         }
     }
@@ -1563,7 +1563,7 @@ fn construct_plain_date_time(
     let d = super::to_integer_with_truncation(agent, args.get(2).unwrap_or(&Value::Undefined))?;
     let mut t = [0i64; 6];
     for (i, value) in args.iter().skip(3).take(6).enumerate() {
-        if !matches!(value, Value::Undefined) {
+        if !matches!(value.kind(), ValueKind::Undefined) {
             t[i] = super::to_integer_with_truncation(agent, value)?;
         }
     }
@@ -1809,7 +1809,7 @@ pub fn to_plain_date_with_options(
     item: &Value,
     options: &Value,
 ) -> Result<Value, JsError> {
-    if let Value::Object(obj) = item {
+    if let ValueKind::Object(obj) = item.kind() {
         if let Some(record) = agent.temporal_data.get(&obj.id()).cloned() {
             return match &record {
                 TemporalRecord::PlainDate(d) => {
@@ -1845,7 +1845,7 @@ pub fn to_plain_date_with_options(
         for key in ["day", "month", "monthCode", "year"] {
             let value =
                 crate::context::get_property(agent, item, &JsString::from_utf8(key), item.clone())?;
-            if matches!(value, Value::Undefined) {
+            if matches!(value.kind(), ValueKind::Undefined) {
                 continue;
             }
             match key {
@@ -1860,7 +1860,7 @@ pub fn to_plain_date_with_options(
             super::get_temporal_overflow_option(agent, &options)? == Overflow::Constrain;
         return date_from_merged_fields(agent, year, month, month_code, day, constrain);
     }
-    if !matches!(item, Value::String(_)) {
+    if !matches!(item.kind(), ValueKind::String(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "value must be a string or object".into(),
@@ -1905,7 +1905,7 @@ pub fn to_plain_time_with_options(
     item: &Value,
     options: &Value,
 ) -> Result<Value, JsError> {
-    if let Value::Object(obj) = item {
+    if let ValueKind::Object(obj) = item.kind() {
         if let Some(record) = agent.temporal_data.get(&obj.id()).cloned() {
             let opts = super::get_options_object(options)?;
             super::get_temporal_overflow_option(agent, &opts)?;
@@ -1945,7 +1945,7 @@ pub fn to_plain_time_with_options(
         regulate_time(&mut t, constrain)?;
         return create_plain_time(agent, t, &Value::Undefined);
     }
-    if !matches!(item, Value::String(_)) {
+    if !matches!(item.kind(), ValueKind::String(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "value must be a string or object".into(),
@@ -1987,7 +1987,7 @@ pub fn to_plain_date_time(
     item: &Value,
     options: &Value,
 ) -> Result<Value, JsError> {
-    if let Value::Object(obj) = item
+    if let ValueKind::Object(obj) = item.kind()
         && let Some(record) = agent.temporal_data.get(&obj.id()).cloned()
     {
         let opts = super::get_options_object(options)?;
@@ -2023,7 +2023,7 @@ pub fn to_plain_date_time(
             )),
         };
     }
-    if matches!(item, Value::String(_)) {
+    if matches!(item.kind(), ValueKind::String(_)) {
         let text = crate::context::to_string(agent, item)?;
         let parsed = iso::parse_iso_date_time(text.as_slice(), iso::Format::DateTimePlain)
             .map_err(|_| JsError::new(ErrorKind::RangeError, "invalid date-time string".into()))?;
@@ -2078,7 +2078,7 @@ pub fn to_plain_date_time(
             ]),
         );
     }
-    if let Value::Object(_) = item {
+    if let ValueKind::Object(_) = item.kind() {
         // Property bag: the calendar (iso8601 default), then all ten fields
         // read in ascending code point order (PrepareCalendarFields complete).
         read_bag_calendar(agent, item)?;
@@ -2154,7 +2154,7 @@ fn read_zoned_fields(agent: &mut Agent, bag: &Value) -> Result<ZonedFields, JsEr
     ] {
         let value =
             crate::context::get_property(agent, bag, &JsString::from_utf8(key), bag.clone())?;
-        if matches!(value, Value::Undefined) {
+        if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
         match key {
@@ -2180,7 +2180,7 @@ fn read_zoned_fields(agent: &mut Agent, bag: &Value) -> Result<ZonedFields, JsEr
                     &value,
                     crux::convert::ToPrimitiveHint::String,
                 )?;
-                let Value::String(text) = prim else {
+                let ValueKind::String(text) = prim.kind() else {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
                         "offset must be a string".into(),
@@ -2243,7 +2243,7 @@ fn read_zoned_with_fields(
     ] {
         let value =
             crate::context::get_property(agent, bag, &JsString::from_utf8(key), bag.clone())?;
-        if matches!(value, Value::Undefined) {
+        if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
         any = true;
@@ -2262,7 +2262,7 @@ fn read_zoned_with_fields(
                     &value,
                     crux::convert::ToPrimitiveHint::String,
                 )?;
-                let Value::String(text) = prim else {
+                let ValueKind::String(text) = prim.kind() else {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
                         "offset must be a string".into(),
@@ -2373,7 +2373,7 @@ fn check_balanced_range(epoch: i128) -> Result<(), JsError> {
 /// the disambiguation/offset/overflow options). Only UTC and fixed-offset
 /// zones are supported.
 pub fn to_zoned(agent: &mut Agent, item: &Value, options: &Value) -> Result<Value, JsError> {
-    if let Value::Object(obj) = item
+    if let ValueKind::Object(obj) = item.kind()
         && let Some(TemporalRecord::ZonedDateTime(ns, tz)) =
             agent.temporal_data.get(&obj.id()).cloned()
     {
@@ -2388,7 +2388,7 @@ pub fn to_zoned(agent: &mut Agent, item: &Value, options: &Value) -> Result<Valu
             TemporalRecord::ZonedDateTime(ns, tz),
         );
     }
-    if matches!(item, Value::String(_)) {
+    if matches!(item.kind(), ValueKind::String(_)) {
         let text = crate::context::to_string(agent, item)?;
         let parsed = iso::parse_iso_date_time(text.as_slice(), iso::Format::DateTimeZoned)
             .map_err(|_| {
@@ -2443,7 +2443,7 @@ pub fn to_zoned(agent: &mut Agent, item: &Value, options: &Value) -> Result<Valu
             TemporalRecord::ZonedDateTime(epoch, JsString::from_utf8(&tz)),
         );
     }
-    if let Value::Object(_) = item {
+    if let ValueKind::Object(_) = item.kind() {
         // Property bag: the calendar, then the fields in ascending code point
         // order (the time zone is required), then the options.
         read_bag_calendar(agent, item)?;
@@ -2576,48 +2576,52 @@ fn to_compare_value(
     kind: RecordKind,
 ) -> Result<TemporalRecord, JsError> {
     match kind {
-        RecordKind::PlainDate => match to_plain_date(agent, &item)? {
-            Value::Object(obj) => agent
+        RecordKind::PlainDate => match to_plain_date(agent, &item)?.kind() {
+            ValueKind::Object(obj) => agent
                 .temporal_data
                 .get(&obj.id())
                 .cloned()
                 .ok_or_else(|| JsError::new(ErrorKind::TypeError, "brand check failed".into())),
             _ => unreachable!(),
         },
-        RecordKind::PlainTime => match to_plain_time(agent, &item)? {
-            Value::Object(obj) => agent
+        RecordKind::PlainTime => match to_plain_time(agent, &item)?.kind() {
+            ValueKind::Object(obj) => agent
                 .temporal_data
                 .get(&obj.id())
                 .cloned()
                 .ok_or_else(|| JsError::new(ErrorKind::TypeError, "brand check failed".into())),
             _ => unreachable!(),
         },
-        RecordKind::PlainDateTime => match to_plain_date_time(agent, &item, &Value::Undefined)? {
-            Value::Object(obj) => agent
+        RecordKind::PlainDateTime => {
+            match to_plain_date_time(agent, &item, &Value::Undefined)?.kind() {
+                ValueKind::Object(obj) => {
+                    agent.temporal_data.get(&obj.id()).cloned().ok_or_else(|| {
+                        JsError::new(ErrorKind::TypeError, "brand check failed".into())
+                    })
+                }
+                _ => unreachable!(),
+            }
+        }
+        RecordKind::YearMonth => {
+            match to_plain_year_month(agent, &item, &Value::Undefined)?.kind() {
+                ValueKind::Object(obj) => {
+                    agent.temporal_data.get(&obj.id()).cloned().ok_or_else(|| {
+                        JsError::new(ErrorKind::TypeError, "brand check failed".into())
+                    })
+                }
+                _ => unreachable!(),
+            }
+        }
+        RecordKind::MonthDay => match to_plain_month_day(agent, &item, &Value::Undefined)?.kind() {
+            ValueKind::Object(obj) => agent
                 .temporal_data
                 .get(&obj.id())
                 .cloned()
                 .ok_or_else(|| JsError::new(ErrorKind::TypeError, "brand check failed".into())),
             _ => unreachable!(),
         },
-        RecordKind::YearMonth => match to_plain_year_month(agent, &item, &Value::Undefined)? {
-            Value::Object(obj) => agent
-                .temporal_data
-                .get(&obj.id())
-                .cloned()
-                .ok_or_else(|| JsError::new(ErrorKind::TypeError, "brand check failed".into())),
-            _ => unreachable!(),
-        },
-        RecordKind::MonthDay => match to_plain_month_day(agent, &item, &Value::Undefined)? {
-            Value::Object(obj) => agent
-                .temporal_data
-                .get(&obj.id())
-                .cloned()
-                .ok_or_else(|| JsError::new(ErrorKind::TypeError, "brand check failed".into())),
-            _ => unreachable!(),
-        },
-        _ => match to_zoned(agent, &item, &Value::Undefined)? {
-            Value::Object(obj) => agent
+        _ => match to_zoned(agent, &item, &Value::Undefined)?.kind() {
+            ValueKind::Object(obj) => agent
                 .temporal_data
                 .get(&obj.id())
                 .cloned()
@@ -2701,7 +2705,7 @@ fn plain_time_with(
         TemporalRecord::PlainTime(t) => t,
         _ => unreachable!(),
     };
-    if !matches!(item, Value::Object(_) | Value::Function(_)) {
+    if !matches!(item.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "invalid argument".into(),
@@ -2753,13 +2757,13 @@ fn plain_time_round(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
         _ => unreachable!(),
     };
     let round_to = args.first().cloned().unwrap_or(Value::Undefined);
-    if matches!(round_to, Value::Undefined) {
+    if matches!(round_to.kind(), ValueKind::Undefined) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "roundTo is required".into(),
         ));
     }
-    let round_to = if let Value::String(text) = &round_to {
+    let round_to = if let ValueKind::String(text) = &round_to.kind() {
         let obj = crux::object::JsObject::ordinary_object_create(None);
         obj.create_data_property_or_throw(
             &JsString::from_utf8("smallestUnit"),
@@ -2886,7 +2890,7 @@ fn read_partial_time_fields(agent: &mut Agent, bag: &Value) -> Result<[Option<i6
     ] {
         let value =
             crate::context::get_property(agent, bag, &JsString::from_utf8(key), bag.clone())?;
-        if matches!(value, Value::Undefined) {
+        if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
         any = true;
@@ -2949,7 +2953,7 @@ fn read_date_time_fields(
     ] {
         let value =
             crate::context::get_property(agent, bag, &JsString::from_utf8(key), bag.clone())?;
-        if matches!(value, Value::Undefined) {
+        if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
         any = true;
@@ -3175,7 +3179,7 @@ fn plain_date_time_with(
         TemporalRecord::PlainDateTime(dt) => dt,
         _ => unreachable!(),
     };
-    if !matches!(item, Value::Object(_) | Value::Function(_)) {
+    if !matches!(item.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "invalid argument".into(),
@@ -3229,7 +3233,7 @@ fn plain_date_time_with_plain_time(
         TemporalRecord::PlainDateTime(dt) => dt,
         _ => unreachable!(),
     };
-    let t = if matches!(temporal_time, Value::Undefined) {
+    let t = if matches!(temporal_time.kind(), ValueKind::Undefined) {
         [0i64; 6]
     } else {
         let time_value = to_plain_time(agent, &temporal_time)?;
@@ -3333,13 +3337,13 @@ fn plain_date_time_round(
         _ => unreachable!(),
     };
     let round_to = args.first().cloned().unwrap_or(Value::Undefined);
-    if matches!(round_to, Value::Undefined) {
+    if matches!(round_to.kind(), ValueKind::Undefined) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "roundTo is required".into(),
         ));
     }
-    let round_to = if let Value::String(text) = &round_to {
+    let round_to = if let ValueKind::String(text) = &round_to.kind() {
         let obj = crux::object::JsObject::ordinary_object_create(None);
         obj.create_data_property_or_throw(
             &JsString::from_utf8("smallestUnit"),
@@ -3676,7 +3680,7 @@ fn zoned_with(
     options: Value,
 ) -> Result<Value, JsError> {
     let (ns, tz) = zoned_parts(agent, this)?;
-    if !matches!(item, Value::Object(_) | Value::Function(_)) {
+    if !matches!(item.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "invalid argument".into(),
@@ -3728,7 +3732,7 @@ fn zoned_with_plain_time(
 ) -> Result<Value, JsError> {
     let (ns, tz) = zoned_parts(agent, this)?;
     let local = zoned_local(agent, ns, &tz)?;
-    let t = if matches!(temporal_time, Value::Undefined) {
+    let t = if matches!(temporal_time.kind(), ValueKind::Undefined) {
         [0i64; 6]
     } else {
         let time_value = to_plain_time(agent, &temporal_time)?;
@@ -3818,13 +3822,13 @@ fn zoned_add_subtract(
 fn zoned_round(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let (ns, tz) = zoned_parts(agent, this)?;
     let round_to = args.first().cloned().unwrap_or(Value::Undefined);
-    if matches!(round_to, Value::Undefined) {
+    if matches!(round_to.kind(), ValueKind::Undefined) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "roundTo is required".into(),
         ));
     }
-    let round_to = if let Value::String(text) = &round_to {
+    let round_to = if let ValueKind::String(text) = &round_to.kind() {
         let obj = crux::object::JsObject::ordinary_object_create(None);
         obj.create_data_property_or_throw(
             &JsString::from_utf8("smallestUnit"),
@@ -4000,13 +4004,13 @@ fn zoned_get_time_zone_transition(
     direction: Value,
 ) -> Result<Value, JsError> {
     let (_, tz) = zoned_parts(agent, this)?;
-    if matches!(direction, Value::Undefined) {
+    if matches!(direction.kind(), ValueKind::Undefined) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "options parameter is required".into(),
         ));
     }
-    let direction = if let Value::String(text) = &direction {
+    let direction = if let ValueKind::String(text) = &direction.kind() {
         let obj = crux::object::JsObject::ordinary_object_create(None);
         obj.create_data_property_or_throw(
             &JsString::from_utf8("direction"),
@@ -4208,7 +4212,7 @@ fn has_time_designator(text: &str) -> bool {
 /// a Temporal object with a calendar slot passes its own calendar, any other
 /// non-String is a TypeError, an unsupported String a RangeError.
 fn to_temporal_calendar_identifier(agent: &mut Agent, value: &Value) -> Result<(), JsError> {
-    if let Value::Object(obj) = value
+    if let ValueKind::Object(obj) = value.kind()
         && let Some(record) = agent.temporal_data.get(&obj.id())
     {
         return match record {
@@ -4219,7 +4223,7 @@ fn to_temporal_calendar_identifier(agent: &mut Agent, value: &Value) -> Result<(
             _ => Ok(()),
         };
     }
-    if !matches!(value, Value::String(_)) {
+    if !matches!(value.kind(), ValueKind::String(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "calendar must be a string".into(),
@@ -4270,7 +4274,7 @@ fn to_temporal_calendar_identifier(agent: &mut Agent, value: &Value) -> Result<(
 fn read_bag_calendar(agent: &mut Agent, item: &Value) -> Result<(), JsError> {
     let calendar =
         crate::context::get_property(agent, item, &JsString::from_utf8("calendar"), item.clone())?;
-    if matches!(calendar, Value::Undefined) {
+    if matches!(calendar.kind(), ValueKind::Undefined) {
         return Ok(());
     }
     to_temporal_calendar_identifier(agent, &calendar)
@@ -4283,7 +4287,7 @@ fn read_bag_calendar(agent: &mut Agent, item: &Value) -> Result<(), JsError> {
 /// fixture's "syntax before year type, suitability after" order).
 fn read_month_code(agent: &mut Agent, value: &Value) -> Result<String, JsError> {
     let prim = crate::context::to_primitive(agent, value, crux::convert::ToPrimitiveHint::String)?;
-    let Value::String(text) = prim else {
+    let ValueKind::String(text) = prim.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "month code must be a string".into(),
@@ -4324,7 +4328,7 @@ fn prepare_partial_date_fields(
     for key in ["day", "month", "monthCode", "year"] {
         let value =
             crate::context::get_property(agent, bag, &JsString::from_utf8(key), bag.clone())?;
-        if matches!(value, Value::Undefined) {
+        if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
         any = true;
@@ -4347,7 +4351,7 @@ fn prepare_partial_date_fields(
 /// RejectTemporalLikeObject (spec 14.4): no calendar/timeZone properties and
 /// not a Temporal object.
 fn reject_temporal_like_object(agent: &mut Agent, item: &Value) -> Result<(), JsError> {
-    if let Value::Object(obj) = item {
+    if let ValueKind::Object(obj) = item.kind() {
         if agent.temporal_data.contains_key(&obj.id()) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -4360,7 +4364,7 @@ fn reject_temporal_like_object(agent: &mut Agent, item: &Value) -> Result<(), Js
             &JsString::from_utf8("calendar"),
             item.clone(),
         )?;
-        if !matches!(calendar, Value::Undefined) {
+        if !matches!(calendar.kind(), ValueKind::Undefined) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "with() does not support a calendar property".into(),
@@ -4372,7 +4376,7 @@ fn reject_temporal_like_object(agent: &mut Agent, item: &Value) -> Result<(), Js
             &JsString::from_utf8("timeZone"),
             item.clone(),
         )?;
-        if !matches!(time_zone, Value::Undefined) {
+        if !matches!(time_zone.kind(), ValueKind::Undefined) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "with() does not support a timeZone property".into(),
@@ -4435,7 +4439,7 @@ fn plain_date_with(
     options: Value,
 ) -> Result<Value, JsError> {
     let [y, m, d, ..] = require_date(agent, this)?;
-    if !matches!(item, Value::Object(_) | Value::Function(_)) {
+    if !matches!(item.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "invalid argument".into(),
@@ -4617,7 +4621,7 @@ fn plain_date_to_plain_date_time(
     temporal_time: Value,
 ) -> Result<Value, JsError> {
     let [y, m, d, ..] = require_date(agent, this)?;
-    let t = if matches!(temporal_time, Value::Undefined) {
+    let t = if matches!(temporal_time.kind(), ValueKind::Undefined) {
         [0i64; 6]
     } else {
         let time_value = to_plain_time(agent, &temporal_time)?;
@@ -4649,14 +4653,14 @@ fn plain_date_to_zoned_date_time(
     item: Value,
 ) -> Result<Value, JsError> {
     let [y, m, d, ..] = require_date(agent, this)?;
-    let (tz, time) = if matches!(item, Value::Object(_) | Value::Function(_)) {
+    let (tz, time) = if matches!(item.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         let time_zone_like = crate::context::get_property(
             agent,
             &item,
             &JsString::from_utf8("timeZone"),
             item.clone(),
         )?;
-        if matches!(time_zone_like, Value::Undefined) {
+        if matches!(time_zone_like.kind(), ValueKind::Undefined) {
             let tz = super::instant::to_temporal_time_zone_identifier(agent, &item)?;
             (tz, None)
         } else {
@@ -4667,7 +4671,7 @@ fn plain_date_to_zoned_date_time(
                 &JsString::from_utf8("plainTime"),
                 item.clone(),
             )?;
-            let time = if matches!(plain_time, Value::Undefined) {
+            let time = if matches!(plain_time.kind(), ValueKind::Undefined) {
                 None
             } else {
                 let time_value = to_plain_time(agent, &plain_time)?;
@@ -4901,7 +4905,7 @@ fn read_year_month_fields(
     for key in ["month", "monthCode", "year"] {
         let value =
             crate::context::get_property(agent, bag, &JsString::from_utf8(key), bag.clone())?;
-        if matches!(value, Value::Undefined) {
+        if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
         any = true;
@@ -4936,7 +4940,7 @@ fn read_month_day_fields(
     for key in ["day", "month", "monthCode", "year"] {
         let value =
             crate::context::get_property(agent, bag, &JsString::from_utf8(key), bag.clone())?;
-        if matches!(value, Value::Undefined) {
+        if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
         any = true;
@@ -5050,7 +5054,7 @@ fn plain_year_month_with(
         TemporalRecord::YearMonth(ym) => ym,
         _ => unreachable!(),
     };
-    if !matches!(item, Value::Object(_) | Value::Function(_)) {
+    if !matches!(item.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "invalid argument".into(),
@@ -5271,7 +5275,7 @@ fn plain_year_month_to_plain_date(
         TemporalRecord::YearMonth(ym) => ym,
         _ => unreachable!(),
     };
-    if !matches!(item, Value::Object(_) | Value::Function(_)) {
+    if !matches!(item.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "argument should be an object".into(),
@@ -5279,11 +5283,11 @@ fn plain_year_month_to_plain_date(
     }
     let value =
         crate::context::get_property(agent, &item, &JsString::from_utf8("day"), item.clone())?;
-    let day = match value {
-        Value::Undefined => {
+    let day = match value.kind() {
+        ValueKind::Undefined => {
             return Err(JsError::new(ErrorKind::TypeError, "day is required".into()));
         }
-        v => super::to_positive_integer_with_truncation(agent, &v)?,
+        _ => super::to_positive_integer_with_truncation(agent, &value)?,
     };
     let (y, m, d) = resolve_date_fields(
         Some(ym[0]),
@@ -5306,7 +5310,7 @@ fn plain_month_day_with(
         TemporalRecord::MonthDay(md) => md,
         _ => unreachable!(),
     };
-    if !matches!(item, Value::Object(_) | Value::Function(_)) {
+    if !matches!(item.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "invalid argument".into(),
@@ -5367,7 +5371,7 @@ fn plain_month_day_to_plain_date(
         TemporalRecord::MonthDay(md) => md,
         _ => unreachable!(),
     };
-    if !matches!(item, Value::Object(_) | Value::Function(_)) {
+    if !matches!(item.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "argument should be an object".into(),
@@ -5375,14 +5379,14 @@ fn plain_month_day_to_plain_date(
     }
     let value =
         crate::context::get_property(agent, &item, &JsString::from_utf8("year"), item.clone())?;
-    let year = match value {
-        Value::Undefined => {
+    let year = match value.kind() {
+        ValueKind::Undefined => {
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "year is required".into(),
             ));
         }
-        v => super::to_integer_with_truncation(agent, &v)?,
+        _ => super::to_integer_with_truncation(agent, &value)?,
     };
     let (y, m, d) = resolve_date_fields(
         Some(year),
@@ -5405,7 +5409,9 @@ fn construct_year_month(
     let m = super::to_integer_with_truncation(agent, args.get(1).unwrap_or(&Value::Undefined))?;
     check_calendar(agent, args.get(2).unwrap_or(&Value::Undefined))?;
     let d = match args.get(3) {
-        Some(v) if !matches!(v, Value::Undefined) => super::to_integer_with_truncation(agent, v)?,
+        Some(v) if !matches!(v.kind(), ValueKind::Undefined) => {
+            super::to_integer_with_truncation(agent, v)?
+        }
         _ => 1,
     };
     if !iso::is_valid_iso_date(y, m, d)
@@ -5437,7 +5443,9 @@ fn construct_month_day(
     let d = super::to_integer_with_truncation(agent, args.get(1).unwrap_or(&Value::Undefined))?;
     check_calendar(agent, args.get(2).unwrap_or(&Value::Undefined))?;
     let y = match args.get(3) {
-        Some(v) if !matches!(v, Value::Undefined) => super::to_integer_with_truncation(agent, v)?,
+        Some(v) if !matches!(v.kind(), ValueKind::Undefined) => {
+            super::to_integer_with_truncation(agent, v)?
+        }
         _ => 1972,
     };
     if !iso::is_valid_iso_date(y, m, d) {
@@ -5510,7 +5518,7 @@ pub fn to_plain_year_month(
     item: &Value,
     options: &Value,
 ) -> Result<Value, JsError> {
-    if let Value::Object(obj) = item
+    if let ValueKind::Object(obj) = item.kind()
         && let Some(record) = agent.temporal_data.get(&obj.id()).cloned()
     {
         let opts = super::get_options_object(options)?;
@@ -5540,7 +5548,7 @@ pub fn to_plain_year_month(
             )),
         };
     }
-    if matches!(item, Value::String(_)) {
+    if matches!(item.kind(), ValueKind::String(_)) {
         let text = crate::context::to_string(agent, item)?;
         let parsed = iso::parse_iso_date_time(text.as_slice(), iso::Format::DateTimePlain)
             .or_else(|_| iso::parse_iso_date_time(text.as_slice(), iso::Format::YearMonthString))
@@ -5571,7 +5579,7 @@ pub fn to_plain_year_month(
             TemporalRecord::YearMonth([y, m, 1]),
         );
     }
-    if let Value::Object(_) = item {
+    if let ValueKind::Object(_) = item.kind() {
         // Property bag: the calendar, then the fields in ascending code point
         // order (PrepareCalendarFields complete).
         read_bag_calendar(agent, item)?;
@@ -5600,7 +5608,7 @@ pub fn to_plain_month_day(
     item: &Value,
     options: &Value,
 ) -> Result<Value, JsError> {
-    if let Value::Object(obj) = item
+    if let ValueKind::Object(obj) = item.kind()
         && let Some(record) = agent.temporal_data.get(&obj.id()).cloned()
     {
         let opts = super::get_options_object(options)?;
@@ -5630,7 +5638,7 @@ pub fn to_plain_month_day(
             )),
         };
     }
-    if matches!(item, Value::String(_)) {
+    if matches!(item.kind(), ValueKind::String(_)) {
         let text = crate::context::to_string(agent, item)?;
         let parsed = iso::parse_iso_date_time(text.as_slice(), iso::Format::DateTimePlain)
             .or_else(|_| iso::parse_iso_date_time(text.as_slice(), iso::Format::MonthDayString))
@@ -5658,7 +5666,7 @@ pub fn to_plain_month_day(
             TemporalRecord::MonthDay([1972, parsed.month, parsed.day]),
         );
     }
-    if let Value::Object(_) = item {
+    if let ValueKind::Object(_) = item.kind() {
         // Property bag: the calendar, then the fields in ascending code point
         // order (PrepareCalendarFields complete).
         read_bag_calendar(agent, item)?;

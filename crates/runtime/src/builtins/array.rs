@@ -16,7 +16,7 @@ use crux::object::{JsObject, ObjectKind};
 use crux::ops::{is_strictly_equal, same_value_zero};
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
-use crux::value::{Value, is_callable, is_constructor};
+use crux::value::{Value, ValueKind, is_callable, is_constructor};
 
 use crate::agent::Agent;
 use crate::context::{as_object, get_property};
@@ -97,8 +97,8 @@ fn key(index: u64) -> JsString {
 /// IsArray (spec 7.2.2): Array exotics and proxies whose target is an
 /// array (recursively).
 pub fn is_array(value: &Value) -> bool {
-    match value {
-        Value::Object(obj) => match &obj.kind {
+    match value.kind() {
+        ValueKind::Object(obj) => match &obj.kind {
             ObjectKind::Array => true,
             ObjectKind::Proxy(slots) => slots
                 .target
@@ -108,7 +108,7 @@ pub fn is_array(value: &Value) -> bool {
                 .unwrap_or(false),
             _ => false,
         },
-        Value::Function(function) => matches!(function.object.kind, ObjectKind::Array),
+        ValueKind::Function(function) => matches!(function.object.kind, ObjectKind::Array),
         _ => false,
     }
 }
@@ -116,8 +116,8 @@ pub fn is_array(value: &Value) -> bool {
 /// IsArray (spec 7.2.2) that reports a revoked proxy as a TypeError (step
 /// 3.a) instead of false.
 pub fn is_array_or_throw(value: &Value) -> Result<bool, JsError> {
-    match value {
-        Value::Object(obj) => match &obj.kind {
+    match value.kind() {
+        ValueKind::Object(obj) => match &obj.kind {
             ObjectKind::Array => Ok(true),
             ObjectKind::Proxy(slots) => {
                 let Some(target) = slots.target.borrow().as_ref().cloned() else {
@@ -130,7 +130,7 @@ pub fn is_array_or_throw(value: &Value) -> Result<bool, JsError> {
             }
             _ => Ok(false),
         },
-        Value::Function(function) => Ok(matches!(function.object.kind, ObjectKind::Array)),
+        ValueKind::Function(function) => Ok(matches!(function.object.kind, ObjectKind::Array)),
         _ => Ok(false),
     }
 }
@@ -166,7 +166,8 @@ fn length_of_array_like(agent: &mut Agent, value: &Value) -> Result<u64, JsError
 /// clamped to `[0, len]`.
 fn clamped_end(args: &[Value], len: u64) -> Result<u64, JsError> {
     match args.get(1) {
-        None | Some(Value::Undefined) => Ok(len),
+        None => Ok(len),
+        Some(_v) if _v.is_undefined() => Ok(len),
         Some(value) => {
             let n = to_integer_or_infinity(to_number(value)?);
             Ok(if n < 0.0 {
@@ -180,9 +181,9 @@ fn clamped_end(args: &[Value], len: u64) -> Result<u64, JsError> {
 
 /// HasProperty (spec 7.3.13) on a language value.
 fn has_property(value: &Value, name: &JsString) -> Result<bool, JsError> {
-    match value {
-        Value::Object(obj) => obj.has_property_key(&PropertyKey::from_js_string(name)),
-        Value::Function(function) => function
+    match value.kind() {
+        ValueKind::Object(obj) => obj.has_property_key(&PropertyKey::from_js_string(name)),
+        ValueKind::Function(function) => function
             .object
             .has_property_key(&PropertyKey::from_js_string(name)),
         _ => Ok(false),
@@ -196,12 +197,12 @@ fn get(agent: &mut Agent, value: &Value, name: &JsString) -> Result<Value, JsErr
 
 /// Set (spec 7.3.3) with `throw = true`.
 fn set_property(value: &Value, name: &JsString, v: Value) -> Result<(), JsError> {
-    match value {
-        Value::Object(obj) => {
+    match value.kind() {
+        ValueKind::Object(obj) => {
             obj.set(name, v, true)?;
             Ok(())
         }
-        Value::Function(function) => {
+        ValueKind::Function(function) => {
             function.object.set(name, v, true)?;
             Ok(())
         }
@@ -211,9 +212,9 @@ fn set_property(value: &Value, name: &JsString, v: Value) -> Result<(), JsError>
 
 /// DeletePropertyOrThrow (spec 7.3.6).
 fn delete_property_or_throw(value: &Value, name: &JsString) -> Result<(), JsError> {
-    let deleted = match value {
-        Value::Object(obj) => obj.delete(name)?,
-        Value::Function(function) => function.object.delete(name)?,
+    let deleted = match value.kind() {
+        ValueKind::Object(obj) => obj.delete(name)?,
+        ValueKind::Function(function) => function.object.delete(name)?,
         _ => true,
     };
     if deleted {
@@ -229,9 +230,9 @@ fn delete_property_or_throw(value: &Value, name: &JsString) -> Result<(), JsErro
 /// The object half of a value (spec ToObject requires the caller to have
 /// coerced primitives already).
 fn object_of(value: &Value) -> Result<Handle<JsObject>, JsError> {
-    match value {
-        Value::Object(obj) => Ok(obj.clone()),
-        Value::Function(_) => Err(JsError::new(
+    match value.kind() {
+        ValueKind::Object(obj) => Ok(obj.clone()),
+        ValueKind::Function(_) => Err(JsError::new(
             ErrorKind::TypeError,
             "expected an object receiver".into(),
         )),
@@ -306,9 +307,9 @@ fn array_species_create(
             c = Value::Undefined;
         }
     }
-    let species = match c {
-        Value::Undefined => return array_create(agent, length),
-        Value::Object(_) | Value::Function(_) => {
+    let species = match c.kind() {
+        ValueKind::Undefined => return array_create(agent, length),
+        ValueKind::Object(_) | ValueKind::Function(_) => {
             let species_key =
                 PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone());
             crate::context::get_property_key(agent, &c, &species_key, c.clone())?
@@ -320,9 +321,9 @@ fn array_species_create(
             ));
         }
     };
-    let ctor = match species {
-        Value::Null | Value::Undefined => return array_create(agent, length),
-        value if is_constructor(&value) => value,
+    let ctor = match species.kind() {
+        ValueKind::Null | ValueKind::Undefined => return array_create(agent, length),
+        _ if is_constructor(&species) => species,
         _ => {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -345,7 +346,7 @@ fn array_construct(
         return Ok(Value::Object(JsObject::array_create(Some(proto), 0.0)?));
     }
     if args.len() == 1
-        && let Value::Number(number) = args[0]
+        && let ValueKind::Number(number) = args[0].kind()
     {
         let int_length = to_uint32(number);
         if !same_value_zero(&Value::Number(int_length as f64), &Value::Number(number)) {
@@ -416,7 +417,7 @@ fn array_from(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
     let items = args.first().cloned().unwrap_or(Value::Undefined);
     let mapfn = args.get(1).cloned().unwrap_or(Value::Undefined);
     let this_arg = args.get(2).cloned().unwrap_or(Value::Undefined);
-    let mapping = if matches!(mapfn, Value::Undefined) {
+    let mapping = if matches!(mapfn.kind(), ValueKind::Undefined) {
         false
     } else {
         if !is_callable(&mapfn) {
@@ -437,7 +438,7 @@ fn array_from(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
             Value::Object(array_create(agent, 0.0)?)
         };
         let iterator = crate::function::call(agent, &iterator_method, items.clone(), &[])?;
-        if !matches!(iterator, Value::Object(_)) {
+        if !matches!(iterator.kind(), ValueKind::Object(_)) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "Iterator is not an object".into(),
@@ -546,7 +547,7 @@ fn at(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError>
 
 /// IsConcatSpreadable (spec 23.1.3.2.2).
 fn is_concat_spreadable(agent: &mut Agent, value: &Value) -> Result<bool, JsError> {
-    if !matches!(value, Value::Object(_) | Value::Function(_)) {
+    if !matches!(value.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Ok(false);
     }
     let spreadable_key = PropertyKey::Symbol(
@@ -556,7 +557,7 @@ fn is_concat_spreadable(agent: &mut Agent, value: &Value) -> Result<bool, JsErro
     );
     let spreadable =
         crate::context::get_property_key(agent, value, &spreadable_key, value.clone())?;
-    if !matches!(spreadable, Value::Undefined) {
+    if !matches!(spreadable.kind(), ValueKind::Undefined) {
         return Ok(to_boolean(&spreadable));
     }
     is_array_or_throw(value)
@@ -936,7 +937,8 @@ fn flat(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     let object = crate::context::to_object(agent, this)?;
     let source_len = length_of_array_like(agent, &object)?;
     let depth_number = match args.first() {
-        None | Some(Value::Undefined) => 1.0,
+        None => 1.0,
+        Some(_v) if _v.is_undefined() => 1.0,
         Some(value) => to_integer_or_infinity(to_number(value)?),
     };
     let array = array_species_create(agent, &object, 0.0)?;
@@ -1062,7 +1064,8 @@ fn join(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     // a fixed-length view out of bounds) does not change the iteration count.
     let length = length_of_array_like(agent, &object)?;
     let separator = match args.first() {
-        Some(Value::Undefined) | None => ",".to_string(),
+        Some(_v) if _v.is_undefined() => ",".to_string(),
+        None => ",".to_string(),
         Some(value) => crate::context::to_string(agent, value)?.to_string_lossy(),
     };
     let mut result = String::new();
@@ -1071,7 +1074,7 @@ fn join(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
             result.push_str(&separator);
         }
         let element = get(agent, &object, &key(k))?;
-        if matches!(element, Value::Undefined | Value::Null) {
+        if matches!(element.kind(), ValueKind::Undefined | ValueKind::Null) {
             continue;
         }
         result.push_str(&crate::context::to_string(agent, &element)?.to_string_lossy());
@@ -1445,16 +1448,16 @@ fn sort_compare(
     x: &Value,
     y: &Value,
 ) -> Result<f64, JsError> {
-    if matches!(x, Value::Undefined) && matches!(y, Value::Undefined) {
+    if matches!(x.kind(), ValueKind::Undefined) && matches!(y.kind(), ValueKind::Undefined) {
         return Ok(0.0);
     }
-    if matches!(x, Value::Undefined) {
+    if matches!(x.kind(), ValueKind::Undefined) {
         return Ok(1.0);
     }
-    if matches!(y, Value::Undefined) {
+    if matches!(y.kind(), ValueKind::Undefined) {
         return Ok(-1.0);
     }
-    if !matches!(comparefn, Value::Undefined) {
+    if !matches!(comparefn.kind(), ValueKind::Undefined) {
         let v = crate::function::call(agent, comparefn, Value::Undefined, &[x.clone(), y.clone()])?;
         let v = to_number(&v)?;
         return Ok(if v.is_nan() { 0.0 } else { v });
@@ -1515,7 +1518,7 @@ fn sort(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     require_object_coercible(this)?;
     let object = crate::context::to_object(agent, this)?;
     let comparefn = args.first().cloned().unwrap_or(Value::Undefined);
-    if !matches!(comparefn, Value::Undefined) && !is_callable(&comparefn) {
+    if !matches!(comparefn.kind(), ValueKind::Undefined) && !is_callable(&comparefn) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Array.prototype.sort: comparefn is not a function".into(),
@@ -1628,7 +1631,7 @@ fn to_locale_string(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<
             result.push(',');
         }
         let element = get(agent, &object, &key(k))?;
-        if matches!(element, Value::Undefined | Value::Null) {
+        if matches!(element.kind(), ValueKind::Undefined | ValueKind::Null) {
             continue;
         }
         let boxed = crate::context::to_object(agent, &element)?;
@@ -1662,7 +1665,7 @@ fn to_sorted(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, J
     require_object_coercible(this)?;
     let object = crate::context::to_object(agent, this)?;
     let comparefn = args.first().cloned().unwrap_or(Value::Undefined);
-    if !matches!(comparefn, Value::Undefined) && !is_callable(&comparefn) {
+    if !matches!(comparefn.kind(), ValueKind::Undefined) && !is_callable(&comparefn) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Array.prototype.toSorted: comparefn is not a function".into(),
@@ -1848,7 +1851,7 @@ fn iter_result(agent: &Agent, value: Value, done: bool) -> Result<Value, JsError
 
 /// spec 23.1.5.2.1 ArrayIterator.prototype.next.
 fn array_iterator_next(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
-    let Value::Object(obj) = this else {
+    let ValueKind::Object(obj) = this.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Array Iterator.prototype.next requires an Array Iterator".into(),
@@ -1860,13 +1863,13 @@ fn array_iterator_next(agent: &mut Agent, this: &Value, _args: &[Value]) -> Resu
             "Incompatible receiver".into(),
         ));
     };
-    if matches!(array, Value::Undefined) {
+    if matches!(array.kind(), ValueKind::Undefined) {
         return iter_result(agent, Value::Undefined, true);
     }
     // spec %ArrayIteratorPrototype%.next step 5.a: iterating a TypedArray
     // whose view is out of bounds (detached, or resized past the view's
     // bounds) throws (resizable-buffer iterator fixtures).
-    if let Value::Object(iter_obj) = &array
+    if let ValueKind::Object(iter_obj) = array.kind()
         && let crux::object::ObjectKind::IntegerIndexed(slots) = &iter_obj.kind
         && (slots.buffer.is_detached() || crate::builtins::typed_array::view_out_of_bounds(slots))
     {
@@ -2102,7 +2105,7 @@ fn from_async_resume(
             }
             let step_value =
                 get_property(agent, &value, &JsString::from_utf8("value"), value.clone())?;
-            let mapping = !matches!(state.borrow().mapfn, Value::Undefined);
+            let mapping = !matches!(state.borrow().mapfn.kind(), ValueKind::Undefined);
             if mapping {
                 from_async_map_and_await(agent, &state, step_value)
             } else {
@@ -2114,7 +2117,7 @@ fn from_async_resume(
         FromAsyncPhase::Element => {
             // `value` is the resolved array-like element (spec step 14.e);
             // map it when a mapper is present, else define it directly.
-            let mapping = !matches!(state.borrow().mapfn, Value::Undefined);
+            let mapping = !matches!(state.borrow().mapfn.kind(), ValueKind::Undefined);
             if mapping {
                 from_async_map_and_await(agent, &state, value)
             } else {
@@ -2144,7 +2147,7 @@ fn from_async_map_and_await(
             state.array.clone(),
         )
     };
-    let mapped = if matches!(mapfn, Value::Undefined) {
+    let mapped = if matches!(mapfn.kind(), ValueKind::Undefined) {
         value
     } else {
         match crate::function::call(
@@ -2182,7 +2185,7 @@ fn from_async(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
         let items = args.first().cloned().unwrap_or(Value::Undefined);
         let mapfn = args.get(1).cloned().unwrap_or(Value::Undefined);
         let this_arg = args.get(2).cloned().unwrap_or(Value::Undefined);
-        let mapping = !matches!(mapfn, Value::Undefined);
+        let mapping = !matches!(mapfn.kind(), ValueKind::Undefined);
         if mapping && !is_callable(&mapfn) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -2823,7 +2826,7 @@ pub fn dispatch_call(
         return Some(array_iterator_next(agent, this, args));
     }
     // The fromAsync continuations, keyed by function identity.
-    if let Value::Function(function) = callee
+    if let ValueKind::Function(function) = callee.kind()
         && let Some((state, is_reject)) = agent.array_from_async.get(&function.id()).cloned()
     {
         if is_reject {
@@ -2868,22 +2871,22 @@ mod tests {
     }
 
     fn text(source: &str) -> String {
-        match run(source).unwrap() {
-            Value::String(s) => s.to_string_lossy(),
+        match run(source).unwrap().kind() {
+            ValueKind::String(s) => s.to_string_lossy(),
             other => panic!("expected a string, got {other:?}"),
         }
     }
 
     fn number(source: &str) -> f64 {
-        match run(source).unwrap() {
-            Value::Number(n) => n,
+        match run(source).unwrap().kind() {
+            ValueKind::Number(n) => n,
             other => panic!("expected a number, got {other:?}"),
         }
     }
 
     fn bool(source: &str) -> bool {
-        match run(source).unwrap() {
-            Value::Boolean(b) => b,
+        match run(source).unwrap().kind() {
+            ValueKind::Boolean(b) => b,
             other => panic!("expected a boolean, got {other:?}"),
         }
     }
@@ -2903,7 +2906,7 @@ mod tests {
     }
 
     fn settled(agent: &Agent, value: &Value) -> Result<Value, JsError> {
-        let Value::Object(obj) = value else {
+        let ValueKind::Object(obj) = value.kind() else {
             return Ok(value.clone());
         };
         let Some(data) = agent.promises.get(&obj.id()) else {
@@ -3117,7 +3120,7 @@ mod tests {
         // Non-array array-likes are not (async) iterable: rejected per spec.
         assert!(matches!(
             settle("Array.fromAsync({length: 2}, (_, i) => i + 1)"),
-            Ok(Value::Object(_))
+            Ok(v) if matches!(v.kind(), ValueKind::Object(_))
         ));
         // A sync iterable is wrapped in an AsyncFromSyncIterator.
         let value = settle("Array.fromAsync(\"ab\")").unwrap();
@@ -3128,11 +3131,11 @@ mod tests {
     }
 
     fn joined_value(value: &Value) -> String {
-        let Value::Object(obj) = value else {
+        let ValueKind::Object(obj) = value.kind() else {
             panic!("expected an array");
         };
         let length = obj.get(&JsString::from_utf8("length")).unwrap();
-        let Value::Number(n) = length else {
+        let ValueKind::Number(n) = length.kind() else {
             panic!("expected a numeric length");
         };
         let mut parts = Vec::new();

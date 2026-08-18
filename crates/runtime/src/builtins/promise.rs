@@ -12,7 +12,7 @@ use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
-use crux::value::{Value, is_callable, is_constructor};
+use crux::value::{Value, ValueKind, is_callable, is_constructor};
 
 use crate::agent::Agent;
 use crate::promise::{
@@ -300,7 +300,7 @@ pub fn dispatch_call(
     this: &Value,
     args: &[Value],
 ) -> Option<Result<Value, JsError>> {
-    let Value::Function(function) = callee else {
+    let ValueKind::Function(function) = callee.kind() else {
         return None;
     };
     if let Some(resolver) = agent.promise_resolvers.get(&function.id()) {
@@ -501,7 +501,7 @@ fn promise_finally_method(
 ) -> Result<Value, JsError> {
     // spec steps 1-2: only a non-object receiver throws; thenables and
     // proxies are accepted (their own `then` is invoked below).
-    if !matches!(this, Value::Object(_) | Value::Function(_)) {
+    if !matches!(this.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Promise.prototype.finally called on a non-object".into(),
@@ -598,7 +598,7 @@ fn promise_static_resolve(
     this: &Value,
     args: &[Value],
 ) -> Result<Value, JsError> {
-    if !matches!(this, Value::Object(_) | Value::Function(_)) {
+    if !matches!(this.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Promise.resolve requires this to be an object".into(),
@@ -614,7 +614,7 @@ fn promise_static_reject(
     this: &Value,
     args: &[Value],
 ) -> Result<Value, JsError> {
-    if !matches!(this, Value::Object(_) | Value::Function(_)) {
+    if !matches!(this.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Promise.reject requires this to be an object".into(),
@@ -1258,10 +1258,13 @@ fn species_constructor(agent: &mut Agent, promise: &Value) -> Result<Value, JsEr
     )?;
     // spec 7.3.21 steps 2-3: only `undefined` falls back to the default; a
     // null or primitive constructor is a TypeError.
-    if matches!(constructor, Value::Undefined) {
+    if matches!(constructor.kind(), ValueKind::Undefined) {
         return Ok(default);
     }
-    if !matches!(constructor, Value::Object(_) | Value::Function(_)) {
+    if !matches!(
+        constructor.kind(),
+        ValueKind::Object(_) | ValueKind::Function(_)
+    ) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Species constructor is not an object".into(),
@@ -1274,7 +1277,7 @@ fn species_constructor(agent: &mut Agent, promise: &Value) -> Result<Value, JsEr
         crate::context::get_property_key(agent, &constructor, &species_key, constructor.clone())?;
     // spec steps 5-7: undefined/null fall back to the default; anything else
     // must be a constructor.
-    if matches!(species, Value::Undefined | Value::Null) {
+    if matches!(species.kind(), ValueKind::Undefined | ValueKind::Null) {
         Ok(constructor)
     } else if is_constructor(&species) {
         Ok(species)
@@ -1328,7 +1331,7 @@ mod tests {
 
     /// The settled value of the promise a script returned.
     fn settled_value(agent: &Agent, value: &Value) -> Result<Value, JsError> {
-        let Value::Object(obj) = value else {
+        let ValueKind::Object(obj) = value.kind() else {
             return Ok(value.clone());
         };
         let Some(data) = agent.promises.get(&obj.id()) else {
@@ -1436,7 +1439,7 @@ mod tests {
     #[test]
     fn promise_constructor_creates_an_object() {
         let value = run("new Promise(function () {})").unwrap();
-        assert!(matches!(value, Value::Object(_)));
+        assert!(matches!(value.kind(), ValueKind::Object(_)));
     }
 
     #[test]
@@ -1470,7 +1473,7 @@ mod tests {
     fn executor_throw_rejects() {
         // A throwing executor rejects the promise with the thrown value.
         let result = settle("new Promise(function () { throw 'bad'; })").unwrap();
-        assert!(matches!(result, Value::String(_)));
+        assert!(matches!(result.kind(), ValueKind::String(_)));
     }
 
     #[test]

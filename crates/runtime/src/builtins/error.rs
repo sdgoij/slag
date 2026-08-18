@@ -12,7 +12,7 @@ use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
-use crux::value::{Value, is_constructor};
+use crux::value::{Value, ValueKind, is_constructor};
 
 use crate::agent::Agent;
 use crate::context::as_object;
@@ -470,7 +470,7 @@ fn define_message(object: &JsObject, message: Option<&Value>) -> Result<(), JsEr
     let Some(message) = message else {
         return Ok(());
     };
-    if matches!(message, Value::Undefined) {
+    if matches!(message.kind(), ValueKind::Undefined) {
         return Ok(());
     }
     let text = to_string(message)?;
@@ -533,11 +533,10 @@ fn install_cause(
 fn define_stack(agent: &mut Agent, object: &JsObject, name: &str) -> Result<(), JsError> {
     let message = object
         .get_own_property_key(&PropertyKey::from_utf8("message"))?
-        .and_then(|property| match property.kind {
-            crux::object::PropertyKind::Data {
-                value: Value::String(text),
-                ..
-            } => Some(text.to_string_lossy()),
+        .and_then(|property| match &property.kind {
+            crux::object::PropertyKind::Data { value, .. } => {
+                value.as_string().map(|text| text.to_string_lossy())
+            }
             _ => None,
         })
         .unwrap_or_default();
@@ -551,8 +550,8 @@ fn define_stack(agent: &mut Agent, object: &JsObject, name: &str) -> Result<(), 
         let frame = context
             .function
             .as_ref()
-            .and_then(|function| match function {
-                Value::Function(f) => f.name.clone(),
+            .and_then(|function| match function.kind() {
+                ValueKind::Function(f) => f.name.clone(),
                 _ => None,
             })
             .map(|name| name.to_string_lossy())
@@ -598,7 +597,7 @@ fn stack_setter(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
         ));
     };
     let value = args.first().cloned().unwrap_or(Value::Undefined);
-    if !matches!(value, Value::String(_)) {
+    if !matches!(value.kind(), ValueKind::String(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Error.prototype.stack setter expects a string".into(),
@@ -635,7 +634,7 @@ fn stack_setter(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
 /// iterate when the value has @@iterator, otherwise fall back to the
 /// array-like copy.
 fn list_to_array(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
-    if !matches!(value, Value::Object(_)) {
+    if !matches!(value.kind(), ValueKind::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "AggregateError requires an array-like errors argument".into(),
@@ -684,8 +683,8 @@ fn list_to_array(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
 
 /// Whether the value is an [[ErrorData]] object (spec 20.5.2.1).
 pub fn is_error(agent: &Agent, value: Value) -> bool {
-    match value {
-        Value::Object(obj) => agent.error_data.contains(&obj.id()),
+    match value.kind() {
+        ValueKind::Object(obj) => agent.error_data.contains(&obj.id()),
         _ => false,
     }
 }
@@ -693,7 +692,7 @@ pub fn is_error(agent: &Agent, value: Value) -> bool {
 /// Error.prototype.toString (spec 20.5.3.4): `name + ": " + message` with
 /// the empty-string fallbacks.
 fn error_prototype_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
-    if !matches!(this, Value::Object(_)) {
+    if !matches!(this.kind(), ValueKind::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Error.prototype.toString requires an object".into(),
@@ -701,15 +700,15 @@ fn error_prototype_to_string(agent: &mut Agent, this: &Value) -> Result<Value, J
     }
     let name =
         crate::context::get_property(agent, this, &JsString::from_utf8("name"), this.clone())?;
-    let name = match name {
-        Value::Undefined => "Error".to_string(),
-        other => to_string(&other)?.to_string_lossy(),
+    let name = match name.kind() {
+        ValueKind::Undefined => "Error".to_string(),
+        _ => to_string(&name)?.to_string_lossy(),
     };
     let message =
         crate::context::get_property(agent, this, &JsString::from_utf8("message"), this.clone())?;
-    let message = match message {
-        Value::Undefined => String::new(),
-        other => to_string(&other)?.to_string_lossy(),
+    let message = match message.kind() {
+        ValueKind::Undefined => String::new(),
+        _ => to_string(&message)?.to_string_lossy(),
     };
     let text = if name.is_empty() {
         message

@@ -11,7 +11,7 @@ use crux::object::JsObject;
 use crux::ops::same_value;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
-use crux::value::{Value, is_callable};
+use crux::value::{Value, ValueKind, is_callable};
 
 use crate::agent::Agent;
 use crate::context::{as_object, get_property};
@@ -103,8 +103,8 @@ impl<'a> JsonParser<'a> {
             _ => return Err(self.syntax_error()),
         };
         let end = self.pos;
-        let source = match &value {
-            Value::Object(_) | Value::Function(_) => None,
+        let source = match value.kind() {
+            ValueKind::Object(_) | ValueKind::Function(_) => None,
             _ => Some(JsString::from_utf8(
                 std::str::from_utf8(&self.text[start..end]).unwrap_or(""),
             )),
@@ -361,16 +361,16 @@ fn str(text: &str) -> Value {
 
 /// IsRawJSON (spec 26.6.4): an object registered in the raw-JSON table.
 fn is_raw_json(agent: &Agent, value: &Value) -> bool {
-    match value {
-        Value::Object(obj) => agent.raw_json_data.contains_key(&obj.id()),
+    match value.kind() {
+        ValueKind::Object(obj) => agent.raw_json_data.contains_key(&obj.id()),
         _ => false,
     }
 }
 
 /// The [[RawJSON]] text of a raw-JSON object.
 fn raw_json_source(agent: &Agent, value: &Value) -> Option<JsString> {
-    match value {
-        Value::Object(obj) => agent.raw_json_data.get(&obj.id()).cloned(),
+    match value.kind() {
+        ValueKind::Object(obj) => agent.raw_json_data.get(&obj.id()).cloned(),
         _ => None,
     }
 }
@@ -388,7 +388,10 @@ fn json_primitive_value(agent: &mut Agent, text: &JsString) -> Result<Option<Val
         Ok(record) => record,
         Err(_) => return Ok(None),
     };
-    if !matches!(record.value, Value::Object(_) | Value::Function(_)) {
+    if !matches!(
+        record.value.kind(),
+        ValueKind::Object(_) | ValueKind::Function(_)
+    ) {
         parser.skip_ws();
         if parser.pos == parser.text.len() {
             return Ok(Some(record.value));
@@ -478,7 +481,7 @@ fn internalize_json_property(
     );
     let (elements, entries) = match record {
         Some(record) if same_value(&record.value, &value) => {
-            if !matches!(value, Value::Object(_) | Value::Function(_))
+            if !matches!(value.kind(), ValueKind::Object(_) | ValueKind::Function(_))
                 && let Some(source) = &record.source
             {
                 context.create_data_property_or_throw(
@@ -490,7 +493,7 @@ fn internalize_json_property(
         }
         _ => (&[][..], &[][..]),
     };
-    if let Value::Object(obj) = &value {
+    if let ValueKind::Object(obj) = value.kind() {
         if crate::builtins::array::is_array(&value) {
             let length = length_of_array_like(agent, &value)?;
             for index in 0..length {
@@ -498,12 +501,12 @@ fn internalize_json_property(
                 let element_record = elements.get(index as usize);
                 let new_element = internalize_json_property(
                     agent,
-                    obj,
+                    &obj,
                     &index_key.to_string_lossy(),
                     reviver,
                     element_record,
                 )?;
-                if matches!(new_element, Value::Undefined) {
+                if matches!(new_element.kind(), ValueKind::Undefined) {
                     obj.delete_key(&PropertyKey::from_js_string(&index_key))?;
                 } else {
                     // spec step 28.a.3: CreateDataProperty is silent — a
@@ -521,12 +524,12 @@ fn internalize_json_property(
                     .map(|(_, record)| record);
                 let new_element = internalize_json_property(
                     agent,
-                    obj,
+                    &obj,
                     &key.to_string_lossy(),
                     reviver,
                     entry_record,
                 )?;
-                if matches!(new_element, Value::Undefined) {
+                if matches!(new_element.kind(), ValueKind::Undefined) {
                     obj.delete_key(&PropertyKey::from_js_string(&key))?;
                 } else {
                     obj.create_data_property(&key, new_element)?;
@@ -584,14 +587,14 @@ fn json_stringify(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
     let replacer = args.get(1).cloned().unwrap_or(Value::Undefined);
     let space = args.get(2).cloned().unwrap_or(Value::Undefined);
 
-    let (replacer_function, property_list) = match &replacer {
-        Value::Object(_) | Value::Function(_) => {
+    let (replacer_function, property_list) = match replacer.kind() {
+        ValueKind::Object(_) | ValueKind::Function(_) => {
             if is_callable(&replacer) {
                 (Some(replacer.clone()), None)
             } else {
                 // spec 26.6.3.1 step 4.b.i: IsArray on a revoked proxy
                 // throws a TypeError.
-                if let Value::Object(obj) = &replacer
+                if let Some(obj) = replacer.as_object()
                     && let crux::object::ObjectKind::Proxy(slots) = &obj.kind
                     && slots.target.borrow().is_none()
                 {
@@ -610,8 +613,8 @@ fn json_stringify(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
         _ => (None, None),
     };
 
-    let gap = match &space {
-        Value::Object(obj) => {
+    let gap = match space.kind() {
+        ValueKind::Object(obj) => {
             // spec 26.6.3.1 steps 8-10: only wrappers with [[NumberData]]
             // or [[StringData]] are converted (honoring overrides); any
             // other object is ignored.
@@ -625,7 +628,7 @@ fn json_stringify(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
                 String::new()
             }
         }
-        other => space_string(other)?,
+        _ => space_string(&space)?,
     };
 
     let mut state = StringifyState {
@@ -651,20 +654,20 @@ fn json_stringify(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
 
 /// The `space` argument → the gap string (spec 26.6.3.1 steps 8-11).
 fn space_string(space: &Value) -> Result<String, JsError> {
-    match space {
-        Value::Number(n) => {
-            let count = if n.is_finite() && *n > 0.0 {
-                ((*n).floor() as usize).min(10)
+    match space.kind() {
+        ValueKind::Number(n) => {
+            let count = if n.is_finite() && n > 0.0 {
+                (n.floor() as usize).min(10)
             } else {
                 0
             };
             Ok(" ".repeat(count))
         }
-        Value::String(s) => {
+        ValueKind::String(s) => {
             let text = s.to_string_lossy();
             Ok(text.chars().take(10).collect())
         }
-        Value::Object(_) => Ok(String::new()),
+        ValueKind::Object(_) => Ok(String::new()),
         _ => Ok(String::new()),
     }
 }
@@ -681,19 +684,19 @@ fn property_list_from(agent: &mut Agent, replacer: &Value) -> Result<Vec<JsStrin
             &JsString::from_utf8(&index.to_string()),
             replacer.clone(),
         )?;
-        match &item {
-            Value::String(s) => {
-                if !list.contains(s) {
+        match item.kind() {
+            ValueKind::String(s) => {
+                if !list.contains(&s) {
                     list.push(s.as_ref().clone());
                 }
             }
-            Value::Number(n) => {
-                let text = value_to_string(&Value::Number(*n))?;
+            ValueKind::Number(n) => {
+                let text = value_to_string(&Value::Number(n))?;
                 if !list.contains(&text) {
                     list.push(text);
                 }
             }
-            Value::Object(obj) => {
+            ValueKind::Object(obj) => {
                 // spec 26.6.3.1 step 5.e: an object with [[StringData]] or
                 // [[NumberData]] is coerced via ToString (honoring
                 // overrides); any other object is ignored.
@@ -722,8 +725,8 @@ fn serialize_json_property(
     let key_string = JsString::from_utf8(key);
     let mut value = get_property(agent, holder, &key_string, holder.clone())?;
     if matches!(
-        value,
-        Value::Object(_) | Value::Function(_) | Value::BigInt(_)
+        value.kind(),
+        ValueKind::Object(_) | ValueKind::Function(_) | ValueKind::BigInt(_)
     ) {
         let to_json = get_property(agent, &value, &JsString::from_utf8("toJSON"), value.clone())?;
         if is_callable(&to_json) {
@@ -734,7 +737,7 @@ fn serialize_json_property(
         value =
             crate::function::call(agent, replacer_function, holder.clone(), &[str(key), value])?;
     }
-    if let Value::Object(obj) = &value {
+    if let ValueKind::Object(obj) = value.kind() {
         if is_raw_json(agent, &value) {
             let source = raw_json_source(agent, &value).unwrap_or_else(|| JsString::from_utf8(""));
             return Ok(Some(source));
@@ -753,25 +756,25 @@ fn serialize_json_property(
             value = Value::BigInt(Handle::new(big.clone()));
         }
     }
-    match &value {
-        Value::Null => Ok(Some(JsString::from_utf8("null"))),
-        Value::Boolean(true) => Ok(Some(JsString::from_utf8("true"))),
-        Value::Boolean(false) => Ok(Some(JsString::from_utf8("false"))),
-        Value::String(s) => Ok(Some(quote_json_string(s))),
-        Value::Number(n) => {
+    match value.kind() {
+        ValueKind::Null => Ok(Some(JsString::from_utf8("null"))),
+        ValueKind::Boolean(true) => Ok(Some(JsString::from_utf8("true"))),
+        ValueKind::Boolean(false) => Ok(Some(JsString::from_utf8("false"))),
+        ValueKind::String(s) => Ok(Some(quote_json_string(&s))),
+        ValueKind::Number(n) => {
             if n.is_finite() {
-                Ok(Some(crux::number::to_string(*n)))
+                Ok(Some(crux::number::to_string(n)))
             } else {
                 Ok(Some(JsString::from_utf8("null")))
             }
         }
-        Value::BigInt(_) => Err(JsError::new(
+        ValueKind::BigInt(_) => Err(JsError::new(
             ErrorKind::TypeError,
             "Do not know how to serialize a BigInt".into(),
         )),
         // Only non-callable objects are serialized; callable objects,
         // undefined, and symbols are omitted (spec steps 15-16).
-        Value::Object(_) | Value::Function(_) if !is_callable(&value) => {
+        ValueKind::Object(_) | ValueKind::Function(_) if !is_callable(&value) => {
             if crate::builtins::array::is_array(&value) {
                 serialize_json_array(agent, state, &value)
             } else {

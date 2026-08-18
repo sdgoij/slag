@@ -15,7 +15,7 @@ use crux::object::JsObject;
 use crux::ops::same_value;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
-use crux::value::{Value, is_callable};
+use crux::value::{Value, ValueKind, is_callable};
 
 use crate::agent::Agent;
 use crate::context::as_object;
@@ -296,7 +296,7 @@ pub fn dispatch_call(
     if intrinsics.get(WEAK_REF_DEREF).as_ref() == Some(callee) {
         return Some((|| {
             // spec 26.1.3.2: a TypeError unless `this` has a [[Target]] slot.
-            let Value::Object(obj) = this else {
+            let ValueKind::Object(obj) = this.kind() else {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
                     "WeakRef.prototype.deref requires a WeakRef".into(),
@@ -371,7 +371,7 @@ fn finalization_register(
     this: &Value,
     args: &[Value],
 ) -> Result<Value, JsError> {
-    let Value::Object(obj) = this else {
+    let ValueKind::Object(obj) = this.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "FinalizationRegistry.prototype.register requires a registry".into(),
@@ -394,7 +394,7 @@ fn finalization_register(
     }
     let token = args.get(2).cloned().unwrap_or(Value::Undefined);
     let token = match token {
-        Value::Undefined => None,
+        v if v.is_undefined() => None,
         _ => {
             weakly_holdable(agent, &token)?;
             Some(token)
@@ -414,7 +414,7 @@ fn finalization_unregister(
     this: &Value,
     args: &[Value],
 ) -> Result<Value, JsError> {
-    let Value::Object(obj) = this else {
+    let ValueKind::Object(obj) = this.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "FinalizationRegistry.prototype.unregister requires a registry".into(),

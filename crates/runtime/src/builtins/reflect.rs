@@ -10,7 +10,7 @@ use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
-use crux::value::{Value, is_callable, is_constructor};
+use crux::value::{Value, ValueKind, is_callable, is_constructor};
 
 use crate::agent::Agent;
 use crate::context::as_object;
@@ -123,9 +123,9 @@ pub fn dispatch_call(
 
 /// The object half of a Reflect target: `TypeError` for primitives.
 fn object_of(value: &Value) -> Result<Handle<JsObject>, JsError> {
-    match value {
-        Value::Object(obj) => Ok(obj.clone()),
-        Value::Function(f) => f.object.handle().ok_or_else(|| {
+    match value.kind() {
+        ValueKind::Object(obj) => Ok(obj.clone()),
+        ValueKind::Function(f) => f.object.handle().ok_or_else(|| {
             JsError::new(ErrorKind::TypeError, "Reflect target has no object".into())
         }),
         _ => Err(JsError::new(
@@ -140,7 +140,7 @@ fn object_of(value: &Value) -> Result<Handle<JsObject>, JsError> {
 /// function value is an Object (its function-object part reads the
 /// array-like indices).
 fn list_from_array_like(agent: &mut Agent, value: &Value) -> Result<Vec<Value>, JsError> {
-    if !matches!(value, Value::Object(_) | Value::Function(_)) {
+    if !matches!(value.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "argumentsList must be an object".into(),
@@ -186,7 +186,7 @@ fn reflect_method(agent: &mut Agent, name: &str, args: &[Value]) -> Result<Value
                 ));
             }
             let new_target = match arg(2) {
-                Value::Undefined => target.clone(),
+                v if v.is_undefined() => target.clone(),
                 other => {
                     if !is_constructor(&other) {
                         return Err(JsError::new(
@@ -216,7 +216,7 @@ fn reflect_method(agent: &mut Agent, name: &str, args: &[Value]) -> Result<Value
             let obj = object_of(&arg(0))?;
             let key = crate::context::to_property_key(agent, &arg(1))?;
             let receiver = match arg(2) {
-                Value::Undefined => Value::Object(obj.clone()),
+                v if v.is_undefined() => Value::Object(obj.clone()),
                 other => other,
             };
             crate::context::get_property_key(agent, &Value::Object(obj), &key, receiver)
@@ -282,7 +282,7 @@ fn reflect_method(agent: &mut Agent, name: &str, args: &[Value]) -> Result<Value
             let key = crate::context::to_property_key(agent, &arg(1))?;
             let value = arg(2);
             let receiver = match arg(3) {
-                Value::Undefined => Value::Object(obj.clone()),
+                v if v.is_undefined() => Value::Object(obj.clone()),
                 other => other,
             };
             let status = obj.set_with_receiver_key(&key, value, receiver, false)?;
@@ -290,9 +290,9 @@ fn reflect_method(agent: &mut Agent, name: &str, args: &[Value]) -> Result<Value
         }
         "setPrototypeOf" => {
             let obj = object_of(&arg(0))?;
-            let proto = match arg(1) {
-                Value::Object(proto) => Some(proto),
-                Value::Null => None,
+            let proto = match arg(1).kind() {
+                ValueKind::Object(proto) => Some(proto),
+                ValueKind::Null => None,
                 _ => {
                     return Err(JsError::new(
                         ErrorKind::TypeError,

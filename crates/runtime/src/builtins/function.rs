@@ -7,7 +7,7 @@ use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
-use crux::value::{Value, is_callable};
+use crux::value::{Value, ValueKind, is_callable};
 
 use crate::agent::Agent;
 use crate::context::{as_object, get_property_key};
@@ -329,7 +329,7 @@ fn create_dynamic_function(
     param_args: &[Value],
     body_arg: Option<&Value>,
 ) -> Result<Value, JsError> {
-    let new_target = if matches!(new_target, Value::Undefined) {
+    let new_target = if matches!(new_target.kind(), ValueKind::Undefined) {
         ctor.clone()
     } else {
         new_target.clone()
@@ -394,7 +394,7 @@ fn apply(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
     }
     let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
     let arg_array = args.get(1).cloned().unwrap_or(Value::Undefined);
-    if matches!(arg_array, Value::Undefined | Value::Null) {
+    if matches!(arg_array.kind(), ValueKind::Undefined | ValueKind::Null) {
         return crate::function::call(agent, &func, this_arg, &[]);
     }
     let arg_list = create_list_from_array_like(agent, &arg_array)?;
@@ -437,9 +437,9 @@ fn bind(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     // SetFunctionLength (spec steps 4-7): always an own `length`, computed
     // from the target's when it is a Number.
     let mut length = 0.0;
-    let has_length = match &target {
-        Value::Function(f) => f.has_own_property(&JsString::from_utf8("length"))?,
-        Value::Object(obj) => obj.has_own_property(&JsString::from_utf8("length"))?,
+    let has_length = match target.kind() {
+        ValueKind::Function(f) => f.has_own_property(&JsString::from_utf8("length"))?,
+        ValueKind::Object(obj) => obj.has_own_property(&JsString::from_utf8("length"))?,
         _ => false,
     };
     if has_length {
@@ -449,7 +449,7 @@ fn bind(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
             &PropertyKey::from_utf8("length"),
             target.clone(),
         )?;
-        if let Value::Number(number) = target_length {
+        if let ValueKind::Number(number) = target_length.kind() {
             let int = to_integer_or_infinity(number);
             length = if int == f64::INFINITY {
                 f64::INFINITY
@@ -479,8 +479,8 @@ fn bind(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         &PropertyKey::from_utf8("name"),
         target.clone(),
     )?;
-    let target_name = match target_name {
-        Value::String(text) => text.as_ref().clone(),
+    let target_name = match target_name.kind() {
+        ValueKind::String(text) => text.as_ref().clone(),
         _ => JsString::from_utf8(""),
     };
     crate::function::set_function_name(&bound.self_value(), &target_name, Some("bound"))?;
@@ -497,15 +497,15 @@ fn function_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsError>
             "Function.prototype.toString requires a callable this".into(),
         ));
     }
-    if let Value::Function(function) = this
+    if let ValueKind::Function(function) = this.kind()
         && let Some(data) = agent.ecma_functions.get(&function.id())
         && let Some(source) = &data.source
     {
         return Ok(Value::String(Handle::new(source.clone())));
     }
     let name = get_property_key(agent, this, &PropertyKey::from_utf8("name"), this.clone())?;
-    let name = match name {
-        Value::String(text) => text.to_string_lossy(),
+    let name = match name.kind() {
+        ValueKind::String(text) => text.to_string_lossy(),
         _ => String::new(),
     };
     Ok(Value::String(Handle::new(JsString::from_utf8(&format!(
@@ -515,7 +515,7 @@ fn function_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsError>
 
 /// CreateListFromArrayLike (spec 7.3.19): `length` then indexed `Get`s.
 fn create_list_from_array_like(agent: &mut Agent, value: &Value) -> Result<Vec<Value>, JsError> {
-    if !matches!(value, Value::Object(_) | Value::Function(_)) {
+    if !matches!(value.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "CreateListFromArrayLike called on non-object".into(),
@@ -533,7 +533,7 @@ fn create_list_from_array_like(agent: &mut Agent, value: &Value) -> Result<Vec<V
     // property-escape fixtures call `String.fromCodePoint.apply(null, …)`
     // on 10k-element arrays). Read the store once; any accessor or hole
     // falls back to the spec [[Get]] loop.
-    if let Value::Object(obj) = value
+    if let ValueKind::Object(obj) = value.kind()
         && matches!(obj.kind, crux::object::ObjectKind::Array)
     {
         let props = obj.properties.borrow();
@@ -641,7 +641,7 @@ mod tests {
         );
         // apply with undefined/null argArray forwards no arguments.
         let result = value("(function (a, b) { return a + b; }).apply(null, undefined)");
-        assert!(matches!(result, Value::Number(n) if n.is_nan()));
+        assert!(matches!(result.kind(), ValueKind::Number(n) if n.is_nan()));
         // apply with a non-object argArray is a TypeError.
         errors("(function () {}).apply(null, 'x')");
         errors("Function.prototype.call.call(1)");
@@ -667,7 +667,9 @@ mod tests {
             Value::Number(1.0)
         );
         let bound_name = value("(function myFn() {}).bind(null).name");
-        assert!(matches!(bound_name, Value::String(s) if s.to_string_lossy() == "bound myFn"));
+        assert!(
+            matches!(bound_name.kind(), ValueKind::String(s) if s.to_string_lossy() == "bound myFn")
+        );
         errors("Function.prototype.bind.call(1)");
     }
 
@@ -700,8 +702,8 @@ mod tests {
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
         agent.run_script("function C() {}").unwrap();
-        let ctor = match agent.run_script("C").unwrap() {
-            Value::Function(f) => f,
+        let ctor = match agent.run_script("C").unwrap().kind() {
+            ValueKind::Function(f) => f,
             other => panic!("C should be a function, got {other:?}"),
         };
         let key = PropertyKey::Symbol(crux::symbol::well_known("hasInstance").as_ref().clone());
@@ -739,7 +741,7 @@ mod tests {
         assert_eq!(value("Function.prototype()"), Value::Undefined);
         assert_eq!(value("Function.prototype.length"), Value::Number(0.0));
         let name = value("Function.prototype.name");
-        assert!(matches!(name, Value::String(s) if s.to_string_lossy() == ""));
+        assert!(matches!(name.kind(), ValueKind::String(s) if s.to_string_lossy() == ""));
         // Not a constructor.
         errors("new Function.prototype()");
     }
@@ -749,22 +751,22 @@ mod tests {
         // User functions render their exact source text (spec 20.2.3.5).
         let text = value("(function named() { return 1; }).toString()");
         assert!(
-            matches!(text, Value::String(s) if s.to_string_lossy() == "function named() { return 1; }")
+            matches!(text.kind(), ValueKind::String(s) if s.to_string_lossy() == "function named() { return 1; }")
         );
         // Function expressions with whitespace round-trip exactly.
         let text = value("var f = function (a, b) {\n  return a + b;\n}; f.toString()");
         assert!(
-            matches!(text, Value::String(s) if s.to_string_lossy() == "function (a, b) {\n  return a + b;\n}")
+            matches!(text.kind(), ValueKind::String(s) if s.to_string_lossy() == "function (a, b) {\n  return a + b;\n}")
         );
         // Arrow functions have no tracked source (native form).
         let text = value("var g = (x) => x; g.toString()");
         assert!(
-            matches!(text, Value::String(s) if s.to_string_lossy() == "function g() { [native code] }")
+            matches!(text.kind(), ValueKind::String(s) if s.to_string_lossy() == "function g() { [native code] }")
         );
         // %Function.prototype% has an empty name.
         let text = value("Function.prototype.toString()");
         assert!(
-            matches!(text, Value::String(s) if s.to_string_lossy() == "function () { [native code] }")
+            matches!(text.kind(), ValueKind::String(s) if s.to_string_lossy() == "function () { [native code] }")
         );
         errors("Function.prototype.toString.call({})");
     }

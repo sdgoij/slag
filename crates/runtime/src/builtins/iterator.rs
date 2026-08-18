@@ -17,7 +17,7 @@ use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
-use crux::value::{Value, is_callable};
+use crux::value::{Value, ValueKind, is_callable};
 
 use crate::agent::Agent;
 use crate::context::{as_object, get_property, get_property_key, to_string as context_to_string};
@@ -582,7 +582,7 @@ pub fn dispatch_call(
     this: &Value,
     args: &[Value],
 ) -> Option<Result<Value, JsError>> {
-    let Value::Function(_function) = callee else {
+    let ValueKind::Function(_function) = callee.kind() else {
         return None;
     };
     // The iterator-helper `next`/`return` operate on `this`.
@@ -602,7 +602,7 @@ pub fn dispatch_call(
     let realm = agent.current_realm().ok()?;
     let intrinsics = &realm.intrinsics;
     let proto_value = intrinsics.get(ITERATOR_PROTO)?;
-    let Value::Object(proto_obj) = &proto_value else {
+    let ValueKind::Object(proto_obj) = proto_value.kind() else {
         return None;
     };
     let methods: &[(&str, MethodHandler)] = &[
@@ -649,7 +649,7 @@ pub fn dispatch_call(
             agent,
             this,
             args,
-            proto_obj,
+            &proto_obj,
             PropertyKey::from_utf8("constructor"),
         ));
     }
@@ -662,7 +662,7 @@ pub fn dispatch_call(
             agent,
             this,
             args,
-            proto_obj,
+            &proto_obj,
             PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
         ));
     }
@@ -783,7 +783,7 @@ fn iterator_result(agent: &Agent, value: Value, done: bool) -> Result<Value, JsE
 /// GetIteratorDirect (spec 7.4.1): `this` must be an object with a callable
 /// `next` method.
 fn get_iterator_direct(agent: &mut Agent, this: &Value) -> Result<IteratorRecord, JsError> {
-    let (Value::Object(_) | Value::Function(_)) = this else {
+    let (ValueKind::Object(_) | ValueKind::Function(_)) = this.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Iterator method called on a non-object".into(),
@@ -1014,7 +1014,7 @@ fn to_array_method(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<V
 
 fn includes_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     // spec 27.1.3.?: an Object this is required (no ToObject coercion).
-    if !matches!(this, Value::Object(_) | Value::Function(_)) {
+    if !matches!(this.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Iterator.prototype.includes requires an object this".into(),
@@ -1023,9 +1023,10 @@ fn includes_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Va
     let search = args.first().cloned().unwrap_or(Value::Undefined);
     // skippedElements: undefined -> 0; otherwise it must be an integral
     // Number (Infinity allowed) with no coercion, else TypeError + close.
-    let mut to_skip = match args.get(1).cloned() {
-        None | Some(Value::Undefined) => 0.0,
-        Some(Value::Number(n)) => {
+    let mut to_skip = match args.get(1) {
+        None => 0.0,
+        Some(_v) if _v.is_undefined() => 0.0,
+        Some(v) if let Some(n) = v.as_number() => {
             let integral = n.is_infinite() || n.fract() == 0.0;
             if !integral {
                 let error = JsError::new(
@@ -1080,7 +1081,8 @@ fn join_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
     // spec 27.1.3.?: the separator is coerced first, and a coercion error
     // closes the receiver.
     let separator = match args.first() {
-        Some(Value::Undefined) | None => JsString::from_utf8(","),
+        Some(_v) if _v.is_undefined() => JsString::from_utf8(","),
+        None => JsString::from_utf8(","),
         Some(value) => match context_to_string(agent, value) {
             Ok(text) => text,
             Err(e) => return close_this_on_error(agent, this, e),
@@ -1090,9 +1092,9 @@ fn join_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
     let mut parts = Vec::new();
     iterate_eager(agent, &record, 0.0, |agent, value, _counter| {
         // Nullish contents join as the empty string (like Array.prototype.join).
-        let text = match value {
-            Value::Null | Value::Undefined => String::new(),
-            other => context_to_string(agent, &other)?.to_string_lossy(),
+        let text = match value.kind() {
+            ValueKind::Null | ValueKind::Undefined => String::new(),
+            _ => context_to_string(agent, &value)?.to_string_lossy(),
         };
         parts.push(text);
         Ok(None)
@@ -1245,7 +1247,7 @@ fn flat_map_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Va
 /// be an integral Number in [1, 2^32 - 1]. Unlike take/drop, no ToNumber
 /// coercion happens, so user-defined valueOf/toString are never called.
 fn chunk_window_size(arg: &Value) -> Result<f64, JsError> {
-    let Value::Number(size) = arg else {
+    let ValueKind::Number(size) = arg.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "size must be a Number".into(),
@@ -1257,13 +1259,13 @@ fn chunk_window_size(arg: &Value) -> Result<f64, JsError> {
             "size must be an integral Number".into(),
         ));
     }
-    if *size < 1.0 || *size > 4294967295.0 {
+    if !(1.0..=4294967295.0).contains(&size) {
         return Err(JsError::new(
             ErrorKind::RangeError,
             "size must be in the range 1 to 2^32 - 1".into(),
         ));
     }
-    Ok(*size)
+    Ok(size)
 }
 
 /// The take/drop limit (spec 27.1.3.3 steps 2-6 / 27.1.3.6): ToNumber through
@@ -1272,7 +1274,7 @@ fn chunk_window_size(arg: &Value) -> Result<f64, JsError> {
 fn take_drop_limit(agent: &mut Agent, this: &Value, arg: Value) -> Result<f64, JsError> {
     // RequireObjectCoercible (spec 27.1.3.3 step 1): a nullish this fails
     // before the argument is coerced.
-    if !matches!(this, Value::Object(_) | Value::Function(_)) {
+    if !matches!(this.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Iterator.prototype.take/drop requires an object this".into(),
@@ -1296,7 +1298,7 @@ fn take_drop_limit(agent: &mut Agent, this: &Value, arg: Value) -> Result<f64, J
 
 fn chunks_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     // RequireObjectCoercible first (spec 27.1.3.?: step 2).
-    if !matches!(this, Value::Object(_) | Value::Function(_)) {
+    if !matches!(this.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Iterator.prototype.chunks requires an object this".into(),
@@ -1326,7 +1328,7 @@ fn chunks_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Valu
 
 fn windows_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     // RequireObjectCoercible first.
-    if !matches!(this, Value::Object(_) | Value::Function(_)) {
+    if !matches!(this.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Iterator.prototype.windows requires an object this".into(),
@@ -1340,9 +1342,9 @@ fn windows_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
     // undersized defaults to "only-full" and must be one of the two strings.
     let undersized = args.get(1).cloned().unwrap_or(Value::Undefined);
     let mut allow_partial = false;
-    let valid_undersized = match &undersized {
-        Value::Undefined => true,
-        Value::String(text) => {
+    let valid_undersized = match undersized.kind() {
+        ValueKind::Undefined => true,
+        ValueKind::String(text) => {
             let text = text.to_string_lossy();
             allow_partial = text == "allow-partial";
             text == "only-full" || text == "allow-partial"
@@ -1391,7 +1393,7 @@ fn helper_method(
     this: &Value,
     args: &[Value],
 ) -> Result<Value, JsError> {
-    let Value::Object(obj) = this else {
+    let ValueKind::Object(obj) = this.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Iterator helper method called on a non-object".into(),
@@ -1629,7 +1631,7 @@ fn step_helper(agent: &mut Agent, state: &mut HelperState) -> Result<Value, JsEr
                         return Err(e);
                     }
                 };
-                if !matches!(mapped, Value::Object(_) | Value::Function(_)) {
+                if !matches!(mapped.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
                         "flatMap mapper must return an iterable object".into(),
@@ -1729,7 +1731,10 @@ fn step_helper(agent: &mut Agent, state: &mut HelperState) -> Result<Value, JsEr
                 // require an object iterator with a callable next.
                 let iterator =
                     crate::function::call(agent, &item.open_method, item.iterable.clone(), &[])?;
-                if !matches!(iterator, Value::Object(_) | Value::Function(_)) {
+                if !matches!(
+                    iterator.kind(),
+                    ValueKind::Object(_) | ValueKind::Function(_)
+                ) {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
                         "Iterator must be an object".into(),
@@ -1920,8 +1925,8 @@ fn get_iterator_flattenable(
     value: &Value,
     accept_strings: bool,
 ) -> Result<(IteratorRecord, bool), JsError> {
-    if !(matches!(value, Value::Object(_) | Value::Function(_))
-        || accept_strings && matches!(value, Value::String(_)))
+    if !(matches!(value.kind(), ValueKind::Object(_) | ValueKind::Function(_))
+        || accept_strings && matches!(value.kind(), ValueKind::String(_)))
     {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -1943,7 +1948,7 @@ fn get_iterator_flattenable(
         ));
     };
     let iterator = crate::function::call(agent, &method, value.clone(), &[])?;
-    if !matches!(iterator, Value::Object(_)) {
+    if !matches!(iterator.kind(), ValueKind::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Iterator must be an object".into(),
@@ -1990,7 +1995,7 @@ fn wrap_method(
     this: &Value,
     args: &[Value],
 ) -> Result<Value, JsError> {
-    let Value::Object(obj) = this else {
+    let ValueKind::Object(obj) = this.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "WrapForValidIterator method called on a non-object".into(),
@@ -2005,7 +2010,7 @@ fn wrap_method(
     match name {
         NEXT => {
             let result = crate::function::call(agent, &record.next, record.iterator.clone(), args)?;
-            if !matches!(result, Value::Object(_)) {
+            if !matches!(result.kind(), ValueKind::Object(_)) {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
                     "Iterator result is not an object".into(),
@@ -2055,7 +2060,7 @@ fn iterator_concat(agent: &mut Agent, _this: &Value, args: &[Value]) -> Result<V
     // at a time, as iteration reaches it.
     let mut items = Vec::new();
     for value in args {
-        if !matches!(value, Value::Object(_) | Value::Function(_)) {
+        if !matches!(value.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "Iterator.concat requires each item to be an object".into(),
@@ -2097,7 +2102,10 @@ fn iterator_zip(
 ) -> Result<Value, JsError> {
     let iterables = args.first().cloned().unwrap_or(Value::Undefined);
     // spec step 1: the iterables argument must be an Object.
-    if !matches!(iterables, Value::Object(_) | Value::Function(_)) {
+    if !matches!(
+        iterables.kind(),
+        ValueKind::Object(_) | ValueKind::Function(_)
+    ) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Iterator.zip requires an object iterables argument".into(),
@@ -2139,7 +2147,7 @@ fn iterator_zip(
                     return Err(e);
                 }
             };
-            if matches!(value, Value::Undefined) {
+            if matches!(value.kind(), ValueKind::Undefined) {
                 continue;
             }
             let (inner, _) = match get_iterator_flattenable(agent, &value, false) {
@@ -2218,8 +2226,13 @@ fn zip_options(
     options: Option<Value>,
 ) -> Result<(ZipMode, Option<Value>), JsError> {
     let options = match options {
-        None | Some(Value::Undefined) => Value::Object(JsObject::ordinary_object_create(None)),
-        Some(value @ (Value::Object(_) | Value::Function(_))) => value,
+        None => Value::Object(JsObject::ordinary_object_create(None)),
+        Some(value) if value.is_undefined() => {
+            Value::Object(JsObject::ordinary_object_create(None))
+        }
+        Some(value) if matches!(value.kind(), ValueKind::Object(_) | ValueKind::Function(_)) => {
+            value
+        }
         Some(_) => {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -2233,11 +2246,11 @@ fn zip_options(
         &JsString::from_utf8("mode"),
         options.clone(),
     )?;
-    let mode = match &mode_value {
-        Value::Undefined => ZipMode::Shortest,
-        Value::String(text) if text.to_string_lossy() == "shortest" => ZipMode::Shortest,
-        Value::String(text) if text.to_string_lossy() == "longest" => ZipMode::Longest,
-        Value::String(text) if text.to_string_lossy() == "strict" => ZipMode::Strict,
+    let mode = match mode_value.kind() {
+        ValueKind::Undefined => ZipMode::Shortest,
+        ValueKind::String(text) if text.to_string_lossy() == "shortest" => ZipMode::Shortest,
+        ValueKind::String(text) if text.to_string_lossy() == "longest" => ZipMode::Longest,
+        ValueKind::String(text) if text.to_string_lossy() == "strict" => ZipMode::Strict,
         _ => {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -2253,8 +2266,8 @@ fn zip_options(
             options.clone(),
         )?;
         if !matches!(
-            padding,
-            Value::Undefined | Value::Object(_) | Value::Function(_)
+            padding.kind(),
+            ValueKind::Undefined | ValueKind::Object(_) | ValueKind::Function(_)
         ) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -2283,7 +2296,7 @@ fn build_padding(
     let Some(padding_value) = padding_option else {
         return Ok(Vec::new());
     };
-    if matches!(padding_value, Value::Undefined) {
+    if matches!(padding_value.kind(), ValueKind::Undefined) {
         return Ok(Vec::new());
     }
     let record = match get_iterator(agent, &padding_value) {
@@ -2337,7 +2350,7 @@ fn build_keyed_padding(
     let Some(padding_value) = padding_option else {
         return Ok(Vec::new());
     };
-    if matches!(padding_value, Value::Undefined) {
+    if matches!(padding_value.kind(), ValueKind::Undefined) {
         return Ok(Vec::new());
     }
     let mut padding = Vec::with_capacity(keys.len());

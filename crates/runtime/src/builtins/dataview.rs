@@ -12,7 +12,7 @@ use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
 use crux::typed_array::{ElementType, decode_element, encode_element};
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
 use crate::context::{as_object, get_property_key};
@@ -126,7 +126,7 @@ fn data_view_construct(
     args: &[Value],
     new_target: &Value,
 ) -> Result<Value, JsError> {
-    if matches!(new_target, Value::Undefined) {
+    if matches!(new_target.kind(), ValueKind::Undefined) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "DataView must be called with 'new'".into(),
@@ -160,7 +160,17 @@ fn data_view_construct(
         .map(|cell| cell.borrow().byte_length)
         .unwrap_or(0);
     let byte_length = match args.get(2) {
-        None | Some(Value::Undefined) => {
+        None => {
+            // step 8: an omitted length is auto; the offset must still fit.
+            if byte_offset > buffer_byte_length {
+                return Err(JsError::new(
+                    ErrorKind::RangeError,
+                    "byteOffset exceeds the buffer length".into(),
+                ));
+            }
+            None
+        }
+        Some(value) if value.is_undefined() => {
             // step 8: an omitted length is auto; the offset must still fit.
             if byte_offset > buffer_byte_length {
                 return Err(JsError::new(
@@ -689,15 +699,15 @@ mod tests {
     }
 
     fn number(source: &str) -> f64 {
-        match run(source).unwrap() {
-            Value::Number(n) => n,
+        match run(source).unwrap().kind() {
+            ValueKind::Number(n) => n,
             other => panic!("expected a number, got {other:?}"),
         }
     }
 
     fn bool(source: &str) -> bool {
-        match run(source).unwrap() {
-            Value::Boolean(b) => b,
+        match run(source).unwrap().kind() {
+            ValueKind::Boolean(b) => b,
             other => panic!("expected a boolean, got {other:?}"),
         }
     }

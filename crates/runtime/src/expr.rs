@@ -14,7 +14,7 @@ use crux::handle::Handle;
 use crux::ops::{is_strictly_equal, same_value};
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
-use crux::value::{Value, is_callable, type_of};
+use crux::value::{Value, ValueKind, is_callable, type_of};
 use syntax::ast::{
     Argument, ArrayElement, AssignOp, BinaryOp, BindingElement, Expr, ExprKind, Literal, LogicalOp,
     MemberExpr, MemberProperty, ObjectLiteral, ObjectProperty, PropertyName, TemplateLiteral,
@@ -91,7 +91,7 @@ pub fn eval_expr(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Value, 
             // right-hand side must be an object (spec 13.10.3).
             let name_id = crate::context::resolve_private_name(agent, *name)?.id;
             let object = eval_expr(agent, object, strict)?;
-            if !matches!(object, Value::Object(_) | Value::Function(_)) {
+            if !matches!(object.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
                     "Cannot use 'in' operator with a non-object value".into(),
@@ -328,7 +328,7 @@ fn eval_call_chain(
         // one, which is *undefined*) is returned as-is — eval never coerces
         // (S15.1.2.1_A1.1_T2).
         let source = args.first().cloned().unwrap_or(Value::Undefined);
-        let Value::String(source) = source else {
+        let ValueKind::String(source) = source.kind() else {
             return Ok(Some(ChainResult::Value(source)));
         };
         // Only a plain identifier callee makes a direct eval; an optional
@@ -366,7 +366,7 @@ fn nullish_member_error(member: &MemberExpr) -> JsError {
 }
 
 fn is_nullish(value: &Value) -> bool {
-    matches!(value, Value::Undefined | Value::Null)
+    matches!(value.kind(), ValueKind::Undefined | ValueKind::Null)
 }
 
 /// The referenced property key of a member access.
@@ -681,11 +681,11 @@ fn eval_object_literal(
                     )
                     && matches!(&key, PropertyKey::String(id) if crux::lookup(*id).to_string_lossy() == "__proto__");
                 if proto_setter {
-                    match value {
-                        Value::Object(proto) => {
+                    match value.kind() {
+                        ValueKind::Object(proto) => {
                             set_proto_or_throw(&object, Some(proto))?;
                         }
-                        Value::Null => {
+                        ValueKind::Null => {
                             set_proto_or_throw(&object, None)?;
                         }
                         // B.3.1 step 6: a non-object, non-null value sets
@@ -808,10 +808,10 @@ pub(crate) fn copy_data_properties(
     to: &crux::object::JsObject,
     from: &Value,
 ) -> Result<(), JsError> {
-    if matches!(from, Value::Null | Value::Undefined) {
+    if matches!(from.kind(), ValueKind::Null | ValueKind::Undefined) {
         return Ok(());
     }
-    let Value::Object(from_obj) = crate::context::to_object(agent, from)? else {
+    let ValueKind::Object(from_obj) = crate::context::to_object(agent, from)?.kind() else {
         return Ok(());
     };
     for key in from_obj.own_property_keys()? {
@@ -925,9 +925,9 @@ fn eval_unary(
             // [[Call]] is fixed at creation, so a revoked callable proxy still
             // reads "function" (the crux type_of consults the revoked
             // target).
-            let type_name = match &value {
-                Value::Null => "object",
-                Value::Object(obj)
+            let type_name = match value.kind() {
+                ValueKind::Null => "object",
+                ValueKind::Object(obj)
                     if matches!(
                         &obj.kind,
                         crux::object::ObjectKind::Proxy(slots) if slots.callable.get()
@@ -935,7 +935,7 @@ fn eval_unary(
                 {
                     "function"
                 }
-                other => type_of(other),
+                _ => type_of(&value),
             };
             Ok(Value::String(Handle::new(JsString::from_utf8(type_name))))
         }
@@ -946,20 +946,20 @@ fn eval_unary(
         UnaryOp::Minus => {
             let value = eval_expr(agent, operand, strict)?;
             let numeric = to_numeric_operand(agent, &value)?;
-            match numeric {
-                Value::Number(n) => Ok(Value::Number(-n)),
-                Value::BigInt(b) => Ok(Value::BigInt(Handle::new(bigint::unary_minus(&b)))),
+            match numeric.kind() {
+                ValueKind::Number(n) => Ok(Value::Number(-n)),
+                ValueKind::BigInt(b) => Ok(Value::BigInt(Handle::new(bigint::unary_minus(&b)))),
                 _ => unreachable!(),
             }
         }
         UnaryOp::BitNot => {
             let value = eval_expr(agent, operand, strict)?;
             let numeric = to_numeric_operand(agent, &value)?;
-            match numeric {
+            match numeric.kind() {
                 // ToInt32 (mod 2^32), not a saturating cast: ~-2147483649 is
                 // ~2147483647 (S9.5_A2.1_T2).
-                Value::Number(n) => Ok(Value::Number((!to_int32(n)) as f64)),
-                Value::BigInt(b) => Ok(Value::BigInt(Handle::new(bigint::bitwise_not(&b)))),
+                ValueKind::Number(n) => Ok(Value::Number((!to_int32(n)) as f64)),
+                ValueKind::BigInt(b) => Ok(Value::BigInt(Handle::new(bigint::bitwise_not(&b)))),
                 _ => unreachable!(),
             }
         }
@@ -985,17 +985,17 @@ pub(crate) fn eval_unary_value(
         UnaryOp::Plus => Ok(Value::Number(crate::context::to_number(agent, &value)?)),
         UnaryOp::Minus => {
             let numeric = to_numeric_operand(agent, &value)?;
-            match numeric {
-                Value::Number(n) => Ok(Value::Number(-n)),
-                Value::BigInt(b) => Ok(Value::BigInt(Handle::new(bigint::unary_minus(&b)))),
+            match numeric.kind() {
+                ValueKind::Number(n) => Ok(Value::Number(-n)),
+                ValueKind::BigInt(b) => Ok(Value::BigInt(Handle::new(bigint::unary_minus(&b)))),
                 _ => unreachable!(),
             }
         }
         UnaryOp::BitNot => {
             let numeric = to_numeric_operand(agent, &value)?;
-            match numeric {
-                Value::Number(n) => Ok(Value::Number((!to_int32(n)) as f64)),
-                Value::BigInt(b) => Ok(Value::BigInt(Handle::new(bigint::bitwise_not(&b)))),
+            match numeric.kind() {
+                ValueKind::Number(n) => Ok(Value::Number((!to_int32(n)) as f64)),
+                ValueKind::BigInt(b) => Ok(Value::BigInt(Handle::new(bigint::bitwise_not(&b)))),
                 _ => unreachable!(),
             }
         }
@@ -1014,8 +1014,8 @@ fn eval_update(
     let reference = eval_reference(agent, target, strict)?;
     let old = get_reference_value(agent, &reference)?;
     let old_numeric = to_numeric_operand(agent, &old)?;
-    let new = match old_numeric.clone() {
-        Value::Number(n) => {
+    let new = match old_numeric.kind() {
+        ValueKind::Number(n) => {
             let delta = if matches!(op, UpdateOp::Increment) {
                 1.0
             } else {
@@ -1023,7 +1023,7 @@ fn eval_update(
             };
             Value::Number(n + delta)
         }
-        Value::BigInt(b) => {
+        ValueKind::BigInt(b) => {
             let one = crux::BigInt::from(1i64);
             let delta = if matches!(op, UpdateOp::Increment) {
                 one
@@ -1207,7 +1207,7 @@ fn mixed_bigint_error() -> JsError {
 /// ToNumeric with agent-dispatched ToPrimitive for object operands (the
 /// crux `to_numeric` cannot reach the valueOf/toString builtins).
 fn to_numeric_operand(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
-    if matches!(value, Value::Object(_) | Value::Function(_)) {
+    if matches!(value.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         let prim = crate::context::to_primitive(agent, value, ToPrimitiveHint::Number)?;
         to_numeric(&prim)
     } else {
@@ -1225,10 +1225,15 @@ pub(crate) fn apply_binary(
 ) -> Result<Value, JsError> {
     match op {
         BinaryOp::Add => {
+            // Fast path: both operands are already numbers — direct double
+            // addition without the ToPrimitive round-trips.
+            if let (Some(left), Some(right)) = (left.as_number(), right.as_number()) {
+                return Ok(Value::Number(left + right));
+            }
             // Fast path: both operands are already strings — skip the
             // ToPrimitive/ToString round-trips (the Sputnik decodeURI
             // fixtures concatenate millions of small strings).
-            if let (Value::String(left_text), Value::String(right_text)) = (left, right) {
+            if let (Some(left_text), Some(right_text)) = (left.as_string(), right.as_string()) {
                 let mut units = Vec::with_capacity(left_text.len() + right_text.len());
                 units.extend_from_slice(left_text.as_slice());
                 units.extend_from_slice(right_text.as_slice());
@@ -1236,7 +1241,9 @@ pub(crate) fn apply_binary(
             }
             let left_prim = crate::context::to_primitive(agent, left, ToPrimitiveHint::Default)?;
             let right_prim = crate::context::to_primitive(agent, right, ToPrimitiveHint::Default)?;
-            if matches!(left_prim, Value::String(_)) || matches!(right_prim, Value::String(_)) {
+            if matches!(left_prim.kind(), ValueKind::String(_))
+                || matches!(right_prim.kind(), ValueKind::String(_))
+            {
                 // Concatenate at the UTF-16 unit level; a lossy Display path
                 // would replace lone surrogates with U+FFFD.
                 let left_text = crate::context::to_string(agent, &left_prim)?;
@@ -1278,11 +1285,11 @@ pub(crate) fn apply_binary(
         BinaryOp::StrictNotEqual => Ok(Value::Boolean(!is_strictly_equal(left, right))),
         BinaryOp::In => {
             let key = crate::context::to_property_key(agent, left)?;
-            match right {
-                Value::Object(obj) => Ok(Value::Boolean(
-                    crate::module::has_property_with_deferred_trigger(agent, obj, &key)?,
+            match right.kind() {
+                ValueKind::Object(obj) => Ok(Value::Boolean(
+                    crate::module::has_property_with_deferred_trigger(agent, &obj, &key)?,
                 )),
-                Value::Function(f) => Ok(Value::Boolean(
+                ValueKind::Function(f) => Ok(Value::Boolean(
                     crate::module::has_property_with_deferred_trigger(agent, &f.object, &key)?,
                 )),
                 _ => Err(JsError::new(
@@ -1294,7 +1301,7 @@ pub(crate) fn apply_binary(
         BinaryOp::Instanceof => {
             // InstanceofOperator (spec 7.3.20): an @@hasInstance method on the
             // right-hand side overrides the default prototype-chain walk.
-            if !matches!(right, Value::Object(_) | Value::Function(_)) {
+            if !matches!(right.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
                     "Right-hand side of 'instanceof' is not an object".into(),
@@ -1332,7 +1339,7 @@ pub fn ordinary_has_instance(
         return Ok(Value::Boolean(false));
     }
     // spec 7.3.19 step 2: a bound function delegates to its target.
-    if let Value::Function(function) = constructor
+    if let ValueKind::Function(function) = constructor.kind()
         && let crux::function::FunctionKind::Bound { target, .. } = &function.kind
     {
         return ordinary_has_instance(agent, target, value);
@@ -1370,8 +1377,10 @@ pub fn ordinary_has_instance(
 
 /// The `+` operator after ToPrimitive: same-type numeric addition.
 fn numeric_add(left: &Value, right: &Value) -> Result<Value, JsError> {
-    match (left, right) {
-        (Value::BigInt(a), Value::BigInt(b)) => Ok(Value::BigInt(Handle::new(bigint::add(a, b)))),
+    match (left.kind(), right.kind()) {
+        (ValueKind::BigInt(a), ValueKind::BigInt(b)) => {
+            Ok(Value::BigInt(Handle::new(bigint::add(&a, &b))))
+        }
         _ => {
             let left = to_number(left)?;
             let right = to_number(right)?;
@@ -1389,8 +1398,20 @@ fn numeric_binary(
 ) -> Result<Value, JsError> {
     let left = to_numeric_operand(agent, left)?;
     let right = to_numeric_operand(agent, right)?;
-    match (left, right) {
-        (Value::BigInt(a), Value::BigInt(b)) => {
+    // Fast path: plain doubles — direct machine arithmetic.
+    if let (Some(left), Some(right)) = (left.as_number(), right.as_number()) {
+        let result = match op {
+            BinaryOp::Sub => left - right,
+            BinaryOp::Mul => left * right,
+            BinaryOp::Div => left / right,
+            BinaryOp::Rem => left % right,
+            BinaryOp::Exp => number_exponentiate(left, right),
+            _ => unreachable!("non-arithmetic op"),
+        };
+        return Ok(Value::Number(result));
+    }
+    match (left.kind(), right.kind()) {
+        (ValueKind::BigInt(a), ValueKind::BigInt(b)) => {
             let result = match op {
                 BinaryOp::Sub => bigint::subtract(&a, &b),
                 BinaryOp::Mul => bigint::multiply(&a, &b),
@@ -1417,7 +1438,7 @@ fn numeric_binary(
             };
             Ok(Value::BigInt(Handle::new(result)))
         }
-        (Value::Number(a), Value::Number(b)) => {
+        (ValueKind::Number(a), ValueKind::Number(b)) => {
             let result = match op {
                 BinaryOp::Sub => a - b,
                 BinaryOp::Mul => a * b,
@@ -1428,9 +1449,8 @@ fn numeric_binary(
             };
             Ok(Value::Number(result))
         }
-        (Value::BigInt(_), Value::Number(_)) | (Value::Number(_), Value::BigInt(_)) => {
-            Err(mixed_bigint_error())
-        }
+        (ValueKind::BigInt(_), ValueKind::Number(_))
+        | (ValueKind::Number(_), ValueKind::BigInt(_)) => Err(mixed_bigint_error()),
         _ => unreachable!("ToNumeric produces Number or BigInt"),
     }
 }
@@ -1511,8 +1531,8 @@ fn bitwise_binary(
 ) -> Result<Value, JsError> {
     let left = to_numeric_operand(agent, left)?;
     let right = to_numeric_operand(agent, right)?;
-    match (left, right) {
-        (Value::BigInt(a), Value::BigInt(b)) => {
+    match (left.kind(), right.kind()) {
+        (ValueKind::BigInt(a), ValueKind::BigInt(b)) => {
             if matches!(op, BinaryOp::UnsignedRightShift) {
                 return Err(mixed_bigint_error());
             }
@@ -1527,7 +1547,7 @@ fn bitwise_binary(
             };
             Ok(Value::BigInt(Handle::new(result)))
         }
-        (Value::Number(a), Value::Number(b)) => {
+        (ValueKind::Number(a), ValueKind::Number(b)) => {
             let result = match op {
                 BinaryOp::LeftShift => (to_int32(a) << (to_uint32(b) & 0x1F)) as f64,
                 BinaryOp::RightShift => (to_int32(a) >> (to_uint32(b) & 0x1F)) as f64,
@@ -1539,9 +1559,8 @@ fn bitwise_binary(
             };
             Ok(Value::Number(result))
         }
-        (Value::BigInt(_), Value::Number(_)) | (Value::Number(_), Value::BigInt(_)) => {
-            Err(mixed_bigint_error())
-        }
+        (ValueKind::BigInt(_), ValueKind::Number(_))
+        | (ValueKind::Number(_), ValueKind::BigInt(_)) => Err(mixed_bigint_error()),
         _ => unreachable!("ToNumeric produces Number or BigInt"),
     }
 }
@@ -1567,34 +1586,41 @@ fn abstract_relational(
         let left_prim = crate::context::to_primitive(agent, left, ToPrimitiveHint::Number)?;
         (left_prim, right_prim)
     };
-    if let (Value::String(a), Value::String(b)) = (&left_prim, &right_prim) {
+    // Fast path: plain doubles — direct comparison.
+    if let (Some(a), Some(b)) = (left_prim.as_number(), right_prim.as_number()) {
+        if a.is_nan() || b.is_nan() {
+            return Ok(None);
+        }
+        return Ok(Some(a < b));
+    }
+    if let (Some(a), Some(b)) = (left_prim.as_string(), right_prim.as_string()) {
         return Ok(Some(a.as_slice() < b.as_slice()));
     }
     // spec 7.2.11 steps 4-5: a BigInt and a String compare by StringToBigInt;
     // a non-integer string makes the relation undefined. The type check uses
     // the ToPrimitive results, not the ToNumeric results below.
-    if let (Value::BigInt(a), Value::String(b)) = (&left_prim, &right_prim) {
-        return Ok(crux::convert::string_to_bigint(b).map(|ny| bigint::less_than(a, &ny)));
+    if let (Some(a), Some(b)) = (left_prim.as_bigint(), right_prim.as_string()) {
+        return Ok(crux::convert::string_to_bigint(&b).map(|ny| bigint::less_than(&a, &ny)));
     }
-    if let (Value::String(a), Value::BigInt(b)) = (&left_prim, &right_prim) {
-        return Ok(crux::convert::string_to_bigint(a).map(|nx| bigint::less_than(&nx, b)));
+    if let (Some(a), Some(b)) = (left_prim.as_string(), right_prim.as_bigint()) {
+        return Ok(crux::convert::string_to_bigint(&a).map(|nx| bigint::less_than(&nx, &b)));
     }
     let left_num = to_numeric(&left_prim)?;
     let right_num = to_numeric(&right_prim)?;
-    match (&left_num, &right_num) {
-        (Value::BigInt(a), Value::BigInt(b)) => Ok(Some(bigint::less_than(a, b))),
-        (Value::Number(a), Value::Number(b)) => {
+    match (left_num.kind(), right_num.kind()) {
+        (ValueKind::BigInt(a), ValueKind::BigInt(b)) => Ok(Some(bigint::less_than(&a, &b))),
+        (ValueKind::Number(a), ValueKind::Number(b)) => {
             if a.is_nan() || b.is_nan() {
                 Ok(None)
             } else {
                 Ok(Some(a < b))
             }
         }
-        (Value::BigInt(a), Value::Number(b)) => {
-            Ok(bigint_number_cmp(a, *b)?.map(|o| o == std::cmp::Ordering::Less))
+        (ValueKind::BigInt(a), ValueKind::Number(b)) => {
+            Ok(bigint_number_cmp(&a, b)?.map(|o| o == std::cmp::Ordering::Less))
         }
-        (Value::Number(a), Value::BigInt(b)) => {
-            Ok(bigint_number_cmp(b, *a)?.map(|o| o == std::cmp::Ordering::Greater))
+        (ValueKind::Number(a), ValueKind::BigInt(b)) => {
+            Ok(bigint_number_cmp(&b, a)?.map(|o| o == std::cmp::Ordering::Greater))
         }
         _ => unreachable!("ToNumeric produces Number or BigInt"),
     }
@@ -1607,13 +1633,13 @@ fn abstract_relational(
 fn abstract_loosely_equal(agent: &mut Agent, left: &Value, right: &Value) -> Result<bool, JsError> {
     // spec 7.2.15 steps 1-2: an [[IsHTMLDDA]] object is loosely equal to
     // null/undefined before any ToPrimitive runs.
-    if is_htmldda(left) && matches!(right, Value::Null | Value::Undefined)
-        || is_htmldda(right) && matches!(left, Value::Null | Value::Undefined)
+    if is_htmldda(left) && matches!(right.kind(), ValueKind::Null | ValueKind::Undefined)
+        || is_htmldda(right) && matches!(left.kind(), ValueKind::Null | ValueKind::Undefined)
     {
         return Ok(true);
     }
-    let left_obj = matches!(left, Value::Object(_) | Value::Function(_));
-    let right_obj = matches!(right, Value::Object(_) | Value::Function(_));
+    let left_obj = matches!(left.kind(), ValueKind::Object(_) | ValueKind::Function(_));
+    let right_obj = matches!(right.kind(), ValueKind::Object(_) | ValueKind::Function(_));
     if left_obj && right_obj {
         return Ok(is_strictly_equal(left, right));
     }
@@ -1630,13 +1656,13 @@ fn abstract_loosely_equal(agent: &mut Agent, left: &Value, right: &Value) -> Res
     // spec 7.2.15 steps 6-7: a BigInt and a String compare by StringToBigInt.
     // The crux `is_loosely_equal` uses a variant that rejects the empty
     // string, which StringToBigInt maps to 0n.
-    if let (Value::BigInt(a), Value::String(s)) = (&left_prim, &right_prim) {
-        return Ok(crux::convert::string_to_bigint(s).is_some_and(|n| {
+    if let (ValueKind::BigInt(a), ValueKind::String(s)) = (left_prim.kind(), right_prim.kind()) {
+        return Ok(crux::convert::string_to_bigint(&s).is_some_and(|n| {
             is_strictly_equal(&Value::BigInt(Handle::new(n)), &Value::BigInt(a.clone()))
         }));
     }
-    if let (Value::String(s), Value::BigInt(b)) = (&left_prim, &right_prim) {
-        return Ok(crux::convert::string_to_bigint(s).is_some_and(|n| {
+    if let (ValueKind::String(s), ValueKind::BigInt(b)) = (left_prim.kind(), right_prim.kind()) {
+        return Ok(crux::convert::string_to_bigint(&s).is_some_and(|n| {
             is_strictly_equal(&Value::BigInt(Handle::new(n)), &Value::BigInt(b.clone()))
         }));
     }
@@ -1646,8 +1672,8 @@ fn abstract_loosely_equal(agent: &mut Agent, left: &Value, right: &Value) -> Res
 /// Whether the value is the host's `$262.IsHTMLDDA` (Annex B.3.7).
 fn is_htmldda(value: &Value) -> bool {
     matches!(
-        value,
-        Value::Object(obj) if matches!(obj.kind, crux::object::ObjectKind::IsHTMLDDA)
+        value.kind(),
+        ValueKind::Object(obj) if matches!(obj.kind, crux::object::ObjectKind::IsHTMLDDA)
     )
 }
 
@@ -1914,7 +1940,7 @@ pub fn get_iterator(agent: &mut Agent, value: &Value) -> Result<IteratorRecord, 
         ));
     };
     let iterator = crate::function::call(agent, &method, value.clone(), &[])?;
-    if !matches!(iterator, Value::Object(_)) {
+    if !matches!(iterator.kind(), ValueKind::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Iterator must be an object".into(),
@@ -1966,7 +1992,7 @@ pub fn iterator_step(
 ) -> Result<Option<Value>, JsError> {
     let next = iterator_next_method(agent, iterator)?;
     let result = crate::function::call(agent, &next, iterator.iterator.clone(), &[])?;
-    if !matches!(result, Value::Object(_)) {
+    if !matches!(result.kind(), ValueKind::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Iterator result is not an object".into(),
@@ -2005,7 +2031,7 @@ pub fn iterator_close_throw(agent: &mut Agent, iterator: &IteratorRecord) -> Res
         Ok(method) => method,
         Err(_) => return Ok(()),
     };
-    if matches!(return_method, Value::Undefined | Value::Null) {
+    if matches!(return_method.kind(), ValueKind::Undefined | ValueKind::Null) {
         return Ok(());
     }
     let _ = crate::function::call(agent, &return_method, iterator.iterator.clone(), &[]);
@@ -2023,11 +2049,11 @@ pub(crate) fn iterator_close_inner(
         &JsString::from_utf8("return"),
         iterator.iterator.clone(),
     )?;
-    if matches!(return_method, Value::Undefined | Value::Null) {
+    if matches!(return_method.kind(), ValueKind::Undefined | ValueKind::Null) {
         return Ok(());
     }
     let result = crate::function::call(agent, &return_method, iterator.iterator.clone(), &[])?;
-    if !completion_is_throw && !matches!(result, Value::Object(_)) {
+    if !completion_is_throw && !matches!(result.kind(), ValueKind::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Iterator result return is not an object".into(),
@@ -2072,9 +2098,9 @@ pub fn get_method(
             .clone(),
     );
     let method = get_property_key(agent, value, &key, value.clone())?;
-    match method {
-        Value::Undefined | Value::Null => Ok(None),
-        v if is_callable(&v) => Ok(Some(v)),
+    match method.kind() {
+        ValueKind::Undefined | ValueKind::Null => Ok(None),
+        _ if is_callable(&method) => Ok(Some(method)),
         _ => Err(JsError::new(
             ErrorKind::TypeError,
             format!("{symbol_name} is not a function"),

@@ -11,7 +11,7 @@ use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
 use crate::context::as_object;
@@ -142,7 +142,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             // the GeneratorFunction prototype object (the "Generator" in
             // `Object.getPrototypeOf(g)`), so `G.prototype.constructor === G`
             // (GeneratorPrototype/constructor.js).
-            if let Value::Object(instance_obj) = &instance_proto {
+            if let ValueKind::Object(instance_obj) = instance_proto.kind() {
                 instance_obj.define_property(
                     &JsString::from_utf8("constructor"),
                     &PropertyDescriptor {
@@ -268,7 +268,7 @@ fn create_dynamic_function(
     args: &[Value],
     kind: Kind,
 ) -> Result<Value, JsError> {
-    let new_target = if matches!(new_target, Value::Undefined) {
+    let new_target = if matches!(new_target.kind(), ValueKind::Undefined) {
         ctor.clone()
     } else {
         new_target.clone()

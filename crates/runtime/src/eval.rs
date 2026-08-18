@@ -11,7 +11,7 @@ use crux::error::{ErrorKind, JsError};
 use crux::handle::Handle;
 use crux::property::PropertyKey;
 use crux::string::JsString;
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 use syntax::ast::{
     BindingPattern, ExprKind, ForBinding, ForInit, Program, Stmt, StmtKind, VarDeclKind,
 };
@@ -348,7 +348,7 @@ pub(crate) fn create_disposable_resource(
     value: &Value,
     kind: DisposalKind,
 ) -> Result<crate::env::DisposableResource, JsError> {
-    if matches!(value, Value::Null | Value::Undefined) {
+    if matches!(value.kind(), ValueKind::Null | ValueKind::Undefined) {
         return Ok(crate::env::DisposableResource {
             value: Value::Undefined,
             method: Value::Undefined,
@@ -377,7 +377,7 @@ pub(crate) fn create_disposable_resource(
         method = crate::expr::get_method(agent, value, "@@dispose")?;
     }
     let method = method.unwrap_or(Value::Undefined);
-    if matches!(method, Value::Undefined) {
+    if matches!(method.kind(), ValueKind::Undefined) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Object is not disposable".into(),
@@ -409,7 +409,7 @@ pub(crate) fn dispose_env_resources(
     }
     let mut completion = completion;
     for resource in resources.iter().rev() {
-        if matches!(resource.method, Value::Undefined) {
+        if resource.method.is_undefined() {
             continue;
         }
         match crate::function::call(agent, &resource.method, resource.value.clone(), &[]) {
@@ -1001,7 +1001,7 @@ fn for_in_key_levels_inner(agent: &mut Agent, rhs: &Value) -> Result<Vec<(usize,
             current = obj.get_prototype_of()?;
             level += 1;
         }
-    } else if let Value::String(text) = rhs {
+    } else if let Some(text) = rhs.as_string() {
         // ToObject of a primitive string: its own enumerable index keys.
         for index in 0..text.len() {
             keys.push((
@@ -1009,7 +1009,7 @@ fn for_in_key_levels_inner(agent: &mut Agent, rhs: &Value) -> Result<Vec<(usize,
                 Value::String(Handle::new(JsString::from_utf8(&index.to_string()))),
             ));
         }
-    } else if matches!(rhs, Value::Undefined | Value::Null) {
+    } else if matches!(rhs.kind(), ValueKind::Undefined | ValueKind::Null) {
         return Ok(Vec::new());
     }
     Ok(keys)
@@ -1023,10 +1023,10 @@ fn key_enumerable_at_level(
     level: usize,
     key: &Value,
 ) -> Result<bool, JsError> {
-    let Value::String(key) = key else {
+    let ValueKind::String(key) = key.kind() else {
         return Ok(false);
     };
-    let key = PropertyKey::from_js_string(key);
+    let key = PropertyKey::from_js_string(key.as_ref());
     let mut current = Some(obj.clone());
     for _ in 0..level {
         let Some(next) = current else {
@@ -1691,7 +1691,7 @@ mod tests {
         agent.run_script("function f() {}").unwrap();
         let global = agent.running_context().unwrap().realm.global_object.clone();
         let value = global.get(&JsString::from_utf8("f")).unwrap();
-        assert!(matches!(value, Value::Function(_)));
+        assert!(matches!(value.kind(), ValueKind::Function(_)));
     }
 
     #[test]
@@ -1855,7 +1855,7 @@ mod tests {
     #[test]
     fn array_and_object_literals() {
         let arr = run("[1, 2, 3]").unwrap();
-        assert!(matches!(arr, Value::Object(_)));
+        assert!(matches!(arr.kind(), ValueKind::Object(_)));
         assert_eq!(
             run("let a = [1, 2, 3]; a[0] + a[2]").unwrap(),
             Value::Number(4.0)
@@ -1947,12 +1947,12 @@ mod tests {
             Some(JsString::from_utf8("add")),
             2,
             Box::new(|_, args| {
-                let a = match args.first() {
-                    Some(Value::Number(n)) => *n,
+                let a = match args.first().map(|v| v.kind()) {
+                    Some(ValueKind::Number(n)) => n,
                     _ => 0.0,
                 };
-                let b = match args.get(1) {
-                    Some(Value::Number(n)) => *n,
+                let b = match args.get(1).map(|v| v.kind()) {
+                    Some(ValueKind::Number(n)) => n,
                     _ => 0.0,
                 };
                 Ok(Value::Number(a + b))
@@ -1974,8 +1974,8 @@ mod tests {
         let getter = crux::Function::create_builtin(
             Some(JsString::from_utf8("getX")),
             0,
-            Box::new(|this, _| match this {
-                Value::Object(obj) => obj.get(&JsString::from_utf8("x")),
+            Box::new(|this, _| match this.kind() {
+                ValueKind::Object(obj) => obj.get(&JsString::from_utf8("x")),
                 _ => Ok(Value::Undefined),
             }),
             None,

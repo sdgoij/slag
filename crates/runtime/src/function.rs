@@ -10,7 +10,7 @@ use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::PropertyDescriptor;
 use crux::string::JsString;
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 use syntax::ast::{
     ArrowBody, BindingElement, BindingPattern, Block, Expr, ExprKind, Literal, Stmt, StmtKind,
 };
@@ -263,7 +263,7 @@ pub fn set_function_name(
     name: &JsString,
     prefix: Option<&str>,
 ) -> Result<(), JsError> {
-    let Value::Function(function) = function else {
+    let ValueKind::Function(function) = function.kind() else {
         return Ok(());
     };
     let own = function
@@ -279,13 +279,9 @@ pub fn set_function_name(
     let placeholder = match own {
         None => true,
         Some(crux::object::Property {
-            kind:
-                crux::object::PropertyKind::Data {
-                    value: Value::String(value),
-                    ..
-                },
+            kind: crux::object::PropertyKind::Data { value, .. },
             ..
-        }) => value.is_empty(),
+        }) => value.as_string().is_some_and(|s| s.is_empty()),
         _ => false,
     };
     if !placeholder {
@@ -577,7 +573,7 @@ fn instantiate_class_constructor_with(
         None,
     )?;
     if default_derived
-        && let Value::Function(function) = &function
+        && let Some(function) = function.as_function()
         && let Some(data) = agent.ecma_functions.get_mut(&function.id())
     {
         data.default_derived = true;
@@ -588,7 +584,7 @@ fn instantiate_class_constructor_with(
 /// MakeMethod (spec 10.2.12): attach the [[HomeObject]] slot that `super`
 /// property access resolves through.
 pub fn make_method(agent: &mut Agent, function: &Value, home_object: Value) -> Result<(), JsError> {
-    let Value::Function(function) = function else {
+    let ValueKind::Function(function) = function.kind() else {
         return Ok(());
     };
     let Some(data) = agent.ecma_functions.get_mut(&function.id()) else {
@@ -865,7 +861,7 @@ pub fn instantiate_dynamic_function(
         Some(strict),
     )?;
     // GetPrototypeFromConstructor wins over the default %Function.prototype%.
-    let Value::Function(function) = &value else {
+    let ValueKind::Function(function) = value.kind() else {
         unreachable!("register_function returns a function");
     };
     function.object.set_prototype_of(Some(proto))?;
@@ -1010,8 +1006,8 @@ fn call_inner(
     // is always the owning one, so the (cached) owning-realm lookup is
     // skipped on every call.
     if agent.realms.borrow().len() > 1
-        && let Value::Function(function) = callee
-        && let Some(owning) = owning_realm(agent, function)
+        && let ValueKind::Function(function) = callee.kind()
+        && let Some(owning) = owning_realm(agent, &function)
         && owning.global_object.id() != agent.current_realm()?.global_object.id()
     {
         agent.push_bootstrap_context(owning);
@@ -1029,8 +1025,8 @@ fn call_inner(
         agent.execution_context_stack.pop();
         return result;
     }
-    match callee {
-        Value::Function(function) => match &function.kind {
+    match callee.kind() {
+        ValueKind::Function(function) => match &function.kind {
             crux::function::FunctionKind::EcmaScript => {
                 if let Some(data) = agent.ecma_functions.get(&function.id())
                     && data.is_class_constructor
@@ -1058,13 +1054,13 @@ fn call_inner(
                 let saved_depth = agent.field_initializer_depth;
                 agent.field_initializer_depth = if marked { saved_depth + 1 } else { 0 };
                 let result = if is_async_gen {
-                    crate::async_generator::call_async_generator(agent, function, this, args)
+                    crate::async_generator::call_async_generator(agent, &function, this, args)
                 } else if is_async {
-                    crate::async_await::call_async_function(agent, function, this, args)
+                    crate::async_await::call_async_function(agent, &function, this, args)
                 } else if is_generator {
-                    crate::generator::call_generator(agent, function, this, args)
+                    crate::generator::call_generator(agent, &function, this, args)
                 } else {
-                    ordinary_call(agent, function, this, args)
+                    ordinary_call(agent, &function, this, args)
                 };
                 agent.field_initializer_depth = saved_depth;
                 result
@@ -1231,8 +1227,8 @@ fn construct_inner(
 ) -> Result<Value, JsError> {
     // Cross-realm builtin constructors (`new $262.createRealm().global.Array`)
     // dispatch with their own realm current, like `call_inner`.
-    if let Value::Function(function) = callee
-        && let Some(owning) = owning_realm(agent, function)
+    if let ValueKind::Function(function) = callee.kind()
+        && let Some(owning) = owning_realm(agent, &function)
         && owning.global_object.id() != agent.current_realm()?.global_object.id()
     {
         agent.push_bootstrap_context(owning);
@@ -1249,8 +1245,8 @@ fn construct_inner(
         agent.execution_context_stack.pop();
         return result;
     }
-    match callee {
-        Value::Function(function) => match &function.kind {
+    match callee.kind() {
+        ValueKind::Function(function) => match &function.kind {
             crux::function::FunctionKind::EcmaScript => {
                 // Generator, async, and async-generator functions have no
                 // [[Construct]] (spec 27.4.2/27.5.2/27.6.2 FunctionAllocate);
@@ -1271,7 +1267,7 @@ fn construct_inner(
                     .is_some_and(|data| data.class_field_initializer);
                 let saved_depth = agent.field_initializer_depth;
                 agent.field_initializer_depth = if marked { saved_depth + 1 } else { 0 };
-                let result = ordinary_construct(agent, function, args, new_target);
+                let result = ordinary_construct(agent, &function, args, new_target);
                 agent.field_initializer_depth = saved_depth;
                 result
             }
@@ -1429,7 +1425,7 @@ fn is_constructible_data(data: &EcmaFunction) -> bool {
 /// check reports every ECMAScript function as constructible; the slots above
 /// narrow it (a class extends an arrow, or `new` on a method, must throw).
 pub fn is_constructor(agent: &Agent, value: &Value) -> bool {
-    let Value::Function(function) = value else {
+    let ValueKind::Function(function) = value.kind() else {
         return crux::value::is_constructor(value);
     };
     match &function.kind {
@@ -1509,13 +1505,13 @@ fn ordinary_call(
         // binds nothing.
         if this_mode != ThisMode::Lexical {
             let this = if this_mode == ThisMode::Sloppy {
-                match this {
-                    Value::Undefined | Value::Null => {
+                match this.kind() {
+                    ValueKind::Undefined | ValueKind::Null => {
                         let global = agent.running_context()?.realm.global_object.clone();
                         Value::Object(global)
                     }
-                    Value::Object(_) | Value::Function(_) => this,
-                    other => crate::context::to_object(agent, &other)?,
+                    ValueKind::Object(_) | ValueKind::Function(_) => this,
+                    _ => crate::context::to_object(agent, &this)?,
                 }
             } else {
                 this
@@ -1572,8 +1568,8 @@ fn evaluate_body(agent: &mut Agent, body: &Block, strict: bool) -> Result<Value,
 /// (spec 10.5.13): its internal methods all throw a TypeError.
 fn is_revoked_proxy(value: &Value) -> bool {
     matches!(
-        value,
-        Value::Object(obj)
+        value.kind(),
+        ValueKind::Object(obj)
             if matches!(&obj.kind, crux::object::ObjectKind::Proxy(slots) if slots.target.borrow().is_none())
     )
 }
@@ -1703,10 +1699,10 @@ fn ordinary_construct(
         // constructor falls back to `this`; a derived constructor returns the
         // `super()`-bound `this` (or throws on any other value).
         match completed {
-            Completion::Return(value) => match value {
-                Value::Object(_) | Value::Function(_) => Ok(value),
+            Completion::Return(value) => match value.kind() {
+                ValueKind::Object(_) | ValueKind::Function(_) => Ok(value),
                 _ if derived => {
-                    if matches!(value, Value::Undefined) {
+                    if matches!(value.kind(), ValueKind::Undefined) {
                         function_env.get_this_binding()
                     } else {
                         Err(JsError::new(
@@ -1747,14 +1743,14 @@ pub fn initialize_instance_elements(
     obj: &Value,
     ctor: &Value,
 ) -> Result<(), JsError> {
-    let Value::Function(ctor) = ctor else {
+    let ValueKind::Function(ctor) = ctor.kind() else {
         return Ok(());
     };
     let data = agent.ecma_functions.get(&ctor.id()).cloned();
     let Some(data) = data else {
         return Ok(());
     };
-    let Value::Object(obj) = obj else {
+    let ValueKind::Object(obj) = obj.kind() else {
         return Ok(());
     };
     // Private methods/accessors first (spec 7.3.27 step 1); both private
@@ -1813,7 +1809,7 @@ pub fn initialize_instance_elements(
             // DefineField on a deferred namespace: the receiver descriptor
             // read triggers the module's evaluation (import-defer
             // [[DefineOwnProperty]] step 2 — the [[GetOwnProperty]] probe).
-            crate::module::ensure_deferred_namespace_evaluation_key(agent, obj, &field.name)?;
+            crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, &field.name)?;
             obj.create_data_property_or_throw_key(&field.name, value)?;
         }
     }

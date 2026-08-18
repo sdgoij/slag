@@ -11,7 +11,7 @@ use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
 
@@ -611,7 +611,7 @@ impl ObjectEnv {
         // truthy value.
         let unscopables_key = PropertyKey::Symbol(crux::symbol::unscopables().as_ref().clone());
         let unscopables = self.binding_object.get_key(&unscopables_key)?;
-        if let Value::Object(unscopables_obj) = unscopables
+        if let ValueKind::Object(unscopables_obj) = unscopables.kind()
             && crux::convert::to_boolean(&unscopables_obj.get(name)?)
         {
             return Ok(false);
@@ -747,7 +747,7 @@ impl FunctionEnv {
     fn function_object_has_home_object(&self, agent: &Agent) -> bool {
         // spec 9.2.1.10: `[[FunctionObject]].[[HomeObject]]` is not
         // *undefined* — the function was defined as a method.
-        let Value::Function(function) = &self.function_object else {
+        let ValueKind::Function(function) = self.function_object.kind() else {
             return false;
         };
         agent
@@ -1216,7 +1216,10 @@ mod tests {
         let global = JsObject::ordinary_object_create(None);
         let env = new_global_environment(global.clone(), global.clone());
         assert!(env.has_this_binding());
-        assert!(matches!(env.get_this_binding().unwrap(), Value::Object(_)));
+        assert!(matches!(
+            env.get_this_binding().unwrap().kind(),
+            ValueKind::Object(_)
+        ));
         // Lexical bindings go to the declarative record...
         env.create_mutable_binding(&name("let_x"), false).unwrap();
         env.initialize_binding(&name("let_x"), Value::Number(1.0))

@@ -5,7 +5,7 @@ use crux::function::Function;
 use crux::handle::Handle;
 use crux::property::PropertyDescriptor;
 use crux::string::JsString;
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
 use crate::realm::Realm;
@@ -334,8 +334,8 @@ fn cmp(a: i128, b: i128) -> i64 {
 
 /// spec 8.5.3 ToTemporalInstant.
 pub fn to_temporal_instant(agent: &mut Agent, item: &Value) -> Result<i128, JsError> {
-    if matches!(item, Value::Object(_) | Value::Function(_)) {
-        if let Value::Object(obj) = item
+    if matches!(item.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
+        if let ValueKind::Object(obj) = item.kind()
             && let Some(record) = agent.temporal_data.get(&obj.id())
         {
             match record {
@@ -348,7 +348,7 @@ pub fn to_temporal_instant(agent: &mut Agent, item: &Value) -> Result<i128, JsEr
         // toString yields a source string that then fails to parse.
         let prim =
             crate::context::to_primitive(agent, item, crux::convert::ToPrimitiveHint::String)?;
-        if !matches!(prim, Value::String(_)) {
+        if !matches!(prim.kind(), ValueKind::String(_)) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "value must be a string or Temporal.Instant".into(),
@@ -356,7 +356,7 @@ pub fn to_temporal_instant(agent: &mut Agent, item: &Value) -> Result<i128, JsEr
         }
         return instant_from_string(agent, &prim);
     }
-    if !matches!(item, Value::String(_)) {
+    if !matches!(item.kind(), ValueKind::String(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "value must be a string or Temporal.Instant".into(),
@@ -488,13 +488,13 @@ fn add_subtract(
 /// spec 8.3.9 `round`.
 fn round(agent: &mut Agent, this: &Value, round_to: &Value) -> Result<Value, JsError> {
     let ns = require_instant(agent, this)?;
-    if matches!(round_to, Value::Undefined) {
+    if matches!(round_to.kind(), ValueKind::Undefined) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "roundTo is required".into(),
         ));
     }
-    let round_to = if let Value::String(text) = round_to {
+    let round_to = if let ValueKind::String(text) = round_to.kind() {
         let obj = crux::object::JsObject::ordinary_object_create(None);
         obj.create_data_property_or_throw(
             &JsString::from_utf8("smallestUnit"),
@@ -655,7 +655,7 @@ fn to_string_impl(agent: &mut Agent, this: &Value, options: &Value) -> Result<Va
         &JsString::from_utf8("timeZone"),
         resolved.clone(),
     )?;
-    let time_zone = if matches!(time_zone, Value::Undefined) {
+    let time_zone = if matches!(time_zone.kind(), ValueKind::Undefined) {
         None
     } else {
         Some(to_temporal_time_zone_identifier(agent, &time_zone)?)
@@ -745,12 +745,12 @@ pub fn to_temporal_time_zone_identifier(
     agent: &mut Agent,
     value: &Value,
 ) -> Result<String, JsError> {
-    if let Value::Object(obj) = value
+    if let ValueKind::Object(obj) = value.kind()
         && let Some(TemporalRecord::ZonedDateTime(_, tz)) = agent.temporal_data.get(&obj.id())
     {
         return Ok(tz.to_string_lossy());
     }
-    if !matches!(value, Value::String(_)) {
+    if !matches!(value.kind(), ValueKind::String(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "time zone must be a string".into(),
@@ -847,7 +847,7 @@ pub fn to_constructor_time_zone_identifier(
     agent: &mut Agent,
     value: &Value,
 ) -> Result<String, JsError> {
-    if !matches!(value, Value::String(_)) {
+    if !matches!(value.kind(), ValueKind::String(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "time zone must be a string".into(),

@@ -10,7 +10,7 @@ use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::PropertyDescriptor;
 use crux::string::JsString;
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
 use crate::context::as_object;
@@ -154,7 +154,7 @@ pub fn dispatch_call(
 fn module_source_to_string_tag(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     // spec 28.3.3.2 steps 1-3: a non-object receiver, or one without a
     // [[ModuleSourceClassName]] internal slot, reads as *undefined*.
-    let Value::Object(obj) = this else {
+    let ValueKind::Object(obj) = this.kind() else {
         return Ok(Value::Undefined);
     };
     let Some(module) = agent.module_sources.get(&obj.id()).cloned() else {
@@ -170,7 +170,7 @@ fn module_source_to_string_tag(agent: &mut Agent, this: &Value) -> Result<Value,
 }
 
 fn module_source_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
-    let Value::Object(obj) = this else {
+    let ValueKind::Object(obj) = this.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "AbstractModuleSource.prototype.toString requires a ModuleSource".into(),

@@ -14,7 +14,7 @@ use crux::ops::{is_strictly_equal, same_value_zero};
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
 use crux::typed_array::{ContentType, ElementType, SharedBuffer};
-use crux::value::{Value, is_callable, is_constructor};
+use crux::value::{Value, ValueKind, is_callable, is_constructor};
 
 use crate::agent::Agent;
 use crate::context::{as_object, get_property};
@@ -168,16 +168,16 @@ fn key(index: u64) -> JsString {
 
 /// IsTypedArray (spec 25.2.4.4): an Integer-Indexed exotic object.
 fn is_typed_array(value: &Value) -> bool {
-    match value {
-        Value::Object(obj) => matches!(obj.kind, ObjectKind::IntegerIndexed(_)),
+    match value.kind() {
+        ValueKind::Object(obj) => matches!(obj.kind, ObjectKind::IntegerIndexed(_)),
         _ => false,
     }
 }
 
 /// The Integer-Indexed slots of a TypedArray value.
 fn typed_array_slots(value: &Value) -> Option<Handle<TypedArraySlots>> {
-    match value {
-        Value::Object(obj) => match &obj.kind {
+    match value.kind() {
+        ValueKind::Object(obj) => match &obj.kind {
             ObjectKind::IntegerIndexed(slots) => Some(slots.clone()),
             _ => None,
         },
@@ -272,8 +272,8 @@ fn typed_array_buffer_detached(agent: &Agent, slots: &TypedArraySlots) -> bool {
 /// IsArrayBuffer: an object registered in the buffer table (Phase 14 adds
 /// the full ArrayBuffer builtin; Phase 12 buffers back TypedArrays).
 fn is_array_buffer(agent: &Agent, value: &Value) -> bool {
-    match value {
-        Value::Object(obj) => agent.buffer_data.contains_key(&obj.id()),
+    match value.kind() {
+        ValueKind::Object(obj) => agent.buffer_data.contains_key(&obj.id()),
         _ => false,
     }
 }
@@ -285,12 +285,12 @@ fn get(agent: &mut Agent, value: &Value, name: &JsString) -> Result<Value, JsErr
 
 /// Set (spec 7.3.3) with `throw = true`.
 fn set_property(value: &Value, name: &JsString, v: Value) -> Result<(), JsError> {
-    match value {
-        Value::Object(obj) => {
+    match value.kind() {
+        ValueKind::Object(obj) => {
             obj.set(name, v, true)?;
             Ok(())
         }
-        Value::Function(function) => {
+        ValueKind::Function(function) => {
             function.object.set(name, v, true)?;
             Ok(())
         }
@@ -389,7 +389,8 @@ fn allocate_typed_array_buffer(
 /// The clamped end of `slice`/`fill`/`copyWithin` (undefined means `len`).
 fn clamped_end(agent: &mut Agent, args: &[Value], len: u64) -> Result<u64, JsError> {
     match args.get(1) {
-        None | Some(Value::Undefined) => Ok(len),
+        None => Ok(len),
+        Some(value) if value.is_undefined() => Ok(len),
         Some(value) => {
             let n = to_integer_or_infinity(crate::context::to_number(agent, value)?);
             Ok(if n < 0.0 {
@@ -457,10 +458,10 @@ fn species_constructor(
     default_ctor: Value,
 ) -> Result<Value, JsError> {
     let ctor = get(agent, exemplar, &JsString::from_utf8("constructor"))?;
-    if matches!(ctor, Value::Undefined) {
+    if matches!(ctor.kind(), ValueKind::Undefined) {
         return Ok(default_ctor);
     }
-    if !is_constructor(&ctor) && !matches!(ctor, Value::Object(_)) {
+    if !is_constructor(&ctor) && !matches!(ctor.kind(), ValueKind::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "constructor is not an object".into(),
@@ -468,9 +469,9 @@ fn species_constructor(
     }
     let species_key = PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone());
     let species = crate::context::get_property_key(agent, &ctor, &species_key, ctor.clone())?;
-    match species {
-        Value::Null | Value::Undefined => Ok(default_ctor),
-        value if is_constructor(&value) => Ok(value),
+    match species.kind() {
+        ValueKind::Null | ValueKind::Undefined => Ok(default_ctor),
+        _ if is_constructor(&species) => Ok(species),
         _ => Err(JsError::new(
             ErrorKind::TypeError,
             "species is not a constructor".into(),
@@ -568,7 +569,7 @@ fn typed_array_construct(
     new_target: &Value,
     element_type: ElementType,
 ) -> Result<Value, JsError> {
-    if matches!(new_target, Value::Undefined) {
+    if matches!(new_target.kind(), ValueKind::Undefined) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "TypedArray constructors must be invoked with 'new'".into(),
@@ -583,7 +584,7 @@ fn typed_array_construct(
     // read, so e.g. `new TA(Symbol())` throws the ToIndex TypeError first
     // (spec 25.2.2.1).
     if let Some(first) = args.first()
-        && !matches!(first, Value::Object(_) | Value::Function(_))
+        && !matches!(first.kind(), ValueKind::Object(_) | ValueKind::Function(_))
         && args.len() == 1
     {
         let length = crate::context::to_index(agent, first)? as usize;
@@ -595,7 +596,7 @@ fn typed_array_construct(
         return allocate_typed_array_buffer(agent, prototype, element_type, 0);
     }
     if let Some(first) = args.first()
-        && matches!(first, Value::Object(_) | Value::Function(_))
+        && matches!(first.kind(), ValueKind::Object(_) | ValueKind::Function(_))
     {
         if is_typed_array(first) && args.len() == 1 {
             return copy_typed_array(agent, prototype, element_type, first);
@@ -704,7 +705,7 @@ fn typed_array_buffer_path(
     buffer: &Value,
     args: &[Value],
 ) -> Result<Value, JsError> {
-    let Value::Object(buffer_object) = buffer else {
+    let ValueKind::Object(buffer_object) = buffer.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "ArrayBuffer expected".into(),
@@ -726,7 +727,8 @@ fn typed_array_buffer_path(
     };
     let element_size = element_type.size();
     let byte_offset = match args.first() {
-        None | Some(Value::Undefined) => 0,
+        None => 0,
+        Some(value) if value.is_undefined() => 0,
         Some(value) => {
             let offset = crate::context::to_index(agent, value)? as usize;
             if !offset.is_multiple_of(element_size) {
@@ -751,7 +753,7 @@ fn typed_array_buffer_path(
             "ArrayBuffer is detached".into(),
         ));
     }
-    let explicit_length = args.len() > 1 && !matches!(args[1], Value::Undefined);
+    let explicit_length = args.len() > 1 && !matches!(args[1].kind(), ValueKind::Undefined);
     let byte_length = if explicit_length {
         let length = crate::context::to_index(agent, &args[1])? as usize;
         // The length coercion may have detached the buffer (spec 25.2.2.1
@@ -1247,7 +1249,8 @@ fn join(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     let slots = validate_typed_array(agent, this)?;
     let length = typed_array_effective_length(&slots) as u64;
     let separator = match args.first() {
-        Some(Value::Undefined) | None => ",".to_string(),
+        Some(value) if value.is_undefined() => ",".to_string(),
+        None => ",".to_string(),
         Some(value) => crate::context::to_string(agent, value)?.to_string_lossy(),
     };
     let mut result = String::new();
@@ -1256,7 +1259,7 @@ fn join(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
             result.push_str(&separator);
         }
         let element = get(agent, this, &key(k))?;
-        let text = if matches!(element, Value::Undefined | Value::Null) {
+        let text = if matches!(element.kind(), ValueKind::Undefined | ValueKind::Null) {
             String::new()
         } else {
             crate::context::to_string(agent, &element)?.to_string_lossy()
@@ -1439,7 +1442,8 @@ fn set(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
     if is_typed_array(&source) {
         let source_slots = validate_typed_array(agent, &source)?;
         let offset = match args.get(1) {
-            None | Some(Value::Undefined) => 0,
+            None => 0,
+            Some(value) if value.is_undefined() => 0,
             Some(value) => crate::context::to_index(agent, value)? as usize,
         };
         if offset > target_length {
@@ -1492,7 +1496,8 @@ fn set(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
     let source_object = crate::context::to_object(agent, &source)?;
     let source_length = length_of_array_like(agent, &source_object)? as usize;
     let offset = match args.get(1) {
-        None | Some(Value::Undefined) => 0,
+        None => 0,
+        Some(value) if value.is_undefined() => 0,
         Some(value) => crate::context::to_index(agent, value)? as usize,
     };
     if typed_array_buffer_detached(agent, &target_slots) {
@@ -1593,8 +1598,8 @@ fn typed_sort_compare(
     x: &Value,
     y: &Value,
 ) -> Result<f64, JsError> {
-    let x_nan = matches!(x, Value::Number(n) if n.is_nan());
-    let y_nan = matches!(y, Value::Number(n) if n.is_nan());
+    let x_nan = matches!(x.kind(), ValueKind::Number(n) if n.is_nan());
+    let y_nan = matches!(y.kind(), ValueKind::Number(n) if n.is_nan());
     if x_nan && y_nan {
         return Ok(0.0);
     }
@@ -1604,14 +1609,16 @@ fn typed_sort_compare(
     if y_nan {
         return Ok(-1.0);
     }
-    if !matches!(comparefn, Value::Undefined) {
+    if !matches!(comparefn.kind(), ValueKind::Undefined) {
         let v = crate::function::call(agent, comparefn, Value::Undefined, &[x.clone(), y.clone()])?;
         let v = crate::context::to_number(agent, &v)?;
         return Ok(if v.is_nan() { 0.0 } else { v });
     }
-    let order = match (x, y) {
-        (Value::BigInt(a), Value::BigInt(b)) => a.as_ref().0.cmp(&b.as_ref().0),
-        (Value::Number(a), Value::Number(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+    let order = match (x.kind(), y.kind()) {
+        (ValueKind::BigInt(a), ValueKind::BigInt(b)) => a.as_ref().0.cmp(&b.as_ref().0),
+        (ValueKind::Number(a), ValueKind::Number(b)) => {
+            a.partial_cmp(&b).unwrap_or(Ordering::Equal)
+        }
         _ => {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -1662,7 +1669,7 @@ fn sort_indexed_properties(
 fn sort(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let slots = validate_typed_array_write(agent, this)?;
     let comparefn = args.first().cloned().unwrap_or(Value::Undefined);
-    if !matches!(comparefn, Value::Undefined) && !is_callable(&comparefn) {
+    if !matches!(comparefn.kind(), ValueKind::Undefined) && !is_callable(&comparefn) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "TypedArray.prototype.sort: comparefn is not a function".into(),
@@ -1686,7 +1693,7 @@ fn subarray(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
     let count = end.saturating_sub(begin);
     let new_byte_offset = slots.byte_offset + begin as usize * slots.element_type.size();
     let buffer = slots.buffer_object.clone();
-    if slots.auto_length && matches!(args.get(1), None | Some(Value::Undefined)) {
+    if slots.auto_length && args.get(1).is_none_or(|v| v.is_undefined()) {
         // An auto-length view with no explicit end yields an auto-length
         // result: species create with « buffer, byteOffset » (spec 25.2.3.30
         // step 15).
@@ -1716,7 +1723,7 @@ fn to_locale_string(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<
             result.push(',');
         }
         let element = get(agent, this, &key(k))?;
-        if matches!(element, Value::Undefined | Value::Null) {
+        if matches!(element.kind(), ValueKind::Undefined | ValueKind::Null) {
             continue;
         }
         let boxed = crate::context::to_object(agent, &element)?;
@@ -1743,7 +1750,7 @@ fn to_reversed(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value
 fn to_sorted(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let slots = validate_typed_array(agent, this)?;
     let comparefn = args.first().cloned().unwrap_or(Value::Undefined);
-    if !matches!(comparefn, Value::Undefined) && !is_callable(&comparefn) {
+    if !matches!(comparefn.kind(), ValueKind::Undefined) && !is_callable(&comparefn) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "TypedArray.prototype.toSorted: comparefn is not a function".into(),
@@ -1863,7 +1870,7 @@ fn from(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     let items = args.first().cloned().unwrap_or(Value::Undefined);
     let mapfn = args.get(1).cloned().unwrap_or(Value::Undefined);
     let this_arg = args.get(2).cloned().unwrap_or(Value::Undefined);
-    let mapping = !matches!(mapfn, Value::Undefined);
+    let mapping = !matches!(mapfn.kind(), ValueKind::Undefined);
     if mapping && !is_callable(&mapfn) {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -2067,7 +2074,8 @@ fn syntax_error(message: &str) -> JsError {
 /// empty object, otherwise ToObject.
 fn get_options_object(agent: &mut Agent, arg: Option<&Value>) -> Result<Value, JsError> {
     match arg {
-        None | Some(Value::Undefined) | Some(Value::Null) => {
+        None => Ok(Value::Object(JsObject::ordinary_object_create(None))),
+        Some(v) if v.is_undefined() || v.is_null() => {
             Ok(Value::Object(JsObject::ordinary_object_create(None)))
         }
         Some(value) => crate::context::to_object(agent, value),
@@ -2078,9 +2086,9 @@ fn get_options_object(agent: &mut Agent, arg: Option<&Value>) -> Result<Value, J
 /// anything but a String equal to "base64"/"base64url" is a TypeError.
 fn base64_alphabet_option(agent: &mut Agent, options: &Value) -> Result<&'static [u8], JsError> {
     let alphabet = get(agent, options, &JsString::from_utf8("alphabet"))?;
-    match alphabet {
-        Value::Undefined => Ok(base64_alphabet(false)),
-        Value::String(text) => match text.to_string_lossy().as_str() {
+    match alphabet.kind() {
+        ValueKind::Undefined => Ok(base64_alphabet(false)),
+        ValueKind::String(text) => match text.to_string_lossy().as_str() {
             "base64" => Ok(base64_alphabet(false)),
             "base64url" => Ok(base64_alphabet(true)),
             _ => Err(JsError::new(
@@ -2109,9 +2117,9 @@ fn last_chunk_handling_option(
     options: &Value,
 ) -> Result<LastChunkHandling, JsError> {
     let handling = get(agent, options, &JsString::from_utf8("lastChunkHandling"))?;
-    match handling {
-        Value::Undefined => Ok(LastChunkHandling::Loose),
-        Value::String(text) => match text.to_string_lossy().as_str() {
+    match handling.kind() {
+        ValueKind::Undefined => Ok(LastChunkHandling::Loose),
+        ValueKind::String(text) => match text.to_string_lossy().as_str() {
             "loose" => Ok(LastChunkHandling::Loose),
             "strict" => Ok(LastChunkHandling::Strict),
             "stop-before-partial" => Ok(LastChunkHandling::StopBeforePartial),
@@ -2130,13 +2138,15 @@ fn last_chunk_handling_option(
 /// The string argument of the hex/base64 methods: a raw String check that
 /// throws a TypeError instead of coercing (spec 25.2.4.4-5, 25.2.4.7-8).
 fn string_arg(args: &[Value]) -> Result<Handle<JsString>, JsError> {
-    match args.first() {
-        Some(Value::String(string)) => Ok(string.clone()),
-        _ => Err(JsError::new(
-            ErrorKind::TypeError,
-            "The string argument must be a String".into(),
-        )),
+    if let Some(value) = args.first()
+        && let ValueKind::String(string) = value.kind()
+    {
+        return Ok(string.clone());
     }
+    Err(JsError::new(
+        ErrorKind::TypeError,
+        "The string argument must be a String".into(),
+    ))
 }
 
 /// SkipAsciiWhitespace (spec 25.2.4.6): TAB/LF/FF/CR/SPACE only.
@@ -2875,8 +2885,8 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             realm
                 .intrinsics
                 .get("%Function.prototype%")
-                .and_then(|value| match value {
-                    Value::Function(function) => function.object.handle(),
+                .and_then(|value| match value.kind() {
+                    ValueKind::Function(function) => function.object.handle(),
                     _ => None,
                 })
         {
@@ -3171,22 +3181,22 @@ mod tests {
     }
 
     fn text(source: &str) -> String {
-        match run(source).unwrap() {
-            Value::String(s) => s.to_string_lossy(),
+        match run(source).unwrap().kind() {
+            ValueKind::String(s) => s.to_string_lossy(),
             other => panic!("expected a string, got {other:?}"),
         }
     }
 
     fn number(source: &str) -> f64 {
-        match run(source).unwrap() {
-            Value::Number(n) => n,
+        match run(source).unwrap().kind() {
+            ValueKind::Number(n) => n,
             other => panic!("expected a number, got {other:?}"),
         }
     }
 
     fn bool(source: &str) -> bool {
-        match run(source).unwrap() {
-            Value::Boolean(b) => b,
+        match run(source).unwrap().kind() {
+            ValueKind::Boolean(b) => b,
             other => panic!("expected a boolean, got {other:?}"),
         }
     }

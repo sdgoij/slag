@@ -12,7 +12,7 @@ use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::PropertyDescriptor;
 use crux::string::JsString;
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
 use crate::context::as_object;
@@ -38,9 +38,9 @@ fn placeholder(name: &'static str) -> NativeFn {
 
 /// spec 21.1.3.1 ThisNumberValue: a Number or a Number wrapper object.
 fn this_number_value(agent: &Agent, this: &Value) -> Result<f64, JsError> {
-    match this {
-        Value::Number(n) => Ok(*n),
-        Value::Object(obj) => {
+    match this.kind() {
+        ValueKind::Number(n) => Ok(n),
+        ValueKind::Object(obj) => {
             // %Number.prototype% wraps 0 per spec (21.1.3.1); the agent tables
             // are populated only by `new Number(v)`.
             let is_prototype = agent
@@ -100,13 +100,13 @@ fn number_argument(agent: &mut Agent, value: &Value) -> Result<f64, JsError> {
     // converts to its numeric value while Symbol throws (crux ToNumber rejects
     // both and cannot reach the agent's dispatch).
     let prim = crate::context::to_primitive(agent, value, ToPrimitiveHint::Number)?;
-    match prim {
-        Value::BigInt(b) => Ok(b.as_ref().to_f64()),
-        Value::Symbol(_) => Err(JsError::new(
+    match prim.kind() {
+        ValueKind::BigInt(b) => Ok(b.as_ref().to_f64()),
+        ValueKind::Symbol(_) => Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert a Symbol value to a number".into(),
         )),
-        other => to_number(&other),
+        _ => to_number(&prim),
     }
 }
 
@@ -140,7 +140,7 @@ fn to_fixed(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
     // spec 21.1.3.4 step 1: ThisNumberValue — a Number object or primitive.
     let number = this_number_value(agent, this)?;
     let fraction = args.first().cloned().unwrap_or(Value::Undefined);
-    let fraction_count = if matches!(fraction, Value::Undefined) {
+    let fraction_count = if matches!(fraction.kind(), ValueKind::Undefined) {
         0.0
     } else {
         to_integer_or_infinity(crate::context::to_number(agent, &fraction)?)
@@ -208,7 +208,7 @@ fn to_exponential(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
     // spec 21.1.3.3 step 1: ThisNumberValue — a Number object or primitive.
     let number = this_number_value(agent, this)?;
     let fraction = args.first().cloned().unwrap_or(Value::Undefined);
-    let f_is_undefined = matches!(fraction, Value::Undefined);
+    let f_is_undefined = matches!(fraction.kind(), ValueKind::Undefined);
     let fraction_count = if f_is_undefined {
         0.0
     } else {
@@ -252,7 +252,7 @@ fn to_precision(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     // spec 21.1.3.6 step 1: ThisNumberValue — a Number object or primitive.
     let number = this_number_value(agent, this)?;
     let precision = args.first().cloned().unwrap_or(Value::Undefined);
-    if matches!(precision, Value::Undefined) {
+    if matches!(precision.kind(), ValueKind::Undefined) {
         return Ok(number_to_string(number));
     }
     let precision_count = to_integer_or_infinity(crate::context::to_number(agent, &precision)?);
@@ -314,7 +314,7 @@ fn to_string_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
     // spec 21.1.3.2 step 1: ThisNumberValue — a Number object or primitive.
     let number = this_number_value(agent, this)?;
     let radix = args.first().cloned().unwrap_or(Value::Undefined);
-    let radix_value = if matches!(radix, Value::Undefined) {
+    let radix_value = if matches!(radix.kind(), ValueKind::Undefined) {
         10.0
     } else {
         to_integer_or_infinity(crate::context::to_number(agent, &radix)?)
@@ -341,31 +341,33 @@ type StaticFn = fn(&Value, &[Value]) -> Result<Value, JsError>;
 /// spec 21.1.2.4 Number.isFinite: only Number values, no coercion.
 fn is_finite(_this: &Value, args: &[Value]) -> Result<Value, JsError> {
     Ok(Value::Boolean(
-        matches!(args.first(), Some(Value::Number(n)) if n.is_finite()),
+        matches!(args.first(), Some(v) if matches!(v.kind(), ValueKind::Number(n) if n.is_finite())),
     ))
 }
 
 /// spec 21.1.2.6 Number.isNaN.
 fn is_nan(_this: &Value, args: &[Value]) -> Result<Value, JsError> {
     Ok(Value::Boolean(
-        matches!(args.first(), Some(Value::Number(n)) if n.is_nan()),
+        matches!(args.first(), Some(v) if matches!(v.kind(), ValueKind::Number(n) if n.is_nan())),
     ))
 }
 
 /// spec 21.1.2.5 Number.isInteger.
 fn is_integer(_this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    Ok(Value::Boolean(
-        matches!(args.first(), Some(Value::Number(n)) if n.is_finite() && n.trunc() == *n),
-    ))
+    Ok(Value::Boolean(matches!(
+        args.first(),
+        Some(v) if matches!(v.kind(), ValueKind::Number(n) if n.is_finite() && n.trunc() == n)
+    )))
 }
 
 /// spec 21.1.2.7 Number.isSafeInteger.
 fn is_safe_integer(_this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    Ok(Value::Boolean(
-        matches!(args.first(), Some(Value::Number(n)) if n.is_finite()
-        && n.trunc() == *n
-        && n.abs() <= 9007199254740991.0),
-    ))
+    Ok(Value::Boolean(matches!(
+        args.first(),
+        Some(v) if matches!(v.kind(), ValueKind::Number(n) if n.is_finite()
+            && n.trunc() == n
+            && n.abs() <= 9007199254740991.0)
+    )))
 }
 
 /// Install the Number intrinsics and the global `Number` binding (spec
@@ -453,14 +455,13 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         ("isNaN", 1, is_nan),
         ("isSafeInteger", 1, is_safe_integer),
     ];
-    let function_proto =
-        realm
-            .intrinsics
-            .get("%Function.prototype%")
-            .and_then(|value| match value {
-                Value::Function(function) => function.object.handle(),
-                _ => None,
-            });
+    let function_proto = realm
+        .intrinsics
+        .get("%Function.prototype%")
+        .and_then(|value| match value.kind() {
+            ValueKind::Function(function) => function.object.handle(),
+            _ => None,
+        });
     for (name, length, body) in statics {
         let func = Function::create_builtin(
             Some(JsString::from_utf8(name)),
@@ -602,22 +603,22 @@ mod tests {
     }
 
     fn text(source: &str) -> String {
-        match run(source).unwrap() {
-            Value::String(s) => s.to_string_lossy(),
+        match run(source).unwrap().kind() {
+            ValueKind::String(s) => s.to_string_lossy(),
             other => panic!("expected a string, got {other:?}"),
         }
     }
 
     fn number(source: &str) -> f64 {
-        match run(source).unwrap() {
-            Value::Number(n) => n,
+        match run(source).unwrap().kind() {
+            ValueKind::Number(n) => n,
             other => panic!("expected a number, got {other:?}"),
         }
     }
 
     fn bool(source: &str) -> bool {
-        match run(source).unwrap() {
-            Value::Boolean(b) => b,
+        match run(source).unwrap().kind() {
+            ValueKind::Boolean(b) => b,
             other => panic!("expected a boolean, got {other:?}"),
         }
     }

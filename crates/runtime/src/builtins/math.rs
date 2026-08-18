@@ -11,7 +11,7 @@ use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
 use crate::context::as_object;
@@ -389,7 +389,7 @@ fn sub_magnitude(a: &mut Vec<u64>, b: &[u64]) {
 /// Numbers, with the spec's plus/minus-infinity and minus-zero state machine.
 fn sum_precise(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
     let items = args.first().cloned().unwrap_or(Value::Undefined);
-    if matches!(items, Value::Undefined | Value::Null) {
+    if matches!(items.kind(), ValueKind::Undefined | ValueKind::Null) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert undefined or null to object".into(),
@@ -418,7 +418,7 @@ fn sum_precise(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
             let _ = crate::expr::iterator_close(agent, &iterator);
             return Err(err);
         }
-        let Value::Number(n) = value else {
+        let ValueKind::Number(n) = value.kind() else {
             let err = JsError::new(
                 ErrorKind::TypeError,
                 "Math.sumPrecise requires Number values".into(),
@@ -709,8 +709,8 @@ mod tests {
     }
 
     fn number(source: &str) -> f64 {
-        match run(source).unwrap() {
-            Value::Number(n) => n,
+        match run(source).unwrap().kind() {
+            ValueKind::Number(n) => n,
             other => panic!("expected a number, got {other:?}"),
         }
     }
@@ -938,8 +938,11 @@ mod tests {
                     Value::Function(iterator_method),
                 )
                 .unwrap();
-            match sum_precise(&mut agent, &[Value::Object(iterable)]).unwrap() {
-                Value::Number(n) => n,
+            match sum_precise(&mut agent, &[Value::Object(iterable)])
+                .unwrap()
+                .kind()
+            {
+                ValueKind::Number(n) => n,
                 other => panic!("expected a number, got {other:?}"),
             }
         };

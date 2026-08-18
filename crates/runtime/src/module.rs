@@ -12,7 +12,7 @@ use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::PropertyKey;
 use crux::string::JsString;
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 
 use syntax::ast::{
     Argument, ArrayElement, AttributeKey, BindingPattern, Class, ClassElement, ClassElementName,
@@ -1014,7 +1014,7 @@ fn instantiate_module_declarations(
             // The function's `import.meta` resolves lexically to this module
             // (spec 13.3.7.1); instantiation runs in the harness context, so
             // record the declaring module explicitly.
-            if let Value::Function(handle) = &func
+            if let ValueKind::Function(handle) = func.kind()
                 && let Some(record) = agent.ecma_functions.get_mut(&handle.id())
             {
                 record.declaring_module = Some(module.clone());
@@ -1646,7 +1646,7 @@ pub fn dispatch_deferred_module_then(
     _this: &Value,
     args: &[Value],
 ) -> Option<Result<Value, JsError>> {
-    let Value::Function(function) = callee else {
+    let ValueKind::Function(function) = callee.kind() else {
         return None;
     };
     let module = agent.deferred_module_thens.get(&function.id()).cloned()?;
@@ -1802,7 +1802,7 @@ pub fn dispatch_deferred_module_wait(
     callee: &Value,
     args: &[Value],
 ) -> Option<Result<Value, JsError>> {
-    let Value::Function(function) = callee else {
+    let ValueKind::Function(function) = callee.kind() else {
         return None;
     };
     let (wait_id, is_reject) = agent
@@ -2585,7 +2585,7 @@ pub fn dynamic_import(
     // undefined").
     let mut parsed_attributes: Vec<(AttributeKey, JsString)> = Vec::new();
     if let Some(options) = options
-        && !matches!(options, Value::Undefined)
+        && !matches!(options.kind(), ValueKind::Undefined)
     {
         let attributes = match import_attributes(agent, options) {
             Ok(attributes) => attributes,
@@ -2685,7 +2685,7 @@ pub fn dynamic_import(
 }
 
 fn is_promise_value(agent: &Agent, value: &Value) -> bool {
-    let Value::Object(obj) = value else {
+    let ValueKind::Object(obj) = value.kind() else {
         return false;
     };
     agent.promises.contains_key(&obj.id())
@@ -2721,7 +2721,7 @@ pub fn dispatch_import_resolver(
     callee: &Value,
     args: &[Value],
 ) -> Option<Result<Value, JsError>> {
-    let Value::Function(function) = callee else {
+    let ValueKind::Function(function) = callee.kind() else {
         return None;
     };
     let (resolve, namespace) = agent
@@ -2769,7 +2769,7 @@ fn import_attributes(
     // The attributes are the `with` property's own enumerable string keys
     // (spec 13.3.10.2 / import-attributes): the options object itself is the
     // envelope, not the attribute map.
-    let Value::Object(_) = options else {
+    let ValueKind::Object(_) = options.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "import options must be an object".into(),
@@ -2781,10 +2781,10 @@ fn import_attributes(
         &JsString::from_utf8("with"),
         options.clone(),
     )?;
-    if matches!(with, Value::Undefined) {
+    if matches!(with.kind(), ValueKind::Undefined) {
         return Ok(Vec::new());
     }
-    let Value::Object(with_obj) = with else {
+    let ValueKind::Object(with_obj) = with.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "import attributes must be an object".into(),
@@ -2804,7 +2804,7 @@ fn import_attributes(
         let name = crux::lookup(id);
         let value = with_obj.get(&name)?;
         // spec: attribute values must already be strings — no coercion.
-        let Value::String(text) = value else {
+        let ValueKind::String(text) = value.kind() else {
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "import attribute value must be a string".into(),
@@ -2867,7 +2867,7 @@ mod tests {
 
     /// The settled value of a promise (or the value itself if not a promise).
     fn settled(agent: &Agent, value: &Value) -> Result<Value, JsError> {
-        let Value::Object(obj) = value else {
+        let ValueKind::Object(obj) = value.kind() else {
             return Ok(value.clone());
         };
         let Some(data) = agent.promises.get(&obj.id()) else {
@@ -3249,6 +3249,6 @@ mod tests {
         assert_eq!(*b.status.borrow(), ModuleStatus::Evaluated);
         assert_eq!(*m.status.borrow(), ModuleStatus::Evaluated);
         let settled = settled(&agent, &m_promise);
-        assert!(matches!(settled, Ok(Value::Undefined)));
+        assert!(matches!(settled, Ok(v) if v.is_undefined()));
     }
 }

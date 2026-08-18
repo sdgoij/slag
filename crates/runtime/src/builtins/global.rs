@@ -8,7 +8,7 @@ use crux::error::{ErrorKind, JsError};
 use crux::function::Function;
 use crux::handle::Handle;
 use crux::string::JsString;
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 
 use crate::realm::Realm;
 
@@ -57,14 +57,13 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     // CreateBuiltinFunction (spec 10.2.3 step 1): the [[Prototype]] defaults
     // to %Function.prototype%. The realm's post-pass only links intrinsics,
     // and these functions live on the global object, so set it here.
-    let function_proto =
-        realm
-            .intrinsics
-            .get("%Function.prototype%")
-            .and_then(|value| match value {
-                Value::Function(function) => function.object.handle(),
-                _ => None,
-            });
+    let function_proto = realm
+        .intrinsics
+        .get("%Function.prototype%")
+        .and_then(|value| match value.kind() {
+            ValueKind::Function(function) => function.object.handle(),
+            _ => None,
+        });
     for (name, length, call) in [
         (
             "isFinite",
@@ -502,7 +501,7 @@ mod tests {
     }
 
     fn is_nan_value(value: &Value) -> bool {
-        matches!(value, Value::Number(n) if n.is_nan())
+        matches!(value.kind(), ValueKind::Number(n) if n.is_nan())
     }
 
     #[test]
