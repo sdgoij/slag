@@ -8,6 +8,7 @@ members = [
     "crates/parser",
     "crates/regexp",
     "crates/runtime",
+    "crates/ffi",
     "crates/cli",
     "crates/test262",
 ]

@@ -8,6 +8,7 @@ pub mod convert;
 pub mod error;
 pub mod function;
 pub mod handle;
+pub mod host;
 pub mod number;
 pub mod object;
 pub mod ops;

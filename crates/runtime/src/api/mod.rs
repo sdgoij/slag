@@ -94,8 +94,9 @@ impl Isolate {
         }
     }
 
-    /// The agent pointer at offset 0.
-    pub(crate) fn agent_ptr(&self) -> *mut Agent {
+    /// The agent pointer at offset 0 (FFI-facing; valid while the isolate
+    /// is alive).
+    pub fn agent_ptr(&self) -> *mut Agent {
         self as *const Isolate as *const Agent as *mut Agent
     }
 
@@ -131,11 +132,11 @@ impl Isolate {
         self.pending_exception.borrow().clone()
     }
 
-    pub(crate) fn set_pending_exception(&self, value: Value) {
+    pub fn set_pending_exception(&self, value: Value) {
         *self.pending_exception.borrow_mut() = Some(value);
     }
 
-    pub(crate) fn take_pending_exception(&self) -> Option<Value> {
+    pub fn take_pending_exception(&self) -> Option<Value> {
         self.pending_exception.borrow_mut().take()
     }
 }

@@ -1,0 +1,9 @@
+[package]
+name = "ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+crux = { path = "../crux" }
+runtime = { path = "../runtime" }

@@ -186,6 +186,10 @@ pub enum ObjectKind {
     /// A host `External` (v8::External): an ordinary object carrying a host
     /// pointer. All internal methods are ordinary; the pointer is opaque.
     External(usize),
+    /// A host-defined exotic (JSC `JSClassRef` objects, V8 handler
+    /// objects): internal methods dispatch to a [`crate::host::HostOps`]
+    /// implementation with ordinary fallback.
+    Host(Handle<dyn crate::host::HostOps>),
 }
 
 /// The [[ParameterMap]] of an arguments exotic object (spec 10.4.4): an
@@ -244,6 +248,7 @@ impl ObjectKind {
             ObjectKind::IntegerIndexed(_) => "TypedArray",
             ObjectKind::ModuleNamespace(_) => "Module",
             ObjectKind::External(_) => "External",
+            ObjectKind::Host(_) => "Host",
         }
     }
 }
@@ -398,6 +403,20 @@ impl JsObject {
     ) -> Handle<JsObject> {
         let object = Handle::new(Self {
             kind: ObjectKind::External(pointer),
+            ..Self::basic_object_create(prototype)
+        });
+        Self::link_self_handle(&object);
+        object
+    }
+
+    /// Create a host exotic object: internal methods dispatch to `ops` with
+    /// ordinary fallback (JSC `JSClassRef` objects, V8 handler objects).
+    pub fn host_object_create(
+        ops: Handle<dyn crate::host::HostOps>,
+        prototype: Option<Handle<JsObject>>,
+    ) -> Handle<JsObject> {
+        let object = Handle::new(Self {
+            kind: ObjectKind::Host(ops),
             ..Self::basic_object_create(prototype)
         });
         Self::link_self_handle(&object);
@@ -963,6 +982,10 @@ impl JsObject {
                 }
                 Ok(Some(property))
             }
+            ObjectKind::Host(ops) => match ops.get_own_property(self, key) {
+                Some(result) => result.map(Some),
+                None => self.ordinary_get_own_property(key),
+            },
             _ => self.ordinary_get_own_property(key),
         }
     }
@@ -1031,6 +1054,11 @@ impl JsObject {
         if let ObjectKind::Proxy(slots) = &self.kind {
             return crate::proxy::has_property(slots, key);
         }
+        if let ObjectKind::Host(ops) = &self.kind
+            && let Some(result) = ops.has_property(self, key)
+        {
+            return result;
+        }
         // The Integer-Indexed [[HasProperty]] intercepts canonical numeric
         // index strings: an invalid index reads *undefined*, so the property
         // is absent without consulting the prototype chain (spec 10.4.7.4).
@@ -1082,6 +1110,11 @@ impl JsObject {
                     && map.has_own_property_key(key)?
                 {
                     return map.get_key(key);
+                }
+            }
+            ObjectKind::Host(ops) => {
+                if let Some(result) = ops.get(self, key, &receiver) {
+                    return result;
                 }
             }
             _ => {}
@@ -1138,6 +1171,21 @@ impl JsObject {
                     map.set_key(key, value.clone(), false)?;
                 }
             }
+            ObjectKind::Host(ops) => {
+                if let Some(result) = ops.set(self, key, &value, &receiver) {
+                    let success = result?;
+                    return if success {
+                        Ok(true)
+                    } else if throw {
+                        Err(JsError::new(
+                            ErrorKind::TypeError,
+                            format!("Cannot set property {:?}", key.display_string()),
+                        ))
+                    } else {
+                        Ok(false)
+                    };
+                }
+            }
             _ => {}
         }
         ordinary_set(self, key, value, receiver, throw)
@@ -1183,6 +1231,11 @@ impl JsObject {
             }
             ObjectKind::Arguments(slots) => {
                 return arguments_define_own_property(self, slots, key, desc);
+            }
+            ObjectKind::Host(ops) => {
+                if let Some(result) = ops.define_property(self, key, desc) {
+                    return result;
+                }
             }
             _ => {}
         }
@@ -1356,6 +1409,11 @@ impl JsObject {
                 }
                 return Ok(result);
             }
+            ObjectKind::Host(ops) => {
+                if let Some(result) = ops.delete(self, key) {
+                    return result;
+                }
+            }
             _ => {}
         }
         let result = {
@@ -1389,6 +1447,10 @@ impl JsObject {
             }
             ObjectKind::Array => Ok(array_own_property_keys(self)),
             ObjectKind::String(string) => Ok(string_own_property_keys(string, self)),
+            ObjectKind::Host(ops) => match ops.own_property_keys(self) {
+                Some(result) => result,
+                None => Ok(ordinary_own_property_keys(self)),
+            },
             _ => Ok(ordinary_own_property_keys(self)),
         }
     }

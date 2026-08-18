@@ -419,6 +419,13 @@ pub fn call(callee: &Value, this: Value, args: &[Value]) -> Result<Value, JsErro
         Value::Object(obj) => match &obj.kind {
             crate::object::ObjectKind::IsHTMLDDA => Ok(Value::Null),
             crate::object::ObjectKind::Proxy(slots) => crate::proxy::apply(slots, this, args),
+            crate::object::ObjectKind::Host(ops) => match ops.call(obj, &this, args) {
+                Some(result) => result,
+                None => Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "value is not a function".into(),
+                )),
+            },
             _ => Err(JsError::new(
                 ErrorKind::TypeError,
                 "value is not a function".into(),
@@ -463,6 +470,10 @@ pub fn construct(callee: &Value, args: &[Value], new_target: &Value) -> Result<V
             crate::object::ObjectKind::Proxy(slots) => {
                 crate::proxy::construct(slots, args, new_target)
             }
+            crate::object::ObjectKind::Host(ops) => match ops.construct(obj, args, new_target) {
+                Some(result) => result,
+                None => Err(not_constructible(callee)),
+            },
             _ => Err(not_constructible(callee)),
         },
         _ => Err(not_constructible(callee)),

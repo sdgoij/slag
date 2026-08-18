@@ -51,6 +51,7 @@ pub fn type_of(value: &Value) -> &'static str {
             {
                 "function"
             }
+            crate::object::ObjectKind::Host(ops) if ops.is_callable() => "function",
             _ => "object",
         },
         Value::Function(_) => "function",
@@ -66,6 +67,7 @@ pub fn is_callable(value: &Value) -> bool {
         Value::Object(obj) => match &obj.kind {
             crate::object::ObjectKind::IsHTMLDDA => true,
             crate::object::ObjectKind::Proxy(slots) => slots.callable.get(),
+            crate::object::ObjectKind::Host(ops) => ops.is_callable(),
             _ => false,
         },
         _ => false,
@@ -80,6 +82,7 @@ pub fn is_constructor(value: &Value) -> bool {
         Value::Function(function) => function.is_constructor(),
         Value::Object(obj) => match &obj.kind {
             crate::object::ObjectKind::Proxy(slots) => slots.constructible.get(),
+            crate::object::ObjectKind::Host(ops) => ops.is_constructible(),
             _ => false,
         },
         _ => false,
