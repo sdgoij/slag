@@ -9,6 +9,7 @@ members = [
     "crates/regexp",
     "crates/runtime",
     "crates/ffi",
+    "crates/jsc",
     "crates/cli",
     "crates/test262",
 ]

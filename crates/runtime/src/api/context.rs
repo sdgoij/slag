@@ -45,6 +45,11 @@ impl Context {
         Local(Value::Object(self.realm.global_object.clone()))
     }
 
+    /// An intrinsic value by `%`-name (e.g. `%Object.prototype%`).
+    pub fn intrinsic(&self, name: &str) -> Option<Value> {
+        self.realm.intrinsics.get(name)
+    }
+
     /// The current realm.
     pub(crate) fn realm(&self) -> &Handle<Realm> {
         &self.realm

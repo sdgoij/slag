@@ -82,6 +82,16 @@ pub fn string(id: u64) -> Option<JsString> {
     STRING_TABLE.with(|table| table.get(id))
 }
 
+/// Run `f` with the retained string for `id`, without cloning it (the
+/// pointer returned from such a borrow stays valid while the ref is
+/// retained).
+pub fn with_string<R>(id: u64, f: impl FnOnce(&JsString) -> R) -> Option<R> {
+    STRING_TABLE.with(|table| {
+        let entries = table.entries.borrow();
+        entries.get(&id).map(f)
+    })
+}
+
 /// Release a retained string.
 pub fn release_string(id: u64) {
     STRING_TABLE.with(|table| table.remove(id));
