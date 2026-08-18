@@ -590,20 +590,28 @@ fn eval_literal(agent: &mut Agent, literal: &Literal) -> Result<Value, JsError> 
         Literal::Number(n) => Ok(Value::Number(*n)),
         Literal::BigInt(n) => Ok(Value::BigInt(Handle::new(n.clone()))),
         Literal::Str(s) => Ok(Value::String(Handle::new(s.clone()))),
-        Literal::RegExp { pattern, flags } => {
-            // RegExpCreate (spec 22.2.4.6) from a literal; the lexer already
-            // validated the pattern for early errors.
-            let realm = agent.current_realm()?;
-            let ctor = realm.intrinsics.get("%RegExp%").ok_or_else(|| {
-                JsError::new(ErrorKind::TypeError, "%RegExp% is not defined".into())
-            })?;
-            let args = vec![
-                Value::String(Handle::new(pattern.clone())),
-                Value::String(Handle::new(flags.clone())),
-            ];
-            crate::function::construct(agent, &ctor, &args, &ctor)
-        }
+        Literal::RegExp { pattern, flags } => eval_regexp_literal(agent, pattern, flags),
     }
+}
+
+/// RegExpCreate (spec 22.2.4.6) from a literal; the lexer already validated
+/// the pattern for early errors. A literal creates a fresh RegExp object per
+/// evaluation.
+pub(crate) fn eval_regexp_literal(
+    agent: &mut Agent,
+    pattern: &JsString,
+    flags: &JsString,
+) -> Result<Value, JsError> {
+    let realm = agent.current_realm()?;
+    let ctor = realm
+        .intrinsics
+        .get("%RegExp%")
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "%RegExp% is not defined".into()))?;
+    let args = vec![
+        Value::String(Handle::new(pattern.clone())),
+        Value::String(Handle::new(flags.clone())),
+    ];
+    crate::function::construct(agent, &ctor, &args, &ctor)
 }
 
 /// ArrayLiteral evaluation (spec 13.2.4.1): holes advance the index, spread
@@ -828,7 +836,7 @@ pub(crate) fn copy_data_properties(
 }
 
 /// The property name, evaluating computed keys (spec 13.2.5.5).
-fn eval_property_name(
+pub(crate) fn eval_property_name(
     agent: &mut Agent,
     key: &PropertyName,
     strict: bool,

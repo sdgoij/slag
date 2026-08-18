@@ -25,8 +25,24 @@ use crate::script::bound_names;
 
 /// Evaluate a whole program (the Evaluation of |Script|, spec 16.1.6 step
 /// 11). The completion value is the value of the last evaluated statement.
+/// Script bodies compile to steps and run on the VM, so the whole engine
+/// executes bytecode (the top-level path is compiled like any body).
 pub fn eval_program(agent: &mut Agent, program: &Program, strict: bool) -> Result<Value, JsError> {
-    let completion = eval_statement_list(agent, &program.body, strict)?;
+    let body = crate::ir::compile_statements(&program.body, strict)?;
+    let env = agent.running_context()?.lexical_environment.clone();
+    let mut vm = crate::ir::Vm::new(env.clone(), strict);
+    let completion = match vm.start(agent, &body)? {
+        crate::ir::VmOutcome::Completed(completion) => completion,
+        crate::ir::VmOutcome::Suspended(_) => {
+            return Err(JsError::new(
+                ErrorKind::SyntaxError,
+                "yield/await in a script top level".into(),
+            ));
+        }
+    };
+    // The script's `using` resources are disposed when the list completes
+    // (spec 14.2.3 step 6), like the walked statement list.
+    let completion = dispose_env_resources(agent, &env, Ok(completion))?;
     completion_to_result(completion)
 }
 
@@ -453,7 +469,7 @@ pub(crate) fn dispose_env_resources(
 /// f(){}` in sloppy code) behaves as if the declaration were wrapped in a
 /// block — a block-scoped binding for the function's own scope plus the
 /// var-scoped hoist, copied into the variable environment at evaluation.
-fn eval_statement_position_function(
+pub(crate) fn eval_statement_position_function(
     agent: &mut Agent,
     f: &syntax::ast::Function,
     stmt: &Stmt,
@@ -471,7 +487,7 @@ fn eval_statement_position_function(
 /// FunctionDeclaration evaluation (spec 15.2.6): instantiate the function
 /// object against the current lexical environment and bind it in the
 /// VariableEnvironment.
-fn eval_function_declaration(
+pub(crate) fn eval_function_declaration(
     agent: &mut Agent,
     f: &syntax::ast::Function,
     strict: bool,
@@ -950,19 +966,15 @@ fn eval_for(
 }
 
 /// ForIn/ForOfBodyEvaluation: the enumerable string keys of `rhs` and its
-/// prototype chain, in walk order (spec 14.7.5.6 steps 2-6). Shared with the
-/// resumable-function IR's `ForInBegin` step.
-pub(crate) fn for_in_keys(agent: &mut Agent, rhs: &Value) -> Result<Vec<Value>, JsError> {
-    Ok(for_in_key_levels_inner(agent, rhs)?
-        .into_iter()
-        .map(|(_, key)| key)
-        .collect())
-}
-
-/// Like `for_in_keys`, but tagging each key with the prototype-chain level it
-/// was found at, so a key deleted during enumeration can be re-checked against
-/// its own level at visit time (spec EnumerateObjectProperties).
-fn for_in_key_levels(agent: &mut Agent, rhs: &Value) -> Result<Vec<(usize, Value)>, JsError> {
+/// prototype chain, in walk order (spec 14.7.5.6 steps 2-6), each tagged with
+/// the prototype-chain level it was found at, so a key deleted during
+/// enumeration can be re-checked against its own level at visit time (spec
+/// EnumerateObjectProperties). Shared with the resumable-function IR's
+/// `ForInBegin` step.
+pub(crate) fn for_in_key_levels(
+    agent: &mut Agent,
+    rhs: &Value,
+) -> Result<Vec<(usize, Value)>, JsError> {
     for_in_key_levels_inner(agent, rhs)
 }
 
@@ -1021,7 +1033,7 @@ fn for_in_key_levels_inner(agent: &mut Agent, rhs: &Value) -> Result<Vec<(usize,
 /// Whether `key` (a string value) is still an enumerable own property of the
 /// `level`-th object in `obj`'s prototype chain (a key deleted during
 /// enumeration is skipped — spec EnumerateObjectProperties step 5.a.v).
-fn key_enumerable_at_level(
+pub(crate) fn key_enumerable_at_level(
     obj: &Handle<crux::object::JsObject>,
     level: usize,
     key: &Value,

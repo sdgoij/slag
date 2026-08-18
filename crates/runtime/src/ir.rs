@@ -3,12 +3,12 @@
 //! `yield`/`await` suspend and resume exactly like the spec's generator
 //! resume algorithm. This is the seed of the Phase 18 bytecode VM.
 //!
-//! The compiler batches suspension-free statements (`Step::Stmt`) and
-//! expression subtrees (`Step::Expr`) to the existing tree-walking evaluator,
-//! and linearizes only the paths that contain suspension points. Control flow
-//! is explicit jumps; lexical environments mirror the compiler's scope stack
-//! on the VM side; `try`/`catch`/`finally` use a handler table plus a runtime
-//! try stack and a pending-control slot.
+//! Every expression and statement compiles to `Step`s; suspension is just
+//! more bytecode (`Yield`/`Await`), so generators and async functions are
+//! ordinary compiled bodies. Control flow is explicit jumps; lexical
+//! environments mirror the compiler's scope stack on the VM side;
+//! `try`/`catch`/`finally` use a handler table plus a runtime try stack and
+//! a pending-control slot.
 
 use std::collections::HashMap;
 
@@ -30,7 +30,7 @@ use crate::context::{
     resolve_this_binding,
 };
 use crate::env::{EnvRef, new_declarative_environment};
-use crate::eval::{block_declaration_instantiation, eval_statement};
+use crate::eval::block_declaration_instantiation;
 use crate::expr::{get_iterator, iterator_close, iterator_step};
 use crate::flow::Completion;
 use crate::function::EcmaFunction;
@@ -38,11 +38,6 @@ use crate::function::EcmaFunction;
 /// One resumable-function instruction.
 #[derive(Debug, Clone)]
 pub enum Step {
-    // ----- eager evaluation (batched to the tree walker) -----
-    /// Evaluate a suspension-free expression subtree and push its value.
-    Expr(Expr),
-    /// Evaluate a suspension-free statement (updates the completion register).
-    Stmt(Stmt),
     // ----- stack -----
     Push(Value),
     Pop,
@@ -62,6 +57,11 @@ pub enum Step {
         atom: crux::AtomId,
     },
     ThisValue,
+    /// Resolve a bare identifier reference (TDZ check included) and push its
+    /// current value (spec 13.1.2).
+    LoadIdent {
+        name: crux::AtomId,
+    },
     GetSuperBase,
     AssignIdent {
         name: crux::AtomId,
@@ -134,6 +134,14 @@ pub enum Step {
     DeclInit {
         pattern: BindingPattern,
     },
+    /// Resolve a `var` declaration's binding before its initializer runs
+    /// (spec 14.3.2 step 2): a `with` object's property is the assignment
+    /// target even when the initializer mutates the object.
+    ResolveVarIdent {
+        name: crux::AtomId,
+    },
+    /// Assign a `var` declaration's value to the pre-resolved reference.
+    PutVarReference,
     /// Evaluate a `using`/`await using` initializer: register the value as a
     /// disposable resource on the current lexical environment, then bind it
     /// (spec 9.3.1 / 14.2.2).
@@ -188,6 +196,11 @@ pub enum Step {
     },
     DeleteMemberComputed,
     TypeofTop,
+    /// `typeof <identifier>`: an unresolvable reference yields "undefined"
+    /// instead of throwing (spec 13.5.3.2 step 1).
+    TypeofIdent {
+        name: crux::AtomId,
+    },
     PrivateIn {
         atom: crux::AtomId,
     },
@@ -199,11 +212,35 @@ pub enum Step {
     SuperCall,
     Construct,
     TaggedTemplate(syntax::ast::TemplateLiteral),
+    /// Create a function expression's closure against the current lexical
+    /// environment (spec 15.2.5).
+    CreateFunction {
+        function: Box<syntax::ast::Function>,
+    },
+    /// Create an arrow function's closure: `[[ThisMode]]` is lexical and
+    /// there is no `prototype` (spec 15.3.2).
+    CreateArrow {
+        is_async: bool,
+        params: Vec<syntax::ast::BindingElement>,
+        body: syntax::ast::ArrowBody,
+    },
+    /// `new.target` (spec 13.3.5.3): the active constructor, or *undefined*
+    /// at the script level.
+    NewTarget,
+    /// A `RegExp` literal: construct a fresh RegExp object at runtime — a
+    /// literal creates a new object per evaluation (spec 13.2.4.4).
+    RegExpLiteral {
+        pattern: JsString,
+        flags: JsString,
+    },
     // ----- literals -----
     ArrayBegin,
     ArrayElement,
     ArraySpread,
     ArrayHole,
+    /// Finish the array literal: set its length to the element count (spec
+    /// 13.2.4.1 step 6).
+    ArrayEnd,
     // ----- class definitions with suspending heritage/computed names -----
     ClassBegin {
         class: Box<Class>,
@@ -221,6 +258,9 @@ pub enum Step {
     ObjectInitName {
         name: crux::AtomId,
         set_name: bool,
+        /// A shorthand property (`{ x }`): never the `__proto__` setter
+        /// (Annex B.3.1).
+        shorthand: bool,
     },
     ObjectInitComputed {
         set_name: bool,
@@ -248,12 +288,43 @@ pub enum Step {
     ConcatStr,
     ConcatStrConst(JsString),
     // ----- arguments -----
+    /// Record the current argument-vector length: a call's arguments are
+    /// appended after it and the call takes exactly the appended slice, so
+    /// nested calls (an argument that is itself a call) keep their vectors
+    /// separate.
+    ArgsBase,
     ArgsPush,
     ArgsSpread,
     // ----- statements -----
+    /// Create the block environment and instantiate its declarations.
     EnterBlock {
-        stmts: Vec<Stmt>,
+        decls: Vec<Stmt>,
     },
+    /// Evaluate a function declaration: instantiate the closure and bind the
+    /// hoisted name (spec 15.2.6, incl. the Annex B statement-position form).
+    FunctionDecl {
+        stmt: Box<Stmt>,
+    },
+    /// Reset the statement-completion register to an empty completion (spec
+    /// 6.2.2.3): the current statement's completion starts empty.
+    ResetCompletion,
+    /// UpdateEmpty with *undefined* (spec 6.2.2.4): the statement always
+    /// completes normally, so an empty register becomes *undefined*.
+    NormalizeCompletion,
+    /// Enter a statement list (spec 14.2.1): save the enclosing list's
+    /// completion state and start the new list empty.
+    ListBegin,
+    /// Leave a statement list: an empty list restores the enclosing list's
+    /// state (UpdateEmpty of the statement list), a valued list keeps its
+    /// value as the new accumulation.
+    ListEnd,
+    /// Save the statement-completion register before a `finally` block runs:
+    /// the finally's statements must not clobber the completion of the
+    /// statement whose control passes through it (spec 14.15.5).
+    SaveCompletion,
+    /// Restore the statement-completion register after a `finally` block
+    /// completed normally (an abrupt finally replaces the completion anyway).
+    RestoreCompletion,
     LeaveBlock,
     EnterTry {
         handler: usize,
@@ -263,7 +334,7 @@ pub enum Step {
     },
     CatchBind {
         param: Option<BindingPattern>,
-        stmts: Vec<Stmt>,
+        decls: Vec<Stmt>,
     },
     FinallyEnd,
     EnterWith,
@@ -274,6 +345,13 @@ pub enum Step {
         kind: VarDeclKind,
         decls: Vec<VarDeclarator>,
     },
+    /// A for-in/for-of lexical head's temporary environment: the head names
+    /// are uninitialized (in TDZ) while the RHS evaluates (spec 14.7.5.4 /
+    /// 14.7.6.1).
+    EnterIterTdzEnv {
+        names: Vec<JsString>,
+    },
+    LeaveIterTdzEnv,
     ForInBegin,
     ForInNext {
         done: usize,
@@ -474,6 +552,10 @@ pub enum CtlResult {
     Done(VmOutcome),
 }
 
+/// A for-in enumeration in progress: the base object, the
+/// (prototype-level, key) pairs, and the next index.
+type ForInState = (Handle<crux::object::JsObject>, Vec<(usize, Value)>, usize);
+
 /// The resumable VM state. Saved across suspension by the driver.
 #[derive(Debug)]
 pub struct Vm {
@@ -487,7 +569,11 @@ pub struct Vm {
     pub pending: Option<PendingControl>,
     pub thrown: Option<Value>,
     pub resume_abrupt: Option<ResumeAbrupt>,
-    pub for_in_stack: Vec<(Vec<Value>, usize)>,
+    /// In-progress for-in enumerations: the (prototype-level, key) pairs and
+    /// the enumerated base object, so a key deleted during enumeration can be
+    /// re-checked against its own level at visit time (spec
+    /// EnumerateObjectProperties).
+    pub for_in_stack: Vec<ForInState>,
     pub for_of_stack: Vec<crate::expr::IteratorRecord>,
     pub async_for_of_stack: Vec<crate::expr::IteratorRecord>,
     pub destructure_stack: Vec<crate::expr::IteratorRecord>,
@@ -512,6 +598,25 @@ pub struct Vm {
     /// binding the parameter. `(saved_env, env_depth)` of the try frame.
     pub pending_catch_disposal: Option<(EnvRef, usize)>,
     pub strict: bool,
+    /// Whether the statement-completion register holds an empty completion
+    /// (spec 6.2.2.3): no value-producing statement has run since the last
+    /// reset. Only the top-level script path observes it.
+    pub completion_is_empty: bool,
+    /// Completion-register saves for the `finally` blocks currently running
+    /// (nested finallys push in order).
+    completion_stack: Vec<(Value, bool)>,
+    /// Completion-state saves for the statement lists currently running
+    /// (nested blocks/try bodies push in order).
+    list_stack: Vec<(Value, bool)>,
+    /// Pre-resolved `var` declaration references awaiting their initializer's
+    /// value (spec 14.3.2 step 2).
+    var_ref_stack: Vec<crate::context::Reference>,
+    /// The next element index of each in-progress array literal (nested
+    /// literals push in order); the length is set once at `ArrayEnd`.
+    array_index_stack: Vec<usize>,
+    /// The argument-vector boundary of each in-progress call (nested calls
+    /// push in order); the call step pops it and takes the appended slice.
+    args_base_stack: Vec<usize>,
 }
 
 /// The per-class-definition state while the resumable VM evaluates a
@@ -586,11 +691,26 @@ impl Vm {
             pending_disposal: None,
             pending_catch_disposal: None,
             strict,
+            completion_is_empty: true,
+            completion_stack: Vec::new(),
+            list_stack: Vec::new(),
+            var_ref_stack: Vec::new(),
+            array_index_stack: Vec::new(),
+            args_base_stack: Vec::new(),
         }
     }
 
     fn pop(&mut self) -> Value {
         self.stack.pop().unwrap_or(Value::Undefined)
+    }
+
+    fn array_index(&mut self) -> Result<&mut usize, JsError> {
+        self.array_index_stack.last_mut().ok_or_else(|| {
+            JsError::new(
+                ErrorKind::SyntaxError,
+                "Array step without an array literal".into(),
+            )
+        })
     }
 
     fn restore_env(&mut self, env: EnvRef, depth: usize) {
@@ -715,7 +835,26 @@ impl Vm {
         // Record the agent for the duration so crux-side ECMAScript calls
         // (proxy traps reached through property access) can find the runtime.
         crux::function::with_agent(agent as *mut Agent as *mut (), || {
-            self.run_inner_inner(agent, body)
+            match self.run_inner_inner(agent, body) {
+                Ok(outcome) => Ok(outcome),
+                // A step's engine error (a TypeError from a property access, a
+                // ReferenceError from an unresolved identifier, ...) inside a
+                // `try` is a thrown completion: route it through the handler
+                // table so `catch` sees it, like the interpreter path. Without
+                // a covering handler the original error propagates untouched.
+                Err(error) => {
+                    let covered = self.try_stack.iter().any(|frame| {
+                        body.handlers.get(frame.handler).is_some_and(|handler| {
+                            self.ip >= handler.start && self.ip < handler.try_end
+                        })
+                    });
+                    if covered {
+                        self.throw_error(agent, body, error)
+                    } else {
+                        Err(error)
+                    }
+                }
+            }
         })
     }
 
@@ -727,11 +866,13 @@ impl Vm {
         loop {
             let steps = &body.steps;
             if self.ip >= steps.len() {
-                // Fell off the end: the body completes normally with the
-                // statement-list completion value.
-                return Ok(VmOutcome::Completed(Completion::Normal(
-                    self.completion.clone(),
-                )));
+                // Fell off the end: the body completes with the statement-list
+                // completion — empty when the last statement produced no value.
+                return Ok(VmOutcome::Completed(if self.completion_is_empty {
+                    Completion::Empty
+                } else {
+                    Completion::Normal(self.completion.clone())
+                }));
             }
             let step = steps.get(self.ip).cloned().ok_or_else(|| {
                 JsError::new(
@@ -744,27 +885,59 @@ impl Vm {
                 context.lexical_environment = self.lexical_env.clone();
             }
             match step {
-                Step::Expr(expr) => {
-                    let value = match crate::expr::eval_expr(agent, &expr, self.strict) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            return self.throw_error(agent, body, error);
-                        }
-                    };
+                Step::LoadIdent { name } => {
+                    let reference =
+                        crate::context::resolve_binding(agent, &crux::lookup(name), self.strict)?;
+                    let value = crate::context::get_value(agent, &reference)?;
                     self.stack.push(value);
                 }
-                Step::Stmt(stmt) => {
-                    let completion = match eval_statement(agent, &stmt, self.strict) {
-                        Ok(completion) => completion,
-                        Err(error) => {
-                            return self.throw_error(agent, body, error);
-                        }
+                Step::CreateFunction { function } => {
+                    let env = agent.running_context()?.lexical_environment.clone();
+                    let value = crate::function::instantiate_function_expression(
+                        agent,
+                        &function,
+                        env,
+                        self.strict,
+                    )?;
+                    self.stack.push(value);
+                }
+                Step::CreateArrow {
+                    is_async,
+                    params,
+                    body,
+                } => {
+                    let env = agent.running_context()?.lexical_environment.clone();
+                    let value = crate::function::instantiate_arrow(
+                        agent,
+                        is_async,
+                        params,
+                        body,
+                        env,
+                        self.strict,
+                    )?;
+                    self.stack.push(value);
+                }
+                Step::NewTarget => {
+                    let value = get_new_target(agent)?;
+                    self.stack.push(value);
+                }
+                Step::RegExpLiteral { pattern, flags } => {
+                    let value = crate::expr::eval_regexp_literal(agent, &pattern, &flags)?;
+                    self.stack.push(value);
+                }
+                Step::FunctionDecl { stmt } => {
+                    let StmtKind::FunctionDecl(function) = &stmt.kind else {
+                        unreachable!("FunctionDecl step carries a function declaration");
                     };
-                    if let Some(outcome) = self.apply_statement_completion(body, completion)? {
-                        return Ok(outcome);
-                    }
-                    if let Ok(context) = agent.running_context_mut() {
-                        self.lexical_env = context.lexical_environment.clone();
+                    if function.statement_position && !self.strict {
+                        crate::eval::eval_statement_position_function(
+                            agent,
+                            function,
+                            &stmt,
+                            self.strict,
+                        )?;
+                    } else {
+                        crate::eval::eval_function_declaration(agent, function, self.strict)?;
                     }
                 }
                 Step::Push(value) => self.stack.push(value),
@@ -1022,6 +1195,22 @@ impl Vm {
                     )?;
                     self.stack.push(value);
                 }
+                Step::ResolveVarIdent { name } => {
+                    let reference =
+                        crate::context::resolve_binding(agent, &crux::lookup(name), self.strict)?;
+                    self.var_ref_stack.push(reference);
+                }
+                Step::PutVarReference => {
+                    let value = self.pop();
+                    let reference = self.var_ref_stack.pop().ok_or_else(|| {
+                        JsError::new(
+                            ErrorKind::SyntaxError,
+                            "PutVarReference without a resolution".into(),
+                        )
+                    })?;
+                    crate::context::put_value(agent, &reference, value.clone())?;
+                    self.stack.push(value);
+                }
                 Step::UsingInit { pattern, is_await } => {
                     let value = self.pop();
                     let kind = if is_await {
@@ -1160,6 +1349,20 @@ impl Vm {
                             crux::value::type_of(&value),
                         ))));
                 }
+                Step::TypeofIdent { name } => {
+                    // spec 13.5.3.2 step 1: an unresolvable reference is
+                    // "undefined", not a ReferenceError.
+                    let reference =
+                        crate::context::resolve_binding(agent, &crux::lookup(name), self.strict)?;
+                    let value = match &reference.base {
+                        crate::context::ReferenceBase::Unresolvable => Value::Undefined,
+                        _ => crate::context::get_value(agent, &reference)?,
+                    };
+                    self.stack
+                        .push(Value::String(Handle::new(JsString::from_utf8(
+                            crux::value::type_of(&value),
+                        ))));
+                }
                 Step::PrivateIn { atom } => {
                     let object = self.pop();
                     let name_id = crate::context::resolve_private_name(agent, atom)?.id;
@@ -1171,7 +1374,13 @@ impl Vm {
                     self.do_call(agent, direct_eval)?;
                 }
                 Step::SuperCall => {
-                    let args = std::mem::take(&mut self.args);
+                    let base = self.args_base_stack.pop().ok_or_else(|| {
+                        JsError::new(
+                            ErrorKind::SyntaxError,
+                            "SuperCall without an argument boundary".into(),
+                        )
+                    })?;
+                    let args = self.args.split_off(base);
                     let new_target = get_new_target(agent)?;
                     let super_ctor = get_super_constructor(agent)?;
                     let result =
@@ -1189,25 +1398,39 @@ impl Vm {
                 }
                 Step::Construct => {
                     let callee = self.pop();
-                    let args = std::mem::take(&mut self.args);
+                    let base = self.args_base_stack.pop().ok_or_else(|| {
+                        JsError::new(
+                            ErrorKind::SyntaxError,
+                            "Construct without an argument boundary".into(),
+                        )
+                    })?;
+                    let args = self.args.split_off(base);
                     let result = crate::function::construct(agent, &callee, &args, &callee)?;
                     self.stack.push(result);
                 }
                 Step::TaggedTemplate(template) => {
                     let tag = self.pop();
-                    let substitutions = std::mem::take(&mut self.args);
+                    let base = self.args_base_stack.pop().ok_or_else(|| {
+                        JsError::new(
+                            ErrorKind::SyntaxError,
+                            "TaggedTemplate without an argument boundary".into(),
+                        )
+                    })?;
+                    let substitutions = self.args.split_off(base);
                     let value = tagged_template(agent, tag, &template, substitutions)?;
                     self.stack.push(value);
                 }
                 Step::ArrayBegin => {
                     let array = crate::builtins::array::array_create(agent, 0.0)?;
+                    self.array_index_stack.push(0);
                     self.stack.push(Value::Object(array));
                 }
                 Step::ArrayElement => {
                     let value = self.pop();
                     let array = self.pop();
-                    let index = array_length(agent, &array)?;
+                    let index = *self.array_index()?;
                     array_set(&array, &index.to_string(), value)?;
+                    *self.array_index()? = index + 1;
                     self.stack.push(array);
                 }
                 Step::ArraySpread => {
@@ -1215,15 +1438,29 @@ impl Vm {
                     let array = self.pop();
                     let iterator = get_iterator(agent, &iterable)?;
                     while let Some(value) = iterator_step(agent, &iterator)? {
-                        let index = array_length(agent, &array)?;
+                        let index = *self.array_index()?;
                         array_set(&array, &index.to_string(), value)?;
+                        *self.array_index()? = index + 1;
                     }
                     self.stack.push(array);
                 }
                 Step::ArrayHole => {
+                    let index = *self.array_index()?;
+                    *self.array_index()? = index + 1;
+                }
+                Step::ArrayEnd => {
                     let array = self.pop();
-                    let length = array_length(agent, &array)?;
-                    array_set(&array, "length", Value::Number(length + 1.0))?;
+                    let length = self.array_index_stack.pop().ok_or_else(|| {
+                        JsError::new(ErrorKind::SyntaxError, "ArrayEnd without an array".into())
+                    })?;
+                    let ValueKind::Object(obj) = array.kind() else {
+                        return Err(JsError::new(ErrorKind::TypeError, "not an object".into()));
+                    };
+                    obj.set(
+                        &JsString::from_utf8("length"),
+                        Value::Number(length as f64),
+                        true,
+                    )?;
                     self.stack.push(array);
                 }
                 Step::ObjectBegin => {
@@ -1235,30 +1472,43 @@ impl Vm {
                     let object = crux::object::JsObject::ordinary_object_create(proto);
                     self.stack.push(Value::Object(object));
                 }
-                Step::ObjectInitName { name, set_name } => {
+                Step::ObjectInitName {
+                    name,
+                    set_name,
+                    shorthand,
+                } => {
                     let value = self.pop();
                     let object = self.pop();
-                    object_init(agent, &object, &PropertyName::Ident(name), value, set_name)?;
+                    object_init(
+                        &object,
+                        &PropertyName::Ident(name),
+                        value,
+                        set_name,
+                        shorthand,
+                    )?;
                     self.stack.push(object);
                 }
                 Step::ObjectInitComputed { set_name } => {
                     let value = self.pop();
                     let key = self.pop();
                     let object = self.pop();
-                    let name = property_name_from_value(agent, key)?;
-                    object_init(agent, &object, &name, value, set_name)?;
+                    let ValueKind::Object(obj) = object.kind() else {
+                        return Err(JsError::new(ErrorKind::TypeError, "not an object".into()));
+                    };
+                    let key = crate::context::to_property_key(agent, &key)?;
+                    object_init_key(&obj, key, value, set_name)?;
                     self.stack.push(object);
                 }
                 Step::ObjectMethodName { name, function } => {
                     let object = self.pop();
-                    object_method(agent, &object, &PropertyName::Ident(name), &function)?;
+                    object_method(agent, &object, PropertyKey::String(name), &function)?;
                     self.stack.push(object);
                 }
                 Step::ObjectMethodComputed { function } => {
                     let key = self.pop();
                     let object = self.pop();
-                    let name = property_name_from_value(agent, key)?;
-                    object_method(agent, &object, &name, &function)?;
+                    let key = crate::context::to_property_key(agent, &key)?;
+                    object_method(agent, &object, key, &function)?;
                     self.stack.push(object);
                 }
                 Step::ObjectAccessorName {
@@ -1271,7 +1521,7 @@ impl Vm {
                     object_accessor(
                         agent,
                         &object,
-                        &PropertyName::Ident(name),
+                        PropertyKey::String(name),
                         get,
                         param.as_ref(),
                         &body,
@@ -1281,8 +1531,8 @@ impl Vm {
                 Step::ObjectAccessorComputed { get, param, body } => {
                     let key = self.pop();
                     let object = self.pop();
-                    let name = property_name_from_value(agent, key)?;
-                    object_accessor(agent, &object, &name, get, param.as_ref(), &body)?;
+                    let key = crate::context::to_property_key(agent, &key)?;
+                    object_accessor(agent, &object, key, get, param.as_ref(), &body)?;
                     self.stack.push(object);
                 }
                 Step::ObjectSpread => {
@@ -1412,6 +1662,9 @@ impl Vm {
                     self.stack
                         .push(Value::String(Handle::new(JsString::from_utf16(&units))));
                 }
+                Step::ArgsBase => {
+                    self.args_base_stack.push(self.args.len());
+                }
                 Step::ArgsPush => {
                     let value = self.pop();
                     self.args.push(value);
@@ -1423,10 +1676,10 @@ impl Vm {
                         self.args.push(value);
                     }
                 }
-                Step::EnterBlock { stmts } => {
+                Step::EnterBlock { decls } => {
                     let old_env = self.lexical_env.clone();
                     let env = new_declarative_environment(Some(old_env));
-                    block_declaration_instantiation(agent, &stmts, &env, self.strict)?;
+                    block_declaration_instantiation(agent, &decls, &env, self.strict)?;
                     self.lexical_env = env.clone();
                     self.env_stack.push(env);
                 }
@@ -1470,7 +1723,7 @@ impl Vm {
                         CtlResult::Done(outcome) => return Ok(outcome),
                     }
                 }
-                Step::CatchBind { param, stmts } => {
+                Step::CatchBind { param, decls } => {
                     // A caught throw discarded the try block's envs: dispose
                     // their `using` resources first, folding into the thrown
                     // value (spec 9.4.3 on the try block's abrupt
@@ -1509,20 +1762,38 @@ impl Vm {
                     let thrown = self.thrown.take().unwrap_or(Value::Undefined);
                     let old_env = self.lexical_env.clone();
                     let env = new_declarative_environment(Some(old_env));
-                    if let Some(param) = &param {
-                        let BindingPattern::Ident(name) = param else {
-                            return Err(JsError::new(
-                                ErrorKind::TypeError,
-                                "catch destructuring is not supported in resumable bodies".into(),
-                            ));
-                        };
-                        let name = crux::lookup(*name);
-                        env.create_mutable_binding(&name, false)?;
-                        env.initialize_binding(&name, thrown)?;
-                    }
-                    block_declaration_instantiation(agent, &stmts, &env, self.strict)?;
-                    self.lexical_env = env.clone();
-                    self.env_stack.push(env);
+                    // The catch parameter binds in its own environment, so a
+                    // default initializer's closure captures the parameter
+                    // (spec 15.1.7 step 7).
+                    let body_env = match &param {
+                        Some(param) => {
+                            let param_env = new_declarative_environment(Some(env));
+                            let mut names = Vec::new();
+                            crate::script::bound_names(param, &mut names);
+                            for name in &names {
+                                param_env.create_mutable_binding(name, false)?;
+                            }
+                            // The parameter environment is the running
+                            // environment while the default initializers run,
+                            // so a closure captures the parameter (spec
+                            // 15.1.7 step 7).
+                            if let Ok(context) = agent.running_context_mut() {
+                                context.lexical_environment = param_env.clone();
+                            }
+                            crate::binding::binding_initialization(
+                                agent,
+                                param,
+                                thrown,
+                                Some(&param_env),
+                                self.strict,
+                            )?;
+                            new_declarative_environment(Some(param_env))
+                        }
+                        None => env,
+                    };
+                    block_declaration_instantiation(agent, &decls, &body_env, self.strict)?;
+                    self.lexical_env = body_env.clone();
+                    self.env_stack.push(body_env);
                 }
                 Step::FinallyEnd => {
                     let pending = self.pending.take().ok_or_else(|| {
@@ -1558,14 +1829,34 @@ impl Vm {
                         CtlResult::Done(outcome) => return Ok(outcome),
                     }
                 }
+                Step::EnterIterTdzEnv { names } => {
+                    let old_env = self.lexical_env.clone();
+                    let env = new_declarative_environment(Some(old_env));
+                    for name in &names {
+                        env.create_mutable_binding(name, false)?;
+                    }
+                    self.lexical_env = env.clone();
+                    self.env_stack.push(env);
+                }
+                Step::LeaveIterTdzEnv => {
+                    let popped = self.env_stack.pop().ok_or_else(|| {
+                        JsError::new(
+                            ErrorKind::SyntaxError,
+                            "LeaveIterTdzEnv without an environment".into(),
+                        )
+                    })?;
+                    self.lexical_env = popped.outer().unwrap_or(popped);
+                }
                 Step::EnterWith => {
                     let object = self.pop();
-                    let ValueKind::Object(obj) = object.kind() else {
-                        return Err(JsError::new(
+                    // spec 14.15.4 step 2: primitives are boxed (ToObject).
+                    let object_value = crate::context::to_object(agent, &object)?;
+                    let obj = crate::context::as_object(&object_value).ok_or_else(|| {
+                        JsError::new(
                             ErrorKind::TypeError,
                             "Cannot use 'with' on a non-object value".into(),
-                        ));
-                    };
+                        )
+                    })?;
                     let with_env = crate::env::new_object_environment(
                         obj,
                         true,
@@ -1623,23 +1914,35 @@ impl Vm {
                 }
                 Step::ForInBegin => {
                     let rhs = self.pop();
-                    let keys = crate::eval::for_in_keys(agent, &rhs)?;
-                    self.for_in_stack.push((keys, 0));
+                    let obj = crate::context::to_object(agent, &rhs)?;
+                    let obj = crate::context::as_object(&obj).ok_or_else(|| {
+                        JsError::new(ErrorKind::TypeError, "for-in over a non-object".into())
+                    })?;
+                    let keys = crate::eval::for_in_key_levels(agent, &rhs)?;
+                    self.for_in_stack.push((obj, keys, 0));
                 }
                 Step::ForInNext { done } => {
-                    let Some((keys, index)) = self.for_in_stack.last_mut() else {
+                    let Some((obj, keys, index)) = self.for_in_stack.last_mut() else {
                         return Err(JsError::new(
                             ErrorKind::SyntaxError,
                             "ForInNext without a for-in".into(),
                         ));
                     };
-                    if *index >= keys.len() {
+                    let mut pushed = false;
+                    while *index < keys.len() {
+                        let (level, key) = keys[*index].clone();
+                        *index += 1;
+                        // A key deleted during enumeration is skipped (spec
+                        // EnumerateObjectProperties step 5.a.v).
+                        if crate::eval::key_enumerable_at_level(obj, level, &key)? {
+                            self.stack.push(key);
+                            pushed = true;
+                            break;
+                        }
+                    }
+                    if !pushed {
                         self.for_in_stack.pop();
                         self.ip = done;
-                    } else {
-                        let key = keys[*index].clone();
-                        *index += 1;
-                        self.stack.push(key);
                     }
                 }
                 Step::ForInBind { left } => {
@@ -1647,7 +1950,7 @@ impl Vm {
                     self.for_binding_put(agent, &left, value)?;
                 }
                 Step::ForInRestore => {
-                    self.restore_per_iteration();
+                    self.restore_per_iteration(agent)?;
                 }
                 Step::ForOfBegin => {
                     let rhs = self.pop();
@@ -1675,7 +1978,7 @@ impl Vm {
                     self.for_binding_put(agent, &left, value)?;
                 }
                 Step::ForOfRestore => {
-                    self.restore_per_iteration();
+                    self.restore_per_iteration(agent)?;
                 }
                 Step::ForOfClose => {
                     if let Some(iterator) = self.for_of_stack.pop() {
@@ -1737,7 +2040,7 @@ impl Vm {
                     self.for_binding_put(agent, &left, value)?;
                 }
                 Step::AsyncForOfRestore => {
-                    self.restore_per_iteration();
+                    self.restore_per_iteration(agent)?;
                 }
                 Step::SwitchDisc => {
                     let disc = self.pop();
@@ -1758,6 +2061,41 @@ impl Vm {
                 Step::SetCompletion => {
                     let value = self.pop();
                     self.completion = value;
+                    self.completion_is_empty = false;
+                }
+                Step::ResetCompletion => {
+                    self.completion = Value::Undefined;
+                    self.completion_is_empty = true;
+                }
+                Step::NormalizeCompletion => {
+                    if self.completion_is_empty {
+                        self.completion = Value::Undefined;
+                        self.completion_is_empty = false;
+                    }
+                }
+                Step::ListBegin => {
+                    self.list_stack
+                        .push((self.completion.clone(), self.completion_is_empty));
+                    self.completion = Value::Undefined;
+                    self.completion_is_empty = true;
+                }
+                Step::ListEnd => {
+                    if let Some((value, empty)) = self.list_stack.pop()
+                        && self.completion_is_empty
+                    {
+                        self.completion = value;
+                        self.completion_is_empty = empty;
+                    }
+                }
+                Step::SaveCompletion => {
+                    self.completion_stack
+                        .push((self.completion.clone(), self.completion_is_empty));
+                }
+                Step::RestoreCompletion => {
+                    if let Some((value, empty)) = self.completion_stack.pop() {
+                        self.completion = value;
+                        self.completion_is_empty = empty;
+                    }
                 }
                 Step::Jump(target) => self.ip = target,
                 Step::JumpIfFalse(target) => {
@@ -1777,6 +2115,10 @@ impl Vm {
                     if !crux::convert::to_boolean(&value) {
                         self.stack.push(value);
                         self.ip = target;
+                    } else {
+                        // The left operand is not the result: leave it for the
+                        // following Pop to discard (it was already popped).
+                        self.stack.push(value);
                     }
                 }
                 Step::JumpIfTrueKeep(target) => {
@@ -1784,6 +2126,8 @@ impl Vm {
                     if crux::convert::to_boolean(&value) {
                         self.stack.push(value);
                         self.ip = target;
+                    } else {
+                        self.stack.push(value);
                     }
                 }
                 Step::JumpIfNullishKeep(target) => {
@@ -1798,6 +2142,8 @@ impl Vm {
                     if !is_nullish(&value) {
                         self.stack.push(value);
                         self.ip = target;
+                    } else {
+                        self.stack.push(value);
                     }
                 }
                 Step::Return => {
@@ -2319,38 +2665,6 @@ impl Vm {
         }
     }
 
-    /// Deliver a batched statement's completion; `Some(outcome)` means the VM
-    /// run finished.
-    fn apply_statement_completion(
-        &mut self,
-        body: &CompiledBody,
-        completion: Completion,
-    ) -> Result<Option<VmOutcome>, JsError> {
-        match completion {
-            Completion::Normal(value) => self.completion = value,
-            Completion::Empty => {}
-            Completion::Break { .. } | Completion::Continue { .. } => {
-                return Err(JsError::new(
-                    ErrorKind::SyntaxError,
-                    "Illegal control flow in a batched statement".into(),
-                ));
-            }
-            Completion::Return(value) => {
-                return match self.control_transfer(body, Ctl::Return { value })? {
-                    CtlResult::Continue => Ok(None),
-                    CtlResult::Done(outcome) => Ok(Some(outcome)),
-                };
-            }
-            Completion::Throw(value) => {
-                return match self.throw_machinery(body, value)? {
-                    CtlResult::Continue => Ok(None),
-                    CtlResult::Done(outcome) => Ok(Some(outcome)),
-                };
-            }
-        }
-        Ok(None)
-    }
-
     /// Begin disposing a scope's `using` resources in reverse order, folding
     /// each result into the completion (spec 9.4.3). When an async-dispose
     /// awaits, the driver suspends with `Suspension::Await`; `run_abrupt`
@@ -2613,7 +2927,13 @@ impl Vm {
     fn do_call(&mut self, agent: &mut Agent, direct_eval: bool) -> Result<(), JsError> {
         let callee = self.pop();
         let this = self.pop();
-        let args = std::mem::take(&mut self.args);
+        let base = self.args_base_stack.pop().ok_or_else(|| {
+            JsError::new(
+                ErrorKind::SyntaxError,
+                "Call without an argument boundary".into(),
+            )
+        })?;
+        let args = self.args.split_off(base);
         if is_eval_function(agent, &callee)? {
             let source = args.first().cloned().unwrap_or(Value::Undefined);
             let source = crux::convert::to_string(&source)?;
@@ -2658,11 +2978,27 @@ impl Vm {
                     let mut names = Vec::new();
                     crate::script::bound_names(pattern, &mut names);
                     for name in &names {
-                        if *kind == VarDeclKind::Const {
+                        if *kind == VarDeclKind::Const
+                            || matches!(*kind, VarDeclKind::Using | VarDeclKind::AwaitUsing)
+                        {
+                            // `using` bindings are immutable like `const`
+                            // (spec 15.14.2).
                             env.create_immutable_binding(name, true)?;
                         } else {
                             env.create_mutable_binding(name, false)?;
                         }
+                    }
+                    // spec 14.7.5.6 step 5.e: AddDisposableResource runs
+                    // before InitializeReferencedBinding.
+                    if matches!(*kind, VarDeclKind::Using | VarDeclKind::AwaitUsing) {
+                        let kind = if *kind == VarDeclKind::AwaitUsing {
+                            crate::eval::DisposalKind::Async
+                        } else {
+                            crate::eval::DisposalKind::Sync
+                        };
+                        let resource =
+                            crate::eval::create_disposable_resource(agent, &value, kind)?;
+                        env.add_disposable_resource(resource);
                     }
                     crate::binding::binding_initialization(
                         agent,
@@ -2673,7 +3009,8 @@ impl Vm {
                     )?;
                     // The per-iteration environment replaces the lexical
                     // environment without joining the stack; the loop's
-                    // restore step is a no-op.
+                    // restore step disposes its resources and the next
+                    // iteration's bind replaces it.
                     self.lexical_env = env;
                 }
             }
@@ -2681,10 +3018,20 @@ impl Vm {
         Ok(())
     }
 
-    /// Pop a per-iteration environment created by a for-in/for-of bind.
-    fn restore_per_iteration(&mut self) {
+    /// Pop a per-iteration environment created by a for-in/for-of bind,
+    /// disposing its `using` resources (spec 14.7.5.6 / 14.7.6.2: the
+    /// iteration environment is disposed at iteration end).
+    fn restore_per_iteration(&mut self, agent: &mut Agent) -> Result<(), JsError> {
         // The per-iteration environment lives in the lexical environment, not
         // the stack; the next iteration's bind step replaces it.
+        let env = self.lexical_env.clone();
+        let resources = env.drain_disposable_resources();
+        for resource in resources.iter().rev() {
+            if !resource.method.is_undefined() {
+                crate::function::call(agent, &resource.method, resource.value.clone(), &[])?;
+            }
+        }
+        Ok(())
     }
 
     /// The control-transfer machinery: route through pending finallys, then
@@ -2815,15 +3162,27 @@ impl Vm {
             };
             match decision {
                 Some((index, ThrowAction::Catch)) => {
-                    let frame = self.try_stack.remove(index);
+                    let handler_index = self.try_stack[index].handler;
+                    let has_finally = body
+                        .handlers
+                        .get(handler_index)
+                        .is_some_and(|h| h.finally.is_some());
+                    let saved_env = self.try_stack[index].saved_env.clone();
+                    let env_depth = self.try_stack[index].env_depth;
+                    if !has_finally {
+                        // Keep the frame when a finally is pending: the catch's
+                        // `Exit` routes through it (spec 14.15.4 step 5: the
+                        // finally runs even after a caught error).
+                        self.try_stack.remove(index);
+                    }
                     // Leave the try block's envs on the stack: `CatchBind`
                     // disposes their `using` resources (folding into the
                     // thrown value) before restoring the saved environment.
-                    self.pending_catch_disposal = Some((frame.saved_env, frame.env_depth));
+                    self.pending_catch_disposal = Some((saved_env, env_depth));
                     self.thrown = Some(value);
                     let catch_start = body
                         .handlers
-                        .get(frame.handler)
+                        .get(handler_index)
                         .and_then(|h| h.catch)
                         .map(|c| c.start)
                         .unwrap_or(self.ip);
@@ -3023,23 +3382,6 @@ fn is_eval_function(agent: &Agent, value: &Value) -> Result<bool, JsError> {
     Ok(realm.intrinsics.get("%eval%").as_ref() == Some(value))
 }
 
-fn property_name_from_value(agent: &mut Agent, value: Value) -> Result<PropertyName, JsError> {
-    let key = crate::context::to_property_key(agent, &value)?;
-    match key {
-        PropertyKey::String(id) => Ok(PropertyName::Ident(id)),
-        PropertyKey::Symbol(_) => Err(JsError::new(
-            ErrorKind::TypeError,
-            "symbol property keys are not supported in object literals yet".into(),
-        )),
-    }
-}
-
-fn array_length(agent: &mut Agent, array: &Value) -> Result<f64, JsError> {
-    let length =
-        crate::context::get_property(agent, array, &JsString::from_utf8("length"), array.clone())?;
-    crux::convert::to_number(&length)
-}
-
 fn array_set(array: &Value, key: &str, value: Value) -> Result<(), JsError> {
     let ValueKind::Object(obj) = array.kind() else {
         return Err(JsError::new(ErrorKind::TypeError, "not an object".into()));
@@ -3051,11 +3393,11 @@ fn array_set(array: &Value, key: &str, value: Value) -> Result<(), JsError> {
 /// Object literal `Init` property definition (spec 13.2.5.5 step 4): the
 /// `__proto__` prototype-setter special case plus name inference.
 fn object_init(
-    agent: &mut Agent,
     object: &Value,
     key: &PropertyName,
     value: Value,
     set_name: bool,
+    shorthand: bool,
 ) -> Result<(), JsError> {
     let ValueKind::Object(obj) = object.kind() else {
         return Err(JsError::new(ErrorKind::TypeError, "not an object".into()));
@@ -3064,17 +3406,15 @@ fn object_init(
         PropertyName::Ident(id) => crux::lookup(*id),
         PropertyName::Str(text) => text.clone(),
         PropertyName::Number(n) => crux::convert::to_string(&Value::Number(*n))?,
-        PropertyName::Computed(expr) => {
-            let key = crate::expr::eval_expr(agent, expr, false)?;
-            let key = crate::context::to_property_key(agent, &key)?;
-            return object_init_key(agent, &obj, key, value, set_name);
+        PropertyName::Computed(_) => {
+            unreachable!("computed keys use the ObjectInitComputed step")
         }
     };
     if set_name {
         crate::function::set_function_name(&value, &name, None)?;
     }
     let name_text = name.to_string_lossy();
-    if name_text == "__proto__" {
+    if !shorthand && name_text == "__proto__" {
         match value.kind() {
             ValueKind::Object(proto) => {
                 if !obj.set_prototype_of(Some(proto))? {
@@ -3084,17 +3424,15 @@ fn object_init(
                     ));
                 }
             }
-            ValueKind::Null => {
-                if !obj.set_prototype_of(None)? {
-                    return Err(JsError::new(
-                        ErrorKind::TypeError,
-                        "Cannot set prototype of non-extensible object".into(),
-                    ));
-                }
+            ValueKind::Null if !obj.set_prototype_of(None)? => {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "Cannot set prototype of non-extensible object".into(),
+                ));
             }
-            _ => {
-                obj.create_data_property(&name, value)?;
-            }
+            // B.3.1 step 6: a non-object, non-null value sets neither the
+            // prototype nor an own property — the definition is a no-op.
+            _ => {}
         }
     } else {
         obj.create_data_property(&name, value)?;
@@ -3102,54 +3440,19 @@ fn object_init(
     Ok(())
 }
 
+/// A computed-key `Init` property definition (spec 13.2.5.5 step 4): a
+/// computed key is never the `__proto__` prototype setter, and SetFunctionName
+/// uses the key's display form (a symbol's bracketed description).
 fn object_init_key(
-    _agent: &mut Agent,
     obj: &crux::object::JsObject,
     key: PropertyKey,
     value: Value,
     set_name: bool,
 ) -> Result<(), JsError> {
     if set_name {
-        let name = match &key {
-            PropertyKey::String(id) => crux::lookup(*id),
-            PropertyKey::Symbol(_) => {
-                return Err(JsError::new(
-                    ErrorKind::TypeError,
-                    "symbol property keys are not supported in object literals yet".into(),
-                ));
-            }
-        };
-        crate::function::set_function_name(&value, &name, None)?;
+        crate::function::set_function_name(&value, &crate::expr::property_key_display(&key), None)?;
     }
-    let name_text = match &key {
-        PropertyKey::String(id) => crux::lookup(*id).to_string_lossy(),
-        PropertyKey::Symbol(_) => String::new(),
-    };
-    if name_text == "__proto__" {
-        match value.kind() {
-            ValueKind::Object(proto) => {
-                if !obj.set_prototype_of(Some(proto))? {
-                    return Err(JsError::new(
-                        ErrorKind::TypeError,
-                        "Cannot set prototype of non-extensible object".into(),
-                    ));
-                }
-            }
-            ValueKind::Null => {
-                if !obj.set_prototype_of(None)? {
-                    return Err(JsError::new(
-                        ErrorKind::TypeError,
-                        "Cannot set prototype of non-extensible object".into(),
-                    ));
-                }
-            }
-            _ => {
-                obj.create_data_property_key(&key, value)?;
-            }
-        }
-    } else {
-        obj.create_data_property_key(&key, value)?;
-    }
+    obj.create_data_property_key(&key, value)?;
     Ok(())
 }
 
@@ -3157,33 +3460,17 @@ fn object_init_key(
 fn object_method(
     agent: &mut Agent,
     object: &Value,
-    key: &PropertyName,
+    key: PropertyKey,
     function: &Function,
 ) -> Result<(), JsError> {
     let ValueKind::Object(obj) = object.kind() else {
         return Err(JsError::new(ErrorKind::TypeError, "not an object".into()));
     };
-    let name = match key {
-        PropertyName::Ident(id) => crux::lookup(*id),
-        PropertyName::Str(text) => text.clone(),
-        PropertyName::Number(n) => crux::convert::to_string(&Value::Number(*n))?,
-        PropertyName::Computed(expr) => {
-            let key = crate::expr::eval_expr(agent, expr, false)?;
-            let key = crate::context::to_property_key(agent, &key)?;
-            let PropertyKey::String(id) = key else {
-                return Err(JsError::new(
-                    ErrorKind::TypeError,
-                    "symbol property keys are not supported yet".into(),
-                ));
-            };
-            crux::lookup(id)
-        }
-    };
     let env = agent.running_context()?.lexical_environment.clone();
     let closure = crate::function::instantiate_method(agent, function, env, false)?;
     crate::function::make_method(agent, &closure, Value::Object(obj.clone()))?;
-    crate::function::set_function_name(&closure, &name, None)?;
-    obj.create_data_property(&name, closure)?;
+    crate::function::set_function_name(&closure, &crate::expr::property_key_display(&key), None)?;
+    obj.create_data_property_key(&key, closure)?;
     Ok(())
 }
 
@@ -3192,29 +3479,13 @@ fn object_method(
 fn object_accessor(
     agent: &mut Agent,
     object: &Value,
-    key: &PropertyName,
+    key: PropertyKey,
     get: bool,
     param: Option<&BindingElement>,
     body: &syntax::ast::Block,
 ) -> Result<(), JsError> {
     let ValueKind::Object(obj) = object.kind() else {
         return Err(JsError::new(ErrorKind::TypeError, "not an object".into()));
-    };
-    let name = match key {
-        PropertyName::Ident(id) => crux::lookup(*id),
-        PropertyName::Str(text) => text.clone(),
-        PropertyName::Number(n) => crux::convert::to_string(&Value::Number(*n))?,
-        PropertyName::Computed(expr) => {
-            let key = crate::expr::eval_expr(agent, expr, false)?;
-            let key = crate::context::to_property_key(agent, &key)?;
-            let PropertyKey::String(id) = key else {
-                return Err(JsError::new(
-                    ErrorKind::TypeError,
-                    "symbol property keys are not supported yet".into(),
-                ));
-            };
-            crux::lookup(id)
-        }
     };
     let env = agent.running_context()?.lexical_environment.clone();
     let params = if let Some(param) = param {
@@ -3225,7 +3496,7 @@ fn object_accessor(
     let closure = crate::function::instantiate_accessor(agent, params, body.clone(), env, false)?;
     crate::function::make_method(agent, &closure, Value::Object(obj.clone()))?;
     let prefix = if get { Some("get") } else { Some("set") };
-    crate::function::set_function_name(&closure, &name, prefix)?;
+    crate::function::set_function_name(&closure, &crate::expr::property_key_display(&key), prefix)?;
     let descriptor = crux::property::PropertyDescriptor {
         value: None,
         writable: None,
@@ -3234,7 +3505,7 @@ fn object_accessor(
         enumerable: Some(true),
         configurable: Some(true),
     };
-    obj.define_property(&name, &descriptor)?;
+    obj.define_property_key(&key, &descriptor)?;
     Ok(())
 }
 
@@ -3680,44 +3951,6 @@ pub fn stmt_contains_suspension(stmt: &Stmt) -> bool {
     }
 }
 
-/// Whether a statement contains a `break`/`continue` that targets a point
-/// outside the statement: batched to the tree walker, such exits cannot
-/// cross the `Step::Stmt` boundary, so the statement is compiled and the
-/// exit routes through the VM's control machinery instead.
-fn stmt_contains_exit(stmt: &Stmt) -> bool {
-    match &stmt.kind {
-        StmtKind::Break(_) | StmtKind::Continue(_) => true,
-        StmtKind::Block(block) => block.stmts.iter().any(stmt_contains_exit),
-        StmtKind::If {
-            consequent,
-            alternate,
-            ..
-        } => stmt_contains_exit(consequent) || alternate.as_deref().is_some_and(stmt_contains_exit),
-        StmtKind::While { body, .. } | StmtKind::DoWhile { body, .. } => stmt_contains_exit(body),
-        StmtKind::For { body, .. }
-        | StmtKind::ForIn { body, .. }
-        | StmtKind::ForOf { body, .. } => stmt_contains_exit(body),
-        StmtKind::Labeled { body, .. } => stmt_contains_exit(body),
-        StmtKind::Switch { cases, .. } => cases
-            .iter()
-            .any(|case| case.consequent.iter().any(stmt_contains_exit)),
-        StmtKind::Try {
-            block,
-            handler,
-            finalizer,
-        } => {
-            block.stmts.iter().any(stmt_contains_exit)
-                || handler
-                    .as_ref()
-                    .is_some_and(|h| h.body.stmts.iter().any(stmt_contains_exit))
-                || finalizer
-                    .as_ref()
-                    .is_some_and(|f| f.stmts.iter().any(stmt_contains_exit))
-        }
-        _ => false,
-    }
-}
-
 fn for_init_contains_suspension(init: &ForInit) -> bool {
     match init {
         ForInit::Expr(expr) => expr_contains_suspension(expr),
@@ -3910,38 +4143,6 @@ impl Compiler {
         Ok(())
     }
 
-    /// Compile a chain base (member object / call callee): an expression
-    /// that may short-circuit must run as steps so its `?.` sets the VM's
-    /// chain-short flag — the tree walker cannot signal the flag.
-    fn compile_chain_base(&mut self, expr: &Expr) -> Result<(), JsError> {
-        if expr_may_short_circuit(expr) {
-            self.compile_expr_force(expr)
-        } else {
-            self.compile_expr(expr)
-        }
-    }
-
-    /// Compile an expression even when it has no suspension, so `?.` links
-    /// inside it set the chain-short flag.
-    fn compile_expr_force(&mut self, expr: &Expr) -> Result<(), JsError> {
-        match &expr.kind {
-            ExprKind::Member(member) => {
-                self.enter_chain(expr);
-                self.compile_member(member)?;
-                self.leave_chain();
-                Ok(())
-            }
-            ExprKind::Call(call) => {
-                self.enter_chain(expr);
-                self.compile_call(call)?;
-                self.leave_chain();
-                Ok(())
-            }
-            ExprKind::Paren(inner) => self.compile_expr_force(inner),
-            _ => self.compile_expr(expr),
-        }
-    }
-
     /// Compile a call's arguments and the call step, skipping both when an
     /// upstream `?.` short-circuited: the whole chain is `undefined` (spec
     /// 13.4.3).
@@ -3984,6 +4185,53 @@ impl Compiler {
     fn leave_scopes(&mut self, count: usize) {
         for _ in 0..count {
             self.emit(Step::LeaveBlock);
+        }
+    }
+
+    /// A label scoping a loop defers its continue target to the loop with a
+    /// sentinel (see `labeled_continue_target`): when the loop's scope is
+    /// pushed, resolve any sentinel targets in the label scopes directly
+    /// beneath it (an intermediate non-loop label or other scope stops the
+    /// walk).
+    fn resolve_labeled_continue(&mut self, continue_target: usize, continue_count: usize) {
+        // The loop's own scope is on top; the labels it resolves are beneath.
+        for scope in self.scope_stack.iter_mut().rev().skip(1) {
+            match scope {
+                Scope::Label {
+                    continue_target: target,
+                    ..
+                } => {
+                    if let Some((usize::MAX, _)) = target {
+                        *target = Some((continue_target, continue_count));
+                    } else {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+    }
+
+    /// Whether a for-in/for-of head needs its lexical names in TDZ while the
+    /// RHS evaluates, and if so emit the TDZ environment (spec 14.7.5.4 /
+    /// 14.7.6.1).
+    fn enter_iter_tdz_env(&mut self, left: &ForBinding) -> bool {
+        if let ForBinding::VarDecl { kind, pattern, .. } = left
+            && *kind != VarDeclKind::Var
+        {
+            let mut names = Vec::new();
+            crate::script::bound_names(pattern, &mut names);
+            if !names.is_empty() {
+                self.emit(Step::EnterIterTdzEnv { names });
+                return true;
+            }
+        }
+        false
+    }
+
+    fn leave_iter_tdz_env(&mut self, entered: bool) {
+        if entered {
+            self.emit(Step::LeaveIterTdzEnv);
         }
     }
 
@@ -4198,33 +4446,39 @@ impl Compiler {
 impl Compiler {
     fn compile_statements(&mut self, stmts: &[Stmt]) -> Result<(), JsError> {
         for stmt in stmts {
-            // `return expr` in an async generator awaits the value, so it is
-            // not batched to the tree walker (spec ReturnStatement
-            // evaluation). A statement containing a `break`/`continue` is
-            // compiled too: the tree walker cannot deliver an exit across
-            // the `Step::Stmt` boundary.
-            if !(stmt_contains_suspension(stmt)
-                || stmt_contains_exit(stmt)
-                || self.is_async_generator && matches!(stmt.kind, StmtKind::Return(Some(_))))
-            {
-                self.emit(Step::Stmt(stmt.clone()));
-                continue;
-            }
             self.compile_statement(stmt)?;
         }
         Ok(())
     }
 
+    /// The declarations a block environment instantiates at entry:
+    /// `block_declaration_instantiation` ignores every other statement kind.
+    fn block_decls(stmts: &[Stmt]) -> Vec<Stmt> {
+        stmts
+            .iter()
+            .filter(|stmt| match &stmt.kind {
+                StmtKind::VarDecl { kind, .. } => *kind != VarDeclKind::Var,
+                StmtKind::UsingDecl { .. } | StmtKind::ClassDecl(_) | StmtKind::FunctionDecl(_) => {
+                    true
+                }
+                _ => false,
+            })
+            .cloned()
+            .collect()
+    }
+
     fn compile_statement(&mut self, stmt: &Stmt) -> Result<(), JsError> {
         match &stmt.kind {
             StmtKind::Block(block) => {
+                self.emit(Step::ListBegin);
                 self.emit(Step::EnterBlock {
-                    stmts: block.stmts.clone(),
+                    decls: Self::block_decls(&block.stmts),
                 });
                 self.scope_count += 1;
                 self.compile_statements(&block.stmts)?;
                 self.scope_count -= 1;
                 self.emit(Step::LeaveBlock);
+                self.emit(Step::ListEnd);
             }
             StmtKind::Expr(expr) => {
                 self.compile_expr(expr)?;
@@ -4234,6 +4488,13 @@ impl Compiler {
                 let declaration = *kind != VarDeclKind::Var;
                 for decl in decls {
                     if let Some(init) = &decl.init {
+                        // spec 14.3.2 step 2: a `var` identifier's binding is
+                        // resolved before its initializer runs — a `with`
+                        // object's property is the assignment target even
+                        // when the initializer mutates the object.
+                        if !declaration && let BindingPattern::Ident(name) = &decl.pattern {
+                            self.emit(Step::ResolveVarIdent { name: *name });
+                        }
                         self.compile_expr(init)?;
                         if let BindingPattern::Ident(name) = &decl.pattern
                             && crate::function::is_anonymous_function_definition(init)
@@ -4247,6 +4508,8 @@ impl Compiler {
                             // Defaults/computed keys with `yield`/`await`
                             // compile inline so they can suspend.
                             self.compile_destructure_binding(&decl.pattern, declaration)?;
+                        } else if !declaration && matches!(decl.pattern, BindingPattern::Ident(_)) {
+                            self.emit(Step::PutVarReference);
                         } else {
                             let step = if declaration {
                                 Step::DeclInit {
@@ -4259,6 +4522,14 @@ impl Compiler {
                             };
                             self.emit(step);
                         }
+                    } else if declaration {
+                        // `let x;` initializes the binding to *undefined*
+                        // (spec 14.2.1 step 4); the binding was created
+                        // uninitialized by declaration instantiation.
+                        self.emit(Step::Push(Value::Undefined));
+                        self.emit(Step::DeclInit {
+                            pattern: decl.pattern.clone(),
+                        });
                     }
                 }
             }
@@ -4304,6 +4575,7 @@ impl Compiler {
                 consequent,
                 alternate,
             } => {
+                self.emit(Step::ResetCompletion);
                 self.compile_expr(test)?;
                 let else_label = self.new_label();
                 let end_label = self.new_label();
@@ -4315,8 +4587,10 @@ impl Compiler {
                     self.compile_statement(alternate)?;
                 }
                 self.place(end_label);
+                self.emit(Step::NormalizeCompletion);
             }
             StmtKind::While { test, body } => {
+                self.emit(Step::ResetCompletion);
                 let test_label = self.new_label();
                 let end_label = self.new_label();
                 let break_count = self.scope_count;
@@ -4327,15 +4601,18 @@ impl Compiler {
                     continue_target: test_label,
                     continue_count,
                 });
+                self.resolve_labeled_continue(test_label, continue_count);
                 self.place(test_label);
                 self.compile_expr(test)?;
                 self.jump_if_false(end_label);
                 self.compile_statement(body)?;
                 self.jump(test_label);
                 self.place(end_label);
+                self.emit(Step::NormalizeCompletion);
                 self.scope_stack.pop();
             }
             StmtKind::DoWhile { body, test } => {
+                self.emit(Step::ResetCompletion);
                 let body_label = self.new_label();
                 let test_label = self.new_label();
                 let end_label = self.new_label();
@@ -4347,12 +4624,14 @@ impl Compiler {
                     continue_target: test_label,
                     continue_count,
                 });
+                self.resolve_labeled_continue(test_label, continue_count);
                 self.place(body_label);
                 self.compile_statement(body)?;
                 self.place(test_label);
                 self.compile_expr(test)?;
                 self.jump_if_true(body_label);
                 self.place(end_label);
+                self.emit(Step::NormalizeCompletion);
                 self.scope_stack.pop();
             }
             StmtKind::For {
@@ -4377,6 +4656,7 @@ impl Compiler {
                 }
             }
             StmtKind::Labeled { label, body } => {
+                self.emit(Step::ResetCompletion);
                 let break_target = self.new_label();
                 let break_count = self.scope_count;
                 let continue_target = labeled_continue_target(body);
@@ -4388,6 +4668,7 @@ impl Compiler {
                 });
                 self.compile_statement(body)?;
                 self.place(break_target);
+                self.emit(Step::NormalizeCompletion);
                 self.scope_stack.pop();
             }
             StmtKind::Break(label) => {
@@ -4410,12 +4691,14 @@ impl Compiler {
                 finalizer,
             } => self.compile_try(block, handler.as_ref(), finalizer.as_ref())?,
             StmtKind::With { object, body } => {
+                self.emit(Step::ResetCompletion);
                 self.compile_expr(object)?;
                 self.emit(Step::EnterWith);
                 self.scope_count += 1;
                 self.compile_statement(body)?;
                 self.scope_count -= 1;
                 self.emit(Step::LeaveBlock);
+                self.emit(Step::NormalizeCompletion);
             }
             StmtKind::ClassDecl(class) => {
                 // A class declaration whose heritage or computed names
@@ -4429,9 +4712,11 @@ impl Compiler {
                     });
                 }
             }
-            _ => {
-                // Empty, Debugger, FunctionDecl, ClassDecl.
-                self.emit(Step::Stmt(stmt.clone()));
+            StmtKind::Empty | StmtKind::Debugger => {}
+            StmtKind::FunctionDecl(_) => {
+                self.emit(Step::FunctionDecl {
+                    stmt: Box::new(stmt.clone()),
+                });
             }
         }
         Ok(())
@@ -4444,6 +4729,7 @@ impl Compiler {
         update: Option<&Expr>,
         body: &Stmt,
     ) -> Result<(), JsError> {
+        self.emit(Step::ResetCompletion);
         let mut has_loop_env = false;
         let mut per_iteration: Vec<JsString> = Vec::new();
         match init {
@@ -4497,6 +4783,7 @@ impl Compiler {
             continue_target: continue_label,
             continue_count,
         });
+        self.resolve_labeled_continue(continue_label, continue_count);
         self.place(test_label);
         match test {
             Some(test) => self.compile_expr(test)?,
@@ -4516,6 +4803,7 @@ impl Compiler {
         }
         self.jump(test_label);
         self.place(end_label);
+        self.emit(Step::NormalizeCompletion);
         self.scope_stack.pop();
         if has_loop_env {
             self.scope_count -= 1;
@@ -4530,6 +4818,7 @@ impl Compiler {
         right: &Expr,
         body: &Stmt,
     ) -> Result<(), JsError> {
+        self.emit(Step::ResetCompletion);
         // Annex B.2.6: `for (var a = init in expr)` — the initializer runs
         // once and binds `a` before the RHS is evaluated (sloppy mode only).
         if let ForBinding::VarDecl {
@@ -4548,7 +4837,9 @@ impl Compiler {
                 },
             });
         }
+        let tdz = self.enter_iter_tdz_env(left);
         self.compile_expr(right)?;
+        self.leave_iter_tdz_env(tdz);
         self.emit(Step::ForInBegin);
         let top_label = self.new_label();
         let end_label = self.new_label();
@@ -4560,6 +4851,7 @@ impl Compiler {
             continue_target: continue_label,
             break_target: end_label,
         });
+        self.resolve_labeled_continue(continue_label, scope);
         self.place(top_label);
         let step_index = self.steps.len();
         self.emit(Step::ForInNext { done: 0 });
@@ -4570,6 +4862,7 @@ impl Compiler {
         self.place(continue_label);
         self.jump(top_label);
         self.place(end_label);
+        self.emit(Step::NormalizeCompletion);
         self.scope_stack.pop();
         Ok(())
     }
@@ -4580,10 +4873,14 @@ impl Compiler {
         right: &Expr,
         body: &Stmt,
     ) -> Result<(), JsError> {
+        self.emit(Step::ResetCompletion);
+        let tdz = self.enter_iter_tdz_env(left);
         self.compile_expr(right)?;
+        self.leave_iter_tdz_env(tdz);
         self.emit(Step::ForOfBegin);
         let top_label = self.new_label();
         let end_label = self.new_label();
+        let done_label = self.new_label();
         let continue_label = self.new_label();
         let scope = self.scope_count;
         self.scope_stack.push(Scope::Iteration {
@@ -4592,10 +4889,11 @@ impl Compiler {
             continue_target: continue_label,
             break_target: end_label,
         });
+        self.resolve_labeled_continue(continue_label, scope);
         self.place(top_label);
         let step_index = self.steps.len();
         self.emit(Step::ForOfNext { done: 0 });
-        self.fixups.push(Fixup::ForOfNext(step_index, end_label));
+        self.fixups.push(Fixup::ForOfNext(step_index, done_label));
         // A destructuring head is compiled as steps (member targets and
         // defaults with `yield`/`await` need the resumable machinery).
         match left {
@@ -4612,6 +4910,10 @@ impl Compiler {
         self.jump(top_label);
         self.place(end_label);
         self.emit(Step::ForOfClose);
+        // The exhausted path jumped past the close (the iterator was already
+        // popped by ForOfNext), so a `break` is the only way to reach it.
+        self.place(done_label);
+        self.emit(Step::NormalizeCompletion);
         self.scope_stack.pop();
         Ok(())
     }
@@ -4622,10 +4924,14 @@ impl Compiler {
         right: &Expr,
         body: &Stmt,
     ) -> Result<(), JsError> {
+        self.emit(Step::ResetCompletion);
+        let tdz = self.enter_iter_tdz_env(left);
         self.compile_expr(right)?;
+        self.leave_iter_tdz_env(tdz);
         self.emit(Step::AsyncForOfBegin);
         let top_label = self.new_label();
         let end_label = self.new_label();
+        let done_label = self.new_label();
         let continue_label = self.new_label();
         let scope = self.scope_count;
         self.scope_stack.push(Scope::Iteration {
@@ -4634,12 +4940,13 @@ impl Compiler {
             continue_target: continue_label,
             break_target: end_label,
         });
+        self.resolve_labeled_continue(continue_label, scope);
         self.place(top_label);
         self.emit(Step::AsyncForOfNext);
         let step_index = self.steps.len();
         self.emit(Step::AsyncForOfTest { done: 0 });
         self.fixups
-            .push(Fixup::AsyncForOfNext(step_index, end_label));
+            .push(Fixup::AsyncForOfNext(step_index, done_label));
         // A destructuring head is compiled as steps (member targets and
         // defaults with `await` need the resumable machinery), mirroring the
         // sync for-of compiler.
@@ -4657,15 +4964,23 @@ impl Compiler {
         self.jump(top_label);
         self.place(end_label);
         self.emit(Step::AsyncForOfClose);
+        // The exhausted path jumped past the close (the iterator was already
+        // popped by AsyncForOfTest), so a `break` is the only way to reach it.
+        self.place(done_label);
+        self.emit(Step::NormalizeCompletion);
         self.scope_stack.pop();
         Ok(())
     }
 
     fn compile_switch(&mut self, discriminant: &Expr, cases: &[SwitchCase]) -> Result<(), JsError> {
+        self.emit(Step::ResetCompletion);
         self.compile_expr(discriminant)?;
         self.emit(Step::SwitchDisc);
         let all_stmts: Vec<Stmt> = cases.iter().flat_map(|c| c.consequent.clone()).collect();
-        self.emit(Step::EnterBlock { stmts: all_stmts });
+        self.emit(Step::EnterBlock {
+            decls: Self::block_decls(&all_stmts),
+        });
+        self.emit(Step::ListBegin);
         self.scope_count += 1;
         let end_label = self.new_label();
         let default_label = self.new_label();
@@ -4687,15 +5002,25 @@ impl Compiler {
             }
         }
         self.jump(default_label);
+        let mut has_default = false;
         for (index, case) in cases.iter().enumerate() {
             self.place(case_labels[index]);
+            if case.test.is_none() {
+                // The no-match path lands on the default case's statements.
+                self.place(default_label);
+                has_default = true;
+            }
             self.compile_statements(&case.consequent)?;
         }
-        self.place(default_label);
+        if !has_default {
+            self.place(default_label);
+        }
         self.scope_stack.pop();
         self.scope_count -= 1;
         self.emit(Step::LeaveBlock);
+        self.emit(Step::ListEnd);
         self.place(end_label);
+        self.emit(Step::NormalizeCompletion);
         Ok(())
     }
 
@@ -4717,13 +5042,16 @@ impl Compiler {
         self.emit(Step::EnterTry {
             handler: handler_index,
         });
+        self.emit(Step::ResetCompletion);
+        self.emit(Step::ListBegin);
         self.emit(Step::EnterBlock {
-            stmts: block.stmts.clone(),
+            decls: Self::block_decls(&block.stmts),
         });
         self.scope_count += 1;
         self.compile_statements(&block.stmts)?;
         self.scope_count -= 1;
         self.emit(Step::LeaveBlock);
+        self.emit(Step::ListEnd);
         let exit_index = self.steps.len();
         self.emit(Step::Exit { after: 0 });
         let after_label = self.new_label();
@@ -4734,12 +5062,15 @@ impl Compiler {
             let catch_start = self.steps.len();
             self.emit(Step::CatchBind {
                 param: handler.param.clone(),
-                stmts: handler.body.stmts.clone(),
+                decls: Self::block_decls(&handler.body.stmts),
             });
+            self.emit(Step::ResetCompletion);
+            self.emit(Step::ListBegin);
             self.scope_count += 1;
             self.compile_statements(&handler.body.stmts)?;
             self.scope_count -= 1;
             self.emit(Step::LeaveBlock);
+            self.emit(Step::ListEnd);
             let exit_index = self.steps.len();
             self.emit(Step::Exit { after: 0 });
             self.fixups.push(Fixup::Exit(exit_index, after_label));
@@ -4752,27 +5083,25 @@ impl Compiler {
         if let Some(finalizer) = finalizer {
             let finally_start = self.steps.len();
             self.handlers[handler_index].finally = Some(finally_start);
+            self.emit(Step::SaveCompletion);
+            self.emit(Step::ListBegin);
             self.emit(Step::EnterBlock {
-                stmts: finalizer.stmts.clone(),
+                decls: Self::block_decls(&finalizer.stmts),
             });
             self.scope_count += 1;
             self.compile_statements(&finalizer.stmts)?;
             self.scope_count -= 1;
             self.emit(Step::LeaveBlock);
+            self.emit(Step::ListEnd);
+            self.emit(Step::RestoreCompletion);
             self.emit(Step::FinallyEnd);
         }
         self.place(after_label);
+        self.emit(Step::NormalizeCompletion);
         Ok(())
     }
 
     fn compile_expr(&mut self, expr: &Expr) -> Result<(), JsError> {
-        // A chain containing `?.` is compiled (not batched to the tree
-        // walker): a short-circuited link sets the VM's flag that guards the
-        // rest of the chain (spec 13.4.3).
-        if !expr_contains_suspension(expr) && !expr_may_short_circuit(expr) {
-            self.emit(Step::Expr(expr.clone()));
-            return Ok(());
-        }
         match &expr.kind {
             ExprKind::Paren(inner) => self.compile_expr(inner),
             ExprKind::Sequence(exprs) => {
@@ -4784,6 +5113,37 @@ impl Compiler {
                 }
                 Ok(())
             }
+            ExprKind::Literal(literal) => self.compile_literal(literal),
+            ExprKind::Ident(name) => {
+                self.emit(Step::LoadIdent { name: *name });
+                Ok(())
+            }
+            ExprKind::This => {
+                self.emit(Step::ThisValue);
+                Ok(())
+            }
+            ExprKind::Super => Err(JsError::new(
+                ErrorKind::SyntaxError,
+                "super is not valid here".into(),
+            )),
+            ExprKind::Function(function) => {
+                self.emit(Step::CreateFunction {
+                    function: Box::new(function.clone()),
+                });
+                Ok(())
+            }
+            ExprKind::Arrow {
+                is_async,
+                params,
+                body,
+            } => {
+                self.emit(Step::CreateArrow {
+                    is_async: *is_async,
+                    params: params.clone(),
+                    body: body.clone(),
+                });
+                Ok(())
+            }
             ExprKind::Unary { op, operand } => match op {
                 UnaryOp::Delete => self.compile_delete(operand),
                 UnaryOp::Void => {
@@ -4793,8 +5153,19 @@ impl Compiler {
                     Ok(())
                 }
                 UnaryOp::Typeof => {
-                    self.compile_expr(operand)?;
-                    self.emit(Step::TypeofTop);
+                    // spec 13.5.3.2 step 1: `typeof` of an unresolvable
+                    // identifier reference is "undefined", not an error
+                    // (parentheses are transparent).
+                    let mut operand = operand;
+                    while let ExprKind::Paren(inner) = &operand.kind {
+                        operand = inner;
+                    }
+                    if let ExprKind::Ident(name) = &operand.kind {
+                        self.emit(Step::TypeofIdent { name: *name });
+                    } else {
+                        self.compile_expr(operand)?;
+                        self.emit(Step::TypeofTop);
+                    }
                     Ok(())
                 }
                 _ => {
@@ -4871,6 +5242,7 @@ impl Compiler {
             }
             ExprKind::TaggedTemplate { tag, quasi } => {
                 self.compile_expr(tag)?;
+                self.emit(Step::ArgsBase);
                 for expr in &quasi.exprs {
                     self.compile_expr(expr)?;
                     self.emit(Step::ArgsPush);
@@ -4894,6 +5266,7 @@ impl Compiler {
                         }
                     }
                 }
+                self.emit(Step::ArrayEnd);
                 Ok(())
             }
             ExprKind::Class(class) => self.compile_class(class),
@@ -4991,15 +5364,37 @@ impl Compiler {
                 if meta_name == "import" && property_name == "meta" {
                     self.emit(Step::ImportMeta);
                 } else {
-                    self.emit(Step::Expr(expr.clone()));
+                    // new.target (spec 13.3.5.3).
+                    self.emit(Step::NewTarget);
                 }
                 Ok(())
             }
-            _ => {
-                self.emit(Step::Expr(expr.clone()));
-                Ok(())
+        }
+    }
+
+    /// A literal's value is known at compile time; a `RegExp` literal
+    /// constructs its object at runtime (spec 13.2.4.4).
+    fn compile_literal(&mut self, literal: &syntax::ast::Literal) -> Result<(), JsError> {
+        match literal {
+            syntax::ast::Literal::Null => self.emit(Step::Push(Value::Null)),
+            syntax::ast::Literal::Boolean(value) => {
+                self.emit(Step::Push(Value::Boolean(*value)));
+            }
+            syntax::ast::Literal::Number(value) => self.emit(Step::Push(Value::Number(*value))),
+            syntax::ast::Literal::BigInt(value) => {
+                self.emit(Step::Push(Value::BigInt(Handle::new(value.clone()))));
+            }
+            syntax::ast::Literal::Str(value) => {
+                self.emit(Step::Push(Value::String(Handle::new(value.clone()))));
+            }
+            syntax::ast::Literal::RegExp { pattern, flags } => {
+                self.emit(Step::RegExpLiteral {
+                    pattern: pattern.clone(),
+                    flags: flags.clone(),
+                });
             }
         }
+        Ok(())
     }
 
     fn compile_delete(&mut self, operand: &Expr) -> Result<(), JsError> {
@@ -5045,7 +5440,7 @@ impl Compiler {
     ) -> Result<(), JsError> {
         match &target.kind {
             ExprKind::Ident(name) => {
-                self.emit(Step::Expr(target.clone()));
+                self.emit(Step::LoadIdent { name: *name });
                 self.emit(Step::UpdateIdent {
                     name: *name,
                     op: *op,
@@ -5129,7 +5524,7 @@ impl Compiler {
                         });
                     }
                     AssignOp::AndAssign | AssignOp::OrAssign | AssignOp::NullishAssign => {
-                        self.emit(Step::Expr(target.clone()));
+                        self.emit(Step::LoadIdent { name: *name });
                         let end_label = self.new_label();
                         match op {
                             AssignOp::AndAssign => self.jump_if_false_keep(end_label),
@@ -5146,7 +5541,7 @@ impl Compiler {
                         self.place(end_label);
                     }
                     _ => {
-                        self.emit(Step::Expr(target.clone()));
+                        self.emit(Step::LoadIdent { name: *name });
                         self.compile_expr(value)?;
                         self.emit(Step::AssignIdent {
                             name: *name,
@@ -5725,7 +6120,7 @@ impl Compiler {
         if member.optional {
             let short = self.new_label();
             let end = self.new_label();
-            self.compile_chain_base(&member.object)?;
+            self.compile_expr(&member.object)?;
             self.emit(Step::Dup);
             self.jump_if_nullish_keep(short);
             self.compile_member_property_guarded(member)?;
@@ -5738,7 +6133,7 @@ impl Compiler {
             self.emit(Step::SetChainShort);
             self.place(end);
         } else {
-            self.compile_chain_base(&member.object)?;
+            self.compile_expr(&member.object)?;
             self.compile_member_property_guarded(member)?;
         }
         Ok(())
@@ -5761,6 +6156,7 @@ impl Compiler {
     }
 
     fn compile_arguments(&mut self, args: &[Argument]) -> Result<(), JsError> {
+        self.emit(Step::ArgsBase);
         for argument in args {
             match argument {
                 Argument::Expr(expr) => {
@@ -5811,7 +6207,7 @@ impl Compiler {
                 return Ok(());
             }
             // obj.m(args)
-            self.compile_chain_base(&member.object)?;
+            self.compile_expr(&member.object)?;
             self.emit(Step::Dup);
             if member.optional {
                 // `?.` on the member: a nullish object short-circuits the
@@ -5852,7 +6248,7 @@ impl Compiler {
             ExprKind::Ident(id) if crux::lookup(id) == JsString::from_utf8("eval")
         );
         self.emit(Step::Push(Value::Undefined));
-        self.compile_chain_base(&call.callee)?;
+        self.compile_expr(&call.callee)?;
         if call.optional {
             self.compile_optional_call_tail(&call.args)?;
         } else {
@@ -5938,7 +6334,11 @@ impl Compiler {
         self.emit(Step::ObjectBegin);
         for property in &literal.props {
             match property {
-                ObjectProperty::Init { key, value, .. } => {
+                ObjectProperty::Init {
+                    key,
+                    value,
+                    shorthand,
+                } => {
                     let set_name = crate::function::is_anonymous_function_definition(value);
                     match key {
                         PropertyName::Ident(id) => {
@@ -5946,6 +6346,7 @@ impl Compiler {
                             self.emit(Step::ObjectInitName {
                                 name: *id,
                                 set_name,
+                                shorthand: *shorthand,
                             });
                         }
                         PropertyName::Computed(key_expr) => {
@@ -5956,13 +6357,21 @@ impl Compiler {
                         PropertyName::Str(text) => {
                             self.compile_expr(value)?;
                             let id = crux::intern(text.as_slice());
-                            self.emit(Step::ObjectInitName { name: id, set_name });
+                            self.emit(Step::ObjectInitName {
+                                name: id,
+                                set_name,
+                                shorthand: false,
+                            });
                         }
                         PropertyName::Number(n) => {
                             self.compile_expr(value)?;
                             let text = crux::convert::to_string(&Value::Number(*n))?;
                             let id = crux::intern(text.as_slice());
-                            self.emit(Step::ObjectInitName { name: id, set_name });
+                            self.emit(Step::ObjectInitName {
+                                name: id,
+                                set_name,
+                                shorthand: false,
+                            });
                         }
                     }
                 }
