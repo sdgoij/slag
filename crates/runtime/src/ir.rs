@@ -144,8 +144,52 @@ pub enum Step {
     ResolveVarIdent {
         name: crux::AtomId,
     },
+    /// Resolve a private member reference: pop the receiver, resolve the
+    /// private name, and push the reference — the base stays off the value
+    /// stack, so a short-circuited `&&=`/`||=`/`??=` leaves only the old
+    /// value as the result.
+    ResolvePrivateRef {
+        atom: crux::AtomId,
+    },
+    /// Resolve a named member reference the same way: pop the receiver and
+    /// push the reference.
+    ResolveMemberRefName {
+        name: crux::AtomId,
+    },
+    /// Resolve a computed member reference: pop the key (converting it to a
+    /// property key once, spec 13.15.4: ToPropertyKey runs before the read)
+    /// and the receiver, then push the reference.
+    ResolveMemberRefComputed,
+    /// Push the value of the reference on top of the var-reference stack —
+    /// the assignment target resolved before its RHS evaluated (spec
+    /// 13.15.3 steps 1-5: PutValue uses the initially created reference even
+    /// if the binding is gone by then).
+    GetVarReference,
     /// Assign a `var` declaration's value to the pre-resolved reference.
     PutVarReference,
+    /// Discard the pre-resolved reference without assigning (a
+    /// short-circuited `&&=`/`||=`/`??=` never reaches PutVarReference).
+    PopVarReference,
+    /// Resolve a super property reference: GetThisBinding then GetSuperBase
+    /// (spec 13.3.7.1), the receiver recorded in [[ThisValue]].
+    ResolveSuperRefName {
+        name: crux::AtomId,
+    },
+    /// Resolve a computed super property reference: the base copy is already
+    /// on the stack (GetSuperBase ran the this-check first), the converted
+    /// key on top; both are consumed and the reference recorded.
+    ResolveSuperRefComputed,
+    /// Apply a compound assignment (`+=`, ...) to the pre-resolved
+    /// reference: pop the new value and the old value, compute the result,
+    /// and put it.
+    PutVarReferenceOp {
+        op: AssignOp,
+    },
+    /// Apply a `++`/`--` to the pre-resolved reference.
+    UpdateVarReference {
+        op: UpdateOp,
+        prefix: bool,
+    },
     /// Evaluate a `using`/`await using` initializer: register the value as a
     /// disposable resource on the current lexical environment, then bind it
     /// (spec 9.3.1 / 14.2.2).
@@ -199,6 +243,13 @@ pub enum Step {
         name: crux::AtomId,
     },
     DeleteMemberComputed,
+    /// `delete super.x` / `delete super[x]`: a ReferenceError before the key
+    /// is evaluated (spec 13.5.1.2 step 4.b).
+    DeleteSuper,
+    /// Pop a value and push its property key (ToPropertyKey, spec 7.3.21) as
+    /// a string/symbol value: a computed member compound assignment converts
+    /// the key once, before the read and the write each consume a copy.
+    ToPropertyKey,
     TypeofTop,
     /// `typeof <identifier>`: an unresolvable reference yields "undefined"
     /// instead of throwing (spec 13.5.3.2 step 1).
@@ -1030,6 +1081,11 @@ impl Vm {
                     self.stack.push(this);
                 }
                 Step::GetSuperBase => {
+                    // SuperProperty evaluation checks GetThisBinding first
+                    // (spec 13.3.7.1): an uninitialized `this` in a derived
+                    // constructor throws before the base is read or the key
+                    // evaluates.
+                    resolve_this_binding(agent)?;
                     let base = get_super_base(agent)?;
                     self.stack.push(base);
                 }
@@ -1104,13 +1160,18 @@ impl Vm {
                     let value = self.pop();
                     let object = self.pop();
                     let name_id = crate::context::resolve_private_name(agent, *atom)?.id;
-                    let old = crate::context::private_get(agent, &object, name_id)?;
+                    // Only a compound assignment reads the old value; a plain
+                    // `=` must not invoke the getter (PrivateSet on an
+                    // accessor runs the setter, spec 10.2.12.2).
                     let new = match *op {
                         AssignOp::Assign
                         | AssignOp::AndAssign
                         | AssignOp::OrAssign
                         | AssignOp::NullishAssign => value.clone(),
-                        _ => crate::expr::apply_compound(agent, *op, &old, &value)?,
+                        _ => {
+                            let old = crate::context::private_get(agent, &object, name_id)?;
+                            crate::expr::apply_compound(agent, *op, &old, &value)?
+                        }
                     };
                     crate::context::private_set(agent, &object, name_id, new.clone())?;
                     self.stack.push(new);
@@ -1252,6 +1313,31 @@ impl Vm {
                         crate::context::resolve_binding(agent, &crux::lookup(*name), self.strict)?;
                     self.var_ref_stack.push(reference);
                 }
+                Step::ResolvePrivateRef { atom } => {
+                    let object = self.pop();
+                    let name_id = crate::context::resolve_private_name(agent, *atom)?.id;
+                    self.var_ref_stack.push(crate::context::Reference {
+                        base: crate::context::ReferenceBase::Value(object),
+                        name: PropertyKey::from_utf8(""),
+                        strict: self.strict,
+                        this_value: None,
+                        private_name: Some(name_id),
+                    });
+                }
+                Step::ResolveMemberRefName { name } => {
+                    let object = self.pop();
+                    let reference =
+                        member_reference(&object, &PropertyKeyName::Name(*name), self.strict);
+                    self.var_ref_stack.push(reference);
+                }
+                Step::ResolveMemberRefComputed => {
+                    let key = self.pop();
+                    let object = self.pop();
+                    let key = crate::context::to_property_key(agent, &key)?;
+                    let reference =
+                        member_reference(&object, &PropertyKeyName::Key(key), self.strict);
+                    self.var_ref_stack.push(reference);
+                }
                 Step::PutVarReference => {
                     let value = self.pop();
                     let reference = self.var_ref_stack.pop().ok_or_else(|| {
@@ -1262,6 +1348,74 @@ impl Vm {
                     })?;
                     crate::context::put_value(agent, &reference, value.clone())?;
                     self.stack.push(value);
+                }
+                Step::PopVarReference => {
+                    self.var_ref_stack.pop().ok_or_else(|| {
+                        JsError::new(
+                            ErrorKind::SyntaxError,
+                            "PopVarReference without a resolution".into(),
+                        )
+                    })?;
+                }
+                Step::ResolveSuperRefName { name } => {
+                    let this = resolve_this_binding(agent)?;
+                    let base = get_super_base(agent)?;
+                    self.var_ref_stack.push(crate::context::Reference {
+                        base: crate::context::ReferenceBase::Value(base),
+                        name: PropertyKey::from_js_string(&crux::lookup(*name)),
+                        strict: self.strict,
+                        this_value: Some(this),
+                        private_name: None,
+                    });
+                }
+                Step::ResolveSuperRefComputed => {
+                    let key = self.pop();
+                    self.pop(); // base copy (recomputed from the environment)
+                    let key = crate::context::to_property_key(agent, &key)?;
+                    let this = resolve_this_binding(agent)?;
+                    let base = get_super_base(agent)?;
+                    self.var_ref_stack.push(crate::context::Reference {
+                        base: crate::context::ReferenceBase::Value(base),
+                        name: key,
+                        strict: self.strict,
+                        this_value: Some(this),
+                        private_name: None,
+                    });
+                }
+                Step::GetVarReference => {
+                    let reference = self.var_ref_stack.last().ok_or_else(|| {
+                        JsError::new(
+                            ErrorKind::SyntaxError,
+                            "GetVarReference without a resolution".into(),
+                        )
+                    })?;
+                    let value = crate::context::get_value(agent, reference)?;
+                    self.stack.push(value);
+                }
+                Step::PutVarReferenceOp { op } => {
+                    let value = self.pop();
+                    let old = self.pop();
+                    let reference = self.var_ref_stack.pop().ok_or_else(|| {
+                        JsError::new(
+                            ErrorKind::SyntaxError,
+                            "PutVarReferenceOp without a resolution".into(),
+                        )
+                    })?;
+                    let new = crate::expr::apply_compound(agent, *op, &old, &value)?;
+                    crate::context::put_value(agent, &reference, new.clone())?;
+                    self.stack.push(new);
+                }
+                Step::UpdateVarReference { op, prefix } => {
+                    let old = self.pop();
+                    let new = update_value(agent, op, &old)?;
+                    let reference = self.var_ref_stack.pop().ok_or_else(|| {
+                        JsError::new(
+                            ErrorKind::SyntaxError,
+                            "UpdateVarReference without a resolution".into(),
+                        )
+                    })?;
+                    crate::context::put_value(agent, &reference, new.clone())?;
+                    self.stack.push(if *prefix { new } else { old });
                 }
                 Step::UsingInit { pattern, is_await } => {
                     let value = self.pop();
@@ -1370,6 +1524,9 @@ impl Vm {
                 }
                 Step::DeleteMemberName { name } => {
                     let object = self.pop();
+                    if is_nullish(&object) {
+                        return Err(nullish_error("Cannot convert undefined or null to object"));
+                    }
                     let reference = crate::context::Reference {
                         base: crate::context::ReferenceBase::Value(object),
                         name: PropertyKey::from_js_string(&crux::lookup(*name)),
@@ -1383,6 +1540,9 @@ impl Vm {
                 Step::DeleteMemberComputed => {
                     let key = self.pop();
                     let object = self.pop();
+                    if is_nullish(&object) {
+                        return Err(nullish_error("Cannot convert undefined or null to object"));
+                    }
                     let key = crate::context::to_property_key(agent, &key)?;
                     let reference = crate::context::Reference {
                         base: crate::context::ReferenceBase::Value(object),
@@ -1393,6 +1553,23 @@ impl Vm {
                     };
                     let deleted = crate::context::delete_property_or_throw(agent, &reference)?;
                     self.stack.push(Value::Boolean(deleted));
+                }
+                Step::DeleteSuper => {
+                    // `delete super.x` is a ReferenceError before the key is
+                    // even evaluated (spec 13.5.1.2 step 4.b).
+                    return Err(JsError::new(
+                        ErrorKind::ReferenceError,
+                        "Unsupported reference to 'super'".into(),
+                    ));
+                }
+                Step::ToPropertyKey => {
+                    let value = self.pop();
+                    let key = crate::context::to_property_key(agent, &value)?;
+                    let key = match key {
+                        PropertyKey::String(id) => Value::String(Handle::new(crux::lookup(id))),
+                        PropertyKey::Symbol(symbol) => Value::Symbol(Handle::new(symbol)),
+                    };
+                    self.stack.push(key);
                 }
                 Step::TypeofTop => {
                     let value = self.pop();
@@ -3709,15 +3886,10 @@ fn pattern_of_target(target: &Expr) -> Result<BindingPattern, JsError> {
             for prop in &literal.props {
                 match prop {
                     ObjectProperty::Init { key, value, .. } => {
-                        let element = pattern_of_target(value)?;
+                        let element = binding_element_of_target(value)?;
                         properties.push(syntax::ast::ObjectBindingProperty::Property {
                             key: key.clone(),
-                            element: BindingElement {
-                                pattern: element,
-                                init: None,
-                                rest: false,
-                                span: target.span,
-                            },
+                            element,
                             span: target.span,
                         });
                     }
@@ -3746,13 +3918,9 @@ fn pattern_of_target(target: &Expr) -> Result<BindingPattern, JsError> {
                 match element {
                     ArrayElement::Hole => elements.push(syntax::ast::ArrayBindingElement::Hole),
                     ArrayElement::Expr(expr) => {
-                        let pattern = pattern_of_target(expr)?;
-                        elements.push(syntax::ast::ArrayBindingElement::Element(BindingElement {
-                            pattern,
-                            init: None,
-                            rest: false,
-                            span: target.span,
-                        }));
+                        elements.push(syntax::ast::ArrayBindingElement::Element(
+                            binding_element_of_target(expr)?,
+                        ));
                     }
                     ArrayElement::Spread(expr) => {
                         let pattern = pattern_of_target(expr)?;
@@ -3790,6 +3958,32 @@ fn pattern_of_target(target: &Expr) -> Result<BindingPattern, JsError> {
             ErrorKind::SyntaxError,
             "Invalid destructuring assignment target".into(),
         )),
+    }
+}
+
+/// A destructuring assignment element: an assignment expression `x = 1` is a
+/// default initializer (spec 13.15.5: BindingInitialization of `x` with
+/// default `1`), anything else is the plain target pattern.
+fn binding_element_of_target(expr: &Expr) -> Result<BindingElement, JsError> {
+    if let ExprKind::Assign {
+        target,
+        value,
+        op: AssignOp::Assign,
+    } = &expr.kind
+    {
+        Ok(BindingElement {
+            pattern: pattern_of_target(target)?,
+            init: Some((**value).clone()),
+            rest: false,
+            span: expr.span,
+        })
+    } else {
+        Ok(BindingElement {
+            pattern: pattern_of_target(expr)?,
+            init: None,
+            rest: false,
+            span: expr.span,
+        })
     }
 }
 
@@ -5471,6 +5665,12 @@ impl Compiler {
                 Ok(())
             }
             ExprKind::Member(member) => {
+                if matches!(member.object.kind, ExprKind::Super) {
+                    // `delete super.x` throws a ReferenceError before the key
+                    // evaluates (spec 13.5.1.2 step 4.b).
+                    self.emit(Step::DeleteSuper);
+                    return Ok(());
+                }
                 match &member.property {
                     MemberProperty::Name(name) => {
                         self.compile_expr(&member.object)?;
@@ -5507,14 +5707,41 @@ impl Compiler {
     ) -> Result<(), JsError> {
         match &target.kind {
             ExprKind::Ident(name) => {
-                self.emit(Step::LoadIdent { name: *name });
-                self.emit(Step::UpdateIdent {
-                    name: *name,
-                    op: *op,
-                    prefix,
-                });
+                // The assignment target's reference resolves before the RHS:
+                // PutValue uses the initially created reference even when the
+                // binding disappears while the RHS evaluates (spec 13.15.3
+                // steps 1, 5 — a `with` scope whose binding the RHS deletes).
+                self.emit(Step::ResolveVarIdent { name: *name });
+                self.emit(Step::GetVarReference);
+                self.emit(Step::UpdateVarReference { op: *op, prefix });
             }
             ExprKind::Member(member) => {
+                if matches!(member.object.kind, ExprKind::Super) {
+                    // super.x++ / super[x]++ (spec 13.3.7.1): GetValue
+                    // through the super reference, then PutValue the
+                    // incremented value.
+                    match &member.property {
+                        MemberProperty::Name(name) => {
+                            self.emit(Step::ResolveSuperRefName { name: *name });
+                        }
+                        MemberProperty::Computed(key) => {
+                            // GetSuperBase runs the this-binding check before
+                            // the key evaluates.
+                            self.emit(Step::GetSuperBase);
+                            self.compile_expr(key)?;
+                            self.emit(Step::ResolveSuperRefComputed);
+                        }
+                        MemberProperty::Private(_) => {
+                            return Err(JsError::new(
+                                ErrorKind::SyntaxError,
+                                "update of super.#x is a syntax error".into(),
+                            ));
+                        }
+                    }
+                    self.emit(Step::GetVarReference);
+                    self.emit(Step::UpdateVarReference { op: *op, prefix });
+                    return Ok(());
+                }
                 self.compile_expr(&member.object)?;
                 match &member.property {
                     MemberProperty::Name(name) => {
@@ -5528,6 +5755,7 @@ impl Compiler {
                     }
                     MemberProperty::Computed(key) => {
                         self.compile_expr(key)?;
+                        self.emit(Step::ToPropertyKey);
                         self.emit(Step::Dup2);
                         self.emit(Step::GetMemberComputed);
                         self.emit(Step::UpdateMemberComputed { op: *op, prefix });
@@ -5583,12 +5811,17 @@ impl Compiler {
             ExprKind::Ident(name) => {
                 match op {
                     AssignOp::Assign => {
+                        // Resolve the reference before the RHS: PutValue uses
+                        // the initially created reference even if the binding
+                        // disappears while the RHS evaluates (spec 13.15.3
+                        // steps 1, 5 — e.g. a `with` scope whose binding the
+                        // RHS deletes).
+                        self.emit(Step::ResolveVarIdent { name: *name });
                         self.compile_expr(value)?;
-                        self.emit(Step::AssignIdent {
-                            name: *name,
-                            op: *op,
-                            set_name,
-                        });
+                        if set_name {
+                            self.emit(Step::SetFunctionName { name: *name });
+                        }
+                        self.emit(Step::PutVarReference);
                     }
                     AssignOp::AndAssign | AssignOp::OrAssign | AssignOp::NullishAssign => {
                         self.emit(Step::LoadIdent { name: *name });
@@ -5608,13 +5841,10 @@ impl Compiler {
                         self.place(end_label);
                     }
                     _ => {
-                        self.emit(Step::LoadIdent { name: *name });
+                        self.emit(Step::ResolveVarIdent { name: *name });
+                        self.emit(Step::GetVarReference);
                         self.compile_expr(value)?;
-                        self.emit(Step::AssignIdent {
-                            name: *name,
-                            op: *op,
-                            set_name,
-                        });
+                        self.emit(Step::PutVarReferenceOp { op: *op });
                     }
                 }
                 Ok(())
@@ -6056,12 +6286,87 @@ impl Compiler {
         Ok(())
     }
 
+    /// `&&=`, `||=`, `??=` on a member/super/private target (spec 13.15.4-6):
+    /// resolve the reference (base consumed), read the old value, test it,
+    /// short-circuit with the old value as the expression result, or evaluate
+    /// the RHS and assign. The reference lives on the var-reference stack, so
+    /// both paths leave exactly one value.
+    fn compile_logical_assign(
+        &mut self,
+        member: &syntax::ast::MemberExpr,
+        op: &AssignOp,
+        value: &Expr,
+    ) -> Result<(), JsError> {
+        let end_label = self.new_label();
+        let short_label = self.new_label();
+        if matches!(member.object.kind, ExprKind::Super) {
+            match &member.property {
+                MemberProperty::Name(name) => {
+                    self.emit(Step::ResolveSuperRefName { name: *name });
+                }
+                MemberProperty::Computed(key) => {
+                    // GetSuperBase runs the this-binding check before the key
+                    // evaluates (spec 13.3.7.1); the base copy it leaves is
+                    // consumed by ResolveSuperRefComputed.
+                    self.emit(Step::GetSuperBase);
+                    self.compile_expr(key)?;
+                    self.emit(Step::ResolveSuperRefComputed);
+                }
+                MemberProperty::Private(_) => {
+                    return Err(JsError::new(
+                        ErrorKind::SyntaxError,
+                        "super.#x is a syntax error".into(),
+                    ));
+                }
+            }
+        } else {
+            self.compile_expr(&member.object)?;
+            match &member.property {
+                MemberProperty::Name(name) => {
+                    self.emit(Step::ResolveMemberRefName { name: *name });
+                }
+                MemberProperty::Computed(key) => {
+                    self.compile_expr(key)?;
+                    self.emit(Step::ResolveMemberRefComputed);
+                }
+                MemberProperty::Private(atom) => {
+                    self.emit(Step::ResolvePrivateRef { atom: *atom });
+                }
+            }
+        }
+        self.emit(Step::GetVarReference);
+        self.emit(Step::Dup);
+        match op {
+            AssignOp::AndAssign => self.jump_if_false_keep(short_label),
+            AssignOp::OrAssign => self.jump_if_true_keep(short_label),
+            _ => self.jump_if_not_nullish_keep(short_label),
+        }
+        // The write path: discard the old value, evaluate the RHS, assign
+        // through the pre-resolved reference.
+        self.emit(Step::Pop);
+        self.compile_expr(value)?;
+        self.emit(Step::PutVarReference);
+        self.jump(end_label);
+        // The short-circuit path: keep the old value, drop the reference.
+        self.place(short_label);
+        self.emit(Step::Pop);
+        self.emit(Step::PopVarReference);
+        self.place(end_label);
+        Ok(())
+    }
+
     fn compile_member_assign(
         &mut self,
         member: &syntax::ast::MemberExpr,
         op: &AssignOp,
         value: &Expr,
     ) -> Result<(), JsError> {
+        if matches!(
+            op,
+            AssignOp::AndAssign | AssignOp::OrAssign | AssignOp::NullishAssign
+        ) {
+            return self.compile_logical_assign(member, op, value);
+        }
         if matches!(member.object.kind, ExprKind::Super) {
             // super.x = v / super[x] = v
             self.emit(Step::GetSuperBase);
@@ -6110,6 +6415,9 @@ impl Compiler {
                             | AssignOp::BitOrAssign
                     );
                     if needs_old {
+                        // ToPropertyKey runs once, before the read and the
+                        // write each consume a copy (spec 13.15.4 step 2.c).
+                        self.emit(Step::ToPropertyKey);
                         self.emit(Step::Dup2);
                         self.emit(Step::GetSuperComputed);
                     }
@@ -6143,6 +6451,9 @@ impl Compiler {
                 self.compile_expr(&member.object)?;
                 self.compile_expr(key)?;
                 if is_compound_assign(op) {
+                    // ToPropertyKey runs once, before the read and the write
+                    // each consume a copy (spec 13.15.4 step 2.c).
+                    self.emit(Step::ToPropertyKey);
                     self.emit(Step::Dup2);
                     self.emit(Step::GetMemberComputed);
                 }
