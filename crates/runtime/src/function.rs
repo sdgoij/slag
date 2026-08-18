@@ -1592,17 +1592,34 @@ fn run_compiled_body(
 ) -> Result<Value, JsError> {
     let body_env = agent.running_context()?.lexical_environment.clone();
     let mut vm = Vm::new(body_env.clone(), strict);
-    let completion = match vm.start(agent, ir)? {
-        VmOutcome::Completed(completion) => completion,
-        VmOutcome::Suspended(_) => {
+    let outcome = vm.start(agent, ir);
+    let completion = match outcome {
+        Ok(VmOutcome::Completed(completion)) => completion,
+        Ok(VmOutcome::Suspended(_)) => {
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "ordinary function suspended unexpectedly".into(),
             ));
         }
+        // The body env's `using` resources dispose on an abrupt error too
+        // (spec 14.2.3 step 6, mirroring the walker's eval_statement_list);
+        // a throwing disposal folds into the error as a SuppressedError.
+        Err(error) => return Err(body_error_after_disposal(agent, &body_env, error)),
     };
     let completion = crate::eval::dispose_env_resources(agent, &body_env, Ok(completion))?;
     body_completion_to_value(completion)
+}
+
+/// Dispose a body environment after an abrupt engine error, folding disposal
+/// errors into the error (spec 9.4.3) and returning the resulting error.
+fn body_error_after_disposal(agent: &mut Agent, env: &EnvRef, error: JsError) -> JsError {
+    match crate::eval::dispose_env_resources(agent, env, Err(error)) {
+        Ok(Completion::Throw(value)) => {
+            JsError::new(ErrorKind::TypeError, format!("Uncaught {value:?}")).with_value(value)
+        }
+        Ok(_) => JsError::new(ErrorKind::TypeError, "Uncaught disposal error".into()),
+        Err(error) => error,
+    }
 }
 
 /// The `[[Construct]]` of an ordinary function (spec 10.2.1): create `this`
@@ -1743,14 +1760,16 @@ fn ordinary_construct(
             Some(ir) => {
                 let body_env = agent.running_context()?.lexical_environment.clone();
                 let mut vm = Vm::new(body_env.clone(), data.strict);
-                let completion = match vm.start(agent, ir)? {
-                    VmOutcome::Completed(completion) => completion,
-                    VmOutcome::Suspended(_) => {
+                let outcome = vm.start(agent, ir);
+                let completion = match outcome {
+                    Ok(VmOutcome::Completed(completion)) => completion,
+                    Ok(VmOutcome::Suspended(_)) => {
                         return Err(JsError::new(
                             ErrorKind::TypeError,
                             "constructor body suspended unexpectedly".into(),
                         ));
                     }
+                    Err(error) => return Err(body_error_after_disposal(agent, &body_env, error)),
                 };
                 crate::eval::dispose_env_resources(agent, &body_env, Ok(completion))?
             }

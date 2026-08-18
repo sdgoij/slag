@@ -1793,7 +1793,7 @@ fn eval_template(
 // the spec's same-site identity. Node addresses can be reused across parses
 // (a freed AST reallocated for the next `eval`), so each parse also gets a
 // fresh generation: the node pointer alone would falsely cache across evals.
-type TemplateCacheKey = (usize, usize, usize);
+type TemplateCacheKey = (usize, usize, usize, usize);
 thread_local! {
     static TEMPLATE_OBJECT_CACHE: std::cell::RefCell<Vec<(TemplateCacheKey, Value)>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -1805,6 +1805,113 @@ thread_local! {
 /// a fresh site).
 pub fn bump_template_parse_generation() {
     TEMPLATE_PARSE_GENERATION.set(TEMPLATE_PARSE_GENERATION.get() + 1);
+}
+
+/// GetTemplateObject (spec 12.2.9.3): the realm's template cache, keyed by
+/// parse-node identity and parse generation — the same source location yields
+/// the same frozen array. Shared with the step VM's `TaggedTemplate`.
+pub(crate) fn get_template_object(
+    agent: &Agent,
+    template: &TemplateLiteral,
+) -> Result<Value, JsError> {
+    let realm = agent.current_realm()?;
+    let generation = TEMPLATE_PARSE_GENERATION.get();
+    // The cache is keyed by source location, not parse-node identity: the
+    // step VM embeds a clone of the template literal per compilation, so two
+    // instances of the same factory-created function would otherwise miss.
+    let span = template.span;
+    let key = (
+        generation,
+        crux::handle::Handle::as_ptr(&realm) as usize,
+        span.start as usize,
+        span.end as usize,
+    );
+    let cached = TEMPLATE_OBJECT_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .iter()
+            .find(|(cached_key, _)| *cached_key == key)
+            .map(|(_, value)| value.clone())
+    });
+    if let Some(value) = cached {
+        return Ok(value);
+    }
+    // GetTemplateObject (spec 12.2.9.3): index properties are
+    // non-writable/non-configurable, `raw` is non-enumerable, and both
+    // arrays are frozen.
+    let obj = crux::object::JsObject::array_create(None, template.quasis.len() as f64)?;
+    let raw = crux::object::JsObject::array_create(None, template.quasis.len() as f64)?;
+    for (index, quasi) in template.quasis.iter().enumerate() {
+        let key = &index.to_string();
+        // A quasi whose TV is undefined (an invalid escape sequence)
+        // yields the value *undefined*, not a string (spec 12.2.9.3).
+        let cooked = match quasi.cooked.clone() {
+            Some(cooked) => Value::String(Handle::new(cooked)),
+            None => Value::Undefined,
+        };
+        obj.define_property_key(
+            &PropertyKey::from_utf8(key),
+            &PropertyDescriptor {
+                value: Some(cooked),
+                writable: Some(false),
+                get: None,
+                set: None,
+                enumerable: Some(true),
+                configurable: Some(false),
+            },
+        )?;
+        raw.define_property_key(
+            &PropertyKey::from_utf8(key),
+            &PropertyDescriptor {
+                value: Some(Value::String(Handle::new(quasi.raw.clone()))),
+                writable: Some(false),
+                get: None,
+                set: None,
+                enumerable: Some(true),
+                configurable: Some(false),
+            },
+        )?;
+    }
+    raw.define_property_key(
+        &PropertyKey::from_utf8("length"),
+        &PropertyDescriptor {
+            value: Some(Value::Number(template.quasis.len() as f64)),
+            writable: Some(false),
+            get: None,
+            set: None,
+            enumerable: None,
+            configurable: Some(false),
+        },
+    )?;
+    raw.prevent_extensions()?;
+    obj.define_property_key(
+        &PropertyKey::from_utf8("raw"),
+        &PropertyDescriptor {
+            value: Some(Value::Object(raw)),
+            writable: Some(false),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(false),
+        },
+    )?;
+    obj.define_property_key(
+        &PropertyKey::from_utf8("length"),
+        &PropertyDescriptor {
+            value: Some(Value::Number(template.quasis.len() as f64)),
+            writable: Some(false),
+            get: None,
+            set: None,
+            enumerable: None,
+            configurable: Some(false),
+        },
+    )?;
+    obj.prevent_extensions()?;
+    let value = Value::Object(obj);
+    TEMPLATE_OBJECT_CACHE.with(|cache| {
+        cache.borrow_mut().push((key, value.clone()));
+    });
+    Ok(value)
 }
 
 fn eval_tagged_template(
@@ -1830,101 +1937,7 @@ fn eval_tagged_template(
             format!("{} is not a function", type_of(&tag_value)),
         ));
     }
-    let realm = agent.current_realm()?;
-    let generation = TEMPLATE_PARSE_GENERATION.get();
-    let key = (
-        generation,
-        crux::handle::Handle::as_ptr(&realm) as usize,
-        template as *const TemplateLiteral as usize,
-    );
-    let cached = TEMPLATE_OBJECT_CACHE.with(|cache| {
-        cache
-            .borrow()
-            .iter()
-            .find(|(cached_key, _)| *cached_key == key)
-            .map(|(_, value)| value.clone())
-    });
-    let template_object = match cached {
-        Some(value) => value,
-        None => {
-            // GetTemplateObject (spec 12.2.9.3): index properties are
-            // non-writable/non-configurable, `raw` is non-enumerable, and both
-            // arrays are frozen.
-            let obj = crux::object::JsObject::array_create(None, template.quasis.len() as f64)?;
-            let raw = crux::object::JsObject::array_create(None, template.quasis.len() as f64)?;
-            for (index, quasi) in template.quasis.iter().enumerate() {
-                let key = &index.to_string();
-                // A quasi whose TV is undefined (an invalid escape sequence)
-                // yields the value *undefined*, not a string (spec 12.2.9.3).
-                let cooked = match quasi.cooked.clone() {
-                    Some(cooked) => Value::String(Handle::new(cooked)),
-                    None => Value::Undefined,
-                };
-                obj.define_property_key(
-                    &PropertyKey::from_utf8(key),
-                    &PropertyDescriptor {
-                        value: Some(cooked),
-                        writable: Some(false),
-                        get: None,
-                        set: None,
-                        enumerable: Some(true),
-                        configurable: Some(false),
-                    },
-                )?;
-                raw.define_property_key(
-                    &PropertyKey::from_utf8(key),
-                    &PropertyDescriptor {
-                        value: Some(Value::String(Handle::new(quasi.raw.clone()))),
-                        writable: Some(false),
-                        get: None,
-                        set: None,
-                        enumerable: Some(true),
-                        configurable: Some(false),
-                    },
-                )?;
-            }
-            raw.define_property_key(
-                &PropertyKey::from_utf8("length"),
-                &PropertyDescriptor {
-                    value: Some(Value::Number(template.quasis.len() as f64)),
-                    writable: Some(false),
-                    get: None,
-                    set: None,
-                    enumerable: None,
-                    configurable: Some(false),
-                },
-            )?;
-            raw.prevent_extensions()?;
-            obj.define_property_key(
-                &PropertyKey::from_utf8("raw"),
-                &PropertyDescriptor {
-                    value: Some(Value::Object(raw)),
-                    writable: Some(false),
-                    get: None,
-                    set: None,
-                    enumerable: Some(false),
-                    configurable: Some(false),
-                },
-            )?;
-            obj.define_property_key(
-                &PropertyKey::from_utf8("length"),
-                &PropertyDescriptor {
-                    value: Some(Value::Number(template.quasis.len() as f64)),
-                    writable: Some(false),
-                    get: None,
-                    set: None,
-                    enumerable: None,
-                    configurable: Some(false),
-                },
-            )?;
-            obj.prevent_extensions()?;
-            let value = Value::Object(obj);
-            TEMPLATE_OBJECT_CACHE.with(|cache| {
-                cache.borrow_mut().push((key, value.clone()));
-            });
-            value
-        }
-    };
+    let template_object = get_template_object(agent, template)?;
     let mut args = vec![template_object];
     for expr in &template.exprs {
         args.push(eval_expr(agent, expr, strict)?);

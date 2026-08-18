@@ -53,6 +53,11 @@ pub enum Step {
         name: crux::AtomId,
     },
     GetMemberComputed,
+    /// The compound/update variant of GetMemberComputed: convert the key once
+    /// (after the nullish check) and leave the converted key for the write.
+    GetMemberComputedKeep,
+    /// The compound/update variant of GetSuperComputed.
+    GetSuperComputedKeep,
     GetSuperName {
         name: crux::AtomId,
     },
@@ -246,10 +251,6 @@ pub enum Step {
     /// `delete super.x` / `delete super[x]`: a ReferenceError before the key
     /// is evaluated (spec 13.5.1.2 step 4.b).
     DeleteSuper,
-    /// Pop a value and push its property key (ToPropertyKey, spec 7.3.21) as
-    /// a string/symbol value: a computed member compound assignment converts
-    /// the key once, before the read and the write each consume a copy.
-    ToPropertyKey,
     TypeofTop,
     /// `typeof <identifier>`: an unresolvable reference yields "undefined"
     /// instead of throwing (spec 13.5.3.2 step 1).
@@ -456,6 +457,10 @@ pub enum Step {
     Continue {
         target: usize,
     },
+    /// A function-call assignment target in sloppy code: the operands are
+    /// evaluated, then PutValue on the call's value reference throws a
+    /// ReferenceError (Annex B web-compat, spec 13.15.3 / 6.2.5.6).
+    InvalidAssignmentTarget,
     Return,
     Throw,
     // ----- suspension -----
@@ -637,6 +642,9 @@ pub struct Vm {
     /// a `next()` error propagates without closing the iterator (spec
     /// 14.7.6.2 uses `?`), unlike a body or head-binding error.
     pub for_of_stepping: bool,
+    /// Whether the innermost destructure is stepping its iterator
+    /// (`DestructureNext`): an abrupt step leaves the iterator open.
+    pub destructure_stepping: bool,
     /// In-progress for-in enumerations: the (prototype-level, key) pairs and
     /// the enumerated base object, so a key deleted during enumeration can be
     /// re-checked against its own level at visit time (spec
@@ -747,6 +755,7 @@ impl Vm {
             thrown: None,
             resume_abrupt: None,
             for_of_stepping: false,
+            destructure_stepping: false,
             for_in_stack: Vec::new(),
             for_of_stack: Vec::new(),
             async_for_of_stack: Vec::new(),
@@ -947,7 +956,7 @@ impl Vm {
                     // the error (spec 7.4.11). The tree-walker's
                     // array_assignment does the same on its error path.
                     let mut error = error;
-                    if !self.destructure_stack.is_empty() {
+                    if !self.destructure_stack.is_empty() && !self.destructure_stepping {
                         let mut close_error: Option<JsError> = None;
                         while let Some(index) = self.destructure_stack.len().checked_sub(1) {
                             let iterator = self.destructure_stack[index].clone();
@@ -1128,6 +1137,47 @@ impl Vm {
                         crate::context::get_property_key(agent, &object, &key, object.clone())?;
                     self.stack.push(value);
                 }
+                Step::GetMemberComputedKeep => {
+                    // Compound/update paths: the (object, key) pair was
+                    // duplicated; convert the key once (after the nullish
+                    // check, spec 13.3.3 step 3 before step 6) and leave the
+                    // converted key on the stack for the write, so the key's
+                    // ToPropertyKey runs exactly once (spec 13.15.4).
+                    let key = self.pop();
+                    let object = self.pop();
+                    if is_nullish(&object) {
+                        return Err(nullish_error("Cannot read properties of null"));
+                    }
+                    let key = crate::context::to_property_key(agent, &key)?;
+                    let value =
+                        crate::context::get_property_key(agent, &object, &key, object.clone())?;
+                    self.pop(); // the write copy of the raw key
+                    let key = match key {
+                        PropertyKey::String(id) => Value::String(Handle::new(crux::lookup(id))),
+                        PropertyKey::Symbol(symbol) => Value::Symbol(Handle::new(symbol)),
+                    };
+                    self.stack.push(key);
+                    self.stack.push(value);
+                }
+                Step::GetSuperComputedKeep => {
+                    // Mirror of GetMemberComputedKeep for super: the key is
+                    // converted once and the converted value left for the
+                    // write; the base captured by GetSuperBase is used, not
+                    // recomputed (a key whose toString mutates the prototype
+                    // must still see the original base, spec 13.3.7.1).
+                    let key = self.pop();
+                    let base = self.pop();
+                    let key = crate::context::to_property_key(agent, &key)?;
+                    let this = resolve_this_binding(agent)?;
+                    let value = crate::context::get_property_key(agent, &base, &key, this)?;
+                    self.pop(); // the write copy of the raw key
+                    let key = match key {
+                        PropertyKey::String(id) => Value::String(Handle::new(crux::lookup(id))),
+                        PropertyKey::Symbol(symbol) => Value::Symbol(Handle::new(symbol)),
+                    };
+                    self.stack.push(key);
+                    self.stack.push(value);
+                }
                 Step::GetSuperName { name } => {
                     let base = self.pop();
                     let this = resolve_this_binding(agent)?;
@@ -1274,15 +1324,24 @@ impl Vm {
                         )
                     })?;
                     let iterator = self.destructure_stack[index].clone();
-                    match iterator_step(agent, &iterator)? {
-                        Some(value) => self.stack.push(value),
-                        None => {
+                    // An abrupt iterator step does not close the iterator
+                    // (the error path in `run_inner` skips the close while the
+                    // flag is set; it stays set on the error path).
+                    self.destructure_stepping = true;
+                    match iterator_step(agent, &iterator) {
+                        Ok(Some(value)) => {
+                            self.destructure_stepping = false;
+                            self.stack.push(value);
+                        }
+                        Ok(None) => {
+                            self.destructure_stepping = false;
                             // The iterator is exhausted but the element still
                             // receives *undefined*: a default initializer must
                             // run (and may suspend) even after exhaustion.
                             self.destructure_done[index] = true;
                             self.stack.push(Value::Undefined);
                         }
+                        Err(error) => return Err(error),
                     }
                 }
                 Step::DestructureUndef { use_default } => {
@@ -1301,9 +1360,23 @@ impl Vm {
                         )
                     })?;
                     let iterator = self.destructure_stack[index].clone();
+                    // An abrupt step during the rest collection leaves the
+                    // iterator open (mirroring DestructureNext); the flag stays
+                    // set on the error path.
+                    self.destructure_stepping = true;
                     let mut collected = Vec::new();
-                    while let Some(value) = iterator_step(agent, &iterator)? {
-                        collected.push(value);
+                    let stepped = loop {
+                        match iterator_step(agent, &iterator) {
+                            Ok(Some(value)) => collected.push(value),
+                            Ok(None) => break Ok(()),
+                            Err(error) => break Err(error),
+                        }
+                    };
+                    match stepped {
+                        Ok(()) => {
+                            self.destructure_stepping = false;
+                        }
+                        Err(error) => return Err(error),
                     }
                     self.destructure_stack.pop();
                     self.destructure_done.pop();
@@ -1359,12 +1432,15 @@ impl Vm {
                 }
                 Step::DestructureClose => {
                     if let Some(index) = self.destructure_stack.len().checked_sub(1) {
-                        let iterator = self.destructure_stack[index].clone();
-                        if !self.destructure_done[index] {
+                        let done = self.destructure_done.get(index).copied().unwrap_or(false);
+                        // Pop before closing: a throwing `return` then reaches
+                        // `run_inner` with an empty destructure stack, so the
+                        // error-path close does not close it a second time.
+                        let iterator = self.destructure_stack.pop().unwrap();
+                        self.destructure_done.pop();
+                        if !done {
                             iterator_close(agent, &iterator)?;
                         }
-                        self.destructure_stack.pop();
-                        self.destructure_done.pop();
                     }
                 }
                 Step::DestructureObjEnd => {
@@ -1634,15 +1710,6 @@ impl Vm {
                         "Unsupported reference to 'super'".into(),
                     ));
                 }
-                Step::ToPropertyKey => {
-                    let value = self.pop();
-                    let key = crate::context::to_property_key(agent, &value)?;
-                    let key = match key {
-                        PropertyKey::String(id) => Value::String(Handle::new(crux::lookup(id))),
-                        PropertyKey::Symbol(symbol) => Value::Symbol(Handle::new(symbol)),
-                    };
-                    self.stack.push(key);
-                }
                 Step::TypeofTop => {
                     let value = self.pop();
                     self.stack
@@ -1666,6 +1733,15 @@ impl Vm {
                 }
                 Step::PrivateIn { atom } => {
                     let object = self.pop();
+                    // `#x in rhs` requires an object RHS (spec 13.11.1 step
+                    // 4), like the `in` operator's non-object check.
+                    if !matches!(object.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
+                        return Err(JsError::new(
+                            ErrorKind::TypeError,
+                            "Cannot use 'in' operator to search for a property in a non-object"
+                                .into(),
+                        ));
+                    }
                     let name_id = crate::context::resolve_private_name(agent, *atom)?.id;
                     self.stack.push(Value::Boolean(crate::context::private_in(
                         &object, name_id,
@@ -2193,27 +2269,69 @@ impl Vm {
                 Step::EnterLoopEnv { kind, decls } => {
                     let old_env = self.lexical_env.clone();
                     let env = new_declarative_environment(Some(old_env));
-                    for decl in decls {
-                        let mut names = Vec::new();
-                        crate::script::bound_names(&decl.pattern, &mut names);
-                        for name in &names {
-                            if *kind == VarDeclKind::Const {
-                                env.create_immutable_binding(name, true)?;
-                            } else {
-                                env.create_mutable_binding(name, false)?;
+                    let head = (|| -> Result<(), JsError> {
+                        for decl in decls {
+                            let mut names = Vec::new();
+                            crate::script::bound_names(&decl.pattern, &mut names);
+                            for name in &names {
+                                if *kind == VarDeclKind::Const
+                                    || matches!(*kind, VarDeclKind::Using | VarDeclKind::AwaitUsing)
+                                {
+                                    // `using` heads bind immutably like
+                                    // `const` (spec 15.14.2).
+                                    env.create_immutable_binding(name, true)?;
+                                } else {
+                                    env.create_mutable_binding(name, false)?;
+                                }
                             }
+                            let value = match &decl.init {
+                                Some(init) => crate::expr::eval_expr(agent, init, self.strict)?,
+                                None => Value::Undefined,
+                            };
+                            // A `using` head registers the disposable resource
+                            // before the binding initializes (spec 14.7.4.2
+                            // step 5.e, like the UsingInit step).
+                            if matches!(*kind, VarDeclKind::Using | VarDeclKind::AwaitUsing) {
+                                let disposal_kind = if *kind == VarDeclKind::AwaitUsing {
+                                    crate::eval::DisposalKind::Async
+                                } else {
+                                    crate::eval::DisposalKind::Sync
+                                };
+                                let resource = crate::eval::create_disposable_resource(
+                                    agent,
+                                    &value,
+                                    disposal_kind,
+                                )?;
+                                env.add_disposable_resource(resource);
+                            }
+                            crate::binding::binding_initialization(
+                                agent,
+                                &decl.pattern,
+                                value,
+                                Some(&env),
+                                self.strict,
+                            )?;
                         }
-                        let value = match &decl.init {
-                            Some(init) => crate::expr::eval_expr(agent, init, self.strict)?,
-                            None => Value::Undefined,
-                        };
-                        crate::binding::binding_initialization(
-                            agent,
-                            &decl.pattern,
-                            value,
-                            Some(&env),
-                            self.strict,
-                        )?;
+                        Ok(())
+                    })();
+                    if let Err(error) = head {
+                        // spec 14.7.4.2 step 9: an abrupt head disposes the
+                        // loop environment's resources before propagating,
+                        // folding a throwing disposal into the error.
+                        return Err(
+                            match crate::eval::dispose_env_resources(agent, &env, Err(error)) {
+                                Ok(Completion::Throw(value)) => JsError::new(
+                                    ErrorKind::TypeError,
+                                    format!("Uncaught {value:?}"),
+                                )
+                                .with_value(value),
+                                Ok(_) => JsError::new(
+                                    ErrorKind::TypeError,
+                                    "Uncaught disposal error".into(),
+                                ),
+                                Err(error) => error,
+                            },
+                        );
                     }
                     self.lexical_env = env.clone();
                     self.env_stack.push(env);
@@ -2272,17 +2390,20 @@ impl Vm {
                     };
                     let iterator = iterator.clone();
                     // A `next()` error propagates without closing the iterator
-                    // (spec 14.7.6.2 uses `?`): the flag suppresses the
-                    // error-path close in `run_inner`.
+                    // (spec 14.7.6.2 uses `?`): the flag stays set on the
+                    // error path so `run_inner` skips the close.
                     self.for_of_stepping = true;
-                    let stepped = iterator_step(agent, &iterator);
-                    self.for_of_stepping = false;
-                    match stepped? {
-                        Some(value) => self.stack.push(value),
-                        None => {
+                    match iterator_step(agent, &iterator) {
+                        Ok(Some(value)) => {
+                            self.for_of_stepping = false;
+                            self.stack.push(value);
+                        }
+                        Ok(None) => {
+                            self.for_of_stepping = false;
                             self.for_of_stack.pop();
                             self.ip = *done;
                         }
+                        Err(error) => return Err(error),
                     }
                 }
                 Step::ForOfBind { left } => {
@@ -2469,6 +2590,12 @@ impl Vm {
                         CtlResult::Continue => continue,
                         CtlResult::Done(outcome) => return Ok(outcome),
                     }
+                }
+                Step::InvalidAssignmentTarget => {
+                    return Err(JsError::new(
+                        ErrorKind::ReferenceError,
+                        "Invalid left-hand side in assignment".into(),
+                    ));
                 }
                 Step::Return => {
                     let value = self.pop();
@@ -3368,7 +3495,10 @@ impl Vm {
     /// iteration environment is disposed at iteration end).
     fn restore_per_iteration(&mut self, agent: &mut Agent) -> Result<(), JsError> {
         // The per-iteration environment lives in the lexical environment, not
-        // the stack; the next iteration's bind step replaces it.
+        // the stack; the loop's restore step disposes its resources and
+        // unwinds back to the pre-iteration environment (each iteration's
+        // bind step creates a fresh copy whose outer is the loop base, so
+        // closures never chain through previous iterations).
         let env = self.lexical_env.clone();
         let resources = env.drain_disposable_resources();
         for resource in resources.iter().rev() {
@@ -3376,6 +3506,7 @@ impl Vm {
                 crate::function::call(agent, &resource.method, resource.value.clone(), &[])?;
             }
         }
+        self.lexical_env = env.outer().unwrap_or(env);
         Ok(())
     }
 
@@ -3894,24 +4025,10 @@ fn tagged_template(
             format!("{} is not a function", crux::value::type_of(&tag)),
         ));
     }
-    let template_object =
-        crate::builtins::array::array_create(agent, template.quasis.len() as f64)?;
-    let raw = crate::builtins::array::array_create(agent, template.quasis.len() as f64)?;
-    for (index, quasi) in template.quasis.iter().enumerate() {
-        // A quasi whose TV is undefined (an invalid escape sequence) yields
-        // the value *undefined*, not a string (spec 12.2.9.3).
-        let cooked = match quasi.cooked.clone() {
-            Some(cooked) => Value::String(Handle::new(cooked)),
-            None => Value::Undefined,
-        };
-        template_object.create_data_property(&JsString::from_utf8(&index.to_string()), cooked)?;
-        raw.create_data_property(
-            &JsString::from_utf8(&index.to_string()),
-            Value::String(Handle::new(quasi.raw.clone())),
-        )?;
-    }
-    template_object.create_data_property(&JsString::from_utf8("raw"), Value::Object(raw))?;
-    let mut args = vec![Value::Object(template_object)];
+    // GetTemplateObject (spec 12.2.9.3): the same parse node yields the same
+    // frozen array across calls, via the shared realm/parse-generation cache.
+    let template_object = crate::expr::get_template_object(agent, template)?;
+    let mut args = vec![template_object];
     args.extend(substitutions);
     crate::function::call(agent, &tag, Value::Undefined, &args)
 }
@@ -5161,6 +5278,15 @@ impl Compiler {
                     self.scope_count += 1;
                     has_loop_env = true;
                     for decl in decls {
+                        // `const` (and `using`) heads share one binding —
+                        // the update would otherwise mutate a per-iteration
+                        // copy instead of throwing on the immutable binding
+                        // (spec 14.7.4.2, mirroring the tree-walker).
+                        if *kind == VarDeclKind::Const
+                            || matches!(*kind, VarDeclKind::Using | VarDeclKind::AwaitUsing)
+                        {
+                            continue;
+                        }
                         let mut names = Vec::new();
                         crate::script::bound_names(&decl.pattern, &mut names);
                         per_iteration.extend(names);
@@ -5263,7 +5389,16 @@ impl Compiler {
         self.fixups.push(Fixup::ForInNext(step_index, end_label));
         self.emit(Step::ForInBind { left: left.clone() });
         self.compile_statement(body)?;
-        self.emit(Step::ForInRestore);
+        // Only a lexical head creates a per-iteration environment that needs
+        // restoring; a `var`/expression head leaves the running environment
+        // untouched.
+        let lexical_head = matches!(
+            left,
+            ForBinding::VarDecl { kind, .. } if *kind != VarDeclKind::Var
+        );
+        if lexical_head {
+            self.emit(Step::ForInRestore);
+        }
         self.place(continue_label);
         self.jump(top_label);
         self.place(end_label);
@@ -5310,7 +5445,16 @@ impl Compiler {
             _ => self.emit(Step::ForOfBind { left: left.clone() }),
         }
         self.compile_statement(body)?;
-        self.emit(Step::ForOfRestore);
+        // Only a lexical head creates a per-iteration environment that needs
+        // restoring; a `var`/expression head leaves the running environment
+        // untouched.
+        let lexical_head = matches!(
+            left,
+            ForBinding::VarDecl { kind, .. } if *kind != VarDeclKind::Var
+        );
+        if lexical_head {
+            self.emit(Step::ForOfRestore);
+        }
         self.place(continue_label);
         self.jump(top_label);
         self.place(end_label);
@@ -5364,7 +5508,16 @@ impl Compiler {
             _ => self.emit(Step::AsyncForOfBind { left: left.clone() }),
         }
         self.compile_statement(body)?;
-        self.emit(Step::AsyncForOfRestore);
+        // Only a lexical head creates a per-iteration environment that needs
+        // restoring; a `var`/expression head leaves the running environment
+        // untouched.
+        let lexical_head = matches!(
+            left,
+            ForBinding::VarDecl { kind, .. } if *kind != VarDeclKind::Var
+        );
+        if lexical_head {
+            self.emit(Step::AsyncForOfRestore);
+        }
         self.place(continue_label);
         self.jump(top_label);
         self.place(end_label);
@@ -5907,9 +6060,8 @@ impl Compiler {
                     }
                     MemberProperty::Computed(key) => {
                         self.compile_expr(key)?;
-                        self.emit(Step::ToPropertyKey);
                         self.emit(Step::Dup2);
-                        self.emit(Step::GetMemberComputed);
+                        self.emit(Step::GetMemberComputedKeep);
                         self.emit(Step::UpdateMemberComputed { op: *op, prefix });
                     }
                     MemberProperty::Private(atom) => {
@@ -5928,6 +6080,13 @@ impl Compiler {
                     ErrorKind::SyntaxError,
                     "update of super is a syntax error".into(),
                 ));
+            }
+            ExprKind::Call(_) => {
+                // Annex B web-compat: a sloppy-mode call target evaluates its
+                // operand, then the update's PutValue throws a ReferenceError.
+                self.compile_expr(target)?;
+                self.emit(Step::Pop);
+                self.emit(Step::InvalidAssignmentTarget);
             }
             _ => {
                 return Err(JsError::new(
@@ -6002,6 +6161,16 @@ impl Compiler {
                 Ok(())
             }
             ExprKind::Member(member) => self.compile_member_assign(member, op, value),
+            ExprKind::Call(_) => {
+                // Annex B web-compat: a sloppy-mode function-call assignment
+                // target evaluates the call, then throws a ReferenceError
+                // before the RHS evaluates (spec 13.15.3). Strict mode
+                // rejects the syntax at parse time.
+                self.compile_expr(target)?;
+                self.emit(Step::Pop);
+                self.emit(Step::InvalidAssignmentTarget);
+                Ok(())
+            }
             ExprKind::Super => Err(JsError::new(
                 ErrorKind::SyntaxError,
                 "Invalid left-hand side in assignment".into(),
@@ -6567,11 +6736,8 @@ impl Compiler {
                             | AssignOp::BitOrAssign
                     );
                     if needs_old {
-                        // ToPropertyKey runs once, before the read and the
-                        // write each consume a copy (spec 13.15.4 step 2.c).
-                        self.emit(Step::ToPropertyKey);
                         self.emit(Step::Dup2);
-                        self.emit(Step::GetSuperComputed);
+                        self.emit(Step::GetSuperComputedKeep);
                     }
                     self.compile_expr(value)?;
                     self.emit(Step::AssignSuperComputed { op: *op });
@@ -6603,11 +6769,11 @@ impl Compiler {
                 self.compile_expr(&member.object)?;
                 self.compile_expr(key)?;
                 if is_compound_assign(op) {
-                    // ToPropertyKey runs once, before the read and the write
-                    // each consume a copy (spec 13.15.4 step 2.c).
-                    self.emit(Step::ToPropertyKey);
+                    // ToPropertyKey runs once, after the nullish check, with
+                    // the converted key shared by the read and the write (spec
+                    // 13.15.4 step 2.c).
                     self.emit(Step::Dup2);
-                    self.emit(Step::GetMemberComputed);
+                    self.emit(Step::GetMemberComputedKeep);
                 }
                 self.compile_expr(value)?;
                 self.emit(Step::AssignMemberComputed { op: *op });
