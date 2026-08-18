@@ -18,9 +18,11 @@ over the vendored test262 submodule. The engine's own test suite is
 - Full area: `target/release/sweep.exe language --jobs 8 --batch 32
   --timeout 120 --recheck-timeout 120 --json > out.json` (areas:
   `language` | `built-ins` | `annexB` | `all`). The JSON has
-  `total/pass/fail/skip/crash/hang` plus `failures` and `hangs` arrays.
-  Use the long deadlines — the default recheck is too short for the O(n²)
-  crash-test fixtures and misclassifies them as hangs.
+  `total/pass/fail/skip/crash/hang` plus `failures` and `hangs` arrays;
+  the `failures` array holds fail AND crash entries (the summary `fail`
+  and `crash` counts are separate). Use the long deadlines — the default
+  recheck is too short for the O(n²) crash-test fixtures and misclassifies
+  them as hangs.
 - Cluster: `--list FILE` where every line is an AREA-ROOT-RELATIVE path
   (`import/import-defer/x.js`, never `language/import/…`). Generate the
   list with a frontmatter-aware walk (Python or `tools/skip_tally.js` style
@@ -95,11 +97,27 @@ operator change in the language import-defer work regressed 4
 `built-ins/Proxy/has/*` fixtures. After any dispatcher change, sweep all
 three areas, not just your cluster.
 
+### 5. Load-dependent fail/crash/hang classification — diff the union
+
+Batch classification wobbles with machine load: a fixture that errors can
+report as `fail`, `crash` ("fixture process died" / "batch process died
+mid-fixture"), or `hang` depending on whether its batch times out and how
+the individual recheck lands. The known decodeURI/decodeURIComponent
+batch-death fixtures moved between `fail` and `crash` on the SAME binary
+across runs. When A/B-ing two builds, diff the fail+crash UNION of paths
+(from the `failures` array), not the raw summary `fail` counts, and run
+both sides under similar load. For a clean comparison, rebuild both
+worktrees' sweep binaries first (the parent A/B worktree at
+`C:/Users/T/Desktop/jsrt-parent` is at `8c2f0cf`).
+
 ## Relationship to the other skills
 
 - `slag-modules` — the module machinery: DFS evaluation waves, dynamic
   import, import-defer trigger matrix, cycle roots, module harness. Load it
   for anything `flags: [module]`.
+- `slag-bytecode-vm` — the compiled `Step` VM and compiler
+  (`crates/runtime/src/ir.rs`): lowering and stack-protocol traps, and the
+  bench-noise reality. Load it when a fix touches the VM path.
 - `git-commit-messages` — commit message format.
 - Keep the skip taxonomy (what `run_fixture` skips) in sync with
   `tools/skip_tally.js`; as of the atomics closure the only skips are

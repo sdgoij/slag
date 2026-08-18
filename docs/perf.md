@@ -12,8 +12,13 @@ correctness gate.
   exactly. Heap values own one strong `Rc` ref; `Clone`/`Drop` reconstruct
   the `Rc` from the payload. `match value.kind()` keeps the old enum arm
   shapes via a `ValueKind` mirror.
-- **Interpreter**: a tree-walker over the parser's AST (the resumable
-  function IR from Phase 7); there is no bytecode.
+- **Interpreter**: a `Step` bytecode VM over the compiled function IR
+  (`crates/runtime/src/ir.rs`): every expression and statement compiles to
+  a `Step` at creation, and a `Vm` dispatch loop executes the compiled
+  body for ordinary calls/constructs, generators, async functions, and
+  top-level scripts. The old tree-walker survives only as isolated
+  single-expression helpers (computed keys, destructuring defaults, class
+  heritage); no statement or control-flow structure is walked anymore.
 - **Objects**: ordinary Rust structs with a property vector and a prototype
   `RefCell`; per-object state (promises, generators, buffers, ...) lives in
   agent-side tables keyed by object id. There is no shape/IC machinery; a
@@ -73,7 +78,7 @@ Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
 | Milestone | Gate | Status |
 |---|---|---|
 | NaN-boxed `Value` (u64 with tag fast paths) | arithmetic micro-benchmark ≥ 2x vs snapshot | **Done** — correctness landed (migration below) and the shapes work closed the gate: real-loop arithmetic is ~2.2x the corrected baseline. |
-| Bytecode VM replacing the tree-walker | `--print-bytecode` dumps real bytecode; hot-path bench ≥ 5x | Deferred: the Phase 7 IR would need to grow a full instruction set (property load/store, call/construct with ICs, closures, control flow). |
+| Bytecode VM replacing the tree-walker | `--print-bytecode` dumps real bytecode; hot-path bench ≥ 5x | **Cut 1 + first half of Cut 2 delivered** — everything compiles and runs on the `Vm`; literal immediates (`BinaryImm`) and 0-2-arity fast calls (`CallFast`) landed with zero conformance regressions, but at walker parity the ≥5x gate is still open. |
 | Object shapes / hidden classes + inline caches | property-access micro-benchmark ≥ 2x | **Done** — the cache layer below (interner memo, own-data fast paths, lazy property index) measured 2.1x on the corrected property-access baseline. |
 | String rope representation | string-concat micro-benchmark ≥ 2x | **Done** — the rope below measured ~5x on the corrected concat baseline (0.88s → ~0.15s). |
 | `--gc-stress` + leak-detection harness | stress runs clean, no leaks | Deferred: requires the arena heap + mark-sweep GC milestone (below). |
@@ -137,8 +142,6 @@ accessors must reject doubles before reading the tag — a double's bits
 whose bits 47-44 read as the BigInt tag), and an unguarded `as_bigint()`
 would reconstruct an `Rc` from the double's low bits and crash. Every tag
 accessor now checks `!is_double()` first.
-
-### Benchmark analysis (why the 2x gate is not yet met)
 
 ### Benchmark analysis (the gate, closed by the shapes work)
 
@@ -234,6 +237,48 @@ release sweep over 48,622 fixtures: 0 fail, 229 skip (unchanged taxonomy),
 a documented `#[allow(clippy::mutable_key_type)]`: a rope's first hash
 materializes its flat cache, but the hash output is content-stable.)
 
+## Bytecode VM milestone (Cut 1 delivered, gate open)
+
+The tree-walker is gone from normal execution: every expression and
+statement compiles to `Step` bytecode at creation (`compile_expr`/
+`compile_statements` in `crates/runtime/src/ir.rs`), and a `Vm` dispatch
+loop runs the compiled body for ordinary calls/constructs, generators,
+async functions, and top-level scripts. The batching defaults that cloned
+suspension-free subtrees into `Step::Expr`/`Step::Stmt` for runtime
+tree-walking are deleted. Removing the walker exposed a long tail of bugs
+the batching used to mask (assignment-reference timing, member/private/
+super `&&=`/`||=`/`??=` short-circuits, computed-compound key conversion
+order, destructure/for-of iterator-close semantics, catch env unwinding,
+finally routing, super base capture, template-object caching, Annex B
+call-assignment targets, `using` disposal on abrupt errors); all fixed, and
+the full release sweeps are at zero regressions vs the parent commit with
+122 net fixes in `language` (152 fail vs the parent's 274).
+
+The compiled path is at or near walker parity on every benchmark — nothing
+lost, but the ≥5x gate is not met (arithmetic needs ≤0.23s):
+
+| Benchmark | walker baseline | post-Cut-1 | Cut 2 (HEAD) |
+|---|---|---|---|
+| arithmetic | 1.14s | 1.56s | 1.19s |
+| property access | 1.50s | 1.93s | 1.59s |
+| string concat | ~0.15s | 0.196s | 0.160s |
+| array iteration | 13.6–15s | 13.9s | 14.1s |
+| function calls | 4.2–4.4s | 4.68s | 4.56s |
+
+(The Cut 2 column is the first two encoding tightenings — `BinaryImm`
+literal immediates and `CallFast` 0-2-arity calls — plus the optional-call
+nullish-short-path fix they exposed. The runs are noisy on this machine
+(±15%, the array iteration bounced 13.7–19.1s across runs); only string
+concat moved consistently, ~5% lower, from the fused loop-test compare.)
+
+Closing the gate is the rest of Cut 2's encoding tightening (constant
+pool, zero-operand constants — see `docs/bytecode-plan.md`), then Cut 3
+(registers) if needed; the measured wins so far are within bench noise, so
+the structural costs (per-identifier env resolution, per-call function
+machinery) dominate and a 5x will likely need one of those. `--print-bytecode`
+remains a no-op because the printer does not exist yet, not because the VM
+is missing.
+
 ## GC milestone (PLAN Phase 18 item 2)
 
 The plan's GC milestone (arena heap + mark-sweep; root tracing;
@@ -250,3 +295,5 @@ collector itself is missing.
 the CLI for compatibility. They are no-ops because the corresponding
 machinery (call-stack depth control, a heap to cap, a bytecode printer)
 does not exist yet; they will become live as the milestones above land.
+(`--print-bytecode` will gain a real printer as Cut 2 lands — the `Step`
+VM itself already exists.)
