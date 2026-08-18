@@ -21,6 +21,7 @@ use crate::env::{EnvRef, new_declarative_environment, new_function_environment};
 use crate::eval::eval_statement_list;
 use crate::expr::eval_expr;
 use crate::flow::Completion;
+use crate::ir::{Vm, VmOutcome};
 use crate::realm::Realm;
 use crate::script::{
     bound_names, is_constant_declaration, top_level_lexically_declared_names,
@@ -155,9 +156,10 @@ pub struct EcmaFunction {
     /// The module this function's source text appears in (import.meta resolves
     /// lexically to it, spec 13.3.7.1); `None` for script and builtin code.
     pub declaring_module: Option<Handle<crate::module::SourceTextModule>>,
-    /// The compiled resumable body (PLAN §4.5) for generator/async
-    /// functions; ordinary functions evaluate the AST directly.
-    pub ir: Option<crate::ir::CompiledBody>,
+    /// The compiled body (PLAN §4.5): every function body compiles to the
+    /// step IR, and ordinary calls/constructs run it on the VM. Shared so
+    /// the per-call record read does not copy the steps.
+    pub ir: Option<std::rc::Rc<crate::ir::CompiledBody>>,
 }
 
 /// FunctionBodyContainsUseStrict (spec 15.2.1): a `"use strict"` directive in
@@ -652,11 +654,9 @@ fn register_function(
         declaring_module,
         ir: None,
     };
-    if kind.is_generator || kind.is_async {
-        // Resumable bodies compile to the step IR; ordinary functions keep
-        // the tree-walking evaluator.
-        data.ir = Some(crate::ir::compile_body(&data)?);
-    }
+    // Every body compiles to the step IR; the VM executes ordinary bodies
+    // the same way it runs the resumable kinds.
+    data.ir = Some(std::rc::Rc::new(crate::ir::compile_body(&data)?));
     let function = Function::new(name.clone());
     agent.ecma_functions.insert(function.id(), data);
     set_function_properties(&function, &params, name.as_ref())?;
@@ -919,9 +919,7 @@ pub fn instantiate_arrow(
         declaring_module: None,
         ir: None,
     };
-    if is_async {
-        data.ir = Some(crate::ir::compile_body(&data)?);
-    }
+    data.ir = Some(std::rc::Rc::new(crate::ir::compile_body(&data)?));
     let function = Function::new(None);
     let params = data.params.clone();
     agent.ecma_functions.insert(function.id(), data);
@@ -1450,7 +1448,17 @@ fn ordinary_call(
     // Copy only the slots a call reads; the record also holds per-function
     // data (source text, compiled IR, class fields) whose clones would
     // re-allocate on every call.
-    let (old_env, this_mode, realm, private_environment, strict, params, body, declaring_module) = {
+    let (
+        old_env,
+        this_mode,
+        realm,
+        private_environment,
+        strict,
+        params,
+        body,
+        declaring_module,
+        ir,
+    ) = {
         let record = agent.ecma_functions.get(&function.id()).ok_or_else(|| {
             JsError::new(
                 ErrorKind::TypeError,
@@ -1466,6 +1474,7 @@ fn ordinary_call(
             record.params.clone(),
             record.body.clone(),
             record.declaring_module.clone(),
+            record.ir.clone(),
         )
     };
     let function_value = function.self_value();
@@ -1528,7 +1537,10 @@ fn ordinary_call(
             args,
             &function_env,
         )?;
-        evaluate_body(agent, &body, strict)
+        match ir {
+            Some(ir) => run_compiled_body(agent, strict, &ir),
+            None => evaluate_body(agent, &body, strict),
+        }
     })();
     // A kind-only engine error escapes the body with the function's realm
     // context still current; surface it as that realm's error object now, so
@@ -1547,7 +1559,15 @@ fn ordinary_call(
 /// OrdinaryCallEvaluateBody: evaluate the body; a `return` completion is the
 /// result, any other normal completion yields *undefined* (spec 15.2.2).
 fn evaluate_body(agent: &mut Agent, body: &Block, strict: bool) -> Result<Value, JsError> {
-    match eval_statement_list(agent, &body.stmts, strict)? {
+    let completion = eval_statement_list(agent, &body.stmts, strict)?;
+    body_completion_to_value(completion)
+}
+
+/// Map a function body's completion to its call result (spec 15.2.2): a
+/// `return` completion is the value, any other normal completion is
+/// *undefined*; an uncaught throw and stray control transfers are errors.
+fn body_completion_to_value(completion: Completion) -> Result<Value, JsError> {
+    match completion {
         Completion::Return(value) => Ok(value),
         Completion::Normal(_) | Completion::Empty => Ok(Value::Undefined),
         Completion::Throw(value) => {
@@ -1558,6 +1578,31 @@ fn evaluate_body(agent: &mut Agent, body: &Block, strict: bool) -> Result<Value,
             "Illegal break/continue statement".into(),
         )),
     }
+}
+
+/// Run an ordinary function body on the step VM. The body runs in the
+/// environment `function_declaration_instantiation` installed on the running
+/// context; on completion the body env's `using` resources are disposed —
+/// top-level `using` binds into the body env, which has no scope-exit step to
+/// dispose it (spec 14.2.3 step 6). Ordinary bodies never suspend.
+fn run_compiled_body(
+    agent: &mut Agent,
+    strict: bool,
+    ir: &std::rc::Rc<crate::ir::CompiledBody>,
+) -> Result<Value, JsError> {
+    let body_env = agent.running_context()?.lexical_environment.clone();
+    let mut vm = Vm::new(body_env.clone(), strict);
+    let completion = match vm.start(agent, ir)? {
+        VmOutcome::Completed(completion) => completion,
+        VmOutcome::Suspended(_) => {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "ordinary function suspended unexpectedly".into(),
+            ));
+        }
+    };
+    let completion = crate::eval::dispose_env_resources(agent, &body_env, Ok(completion))?;
+    body_completion_to_value(completion)
 }
 
 /// The `[[Construct]]` of an ordinary function (spec 10.2.1): create `this`
@@ -1694,7 +1739,23 @@ fn ordinary_construct(
             args,
             &function_env,
         )?;
-        let completed = eval_statement_list(agent, &data.body.stmts, data.strict)?;
+        let completed = match &data.ir {
+            Some(ir) => {
+                let body_env = agent.running_context()?.lexical_environment.clone();
+                let mut vm = Vm::new(body_env.clone(), data.strict);
+                let completion = match vm.start(agent, ir)? {
+                    VmOutcome::Completed(completion) => completion,
+                    VmOutcome::Suspended(_) => {
+                        return Err(JsError::new(
+                            ErrorKind::TypeError,
+                            "constructor body suspended unexpectedly".into(),
+                        ));
+                    }
+                };
+                crate::eval::dispose_env_resources(agent, &body_env, Ok(completion))?
+            }
+            None => eval_statement_list(agent, &data.body.stmts, data.strict)?,
+        };
         // spec 10.2.1 [[Construct]] steps 15-21: an object return wins; a base
         // constructor falls back to `this`; a derived constructor returns the
         // `super()`-bound `this` (or throws on any other value).

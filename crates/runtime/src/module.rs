@@ -1395,7 +1395,7 @@ fn execute_module_body(
     };
     let state = Rc::new(RefCell::new(AsyncFunctionState {
         vm: Vm::new(env, strict),
-        body,
+        body: Rc::new(body),
         context,
         promise,
         resolve,

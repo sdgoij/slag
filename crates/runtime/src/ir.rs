@@ -42,6 +42,10 @@ pub enum Step {
     Push(Value),
     Pop,
     Dup,
+    /// Duplicate the top two values in order: `[a, b] -> [a, b, a, b]` — a
+    /// computed member/super compound assignment needs the (base, key) pair
+    /// twice: once for the read, once for the write.
+    Dup2,
     // ----- expression continuation steps -----
     Unary(UnaryOp),
     Binary(BinaryOp),
@@ -874,20 +878,26 @@ impl Vm {
                     Completion::Normal(self.completion.clone())
                 }));
             }
-            let step = steps.get(self.ip).cloned().ok_or_else(|| {
+            let step = steps.get(self.ip).ok_or_else(|| {
                 JsError::new(
                     ErrorKind::SyntaxError,
                     "Instruction pointer out of bounds".into(),
                 )
             })?;
             self.ip += 1;
-            if let Ok(context) = agent.running_context_mut() {
+            // Steps that read the running context (resolve_binding, member
+            // helpers, closure creation) see the VM's lexical environment
+            // through the context; the sync is skipped when it has not
+            // changed since the last step (an `Rc` pointer comparison).
+            if let Ok(context) = agent.running_context_mut()
+                && !std::rc::Rc::ptr_eq(&context.lexical_environment, &self.lexical_env)
+            {
                 context.lexical_environment = self.lexical_env.clone();
             }
             match step {
                 Step::LoadIdent { name } => {
                     let reference =
-                        crate::context::resolve_binding(agent, &crux::lookup(name), self.strict)?;
+                        crate::context::resolve_binding(agent, &crux::lookup(*name), self.strict)?;
                     let value = crate::context::get_value(agent, &reference)?;
                     self.stack.push(value);
                 }
@@ -895,7 +905,7 @@ impl Vm {
                     let env = agent.running_context()?.lexical_environment.clone();
                     let value = crate::function::instantiate_function_expression(
                         agent,
-                        &function,
+                        function,
                         env,
                         self.strict,
                     )?;
@@ -909,9 +919,9 @@ impl Vm {
                     let env = agent.running_context()?.lexical_environment.clone();
                     let value = crate::function::instantiate_arrow(
                         agent,
-                        is_async,
-                        params,
-                        body,
+                        *is_async,
+                        params.clone(),
+                        body.clone(),
                         env,
                         self.strict,
                     )?;
@@ -922,7 +932,7 @@ impl Vm {
                     self.stack.push(value);
                 }
                 Step::RegExpLiteral { pattern, flags } => {
-                    let value = crate::expr::eval_regexp_literal(agent, &pattern, &flags)?;
+                    let value = crate::expr::eval_regexp_literal(agent, pattern, flags)?;
                     self.stack.push(value);
                 }
                 Step::FunctionDecl { stmt } => {
@@ -933,14 +943,14 @@ impl Vm {
                         crate::eval::eval_statement_position_function(
                             agent,
                             function,
-                            &stmt,
+                            stmt,
                             self.strict,
                         )?;
                     } else {
                         crate::eval::eval_function_declaration(agent, function, self.strict)?;
                     }
                 }
-                Step::Push(value) => self.stack.push(value),
+                Step::Push(value) => self.stack.push(value.clone()),
                 Step::Pop => {
                     self.pop();
                 }
@@ -949,15 +959,23 @@ impl Vm {
                     self.stack.push(top.clone());
                     self.stack.push(top);
                 }
+                Step::Dup2 => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    self.stack.push(a.clone());
+                    self.stack.push(b.clone());
+                    self.stack.push(a);
+                    self.stack.push(b);
+                }
                 Step::Unary(op) => {
                     let operand = self.pop();
-                    let value = crate::expr::eval_unary_value(agent, &op, operand)?;
+                    let value = crate::expr::eval_unary_value(agent, op, operand)?;
                     self.stack.push(value);
                 }
                 Step::Binary(op) => {
                     let right = self.pop();
                     let left = self.pop();
-                    let value = crate::expr::apply_binary(agent, op, &left, &right)?;
+                    let value = crate::expr::apply_binary(agent, *op, &left, &right)?;
                     self.stack.push(value);
                 }
                 Step::GetMemberName { name } => {
@@ -968,7 +986,7 @@ impl Vm {
                     let value = crate::context::get_property(
                         agent,
                         &object,
-                        &crux::lookup(name),
+                        &crux::lookup(*name),
                         object.clone(),
                     )?;
                     self.stack.push(value);
@@ -989,7 +1007,7 @@ impl Vm {
                     let this = resolve_this_binding(agent)?;
                     let base = get_super_base(agent)?;
                     let value =
-                        crate::context::get_property(agent, &base, &crux::lookup(name), this)?;
+                        crate::context::get_property(agent, &base, &crux::lookup(*name), this)?;
                     self.stack.push(value);
                 }
                 Step::GetSuperComputed => {
@@ -1003,7 +1021,7 @@ impl Vm {
                 }
                 Step::GetPrivate { atom } => {
                     let object = self.pop();
-                    let name_id = crate::context::resolve_private_name(agent, atom)?.id;
+                    let name_id = crate::context::resolve_private_name(agent, *atom)?.id;
                     let value = crate::context::private_get(agent, &object, name_id)?;
                     self.stack.push(value);
                 }
@@ -1016,49 +1034,83 @@ impl Vm {
                     self.stack.push(base);
                 }
                 Step::AssignIdent { name, op, set_name } => {
-                    self.assign_ident(agent, name, op, set_name)?;
+                    self.assign_ident(agent, *name, *op, *set_name)?;
                 }
                 Step::AssignMemberName { name, op } => {
                     let value = self.pop();
+                    let old = if is_compound_assign(op) {
+                        Some(self.pop())
+                    } else {
+                        None
+                    };
                     let object = self.pop();
                     if is_nullish(&object) {
                         return Err(nullish_error("Cannot set properties of null"));
                     }
-                    self.assign_member(agent, object, PropertyKeyName::Name(name), value, op)?;
+                    self.assign_member(
+                        agent,
+                        object,
+                        PropertyKeyName::Name(*name),
+                        old,
+                        value,
+                        *op,
+                    )?;
                 }
                 Step::AssignMemberComputed { op } => {
                     let value = self.pop();
+                    let old = if is_compound_assign(op) {
+                        Some(self.pop())
+                    } else {
+                        None
+                    };
                     let key = self.pop();
                     let object = self.pop();
                     if is_nullish(&object) {
                         return Err(nullish_error("Cannot set properties of null"));
                     }
                     let key = crate::context::to_property_key(agent, &key)?;
-                    self.assign_member(agent, object, PropertyKeyName::Key(key), value, op)?;
+                    self.assign_member(
+                        agent,
+                        object,
+                        PropertyKeyName::Key(key.clone()),
+                        old,
+                        value,
+                        *op,
+                    )?;
                 }
                 Step::AssignSuperName { name, op } => {
                     let value = self.pop();
+                    let old = if is_compound_assign(op) {
+                        Some(self.pop())
+                    } else {
+                        None
+                    };
                     self.pop(); // base
-                    self.assign_super(agent, PropertyKeyName::Name(name), value, op)?;
+                    self.assign_super(agent, PropertyKeyName::Name(*name), old, value, *op)?;
                 }
                 Step::AssignSuperComputed { op } => {
                     let value = self.pop();
+                    let old = if is_compound_assign(op) {
+                        Some(self.pop())
+                    } else {
+                        None
+                    };
                     let key = self.pop();
                     self.pop(); // base
                     let key = crate::context::to_property_key(agent, &key)?;
-                    self.assign_super(agent, PropertyKeyName::Key(key), value, op)?;
+                    self.assign_super(agent, PropertyKeyName::Key(key.clone()), old, value, *op)?;
                 }
                 Step::AssignPrivate { atom, op } => {
                     let value = self.pop();
                     let object = self.pop();
-                    let name_id = crate::context::resolve_private_name(agent, atom)?.id;
+                    let name_id = crate::context::resolve_private_name(agent, *atom)?.id;
                     let old = crate::context::private_get(agent, &object, name_id)?;
-                    let new = match op {
+                    let new = match *op {
                         AssignOp::Assign
                         | AssignOp::AndAssign
                         | AssignOp::OrAssign
                         | AssignOp::NullishAssign => value.clone(),
-                        _ => crate::expr::apply_compound(agent, op, &old, &value)?,
+                        _ => crate::expr::apply_compound(agent, *op, &old, &value)?,
                     };
                     crate::context::private_set(agent, &object, name_id, new.clone())?;
                     self.stack.push(new);
@@ -1067,7 +1119,7 @@ impl Vm {
                     let value = self.pop();
                     crate::binding::binding_initialization(
                         agent,
-                        &pattern,
+                        pattern,
                         value.clone(),
                         None,
                         self.strict,
@@ -1102,7 +1154,7 @@ impl Vm {
                 Step::DestructureUndef { use_default } => {
                     let value = self.pop();
                     if matches!(value.kind(), ValueKind::Undefined) {
-                        self.ip = use_default;
+                        self.ip = *use_default;
                     } else {
                         self.stack.push(value);
                     }
@@ -1142,7 +1194,7 @@ impl Vm {
                         )
                     })?;
                     let value =
-                        crate::context::get_property_key(agent, &object, &key, object.clone())?;
+                        crate::context::get_property_key(agent, &object, key, object.clone())?;
                     self.stack.push(value);
                 }
                 Step::DestructureObjKeyComputed => {
@@ -1167,7 +1219,7 @@ impl Vm {
                     })?;
                     let rest = crate::binding::rest_object(agent)?;
                     crate::binding::copy_data_properties_excluding(
-                        agent, &rest, &object, &excluded,
+                        agent, &rest, &object, excluded,
                     )?;
                     self.stack.push(Value::Object(rest));
                 }
@@ -1188,7 +1240,7 @@ impl Vm {
                     let value = self.pop();
                     crate::binding::binding_initialization(
                         agent,
-                        &pattern,
+                        pattern,
                         value.clone(),
                         Some(&self.lexical_env),
                         self.strict,
@@ -1197,7 +1249,7 @@ impl Vm {
                 }
                 Step::ResolveVarIdent { name } => {
                     let reference =
-                        crate::context::resolve_binding(agent, &crux::lookup(name), self.strict)?;
+                        crate::context::resolve_binding(agent, &crux::lookup(*name), self.strict)?;
                     self.var_ref_stack.push(reference);
                 }
                 Step::PutVarReference => {
@@ -1213,7 +1265,7 @@ impl Vm {
                 }
                 Step::UsingInit { pattern, is_await } => {
                     let value = self.pop();
-                    let kind = if is_await {
+                    let kind = if *is_await {
                         crate::eval::DisposalKind::Async
                     } else {
                         crate::eval::DisposalKind::Sync
@@ -1222,7 +1274,7 @@ impl Vm {
                     self.lexical_env.add_disposable_resource(resource);
                     crate::binding::binding_initialization(
                         agent,
-                        &pattern,
+                        pattern,
                         value.clone(),
                         Some(&self.lexical_env),
                         self.strict,
@@ -1232,8 +1284,8 @@ impl Vm {
                 Step::SetFunctionName { name } => {
                     let value = self.pop();
                     let display =
-                        crate::function::default_binding_display_name(Some(crux::lookup(name)))
-                            .unwrap_or_else(|| crux::lookup(name));
+                        crate::function::default_binding_display_name(Some(crux::lookup(*name)))
+                            .unwrap_or_else(|| crux::lookup(*name));
                     crate::function::set_function_name(&value, &display, None)?;
                     self.stack.push(value);
                 }
@@ -1245,16 +1297,16 @@ impl Vm {
                 }
                 Step::JumpIfChainShort(target) => {
                     if self.chain_short {
-                        self.ip = target;
+                        self.ip = *target;
                     }
                 }
                 Step::UpdateIdent { name, op, prefix } => {
                     let old = self.pop();
-                    let new = update_value(agent, &op, &old)?;
+                    let new = update_value(agent, op, &old)?;
                     let reference =
-                        crate::context::resolve_binding(agent, &crux::lookup(name), self.strict)?;
+                        crate::context::resolve_binding(agent, &crux::lookup(*name), self.strict)?;
                     crate::context::put_value(agent, &reference, new.clone())?;
-                    self.stack.push(if prefix { new } else { old });
+                    self.stack.push(if *prefix { new } else { old });
                 }
                 Step::UpdateMemberName { name, op, prefix } => {
                     let old = self.pop();
@@ -1262,13 +1314,13 @@ impl Vm {
                     if is_nullish(&object) {
                         return Err(nullish_error("Cannot set properties of null"));
                     }
-                    let new = update_value(agent, &op, &old)?;
+                    let new = update_value(agent, op, &old)?;
                     crate::context::put_value(
                         agent,
-                        &member_reference(&object, &PropertyKeyName::Name(name), self.strict),
+                        &member_reference(&object, &PropertyKeyName::Name(*name), self.strict),
                         new.clone(),
                     )?;
-                    self.stack.push(if prefix { new } else { old });
+                    self.stack.push(if *prefix { new } else { old });
                 }
                 Step::UpdateMemberComputed { op, prefix } => {
                     let old = self.pop();
@@ -1277,42 +1329,42 @@ impl Vm {
                     if is_nullish(&object) {
                         return Err(nullish_error("Cannot set properties of null"));
                     }
-                    let new = update_value(agent, &op, &old)?;
+                    let new = update_value(agent, op, &old)?;
                     let key = crate::context::to_property_key(agent, &key)?;
                     crate::context::put_value(
                         agent,
                         &member_reference(&object, &PropertyKeyName::Key(key), self.strict),
                         new.clone(),
                     )?;
-                    self.stack.push(if prefix { new } else { old });
+                    self.stack.push(if *prefix { new } else { old });
                 }
                 Step::UpdateSuperName { name, op, prefix } => {
                     let old = self.pop();
                     self.pop(); // base
-                    let new = update_value(agent, &op, &old)?;
-                    self.put_super(agent, PropertyKeyName::Name(name), new.clone())?;
-                    self.stack.push(if prefix { new } else { old });
+                    let new = update_value(agent, op, &old)?;
+                    self.put_super(agent, PropertyKeyName::Name(*name), new.clone())?;
+                    self.stack.push(if *prefix { new } else { old });
                 }
                 Step::UpdateSuperComputed { op, prefix } => {
                     let old = self.pop();
                     let key = self.pop();
                     self.pop(); // base
-                    let new = update_value(agent, &op, &old)?;
+                    let new = update_value(agent, op, &old)?;
                     let key = crate::context::to_property_key(agent, &key)?;
                     self.put_super(agent, PropertyKeyName::Key(key), new.clone())?;
-                    self.stack.push(if prefix { new } else { old });
+                    self.stack.push(if *prefix { new } else { old });
                 }
                 Step::UpdatePrivate { atom, op, prefix } => {
                     let old = self.pop();
                     let object = self.pop();
-                    let new = update_value(agent, &op, &old)?;
-                    let name_id = crate::context::resolve_private_name(agent, atom)?.id;
+                    let new = update_value(agent, op, &old)?;
+                    let name_id = crate::context::resolve_private_name(agent, *atom)?.id;
                     crate::context::private_set(agent, &object, name_id, new.clone())?;
-                    self.stack.push(if prefix { new } else { old });
+                    self.stack.push(if *prefix { new } else { old });
                 }
                 Step::DeleteIdent { name } => {
                     let reference =
-                        crate::context::resolve_binding(agent, &crux::lookup(name), self.strict)?;
+                        crate::context::resolve_binding(agent, &crux::lookup(*name), self.strict)?;
                     let deleted = crate::context::delete_property_or_throw(agent, &reference)?;
                     self.stack.push(Value::Boolean(deleted));
                 }
@@ -1320,7 +1372,7 @@ impl Vm {
                     let object = self.pop();
                     let reference = crate::context::Reference {
                         base: crate::context::ReferenceBase::Value(object),
-                        name: PropertyKey::from_js_string(&crux::lookup(name)),
+                        name: PropertyKey::from_js_string(&crux::lookup(*name)),
                         strict: self.strict,
                         this_value: None,
                         private_name: None,
@@ -1353,7 +1405,7 @@ impl Vm {
                     // spec 13.5.3.2 step 1: an unresolvable reference is
                     // "undefined", not a ReferenceError.
                     let reference =
-                        crate::context::resolve_binding(agent, &crux::lookup(name), self.strict)?;
+                        crate::context::resolve_binding(agent, &crux::lookup(*name), self.strict)?;
                     let value = match &reference.base {
                         crate::context::ReferenceBase::Unresolvable => Value::Undefined,
                         _ => crate::context::get_value(agent, &reference)?,
@@ -1365,13 +1417,13 @@ impl Vm {
                 }
                 Step::PrivateIn { atom } => {
                     let object = self.pop();
-                    let name_id = crate::context::resolve_private_name(agent, atom)?.id;
+                    let name_id = crate::context::resolve_private_name(agent, *atom)?.id;
                     self.stack.push(Value::Boolean(crate::context::private_in(
                         &object, name_id,
                     )?));
                 }
                 Step::Call { direct_eval } => {
-                    self.do_call(agent, direct_eval)?;
+                    self.do_call(agent, *direct_eval)?;
                 }
                 Step::SuperCall => {
                     let base = self.args_base_stack.pop().ok_or_else(|| {
@@ -1417,7 +1469,7 @@ impl Vm {
                         )
                     })?;
                     let substitutions = self.args.split_off(base);
-                    let value = tagged_template(agent, tag, &template, substitutions)?;
+                    let value = tagged_template(agent, tag, template, substitutions)?;
                     self.stack.push(value);
                 }
                 Step::ArrayBegin => {
@@ -1481,10 +1533,10 @@ impl Vm {
                     let object = self.pop();
                     object_init(
                         &object,
-                        &PropertyName::Ident(name),
+                        &PropertyName::Ident(*name),
                         value,
-                        set_name,
-                        shorthand,
+                        *set_name,
+                        *shorthand,
                     )?;
                     self.stack.push(object);
                 }
@@ -1496,19 +1548,19 @@ impl Vm {
                         return Err(JsError::new(ErrorKind::TypeError, "not an object".into()));
                     };
                     let key = crate::context::to_property_key(agent, &key)?;
-                    object_init_key(&obj, key, value, set_name)?;
+                    object_init_key(&obj, key, value, *set_name)?;
                     self.stack.push(object);
                 }
                 Step::ObjectMethodName { name, function } => {
                     let object = self.pop();
-                    object_method(agent, &object, PropertyKey::String(name), &function)?;
+                    object_method(agent, &object, PropertyKey::String(*name), function)?;
                     self.stack.push(object);
                 }
                 Step::ObjectMethodComputed { function } => {
                     let key = self.pop();
                     let object = self.pop();
                     let key = crate::context::to_property_key(agent, &key)?;
-                    object_method(agent, &object, key, &function)?;
+                    object_method(agent, &object, key, function)?;
                     self.stack.push(object);
                 }
                 Step::ObjectAccessorName {
@@ -1521,10 +1573,10 @@ impl Vm {
                     object_accessor(
                         agent,
                         &object,
-                        PropertyKey::String(name),
-                        get,
+                        PropertyKey::String(*name),
+                        *get,
                         param.as_ref(),
-                        &body,
+                        body,
                     )?;
                     self.stack.push(object);
                 }
@@ -1532,7 +1584,7 @@ impl Vm {
                     let key = self.pop();
                     let object = self.pop();
                     let key = crate::context::to_property_key(agent, &key)?;
-                    object_accessor(agent, &object, key, get, param.as_ref(), &body)?;
+                    object_accessor(agent, &object, key, *get, param.as_ref(), body)?;
                     self.stack.push(object);
                 }
                 Step::ObjectSpread => {
@@ -1556,7 +1608,7 @@ impl Vm {
                     let outer_env = self.lexical_env.clone();
                     let class_env = new_declarative_environment(Some(outer_env.clone()));
                     if let Some(binding) = binding {
-                        let name = crux::lookup(binding);
+                        let name = crux::lookup(*binding);
                         class_env.create_immutable_binding(&name, true)?;
                     }
                     let outer_private_env = agent.running_context()?.private_environment.clone();
@@ -1616,8 +1668,8 @@ impl Vm {
                     binding,
                     key_count,
                 } => {
-                    let mut keys: Vec<Option<PropertyKey>> = Vec::with_capacity(key_count);
-                    for _ in 0..key_count {
+                    let mut keys: Vec<Option<PropertyKey>> = Vec::with_capacity(*key_count);
+                    for _ in 0..*key_count {
                         let value = self.pop();
                         let key = crate::context::to_property_key(agent, &value)?;
                         keys.push(Some(key));
@@ -1636,15 +1688,15 @@ impl Vm {
                     }
                     let class_value = crate::class::class_definition_evaluation_with_keys(
                         agent,
-                        &class,
-                        binding,
+                        class,
+                        *binding,
                         state.heritage.clone(),
                         &keys,
                     )?;
                     self.stack.push(class_value);
                 }
                 Step::PushStr(text) => {
-                    self.stack.push(Value::String(Handle::new(text)));
+                    self.stack.push(Value::String(Handle::new(text.clone())));
                 }
                 Step::ConcatStr => {
                     let value = self.pop();
@@ -1679,7 +1731,7 @@ impl Vm {
                 Step::EnterBlock { decls } => {
                     let old_env = self.lexical_env.clone();
                     let env = new_declarative_environment(Some(old_env));
-                    block_declaration_instantiation(agent, &decls, &env, self.strict)?;
+                    block_declaration_instantiation(agent, decls, &env, self.strict)?;
                     self.lexical_env = env.clone();
                     self.env_stack.push(env);
                 }
@@ -1712,13 +1764,13 @@ impl Vm {
                 }
                 Step::EnterTry { handler } => {
                     self.try_stack.push(TryFrame {
-                        handler,
+                        handler: *handler,
                         saved_env: self.lexical_env.clone(),
                         env_depth: self.env_stack.len(),
                     });
                 }
                 Step::Exit { after } => {
-                    match self.control_transfer(body, Ctl::Normal { after })? {
+                    match self.control_transfer(body, Ctl::Normal { after: *after })? {
                         CtlResult::Continue => continue,
                         CtlResult::Done(outcome) => return Ok(outcome),
                     }
@@ -1791,7 +1843,7 @@ impl Vm {
                         }
                         None => env,
                     };
-                    block_declaration_instantiation(agent, &decls, &body_env, self.strict)?;
+                    block_declaration_instantiation(agent, decls, &body_env, self.strict)?;
                     self.lexical_env = body_env.clone();
                     self.env_stack.push(body_env);
                 }
@@ -1832,7 +1884,7 @@ impl Vm {
                 Step::EnterIterTdzEnv { names } => {
                     let old_env = self.lexical_env.clone();
                     let env = new_declarative_environment(Some(old_env));
-                    for name in &names {
+                    for name in names {
                         env.create_mutable_binding(name, false)?;
                     }
                     self.lexical_env = env.clone();
@@ -1874,7 +1926,7 @@ impl Vm {
                         )
                     })?;
                     let env = new_declarative_environment(Some(outer));
-                    for name in &names {
+                    for name in names {
                         let value = last.get_binding_value(name, false)?;
                         env.create_mutable_binding(name, false)?;
                         env.initialize_binding(name, value)?;
@@ -1887,11 +1939,11 @@ impl Vm {
                 Step::EnterLoopEnv { kind, decls } => {
                     let old_env = self.lexical_env.clone();
                     let env = new_declarative_environment(Some(old_env));
-                    for decl in &decls {
+                    for decl in decls {
                         let mut names = Vec::new();
                         crate::script::bound_names(&decl.pattern, &mut names);
                         for name in &names {
-                            if kind == VarDeclKind::Const {
+                            if *kind == VarDeclKind::Const {
                                 env.create_immutable_binding(name, true)?;
                             } else {
                                 env.create_mutable_binding(name, false)?;
@@ -1942,12 +1994,12 @@ impl Vm {
                     }
                     if !pushed {
                         self.for_in_stack.pop();
-                        self.ip = done;
+                        self.ip = *done;
                     }
                 }
                 Step::ForInBind { left } => {
                     let value = self.pop();
-                    self.for_binding_put(agent, &left, value)?;
+                    self.for_binding_put(agent, left, value)?;
                 }
                 Step::ForInRestore => {
                     self.restore_per_iteration(agent)?;
@@ -1969,13 +2021,13 @@ impl Vm {
                         Some(value) => self.stack.push(value),
                         None => {
                             self.for_of_stack.pop();
-                            self.ip = done;
+                            self.ip = *done;
                         }
                     }
                 }
                 Step::ForOfBind { left } => {
                     let value = self.pop();
-                    self.for_binding_put(agent, &left, value)?;
+                    self.for_binding_put(agent, left, value)?;
                 }
                 Step::ForOfRestore => {
                     self.restore_per_iteration(agent)?;
@@ -2022,7 +2074,7 @@ impl Vm {
                     let is_done = iterator_result_done(agent, &result)?;
                     if is_done {
                         self.async_for_of_stack.pop();
-                        self.ip = done;
+                        self.ip = *done;
                     } else {
                         let value = iterator_result_value(agent, &result)?;
                         // The element value is already unwrapped upstream —
@@ -2037,7 +2089,7 @@ impl Vm {
                 }
                 Step::AsyncForOfBind { left } => {
                     let value = self.pop();
-                    self.for_binding_put(agent, &left, value)?;
+                    self.for_binding_put(agent, left, value)?;
                 }
                 Step::AsyncForOfRestore => {
                     self.restore_per_iteration(agent)?;
@@ -2055,7 +2107,7 @@ impl Vm {
                         )
                     })?;
                     if crux::ops::is_strictly_equal(disc, &test) {
-                        self.ip = case;
+                        self.ip = *case;
                     }
                 }
                 Step::SetCompletion => {
@@ -2097,24 +2149,24 @@ impl Vm {
                         self.completion_is_empty = empty;
                     }
                 }
-                Step::Jump(target) => self.ip = target,
+                Step::Jump(target) => self.ip = *target,
                 Step::JumpIfFalse(target) => {
                     let value = self.pop();
                     if !crux::convert::to_boolean(&value) {
-                        self.ip = target;
+                        self.ip = *target;
                     }
                 }
                 Step::JumpIfTrue(target) => {
                     let value = self.pop();
                     if crux::convert::to_boolean(&value) {
-                        self.ip = target;
+                        self.ip = *target;
                     }
                 }
                 Step::JumpIfFalseKeep(target) => {
                     let value = self.pop();
                     if !crux::convert::to_boolean(&value) {
                         self.stack.push(value);
-                        self.ip = target;
+                        self.ip = *target;
                     } else {
                         // The left operand is not the result: leave it for the
                         // following Pop to discard (it was already popped).
@@ -2125,7 +2177,7 @@ impl Vm {
                     let value = self.pop();
                     if crux::convert::to_boolean(&value) {
                         self.stack.push(value);
-                        self.ip = target;
+                        self.ip = *target;
                     } else {
                         self.stack.push(value);
                     }
@@ -2134,14 +2186,14 @@ impl Vm {
                     let value = self.pop();
                     if is_nullish(&value) {
                         self.stack.push(value);
-                        self.ip = target;
+                        self.ip = *target;
                     }
                 }
                 Step::JumpIfNotNullishKeep(target) => {
                     let value = self.pop();
                     if !is_nullish(&value) {
                         self.stack.push(value);
-                        self.ip = target;
+                        self.ip = *target;
                     } else {
                         self.stack.push(value);
                     }
@@ -2162,7 +2214,10 @@ impl Vm {
                 }
                 Step::Yield { delegate } => {
                     let value = self.pop();
-                    return Ok(VmOutcome::Suspended(Suspension::Yield { value, delegate }));
+                    return Ok(VmOutcome::Suspended(Suspension::Yield {
+                        value,
+                        delegate: *delegate,
+                    }));
                 }
                 Step::Await => {
                     let value = self.pop();
@@ -2242,7 +2297,7 @@ impl Vm {
                         };
                         self.yield_star_stack.pop();
                         self.stack.push(value);
-                        self.ip = done;
+                        self.ip = *done;
                     } else {
                         // Spec 15.5.5: GeneratorYield(innerResult) yields the
                         // inner iterator result object itself, so the outer
@@ -2261,7 +2316,7 @@ impl Vm {
                             if let Some(state) = self.yield_star_stack.last_mut() {
                                 state.received = received;
                             }
-                            self.ip = loop_top;
+                            self.ip = *loop_top;
                         }
                         Some(ResumeAbrupt::Throw(value)) => {
                             let Some(state) = self.yield_star_stack.last() else {
@@ -2329,10 +2384,10 @@ impl Vm {
                                     };
                                     self.yield_star_stack.pop();
                                     self.stack.push(value);
-                                    self.ip = done;
+                                    self.ip = *done;
                                 } else {
                                     self.stack.push(inner);
-                                    self.ip = yield_at;
+                                    self.ip = *yield_at;
                                 }
                             } else {
                                 // No throw method: IteratorClose with a normal
@@ -2431,7 +2486,7 @@ impl Vm {
                                     }
                                 } else {
                                     self.stack.push(inner);
-                                    self.ip = yield_at;
+                                    self.ip = *yield_at;
                                 }
                             } else {
                                 // No return method: the delegation completes
@@ -2523,7 +2578,7 @@ impl Vm {
                             // The loop's done case: the yield* expression
                             // completes with the value and the body continues.
                             self.stack.push(value);
-                            self.ip = done;
+                            self.ip = *done;
                         }
                     } else {
                         let value = match iterator_result_value(agent, &result) {
@@ -2548,7 +2603,7 @@ impl Vm {
                                 state.received = received;
                                 state.resumed_return = false;
                             }
-                            self.ip = loop_top;
+                            self.ip = *loop_top;
                         }
                         Some(ResumeAbrupt::Throw(value)) => {
                             let (iterator,) = {
@@ -2576,7 +2631,7 @@ impl Vm {
                                     iterator.iterator.clone(),
                                     &[value],
                                 )?;
-                                self.ip = inspect;
+                                self.ip = *inspect;
                                 return Ok(VmOutcome::Suspended(Suspension::Await(inner)));
                             }
                             iterator_close(agent, &iterator)?;
@@ -2618,7 +2673,7 @@ impl Vm {
                                     iterator.iterator.clone(),
                                     &[value],
                                 )?;
-                                self.ip = inspect;
+                                self.ip = *inspect;
                                 return Ok(VmOutcome::Suspended(Suspension::Await(inner)));
                             }
                             self.yield_star_stack.pop();
@@ -2630,10 +2685,10 @@ impl Vm {
                     }
                 }
                 Step::ImportCall { has_options, phase } => {
-                    let options = if has_options { Some(self.pop()) } else { None };
+                    let options = if *has_options { Some(self.pop()) } else { None };
                     let specifier = self.pop();
                     let promise =
-                        crate::module::dynamic_import(agent, &specifier, options.as_ref(), phase)?;
+                        crate::module::dynamic_import(agent, &specifier, options.as_ref(), *phase)?;
                     self.stack.push(promise);
                 }
                 Step::ImportMeta => {
@@ -2860,6 +2915,7 @@ impl Vm {
         agent: &mut Agent,
         object: Value,
         key: PropertyKeyName,
+        old: Option<Value>,
         value: Value,
         op: AssignOp,
     ) -> Result<(), JsError> {
@@ -2873,7 +2929,12 @@ impl Vm {
                 self.stack.push(value);
             }
             _ => {
-                let old = self.pop();
+                let Some(old) = old else {
+                    return Err(JsError::new(
+                        ErrorKind::SyntaxError,
+                        "compound assignment without a cached old value".into(),
+                    ));
+                };
                 let new = crate::expr::apply_compound(agent, op, &old, &value)?;
                 let reference = member_reference(&object, &key, self.strict);
                 crate::context::put_value(agent, &reference, new.clone())?;
@@ -2887,6 +2948,7 @@ impl Vm {
         &mut self,
         agent: &mut Agent,
         key: PropertyKeyName,
+        old: Option<Value>,
         value: Value,
         op: AssignOp,
     ) -> Result<(), JsError> {
@@ -2902,7 +2964,12 @@ impl Vm {
                 self.stack.push(value);
             }
             _ => {
-                let old = self.pop();
+                let Some(old) = old else {
+                    return Err(JsError::new(
+                        ErrorKind::SyntaxError,
+                        "compound assignment without a cached old value".into(),
+                    ));
+                };
                 let new = crate::expr::apply_compound(agent, op, &old, &value)?;
                 let reference = super_reference(&base, &key, self.strict, &this);
                 crate::context::put_value(agent, &reference, new.clone())?;
@@ -5461,12 +5528,12 @@ impl Compiler {
                     }
                     MemberProperty::Computed(key) => {
                         self.compile_expr(key)?;
-                        self.emit(Step::Dup);
-                        self.emit(Step::Dup);
+                        self.emit(Step::Dup2);
                         self.emit(Step::GetMemberComputed);
                         self.emit(Step::UpdateMemberComputed { op: *op, prefix });
                     }
                     MemberProperty::Private(atom) => {
+                        self.emit(Step::Dup);
                         self.emit(Step::GetPrivate { atom: *atom });
                         self.emit(Step::UpdatePrivate {
                             atom: *atom,
@@ -6043,8 +6110,7 @@ impl Compiler {
                             | AssignOp::BitOrAssign
                     );
                     if needs_old {
-                        self.emit(Step::Dup);
-                        self.emit(Step::Dup);
+                        self.emit(Step::Dup2);
                         self.emit(Step::GetSuperComputed);
                     }
                     self.compile_expr(value)?;
@@ -6077,8 +6143,7 @@ impl Compiler {
                 self.compile_expr(&member.object)?;
                 self.compile_expr(key)?;
                 if is_compound_assign(op) {
-                    self.emit(Step::Dup);
-                    self.emit(Step::Dup);
+                    self.emit(Step::Dup2);
                     self.emit(Step::GetMemberComputed);
                 }
                 self.compile_expr(value)?;
@@ -6086,7 +6151,6 @@ impl Compiler {
             }
             MemberProperty::Private(atom) => {
                 self.compile_expr(&member.object)?;
-                self.emit(Step::GetPrivate { atom: *atom });
                 self.compile_expr(value)?;
                 self.emit(Step::AssignPrivate {
                     atom: *atom,

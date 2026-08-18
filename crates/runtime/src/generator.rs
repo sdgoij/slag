@@ -40,7 +40,7 @@ pub enum GeneratorFlag {
 pub struct GeneratorState {
     pub flag: GeneratorFlag,
     pub vm: Option<Vm>,
-    pub body: Option<CompiledBody>,
+    pub body: Option<Rc<CompiledBody>>,
     pub context: Option<ExecutionContext>,
     pub function: Value,
     pub realm: Handle<Realm>,

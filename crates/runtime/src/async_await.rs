@@ -28,7 +28,7 @@ use crate::promise::{
 #[derive(Debug)]
 pub struct AsyncFunctionState {
     pub vm: Vm,
-    pub body: CompiledBody,
+    pub body: Rc<CompiledBody>,
     pub context: ExecutionContext,
     pub promise: Value,
     pub resolve: Value,
