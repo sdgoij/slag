@@ -183,6 +183,9 @@ pub enum ObjectKind {
     /// [[IsHTMLDDA]] internal slot — `typeof` "undefined", falsy, callable
     /// (returns null), and loosely equal to null/undefined.
     IsHTMLDDA,
+    /// A host `External` (v8::External): an ordinary object carrying a host
+    /// pointer. All internal methods are ordinary; the pointer is opaque.
+    External(usize),
 }
 
 /// The [[ParameterMap]] of an arguments exotic object (spec 10.4.4): an
@@ -240,6 +243,7 @@ impl ObjectKind {
             ObjectKind::Proxy(_) => "Proxy",
             ObjectKind::IntegerIndexed(_) => "TypedArray",
             ObjectKind::ModuleNamespace(_) => "Module",
+            ObjectKind::External(_) => "External",
         }
     }
 }
@@ -382,6 +386,20 @@ impl JsObject {
     /// OrdinaryObjectCreate (spec 10.1.13).
     pub fn ordinary_object_create(prototype: Option<Handle<JsObject>>) -> Handle<JsObject> {
         let object = Handle::new(Self::basic_object_create(prototype));
+        Self::link_self_handle(&object);
+        object
+    }
+
+    /// Create a host `External` object (v8::External): ordinary behaviour
+    /// plus an opaque host pointer stored in the kind.
+    pub fn external_object_create(
+        pointer: usize,
+        prototype: Option<Handle<JsObject>>,
+    ) -> Handle<JsObject> {
+        let object = Handle::new(Self {
+            kind: ObjectKind::External(pointer),
+            ..Self::basic_object_create(prototype)
+        });
         Self::link_self_handle(&object);
         object
     }
