@@ -13,11 +13,13 @@ use crate::symbol::Symbol;
 
 /// A value is *tagged* when its top 16 bits are `0x7FF8` — a quiet NaN whose
 /// payload bits 50-48 are zero. The tag occupies bits 47-44 and the payload
-/// bits 43-0 (an `Rc` pointer for heap values). Every other bit pattern is a
-/// double, stored exactly: signaling NaNs and quiet NaNs with bits 50-48
-/// non-zero survive as-is. A quiet NaN whose top 16 bits are exactly `0x7FF8`
-/// collides with the tag region and is canonicalized to `0x7FF9_0000_0000_0000`
-/// on box; JS cannot observe a NaN payload, so this is unobservable.
+/// bits 43-0 (an `Rc` pointer for heap values, stored shifted right 4 — the
+/// allocation is 16-byte aligned, so this recovers the full 48-bit address
+/// space). Every other bit pattern is a double, stored exactly: signaling
+/// NaNs and quiet NaNs with bits 50-48 non-zero survive as-is. A quiet NaN
+/// whose top 16 bits are exactly `0x7FF8` collides with the tag region and is
+/// canonicalized to `0x7FF9_0000_0000_0000` on box; JS cannot observe a NaN
+/// payload, so this is unobservable.
 const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
 const TAG_PREFIX: u64 = 0x7FF8_0000_0000_0000;
 const CANON_NAN: u64 = 0x7FF9_0000_0000_0000;
@@ -123,14 +125,22 @@ impl Value {
     }
 
     /// Leak one strong ref into the box and store its pointer in the payload.
+    ///
+    /// The payload is only 44 bits, so the pointer is stored shifted right 4:
+    /// the `RcBox` allocation base is 16-byte aligned, which recovers a full
+    /// 48-bit address space.
     fn box_heap<T>(tag: u64, h: Handle<T>) -> Value {
         let ptr = Rc::into_raw(h) as usize as u64;
         debug_assert!(
-            ptr & !PAYLOAD_MASK == 0,
-            "pointer exceeds the 44-bit payload"
+            ptr & 0xF == 0,
+            "heap value is not 16-byte aligned (the payload shift would lose bits)"
+        );
+        debug_assert!(
+            (ptr >> 4) & !PAYLOAD_MASK == 0,
+            "pointer exceeds the 48-bit payload"
         );
         Value(
-            TAG_PREFIX | (tag << 44) | (ptr & PAYLOAD_MASK),
+            TAG_PREFIX | (tag << 44) | ((ptr >> 4) & PAYLOAD_MASK),
             std::marker::PhantomData,
         )
     }
@@ -157,7 +167,7 @@ impl Value {
         if !self.is_double() && self.tag() == tag {
             // SAFETY: the payload holds a ref leaked by `box_heap`'s
             // `Rc::into_raw`; `forget` below leaks it back.
-            let rc = unsafe { Rc::from_raw(self.payload() as usize as *const T) };
+            let rc = unsafe { Rc::from_raw((self.payload() << 4) as usize as *const T) };
             let out = Rc::clone(&rc);
             std::mem::forget(rc);
             Some(out)
@@ -289,7 +299,7 @@ impl Drop for Value {
         }
         unsafe fn release<T>(payload: u64) {
             // SAFETY: the payload holds a ref leaked by `box_heap`.
-            drop(unsafe { Rc::from_raw(payload as usize as *const T) });
+            drop(unsafe { Rc::from_raw((payload << 4) as usize as *const T) });
         }
         unsafe {
             match self.tag() {

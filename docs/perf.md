@@ -9,7 +9,9 @@ correctness gate.
 - **Value representation**: a NaN-boxed `u64` (PLAN Phase 18): a quiet-NaN
   tag region (top 16 bits `0x7FF8`) holds a 4-bit tag plus a 44-bit `Rc`
   payload for the heap variants; every other bit pattern is a double stored
-  exactly. Heap values own one strong `Rc` ref; `Clone`/`Drop` reconstruct
+  exactly. The payload holds the allocation pointer shifted right 4 (the
+  `RcBox` base is 16-byte aligned), so a full 48-bit address space round-
+  trips. Heap values own one strong `Rc` ref; `Clone`/`Drop` reconstruct
   the `Rc` from the payload. `match value.kind()` keeps the old enum arm
   shapes via a `ValueKind` mirror.
 - **Interpreter**: a `Step` bytecode VM over the compiled function IR
@@ -124,7 +126,8 @@ refcount reconstruction. The concrete layout:
 
 - **Tagged region** — quiet NaNs whose top 16 bits are `0x7FF8` (exponent
   `0x7FF`, quiet bit 51 set, bits 50-48 zero): `tag` in bits 47-44,
-  `payload` in bits 43-0 (the `Rc` pointer).
+  `payload` in bits 43-0 (the `Rc` pointer shifted right 4 — the
+  16-byte-aligned allocation base, so a 48-bit address space).
 - **Doubles** — every other bit pattern, preserved exactly: signaling NaNs
   and quiet NaNs with bits 50-48 ≠ 0 survive as-is. A quiet NaN with bits
   50-48 = 0 collides with the tag region and is canonicalized on box to
@@ -133,8 +136,9 @@ refcount reconstruction. The concrete layout:
   (verified by the full sweep).
 - **Tags** — `0x0` undefined, `0x1` null, `0x2` false, `0x3` true, `0x4`
   BigInt, `0x5` String, `0x6` Symbol, `0x7` Object, `0x8` Function;
-  `0x9`-`0xF` reserved. Payload capacity is 44 bits (17.6 TB), far above
-  any real `Rc` allocation.
+  `0x9`-`0xF` reserved. Payload capacity is 44 bits (17.6 TB) of shifted
+  pointer, i.e. a 48-bit address space — far above any real `Rc`
+  allocation.
 - **Refcounts** — `Clone` reconstructs the `Rc` via `Rc::from_raw(ptr)`, clones
   it, and forgets the reconstruction (`Rc::into_raw` on the clone); `Drop`
   reconstructs and drops. Refcounts stay exact, and heap values move by

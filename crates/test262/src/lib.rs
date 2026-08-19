@@ -12516,15 +12516,27 @@ var $DONE = function (error) {
         FixtureResult::Pass
     }
 
+    /// The submodule root for `area`, or `None` with a one-time notice when
+    /// the test262 submodule is not checked out (a fresh clone passes the
+    /// fixture tests vacuously).
+    #[cfg(test)]
+    fn fixture_root(area: Area) -> Option<PathBuf> {
+        static NOTICE: std::sync::Once = std::sync::Once::new();
+        let root = area.root();
+        if !root.exists() {
+            NOTICE.call_once(|| {
+                eprintln!("test262 submodule not checked out; run `git submodule update --init`");
+            });
+            return None;
+        }
+        Some(root)
+    }
+
     /// Run one fixture as its own test. Skips print and pass; a missing
     /// submodule (fresh clone) makes every fixture pass vacuously.
     #[cfg(test)]
     fn assert_fixture(area: Area, relative: &str) {
-        static NOTICE: std::sync::Once = std::sync::Once::new();
-        if !area.root().exists() {
-            NOTICE.call_once(|| {
-                eprintln!("test262 submodule not checked out; run `git submodule update --init`");
-            });
+        if fixture_root(area).is_none() {
             return;
         }
         match run_fixture(area, relative) {
@@ -12536,8 +12548,9 @@ var $DONE = function (error) {
 
     #[test]
     fn debug_copywithin_fixture() {
-        let base =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test262/test/built-ins");
+        let Some(base) = fixture_root(Area::Builtins) else {
+            return;
+        };
         let path = base.join(
             "TypedArray/prototype/copyWithin/BigInt/return-abrupt-from-this-out-of-bounds.js",
         );
@@ -12551,8 +12564,9 @@ var $DONE = function (error) {
 
     #[test]
     fn debug_atomics_fixture() {
-        let base =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test262/test/built-ins");
+        let Some(base) = fixture_root(Area::Builtins) else {
+            return;
+        };
         let path = base.join("Atomics/notify/notify-one.js");
         let source = std::fs::read_to_string(&path).unwrap();
         let (fm, body) = parse_fixture(&source).unwrap();
@@ -12564,8 +12578,9 @@ var $DONE = function (error) {
 
     #[test]
     fn debug_module_fixture() {
-        let base =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test262/test/language");
+        let Some(base) = fixture_root(Area::Language) else {
+            return;
+        };
         let path = base.join(
             "import/import-defer/evaluation-top-level-await/async-cycle-dependency-of-deferred-module/main.js",
         );
