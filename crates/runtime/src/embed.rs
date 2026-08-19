@@ -218,10 +218,10 @@ impl Context {
     }
 
     /// Install an `fs` global with a minimal Node-style subset —
-    /// `readFileSync`, `readdirSync`, `statSync` — backed by the host
-    /// filesystem. Not a full Node `fs`; enough for host tools written in
-    /// Slag (the test262 fixture tally is one). Only compiled with the
-    /// `fs` feature.
+    /// `readFileSync`, `writeFileSync`, `readdirSync`, `statSync` — backed
+    /// by the host filesystem. Not a full Node `fs`; enough for host tools
+    /// written in Slag (the regexp table generator and the test262 fixture
+    /// tally are two). Only compiled with the `fs` feature.
     #[cfg(feature = "fs")]
     pub fn install_fs(&mut self) -> Result<(), JsError> {
         let realm = self.agent.current_realm()?;
@@ -248,6 +248,25 @@ impl Context {
         fs.create_data_property_or_throw(
             &JsString::from_utf8("readFileSync"),
             Value::Function(read_file),
+        )?;
+
+        let write_file = Function::create_builtin(
+            Some(JsString::from_utf8("writeFileSync")),
+            2,
+            Box::new(|_, args| {
+                let path = string_arg(args, 0, "writeFileSync")?;
+                let text = string_arg(args, 1, "writeFileSync")?;
+                std::fs::write(&path, text).map_err(|e| {
+                    JsError::new(ErrorKind::TypeError, format!("writeFileSync: {path}: {e}"))
+                })?;
+                Ok(Value::Undefined)
+            }),
+            None,
+            None,
+        )?;
+        fs.create_data_property_or_throw(
+            &JsString::from_utf8("writeFileSync"),
+            Value::Function(write_file),
         )?;
 
         let read_dir = Function::create_builtin(
@@ -967,6 +986,14 @@ mod tests {
             .eval(&format!("fs.readdirSync('{}').join(',')", js_path(&dir)))
             .unwrap();
         assert_eq!(listing.as_string().as_deref(), Some("hello.txt"));
+        let out = dir.join("out.txt");
+        context
+            .eval(&format!(
+                "fs.writeFileSync('{}', 'written back')",
+                js_path(&out)
+            ))
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "written back");
         std::fs::remove_dir_all(&dir).ok();
     }
 
