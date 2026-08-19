@@ -70,6 +70,35 @@ loops in release on the same machine:
 numbers are dominated by the tree-walker's identifier resolution and
 environment machinery, not by value representation.)
 
+### Current status (measured 2026-08-19)
+
+The bytecode VM work — Cut 1-4, the script-level binding fast path, the
+fused loop test/update ops, and the relational fast path — is at zero
+conformance regressions. Against the corrected baseline:
+
+| Benchmark | corrected baseline | today | speedup | 5x target |
+|---|---|---|---|---|
+| arithmetic | 2.52s | ~1.08s | 2.3x | 0.50s |
+| property access | 3.22s | ~1.30s | 2.5x | 0.64s |
+| string concat | 0.88s | ~0.16s | 5.5x — gate met | — |
+| array iteration | 15.42s | ~13.5s | 1.1x | 3.08s |
+| function calls | 5.73s | ~1.72s | 3.3x | 1.15s |
+
+(The `bytecode-plan.md` gate used a later, already-optimized walker
+baseline — arithmetic 1.14s → the plan's "≤0.23s"; this table is the
+documented 2026-08-18 corrected baseline, which the bytecode work has
+moved 2.3-3.3x on the hot benches.)
+
+The two hot gates are arithmetic (needs ~2.2x more) and function calls
+(~1.5x). The measured cost model (bytecode-plan.md §7): top-level loops
+are bound by global-object property access (~5 accesses/iteration at
+~100-200ns each) and fast-function loops by the binary evaluator
+(`apply_binary`/`abstract_relational` at ~20-40ns vs ~2-5ns for
+mechanical steps). Remaining levers: numeric fast paths in the
+evaluators, a fast global-property access (cell/IC), and less per-call
+machinery (a fast call still pushes a full `ExecutionContext` and bumps
+~10 `Rc` refcounts).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
@@ -237,13 +266,19 @@ release sweep over 48,622 fixtures: 0 fail, 229 skip (unchanged taxonomy),
 a documented `#[allow(clippy::mutable_key_type)]`: a rope's first hash
 materializes its flat cache, but the hash output is content-stable.)
 
-## Bytecode VM milestone (Cut 1 delivered, gate open)
+## Bytecode VM milestone (Cut 1-4 + script-level bindings landed, gate open)
 
 The tree-walker is gone from normal execution: every expression and
 statement compiles to `Step` bytecode at creation (`compile_expr`/
 `compile_statements` in `crates/runtime/src/ir.rs`), and a `Vm` dispatch
 loop runs the compiled body for ordinary calls/constructs, generators,
-async functions, and top-level scripts. The batching defaults that cloned
+async functions, and top-level scripts. Cut 3 gives simple-param
+functions and arrows frame-slot bindings; Cut 4 fuses the loop test and
+update into slot ops and adds a primitive fast path to the relational
+evaluator; the script-level binding fast path reads declared top-level
+vars directly off the global object. All at zero conformance regressions.
+
+The batching defaults that cloned
 suspension-free subtrees into `Step::Expr`/`Step::Stmt` for runtime
 tree-walking are deleted. Removing the walker exposed a long tail of bugs
 the batching used to mask (assignment-reference timing, member/private/
@@ -255,29 +290,23 @@ the full release sweeps are at zero regressions vs the parent commit with
 122 net fixes in `language` (152 fail vs the parent's 274).
 
 The compiled path is at or near walker parity on every benchmark — nothing
-lost, but the ≥5x gate is not met (arithmetic needs ≤0.23s):
+lost, and function calls have moved ~2.5x vs the walker; the ≥5x gate is
+not met:
 
-| Benchmark | walker baseline | post-Cut-1 | Cut 2 (HEAD) |
+| Benchmark | walker baseline | Cut 2 (HEAD) | now |
 |---|---|---|---|
-| arithmetic | 1.14s | 1.56s | 1.19s |
-| property access | 1.50s | 1.93s | 1.59s |
-| string concat | ~0.15s | 0.196s | 0.160s |
-| array iteration | 13.6–15s | 13.9s | 14.1s |
-| function calls | 4.2–4.4s | 4.68s | 4.56s |
+| arithmetic | 1.14s | 1.19s | ~1.08s |
+| property access | 1.50s | 1.59s | ~1.30s |
+| string concat | ~0.15s | 0.160s | ~0.16s |
+| array iteration | 13.6–15s | 14.1s | ~13.5s |
+| function calls | 4.2–4.4s | 4.56s | ~1.72s |
 
-(The Cut 2 column is the first two encoding tightenings — `BinaryImm`
-literal immediates and `CallFast` 0-2-arity calls — plus the optional-call
-nullish-short-path fix they exposed. The runs are noisy on this machine
-(±15%, the array iteration bounced 13.7–19.1s across runs); only string
-concat moved consistently, ~5% lower, from the fused loop-test compare.)
-
-Closing the gate is the rest of Cut 2's encoding tightening (constant
-pool, zero-operand constants — see `docs/bytecode-plan.md`), then Cut 3
-(registers) if needed; the measured wins so far are within bench noise, so
-the structural costs (per-identifier env resolution, per-call function
-machinery) dominate and a 5x will likely need one of those. `--print-bytecode`
-remains a no-op because the printer does not exist yet, not because the VM
-is missing.
+The runs are noisy on this machine (±15%). The measured cost model
+(bytecode-plan.md §7) says arithmetic is bound by global-object property
+access (the walker's arithmetic was already fast) and fast-function loops
+by the binary evaluator; the gate's arithmetic target needs a fast global
+property access (cell/IC) plus evaluator numeric fast paths, and function
+calls need less per-call machinery.
 
 ## GC milestone (PLAN Phase 18 item 2)
 

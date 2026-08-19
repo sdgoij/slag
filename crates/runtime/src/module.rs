@@ -1379,7 +1379,7 @@ fn execute_module_body(
     };
     agent.execution_context_stack.push(context.clone());
     let strict = true;
-    let body = crate::ir::compile_statements(&stmts, strict)?;
+    let body = crate::ir::compile_statements(&stmts, strict, false)?;
     let (promise, resolve, reject) = {
         let capability = module
             .top_level_capability

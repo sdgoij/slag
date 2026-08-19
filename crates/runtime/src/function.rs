@@ -1445,47 +1445,44 @@ fn ordinary_call(
     this: Value,
     args: &[Value],
 ) -> Result<Value, JsError> {
-    // Copy only the slots a call reads; the record also holds per-function
-    // data (source text, compiled IR, class fields) whose clones would
-    // re-allocate on every call.
-    let (
-        old_env,
-        this_mode,
-        realm,
-        private_environment,
-        strict,
-        params,
-        body,
-        declaring_module,
-        ir,
-    ) = {
-        let record = agent.ecma_functions.get(&function.id()).ok_or_else(|| {
-            JsError::new(
-                ErrorKind::TypeError,
-                "Function body is not registered".into(),
-            )
-        })?;
-        (
-            record.environment.clone(),
-            record.this_mode,
-            record.realm.clone(),
-            record.private_environment.clone(),
-            record.strict,
-            record.params.clone(),
-            record.body.clone(),
-            record.declaring_module.clone(),
-            record.ir.clone(),
-        )
-    };
     let function_value = function.self_value();
     // Cut 3 fast path: the body's bindings are frame slots, so no function
     // environment, `this` binding, or declaration instantiation are needed —
     // the scope analysis certified the body references none of them. The
     // context's lexical environment is the closure's captured environment;
-    // outer/global reads resolve through it.
+    // outer/global reads resolve through it. Only the slots this branch
+    // reads are cloned — the slow path's `params`/`body` AST clones are
+    // skipped entirely for a fast call (the record borrow ends at the last
+    // field read, before the branch touches `agent` mutably).
+    let ir = agent
+        .ecma_functions
+        .get(&function.id())
+        .ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                "Function body is not registered".into(),
+            )
+        })?
+        .ir
+        .clone();
     if let Some(ir) = &ir
         && ir.scope.is_some()
     {
+        let (old_env, realm, private_environment, strict, declaring_module) = {
+            let record = agent.ecma_functions.get(&function.id()).ok_or_else(|| {
+                JsError::new(
+                    ErrorKind::TypeError,
+                    "Function body is not registered".into(),
+                )
+            })?;
+            (
+                record.environment.clone(),
+                record.realm.clone(),
+                record.private_environment.clone(),
+                record.strict,
+                record.declaring_module.clone(),
+            )
+        };
         let caller_script_or_module = agent
             .running_context()
             .ok()
@@ -1521,6 +1518,38 @@ fn ordinary_call(
         agent.execution_context_stack.pop();
         return result;
     }
+    // Copy only the slots a call reads; the record also holds per-function
+    // data (source text, compiled IR, class fields) whose clones would
+    // re-allocate on every call.
+    let (
+        old_env,
+        this_mode,
+        realm,
+        private_environment,
+        strict,
+        params,
+        body,
+        declaring_module,
+        ir,
+    ) = {
+        let record = agent.ecma_functions.get(&function.id()).ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                "Function body is not registered".into(),
+            )
+        })?;
+        (
+            record.environment.clone(),
+            record.this_mode,
+            record.realm.clone(),
+            record.private_environment.clone(),
+            record.strict,
+            record.params.clone(),
+            record.body.clone(),
+            record.declaring_module.clone(),
+            record.ir.clone(),
+        )
+    };
     let function_env = new_function_environment(
         Some(old_env),
         function_value.clone(),

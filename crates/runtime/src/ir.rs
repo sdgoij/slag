@@ -10,7 +10,7 @@
 //! `try`/`catch`/`finally` use a handler table plus a runtime try stack and
 //! a pending-control slot.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crux::error::{ErrorKind, JsError};
 use crux::handle::Handle;
@@ -520,6 +520,56 @@ pub enum Step {
         imm: f64,
         target: usize,
     },
+    // ----- top-level fast path (script-level bindings) -----
+    /// Read a declared top-level `var`/function directly off the global
+    /// object — the binding is guaranteed to exist (script instantiation
+    /// created the property), so the env-chain resolve walk disappears.
+    LoadGlobal {
+        name: crux::AtomId,
+    },
+    /// Pop into a declared top-level `var` (a `var x = v` initializer or an
+    /// assignment to `x`).
+    StoreGlobal {
+        name: crux::AtomId,
+    },
+    /// Apply `++`/`--` to a top-level `var`, pushing the result (old for
+    /// postfix, new for prefix).
+    UpdateGlobal {
+        name: crux::AtomId,
+        op: UpdateOp,
+        prefix: bool,
+    },
+    /// Fused top-level `i++` in a value-discarding position (the `for`
+    /// update): read, add 1, store, push nothing.
+    IncGlobal {
+        name: crux::AtomId,
+    },
+    /// Fused top-level `i--` in a value-discarding position.
+    DecGlobal {
+        name: crux::AtomId,
+    },
+    /// Fused top-level loop test `x <op> imm` (see `JumpIfLtImm`): the
+    /// slot is a declared global var.
+    JumpIfLtGlobalImm {
+        name: crux::AtomId,
+        imm: f64,
+        target: usize,
+    },
+    JumpIfLeGlobalImm {
+        name: crux::AtomId,
+        imm: f64,
+        target: usize,
+    },
+    JumpIfGtGlobalImm {
+        name: crux::AtomId,
+        imm: f64,
+        target: usize,
+    },
+    JumpIfGeGlobalImm {
+        name: crux::AtomId,
+        imm: f64,
+        target: usize,
+    },
     /// A `break` statement: route through any pending finallys, then jump to
     /// `target` (spec 14.14.4).
     Break {
@@ -626,6 +676,13 @@ pub struct CompiledBody {
     /// The fast-path frame layout, when the scope analysis certified the
     /// body (see [`ScopeInfo`]). `None` = the environment-machinery path.
     pub scope: Option<ScopeInfo>,
+    /// The certified top-level fast path (script-level bindings): the
+    /// declared `var`/function names a script reads and writes directly on
+    /// the global object, skipping the env-chain walk. `None` = the
+    /// environment-machinery path (modules, eval bodies, uncertified
+    /// scripts). Keys are `String` (not `JsString`) so the set stays free of
+    /// interior-mutability lints.
+    pub script_globals: Option<HashSet<String>>,
 }
 
 /// A runtime `try` frame.
@@ -730,6 +787,37 @@ pub enum CtlResult {
 /// (prototype-level, key) pairs, and the next index.
 type ForInState = (Handle<crux::object::JsObject>, Vec<(usize, Value)>, usize);
 
+/// Frame slots for small layouts live in a fixed inline array so a fast
+/// call allocates nothing (the bench's simple-param functions are ≤ 8
+/// slots); larger layouts fall back to the heap.
+const INLINE_FRAME: usize = 8;
+
+/// The fast-path frame storage: an inline buffer for small layouts, a `Vec`
+/// otherwise.
+#[derive(Clone, Debug)]
+pub(crate) enum Frame {
+    Inline([Value; INLINE_FRAME]),
+    Heap(Vec<Value>),
+}
+
+impl Frame {
+    #[inline]
+    fn get(&self, slot: usize) -> &Value {
+        match self {
+            Frame::Inline(buf) => &buf[slot],
+            Frame::Heap(vec) => &vec[slot],
+        }
+    }
+
+    #[inline]
+    fn get_mut(&mut self, slot: usize) -> &mut Value {
+        match self {
+            Frame::Inline(buf) => &mut buf[slot],
+            Frame::Heap(vec) => &mut vec[slot],
+        }
+    }
+}
+
 /// The resumable VM state. Saved across suspension by the driver.
 #[derive(Debug)]
 pub struct Vm {
@@ -737,7 +825,7 @@ pub struct Vm {
     pub stack: Vec<Value>,
     /// The fast-path frame (Cut 3): named-binding slots for the active body,
     /// sized by `ScopeInfo::frame_size`. Empty on the environment path.
-    pub frame: Vec<Value>,
+    pub(crate) frame: Frame,
     pub args: Vec<Value>,
     pub lexical_env: EnvRef,
     pub env_stack: Vec<EnvRef>,
@@ -854,7 +942,7 @@ impl Vm {
         Self {
             ip: 0,
             stack: Vec::new(),
-            frame: Vec::new(),
+            frame: Frame::Inline(std::array::from_fn(|_| Value::Undefined)),
             args: Vec::new(),
             lexical_env: lexical_env.clone(),
             env_stack: vec![lexical_env],
@@ -899,12 +987,19 @@ impl Vm {
     /// body with no `arguments`/`this` references and no lexical
     /// declarations, which is exactly what the scope analysis certified.
     pub fn setup_frame(&mut self, scope: &ScopeInfo, args: &[Value]) {
-        self.frame = vec![Value::Undefined; scope.frame_size];
-        for (index, arg) in args.iter().enumerate() {
-            if index < scope.arity {
-                self.frame[index] = arg.clone();
+        self.frame = if scope.frame_size <= INLINE_FRAME {
+            let mut buf = std::array::from_fn(|_| Value::Undefined);
+            for (index, arg) in args.iter().take(scope.arity).enumerate() {
+                buf[index] = arg.clone();
             }
-        }
+            Frame::Inline(buf)
+        } else {
+            let mut slots = vec![Value::Undefined; scope.frame_size];
+            for (index, arg) in args.iter().take(scope.arity).enumerate() {
+                slots[index] = arg.clone();
+            }
+            Frame::Heap(slots)
+        };
     }
 
     /// The fused relational-imm loop test (Cut 4): read the slot (TDZ-checked
@@ -919,13 +1014,55 @@ impl Vm {
         imm: f64,
         target: usize,
     ) -> Result<(), JsError> {
-        let left = self.frame[slot].clone();
+        let left = self.frame.get(slot).clone();
         if left.is_uninitialized() {
             return Err(JsError::new(
                 ErrorKind::ReferenceError,
                 "Cannot access a binding before initialization".into(),
             ));
         }
+        let right = Value::Number(imm);
+        let value = crate::expr::apply_binary(agent, op, &left, &right)?;
+        if !crux::convert::to_boolean(&value) {
+            self.ip = target;
+        }
+        Ok(())
+    }
+
+    /// The top-level fast path's reference for a declared global var: a
+    /// value reference against the realm's global object (the global
+    /// environment's binding object), so `get_value`/`put_value` run the
+    /// exact property machinery the env path uses after its resolve walk.
+    fn global_reference(
+        &self,
+        agent: &Agent,
+        name: crux::AtomId,
+    ) -> Result<crate::context::Reference, JsError> {
+        let global = agent.running_context()?.realm.global_object.clone();
+        let global_value = Value::Object(global);
+        Ok(crate::context::Reference {
+            base: crate::context::ReferenceBase::Value(global_value.clone()),
+            name: PropertyKey::from_js_string(&crux::lookup(name)),
+            strict: self.strict,
+            this_value: Some(global_value),
+            private_name: None,
+        })
+    }
+
+    /// The fused relational-imm loop test on a declared top-level var: read
+    /// the global binding, abstract-compare against the constant, jump to
+    /// `target` when the test is false — exactly what
+    /// `LoadGlobal; BinaryImm; JumpIfFalse` computes.
+    fn jump_if_rel_global(
+        &mut self,
+        agent: &mut Agent,
+        op: BinaryOp,
+        name: crux::AtomId,
+        imm: f64,
+        target: usize,
+    ) -> Result<(), JsError> {
+        let reference = self.global_reference(agent, name)?;
+        let left = crate::context::get_value(agent, &reference)?;
         let right = Value::Number(imm);
         let value = crate::expr::apply_binary(agent, op, &left, &right)?;
         if !crux::convert::to_boolean(&value) {
@@ -1189,7 +1326,7 @@ impl Vm {
                     self.stack.push(value);
                 }
                 Step::LoadLocal { slot } => {
-                    let value = self.frame[*slot].clone();
+                    let value = self.frame.get(*slot).clone();
                     if value.is_uninitialized() {
                         return Err(JsError::new(
                             ErrorKind::ReferenceError,
@@ -1200,20 +1337,30 @@ impl Vm {
                 }
                 Step::StoreLocal { slot } => {
                     let value = self.pop();
-                    if self.frame[*slot].is_uninitialized() {
+                    if self.frame.get(*slot).is_uninitialized() {
                         return Err(JsError::new(
                             ErrorKind::ReferenceError,
                             "Cannot access a binding before initialization".into(),
                         ));
                     }
-                    self.frame[*slot] = value;
+                    *self.frame.get_mut(*slot) = value;
+                }
+                Step::LoadGlobal { name } => {
+                    let reference = self.global_reference(agent, *name)?;
+                    let value = crate::context::get_value(agent, &reference)?;
+                    self.stack.push(value);
+                }
+                Step::StoreGlobal { name } => {
+                    let value = self.pop();
+                    let reference = self.global_reference(agent, *name)?;
+                    crate::context::put_value(agent, &reference, value)?;
                 }
                 Step::InitLocal { slot } => {
                     let value = self.pop();
-                    self.frame[*slot] = value;
+                    *self.frame.get_mut(*slot) = value;
                 }
                 Step::UpdateLocal { slot, op, prefix } => {
-                    let old = self.frame[*slot].clone();
+                    let old = self.frame.get(*slot).clone();
                     if old.is_uninitialized() {
                         return Err(JsError::new(
                             ErrorKind::ReferenceError,
@@ -1221,28 +1368,47 @@ impl Vm {
                         ));
                     }
                     let new = update_value(agent, op, &old)?;
-                    self.frame[*slot] = new.clone();
+                    *self.frame.get_mut(*slot) = new.clone();
                     self.stack.push(if *prefix { new } else { old });
                 }
                 Step::Inc { slot } => {
-                    let old = self.frame[*slot].clone();
+                    let old = self.frame.get(*slot).clone();
                     if old.is_uninitialized() {
                         return Err(JsError::new(
                             ErrorKind::ReferenceError,
                             "Cannot access a binding before initialization".into(),
                         ));
                     }
-                    self.frame[*slot] = update_value(agent, &UpdateOp::Increment, &old)?;
+                    *self.frame.get_mut(*slot) = update_value(agent, &UpdateOp::Increment, &old)?;
                 }
                 Step::Dec { slot } => {
-                    let old = self.frame[*slot].clone();
+                    let old = self.frame.get(*slot).clone();
                     if old.is_uninitialized() {
                         return Err(JsError::new(
                             ErrorKind::ReferenceError,
                             "Cannot access a binding before initialization".into(),
                         ));
                     }
-                    self.frame[*slot] = update_value(agent, &UpdateOp::Decrement, &old)?;
+                    *self.frame.get_mut(*slot) = update_value(agent, &UpdateOp::Decrement, &old)?;
+                }
+                Step::UpdateGlobal { name, op, prefix } => {
+                    let reference = self.global_reference(agent, *name)?;
+                    let old = crate::context::get_value(agent, &reference)?;
+                    let new = update_value(agent, op, &old)?;
+                    crate::context::put_value(agent, &reference, new.clone())?;
+                    self.stack.push(if *prefix { new } else { old });
+                }
+                Step::IncGlobal { name } => {
+                    let reference = self.global_reference(agent, *name)?;
+                    let old = crate::context::get_value(agent, &reference)?;
+                    let new = update_value(agent, &UpdateOp::Increment, &old)?;
+                    crate::context::put_value(agent, &reference, new)?;
+                }
+                Step::DecGlobal { name } => {
+                    let reference = self.global_reference(agent, *name)?;
+                    let old = crate::context::get_value(agent, &reference)?;
+                    let new = update_value(agent, &UpdateOp::Decrement, &old)?;
+                    crate::context::put_value(agent, &reference, new)?;
                 }
                 Step::CreateFunction { function } => {
                     let env = agent.running_context()?.lexical_environment.clone();
@@ -2765,6 +2931,18 @@ impl Vm {
                 }
                 Step::JumpIfGeImm { slot, imm, target } => {
                     self.jump_if_rel_imm(agent, BinaryOp::GreaterEqual, *slot, *imm, *target)?
+                }
+                Step::JumpIfLtGlobalImm { name, imm, target } => {
+                    self.jump_if_rel_global(agent, BinaryOp::LessThan, *name, *imm, *target)?
+                }
+                Step::JumpIfLeGlobalImm { name, imm, target } => {
+                    self.jump_if_rel_global(agent, BinaryOp::LessEqual, *name, *imm, *target)?
+                }
+                Step::JumpIfGtGlobalImm { name, imm, target } => {
+                    self.jump_if_rel_global(agent, BinaryOp::GreaterThan, *name, *imm, *target)?
+                }
+                Step::JumpIfGeGlobalImm { name, imm, target } => {
+                    self.jump_if_rel_global(agent, BinaryOp::GreaterEqual, *name, *imm, *target)?
                 }
                 Step::JumpIfTrue(target) => {
                     let value = self.pop();
@@ -4774,6 +4952,15 @@ enum Fixup {
         slot: usize,
         imm: f64,
     },
+    /// The fused relational-imm loop test on a declared top-level var (the
+    /// fast-script variant of `JumpIfRelImm`).
+    JumpIfRelGlobalImm {
+        index: usize,
+        label: usize,
+        op: BinaryOp,
+        name: crux::AtomId,
+        imm: f64,
+    },
     Break(usize, usize),
     Continue(usize, usize),
     JumpIfChainShort(usize, usize),
@@ -4836,6 +5023,20 @@ struct Compiler {
     /// with no lexical declarations skip their environment. `None` compiles
     /// through the environment machinery.
     scope: Option<ScopeInfo>,
+    /// The certified top-level fast path (script-level bindings): the
+    /// declared `var`/function names read and written directly on the
+    /// global object (`LoadGlobal`/`StoreGlobal`), skipping the env-chain
+    /// walk. `None` (and `ScopeInfo` above) means the environment path.
+    script_globals: Option<HashSet<String>>,
+}
+
+/// Where a binding lives for emission purposes: a frame slot (fast body),
+/// a declared top-level var (fast script), or the environment machinery.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BindingLoc {
+    Slot(usize),
+    Global,
+    Env,
 }
 
 impl Compiler {
@@ -4844,11 +5045,58 @@ impl Compiler {
         self.scope.as_ref().and_then(|scope| scope.slot_of(name))
     }
 
-    /// A loop test of the shape `slot <op> NumberLiteral` in a fast body
-    /// (Cut 4): the fused `JumpIf*Imm` step replaces `LoadLocal; BinaryImm;
-    /// JumpIfFalse`. The comparison stays the general `apply_binary`
-    /// semantics, so a non-number slot value coerces exactly as before.
-    fn fused_rel_test(&self, test: &Expr) -> Option<(BinaryOp, usize, f64)> {
+    /// Where a binding resolves: the frame (fast body), the global object
+    /// (certified fast script), or the environment machinery.
+    fn binding(&self, name: crux::AtomId) -> BindingLoc {
+        if let Some(slot) = self.slot_of(name) {
+            BindingLoc::Slot(slot)
+        } else if self
+            .script_globals
+            .as_ref()
+            .is_some_and(|globals| globals.contains(&crux::lookup(name).to_string_lossy()))
+        {
+            BindingLoc::Global
+        } else {
+            BindingLoc::Env
+        }
+    }
+
+    /// Emit the load for a fast binding: a frame slot read or a direct
+    /// global-object read (both are guaranteed to resolve).
+    fn emit_load(&mut self, loc: BindingLoc, name: crux::AtomId) {
+        match loc {
+            BindingLoc::Slot(slot) => self.emit(Step::LoadLocal { slot }),
+            BindingLoc::Global => self.emit(Step::LoadGlobal { name }),
+            BindingLoc::Env => unreachable!("emit_load on the environment path"),
+        }
+    }
+
+    /// Emit `Dup; Store` for a fast binding, leaving the assigned value as
+    /// the expression result (the store itself pops the duplicate).
+    fn emit_dup_store(&mut self, loc: BindingLoc, name: crux::AtomId) {
+        self.emit(Step::Dup);
+        match loc {
+            BindingLoc::Slot(slot) => self.emit(Step::StoreLocal { slot }),
+            BindingLoc::Global => self.emit(Step::StoreGlobal { name }),
+            BindingLoc::Env => unreachable!("emit_dup_store on the environment path"),
+        }
+    }
+
+    /// Whether a block with no lexical declarations contributes no
+    /// environment — true on the fast body (Cut 3) and the fast script
+    /// (script-level bindings): the per-iteration env allocation in hot
+    /// loops disappears.
+    fn fast_block(&self, stmts: &[Stmt]) -> bool {
+        (self.scope.is_some() || self.script_globals.is_some())
+            && Self::block_decls(stmts).is_empty()
+    }
+
+    /// A loop test of the shape `binding <op> NumberLiteral` on the fast
+    /// path (Cut 4): the fused `JumpIf*Imm` step replaces `LoadLocal;
+    /// BinaryImm; JumpIfFalse` (and the `LoadGlobal` equivalent on the fast
+    /// script). The comparison stays the general `apply_binary` semantics,
+    /// so a non-number value coerces exactly as before.
+    fn fused_rel_test(&self, test: &Expr) -> Option<(BinaryOp, BindingLoc, crux::AtomId, f64)> {
         if let ExprKind::Binary { op, left, right } = &test.kind
             && matches!(
                 op,
@@ -4858,52 +5106,77 @@ impl Compiler {
                     | BinaryOp::GreaterEqual
             )
             && let ExprKind::Ident(name) = &left.kind
-            && let Some(slot) = self.slot_of(*name)
             && let ExprKind::Literal(syntax::ast::Literal::Number(n)) = &right.kind
         {
-            Some((*op, slot, *n))
+            match self.binding(*name) {
+                BindingLoc::Env => None,
+                loc => Some((*op, loc, *name, *n)),
+            }
         } else {
             None
         }
     }
 
-    /// A `for` update that is a bare `i++`/`i--` on a frame slot (Cut 4):
+    /// A `for` update that is a bare `i++`/`i--` on a fast binding (Cut 4):
     /// the loop protocol discards the update's value, so the fused `Inc`/
-    /// `Dec` (store, no push) is exactly `UpdateLocal` + `Pop`. Only the
+    /// `Dec` (store, no push) is exactly the update step + `Pop`. Only the
     /// `UpdateOp` shapes qualify — `i += 1` is not equivalent (string
     /// operands concatenate under `+=` but coerce numerically under `++`).
-    fn fused_update(&self, update: &Expr) -> Option<(usize, UpdateOp)> {
+    fn fused_update(&self, update: &Expr) -> Option<(BindingLoc, crux::AtomId, UpdateOp)> {
         if let ExprKind::Update { op, target, .. } = &update.kind
             && let ExprKind::Ident(name) = &target.kind
         {
-            return self.slot_of(*name).map(|slot| (slot, *op));
+            match self.binding(*name) {
+                BindingLoc::Env => None,
+                loc => Some((loc, *name, *op)),
+            }
+        } else {
+            None
         }
-        None
     }
 
     /// Emit a fused relational-imm loop test (Cut 4): the `JumpIf*Imm` step
     /// with `target: 0`, patched to `target_label` at compile end.
-    fn emit_fused_rel_test(&mut self, op: BinaryOp, slot: usize, imm: f64, target_label: usize) {
+    fn emit_fused_rel_test(
+        &mut self,
+        op: BinaryOp,
+        loc: BindingLoc,
+        name: crux::AtomId,
+        imm: f64,
+        target_label: usize,
+    ) {
         let index = self.steps.len();
-        self.emit(Step::JumpIfLtImm {
-            slot,
-            imm,
-            target: 0,
-        });
-        self.fixups.push(Fixup::JumpIfRelImm {
-            index,
-            label: target_label,
-            op,
-            slot,
-            imm,
-        });
-    }
-
-    /// Whether the current body runs on the fast path: if so, a block with
-    /// no lexical declarations contributes no environment (Cut 3 — the
-    /// per-iteration env allocation in hot loops disappears).
-    fn fast_block(&self, stmts: &[Stmt]) -> bool {
-        self.scope.is_some() && Self::block_decls(stmts).is_empty()
+        match loc {
+            BindingLoc::Slot(slot) => {
+                self.emit(Step::JumpIfLtImm {
+                    slot,
+                    imm,
+                    target: 0,
+                });
+                self.fixups.push(Fixup::JumpIfRelImm {
+                    index,
+                    label: target_label,
+                    op,
+                    slot,
+                    imm,
+                });
+            }
+            BindingLoc::Global => {
+                self.emit(Step::JumpIfLtGlobalImm {
+                    name,
+                    imm,
+                    target: 0,
+                });
+                self.fixups.push(Fixup::JumpIfRelGlobalImm {
+                    index,
+                    label: target_label,
+                    op,
+                    name,
+                    imm,
+                });
+            }
+            BindingLoc::Env => unreachable!("emit_fused_rel_test on the environment path"),
+        }
     }
 
     fn new_label(&mut self) -> usize {
@@ -5132,6 +5405,22 @@ impl Compiler {
                         BinaryOp::GreaterThan => Step::JumpIfGtImm { slot, imm, target },
                         BinaryOp::GreaterEqual => Step::JumpIfGeImm { slot, imm, target },
                         _ => unreachable!("JumpIfRelImm fixup with a non-relational op"),
+                    };
+                }
+                Fixup::JumpIfRelGlobalImm {
+                    index,
+                    label,
+                    op,
+                    name,
+                    imm,
+                } => {
+                    let target = self.labels[&label];
+                    self.steps[index] = match op {
+                        BinaryOp::LessThan => Step::JumpIfLtGlobalImm { name, imm, target },
+                        BinaryOp::LessEqual => Step::JumpIfLeGlobalImm { name, imm, target },
+                        BinaryOp::GreaterThan => Step::JumpIfGtGlobalImm { name, imm, target },
+                        BinaryOp::GreaterEqual => Step::JumpIfGeGlobalImm { name, imm, target },
+                        _ => unreachable!("JumpIfRelGlobalImm fixup with a non-relational op"),
                     };
                 }
                 Fixup::Break(index, label) => {
@@ -5381,17 +5670,33 @@ impl Compiler {
                 let declaration = *kind != VarDeclKind::Var;
                 for decl in decls {
                     if let Some(init) = &decl.init {
-                        // Cut 3 fast path: `var x = init` with a frame-slot
-                        // binding — the slot exists (hoisted, undefined), so
-                        // the initializer writes it directly. The
+                        // Cut 3/5 fast path: `var x = init` with a fast
+                        // binding — the slot exists (hoisted, undefined) or
+                        // the global property exists (instantiation created
+                        // it), so the initializer writes it directly. The
                         // resolve-before-init rule is only observable via a
                         // `with` scope (excluded from the fast path).
-                        if let BindingPattern::Ident(name) = &decl.pattern
-                            && let Some(slot) = self.slot_of(*name)
-                        {
-                            self.compile_expr(init)?;
-                            self.emit(Step::InitLocal { slot });
-                            continue;
+                        if let BindingPattern::Ident(name) = &decl.pattern {
+                            match self.binding(*name) {
+                                BindingLoc::Slot(slot) => {
+                                    self.compile_expr(init)?;
+                                    self.emit(Step::InitLocal { slot });
+                                    continue;
+                                }
+                                BindingLoc::Global => {
+                                    self.compile_expr(init)?;
+                                    if crate::function::is_anonymous_function_definition(init) {
+                                        // NamedEvaluation (spec 14.2.2 step
+                                        // 2.d): `var f = function () {}`
+                                        // names the function after the
+                                        // binding.
+                                        self.emit(Step::SetFunctionName { name: *name });
+                                    }
+                                    self.emit(Step::StoreGlobal { name: *name });
+                                    continue;
+                                }
+                                BindingLoc::Env => {}
+                            }
                         }
                         // spec 14.3.2 step 2: a `var` identifier's binding is
                         // resolved before its initializer runs — a `with`
@@ -5508,10 +5813,11 @@ impl Compiler {
                 });
                 self.resolve_labeled_continue(test_label, continue_count);
                 self.place(test_label);
-                if let Some((op, slot, imm)) = self.fused_rel_test(test) {
-                    // Cut 4: the loop test `slot <op> imm` fuses with the
-                    // false-jump (LoadLocal + BinaryImm + JumpIfFalse).
-                    self.emit_fused_rel_test(op, slot, imm, end_label);
+                if let Some((op, loc, name, imm)) = self.fused_rel_test(test) {
+                    // Cut 4/5: the loop test `binding <op> imm` fuses with
+                    // the false-jump (LoadLocal/LoadGlobal + BinaryImm +
+                    // JumpIfFalse).
+                    self.emit_fused_rel_test(op, loc, name, imm, end_label);
                 } else {
                     self.compile_expr(test)?;
                     self.jump_if_false(end_label);
@@ -5657,19 +5963,28 @@ impl Compiler {
                 if *kind == VarDeclKind::Var {
                     for decl in decls {
                         if let Some(init) = &decl.init {
-                            // Cut 3 fast path: a `var` head binding is a
-                            // frame slot (hoisted, undefined), so the
+                            // Cut 3/5 fast path: a `var` head binding is a
+                            // fast binding (hoisted, undefined — or a global
+                            // property instantiation created), so the
                             // initializer writes it directly — `Destructure`
-                            // would walk the env for a binding the fast call
-                            // path never created. The resolve-before-init
-                            // rule is only observable via a `with` scope
-                            // (excluded from the fast path).
-                            if let BindingPattern::Ident(name) = &decl.pattern
-                                && let Some(slot) = self.slot_of(*name)
-                            {
-                                self.compile_expr(init)?;
-                                self.emit(Step::InitLocal { slot });
-                                continue;
+                            // would walk the env for a binding the fast path
+                            // never created. The resolve-before-init rule is
+                            // only observable via a `with` scope (excluded
+                            // from the fast path).
+                            if let BindingPattern::Ident(name) = &decl.pattern {
+                                match self.binding(*name) {
+                                    BindingLoc::Slot(slot) => {
+                                        self.compile_expr(init)?;
+                                        self.emit(Step::InitLocal { slot });
+                                        continue;
+                                    }
+                                    BindingLoc::Global => {
+                                        self.compile_expr(init)?;
+                                        self.emit(Step::StoreGlobal { name: *name });
+                                        continue;
+                                    }
+                                    BindingLoc::Env => {}
+                                }
                             }
                             self.compile_expr(init)?;
                             self.emit(Step::Destructure {
@@ -5725,10 +6040,11 @@ impl Compiler {
         self.place(test_label);
         match test {
             Some(test) => {
-                if let Some((op, slot, imm)) = self.fused_rel_test(test) {
-                    // Cut 4: the loop test `slot <op> imm` fuses with the
-                    // false-jump (LoadLocal + BinaryImm + JumpIfFalse).
-                    self.emit_fused_rel_test(op, slot, imm, end_label);
+                if let Some((op, loc, name, imm)) = self.fused_rel_test(test) {
+                    // Cut 4/5: the loop test `binding <op> imm` fuses with
+                    // the false-jump (LoadLocal/LoadGlobal + BinaryImm +
+                    // JumpIfFalse).
+                    self.emit_fused_rel_test(op, loc, name, imm, end_label);
                 } else {
                     self.compile_expr(test)?;
                     self.jump_if_false(end_label);
@@ -5744,14 +6060,17 @@ impl Compiler {
             });
         }
         if let Some(update) = update {
-            if let Some((slot, op)) = self.fused_update(update) {
-                // Cut 4: the update's value is discarded by the loop
-                // protocol, so a bare `i++`/`i--` fuses to one step (no
-                // result push to pop). `i += 1` stays on the general path
-                // (`+=` concatenates strings, `++` does not).
-                let step = match op {
-                    UpdateOp::Increment => Step::Inc { slot },
-                    UpdateOp::Decrement => Step::Dec { slot },
+            if let Some((loc, name, op)) = self.fused_update(update) {
+                // Cut 4/5: the update's value is discarded by the loop
+                // protocol, so a bare `i++`/`i--` on a fast binding fuses to
+                // one step (no result push to pop). `i += 1` stays on the
+                // general path (`+=` concatenates strings, `++` does not).
+                let step = match (loc, op) {
+                    (BindingLoc::Slot(slot), UpdateOp::Increment) => Step::Inc { slot },
+                    (BindingLoc::Slot(slot), UpdateOp::Decrement) => Step::Dec { slot },
+                    (BindingLoc::Global, UpdateOp::Increment) => Step::IncGlobal { name },
+                    (BindingLoc::Global, UpdateOp::Decrement) => Step::DecGlobal { name },
+                    (BindingLoc::Env, _) => unreachable!("fused_update on the environment path"),
                 };
                 self.emit(step);
             } else {
@@ -6108,11 +6427,13 @@ impl Compiler {
             }
             ExprKind::Literal(literal) => self.compile_literal(literal),
             ExprKind::Ident(name) => {
-                if let Some(slot) = self.slot_of(*name) {
+                match self.binding(*name) {
                     // Cut 3 fast path: the binding is a frame slot.
-                    self.emit(Step::LoadLocal { slot });
-                } else {
-                    self.emit(Step::LoadIdent { name: *name });
+                    BindingLoc::Slot(slot) => self.emit(Step::LoadLocal { slot }),
+                    // Cut 5 fast script: a declared top-level var, read
+                    // directly off the global object.
+                    BindingLoc::Global => self.emit(Step::LoadGlobal { name: *name }),
+                    BindingLoc::Env => self.emit(Step::LoadIdent { name: *name }),
                 }
                 Ok(())
             }
@@ -6159,18 +6480,25 @@ impl Compiler {
                         operand = inner;
                     }
                     if let ExprKind::Ident(name) = &operand.kind {
-                        if let Some(slot) = self.slot_of(*name) {
-                            // Cut 3 fast path: a slot binding always exists
+                        match self.binding(*name) {
+                            // Cut 3/5 fast path: a fast binding always exists
                             // (never an unresolvable reference), so load it
                             // and compute the type — `TypeofIdent` would walk
-                            // the environment for a binding the fast call
-                            // path never created. `LoadLocal`'s TDZ check
+                            // the environment for a binding the fast path
+                            // never created. `LoadLocal`'s TDZ check
                             // preserves `typeof` of a `let`/`const` slot
                             // throwing (spec 13.5.3.2 step 1).
-                            self.emit(Step::LoadLocal { slot });
-                            self.emit(Step::TypeofTop);
-                        } else {
-                            self.emit(Step::TypeofIdent { name: *name });
+                            BindingLoc::Slot(slot) => {
+                                self.emit(Step::LoadLocal { slot });
+                                self.emit(Step::TypeofTop);
+                            }
+                            BindingLoc::Global => {
+                                self.emit(Step::LoadGlobal { name: *name });
+                                self.emit(Step::TypeofTop);
+                            }
+                            BindingLoc::Env => {
+                                self.emit(Step::TypeofIdent { name: *name });
+                            }
                         }
                     } else {
                         self.compile_expr(operand)?;
@@ -6420,12 +6748,12 @@ impl Compiler {
     fn compile_delete(&mut self, operand: &Expr) -> Result<(), JsError> {
         match &operand.kind {
             ExprKind::Ident(name) => {
-                if self.slot_of(*name).is_some() {
-                    // Cut 3 fast path: a slot binding is never unresolvable,
-                    // and strict-mode `delete x` is a parse error, so the
-                    // result is always false (spec 13.5.1.2 step 3) —
-                    // `DeleteIdent` would walk the environment for a binding
-                    // the fast call path never created.
+                if !matches!(self.binding(*name), BindingLoc::Env) {
+                    // Cut 3/5 fast path: a fast binding is never
+                    // unresolvable, and strict-mode `delete x` is a parse
+                    // error, so the result is always false (spec 13.5.1.2
+                    // step 3) — `DeleteIdent` would walk the environment for
+                    // a binding the fast path never created.
                     self.emit(Step::Push(Value::Boolean(false)));
                 } else {
                     self.emit(Step::DeleteIdent { name: *name });
@@ -6475,15 +6803,28 @@ impl Compiler {
     ) -> Result<(), JsError> {
         match &target.kind {
             ExprKind::Ident(name) => {
-                if let Some(slot) = self.slot_of(*name) {
-                    // Cut 3 fast path: the update reads and writes the frame
-                    // slot directly.
-                    self.emit(Step::UpdateLocal {
-                        slot,
-                        op: *op,
-                        prefix,
-                    });
-                    return Ok(());
+                match self.binding(*name) {
+                    BindingLoc::Slot(slot) => {
+                        // Cut 3 fast path: the update reads and writes the
+                        // frame slot directly.
+                        self.emit(Step::UpdateLocal {
+                            slot,
+                            op: *op,
+                            prefix,
+                        });
+                        return Ok(());
+                    }
+                    BindingLoc::Global => {
+                        // Cut 5 fast script: the update reads and writes the
+                        // global binding directly.
+                        self.emit(Step::UpdateGlobal {
+                            name: *name,
+                            op: *op,
+                            prefix,
+                        });
+                        return Ok(());
+                    }
+                    BindingLoc::Env => {}
                 }
                 // The assignment target's reference resolves before the RHS:
                 // PutValue uses the initially created reference even when the
@@ -6593,82 +6934,91 @@ impl Compiler {
             && crate::function::is_anonymous_function_definition(value);
         match &target.kind {
             ExprKind::Ident(name) => {
-                if let Some(slot) = self.slot_of(*name) {
-                    // Cut 3 fast path: the target is a frame slot; no
-                    // reference machinery (there is no `with` to observe the
-                    // resolve-before-RHS rule, and function-literal
-                    // initializers bail the fast path so `set_name` cannot
-                    // trigger). The `Dup` before `StoreLocal` leaves the
-                    // assigned value as the expression's result.
-                    match op {
-                        AssignOp::Assign => {
-                            self.compile_expr(value)?;
-                            self.emit(Step::Dup);
-                            self.emit(Step::StoreLocal { slot });
-                        }
-                        AssignOp::AndAssign | AssignOp::OrAssign | AssignOp::NullishAssign => {
-                            self.emit(Step::LoadLocal { slot });
-                            let end_label = self.new_label();
-                            match op {
-                                AssignOp::AndAssign => self.jump_if_false_keep(end_label),
-                                AssignOp::OrAssign => self.jump_if_true_keep(end_label),
-                                _ => self.jump_if_not_nullish_keep(end_label),
-                            }
-                            self.emit(Step::Pop);
-                            self.compile_expr(value)?;
-                            self.emit(Step::Dup);
-                            self.emit(Step::StoreLocal { slot });
-                            self.place(end_label);
-                        }
-                        _ => {
-                            self.emit(Step::LoadLocal { slot });
-                            self.compile_expr(value)?;
-                            self.emit(Step::Binary(crate::expr::compound_binary(*op)));
-                            self.emit(Step::Dup);
-                            self.emit(Step::StoreLocal { slot });
-                        }
-                    }
-                    return Ok(());
-                }
-                match op {
-                    AssignOp::Assign => {
-                        // Resolve the reference before the RHS: PutValue uses
-                        // the initially created reference even if the binding
-                        // disappears while the RHS evaluates (spec 13.15.3
-                        // steps 1, 5 — e.g. a `with` scope whose binding the
-                        // RHS deletes).
-                        self.emit(Step::ResolveVarIdent { name: *name });
-                        self.compile_expr(value)?;
-                        if set_name {
-                            self.emit(Step::SetFunctionName { name: *name });
-                        }
-                        self.emit(Step::PutVarReference);
-                    }
-                    AssignOp::AndAssign | AssignOp::OrAssign | AssignOp::NullishAssign => {
-                        self.emit(Step::LoadIdent { name: *name });
-                        let end_label = self.new_label();
+                match self.binding(*name) {
+                    loc @ (BindingLoc::Slot(_) | BindingLoc::Global) => {
+                        // Cut 3/5 fast path: the target is a frame slot or a
+                        // declared top-level var; no reference machinery
+                        // (there is no `with` to observe the
+                        // resolve-before-RHS rule, and function-literal
+                        // initializers bail the fast path so `set_name`
+                        // cannot trigger). The `Dup` before the store leaves
+                        // the assigned value as the expression's result.
                         match op {
-                            AssignOp::AndAssign => self.jump_if_false_keep(end_label),
-                            AssignOp::OrAssign => self.jump_if_true_keep(end_label),
-                            _ => self.jump_if_not_nullish_keep(end_label),
+                            AssignOp::Assign => {
+                                self.compile_expr(value)?;
+                                if set_name {
+                                    // NamedEvaluation (spec 13.15.3 step
+                                    // 2.d): a plain assignment of an
+                                    // anonymous function names it after the
+                                    // binding — the env path does this too.
+                                    self.emit(Step::SetFunctionName { name: *name });
+                                }
+                                self.emit_dup_store(loc, *name);
+                            }
+                            AssignOp::AndAssign | AssignOp::OrAssign | AssignOp::NullishAssign => {
+                                self.emit_load(loc, *name);
+                                let end_label = self.new_label();
+                                match op {
+                                    AssignOp::AndAssign => self.jump_if_false_keep(end_label),
+                                    AssignOp::OrAssign => self.jump_if_true_keep(end_label),
+                                    _ => self.jump_if_not_nullish_keep(end_label),
+                                }
+                                self.emit(Step::Pop);
+                                self.compile_expr(value)?;
+                                self.emit_dup_store(loc, *name);
+                                self.place(end_label);
+                            }
+                            _ => {
+                                self.emit_load(loc, *name);
+                                self.compile_expr(value)?;
+                                self.emit(Step::Binary(crate::expr::compound_binary(*op)));
+                                self.emit_dup_store(loc, *name);
+                            }
                         }
-                        self.emit(Step::Pop);
-                        self.compile_expr(value)?;
-                        self.emit(Step::AssignIdent {
-                            name: *name,
-                            op: *op,
-                            set_name,
-                        });
-                        self.place(end_label);
+                        Ok(())
                     }
-                    _ => {
-                        self.emit(Step::ResolveVarIdent { name: *name });
-                        self.emit(Step::GetVarReference);
-                        self.compile_expr(value)?;
-                        self.emit(Step::PutVarReferenceOp { op: *op });
+                    BindingLoc::Env => {
+                        match op {
+                            AssignOp::Assign => {
+                                // Resolve the reference before the RHS: PutValue
+                                // uses the initially created reference even if
+                                // the binding disappears while the RHS evaluates
+                                // (spec 13.15.3 steps 1, 5 — e.g. a `with`
+                                // scope whose binding the RHS deletes).
+                                self.emit(Step::ResolveVarIdent { name: *name });
+                                self.compile_expr(value)?;
+                                if set_name {
+                                    self.emit(Step::SetFunctionName { name: *name });
+                                }
+                                self.emit(Step::PutVarReference);
+                            }
+                            AssignOp::AndAssign | AssignOp::OrAssign | AssignOp::NullishAssign => {
+                                self.emit(Step::LoadIdent { name: *name });
+                                let end_label = self.new_label();
+                                match op {
+                                    AssignOp::AndAssign => self.jump_if_false_keep(end_label),
+                                    AssignOp::OrAssign => self.jump_if_true_keep(end_label),
+                                    _ => self.jump_if_not_nullish_keep(end_label),
+                                }
+                                self.emit(Step::Pop);
+                                self.compile_expr(value)?;
+                                self.emit(Step::AssignIdent {
+                                    name: *name,
+                                    op: *op,
+                                    set_name,
+                                });
+                                self.place(end_label);
+                            }
+                            _ => {
+                                self.emit(Step::ResolveVarIdent { name: *name });
+                                self.emit(Step::GetVarReference);
+                                self.compile_expr(value)?;
+                                self.emit(Step::PutVarReferenceOp { op: *op });
+                            }
+                        }
+                        Ok(())
                     }
                 }
-                Ok(())
             }
             ExprKind::Member(member) => self.compile_member_assign(member, op, value),
             ExprKind::Call(_) => {
@@ -7761,12 +8111,30 @@ pub fn compile_body(function: &EcmaFunction) -> Result<CompiledBody, JsError> {
         handlers: compiler.handlers,
         strict: function.strict,
         scope: compiler.scope,
+        script_globals: None,
     })
 }
 
 /// Compile a statement list standalone (modules and top-level await).
-pub fn compile_statements(stmts: &[Stmt], strict: bool) -> Result<CompiledBody, JsError> {
-    let mut compiler = Compiler::default();
+/// `fast_script` certifies a top-level *script* for the script-level
+/// binding fast path (declared `var`s read/written directly on the global
+/// object); modules and eval bodies pass `false` — modules bind into the
+/// module environment, and eval bodies can see (and shadow) the caller's
+/// lexical environment, so neither may bypass the env walk.
+pub fn compile_statements(
+    stmts: &[Stmt],
+    strict: bool,
+    fast_script: bool,
+) -> Result<CompiledBody, JsError> {
+    let script_globals = if fast_script {
+        analyze_script_scope(stmts)
+    } else {
+        None
+    };
+    let mut compiler = Compiler {
+        script_globals,
+        ..Compiler::default()
+    };
     compiler.compile_statements(stmts)?;
     compiler.resolve();
     Ok(CompiledBody {
@@ -7774,6 +8142,7 @@ pub fn compile_statements(stmts: &[Stmt], strict: bool) -> Result<CompiledBody, 
         handlers: compiler.handlers,
         strict,
         scope: None,
+        script_globals: compiler.script_globals,
     })
 }
 
@@ -7996,5 +8365,174 @@ fn scope_scan_expr(expr: &Expr) -> bool {
         | ExprKind::Await(_)
         | ExprKind::MetaProperty { .. }
         | ExprKind::ImportCall { .. } => false,
+    }
+}
+
+// ---- Script-level bindings (fast scripts) ----
+//
+// Certify a top-level *script* for direct global-object access: every
+// declared `var`/function name becomes a `LoadGlobal`/`StoreGlobal`
+// binding, skipping the env-chain resolve walk that top-level reads pay
+// today (the bench loops and host tools are top-level scripts). Script
+// instantiation already created the global properties, so a fast read is
+// guaranteed to resolve; undeclared names stay on the env path (the
+// ReferenceError / host-global cases). Modules and eval bodies never take
+// this path — modules bind into the module environment, and eval bodies
+// can see (and shadow) the caller's lexical environment.
+
+/// The declared var/function names of a certified script, or `None` when a
+/// construct could change binding resolution (a `with`, a `try`/`catch`
+/// whose parameter shadows a same-named global, a `switch` with lexical
+/// cases, a `for-in`/`for-of`, or a direct `eval` call).
+fn analyze_script_scope(stmts: &[Stmt]) -> Option<HashSet<String>> {
+    if !script_scan_allows(stmts) {
+        return None;
+    }
+    let mut globals: HashSet<String> = HashSet::new();
+    for name in crate::script::top_level_var_declared_names(stmts) {
+        globals.insert(name.to_string_lossy());
+    }
+    Some(globals)
+}
+
+fn script_scan_allows(stmts: &[Stmt]) -> bool {
+    stmts.iter().all(script_stmt_allows)
+}
+
+fn script_stmt_allows(stmt: &Stmt) -> bool {
+    match &stmt.kind {
+        StmtKind::Block(block) => script_scan_allows(&block.stmts),
+        StmtKind::Empty | StmtKind::Debugger | StmtKind::Break(_) | StmtKind::Continue(_) => true,
+        StmtKind::Expr(expr) => script_expr_allows(expr),
+        StmtKind::VarDecl { kind, decls } => {
+            *kind == VarDeclKind::Var
+                && decls
+                    .iter()
+                    .all(|decl| decl.init.as_ref().is_none_or(script_expr_allows))
+        }
+        StmtKind::If {
+            test,
+            consequent,
+            alternate,
+        } => {
+            script_expr_allows(test)
+                && script_stmt_allows(consequent)
+                && alternate.as_deref().is_none_or(script_stmt_allows)
+        }
+        StmtKind::While { test, body } | StmtKind::DoWhile { body, test } => {
+            script_expr_allows(test) && script_stmt_allows(body)
+        }
+        StmtKind::For {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            let init_ok = match init {
+                None => true,
+                Some(ForInit::Expr(expr)) => script_expr_allows(expr),
+                Some(ForInit::VarDecl { kind, decls }) => {
+                    *kind == VarDeclKind::Var
+                        && decls
+                            .iter()
+                            .all(|decl| decl.init.as_ref().is_none_or(script_expr_allows))
+                }
+            };
+            init_ok
+                && test.as_ref().is_none_or(script_expr_allows)
+                && update.as_ref().is_none_or(script_expr_allows)
+                && script_stmt_allows(body)
+        }
+        StmtKind::Return(expr) => expr.as_ref().is_none_or(script_expr_allows),
+        StmtKind::Throw(expr) => script_expr_allows(expr),
+        StmtKind::Labeled { body, .. } => script_stmt_allows(body),
+        StmtKind::FunctionDecl(_) | StmtKind::ClassDecl(_) => true,
+        // `with` re-resolves every name against an object env; a `catch`
+        // parameter shadows a same-named global inside its handler; a
+        // `switch` case can hold lexical declarations; `for-in`/`for-of`
+        // heads have their own binding machinery; `using` is lexical.
+        // All fall back to the env path.
+        StmtKind::With { .. }
+        | StmtKind::Try { .. }
+        | StmtKind::Switch { .. }
+        | StmtKind::ForIn { .. }
+        | StmtKind::ForOf { .. }
+        | StmtKind::UsingDecl { .. } => false,
+    }
+}
+
+fn script_expr_allows(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Literal(_)
+        | ExprKind::Ident(_)
+        | ExprKind::This
+        | ExprKind::Function(_)
+        | ExprKind::Arrow { .. }
+        | ExprKind::Class(_)
+        | ExprKind::Array(_)
+        | ExprKind::Object(_) => true,
+        ExprKind::Paren(inner) => script_expr_allows(inner),
+        ExprKind::Unary { operand, .. } => script_expr_allows(operand),
+        ExprKind::Update { target, .. } => script_expr_allows(target),
+        ExprKind::Binary { left, right, .. } => {
+            script_expr_allows(left) && script_expr_allows(right)
+        }
+        ExprKind::Logical { left, right, .. } => {
+            script_expr_allows(left) && script_expr_allows(right)
+        }
+        ExprKind::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            script_expr_allows(test)
+                && script_expr_allows(consequent)
+                && script_expr_allows(alternate)
+        }
+        ExprKind::Assign { target, value, .. } => {
+            script_expr_allows(target) && script_expr_allows(value)
+        }
+        ExprKind::Member(member) => {
+            if matches!(member.property, MemberProperty::Private(_)) {
+                return false;
+            }
+            script_expr_allows(&member.object)
+                && match &member.property {
+                    MemberProperty::Computed(key) => script_expr_allows(key),
+                    _ => true,
+                }
+        }
+        ExprKind::Call(call) => {
+            // A direct `eval` call can see and change the script's
+            // resolution; bail conservatively (matches the fast-body
+            // certification).
+            if matches!(&call.callee.kind, ExprKind::Ident(id)
+                if crux::lookup(*id) == JsString::from_utf8("eval"))
+            {
+                return false;
+            }
+            script_expr_allows(&call.callee)
+                && call.args.iter().all(|arg| match arg {
+                    Argument::Expr(expr) => script_expr_allows(expr),
+                    Argument::Spread(expr) => script_expr_allows(expr),
+                })
+        }
+        ExprKind::New(new) => {
+            script_expr_allows(&new.callee)
+                && new.args.iter().all(|arg| match arg {
+                    Argument::Expr(expr) => script_expr_allows(expr),
+                    Argument::Spread(expr) => script_expr_allows(expr),
+                })
+        }
+        ExprKind::Template(template) => template.exprs.iter().all(script_expr_allows),
+        ExprKind::TaggedTemplate { tag, quasi } => {
+            script_expr_allows(tag) && quasi.exprs.iter().all(script_expr_allows)
+        }
+        ExprKind::Sequence(exprs) => exprs.iter().all(script_expr_allows),
+        ExprKind::MetaProperty { .. } => true,
+        ExprKind::ImportCall { .. } => true,
+        ExprKind::PrivateIn { .. } => false,
+        ExprKind::Super => false,
+        ExprKind::Yield { .. } | ExprKind::Await(_) => false,
     }
 }

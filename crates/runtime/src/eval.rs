@@ -27,8 +27,16 @@ use crate::script::bound_names;
 /// 11). The completion value is the value of the last evaluated statement.
 /// Script bodies compile to steps and run on the VM, so the whole engine
 /// executes bytecode (the top-level path is compiled like any body).
-pub fn eval_program(agent: &mut Agent, program: &Program, strict: bool) -> Result<Value, JsError> {
-    let body = crate::ir::compile_statements(&program.body, strict)?;
+/// `fast_script` certifies top-level *script* evaluation for the
+/// script-level binding fast path; eval bodies pass `false` (they can see
+/// the caller's lexical environment).
+pub fn eval_program(
+    agent: &mut Agent,
+    program: &Program,
+    strict: bool,
+    fast_script: bool,
+) -> Result<Value, JsError> {
+    let body = crate::ir::compile_statements(&program.body, strict, fast_script)?;
     let env = agent.running_context()?.lexical_environment.clone();
     let mut vm = crate::ir::Vm::new(env.clone(), strict);
     let completion = match vm.start(agent, &body)? {
@@ -3217,5 +3225,103 @@ mod tests {
                 .unwrap(),
             Value::String(Handle::new(JsString::from_utf8("abb")))
         );
+    }
+
+    // ---- Cut 5: script-level bindings (top-level vars) ----
+
+    #[test]
+    fn fast_script_compiles_globals_to_direct_access() {
+        let program =
+            parser::parse_script("var n = 0; for (var i = 0; i < 100; i++) { n += i; } n").unwrap();
+        let body = crate::ir::compile_statements(&program.body, false, true).unwrap();
+        assert!(
+            body.script_globals.is_some(),
+            "the script must be certified"
+        );
+        assert!(
+            body.steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::StoreGlobal { .. }))
+        );
+        assert!(
+            body.steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::JumpIfLtGlobalImm { .. }))
+        );
+        assert!(
+            body.steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::IncGlobal { .. }))
+        );
+        assert!(
+            !body
+                .steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::LoadIdent { .. })),
+            "declared var reads must not walk the environment"
+        );
+        assert!(
+            !body
+                .steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::JumpIfFalse(_))),
+            "the loop test must fuse against the global binding"
+        );
+        // The eval/module mode never certifies.
+        let body = crate::ir::compile_statements(&program.body, false, false).unwrap();
+        assert!(
+            body.script_globals.is_none(),
+            "eval/module mode must stay env-path"
+        );
+    }
+
+    #[test]
+    fn fast_script_behavior() {
+        assert_eq!(
+            run("var n = 0; for (var i = 0; i < 1000; i++) { n += i * 2; } n").unwrap(),
+            Value::Number(999000.0)
+        );
+        // Var hoisting: the instantiation created the global property.
+        assert_eq!(run("x; var x = 1;").unwrap(), Value::Undefined);
+        // `typeof` of an undeclared name is "undefined", not an error.
+        assert_eq!(
+            run("typeof not_declared_anywhere").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("undefined")))
+        );
+        // Reading an undeclared name still throws.
+        assert!(matches!(
+            run("not_declared_anywhere"),
+            Err(error) if error.kind == crux::ErrorKind::ReferenceError
+        ));
+    }
+
+    #[test]
+    fn fast_script_bails_preserve_env_behavior() {
+        // try/catch (a catch param shadows a same-named global), `with`,
+        // and direct eval all fall back to the env path and keep their
+        // semantics.
+        assert_eq!(
+            run("var n = 0; try { throw 7; } catch (e) { n = e; } n").unwrap(),
+            Value::Number(7.0)
+        );
+        assert_eq!(
+            run("var n = 0; var o = { x: 9 }; with (o) { n = x; } n").unwrap(),
+            Value::Number(9.0)
+        );
+        assert_eq!(
+            run("var n = 0; eval('var n = 5;'); n").unwrap(),
+            Value::Number(5.0)
+        );
+    }
+
+    #[test]
+    fn fast_script_globals_share_the_global_object() {
+        // Two script evaluations in one realm: the second sees the first's
+        // vars — the fast path reads the global object directly.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.run_script("var x = 41;").unwrap();
+        let value = agent.run_script("x + 1").unwrap();
+        assert_eq!(value, Value::Number(42.0));
     }
 }

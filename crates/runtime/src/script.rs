@@ -66,7 +66,7 @@ pub fn script_evaluation(
     let strict = script_is_strict(&script.source, &script.code);
     let result = (|| -> Result<Value, JsError> {
         global_declaration_instantiation(agent, &script.code, &global_env, strict)?;
-        crate::eval::eval_program(agent, &script.code, strict)
+        crate::eval::eval_program(agent, &script.code, strict, true)
     })();
 
     agent.execution_context_stack.pop();
@@ -800,7 +800,7 @@ pub fn perform_eval(
     agent.execution_context_stack.push(eval_context);
     let result = (|| -> Result<Value, JsError> {
         eval_declaration_instantiation(agent, &program, &variable_env, &lexical_env, strict_eval)?;
-        crate::eval::eval_program(agent, &program, strict_eval)
+        crate::eval::eval_program(agent, &program, strict_eval, false)
     })();
     agent.execution_context_stack.pop();
     result

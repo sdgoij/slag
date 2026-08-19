@@ -201,6 +201,23 @@ arithmetic loop needs top-level vars first. Slot-arg calls remain open
 (Cut 4 continuation). Cut 5 (encoding: constant pool, immediates, zero-
 operand constants, `--print-bytecode`) closes the gate's second half.
 
+**The step-cost model, measured (fast-function loop, same binary)**: steps
+are not uniform — the evaluator-backed steps dominate. An empty loop is
+~107ns/iter over 3 evaluator steps; adding `n += 1` (5 mechanical steps)
+costs +11ns (~2-5ns/step — nearly free); adding a second `Mul` evaluator
+call costs +50ns (~40ns per `apply_binary` call). So the fusions (Cut 4)
+and the accumulator (below) remove dispatches that were already nearly
+free; the real costs are the evaluator calls (`apply_binary`/
+`abstract_relational`/`update_value` at ~20-40ns) and, at top level,
+global-object property access (~100-200ns per access — the arithmetic
+bench's ~5 accesses/iteration). The gate's two levers are therefore
+**numeric fast paths in the evaluators** (hoist the number-number check
+above `to_numeric_operand`/`to_primitive` for all arithmetic ops, like
+`Add` already has) and a **fast global-property access** (cell/IC). The
+gate targets, re-baselined against the documented 2026-08-18 corrected
+snapshot (perf.md): arithmetic ≤0.50s (5x of 2.52s), function calls
+≤1.15s, property access ≤0.64s.
+
 ## 8. The hard corners (risk register — investigate before implementing)
 
 1. **Mapped `arguments`**: non-strict functions with simple params have a
