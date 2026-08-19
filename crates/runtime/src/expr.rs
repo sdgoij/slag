@@ -1406,6 +1406,22 @@ fn numeric_binary(
     left: &Value,
     right: &Value,
 ) -> Result<Value, JsError> {
+    // Fast path: both raw operands are already numbers — direct machine
+    // arithmetic before the ToPrimitive/ToNumeric round-trips (ToNumeric on
+    // a primitive is identity, so skipping it is exact). This is the hot
+    // shape of arithmetic loops: the bench `i * 2` pays two tag checks here
+    // instead of two `to_numeric_operand` calls.
+    if let (Some(left_num), Some(right_num)) = (left.as_number(), right.as_number()) {
+        let result = match op {
+            BinaryOp::Sub => left_num - right_num,
+            BinaryOp::Mul => left_num * right_num,
+            BinaryOp::Div => left_num / right_num,
+            BinaryOp::Rem => left_num % right_num,
+            BinaryOp::Exp => number_exponentiate(left_num, right_num),
+            _ => unreachable!("non-arithmetic op"),
+        };
+        return Ok(Value::Number(result));
+    }
     let left = to_numeric_operand(agent, left)?;
     let right = to_numeric_operand(agent, right)?;
     // Fast path: plain doubles — direct machine arithmetic.
@@ -1539,6 +1555,21 @@ fn bitwise_binary(
     left: &Value,
     right: &Value,
 ) -> Result<Value, JsError> {
+    // Fast path: both raw operands are already numbers — direct bit
+    // arithmetic before the ToPrimitive/ToNumeric round-trips (identity for
+    // primitives, so skipping them is exact).
+    if let (Some(a), Some(b)) = (left.as_number(), right.as_number()) {
+        let result = match op {
+            BinaryOp::LeftShift => (to_int32(a) << (to_uint32(b) & 0x1F)) as f64,
+            BinaryOp::RightShift => (to_int32(a) >> (to_uint32(b) & 0x1F)) as f64,
+            BinaryOp::UnsignedRightShift => (to_uint32(a) >> (to_uint32(b) & 0x1F)) as f64,
+            BinaryOp::BitAnd => (to_int32(a) & to_int32(b)) as f64,
+            BinaryOp::BitXor => (to_int32(a) ^ to_int32(b)) as f64,
+            BinaryOp::BitOr => (to_int32(a) | to_int32(b)) as f64,
+            _ => unreachable!("non-bitwise op"),
+        };
+        return Ok(Value::Number(result));
+    }
     let left = to_numeric_operand(agent, left)?;
     let right = to_numeric_operand(agent, right)?;
     match (left.kind(), right.kind()) {

@@ -75,31 +75,37 @@ environment machinery, not by value representation.)
 ### Current status (measured 2026-08-19)
 
 The bytecode VM work — Cut 1-4, the script-level binding fast path, the
-fused loop test/update ops, and the relational fast path — is at zero
-conformance regressions. Against the corrected baseline:
+fused loop test/update ops, the relational fast path, and the evaluator
+numeric fast paths — is at zero conformance regressions. Against the
+corrected baseline:
 
 | Benchmark | corrected baseline | today | speedup | 5x target |
 |---|---|---|---|---|
-| arithmetic | 2.52s | ~1.08s | 2.3x | 0.50s |
+| arithmetic | 2.52s | ~1.05s | 2.4x | 0.50s |
 | property access | 3.22s | ~1.30s | 2.5x | 0.64s |
 | string concat | 0.88s | ~0.16s | 5.5x — gate met | — |
 | array iteration | 15.42s | ~13.5s | 1.1x | 3.08s |
-| function calls | 5.73s | ~1.72s | 3.3x | 1.15s |
+| function calls | 5.73s | ~1.66s | 3.4x | 1.15s |
 
 (The `bytecode-plan.md` gate used a later, already-optimized walker
 baseline — arithmetic 1.14s → the plan's "≤0.23s"; this table is the
 documented 2026-08-18 corrected baseline, which the bytecode work has
-moved 2.3-3.3x on the hot benches.)
+moved 2.4-3.4x on the hot benches.)
 
-The two hot gates are arithmetic (needs ~2.2x more) and function calls
-(~1.5x). The measured cost model (bytecode-plan.md §7): top-level loops
+The two hot gates are arithmetic (needs ~2.1x more) and function calls
+(~1.4x). The measured cost model (bytecode-plan.md §7): top-level loops
 are bound by global-object property access (~5 accesses/iteration at
 ~100-200ns each) and fast-function loops by the binary evaluator
 (`apply_binary`/`abstract_relational` at ~20-40ns vs ~2-5ns for
-mechanical steps). Remaining levers: numeric fast paths in the
-evaluators, a fast global-property access (cell/IC), and less per-call
-machinery (a fast call still pushes a full `ExecutionContext` and bumps
-~10 `Rc` refcounts).
+mechanical steps). The evaluator numeric fast paths have landed — the
+number-number check now sits above the ToNumeric/ToPrimitive round-trips
+in `apply_binary`'s arithmetic/bitwise paths and in `abstract_relational`
+(measured ~6% on the top-level arithmetic bench, and ~25% on the
+fast-function loop shape — 0.166s → 0.125s, where `apply_binary`
+dominates; 3-run medians) — so the remaining levers are a fast
+global-property access (cell/IC) and less per-call machinery (a fast
+call still pushes a full `ExecutionContext` and bumps ~10 `Rc`
+refcounts).
 
 ## Deferred milestones
 
@@ -270,7 +276,7 @@ release sweep over 48,622 fixtures: 0 fail, 229 skip (unchanged taxonomy),
 a documented `#[allow(clippy::mutable_key_type)]`: a rope's first hash
 materializes its flat cache, but the hash output is content-stable.)
 
-## Bytecode VM milestone (Cut 1-4 + script-level bindings landed, gate open)
+## Bytecode VM milestone (Cut 1-4 + script-level bindings + evaluator fast paths landed, gate open)
 
 The tree-walker is gone from normal execution: every expression and
 statement compiles to `Step` bytecode at creation (`compile_expr`/
@@ -280,7 +286,10 @@ async functions, and top-level scripts. Cut 3 gives simple-param
 functions and arrows frame-slot bindings; Cut 4 fuses the loop test and
 update into slot ops and adds a primitive fast path to the relational
 evaluator; the script-level binding fast path reads declared top-level
-vars directly off the global object. All at zero conformance regressions.
+vars directly off the global object; and the evaluator numeric fast paths
+hoist the number-number check above the ToNumeric/ToPrimitive round-trips
+in `apply_binary`'s arithmetic/bitwise paths. All at zero conformance
+regressions.
 
 The batching defaults that cloned
 suspension-free subtrees into `Step::Expr`/`Step::Stmt` for runtime
@@ -299,18 +308,19 @@ not met:
 
 | Benchmark | walker baseline | Cut 2 (HEAD) | now |
 |---|---|---|---|
-| arithmetic | 1.14s | 1.19s | ~1.08s |
+| arithmetic | 1.14s | 1.19s | ~1.05s |
 | property access | 1.50s | 1.59s | ~1.30s |
 | string concat | ~0.15s | 0.160s | ~0.16s |
 | array iteration | 13.6–15s | 14.1s | ~13.5s |
-| function calls | 4.2–4.4s | 4.56s | ~1.72s |
+| function calls | 4.2–4.4s | 4.56s | ~1.66s |
 
 The runs are noisy on this machine (±15%). The measured cost model
 (bytecode-plan.md §7) says arithmetic is bound by global-object property
 access (the walker's arithmetic was already fast) and fast-function loops
-by the binary evaluator; the gate's arithmetic target needs a fast global
-property access (cell/IC) plus evaluator numeric fast paths, and function
-calls need less per-call machinery.
+by the binary evaluator. The evaluator numeric fast paths landed (~6% on
+arithmetic, 3-run medians); the gate's arithmetic target still needs a
+fast global property access (cell/IC), and function calls need less
+per-call machinery.
 
 ## GC milestone (PLAN Phase 18 item 2)
 

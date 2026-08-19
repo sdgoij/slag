@@ -190,16 +190,18 @@ slot/imm operands — no push/pop for the common shapes:
 **Measured (first slice landed)**: the fused update and test-jump ops
 shipped (`Inc`/`Dec`; the `JumpIfLt/Le/Gt/GeImm` family for `for`/`while`
 tests), plus a primitive fast path in the relational evaluator. On a
-fast-certified body, the empty loop dropped 0.109s → 0.079s (~28%) and
-the arithmetic loop stayed flat at ~0.19s — it is bound by `apply_binary`'s
-machinery and the body's stack round-trips, which is the accumulator
-model's remaining work. The earlier estimates (~0.6-0.7s after Cut 3,
-~0.3-0.4s after Cut 4) were written against the *top-level* bench, which
-stays on the env path until the script-level binding mechanism lands — the
-fused ops only engage inside fast-certified bodies, so the gate's
-arithmetic loop needs top-level vars first. Slot-arg calls remain open
-(Cut 4 continuation). Cut 5 (encoding: constant pool, immediates, zero-
-operand constants, `--print-bytecode`) closes the gate's second half.
+fast-certified body, the empty loop dropped 0.109s → 0.079s (~28%); the
+arithmetic loop stayed flat at ~0.19s while the fusions landed, bound by
+`apply_binary`'s machinery — the evaluator numeric fast paths (the
+levers below) then moved it to ~0.125s (~25%), with the body's stack
+round-trips remaining as the accumulator model's work. The earlier
+estimates (~0.6-0.7s after Cut 3, ~0.3-0.4s after Cut 4) were written
+against the *top-level* bench, which stays on the env path until the
+script-level binding mechanism lands — the fused ops only engage inside
+fast-certified bodies, so the gate's arithmetic loop needs top-level
+vars first. Slot-arg calls remain open (Cut 4 continuation). Cut 5
+(encoding: constant pool, immediates, zero-operand constants,
+`--print-bytecode`) closes the gate's second half.
 
 **The step-cost model, measured (fast-function loop, same binary)**: steps
 are not uniform — the evaluator-backed steps dominate. An empty loop is
@@ -210,13 +212,16 @@ and the accumulator (below) remove dispatches that were already nearly
 free; the real costs are the evaluator calls (`apply_binary`/
 `abstract_relational`/`update_value` at ~20-40ns) and, at top level,
 global-object property access (~100-200ns per access — the arithmetic
-bench's ~5 accesses/iteration). The gate's two levers are therefore
-**numeric fast paths in the evaluators** (hoist the number-number check
-above `to_numeric_operand`/`to_primitive` for all arithmetic ops, like
-`Add` already has) and a **fast global-property access** (cell/IC). The
-gate targets, re-baselined against the documented 2026-08-18 corrected
-snapshot (perf.md): arithmetic ≤0.50s (5x of 2.52s), function calls
-≤1.15s, property access ≤0.64s.
+bench's ~5 accesses/iteration). The evaluator lever has landed: the
+number-number check now sits above `to_numeric_operand`/`to_primitive`
+for all arithmetic and bitwise ops in `apply_binary` (mirroring `Add`)
+and in `abstract_relational` — measured ~25% on the fast-function
+arithmetic loop (0.166s → 0.125s, 3-run medians) and ~6% on the
+*top-level* arithmetic bench, which stays bound by its global-property
+accesses. The remaining lever is a **fast global-property access**
+(cell/IC). The gate targets, re-baselined against the documented
+2026-08-18 corrected snapshot (perf.md): arithmetic ≤0.50s (5x of 2.52s),
+function calls ≤1.15s, property access ≤0.64s.
 
 ## 8. The hard corners (risk register — investigate before implementing)
 
