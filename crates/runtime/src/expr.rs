@@ -1587,6 +1587,18 @@ fn abstract_relational(
     right: &Value,
     left_first: bool,
 ) -> Result<Option<bool>, JsError> {
+    // Fast path: both operands are already numbers — direct comparison
+    // without the ToPrimitive round-trips (ToPrimitive on a primitive is a
+    // no-op, so skipping it is exact). This is the hot shape of loop tests.
+    if let (Some(a), Some(b)) = (left.as_number(), right.as_number()) {
+        if a.is_nan() || b.is_nan() {
+            return Ok(None);
+        }
+        return Ok(Some(a < b));
+    }
+    if let (Some(a), Some(b)) = (left.as_string(), right.as_string()) {
+        return Ok(Some(a.as_slice() < b.as_slice()));
+    }
     let (left_prim, right_prim) = if left_first {
         let left_prim = crate::context::to_primitive(agent, left, ToPrimitiveHint::Number)?;
         let right_prim = crate::context::to_primitive(agent, right, ToPrimitiveHint::Number)?;

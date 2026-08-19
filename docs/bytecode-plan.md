@@ -6,15 +6,18 @@ algorithm, the runtime integration points, and the quantified path to the
 perf.md gate. The reference is the V8 checkout in `v8/` — the file/function
 names below are the exact places to read.
 
-Status: **Cut 1, Cut 2, and Cut 3's first slice landed and validated**
-(zero conformance regressions each). The first slice gives simple-param
-functions and arrows compile-time binding resolution — params and `var`s
-become fixed frame slots, so identifier ops emit `LoadLocal`/`StoreLocal`/
-`InitLocal`/`UpdateLocal` instead of the per-read environment-chain walk —
-but contexts, lexical blocks, `arguments`, and Annex B are deferred to the
-continuation (§13). The function-calls bench is ~2.2x faster; the
-arithmetic bench needs the top-level-var mechanism (the continuation) and
-the loop machinery (Cut 4), so the gate (hot-path ≥ 5x) is still open.
+Status: **Cut 1, Cut 2, Cut 3's first slice, and Cut 4's first slice
+landed and validated** (zero conformance regressions each). Cut 3 gives
+simple-param functions and arrows compile-time binding resolution — params
+and `var`s become fixed frame slots, so identifier ops emit
+`LoadLocal`/`StoreLocal`/`InitLocal`/`UpdateLocal` instead of the
+per-read environment-chain walk — but contexts, lexical blocks,
+`arguments`, and Annex B are deferred to the continuation (§13). Cut 4
+fuses the loop test and update into slot ops and adds a primitive fast
+path to the relational evaluator (§7). The function-calls bench is ~2.2x
+faster; the arithmetic bench needs the top-level-var mechanism (the
+continuation) and the accumulator model (Cut 4 continuation), so the gate
+(hot-path ≥ 5x) is still open.
 
 ---
 
@@ -184,12 +187,19 @@ slot/imm operands — no push/pop for the common shapes:
 - Arity calls against slots: `CallFast` already reads args off the stack;
   slot-arg calls remove the remaining pushes.
 
-Expected arithmetic after Cut 3: ~0.6-0.7s (body walks gone, empty loop
-dominates). After Cut 4: ~0.3-0.4s (loop steps halve). Cut 5 (encoding:
-constant pool, immediates everywhere, zero-operand constants,
-`--print-bytecode`): ~0.25s. **The 5x gate (≤0.23s) needs Cut 4 and 5,
-not Cut 3 alone** — the doc now says so explicitly instead of promising the
-gate at Cut 3.
+**Measured (first slice landed)**: the fused update and test-jump ops
+shipped (`Inc`/`Dec`; the `JumpIfLt/Le/Gt/GeImm` family for `for`/`while`
+tests), plus a primitive fast path in the relational evaluator. On a
+fast-certified body, the empty loop dropped 0.109s → 0.079s (~28%) and
+the arithmetic loop stayed flat at ~0.19s — it is bound by `apply_binary`'s
+machinery and the body's stack round-trips, which is the accumulator
+model's remaining work. The earlier estimates (~0.6-0.7s after Cut 3,
+~0.3-0.4s after Cut 4) were written against the *top-level* bench, which
+stays on the env path until the script-level binding mechanism lands — the
+fused ops only engage inside fast-certified bodies, so the gate's
+arithmetic loop needs top-level vars first. Slot-arg calls remain open
+(Cut 4 continuation). Cut 5 (encoding: constant pool, immediates, zero-
+operand constants, `--print-bytecode`) closes the gate's second half.
 
 ## 8. The hard corners (risk register — investigate before implementing)
 
@@ -260,7 +270,9 @@ gate at Cut 3.
 3. **Cut 3 — scope analysis + frame slots** (first slice landed — the
    frame-slot half, §13; the continuation — contexts, lexical blocks,
    `arguments`, loop-head bindings — tracks §8 risk items 1-7 and §9).
-4. **Cut 4 — accumulator + fused ops** (§7; the empty-loop cost).
+4. **Cut 4 — accumulator + fused ops** (first slice landed — the fused
+   update/test-jump ops and the relational fast path, §7; the accumulator
+   model for the body and slot-arg calls remain).
 5. **Cut 5 — encoding + `--print-bytecode`** (constant pool, immediates,
    zero-operand constants, the disassembler; closes the gate's first half).
 6. **Cut 6 — mapped arguments + Annex B + remaining corners** (§8 items

@@ -2909,10 +2909,16 @@ mod tests {
                 .iter()
                 .any(|s| matches!(s, crate::ir::Step::InitLocal { .. }))
         );
+        // Cut 4: the loop test and update fuse into slot ops.
         assert!(
             ir.steps
                 .iter()
-                .any(|s| matches!(s, crate::ir::Step::UpdateLocal { .. }))
+                .any(|s| matches!(s, crate::ir::Step::JumpIfLtImm { .. }))
+        );
+        assert!(
+            ir.steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::Inc { .. }))
         );
         assert!(
             !ir.steps
@@ -3120,6 +3126,96 @@ mod tests {
         assert!(
             ir.scope.is_none(),
             "an `arguments` body must stay on the env path"
+        );
+    }
+
+    // ---- Cut 4: fused loop test + update ----
+
+    #[test]
+    fn cut4_loop_fuses_test_and_update() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script("function loop() { var n = 0; for (var i = 0; i < 100; i++) { n += i; } return n; }")
+            .unwrap();
+        let ir = compiled_body_of(&mut agent, "loop");
+        assert!(ir.scope.is_some(), "the loop body must be certified");
+        assert!(
+            ir.steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::JumpIfLtImm { .. }))
+        );
+        assert!(
+            ir.steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::Inc { .. }))
+        );
+        assert!(
+            !ir.steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::JumpIfFalse(_))),
+            "the loop test must not emit LoadLocal + BinaryImm + JumpIfFalse"
+        );
+        assert!(
+            !ir.steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::UpdateLocal { .. })),
+            "the for-update must not emit UpdateLocal + Pop"
+        );
+    }
+
+    #[test]
+    fn cut4_fused_loop_behaves() {
+        assert_eq!(
+            run("function loop() { var n = 0; for (var i = 0; i < 1000; i++) { n += i; } return n; } loop()")
+                .unwrap(),
+            Value::Number(499500.0)
+        );
+        // The while-test fuses too; a statement-position `i++` (whose value
+        // matters) stays on the general path.
+        assert_eq!(
+            run("function w() { var n = 0; var i = 0; while (i < 1000) { n += i; i++; } return n; } w()")
+                .unwrap(),
+            Value::Number(499500.0)
+        );
+        // Descending loop: `i > 0` and `i--` fuse.
+        assert_eq!(
+            run(
+                "function d() { var n = 0; for (var i = 10; i > 0; i--) { n += i; } return n; } d()"
+            )
+            .unwrap(),
+            Value::Number(55.0)
+        );
+        // `<=` / `>=` fuse.
+        assert_eq!(
+            run(
+                "function e() { var n = 0; for (var i = 0; i <= 5; i++) { n += i; } return n; } e()"
+            )
+            .unwrap(),
+            Value::Number(15.0)
+        );
+        assert_eq!(
+            run("function f2() { var n = 0; for (var i = 5; i >= 0; i--) { n += i; } return n; } f2()")
+                .unwrap(),
+            Value::Number(15.0)
+        );
+    }
+
+    #[test]
+    fn cut4_fused_test_coerces_and_skips_compound() {
+        // The fused comparison keeps the general abstract semantics: a
+        // string slot value coerces numerically against the Number literal.
+        assert_eq!(
+            run("function s() { var i = '5'; var n = 0; while (i < 10) { n++; i = String(Number(i) + 1); } return n; } s()")
+                .unwrap(),
+            Value::Number(5.0)
+        );
+        // `i += 1` is NOT fused (`+=` concatenates strings, `++` does not),
+        // so the loop body's string compound still concatenates.
+        assert_eq!(
+            run("function c() { var s = 'a'; for (var i = 0; i < 2; i++) { s += 'b'; } return s; } c()")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("abb")))
         );
     }
 }

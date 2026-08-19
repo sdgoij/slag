@@ -100,6 +100,16 @@ pub enum Step {
         op: UpdateOp,
         prefix: bool,
     },
+    /// Fused `i++` in a value-discarding position (the `for` update): read
+    /// the slot, add 1, store, push nothing (Cut 4).
+    Inc {
+        slot: usize,
+    },
+    /// Fused `i--` in a value-discarding position: read the slot, subtract 1,
+    /// store, push nothing (Cut 4).
+    Dec {
+        slot: usize,
+    },
     GetSuperBase,
     AssignIdent {
         name: crux::AtomId,
@@ -485,6 +495,31 @@ pub enum Step {
     JumpIfTrueKeep(usize),
     JumpIfNullishKeep(usize),
     JumpIfNotNullishKeep(usize),
+    /// Fused loop test `slot <op> imm` (Cut 4): read the slot, abstract-compare
+    /// against the constant, jump to `target` when the test is false — the
+    /// arithmetic loop's `i < 1_000_000` (LoadLocal + BinaryImm + JumpIfFalse)
+    /// becomes one step. The relational semantics are `apply_binary`'s, so the
+    /// comparison is exactly what the general path computes.
+    JumpIfLtImm {
+        slot: usize,
+        imm: f64,
+        target: usize,
+    },
+    JumpIfLeImm {
+        slot: usize,
+        imm: f64,
+        target: usize,
+    },
+    JumpIfGtImm {
+        slot: usize,
+        imm: f64,
+        target: usize,
+    },
+    JumpIfGeImm {
+        slot: usize,
+        imm: f64,
+        target: usize,
+    },
     /// A `break` statement: route through any pending finallys, then jump to
     /// `target` (spec 14.14.4).
     Break {
@@ -872,6 +907,33 @@ impl Vm {
         }
     }
 
+    /// The fused relational-imm loop test (Cut 4): read the slot (TDZ-checked
+    /// like `LoadLocal`), abstract-compare against the constant with the
+    /// general binary evaluator, and jump to `target` when the test is false
+    /// — exactly what `LoadLocal; BinaryImm; JumpIfFalse` computes.
+    fn jump_if_rel_imm(
+        &mut self,
+        agent: &mut Agent,
+        op: BinaryOp,
+        slot: usize,
+        imm: f64,
+        target: usize,
+    ) -> Result<(), JsError> {
+        let left = self.frame[slot].clone();
+        if left.is_uninitialized() {
+            return Err(JsError::new(
+                ErrorKind::ReferenceError,
+                "Cannot access a binding before initialization".into(),
+            ));
+        }
+        let right = Value::Number(imm);
+        let value = crate::expr::apply_binary(agent, op, &left, &right)?;
+        if !crux::convert::to_boolean(&value) {
+            self.ip = target;
+        }
+        Ok(())
+    }
+
     fn array_index(&mut self) -> Result<&mut usize, JsError> {
         self.array_index_stack.last_mut().ok_or_else(|| {
             JsError::new(
@@ -1161,6 +1223,26 @@ impl Vm {
                     let new = update_value(agent, op, &old)?;
                     self.frame[*slot] = new.clone();
                     self.stack.push(if *prefix { new } else { old });
+                }
+                Step::Inc { slot } => {
+                    let old = self.frame[*slot].clone();
+                    if old.is_uninitialized() {
+                        return Err(JsError::new(
+                            ErrorKind::ReferenceError,
+                            "Cannot access a binding before initialization".into(),
+                        ));
+                    }
+                    self.frame[*slot] = update_value(agent, &UpdateOp::Increment, &old)?;
+                }
+                Step::Dec { slot } => {
+                    let old = self.frame[*slot].clone();
+                    if old.is_uninitialized() {
+                        return Err(JsError::new(
+                            ErrorKind::ReferenceError,
+                            "Cannot access a binding before initialization".into(),
+                        ));
+                    }
+                    self.frame[*slot] = update_value(agent, &UpdateOp::Decrement, &old)?;
                 }
                 Step::CreateFunction { function } => {
                     let env = agent.running_context()?.lexical_environment.clone();
@@ -2671,6 +2753,18 @@ impl Vm {
                     if !crux::convert::to_boolean(&value) {
                         self.ip = *target;
                     }
+                }
+                Step::JumpIfLtImm { slot, imm, target } => {
+                    self.jump_if_rel_imm(agent, BinaryOp::LessThan, *slot, *imm, *target)?
+                }
+                Step::JumpIfLeImm { slot, imm, target } => {
+                    self.jump_if_rel_imm(agent, BinaryOp::LessEqual, *slot, *imm, *target)?
+                }
+                Step::JumpIfGtImm { slot, imm, target } => {
+                    self.jump_if_rel_imm(agent, BinaryOp::GreaterThan, *slot, *imm, *target)?
+                }
+                Step::JumpIfGeImm { slot, imm, target } => {
+                    self.jump_if_rel_imm(agent, BinaryOp::GreaterEqual, *slot, *imm, *target)?
                 }
                 Step::JumpIfTrue(target) => {
                     let value = self.pop();
@@ -4671,6 +4765,15 @@ enum Fixup {
     JumpIfTrueKeep(usize, usize),
     JumpIfNullishKeep(usize, usize),
     JumpIfNotNullishKeep(usize, usize),
+    /// The fused relational-imm loop test (Cut 4): the step's `target` is
+    /// resolved at compile end; op/slot/imm were fixed at emission.
+    JumpIfRelImm {
+        index: usize,
+        label: usize,
+        op: BinaryOp,
+        slot: usize,
+        imm: f64,
+    },
     Break(usize, usize),
     Continue(usize, usize),
     JumpIfChainShort(usize, usize),
@@ -4739,6 +4842,61 @@ impl Compiler {
     /// The frame slot of a binding under this body's fast-path analysis.
     fn slot_of(&self, name: crux::AtomId) -> Option<usize> {
         self.scope.as_ref().and_then(|scope| scope.slot_of(name))
+    }
+
+    /// A loop test of the shape `slot <op> NumberLiteral` in a fast body
+    /// (Cut 4): the fused `JumpIf*Imm` step replaces `LoadLocal; BinaryImm;
+    /// JumpIfFalse`. The comparison stays the general `apply_binary`
+    /// semantics, so a non-number slot value coerces exactly as before.
+    fn fused_rel_test(&self, test: &Expr) -> Option<(BinaryOp, usize, f64)> {
+        if let ExprKind::Binary { op, left, right } = &test.kind
+            && matches!(
+                op,
+                BinaryOp::LessThan
+                    | BinaryOp::LessEqual
+                    | BinaryOp::GreaterThan
+                    | BinaryOp::GreaterEqual
+            )
+            && let ExprKind::Ident(name) = &left.kind
+            && let Some(slot) = self.slot_of(*name)
+            && let ExprKind::Literal(syntax::ast::Literal::Number(n)) = &right.kind
+        {
+            Some((*op, slot, *n))
+        } else {
+            None
+        }
+    }
+
+    /// A `for` update that is a bare `i++`/`i--` on a frame slot (Cut 4):
+    /// the loop protocol discards the update's value, so the fused `Inc`/
+    /// `Dec` (store, no push) is exactly `UpdateLocal` + `Pop`. Only the
+    /// `UpdateOp` shapes qualify — `i += 1` is not equivalent (string
+    /// operands concatenate under `+=` but coerce numerically under `++`).
+    fn fused_update(&self, update: &Expr) -> Option<(usize, UpdateOp)> {
+        if let ExprKind::Update { op, target, .. } = &update.kind
+            && let ExprKind::Ident(name) = &target.kind
+        {
+            return self.slot_of(*name).map(|slot| (slot, *op));
+        }
+        None
+    }
+
+    /// Emit a fused relational-imm loop test (Cut 4): the `JumpIf*Imm` step
+    /// with `target: 0`, patched to `target_label` at compile end.
+    fn emit_fused_rel_test(&mut self, op: BinaryOp, slot: usize, imm: f64, target_label: usize) {
+        let index = self.steps.len();
+        self.emit(Step::JumpIfLtImm {
+            slot,
+            imm,
+            target: 0,
+        });
+        self.fixups.push(Fixup::JumpIfRelImm {
+            index,
+            label: target_label,
+            op,
+            slot,
+            imm,
+        });
     }
 
     /// Whether the current body runs on the fast path: if so, a block with
@@ -4959,6 +5117,22 @@ impl Compiler {
                 }
                 Fixup::JumpIfNotNullishKeep(index, label) => {
                     self.steps[index] = Step::JumpIfNotNullishKeep(self.labels[&label]);
+                }
+                Fixup::JumpIfRelImm {
+                    index,
+                    label,
+                    op,
+                    slot,
+                    imm,
+                } => {
+                    let target = self.labels[&label];
+                    self.steps[index] = match op {
+                        BinaryOp::LessThan => Step::JumpIfLtImm { slot, imm, target },
+                        BinaryOp::LessEqual => Step::JumpIfLeImm { slot, imm, target },
+                        BinaryOp::GreaterThan => Step::JumpIfGtImm { slot, imm, target },
+                        BinaryOp::GreaterEqual => Step::JumpIfGeImm { slot, imm, target },
+                        _ => unreachable!("JumpIfRelImm fixup with a non-relational op"),
+                    };
                 }
                 Fixup::Break(index, label) => {
                     self.steps[index] = Step::Break {
@@ -5334,8 +5508,14 @@ impl Compiler {
                 });
                 self.resolve_labeled_continue(test_label, continue_count);
                 self.place(test_label);
-                self.compile_expr(test)?;
-                self.jump_if_false(end_label);
+                if let Some((op, slot, imm)) = self.fused_rel_test(test) {
+                    // Cut 4: the loop test `slot <op> imm` fuses with the
+                    // false-jump (LoadLocal + BinaryImm + JumpIfFalse).
+                    self.emit_fused_rel_test(op, slot, imm, end_label);
+                } else {
+                    self.compile_expr(test)?;
+                    self.jump_if_false(end_label);
+                }
                 self.compile_statement(body)?;
                 self.jump(test_label);
                 self.place(end_label);
@@ -5544,10 +5724,18 @@ impl Compiler {
         self.resolve_labeled_continue(continue_label, continue_count);
         self.place(test_label);
         match test {
-            Some(test) => self.compile_expr(test)?,
+            Some(test) => {
+                if let Some((op, slot, imm)) = self.fused_rel_test(test) {
+                    // Cut 4: the loop test `slot <op> imm` fuses with the
+                    // false-jump (LoadLocal + BinaryImm + JumpIfFalse).
+                    self.emit_fused_rel_test(op, slot, imm, end_label);
+                } else {
+                    self.compile_expr(test)?;
+                    self.jump_if_false(end_label);
+                }
+            }
             None => self.emit(Step::Push(Value::Boolean(true))),
         }
-        self.jump_if_false(end_label);
         self.compile_statement(body)?;
         self.place(continue_label);
         if !per_iteration.is_empty() {
@@ -5556,8 +5744,20 @@ impl Compiler {
             });
         }
         if let Some(update) = update {
-            self.compile_expr(update)?;
-            self.emit(Step::Pop);
+            if let Some((slot, op)) = self.fused_update(update) {
+                // Cut 4: the update's value is discarded by the loop
+                // protocol, so a bare `i++`/`i--` fuses to one step (no
+                // result push to pop). `i += 1` stays on the general path
+                // (`+=` concatenates strings, `++` does not).
+                let step = match op {
+                    UpdateOp::Increment => Step::Inc { slot },
+                    UpdateOp::Decrement => Step::Dec { slot },
+                };
+                self.emit(step);
+            } else {
+                self.compile_expr(update)?;
+                self.emit(Step::Pop);
+            }
         }
         self.jump(test_label);
         self.place(end_label);
