@@ -23,6 +23,7 @@ use crate::function::{
     ConstructorKind, default_binding_display_name, instantiate_accessor,
     instantiate_class_constructor, instantiate_method, make_method, set_function_name,
 };
+use crate::ir::has_computed_public_name;
 
 /// ClassDefinitionEvaluation (spec 15.7.14). `class_binding` is the class
 /// name for declarations (bound in the class scope AND returned for the
@@ -332,7 +333,8 @@ fn build_class(
     let mut static_elements: Vec<StaticElement> = Vec::new();
     agent.running_context_mut()?.lexical_environment = class_env.clone();
     agent.running_context_mut()?.private_environment = Some(class_private_env.clone());
-    for (index, element) in class.elements.iter().enumerate() {
+    let mut computed_key_index = 0;
+    for element in &class.elements {
         if matches!(
             element,
             ClassElement::Method {
@@ -352,7 +354,7 @@ fn build_class(
         match element {
             ClassElement::Method { name, function, .. } => {
                 let (private_id, key) =
-                    element_key_with(agent, name, strict, precomputed_keys, index)?;
+                    element_key_with(agent, name, strict, precomputed_keys, computed_key_index)?;
                 let closure = instantiate_method(agent, function, class_env.clone(), true)?;
                 set_private_environment(agent, &closure, &class_private_env)?;
                 make_method(agent, &closure, home.clone())?;
@@ -374,7 +376,7 @@ fn build_class(
             }
             ClassElement::Get { name, body, .. } => {
                 let (private_id, key) =
-                    element_key_with(agent, name, strict, precomputed_keys, index)?;
+                    element_key_with(agent, name, strict, precomputed_keys, computed_key_index)?;
                 let getter =
                     instantiate_accessor(agent, Vec::new(), body.clone(), class_env.clone(), true)?;
                 set_private_environment(agent, &getter, &class_private_env)?;
@@ -405,7 +407,7 @@ fn build_class(
                 ..
             } => {
                 let (private_id, key) =
-                    element_key_with(agent, name, strict, precomputed_keys, index)?;
+                    element_key_with(agent, name, strict, precomputed_keys, computed_key_index)?;
                 let setter = instantiate_accessor(
                     agent,
                     vec![BindingElement {
@@ -440,7 +442,7 @@ fn build_class(
             }
             ClassElement::Field { name, init, .. } => {
                 let (private_id, key) =
-                    element_key_with(agent, name, strict, precomputed_keys, index)?;
+                    element_key_with(agent, name, strict, precomputed_keys, computed_key_index)?;
                 if let Some(name_id) = private_id {
                     let ClassElementName::Private(atom) = name else {
                         unreachable!("private id implies a private name");
@@ -482,6 +484,13 @@ fn build_class(
             ClassElement::StaticBlock(block) => {
                 static_elements.push(StaticElement::Block(block.clone()));
             }
+        }
+        // The compiled key list (see `compile_class` in ir.rs) holds one
+        // entry per computed public element in source order; index it by
+        // that position, not the element index, or a static method before a
+        // computed one consumes its neighbor's key.
+        if has_computed_public_name(element) {
+            computed_key_index += 1;
         }
     }
     agent.running_context_mut()?.lexical_environment = env_record.clone();
@@ -644,13 +653,24 @@ fn element_key_with(
             let name = crate::context::resolve_private_name(agent, *atom)?;
             Ok((Some(name.id), None))
         }
-        ClassElementName::Property(name) => match precomputed_keys.get(index).cloned().flatten() {
-            Some(key) => Ok((None, Some(key))),
-            None => {
-                let key = property_name_key(agent, name, strict)?;
-                Ok((None, Some(key)))
+        // Only a computed public name consumes a slot in `precomputed_keys`
+        // (indexed by its position among the computed elements, not the
+        // element index); a static name is synthesized from the AST, or its
+        // computed expression is evaluated inline when the key is absent
+        // (the non-VM path shares this fallback).
+        ClassElementName::Property(name @ PropertyName::Computed(_)) => {
+            match precomputed_keys.get(index).cloned().flatten() {
+                Some(key) => Ok((None, Some(key))),
+                None => {
+                    let key = property_name_key(agent, name, strict)?;
+                    Ok((None, Some(key)))
+                }
             }
-        },
+        }
+        ClassElementName::Property(name) => {
+            let key = property_name_key(agent, name, strict)?;
+            Ok((None, Some(key)))
+        }
     }
 }
 

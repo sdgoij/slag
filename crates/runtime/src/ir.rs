@@ -2531,6 +2531,9 @@ impl Vm {
                     let body_env = match &param {
                         Some(param) => {
                             let param_env = new_declarative_environment(Some(env.clone()));
+                            // Annex B.3.5: a direct eval's var-vs-lexical walk
+                            // skips the catch parameter's environment.
+                            param_env.mark_catch_param_env();
                             self.env_stack.push(env);
                             let mut names = Vec::new();
                             crate::script::bound_names(param, &mut names);
@@ -4787,7 +4790,7 @@ fn computed_public_name(element: &ClassElement) -> Option<&Expr> {
     }
 }
 
-fn has_computed_public_name(element: &ClassElement) -> bool {
+pub(crate) fn has_computed_public_name(element: &ClassElement) -> bool {
     computed_public_name(element).is_some()
 }
 
