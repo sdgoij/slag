@@ -1478,6 +1478,49 @@ fn ordinary_call(
         )
     };
     let function_value = function.self_value();
+    // Cut 3 fast path: the body's bindings are frame slots, so no function
+    // environment, `this` binding, or declaration instantiation are needed —
+    // the scope analysis certified the body references none of them. The
+    // context's lexical environment is the closure's captured environment;
+    // outer/global reads resolve through it.
+    if let Some(ir) = &ir
+        && ir.scope.is_some()
+    {
+        let caller_script_or_module = agent
+            .running_context()
+            .ok()
+            .and_then(|context| context.script_or_module.clone());
+        let script_or_module = declaring_module
+            .map(crate::context::ScriptOrModule::Module)
+            .or(caller_script_or_module);
+        agent.execution_context_stack.push(ExecutionContext {
+            function: Some(function_value.clone()),
+            realm,
+            script_or_module,
+            lexical_environment: old_env.clone(),
+            variable_environment: old_env.clone(),
+            private_environment,
+            source: agent
+                .running_context()
+                .ok()
+                .and_then(|context| context.source.clone()),
+            annex_b_hoistable: Default::default(),
+        });
+        let result = run_compiled_body(agent, strict, ir, args);
+        // A kind-only engine error escapes the body with the function's realm
+        // context still current; surface it as that realm's error object now,
+        // so a caller from another realm sees the right constructor (mirrors
+        // the slow path below).
+        let result = match result {
+            Err(e) if e.value.is_none() => match crate::builtins::error::to_throwable(agent, &e) {
+                Ok(value) => Err(e.with_value(value)),
+                Err(conversion) => Err(conversion),
+            },
+            other => other,
+        };
+        agent.execution_context_stack.pop();
+        return result;
+    }
     let function_env = new_function_environment(
         Some(old_env),
         function_value.clone(),
@@ -1538,7 +1581,7 @@ fn ordinary_call(
             &function_env,
         )?;
         match ir {
-            Some(ir) => run_compiled_body(agent, strict, &ir),
+            Some(ir) => run_compiled_body(agent, strict, &ir, args),
             None => evaluate_body(agent, &body, strict),
         }
     })();
@@ -1589,9 +1632,13 @@ fn run_compiled_body(
     agent: &mut Agent,
     strict: bool,
     ir: &std::rc::Rc<crate::ir::CompiledBody>,
+    args: &[Value],
 ) -> Result<Value, JsError> {
     let body_env = agent.running_context()?.lexical_environment.clone();
     let mut vm = Vm::new(body_env.clone(), strict);
+    if let Some(scope) = &ir.scope {
+        vm.setup_frame(scope, args);
+    }
     let outcome = vm.start(agent, ir);
     let completion = match outcome {
         Ok(VmOutcome::Completed(completion)) => completion,
@@ -1760,6 +1807,9 @@ fn ordinary_construct(
             Some(ir) => {
                 let body_env = agent.running_context()?.lexical_environment.clone();
                 let mut vm = Vm::new(body_env.clone(), data.strict);
+                if let Some(scope) = &ir.scope {
+                    vm.setup_frame(scope, args);
+                }
                 let outcome = vm.start(agent, ir);
                 let completion = match outcome {
                     Ok(VmOutcome::Completed(completion)) => completion,

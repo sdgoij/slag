@@ -78,6 +78,28 @@ pub enum Step {
     LoadIdent {
         name: crux::AtomId,
     },
+    /// Push a frame-slot binding's value (Cut 3 fast path); a TDZ marker
+    /// throws the ReferenceError.
+    LoadLocal {
+        slot: usize,
+    },
+    /// Pop into a frame slot (assignment to a binding; a TDZ-marker current
+    /// value throws for `let`/`const`-like bindings).
+    StoreLocal {
+        slot: usize,
+    },
+    /// Pop into a frame slot, no TDZ check (the declaration's first write).
+    InitLocal {
+        slot: usize,
+    },
+    /// Apply a `++`/`--` to a frame-slot binding: read the slot, compute the
+    /// new value, store it, and push the result (old for postfix, new for
+    /// prefix).
+    UpdateLocal {
+        slot: usize,
+        op: UpdateOp,
+        prefix: bool,
+    },
     GetSuperBase,
     AssignIdent {
         name: crux::AtomId,
@@ -530,12 +552,45 @@ pub struct CatchHandler {
     pub end: usize,
 }
 
+/// The compile-time binding layout of a fast-path function body (Cut 3):
+/// params and `var` bindings get fixed frame slots, so identifier ops emit
+/// `LoadLocal`/`StoreLocal` instead of a runtime environment-chain walk. The
+/// body compiles with `scope = Some` only when the scope analysis certified
+/// it (simple params, no closures/eval/with/`this`/`arguments`/`new.target`/
+/// `super`, no lexical block declarations) — otherwise `CompiledBody.scope`
+/// is `None` and the body uses the environment machinery unchanged.
+#[derive(Debug, Clone)]
+pub struct ScopeInfo {
+    /// Total frame slots for named bindings. Params occupy slots `0..arity`
+    /// (in source order), `var` bindings follow in first-declaration order.
+    pub frame_size: usize,
+    /// The parameter count: `setup_frame` copies only this many arguments
+    /// (extra call arguments are ignored per spec 10.2.11 — copying by
+    /// `frame_size` would let them land in `var` slots).
+    pub arity: usize,
+    /// Binding name → frame slot.
+    pub slots: HashMap<crux::AtomId, usize>,
+    /// Per-slot: `StoreLocal` must TDZ-check the current value (a `let`/
+    /// `const` binding — the slice's params/`var`s are all false).
+    pub tdz_store: Vec<bool>,
+}
+
+impl ScopeInfo {
+    /// The frame slot of a binding, when this body's analysis covers it.
+    fn slot_of(&self, name: crux::AtomId) -> Option<usize> {
+        self.slots.get(&name).copied()
+    }
+}
+
 /// A compiled resumable function body.
 #[derive(Debug, Clone)]
 pub struct CompiledBody {
     pub steps: Vec<Step>,
     pub handlers: Vec<Handler>,
     pub strict: bool,
+    /// The fast-path frame layout, when the scope analysis certified the
+    /// body (see [`ScopeInfo`]). `None` = the environment-machinery path.
+    pub scope: Option<ScopeInfo>,
 }
 
 /// A runtime `try` frame.
@@ -645,6 +700,9 @@ type ForInState = (Handle<crux::object::JsObject>, Vec<(usize, Value)>, usize);
 pub struct Vm {
     pub ip: usize,
     pub stack: Vec<Value>,
+    /// The fast-path frame (Cut 3): named-binding slots for the active body,
+    /// sized by `ScopeInfo::frame_size`. Empty on the environment path.
+    pub frame: Vec<Value>,
     pub args: Vec<Value>,
     pub lexical_env: EnvRef,
     pub env_stack: Vec<EnvRef>,
@@ -761,6 +819,7 @@ impl Vm {
         Self {
             ip: 0,
             stack: Vec::new(),
+            frame: Vec::new(),
             args: Vec::new(),
             lexical_env: lexical_env.clone(),
             env_stack: vec![lexical_env],
@@ -795,6 +854,22 @@ impl Vm {
 
     fn pop(&mut self) -> Value {
         self.stack.pop().unwrap_or(Value::Undefined)
+    }
+
+    /// Allocate the fast-path frame and bind the arguments into their slots
+    /// (Cut 3). Params are slots `0..arity` in source order; extra arguments
+    /// are ignored (spec 10.2.11, ordinary call), missing ones stay
+    /// `undefined`, and the remaining slots (`var` bindings) initialize to
+    /// `undefined` — matching `function_declaration_instantiation` for a
+    /// body with no `arguments`/`this` references and no lexical
+    /// declarations, which is exactly what the scope analysis certified.
+    pub fn setup_frame(&mut self, scope: &ScopeInfo, args: &[Value]) {
+        self.frame = vec![Value::Undefined; scope.frame_size];
+        for (index, arg) in args.iter().enumerate() {
+            if index < scope.arity {
+                self.frame[index] = arg.clone();
+            }
+        }
     }
 
     fn array_index(&mut self) -> Result<&mut usize, JsError> {
@@ -1050,6 +1125,42 @@ impl Vm {
                         crate::context::resolve_binding(agent, &crux::lookup(*name), self.strict)?;
                     let value = crate::context::get_value(agent, &reference)?;
                     self.stack.push(value);
+                }
+                Step::LoadLocal { slot } => {
+                    let value = self.frame[*slot].clone();
+                    if value.is_uninitialized() {
+                        return Err(JsError::new(
+                            ErrorKind::ReferenceError,
+                            "Cannot access a binding before initialization".into(),
+                        ));
+                    }
+                    self.stack.push(value);
+                }
+                Step::StoreLocal { slot } => {
+                    let value = self.pop();
+                    if self.frame[*slot].is_uninitialized() {
+                        return Err(JsError::new(
+                            ErrorKind::ReferenceError,
+                            "Cannot access a binding before initialization".into(),
+                        ));
+                    }
+                    self.frame[*slot] = value;
+                }
+                Step::InitLocal { slot } => {
+                    let value = self.pop();
+                    self.frame[*slot] = value;
+                }
+                Step::UpdateLocal { slot, op, prefix } => {
+                    let old = self.frame[*slot].clone();
+                    if old.is_uninitialized() {
+                        return Err(JsError::new(
+                            ErrorKind::ReferenceError,
+                            "Cannot access a binding before initialization".into(),
+                        ));
+                    }
+                    let new = update_value(agent, op, &old)?;
+                    self.frame[*slot] = new.clone();
+                    self.stack.push(if *prefix { new } else { old });
                 }
                 Step::CreateFunction { function } => {
                     let env = agent.running_context()?.lexical_environment.clone();
@@ -4617,9 +4728,26 @@ struct Compiler {
     /// The nesting depth of optional chains being compiled: the outermost
     /// chain node clears the runtime short-circuit flag when it finishes.
     chain_depth: usize,
+    /// The fast-path frame layout (Cut 3): when `Some`, the body's binding
+    /// names resolve to frame slots (`LoadLocal`/`StoreLocal`) and blocks
+    /// with no lexical declarations skip their environment. `None` compiles
+    /// through the environment machinery.
+    scope: Option<ScopeInfo>,
 }
 
 impl Compiler {
+    /// The frame slot of a binding under this body's fast-path analysis.
+    fn slot_of(&self, name: crux::AtomId) -> Option<usize> {
+        self.scope.as_ref().and_then(|scope| scope.slot_of(name))
+    }
+
+    /// Whether the current body runs on the fast path: if so, a block with
+    /// no lexical declarations contributes no environment (Cut 3 — the
+    /// per-iteration env allocation in hot loops disappears).
+    fn fast_block(&self, stmts: &[Stmt]) -> bool {
+        self.scope.is_some() && Self::block_decls(stmts).is_empty()
+    }
+
     fn new_label(&mut self) -> usize {
         let label = self.next_label;
         self.next_label += 1;
@@ -5054,13 +5182,21 @@ impl Compiler {
         match &stmt.kind {
             StmtKind::Block(block) => {
                 self.emit(Step::ListBegin);
-                self.emit(Step::EnterBlock {
-                    decls: Self::block_decls(&block.stmts),
-                });
-                self.scope_count += 1;
-                self.compile_statements(&block.stmts)?;
-                self.scope_count -= 1;
-                self.emit(Step::LeaveBlock);
+                if self.fast_block(&block.stmts) {
+                    // Cut 3: a fast body's block has no lexical declarations,
+                    // so it contributes no environment (the per-iteration env
+                    // allocation in hot loops disappears). The scope count is
+                    // untouched, so control-transfer unwinds stay balanced.
+                    self.compile_statements(&block.stmts)?;
+                } else {
+                    self.emit(Step::EnterBlock {
+                        decls: Self::block_decls(&block.stmts),
+                    });
+                    self.scope_count += 1;
+                    self.compile_statements(&block.stmts)?;
+                    self.scope_count -= 1;
+                    self.emit(Step::LeaveBlock);
+                }
                 self.emit(Step::ListEnd);
             }
             StmtKind::Expr(expr) => {
@@ -5071,6 +5207,18 @@ impl Compiler {
                 let declaration = *kind != VarDeclKind::Var;
                 for decl in decls {
                     if let Some(init) = &decl.init {
+                        // Cut 3 fast path: `var x = init` with a frame-slot
+                        // binding — the slot exists (hoisted, undefined), so
+                        // the initializer writes it directly. The
+                        // resolve-before-init rule is only observable via a
+                        // `with` scope (excluded from the fast path).
+                        if let BindingPattern::Ident(name) = &decl.pattern
+                            && let Some(slot) = self.slot_of(*name)
+                        {
+                            self.compile_expr(init)?;
+                            self.emit(Step::InitLocal { slot });
+                            continue;
+                        }
                         // spec 14.3.2 step 2: a `var` identifier's binding is
                         // resolved before its initializer runs — a `with`
                         // object's property is the assignment target even
@@ -5329,6 +5477,20 @@ impl Compiler {
                 if *kind == VarDeclKind::Var {
                     for decl in decls {
                         if let Some(init) = &decl.init {
+                            // Cut 3 fast path: a `var` head binding is a
+                            // frame slot (hoisted, undefined), so the
+                            // initializer writes it directly — `Destructure`
+                            // would walk the env for a binding the fast call
+                            // path never created. The resolve-before-init
+                            // rule is only observable via a `with` scope
+                            // (excluded from the fast path).
+                            if let BindingPattern::Ident(name) = &decl.pattern
+                                && let Some(slot) = self.slot_of(*name)
+                            {
+                                self.compile_expr(init)?;
+                                self.emit(Step::InitLocal { slot });
+                                continue;
+                            }
                             self.compile_expr(init)?;
                             self.emit(Step::Destructure {
                                 pattern: decl.pattern.clone(),
@@ -5746,7 +5908,12 @@ impl Compiler {
             }
             ExprKind::Literal(literal) => self.compile_literal(literal),
             ExprKind::Ident(name) => {
-                self.emit(Step::LoadIdent { name: *name });
+                if let Some(slot) = self.slot_of(*name) {
+                    // Cut 3 fast path: the binding is a frame slot.
+                    self.emit(Step::LoadLocal { slot });
+                } else {
+                    self.emit(Step::LoadIdent { name: *name });
+                }
                 Ok(())
             }
             ExprKind::This => {
@@ -5792,7 +5959,19 @@ impl Compiler {
                         operand = inner;
                     }
                     if let ExprKind::Ident(name) = &operand.kind {
-                        self.emit(Step::TypeofIdent { name: *name });
+                        if let Some(slot) = self.slot_of(*name) {
+                            // Cut 3 fast path: a slot binding always exists
+                            // (never an unresolvable reference), so load it
+                            // and compute the type — `TypeofIdent` would walk
+                            // the environment for a binding the fast call
+                            // path never created. `LoadLocal`'s TDZ check
+                            // preserves `typeof` of a `let`/`const` slot
+                            // throwing (spec 13.5.3.2 step 1).
+                            self.emit(Step::LoadLocal { slot });
+                            self.emit(Step::TypeofTop);
+                        } else {
+                            self.emit(Step::TypeofIdent { name: *name });
+                        }
                     } else {
                         self.compile_expr(operand)?;
                         self.emit(Step::TypeofTop);
@@ -6041,7 +6220,16 @@ impl Compiler {
     fn compile_delete(&mut self, operand: &Expr) -> Result<(), JsError> {
         match &operand.kind {
             ExprKind::Ident(name) => {
-                self.emit(Step::DeleteIdent { name: *name });
+                if self.slot_of(*name).is_some() {
+                    // Cut 3 fast path: a slot binding is never unresolvable,
+                    // and strict-mode `delete x` is a parse error, so the
+                    // result is always false (spec 13.5.1.2 step 3) —
+                    // `DeleteIdent` would walk the environment for a binding
+                    // the fast call path never created.
+                    self.emit(Step::Push(Value::Boolean(false)));
+                } else {
+                    self.emit(Step::DeleteIdent { name: *name });
+                }
                 Ok(())
             }
             ExprKind::Member(member) => {
@@ -6087,6 +6275,16 @@ impl Compiler {
     ) -> Result<(), JsError> {
         match &target.kind {
             ExprKind::Ident(name) => {
+                if let Some(slot) = self.slot_of(*name) {
+                    // Cut 3 fast path: the update reads and writes the frame
+                    // slot directly.
+                    self.emit(Step::UpdateLocal {
+                        slot,
+                        op: *op,
+                        prefix,
+                    });
+                    return Ok(());
+                }
                 // The assignment target's reference resolves before the RHS:
                 // PutValue uses the initially created reference even when the
                 // binding disappears while the RHS evaluates (spec 13.15.3
@@ -6195,6 +6393,43 @@ impl Compiler {
             && crate::function::is_anonymous_function_definition(value);
         match &target.kind {
             ExprKind::Ident(name) => {
+                if let Some(slot) = self.slot_of(*name) {
+                    // Cut 3 fast path: the target is a frame slot; no
+                    // reference machinery (there is no `with` to observe the
+                    // resolve-before-RHS rule, and function-literal
+                    // initializers bail the fast path so `set_name` cannot
+                    // trigger). The `Dup` before `StoreLocal` leaves the
+                    // assigned value as the expression's result.
+                    match op {
+                        AssignOp::Assign => {
+                            self.compile_expr(value)?;
+                            self.emit(Step::Dup);
+                            self.emit(Step::StoreLocal { slot });
+                        }
+                        AssignOp::AndAssign | AssignOp::OrAssign | AssignOp::NullishAssign => {
+                            self.emit(Step::LoadLocal { slot });
+                            let end_label = self.new_label();
+                            match op {
+                                AssignOp::AndAssign => self.jump_if_false_keep(end_label),
+                                AssignOp::OrAssign => self.jump_if_true_keep(end_label),
+                                _ => self.jump_if_not_nullish_keep(end_label),
+                            }
+                            self.emit(Step::Pop);
+                            self.compile_expr(value)?;
+                            self.emit(Step::Dup);
+                            self.emit(Step::StoreLocal { slot });
+                            self.place(end_label);
+                        }
+                        _ => {
+                            self.emit(Step::LoadLocal { slot });
+                            self.compile_expr(value)?;
+                            self.emit(Step::Binary(crate::expr::compound_binary(*op)));
+                            self.emit(Step::Dup);
+                            self.emit(Step::StoreLocal { slot });
+                        }
+                    }
+                    return Ok(());
+                }
                 match op {
                     AssignOp::Assign => {
                         // Resolve the reference before the RHS: PutValue uses
@@ -7313,8 +7548,10 @@ fn labeled_continue_target(body: &Stmt) -> Option<(usize, usize)> {
 
 /// Compile a function body for resumable execution.
 pub fn compile_body(function: &EcmaFunction) -> Result<CompiledBody, JsError> {
+    let scope = analyze_scope(function);
     let mut compiler = Compiler {
         is_async_generator: function.is_generator && function.is_async,
+        scope,
         ..Compiler::default()
     };
     compiler.compile_statements(&function.body.stmts)?;
@@ -7323,6 +7560,7 @@ pub fn compile_body(function: &EcmaFunction) -> Result<CompiledBody, JsError> {
         steps: compiler.steps,
         handlers: compiler.handlers,
         strict: function.strict,
+        scope: compiler.scope,
     })
 }
 
@@ -7335,5 +7573,228 @@ pub fn compile_statements(stmts: &[Stmt], strict: bool) -> Result<CompiledBody, 
         steps: compiler.steps,
         handlers: compiler.handlers,
         strict,
+        scope: None,
     })
+}
+
+// ---- Cut 3 scope analysis ----
+//
+// Certify a function body for the frame-slot fast path and lay out its
+// frame. The first slice is deliberately narrow: simple identifier params,
+// `var`-only declarations (no `let`/`const`/class/function/using), no
+// closures, no `eval`/`with`, no `this`/`arguments`/`new.target`/`super`,
+// no `try`/`switch`/`for-in`/`for-of`/destructuring, no tagged templates.
+// Anything else returns `None` and the body compiles through the existing
+// environment machinery (the correctness backstop).
+
+/// Lay out the frame for a fast-path body, or return `None` when the body
+/// needs the environment path.
+fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
+    if function.is_async || function.is_generator {
+        return None;
+    }
+    let mut slots = HashMap::new();
+    let mut next_slot = 0usize;
+    for param in &function.params {
+        if param.rest || param.init.is_some() {
+            return None;
+        }
+        let BindingPattern::Ident(name) = param.pattern else {
+            return None;
+        };
+        slots.insert(name, next_slot);
+        next_slot += 1;
+    }
+    let arity = next_slot;
+    if !scope_scan_stmts(&function.body.stmts, &mut slots, &mut next_slot) {
+        return None;
+    }
+    let frame_size = next_slot;
+    Some(ScopeInfo {
+        frame_size,
+        arity,
+        slots,
+        tdz_store: vec![false; frame_size],
+    })
+}
+
+fn scope_scan_stmts(
+    stmts: &[Stmt],
+    slots: &mut HashMap<crux::AtomId, usize>,
+    next_slot: &mut usize,
+) -> bool {
+    stmts
+        .iter()
+        .all(|stmt| scope_scan_stmt(stmt, slots, next_slot))
+}
+
+fn scope_scan_stmt(
+    stmt: &Stmt,
+    slots: &mut HashMap<crux::AtomId, usize>,
+    next_slot: &mut usize,
+) -> bool {
+    match &stmt.kind {
+        StmtKind::Block(block) => scope_scan_stmts(&block.stmts, slots, next_slot),
+        StmtKind::Empty | StmtKind::Debugger | StmtKind::Break(_) | StmtKind::Continue(_) => true,
+        StmtKind::Expr(expr) => scope_scan_expr(expr),
+        StmtKind::VarDecl { kind, decls } => {
+            if *kind != VarDeclKind::Var {
+                return false;
+            }
+            for decl in decls {
+                let BindingPattern::Ident(name) = decl.pattern else {
+                    return false;
+                };
+                slots.entry(name).or_insert_with(|| {
+                    let slot = *next_slot;
+                    *next_slot += 1;
+                    slot
+                });
+                if let Some(init) = &decl.init
+                    && !scope_scan_expr(init)
+                {
+                    return false;
+                }
+            }
+            true
+        }
+        StmtKind::If {
+            test,
+            consequent,
+            alternate,
+        } => {
+            scope_scan_expr(test)
+                && scope_scan_stmt(consequent, slots, next_slot)
+                && alternate
+                    .as_deref()
+                    .is_none_or(|a| scope_scan_stmt(a, slots, next_slot))
+        }
+        StmtKind::While { test, body } => {
+            scope_scan_expr(test) && scope_scan_stmt(body, slots, next_slot)
+        }
+        StmtKind::DoWhile { body, test } => {
+            scope_scan_stmt(body, slots, next_slot) && scope_scan_expr(test)
+        }
+        StmtKind::For {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            let init_ok = match init {
+                None => true,
+                Some(ForInit::Expr(expr)) => scope_scan_expr(expr),
+                Some(ForInit::VarDecl { kind, decls }) => {
+                    if *kind != VarDeclKind::Var {
+                        return false;
+                    }
+                    for decl in decls {
+                        let BindingPattern::Ident(name) = decl.pattern else {
+                            return false;
+                        };
+                        slots.entry(name).or_insert_with(|| {
+                            let slot = *next_slot;
+                            *next_slot += 1;
+                            slot
+                        });
+                        if let Some(init) = &decl.init
+                            && !scope_scan_expr(init)
+                        {
+                            return false;
+                        }
+                    }
+                    true
+                }
+            };
+            init_ok
+                && test.as_ref().is_none_or(scope_scan_expr)
+                && update.as_ref().is_none_or(scope_scan_expr)
+                && scope_scan_stmt(body, slots, next_slot)
+        }
+        StmtKind::Return(expr) => expr.as_ref().is_none_or(scope_scan_expr),
+        StmtKind::Throw(expr) => scope_scan_expr(expr),
+        StmtKind::Labeled { body, .. } => scope_scan_stmt(body, slots, next_slot),
+        StmtKind::ForIn { .. }
+        | StmtKind::ForOf { .. }
+        | StmtKind::UsingDecl { .. }
+        | StmtKind::FunctionDecl(_)
+        | StmtKind::ClassDecl(_)
+        | StmtKind::Try { .. }
+        | StmtKind::Switch { .. }
+        | StmtKind::With { .. } => false,
+    }
+}
+
+fn scope_scan_expr(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Literal(_) => true,
+        // `arguments` is the special unmapped/mapped binding the fast path
+        // doesn't create — a reference (even a shadowed local is fine to
+        // bail) must fall back to the environment machinery.
+        ExprKind::Ident(name) => crux::lookup(*name) != JsString::from_utf8("arguments"),
+        ExprKind::Paren(inner) => scope_scan_expr(inner),
+        ExprKind::Unary { operand, .. } => scope_scan_expr(operand),
+        ExprKind::Update { target, .. } => scope_scan_expr(target),
+        ExprKind::Binary { left, right, .. } => scope_scan_expr(left) && scope_scan_expr(right),
+        ExprKind::Logical { left, right, .. } => scope_scan_expr(left) && scope_scan_expr(right),
+        ExprKind::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => scope_scan_expr(test) && scope_scan_expr(consequent) && scope_scan_expr(alternate),
+        ExprKind::Assign { target, value, .. } => {
+            if matches!(target.kind, ExprKind::Object(_) | ExprKind::Array(_)) {
+                return false;
+            }
+            scope_scan_expr(target) && scope_scan_expr(value)
+        }
+        ExprKind::Member(member) => {
+            if matches!(member.property, MemberProperty::Private(_)) {
+                return false;
+            }
+            let object_ok = scope_scan_expr(&member.object);
+            let key_ok = match &member.property {
+                MemberProperty::Computed(key) => scope_scan_expr(key),
+                _ => true,
+            };
+            object_ok && key_ok
+        }
+        ExprKind::Call(call) => {
+            if matches!(
+                &call.callee.kind,
+                ExprKind::Ident(id) if crux::lookup(*id) == JsString::from_utf8("eval")
+            ) {
+                return false;
+            }
+            let callee_ok = scope_scan_expr(&call.callee);
+            let args_ok = call.args.iter().all(|arg| match arg {
+                Argument::Expr(expr) => scope_scan_expr(expr),
+                Argument::Spread(expr) => scope_scan_expr(expr),
+            });
+            callee_ok && args_ok
+        }
+        ExprKind::New(new) => {
+            let callee_ok = scope_scan_expr(&new.callee);
+            let args_ok = new.args.iter().all(|arg| match arg {
+                Argument::Expr(expr) => scope_scan_expr(expr),
+                Argument::Spread(expr) => scope_scan_expr(expr),
+            });
+            callee_ok && args_ok
+        }
+        ExprKind::Template(template) => template.exprs.iter().all(scope_scan_expr),
+        ExprKind::Sequence(exprs) => exprs.iter().all(scope_scan_expr),
+        ExprKind::This
+        | ExprKind::Super
+        | ExprKind::Array(_)
+        | ExprKind::Object(_)
+        | ExprKind::Function(_)
+        | ExprKind::Class(_)
+        | ExprKind::PrivateIn { .. }
+        | ExprKind::TaggedTemplate { .. }
+        | ExprKind::Arrow { .. }
+        | ExprKind::Yield { .. }
+        | ExprKind::Await(_)
+        | ExprKind::MetaProperty { .. }
+        | ExprKind::ImportCall { .. } => false,
+    }
 }

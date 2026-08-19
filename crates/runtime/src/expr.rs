@@ -1176,7 +1176,7 @@ fn named_eval_rhs(
 }
 
 /// Map a compound assignment operator onto its binary operator.
-fn compound_binary(op: AssignOp) -> BinaryOp {
+pub(crate) fn compound_binary(op: AssignOp) -> BinaryOp {
     match op {
         AssignOp::AddAssign => BinaryOp::Add,
         AssignOp::SubAssign => BinaryOp::Sub,

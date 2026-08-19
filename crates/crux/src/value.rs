@@ -32,6 +32,11 @@ const TAG_STRING: u64 = 5;
 const TAG_SYMBOL: u64 = 6;
 const TAG_OBJECT: u64 = 7;
 const TAG_FUNCTION: u64 = 8;
+/// The frame-slot TDZ marker (tag 9 in the reserved range): a `let`-like
+/// binding before its `InitLocal`. It lives only in VM frames; every frame
+/// access checks it before the value can reach user-visible ops, so it never
+/// escapes (and `kind()`'s reserved-tag `unreachable!` stays unreachable).
+const TAG_UNINITIALIZED: u64 = 9;
 
 /// An ECMAScript language value (spec 6.1).
 ///
@@ -68,6 +73,18 @@ impl Value {
     pub const Undefined: Value =
         Value(TAG_PREFIX | (TAG_UNDEFINED << 44), std::marker::PhantomData);
     pub const Null: Value = Value(TAG_PREFIX | (TAG_NULL << 44), std::marker::PhantomData);
+
+    /// The frame-slot TDZ marker (see [`crate::value::TAG_UNINITIALIZED`]).
+    pub fn uninitialized() -> Value {
+        Value(
+            TAG_PREFIX | (TAG_UNINITIALIZED << 44),
+            std::marker::PhantomData,
+        )
+    }
+
+    pub fn is_uninitialized(&self) -> bool {
+        !self.is_double() && self.tag() == TAG_UNINITIALIZED
+    }
 
     pub fn Boolean(b: bool) -> Value {
         let tag = if b { TAG_TRUE } else { TAG_FALSE };

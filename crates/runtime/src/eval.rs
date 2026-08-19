@@ -2856,4 +2856,270 @@ mod tests {
             Err(error) if error.kind == crux::ErrorKind::ReferenceError
         ));
     }
+
+    // ---- Cut 3: frame-slot fast path ----
+
+    /// The compiled body of a function bound on the global object.
+    fn compiled_body_of(agent: &mut Agent, name: &str) -> std::rc::Rc<crate::ir::CompiledBody> {
+        let global = agent.running_context().unwrap().realm.global_object.clone();
+        let value = global.get(&JsString::from_utf8(name)).unwrap();
+        let ValueKind::Function(function) = value.kind() else {
+            panic!("{name} is not a function");
+        };
+        agent
+            .ecma_functions
+            .get(&function.id())
+            .expect("function is registered")
+            .ir
+            .clone()
+            .expect("function has compiled IR")
+    }
+
+    #[test]
+    fn fast_path_params_compile_to_frame_slots() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.run_script("function f(x) { return x + 1; }").unwrap();
+        let ir = compiled_body_of(&mut agent, "f");
+        assert!(ir.scope.is_some(), "a simple param body must be certified");
+        assert!(
+            ir.steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::LoadLocal { .. }))
+        );
+        assert!(
+            !ir.steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::LoadIdent { .. })),
+            "param reads must not walk the environment"
+        );
+    }
+
+    #[test]
+    fn fast_path_loop_bindings_are_frame_slots() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script("function loop() { var n = 0; for (var i = 0; i < 100; i++) { n += i * 2; } return n; }")
+            .unwrap();
+        let ir = compiled_body_of(&mut agent, "loop");
+        assert!(ir.scope.is_some(), "the loop body must be certified");
+        assert!(
+            ir.steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::InitLocal { .. }))
+        );
+        assert!(
+            ir.steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::UpdateLocal { .. }))
+        );
+        assert!(
+            !ir.steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::EnterBlock { .. })),
+            "a block with no lexical declarations must not allocate an env"
+        );
+        assert!(
+            !ir.steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::LoadIdent { .. })),
+            "binding reads must not walk the environment"
+        );
+    }
+
+    #[test]
+    fn fast_path_arrow_binds_params_to_slots() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.run_script("var f = (x) => x + 1;").unwrap();
+        let ir = compiled_body_of(&mut agent, "f");
+        assert!(ir.scope.is_some(), "a simple arrow must be certified");
+        assert!(
+            !ir.steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::LoadIdent { .. })),
+            "param reads must not walk the environment"
+        );
+        assert_eq!(
+            run("var f = (x) => x + 1; f(41)").unwrap(),
+            Value::Number(42.0)
+        );
+    }
+
+    #[test]
+    fn fast_path_call_binds_params_to_slots() {
+        assert_eq!(
+            run("function f(x) { return x + 1; } f(41)").unwrap(),
+            Value::Number(42.0)
+        );
+    }
+
+    #[test]
+    fn fast_path_var_hoists_to_undefined() {
+        assert_eq!(
+            run("function g() { return x; var x = 1; } g()").unwrap(),
+            Value::Undefined
+        );
+    }
+
+    #[test]
+    fn fast_path_var_has_no_tdz() {
+        assert_eq!(
+            run("function h() { x = 5; var x; return x; } h()").unwrap(),
+            Value::Number(5.0)
+        );
+    }
+
+    #[test]
+    fn fast_path_ignores_extra_call_arguments() {
+        // Extra arguments must not land in `var` slots (spec 10.2.11).
+        assert_eq!(
+            run("function f(a) { return x; var x; } f(1, 2)").unwrap(),
+            Value::Undefined
+        );
+        assert_eq!(
+            run("function f(a, b) { return a + b; } f(1, 2, 3)").unwrap(),
+            Value::Number(3.0)
+        );
+    }
+
+    #[test]
+    fn fast_path_for_var_head_initializes_the_slot() {
+        assert_eq!(
+            run("function loop() { var n = 0; for (var i = 0; i < 1000; i++) { n += i; } return n; } loop()")
+                .unwrap(),
+            Value::Number(499500.0)
+        );
+    }
+
+    #[test]
+    fn fast_path_var_in_block_is_function_scoped() {
+        assert_eq!(
+            run("function k() { var s = 0; { var q = 2; s += q; } return s + q; } k()").unwrap(),
+            Value::Number(4.0)
+        );
+    }
+
+    #[test]
+    fn fast_path_update_and_compound_assign() {
+        assert_eq!(
+            run("function u() { var n = 5; n++; return n; } u()").unwrap(),
+            Value::Number(6.0)
+        );
+        assert_eq!(
+            run("function p() { var n = 5; return ++n; } p()").unwrap(),
+            Value::Number(6.0)
+        );
+        assert_eq!(
+            run("function q() { var n = 5; return n++; } q()").unwrap(),
+            Value::Number(5.0)
+        );
+        assert_eq!(
+            run("function c() { var n = 2; n += 3; return n; } c()").unwrap(),
+            Value::Number(5.0)
+        );
+    }
+
+    #[test]
+    fn fast_path_assignment_expression_keeps_its_value() {
+        // An assignment is an expression: its value must remain on the stack
+        // (spec 13.15.3 step 3) even when the target is a frame slot — the
+        // harness's `while ((x = f()) !== expected)` loop shape depends on it.
+        assert_eq!(
+            run("function f() { var a = 0; return (a = 5) + 1; } f()").unwrap(),
+            Value::Number(6.0)
+        );
+        assert_eq!(
+            run("function g() { var a; var b; b = a = 7; return b; } g()").unwrap(),
+            Value::Number(7.0)
+        );
+        assert_eq!(
+            run("function h() { var n = 0; var r = -1; while ((r = n) !== 3) { n++; } return r; } h()")
+                .unwrap(),
+            Value::Number(3.0)
+        );
+        assert_eq!(
+            run("function j() { var x = 0; var r; while ((r = ++x) < 3) {} return r; } j()")
+                .unwrap(),
+            Value::Number(3.0)
+        );
+    }
+
+    #[test]
+    fn fast_path_typeof_reads_the_slot() {
+        // `typeof` of a slot binding must read the frame, not walk the
+        // environment (a fast body has no env binding for the name). The
+        // harness's `$DETACHBUFFER` shape (`typeof buffer !== "object"`)
+        // depends on it.
+        assert_eq!(
+            run("function f(x) { return typeof x; } f(42)").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("number")))
+        );
+        assert_eq!(
+            run("function g() { var v = 1; return typeof v; } g()").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("number")))
+        );
+        assert_eq!(
+            run("function h(b) { if (typeof b !== 'object' || b === null || typeof b.transfer !== 'function') { return 'no'; } return 'yes'; } h({ transfer: function () {} })")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("yes")))
+        );
+        assert_eq!(
+            run("function k() { return typeof missing_global; } k()").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("undefined")))
+        );
+    }
+
+    #[test]
+    fn fast_path_delete_of_a_slot_is_false() {
+        // A slot binding is never unresolvable, so sloppy `delete x` is false
+        // (spec 13.5.1.2) — the env-path `DeleteIdent` would report true.
+        assert_eq!(
+            run("function d() { var x = 1; return delete x; } d()").unwrap(),
+            Value::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn fast_path_reads_outer_bindings_through_the_env() {
+        assert_eq!(
+            run("var base = 10; function add(x) { return x + base; } add(5)").unwrap(),
+            Value::Number(15.0)
+        );
+    }
+
+    #[test]
+    fn slow_path_this_body_keeps_behavior() {
+        assert_eq!(
+            run("function m() { return this.x; } m.call({ x: 9 })").unwrap(),
+            Value::Number(9.0)
+        );
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.run_script("function m() { return this.x; }").unwrap();
+        let ir = compiled_body_of(&mut agent, "m");
+        assert!(
+            ir.scope.is_none(),
+            "a `this` body must stay on the env path"
+        );
+    }
+
+    #[test]
+    fn slow_path_arguments_body_keeps_behavior() {
+        assert_eq!(
+            run("function a() { return arguments[0]; } a(7)").unwrap(),
+            Value::Number(7.0)
+        );
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script("function a() { return arguments[0]; }")
+            .unwrap();
+        let ir = compiled_body_of(&mut agent, "a");
+        assert!(
+            ir.scope.is_none(),
+            "an `arguments` body must stay on the env path"
+        );
+    }
 }

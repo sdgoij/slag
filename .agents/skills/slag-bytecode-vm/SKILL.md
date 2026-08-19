@@ -14,6 +14,16 @@ control-flow structure back through it. These are the traps that cost real
 debugging time; the vendored unit suite stayed green throughout, so the
 full conformance sweep is the regression test for this file.
 
+## The v8 reference checkout is gitignored
+
+The proper reference for the VM work is the vendored V8 checkout in
+`v8/` (`src/interpreter/bytecodes.h`, `bytecode-generator.cc`
+`BuildVariableLoad`, `src/ast/scopes.cc` `AllocateNonParameterLocal`,
+`src/contexts.h`). It is in the repo's local `.gitignore`, so the agent
+file tools (`read_file`/`grep`/`find_path`) treat it as absent — read it
+via the **terminal** (shell grep/sed/`ls`) instead. Never conclude from
+an empty agent-tool result that the checkout is missing.
+
 ## 1. Optional-call short paths must pop the receiver too
 
 `compile_optional_call_tail`'s nullish path runs with `[receiver, callee,
