@@ -1,0 +1,22 @@
+{
+  "languages": {
+    "C++": {
+      "enable_language_server": false,
+    },
+    "C": {
+      "enable_language_server": false,
+    },
+    "Python": {
+      "enable_language_server": false,
+    },
+    "JavaScript": {
+      "enable_language_server": false,
+    },
+    "TypeScript": {
+      "enable_language_server": false,
+    },
+    "TSX": {
+      "enable_language_server": false,
+    },
+  },
+}
