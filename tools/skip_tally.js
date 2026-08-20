@@ -116,7 +116,8 @@ function classify(file, source) {
   // until its component lands (docs/intl-plan.md cuts). Cut 1 implements
   // `Intl.Locale`; Cut 2 opens NumberFormat (basic/unified/v3) and
   // supportedValuesOf (the `Intl-enumeration` tag); Cut 3 opens
-  // PluralRules and RelativeTimeFormat.
+  // PluralRules and RelativeTimeFormat; Cut 4 opens ListFormat and
+  // DisplayNames (+ the -v2 tag).
   const INTL_IMPLEMENTED = new Set([
     "Intl.Locale",
     "Intl.NumberFormat",
@@ -124,6 +125,9 @@ function classify(file, source) {
     "Intl.NumberFormat-v3",
     "Intl.PluralRules",
     "Intl.RelativeTimeFormat",
+    "Intl.ListFormat",
+    "Intl.DisplayNames",
+    "Intl.DisplayNames-v2",
     "Intl-enumeration",
   ]);
   for (const feature of features) {

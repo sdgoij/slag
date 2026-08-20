@@ -6,6 +6,8 @@
 
 pub mod bcp47;
 pub mod data;
+pub mod display_names;
+pub mod list_format;
 pub mod locale;
 pub mod number_data;
 pub mod number_format;
@@ -98,6 +100,8 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     supported_values::install(realm, &intl_value)?;
     plural_rules::install(realm, &intl_value)?;
     relative_time_format::install(realm, &intl_value)?;
+    list_format::install(realm, &intl_value)?;
+    display_names::install(realm, &intl_value)?;
 
     realm.global_object.define_property_or_throw(
         &JsString::from_utf8("Intl"),
@@ -146,7 +150,13 @@ pub fn dispatch_call(
     if let Some(result) = plural_rules::dispatch_call(agent, callee, this, args) {
         return Some(result);
     }
-    relative_time_format::dispatch_call(agent, callee, this, args)
+    if let Some(result) = relative_time_format::dispatch_call(agent, callee, this, args) {
+        return Some(result);
+    }
+    if let Some(result) = list_format::dispatch_call(agent, callee, this, args) {
+        return Some(result);
+    }
+    display_names::dispatch_call(agent, callee, this, args)
 }
 
 /// dispatch_construct: `new Intl.Locale(...)` and `new Intl.NumberFormat(...)`.
@@ -165,7 +175,14 @@ pub fn dispatch_construct(
     if let Some(result) = plural_rules::dispatch_construct(agent, callee, args, new_target) {
         return Some(result);
     }
-    relative_time_format::dispatch_construct(agent, callee, args, new_target)
+    if let Some(result) = relative_time_format::dispatch_construct(agent, callee, args, new_target)
+    {
+        return Some(result);
+    }
+    if let Some(result) = list_format::dispatch_construct(agent, callee, args, new_target) {
+        return Some(result);
+    }
+    display_names::dispatch_construct(agent, callee, args, new_target)
 }
 
 /// CanonicalizeLocaleList (ECMA-402 §9.2.1): the `locales` argument — an

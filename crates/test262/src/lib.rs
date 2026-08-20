@@ -12398,7 +12398,8 @@ var $DONE = function (error) {
     /// §4). Cut 1: `%Intl%`, `Intl.getCanonicalLocales`, and `Intl.Locale`.
     /// Cut 2: `Intl.NumberFormat` (basic, unified, v3) and
     /// `Intl.supportedValuesOf` (the `Intl-enumeration` tag). Cut 3:
-    /// `Intl.PluralRules` and `Intl.RelativeTimeFormat`. The remaining
+    /// Cut 3: `Intl.PluralRules` and `Intl.RelativeTimeFormat`. Cut 4:
+    /// `Intl.ListFormat` and `Intl.DisplayNames` (+ `-v2`). The remaining
     /// features still skip via `unimplemented_intl_feature`.
     const INTL_IMPLEMENTED: &[&str] = &[
         "Intl.Locale",
@@ -12407,6 +12408,9 @@ var $DONE = function (error) {
         "Intl.NumberFormat-v3",
         "Intl.PluralRules",
         "Intl.RelativeTimeFormat",
+        "Intl.ListFormat",
+        "Intl.DisplayNames",
+        "Intl.DisplayNames-v2",
         "Intl-enumeration",
     ];
 

@@ -234,6 +234,14 @@ pub struct Agent {
         u64,
         crate::builtins::intl::relative_time_format::RelativeTimeFormatRecord,
     >,
+    /// The [[InitializedListFormat]] records of Intl.ListFormat instances,
+    /// keyed by object identity (ECMA-402 §14: locale, type, style).
+    pub intl_list_format_data:
+        std::collections::HashMap<u64, crate::builtins::intl::list_format::ListFormatRecord>,
+    /// The [[InitializedDisplayNames]] records of Intl.DisplayNames
+    /// instances, keyed by object identity (ECMA-402 §12).
+    pub intl_display_names_data:
+        std::collections::HashMap<u64, crate::builtins::intl::display_names::DisplayNamesRecord>,
     /// The [[InitializedTemporal*]] records of Temporal instances, keyed by
     /// object identity (the proposal-temporal internal slots).
     pub temporal_data: std::collections::HashMap<u64, crate::builtins::temporal::TemporalRecord>,
@@ -395,6 +403,8 @@ impl Agent {
             intl_format_functions: std::collections::HashMap::new(),
             intl_plural_rules_data: std::collections::HashMap::new(),
             intl_rtf_data: std::collections::HashMap::new(),
+            intl_list_format_data: std::collections::HashMap::new(),
+            intl_display_names_data: std::collections::HashMap::new(),
             temporal_data: std::collections::HashMap::new(),
             regexp_data: std::collections::HashMap::new(),
             regexp_string_iter_data: std::collections::HashMap::new(),
