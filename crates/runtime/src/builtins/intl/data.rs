@@ -76,7 +76,6 @@ pub const TERRITORY_ALIASES: &[(&str, &[&str])] = &[
 pub const UVALUE_ALIASES: &[(&str, &str, &str)] = &[
     ("ca", "ethiopic-amete-alem", "ethioaa"),
     ("ca", "islamicc", "islamic-civil"),
-    ("ca", "islamic", "islamic-civil"),
     ("ks", "primary", "level1"),
     ("ks", "tertiary", "level3"),
     ("ms", "imperial", "uksystem"),

@@ -1714,9 +1714,12 @@ fn subarray(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
     typed_array_species_create_view(agent, this, buffer, new_byte_offset, count as usize)
 }
 
-/// spec 25.2.3.30 TypedArray.prototype.toLocaleString.
-fn to_locale_string(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
+/// spec 25.2.3.30 TypedArray.prototype.toLocaleString (ECMA-402 §20.5.1: the
+/// element's toLocaleString receives the locales/options arguments).
+fn to_locale_string(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let slots = validate_typed_array(agent, this)?;
+    let locales = args.first().cloned().unwrap_or(Value::Undefined);
+    let options = args.get(1).cloned().unwrap_or(Value::Undefined);
     let mut result = String::new();
     for k in 0..typed_array_effective_length(&slots) as u64 {
         if k > 0 {
@@ -1728,7 +1731,8 @@ fn to_locale_string(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<
         }
         let boxed = crate::context::to_object(agent, &element)?;
         let method = get(agent, &boxed, &JsString::from_utf8("toLocaleString"))?;
-        let text = crate::function::call(agent, &method, boxed, &[])?;
+        let text =
+            crate::function::call(agent, &method, boxed, &[locales.clone(), options.clone()])?;
         result.push_str(&crate::context::to_string(agent, &text)?.to_string_lossy());
     }
     Ok(Value::String(Handle::new(JsString::from_utf8(&result))))

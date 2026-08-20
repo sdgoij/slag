@@ -1175,7 +1175,7 @@ mod tests {
             Some("1996-fonipa".to_string())
         );
         assert_eq!(get_locale_variants("en"), None);
-        assert_eq!(canonicalize_uvalue("ca", "islamic"), "islamic-civil");
+        assert_eq!(canonicalize_uvalue("ca", "islamic"), "islamic");
         assert_eq!(canonicalize_uvalue("nu", "latn"), "latn");
     }
 }

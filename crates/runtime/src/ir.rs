@@ -1268,14 +1268,18 @@ impl Vm {
                     // active iterators (spec 14.7.6.2: a head-binding error or
                     // abrupt body completion returns IteratorClose). A `next()`
                     // error is exempt: it propagates with the iterator open.
-                    if !self.for_of_stepping {
-                        self.close_for_of_throw(agent);
-                    }
+                    // An error covered by a handler whose catch resumes inside
+                    // the loop body must leave the iterators intact — the loop
+                    // continues (mirrors the `throw`-statement path, which only
+                    // closes when the throw escapes).
                     let covered = self.try_stack.iter().any(|frame| {
                         body.handlers.get(frame.handler).is_some_and(|handler| {
                             self.ip >= handler.start && self.ip < handler.try_end
                         })
                     });
+                    if !covered && !self.for_of_stepping {
+                        self.close_for_of_throw(agent);
+                    }
                     if covered {
                         self.throw_error(agent, body, error)
                     } else {

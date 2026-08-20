@@ -7,6 +7,9 @@
 pub mod bcp47;
 pub mod data;
 pub mod locale;
+pub mod number_data;
+pub mod number_format;
+pub mod supported_values;
 
 use crux::error::{ErrorKind, JsError};
 use crux::function::{Function, NativeFn};
@@ -85,8 +88,11 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let intl_value = Value::Object(intl);
     realm.intrinsics.define(INTL, intl_value.clone());
 
-    // Intl.Locale (the constructor + prototype).
+    // Intl.Locale (the constructor + prototype) and Intl.NumberFormat
+    // (plan Cut 2).
     locale::install(realm, &intl_value)?;
+    number_format::install(realm, &intl_value)?;
+    supported_values::install(realm, &intl_value)?;
 
     realm.global_object.define_property_or_throw(
         &JsString::from_utf8("Intl"),
@@ -107,8 +113,8 @@ fn placeholder(name: &str) -> NativeFn {
     Box::new(move |_, _| Err(type_error(&format!("{name} must be dispatched"))))
 }
 
-/// dispatch_call: `Intl.getCanonicalLocales` and the `Intl.Locale`
-/// prototype members.
+/// dispatch_call: `Intl.getCanonicalLocales`, `Intl.supportedValuesOf` and
+/// the `Intl.Locale`/`Intl.NumberFormat` prototype members.
 pub fn dispatch_call(
     agent: &mut Agent,
     callee: &Value,
@@ -123,17 +129,26 @@ pub fn dispatch_call(
             args.first().cloned().unwrap_or(Value::Undefined),
         ));
     }
-    locale::dispatch_call(agent, callee, this, args)
+    if let Some(result) = supported_values::dispatch_call(agent, callee, this, args) {
+        return Some(result);
+    }
+    if let Some(result) = locale::dispatch_call(agent, callee, this, args) {
+        return Some(result);
+    }
+    number_format::dispatch_call(agent, callee, this, args)
 }
 
-/// dispatch_construct: `new Intl.Locale(...)`.
+/// dispatch_construct: `new Intl.Locale(...)` and `new Intl.NumberFormat(...)`.
 pub fn dispatch_construct(
     agent: &mut Agent,
     callee: &Value,
     args: &[Value],
     new_target: &Value,
 ) -> Option<Result<Value, JsError>> {
-    locale::dispatch_construct(agent, callee, args, new_target)
+    if let Some(result) = locale::dispatch_construct(agent, callee, args, new_target) {
+        return Some(result);
+    }
+    number_format::dispatch_construct(agent, callee, args, new_target)
 }
 
 /// CanonicalizeLocaleList (ECMA-402 §9.2.1): the `locales` argument — an
@@ -143,16 +158,19 @@ pub fn dispatch_construct(
 /// ToString, validated and canonicalized, deduplicated. Each element is
 /// processed in its own loop iteration so a `toString` on an earlier element
 /// is observable by later `HasProperty`/`Get` (spec steps 7.b-7.f).
-fn get_canonical_locales(agent: &mut Agent, locales: Value) -> Result<Value, JsError> {
+pub fn canonicalize_locale_list(
+    agent: &mut Agent,
+    locales: &Value,
+) -> Result<Vec<String>, JsError> {
+    let mut result = Vec::new();
     if locales.is_undefined() {
-        return crate::builtins::array::array_from_values(agent, &[]);
+        return Ok(result);
     }
     // Spec §9.2.1 step 3: a String (or an initialized Intl.Locale) is a
     // one-element list, not an array-like to iterate.
     let single = locales.is_string()
-        || as_object(&locales).is_some_and(|obj| agent.intl_locale_data.contains_key(&obj.id()));
+        || as_object(locales).is_some_and(|obj| agent.intl_locale_data.contains_key(&obj.id()));
     let mut seen: Vec<String> = Vec::new();
-    let mut result: Vec<Value> = Vec::new();
     let mut process = |agent: &mut Agent, element: Value| -> Result<(), JsError> {
         // Spec §9.2.1 step 7.c.ii: neither a String nor an Object throws.
         if !element.is_string() && as_object(&element).is_none() {
@@ -177,14 +195,14 @@ fn get_canonical_locales(agent: &mut Agent, locales: Value) -> Result<Value, JsE
         let canonical = bcp47::canonicalize(&tag_text)?;
         if !seen.contains(&canonical) {
             seen.push(canonical.clone());
-            result.push(Value::String(Handle::new(JsString::from_utf8(&canonical))));
+            result.push(canonical);
         }
         Ok(())
     };
     if single {
-        process(agent, locales)?;
+        process(agent, locales.clone())?;
     } else {
-        let object = to_object(agent, &locales)?;
+        let object = to_object(agent, locales)?;
         let length_value = get_property(
             agent,
             &object,
@@ -210,5 +228,16 @@ fn get_canonical_locales(agent: &mut Agent, locales: Value) -> Result<Value, JsE
             process(agent, element)?;
         }
     }
-    crate::builtins::array::array_from_values(agent, &result)
+    Ok(result)
+}
+
+/// Intl.getCanonicalLocales (ECMA-402 §8.3.1): an array of the canonical
+/// locale strings.
+fn get_canonical_locales(agent: &mut Agent, locales: Value) -> Result<Value, JsError> {
+    let list = canonicalize_locale_list(agent, &locales)?;
+    let values: Vec<Value> = list
+        .into_iter()
+        .map(|tag| Value::String(Handle::new(JsString::from_utf8(&tag))))
+        .collect();
+    crate::builtins::array::array_from_values(agent, &values)
 }

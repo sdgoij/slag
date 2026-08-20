@@ -214,6 +214,14 @@ pub struct Agent {
     /// The [[InitializedLocale]] records of Intl.Locale instances, keyed by
     /// object identity (ECMA-402 §15: the canonical locale string).
     pub intl_locale_data: std::collections::HashMap<u64, crate::builtins::intl::IntlLocaleRecord>,
+    /// The [[InitializedNumberFormat]] records of Intl.NumberFormat
+    /// instances, keyed by object identity (ECMA-402 §16: the resolved
+    /// options).
+    pub intl_number_format_data:
+        std::collections::HashMap<u64, crate::builtins::intl::number_format::NumberFormatRecord>,
+    /// The per-instance bound `format` functions: function id → the
+    /// NumberFormat instance's object id (ECMA-402 §16.5.2 [[NumberFormat]]).
+    pub intl_format_functions: std::collections::HashMap<u64, u64>,
     /// The [[InitializedTemporal*]] records of Temporal instances, keyed by
     /// object identity (the proposal-temporal internal slots).
     pub temporal_data: std::collections::HashMap<u64, crate::builtins::temporal::TemporalRecord>,
@@ -371,6 +379,8 @@ impl Agent {
             bigint_data: std::collections::HashMap::new(),
             date_data: std::collections::HashMap::new(),
             intl_locale_data: std::collections::HashMap::new(),
+            intl_number_format_data: std::collections::HashMap::new(),
+            intl_format_functions: std::collections::HashMap::new(),
             temporal_data: std::collections::HashMap::new(),
             regexp_data: std::collections::HashMap::new(),
             regexp_string_iter_data: std::collections::HashMap::new(),

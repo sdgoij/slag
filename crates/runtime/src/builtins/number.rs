@@ -573,9 +573,28 @@ pub fn dispatch_call(
         return Some(this_number_value(agent, this).map(Value::Number));
     }
     if intrinsics.get(TO_LOCALE_STRING).as_ref() == Some(callee) {
-        return Some(this_number_value(agent, this).map(number_to_string));
+        return Some(to_locale_string_method(agent, this, args));
     }
     None
+}
+
+/// Number.prototype.toLocaleString (ECMA-402 §20.2.1): construct an
+/// Intl.NumberFormat for (locales, options) and format the Number.
+fn to_locale_string_method(
+    agent: &mut Agent,
+    this: &Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    let number = this_number_value(agent, this)?;
+    let x = crate::builtins::intl::number_format::to_intl_mathematical_value(
+        agent,
+        &Value::Number(number),
+    )?;
+    let locales = args.first().cloned().unwrap_or(Value::Undefined);
+    let options = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let text =
+        crate::builtins::intl::number_format::to_locale_string(agent, &locales, &options, &x)?;
+    Ok(Value::String(Handle::new(JsString::from_utf8(&text))))
 }
 
 pub fn dispatch_construct(

@@ -291,7 +291,7 @@ pub fn dispatch_call(
         return Some(to_string_method(agent, this, args));
     }
     if intrinsics.get(PROTO_TO_LOCALE_STRING).as_ref() == Some(callee) {
-        return Some(to_string_method(agent, this, &[]));
+        return Some(to_locale_string_method(agent, this, args));
     }
     if intrinsics.get(PROTO_VALUE_OF).as_ref() == Some(callee) {
         return match this_bigint_value(agent, this) {
@@ -300,6 +300,23 @@ pub fn dispatch_call(
         };
     }
     None
+}
+
+/// BigInt.prototype.toLocaleString (ECMA-402 §20.3.1): construct an
+/// Intl.NumberFormat for (locales, options) and format the BigInt's exact
+/// mathematical value.
+fn to_locale_string_method(
+    agent: &mut Agent,
+    this: &Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    let big = this_bigint_value(agent, this)?;
+    let x = crate::builtins::intl::number_format::bigint_to_intl_mv(big);
+    let locales = args.first().cloned().unwrap_or(Value::Undefined);
+    let options = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let text =
+        crate::builtins::intl::number_format::to_locale_string(agent, &locales, &options, &x)?;
+    Ok(Value::String(Handle::new(JsString::from_utf8(&text))))
 }
 
 pub fn dispatch_construct(

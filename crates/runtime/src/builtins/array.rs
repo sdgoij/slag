@@ -1620,11 +1620,14 @@ fn splice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
     Ok(Value::Object(removed))
 }
 
-/// spec 23.1.3.31 Array.prototype.toLocaleString.
-fn to_locale_string(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
+/// spec 23.1.3.31 Array.prototype.toLocaleString (ECMA-402 §20.5.1: the
+/// element's toLocaleString is invoked with the locales/options arguments).
+fn to_locale_string(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
     let object = crate::context::to_object(agent, this)?;
     let length = length_of_array_like(agent, &object)?;
+    let locales = args.first().cloned().unwrap_or(Value::Undefined);
+    let options = args.get(1).cloned().unwrap_or(Value::Undefined);
     let mut result = String::new();
     for k in 0..length {
         if k > 0 {
@@ -1638,8 +1641,10 @@ fn to_locale_string(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<
         let method = get(agent, &boxed, &JsString::from_utf8("toLocaleString"))?;
         // spec steps 10-12: the method is invoked with the *element* as the
         // receiver (not the box), so a primitives' overridden toString sees
-        // the primitive (primitive_this_value.js).
-        let text = crate::function::call(agent, &method, element, &[])?;
+        // the primitive (primitive_this_value.js); the locales and options
+        // arguments pass through.
+        let text =
+            crate::function::call(agent, &method, element, &[locales.clone(), options.clone()])?;
         result.push_str(&crate::context::to_string(agent, &text)?.to_string_lossy());
     }
     Ok(Value::String(Handle::new(JsString::from_utf8(&result))))

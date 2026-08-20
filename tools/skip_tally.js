@@ -114,8 +114,15 @@ function classify(file, source) {
   if (features.has("ShadowRealm")) return "ShadowRealm";
   // ECMA-402 feature gates (mirrors run_fixture): each `Intl.*` tag skips
   // until its component lands (docs/intl-plan.md cuts). Cut 1 implements
-  // `Intl.Locale`; the rest stay skipped.
-  const INTL_IMPLEMENTED = new Set(["Intl.Locale"]);
+  // `Intl.Locale`; Cut 2 opens NumberFormat (basic/unified/v3) and
+  // supportedValuesOf (the `Intl-enumeration` tag).
+  const INTL_IMPLEMENTED = new Set([
+    "Intl.Locale",
+    "Intl.NumberFormat",
+    "Intl.NumberFormat-unified",
+    "Intl.NumberFormat-v3",
+    "Intl-enumeration",
+  ]);
   for (const feature of features) {
     if (feature.startsWith("Intl") && !INTL_IMPLEMENTED.has(feature)) {
       return `Intl feature ${feature} not yet implemented`;
