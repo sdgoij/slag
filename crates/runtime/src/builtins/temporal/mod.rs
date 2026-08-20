@@ -1389,25 +1389,24 @@ fn relative_to_object(agent: &mut Agent, item: &Value) -> Result<RelativeTo, JsE
             "relativeTo is outside the representable range".into(),
         ));
     }
-    let utc = iso::get_utc_epoch_nanoseconds(
-        year, month, day, time[0], time[1], time[2], time[3], time[4], time[5],
-    );
-    let zone_offset = offset_ns_at(&time_zone, utc)
-        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
-    let epoch = match offset {
-        Some(offset) => {
-            let given = iso::parse_date_time_utc_offset(&offset)
-                .map_err(|_| JsError::new(ErrorKind::RangeError, "invalid offset".into()))?;
-            if given != zone_offset {
-                return Err(JsError::new(
-                    ErrorKind::RangeError,
-                    "offset does not match the time zone".into(),
-                ));
-            }
-            utc - given
-        }
-        None => utc - zone_offset,
+    let offset_ns = match &offset {
+        Some(text) => Some(
+            iso::parse_date_time_utc_offset(text)
+                .map_err(|_| JsError::new(ErrorKind::RangeError, "invalid offset".into()))?,
+        ),
+        None => None,
     };
+    let epoch = shell::interpret_iso_date_time_offset(
+        [
+            year, month, day, time[0], time[1], time[2], time[3], time[4], time[5],
+        ],
+        &time_zone,
+        offset_ns,
+        false,
+        "reject",
+        "compatible",
+        false,
+    )?;
     // spec 13.19: InterpretISODateTimeOffset validates the resulting exact
     // time against the Instant range.
     if !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&epoch) {
@@ -1481,7 +1480,6 @@ fn relative_to_string(agent: &mut Agent, item: &Value) -> Result<RelativeTo, JsE
             "invalid calendar identifier".into(),
         ));
     }
-    let [h, min, s, ms, us, ns] = parsed.time.unwrap_or([0, 0, 0, 0, 0, 0]);
     let date = (parsed.year, parsed.month, parsed.day);
     if parsed.tz.annotation.is_empty() {
         // spec 13.19: a plain relativeTo must be within the PlainDate limits
@@ -1506,24 +1504,32 @@ fn relative_to_string(agent: &mut Agent, item: &Value) -> Result<RelativeTo, JsE
             "relativeTo is outside the representable range".into(),
         ));
     }
-    let utc = iso::get_utc_epoch_nanoseconds(date.0, date.1, date.2, h, min, s, ms, us, ns);
-    let zone_offset = offset_ns_at(&time_zone, utc)
-        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
-    let epoch = if parsed.tz.z {
-        utc
+    if parsed.time.is_none() {
+        // Start-of-day (spec 6.5.1): a date-only relativeTo resolves through
+        // GetStartOfDay, not the disambiguation of 00:00.
+        let epoch = shell::zoned_start_of_day_ns(agent, &time_zone, date.0, date.1, date.2)?;
+        return Ok(RelativeTo::Zoned(epoch, time_zone));
+    }
+    let t = parsed.time.unwrap_or([0, 0, 0, 0, 0, 0]);
+    let offset_ns = if parsed.tz.z {
+        None
     } else if !parsed.tz.offset_string.is_empty() {
-        let given = iso::parse_date_time_utc_offset(&parsed.tz.offset_string)
-            .map_err(|_| JsError::new(ErrorKind::RangeError, "invalid offset".into()))?;
-        if given != zone_offset {
-            return Err(JsError::new(
-                ErrorKind::RangeError,
-                "offset does not match the time zone".into(),
-            ));
-        }
-        utc - given
+        Some(
+            iso::parse_date_time_utc_offset(&parsed.tz.offset_string)
+                .map_err(|_| JsError::new(ErrorKind::RangeError, "invalid offset".into()))?,
+        )
     } else {
-        utc - zone_offset
+        None
     };
+    let epoch = shell::interpret_iso_date_time_offset(
+        [date.0, date.1, date.2, t[0], t[1], t[2], t[3], t[4], t[5]],
+        &time_zone,
+        offset_ns,
+        parsed.tz.z,
+        "reject",
+        "compatible",
+        !shell::offset_string_has_seconds(&parsed.tz.offset_string),
+    )?;
     // spec 13.19: InterpretISODateTimeOffset validates the resulting exact
     // time against the Instant range.
     if !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&epoch) {

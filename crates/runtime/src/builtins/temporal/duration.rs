@@ -428,42 +428,18 @@ fn cmp_i128(a: i128, b: i128) -> i64 {
     }
 }
 
-/// Add an internal duration to an epoch in a fixed-offset time zone
-/// (spec 6.5.5 AddZonedDateTime for offset zones).
+/// Add an internal duration to an epoch in a time zone (spec 6.5.5
+/// AddZonedDateTime: the date part adds to the local date first, then the
+/// new wall time resolves with the compatible disambiguation — a DST
+/// transition between the wall times shifts the offset — then the time part
+/// adds to the resulting instant).
 pub fn add_zoned_date_time(
     epoch_ns: i128,
     tz: &str,
     duration: super::InternalDuration,
 ) -> Result<i128, JsError> {
-    let offset = super::offset_time_zone_offset_ns(tz)
-        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
-    let (y, m, d, h, min, s, ms, us, ns) = iso::iso_parts_from_epoch(epoch_ns + offset);
-    if duration.date[0] != 0.0
-        || duration.date[1] != 0.0
-        || duration.date[2] != 0.0
-        || duration.date[3] != 0.0
-    {
-        let (y, m, d) = iso::calendar_date_add(
-            y,
-            m,
-            d,
-            duration.date[0] as i64,
-            duration.date[1] as i64,
-            duration.date[2] as i64,
-            duration.date[3] as i64,
-            true,
-        )
-        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "date out of range".into()))?;
-        let intermediate = iso::get_utc_epoch_nanoseconds(y, m, d, h, min, s, ms, us, ns) - offset;
-        let result = intermediate + duration.time;
-        if !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&result) {
-            return Err(JsError::new(
-                ErrorKind::RangeError,
-                "result out of range".into(),
-            ));
-        }
-        Ok(result)
-    } else {
+    let date_zero = duration.date == [0.0, 0.0, 0.0, 0.0];
+    if date_zero {
         let result = epoch_ns + duration.time;
         if !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&result) {
             return Err(JsError::new(
@@ -471,8 +447,32 @@ pub fn add_zoned_date_time(
                 "result out of range".into(),
             ));
         }
-        Ok(result)
+        return Ok(result);
     }
+    let offset = super::offset_ns_at(tz, epoch_ns)
+        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
+    let (y, m, d, h, min, s, ms, us, ns) = iso::iso_parts_from_epoch(epoch_ns + offset);
+    let (y, m, d) = iso::calendar_date_add(
+        y,
+        m,
+        d,
+        duration.date[0] as i64,
+        duration.date[1] as i64,
+        duration.date[2] as i64,
+        duration.date[3] as i64,
+        true,
+    )
+    .ok_or_else(|| JsError::new(ErrorKind::RangeError, "date out of range".into()))?;
+    let intermediate =
+        super::shell::wall_to_epoch_ns(tz, y, m, d, h, min, s, ms, us, ns, "compatible")?;
+    let result = intermediate + duration.time;
+    if !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&result) {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "result out of range".into(),
+        ));
+    }
+    Ok(result)
 }
 
 /// spec 7.3.20 `round`.
@@ -700,7 +700,7 @@ fn total(agent: &mut Agent, this: &Value, total_of: &Value) -> Result<Value, JsE
             // days is the exact epoch difference (spec 6.5.8 for time units;
             // the NudgeToCalendarUnit day path applies to DST zones).
             if iso::is_calendar_unit(unit) {
-                let offset = super::offset_time_zone_offset_ns(&tz).unwrap_or(0);
+                let offset = super::offset_ns_at(&tz, ns).unwrap_or(0);
                 let dt = iso::iso_parts_from_epoch(ns + offset);
                 // DifferenceZonedDateTime (spec 6.5.7): re-derive the calendar
                 // difference between the origin and the added instant, then
@@ -728,29 +728,31 @@ fn total(agent: &mut Agent, this: &Value, total_of: &Value) -> Result<Value, JsE
                 )?
             } else if unit == iso::Unit::Day {
                 // spec 7.5.39: a zoned day total goes through
-                // NudgeToCalendarUnit, whose ComputeNudgeWindow materializes
-                // the ±1-day end boundary; the boundary's exact time must be
-                // a valid Instant (test262 relativeto-date-limits).
-                let offset = super::offset_time_zone_offset_ns(&tz).unwrap_or(0);
+                // NudgeToCalendarUnit with the actual local day length (a
+                // DST day differs from 24h — test262 dst-day-length.js); the
+                // boundary's exact time is materialized by
+                // ComputeNudgeWindow (test262 relativeto-date-limits).
+                let offset = super::offset_ns_at(&tz, ns).unwrap_or(0);
                 let dt = iso::iso_parts_from_epoch(ns + offset);
-                let sign = if target - ns < 0 { -1i64 } else { 1i64 };
-                let (ey, em, ed) = iso::add_days_to_iso_date(dt.0, dt.1, dt.2, sign);
-                if iso::iso_date_to_epoch_days(ey, em - 1, ed).abs() > 100_000_000 {
-                    return Err(JsError::new(
-                        ErrorKind::RangeError,
-                        "result is out of range".into(),
-                    ));
-                }
-                let end_epoch =
-                    iso::get_utc_epoch_nanoseconds(ey, em, ed, dt.3, dt.4, dt.5, dt.6, dt.7, dt.8)
-                        - offset;
-                if !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&end_epoch) {
-                    return Err(JsError::new(
-                        ErrorKind::RangeError,
-                        "result is out of range".into(),
-                    ));
-                }
-                super::total_time_duration(target - ns, unit)
+                let diff = difference_zoned_date_time_with_rounding(
+                    ns,
+                    target,
+                    &tz,
+                    unit,
+                    1,
+                    Unit::Nanosecond,
+                    RoundingMode::Trunc,
+                )?;
+                nudge_to_calendar_unit_total(
+                    internal_duration_sign(&diff),
+                    diff,
+                    ns,
+                    target,
+                    dt,
+                    Some(&tz),
+                    1,
+                    unit,
+                )?
             } else {
                 super::total_time_duration(target - ns, unit)
             }
@@ -1049,7 +1051,84 @@ pub fn difference_plain_date_time_with_rounding(
     Ok(diff)
 }
 
-/// spec 6.5.7 DifferenceZonedDateTimeWithRounding for fixed-offset zones.
+/// spec 6.5.6 DifferenceZonedDateTime: the end date is nudged by whole
+/// days until the instant difference to the destination changes sign (a DST
+/// transition can shift the intermediate wall time), then the date part is
+/// the calendar difference between the start and the intermediate dates.
+fn difference_zoned_date_time(
+    ns1: i128,
+    ns2: i128,
+    tz: &str,
+    largest_unit: Unit,
+) -> Result<super::InternalDuration, JsError> {
+    if ns1 == ns2 {
+        return Ok(super::InternalDuration {
+            date: [0.0, 0.0, 0.0, 0.0],
+            time: 0,
+        });
+    }
+    let offset1 = super::offset_ns_at(tz, ns1)
+        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
+    let offset2 = super::offset_ns_at(tz, ns2)
+        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
+    let (y1, m1, d1, h1, min1, s1, ms1, us1, ns1r) = iso::iso_parts_from_epoch(ns1 + offset1);
+    let (y2, m2, d2, h2, min2, s2, ms2, us2, ns2r) = iso::iso_parts_from_epoch(ns2 + offset2);
+    if (y1, m1, d1) == (y2, m2, d2) {
+        return Ok(super::InternalDuration {
+            date: [0.0, 0.0, 0.0, 0.0],
+            time: ns2 - ns1,
+        });
+    }
+    let sign = if ns2 - ns1 < 0 { 1i64 } else { -1i64 };
+    let max_day_correction = if sign == -1 { 2 } else { 1 };
+    let mut day_correction = 0i64;
+    let mut time_duration = time_record_ns((h2, min2, s2, ms2, us2, ns2r))
+        - time_record_ns((h1, min1, s1, ms1, us1, ns1r));
+    if time_duration.signum() == sign as i128 {
+        day_correction += 1;
+    }
+    let mut intermediate = (y2, m2, d2, h1, min1, s1, ms1, us1, ns1r);
+    let mut success = false;
+    while day_correction <= max_day_correction && !success {
+        let (iy, im, id) = iso::add_days_to_iso_date(y2, m2, d2, day_correction * sign);
+        intermediate = (iy, im, id, h1, min1, s1, ms1, us1, ns1r);
+        let intermediate_ns = super::shell::wall_to_epoch_ns(
+            tz,
+            iy,
+            im,
+            id,
+            h1,
+            min1,
+            s1,
+            ms1,
+            us1,
+            ns1r,
+            "compatible",
+        )?;
+        time_duration = ns2 - intermediate_ns;
+        if time_duration.signum() != sign as i128 {
+            success = true;
+        }
+        day_correction += 1;
+    }
+    let date_largest = iso::larger_of_two_units(Unit::Day, largest_unit);
+    let date_difference = iso::calendar_date_until(
+        (y1, m1, d1),
+        (intermediate.0, intermediate.1, intermediate.2),
+        date_largest,
+    );
+    Ok(super::InternalDuration {
+        date: [
+            date_difference.0 as f64,
+            date_difference.1 as f64,
+            date_difference.2 as f64,
+            date_difference.3 as f64,
+        ],
+        time: time_duration,
+    })
+}
+
+/// spec 6.5.7 DifferenceZonedDateTimeWithRounding.
 pub fn difference_zoned_date_time_with_rounding(
     ns1: i128,
     ns2: i128,
@@ -1068,19 +1147,13 @@ pub fn difference_zoned_date_time_with_rounding(
             time,
         });
     }
-    let offset = super::offset_time_zone_offset_ns(tz)
-        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
-    let (y1, m1, d1, h1, min1, s1, ms1, us1, ns1_rest) = iso::iso_parts_from_epoch(ns1 + offset);
-    let (y2, m2, d2, h2, min2, s2, ms2, us2, ns2_rest) = iso::iso_parts_from_epoch(ns2 + offset);
-    let mut diff = difference_iso_date_time(
-        (y1, m1, d1, h1, min1, s1, ms1, us1, ns1_rest),
-        (y2, m2, d2, h2, min2, s2, ms2, us2, ns2_rest),
-        largest_unit,
-    );
+    let mut diff = difference_zoned_date_time(ns1, ns2, tz, largest_unit)?;
     if smallest_unit == Unit::Nanosecond && rounding_increment == 1 {
         return Ok(diff);
     }
-    let date_time = (y1, m1, d1, h1, min1, s1, ms1, us1, ns1_rest);
+    let offset = super::offset_ns_at(tz, ns1)
+        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
+    let date_time = iso::iso_parts_from_epoch(ns1 + offset);
     round_relative_duration(
         &mut diff,
         ns1,
@@ -1434,18 +1507,26 @@ struct Window {
     end_duration: super::InternalDuration,
 }
 
-/// The epoch nanoseconds of a wall-clock date-time in a fixed-offset zone
-/// (`None` = UTC).
+/// The epoch nanoseconds of a wall-clock date-time in a time zone (`None` =
+/// UTC), via GetEpochNanosecondsFor with the compatible disambiguation.
 fn date_time_epoch(dt: IsoDateTime, time_zone: Option<&str>) -> Result<i128, JsError> {
-    let utc = iso::get_utc_epoch_nanoseconds(dt.0, dt.1, dt.2, dt.3, dt.4, dt.5, dt.6, dt.7, dt.8);
     match time_zone {
-        Some(tz) => {
-            let offset = super::offset_time_zone_offset_ns(tz).ok_or_else(|| {
-                JsError::new(ErrorKind::RangeError, "unsupported time zone".into())
-            })?;
-            Ok(utc - offset)
-        }
-        None => Ok(utc),
+        Some(tz) => super::shell::wall_to_epoch_ns(
+            tz,
+            dt.0,
+            dt.1,
+            dt.2,
+            dt.3,
+            dt.4,
+            dt.5,
+            dt.6,
+            dt.7,
+            dt.8,
+            "compatible",
+        ),
+        None => Ok(iso::get_utc_epoch_nanoseconds(
+            dt.0, dt.1, dt.2, dt.3, dt.4, dt.5, dt.6, dt.7, dt.8,
+        )),
     }
 }
 
@@ -1641,7 +1722,7 @@ fn unsigned_rounding_mode(mode: RoundingMode, negative: bool) -> Unsigned {
     }
 }
 
-/// spec 7.5.35 NudgeToZonedTime (fixed-offset zones).
+/// spec 7.5.35 NudgeToZonedTime.
 fn nudge_to_zoned_time(
     sign: i64,
     duration: super::InternalDuration,
@@ -1651,8 +1732,6 @@ fn nudge_to_zoned_time(
     unit: Unit,
     rounding_mode: RoundingMode,
 ) -> Result<(super::InternalDuration, bool, i128), JsError> {
-    let offset = super::offset_time_zone_offset_ns(tz)
-        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
     let start = calendar_date_add_checked(
         iso_date_time.0,
         iso_date_time.1,
@@ -1663,7 +1742,8 @@ fn nudge_to_zoned_time(
         duration.date[3] as i64,
         true,
     )?;
-    let start_epoch_ns = iso::get_utc_epoch_nanoseconds(
+    let start_epoch_ns = super::shell::wall_to_epoch_ns(
+        tz,
         start.0,
         start.1,
         start.2,
@@ -1673,13 +1753,15 @@ fn nudge_to_zoned_time(
         iso_date_time.6,
         iso_date_time.7,
         iso_date_time.8,
-    ) - offset;
+        "compatible",
+    )?;
     // The day-boundary direction for a zero-sign duration is +1 (the spec's
     // GetDurationUnitLength adds one day); without it the boundary collapses
     // to the origin date and an edge overflow goes undetected.
     let sign = if sign == 0 { 1 } else { sign };
     let end_date = iso::add_days_to_iso_date(start.0, start.1, start.2, sign);
-    let end_epoch_ns = iso::get_utc_epoch_nanoseconds(
+    let end_epoch_ns = super::shell::wall_to_epoch_ns(
+        tz,
         end_date.0,
         end_date.1,
         end_date.2,
@@ -1689,7 +1771,8 @@ fn nudge_to_zoned_time(
         iso_date_time.6,
         iso_date_time.7,
         iso_date_time.8,
-    ) - offset;
+        "compatible",
+    )?;
     // The next-day boundary is an exact instant: it must stay within the
     // Instant range even when the origin date is at the representable edge
     // (test262 Duration/prototype/round/next-day-out-of-range).

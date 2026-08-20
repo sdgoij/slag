@@ -1907,7 +1907,13 @@ fn zoned_month_code(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
 /// or near midnight), validated against the actual local time at the
 /// candidate — the `00:00` local time may be skipped (a midnight gap) or
 /// occur twice (a midnight overlap).
-fn zoned_start_of_day_ns(agent: &Agent, tz: &str, y: i64, m: i64, d: i64) -> Result<i128, JsError> {
+pub(super) fn zoned_start_of_day_ns(
+    agent: &Agent,
+    tz: &str,
+    y: i64,
+    m: i64,
+    d: i64,
+) -> Result<i128, JsError> {
     let wall = iso::get_utc_epoch_nanoseconds(y, m, d, 0, 0, 0, 0, 0, 0);
     if tz == "UTC" || iso::parse_date_time_utc_offset(tz).is_ok() {
         return Ok(wall - super::offset_time_zone_offset_ns(tz).unwrap_or(0));
@@ -2061,9 +2067,10 @@ fn disambiguate_possible_instants(
 
 /// GetEpochNanosecondsFor (spec 6.5.3): the possible instants for the wall
 /// date-time, disambiguated. The shared primitive behind `from`, `with`,
-/// `round`, `withPlainTime`, and the AddZonedDateTime intermediate.
+/// `round`, `withPlainTime`, the AddZonedDateTime intermediate, and the
+/// Duration relativeTo machinery.
 #[allow(clippy::too_many_arguments)]
-fn wall_to_epoch_ns(
+pub(super) fn wall_to_epoch_ns(
     tz: &str,
     y: i64,
     m: i64,
@@ -2105,7 +2112,13 @@ fn zoned_calendar_field(agent: &mut Agent, this: &Value, name: &str) -> Result<V
             (tomorrow - today) as f64 / iso::NS_PER_HOUR as f64,
         ));
     }
-    calendar_field_value(local.0, local.1, local.2, name)
+    calendar_field_value(
+        &super::temporal_calendar_id(agent, this).to_string_lossy(),
+        local.0,
+        local.1,
+        local.2,
+        name,
+    )
 }
 
 fn zoned_to_instant(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
@@ -2608,16 +2621,19 @@ fn read_zoned_with_fields(
 /// behaviours disambiguate the zone's possible instants; "prefer" returns
 /// the given offset when it is one of the possible instants and otherwise
 /// falls back to the disambiguation; "reject" throws when the given offset
-/// is not a possible instant. `match_minute` is irrelevant because both the
-/// string offset and the zone's offsets are minute multiples or coarser.
+/// is not a possible instant. `match_minutes` (a string parse, spec 6.5.1)
+/// accepts a possible instant whose offset rounds to the given offset at
+/// minute precision — a sub-minute zone offset like -06:36:36 matches the
+/// string offset -06:36.
 #[allow(clippy::too_many_arguments)]
-fn interpret_iso_date_time_offset(
+pub(super) fn interpret_iso_date_time_offset(
     dt: [i64; 9],
     tz: &str,
     offset_ns: Option<i128>,
     has_z: bool,
     offset_opt: &str,
     disambiguation: &str,
+    match_minutes: bool,
 ) -> Result<i128, JsError> {
     let utc_wall = iso::get_utc_epoch_nanoseconds(
         dt[0], dt[1], dt[2], dt[3], dt[4], dt[5], dt[6], dt[7], dt[8],
@@ -2655,18 +2671,28 @@ fn interpret_iso_date_time_offset(
         check_balanced_range(epoch)?;
         return Ok(epoch);
     }
-    // offsetBehaviour option: the given offset wins when it is one of the
-    // possible instants; "prefer" then falls back to the disambiguation and
-    // "reject" throws.
+    // offsetBehaviour option: the given offset wins when it matches one of
+    // the possible instants (match-minutes accepts a minute-rounded offset
+    // for a sub-minute zone); "prefer" then falls back to the disambiguation
+    // and "reject" throws.
     check_iso_days_range(iso::iso_date_to_epoch_days(dt[0], dt[1] - 1, dt[2]))?;
     let given = offset_ns.unwrap();
-    let candidate = utc_wall - given;
     let possible = possible_instants_for_wall(
         tz, dt[0], dt[1], dt[2], dt[3], dt[4], dt[5], dt[6], dt[7], dt[8],
     )?;
-    if possible.contains(&candidate) {
-        check_balanced_range(candidate)?;
-        return Ok(candidate);
+    for p in &possible {
+        let candidate_offset = utc_wall - p;
+        if candidate_offset == given
+            || (match_minutes
+                && iso::round_number_to_increment(
+                    candidate_offset,
+                    60 * 1_000_000_000,
+                    RoundingMode::HalfExpand,
+                ) == given)
+        {
+            check_balanced_range(*p)?;
+            return Ok(*p);
+        }
     }
     if offset_opt == "reject" {
         return Err(JsError::new(
@@ -2703,6 +2729,18 @@ fn check_balanced_range(epoch: i128) -> Result<(), JsError> {
         ));
     }
     Ok(())
+}
+
+/// Whether an offset string specifies seconds (spec 6.5.2: a second
+/// MinuteSecond Parse Node makes the offset match-exactly rather than
+/// match-minutes).
+pub(super) fn offset_string_has_seconds(text: &str) -> bool {
+    let digits = text.trim_start_matches(['+', '-']);
+    if digits.contains(':') {
+        digits.matches(':').count() >= 2
+    } else {
+        digits.len() > 4
+    }
 }
 
 /// spec 6.5.2 ToTemporalZonedDateTime: records, strings (ZonedDateTimeString),
@@ -2788,6 +2826,7 @@ pub fn to_zoned(agent: &mut Agent, item: &Value, options: &Value) -> Result<Valu
             parsed.tz.z,
             &offset_opt,
             &disambiguation,
+            !offset_string_has_seconds(&parsed.tz.offset_string),
         )?;
         let value = create_temporal_object(
             agent,
@@ -2848,6 +2887,7 @@ pub fn to_zoned(agent: &mut Agent, item: &Value, options: &Value) -> Result<Valu
             false,
             &offset_opt,
             &disambiguation,
+            false,
         )?;
         let value = create_temporal_object(
             agent,
@@ -4147,6 +4187,7 @@ fn zoned_with(
         false,
         &offset_opt,
         &disambiguation,
+        false,
     )?;
     create_zoned(agent, epoch, &tz)
 }
@@ -4232,6 +4273,21 @@ fn zoned_add_subtract(
     // at the wrong point (test262 subtract/dst.js) — and the time parts add
     // to the resulting instant.
     let internal = super::to_internal_duration_record(&duration);
+    // spec 6.5.5 AddZonedDateTime step 1: a duration with no date units adds
+    // directly to the instant (AddInstant). Wall arithmetic would re-resolve
+    // the wall time across a transition — subtracting 1s from an instant at a
+    // transition would land on the wrong side (test262 getTimeZoneTransition/
+    // subtract-second-and-nanosecond-from-last-transition.js).
+    if internal.date.iter().all(|&d| d == 0.0) {
+        let end_ns = ns + internal.time;
+        if !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&end_ns) {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "result is out of range".into(),
+            ));
+        }
+        return create_zoned(agent, end_ns, &tz);
+    }
     // AddZonedDateTime: CalendarDateAdd on the local date (the days fold into
     // the calendar add), then GetEpochNanosecondsFor for the new wall time.
     let local = zoned_local(agent, ns, &tz)?;
@@ -4375,7 +4431,15 @@ fn zoned_round(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
             local.0, local.1, local.2, local.3, local.4, local.5, local.6, local.7, local.8,
         ];
         let rounded = round_iso_date_time(dt, rounding_increment, smallest, rounding_mode)?;
-        interpret_iso_date_time_offset(rounded, &tz, Some(offset), false, "prefer", "compatible")?
+        interpret_iso_date_time_offset(
+            rounded,
+            &tz,
+            Some(offset),
+            false,
+            "prefer",
+            "compatible",
+            false,
+        )?
     };
     create_zoned(agent, epoch, &tz)
 }
@@ -4400,7 +4464,7 @@ fn zoned_until_since(
             "calendars must match".into(),
         ));
     }
-    let (ons, _) = match require_record(agent, &other, RecordKind::ZonedDateTime)? {
+    let (ons, ons_tz) = match require_record(agent, &other, RecordKind::ZonedDateTime)? {
         TemporalRecord::ZonedDateTime(ns, tz) => (ns, tz.to_string_lossy()),
         _ => unreachable!(),
     };
@@ -4435,6 +4499,16 @@ fn zoned_until_since(
         UnitOption::Unset | UnitOption::Auto => default_largest,
         UnitOption::Unit(u) => u,
     };
+    // spec 6.5.9: different time zones are only comparable in time units;
+    // the identifiers are canonicalized at creation (spec 11.1.15
+    // TimeZoneEquals — test262 canonicalize-iana-identifiers-before-
+    // comparing).
+    if largest.category() == iso::Category::Date && tz != ons_tz {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "time zones must match".into(),
+        ));
+    }
     if iso::larger_of_two_units(largest, smallest) != largest {
         return Err(JsError::new(
             ErrorKind::RangeError,
@@ -4453,7 +4527,10 @@ fn zoned_until_since(
         smallest,
         rounding_mode,
     )?;
-    let mut fields = super::temporal_duration_from_internal(diff.date, diff.time, largest)?;
+    // spec 6.5.9 step 9: the result balances up to hours, not the settings
+    // largestUnit (24 hours does not become 1 day in a 25-hour day — test262
+    // dst-balancing-result.js).
+    let mut fields = super::temporal_duration_from_internal(diff.date, diff.time, Unit::Hour)?;
     if since {
         fields = super::negate_duration(&fields);
     }
@@ -5276,7 +5353,13 @@ fn plain_date_equals(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<
 /// ISO): era/eraYear are undefined for iso8601.
 fn plain_date_calendar_field(agent: &Agent, this: &Value, name: &str) -> Result<Value, JsError> {
     let [y, m, d, ..] = require_date(agent, this)?;
-    calendar_field_value(y, m, d, name)
+    calendar_field_value(
+        &super::temporal_calendar_id(agent, this).to_string_lossy(),
+        y,
+        m,
+        d,
+        name,
+    )
 }
 
 /// The ISO calendar's derived PlainDateTime getters (computed from the date
@@ -5290,16 +5373,56 @@ fn plain_date_time_calendar_field(
         TemporalRecord::PlainDateTime(dt) => dt,
         _ => unreachable!(),
     };
-    calendar_field_value(dt[0], dt[1], dt[2], name)
+    calendar_field_value(
+        &super::temporal_calendar_id(agent, this).to_string_lossy(),
+        dt[0],
+        dt[1],
+        dt[2],
+        name,
+    )
 }
 
-fn calendar_field_value(y: i64, m: i64, d: i64, name: &str) -> Result<Value, JsError> {
+fn calendar_field_value(
+    calendar: &str,
+    y: i64,
+    m: i64,
+    d: i64,
+    name: &str,
+) -> Result<Value, JsError> {
     let value = match name {
-        "era" | "eraYear" => Value::Undefined,
+        "era" | "eraYear" => {
+            // The gregory calendar names the ISO years CE/BCE (the corpus's
+            // construct-non-utc-non-iso.js pins the "ce" era for 1976); the
+            // other calendars' era surfaces need their calendar arithmetic
+            // and stay undefined here.
+            if calendar == "gregory" {
+                if y < 1 {
+                    if name == "era" {
+                        Value::String(Handle::new(JsString::from_utf8("bce")))
+                    } else {
+                        Value::Number((1 - y) as f64)
+                    }
+                } else if name == "era" {
+                    Value::String(Handle::new(JsString::from_utf8("ce")))
+                } else {
+                    Value::Number(y as f64)
+                }
+            } else {
+                Value::Undefined
+            }
+        }
         "dayOfWeek" => Value::Number(iso::iso_day_of_week(y, m, d) as f64),
         "dayOfYear" => Value::Number(iso::iso_day_of_year(y, m, d) as f64),
-        "weekOfYear" => Value::Number(iso_week_of_year(y, m, d).0 as f64),
-        "yearOfWeek" => Value::Number(iso_week_of_year(y, m, d).1 as f64),
+        // The week fields are defined for the iso8601 calendar only; the
+        // other calendars' weekOfYear/yearOfWeek are undefined (the corpus's
+        // construct-non-utc-non-iso.js pins gregory's undefined).
+        "weekOfYear" | "yearOfWeek" => {
+            if calendar == "iso8601" {
+                Value::Number(iso_week_of_year(y, m, d).0 as f64)
+            } else {
+                Value::Undefined
+            }
+        }
         "monthsInYear" => Value::Number(12.0),
         "daysInWeek" => Value::Number(7.0),
         "daysInMonth" => Value::Number(iso::days_in_month(y, m) as f64),
@@ -5315,8 +5438,25 @@ fn year_month_calendar_field(agent: &Agent, this: &Value, name: &str) -> Result<
         TemporalRecord::YearMonth(ym) => ym,
         _ => unreachable!(),
     };
+    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
     let value = match name {
-        "era" | "eraYear" => Value::Undefined,
+        "era" | "eraYear" => {
+            if calendar == "gregory" {
+                if y < 1 {
+                    if name == "era" {
+                        Value::String(Handle::new(JsString::from_utf8("bce")))
+                    } else {
+                        Value::Number((1 - y) as f64)
+                    }
+                } else if name == "era" {
+                    Value::String(Handle::new(JsString::from_utf8("ce")))
+                } else {
+                    Value::Number(y as f64)
+                }
+            } else {
+                Value::Undefined
+            }
+        }
         "daysInMonth" => Value::Number(iso::days_in_month(y, m) as f64),
         "daysInYear" => Value::Number(if iso::is_leap_year(y) { 366.0 } else { 365.0 }),
         "monthsInYear" => Value::Number(12.0),
@@ -6424,7 +6564,8 @@ mod tests {
                 None,
                 false,
                 "reject",
-                "compatible"
+                "compatible",
+                true
             )
             .unwrap(),
             wall_epoch(2020, 3, 8, 10, 30)
@@ -6438,6 +6579,7 @@ mod tests {
                 false,
                 "prefer",
                 "compatible",
+                true,
             )
             .unwrap(),
             wall_epoch(2020, 3, 8, 10, 30)
@@ -6451,6 +6593,7 @@ mod tests {
                 false,
                 "reject",
                 "compatible",
+                true,
             )
             .is_err()
         );
@@ -6464,6 +6607,7 @@ mod tests {
                 false,
                 "prefer",
                 "compatible",
+                true,
             )
             .unwrap(),
             wall_epoch(2020, 11, 1, 9, 30)

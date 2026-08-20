@@ -718,7 +718,7 @@ pub fn temporal_instant_to_string(
     precision: FracPrecision,
 ) -> Result<String, JsError> {
     let output_time_zone = time_zone.unwrap_or("UTC");
-    let offset = super::offset_time_zone_offset_ns(output_time_zone)
+    let offset = super::offset_ns_at(output_time_zone, ns)
         .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
     let (y, m, d, h, min, s, ms, us, ns_rest) = iso::iso_parts_from_epoch(ns);
     let balanced = balance_iso_date_time(

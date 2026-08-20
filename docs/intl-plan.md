@@ -15,9 +15,14 @@ Segmenter, DurationFormat). Cut 9 (the intl402/Temporal integration) is in
 flight: the Temporal×DateTimeFormat integration (format/toLocaleString on
 Temporal values, the [[Calendar]] slots, the un-skipped intl402 gate) is
 committed; the **time-zone data decision is made** (corpus-derived tables,
-spike validated — see `docs/tz-data-decision.md`); the remaining work is the
-DST-aware Temporal algorithms (add/subtract/round/with, property-bag
-disambiguation, Duration relativeTo) and the non-iso calendar data.
+spike validated — see `docs/tz-data-decision.md`). The DST-aware Temporal
+algorithms are done (the wall→instant resolver + disambiguation in
+`temporal/shell.rs`, AddZonedDateTime/AddInstant, zoned round/with/until/
+since, getTimeZoneTransition with strictly-before previous semantics, and
+the Duration `relativeTo`/difference/total machinery — the 116-fixture tz
+cluster is 116/116); the remaining work is the non-iso calendar data
+(era/eraYear beyond gregory, calendar arithmetic) and the surrounding
+intl402/Temporal fixtures it unblocks.
 
 ## 1. The fixture surface (measured)
 

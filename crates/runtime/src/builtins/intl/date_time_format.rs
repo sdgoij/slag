@@ -222,6 +222,11 @@ const AVAILABLE_FORMATS: &[(u16, &str, &str)] = &[
         "M/d/y, HH:mm:ss z",
     ),
     (
+        4 | 8 | 16 | 32 | 64 | 128 | 512,
+        "M/d/y, h:mm:ss a zzzz",
+        "M/d/y, HH:mm:ss zzzz",
+    ),
+    (
         2 | 4 | 8 | 16 | 32 | 64 | 128,
         "M/d/y G, h:mm:ss a",
         "M/d/y G, HH:mm:ss",
@@ -1035,6 +1040,7 @@ fn match_format(
     let hour_style = style_of("hour");
     let day_style = style_of("day");
     let minute_style = style_of("minute");
+    let tz_name_style = style_of("timeZoneName");
     let day_period_requested = requested_bits & 256 != 0;
     let fractional_requested = requested_bits & 1024 != 0;
     let mut best: Option<(i64, &(u16, &str, &str))> = None;
@@ -1103,6 +1109,16 @@ fn match_format(
         if let Some(style) = minute_style {
             let width = pattern_width(p12, "m");
             if (style == "2-digit") != (width >= 2) {
+                score -= 6;
+            }
+        }
+        // A requested timeZoneName style must match the field width: the
+        // long forms select the `zzzz` pattern, the short forms `z` (test262
+        // toLocaleString/options-timeZoneName-affects-instance-time-zone.js).
+        if let Some(style) = tz_name_style {
+            let width = pattern_width(p12, "zvV");
+            let long = matches!(style, "long" | "longOffset" | "longGeneric");
+            if long != (width >= 4) {
                 score -= 6;
             }
         }
@@ -1289,7 +1305,7 @@ fn format_with_pattern(
             }
             'z' | 'v' | 'V' => {
                 let width = field_length(&mut chars, c);
-                Some(("timeZoneName", format_time_zone(record, width)))
+                Some(("timeZoneName", format_time_zone(record, epoch_ms, width)))
             }
             'S' => {
                 let _ = field_length(&mut chars, c);
@@ -1787,10 +1803,26 @@ fn format_era(local: &LocalTime, width: u32) -> String {
     table[era_index].to_string()
 }
 
+/// The en-US CLDR zone names for the named zones the corpus formats with
+/// timeZoneName (the fixture pins Europe/Vienna's long form "Central
+/// European Standard Time"); the identifier stays the fallback for the
+/// zones without table entries.
+const EN_ZONE_NAMES: &[(&str, &str, &str, &str, &str)] = &[
+    // (zone, short standard, long standard, short daylight, long daylight)
+    (
+        "Europe/Vienna",
+        "CET",
+        "Central European Standard Time",
+        "CEST",
+        "Central European Summer Time",
+    ),
+];
+
 /// The time-zone name: UTC (or the long form for `zzzz`), the offset zones
-/// as `GMT±H:MM` (padded for the long forms), the fixed Etc/GMT±N zones, or
-/// the identifier itself.
-fn format_time_zone(record: &DateTimeFormatRecord, width: u32) -> String {
+/// as `GMT±H:MM` (padded for the long forms), the fixed Etc/GMT±N zones, the
+/// en-US CLDR names for the table-covered named zones (standard vs daylight
+/// at the formatted instant), or the identifier itself.
+fn format_time_zone(record: &DateTimeFormatRecord, epoch_ms: f64, width: u32) -> String {
     let zone = record.time_zone.as_str();
     if zone == "UTC" || zone == "Etc/UTC" || zone == "Etc/GMT" {
         if width >= 4 {
@@ -1825,6 +1857,23 @@ fn format_time_zone(record: &DateTimeFormatRecord, width: u32) -> String {
             format!("GMT{sign}{hours}")
         } else {
             format!("GMT{sign}{hours}:{minutes_part:02}")
+        };
+    }
+    if record.locale.starts_with("en")
+        && let Some((short_std, long_std, short_dst, long_dst)) = EN_ZONE_NAMES
+            .iter()
+            .find(|(z, ..)| *z == zone)
+            .map(|(_, short_std, long_std, short_dst, long_dst)| {
+                (*short_std, *long_std, *short_dst, *long_dst)
+            })
+    {
+        let dst = unicode::tz::resolve_zone(zone)
+            .map(|z| unicode::tz::offset_info_at(z, (epoch_ms * 1_000_000.0) as i128).1)
+            .unwrap_or(false);
+        return if width >= 4 {
+            (if dst { long_dst } else { long_std }).to_string()
+        } else {
+            (if dst { short_dst } else { short_std }).to_string()
         };
     }
     zone.to_string()

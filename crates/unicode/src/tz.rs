@@ -69,13 +69,16 @@ pub fn next_transition(zone: usize, epoch_ns: i128) -> Option<TzTransition> {
     None
 }
 
-/// The latest transition at or before the instant that changes the offset
+/// The latest transition strictly before the instant that changes the offset
 /// (GetNamedTimeZonePreviousTransition, with the same offset-preserving
-/// filter).
+/// filter). A transition at exactly the starting instant does not count —
+/// starting from a transition instant must yield the one before it (test262
+/// getTimeZoneTransition/nanoseconds-subtracted-or-added-at-dst-transition.js,
+/// result-type.js).
 pub fn previous_transition(zone: usize, epoch_ns: i128) -> Option<TzTransition> {
     let z = &ZONES[zone];
     let ts = z.transitions;
-    let mut i = ts.partition_point(|t| t.at_secs as i128 * NS_PER_SEC <= epoch_ns);
+    let mut i = ts.partition_point(|t| t.at_secs as i128 * NS_PER_SEC < epoch_ns);
     while i > 0 {
         let offset_before = if i - 1 == 0 {
             z.initial_offset
@@ -185,5 +188,31 @@ mod tests {
         assert_eq!(primary_identifier(zone("US/Eastern")), "America/New_York");
         assert!(resolve_zone("Etc/GMT+24").is_none());
         assert!(resolve_zone("Not/AZone").is_none());
+    }
+
+    #[test]
+    fn previous_transition_is_strictly_before() {
+        // Berlin's 2021-03-28T01:00:00Z spring-forward: the previous
+        // transition from the transition instant itself (and one ns before)
+        // is the 2020-10-25 fall-back, not the same transition (test262
+        // nanoseconds-subtracted-or-added-at-dst-transition.js); one ns
+        // after the transition, the transition itself is the previous one.
+        let spring = 1_616_893_200; // 2021-03-28T01:00:00Z
+        let fall_back = 1_603_587_600; // 2020-10-25T01:00:00Z
+        let zone = zone("Europe/Berlin");
+        for ns in [spring, spring - 1] {
+            assert_eq!(
+                previous_transition(zone, ns as i128 * NS_PER_SEC)
+                    .unwrap()
+                    .at_secs,
+                fall_back
+            );
+        }
+        assert_eq!(
+            previous_transition(zone, (spring + 1) as i128 * NS_PER_SEC)
+                .unwrap()
+                .at_secs,
+            spring
+        );
     }
 }
