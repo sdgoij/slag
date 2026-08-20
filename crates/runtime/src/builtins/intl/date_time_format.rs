@@ -2861,7 +2861,16 @@ pub(crate) fn plain_to_locale_string(
 ) -> Result<String, JsError> {
     let record = initialize(agent, locales, options, required, defaults)?;
     let calendar = crate::builtins::temporal::temporal_calendar_id(agent, value).to_string_lossy();
-    if calendar != "iso8601" && calendar != record.calendar {
+    // PlainDate/PlainDateTime/PlainTime (like ZonedDateTime) format an
+    // iso8601 value in the locale calendar; PlainYearMonth/PlainMonthDay
+    // require an exact calendar match (test262
+    // toLocaleString/calendar-mismatch.js).
+    let iso_exception = calendar == "iso8601"
+        && matches!(
+            kind,
+            PlainKind::Date | PlainKind::DateTime | PlainKind::Time
+        );
+    if !iso_exception && calendar != record.calendar {
         return Err(range_error("calendar does not match the locale calendar"));
     }
     let format_value = handle_datetime_value(agent, value, &record.calendar)?

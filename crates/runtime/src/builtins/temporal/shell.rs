@@ -769,6 +769,35 @@ fn field_number(
     Ok(Value::Number(value as f64))
 }
 
+/// The calendar-aware `year` getter: the linear calendars the corpus
+/// exercises convert the ISO year (roc offsets by 1911; gregory and
+/// japanese keep it), the rest return the ISO year.
+fn calendar_year_getter(
+    agent: &mut Agent,
+    this: &Value,
+    kind: RecordKind,
+) -> Result<Value, JsError> {
+    let record = require_record(agent, this, kind)?;
+    let iso_year = match (&record, kind) {
+        (TemporalRecord::PlainDate(d), RecordKind::PlainDate) => d[0],
+        (TemporalRecord::PlainDateTime(dt), RecordKind::PlainDateTime) => dt[0],
+        (TemporalRecord::YearMonth(ym), RecordKind::YearMonth) => ym[0],
+        (TemporalRecord::ZonedDateTime(ns, tz), RecordKind::ZonedDateTime) => {
+            zoned_local(agent, *ns, &tz.to_string_lossy())?.0
+        }
+        _ => {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "brand check failed".into(),
+            ));
+        }
+    };
+    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
+    Ok(Value::Number(
+        calendar_year_fields(&calendar, iso_year).0 as f64,
+    ))
+}
+
 pub fn dispatch_call(
     agent: &mut Agent,
     callee: &Value,
@@ -796,7 +825,7 @@ pub fn dispatch_call(
     // Field getters.
     let field = |name: &str| intrinsics.get(name).as_ref() == Some(callee);
     if field("%Temporal.PlainDate.prototype.year%") {
-        return Some(field_number(agent, this, RecordKind::PlainDate, 0));
+        return Some(calendar_year_getter(agent, this, RecordKind::PlainDate));
     }
     if field("%Temporal.PlainDate.prototype.month%") {
         return Some(field_number(agent, this, RecordKind::PlainDate, 1));
@@ -848,6 +877,9 @@ pub fn dispatch_call(
     }
     if field("%Temporal.ZonedDateTime.prototype.epochMilliseconds%") {
         return Some(zoned_epoch_ms(agent, this));
+    }
+    if field("%Temporal.ZonedDateTime.prototype.year%") {
+        return Some(calendar_year_getter(agent, this, RecordKind::ZonedDateTime));
     }
     for (idx, name) in [
         (0, "year"),
@@ -915,6 +947,9 @@ pub fn dispatch_call(
         if field(key) {
             return Some(zoned_calendar_field(agent, this, name));
         }
+    }
+    if field("%Temporal.PlainDateTime.prototype.year%") {
+        return Some(calendar_year_getter(agent, this, RecordKind::PlainDateTime));
     }
     for (idx, name) in [
         (0, "year"),
@@ -992,7 +1027,7 @@ pub fn dispatch_call(
     }
     // PlainYearMonth getters.
     if field("%Temporal.PlainYearMonth.prototype.year%") {
-        return Some(field_number(agent, this, RecordKind::YearMonth, 0));
+        return Some(calendar_year_getter(agent, this, RecordKind::YearMonth));
     }
     if field("%Temporal.PlainYearMonth.prototype.month%") {
         return Some(field_number(agent, this, RecordKind::YearMonth, 1));
@@ -2192,6 +2227,7 @@ pub fn to_plain_date_with_options(
                 _ => year = Some(super::to_integer_with_truncation(agent, &value)?),
             }
         }
+        let year = read_era_fields(agent, item, calendar.as_deref(), year, true)?;
         let options = super::get_options_object(options)?;
         let constrain =
             super::get_temporal_overflow_option(agent, &options)? == Overflow::Constrain;
@@ -2411,6 +2447,7 @@ pub fn to_plain_date_time(
         // read in ascending code point order (PrepareCalendarFields complete).
         let calendar = read_bag_calendar(agent, item)?;
         let (year, month, month_code, day, t) = read_date_time_fields(agent, item, false)?;
+        let year = read_era_fields(agent, item, calendar.as_deref(), year, true)?;
         let opts = super::get_options_object(options)?;
         let constrain = super::get_temporal_overflow_option(agent, &opts)? == Overflow::Constrain;
         let (y, m, d) = resolve_date_fields(year, month, month_code, day, constrain)?;
@@ -2840,7 +2877,8 @@ pub fn to_zoned(agent: &mut Agent, item: &Value, options: &Value) -> Result<Valu
         // Property bag: the calendar, then the fields in ascending code point
         // order (the time zone is required), then the options.
         let calendar = read_bag_calendar(agent, item)?;
-        let fields = read_zoned_fields(agent, item)?;
+        let mut fields = read_zoned_fields(agent, item)?;
+        fields.year = read_era_fields(agent, item, calendar.as_deref(), fields.year, true)?;
         let Some(tz) = fields.time_zone else {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -4231,6 +4269,7 @@ fn zoned_with_plain_time(
 }
 
 /// spec 6.5.7 `withTimeZone` (keeps the instant, changes the zone).
+/// spec 6.5.7 `withTimeZone` (the result keeps the instance's calendar).
 fn zoned_with_time_zone(
     agent: &mut Agent,
     this: &Value,
@@ -4238,7 +4277,10 @@ fn zoned_with_time_zone(
 ) -> Result<Value, JsError> {
     let (ns, _) = zoned_parts(agent, this)?;
     let tz = super::instant::to_temporal_time_zone_identifier(agent, &time_zone)?;
-    create_zoned(agent, ns, &tz)
+    let value = create_zoned(agent, ns, &tz)?;
+    let calendar = super::temporal_calendar_id(agent, this);
+    super::set_temporal_calendar(agent, &value, Some(&calendar.to_string_lossy()));
+    Ok(value)
 }
 
 /// spec 6.5.8 `withCalendar`.
@@ -4589,11 +4631,14 @@ fn zoned_get_time_zone_transition(
     create_zoned(agent, at_secs as i128 * 1_000_000_000, &tz)
 }
 
-/// spec 6.5.17 `toPlainDate`.
+/// spec 6.5.17 `toPlainDate` (the result keeps the instance's calendar).
 fn zoned_to_plain_date(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     let (ns, tz) = zoned_parts(agent, this)?;
     let local = zoned_local(agent, ns, &tz)?;
-    create_plain_date(agent, (local.0, local.1, local.2), &Value::Undefined)
+    let value = create_plain_date(agent, (local.0, local.1, local.2), &Value::Undefined)?;
+    let calendar = super::temporal_calendar_id(agent, this);
+    super::set_temporal_calendar(agent, &value, Some(&calendar.to_string_lossy()));
+    Ok(value)
 }
 
 /// spec 6.5.18 `toPlainTime`.
@@ -4876,6 +4921,135 @@ fn read_month_code(agent: &mut Agent, value: &Value) -> Result<String, JsError> 
         ));
     }
     Ok(code)
+}
+
+/// Whether the calendar has eras (Intl.Era-monthcode): iso8601, chinese, and
+/// dangi ignore era/eraYear fields entirely (test262
+/// from/calendar-not-supporting-eras.js).
+fn calendar_uses_eras(calendar: &str) -> bool {
+    !matches!(calendar, "iso8601" | "chinese" | "dangi")
+}
+
+/// The canonical era code of an input era string for a calendar (the
+/// temporalHelpers CalendarEras table; the ad/bc aliases fold to ce/bce).
+/// `None` when the era is not valid for the calendar.
+fn canonical_era(calendar: &str, era: &str) -> Option<&'static str> {
+    let valid: &[&str] = match calendar {
+        "buddhist" => &["be"],
+        "coptic" => &["am"],
+        "ethioaa" => &["aa"],
+        "ethiopic" => &["aa", "am"],
+        "gregory" => &["ce", "bce"],
+        "hebrew" => &["am"],
+        "indian" => &["shaka"],
+        "islamic-civil" | "islamic-tbla" | "islamic-umalqura" => &["ah", "bh"],
+        "japanese" => &["ce", "bce", "meiji", "taisho", "showa", "heisei", "reiwa"],
+        "persian" => &["ap"],
+        "roc" => &["roc", "broc"],
+        _ => return None,
+    };
+    let folded = era.to_ascii_lowercase();
+    let canonical = match folded.as_str() {
+        "ad" => "ce",
+        "bc" => "bce",
+        other => other,
+    };
+    if valid.contains(&canonical) {
+        Some(match canonical {
+            "ce" => "ce",
+            "bce" => "bce",
+            "be" => "be",
+            "am" => "am",
+            "aa" => "aa",
+            "shaka" => "shaka",
+            "ah" => "ah",
+            "bh" => "bh",
+            "meiji" => "meiji",
+            "taisho" => "taisho",
+            "showa" => "showa",
+            "heisei" => "heisei",
+            "reiwa" => "reiwa",
+            "ap" => "ap",
+            "roc" => "roc",
+            "broc" => "broc",
+            _ => unreachable!(),
+        })
+    } else {
+        None
+    }
+}
+
+/// Read the `era` and `eraYear` bag fields (PrepareCalendarFields): both or
+/// neither must be present (a TypeError otherwise), the era must be valid for
+/// the calendar (a RangeError), and eraYear must be a finite integer (a
+/// RangeError — the corpus's `eraYear: Infinity` fixtures). When the calendar
+/// does not use eras the fields are ignored if `year` is present (a TypeError
+/// when they would replace the absent `year` and the caller needs one — a
+/// PlainMonthDay.from accepts a month-day without a year, so era/eraYear are
+/// simply ignored there). Returns the resolved ISO year when era/eraYear
+/// replace the absent `year`.
+pub(super) fn read_era_fields(
+    agent: &mut Agent,
+    bag: &Value,
+    calendar: Option<&str>,
+    year: Option<i64>,
+    year_required: bool,
+) -> Result<Option<i64>, JsError> {
+    let cal = calendar.unwrap_or("iso8601");
+    let mut era: Option<String> = None;
+    let mut era_year: Option<i64> = None;
+    for key in ["era", "eraYear"] {
+        let value =
+            crate::context::get_property(agent, bag, &JsString::from_utf8(key), bag.clone())?;
+        if matches!(value.kind(), ValueKind::Undefined) {
+            continue;
+        }
+        match key {
+            "era" => era = Some(crate::context::to_string(agent, &value)?.to_string_lossy()),
+            _ => era_year = Some(super::to_integer_with_truncation(agent, &value)?),
+        }
+    }
+    match (era, era_year) {
+        (None, None) => Ok(year),
+        (Some(_), None) | (None, Some(_)) => Err(JsError::new(
+            ErrorKind::TypeError,
+            "era and eraYear must both be provided".into(),
+        )),
+        (Some(e), Some(ey)) => {
+            if !calendar_uses_eras(cal) {
+                if year.is_none() && year_required {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "era and eraYear cannot replace year".into(),
+                    ));
+                }
+                return Ok(year);
+            }
+            let Some(canonical) = canonical_era(cal, &e) else {
+                return Err(JsError::new(
+                    ErrorKind::RangeError,
+                    format!("invalid era {e} for calendar {cal}"),
+                ));
+            };
+            if let Some(y) = year {
+                return Ok(Some(y));
+            }
+            if !year_required {
+                return Ok(year);
+            }
+            // The linear ce/bce rule the corpus exercises (gregory, and
+            // japanese before the Meiji-era boundary); the remaining era
+            // codes need their calendar's era-year conversion.
+            match canonical {
+                "ce" => Ok(Some(ey)),
+                "bce" => Ok(Some(1 - ey)),
+                _ => Err(JsError::new(
+                    ErrorKind::RangeError,
+                    format!("{canonical} era-year conversion is not supported"),
+                )),
+            }
+        }
+    }
 }
 
 /// PrepareCalendarFields(calendar, bag, «year, month, monthCode, day», [],
@@ -5311,27 +5485,33 @@ fn plain_date_to_zoned_date_time(
 }
 
 /// spec 3.5.5 `toPlainYearMonth` (CalendarYearMonthFromFields for iso8601:
-/// the reference day is 1).
+/// the reference day is 1; the result keeps the instance's calendar).
 fn plain_date_to_plain_year_month(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     let [y, m, ..] = require_date(agent, this)?;
-    create_temporal_object(
+    let value = create_temporal_object(
         agent,
         &Value::Undefined,
         PLAIN_YEAR_MONTH_PROTO,
         TemporalRecord::YearMonth([y, m, 1]),
-    )
+    )?;
+    let calendar = super::temporal_calendar_id(agent, this);
+    super::set_temporal_calendar(agent, &value, Some(&calendar.to_string_lossy()));
+    Ok(value)
 }
 
 /// spec 3.5.6 `toPlainMonthDay` (CalendarMonthDayFromFields for iso8601: the
-/// 1972 reference year).
+/// 1972 reference year; the result keeps the instance's calendar).
 fn plain_date_to_plain_month_day(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     let [_, m, d, ..] = require_date(agent, this)?;
-    create_temporal_object(
+    let value = create_temporal_object(
         agent,
         &Value::Undefined,
         PLAIN_MONTH_DAY_PROTO,
         TemporalRecord::MonthDay([1972, m, d]),
-    )
+    )?;
+    let calendar = super::temporal_calendar_id(agent, this);
+    super::set_temporal_calendar(agent, &value, Some(&calendar.to_string_lossy()));
+    Ok(value)
 }
 
 /// spec 3.5.10 `equals`.
@@ -5382,6 +5562,32 @@ fn plain_date_time_calendar_field(
     )
 }
 
+/// The calendar year/era/eraYear of an ISO year for the linear-era
+/// calendars the corpus exercises: gregory and japanese (pre-Meiji/BCE)
+/// keep the ISO year with the ce/bce eras, roc offsets by 1911 (broc for
+/// years before 1). The other calendars report era None here (their era
+/// surfaces need their calendar arithmetic).
+fn calendar_year_fields(calendar: &str, iso_year: i64) -> (i64, Option<&'static str>, Option<i64>) {
+    match calendar {
+        "roc" => {
+            let year = iso_year - 1911;
+            if year < 1 {
+                (year, Some("broc"), Some(1 - year))
+            } else {
+                (year, Some("roc"), Some(year))
+            }
+        }
+        "gregory" | "japanese" => {
+            if iso_year < 1 {
+                (iso_year, Some("bce"), Some(1 - iso_year))
+            } else {
+                (iso_year, Some("ce"), Some(iso_year))
+            }
+        }
+        _ => (iso_year, None, None),
+    }
+}
+
 fn calendar_field_value(
     calendar: &str,
     y: i64,
@@ -5389,28 +5595,17 @@ fn calendar_field_value(
     d: i64,
     name: &str,
 ) -> Result<Value, JsError> {
+    let (cal_year, era, era_year) = calendar_year_fields(calendar, y);
     let value = match name {
-        "era" | "eraYear" => {
-            // The gregory calendar names the ISO years CE/BCE (the corpus's
-            // construct-non-utc-non-iso.js pins the "ce" era for 1976); the
-            // other calendars' era surfaces need their calendar arithmetic
-            // and stay undefined here.
-            if calendar == "gregory" {
-                if y < 1 {
-                    if name == "era" {
-                        Value::String(Handle::new(JsString::from_utf8("bce")))
-                    } else {
-                        Value::Number((1 - y) as f64)
-                    }
-                } else if name == "era" {
-                    Value::String(Handle::new(JsString::from_utf8("ce")))
-                } else {
-                    Value::Number(y as f64)
-                }
-            } else {
-                Value::Undefined
-            }
-        }
+        "era" => match era {
+            Some(era) => Value::String(Handle::new(JsString::from_utf8(era))),
+            None => Value::Undefined,
+        },
+        "eraYear" => match era_year {
+            Some(era_year) => Value::Number(era_year as f64),
+            None => Value::Undefined,
+        },
+        "year" => Value::Number(cal_year as f64),
         "dayOfWeek" => Value::Number(iso::iso_day_of_week(y, m, d) as f64),
         "dayOfYear" => Value::Number(iso::iso_day_of_year(y, m, d) as f64),
         // The week fields are defined for the iso8601 calendar only; the
@@ -5439,24 +5634,16 @@ fn year_month_calendar_field(agent: &Agent, this: &Value, name: &str) -> Result<
         _ => unreachable!(),
     };
     let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
+    let (_, era, era_year) = calendar_year_fields(&calendar, y);
     let value = match name {
-        "era" | "eraYear" => {
-            if calendar == "gregory" {
-                if y < 1 {
-                    if name == "era" {
-                        Value::String(Handle::new(JsString::from_utf8("bce")))
-                    } else {
-                        Value::Number((1 - y) as f64)
-                    }
-                } else if name == "era" {
-                    Value::String(Handle::new(JsString::from_utf8("ce")))
-                } else {
-                    Value::Number(y as f64)
-                }
-            } else {
-                Value::Undefined
-            }
-        }
+        "era" => match era {
+            Some(era) => Value::String(Handle::new(JsString::from_utf8(era))),
+            None => Value::Undefined,
+        },
+        "eraYear" => match era_year {
+            Some(era_year) => Value::Number(era_year as f64),
+            None => Value::Undefined,
+        },
         "daysInMonth" => Value::Number(iso::days_in_month(y, m) as f64),
         "daysInYear" => Value::Number(if iso::is_leap_year(y) { 366.0 } else { 365.0 }),
         "monthsInYear" => Value::Number(12.0),
@@ -5525,8 +5712,12 @@ fn year_month_to_string_impl(
     let options = super::get_options_object(&options)?;
     let show = get_temporal_show_calendar_name_option(agent, &options)?;
     let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
+    // spec TemporalYearMonthToString: the reference day is shown whenever the
+    // calendarName is always/critical, or the calendar is not iso8601 (it is
+    // required to round-trip the month), independent of the calendarName
+    // option (test262 toString/calendarname-never.js).
     let mut result = format!("{}-{:02}", iso::pad_iso_year(y), m);
-    if show != "never" && (show != "auto" || calendar != "iso8601") {
+    if show == "always" || show == "critical" || calendar != "iso8601" {
         result.push_str(&format!("-{d:02}"));
     }
     let flag = if show == "critical" { "!" } else { "" };
@@ -5550,8 +5741,12 @@ fn month_day_to_string_impl(
     let options = super::get_options_object(&options)?;
     let show = get_temporal_show_calendar_name_option(agent, &options)?;
     let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
+    // spec TemporalMonthDayToString: the reference year is shown whenever the
+    // calendarName is always/critical, or the calendar is not iso8601
+    // (required to round-trip the month-day), independent of the calendarName
+    // option.
     let mut result = format!("{m:02}-{d:02}");
-    if show != "never" && (show != "auto" || calendar != "iso8601") {
+    if show == "always" || show == "critical" || calendar != "iso8601" {
         result = format!("{}-{result}", iso::pad_iso_year(y));
     }
     let flag = if show == "critical" { "!" } else { "" };
@@ -6003,6 +6198,15 @@ fn plain_month_day_with(
     }
     reject_temporal_like_object(agent, &item)?;
     let (pd, pm, pmc, py) = read_month_day_fields(agent, &item, true)?;
+    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
+    // A bare month cannot resolve a non-ISO month-day (test262
+    // prototype/with/fields-missing-properties.js).
+    if calendar != "iso8601" && pm.is_some() && pmc.is_none() && py.is_none() {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "monthCode or year is required for a non-ISO calendar".into(),
+        ));
+    }
     let options = super::get_options_object(&options)?;
     let constrain = super::get_temporal_overflow_option(agent, &options)? == Overflow::Constrain;
     // CalendarMergeFields for iso8601 over {monthCode, day}; the reference
@@ -6066,16 +6270,21 @@ fn plain_month_day_to_plain_date(
             "argument should be an object".into(),
         ));
     }
+    let calendar = super::temporal_calendar_id(agent, this);
     let value =
         crate::context::get_property(agent, &item, &JsString::from_utf8("year"), item.clone())?;
     let year = match value.kind() {
-        ValueKind::Undefined => {
-            return Err(JsError::new(
-                ErrorKind::TypeError,
-                "year is required".into(),
-            ));
-        }
-        _ => super::to_integer_with_truncation(agent, &value)?,
+        ValueKind::Undefined => None,
+        _ => Some(super::to_integer_with_truncation(agent, &value)?),
+    };
+    // era/eraYear can supply the absent year (the corpus's toPlainDate
+    // infinity-throws fixture pins eraYear's RangeError).
+    let year = read_era_fields(agent, &item, Some(&calendar.to_string_lossy()), year, true)?;
+    let Some(year) = year else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "year is required".into(),
+        ));
     };
     let (y, m, d) = resolve_date_fields(
         Some(year),
@@ -6084,7 +6293,9 @@ fn plain_month_day_to_plain_date(
         Some(md[2]),
         true,
     )?;
-    create_plain_date(agent, (y, m, d), &Value::Undefined)
+    let value = create_plain_date(agent, (y, m, d), &Value::Undefined)?;
+    super::set_temporal_calendar(agent, &value, Some(&calendar.to_string_lossy()));
+    Ok(value)
 }
 
 /// spec 6.3.1 Temporal.PlainYearMonth (the optional referenceISODay is
@@ -6283,6 +6494,7 @@ pub fn to_plain_year_month(
         // order (PrepareCalendarFields complete).
         let calendar = read_bag_calendar(agent, item)?;
         let (month, month_code, year) = read_year_month_fields(agent, item, false)?;
+        let year = read_era_fields(agent, item, calendar.as_deref(), year, true)?;
         let opts = super::get_options_object(options)?;
         let constrain = super::get_temporal_overflow_option(agent, &opts)? == Overflow::Constrain;
         let (y, m) = resolve_year_month(year, month, month_code, constrain)?;
@@ -6368,6 +6580,20 @@ pub fn to_plain_month_day(
         // order (PrepareCalendarFields complete).
         let calendar = read_bag_calendar(agent, item)?;
         let (day, month, month_code, year) = read_month_day_fields(agent, item, false)?;
+        let year = read_era_fields(agent, item, calendar.as_deref(), year, false)?;
+        // spec: a non-iso8601 calendar needs a monthCode or a year to resolve
+        // the month (the reference year cannot be derived from a bare month
+        // number — test262 from/fields-object.js, fields-underspecified.js).
+        if calendar.as_deref().unwrap_or("iso8601") != "iso8601"
+            && month.is_some()
+            && month_code.is_none()
+            && year.is_none()
+        {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "monthCode or year is required for a non-ISO calendar".into(),
+            ));
+        }
         let opts = super::get_options_object(options)?;
         let constrain = super::get_temporal_overflow_option(agent, &opts)? == Overflow::Constrain;
         let (m, d) = resolve_month_day(year, month, month_code, day, constrain)?;

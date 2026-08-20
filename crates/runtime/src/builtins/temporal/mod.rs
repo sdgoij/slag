@@ -1286,6 +1286,15 @@ fn relative_to_object(agent: &mut Agent, item: &Value) -> Result<RelativeTo, JsE
             ));
         }
     }
+    // The canonical calendar id (None for the iso8601 default) drives the
+    // era-field resolution.
+    let calendar_id = if matches!(calendar.kind(), ValueKind::Undefined) {
+        None
+    } else if let ValueKind::String(text) = calendar.kind() {
+        canonicalize_calendar_id(&text.to_string_lossy())
+    } else {
+        Some(temporal_calendar_id(agent, &calendar).to_string_lossy())
+    };
     // Fields read in sorted property-name order (PrepareCalendarFields).
     let mut year: Option<i64> = None;
     let mut month: Option<i64> = None;
@@ -1359,6 +1368,13 @@ fn relative_to_object(agent: &mut Agent, item: &Value) -> Result<RelativeTo, JsE
     }
     // Resolve monthCode for the ISO calendar (spec 12.3.31).
     let month = resolve_iso_month(month, month_code)?;
+    let year = crate::builtins::temporal::shell::read_era_fields(
+        agent,
+        item,
+        calendar_id.as_deref(),
+        year,
+        true,
+    )?;
     let (Some(year), Some(month), Some(day)) = (year, month, day) else {
         return Err(JsError::new(
             ErrorKind::TypeError,
