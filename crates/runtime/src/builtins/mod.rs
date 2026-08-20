@@ -17,6 +17,7 @@ pub mod disposable;
 pub mod error;
 pub mod function;
 pub mod global;
+pub mod intl;
 pub mod iterator;
 pub mod json;
 pub mod keyed;

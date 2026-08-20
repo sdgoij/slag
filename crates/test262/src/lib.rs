@@ -275,6 +275,10 @@ var $DONE = function (error) {
         Language,
         Builtins,
         AnnexB,
+        /// ECMA-402 (`test/intl402`): swept separately so the existing
+        /// three-area baseline (language/built-ins/annexB) stays stable
+        /// while the Intl work is in flight.
+        Intl402,
     }
 
     impl Area {
@@ -283,6 +287,7 @@ var $DONE = function (error) {
                 Area::Language => "../../test262/test/language",
                 Area::Builtins => "../../test262/test/built-ins",
                 Area::AnnexB => "../../test262/test/annexB",
+                Area::Intl402 => "../../test262/test/intl402",
             })
         }
     }
@@ -12389,6 +12394,24 @@ var $DONE = function (error) {
         Ok(())
     }
 
+    /// The ECMA-402 features implemented so far (plan cuts; docs/intl-plan.md
+    /// §4). Cut 1: `%Intl%`, `Intl.getCanonicalLocales`, and `Intl.Locale`
+    /// (the `Intl.Locale-info` surface stays deferred until its own cut).
+    /// Features not in this list still skip via `unimplemented_intl_feature`.
+    const INTL_IMPLEMENTED: &[&str] = &["Intl.Locale"];
+
+    /// The first unimplemented ECMA-402 feature a fixture tags, or `None`.
+    /// The `Intl.*` gates flip to implemented as their plan cuts land
+    /// (docs/intl-plan.md §4); the mirror lives in tools/skip_tally.js.
+    fn unimplemented_intl_feature(fm: &Frontmatter) -> Option<String> {
+        for feature in &fm.features {
+            if feature.starts_with("Intl") && !INTL_IMPLEMENTED.iter().any(|f| f == feature) {
+                return Some(format!("Intl feature {feature} not yet implemented"));
+            }
+        }
+        None
+    }
+
     /// Run a fixture file (both modes unless `flags:` says otherwise).
     pub fn run_fixture(area: Area, relative: &str) -> FixtureResult {
         let path = area.root().join(relative);
@@ -12401,6 +12424,13 @@ var $DONE = function (error) {
             None => return FixtureResult::Fail(format!("{relative}: missing frontmatter")),
         };
         if fm.features.iter().any(|f| f == "Temporal") {
+            // The intl402/Temporal integration needs Intl first (plan Cut 9);
+            // the whole intl402 Temporal area stays skipped until then.
+            if area == Area::Intl402 {
+                return FixtureResult::Skip(
+                    "Intl x Temporal integration (Cut 9) not yet implemented".into(),
+                );
+            }
             // Implemented clusters: Duration, Instant, Now, the root-level
             // namespace fixtures, the toStringTag fixtures, and the Plain*
             // clusters (PlainDate, PlainTime, PlainDateTime, PlainYearMonth,
@@ -12447,6 +12477,13 @@ var $DONE = function (error) {
             // ShadowRealm is a stage-3 proposal, not part of ECMA-262 ES2026.
             return FixtureResult::Skip("ShadowRealm is out of scope".into());
         }
+        // ECMA-402 feature gates (docs/intl-plan.md): each `Intl.*` tag
+        // skips with an explicit reason until its component lands. The
+        // implemented set grows per cut; the mirror lives in
+        // tools/skip_tally.js.
+        if let Some(reason) = unimplemented_intl_feature(&fm) {
+            return FixtureResult::Skip(reason);
+        }
         let unsupported: Vec<&str> = fm
             .includes
             .iter()
@@ -12480,6 +12517,8 @@ var $DONE = function (error) {
                         | "regExpUtils.js"
                         | "atomicsHelper.js"
                         | "temporalHelpers.js"
+                        | "testIntl.js"
+                        | "testIntlNumberFormat.js"
                 )
             })
             .collect();

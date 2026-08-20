@@ -30,12 +30,15 @@ const ALLOWED_INCLUDES = new Set([
   "regExpUtils.js",
   "atomicsHelper.js",
   "temporalHelpers.js",
+  "testIntl.js",
+  "testIntlNumberFormat.js",
 ]);
 
 const AREAS = [
   ["language", "test262/test/language"],
   ["built-ins", "test262/test/built-ins"],
   ["annexB", "test262/test/annexB"],
+  ["intl402", "test262/test/intl402"],
 ];
 
 function classify(file, source) {
@@ -69,6 +72,11 @@ function classify(file, source) {
     }
   }
   if (features.has("Temporal")) {
+    // Mirrors run_fixture: the intl402/Temporal integration needs Intl
+    // first (plan Cut 9); the whole intl402 Temporal area stays skipped.
+    if (file.includes("/intl402/")) {
+      return "Intl x Temporal integration (Cut 9) not yet implemented";
+    }
     // Mirrors run_fixture: only the implemented clusters run; the rest of
     // the Temporal namespace stays skipped.
     const rest = file.split("/Temporal/")[1] ?? "";
@@ -104,6 +112,15 @@ function classify(file, source) {
   }
   if (features.has("await-dictionary")) return "await-dictionary";
   if (features.has("ShadowRealm")) return "ShadowRealm";
+  // ECMA-402 feature gates (mirrors run_fixture): each `Intl.*` tag skips
+  // until its component lands (docs/intl-plan.md cuts). Cut 1 implements
+  // `Intl.Locale`; the rest stay skipped.
+  const INTL_IMPLEMENTED = new Set(["Intl.Locale"]);
+  for (const feature of features) {
+    if (feature.startsWith("Intl") && !INTL_IMPLEMENTED.has(feature)) {
+      return `Intl feature ${feature} not yet implemented`;
+    }
+  }
   const unsupported = includes.filter((item) => !ALLOWED_INCLUDES.has(item)).sort();
   if (unsupported.length > 0) return "includes:" + unsupported.join(",");
   return null;

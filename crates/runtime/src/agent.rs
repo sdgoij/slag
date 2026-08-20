@@ -211,6 +211,9 @@ pub struct Agent {
     /// [[DateValue]] of Date instances, keyed by object identity (spec
     /// 21.4.3: ms since the epoch).
     pub date_data: std::collections::HashMap<u64, f64>,
+    /// The [[InitializedLocale]] records of Intl.Locale instances, keyed by
+    /// object identity (ECMA-402 §15: the canonical locale string).
+    pub intl_locale_data: std::collections::HashMap<u64, crate::builtins::intl::IntlLocaleRecord>,
     /// The [[InitializedTemporal*]] records of Temporal instances, keyed by
     /// object identity (the proposal-temporal internal slots).
     pub temporal_data: std::collections::HashMap<u64, crate::builtins::temporal::TemporalRecord>,
@@ -367,6 +370,7 @@ impl Agent {
             number_data: std::collections::HashMap::new(),
             bigint_data: std::collections::HashMap::new(),
             date_data: std::collections::HashMap::new(),
+            intl_locale_data: std::collections::HashMap::new(),
             temporal_data: std::collections::HashMap::new(),
             regexp_data: std::collections::HashMap::new(),
             regexp_string_iter_data: std::collections::HashMap::new(),

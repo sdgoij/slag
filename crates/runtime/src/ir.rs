@@ -3918,6 +3918,14 @@ impl Vm {
                             crate::eval::create_disposable_resource(agent, &value, kind)?;
                         env.add_disposable_resource(resource);
                     }
+                    // The defaults in the pattern resolve against the
+                    // per-iteration environment (a default like `b = a` sees
+                    // the already-bound sibling `a`). Sync the context now so
+                    // the mid-step destructure sees the new environment.
+                    self.lexical_env = env.clone();
+                    if let Ok(context) = agent.running_context_mut() {
+                        context.lexical_environment = env.clone();
+                    }
                     crate::binding::binding_initialization(
                         agent,
                         pattern,

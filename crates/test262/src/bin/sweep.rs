@@ -55,6 +55,7 @@ fn area_label(area: Area) -> &'static str {
         Area::Language => "language",
         Area::Builtins => "built-ins",
         Area::AnnexB => "annexB",
+        Area::Intl402 => "intl402",
     }
 }
 
@@ -63,6 +64,7 @@ fn parse_area(label: &str) -> Option<Area> {
         "language" => Some(Area::Language),
         "built-ins" => Some(Area::Builtins),
         "annexB" => Some(Area::AnnexB),
+        "intl402" => Some(Area::Intl402),
         _ => None,
     }
 }
@@ -152,7 +154,7 @@ struct Options {
 const USAGE: &str = "\
 usage: test262-sweep [area] [options]
 
-area: language | built-ins | annexB | all (default: all)
+area: language | built-ins | annexB | intl402 | all (default: all)
 
 options:
   --jobs N             concurrent batches (default: available parallelism)
@@ -227,6 +229,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
             "language" => options.areas = vec![Area::Language],
             "built-ins" => options.areas = vec![Area::Builtins],
             "annexB" => options.areas = vec![Area::AnnexB],
+            "intl402" => options.areas = vec![Area::Intl402],
             "all" => options.areas = vec![Area::Language, Area::Builtins, Area::AnnexB],
             other => return Err(format!("unknown argument {other}")),
         }
