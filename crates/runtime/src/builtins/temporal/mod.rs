@@ -434,21 +434,20 @@ pub fn get_temporal_overflow_option(
     })
 }
 
-/// spec 13.18 GetTemporalDisambiguationOption. The value is validated and
-/// discarded: only UTC and fixed-offset time zones are supported, which never
-/// have multiple possible instants.
+/// spec 13.18 GetTemporalDisambiguationOption: "compatible" (default),
+/// "earlier", "later", or "reject".
 pub fn get_temporal_disambiguation_option(
     agent: &mut Agent,
     options: &Value,
-) -> Result<(), JsError> {
-    get_option(
+) -> Result<String, JsError> {
+    let value = get_option(
         agent,
         options,
         "disambiguation",
         &["compatible", "earlier", "later", "reject"],
         Some("compatible"),
     )?;
-    Ok(())
+    Ok(value.unwrap_or_else(|| "compatible".to_string()))
 }
 
 /// spec 13.19 GetTemporalOffsetOption: prefer/use/ignore/reject with the

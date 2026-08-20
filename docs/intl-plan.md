@@ -193,11 +193,16 @@ landed the derived tables (data extraction + POSIX-rule extension through
 2050 + the four operations), wiring the offset getters, hoursInDay,
 getTimeZoneTransition, ZonedDateTime.from string/plain conversion, toString,
 and the DateTimeFormat named-zone offsets (sweep: 1402 pass, 0
-regressions). **Remaining:** the DST-aware `add`/`subtract`/`round`/`with`
-machinery, the property-bag disambiguation options (prefer/reject/ignore in
-gaps and overlaps), Duration `relativeTo` with named zones, and the non-iso
-calendar data (chinese/dangi/hebrew/japanese/islamic conversions, era
-fields, leap months).
+regressions). The **DST-aware wall→instant machinery** landed: the shared
+resolver (possible instants + gap/overlap disambiguation, the
+prefer/reject/ignore/use offset semantics, and the start-of-day paths),
+`add`/`subtract` via AddZonedDateTime (days stay calendar days on the wall
+clock), `round` to-day (startOfDay windows), `with`/`withPlainTime`/`from`
+(sweep: 1431 pass, 0 regressions). **Remaining:** Duration `relativeTo`
+with named zones (compare/round/total), `until`/`since`
+(DifferenceZonedDateTimeWithRounding), the non-iso calendar data
+(chinese/dangi/hebrew/japanese/islamic conversions, era fields, leap
+months), sub-minute offset matching, and a few edge singles.
 
 ## 5. Risk register (investigate before implementing)
 

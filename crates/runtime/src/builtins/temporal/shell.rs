@@ -1909,6 +1909,9 @@ fn zoned_month_code(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
 /// occur twice (a midnight overlap).
 fn zoned_start_of_day_ns(agent: &Agent, tz: &str, y: i64, m: i64, d: i64) -> Result<i128, JsError> {
     let wall = iso::get_utc_epoch_nanoseconds(y, m, d, 0, 0, 0, 0, 0, 0);
+    if tz == "UTC" || iso::parse_date_time_utc_offset(tz).is_ok() {
+        return Ok(wall - super::offset_time_zone_offset_ns(tz).unwrap_or(0));
+    }
     let zone = unicode::tz::resolve_zone(tz)
         .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
     let day = 86_400_000_000_000i128;
@@ -1918,17 +1921,164 @@ fn zoned_start_of_day_ns(agent: &Agent, tz: &str, y: i64, m: i64, d: i64) -> Res
     for offset_secs in [o1, o2] {
         let epoch = wall - offset_secs as i128 * 1_000_000_000;
         let local = zoned_local(agent, epoch, tz)?;
-        if local.0 == y && local.1 == m && local.2 == d && best.is_none_or(|b| epoch < b) {
+        // The candidate is the local midnight iff its local time is exactly
+        // 00:00:00.000000000 (a gap can make the offset at the candidate
+        // differ from the one that produced it, landing on 01:00 — the
+        // Toronto 1919 midnight gap).
+        let midnight = local.3 == 0
+            && local.4 == 0
+            && local.5 == 0
+            && local.6 == 0
+            && local.7 == 0
+            && local.8 == 0;
+        if midnight
+            && local.0 == y
+            && local.1 == m
+            && local.2 == d
+            && best.is_none_or(|b| epoch < b)
+        {
             best = Some(epoch);
         }
     }
-    // A skipped day (the Apia dateline jump): no instant has the local date;
-    // the compatible mapping — the offset in effect at the wall instant.
+    // A midnight gap (a spring-forward at or before midnight skips 00:00 —
+    // test262 dst-skipped-cross-midnight.js): the day starts at the
+    // transition instant, the first valid local time (GetStartOfDay falls
+    // back to the earliest local time after the transition; the compatible
+    // mapping of 00:00 would land half an hour late).
     let start = best.unwrap_or_else(|| {
-        let (offset_secs, ..) = unicode::tz::offset_info_at(zone, wall);
-        wall - offset_secs as i128 * 1_000_000_000
+        let e_before = wall - o1 as i128 * 1_000_000_000;
+        let e_after = wall - o2 as i128 * 1_000_000_000;
+        let lo = e_before.min(e_after);
+        let hi = e_before.max(e_after);
+        unicode::tz::next_transition(zone, lo)
+            .filter(|t| {
+                let at = t.at_secs as i128 * 1_000_000_000;
+                at > lo && at <= hi
+            })
+            .map(|t| t.at_secs as i128 * 1_000_000_000)
+            .unwrap_or_else(|| {
+                let (offset_secs, ..) = unicode::tz::offset_info_at(zone, wall);
+                wall - offset_secs as i128 * 1_000_000_000
+            })
     });
     Ok(start)
+}
+
+/// GetPossibleInstantsFor (spec 6.5.2): the instants whose local date-time in
+/// the zone is the wall date-time — 0 (a skipped interval), 1, or 2 (an
+/// overlap). The candidate offsets are those in effect at the wall instant
+/// and a day either side (a transition can shift the wall clock by up to a
+/// day — the Apia dateline jump); each candidate is validated against the
+/// zone's offset at the candidate, which pins which side of the transition
+/// it sits on.
+#[allow(clippy::too_many_arguments)]
+fn possible_instants_for_wall(
+    tz: &str,
+    y: i64,
+    m: i64,
+    d: i64,
+    h: i64,
+    min: i64,
+    s: i64,
+    ms: i64,
+    us: i64,
+    ns: i64,
+) -> Result<Vec<i128>, JsError> {
+    let utc_wall = iso::get_utc_epoch_nanoseconds(y, m, d, h, min, s, ms, us, ns);
+    if tz == "UTC" || iso::parse_date_time_utc_offset(tz).is_ok() {
+        let offset = super::offset_time_zone_offset_ns(tz).unwrap_or(0);
+        return Ok(vec![utc_wall - offset]);
+    }
+    let zone = unicode::tz::resolve_zone(tz)
+        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
+    let day = 86_400_000_000_000i128;
+    let mut offsets: Vec<i32> = [utc_wall - day, utc_wall, utc_wall + day]
+        .iter()
+        .map(|t| unicode::tz::offset_info_at(zone, *t).0)
+        .collect();
+    offsets.sort_unstable();
+    offsets.dedup();
+    let mut possible = Vec::with_capacity(2);
+    for offset_secs in offsets {
+        let epoch = utc_wall - offset_secs as i128 * 1_000_000_000;
+        // The candidate is a real local time iff the zone's offset at the
+        // candidate is the offset that produced it.
+        if unicode::tz::offset_info_at(zone, epoch).0 == offset_secs {
+            possible.push(epoch);
+        }
+    }
+    possible.sort_unstable();
+    Ok(possible)
+}
+
+/// DisambiguatePossibleInstants (spec 6.5.3): a single instant wins; an
+/// overlap picks the first for compatible/earlier and the last for later
+/// (reject throws); a skipped interval resolves to the wall time with the
+/// offset in effect just before the gap (compatible/later — the legacy-Date
+/// mapping) or just after (earlier), and reject throws.
+fn disambiguate_possible_instants(
+    possible: &[i128],
+    tz: &str,
+    utc_wall: i128,
+    disambiguation: &str,
+) -> Result<i128, JsError> {
+    if !possible.is_empty() {
+        if disambiguation == "reject" && possible.len() > 1 {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "no such local time exists".into(),
+            ));
+        }
+        return if disambiguation == "later" {
+            Ok(possible[possible.len() - 1])
+        } else {
+            Ok(possible[0])
+        };
+    }
+    if disambiguation == "reject" {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "no such local time exists".into(),
+        ));
+    }
+    // The gap: the offsets in effect a day either side of the wall instant
+    // bracket the transition (the wall time is always within the offset
+    // difference of it, under a day). Compatible/later apply the offset
+    // before the gap, earlier the offset after.
+    let zone = unicode::tz::resolve_zone(tz)
+        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
+    let day = 86_400_000_000_000i128;
+    let before = unicode::tz::offset_info_at(zone, utc_wall - day).0 as i128 * 1_000_000_000;
+    let after = unicode::tz::offset_info_at(zone, utc_wall + day).0 as i128 * 1_000_000_000;
+    let e_before = utc_wall - before;
+    let e_after = utc_wall - after;
+    Ok(if disambiguation == "earlier" {
+        e_after.min(e_before)
+    } else {
+        e_after.max(e_before)
+    })
+}
+
+/// GetEpochNanosecondsFor (spec 6.5.3): the possible instants for the wall
+/// date-time, disambiguated. The shared primitive behind `from`, `with`,
+/// `round`, `withPlainTime`, and the AddZonedDateTime intermediate.
+#[allow(clippy::too_many_arguments)]
+fn wall_to_epoch_ns(
+    tz: &str,
+    y: i64,
+    m: i64,
+    d: i64,
+    h: i64,
+    min: i64,
+    s: i64,
+    ms: i64,
+    us: i64,
+    ns: i64,
+    disambiguation: &str,
+) -> Result<i128, JsError> {
+    let utc_wall = iso::get_utc_epoch_nanoseconds(y, m, d, h, min, s, ms, us, ns);
+    let possible = possible_instants_for_wall(tz, y, m, d, h, min, s, ms, us, ns)?;
+    disambiguate_possible_instants(&possible, tz, utc_wall, disambiguation)
 }
 
 /// The ISO calendar's derived ZonedDateTime getters (computed from the local
@@ -2453,12 +2603,13 @@ fn read_zoned_with_fields(
 }
 
 /// InterpretISODateTimeOffset (spec 6.5.10): the wall date-time plus the
-/// offset behaviour resolve to an epoch nanosecond. The exact (Z) and option
-/// (offset given) behaviours use the given offset directly and match the
-/// zone's offset AT the resolved instant; the wall behaviour uses the offset
-/// in effect at the wall instant (the compatible-disambiguation
-/// approximation; `match_minute` is irrelevant because both the string
-/// offset and the resolved zone offset are minute multiples).
+/// offset behaviour resolve to an epoch nanosecond. The exact (Z) and "use"
+/// behaviours apply the given offset directly; the wall and "ignore"
+/// behaviours disambiguate the zone's possible instants; "prefer" returns
+/// the given offset when it is one of the possible instants and otherwise
+/// falls back to the disambiguation; "reject" throws when the given offset
+/// is not a possible instant. `match_minute` is irrelevant because both the
+/// string offset and the zone's offsets are minute multiples or coarser.
 #[allow(clippy::too_many_arguments)]
 fn interpret_iso_date_time_offset(
     dt: [i64; 9],
@@ -2466,6 +2617,7 @@ fn interpret_iso_date_time_offset(
     offset_ns: Option<i128>,
     has_z: bool,
     offset_opt: &str,
+    disambiguation: &str,
 ) -> Result<i128, JsError> {
     let utc_wall = iso::get_utc_epoch_nanoseconds(
         dt[0], dt[1], dt[2], dt[3], dt[4], dt[5], dt[6], dt[7], dt[8],
@@ -2476,55 +2628,54 @@ fn interpret_iso_date_time_offset(
     let option = !has_z && offset_ns.is_some();
     if exact || (option && offset_opt == "use") {
         // BalanceISODateTime(wall - offset), CheckISODaysRange, then the
-        // epoch range check.
+        // epoch range check. "use" applies the given offset regardless of
+        // the zone (the result is displayed with the zone's own offset).
         let given = if exact { 0 } else { offset_ns.unwrap() };
         let epoch = utc_wall - given;
         check_balanced_range(epoch)?;
         return Ok(epoch);
     }
-    if option {
-        // The given offset is matched against the zone's offset at the
-        // RESOLVED instant (a transition can fall between the wall-as-UTC
-        // instant and the resolved epoch).
-        check_iso_days_range(iso::iso_date_to_epoch_days(dt[0], dt[1] - 1, dt[2]))?;
-        let given = offset_ns.unwrap();
-        let epoch = utc_wall - given;
-        check_balanced_range(epoch)?;
-        let zone_at_epoch = super::offset_ns_at(tz, epoch)
-            .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
-        if zone_at_epoch != given && offset_opt == "reject" {
-            return Err(JsError::new(
-                ErrorKind::RangeError,
-                "offset does not match the time zone".into(),
-            ));
-        }
-        return Ok(epoch);
-    }
     if wall || offset_opt == "ignore" {
-        // GetEpochNanosecondsFor: the single possible instant for the zone
-        // (the offset in effect at the wall instant).
-        let zone_offset = super::offset_ns_at(tz, utc_wall)
-            .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
-        let epoch = utc_wall - zone_offset;
+        // GetEpochNanosecondsFor without an offset: the possible instants,
+        // disambiguated (test262 from/argument-string-dst-option-
+        // disambiguation.js pins the gap/overlap choices).
+        let epoch = wall_to_epoch_ns(
+            tz,
+            dt[0],
+            dt[1],
+            dt[2],
+            dt[3],
+            dt[4],
+            dt[5],
+            dt[6],
+            dt[7],
+            dt[8],
+            disambiguation,
+        )?;
         check_balanced_range(epoch)?;
         return Ok(epoch);
     }
-    // offsetBehaviour option with prefer: the wall date must be strictly
-    // within the ±10^8-day range; the possible instant is computed from the
-    // given offset and the zone's offset at it is matched (prefer accepts
-    // either).
+    // offsetBehaviour option: the given offset wins when it is one of the
+    // possible instants; "prefer" then falls back to the disambiguation and
+    // "reject" throws.
     check_iso_days_range(iso::iso_date_to_epoch_days(dt[0], dt[1] - 1, dt[2]))?;
     let given = offset_ns.unwrap();
-    let epoch = utc_wall - given;
-    check_balanced_range(epoch)?;
-    let zone_at_epoch = super::offset_ns_at(tz, epoch)
-        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
-    if zone_at_epoch != given && offset_opt == "reject" {
+    let candidate = utc_wall - given;
+    let possible = possible_instants_for_wall(
+        tz, dt[0], dt[1], dt[2], dt[3], dt[4], dt[5], dt[6], dt[7], dt[8],
+    )?;
+    if possible.contains(&candidate) {
+        check_balanced_range(candidate)?;
+        return Ok(candidate);
+    }
+    if offset_opt == "reject" {
         return Err(JsError::new(
             ErrorKind::RangeError,
             "offset does not match the time zone".into(),
         ));
     }
+    let epoch = disambiguate_possible_instants(&possible, tz, utc_wall, disambiguation)?;
+    check_balanced_range(epoch)?;
     Ok(epoch)
 }
 
@@ -2564,7 +2715,7 @@ pub fn to_zoned(agent: &mut Agent, item: &Value, options: &Value) -> Result<Valu
             agent.temporal_data.get(&obj.id()).cloned()
     {
         let opts = super::get_options_object(options)?;
-        super::get_temporal_disambiguation_option(agent, &opts)?;
+        let _ = super::get_temporal_disambiguation_option(agent, &opts)?;
         super::get_temporal_offset_option(agent, &opts, "reject")?;
         super::get_temporal_overflow_option(agent, &opts)?;
         let calendar = super::temporal_calendar_id(agent, item);
@@ -2592,9 +2743,22 @@ pub fn to_zoned(agent: &mut Agent, item: &Value, options: &Value) -> Result<Valu
             &Value::String(Handle::new(JsString::from_utf8(&parsed.tz.annotation))),
         )?;
         let opts = super::get_options_object(options)?;
-        super::get_temporal_disambiguation_option(agent, &opts)?;
+        let disambiguation = super::get_temporal_disambiguation_option(agent, &opts)?;
         let offset_opt = super::get_temporal_offset_option(agent, &opts, "reject")?;
         super::get_temporal_overflow_option(agent, &opts)?;
+        if parsed.time.is_none() {
+            // Start-of-day (spec 6.5.1 InterpretISODateTimeOffset): a string
+            // with no time component resolves through GetStartOfDay, not the
+            // disambiguation of 00:00 (test262 dst-skipped-cross-midnight).
+            let epoch = zoned_start_of_day_ns(agent, &tz, parsed.year, parsed.month, parsed.day)?;
+            let value = create_temporal_object(
+                agent,
+                &Value::Undefined,
+                ZONED_PROTO,
+                TemporalRecord::ZonedDateTime(epoch, JsString::from_utf8(&tz)),
+            )?;
+            return with_calendar(agent, value, calendar.as_deref());
+        }
         let t = parsed.time.unwrap_or([0, 0, 0, 0, 0, 0]);
         let dt = [
             parsed.year,
@@ -2617,7 +2781,14 @@ pub fn to_zoned(agent: &mut Agent, item: &Value, options: &Value) -> Result<Valu
         } else {
             None
         };
-        let epoch = interpret_iso_date_time_offset(dt, &tz, offset_ns, parsed.tz.z, &offset_opt)?;
+        let epoch = interpret_iso_date_time_offset(
+            dt,
+            &tz,
+            offset_ns,
+            parsed.tz.z,
+            &offset_opt,
+            &disambiguation,
+        )?;
         let value = create_temporal_object(
             agent,
             &Value::Undefined,
@@ -2638,7 +2809,7 @@ pub fn to_zoned(agent: &mut Agent, item: &Value, options: &Value) -> Result<Valu
             ));
         };
         let opts = super::get_options_object(options)?;
-        super::get_temporal_disambiguation_option(agent, &opts)?;
+        let disambiguation = super::get_temporal_disambiguation_option(agent, &opts)?;
         let offset_opt = super::get_temporal_offset_option(agent, &opts, "reject")?;
         let constrain = super::get_temporal_overflow_option(agent, &opts)? == Overflow::Constrain;
         // InterpretTemporalDateTimeFields: resolve the date and regulate the
@@ -2670,7 +2841,14 @@ pub fn to_zoned(agent: &mut Agent, item: &Value, options: &Value) -> Result<Valu
             ),
             None => None,
         };
-        let epoch = interpret_iso_date_time_offset(dt, &tz, offset_ns, false, &offset_opt)?;
+        let epoch = interpret_iso_date_time_offset(
+            dt,
+            &tz,
+            offset_ns,
+            false,
+            &offset_opt,
+            &disambiguation,
+        )?;
         let value = create_temporal_object(
             agent,
             &Value::Undefined,
@@ -3734,9 +3912,8 @@ fn plain_date_time_to_plain_time(agent: &mut Agent, this: &Value) -> Result<Valu
     )
 }
 
-/// spec 5.5.11 `toZonedDateTime` (fixed-offset and UTC time zones only; the
-/// disambiguation option is read but has no effect when only one instant
-/// exists).
+/// spec 5.5.11 `toZonedDateTime` (GetEpochNanosecondsFor: the wall date-time
+/// with the disambiguation option).
 fn plain_date_time_to_zoned_date_time(
     agent: &mut Agent,
     this: &Value,
@@ -3749,15 +3926,20 @@ fn plain_date_time_to_zoned_date_time(
     let time_zone_like = args.first().cloned().unwrap_or(Value::Undefined);
     let tz = super::instant::to_temporal_time_zone_identifier(agent, &time_zone_like)?;
     let options = super::get_options_object(args.get(1).unwrap_or(&Value::Undefined))?;
-    super::get_temporal_disambiguation_option(agent, &options)?;
-    let utc = iso::get_utc_epoch_nanoseconds(
-        dt[0], dt[1], dt[2], dt[3], dt[4], dt[5], dt[6], dt[7], dt[8],
-    );
-    // GetEpochNanosecondsFor: the offset in effect at the wall instant (the
-    // compatible-disambiguation approximation for gaps/overlaps).
-    let offset = super::offset_ns_at(&tz, utc)
-        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
-    let epoch = utc - offset;
+    let disambiguation = super::get_temporal_disambiguation_option(agent, &options)?;
+    let epoch = wall_to_epoch_ns(
+        &tz,
+        dt[0],
+        dt[1],
+        dt[2],
+        dt[3],
+        dt[4],
+        dt[5],
+        dt[6],
+        dt[7],
+        dt[8],
+        &disambiguation,
+    )?;
     if !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&epoch) {
         return Err(JsError::new(
             ErrorKind::RangeError,
@@ -3928,10 +4110,10 @@ fn zoned_with(
     reject_temporal_like_object(agent, &item)?;
     let (py, pm, pmc, pd, pt, poffset) = read_zoned_with_fields(agent, &item)?;
     let local = zoned_local(agent, ns, &tz)?;
-    let offset_ns = super::offset_time_zone_offset_ns(&tz)
+    let offset_ns = super::offset_ns_at(&tz, ns)
         .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
     let options = super::get_options_object(&options)?;
-    super::get_temporal_disambiguation_option(agent, &options)?;
+    let disambiguation = super::get_temporal_disambiguation_option(agent, &options)?;
     let offset_opt = super::get_temporal_offset_option(agent, &options, "prefer")?;
     let constrain = super::get_temporal_overflow_option(agent, &options)? == Overflow::Constrain;
     // CalendarMergeFields for iso8601: the partial month/monthCode dedup of
@@ -3958,7 +4140,14 @@ fn zoned_with(
     let dt = [y, m, d, t[0], t[1], t[2], t[3], t[4], t[5]];
     let new_offset_ns = iso::parse_date_time_utc_offset(&offset_text)
         .map_err(|_| JsError::new(ErrorKind::RangeError, "invalid offset".into()))?;
-    let epoch = interpret_iso_date_time_offset(dt, &tz, Some(new_offset_ns), false, &offset_opt)?;
+    let epoch = interpret_iso_date_time_offset(
+        dt,
+        &tz,
+        Some(new_offset_ns),
+        false,
+        &offset_opt,
+        &disambiguation,
+    )?;
     create_zoned(agent, epoch, &tz)
 }
 
@@ -3971,21 +4160,32 @@ fn zoned_with_plain_time(
 ) -> Result<Value, JsError> {
     let (ns, tz) = zoned_parts(agent, this)?;
     let local = zoned_local(agent, ns, &tz)?;
-    let t = if matches!(temporal_time.kind(), ValueKind::Undefined) {
-        [0i64; 6]
-    } else {
-        let time_value = to_plain_time(agent, &temporal_time)?;
-        match require_record(agent, &time_value, RecordKind::PlainTime)? {
-            TemporalRecord::PlainTime(t) => t,
-            _ => unreachable!(),
-        }
+    if matches!(temporal_time.kind(), ValueKind::Undefined) {
+        // GetStartOfDay (spec 6.3.32): a midnight gap skips 00:00
+        // (test262 dst-skipped-cross-midnight.js).
+        let epoch = zoned_start_of_day_ns(agent, &tz, local.0, local.1, local.2)?;
+        return create_zoned(agent, epoch, &tz);
+    }
+    let time_value = to_plain_time(agent, &temporal_time)?;
+    let t = match require_record(agent, &time_value, RecordKind::PlainTime)? {
+        TemporalRecord::PlainTime(t) => t,
+        _ => unreachable!(),
     };
-    // GetEpochNanosecondsFor: the single instant for the local date-time.
-    let offset = super::offset_time_zone_offset_ns(&tz)
-        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
-    let epoch = iso::get_utc_epoch_nanoseconds(
-        local.0, local.1, local.2, t[0], t[1], t[2], t[3], t[4], t[5],
-    ) - offset;
+    // GetEpochNanosecondsFor: the wall date-time with the compatible
+    // disambiguation.
+    let epoch = wall_to_epoch_ns(
+        &tz,
+        local.0,
+        local.1,
+        local.2,
+        t[0],
+        t[1],
+        t[2],
+        t[3],
+        t[4],
+        t[5],
+        "compatible",
+    )?;
     create_zoned(agent, epoch, &tz)
 }
 
@@ -4008,9 +4208,11 @@ fn zoned_with_calendar(agent: &mut Agent, this: &Value, calendar: Value) -> Resu
     with_calendar(agent, value, calendar.as_deref())
 }
 
-/// spec 6.5.9 `add` / 6.5.10 `subtract` (AddDurationToZonedDateTime via
-/// AddZonedDateTime: the date part adds to the local date first, then the
-/// time part adds to the resulting instant).
+/// spec 6.5.9 `add` / 6.5.10 `subtract` (AddDurationToZonedDateTime: the
+/// date part adds to the local date first, then the new wall time resolves
+/// through GetEpochNanosecondsFor with the compatible disambiguation — a DST
+/// transition between the wall times shifts the offset (test262 add/dst.js)
+/// — then the time part adds to the resulting instant).
 fn zoned_add_subtract(
     agent: &mut Agent,
     this: &Value,
@@ -4025,9 +4227,13 @@ fn zoned_add_subtract(
     }
     let options = super::get_options_object(args.get(1).unwrap_or(&Value::Undefined))?;
     let constrain = super::get_temporal_overflow_option(agent, &options)? == Overflow::Constrain;
-    let internal = super::to_internal_duration_record_with_24_hour_days(&duration)?;
+    // AddZonedDateTime splits the duration at the day: the date parts add to
+    // the local (wall) date — not 24h each, which would cross a transition
+    // at the wrong point (test262 subtract/dst.js) — and the time parts add
+    // to the resulting instant.
+    let internal = super::to_internal_duration_record(&duration);
     // AddZonedDateTime: CalendarDateAdd on the local date (the days fold into
-    // the calendar add), then AddInstant with the time part.
+    // the calendar add), then GetEpochNanosecondsFor for the new wall time.
     let local = zoned_local(agent, ns, &tz)?;
     let date = iso::calendar_date_add(
         local.0,
@@ -4040,11 +4246,19 @@ fn zoned_add_subtract(
         constrain,
     )
     .ok_or_else(|| JsError::new(ErrorKind::RangeError, "date out of range".into()))?;
-    let offset = super::offset_time_zone_offset_ns(&tz)
-        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
-    let intermediate_ns = iso::get_utc_epoch_nanoseconds(
-        date.0, date.1, date.2, local.3, local.4, local.5, local.6, local.7, local.8,
-    ) - offset;
+    let intermediate_ns = wall_to_epoch_ns(
+        &tz,
+        date.0,
+        date.1,
+        date.2,
+        local.3,
+        local.4,
+        local.5,
+        local.6,
+        local.7,
+        local.8,
+        "compatible",
+    )?;
     // AddInstant: the result must be a valid instant.
     let end_ns = intermediate_ns + internal.time;
     if !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&end_ns) {
@@ -4111,18 +4325,19 @@ fn zoned_round(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
     if rounding_increment == 1 && smallest == Unit::Nanosecond {
         return create_zoned(agent, ns, &tz);
     }
-    let offset = super::offset_time_zone_offset_ns(&tz)
+    let offset = super::offset_ns_at(&tz, ns)
         .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
     let epoch = if smallest == Unit::Day {
-        // Day rounding: the progress through the local 24-hour day, rounded to
-        // the day length (the offset never changes the day length). Both day
-        // boundaries go through GetStartOfDay (range-checked).
+        // Day rounding: the progress is the local wall time-of-day, rounded
+        // against the span between the start instants of the local date and
+        // the next date — a DST day is shorter or longer than 24h, and an
+        // overlap can replay wall times past the start of the next day
+        // (test262 round/dst-skipped-cross-midnight.js,
+        // same-date-starts-twice.js).
         let local = zoned_local(agent, ns, &tz)?;
-        let start_ns =
-            iso::get_utc_epoch_nanoseconds(local.0, local.1, local.2, 0, 0, 0, 0, 0, 0) - offset;
+        let start_ns = zoned_start_of_day_ns(agent, &tz, local.0, local.1, local.2)?;
         let next = iso::add_days_to_iso_date(local.0, local.1, local.2, 1);
-        let end_ns =
-            iso::get_utc_epoch_nanoseconds(next.0, next.1, next.2, 0, 0, 0, 0, 0, 0) - offset;
+        let end_ns = zoned_start_of_day_ns(agent, &tz, next.0, next.1, next.2)?;
         if !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&start_ns)
             || !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&end_ns)
         {
@@ -4132,21 +4347,35 @@ fn zoned_round(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
             ));
         }
         let day_length = end_ns - start_ns;
+        // The progress is the elapsed time from the day's start (the halfway
+        // point of a 25-hour day is 11:30 local — test262 round-dst-
+        // boundaries.js); an overlap can replay wall times past the start of
+        // the next day, where the local wall time-of-day is used instead
+        // (test262 same-date-starts-twice.js).
+        let progress = if ns < end_ns {
+            ns - start_ns
+        } else {
+            (local.3 as i128 * 3600 + local.4 as i128 * 60 + local.5 as i128) * 1_000_000_000
+                + local.6 as i128 * 1_000_000
+                + local.7 as i128 * 1_000
+                + local.8 as i128
+        };
         let rounded = iso::round_number_to_increment_as_if_positive(
-            ns - start_ns,
+            progress,
             day_length * rounding_increment as i128,
             rounding_mode,
         );
         start_ns + rounded
     } else {
         // Time-unit rounding of the local fields; the current offset is
-        // retained (offset option prefer, compatible disambiguation).
+        // retained when it still applies (offset option prefer, compatible
+        // disambiguation otherwise).
         let local = zoned_local(agent, ns, &tz)?;
         let dt = [
             local.0, local.1, local.2, local.3, local.4, local.5, local.6, local.7, local.8,
         ];
         let rounded = round_iso_date_time(dt, rounding_increment, smallest, rounding_mode)?;
-        interpret_iso_date_time_offset(rounded, &tz, Some(offset), false, "prefer")?
+        interpret_iso_date_time_offset(rounded, &tz, Some(offset), false, "prefer", "compatible")?
     };
     create_zoned(agent, epoch, &tz)
 }
@@ -4964,33 +5193,44 @@ fn plain_date_to_zoned_date_time(
         let tz = super::instant::to_temporal_time_zone_identifier(agent, &item)?;
         (tz, None)
     };
-    let utc = match time {
-        Some(t) => iso::get_utc_epoch_nanoseconds(y, m, d, t[0], t[1], t[2], t[3], t[4], t[5]),
-        // GetStartOfDay: the single possible epoch-nanosecond at midnight
-        // (the offset in effect at the wall instant).
-        None => {
-            let wall = iso::get_utc_epoch_nanoseconds(y, m, d, 0, 0, 0, 0, 0, 0);
-            let offset = super::offset_ns_at(&tz, wall).ok_or_else(|| {
-                JsError::new(ErrorKind::RangeError, "unsupported time zone".into())
-            })?;
-            return create_zoned(agent, wall - offset, &tz);
+    // GetStartOfDay when no plainTime is given (spec 3.3.29: a midnight gap
+    // skips 00:00 — test262 dst-skipped-cross-midnight.js); otherwise
+    // GetEpochNanosecondsFor with the compatible disambiguation.
+    if let Some(t) = time {
+        let epoch = wall_to_epoch_ns(
+            &tz,
+            y,
+            m,
+            d,
+            t[0],
+            t[1],
+            t[2],
+            t[3],
+            t[4],
+            t[5],
+            "compatible",
+        )?;
+        if !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&epoch) {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "result is out of range".into(),
+            ));
         }
-    };
-    let offset = super::offset_ns_at(&tz, utc)
-        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
-    let epoch = utc - offset;
-    if !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&epoch) {
-        return Err(JsError::new(
-            ErrorKind::RangeError,
-            "result is out of range".into(),
-        ));
+        create_temporal_object(
+            agent,
+            &Value::Undefined,
+            ZONED_PROTO,
+            TemporalRecord::ZonedDateTime(epoch, JsString::from_utf8(&tz)),
+        )
+    } else {
+        let epoch = zoned_start_of_day_ns(agent, &tz, y, m, d)?;
+        create_temporal_object(
+            agent,
+            &Value::Undefined,
+            ZONED_PROTO,
+            TemporalRecord::ZonedDateTime(epoch, JsString::from_utf8(&tz)),
+        )
     }
-    create_temporal_object(
-        agent,
-        &Value::Undefined,
-        ZONED_PROTO,
-        TemporalRecord::ZonedDateTime(epoch, JsString::from_utf8(&tz)),
-    )
 }
 
 /// spec 3.5.5 `toPlainYearMonth` (CalendarYearMonthFromFields for iso8601:
@@ -6003,4 +6243,275 @@ pub fn to_plain_month_day(
         ErrorKind::TypeError,
         "value must be a string or object".into(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ns(h: i64, min: i64, s: i64) -> i128 {
+        (h as i128 * 3600 + min as i128 * 60 + s as i128) * 1_000_000_000
+    }
+
+    fn wall_epoch(y: i64, m: i64, d: i64, h: i64, min: i64) -> i128 {
+        iso::get_utc_epoch_nanoseconds(y, m, d, h, min, 0, 0, 0, 0)
+    }
+
+    /// GetPossibleInstantsFor: 0 (a gap), 1, or 2 (an overlap) instants.
+    #[test]
+    fn possible_instants_for_wall_cases() {
+        // Vancouver spring-forward gap 2000-04-02T02:30 (test262 add/dst.js).
+        assert_eq!(
+            possible_instants_for_wall("America/Vancouver", 2000, 4, 2, 2, 30, 0, 0, 0, 0)
+                .unwrap()
+                .len(),
+            0
+        );
+        // The overlap on the same day's evening is a single instant.
+        assert_eq!(
+            possible_instants_for_wall("America/Vancouver", 2000, 4, 2, 12, 0, 0, 0, 0, 0)
+                .unwrap()
+                .len(),
+            1
+        );
+        // Sao Paulo fall-back overlap 2019-02-16T23:45 (-02:00 -> -03:00).
+        let overlap =
+            possible_instants_for_wall("America/Sao_Paulo", 2019, 2, 16, 23, 45, 0, 0, 0, 0)
+                .unwrap();
+        assert_eq!(overlap.len(), 2);
+        assert_eq!(overlap[0], wall_epoch(2019, 2, 17, 1, 45)); // -02:00
+        assert_eq!(overlap[1], wall_epoch(2019, 2, 17, 2, 45)); // -03:00
+        // The Apia dateline jump: 2011-12-30 is a skipped day.
+        assert_eq!(
+            possible_instants_for_wall("Pacific/Apia", 2011, 12, 30, 22, 0, 0, 0, 0, 0)
+                .unwrap()
+                .len(),
+            0
+        );
+        // A normal instant.
+        assert_eq!(
+            possible_instants_for_wall("America/Vancouver", 2000, 4, 2, 12, 0, 0, 0, 0, 0).unwrap(),
+            vec![wall_epoch(2000, 4, 2, 19, 0)]
+        );
+    }
+
+    /// DisambiguatePossibleInstants through a gap (test262
+    /// from/argument-string-dst-option-disambiguation.js: compatible is the
+    /// legacy-Date mapping — the offset before the gap; earlier the offset
+    /// after).
+    #[test]
+    fn gap_disambiguation_la() {
+        let (y, mo, d) = (2020, 3, 8);
+        assert_eq!(
+            wall_to_epoch_ns(
+                "America/Los_Angeles",
+                y,
+                mo,
+                d,
+                2,
+                30,
+                0,
+                0,
+                0,
+                0,
+                "compatible"
+            )
+            .unwrap(),
+            wall_epoch(y, mo, d, 10, 30)
+        );
+        assert_eq!(
+            wall_to_epoch_ns(
+                "America/Los_Angeles",
+                y,
+                mo,
+                d,
+                2,
+                30,
+                0,
+                0,
+                0,
+                0,
+                "earlier"
+            )
+            .unwrap(),
+            wall_epoch(y, mo, d, 9, 30)
+        );
+        assert_eq!(
+            wall_to_epoch_ns("America/Los_Angeles", y, mo, d, 2, 30, 0, 0, 0, 0, "later").unwrap(),
+            wall_epoch(y, mo, d, 10, 30)
+        );
+        assert!(
+            wall_to_epoch_ns("America/Los_Angeles", y, mo, d, 2, 30, 0, 0, 0, 0, "reject").is_err()
+        );
+    }
+
+    /// DisambiguatePossibleInstants through an overlap (test262
+    /// from/argument-string-dst-option-disambiguation.js).
+    #[test]
+    fn overlap_disambiguation_sao_paulo() {
+        let (y, mo, d) = (2019, 2, 16);
+        assert_eq!(
+            wall_to_epoch_ns(
+                "America/Sao_Paulo",
+                y,
+                mo,
+                d,
+                23,
+                45,
+                0,
+                0,
+                0,
+                0,
+                "compatible"
+            )
+            .unwrap(),
+            wall_epoch(2019, 2, 17, 1, 45)
+        );
+        assert_eq!(
+            wall_to_epoch_ns("America/Sao_Paulo", y, mo, d, 23, 45, 0, 0, 0, 0, "earlier").unwrap(),
+            wall_epoch(2019, 2, 17, 1, 45)
+        );
+        assert_eq!(
+            wall_to_epoch_ns("America/Sao_Paulo", y, mo, d, 23, 45, 0, 0, 0, 0, "later").unwrap(),
+            wall_epoch(2019, 2, 17, 2, 45)
+        );
+        assert!(
+            wall_to_epoch_ns("America/Sao_Paulo", y, mo, d, 23, 45, 0, 0, 0, 0, "reject").is_err()
+        );
+    }
+
+    /// The Apia dateline jump: compatible resolves the skipped wall time
+    /// with the offset before the gap (test262 add/dst.js: 22:00 Dec 30 ->
+    /// 08:00Z Dec 31).
+    #[test]
+    fn apia_skipped_day() {
+        assert_eq!(
+            wall_to_epoch_ns(
+                "Pacific/Apia",
+                2011,
+                12,
+                30,
+                22,
+                0,
+                0,
+                0,
+                0,
+                0,
+                "compatible"
+            )
+            .unwrap(),
+            wall_epoch(2011, 12, 31, 8, 0)
+        );
+        assert_eq!(
+            wall_to_epoch_ns("Pacific/Apia", 2011, 12, 30, 22, 0, 0, 0, 0, 0, "earlier").unwrap(),
+            wall_epoch(2011, 12, 30, 8, 0)
+        );
+    }
+
+    /// InterpretISODateTimeOffset wall behaviour routes through the
+    /// disambiguation, and the prefer offset falls back to it when the given
+    /// offset is not a possible instant (test262 from/argument-string-dst-
+    /// option-offset-disambiguation-combinations.js).
+    #[test]
+    fn interpret_offset_options() {
+        // Wall behaviour (no offset in the string), compatible: the gap
+        // resolves to the pre-gap offset.
+        let dt = [2020, 3, 8, 2, 30, 0, 0, 0, 0];
+        assert_eq!(
+            interpret_iso_date_time_offset(
+                dt,
+                "America/Los_Angeles",
+                None,
+                false,
+                "reject",
+                "compatible"
+            )
+            .unwrap(),
+            wall_epoch(2020, 3, 8, 10, 30)
+        );
+        // Prefer with a wrong offset falls back to the disambiguation.
+        assert_eq!(
+            interpret_iso_date_time_offset(
+                dt,
+                "America/Los_Angeles",
+                Some(-86_340_000_000_000), // -23:59
+                false,
+                "prefer",
+                "compatible",
+            )
+            .unwrap(),
+            wall_epoch(2020, 3, 8, 10, 30)
+        );
+        // Reject with a wrong offset throws.
+        assert!(
+            interpret_iso_date_time_offset(
+                dt,
+                "America/Los_Angeles",
+                Some(-86_340_000_000_000),
+                false,
+                "reject",
+                "compatible",
+            )
+            .is_err()
+        );
+        // Prefer with the matching offset (the overlap second occurrence).
+        let dt = [2020, 11, 1, 1, 30, 0, 0, 0, 0];
+        assert_eq!(
+            interpret_iso_date_time_offset(
+                dt,
+                "America/Los_Angeles",
+                Some(-8 * 3_600_000_000_000),
+                false,
+                "prefer",
+                "compatible",
+            )
+            .unwrap(),
+            wall_epoch(2020, 11, 1, 9, 30)
+        );
+    }
+
+    /// The start-of-day instants behind the ZonedDateTime round day path
+    /// (test262 round/dst-skipped-cross-midnight.js: 11:45 is exactly half of
+    /// the 23.5-hour Toronto day; same-date-starts-twice.js: the Casey wall
+    /// day is 27h while the startOfDay span is 24h).
+    fn start_of_day(tz: &str, y: i64, m: i64, d: i64) -> i128 {
+        let possible = possible_instants_for_wall(tz, y, m, d, 0, 0, 0, 0, 0, 0).unwrap();
+        if !possible.is_empty() {
+            return possible[0];
+        }
+        // A midnight gap: the day starts at the transition instant (the
+        // first valid local time).
+        let zone = unicode::tz::resolve_zone(tz).unwrap();
+        let wall = iso::get_utc_epoch_nanoseconds(y, m, d, 0, 0, 0, 0, 0, 0);
+        let day = 86_400_000_000_000i128;
+        let (o1, ..) = unicode::tz::offset_info_at(zone, wall - day);
+        let (o2, ..) = unicode::tz::offset_info_at(zone, wall + day);
+        let e_before = wall - o1 as i128 * 1_000_000_000;
+        let e_after = wall - o2 as i128 * 1_000_000_000;
+        unicode::tz::next_transition(zone, e_before.min(e_after))
+            .unwrap()
+            .at_secs as i128
+            * 1_000_000_000
+    }
+
+    #[test]
+    fn round_day_windows() {
+        // Toronto 1919-03-30: a 23.5-hour day — the transition at 23:30 EST
+        // skips 00:00 on Mar 31, so the day starts at 00:30 EDT (30 minutes
+        // before the disambiguated midnight).
+        let s0 = start_of_day("America/Toronto", 1919, 3, 30);
+        let s1 = start_of_day("America/Toronto", 1919, 3, 31);
+        assert_eq!(s0, wall_epoch(1919, 3, 30, 5, 0)); // 00:00 EST
+        assert_eq!(s1, wall_epoch(1919, 3, 31, 4, 30)); // 00:30 EDT
+        assert_eq!(s1 - s0, ns(23, 30, 0));
+
+        // Casey 2010-03-04: the startOfDay span is 24h, but the 3h backward
+        // shift replays wall times past the start of Mar 5 (13:00Z) — the
+        // round progress for such an instant is the wall time-of-day.
+        let c0 = start_of_day("Antarctica/Casey", 2010, 3, 4);
+        let c1 = start_of_day("Antarctica/Casey", 2010, 3, 5);
+        assert_eq!(c0, wall_epoch(2010, 3, 3, 13, 0)); // 00:00+11:00
+        assert_eq!(c1, wall_epoch(2010, 3, 4, 13, 0)); // the first 00:00
+        assert_eq!(c1 - c0, ns(24, 0, 0));
+    }
 }
