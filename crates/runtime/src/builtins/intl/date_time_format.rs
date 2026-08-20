@@ -533,17 +533,25 @@ fn parse_offset_time_zone(value: &str) -> Option<i64> {
 
 /// The fixed offset (minutes) of the UTC/Etc/GMT±N named zones; None for
 /// the other named zones (whose local time falls back to UTC).
-fn named_zone_offset(time_zone: &str) -> Option<i64> {
+/// The offset (minutes) of a named zone at the formatted instant (the UTC
+/// family and the fixed Etc/GMT±N zones are constant; the IANA zones use the
+/// generated tables). 0 when unsupported (the legacy fallback).
+fn named_zone_offset(time_zone: &str, epoch_ms: f64) -> i64 {
     if time_zone == "UTC" || time_zone == "Etc/UTC" || time_zone == "Etc/GMT" {
-        return Some(0);
+        return 0;
     }
     if let Some(rest) = time_zone.strip_prefix("Etc/GMT") {
         // IANA Etc/GMT-N is UTC+N (the sign is inverted).
         if let Ok(hours) = rest.parse::<i64>() {
-            return Some(-hours * 60);
+            return -hours * 60;
         }
     }
-    None
+    let Some(zone) = unicode::tz::resolve_zone(time_zone) else {
+        return 0;
+    };
+    let epoch_ns = (epoch_ms * 1_000_000.0) as i128;
+    let (offset_secs, ..) = unicode::tz::offset_info_at(zone, epoch_ns);
+    offset_secs as i64 / 60
 }
 
 /// The (gregorian) local-time fields of an epoch milliseconds value in the
@@ -565,7 +573,7 @@ fn to_local_time(epoch_ms: f64, time_zone: &str) -> LocalTime {
     let offset_minutes = if let Some(offset) = parse_offset_time_zone(time_zone) {
         offset
     } else {
-        named_zone_offset(time_zone).unwrap_or(0)
+        named_zone_offset(time_zone, epoch_ms)
     };
     let local_ms = epoch_ms + offset_minutes as f64 * 60_000.0;
     let days = (local_ms / 86_400_000.0).floor() as i64;
@@ -747,11 +755,10 @@ fn initialize(
         } else if value.starts_with("Etc/GMT+") || value.starts_with("Etc/GMT-") {
             // The fixed-offset Etc/GMT±N zones.
             value
-        } else if crate::builtins::intl::number_data::SUPPORTED_TIME_ZONES.contains(&value.as_str())
-        {
-            // The other named zones: accepted if structurally valid; local
-            // time falls back to UTC in to_local_time.
-            value
+        } else if let Some(zone) = unicode::tz::resolve_zone(&value) {
+            // The IANA zones (case-insensitive; links resolve to their
+            // primary identifier).
+            unicode::tz::primary_identifier(zone).to_string()
         } else {
             return Err(range_error("Invalid time zone"));
         }
@@ -1791,9 +1798,14 @@ fn format_time_zone(record: &DateTimeFormatRecord, width: u32) -> String {
         }
         return "UTC".to_string();
     }
-    // The offset zones (stored as `±HH:MM`) and the fixed Etc/GMT±N zones.
-    let offset_minutes = parse_offset_time_zone(zone).or_else(|| named_zone_offset(zone));
-    if let Some(minutes) = offset_minutes {
+    // The offset zones (stored as `±HH:MM`) and the fixed Etc/GMT±N zones
+    // (constant offsets — the GMT±H display).
+    let fixed_minutes = parse_offset_time_zone(zone).or_else(|| {
+        zone.strip_prefix("Etc/GMT")
+            .and_then(|rest| rest.parse::<i64>().ok())
+            .map(|hours| -hours * 60)
+    });
+    if let Some(minutes) = fixed_minutes {
         if minutes == 0 {
             // A zero offset formats as the plain GMT name (the corpus
             // `offset-time-zones.js` pins no `+`/`-` for +00:00).

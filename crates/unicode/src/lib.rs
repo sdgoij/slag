@@ -9,6 +9,8 @@
 use unicode_normalization::UnicodeNormalization;
 
 mod derived_regexp_tables;
+pub mod tz;
+pub mod tz_data;
 
 /// `WhiteSpace` (spec 11.2): TAB, VT, FF, SP, NBSP, ZWNBSP, and the
 /// Space_Separator (Zs) category.

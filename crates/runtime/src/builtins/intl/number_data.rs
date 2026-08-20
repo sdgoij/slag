@@ -339,7 +339,6 @@ pub const SUPPORTED_TIME_ZONES: &[&str] = &[
     "America/Fort_Nelson",
     "America/Fortaleza",
     "America/Glace_Bay",
-    "America/Godthab",
     "America/Goose_Bay",
     "America/Grand_Turk",
     "America/Grenada",
@@ -601,7 +600,7 @@ pub const SUPPORTED_TIME_ZONES: &[&str] = &[
     "Europe/Malta",
     "Europe/Mariehamn",
     "Europe/Minsk",
-    "Europe/Monaco",
+
     "Europe/Moscow",
     "Europe/Oslo",
     "Europe/Paris",

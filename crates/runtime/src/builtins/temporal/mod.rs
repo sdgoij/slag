@@ -1390,11 +1390,11 @@ fn relative_to_object(agent: &mut Agent, item: &Value) -> Result<RelativeTo, JsE
             "relativeTo is outside the representable range".into(),
         ));
     }
-    let zone_offset = offset_time_zone_offset_ns(&time_zone)
-        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
     let utc = iso::get_utc_epoch_nanoseconds(
         year, month, day, time[0], time[1], time[2], time[3], time[4], time[5],
     );
+    let zone_offset = offset_ns_at(&time_zone, utc)
+        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
     let epoch = match offset {
         Some(offset) => {
             let given = iso::parse_date_time_utc_offset(&offset)
@@ -1507,9 +1507,9 @@ fn relative_to_string(agent: &mut Agent, item: &Value) -> Result<RelativeTo, JsE
             "relativeTo is outside the representable range".into(),
         ));
     }
-    let zone_offset = offset_time_zone_offset_ns(&time_zone)
-        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
     let utc = iso::get_utc_epoch_nanoseconds(date.0, date.1, date.2, h, min, s, ms, us, ns);
+    let zone_offset = offset_ns_at(&time_zone, utc)
+        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
     let epoch = if parsed.tz.z {
         utc
     } else if !parsed.tz.offset_string.is_empty() {
@@ -1697,7 +1697,7 @@ fn now_dispatch(
             Err(e) => return Some(Err(e)),
         }
     };
-    let offset = offset_time_zone_offset_ns(&time_zone).unwrap_or(0);
+    let offset = offset_ns_at(&time_zone, ns).unwrap_or(0);
     let (y, m, d, h, min, s, ms, us, n) = iso::iso_parts_from_epoch(ns);
     let (y, m, d, h, min, s, ms, us, ns_local) =
         instant::balance_iso_date_time(y, m, d, h, min, s, ms, us, (n as i128 + offset) as i64);
@@ -1775,10 +1775,51 @@ pub fn dispatch_construct(
     shell::dispatch_construct(agent, callee, args, new_target)
 }
 
-/// Format a `±HH:MM` offset identifier for a numeric-offset time zone.
+/// The offset (in nanoseconds) of a time-zone identifier: the UTC zone, a
+/// numeric `±HH:MM` offset, or a named zone resolved through the generated
+/// IANA tables (`None` when unsupported).
 pub fn offset_time_zone_offset_ns(tz: &str) -> Option<i128> {
     if tz == "UTC" {
         return Some(0);
     }
     iso::parse_date_time_utc_offset(tz).ok()
+}
+
+/// The offset (in nanoseconds) of a named/offset zone at a specific instant
+/// (GetOffsetNanosecondsFor for the generated IANA tables; numeric offset
+/// zones are constant). `None` when the zone is unsupported.
+pub fn offset_ns_at(tz: &str, epoch_ns: i128) -> Option<i128> {
+    if tz == "UTC" {
+        return Some(0);
+    }
+    if let Ok(offset) = iso::parse_date_time_utc_offset(tz) {
+        return Some(offset);
+    }
+    let zone = unicode::tz::resolve_zone(tz)?;
+    let (offset_secs, ..) = unicode::tz::offset_info_at(zone, epoch_ns);
+    Some(offset_secs as i128 * 1_000_000_000)
+}
+
+/// The next/previous transition of a named zone at an instant
+/// (GetIANATimeZoneNextTransition / PreviousTransition): the transition
+/// record with its instant and the new offset, or `None` when the zone is
+/// unsupported or has no such transition.
+pub fn tz_transition(tz: &str, epoch_ns: i128, next: bool) -> Option<(i64, i64, bool)> {
+    if tz == "UTC" {
+        return None;
+    }
+    if iso::parse_date_time_utc_offset(tz).is_ok() {
+        return None;
+    }
+    let zone = unicode::tz::resolve_zone(tz)?;
+    let transition = if next {
+        unicode::tz::next_transition(zone, epoch_ns)
+    } else {
+        unicode::tz::previous_transition(zone, epoch_ns)
+    }?;
+    Some((
+        transition.at_secs,
+        transition.offset_secs as i64,
+        transition.dst,
+    ))
 }

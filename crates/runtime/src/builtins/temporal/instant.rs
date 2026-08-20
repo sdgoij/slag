@@ -830,7 +830,8 @@ pub fn to_temporal_time_zone_identifier(
 }
 
 /// GetAvailableNamedTimeZoneIdentifier: the UTC zone and its IANA links,
-/// ASCII-case-insensitive (spec 11.1.1 + 14.6.2).
+/// ASCII-case-insensitive (spec 11.1.1 + 14.6.2). Returns the canonical
+/// primary identifier.
 fn lookup_named_time_zone(text: &str) -> Result<String, JsError> {
     let upper = text.to_ascii_uppercase();
     if matches!(
@@ -850,10 +851,13 @@ fn lookup_named_time_zone(text: &str) -> Result<String, JsError> {
     ) {
         return Ok("UTC".to_string());
     }
-    Err(JsError::new(
-        ErrorKind::RangeError,
-        format!("unsupported time zone identifier: {text}"),
-    ))
+    match unicode::tz::resolve_zone(text) {
+        Some(zone) => Ok(unicode::tz::primary_identifier(zone).to_string()),
+        None => Err(JsError::new(
+            ErrorKind::RangeError,
+            format!("unsupported time zone identifier: {text}"),
+        )),
+    }
 }
 
 /// spec 6.5.1 step 5: the constructor accepts only a TimeZoneIdentifier (an

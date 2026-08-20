@@ -1835,7 +1835,7 @@ fn zoned_local(
     ns: i128,
     tz: &str,
 ) -> Result<(i64, i64, i64, i64, i64, i64, i64, i64, i64), JsError> {
-    let offset = super::offset_time_zone_offset_ns(tz)
+    let offset = super::offset_ns_at(tz, ns)
         .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
     let (y, m, d, h, min, s, ms, us, n) = iso::iso_parts_from_epoch(ns);
     Ok(super::instant::balance_iso_date_time(
@@ -1872,22 +1872,22 @@ fn zoned_field(agent: &mut Agent, this: &Value, index: usize) -> Result<Value, J
 }
 
 fn zoned_offset(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
-    let (_, tz) = match require_record(agent, this, RecordKind::ZonedDateTime)? {
+    let (ns, tz) = match require_record(agent, this, RecordKind::ZonedDateTime)? {
         TemporalRecord::ZonedDateTime(ns, tz) => (ns, tz.to_string_lossy()),
         _ => unreachable!(),
     };
-    let offset = super::offset_time_zone_offset_ns(&tz).unwrap_or(0);
+    let offset = super::offset_ns_at(&tz, ns).unwrap_or(0);
     Ok(Value::String(Handle::new(JsString::from_utf8(
         &iso::format_offset_nanoseconds(offset),
     ))))
 }
 
 fn zoned_offset_ns(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
-    let (_, tz) = match require_record(agent, this, RecordKind::ZonedDateTime)? {
+    let (ns, tz) = match require_record(agent, this, RecordKind::ZonedDateTime)? {
         TemporalRecord::ZonedDateTime(ns, tz) => (ns, tz.to_string_lossy()),
         _ => unreachable!(),
     };
-    let offset = super::offset_time_zone_offset_ns(&tz).unwrap_or(0);
+    let offset = super::offset_ns_at(&tz, ns).unwrap_or(0);
     Ok(Value::Number(offset as f64))
 }
 
@@ -1901,19 +1901,48 @@ fn zoned_month_code(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     )))))
 }
 
+/// The first instant of the local day (y, m, d) in the zone (GetStartOfDay):
+/// the earliest epoch whose local date is that day. The candidates come from
+/// the two offsets in effect near the day's boundary (a transition can sit at
+/// or near midnight), validated against the actual local time at the
+/// candidate — the `00:00` local time may be skipped (a midnight gap) or
+/// occur twice (a midnight overlap).
+fn zoned_start_of_day_ns(agent: &Agent, tz: &str, y: i64, m: i64, d: i64) -> Result<i128, JsError> {
+    let wall = iso::get_utc_epoch_nanoseconds(y, m, d, 0, 0, 0, 0, 0, 0);
+    let zone = unicode::tz::resolve_zone(tz)
+        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
+    let day = 86_400_000_000_000i128;
+    let (o1, ..) = unicode::tz::offset_info_at(zone, wall - day);
+    let (o2, ..) = unicode::tz::offset_info_at(zone, wall + day);
+    let mut best: Option<i128> = None;
+    for offset_secs in [o1, o2] {
+        let epoch = wall - offset_secs as i128 * 1_000_000_000;
+        let local = zoned_local(agent, epoch, tz)?;
+        if local.0 == y && local.1 == m && local.2 == d && best.is_none_or(|b| epoch < b) {
+            best = Some(epoch);
+        }
+    }
+    // A skipped day (the Apia dateline jump): no instant has the local date;
+    // the compatible mapping — the offset in effect at the wall instant.
+    let start = best.unwrap_or_else(|| {
+        let (offset_secs, ..) = unicode::tz::offset_info_at(zone, wall);
+        wall - offset_secs as i128 * 1_000_000_000
+    });
+    Ok(start)
+}
+
 /// The ISO calendar's derived ZonedDateTime getters (computed from the local
 /// date part; hoursInDay diffs the two GetStartOfDay instants).
 fn zoned_calendar_field(agent: &mut Agent, this: &Value, name: &str) -> Result<Value, JsError> {
     let (ns, tz) = zoned_parts(agent, this)?;
     let local = zoned_local(agent, ns, &tz)?;
     if name == "hoursInDay" {
-        let offset = super::offset_time_zone_offset_ns(&tz)
-            .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
-        let today =
-            iso::get_utc_epoch_nanoseconds(local.0, local.1, local.2, 0, 0, 0, 0, 0, 0) - offset;
+        // The local day length: the difference between the start instants of
+        // the local date and the next date (a DST-transition day differs
+        // from 24h).
+        let today = zoned_start_of_day_ns(agent, &tz, local.0, local.1, local.2)?;
         let next = iso::add_days_to_iso_date(local.0, local.1, local.2, 1);
-        let tomorrow =
-            iso::get_utc_epoch_nanoseconds(next.0, next.1, next.2, 0, 0, 0, 0, 0, 0) - offset;
+        let tomorrow = zoned_start_of_day_ns(agent, &tz, next.0, next.1, next.2)?;
         if !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&today)
             || !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&tomorrow)
         {
@@ -2423,11 +2452,13 @@ fn read_zoned_with_fields(
     Ok((year, month, month_code, day, t, offset))
 }
 
-/// InterpretISODateTimeOffset (spec 6.5.10) for UTC/fixed-offset zones: the
-/// wall date-time plus the offset behaviour resolve to an epoch nanosecond.
-/// Named zones never have multiple possible instants here, so disambiguation
-/// has no effect; `match_minute` is irrelevant because both the string offset
-/// (minute precision) and the zone offset are minute multiples.
+/// InterpretISODateTimeOffset (spec 6.5.10): the wall date-time plus the
+/// offset behaviour resolve to an epoch nanosecond. The exact (Z) and option
+/// (offset given) behaviours use the given offset directly and match the
+/// zone's offset AT the resolved instant; the wall behaviour uses the offset
+/// in effect at the wall instant (the compatible-disambiguation
+/// approximation; `match_minute` is irrelevant because both the string
+/// offset and the resolved zone offset are minute multiples).
 #[allow(clippy::too_many_arguments)]
 fn interpret_iso_date_time_offset(
     dt: [i64; 9],
@@ -2436,8 +2467,6 @@ fn interpret_iso_date_time_offset(
     has_z: bool,
     offset_opt: &str,
 ) -> Result<i128, JsError> {
-    let zone_offset = super::offset_time_zone_offset_ns(tz)
-        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
     let utc_wall = iso::get_utc_epoch_nanoseconds(
         dt[0], dt[1], dt[2], dt[3], dt[4], dt[5], dt[6], dt[7], dt[8],
     );
@@ -2445,12 +2474,6 @@ fn interpret_iso_date_time_offset(
     let exact = has_z;
     let wall = !has_z && offset_ns.is_none();
     let option = !has_z && offset_ns.is_some();
-    if wall || (option && offset_opt == "ignore") {
-        // GetEpochNanosecondsFor: the single possible instant for the zone.
-        let epoch = utc_wall - zone_offset;
-        check_balanced_range(epoch)?;
-        return Ok(epoch);
-    }
     if exact || (option && offset_opt == "use") {
         // BalanceISODateTime(wall - offset), CheckISODaysRange, then the
         // epoch range check.
@@ -2459,24 +2482,50 @@ fn interpret_iso_date_time_offset(
         check_balanced_range(epoch)?;
         return Ok(epoch);
     }
-    // offsetBehaviour option with prefer/reject: the WALL date must be
-    // strictly within the ±10^8-day range, the possible instant is computed
-    // and validated, the given offset is matched, and a mismatch rejects.
+    if option {
+        // The given offset is matched against the zone's offset at the
+        // RESOLVED instant (a transition can fall between the wall-as-UTC
+        // instant and the resolved epoch).
+        check_iso_days_range(iso::iso_date_to_epoch_days(dt[0], dt[1] - 1, dt[2]))?;
+        let given = offset_ns.unwrap();
+        let epoch = utc_wall - given;
+        check_balanced_range(epoch)?;
+        let zone_at_epoch = super::offset_ns_at(tz, epoch)
+            .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
+        if zone_at_epoch != given && offset_opt == "reject" {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "offset does not match the time zone".into(),
+            ));
+        }
+        return Ok(epoch);
+    }
+    if wall || offset_opt == "ignore" {
+        // GetEpochNanosecondsFor: the single possible instant for the zone
+        // (the offset in effect at the wall instant).
+        let zone_offset = super::offset_ns_at(tz, utc_wall)
+            .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
+        let epoch = utc_wall - zone_offset;
+        check_balanced_range(epoch)?;
+        return Ok(epoch);
+    }
+    // offsetBehaviour option with prefer: the wall date must be strictly
+    // within the ±10^8-day range; the possible instant is computed from the
+    // given offset and the zone's offset at it is matched (prefer accepts
+    // either).
     check_iso_days_range(iso::iso_date_to_epoch_days(dt[0], dt[1] - 1, dt[2]))?;
     let given = offset_ns.unwrap();
-    let possible = utc_wall - zone_offset;
-    check_balanced_range(possible)?;
-    if zone_offset == given {
-        return Ok(possible);
-    }
-    if offset_opt == "reject" {
+    let epoch = utc_wall - given;
+    check_balanced_range(epoch)?;
+    let zone_at_epoch = super::offset_ns_at(tz, epoch)
+        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
+    if zone_at_epoch != given && offset_opt == "reject" {
         return Err(JsError::new(
             ErrorKind::RangeError,
             "offset does not match the time zone".into(),
         ));
     }
-    // prefer: DisambiguatePossibleEpochNanoseconds on the single instant.
-    Ok(possible)
+    Ok(epoch)
 }
 
 /// CheckISODaysRange (spec): the ISO date must be strictly within ±10^8 days
@@ -3701,11 +3750,13 @@ fn plain_date_time_to_zoned_date_time(
     let tz = super::instant::to_temporal_time_zone_identifier(agent, &time_zone_like)?;
     let options = super::get_options_object(args.get(1).unwrap_or(&Value::Undefined))?;
     super::get_temporal_disambiguation_option(agent, &options)?;
-    let offset = super::offset_time_zone_offset_ns(&tz)
-        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
     let utc = iso::get_utc_epoch_nanoseconds(
         dt[0], dt[1], dt[2], dt[3], dt[4], dt[5], dt[6], dt[7], dt[8],
     );
+    // GetEpochNanosecondsFor: the offset in effect at the wall instant (the
+    // compatible-disambiguation approximation for gaps/overlaps).
+    let offset = super::offset_ns_at(&tz, utc)
+        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
     let epoch = utc - offset;
     if !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&epoch) {
         return Err(JsError::new(
@@ -3787,7 +3838,7 @@ fn zoned_format_string(
     show_time_zone: &str,
     calendar: &str,
 ) -> Result<Value, JsError> {
-    let offset = super::offset_time_zone_offset_ns(tz).unwrap_or(0);
+    let offset = super::offset_ns_at(tz, ns).unwrap_or(0);
     let (y, m, d, h, min, s, ms, us, n) = iso::iso_parts_from_epoch(ns);
     let balanced = super::instant::balance_iso_date_time(
         y,
@@ -4182,12 +4233,15 @@ fn zoned_until_since(
 
 /// spec 6.5.15 `startOfDay` (GetStartOfDay on the local date).
 fn zoned_start_of_day(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
-    let (ns, tz) = zoned_parts(agent, this)?;
-    let local = zoned_local(agent, ns, &tz)?;
-    let offset = super::offset_time_zone_offset_ns(&tz)
-        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
-    let start =
-        iso::get_utc_epoch_nanoseconds(local.0, local.1, local.2, 0, 0, 0, 0, 0, 0) - offset;
+    let (_, tz) = zoned_parts(agent, this)?;
+    let (y, m, d, ..) = match require_record(agent, this, RecordKind::ZonedDateTime)? {
+        TemporalRecord::ZonedDateTime(ns, _) => {
+            let local = zoned_local(agent, ns, &tz)?;
+            (local.0, local.1, local.2)
+        }
+        _ => unreachable!(),
+    };
+    let start = zoned_start_of_day_ns(agent, &tz, y, m, d)?;
     create_zoned(agent, start, &tz)
 }
 
@@ -4198,7 +4252,6 @@ fn zoned_get_time_zone_transition(
     this: &Value,
     direction: Value,
 ) -> Result<Value, JsError> {
-    let (_, tz) = zoned_parts(agent, this)?;
     if matches!(direction.kind(), ValueKind::Undefined) {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -4222,9 +4275,12 @@ fn zoned_get_time_zone_transition(
             "direction is required".into(),
         ));
     }
-    // UTC and offset time zones have no transitions.
-    let _ = tz;
-    Ok(Value::Null)
+    // The next/previous transition instant (UTC and offset zones have none).
+    let (ns, tz) = zoned_parts(agent, this)?;
+    let Some((at_secs, _, _)) = super::tz_transition(&tz, ns, value.unwrap() == "next") else {
+        return Ok(Value::Null);
+    };
+    create_zoned(agent, at_secs as i128 * 1_000_000_000, &tz)
 }
 
 /// spec 6.5.17 `toPlainDate`.
@@ -4908,13 +4964,20 @@ fn plain_date_to_zoned_date_time(
         let tz = super::instant::to_temporal_time_zone_identifier(agent, &item)?;
         (tz, None)
     };
-    let offset = super::offset_time_zone_offset_ns(&tz)
-        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
     let utc = match time {
         Some(t) => iso::get_utc_epoch_nanoseconds(y, m, d, t[0], t[1], t[2], t[3], t[4], t[5]),
-        // GetStartOfDay: the single possible epoch-nanosecond at midnight.
-        None => iso::get_utc_epoch_nanoseconds(y, m, d, 0, 0, 0, 0, 0, 0),
+        // GetStartOfDay: the single possible epoch-nanosecond at midnight
+        // (the offset in effect at the wall instant).
+        None => {
+            let wall = iso::get_utc_epoch_nanoseconds(y, m, d, 0, 0, 0, 0, 0, 0);
+            let offset = super::offset_ns_at(&tz, wall).ok_or_else(|| {
+                JsError::new(ErrorKind::RangeError, "unsupported time zone".into())
+            })?;
+            return create_zoned(agent, wall - offset, &tz);
+        }
     };
+    let offset = super::offset_ns_at(&tz, utc)
+        .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
     let epoch = utc - offset;
     if !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&epoch) {
         return Err(JsError::new(

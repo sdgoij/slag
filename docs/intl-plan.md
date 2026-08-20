@@ -9,9 +9,15 @@ regression net is the `intl402` fixture area of the pinned test262
 submodule — the corpus encodes the exact locale data this implementation
 must match.
 
-Status: **not started** — no `Intl` namespace exists in the realm, and
-`intl402` is not a sweep area. Everything below is measured against the
-current submodule.
+Status: Cuts 1-8 are committed and green (NumberFormat, Locale, PluralRules,
+RelativeTimeFormat, ListFormat, DisplayNames, DateTimeFormat, Collator,
+Segmenter, DurationFormat). Cut 9 (the intl402/Temporal integration) is in
+flight: the Temporal×DateTimeFormat integration (format/toLocaleString on
+Temporal values, the [[Calendar]] slots, the un-skipped intl402 gate) is
+committed; the **time-zone data decision is made** (corpus-derived tables,
+spike validated — see `docs/tz-data-decision.md`); the remaining work is the
+DST-aware Temporal algorithms (add/subtract/round/with, property-bag
+disambiguation, Duration relativeTo) and the non-iso calendar data.
 
 ## 1. The fixture surface (measured)
 
@@ -151,10 +157,12 @@ Fixtures: 81 + 57.
 **Cut 5 — DateTimeFormat** (+ String/Date `toLocale*`, the largest data
 surface). Calendar machinery (gregory first; the tested alternate
 calendars as needed), month/weekday/day-period/era names, hour cycles,
-date/time patterns, and **time zones** — the IANA tz data question is
-decided here (chrono-tz is the pragmatic pure-Rust option; the corpus
-tests specific zones across DST transitions). `formatToParts` +
-`formatRange`. Fixtures: 244 + 37 formatRange + 31 String/Date.
+date/time patterns, and **time zones** — the IANA tz data question was
+deferred to Cut 9 and **decided in favor of corpus-derived tables**
+(`docs/tz-data-decision.md`): a generator over a vendored IANA subset
+(chrono-tz/jiff lack the transition API the corpus's getTimeZoneTransition
+and hoursInDay fixtures require). `formatToParts` + `formatRange`.
+Fixtures: 244 + 37 formatRange + 31 String/Date.
 
 **Cut 6 — Collator.** The hard data problem: real collation
 (DUCET-level) for the tested locales, including `de-u-co-phonebk` (9
@@ -172,10 +180,24 @@ Fixtures: 110.
 
 **Cut 9 — the intl402/Temporal area (2,029).** DateTimeFormat.format on
 Temporal types (Instant, ZonedDateTime, PlainDate/Time/DateTime),
-`toLocaleString` on the Temporal prototypes (the current "Intl is out of
-scope" skips in `tools/skip_tally.js`), Temporal.Instant/PlainDate etc.
-integration. Un-skip via the feature table. Depends on Cut 5 + the
+`toLocaleString` on the Temporal prototypes, Temporal.Instant/PlainDate
+etc. integration. Un-skip via the feature table. Depends on Cut 5 + the
 existing Temporal implementation.
+
+**In flight.** Committed: the `[[Calendar]]` slots on Temporal instances,
+`HandleDateTimeValue` + the (any/all) re-resolution for format/formatToParts/
+formatRange on Temporal values, the `toLocaleString` family on all Temporal
+prototypes, and the un-skipped intl402 gate (sweep: 1355 pass, 0
+regressions on the previously-passing union). The **time-zone data spike**
+landed the derived tables (data extraction + POSIX-rule extension through
+2050 + the four operations), wiring the offset getters, hoursInDay,
+getTimeZoneTransition, ZonedDateTime.from string/plain conversion, toString,
+and the DateTimeFormat named-zone offsets (sweep: 1402 pass, 0
+regressions). **Remaining:** the DST-aware `add`/`subtract`/`round`/`with`
+machinery, the property-bag disambiguation options (prefer/reject/ignore in
+gaps and overlaps), Duration `relativeTo` with named zones, and the non-iso
+calendar data (chinese/dangi/hebrew/japanese/islamic conversions, era
+fields, leap months).
 
 ## 5. Risk register (investigate before implementing)
 
@@ -186,8 +208,15 @@ existing Temporal implementation.
 2. **Collation depth** — `de-u-co-phonebk`, `sv` (å sorts after z), `tr`,
    `no-bok` require real collation rules. Highest-risk data surface;
    `icu_collator` is the escape hatch.
-3. **Time zones** — DST-correct offsets for specific zones. chrono-tz
-   (vendored IANA data) vs derived tables; decide in Cut 5.
+3. **Time zones** — DST-correct offsets for specific zones. **DECIDED in
+   Cut 9: corpus-derived tables** (the derived-data precedent), validated
+   by the spike: the generator parses a vendored IANA TZif blob
+   (`tools/tzdata/`, from jiff-tzdb) + evaluates the POSIX footer rules
+   through 2050; chrono-tz/jiff were ruled out because neither exposes the
+   transition instants the `getTimeZoneTransition`/`hoursInDay`/DST
+   arithmetic fixtures require. The spike's 47-fixture gain on the tz
+   cluster + the pinned unit tests confirm the era/data shape; the final
+   generator should vendor the exact tzdata 2023a-era pin.
 4. **ICU quirks the corpus encodes** — some fixtures assert
    ICU-specific behavior (number rounding edges, pattern details); the
    derived-tables approach bakes them in by construction.
