@@ -218,7 +218,22 @@ pub fn dispatch_call(
         return Some(to_string_impl(agent, this, &options));
     }
     if intrinsics.get(P_TO_LOCALE).as_ref() == Some(callee) {
-        return Some(to_string_impl(agent, this, &Value::Undefined));
+        return Some(match require_instant(agent, this) {
+            Ok(ns) => {
+                let locales = args.first().cloned().unwrap_or(Value::Undefined);
+                let options = args.get(1).cloned().unwrap_or(Value::Undefined);
+                crate::builtins::intl::date_time_format::to_locale_string(
+                    agent,
+                    &locales,
+                    &options,
+                    ns as f64 / 1_000_000.0,
+                    "any",
+                    "all",
+                )
+                .map(|text| Value::String(Handle::new(JsString::from_utf8(&text))))
+            }
+            Err(error) => Err(error),
+        });
     }
     if intrinsics.get(P_TO_JSON).as_ref() == Some(callee) {
         return Some(to_string_impl(agent, this, &Value::Undefined));

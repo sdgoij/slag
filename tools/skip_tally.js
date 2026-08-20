@@ -72,11 +72,6 @@ function classify(file, source) {
     }
   }
   if (features.has("Temporal")) {
-    // Mirrors run_fixture: the intl402/Temporal integration needs Intl
-    // first (plan Cut 9); the whole intl402 Temporal area stays skipped.
-    if (file.includes("/intl402/")) {
-      return "Intl x Temporal integration (Cut 9) not yet implemented";
-    }
     // Mirrors run_fixture: only the implemented clusters run; the rest of
     // the Temporal namespace stays skipped.
     const rest = file.split("/Temporal/")[1] ?? "";
@@ -98,16 +93,6 @@ function classify(file, source) {
       (!rest.includes("/") && file.includes("/Temporal/")) ||
       file.includes("/Date/prototype/toTemporalInstant/");
     if (!implemented) return "Temporal type not yet implemented";
-    if (
-      rest.startsWith("PlainDate/prototype/toLocaleString/") ||
-      rest.startsWith("PlainTime/prototype/toLocaleString/") ||
-      rest.startsWith("PlainDateTime/prototype/toLocaleString/") ||
-      rest.startsWith("PlainYearMonth/prototype/toLocaleString/") ||
-      rest.startsWith("PlainMonthDay/prototype/toLocaleString/") ||
-      rest.startsWith("ZonedDateTime/prototype/toLocaleString/")
-    ) {
-      return "Intl is out of scope";
-    }
     return null;
   }
   if (features.has("await-dictionary")) return "await-dictionary";

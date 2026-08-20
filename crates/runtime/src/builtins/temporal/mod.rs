@@ -191,6 +191,58 @@ pub fn create_temporal_object(
     Ok(Value::Object(object))
 }
 
+/// CanonicalizeCalendar (ECMA-402 §6.9.2): lowercase the identifier, apply
+/// the two alias mappings (islamicc → islamic-civil, ethiopic-amete-alem →
+/// ethioaa), and validate the well-formed type-identifier form (each subtag
+/// 3-8 ASCII alphanumerics, `-`-separated). `None` when malformed.
+pub fn canonicalize_calendar_id(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let canonical = match lower.as_str() {
+        "islamicc" => "islamic-civil".to_string(),
+        "ethiopic-amete-alem" => "ethioaa".to_string(),
+        other => other.to_string(),
+    };
+    if canonical.is_empty() {
+        return None;
+    }
+    if canonical.split('-').all(|subtag| {
+        (3..=8).contains(&subtag.len()) && subtag.bytes().all(|b| b.is_ascii_alphanumeric())
+    }) {
+        Some(canonical)
+    } else {
+        None
+    }
+}
+
+/// Record the [[Calendar]] internal slot of a Temporal instance (default
+/// "iso8601" when `calendar` is `None`); overwrites any existing value.
+pub fn set_temporal_calendar(agent: &mut Agent, value: &Value, calendar: Option<&str>) {
+    if let ValueKind::Object(obj) = value.kind() {
+        match calendar {
+            Some(calendar) => {
+                agent
+                    .temporal_calendars
+                    .insert(obj.id(), JsString::from_utf8(calendar));
+            }
+            None => {
+                agent
+                    .temporal_calendars
+                    .insert(obj.id(), JsString::from_utf8("iso8601"));
+            }
+        }
+    }
+}
+
+/// The [[Calendar]] of a Temporal instance (default "iso8601").
+pub fn temporal_calendar_id(agent: &Agent, this: &Value) -> JsString {
+    if let ValueKind::Object(obj) = this.kind()
+        && let Some(calendar) = agent.temporal_calendars.get(&obj.id())
+    {
+        return calendar.clone();
+    }
+    JsString::from_utf8("iso8601")
+}
+
 /// RequireInternalSlot: the receiver must be a Temporal object of `kind`.
 pub fn require_record(
     agent: &Agent,
@@ -1211,7 +1263,6 @@ pub fn get_temporal_relative_to(agent: &mut Agent, options: &Value) -> Result<Re
 
 /// The property-bag branch of GetTemporalRelativeToOption (spec 13.19).
 fn relative_to_object(agent: &mut Agent, item: &Value) -> Result<RelativeTo, JsError> {
-    // The calendar: only "iso8601" is available (CanonicalizeCalendar).
     // spec 12.3.10 ToTemporalCalendarIdentifier: a Temporal object passes its
     // own calendar; any other non-String is a TypeError, an unsupported
     // String a RangeError.
@@ -1221,12 +1272,12 @@ fn relative_to_object(agent: &mut Agent, item: &Value) -> Result<RelativeTo, JsE
         if let ValueKind::Object(obj) = calendar.kind()
             && agent.temporal_data.contains_key(&obj.id())
         {
-            // A Temporal object; its calendar is iso8601 in this engine.
+            // A Temporal object's own calendar (validated elsewhere).
         } else if let ValueKind::String(text) = calendar.kind() {
-            if !text.to_string_lossy().eq_ignore_ascii_case("iso8601") {
+            if canonicalize_calendar_id(&text.to_string_lossy()).is_none() {
                 return Err(JsError::new(
                     ErrorKind::RangeError,
-                    "only the iso8601 calendar is supported".into(),
+                    "invalid calendar identifier".into(),
                 ));
             }
         } else {
@@ -1424,11 +1475,11 @@ fn relative_to_string(agent: &mut Agent, item: &Value) -> Result<RelativeTo, JsE
         .or_else(|_| iso::parse_iso_date_time(text.as_slice(), iso::Format::DateTimePlain))
         .map_err(|_| JsError::new(ErrorKind::RangeError, "invalid date-time string".into()))?;
     if let Some(calendar) = &parsed.calendar
-        && !calendar.eq_ignore_ascii_case("iso8601")
+        && canonicalize_calendar_id(calendar).is_none()
     {
         return Err(JsError::new(
             ErrorKind::RangeError,
-            "only the iso8601 calendar is supported".into(),
+            "invalid calendar identifier".into(),
         ));
     }
     let [h, min, s, ms, us, ns] = parsed.time.unwrap_or([0, 0, 0, 0, 0, 0]);

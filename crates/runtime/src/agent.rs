@@ -281,6 +281,9 @@ pub struct Agent {
     /// The [[InitializedTemporal*]] records of Temporal instances, keyed by
     /// object identity (the proposal-temporal internal slots).
     pub temporal_data: std::collections::HashMap<u64, crate::builtins::temporal::TemporalRecord>,
+    /// The [[Calendar]] internal slot of Temporal instances, keyed by object
+    /// identity (the proposal-temporal calendar field; default "iso8601").
+    pub temporal_calendars: std::collections::HashMap<u64, crux::string::JsString>,
     /// The RegExp internal state ([[OriginalSource]], [[OriginalFlags]],
     /// [[RegExpRecord]], [[RegExpMatcher]]) of RegExp instances, keyed by
     /// object identity (spec 22.2.5).
@@ -450,6 +453,7 @@ impl Agent {
             intl_segment_iterator_data: std::collections::HashMap::new(),
             intl_duration_format_data: std::collections::HashMap::new(),
             temporal_data: std::collections::HashMap::new(),
+            temporal_calendars: std::collections::HashMap::new(),
             regexp_data: std::collections::HashMap::new(),
             regexp_string_iter_data: std::collections::HashMap::new(),
             string_iter_data: std::collections::HashMap::new(),

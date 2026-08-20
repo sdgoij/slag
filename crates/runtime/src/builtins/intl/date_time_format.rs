@@ -18,6 +18,7 @@ use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
 use crate::builtins::intl::number_format::{self, get_option};
+use crate::builtins::temporal::TemporalRecord;
 use crate::context::{as_object, get_property, to_number, to_string};
 use crate::realm::Realm;
 
@@ -152,6 +153,7 @@ const AVAILABLE_FORMATS: &[(u16, &str, &str)] = &[
     (4 | 8, "MMMM y", "MMMM y"),
     (4 | 8, "MMM y", "MMM y"),
     (4 | 8, "M/y", "M/y"),
+    (4 | 8, "M/yy", "M/yy"),
     (8 | 16, "M/d", "M/d"),
     (1 | 8 | 16, "E, M/d", "E, M/d"),
     (1 | 8 | 16, "EEE, MMM d", "EEE, MMM d"),
@@ -215,6 +217,16 @@ const AVAILABLE_FORMATS: &[(u16, &str, &str)] = &[
         "M/d/y, HH:mm:ss",
     ),
     (
+        4 | 8 | 16 | 32 | 64 | 128 | 512,
+        "M/d/y, h:mm:ss a z",
+        "M/d/y, HH:mm:ss z",
+    ),
+    (
+        2 | 4 | 8 | 16 | 32 | 64 | 128,
+        "M/d/y G, h:mm:ss a",
+        "M/d/y G, HH:mm:ss",
+    ),
+    (
         1 | 4 | 8 | 16 | 32 | 64 | 128 | 256,
         "EEEE, MMMM d, y 'at' h:mm:ss a",
         "EEEE, MMMM d, y 'at' HH:mm:ss",
@@ -260,6 +272,10 @@ pub struct DateTimeFormatRecord {
     /// The format fields: component name → field format (e.g. "year" →
     /// "2-digit").
     pub fields: Vec<(String, String)>,
+    /// The component bits the caller explicitly requested (the
+    /// CreateDateTimeFormat `hasExplicitFormatComponents` set — excludes the
+    /// non-gregory era addition and the defaults).
+    pub explicit_bits: u16,
     pub fractional_second_digits: Option<u32>,
     /// The cached [[BoundFormat]] function value.
     pub bound_format: Option<Value>,
@@ -287,6 +303,51 @@ fn supported_numbering_systems() -> &'static [&'static str] {
 
 /// The `hc` keyword values.
 const HOUR_CYCLES: [&str; 4] = ["h11", "h12", "h23", "h24"];
+
+/// The CLDR default hour cycle is 24-hour for most of Europe (the corpus
+/// pins de-AT's 24-hour format in the Temporal toLocaleString basic
+/// fixtures; en/ja default to the 12-hour clock).
+fn locale_uses_24h(locale: &str) -> bool {
+    let base = locale.split(['-', '_']).next().unwrap_or(locale);
+    matches!(
+        base,
+        "de" | "fr"
+            | "it"
+            | "es"
+            | "pt"
+            | "nl"
+            | "fi"
+            | "sv"
+            | "no"
+            | "nb"
+            | "nn"
+            | "da"
+            | "is"
+            | "lt"
+            | "lv"
+            | "et"
+            | "pl"
+            | "cs"
+            | "sk"
+            | "sl"
+            | "hr"
+            | "sr"
+            | "bs"
+            | "mk"
+            | "bg"
+            | "el"
+            | "hu"
+            | "ro"
+            | "uk"
+            | "be"
+            | "ru"
+            | "ca"
+            | "sq"
+            | "th"
+            | "vi"
+            | "id"
+    )
+}
 
 /// ResolveLocale for DateTimeFormat: the `ca`, `nu`, and `hc` extension
 /// keys, with the option overrides. Returns
@@ -586,7 +647,7 @@ fn initialize(
     agent: &mut Agent,
     locales: &Value,
     options: &Value,
-    _required: &str,
+    required: &str,
     defaults: &str,
 ) -> Result<DateTimeFormatRecord, JsError> {
     let requested = crate::builtins::intl::canonicalize_locale_list(agent, locales)?;
@@ -637,10 +698,12 @@ fn initialize(
     let ext_hc = (!hc_value.is_empty()).then_some(hc_value.clone());
     // The locale's hour cycles: en-US (and the fallback) use h12/h23; ja
     // uses h11 for the 12-hour clock (the corpus pins `hour12` == h11 for
-    // ja and h23 for `hour12: false` everywhere).
+    // ja and h23 for `hour12: false` everywhere); the CLDR 24-hour locales
+    // (most of Europe plus th/vi/id) default to h23.
     let is_ja = locale.starts_with("ja");
     let hc12 = if is_ja { "h11" } else { "h12" };
     let hc24 = "h23";
+    let default_hc = if locale_uses_24h(&locale) { hc24 } else { hc12 };
     let hc = if let Some(true) = hour12 {
         hc12.to_string()
     } else if let Some(false) = hour12 {
@@ -652,7 +715,7 @@ fn initialize(
     } else if let Some(value) = &ext_hc {
         value.clone()
     } else {
-        hc12.to_string()
+        default_hc.to_string()
     };
     // The hour12 option also drops a differing `hc` unicode-extension
     // keyword from the resolved locale (resolved-locale-with-hc-unicode).
@@ -697,12 +760,14 @@ fn initialize(
     // pinned order (fractionalSecondDigits between second and timeZoneName).
     let mut fields: Vec<(String, String)> = Vec::new();
     let mut requested_bits: u16 = 0;
+    let mut explicit_bits: u16 = 0;
     let mut fractional_second_digits: Option<u32> = None;
     for (property, bit) in COMPONENT_ORDER {
         let value = get_option(agent, &options, property, component_values(property), None)?;
         if let Some(value) = value {
             fields.push((property.to_string(), value));
             requested_bits |= bit;
+            explicit_bits |= bit;
         }
         if *property == "second"
             && let Some(value) =
@@ -710,12 +775,14 @@ fn initialize(
         {
             fractional_second_digits = Some(value as u32);
             requested_bits |= 1024;
+            explicit_bits |= 1024;
         }
     }
     // The non-gregorian calendars format with an era field (V8 adds the
     // era to the japanese/islamic/hebrew etc. patterns; the corpus only
-    // pins that some calendars use a different pattern than gregory).
-    if calendar != "gregory" && !fields.iter().any(|(n, _)| n == "era") {
+    // pins that some calendars use a different pattern than gregory). The
+    // iso8601 calendar formats like gregory (no era).
+    if calendar != "gregory" && calendar != "iso8601" && !fields.iter().any(|(n, _)| n == "era") {
         fields.push(("era".to_string(), "short".to_string()));
         requested_bits |= 2;
     }
@@ -740,10 +807,25 @@ fn initialize(
         &["full", "long", "medium", "short"],
         None,
     )?;
-    if (date_style.is_some() || time_style.is_some()) && requested_bits != 0 {
-        return Err(type_error(
-            "Cannot specify both dateStyle/timeStyle and format components",
-        ));
+    if date_style.is_some() || time_style.is_some() {
+        // CreateDateTimeFormat: format components conflict with the styles,
+        // and a style the required set cannot express is a TypeError (the
+        // PlainDate/PlainTime toLocaleString required date/time rejections).
+        if explicit_bits != 0 {
+            return Err(type_error(
+                "Cannot specify both dateStyle/timeStyle and format components",
+            ));
+        }
+        if required == "date" && time_style.is_some() {
+            return Err(type_error(
+                "timeStyle is not allowed for a date-only toLocaleString",
+            ));
+        }
+        if required == "time" && date_style.is_some() {
+            return Err(type_error(
+                "dateStyle is not allowed for a time-only toLocaleString",
+            ));
+        }
     }
     // The pattern selection.
     let (pattern, pattern12, _field_bits) = if date_style.is_some() || time_style.is_some() {
@@ -760,20 +842,14 @@ fn initialize(
         let mut bits = requested_bits;
         let mut effective = fields.clone();
         let mut need_defaults = true;
-        if _required == "date" || _required == "any" {
-            for (name, _) in [
-                ("weekday", 1),
-                ("era", 2),
-                ("year", 4),
-                ("month", 8),
-                ("day", 16),
-            ] {
+        if required == "date" || required == "any" {
+            for (name, _) in [("weekday", 1), ("year", 4), ("month", 8), ("day", 16)] {
                 if effective.iter().any(|(n, _)| n == name) {
                     need_defaults = false;
                 }
             }
         }
-        if _required == "time" || _required == "any" {
+        if required == "time" || required == "any" {
             for (name, _) in [
                 ("dayPeriod", 256),
                 ("hour", 32),
@@ -783,6 +859,9 @@ fn initialize(
                 if effective.iter().any(|(n, _)| n == name) {
                     need_defaults = false;
                 }
+            }
+            if fractional_second_digits.is_some() {
+                need_defaults = false;
             }
         }
         if need_defaults && (defaults == "date" || defaults == "all") {
@@ -817,6 +896,7 @@ fn initialize(
         pattern,
         pattern12,
         fields,
+        explicit_bits,
         fractional_second_digits,
         bound_format: None,
     })
@@ -1159,10 +1239,21 @@ fn format_with_pattern(
                     ns,
                 ),
             )),
-            'H' | 'k' => Some((
-                "hour",
-                format_hour_24(&local, c == 'k', field_length(&mut chars, c), ns),
-            )),
+            'H' | 'k' => {
+                let width = field_length(&mut chars, c);
+                // `k` is 1-24; the h24 hour cycle also renders midnight as
+                // 24 (spec: set value to 24 when hour is 0 and the cycle is
+                // h24).
+                let hour = if (c == 'k' || record.hour_cycle == "h24") && local.hour == 0 {
+                    24
+                } else {
+                    local.hour
+                };
+                Some((
+                    "hour",
+                    format_number(hour as i64, if width >= 2 { 2 } else { 1 }, ns),
+                ))
+            }
             'm' => {
                 let width = field_length(&mut chars, c);
                 Some((
@@ -1226,7 +1317,355 @@ fn format_with_pattern(
     parts
 }
 
-/// The decimal separator in a literal run: the arabic numbering systems
+/// The plain Temporal kinds handled by HandleDateTimeValue: the value's ISO
+/// fields are interpreted as UTC wall-clock (the time zone is ignored) and
+/// the pattern is filtered to the fields the kind supports.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PlainKind {
+    Date,
+    Time,
+    DateTime,
+    YearMonth,
+    MonthDay,
+}
+
+impl PlainKind {
+    /// Whether the kind keeps a component field (the field-filter of
+    /// HandleDateTimeTemporalDate/Time/DateTime/YearMonth/MonthDay).
+    fn keeps(self, field: &str) -> bool {
+        match self {
+            PlainKind::Date => matches!(field, "weekday" | "era" | "year" | "month" | "day"),
+            PlainKind::Time => matches!(field, "dayPeriod" | "hour" | "minute" | "second"),
+            PlainKind::DateTime => field != "timeZoneName",
+            PlainKind::YearMonth => matches!(field, "era" | "year" | "month"),
+            PlainKind::MonthDay => matches!(field, "weekday" | "era" | "month" | "day"),
+        }
+    }
+
+    /// The fractional-second component is a time-only field.
+    fn keeps_fractional(self) -> bool {
+        matches!(self, PlainKind::Time | PlainKind::DateTime)
+    }
+}
+
+/// The result of HandleDateTimeValue: a tagged value with its epoch
+/// milliseconds (the plain kinds carry the UTC wall-clock epoch).
+pub(crate) enum FormatValue {
+    /// A Temporal.Instant: epoch milliseconds from [[EpochNanoseconds]].
+    Instant { epoch_ms: f64 },
+    /// A Temporal.Plain* value: the UTC wall-clock fields (isPlain true).
+    Plain { kind: PlainKind, epoch_ms: f64 },
+}
+
+/// The UTC epoch milliseconds of an ISO date-time field set (the plain
+/// path: no time-zone offset, no TimeClip — the day count is exact i64
+/// math, so the PlainDate limits far exceed the legacy Date range).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plain_epoch_ms(
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+    millisecond: i64,
+    microsecond: i64,
+    nanosecond: i64,
+) -> f64 {
+    let days = crate::builtins::temporal::iso::iso_date_to_epoch_days(year, month - 1, day);
+    let ms_of_day = hour as f64 * 3_600_000.0
+        + minute as f64 * 60_000.0
+        + second as f64 * 1_000.0
+        + millisecond as f64
+        + microsecond as f64 / 1_000.0
+        + nanosecond as f64 / 1_000_000.0;
+    days as f64 * 86_400_000.0 + ms_of_day
+}
+
+/// HandleDateTimeValue (ECMA-402 §11.5.15): detect a Temporal argument.
+/// Returns `None` for non-Temporal values (the Number/to_number path). A
+/// Temporal.ZonedDateTime throws a TypeError (not supported by format).
+pub(crate) fn handle_datetime_value(
+    agent: &mut Agent,
+    value: &Value,
+    record_calendar: &str,
+) -> Result<Option<FormatValue>, JsError> {
+    let ValueKind::Object(obj) = value.kind() else {
+        return Ok(None);
+    };
+    let Some(record) = agent.temporal_data.get(&obj.id()).cloned() else {
+        return Ok(None);
+    };
+    let calendar = crate::builtins::temporal::temporal_calendar_id(agent, value).to_string_lossy();
+    // A plain value whose calendar is neither iso8601 nor the formatter's
+    // calendar cannot be formatted (a RangeError, like formatRange).
+    let check_calendar = || -> Result<(), JsError> {
+        if calendar != "iso8601" && calendar != record_calendar {
+            return Err(range_error(
+                "calendar does not match the DateTimeFormat calendar",
+            ));
+        }
+        Ok(())
+    };
+    match record {
+        TemporalRecord::Instant(ns) => Ok(Some(FormatValue::Instant {
+            epoch_ms: ns as f64 / 1_000_000.0,
+        })),
+        TemporalRecord::ZonedDateTime(..) => Err(type_error(
+            "format() does not support Temporal.ZonedDateTime",
+        )),
+        TemporalRecord::PlainDate([y, m, d]) => {
+            check_calendar()?;
+            Ok(Some(FormatValue::Plain {
+                kind: PlainKind::Date,
+                epoch_ms: plain_epoch_ms(y, m, d, 12, 0, 0, 0, 0, 0),
+            }))
+        }
+        TemporalRecord::PlainTime([h, min, s, ms, us, ns]) => Ok(Some(FormatValue::Plain {
+            kind: PlainKind::Time,
+            epoch_ms: plain_epoch_ms(1970, 1, 1, h, min, s, ms, us, ns),
+        })),
+        TemporalRecord::PlainDateTime([y, m, d, h, min, s, ms, us, ns]) => {
+            check_calendar()?;
+            Ok(Some(FormatValue::Plain {
+                kind: PlainKind::DateTime,
+                epoch_ms: plain_epoch_ms(y, m, d, h, min, s, ms, us, ns),
+            }))
+        }
+        TemporalRecord::YearMonth([y, m, d]) => {
+            check_calendar()?;
+            Ok(Some(FormatValue::Plain {
+                kind: PlainKind::YearMonth,
+                epoch_ms: plain_epoch_ms(y, m, d, 12, 0, 0, 0, 0, 0),
+            }))
+        }
+        TemporalRecord::MonthDay([y, m, d]) => {
+            check_calendar()?;
+            Ok(Some(FormatValue::Plain {
+                kind: PlainKind::MonthDay,
+                epoch_ms: plain_epoch_ms(y, m, d, 12, 0, 0, 0, 0, 0),
+            }))
+        }
+        TemporalRecord::Duration(_) => Ok(None),
+    }
+}
+
+/// The dateStyle component fields with their real styles (DateTimeStyleFormat
+/// for the plain kinds, which regenerate the pattern via the matcher).
+fn date_style_fields(style: &str) -> Vec<(String, String)> {
+    let fields: &[(&str, &str)] = match style {
+        "full" => &[
+            ("weekday", "long"),
+            ("month", "long"),
+            ("day", "numeric"),
+            ("year", "numeric"),
+        ],
+        "long" => &[("month", "long"), ("day", "numeric"), ("year", "numeric")],
+        "medium" => &[("month", "short"), ("day", "numeric"), ("year", "numeric")],
+        _ => &[
+            ("month", "numeric"),
+            ("day", "numeric"),
+            ("year", "2-digit"),
+        ],
+    };
+    fields
+        .iter()
+        .map(|(name, style)| (name.to_string(), style.to_string()))
+        .collect()
+}
+
+/// Remove a trailing time-zone name field (and the literal before it) from a
+/// pattern — the IsPlain formatting omits timeZoneName parts.
+fn strip_trailing_tz(pattern: &str) -> String {
+    let mut end = pattern.len();
+    let bytes = pattern.as_bytes();
+    while end > 0 && matches!(bytes[end - 1], b'z' | b'v' | b'V') {
+        end -= 1;
+    }
+    if end == pattern.len() {
+        return pattern.to_string();
+    }
+    while end > 0 && !bytes[end - 1].is_ascii_alphanumeric() {
+        end -= 1;
+    }
+    pattern[..end].to_string()
+}
+
+/// The record used to format a plain Temporal value: the time zone becomes
+/// UTC (the wall-clock fields are used directly) and the pattern is
+/// regenerated from the kind's supported fields. A kind with no overlap
+/// with the format throws a TypeError (e.g. a timeStyle-only formatter with
+/// a PlainDate).
+pub(crate) fn plain_record(
+    record: &DateTimeFormatRecord,
+    kind: PlainKind,
+) -> Result<DateTimeFormatRecord, JsError> {
+    let mut plain = record.clone();
+    let has_date = kind.keeps("month");
+    let has_time = kind.keeps("hour");
+    let date_style = if has_date {
+        record.date_style.as_deref()
+    } else {
+        None
+    };
+    let time_style = if has_time {
+        record.time_style.as_deref()
+    } else {
+        None
+    };
+    let (pattern, pattern12) = if date_style.is_some() || time_style.is_some() {
+        match kind {
+            // YearMonth/MonthDay drop fields the date-style pattern cannot
+            // express by string surgery, so the pattern is regenerated from
+            // the filtered style fields.
+            PlainKind::YearMonth | PlainKind::MonthDay => {
+                let mut fields = date_style_fields(date_style.unwrap_or("short"));
+                fields.retain(|(name, _)| kind.keeps(name));
+                if fields.is_empty() {
+                    return Err(type_error(
+                        "format() does not support this Temporal value type",
+                    ));
+                }
+                let mut bits = 0u16;
+                for (name, _) in &fields {
+                    if let Some((_, bit)) = COMPONENT_ORDER.iter().find(|(n, _)| n == name) {
+                        bits |= bit;
+                    }
+                }
+                let (pattern, pattern12, _) = match_format(&fields, bits, &record.hour_cycle, None);
+                (pattern, pattern12)
+            }
+            _ => {
+                let (pattern, pattern12, _) =
+                    style_pattern(date_style, time_style, &mut Vec::new(), &record.hour_cycle);
+                (
+                    strip_trailing_tz(&pattern),
+                    pattern12.map(|p| strip_trailing_tz(&p)),
+                )
+            }
+        }
+    } else {
+        // The component/default path: filter the resolved fields.
+        let filtered: Vec<(String, String)> = record
+            .fields
+            .iter()
+            .filter(|(name, _)| kind.keeps(name))
+            .cloned()
+            .collect();
+        let fractional = record
+            .fractional_second_digits
+            .filter(|_| kind.keeps_fractional());
+        if filtered.is_empty() && fractional.is_none() {
+            return Err(type_error(
+                "format() does not support this Temporal value type",
+            ));
+        }
+        let mut bits = 0u16;
+        for (name, _) in &filtered {
+            if let Some((_, bit)) = COMPONENT_ORDER.iter().find(|(n, _)| n == name) {
+                bits |= bit;
+            }
+        }
+        if fractional.is_some() {
+            bits |= 1024;
+        }
+        let (pattern, pattern12, _) = match_format(&filtered, bits, &record.hour_cycle, fractional);
+        plain.fields = filtered;
+        plain.fractional_second_digits = fractional;
+        (pattern, pattern12)
+    };
+    plain.pattern = pattern;
+    plain.pattern12 = pattern12;
+    plain.time_zone = "UTC".to_string();
+    Ok(plain)
+}
+
+/// The component bit of a field name (0 when not a component).
+fn component_bit(name: &str) -> u16 {
+    COMPONENT_ORDER
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, bit)| *bit)
+        .unwrap_or(0)
+}
+
+/// Whether a record has no explicit format components (the CreateDateTimeFormat
+/// `needDefaults` computation for required="any", defaults="all": the date list
+/// weekday/year/month/day, the time list dayPeriod/hour/minute/second plus
+/// fractionalSecondDigits; era and timeZoneName never suppress the defaults).
+fn need_component_defaults(record: &DateTimeFormatRecord) -> bool {
+    if record.fractional_second_digits.is_some() {
+        return false;
+    }
+    ![
+        "weekday",
+        "year",
+        "month",
+        "day",
+        "dayPeriod",
+        "hour",
+        "minute",
+        "second",
+    ]
+    .iter()
+    .any(|name| record.explicit_bits & component_bit(name) != 0)
+}
+
+/// Re-resolve a record as if created with required="any", defaults="all" —
+/// the Temporal-value branch of HandleDateTimeValue: the user's explicit
+/// components keep their styles, the defaults fill in the missing date and
+/// time fields, and the styles are kept unchanged (an Instant formats with
+/// the full date+time default even when the formatter was created with the
+/// date-only constructor default).
+pub(crate) fn temporal_all_record(record: &DateTimeFormatRecord) -> DateTimeFormatRecord {
+    if record.date_style.is_some() || record.time_style.is_some() {
+        return record.clone();
+    }
+    let mut fields: Vec<(String, String)> = record
+        .fields
+        .iter()
+        .filter(|(name, _)| component_bit(name) & record.explicit_bits != 0)
+        .cloned()
+        .collect();
+    // The non-gregory calendar's era field is kept (a calendar addition,
+    // not a user component).
+    if record.fields.iter().any(|(name, _)| name == "era")
+        && !fields.iter().any(|(name, _)| name == "era")
+    {
+        fields.push(("era".to_string(), "short".to_string()));
+    }
+    let mut bits = record.explicit_bits;
+    if record.fields.iter().any(|(name, _)| name == "era") {
+        bits |= 2;
+    }
+    if need_component_defaults(record) {
+        for (name, bit) in [("year", 4), ("month", 8), ("day", 16)] {
+            if !fields.iter().any(|(n, _)| n == name) {
+                bits |= bit;
+                fields.push((name.to_string(), "numeric".to_string()));
+            }
+        }
+        for (name, bit) in [("hour", 32), ("minute", 64), ("second", 128)] {
+            if !fields.iter().any(|(n, _)| n == name) {
+                bits |= bit;
+                fields.push((name.to_string(), "numeric".to_string()));
+            }
+        }
+    }
+    let (pattern, pattern12, _) = match_format(
+        &fields,
+        bits,
+        &record.hour_cycle,
+        record.fractional_second_digits,
+    );
+    let mut all = record.clone();
+    all.fields = fields;
+    all.pattern = pattern;
+    all.pattern12 = pattern12;
+    all
+}
+
+/// The literal separator in a literal run: the arabic numbering systems
 /// use U+066B (the `٫` of `٢:٣٥:٠٦٫٧٨٩`).
 fn literal_separator(literal: String, ns: &str) -> String {
     if ns == "arab" || ns == "arabext" {
@@ -1305,16 +1744,6 @@ fn format_hour(
     format_number(hour as i64, if width >= 2 { 2 } else { 1 }, ns)
 }
 
-/// The 24-hour hour (H: 0-23, k: 1-24).
-fn format_hour_24(local: &LocalTime, one_based: bool, width: u32, ns: &str) -> String {
-    let hour = if one_based && local.hour == 0 {
-        24
-    } else {
-        local.hour
-    };
-    format_number(hour as i64, if width >= 2 { 2 } else { 1 }, ns)
-}
-
 /// The AM/PM form of the `a` pattern field.
 fn format_am_pm(local: &LocalTime) -> String {
     if local.hour < 12 {
@@ -1365,6 +1794,15 @@ fn format_time_zone(record: &DateTimeFormatRecord, width: u32) -> String {
     // The offset zones (stored as `±HH:MM`) and the fixed Etc/GMT±N zones.
     let offset_minutes = parse_offset_time_zone(zone).or_else(|| named_zone_offset(zone));
     if let Some(minutes) = offset_minutes {
+        if minutes == 0 {
+            // A zero offset formats as the plain GMT name (the corpus
+            // `offset-time-zones.js` pins no `+`/`-` for +00:00).
+            return if width >= 4 {
+                "Greenwich Mean Time".to_string()
+            } else {
+                "GMT".to_string()
+            };
+        }
         let sign = if minutes < 0 { '-' } else { '+' };
         let absolute = minutes.abs();
         let hours = absolute / 60;
@@ -1656,19 +2094,87 @@ fn format_bound(agent: &mut Agent, dtf_id: u64, args: &[Value]) -> Result<Value,
         .cloned()
         .ok_or_else(|| type_error("Not a DateTimeFormat instance"))?;
     let value = args.first().cloned().unwrap_or(Value::Undefined);
-    // A missing/undefined argument formats the current date-time (the
-    // DateTime Format Functions spec: Date.now() when undefined).
-    let epoch_ms = if value.is_undefined() {
-        crate::builtins::date::now_ms()
-    } else {
-        clip_epoch_ms(to_number(agent, &value)?)?
-    };
+    let (record, epoch_ms) = resolve_format_value(agent, &record, &value)?;
     let parts = format_date_time_pattern(&record, epoch_ms);
     let mut result = String::new();
     for part in &parts {
         result.push_str(&part.value);
     }
     Ok(Value::String(Handle::new(JsString::from_utf8(&result))))
+}
+
+/// Resolve a DateTimeFormat value argument: undefined → the current
+/// date-time; a Temporal value → the instant/plain path; otherwise →
+/// ToNumber + TimeClip (the legacy behavior). Returns the record to format
+/// with (the plain record for plain Temporal kinds) and the epoch ms.
+fn resolve_format_value(
+    agent: &mut Agent,
+    record: &DateTimeFormatRecord,
+    value: &Value,
+) -> Result<(DateTimeFormatRecord, f64), JsError> {
+    // A missing/undefined argument formats the current date-time (the
+    // DateTime Format Functions spec: Date.now() when undefined).
+    if value.is_undefined() {
+        return Ok((record.clone(), crate::builtins::date::now_ms()));
+    }
+    if let Some(format_value) = handle_datetime_value(agent, value, &record.calendar)? {
+        // A Temporal value formats with the (any/all) re-resolution: the
+        // user's explicit components plus the date+time defaults (an Instant
+        // keeps the full record; the plain kinds filter it further).
+        let record = temporal_all_record(record);
+        return match format_value {
+            FormatValue::Instant { epoch_ms } => Ok((record, clip_epoch_ms(epoch_ms)?)),
+            FormatValue::Plain { kind, epoch_ms, .. } => {
+                Ok((plain_record(&record, kind)?, epoch_ms))
+            }
+        };
+    }
+    Ok((record.clone(), clip_epoch_ms(to_number(agent, value)?)?))
+}
+
+/// The type tag of a formatRange argument (HandleDateTimeValue): "number"
+/// for a legacy Date or plain Number, the Temporal type name otherwise.
+fn range_value_tag(agent: &mut Agent, value: &Value) -> Result<String, JsError> {
+    let ValueKind::Object(obj) = value.kind() else {
+        return Ok("number".to_string());
+    };
+    let Some(record) = agent.temporal_data.get(&obj.id()).cloned() else {
+        return Ok("number".to_string());
+    };
+    Ok(match record {
+        TemporalRecord::Instant(_) => "instant".to_string(),
+        TemporalRecord::ZonedDateTime(..) => {
+            return Err(type_error(
+                "formatRange does not support Temporal.ZonedDateTime",
+            ));
+        }
+        TemporalRecord::PlainDate(_) => "date".to_string(),
+        TemporalRecord::PlainTime(_) => "time".to_string(),
+        TemporalRecord::PlainDateTime(_) => "datetime".to_string(),
+        TemporalRecord::YearMonth(_) => "yearmonth".to_string(),
+        TemporalRecord::MonthDay(_) => "monthday".to_string(),
+        TemporalRecord::Duration(_) => "number".to_string(),
+    })
+}
+
+/// Resolve a formatRange argument pair: both values must be the same type
+/// (a legacy Date/Number, an Instant, or one plain kind — the corpus pins
+/// the distinct-type TypeError) and each plain value's calendar must match
+/// the formatter's (a RangeError otherwise).
+fn resolve_range_values(
+    agent: &mut Agent,
+    record: &DateTimeFormatRecord,
+    start_arg: &Value,
+    end_arg: &Value,
+) -> Result<(DateTimeFormatRecord, f64, f64), JsError> {
+    let start_tag = range_value_tag(agent, start_arg)?;
+    let end_tag = range_value_tag(agent, end_arg)?;
+    if start_tag != end_tag {
+        return Err(type_error("formatRange arguments must be of the same type"));
+    }
+    let (start_record, start) = resolve_format_value(agent, record, start_arg)?;
+    let (_end_record, end) = resolve_format_value(agent, record, end_arg)?;
+    Ok((start_record, start, end))
 }
 
 /// Intl.DateTimeFormat.prototype.formatToParts (ECMA-402 §11.3.4).
@@ -1680,11 +2186,7 @@ fn format_to_parts_method(
     let dtf = unwrap_date_time_format(agent, this)?;
     let record = date_time_format_record(agent, &dtf)?;
     let value = args.first().cloned().unwrap_or(Value::Undefined);
-    let epoch_ms = if value.is_undefined() {
-        crate::builtins::date::now_ms()
-    } else {
-        clip_epoch_ms(to_number(agent, &value)?)?
-    };
+    let (record, epoch_ms) = resolve_format_value(agent, &record, &value)?;
     let parts = format_date_time_pattern(&record, epoch_ms);
     let object_proto = agent
         .current_realm()?
@@ -2111,8 +2613,7 @@ fn format_range_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Resul
     if start_arg.is_undefined() || end_arg.is_undefined() {
         return Err(type_error("formatRange requires two date arguments"));
     }
-    let start = clip_epoch_ms(to_number(agent, &start_arg)?)?;
-    let end = clip_epoch_ms(to_number(agent, &end_arg)?)?;
+    let (record, start, end) = resolve_range_values(agent, &record, &start_arg, &end_arg)?;
     let parts = partition_date_time_range(&record, start, end);
     let mut result = String::new();
     for part in &parts {
@@ -2135,8 +2636,7 @@ fn format_range_to_parts_method(
     if start_arg.is_undefined() || end_arg.is_undefined() {
         return Err(type_error("formatRangeToParts requires two date arguments"));
     }
-    let start = clip_epoch_ms(to_number(agent, &start_arg)?)?;
-    let end = clip_epoch_ms(to_number(agent, &end_arg)?)?;
+    let (record, start, end) = resolve_range_values(agent, &record, &start_arg, &end_arg)?;
     let parts = partition_date_time_range(&record, start, end);
     let object_proto = agent
         .current_realm()?
@@ -2207,6 +2707,111 @@ pub fn to_locale_string(
         return Ok("Invalid Date".to_string());
     }
     let record = initialize(agent, locales, options, required, defaults)?;
+    let parts = format_date_time_pattern(&record, epoch_ms);
+    let mut result = String::new();
+    for part in &parts {
+        result.push_str(&part.value);
+    }
+    Ok(result)
+}
+
+/// Temporal.ZonedDateTime.prototype.toLocaleString (spec 6.5.6): a
+/// timeZone option is rejected (even when it agrees with the instance's
+/// zone), the formatter uses the instance's own time zone, the value's
+/// calendar must match the locale's (a RangeError when it is neither
+/// iso8601 nor the locale calendar), and the no-options default includes
+/// the time zone name (the corpus's `timeZoneName: "short"` default).
+pub fn zoned_to_locale_string(
+    agent: &mut Agent,
+    locales: &Value,
+    options: &Value,
+    epoch_ns: i128,
+    zone: &str,
+    calendar: &str,
+) -> Result<String, JsError> {
+    let options_obj = number_format::coerce_options_to_object(agent, options)?;
+    let time_zone = get_property(
+        agent,
+        &options_obj,
+        &JsString::from_utf8("timeZone"),
+        options_obj.clone(),
+    )?;
+    if !time_zone.is_undefined() {
+        return Err(type_error(
+            "timeZone option is not allowed for ZonedDateTime.toLocaleString",
+        ));
+    }
+    let mut record = initialize(agent, locales, &options_obj, "any", "all")?;
+    // The calendar must match the locale calendar when it is not iso8601
+    // (the `calendar-mismatch` corpus fixture).
+    if calendar != "iso8601" && calendar != record.calendar {
+        return Err(range_error("calendar does not match the locale calendar"));
+    }
+    record.time_zone = zone.to_string();
+    // The default format includes the zone name (a component formatter with
+    // timeZoneName "short"); dateStyle/timeStyle records keep their style,
+    // and any explicit component suppresses the default (the lone-options
+    // and era fixtures pin `{year: "numeric"}`/`{era: "narrow"}` format
+    // without the zone name).
+    if record.date_style.is_none()
+        && record.time_style.is_none()
+        && !record.fields.iter().any(|(name, _)| name == "timeZoneName")
+        && record.explicit_bits == 0
+    {
+        record
+            .fields
+            .push(("timeZoneName".to_string(), "short".to_string()));
+        let mut bits = 0u16;
+        for (name, _) in &record.fields {
+            if let Some((_, bit)) = COMPONENT_ORDER.iter().find(|(n, _)| n == name) {
+                bits |= bit;
+            }
+        }
+        let (pattern, pattern12, _) = match_format(
+            &record.fields,
+            bits,
+            &record.hour_cycle,
+            record.fractional_second_digits,
+        );
+        record.pattern = pattern;
+        record.pattern12 = pattern12;
+    }
+    let epoch_ms = clip_epoch_ms(epoch_ns as f64 / 1_000_000.0)?;
+    let parts = format_date_time_pattern(&record, epoch_ms);
+    let mut result = String::new();
+    for part in &parts {
+        result.push_str(&part.value);
+    }
+    Ok(result)
+}
+
+/// The Temporal.Plain* toLocaleString methods: build a DateTimeFormat with
+/// the given (required, defaults), verify the value's calendar matches the
+/// formatter's (an iso8601 value is always accepted), and format the plain
+/// wall-clock fields.
+pub(crate) fn plain_to_locale_string(
+    agent: &mut Agent,
+    locales: &Value,
+    options: &Value,
+    value: &Value,
+    kind: PlainKind,
+    required: &str,
+    defaults: &str,
+) -> Result<String, JsError> {
+    let record = initialize(agent, locales, options, required, defaults)?;
+    let calendar = crate::builtins::temporal::temporal_calendar_id(agent, value).to_string_lossy();
+    if calendar != "iso8601" && calendar != record.calendar {
+        return Err(range_error("calendar does not match the locale calendar"));
+    }
+    let format_value = handle_datetime_value(agent, value, &record.calendar)?
+        .ok_or_else(|| type_error("Not a Temporal plain value"))?;
+    let FormatValue::Plain {
+        kind: _, epoch_ms, ..
+    } = format_value
+    else {
+        unreachable!("plain_to_locale_string with a non-plain kind")
+    };
+    let record = plain_record(&record, kind)?;
     let parts = format_date_time_pattern(&record, epoch_ms);
     let mut result = String::new();
     for part in &parts {
