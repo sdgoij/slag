@@ -12417,6 +12417,7 @@ var $DONE = function (error) {
         "Intl.DateTimeFormat-dayPeriod",
         "Intl.DateTimeFormat-datetimestyle",
         "Intl.DateTimeFormat-fractionalSecondDigits",
+        "Intl.Collator",
         "Intl-enumeration",
     ];
 

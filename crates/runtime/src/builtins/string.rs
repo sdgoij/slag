@@ -479,28 +479,23 @@ fn last_index_of(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Valu
     }
 }
 
-/// spec 22.1.3.19 String.prototype.localeCompare: an implementation-defined
-/// ordering; this engine compares code units lexicographically.
+/// spec 22.1.3.19 String.prototype.localeCompare: construct an
+/// Intl.Collator for (locales, options) and CompareStrings.
 fn locale_compare(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
     let s = crate::context::to_string(agent, this)?;
     let that =
         crate::context::to_string(agent, &args.first().cloned().unwrap_or(Value::Undefined))?;
-    // Canonically equivalent strings must compare equal (Unicode default
-    // collation); normalize both sides to NFC first.
-    let a = normalize_text(&s);
-    let b = normalize_text(&that);
-    Ok(Value::Number(match a.as_slice().cmp(b.as_slice()) {
-        std::cmp::Ordering::Less => -1.0,
-        std::cmp::Ordering::Equal => 0.0,
-        std::cmp::Ordering::Greater => 1.0,
-    }))
-}
-
-fn normalize_text(text: &JsString) -> JsString {
-    let cps: Vec<u32> = text.code_points().collect();
-    let normalized = unicode::normalize_code_points(&cps, unicode::NormalizationForm::Nfc);
-    crux::string::code_points_to_string(&normalized).unwrap_or_else(|_| text.clone())
+    let locales = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let options = args.get(2).cloned().unwrap_or(Value::Undefined);
+    let result = crate::builtins::intl::collator::locale_compare(
+        agent,
+        &s.to_string_lossy(),
+        &that.to_string_lossy(),
+        &locales,
+        &options,
+    )?;
+    Ok(Value::Number(result))
 }
 
 /// spec 22.1.3.12 String.prototype.match: `@@match` delegation, then

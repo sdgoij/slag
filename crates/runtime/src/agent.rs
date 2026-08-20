@@ -251,6 +251,13 @@ pub struct Agent {
     /// The per-instance bound `format` functions: function id → the
     /// DateTimeFormat instance's object id (ECMA-402 §11.3.3).
     pub intl_dtf_format_functions: std::collections::HashMap<u64, u64>,
+    /// The [[InitializedCollator]] records of Intl.Collator instances,
+    /// keyed by object identity (ECMA-402 §10).
+    pub intl_collator_data:
+        std::collections::HashMap<u64, crate::builtins::intl::collator::CollatorRecord>,
+    /// The per-instance bound `compare` functions: function id → the
+    /// Collator instance's object id (ECMA-402 §10.3.3).
+    pub intl_collator_compare_functions: std::collections::HashMap<u64, u64>,
     /// The [[InitializedTemporal*]] records of Temporal instances, keyed by
     /// object identity (the proposal-temporal internal slots).
     pub temporal_data: std::collections::HashMap<u64, crate::builtins::temporal::TemporalRecord>,
@@ -416,6 +423,8 @@ impl Agent {
             intl_display_names_data: std::collections::HashMap::new(),
             intl_date_time_format_data: std::collections::HashMap::new(),
             intl_dtf_format_functions: std::collections::HashMap::new(),
+            intl_collator_data: std::collections::HashMap::new(),
+            intl_collator_compare_functions: std::collections::HashMap::new(),
             temporal_data: std::collections::HashMap::new(),
             regexp_data: std::collections::HashMap::new(),
             regexp_string_iter_data: std::collections::HashMap::new(),
