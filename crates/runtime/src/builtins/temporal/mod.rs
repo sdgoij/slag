@@ -3,6 +3,7 @@
 //! object with `Temporal.Now`. Bodies dispatch by intrinsic identity from
 //! `runtime::function::call`/`construct` (the %eval% pattern).
 
+pub mod calendar;
 pub mod duration;
 pub mod instant;
 pub mod iso;

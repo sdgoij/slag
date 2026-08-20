@@ -18,6 +18,7 @@ use crate::builtins::intl::date_time_format::PlainKind;
 use crate::agent::Agent;
 use crate::realm::Realm;
 
+use super::calendar;
 use super::iso::{self, FracPrecision, RoundingMode, Unit};
 use super::{
     Overflow, RecordKind, TemporalRecord, UnitGroup, UnitOption, create_temporal_object,
@@ -2451,6 +2452,14 @@ pub fn to_plain_date_time(
         let opts = super::get_options_object(options)?;
         let constrain = super::get_temporal_overflow_option(agent, &opts)? == Overflow::Constrain;
         let (y, m, d) = resolve_date_fields(year, month, month_code, day, constrain)?;
+        // CalendarDateFromFields for the tabular Islamic calendars.
+        let (y, m, d) = if let Some(calendar) = calendar.as_deref()
+            && let Some((cy, cm, cd)) = calendar::calendar_date_to_iso(calendar, y, m, d)
+        {
+            (cy, cm, cd)
+        } else {
+            (y, m, d)
+        };
         // Missing time fields default to midnight (PrepareCalendarFields
         // complete mode).
         let mut time = t.map(|v| v.unwrap_or(0));
@@ -2898,6 +2907,14 @@ pub fn to_zoned(agent: &mut Agent, item: &Value, options: &Value) -> Result<Valu
             fields.day,
             constrain,
         )?;
+        // CalendarDateFromFields for the tabular Islamic calendars.
+        let (y, m, d) = if let Some(calendar) = calendar.as_deref()
+            && let Some((cy, cm, cd)) = calendar::calendar_date_to_iso(calendar, y, m, d)
+        {
+            (cy, cm, cd)
+        } else {
+            (y, m, d)
+        };
         let mut time = fields.time.map(|v| v.unwrap_or(0));
         regulate_time(&mut time, constrain)?;
         if !iso::iso_date_time_within_limits(
@@ -5169,6 +5186,15 @@ fn date_from_merged_fields(
     calendar: Option<String>,
 ) -> Result<Value, JsError> {
     let (year, month, day) = resolve_date_fields(year, month, month_code, day, constrain)?;
+    // CalendarDateFromFields for the tabular Islamic calendars (the
+    // canonicalize-calendar fixtures: 1445-12-25 → 2024-07-02).
+    let (year, month, day) = if let Some(calendar) = calendar.as_deref()
+        && let Some((y, m, d)) = calendar::calendar_date_to_iso(calendar, year, month, day)
+    {
+        (y, m, d)
+    } else {
+        (year, month, day)
+    };
     let value = create_plain_date(agent, (year, month, day), &Value::Undefined)?;
     with_calendar(agent, value, calendar.as_deref())
 }
@@ -6479,13 +6505,15 @@ pub fn to_plain_year_month(
         let opts = super::get_options_object(options)?;
         super::get_temporal_overflow_option(agent, &opts)?;
         // RejectYearMonthRange, then re-resolve with constrain (iso8601 is
-        // the identity).
+        // the identity). The parsed reference day is kept (test262
+        // equals/canonicalize-calendar.js pins "2024-06-08[u-ca=islamicc]"
+        // with reference day 8).
         let (y, m) = resolve_year_month(Some(parsed.year), Some(parsed.month), None, true)?;
         let value = create_temporal_object(
             agent,
             &Value::Undefined,
             PLAIN_YEAR_MONTH_PROTO,
-            TemporalRecord::YearMonth([y, m, 1]),
+            TemporalRecord::YearMonth([y, m, parsed.day]),
         )?;
         return with_calendar(agent, value, calendar.as_deref());
     }
@@ -6498,11 +6526,21 @@ pub fn to_plain_year_month(
         let opts = super::get_options_object(options)?;
         let constrain = super::get_temporal_overflow_option(agent, &opts)? == Overflow::Constrain;
         let (y, m) = resolve_year_month(year, month, month_code, constrain)?;
+        // CalendarYearMonthFromFields for the tabular Islamic calendars: the
+        // ISO year-month of the month's first day with its reference day
+        // (1445-12 → 2024-06 with reference day 8).
+        let (y, m, d) = if let Some(calendar) = calendar.as_deref()
+            && let Some((cy, cm, cd)) = calendar::calendar_year_month_to_iso(calendar, y, m)
+        {
+            (cy, cm, cd)
+        } else {
+            (y, m, 1)
+        };
         let value = create_temporal_object(
             agent,
             &Value::Undefined,
             PLAIN_YEAR_MONTH_PROTO,
-            TemporalRecord::YearMonth([y, m, 1]),
+            TemporalRecord::YearMonth([y, m, d]),
         )?;
         return with_calendar(agent, value, calendar.as_deref());
     }
@@ -6597,11 +6635,23 @@ pub fn to_plain_month_day(
         let opts = super::get_options_object(options)?;
         let constrain = super::get_temporal_overflow_option(agent, &opts)? == Overflow::Constrain;
         let (m, d) = resolve_month_day(year, month, month_code, day, constrain)?;
+        // CalendarMonthDayFromFields for the tabular Islamic calendars: the
+        // reference date in the latest ISO year at or before 1972 (M12-25 →
+        // 1972-02-11), or the explicit year's date.
+        let (y, m, d) = if let Some(calendar) = calendar.as_deref()
+            && let Some((cy, cm, cd)) = match year {
+                Some(y) => calendar::calendar_date_to_iso(calendar, y, m, d),
+                None => calendar::calendar_month_day_reference(calendar, m, d),
+            } {
+            (cy, cm, cd)
+        } else {
+            (1972, m, d)
+        };
         let value = create_temporal_object(
             agent,
             &Value::Undefined,
             PLAIN_MONTH_DAY_PROTO,
-            TemporalRecord::MonthDay([1972, m, d]),
+            TemporalRecord::MonthDay([y, m, d]),
         )?;
         return with_calendar(agent, value, calendar.as_deref());
     }

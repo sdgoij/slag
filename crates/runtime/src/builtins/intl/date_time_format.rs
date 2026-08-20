@@ -1230,11 +1230,11 @@ fn format_with_pattern(
         let field = match c {
             'y' => Some((
                 "year",
-                format_field_year(&local, field_length(&mut chars, c), ns),
+                format_field_year(&local, field_length(&mut chars, c), ns, &record.calendar),
             )),
             'M' | 'L' => Some((
                 "month",
-                format_field_month(&local, field_length(&mut chars, c), ns),
+                format_field_month(&local, field_length(&mut chars, c), ns, &record.calendar),
             )),
             'd' => Some((
                 "day",
@@ -1709,12 +1709,54 @@ fn field_length(chars: &mut std::iter::Peekable<std::str::Chars>, c: char) -> u3
     count
 }
 
+/// The en islamic month names: [long, short, narrow] (the corpus's
+/// dateStyle fixtures pin "Ramadan" for the 9th month).
+const ISLAMIC_MONTH_NAMES: [[&str; 12]; 3] = [
+    [
+        "Muharram",
+        "Safar",
+        "Rabi' I",
+        "Rabi' II",
+        "Jumada I",
+        "Jumada II",
+        "Rajab",
+        "Sha'ban",
+        "Ramadan",
+        "Shawwal",
+        "Dhu al-Qi'dah",
+        "Dhu al-Hijjah",
+    ],
+    [
+        "Muharram",
+        "Safar",
+        "Rabi' I",
+        "Rabi' II",
+        "Jumada I",
+        "Jumada II",
+        "Rajab",
+        "Sha'ban",
+        "Ramadan",
+        "Shawwal",
+        "Dhu al-Qi'dah",
+        "Dhu al-Hijjah",
+    ],
+    [
+        "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12",
+    ],
+];
+
 /// The year with 2-digit (the last two digits) or full formatting.
-fn format_field_year(local: &LocalTime, width: u32, ns: &str) -> String {
-    let year = if local.year <= 0 {
-        1 - local.year
-    } else {
-        local.year
+fn format_field_year(local: &LocalTime, width: u32, ns: &str, calendar: &str) -> String {
+    let year = match crate::builtins::temporal::calendar::calendar_iso_to_date(
+        calendar,
+        local.year,
+        local.month as i64,
+        local.day as i64,
+    ) {
+        Some((y, ..)) if y <= 0 => 1 - y,
+        Some((y, ..)) => y,
+        None if local.year <= 0 => 1 - local.year,
+        None => local.year,
     };
     if width == 2 {
         let text = year.to_string();
@@ -1732,14 +1774,24 @@ fn format_field_year(local: &LocalTime, width: u32, ns: &str) -> String {
     }
 }
 
-fn format_field_month(local: &LocalTime, width: u32, ns: &str) -> String {
-    let index = (local.month - 1) as usize;
+fn format_field_month(local: &LocalTime, width: u32, ns: &str, calendar: &str) -> String {
+    let (month, names): (i64, &[[&str; 12]; 3]) =
+        match crate::builtins::temporal::calendar::calendar_iso_to_date(
+            calendar,
+            local.year,
+            local.month as i64,
+            local.day as i64,
+        ) {
+            Some((_, m, _)) => (m, &ISLAMIC_MONTH_NAMES),
+            None => (local.month as i64, &MONTH_NAMES),
+        };
+    let index = (month - 1) as usize;
     match width {
-        1 => format_number(local.month as i64, 1, ns),
-        2 => format_number(local.month as i64, 2, ns),
-        3 => MONTH_NAMES[1][index].to_string(),
-        4 => MONTH_NAMES[0][index].to_string(),
-        _ => MONTH_NAMES[2][index].to_string(),
+        1 => format_number(month, 1, ns),
+        2 => format_number(month, 2, ns),
+        3 => names[1][index].to_string(),
+        4 => names[0][index].to_string(),
+        _ => names[2][index].to_string(),
     }
 }
 
