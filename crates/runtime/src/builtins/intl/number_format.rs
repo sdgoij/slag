@@ -180,7 +180,7 @@ impl IntlMv {
     }
 
     /// The mathematical value × 10^e.
-    fn scale_pow10(&self, e: i64) -> IntlMv {
+    pub(crate) fn scale_pow10(&self, e: i64) -> IntlMv {
         match self {
             IntlMv::Value {
                 negative,
@@ -277,7 +277,7 @@ fn cmp_scaled(a: &BigInt, ae: i64, b: &BigInt, be: i64) -> std::cmp::Ordering {
     bigint_cmp(&a_scaled, &b_scaled)
 }
 
-fn multiply_pow10(base: &BigInt, n: u32) -> BigInt {
+pub(crate) fn multiply_pow10(base: &BigInt, n: u32) -> BigInt {
     if n == 0 {
         return base.clone();
     }
@@ -579,7 +579,10 @@ fn ceil_div_bigint(a: &BigInt, b: &BigInt) -> BigInt {
 }
 
 /// FormatNumericToString (ECMA-402 §16.5.3).
-fn format_numeric_to_string(record: &NumberFormatRecord, x: &IntlMv) -> (IntlMv, String) {
+pub(crate) fn format_numeric_to_string(
+    record: &NumberFormatRecord,
+    x: &IntlMv,
+) -> (IntlMv, String) {
     let (sign_negative, x) = match x {
         IntlMv::NegZero => (true, IntlMv::value(false, BigInt::zero(), 0)),
         IntlMv::Value { negative, .. } => (*negative, x.abs()),
@@ -683,7 +686,11 @@ fn compute_exponent_for_magnitude(
 }
 
 /// ComputeExponent (ECMA-402 §16.5.13).
-fn compute_exponent(record: &NumberFormatRecord, data: &NumberLocaleData, x: &IntlMv) -> i64 {
+pub(crate) fn compute_exponent(
+    record: &NumberFormatRecord,
+    data: &NumberLocaleData,
+    x: &IntlMv,
+) -> i64 {
     if x.is_zero() {
         return 0;
     }
@@ -796,10 +803,11 @@ fn partition_pattern(pattern: &str) -> Vec<PatternPart> {
 
 /// A formatted part: type + value (+ source for ranges).
 #[derive(Debug, Clone)]
-struct Part {
-    part_type: &'static str,
-    value: String,
-    source: Option<String>,
+/// A formatted-number part (ECMA-402 §16.5.7 FormatNumericToParts).
+pub(crate) struct Part {
+    pub(crate) part_type: &'static str,
+    pub(crate) value: String,
+    pub(crate) source: Option<String>,
 }
 
 impl Part {
@@ -1147,7 +1155,7 @@ fn unit_templates(record: &NumberFormatRecord, data: &NumberLocaleData) -> (Stri
 }
 
 /// PartitionNumberPattern (ECMA-402 §16.5.4).
-fn partition_number_pattern(
+pub(crate) fn partition_number_pattern(
     record: &NumberFormatRecord,
     data: &NumberLocaleData,
     x: &IntlMv,
@@ -1586,7 +1594,7 @@ fn canonicalize_locale_list(agent: &mut Agent, locales: &Value) -> Result<Vec<St
 }
 
 /// GetOption (ECMA-402 §9.2.11): `values` empty → any string.
-fn get_option(
+pub(crate) fn get_option(
     agent: &mut Agent,
     options: &Value,
     name: &str,
@@ -1608,7 +1616,10 @@ fn get_option(
 
 /// CoerceOptionsToObject (ECMA-402 §9.2.10): undefined → a null-prototype
 /// object; otherwise ToObject.
-fn coerce_options_to_object(agent: &mut Agent, options: &Value) -> Result<Value, JsError> {
+pub(crate) fn coerce_options_to_object(
+    agent: &mut Agent,
+    options: &Value,
+) -> Result<Value, JsError> {
     if options.is_undefined() {
         Ok(Value::Object(JsObject::ordinary_object_create(None)))
     } else {
@@ -1666,7 +1677,7 @@ fn get_number_option(
 }
 
 /// Strip the `-u-...` extension (other extensions and private use stay).
-fn strip_unicode_extension(locale: &str) -> String {
+pub(crate) fn strip_unicode_extension(locale: &str) -> String {
     let Some(parts) = crate::builtins::intl::bcp47::parse_locale_id(locale) else {
         return locale.to_string();
     };
@@ -1688,7 +1699,7 @@ fn strip_unicode_extension(locale: &str) -> String {
 }
 
 /// Read the value of a keyword inside a `-u-` extension sequence.
-fn unicode_extension_keyword_value(extension: &str, key: &str) -> Option<String> {
+pub(crate) fn unicode_extension_keyword_value(extension: &str, key: &str) -> Option<String> {
     let parts: Vec<&str> = extension.split('-').collect();
     let mut i = 0;
     while i < parts.len() {
@@ -1708,7 +1719,7 @@ fn unicode_extension_keyword_value(extension: &str, key: &str) -> Option<String>
 }
 
 /// Insert the `-u-key-value` extension and canonicalize (spec 9.2.6).
-fn insert_unicode_extension(locale: &str, key: &str, value: &str) -> String {
+pub(crate) fn insert_unicode_extension(locale: &str, key: &str, value: &str) -> String {
     let mut tag = strip_unicode_extension(locale);
     let extension = format!("-u-{key}-{value}");
     if let Some(private_index) = tag.find("-x-") {
@@ -1722,7 +1733,7 @@ fn insert_unicode_extension(locale: &str, key: &str, value: &str) -> String {
 
 /// The best-fit matcher: the requested locale (or its longest available
 /// prefix).
-fn best_fit(available: &[&str], requested: &str) -> Option<String> {
+pub(crate) fn best_fit(available: &[&str], requested: &str) -> Option<String> {
     if available.contains(&requested) {
         return Some(requested.to_string());
     }
@@ -1740,7 +1751,7 @@ fn best_fit(available: &[&str], requested: &str) -> Option<String> {
 
 /// ResolveLocale (ECMA-402 §9.2.7) with the single `nu` extension key.
 /// Returns (resolved_locale, numbering_system).
-fn resolve_locale(
+pub(crate) fn resolve_locale(
     _agent: &mut Agent,
     requested: &[String],
     numbering_system: Option<&str>,
@@ -1790,6 +1801,22 @@ fn resolve_locale(
     Ok((found_locale, nu))
 }
 
+/// ResolveLocale for a component with no relevant extension keys
+/// (PluralRules: `[[RelevantExtensionKeys]]` is « »): the u-extension is
+/// dropped from the matched locale entirely.
+pub(crate) fn resolve_locale_simple(requested: &[String]) -> Result<String, JsError> {
+    let available = crate::builtins::intl::number_data::NUMBER_FORMAT_LOCALES;
+    let mut found: Option<String> = None;
+    for locale in requested {
+        let base = strip_unicode_extension(locale);
+        if let Some(matched) = best_fit(available, &base) {
+            found = Some(matched);
+            break;
+        }
+    }
+    Ok(found.unwrap_or_else(|| default_locale().to_string()))
+}
+
 fn supported_numbering_systems() -> &'static [&'static str] {
     crate::builtins::intl::number_data::SUPPORTED_NUMBERING_SYSTEMS
 }
@@ -1806,7 +1833,7 @@ fn is_type_identifier(value: &str) -> bool {
 
 /// ResolveOptions (ECMA-402 §9.2.8) for NumberFormat: reads localeMatcher
 /// and numberingSystem from the coerced options, then ResolveLocale.
-fn resolve_options(
+pub(crate) fn resolve_options(
     agent: &mut Agent,
     locales: &Value,
     options: &Value,
@@ -1954,7 +1981,7 @@ fn default_number_option_value(
 }
 
 /// SetNumberFormatDigitOptions (ECMA-402 §16.1.2).
-fn set_number_format_digit_options(
+pub(crate) fn set_number_format_digit_options(
     agent: &mut Agent,
     record: &mut NumberFormatRecord,
     options: &Value,

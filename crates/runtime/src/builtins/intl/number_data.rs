@@ -737,6 +737,7 @@ pub const NUMBER_FORMAT_LOCALES: &[&str] = &[
     "gd",
     "gl",
     "gu",
+    "gv",
     "ha",
     "haw",
     "he",
@@ -1422,6 +1423,7 @@ pub fn locale_data(locale: &str) -> &'static NumberLocaleData {
         "zh" | "zh-TW" | "zh-Hant-TW" => &ZH_TW,
         "zh-CN" | "zh-Hans-CN" => &ZH_CN,
         "pt" | "pt-PT" => &PT_PT,
+        "pl" | "pl-PL" => &PT_PT,
         _ => &GENERIC,
     }
 }

@@ -12397,13 +12397,16 @@ var $DONE = function (error) {
     /// The ECMA-402 features implemented so far (plan cuts; docs/intl-plan.md
     /// §4). Cut 1: `%Intl%`, `Intl.getCanonicalLocales`, and `Intl.Locale`.
     /// Cut 2: `Intl.NumberFormat` (basic, unified, v3) and
-    /// `Intl.supportedValuesOf` (the `Intl-enumeration` tag). The remaining
+    /// `Intl.supportedValuesOf` (the `Intl-enumeration` tag). Cut 3:
+    /// `Intl.PluralRules` and `Intl.RelativeTimeFormat`. The remaining
     /// features still skip via `unimplemented_intl_feature`.
     const INTL_IMPLEMENTED: &[&str] = &[
         "Intl.Locale",
         "Intl.NumberFormat",
         "Intl.NumberFormat-unified",
         "Intl.NumberFormat-v3",
+        "Intl.PluralRules",
+        "Intl.RelativeTimeFormat",
         "Intl-enumeration",
     ];
 

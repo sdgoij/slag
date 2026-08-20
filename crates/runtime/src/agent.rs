@@ -222,6 +222,18 @@ pub struct Agent {
     /// The per-instance bound `format` functions: function id → the
     /// NumberFormat instance's object id (ECMA-402 §16.5.2 [[NumberFormat]]).
     pub intl_format_functions: std::collections::HashMap<u64, u64>,
+    /// The [[InitializedPluralRules]] records of Intl.PluralRules
+    /// instances, keyed by object identity (ECMA-402 §17: the plural type
+    /// and the digit/notation options).
+    pub intl_plural_rules_data:
+        std::collections::HashMap<u64, crate::builtins::intl::plural_rules::PluralRulesRecord>,
+    /// The [[InitializedRelativeTimeFormat]] records of
+    /// Intl.RelativeTimeFormat instances, keyed by object identity
+    /// (ECMA-402 §18: locale, style, numeric, numbering system).
+    pub intl_rtf_data: std::collections::HashMap<
+        u64,
+        crate::builtins::intl::relative_time_format::RelativeTimeFormatRecord,
+    >,
     /// The [[InitializedTemporal*]] records of Temporal instances, keyed by
     /// object identity (the proposal-temporal internal slots).
     pub temporal_data: std::collections::HashMap<u64, crate::builtins::temporal::TemporalRecord>,
@@ -381,6 +393,8 @@ impl Agent {
             intl_locale_data: std::collections::HashMap::new(),
             intl_number_format_data: std::collections::HashMap::new(),
             intl_format_functions: std::collections::HashMap::new(),
+            intl_plural_rules_data: std::collections::HashMap::new(),
+            intl_rtf_data: std::collections::HashMap::new(),
             temporal_data: std::collections::HashMap::new(),
             regexp_data: std::collections::HashMap::new(),
             regexp_string_iter_data: std::collections::HashMap::new(),

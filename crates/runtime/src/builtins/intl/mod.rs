@@ -9,6 +9,9 @@ pub mod data;
 pub mod locale;
 pub mod number_data;
 pub mod number_format;
+pub mod plural_data;
+pub mod plural_rules;
+pub mod relative_time_format;
 pub mod supported_values;
 
 use crux::error::{ErrorKind, JsError};
@@ -88,11 +91,13 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let intl_value = Value::Object(intl);
     realm.intrinsics.define(INTL, intl_value.clone());
 
-    // Intl.Locale (the constructor + prototype) and Intl.NumberFormat
-    // (plan Cut 2).
+    // Intl.Locale (the constructor + prototype), Intl.NumberFormat (plan
+    // Cut 2), and Intl.PluralRules/Intl.RelativeTimeFormat (plan Cut 3).
     locale::install(realm, &intl_value)?;
     number_format::install(realm, &intl_value)?;
     supported_values::install(realm, &intl_value)?;
+    plural_rules::install(realm, &intl_value)?;
+    relative_time_format::install(realm, &intl_value)?;
 
     realm.global_object.define_property_or_throw(
         &JsString::from_utf8("Intl"),
@@ -135,7 +140,13 @@ pub fn dispatch_call(
     if let Some(result) = locale::dispatch_call(agent, callee, this, args) {
         return Some(result);
     }
-    number_format::dispatch_call(agent, callee, this, args)
+    if let Some(result) = number_format::dispatch_call(agent, callee, this, args) {
+        return Some(result);
+    }
+    if let Some(result) = plural_rules::dispatch_call(agent, callee, this, args) {
+        return Some(result);
+    }
+    relative_time_format::dispatch_call(agent, callee, this, args)
 }
 
 /// dispatch_construct: `new Intl.Locale(...)` and `new Intl.NumberFormat(...)`.
@@ -148,7 +159,13 @@ pub fn dispatch_construct(
     if let Some(result) = locale::dispatch_construct(agent, callee, args, new_target) {
         return Some(result);
     }
-    number_format::dispatch_construct(agent, callee, args, new_target)
+    if let Some(result) = number_format::dispatch_construct(agent, callee, args, new_target) {
+        return Some(result);
+    }
+    if let Some(result) = plural_rules::dispatch_construct(agent, callee, args, new_target) {
+        return Some(result);
+    }
+    relative_time_format::dispatch_construct(agent, callee, args, new_target)
 }
 
 /// CanonicalizeLocaleList (ECMA-402 §9.2.1): the `locales` argument — an

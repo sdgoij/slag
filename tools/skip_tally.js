@@ -115,12 +115,15 @@ function classify(file, source) {
   // ECMA-402 feature gates (mirrors run_fixture): each `Intl.*` tag skips
   // until its component lands (docs/intl-plan.md cuts). Cut 1 implements
   // `Intl.Locale`; Cut 2 opens NumberFormat (basic/unified/v3) and
-  // supportedValuesOf (the `Intl-enumeration` tag).
+  // supportedValuesOf (the `Intl-enumeration` tag); Cut 3 opens
+  // PluralRules and RelativeTimeFormat.
   const INTL_IMPLEMENTED = new Set([
     "Intl.Locale",
     "Intl.NumberFormat",
     "Intl.NumberFormat-unified",
     "Intl.NumberFormat-v3",
+    "Intl.PluralRules",
+    "Intl.RelativeTimeFormat",
     "Intl-enumeration",
   ]);
   for (const feature of features) {
