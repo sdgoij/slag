@@ -3927,6 +3927,7 @@ impl Vm {
                     // the already-bound sibling `a`). Sync the context now so
                     // the mid-step destructure sees the new environment.
                     self.lexical_env = env.clone();
+                    self.env_stack.push(env.clone());
                     if let Ok(context) = agent.running_context_mut() {
                         context.lexical_environment = env.clone();
                     }
@@ -3937,10 +3938,10 @@ impl Vm {
                         Some(&env),
                         self.strict,
                     )?;
-                    // The per-iteration environment replaces the lexical
-                    // environment without joining the stack; the loop's
-                    // restore step disposes its resources and the next
-                    // iteration's bind replaces it.
+                    // The per-iteration environment joins the environment
+                    // stack (the compiler counts it as one scope), so every
+                    // loop exit — fall-through, continue, break, labeled
+                    // break — unwinds it with the same machinery.
                     self.lexical_env = env;
                 }
             }
@@ -3952,12 +3953,17 @@ impl Vm {
     /// disposing its `using` resources (spec 14.7.5.6 / 14.7.6.2: the
     /// iteration environment is disposed at iteration end).
     fn restore_per_iteration(&mut self, agent: &mut Agent) -> Result<(), JsError> {
-        // The per-iteration environment lives in the lexical environment, not
-        // the stack; the loop's restore step disposes its resources and
-        // unwinds back to the pre-iteration environment (each iteration's
+        // The per-iteration environment lives on the environment stack (the
+        // compiler counts it as one scope), so the restore pops it and
+        // unwinds back to the pre-iteration environment; each iteration's
         // bind step creates a fresh copy whose outer is the loop base, so
-        // closures never chain through previous iterations).
-        let env = self.lexical_env.clone();
+        // closures never chain through previous iterations.
+        let env = self.env_stack.pop().ok_or_else(|| {
+            JsError::new(
+                ErrorKind::SyntaxError,
+                "Per-iteration restore without an environment".into(),
+            )
+        })?;
         let resources = env.drain_disposable_resources();
         for resource in resources.iter().rev() {
             if !resource.method.is_undefined() {
@@ -6039,11 +6045,7 @@ impl Compiler {
         let test_label = self.new_label();
         let continue_label = self.new_label();
         let end_label = self.new_label();
-        let break_count = if has_loop_env {
-            self.scope_count - 1
-        } else {
-            self.scope_count
-        };
+        let break_count = self.scope_count;
         let continue_count = self.scope_count;
         self.scope_stack.push(Scope::Loop {
             break_target: end_label,
@@ -6136,7 +6138,18 @@ impl Compiler {
         let top_label = self.new_label();
         let end_label = self.new_label();
         let continue_label = self.new_label();
-        let scope = self.scope_count;
+        let done_label = self.new_label();
+        // A lexical head pushes a per-iteration environment on the stack that
+        // counts as one scope for the body, so every exit — fall-through,
+        // continue, break, labeled break — unwinds it with the same
+        // LeaveBlock/restore machinery (spec 14.7.5.5 step 6). The exhausted
+        // path (done_label) needs no restore: the last iteration's
+        // fall-through or continue already ran it.
+        let lexical_head = matches!(
+            left,
+            ForBinding::VarDecl { kind, .. } if *kind != VarDeclKind::Var
+        );
+        let scope = self.scope_count + usize::from(lexical_head);
         self.scope_stack.push(Scope::Iteration {
             open: scope,
             closed: scope,
@@ -6147,22 +6160,24 @@ impl Compiler {
         self.place(top_label);
         let step_index = self.steps.len();
         self.emit(Step::ForInNext { done: 0 });
-        self.fixups.push(Fixup::ForInNext(step_index, end_label));
+        self.fixups.push(Fixup::ForInNext(step_index, done_label));
         self.emit(Step::ForInBind { left: left.clone() });
+        if lexical_head {
+            self.scope_count += 1;
+        }
         self.compile_statement(body)?;
-        // Only a lexical head creates a per-iteration environment that needs
-        // restoring; a `var`/expression head leaves the running environment
-        // untouched.
-        let lexical_head = matches!(
-            left,
-            ForBinding::VarDecl { kind, .. } if *kind != VarDeclKind::Var
-        );
+        self.place(continue_label);
+        if lexical_head {
+            self.emit(Step::ForInRestore);
+            self.scope_count -= 1;
+        }
+        self.jump(top_label);
+        self.place(end_label);
         if lexical_head {
             self.emit(Step::ForInRestore);
         }
-        self.place(continue_label);
-        self.jump(top_label);
-        self.place(end_label);
+        self.emit(Step::NormalizeCompletion);
+        self.place(done_label);
         self.emit(Step::NormalizeCompletion);
         self.scope_stack.pop();
         Ok(())
@@ -6183,7 +6198,17 @@ impl Compiler {
         let end_label = self.new_label();
         let done_label = self.new_label();
         let continue_label = self.new_label();
-        let scope = self.scope_count;
+        // A lexical head pushes a per-iteration environment on the stack that
+        // counts as one scope for the body, so every exit — fall-through,
+        // continue, break, labeled break — unwinds it with the same
+        // LeaveBlock/restore machinery (spec 14.7.5.6 step 6). The exhausted
+        // path (done_label) needs no restore: the last iteration's
+        // fall-through or continue already ran it.
+        let lexical_head = matches!(
+            left,
+            ForBinding::VarDecl { kind, .. } if *kind != VarDeclKind::Var
+        );
+        let scope = self.scope_count + usize::from(lexical_head);
         self.scope_stack.push(Scope::Iteration {
             open: scope,
             closed: scope,
@@ -6205,20 +6230,20 @@ impl Compiler {
             }
             _ => self.emit(Step::ForOfBind { left: left.clone() }),
         }
+        if lexical_head {
+            self.scope_count += 1;
+        }
         self.compile_statement(body)?;
-        // Only a lexical head creates a per-iteration environment that needs
-        // restoring; a `var`/expression head leaves the running environment
-        // untouched.
-        let lexical_head = matches!(
-            left,
-            ForBinding::VarDecl { kind, .. } if *kind != VarDeclKind::Var
-        );
+        self.place(continue_label);
+        if lexical_head {
+            self.emit(Step::ForOfRestore);
+            self.scope_count -= 1;
+        }
+        self.jump(top_label);
+        self.place(end_label);
         if lexical_head {
             self.emit(Step::ForOfRestore);
         }
-        self.place(continue_label);
-        self.jump(top_label);
-        self.place(end_label);
         self.emit(Step::ForOfClose);
         // The exhausted path jumped past the close (the iterator was already
         // popped by ForOfNext), so a `break` is the only way to reach it.
@@ -6243,7 +6268,17 @@ impl Compiler {
         let end_label = self.new_label();
         let done_label = self.new_label();
         let continue_label = self.new_label();
-        let scope = self.scope_count;
+        // A lexical head pushes a per-iteration environment on the stack that
+        // counts as one scope for the body, so every exit — fall-through,
+        // continue, break, labeled break — unwinds it with the same
+        // LeaveBlock/restore machinery. The exhausted path (done_label)
+        // needs no restore: the last iteration's fall-through or continue
+        // already ran it.
+        let lexical_head = matches!(
+            left,
+            ForBinding::VarDecl { kind, .. } if *kind != VarDeclKind::Var
+        );
+        let scope = self.scope_count + usize::from(lexical_head);
         self.scope_stack.push(Scope::Iteration {
             open: scope,
             closed: scope,
@@ -6268,20 +6303,20 @@ impl Compiler {
             }
             _ => self.emit(Step::AsyncForOfBind { left: left.clone() }),
         }
+        if lexical_head {
+            self.scope_count += 1;
+        }
         self.compile_statement(body)?;
-        // Only a lexical head creates a per-iteration environment that needs
-        // restoring; a `var`/expression head leaves the running environment
-        // untouched.
-        let lexical_head = matches!(
-            left,
-            ForBinding::VarDecl { kind, .. } if *kind != VarDeclKind::Var
-        );
+        self.place(continue_label);
+        if lexical_head {
+            self.emit(Step::AsyncForOfRestore);
+            self.scope_count -= 1;
+        }
+        self.jump(top_label);
+        self.place(end_label);
         if lexical_head {
             self.emit(Step::AsyncForOfRestore);
         }
-        self.place(continue_label);
-        self.jump(top_label);
-        self.place(end_label);
         self.emit(Step::AsyncForOfClose);
         // The exhausted path jumped past the close (the iterator was already
         // popped by AsyncForOfTest), so a `break` is the only way to reach it.

@@ -992,11 +992,13 @@ fn grouping_groups(int_digits: &str, primary: u32, secondary: u32, min2: bool) -
 }
 
 /// The unit display entry for the record's unit (or the fallback: the raw
-/// unit id as the suffix).
+/// unit id as the suffix). `is_one` picks the plural form for the count
+/// (en unit patterns: "1 day" / "2 days").
 fn unit_display_for(
     record: &NumberFormatRecord,
     data: &NumberLocaleData,
     unit: &str,
+    is_one: bool,
 ) -> (String, String, String) {
     for entry in data.units {
         if entry.unit == unit {
@@ -1005,10 +1007,15 @@ fn unit_display_for(
                 DISPLAY_LONG => &entry.long,
                 _ => &entry.short,
             };
+            let suffix = if is_one {
+                display.suffix
+            } else {
+                display.plural_suffix
+            };
             return (
                 display.pattern.to_string(),
                 display.prefix.to_string(),
-                display.suffix.to_string(),
+                suffix.to_string(),
             );
         }
     }
@@ -1147,7 +1154,7 @@ fn currency_templates(
 /// The unit positive/negative templates for the unit/display.
 fn unit_templates(record: &NumberFormatRecord, data: &NumberLocaleData) -> (String, String) {
     let unit = record.unit.as_deref().unwrap_or("fallback");
-    let (pattern, _, _) = unit_display_for(record, data, unit);
+    let (pattern, _, _) = unit_display_for(record, data, unit, false);
     (
         pattern.clone(),
         pattern.replace("{number}", "{minusSign}{number}"),
@@ -1178,6 +1185,10 @@ pub(crate) fn partition_number_pattern(
         formatted_string = formatted;
     }
     let pattern = get_number_format_pattern(record, data, &value);
+    // The en plural unit suffix: "1 day" / "2 days" (1 and -1 both use the
+    // singular form; the rounded value keeps its fraction scaling, e.g.
+    // 1.0 → mant 1000 exp10 -3 under maxFrac 3).
+    let unit_is_one = unit_magnitude_is_one(&value);
     let mut result: Vec<Part> = Vec::new();
     for part in partition_pattern(&pattern) {
         match part {
@@ -1207,7 +1218,7 @@ pub(crate) fn partition_number_pattern(
             }
             PatternPart::UnitPrefix | PatternPart::UnitSuffix => {
                 let unit = record.unit.as_deref().unwrap_or("fallback");
-                let (_, prefix, suffix) = unit_display_for(record, data, unit);
+                let (_, prefix, suffix) = unit_display_for(record, data, unit, unit_is_one);
                 result.push(Part::new(
                     "unit",
                     if matches!(part, PatternPart::UnitPrefix) {
@@ -1221,6 +1232,22 @@ pub(crate) fn partition_number_pattern(
         }
     }
     result
+}
+
+/// Whether an IntlMv has magnitude 1 (the en unit plural "one" form; -1 is
+/// also one, the sign is carried separately).
+fn unit_magnitude_is_one(value: &IntlMv) -> bool {
+    let IntlMv::Value { mant, exp10, .. } = value else {
+        return false;
+    };
+    if *exp10 >= 0 {
+        return crux::bigint::to_string(mant, 10) == "1" && *exp10 == 0;
+    }
+    let digits = crux::bigint::to_string(mant, 10);
+    let zeros = (-exp10) as usize;
+    digits.len() == zeros + 1
+        && digits.starts_with('1')
+        && digits.bytes().skip(1).all(|b| b == b'0')
 }
 
 /// CollapseNumberRange (ECMA-402 §16.5.21, ICU-shaped): drop the redundant
@@ -1655,7 +1682,7 @@ fn get_boolean_or_string_number_format_option(
 }
 
 /// GetNumberOption (ECMA-402 §9.2.14).
-fn get_number_option(
+pub(crate) fn get_number_option(
     agent: &mut Agent,
     options: &Value,
     name: &str,
@@ -1827,7 +1854,7 @@ fn supported_numbering_systems() -> &'static [&'static str] {
 }
 
 /// The `type` Unicode locale nonterminal: alphanumeric subtags of 3-8.
-fn is_type_identifier(value: &str) -> bool {
+pub(crate) fn is_type_identifier(value: &str) -> bool {
     if value.is_empty() {
         return false;
     }

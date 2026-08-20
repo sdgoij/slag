@@ -27,12 +27,12 @@ pub const LF_RESOLVED_OPTIONS: &str = "%Intl.ListFormat.prototype.resolvedOption
 pub const LF_FORMAT: &str = "%Intl.ListFormat.prototype.format%";
 pub const LF_FORMAT_TO_PARTS: &str = "%Intl.ListFormat.prototype.formatToParts%";
 
-const TYPE_CONJUNCTION: u8 = 0;
-const TYPE_DISJUNCTION: u8 = 1;
-const TYPE_UNIT: u8 = 2;
-const STYLE_LONG: u8 = 0;
-const STYLE_SHORT: u8 = 1;
-const STYLE_NARROW: u8 = 2;
+pub(crate) const TYPE_CONJUNCTION: u8 = 0;
+pub(crate) const TYPE_DISJUNCTION: u8 = 1;
+pub(crate) const TYPE_UNIT: u8 = 2;
+pub(crate) const STYLE_LONG: u8 = 0;
+pub(crate) const STYLE_SHORT: u8 = 1;
+pub(crate) const STYLE_NARROW: u8 = 2;
 
 fn type_error(message: &str) -> JsError {
     JsError::new(ErrorKind::TypeError, message.into())
@@ -350,7 +350,10 @@ fn string_list_from_iterable(agent: &mut Agent, iterable: &Value) -> Result<Vec<
 
 /// CreatePartsFromList (ECMA-402 §14.5.2): the element/literal parts from
 /// the Start/Middle/End/Pair templates.
-fn create_parts_from_list(record: &ListFormatRecord, list: &[String]) -> Vec<(String, String)> {
+pub(crate) fn create_parts_from_list(
+    record: &ListFormatRecord,
+    list: &[String],
+) -> Vec<(String, String)> {
     let size = list.len();
     if size == 0 {
         return Vec::new();

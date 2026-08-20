@@ -271,6 +271,13 @@ pub struct Agent {
     /// iterators (ECMA-402 §19.6).
     pub intl_segment_iterator_data:
         std::collections::HashMap<u64, crate::builtins::intl::segmenter::SegmentIteratorRecord>,
+    /// The [[InitializedDurationFormat]] records of Intl.DurationFormat
+    /// instances, keyed by object identity (ECMA-402 §13: locale,
+    /// numberingSystem, style, the per-unit options, fractionalDigits).
+    pub intl_duration_format_data: std::collections::HashMap<
+        u64,
+        crate::builtins::intl::duration_format::DurationFormatRecord,
+    >,
     /// The [[InitializedTemporal*]] records of Temporal instances, keyed by
     /// object identity (the proposal-temporal internal slots).
     pub temporal_data: std::collections::HashMap<u64, crate::builtins::temporal::TemporalRecord>,
@@ -441,6 +448,7 @@ impl Agent {
             intl_segmenter_data: std::collections::HashMap::new(),
             intl_segments_data: std::collections::HashMap::new(),
             intl_segment_iterator_data: std::collections::HashMap::new(),
+            intl_duration_format_data: std::collections::HashMap::new(),
             temporal_data: std::collections::HashMap::new(),
             regexp_data: std::collections::HashMap::new(),
             regexp_string_iter_data: std::collections::HashMap::new(),

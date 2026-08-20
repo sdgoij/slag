@@ -1051,7 +1051,7 @@ pub fn to_temporal_duration(agent: &mut Agent, item: &Value) -> Result<[f64; 10]
 
 /// Parse a duration string into its components via ToTemporalDuration's
 /// string branch.
-fn parse_duration_text(text: &JsString) -> Result<[f64; 10], JsError> {
+pub(crate) fn parse_duration_text(text: &JsString) -> Result<[f64; 10], JsError> {
     let fields = iso::parse_duration_string(text.as_slice())
         .map_err(|_| JsError::new(ErrorKind::RangeError, "invalid duration string".into()))?;
     let fields: [f64; 10] = fields.map(|v| v as f64);

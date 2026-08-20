@@ -266,7 +266,19 @@ pub fn dispatch_call(
         return Some(to_json(agent, this));
     }
     if intrinsics.get(P_TO_LOCALE).as_ref() == Some(callee) {
-        return Some(to_json(agent, this));
+        return Some(match require_duration(agent, this) {
+            Ok(duration) => {
+                let locales = args.first().cloned().unwrap_or(Value::Undefined);
+                let options = args.get(1).cloned().unwrap_or(Value::Undefined);
+                match crate::builtins::intl::duration_format::format_duration_fields(
+                    agent, &locales, &options, &duration,
+                ) {
+                    Ok(text) => Ok(Value::String(Handle::new(JsString::from_utf8(&text)))),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        });
     }
     if intrinsics.get(P_VALUE_OF).as_ref() == Some(callee) {
         return Some(Err(JsError::new(
