@@ -258,6 +258,19 @@ pub struct Agent {
     /// The per-instance bound `compare` functions: function id → the
     /// Collator instance's object id (ECMA-402 §10.3.3).
     pub intl_collator_compare_functions: std::collections::HashMap<u64, u64>,
+    /// The [[InitializedSegmenter]] records of Intl.Segmenter instances,
+    /// keyed by object identity (ECMA-402 §19: locale, granularity).
+    pub intl_segmenter_data:
+        std::collections::HashMap<u64, crate::builtins::intl::segmenter::SegmenterRecord>,
+    /// The [[SegmentsSegmenter]]/[[SegmentsString]] slots of Intl.Segmenter
+    /// `segment()` results (ECMA-402 §19.5).
+    pub intl_segments_data:
+        std::collections::HashMap<u64, crate::builtins::intl::segmenter::SegmentsRecord>,
+    /// The [[IteratingSegmenter]]/[[IteratedString]]/
+    /// [[IteratedStringNextSegmentCodeUnitIndex]] slots of segment
+    /// iterators (ECMA-402 §19.6).
+    pub intl_segment_iterator_data:
+        std::collections::HashMap<u64, crate::builtins::intl::segmenter::SegmentIteratorRecord>,
     /// The [[InitializedTemporal*]] records of Temporal instances, keyed by
     /// object identity (the proposal-temporal internal slots).
     pub temporal_data: std::collections::HashMap<u64, crate::builtins::temporal::TemporalRecord>,
@@ -425,6 +438,9 @@ impl Agent {
             intl_dtf_format_functions: std::collections::HashMap::new(),
             intl_collator_data: std::collections::HashMap::new(),
             intl_collator_compare_functions: std::collections::HashMap::new(),
+            intl_segmenter_data: std::collections::HashMap::new(),
+            intl_segments_data: std::collections::HashMap::new(),
+            intl_segment_iterator_data: std::collections::HashMap::new(),
             temporal_data: std::collections::HashMap::new(),
             regexp_data: std::collections::HashMap::new(),
             regexp_string_iter_data: std::collections::HashMap::new(),

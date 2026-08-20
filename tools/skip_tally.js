@@ -134,6 +134,7 @@ function classify(file, source) {
     "Intl.DateTimeFormat-datetimestyle",
     "Intl.DateTimeFormat-fractionalSecondDigits",
     "Intl.Collator",
+    "Intl.Segmenter",
     "Intl-enumeration",
   ]);
   for (const feature of features) {

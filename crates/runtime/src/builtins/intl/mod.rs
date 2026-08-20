@@ -16,6 +16,7 @@ pub mod number_format;
 pub mod plural_data;
 pub mod plural_rules;
 pub mod relative_time_format;
+pub mod segmenter;
 pub mod supported_values;
 
 use crux::error::{ErrorKind, JsError};
@@ -106,6 +107,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     display_names::install(realm, &intl_value)?;
     date_time_format::install(realm, &intl_value)?;
     collator::install(realm, &intl_value)?;
+    segmenter::install(realm, &intl_value)?;
 
     realm.global_object.define_property_or_throw(
         &JsString::from_utf8("Intl"),
@@ -166,6 +168,9 @@ pub fn dispatch_call(
     if let Some(result) = collator::dispatch_call(agent, callee, this, args) {
         return Some(result);
     }
+    if let Some(result) = segmenter::dispatch_call(agent, callee, this, args) {
+        return Some(result);
+    }
     date_time_format::dispatch_call(agent, callee, this, args)
 }
 
@@ -196,6 +201,9 @@ pub fn dispatch_construct(
         return Some(result);
     }
     if let Some(result) = collator::dispatch_construct(agent, callee, args, new_target) {
+        return Some(result);
+    }
+    if let Some(result) = segmenter::dispatch_construct(agent, callee, args, new_target) {
         return Some(result);
     }
     date_time_format::dispatch_construct(agent, callee, args, new_target)
