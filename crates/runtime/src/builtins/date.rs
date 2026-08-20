@@ -264,7 +264,7 @@ fn utc_time(time: f64) -> f64 {
 }
 
 /// The current time in ms since the epoch.
-fn now_ms() -> f64 {
+pub(crate) fn now_ms() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as f64)
@@ -1280,17 +1280,57 @@ pub fn dispatch_call(
                 .map(|s| Value::String(Handle::new(JsString::from_utf8(&s)))),
         );
     }
-    if intrinsics.get("%Date.prototype.toString%").as_ref() == Some(callee)
-        || intrinsics.get("%Date.prototype.toLocaleString%").as_ref() == Some(callee)
-        || intrinsics
-            .get("%Date.prototype.toLocaleDateString%")
-            .as_ref()
-            == Some(callee)
-        || intrinsics
-            .get("%Date.prototype.toLocaleTimeString%")
-            .as_ref()
-            == Some(callee)
+    if intrinsics.get("%Date.prototype.toLocaleString%").as_ref() == Some(callee) {
+        return Some(match this_date_value(agent, this) {
+            Ok(t) => crate::builtins::intl::date_time_format::to_locale_string(
+                agent,
+                &args.first().cloned().unwrap_or(Value::Undefined),
+                &args.get(1).cloned().unwrap_or(Value::Undefined),
+                t,
+                "any",
+                "all",
+            )
+            .map(|s| Value::String(Handle::new(JsString::from_utf8(&s)))),
+            Err(e) => Err(e),
+        });
+    }
+    if intrinsics
+        .get("%Date.prototype.toLocaleDateString%")
+        .as_ref()
+        == Some(callee)
     {
+        return Some(match this_date_value(agent, this) {
+            Ok(t) => crate::builtins::intl::date_time_format::to_locale_string(
+                agent,
+                &args.first().cloned().unwrap_or(Value::Undefined),
+                &args.get(1).cloned().unwrap_or(Value::Undefined),
+                t,
+                "date",
+                "date",
+            )
+            .map(|s| Value::String(Handle::new(JsString::from_utf8(&s)))),
+            Err(e) => Err(e),
+        });
+    }
+    if intrinsics
+        .get("%Date.prototype.toLocaleTimeString%")
+        .as_ref()
+        == Some(callee)
+    {
+        return Some(match this_date_value(agent, this) {
+            Ok(t) => crate::builtins::intl::date_time_format::to_locale_string(
+                agent,
+                &args.first().cloned().unwrap_or(Value::Undefined),
+                &args.get(1).cloned().unwrap_or(Value::Undefined),
+                t,
+                "time",
+                "time",
+            )
+            .map(|s| Value::String(Handle::new(JsString::from_utf8(&s)))),
+            Err(e) => Err(e),
+        });
+    }
+    if intrinsics.get("%Date.prototype.toString%").as_ref() == Some(callee) {
         return Some(match this_date_value(agent, this) {
             Ok(t) => Ok(Value::String(Handle::new(JsString::from_utf8(
                 &format_time(t),

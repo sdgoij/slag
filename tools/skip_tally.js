@@ -128,6 +128,11 @@ function classify(file, source) {
     "Intl.ListFormat",
     "Intl.DisplayNames",
     "Intl.DisplayNames-v2",
+    "Intl.DateTimeFormat",
+    "Intl.DateTimeFormat-formatRange",
+    "Intl.DateTimeFormat-dayPeriod",
+    "Intl.DateTimeFormat-datetimestyle",
+    "Intl.DateTimeFormat-fractionalSecondDigits",
     "Intl-enumeration",
   ]);
   for (const feature of features) {

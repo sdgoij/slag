@@ -242,6 +242,15 @@ pub struct Agent {
     /// instances, keyed by object identity (ECMA-402 §12).
     pub intl_display_names_data:
         std::collections::HashMap<u64, crate::builtins::intl::display_names::DisplayNamesRecord>,
+    /// The [[InitializedDateTimeFormat]] records of Intl.DateTimeFormat
+    /// instances, keyed by object identity (ECMA-402 §11).
+    pub intl_date_time_format_data: std::collections::HashMap<
+        u64,
+        crate::builtins::intl::date_time_format::DateTimeFormatRecord,
+    >,
+    /// The per-instance bound `format` functions: function id → the
+    /// DateTimeFormat instance's object id (ECMA-402 §11.3.3).
+    pub intl_dtf_format_functions: std::collections::HashMap<u64, u64>,
     /// The [[InitializedTemporal*]] records of Temporal instances, keyed by
     /// object identity (the proposal-temporal internal slots).
     pub temporal_data: std::collections::HashMap<u64, crate::builtins::temporal::TemporalRecord>,
@@ -405,6 +414,8 @@ impl Agent {
             intl_rtf_data: std::collections::HashMap::new(),
             intl_list_format_data: std::collections::HashMap::new(),
             intl_display_names_data: std::collections::HashMap::new(),
+            intl_date_time_format_data: std::collections::HashMap::new(),
+            intl_dtf_format_functions: std::collections::HashMap::new(),
             temporal_data: std::collections::HashMap::new(),
             regexp_data: std::collections::HashMap::new(),
             regexp_string_iter_data: std::collections::HashMap::new(),

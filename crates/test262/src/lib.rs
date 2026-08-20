@@ -12399,7 +12399,8 @@ var $DONE = function (error) {
     /// Cut 2: `Intl.NumberFormat` (basic, unified, v3) and
     /// `Intl.supportedValuesOf` (the `Intl-enumeration` tag). Cut 3:
     /// Cut 3: `Intl.PluralRules` and `Intl.RelativeTimeFormat`. Cut 4:
-    /// `Intl.ListFormat` and `Intl.DisplayNames` (+ `-v2`). The remaining
+    /// `Intl.ListFormat` and `Intl.DisplayNames` (+ `-v2`). Cut 5:
+    /// `Intl.DateTimeFormat` (+ its sub-feature tags). The remaining
     /// features still skip via `unimplemented_intl_feature`.
     const INTL_IMPLEMENTED: &[&str] = &[
         "Intl.Locale",
@@ -12411,6 +12412,11 @@ var $DONE = function (error) {
         "Intl.ListFormat",
         "Intl.DisplayNames",
         "Intl.DisplayNames-v2",
+        "Intl.DateTimeFormat",
+        "Intl.DateTimeFormat-formatRange",
+        "Intl.DateTimeFormat-dayPeriod",
+        "Intl.DateTimeFormat-datetimestyle",
+        "Intl.DateTimeFormat-fractionalSecondDigits",
         "Intl-enumeration",
     ];
 
@@ -12486,6 +12492,13 @@ var $DONE = function (error) {
             // Promise.allKeyed/allSettledKeyed (the await-dictionary stage-3
             // proposal) are not part of ECMA-262 ES2026.
             return FixtureResult::Skip("await-dictionary is out of scope".into());
+        }
+        if fm.features.iter().any(|f| f == "canonical-tz") {
+            // The canonical-tz proposal (2024+: case normalization and
+            // primary-identifier canonicalization of IANA time zone names)
+            // is not part of the DateTimeFormat plan cut; the identifiers
+            // are matched as-written.
+            return FixtureResult::Skip("canonical-tz is out of scope".into());
         }
         if fm.features.iter().any(|f| f == "ShadowRealm") {
             // ShadowRealm is a stage-3 proposal, not part of ECMA-262 ES2026.

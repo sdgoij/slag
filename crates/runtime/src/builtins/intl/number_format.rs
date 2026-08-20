@@ -821,7 +821,7 @@ impl Part {
 }
 
 /// The transliterated digit string for the numbering system (Table 30).
-fn transliterate(numbering_system: &str, digits_text: &str) -> String {
+pub(crate) fn transliterate(numbering_system: &str, digits_text: &str) -> String {
     if numbering_system == "latn" {
         return digits_text.to_string();
     }
@@ -1698,7 +1698,9 @@ pub(crate) fn strip_unicode_extension(locale: &str) -> String {
     out
 }
 
-/// Read the value of a keyword inside a `-u-` extension sequence.
+/// Read the value of a keyword inside a `-u-` extension sequence (the
+/// value is the following type tokens joined with `-`, e.g. the `ca` value
+/// of `islamic-civil`).
 pub(crate) fn unicode_extension_keyword_value(extension: &str, key: &str) -> Option<String> {
     let parts: Vec<&str> = extension.split('-').collect();
     let mut i = 0;
@@ -1706,12 +1708,15 @@ pub(crate) fn unicode_extension_keyword_value(extension: &str, key: &str) -> Opt
         if parts[i] == key {
             // The value: the following type tokens (3-8 chars each).
             let mut j = i + 1;
-            let mut value = None;
+            let mut tokens: Vec<&str> = Vec::new();
             while j < parts.len() && (3..=8).contains(&parts[j].len()) {
-                value = Some(parts[j].to_string());
+                tokens.push(parts[j]);
                 j += 1;
             }
-            return value;
+            if tokens.is_empty() {
+                return None;
+            }
+            return Some(tokens.join("-"));
         }
         i += 1;
     }
@@ -2373,7 +2378,7 @@ fn unwrap_number_format(agent: &mut Agent, nf: &Value) -> Result<Value, JsError>
 
 /// The %Intl%.[[FallbackSymbol]] (a private symbol with the description
 /// "IntlLegacyConstructedSymbol").
-fn fallback_symbol() -> crux::symbol::Symbol {
+pub(crate) fn fallback_symbol() -> crux::symbol::Symbol {
     use std::sync::OnceLock;
     static SYMBOL: OnceLock<crux::symbol::Symbol> = OnceLock::new();
     SYMBOL

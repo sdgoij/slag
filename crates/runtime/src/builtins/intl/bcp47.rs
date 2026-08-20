@@ -617,12 +617,16 @@ fn canonicalize_extension(extension: &str) -> String {
 /// CanonicalizeUValue (ECMA-402 §9.2.2): the canonical form of a u-extension
 /// keyword value per the key's alias data; unchanged when not aliased.
 pub fn canonicalize_uvalue(key: &str, value: &str) -> String {
+    // CanonicalizeUValue (§9.2.2): the value is ASCII-lowercased first
+    // (a `type`-nonterminal check already ran on the option), then the
+    // alias table maps the deprecated spellings.
+    let lower = value.to_ascii_lowercase();
     for &(k, from, to) in data::UVALUE_ALIASES {
-        if k == key && value == from {
+        if k == key && lower == from {
             return to.to_string();
         }
     }
-    value.to_string()
+    lower
 }
 
 /// tfield value aliasing for the `t` extension (m0-names → m0-prprname).

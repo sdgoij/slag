@@ -6,6 +6,7 @@
 
 pub mod bcp47;
 pub mod data;
+pub mod date_time_format;
 pub mod display_names;
 pub mod list_format;
 pub mod locale;
@@ -102,6 +103,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     relative_time_format::install(realm, &intl_value)?;
     list_format::install(realm, &intl_value)?;
     display_names::install(realm, &intl_value)?;
+    date_time_format::install(realm, &intl_value)?;
 
     realm.global_object.define_property_or_throw(
         &JsString::from_utf8("Intl"),
@@ -156,7 +158,10 @@ pub fn dispatch_call(
     if let Some(result) = list_format::dispatch_call(agent, callee, this, args) {
         return Some(result);
     }
-    display_names::dispatch_call(agent, callee, this, args)
+    if let Some(result) = display_names::dispatch_call(agent, callee, this, args) {
+        return Some(result);
+    }
+    date_time_format::dispatch_call(agent, callee, this, args)
 }
 
 /// dispatch_construct: `new Intl.Locale(...)` and `new Intl.NumberFormat(...)`.
@@ -182,7 +187,10 @@ pub fn dispatch_construct(
     if let Some(result) = list_format::dispatch_construct(agent, callee, args, new_target) {
         return Some(result);
     }
-    display_names::dispatch_construct(agent, callee, args, new_target)
+    if let Some(result) = display_names::dispatch_construct(agent, callee, args, new_target) {
+        return Some(result);
+    }
+    date_time_format::dispatch_construct(agent, callee, args, new_target)
 }
 
 /// CanonicalizeLocaleList (ECMA-402 §9.2.1): the `locales` argument — an
