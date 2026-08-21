@@ -2692,6 +2692,65 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     Ok(())
 }
 
+/// The O(1) dispatch table for the Array members that need the agent:
+/// `Intrinsics::define` registers each builtin function's id against its
+/// native handler here, so a warm call skips the linear intrinsic-identity
+/// scan in [`dispatch_call`] (which runs ~50 `intrinsics.get` lookups per
+/// call). The adapter closures reconcile the few handlers that ignore
+/// `this` (the Array constructor) with the uniform `BuiltinHandler` shape.
+/// The fromAsync continuations are keyed by runtime state, not by an
+/// intrinsic name, so they stay on the chain path.
+pub(crate) fn handler_for(name: &str) -> Option<crate::function::BuiltinHandler> {
+    match name {
+        ARRAY => Some(|agent, _this, args| array_call(agent, args)),
+        IS_ARRAY => Some(array_is_array),
+        OF => Some(array_of),
+        FROM => Some(array_from),
+        FROM_ASYNC => Some(from_async),
+        AT => Some(at),
+        CONCAT => Some(concat),
+        COPY_WITHIN => Some(copy_within),
+        ENTRIES => Some(entries),
+        EVERY => Some(every),
+        FILL => Some(fill),
+        FILTER => Some(filter),
+        FIND => Some(find),
+        FIND_INDEX => Some(find_index),
+        FIND_LAST => Some(find_last),
+        FIND_LAST_INDEX => Some(find_last_index),
+        FLAT => Some(flat),
+        FLAT_MAP => Some(flat_map),
+        FOR_EACH => Some(for_each),
+        INCLUDES => Some(includes),
+        INDEX_OF => Some(index_of),
+        JOIN => Some(join),
+        KEYS => Some(keys),
+        LAST_INDEX_OF => Some(last_index_of),
+        MAP => Some(map),
+        POP => Some(pop),
+        PUSH => Some(push),
+        REDUCE => Some(reduce),
+        REDUCE_RIGHT => Some(reduce_right),
+        REVERSE => Some(reverse),
+        SHIFT => Some(shift),
+        SLICE => Some(slice),
+        SOME => Some(some),
+        SORT => Some(sort),
+        SPLICE => Some(splice),
+        TO_LOCALE_STRING => Some(to_locale_string),
+        TO_REVERSED => Some(to_reversed),
+        TO_SORTED => Some(to_sorted),
+        TO_SPLICED => Some(to_spliced),
+        TO_STRING => Some(to_string_method),
+        UNSHIFT => Some(unshift),
+        VALUES | ITERATOR => Some(values),
+        WITH => Some(with),
+        SPECIES => Some(species_getter),
+        ARRAY_ITERATOR_NEXT => Some(array_iterator_next),
+        _ => None,
+    }
+}
+
 /// The Array members that need the agent, dispatched by intrinsic identity
 /// from `runtime::function::call`/`construct`.
 pub fn dispatch_call(

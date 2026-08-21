@@ -278,6 +278,9 @@ impl Value {
 
 impl Clone for Value {
     fn clone(&self) -> Value {
+        if self.is_uninitialized() {
+            return Value::uninitialized();
+        }
         match self.kind() {
             ValueKind::Undefined => Value::Undefined,
             ValueKind::Null => Value::Null,

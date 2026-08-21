@@ -1079,8 +1079,14 @@ pub(crate) fn call_inner(
                 // %eval% pattern). Which dispatch (if any) applies is stable
                 // per function object, so the linear chain is memoized in
                 // `agent.builtin_dispatch_cache` — plain closure builtins
-                // (index 0) skip the chain entirely on warm calls.
+                // (index 0) skip the chain entirely on warm calls. The
+                // installed builtins additionally register their native
+                // handler at `Intrinsics::define` time, so a warm call
+                // dispatches in O(1) without scanning the chain at all.
                 let id = function.id();
+                if let Some(handler) = builtin_handler(id) {
+                    return handler(agent, &this, args);
+                }
                 let cached = agent.builtin_dispatch_cache.get(&id).copied();
                 let dispatched = match cached {
                     Some(0) => None,
@@ -1135,6 +1141,36 @@ pub(crate) fn call_inner(
 /// Run the dispatch at `index` (the memoized per-function slot). Each arm
 /// mirrors one entry of the original `call_inner` chain; a stale entry
 /// (the dispatch no longer applies) returns `None`.
+/// An installed agent-dependent builtin's native handler: every dispatch
+/// chain arm has this shape (some handlers ignore `this` or `callee` — the
+/// adapter closures in the per-chain `handler_for` tables reconcile that).
+pub(crate) type BuiltinHandler = fn(&mut Agent, &Value, &[Value]) -> Result<Value, JsError>;
+
+thread_local! {
+    /// Agent-dependent builtins by function id, registered by
+    /// `Intrinsics::define` at install time (each realm creates its own
+    /// builtin objects with unique ids, and the handlers are
+    /// realm-independent — they take the agent). A warm call dispatches
+    /// through this map in O(1) instead of scanning the linear
+    /// intrinsic-identity chains (`array::dispatch_call` runs ~50
+    /// `intrinsics.get` lookups per call for the Array members).
+    static BUILTIN_HANDLERS: std::cell::RefCell<std::collections::HashMap<u64, BuiltinHandler>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Register a builtin function's native handler (called from
+/// `Intrinsics::define`).
+pub(crate) fn register_builtin_handler(id: u64, handler: BuiltinHandler) {
+    BUILTIN_HANDLERS.with(|registry| {
+        registry.borrow_mut().insert(id, handler);
+    });
+}
+
+/// The registered native handler for a builtin function id, if any.
+pub(crate) fn builtin_handler(id: u64) -> Option<BuiltinHandler> {
+    BUILTIN_HANDLERS.with(|registry| registry.borrow().get(&id).copied())
+}
+
 fn builtin_dispatch_at(
     agent: &mut Agent,
     index: u8,

@@ -1168,6 +1168,38 @@ impl JsObject {
             }
             probe = link.prototype.borrow().clone();
         }
+        // Dense append (index == length): push the element and bump the
+        // length in place, exactly like `array_define_own_property`'s fast
+        // append — the guards (extensible, chain clean, index == length) are
+        // already verified above, so the define machinery's re-interned
+        // "length" key, descriptor completion, and last-entry re-checks are
+        // skipped. An index of 2^32-1 would grow the length past the array
+        // maximum (2^32-1): the define machinery's ArraySetLength throws a
+        // RangeError there, so fall back.
+        if (index as f64) == length && index <= 0xFFFF_FFFE {
+            let mut props = self.properties.borrow_mut();
+            let position = props.len();
+            props.push((
+                key.clone(),
+                Property {
+                    kind: PropertyKind::Data {
+                        value,
+                        writable: true,
+                    },
+                    enumerable: true,
+                    configurable: true,
+                },
+            ));
+            if let Some(index_map) = &mut *self.property_index.borrow_mut() {
+                index_map.insert(key.clone(), position);
+            }
+            if let Some((_, length_prop)) = props.first_mut()
+                && let PropertyKind::Data { value: slot, .. } = &mut length_prop.kind
+            {
+                *slot = Value::Number((index + 1) as f64);
+            }
+            return Ok(Some(()));
+        }
         if self.create_data_property_key(&key, value)? {
             Ok(Some(()))
         } else {

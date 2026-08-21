@@ -1096,19 +1096,35 @@ impl Vm {
     /// Allocate the fast-path frame and bind the arguments into their slots
     /// (Cut 3). Params are slots `0..arity` in source order; extra arguments
     /// are ignored (spec 10.2.11, ordinary call), missing ones stay
-    /// `undefined`, and the remaining slots (`var` bindings) initialize to
-    /// `undefined` — matching `function_declaration_instantiation` for a
-    /// body with no `arguments`/`this` references and no lexical
-    /// declarations, which is exactly what the scope analysis certified.
+    /// `undefined`, `var` bindings initialize to `undefined`, and
+    /// `let`/`const` slots start in the TDZ — matching
+    /// `function_declaration_instantiation` for a body whose references the
+    /// scope analysis certified.
     pub fn setup_frame(&mut self, scope: &ScopeInfo, args: &[Value]) {
         self.frame = if scope.frame_size <= INLINE_FRAME {
-            let mut buf = std::array::from_fn(|_| Value::Undefined);
+            let mut buf = std::array::from_fn(|index| {
+                // A `let`/`const` slot starts in the TDZ (`LoadLocal`/`StoreLocal`
+                // check the marker); params and `var`s start `undefined`.
+                if scope.tdz_store.get(index).copied().unwrap_or(false) {
+                    Value::uninitialized()
+                } else {
+                    Value::Undefined
+                }
+            });
             for (index, arg) in args.iter().take(scope.arity).enumerate() {
                 buf[index] = arg.clone();
             }
             Frame::Inline(buf)
         } else {
-            let mut slots = vec![Value::Undefined; scope.frame_size];
+            let mut slots: Vec<Value> = (0..scope.frame_size)
+                .map(|index| {
+                    if scope.tdz_store[index] {
+                        Value::uninitialized()
+                    } else {
+                        Value::Undefined
+                    }
+                })
+                .collect();
             for (index, arg) in args.iter().take(scope.arity).enumerate() {
                 slots[index] = arg.clone();
             }
@@ -6600,11 +6616,20 @@ impl Compiler {
                     } else if declaration {
                         // `let x;` initializes the binding to *undefined*
                         // (spec 14.2.1 step 4); the binding was created
-                        // uninitialized by declaration instantiation.
-                        self.emit(Step::Push(Value::Undefined));
-                        self.emit(Step::DeclInit {
-                            pattern: decl.pattern.clone(),
-                        });
+                        // uninitialized by declaration instantiation. A
+                        // slot-bound identifier writes the frame slot
+                        // directly (the frame started it in the TDZ).
+                        if let BindingPattern::Ident(name) = &decl.pattern
+                            && let BindingLoc::Slot(slot) = self.binding(*name)
+                        {
+                            self.emit(Step::Push(Value::Undefined));
+                            self.emit(Step::InitLocal { slot });
+                        } else {
+                            self.emit(Step::Push(Value::Undefined));
+                            self.emit(Step::DeclInit {
+                                pattern: decl.pattern.clone(),
+                            });
+                        }
                     }
                 }
             }
@@ -6862,26 +6887,65 @@ impl Compiler {
                             });
                         }
                     }
-                } else {
+                } else if *kind == VarDeclKind::Using || *kind == VarDeclKind::AwaitUsing {
+                    // A `using` head needs the loop environment for the
+                    // disposal machinery (the certification rejects
+                    // `using`, so its bindings are never slots).
                     self.emit(Step::EnterLoopEnv {
                         kind: *kind,
                         decls: decls.clone(),
                     });
                     self.scope_count += 1;
                     has_loop_env = true;
-                    for decl in decls {
-                        // `const` (and `using`) heads share one binding —
-                        // the update would otherwise mutate a per-iteration
-                        // copy instead of throwing on the immutable binding
-                        // (spec 14.7.4.2, mirroring the tree-walker).
-                        if *kind == VarDeclKind::Const
-                            || matches!(*kind, VarDeclKind::Using | VarDeclKind::AwaitUsing)
-                        {
-                            continue;
+                } else {
+                    // A lexical head whose bindings are certified frame
+                    // slots (no closures — the per-iteration freshness is
+                    // unobservable) initializes the slots directly, skipping
+                    // the per-iteration environment machinery. Anything else
+                    // keeps the env path below.
+                    let all_slots = decls.iter().all(|decl| {
+                        matches!(
+                            &decl.pattern,
+                            BindingPattern::Ident(name)
+                                if matches!(self.binding(*name), BindingLoc::Slot(_))
+                        )
+                    });
+                    if all_slots {
+                        for decl in decls {
+                            if let Some(init) = &decl.init {
+                                self.compile_expr(init)?;
+                            } else {
+                                // `for (let i; ...)`: the binding initializes
+                                // to *undefined* (spec 14.2.1 step 4).
+                                self.emit(Step::Push(Value::Undefined));
+                            }
+                            let BindingPattern::Ident(name) = decl.pattern else {
+                                unreachable!("all_slots checked the pattern")
+                            };
+                            let BindingLoc::Slot(slot) = self.binding(name) else {
+                                unreachable!("all_slots checked the binding")
+                            };
+                            self.emit(Step::InitLocal { slot });
                         }
-                        let mut names = Vec::new();
-                        crate::script::bound_names(&decl.pattern, &mut names);
-                        per_iteration.extend(names);
+                    } else {
+                        self.emit(Step::EnterLoopEnv {
+                            kind: *kind,
+                            decls: decls.clone(),
+                        });
+                        self.scope_count += 1;
+                        has_loop_env = true;
+                        for decl in decls {
+                            // `const` heads share one binding — the update
+                            // would otherwise mutate a per-iteration copy
+                            // instead of throwing on the immutable binding
+                            // (spec 14.7.4.2, mirroring the tree-walker).
+                            if *kind == VarDeclKind::Const {
+                                continue;
+                            }
+                            let mut names = Vec::new();
+                            crate::script::bound_names(&decl.pattern, &mut names);
+                            per_iteration.extend(names);
+                        }
                     }
                 }
             }
@@ -9203,12 +9267,14 @@ pub fn compile_statements(
 // ---- Cut 3 scope analysis ----
 //
 // Certify a function body for the frame-slot fast path and lay out its
-// frame. The first slice is deliberately narrow: simple identifier params,
-// `var`-only declarations (no `let`/`const`/class/function/using), no
-// closures, no `eval`/`with`, no `this`/`arguments`/`new.target`/`super`,
-// no `try`/`switch`/`for-in`/`for-of`/destructuring, no tagged templates.
-// Anything else returns `None` and the body compiles through the existing
-// environment machinery (the correctness backstop).
+// frame. The certified slice: simple identifier params, `var` plus
+// `let`/`const` declarations (each lexical binding gets a unique frame
+// slot that starts in the TDZ and is referenced only inside its declaring
+// scope; `const` is never reassigned), side-effect-free array/object
+// literals, no closures, no `eval`/`with`, no `this`/`arguments`/
+// `new.target`/`super`, no `try`/`switch`/`for-in`/`for-of`/destructuring,
+// no tagged templates. Anything else returns `None` and the body compiles
+// through the existing environment machinery (the correctness backstop).
 
 /// Lay out the frame for a fast-path body, or return `None` when the body
 /// needs the environment path.
@@ -9216,8 +9282,7 @@ fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
     if function.is_async || function.is_generator {
         return None;
     }
-    let mut slots = HashMap::new();
-    let mut next_slot = 0usize;
+    let mut scan = FastScopeScan::default();
     for param in &function.params {
         if param.rest || param.init.is_some() {
             return None;
@@ -9225,200 +9290,255 @@ fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
         let BindingPattern::Ident(name) = param.pattern else {
             return None;
         };
-        slots.insert(name, next_slot);
-        next_slot += 1;
+        scan.slots.insert(name, scan.next_slot);
+        scan.tdz.push(false);
+        scan.next_slot += 1;
     }
-    let arity = next_slot;
-    if !scope_scan_stmts(&function.body.stmts, &mut slots, &mut next_slot) {
+    let arity = scan.next_slot;
+    if !scan.stmts(&function.body.stmts, 0) {
         return None;
     }
-    let frame_size = next_slot;
+    let frame_size = scan.next_slot;
     Some(ScopeInfo {
         frame_size,
         arity,
-        slots,
-        tdz_store: vec![false; frame_size],
+        slots: scan.slots,
+        tdz_store: scan.tdz,
     })
 }
 
-fn scope_scan_stmts(
-    stmts: &[Stmt],
-    slots: &mut HashMap<crux::AtomId, usize>,
-    next_slot: &mut usize,
-) -> bool {
-    stmts
-        .iter()
-        .all(|stmt| scope_scan_stmt(stmt, slots, next_slot))
+/// The frame layout under construction: the flat name→slot map (safe
+/// because a certified body declares every lexical binding exactly once and
+/// references it only inside its declaring scope), the per-slot TDZ marks,
+/// the `const` names (the frame has no const enforcement, so the scan
+/// rejects any reassignment), and each lexical binding's block depth.
+#[derive(Default)]
+struct FastScopeScan {
+    slots: HashMap<crux::AtomId, usize>,
+    next_slot: usize,
+    /// In lockstep with `slots`: `true` for a `let`/`const` slot, which the
+    /// frame starts uninitialized (the TDZ marker `LoadLocal`/`StoreLocal`
+    /// check).
+    tdz: Vec<bool>,
+    consts: HashSet<crux::AtomId>,
+    /// The block depth each lexical binding was declared at: a reference
+    /// must sit at an equal or deeper depth (inside its scope).
+    declared_depth: HashMap<crux::AtomId, usize>,
 }
 
-fn scope_scan_stmt(
-    stmt: &Stmt,
-    slots: &mut HashMap<crux::AtomId, usize>,
-    next_slot: &mut usize,
-) -> bool {
-    match &stmt.kind {
-        StmtKind::Block(block) => scope_scan_stmts(&block.stmts, slots, next_slot),
-        StmtKind::Empty | StmtKind::Debugger | StmtKind::Break(_) | StmtKind::Continue(_) => true,
-        StmtKind::Expr(expr) => scope_scan_expr(expr),
-        StmtKind::VarDecl { kind, decls } => {
-            if *kind != VarDeclKind::Var {
-                return false;
+impl FastScopeScan {
+    fn stmts(&mut self, stmts: &[Stmt], depth: usize) -> bool {
+        stmts.iter().all(|stmt| self.stmt(stmt, depth))
+    }
+
+    fn stmt(&mut self, stmt: &Stmt, depth: usize) -> bool {
+        match &stmt.kind {
+            StmtKind::Block(block) => self.stmts(&block.stmts, depth + 1),
+            StmtKind::Empty | StmtKind::Debugger | StmtKind::Break(_) | StmtKind::Continue(_) => {
+                true
             }
-            for decl in decls {
-                let BindingPattern::Ident(name) = decl.pattern else {
-                    return false;
+            StmtKind::Expr(expr) => self.expr(expr, depth),
+            StmtKind::VarDecl { kind, decls } => self.decls(kind, decls, depth),
+            StmtKind::If {
+                test,
+                consequent,
+                alternate,
+            } => {
+                self.expr(test, depth)
+                    && self.stmt(consequent, depth + 1)
+                    && alternate.as_deref().is_none_or(|a| self.stmt(a, depth + 1))
+            }
+            StmtKind::While { test, body } => self.expr(test, depth) && self.stmt(body, depth + 1),
+            StmtKind::DoWhile { body, test } => {
+                self.stmt(body, depth + 1) && self.expr(test, depth)
+            }
+            StmtKind::For {
+                init,
+                test,
+                update,
+                body,
+            } => {
+                let init_ok = match init {
+                    None => true,
+                    Some(ForInit::Expr(expr)) => self.expr(expr, depth),
+                    Some(ForInit::VarDecl { kind, decls }) => self.decls(kind, decls, depth),
                 };
-                slots.entry(name).or_insert_with(|| {
-                    let slot = *next_slot;
-                    *next_slot += 1;
+                init_ok
+                    && test.as_ref().is_none_or(|t| self.expr(t, depth))
+                    && update.as_ref().is_none_or(|u| self.expr(u, depth))
+                    && self.stmt(body, depth + 1)
+            }
+            StmtKind::Return(expr) => expr.as_ref().is_none_or(|e| self.expr(e, depth)),
+            StmtKind::Throw(expr) => self.expr(expr, depth),
+            StmtKind::Labeled { body, .. } => self.stmt(body, depth),
+            StmtKind::ForIn { .. }
+            | StmtKind::ForOf { .. }
+            | StmtKind::UsingDecl { .. }
+            | StmtKind::FunctionDecl(_)
+            | StmtKind::ClassDecl(_)
+            | StmtKind::Try { .. }
+            | StmtKind::Switch { .. }
+            | StmtKind::With { .. } => false,
+        }
+    }
+
+    fn decls(&mut self, kind: &VarDeclKind, decls: &[VarDeclarator], depth: usize) -> bool {
+        let lexical = *kind != VarDeclKind::Var;
+        for decl in decls {
+            let BindingPattern::Ident(name) = decl.pattern else {
+                return false;
+            };
+            if lexical {
+                // A lexical binding must be unique (the flat slot map
+                // cannot tell two scopes apart) and referenced only within
+                // its scope; the per-iteration freshness of a `for`-head
+                // binding is unobservable without closures, which the scan
+                // rejects.
+                if self.slots.contains_key(&name) {
+                    return false;
+                }
+                self.slots.insert(name, self.next_slot);
+                self.tdz.push(true);
+                self.declared_depth.insert(name, depth);
+                if *kind == VarDeclKind::Const {
+                    self.consts.insert(name);
+                }
+                self.next_slot += 1;
+            } else {
+                self.slots.entry(name).or_insert_with(|| {
+                    let slot = self.next_slot;
+                    self.tdz.push(false);
+                    self.next_slot += 1;
                     slot
                 });
-                if let Some(init) = &decl.init
-                    && !scope_scan_expr(init)
-                {
+            }
+            if let Some(init) = &decl.init
+                && !self.expr(init, depth)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn expr(&mut self, expr: &Expr, depth: usize) -> bool {
+        match &expr.kind {
+            ExprKind::Literal(_) => true,
+            // Array/object literals are side-effect-free, but their contents
+            // are scanned: a method/getter/setter (a closure) or a closure
+            // element could capture a certified slot, and a computed key is
+            // an expression.
+            ExprKind::Array(array) => array.elements.iter().all(|element| match element {
+                ArrayElement::Hole => true,
+                ArrayElement::Expr(expr) | ArrayElement::Spread(expr) => self.expr(expr, depth),
+            }),
+            ExprKind::Object(object) => object.props.iter().all(|prop| match prop {
+                ObjectProperty::Method { .. }
+                | ObjectProperty::Get { .. }
+                | ObjectProperty::Set { .. } => false,
+                ObjectProperty::Init { key, value, .. } => {
+                    self.property_name(key, depth) && self.expr(value, depth)
+                }
+                ObjectProperty::Spread(expr) => self.expr(expr, depth),
+            }),
+            // `arguments` is the special unmapped/mapped binding the fast
+            // path doesn't create — a reference must fall back to the
+            // environment machinery. A lexical reference must sit inside
+            // its declaring scope (equal or deeper block depth).
+            ExprKind::Ident(name) => {
+                crux::lookup(*name) != JsString::from_utf8("arguments")
+                    && self
+                        .declared_depth
+                        .get(name)
+                        .is_none_or(|&declared| depth >= declared)
+            }
+            ExprKind::Paren(inner) => self.expr(inner, depth),
+            ExprKind::Unary { operand, .. } => self.expr(operand, depth),
+            ExprKind::Update { target, .. } => {
+                // The frame has no const enforcement: a `const` target must
+                // bail.
+                !matches!(target.kind, ExprKind::Ident(name) if self.consts.contains(&name))
+                    && self.expr(target, depth)
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.expr(left, depth) && self.expr(right, depth)
+            }
+            ExprKind::Logical { left, right, .. } => {
+                self.expr(left, depth) && self.expr(right, depth)
+            }
+            ExprKind::Conditional {
+                test,
+                consequent,
+                alternate,
+            } => {
+                self.expr(test, depth)
+                    && self.expr(consequent, depth)
+                    && self.expr(alternate, depth)
+            }
+            ExprKind::Assign { target, value, .. } => {
+                if matches!(target.kind, ExprKind::Object(_) | ExprKind::Array(_)) {
                     return false;
                 }
+                // A `const` binding cannot be reassigned (the frame slot
+                // has no const enforcement).
+                !matches!(target.kind, ExprKind::Ident(name) if self.consts.contains(&name))
+                    && self.expr(target, depth)
+                    && self.expr(value, depth)
             }
-            true
-        }
-        StmtKind::If {
-            test,
-            consequent,
-            alternate,
-        } => {
-            scope_scan_expr(test)
-                && scope_scan_stmt(consequent, slots, next_slot)
-                && alternate
-                    .as_deref()
-                    .is_none_or(|a| scope_scan_stmt(a, slots, next_slot))
-        }
-        StmtKind::While { test, body } => {
-            scope_scan_expr(test) && scope_scan_stmt(body, slots, next_slot)
-        }
-        StmtKind::DoWhile { body, test } => {
-            scope_scan_stmt(body, slots, next_slot) && scope_scan_expr(test)
-        }
-        StmtKind::For {
-            init,
-            test,
-            update,
-            body,
-        } => {
-            let init_ok = match init {
-                None => true,
-                Some(ForInit::Expr(expr)) => scope_scan_expr(expr),
-                Some(ForInit::VarDecl { kind, decls }) => {
-                    if *kind != VarDeclKind::Var {
-                        return false;
-                    }
-                    for decl in decls {
-                        let BindingPattern::Ident(name) = decl.pattern else {
-                            return false;
-                        };
-                        slots.entry(name).or_insert_with(|| {
-                            let slot = *next_slot;
-                            *next_slot += 1;
-                            slot
-                        });
-                        if let Some(init) = &decl.init
-                            && !scope_scan_expr(init)
-                        {
-                            return false;
-                        }
-                    }
-                    true
+            ExprKind::Member(member) => {
+                if matches!(member.property, MemberProperty::Private(_)) {
+                    return false;
                 }
-            };
-            init_ok
-                && test.as_ref().is_none_or(scope_scan_expr)
-                && update.as_ref().is_none_or(scope_scan_expr)
-                && scope_scan_stmt(body, slots, next_slot)
+                let object_ok = self.expr(&member.object, depth);
+                let key_ok = match &member.property {
+                    MemberProperty::Computed(key) => self.expr(key, depth),
+                    _ => true,
+                };
+                object_ok && key_ok
+            }
+            ExprKind::Call(call) => {
+                if matches!(
+                    &call.callee.kind,
+                    ExprKind::Ident(id) if crux::lookup(*id) == JsString::from_utf8("eval")
+                ) {
+                    return false;
+                }
+                let callee_ok = self.expr(&call.callee, depth);
+                let args_ok = call.args.iter().all(|arg| match arg {
+                    Argument::Expr(expr) => self.expr(expr, depth),
+                    Argument::Spread(expr) => self.expr(expr, depth),
+                });
+                callee_ok && args_ok
+            }
+            ExprKind::New(new) => {
+                let callee_ok = self.expr(&new.callee, depth);
+                let args_ok = new.args.iter().all(|arg| match arg {
+                    Argument::Expr(expr) => self.expr(expr, depth),
+                    Argument::Spread(expr) => self.expr(expr, depth),
+                });
+                callee_ok && args_ok
+            }
+            ExprKind::Template(template) => template.exprs.iter().all(|e| self.expr(e, depth)),
+            ExprKind::Sequence(exprs) => exprs.iter().all(|e| self.expr(e, depth)),
+            ExprKind::This
+            | ExprKind::Super
+            | ExprKind::Function(_)
+            | ExprKind::Class(_)
+            | ExprKind::PrivateIn { .. }
+            | ExprKind::TaggedTemplate { .. }
+            | ExprKind::Arrow { .. }
+            | ExprKind::Yield { .. }
+            | ExprKind::Await(_)
+            | ExprKind::MetaProperty { .. }
+            | ExprKind::ImportCall { .. } => false,
         }
-        StmtKind::Return(expr) => expr.as_ref().is_none_or(scope_scan_expr),
-        StmtKind::Throw(expr) => scope_scan_expr(expr),
-        StmtKind::Labeled { body, .. } => scope_scan_stmt(body, slots, next_slot),
-        StmtKind::ForIn { .. }
-        | StmtKind::ForOf { .. }
-        | StmtKind::UsingDecl { .. }
-        | StmtKind::FunctionDecl(_)
-        | StmtKind::ClassDecl(_)
-        | StmtKind::Try { .. }
-        | StmtKind::Switch { .. }
-        | StmtKind::With { .. } => false,
     }
-}
 
-fn scope_scan_expr(expr: &Expr) -> bool {
-    match &expr.kind {
-        ExprKind::Literal(_) => true,
-        // `arguments` is the special unmapped/mapped binding the fast path
-        // doesn't create — a reference (even a shadowed local is fine to
-        // bail) must fall back to the environment machinery.
-        ExprKind::Ident(name) => crux::lookup(*name) != JsString::from_utf8("arguments"),
-        ExprKind::Paren(inner) => scope_scan_expr(inner),
-        ExprKind::Unary { operand, .. } => scope_scan_expr(operand),
-        ExprKind::Update { target, .. } => scope_scan_expr(target),
-        ExprKind::Binary { left, right, .. } => scope_scan_expr(left) && scope_scan_expr(right),
-        ExprKind::Logical { left, right, .. } => scope_scan_expr(left) && scope_scan_expr(right),
-        ExprKind::Conditional {
-            test,
-            consequent,
-            alternate,
-        } => scope_scan_expr(test) && scope_scan_expr(consequent) && scope_scan_expr(alternate),
-        ExprKind::Assign { target, value, .. } => {
-            if matches!(target.kind, ExprKind::Object(_) | ExprKind::Array(_)) {
-                return false;
-            }
-            scope_scan_expr(target) && scope_scan_expr(value)
+    fn property_name(&mut self, name: &PropertyName, depth: usize) -> bool {
+        match name {
+            PropertyName::Ident(_) | PropertyName::Str(_) | PropertyName::Number(_) => true,
+            PropertyName::Computed(expr) => self.expr(expr, depth),
         }
-        ExprKind::Member(member) => {
-            if matches!(member.property, MemberProperty::Private(_)) {
-                return false;
-            }
-            let object_ok = scope_scan_expr(&member.object);
-            let key_ok = match &member.property {
-                MemberProperty::Computed(key) => scope_scan_expr(key),
-                _ => true,
-            };
-            object_ok && key_ok
-        }
-        ExprKind::Call(call) => {
-            if matches!(
-                &call.callee.kind,
-                ExprKind::Ident(id) if crux::lookup(*id) == JsString::from_utf8("eval")
-            ) {
-                return false;
-            }
-            let callee_ok = scope_scan_expr(&call.callee);
-            let args_ok = call.args.iter().all(|arg| match arg {
-                Argument::Expr(expr) => scope_scan_expr(expr),
-                Argument::Spread(expr) => scope_scan_expr(expr),
-            });
-            callee_ok && args_ok
-        }
-        ExprKind::New(new) => {
-            let callee_ok = scope_scan_expr(&new.callee);
-            let args_ok = new.args.iter().all(|arg| match arg {
-                Argument::Expr(expr) => scope_scan_expr(expr),
-                Argument::Spread(expr) => scope_scan_expr(expr),
-            });
-            callee_ok && args_ok
-        }
-        ExprKind::Template(template) => template.exprs.iter().all(scope_scan_expr),
-        ExprKind::Sequence(exprs) => exprs.iter().all(scope_scan_expr),
-        ExprKind::This
-        | ExprKind::Super
-        | ExprKind::Array(_)
-        | ExprKind::Object(_)
-        | ExprKind::Function(_)
-        | ExprKind::Class(_)
-        | ExprKind::PrivateIn { .. }
-        | ExprKind::TaggedTemplate { .. }
-        | ExprKind::Arrow { .. }
-        | ExprKind::Yield { .. }
-        | ExprKind::Await(_)
-        | ExprKind::MetaProperty { .. }
-        | ExprKind::ImportCall { .. } => false,
     }
 }
 

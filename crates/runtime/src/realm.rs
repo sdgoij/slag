@@ -54,7 +54,17 @@ impl Intrinsics {
     pub fn define(&self, name: &str, value: Value) {
         self.entries
             .borrow_mut()
-            .insert(JsString::from_utf8(name), value);
+            .insert(JsString::from_utf8(name), value.clone());
+        // Register an agent-dependent builtin's native handler so a warm
+        // call dispatches in O(1) (see `builtins::array::handler_for`);
+        // functions without a registered handler (prototypes, plain
+        // closures, the eval hosts, the fromAsync continuations) keep the
+        // intrinsic-identity chain scan.
+        if let Some(function) = value.as_function()
+            && let Some(handler) = crate::builtins::array::handler_for(name)
+        {
+            crate::function::register_builtin_handler(function.id(), handler);
+        }
     }
 
     pub fn is_empty(&self) -> bool {
