@@ -199,6 +199,80 @@ Methodology note: per-process timing is load-sensitive on this machine
 (5.5x spurious swings observed), so only interleaved multi-run medians or
 the in-process `--bench` harness count.
 
+### Cut 11 — for-of begin hoist, fast-script certification, element writes (measured 2026-08-21)
+
+Fresh 3-run medians of `--bench` (release), against the Node v24.12.0
+comparison (same sources, warmed, 2nd run) both with and without the JIT:
+
+| Benchmark | slag | node (jit) | node (--jitless) | slag vs jitless |
+|---|---|---|---|---|
+| arithmetic | 182ms | 1ms | 11ms | 17x |
+| property access | 242ms | 1ms | 13ms | 19x |
+| string concat | 78ms | 4ms | 5ms | 16x |
+| array iteration | 324ms | 3ms | 26ms | 12x |
+| function calls | 642ms | 1ms | 16ms | 40x |
+
+The `--jitless` column (V8's ignition bytecode interpreter, no JIT) is the
+realistic interpreter-vs-interpreter picture; the ratios rank the
+remaining machinery: function calls are the standout gap (the per-call
+`ExecutionContext` push), array iteration is the closest.
+
+The ranked plan's five milestones all landed with zero conformance
+regressions; four further wins followed (each with the same validation —
+clippy clean, `cargo test --workspace` green, language sweep
+23,690/0/34 unchanged, built-ins sweep 0 fail/0 crash):
+
+6. **Hoisted for-of begin detection** — `for_of_begin` verifies the stock
+   `%Array.prototype.values%` iterator over a plain Array (intrinsic
+   identity of `@@iterator`/`next`, no `return` on the
+   `%ArrayIteratorPrototype%` chain) *without allocating the iterator
+   object or calling `values()`* — the created stock iterator is empty and
+   unobservable, so the checks are observably identical. The begin was
+   ~10µs (iterator allocation + `values()` call + array_iter_data
+   bookkeeping + chain checks) and dominated the array bench (100k
+   begins/bench): array iteration 2.17s → **1.37s**.
+7. **Fast-script certification for `for-of` with a simple `var` head** —
+   `script_scan_allows` rejected *every* script containing a `for-of`,
+   sending the whole script (including its plain loops and the body's
+   global reads) to the slow env-chain path (~7x slower loops). A `var`
+   ident head binds via `ForOfBindGlobal`/`ForOfBindLocal` with no
+   per-iteration environment, so the loop is fast-script-safe; lexical
+   heads, destructuring heads, and env-path bodies still bail. Array
+   iteration 1.37s → **0.33s** (the whole script finally runs on global
+   cells); it also removed a per-process pollution where any prior for-of
+   made later index loops 7x slower.
+8. **O(1) property-index maintenance** — appends (the generic define and
+   the array dense-append paths) now insert the new key into the lazy
+   `property_index` HashMap instead of invalidating it, so sequential
+   fills are no longer O(n²) (each member lookup on a growing array
+   rebuilt the index). `Array.prototype.push` growth: 100k pushes >120s
+   (quadratic) → **~1s** (linear); the property-escape fixtures' 10k+
+   element builds stopped dominating their run time.
+9. **O(1) IC slot resolution** — `resolve_member_cell` and
+   `resolve_array_element` replaced linear `props.iter().position()` scans
+   with the `property_index` (`JsObject::property_slot`), fixing the
+   member-lookup half of the push quadratic and big-array element
+   resolution (a 1M-element for-of that hung before completes in ~2s).
+10. **Fast array element writes** — the compiled `a[i] = v` and
+    `Array.prototype.push` element writes bypass the full `[[Set]]`
+    machinery (`JsObject::array_element_write`): an existing own writable
+    data element updates in place, and a missing element (hole fill or
+    dense append) creates the own property after verifying a fully
+    ordinary prototype chain with no own property at the index, a writable
+    length, and an extensible array — anything else falls back to the full
+    `[[Set]]` (accessors, proxies, frozen/sealed, strict-mode errors).
+    Writes 3.1µs → **1.6µs** (dense), the property-escape build 4.3s →
+    **2.9s** (and the push builtin from ~11µs — its dispatch-chain linear
+    scan is a separate, still-open item).
+
+Current suite total: **17.6s → ~1.47s (~12x)**; array iteration 13.25s →
+324ms (~41x). All gates ≥5x vs the corrected baseline are met several
+fold. The remaining known-slow conformance set (RegExp property-escapes:
+~420-440 fixtures hang at the 30s batch timeout under 8-job load; the
+TypedArray copyWithin handful) is build-bound (~6.7s fixture build, ~1µs
+per element write + a per-char property-escape table scan per regex
+test); a precomputed match table per property is the deferred fix.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

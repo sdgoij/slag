@@ -1195,6 +1195,16 @@ fn push(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         ));
     }
     for item in args {
+        // A plain Array's element write goes through the dense fast path
+        // (chain-checked create, length bump included); anything else falls
+        // back to the full `[[Set]]`.
+        if let Some(array) = object.as_object()
+            && matches!(array.kind, crux::object::ObjectKind::Array)
+            && array.array_element_write(length, item.clone())?.is_some()
+        {
+            length += 1;
+            continue;
+        }
         set_property(&object, &key(length), item.clone())?;
         length += 1;
     }

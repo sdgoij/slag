@@ -2036,11 +2036,13 @@ pub enum ForOfState {
 }
 
 /// GetIterator for a `for-of` head, with the dense-Array fast path: the
-/// `@@iterator` method is fetched and invoked exactly once (identical
-/// observable behavior to [`get_iterator`]); when the result is the stock
-/// `%Array.prototype.values%` iterator over a plain Array, the fast state is
-/// returned instead. Any shadowed `@@iterator`, patched `next`/`return` on
-/// the iterator chain, or non-plain-Array receiver keeps the generic record.
+/// `@@iterator` method is fetched exactly once (identical observable
+/// behavior to [`get_iterator`]); when it is the intrinsic
+/// `%Array.prototype.values%` over a plain Array, the fast state is
+/// returned without even creating the iterator object (the stock iterator
+/// is empty and unobservable). Any shadowed `@@iterator`, patched
+/// `next`/`return` on the iterator chain, or non-plain-Array receiver keeps
+/// the generic record.
 pub fn for_of_begin(agent: &mut Agent, value: &Value) -> Result<ForOfState, JsError> {
     let method = get_method(agent, value, "@@iterator")?;
     let Some(method) = method else {
@@ -2049,6 +2051,44 @@ pub fn for_of_begin(agent: &mut Agent, value: &Value) -> Result<ForOfState, JsEr
             "Value is not iterable".into(),
         ));
     };
+    // Hoisted fast-path detection: a plain Array whose `@@iterator` is
+    // still the intrinsic `%Array.prototype.values%` iterates by index in
+    // the Vm with no iterator object at all. The stock iterator the generic
+    // path would create has no own properties (CreateArrayIterator allocates
+    // an empty object) and records exactly `(value, 0, Value)`, so its full
+    // state — over `value` at index 0, intrinsic `next`, no `return` on the
+    // %ArrayIteratorPrototype% → %Object.prototype% chain — is verified here
+    // without the allocation, the `values()` call, or the array_iter_data
+    // bookkeeping. Any divergence (a patched @@iterator/next/return, a
+    // proxy, a non-Array receiver) falls through to the generic path, which
+    // re-checks the created iterator as before.
+    if let Some(realm) = agent.current_realm().ok()
+        && matches!(
+            value.kind(),
+            ValueKind::Object(ref object)
+                if matches!(object.kind, crux::object::ObjectKind::Array)
+        )
+        && realm
+            .intrinsics
+            .get("%Array.prototype[Symbol.iterator]%")
+            .as_ref()
+            == Some(&method)
+    {
+        let iterator_proto = realm.intrinsics.get("%ArrayIteratorPrototype%");
+        if let Some(iterator_proto_value) = iterator_proto
+            && let ValueKind::Object(iterator_proto) = iterator_proto_value.kind()
+        {
+            let intrinsic_next = realm.intrinsics.get("%ArrayIteratorPrototype.next%");
+            let next_is_stock =
+                match iterator_proto.get_own_property_key(&PropertyKey::from_utf8("next"))? {
+                    Some(property) => property.value().as_ref() == intrinsic_next.as_ref(),
+                    None => false,
+                };
+            if next_is_stock && !iterator_chain_has_return(agent, &iterator_proto_value)? {
+                return Ok(ForOfState::FastArray(value.clone()));
+            }
+        }
+    }
     let iterator = crate::function::call(agent, &method, value.clone(), &[])?;
     if !matches!(iterator.kind(), ValueKind::Object(_)) {
         return Err(JsError::new(

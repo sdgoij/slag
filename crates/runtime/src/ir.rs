@@ -1297,12 +1297,15 @@ impl Vm {
             return;
         }
         let key = PropertyKey::String(name);
-        let props = object.properties.borrow();
-        if let Some(slot) = props.iter().position(|(stored, property)| {
-            *stored == key && matches!(property.kind, crux::object::PropertyKind::Data { .. })
-        }) {
-            let index = Self::member_cell_index(object.id(), name);
-            self.member_cells[index] = Some((object.id(), name, slot));
+        if let Some(slot) = object.property_slot(&key) {
+            let props = object.properties.borrow();
+            if let Some((stored, property)) = props.get(slot)
+                && *stored == key
+                && matches!(property.kind, crux::object::PropertyKind::Data { .. })
+            {
+                let index = Self::member_cell_index(object.id(), name);
+                self.member_cells[index] = Some((object.id(), name, slot));
+            }
         }
     }
 
@@ -1345,26 +1348,22 @@ impl Vm {
         if !matches!(object.kind, crux::object::ObjectKind::Array) {
             return;
         }
-        let props = object.properties.borrow();
-        if let Some((atom, slot)) =
-            props
-                .iter()
-                .enumerate()
-                .find_map(|(position, (stored, property))| {
-                    if crux::object::array_index_of(stored) == Some(index)
-                        && matches!(property.kind, crux::object::PropertyKind::Data { .. })
-                    {
-                        match stored {
-                            PropertyKey::String(atom) => Some((*atom, position)),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    }
-                })
-        {
-            let cache_index = Self::array_element_index(object.id(), index);
-            self.array_element_cells[cache_index] = Some((object.id(), index, atom, slot));
+        // Array element keys are the canonical interned index strings, so
+        // the lazy property index finds the slot in O(1) (a linear scan of
+        // the whole vector would make sequential element fills quadratic).
+        let atom = PropertyKey::from_utf8(&index.to_string());
+        let PropertyKey::String(atom) = atom else {
+            return;
+        };
+        if let Some(slot) = object.property_slot(&PropertyKey::String(atom)) {
+            let props = object.properties.borrow();
+            if let Some((stored, property)) = props.get(slot)
+                && *stored == PropertyKey::String(atom)
+                && matches!(property.kind, crux::object::PropertyKind::Data { .. })
+            {
+                let cache_index = Self::array_element_index(object.id(), index);
+                self.array_element_cells[cache_index] = Some((object.id(), index, atom, slot));
+            }
         }
     }
 
@@ -2126,15 +2125,35 @@ impl Vm {
                     if is_nullish(&object) {
                         return Err(nullish_error("Cannot set properties of null"));
                     }
-                    let key = crate::context::to_property_key(agent, &key)?;
-                    self.assign_member(
-                        agent,
-                        object,
-                        PropertyKeyName::Key(key.clone()),
-                        old,
-                        value,
-                        *op,
-                    )?;
+                    // Fast element write: a canonical Number index on a plain
+                    // Array (a Number key converts purely — ToPropertyKey runs
+                    // no user code), so the write skips the
+                    // number→string→intern round-trip and the [[Set]] chain
+                    // machinery; `array_element_write` falls back to the full
+                    // path on any doubt (accessor, non-writable length, proxy
+                    // on the chain, non-dense index, ...).
+                    if matches!(op, AssignOp::Assign)
+                        && let ValueKind::Number(number) = key.kind()
+                        && number.fract() == 0.0
+                        && (0.0..4294967295.0).contains(&number)
+                        && let ValueKind::Object(object_ref) = object.kind()
+                        && matches!(object_ref.kind, crux::object::ObjectKind::Array)
+                        && object_ref
+                            .array_element_write(number as u64, value.clone())?
+                            .is_some()
+                    {
+                        self.stack.push(value);
+                    } else {
+                        let key = crate::context::to_property_key(agent, &key)?;
+                        self.assign_member(
+                            agent,
+                            object,
+                            PropertyKeyName::Key(key.clone()),
+                            old,
+                            value,
+                            *op,
+                        )?;
+                    }
                 }
                 Step::AssignSuperName { name, op } => {
                     let value = self.pop();
@@ -9484,15 +9503,34 @@ fn script_stmt_allows(stmt: &Stmt) -> bool {
         StmtKind::FunctionDecl(_) | StmtKind::ClassDecl(_) => true,
         // `with` re-resolves every name against an object env; a `catch`
         // parameter shadows a same-named global inside its handler; a
-        // `switch` case can hold lexical declarations; `for-in`/`for-of`
-        // heads have their own binding machinery; `using` is lexical.
-        // All fall back to the env path.
+        // `switch` case can hold lexical declarations; `for-in` heads have
+        // their own binding machinery; `using` is lexical. All fall back
+        // to the env path.
         StmtKind::With { .. }
         | StmtKind::Try { .. }
         | StmtKind::Switch { .. }
         | StmtKind::ForIn { .. }
-        | StmtKind::ForOf { .. }
         | StmtKind::UsingDecl { .. } => false,
+        // A `for-of` with a simple `var` ident head binds via the global
+        // cell / frame slot (`ForOfBindGlobal`/`ForOfBindLocal`) with no
+        // per-iteration environment — the iterator protocol, the per-step
+        // length/element re-read, and the close machinery are all VM-side
+        // — so the loop stays on the fast-script path. A lexical head
+        // (per-iteration environments), a destructuring head, or a body
+        // with env-path statements keeps the whole script on the env path.
+        StmtKind::ForOf {
+            left, right, body, ..
+        } => {
+            matches!(
+                left,
+                ForBinding::VarDecl {
+                    kind: VarDeclKind::Var,
+                    pattern: BindingPattern::Ident(_),
+                    ..
+                }
+            ) && script_expr_allows(right)
+                && script_stmt_allows(body)
+        }
     }
 }
 

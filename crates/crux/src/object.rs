@@ -1062,6 +1062,119 @@ impl JsObject {
             .map(|(_, p)| p.clone())
     }
 
+    /// The property-vector slot of an own property, via the lazy index (or
+    /// a linear scan below the threshold), without cloning the property.
+    /// `None` when absent. Callers that cache a slot must re-validate it
+    /// against the stored key afterwards (the index tracks structural
+    /// changes, but value updates keep it valid).
+    pub fn property_slot(&self, key: &PropertyKey) -> Option<usize> {
+        const INDEX_THRESHOLD: usize = 16;
+        let props = self.properties.borrow();
+        if props.len() >= INDEX_THRESHOLD {
+            let index = self.property_index.borrow();
+            match index.as_ref() {
+                Some(map) => map.get(key).copied(),
+                None => {
+                    drop(index);
+                    let mut slot = self.property_index.borrow_mut();
+                    if slot.is_none() {
+                        *slot = Some(
+                            props
+                                .iter()
+                                .enumerate()
+                                .map(|(position, (name, _))| (name.clone(), position))
+                                .collect(),
+                        );
+                    }
+                    slot.as_ref().unwrap().get(key).copied()
+                }
+            }
+        } else {
+            props.iter().position(|(name, _)| name == key)
+        }
+    }
+
+    /// Write `array[index]` — a canonical array index on a plain Array —
+    /// without the full `[[Set]]` machinery. An existing own writable data
+    /// element updates in place (the `[[Set]]` own-descriptor short-circuit
+    /// never consults the chain); a missing element (a hole fill or a dense
+    /// append) creates the own data property after checking that the
+    /// prototype chain is all ordinary objects with no own property at
+    /// `index` (an accessor anywhere would intercept the write, and a
+    /// proxy's traps must run) — a dense append additionally requires a
+    /// writable length. `Ok(None)` means the caller must fall back to the
+    /// full `[[Set]]`.
+    pub fn array_element_write(&self, index: u64, value: Value) -> Result<Option<()>, JsError> {
+        if !matches!(self.kind, ObjectKind::Array) {
+            return Ok(None);
+        }
+        let key = PropertyKey::from_utf8(&index.to_string());
+        let length = {
+            let props = self.properties.borrow();
+            let Some((_, length_property)) = props.first() else {
+                return Ok(None);
+            };
+            let PropertyKind::Data {
+                value: length_value,
+                writable: length_writable,
+            } = &length_property.kind
+            else {
+                return Ok(None);
+            };
+            let Some(length) = length_value.as_number() else {
+                return Ok(None);
+            };
+            // A dense append grows the array, so the length must be writable.
+            if !length_writable && (index as f64) >= length {
+                return Ok(None);
+            }
+            length
+        };
+        if (index as f64) < length
+            && let Some(slot) = self.property_slot(&key)
+        {
+            // An existing own element: the [[Set]] own-descriptor
+            // short-circuit updates a writable data element in place — no
+            // chain consult.
+            let mut props = self.properties.borrow_mut();
+            if let Some((stored, property)) = props.get_mut(slot)
+                && *stored == key
+                && let PropertyKind::Data {
+                    writable: true,
+                    value: slot_value,
+                    ..
+                } = &mut property.kind
+            {
+                *slot_value = value;
+                return Ok(Some(()));
+            }
+            return Ok(None);
+        }
+        if (index as f64) > length {
+            return Ok(None);
+        }
+        // No own element (a hole fill or the dense append): the prototype
+        // chain must be clean and the array extensible.
+        if !self.extensible.get() {
+            return Ok(None);
+        }
+        let mut probe = self.prototype.borrow().clone();
+        while let Some(link) = probe {
+            if !matches!(link.kind, ObjectKind::Ordinary | ObjectKind::Array) {
+                return Ok(None);
+            }
+            if link.get_own_property_key(&key)?.is_some() {
+                return Ok(None);
+            }
+            probe = link.prototype.borrow().clone();
+        }
+        if self.create_data_property_key(&key, value)? {
+            Ok(Some(()))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// spec 7.3.12 HasOwnProperty.
     pub fn has_own_property(&self, key: &JsString) -> Result<bool, JsError> {
         self.has_own_property_key(&PropertyKey::from_js_string(key))
@@ -1695,8 +1808,17 @@ fn validate_and_apply(
         let Some(property) = Property::from_descriptor(&complete) else {
             return Ok(false);
         };
-        obj.properties.borrow_mut().push((key.clone(), property));
-        *obj.property_index.borrow_mut() = None;
+        let mut props = obj.properties.borrow_mut();
+        let position = props.len();
+        props.push((key.clone(), property));
+        drop(props);
+        // Maintain the lazy index incrementally: an append shifts nothing, so
+        // the new key maps to its pushed position (a full rebuild would make
+        // sequential fills O(n^2) — the property-escape fixtures build
+        // 10k-element arrays).
+        if let Some(index) = &mut *obj.property_index.borrow_mut() {
+            index.insert(key.clone(), position);
+        }
         return Ok(true);
     };
     // spec step 3: an empty descriptor leaves the property untouched.
@@ -2054,6 +2176,7 @@ fn array_define_own_property(
             }
         {
             let mut props = array.properties.borrow_mut();
+            let position = props.len();
             props.push((
                 key.clone(),
                 Property {
@@ -2065,7 +2188,13 @@ fn array_define_own_property(
                     configurable: desc.configurable.unwrap_or(true),
                 },
             ));
-            *array.property_index.borrow_mut() = None;
+            // Maintain the lazy index incrementally (an append shifts
+            // nothing) instead of invalidating: the next member lookup on a
+            // growing array would rebuild it from scratch, making sequential
+            // fills O(n^2).
+            if let Some(index) = &mut *array.property_index.borrow_mut() {
+                index.insert(key.clone(), position);
+            }
             // `length` is always the first entry; update it in place.
             if let Some((_, length_prop)) = props.first_mut()
                 && let PropertyKind::Data { value: slot, .. } = &mut length_prop.kind
@@ -2739,10 +2868,12 @@ mod tests {
                 .as_number(),
             Some(500.0)
         );
-        // An insert invalidates; the next lookup rebuilds.
+        // An insert keeps the index valid (appends are maintained
+        // incrementally, so a full rebuild — O(n) per insert — is avoided);
+        // the new key resolves through it.
         obj.create_data_property(&JsString::from_utf8("k24"), Value::Number(24.0))
             .unwrap();
-        assert!(obj.property_index.borrow().is_none());
+        assert!(obj.property_index.borrow().is_some());
         assert_eq!(
             obj.get_key(&PropertyKey::from_utf8("k24"))
                 .unwrap()
