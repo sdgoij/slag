@@ -491,8 +491,8 @@ fn start_body(
     let vm = Vm::new(body_env, data.strict);
     state.body = Some(body.clone());
     state.vm = Some(vm);
-    let outcome = state.vm.as_mut().expect("vm set").start(agent, &body)?;
-    finish_resume(agent, state, Ok(outcome))
+    let outcome = state.vm.as_mut().expect("vm set").start(agent, &body);
+    finish_resume(agent, state, outcome)
 }
 
 /// Resume a suspended generator (spec 27.4.3.2 steps 5-11): re-push the
@@ -542,70 +542,82 @@ fn finish_resume(
     state: &mut GeneratorState,
     outcome: Result<VmOutcome, JsError>,
 ) -> Result<Value, JsError> {
-    match outcome? {
-        VmOutcome::Suspended(Suspension::Yield { value, delegate }) => {
-            let context = agent
-                .execution_context_stack
-                .pop()
-                .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no context to pop".into()))?;
-            state.context = Some(context);
-            state.flag = GeneratorFlag::SuspendedYield;
-            if delegate {
-                // Spec 15.5.5: GeneratorYield(innerResult) yields the inner
-                // iterator result object itself, so the outer consumer reads
-                // its `value`/`done` lazily.
-                Ok(value)
-            } else {
-                iterator_result(agent, value, false)
-            }
-        }
-        VmOutcome::Suspended(Suspension::Await(_)) => {
+    match outcome {
+        Err(error) => {
+            // An engine error escaping the body (an uncaught TypeError from a
+            // reentrant `next`, say) completes the generator (spec 27.4.1 step
+            // 4.d: the body either returned or threw): pop the pushed context
+            // and mark the state completed so a later resume returns the
+            // done-result instead of "already running".
             agent.execution_context_stack.pop();
             state.flag = GeneratorFlag::Completed;
-            Err(JsError::new(
-                ErrorKind::TypeError,
-                "generator body awaited without being async".into(),
-            ))
-        }
-        VmOutcome::Suspended(Suspension::AwaitReturn(_)) => {
-            agent.execution_context_stack.pop();
-            state.flag = GeneratorFlag::Completed;
-            Err(JsError::new(
-                ErrorKind::TypeError,
-                "generator body awaited without being async".into(),
-            ))
-        }
-        VmOutcome::Completed(completion) => {
-            agent.execution_context_stack.pop();
-            state.flag = GeneratorFlag::Completed;
-            // spec 27.4.2.1 step 4.j: the generator body's `using` resources
-            // are disposed when the body completes (implicit or explicit
-            // return), even on an abrupt completion.
-            let env = state.vm.as_ref().map(|vm| vm.lexical_env.clone());
             state.vm = None;
-            let completion = match env {
-                Some(env) => crate::eval::dispose_env_resources(agent, &env, Ok(completion))?,
-                None => completion,
-            };
-            match completion {
-                // Only a `return` completion carries a value; a normal
-                // completion (the last statement's value, e.g. `[yield]` or
-                // a `yield*` delegate's return) yields *undefined*.
-                Completion::Return(value) => iterator_result(agent, value, true),
-                Completion::Normal(_) | Completion::Empty => {
-                    iterator_result(agent, Value::Undefined, true)
-                }
-                Completion::Throw(value) => Err(JsError::new(
-                    ErrorKind::TypeError,
-                    "Uncaught generator throw".into(),
-                )
-                .with_value(value)),
-                Completion::Break { .. } | Completion::Continue { .. } => Err(JsError::new(
-                    ErrorKind::SyntaxError,
-                    "Illegal control flow in a generator body".into(),
-                )),
-            }
+            Err(error)
         }
+        Ok(outcome) => match outcome {
+            VmOutcome::Suspended(Suspension::Yield { value, delegate }) => {
+                let context = agent.execution_context_stack.pop().ok_or_else(|| {
+                    JsError::new(ErrorKind::TypeError, "no context to pop".into())
+                })?;
+                state.context = Some(context);
+                state.flag = GeneratorFlag::SuspendedYield;
+                if delegate {
+                    // Spec 15.5.5: GeneratorYield(innerResult) yields the inner
+                    // iterator result object itself, so the outer consumer reads
+                    // its `value`/`done` lazily.
+                    Ok(value)
+                } else {
+                    iterator_result(agent, value, false)
+                }
+            }
+            VmOutcome::Suspended(Suspension::Await(_)) => {
+                agent.execution_context_stack.pop();
+                state.flag = GeneratorFlag::Completed;
+                Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "generator body awaited without being async".into(),
+                ))
+            }
+            VmOutcome::Suspended(Suspension::AwaitReturn(_)) => {
+                agent.execution_context_stack.pop();
+                state.flag = GeneratorFlag::Completed;
+                Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "generator body awaited without being async".into(),
+                ))
+            }
+            VmOutcome::Completed(completion) => {
+                agent.execution_context_stack.pop();
+                state.flag = GeneratorFlag::Completed;
+                // spec 27.4.2.1 step 4.j: the generator body's `using` resources
+                // are disposed when the body completes (implicit or explicit
+                // return), even on an abrupt completion.
+                let env = state.vm.as_ref().map(|vm| vm.lexical_env.clone());
+                state.vm = None;
+                let completion = match env {
+                    Some(env) => crate::eval::dispose_env_resources(agent, &env, Ok(completion))?,
+                    None => completion,
+                };
+                match completion {
+                    // Only a `return` completion carries a value; a normal
+                    // completion (the last statement's value, e.g. `[yield]` or
+                    // a `yield*` delegate's return) yields *undefined*.
+                    Completion::Return(value) => iterator_result(agent, value, true),
+                    Completion::Normal(_) | Completion::Empty => {
+                        iterator_result(agent, Value::Undefined, true)
+                    }
+                    Completion::Throw(value) => Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "Uncaught generator throw".into(),
+                    )
+                    .with_value(value)),
+                    Completion::Break { .. } | Completion::Continue { .. } => Err(JsError::new(
+                        ErrorKind::SyntaxError,
+                        "Illegal control flow in a generator body".into(),
+                    )),
+                }
+            }
+        },
     }
 }
 

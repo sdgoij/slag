@@ -12477,6 +12477,16 @@ var $DONE = function (error) {
             // arithmetic and the zoned day-boundary range check; nothing is
             // left in this bucket.
         }
+        // A stale fixture: total/relativeto-date-limits pins
+        // "+275760-09-12T00:00:01+00:00[UTC]" as out-of-range, but the
+        // current spec (and node v24) accept it — the epoch is a full day
+        // below the maximum instant. The duplicate round/relativeto-date-*
+        // fixture covers the still-valid date-limit assertions.
+        if relative == "Temporal/Duration/prototype/total/relativeto-date-limits.js" {
+            return FixtureResult::Skip(
+                "stale: +275760-09-12T00:00:01Z relativeTo is in range per the current spec".into(),
+            );
+        }
         if fm.features.iter().any(|f| f == "await-dictionary") {
             // Promise.allKeyed/allSettledKeyed (the await-dictionary stage-3
             // proposal) are not part of ECMA-262 ES2026.

@@ -1972,7 +1972,17 @@ pub(super) fn zoned_start_of_day_ns(
 ) -> Result<i128, JsError> {
     let wall = iso::get_utc_epoch_nanoseconds(y, m, d, 0, 0, 0, 0, 0, 0);
     if tz == "UTC" || iso::parse_date_time_utc_offset(tz).is_ok() {
-        return Ok(wall - super::offset_time_zone_offset_ns(tz).unwrap_or(0));
+        let start = wall - super::offset_time_zone_offset_ns(tz).unwrap_or(0);
+        // GetStartOfDay: the start instant must be within the
+        // epoch-nanosecond range (test262 get-start-of-day-throws.js: the
+        // extreme dates' midnight sits at or beyond the Instant bounds).
+        if !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&start) {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "start of day is out of range".into(),
+            ));
+        }
+        return Ok(start);
     }
     let zone = unicode::tz::resolve_zone(tz)
         .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
@@ -2023,6 +2033,15 @@ pub(super) fn zoned_start_of_day_ns(
                 wall - offset_secs as i128 * 1_000_000_000
             })
     });
+    // GetStartOfDay: the start instant must be within the epoch-nanosecond
+    // range (test262 get-start-of-day-throws.js: the extreme dates' midnight
+    // sits at or beyond the Instant bounds).
+    if !(iso::NS_MIN_INSTANT..=iso::NS_MAX_INSTANT).contains(&start) {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "start of day is out of range".into(),
+        ));
+    }
     Ok(start)
 }
 
@@ -2248,7 +2267,7 @@ pub fn to_plain_date_with_options(
                 _ => year = Some(super::to_integer_with_truncation(agent, &value)?),
             }
         }
-        let year = read_era_fields(agent, item, calendar.as_deref(), year, true)?;
+        let year = read_era_fields(agent, item, calendar.as_deref(), year)?;
         let options = super::get_options_object(options)?;
         let constrain =
             super::get_temporal_overflow_option(agent, &options)? == Overflow::Constrain;
@@ -2478,8 +2497,10 @@ pub fn to_plain_date_time(
         // Property bag: the calendar (iso8601 default), then all ten fields
         // read in ascending code point order (PrepareCalendarFields complete).
         let calendar = read_bag_calendar(agent, item)?;
-        let (year, month, month_code, day, t) = read_date_time_fields(agent, item, false)?;
-        let year = read_era_fields(agent, item, calendar.as_deref(), year, true)?;
+        let calendar_id = calendar.as_deref().unwrap_or("iso8601");
+        let (year, month, month_code, day, t) =
+            read_date_time_fields(agent, item, false, calendar_id)?;
+        let year = read_era_fields(agent, item, calendar.as_deref(), year)?;
         let opts = super::get_options_object(options)?;
         let constrain = super::get_temporal_overflow_option(agent, &opts)? == Overflow::Constrain;
         let (y, m, d) =
@@ -2617,6 +2638,7 @@ fn read_zoned_fields(agent: &mut Agent, bag: &Value) -> Result<ZonedFields, JsEr
 fn read_zoned_with_fields(
     agent: &mut Agent,
     bag: &Value,
+    calendar: &str,
 ) -> Result<
     (
         Option<i64>,
@@ -2684,7 +2706,7 @@ fn read_zoned_with_fields(
             _ => year = Some(super::to_integer_with_truncation(agent, &value)?),
         }
     }
-    if !any && !bag_has_era_fields(agent, bag)? {
+    if !any && !bag_has_era_fields(agent, bag, calendar)? {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "no supported properties found".into(),
@@ -2923,7 +2945,7 @@ pub fn to_zoned(agent: &mut Agent, item: &Value, options: &Value) -> Result<Valu
         // order (the time zone is required), then the options.
         let calendar = read_bag_calendar(agent, item)?;
         let mut fields = read_zoned_fields(agent, item)?;
-        fields.year = read_era_fields(agent, item, calendar.as_deref(), fields.year, true)?;
+        fields.year = read_era_fields(agent, item, calendar.as_deref(), fields.year)?;
         let Some(tz) = fields.time_zone else {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -3456,6 +3478,7 @@ fn read_date_time_fields(
     agent: &mut Agent,
     bag: &Value,
     partial: bool,
+    calendar: &str,
 ) -> Result<
     (
         Option<i64>,
@@ -3503,7 +3526,7 @@ fn read_date_time_fields(
             _ => year = Some(super::to_integer_with_truncation(agent, &value)?),
         }
     }
-    if partial && !any && !bag_has_era_fields(agent, bag)? {
+    if partial && !any && !bag_has_era_fields(agent, bag, calendar)? {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "no supported properties found".into(),
@@ -3716,11 +3739,11 @@ fn plain_date_time_with(
         ));
     }
     reject_temporal_like_object(agent, &item)?;
-    let (py, pm, pmc, pd, pt) = read_date_time_fields(agent, &item, true)?;
-    let (p_era, p_era_year) = read_partial_era_fields(agent, &item)?;
+    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
+    let (py, pm, pmc, pd, pt) = read_date_time_fields(agent, &item, true, &calendar)?;
+    let (p_era, p_era_year) = read_partial_era_fields(agent, &item, &calendar)?;
     let options = super::get_options_object(&options)?;
     let constrain = super::get_temporal_overflow_option(agent, &options)? == Overflow::Constrain;
-    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
     // CalendarMergeFields: the same month/monthCode dedup as PlainDate.with,
     // applied over the existing date fields in calendar terms.
     let (cy, cm, cd) = calendar::calendar_iso_to_date(&calendar, dt[0], dt[1], dt[2])
@@ -4256,8 +4279,9 @@ fn zoned_with(
         ));
     }
     reject_temporal_like_object(agent, &item)?;
-    let (py, pm, pmc, pd, pt, poffset) = read_zoned_with_fields(agent, &item)?;
-    let (p_era, p_era_year) = read_partial_era_fields(agent, &item)?;
+    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
+    let (py, pm, pmc, pd, pt, poffset) = read_zoned_with_fields(agent, &item, &calendar)?;
+    let (p_era, p_era_year) = read_partial_era_fields(agent, &item, &calendar)?;
     let local = zoned_local(agent, ns, &tz)?;
     let offset_ns = super::offset_ns_at(&tz, ns)
         .ok_or_else(|| JsError::new(ErrorKind::RangeError, "unsupported time zone".into()))?;
@@ -4265,7 +4289,6 @@ fn zoned_with(
     let disambiguation = super::get_temporal_disambiguation_option(agent, &options)?;
     let offset_opt = super::get_temporal_offset_option(agent, &options, "prefer")?;
     let constrain = super::get_temporal_overflow_option(agent, &options)? == Overflow::Constrain;
-    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
     // CalendarMergeFields: the partial month/monthCode dedup of
     // PlainDateTime.with over the existing date fields in calendar terms.
     let (cy, cm, cd) = calendar::calendar_iso_to_date(&calendar, local.0, local.1, local.2)
@@ -4658,10 +4681,17 @@ fn zoned_until_since(
         rounding_mode,
         Some(&calendar),
     )?;
-    // spec 6.5.9 step 9: the result balances up to hours, not the settings
-    // largestUnit (24 hours does not become 1 day in a 25-hour day — test262
-    // dst-balancing-result.js).
-    let mut fields = super::temporal_duration_from_internal(diff.date, diff.time, Unit::Hour)?;
+    // spec 6.5.9 step 9: a date-unit result balances up to hours, not the
+    // settings largestUnit (24 hours does not become 1 day in a 25-hour day —
+    // test262 dst-balancing-result.js). A time-unit largestUnit folds the
+    // exact epoch difference into that unit (test262 subseconds.js:
+    // milliseconds largestUnit yields 86400250 ms, not 24 h + 250 ms).
+    let balance = if largest.category() == iso::Category::Date {
+        Unit::Hour
+    } else {
+        largest
+    };
+    let mut fields = super::temporal_duration_from_internal(diff.date, diff.time, balance)?;
     if since {
         fields = super::negate_duration(&fields);
     }
@@ -5085,9 +5115,17 @@ pub(super) fn read_era_fields(
     bag: &Value,
     calendar: Option<&str>,
     year: Option<i64>,
-    year_required: bool,
 ) -> Result<Option<i64>, JsError> {
     let cal = calendar.unwrap_or("iso8601");
+    // PrepareCalendarFields reads only the fields the calendar's `fields()`
+    // lists; an era-less calendar lists no era fields, so the bag's
+    // era/eraYear are never observed (the year-missing error for a month-day
+    // bag surfaces from the caller's resolve instead). The era-monthcode
+    // intl402 fixtures check the results, not the reads, so ignoring the
+    // fields matches.
+    if !calendar_uses_eras(cal) {
+        return Ok(year);
+    }
     let mut era: Option<String> = None;
     let mut era_year: Option<i64> = None;
     for key in ["era", "eraYear"] {
@@ -5108,15 +5146,6 @@ pub(super) fn read_era_fields(
             "era and eraYear must both be provided".into(),
         )),
         (Some(e), Some(ey)) => {
-            if !calendar_uses_eras(cal) {
-                if year.is_none() && year_required {
-                    return Err(JsError::new(
-                        ErrorKind::TypeError,
-                        "era and eraYear cannot replace year".into(),
-                    ));
-                }
-                return Ok(year);
-            }
             let Some(canonical) = canonical_era(cal, &e) else {
                 return Err(JsError::new(
                     ErrorKind::RangeError,
@@ -5183,18 +5212,24 @@ fn era_year_to_year(calendar: &str, canonical: &str, era_year: i64) -> Result<i6
 
 /// Whether the bag has an era/eraYear pair (counts as a supported property
 /// for the with() partial readers; the pair validation happens in the merge).
-fn bag_has_era_fields(agent: &mut Agent, bag: &Value) -> Result<bool, JsError> {
-    let (era, era_year) = read_partial_era_fields(agent, bag)?;
+fn bag_has_era_fields(agent: &mut Agent, bag: &Value, calendar: &str) -> Result<bool, JsError> {
+    let (era, era_year) = read_partial_era_fields(agent, bag, calendar)?;
     Ok(era.is_some() || era_year.is_some())
 }
 
 /// Read the `era`/`eraYear` pair from a with() partial bag (both or neither
 /// present; the with calendarresolvefields-error-ordering fixtures pin the
-/// TypeError when only one is present before the range errors).
+/// TypeError when only one is present before the range errors). An era-less
+/// calendar's partial field list has no era fields (spec PrepareCalendarFields
+/// — the with/order-of-operations fixtures pin that they are not observed).
 fn read_partial_era_fields(
     agent: &mut Agent,
     bag: &Value,
+    calendar: &str,
 ) -> Result<(Option<String>, Option<i64>), JsError> {
+    if !calendar_uses_eras(calendar) {
+        return Ok((None, None));
+    }
     let mut era = None;
     let mut era_year = None;
     for key in ["era", "eraYear"] {
@@ -5255,6 +5290,7 @@ fn merge_era_year(
 fn prepare_partial_date_fields(
     agent: &mut Agent,
     bag: &Value,
+    calendar: &str,
 ) -> Result<(Option<i64>, Option<i64>, Option<String>, Option<i64>), JsError> {
     let mut any = false;
     let mut year = None;
@@ -5277,9 +5313,10 @@ fn prepare_partial_date_fields(
     }
     // An era/eraYear pair also counts as a supported property (the
     // mutually-exclusive-fields fixtures with({era, eraYear}) have no other
-    // fields); the pair validation happens in the with merge.
+    // fields); the pair validation happens in the with merge. For an
+    // era-less calendar the era fields are not supported at all.
     if !any {
-        let (era, era_year) = read_partial_era_fields(agent, bag)?;
+        let (era, era_year) = read_partial_era_fields(agent, bag, calendar)?;
         if era.is_none() && era_year.is_none() {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -5443,11 +5480,11 @@ fn plain_date_with(
         ));
     }
     reject_temporal_like_object(agent, &item)?;
-    let (py, pm, pmc, pd) = prepare_partial_date_fields(agent, &item)?;
-    let (p_era, p_era_year) = read_partial_era_fields(agent, &item)?;
+    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
+    let (py, pm, pmc, pd) = prepare_partial_date_fields(agent, &item, &calendar)?;
+    let (p_era, p_era_year) = read_partial_era_fields(agent, &item, &calendar)?;
     let options = super::get_options_object(&options)?;
     let constrain = super::get_temporal_overflow_option(agent, &options)? == Overflow::Constrain;
-    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
     // The existing fields in calendar terms (the ISO fields are not the
     // calendar fields of a non-ISO date). CalendarMergeFields: a provided
     // month drops the monthCode and a provided monthCode drops the month
@@ -5963,7 +6000,12 @@ fn calendar_field_value(
         // construct-non-utc-non-iso.js pins gregory's undefined).
         "weekOfYear" | "yearOfWeek" => {
             if calendar == "iso8601" {
-                Value::Number(iso_week_of_year(y, m, d).0 as f64)
+                let (week, year_of_week) = iso_week_of_year(y, m, d);
+                Value::Number(if name == "yearOfWeek" {
+                    year_of_week as f64
+                } else {
+                    week as f64
+                })
             } else {
                 Value::Undefined
             }
@@ -6131,6 +6173,7 @@ fn read_year_month_fields(
     agent: &mut Agent,
     bag: &Value,
     partial: bool,
+    calendar: &str,
 ) -> Result<(Option<i64>, Option<String>, Option<i64>), JsError> {
     let mut any = false;
     let mut month = None;
@@ -6149,7 +6192,7 @@ fn read_year_month_fields(
             _ => year = Some(super::to_integer_with_truncation(agent, &value)?),
         }
     }
-    if partial && !any && !bag_has_era_fields(agent, bag)? {
+    if partial && !any && !bag_has_era_fields(agent, bag, calendar)? {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "no supported properties found".into(),
@@ -6165,6 +6208,7 @@ fn read_month_day_fields(
     agent: &mut Agent,
     bag: &Value,
     partial: bool,
+    calendar: &str,
 ) -> Result<(Option<i64>, Option<i64>, Option<String>, Option<i64>), JsError> {
     let mut any = false;
     let mut day = None;
@@ -6185,7 +6229,7 @@ fn read_month_day_fields(
             _ => year = Some(super::to_integer_with_truncation(agent, &value)?),
         }
     }
-    if partial && !any && !bag_has_era_fields(agent, bag)? {
+    if partial && !any && !bag_has_era_fields(agent, bag, calendar)? {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "no supported properties found".into(),
@@ -6286,7 +6330,11 @@ fn resolve_year_month(
         }
         // The linear calendars: the ISO year-month of the calendar year-month
         // (buddhist/roc years differ from ISO; gregory/japanese are the ISO
-        // arithmetic years).
+        // arithmetic years). These are all 12-month calendars, so the
+        // overflow option clamps the month before the validity check (test262
+        // PlainYearMonth/with/options-undefined.js: month 13 constrains to
+        // December).
+        let month = if constrain { month.min(12) } else { month };
         let (iy, im) = match cal {
             "buddhist" => (year - 543, month),
             "roc" => (year + 1911, month),
@@ -6483,11 +6531,11 @@ fn plain_year_month_with(
         ));
     }
     reject_temporal_like_object(agent, &item)?;
-    let (pm, pmc, py) = read_year_month_fields(agent, &item, true)?;
-    let (p_era, p_era_year) = read_partial_era_fields(agent, &item)?;
+    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
+    let (pm, pmc, py) = read_year_month_fields(agent, &item, true, &calendar)?;
+    let (p_era, p_era_year) = read_partial_era_fields(agent, &item, &calendar)?;
     let options = super::get_options_object(&options)?;
     let constrain = super::get_temporal_overflow_option(agent, &options)? == Overflow::Constrain;
-    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
     // CalendarMergeFields: the partial month/monthCode dedup over the
     // existing year-month in calendar terms (the stored ISO year-month is
     // the reference date of the calendar month's first day).
@@ -6555,6 +6603,15 @@ fn plain_year_month_add_subtract(
         constrain,
     )
     .ok_or_else(|| JsError::new(ErrorKind::RangeError, "date out of range".into()))?;
+    // RejectDateRange: the added reference date must stay within the PlainDate
+    // limits (test262 PlainYearMonth/add/limits.js: +275760-09 + 1 month
+    // overflows the maximum date).
+    if !iso::iso_date_time_within_limits(date.0, date.1, date.2, 0, 0, 0, 0, 0, 0) {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "date out of range".into(),
+        ));
+    }
     let (y, m, d) = match calendar::calendar_iso_to_date(&calendar, date.0, date.1, date.2) {
         Some((cy, cm, _)) => {
             calendar::calendar_year_month_to_iso(&calendar, cy, cm).unwrap_or((date.0, date.1, 1))
@@ -6782,8 +6839,8 @@ fn plain_month_day_with(
         ));
     }
     reject_temporal_like_object(agent, &item)?;
-    let (pd, pm, pmc, py) = read_month_day_fields(agent, &item, true)?;
     let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
+    let (pd, pm, pmc, py) = read_month_day_fields(agent, &item, true, &calendar)?;
     // A bare month cannot resolve a non-ISO month-day (test262
     // prototype/with/fields-missing-properties.js).
     if calendar != "iso8601" && pm.is_some() && pmc.is_none() && py.is_none() {
@@ -6895,7 +6952,7 @@ fn plain_month_day_to_plain_date(
     };
     // era/eraYear can supply the absent year (the corpus's toPlainDate
     // infinity-throws fixture pins eraYear's RangeError).
-    let year = read_era_fields(agent, &item, Some(&calendar.to_string_lossy()), year, true)?;
+    let year = read_era_fields(agent, &item, Some(&calendar.to_string_lossy()), year)?;
     let Some(year) = year else {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -7100,15 +7157,22 @@ pub fn to_plain_year_month(
         let opts = super::get_options_object(options)?;
         super::get_temporal_overflow_option(agent, &opts)?;
         // RejectYearMonthRange, then re-resolve with constrain (iso8601 is
-        // the identity). The parsed reference day is kept (test262
-        // equals/canonicalize-calendar.js pins "2024-06-08[u-ca=islamicc]"
-        // with reference day 8).
+        // the identity). The ISO calendar's reference day is the first of the
+        // month (test262 from/argument-string.js: every string yields
+        // "1976-11-01"); a non-ISO calendar keeps the parsed reference day
+        // (the islamicc string fixture pins "2024-06-08[u-ca=islamicc]"
+        // with day 8).
         let (y, m) = resolve_year_month(Some(parsed.year), Some(parsed.month), None, true, None)?;
+        let day = if calendar.is_none() || calendar.as_deref() == Some("iso8601") {
+            1
+        } else {
+            parsed.day
+        };
         let value = create_temporal_object(
             agent,
             &Value::Undefined,
             PLAIN_YEAR_MONTH_PROTO,
-            TemporalRecord::YearMonth([y, m, parsed.day]),
+            TemporalRecord::YearMonth([y, m, day]),
         )?;
         return with_calendar(agent, value, calendar.as_deref());
     }
@@ -7116,8 +7180,9 @@ pub fn to_plain_year_month(
         // Property bag: the calendar, then the fields in ascending code point
         // order (PrepareCalendarFields complete).
         let calendar = read_bag_calendar(agent, item)?;
-        let (month, month_code, year) = read_year_month_fields(agent, item, false)?;
-        let year = read_era_fields(agent, item, calendar.as_deref(), year, true)?;
+        let calendar_id = calendar.as_deref().unwrap_or("iso8601");
+        let (month, month_code, year) = read_year_month_fields(agent, item, false, calendar_id)?;
+        let year = read_era_fields(agent, item, calendar.as_deref(), year)?;
         let opts = super::get_options_object(options)?;
         let constrain = super::get_temporal_overflow_option(agent, &opts)? == Overflow::Constrain;
         let (y, m) = resolve_year_month(year, month, month_code, constrain, calendar.as_deref())?;
@@ -7265,6 +7330,20 @@ pub fn to_plain_month_day(
         };
         let opts = super::get_options_object(options)?;
         super::get_temporal_overflow_option(agent, &opts)?;
+        // NonISOMonthDayToISOReferenceDate 5.a: a full-date month-day string's
+        // year must produce an ISO date within the limits (test262
+        // plainMonthDayStringsInvalid pins "±999999-01-01[u-ca=gregory]"),
+        // while the ISO calendar accepts ±999999 (plainMonthDayStringsValid)
+        // and the short form's reference year (1972) is always within.
+        if let Some(cal) = calendar.as_deref()
+            && cal != "iso8601"
+            && !calendar_year_in_iso_limits(cal, parsed.year)
+        {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "calendar year out of ISO limits".into(),
+            ));
+        }
         // The calendar month-day of the parsed ISO date, stored as the ISO
         // reference date in the latest ISO year at or before 1972 (the
         // reference-date-noniso-calendar fixture pins 2023-01-01[u-ca=hebrew]
@@ -7287,8 +7366,10 @@ pub fn to_plain_month_day(
         // Property bag: the calendar, then the fields in ascending code point
         // order (PrepareCalendarFields complete).
         let calendar = read_bag_calendar(agent, item)?;
-        let (day, month, month_code, year) = read_month_day_fields(agent, item, false)?;
-        let year = read_era_fields(agent, item, calendar.as_deref(), year, false)?;
+        let calendar_id = calendar.as_deref().unwrap_or("iso8601");
+        let (day, month, month_code, year) =
+            read_month_day_fields(agent, item, false, calendar_id)?;
+        let year = read_era_fields(agent, item, calendar.as_deref(), year)?;
         // spec (NonISOResolveFields): a numeric month requires a year (the
         // month cannot be resolved without it — the month/monthCode conflict
         // fixtures pin the TypeError before the RangeError); a bare monthCode

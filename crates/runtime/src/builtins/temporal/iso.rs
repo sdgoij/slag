@@ -543,7 +543,7 @@ pub fn parse_iso_date_time(text: &[u16], format: Format) -> Result<ParsedDateTim
             cur.bump();
         }
         let t = parse_time(&mut cur)?;
-        return finish_parse(&mut cur, format, 1972, 1, 1, Some(t));
+        return finish_parse(&mut cur, format, 1972, 1, 1, Some(t), false);
     }
 
     // Month-day forms `--MM-DD` / `--MMDD` / `MM-DD` / `MMDD` for
@@ -559,7 +559,7 @@ pub fn parse_iso_date_time(text: &[u16], format: Format) -> Result<ParsedDateTim
         if !is_valid_month_day(month, day) {
             return Err(ParseError::Invalid);
         }
-        return finish_parse(&mut cur, format, 1972, month, day, None);
+        return finish_parse(&mut cur, format, 1972, month, day, None, false);
     }
 
     // DateYear: 4 digits, or sign + 6 digits ("-000000" is an early error).
@@ -585,7 +585,7 @@ pub fn parse_iso_date_time(text: &[u16], format: Format) -> Result<ParsedDateTim
     if separated {
         month = cur.digits(2)?;
         if format == Format::YearMonthString && cur.peek() != Some(CU_MINUS) {
-            return finish_parse(&mut cur, format, year, month, 1, None);
+            return finish_parse(&mut cur, format, year, month, 1, None, true);
         }
         cur.expect(CU_MINUS)?;
         day = cur.digits(2)?;
@@ -597,7 +597,7 @@ pub fn parse_iso_date_time(text: &[u16], format: Format) -> Result<ParsedDateTim
             // `YYYYMM` (no day) is only a valid year-month form.
             return Err(ParseError::Invalid);
         } else {
-            return finish_parse(&mut cur, format, year, month, 1, None);
+            return finish_parse(&mut cur, format, year, month, 1, None, true);
         }
     } else {
         return Err(ParseError::Invalid);
@@ -614,7 +614,7 @@ pub fn parse_iso_date_time(text: &[u16], format: Format) -> Result<ParsedDateTim
         None
     };
 
-    finish_parse(&mut cur, format, year, month, day, time)
+    finish_parse(&mut cur, format, year, month, day, time, false)
 }
 
 fn finish_parse(
@@ -624,6 +624,7 @@ fn finish_parse(
     month: i64,
     day: i64,
     time: Option<[i64; 6]>,
+    day_omitted: bool,
 ) -> Result<ParsedDateTime, ParseError> {
     // The RFC 9557 year-month form requires a 01-12 month (the polyfill's
     // yearmonth regex monthpart); the DateTimePlain fallback already checks
@@ -679,6 +680,20 @@ fn finish_parse(
     }
     parse_annotations(cur, &mut tz, &mut calendar)?;
     if !cur.at_end() {
+        return Err(ParseError::Invalid);
+    }
+    // RFC 9557 year-month: a non-default calendar annotation requires the
+    // explicit day (test262 from/argument-string-invalid.js pins
+    // "1976-11[u-ca=hebrew]" invalid while "1976-11[u-ca=iso8601]" and
+    // "2019-12" stay valid). The month-day short form never carries a year,
+    // so a non-default calendar is invalid there too (test262
+    // from/argument-string-date-with-utc-offset.js pins "09-15[u-ca=chinese]"
+    // while a full date "2022-09-15[u-ca=chinese]" parses via DateTimePlain).
+    if (format == Format::YearMonthString && day_omitted || format == Format::MonthDayString)
+        && calendar
+            .as_deref()
+            .is_some_and(|c| !c.eq_ignore_ascii_case("iso8601"))
+    {
         return Err(ParseError::Invalid);
     }
     // An offset/designator only accompanies a time part, and an instant

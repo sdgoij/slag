@@ -879,6 +879,12 @@ pub struct Vm {
     /// a `next()` error propagates without closing the iterator (spec
     /// 14.7.6.2 uses `?`), unlike a body or head-binding error.
     pub for_of_stepping: bool,
+    /// Whether the innermost for-await-of is awaiting its `next()` promise
+    /// (`AsyncForOfNext`): a rejection propagates without closing the
+    /// iterator — the close is only for body abrupt completions (spec
+    /// 14.7.5.5), and the AsyncFromSyncIterator continuation already closed
+    /// an underlying sync iterator on a rejected value.
+    pub async_for_of_stepping: bool,
     /// Whether the innermost destructure is stepping its iterator
     /// (`DestructureNext`): an abrupt step leaves the iterator open.
     pub destructure_stepping: bool,
@@ -1006,6 +1012,7 @@ impl Vm {
             thrown: None,
             resume_abrupt: None,
             for_of_stepping: false,
+            async_for_of_stepping: false,
             destructure_stepping: false,
             for_in_stack: Vec::new(),
             for_of_stack: Vec::new(),
@@ -1206,6 +1213,14 @@ impl Vm {
                     // body's handler table.
                     return self.resume_pending_disposal(agent, body, Err(value));
                 }
+                // A rejected for-await-of `next()` promise leaves the iterator
+                // open (spec 14.7.5.5 — only body abrupt completions close):
+                // drop the record without closing it.
+                if self.async_for_of_stepping {
+                    self.async_for_of_stack.pop();
+                    self.async_for_of_boundaries.pop();
+                    self.async_for_of_stepping = false;
+                }
                 // A resumed `yield`/`await` inside a destructure propagates
                 // the abrupt completion through the pattern, closing its
                 // iterators (spec 13.15.5.2 step 5 + 7.4.11).
@@ -1337,83 +1352,99 @@ impl Vm {
         // Record the agent for the duration so crux-side ECMAScript calls
         // (proxy traps reached through property access) can find the runtime.
         crux::function::with_agent(agent as *mut Agent as *mut (), || {
-            match self.run_inner_inner(agent, body) {
-                Ok(outcome) => Ok(outcome),
-                // A step's engine error (a TypeError from a property access, a
-                // ReferenceError from an unresolved identifier, ...) inside a
-                // `try` is a thrown completion: route it through the handler
-                // table so `catch` sees it, like the interpreter path. Without
-                // a covering handler the original error propagates untouched.
-                Err(error) => {
-                    // An error escaping a step while a destructuring pattern is
-                    // in progress closes the not-done iterators (spec
-                    // 13.15.5.2 step 5): the first throwing `return` replaces
-                    // the error (spec 7.4.11). The tree-walker's
-                    // array_assignment does the same on its error path.
-                    let mut error = error;
-                    if !self.destructure_stack.is_empty() && !self.destructure_stepping {
-                        let mut close_error: Option<JsError> = None;
-                        while let Some(index) = self.destructure_stack.len().checked_sub(1) {
-                            let iterator = self.destructure_stack[index].clone();
-                            let done = self.destructure_done.get(index).copied().unwrap_or(false);
-                            if !done
-                                && let Err(e) = crate::expr::iterator_close_throw(agent, &iterator)
-                                && close_error.is_none()
-                            {
-                                close_error = Some(e);
+            loop {
+                match self.run_inner_inner(agent, body) {
+                    Ok(outcome) => return Ok(outcome),
+                    // A step's engine error (a TypeError from a property access, a
+                    // ReferenceError from an unresolved identifier, ...) inside a
+                    // `try` is a thrown completion: route it through the handler
+                    // table so `catch` sees it, like the interpreter path. Without
+                    // a covering handler the original error propagates untouched.
+                    Err(error) => {
+                        // An error escaping a step while a destructuring pattern is
+                        // in progress closes the not-done iterators (spec
+                        // 13.15.5.2 step 5): the first throwing `return` replaces
+                        // the error (spec 7.4.11). The tree-walker's
+                        // array_assignment does the same on its error path.
+                        let mut error = error;
+                        if !self.destructure_stack.is_empty() && !self.destructure_stepping {
+                            let mut close_error: Option<JsError> = None;
+                            while let Some(index) = self.destructure_stack.len().checked_sub(1) {
+                                let iterator = self.destructure_stack[index].clone();
+                                let done =
+                                    self.destructure_done.get(index).copied().unwrap_or(false);
+                                if !done
+                                    && let Err(e) =
+                                        crate::expr::iterator_close_throw(agent, &iterator)
+                                    && close_error.is_none()
+                                {
+                                    close_error = Some(e);
+                                }
+                                self.destructure_stack.pop();
+                                self.destructure_done.pop();
                             }
-                            self.destructure_stack.pop();
-                            self.destructure_done.pop();
-                        }
-                        self.destructure_obj_stack.clear();
-                        self.destructure_assign_keys.clear();
-                        self.destructure_excluded.clear();
-                        if let Some(e) = close_error {
-                            error = e;
-                        }
-                    }
-                    // An error escaping a for-of body or head closes the
-                    // active iterators (spec 14.7.6.2: a head-binding error or
-                    // abrupt body completion returns IteratorClose). A `next()`
-                    // error is exempt: it propagates with the iterator open.
-                    // An error covered by a handler whose catch resumes inside
-                    // the loop body must leave the iterators intact — the loop
-                    // continues (mirrors the `throw`-statement path, which only
-                    // closes when the throw escapes).
-                    let covered = self.try_stack.iter().any(|frame| {
-                        body.handlers.get(frame.handler).is_some_and(|handler| {
-                            self.ip >= handler.start && self.ip < handler.try_end
-                        })
-                    });
-                    if !covered && !self.for_of_stepping {
-                        self.close_for_of_throw(agent);
-                    }
-                    if covered {
-                        self.throw_error(agent, body, error)
-                    } else {
-                        // spec 9.4.3: an error escaping the body disposes the
-                        // active scopes' `using` resources (innermost first),
-                        // folding a throwing disposal into the error (the
-                        // tree-walker's statement lists do the same).
-                        let resources: Vec<crate::env::DisposableResource> = self
-                            .env_stack
-                            .iter()
-                            .rev()
-                            .flat_map(|env| env.drain_disposable_resources().into_iter().rev())
-                            .collect();
-                        if !resources.is_empty() {
-                            let thrown = crate::promise::error_value(agent, &error);
-                            if let Some(outcome) = self.start_scope_disposal(
-                                agent,
-                                body,
-                                resources,
-                                Completion::Throw(thrown),
-                                DisposalResume::ApplyCompletion,
-                            )? {
-                                return Ok(outcome);
+                            self.destructure_obj_stack.clear();
+                            self.destructure_assign_keys.clear();
+                            self.destructure_excluded.clear();
+                            if let Some(e) = close_error {
+                                error = e;
                             }
                         }
-                        Err(error)
+                        // An error escaping a for-of body or head closes the
+                        // active iterators (spec 14.7.6.2: a head-binding error or
+                        // abrupt body completion returns IteratorClose). A `next()`
+                        // error is exempt: it propagates with the iterator open.
+                        // An error covered by a handler whose catch resumes inside
+                        // the loop body must leave the iterators intact — the loop
+                        // continues (mirrors the `throw`-statement path, which only
+                        // closes when the throw escapes).
+                        let covered = self.try_stack.iter().any(|frame| {
+                            body.handlers.get(frame.handler).is_some_and(|handler| {
+                                self.ip >= handler.start && self.ip < handler.try_end
+                            })
+                        });
+                        if !covered && !self.for_of_stepping {
+                            self.close_for_of_throw(agent);
+                        }
+                        if covered {
+                            // Route the engine error through the handler table
+                            // like a thrown value, then CONTINUE the same loop —
+                            // re-entering run_inner (throw_error) would recurse
+                            // once per caught error and overflow the stack on a
+                            // hot catch loop.
+                            let value = match crate::builtins::error::to_throwable(agent, &error) {
+                                Ok(value) => value,
+                                Err(_) => error_message_value(&error),
+                            };
+                            match self.throw_machinery(agent, body, value)? {
+                                CtlResult::Continue => continue,
+                                CtlResult::Done(outcome) => return Ok(outcome),
+                            }
+                        } else {
+                            // spec 9.4.3: an error escaping the body disposes the
+                            // active scopes' `using` resources (innermost first),
+                            // folding a throwing disposal into the error (the
+                            // tree-walker's statement lists do the same).
+                            let resources: Vec<crate::env::DisposableResource> = self
+                                .env_stack
+                                .iter()
+                                .rev()
+                                .flat_map(|env| env.drain_disposable_resources().into_iter().rev())
+                                .collect();
+                            if !resources.is_empty() {
+                                let thrown = crate::promise::error_value(agent, &error);
+                                if let Some(outcome) = self.start_scope_disposal(
+                                    agent,
+                                    body,
+                                    resources,
+                                    Completion::Throw(thrown),
+                                    DisposalResume::ApplyCompletion,
+                                )? {
+                                    return Ok(outcome);
+                                }
+                            }
+                            return Err(error);
+                        }
                     }
                 }
             }
@@ -3058,6 +3089,12 @@ impl Vm {
                         ));
                     };
                     let iterator = iterator.clone();
+                    // The next() promise is in flight: a rejection must not
+                    // close the iterator (spec 14.7.5.5 — the close is only
+                    // for body abrupt completions). `AsyncForOfTest` clears
+                    // the flag on a fulfilled resume; the rejection path
+                    // discards the record instead.
+                    self.async_for_of_stepping = true;
                     let next_result = crate::function::call(
                         agent,
                         &iterator.next,
@@ -3067,6 +3104,7 @@ impl Vm {
                     return Ok(VmOutcome::Suspended(Suspension::Await(next_result)));
                 }
                 Step::AsyncForOfTest { done } => {
+                    self.async_for_of_stepping = false;
                     // Resumed with the awaited iterator result object.
                     let result = self.pop();
                     let is_done = iterator_result_done(agent, &result)?;
@@ -4274,11 +4312,20 @@ impl Vm {
             match decision {
                 Some((index, Some(finally))) => {
                     let frame = self.try_stack.remove(index);
-                    // The pending restores to the try-entry environment (the
-                    // state when the finally started): the finally's own
-                    // block envs unwind with it, and the pre-try envs stay.
-                    let env = frame.saved_env.clone();
-                    let depth = frame.env_depth;
+                    // The pending re-applies the deferred control at the
+                    // depth the transfer has already unwound to: the
+                    // compiled `leave_scopes` pops run before the
+                    // control-transfer step, so envs below the try (a loop
+                    // body block the `continue` exits) are gone. The finally
+                    // body itself runs at the try-entry environment (restored
+                    // below), and a fresh throw (no leave_scopes) keeps the
+                    // try-entry depth — `min` picks the right one.
+                    let depth = self.env_stack.len().min(frame.env_depth);
+                    let env = self
+                        .env_stack
+                        .get(depth.saturating_sub(1))
+                        .cloned()
+                        .unwrap_or_else(|| self.lexical_env.clone());
                     self.pending.push(match &ctl {
                         Ctl::Normal { after } => PendingControl::Normal {
                             after: *after,
@@ -6814,9 +6861,14 @@ impl Compiler {
             });
             self.emit(Step::ResetCompletion);
             self.emit(Step::ListBegin);
-            self.scope_count += 1;
+            // `CatchBind` pushes the block env, the parameter env and the
+            // body env (3 for a binding catch, 1 for a bare catch) at
+            // runtime — count them as one scope per env so an abrupt
+            // control transfer's `leave_scopes` pops the whole chain (the
+            // normal path pops them with the explicit `LeaveBlock`s below).
+            self.scope_count += if handler.param.is_some() { 3 } else { 1 };
             self.compile_statements(&handler.body.stmts)?;
-            self.scope_count -= 1;
+            self.scope_count -= if handler.param.is_some() { 3 } else { 1 };
             if handler.param.is_some() {
                 // CatchBind pushed the block env and the parameter env in
                 // addition to the body env: unwind the parameter chain before

@@ -3080,6 +3080,26 @@ pub(crate) fn plain_to_locale_string(
     required: &str,
     defaults: &str,
 ) -> Result<String, JsError> {
+    // RequireInternalSlot first: a receiver that is not a Temporal plain
+    // value of the dispatched kind is a TypeError before any locale
+    // machinery runs (test262 toLocaleString/branding.js — the year-month
+    // and month-day paths would otherwise reach the calendar-mismatch
+    // RangeError first).
+    let branded = match value.kind() {
+        ValueKind::Object(obj) => agent.temporal_data.get(&obj.id()).cloned(),
+        _ => None,
+    };
+    let kind_matches = matches!(
+        (&branded, kind),
+        (Some(TemporalRecord::PlainDate(_)), PlainKind::Date)
+            | (Some(TemporalRecord::PlainTime(_)), PlainKind::Time)
+            | (Some(TemporalRecord::PlainDateTime(_)), PlainKind::DateTime)
+            | (Some(TemporalRecord::YearMonth(_)), PlainKind::YearMonth)
+            | (Some(TemporalRecord::MonthDay(_)), PlainKind::MonthDay)
+    );
+    if !kind_matches {
+        return Err(type_error("Not a Temporal plain value"));
+    }
     let record = initialize(agent, locales, options, required, defaults)?;
     let calendar = crate::builtins::temporal::temporal_calendar_id(agent, value).to_string_lossy();
     // PlainDate/PlainDateTime/PlainTime (like ZonedDateTime) format an

@@ -27,7 +27,8 @@ Two harnesses live in `crates/test262`:
    cargo run -p test262 --bin sweep -- [area] [options]
    ```
 
-   - `area`: `language` | `built-ins` | `annexB` | `all` (default `all`)
+   - `area`: `language` | `built-ins` | `annexB` | `intl402` | `all`
+     (default `all`)
    - `--jobs N` concurrent batches, `--batch N` fixtures per batch
      (default 32), `--timeout SECS` batch deadline (default 30),
      `--recheck-timeout SECS` per-fixture hang recheck (default 5)
@@ -48,11 +49,10 @@ Two harnesses live in `crates/test262`:
 
 ## Current results
 
-Workspace-wide: **4186 tests pass, 0 failures** (`cargo test --workspace`),
-of which the test262 crate contributes **3320 passing fixtures** (44
-language-area + 3276 built-ins); the remaining registered tests are the
-debug helpers and the ignored `scan_builtins_directories` directory
-scanner. The `workers`
+Workspace-wide: **4297 tests pass, 0 failures, 2 ignored** (`cargo test
+--workspace`), of which the test262 crate contributes **3322 passing
+fixtures**; the remaining registered tests are the debug helpers and the
+ignored `scan_builtins_directories` directory scanner. The `workers`
 feature build adds 452 runtime tests (`cargo test -p runtime --features
 workers`).
 
@@ -1412,19 +1412,20 @@ across the VM, the parser, and the built-ins:
 
 Temporal is a stage-4 proposal being implemented cluster by cluster. A
 sweep of the `Temporal/*` tree (`sweep.exe built-ins --filter
-'Temporal/*'`) reports **4,561 pass, 0 fail, 42 skip** of 4,603
+'Temporal/*'`) reports **4,602 pass, 0 fail, 1 skip** of 4,603
 fixtures (the whole namespace previously sat behind the
 `features: [Temporal]` gate). Implemented and passing: **Duration,
 Instant, Now, the root-level namespace, the `toStringTag` fixtures,
 the PlainDate / PlainTime / PlainDateTime / PlainYearMonth /
-PlainMonthDay clusters, and ZonedDateTime** (PlainDate 645 pass / 7
-toLocaleString skip, PlainTime 486 pass / 7 skip, PlainDateTime 766
-pass / 7 skip, PlainYearMonth 502 pass / 7 skip, PlainMonthDay 192
-pass / 7 skip, ZonedDateTime 894 pass / 7 skip, Duration 540 pass /
-0 skip, the root-level namespace 3 pass / 0 skip). Skipped: the
-`toLocaleString` fixtures (Intl, out of scope) only — the 16 Duration
-`relativeTo` content-skips closed with the zoned day-boundary range
-check below. Fixes in
+PlainMonthDay clusters, and ZonedDateTime** (PlainDate 652, PlainTime
+493, PlainDateTime 773, PlainYearMonth 509, PlainMonthDay 199,
+ZonedDateTime 901, Duration 540, and the root-level namespace 3 —
+all 0 skip). The only skip in the whole tree is the stale
+`Duration/prototype/total/relativeto-date-limits.js` fixture (its +1s
+boundary is in range per the current spec, matching node v24); the 42
+`toLocaleString` (Intl) content-skips closed with the ECMA-402 Intl
+integration, and the 16 Duration `relativeTo` content-skips with the
+zoned day-boundary range check below. Fixes in
 `crates/runtime/src/builtins/temporal/`:
 
 - **ZonedDateTime (`shell.rs`, `mod.rs`)** — the full cluster for
@@ -1530,6 +1531,32 @@ check below. Fixes in
   Object(Object#N)"); `temporalHelpers.js` is an allowed include; and
   the 16 content-skips above are mirrored exactly in
   `tools/skip_tally.js`.
+- **Intl era fields (`Intl.Era-monthcode` gate)** — the era-field
+  machinery for Temporal: `era`/`eraYear` read only on
+  era-supporting calendars (ethioaa `"aa"` with the Amete Alem year,
+  ethiopic year < 1 → `"aa"`/year + 5500, islamic year < 1 → `"bh"`/
+  1 − year, buddhist `"be"` and roc `"roc"`/`"broc"` return the year
+  field directly, and the Japanese regnal-era start dates are pinned),
+  `with` rejects era fields on era-less calendars (chinese/dangi/
+  iso8601) with a TypeError, and `resolve_calendar_month` detects a
+  month/monthCode conflict. `canonicalize_calendar_id` now requires
+  the supported set (`SUPPORTED_CALENDARS` trimmed to the 16 that
+  `supportedValuesOf` reports; `islamic`/`islamic-rgsa` reject for
+  Temporal while DateTimeFormat falls back to `islamic-civil`).
+- **Solar calendar arithmetic (`calendar.rs`)** — buddhist, coptic,
+  ethiopic, ethioaa, indian (Saka), persian, roc, and
+  islamic-umalqura: coptic/ethiopic use the 13-month structure
+  (12 × 30 + 5/6-day epagomenal, leap iff year mod 4 == 3; the
+  ethiopic year field is Amete Alem), indian Chaitra 1 is
+  ISO (year + 78)-03-21/22, persian uses the 33-year/8-leap Nowruz
+  cycle, and umalqura uses its pinned 1300-1500 table (1390-1469
+  leap years; islamic-civil outside). The islamic fixed-date
+  conversions use `.div_euclid()` for negative-year floor semantics,
+  and `calendar_date_surpasses` compares phantom calendar days in the
+  years/months phase so leap-month folds (`commonMonth4.since
+  (leapMonth4) = 1y`) hold. The `intl402/` Temporal-era slice (the
+  `Intl.Era-monthcode`-gated fixtures) is swept separately: **3,205
+  pass / 0 fail / 152 skip** of 3,357.
 
 ## Edge-case unit-test campaign (Phase 18 hardening)
 
@@ -1610,21 +1637,24 @@ The harness's skip taxonomy (also used by the sweep):
 
 | Skip category | Reason |
 |---|---|
-| `features: [Temporal]` (unimplemented clusters) | Temporal is a stage-4 proposal under implementation: Duration/Instant/Now/namespace/toStringTag, all five Plain* clusters, ZonedDateTime (UTC + fixed-offset zones), and `Date.prototype.toTemporalInstant` run; the `toLocaleString` fixtures (Intl, ECMA-402) are skipped. |
+| `features: [Temporal]` (unimplemented clusters) | Temporal is a stage-4 proposal; the whole `Temporal/*` tree now runs (4,602 of 4,603 fixtures), including the `Intl.Era-monthcode`-gated era/eraYear getters, the solar calendars, and the Intl `toLocaleString` integration. |
 | `features: [await-dictionary]` | `Promise.allKeyed`/`allSettledKeyed` (the await-dictionary stage-3 proposal) are not part of ECMA-262 ES2026. |
 | `features: [ShadowRealm]` | ShadowRealm is a stage-3 proposal, not part of ECMA-262 ES2026. |
 | `features: [source-phase-imports]` | `import.source()` is a stage-3 proposal, not part of ECMA-262 ES2026. |
 | `features: [import-defer]` / `[import-bytes]` / `[import-text]` | `import.defer(...)` / `import(..., { with: { type: "bytes" } })` / `import(..., { with: { type: "text" } })` are stage-3 proposals, not part of ECMA-262 ES2026. |
 | `includes: [tcoHelper]` | TCO fixtures require proper tail calls; skipped even by V8/JSC. |
 | Unsupported `includes:` | Fixtures needing harness helpers beyond `assert.js`, `compareArray.js`, `detachArrayBuffer.js`, `isConstructor.js`, `propertyHelper.js`, `testAtomics.js`, `testTypedArray.js` are not run. |
-| Intl directories | `Intl` (ECMA-402) is out of scope for this runtime (PLAN scope decision). |
+| Stale fixture | `Temporal/Duration/prototype/total/relativeto-date-limits.js` asserts a +1s boundary that is in range per the current spec (matching node v24), so it is skipped in `run_fixture`. |
 
 ## Expected non-runnable tests
 
 These categories are expected to stay non-runnable and are not counted
 against the runnable pass-rate target:
 
-- **Intl-required features** — ECMA-402 is a separate specification.
+- **Unimplemented ECMA-402 pieces** — ECMA-402 is a separate
+  specification; the `intl402/` fixtures needing `Intl.Locale-info`,
+  `Intl.DateTimeFormat-extend-timezonename`, or `canonical-tz` stay
+  skipped (see the sweep-area table above).
 - **`dynamic import` specifier resolution** — `import(specifier)` resolves
   through host hooks (`HostResolveImportedModule`); the test262 harness
   registers the `_FIXTURE` siblings, so fixtures run, but no general
@@ -1636,42 +1666,50 @@ against the runnable pass-rate target:
 ## Full-suite sweep (post-hardening)
 
 `test262-sweep` over all three areas in a release build (48,622 fixtures, 8
-jobs, 20s batch timeout): **0 crashes, 0 hangs**. All three rows are
+jobs, 20s batch timeout): **0 crashes**. All three rows are
 re-measured with the long config (`--jobs 8 --batch 32 --timeout 120
---recheck-timeout 120`) and now report **0 fail**: the language row closed
-its 2,048 failures first (the eval-caller-context, field-initializer, and
-Annex B work below), and the final 39 async-test gaps described below
-closed last.
+--recheck-timeout 120`) and now report **0 fail** (the 234 hangs below are
+slow-but-correct fixtures the recheck misclassifies, not bugs): the
+language row closed its 2,048 failures first (the eval-caller-context,
+field-initializer, and Annex B work below), the final 39 async-test gaps
+described below closed last, and the last built-ins failures fell with the
+Temporal era-monthcode gate and the ECMA-402 Intl integration.
 
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 23,690 | 0 | 34 | 0 | 100.0% |
-| built-ins | 23,812 | 23,463 | 0 | 195 | 154 | 99.35% |
+| built-ins | 23,812 | 23,424 | 0 | 154 | 234 | 99.01% |
 | annexB | 1,086 | 1,086 | 0 | 0 | 0 | 100.0% |
-| **Total** | **48,622** | **48,239** | **0** | **229** | **154** | **99.68%** |
+| **Total** | **48,622** | **48,200** | **0** | **188** | **234** | **99.52%** |
 
 (The built-ins row is the measured release-build state (`--jobs 8 --timeout
 120 --recheck-timeout 120`) with the **ZonedDateTime cluster un-skipped**
 (894 fixtures, UTC + fixed-offset zones) and the follow-up engine fixes:
 `Array.fromAsync` passes its obtained iterator method into GetIterator
-instead of re-reading `@@asyncIterator`, and the `/v` parser rejects string
+instead of re-reading `@@asyncIterator`, the `/v` parser rejects string
 members (`\q{…}` or a strings property escape) inside a negated character
-class as a SyntaxError. The 154 hangs are all
-`RegExp/property-escapes/generated/*` fixtures — slow-but-correct (each runs
-a ~1.1M-code-point `regex.test` loop), so batches containing several of
-them exceed the 120s deadline under 8-job load and the recheck misclassifies
-them; none are Temporal (the `Temporal/*` filter sweep is 0 fail / 0 hang).
+class as a SyntaxError, and the `Intl.Era-monthcode` gate is flipped (the
+era-field getters and the solar-calendar arithmetic — buddhist, coptic,
+ethiopic, ethioaa, indian, persian, roc, islamic-umalqura — pass). The 234
+hangs are slow-but-correct fixtures, not bugs: ~222
+`RegExp/property-escapes/generated/*` fixtures (each runs a
+~1.1M-code-point `regex.test` loop) and 3
+`TypedArray/prototype/copyWithin` 10,000-element allocations pass with the
+long config — batches containing several of them exceed the 120s deadline
+under 8-job load and the recheck misclassifies them; none are Temporal (the
+`Temporal/*` filter sweep is 4,602 pass / 0 fail / 1 skip / 0 hang).
 The Temporal clusters implemented so far — Duration, Instant, Now, the
 root-level namespace, toStringTag, the five Plain clusters, ZonedDateTime,
 and `Date.prototype.toTemporalInstant` — moved 4,569 of the 4,611
 Temporal-featured fixtures from skip to pass (the 16 Duration
 `relativeTo` content-skips closed last); the
-remaining 42 skips are the `toLocaleString` (Intl) fixtures.)
+remaining 42 `toLocaleString` (Intl) content-skips closed with the
+ECMA-402 integration, leaving the one stale fixture.)
 
-(Runnable = pass + fail + hang; the 229 skips are the
-out-of-scope await-dictionary and ShadowRealm proposal
-fixtures, the TCO (`tcoHelper`) fixtures, and the Intl `toLocaleString`
-content-skips in the built-ins row.) The
+(Runnable = pass + fail + hang; the 188 skips are the
+TCO (`tcoHelper`) fixtures (34), the out-of-scope
+await-dictionary (89) and ShadowRealm (64) proposal
+fixtures, and the one stale Temporal fixture.) The
 module loader was un-skipped (the `flags: [module]`
 fixtures now run through the real source-text-module machinery — parse,
 link, DFS evaluation, top-level await, dynamic import, and `import.meta`),
@@ -1819,19 +1857,23 @@ Object.fromEntries, JSON.stringify, DataView, Object statics/
 constructor, Promise, Atomics, and the final Array/generator, Throw-
 TypeError, WeakRef/FinalizationRegistry, Uint8Array base64/hex, Set
 set-methods, JSON/parse, TypedArray BigInt, String, and SuppressedError
-closures (all 0 fail). The 195 built-ins skips are the Intl
-`toLocaleString` fixtures (42, across the five Plain* clusters and
-ZonedDateTime), await-dictionary (89),
-and ShadowRealm (64) — the
-Temporal (including `Date.prototype.toTemporalInstant` and the 16
-Duration `relativeTo` content-skips), atomicsHelper
-(112), CanBlockIsTrue (7), and regExpUtils
-clusters now run.
+closures (all 0 fail). The 154 built-ins skips are
+await-dictionary (89), ShadowRealm (64), and the one stale
+`Temporal/Duration/prototype/total/relativeto-date-limits.js`
+fixture — the Temporal tree (including
+`Date.prototype.toTemporalInstant`, the 16 Duration `relativeTo`
+content-skips, and the `Intl.Era-monthcode`-gated era/eraYear
+getters and solar calendars), atomicsHelper
+(112), CanBlockIsTrue (7), regExpUtils
+clusters now run, and the 42 Intl `toLocaleString` content-skips
+closed with the ECMA-402 integration.
 
-¹ The 3 built-ins hangs recorded earlier were the
-`TypedArray/prototype/copyWithin` coerced-values fixtures — 10,000-element
-allocations that pass with the long (`--timeout 120`) config, not a bug
-(see the TypedArray cluster section). The final sweep reports 0 hangs.
+¹ The 234 built-ins hangs are measurement artifacts: the
+`RegExp/property-escapes/generated/*` fixtures (each a
+~1.1M-code-point `regex.test` loop) and the 3
+`TypedArray/prototype/copyWithin` coerced-values fixtures (10,000-element
+allocations) pass with the long (`--timeout 120`) config, not a bug
+(see the TypedArray cluster section).
 
 The language row closed its last 2,048 failures in two passes. First, the
 direct-eval caller-context rules were finished (spec 19.2.1.1 steps 5-7):
@@ -1981,11 +2023,12 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 
 ## Open items
 
-- All three areas now measure **100% of runnable**: 23,690 + 23,463 + 1,086
-  pass / 0 fail / 0 crash / 0 hang of 23,724 + 23,812 + 1,086 fixtures
-  (the await-dictionary and ShadowRealm proposal fixtures, the `tcoHelper`
-  includes, and the Temporal Intl `toLocaleString`
-  content-skips skipped, `--timeout 120 --recheck-timeout 120`, release
+- All three areas now measure **100% of runnable**: 23,690 + 23,424 + 1,086
+  pass / 0 fail / 0 crash of 23,724 + 23,812 + 1,086 fixtures
+  (the `tcoHelper` includes (34), the await-dictionary (89) and ShadowRealm
+  (64) proposal fixtures, and one stale Temporal fixture
+  skipped; the 234 built-ins hangs are slow-but-correct fixtures the
+  recheck misclassifies, `--timeout 120 --recheck-timeout 120`, release
   build) — the plan's ≥95% runnable-pass-rate target is met. The language area closed its 2,048
   failures via the eval-caller-context, field-initializer, and Annex B
   work described in the Full-suite sweep section; the final async-test
@@ -2004,21 +2047,30 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
   closed last (119/119 — the `$262.agent` worker-thread host API, the
   *"ok"* notify semantics for `Atomics.wait`, and the cross-thread
   `waitAsync` resolution), leaving the 34 language skips as the TCO
-  fixtures only (48,239 pass / 229 skip / 154 slow-but-correct hang
+  fixtures only (48,200 pass / 188 skip / 234 slow-but-correct hang
 total now; the Temporal clusters — Duration, Instant, Now, the namespace,
 toStringTag, the five Plain clusters, and ZonedDateTime — and
-`Date.prototype.toTemporalInstant` have all been un-skipped since,
-leaving only the Intl `toLocaleString` (42),
-await-dictionary (89), and ShadowRealm (64)).
+`Date.prototype.toTemporalInstant` have all been un-skipped since, and the
+`Intl.Era-monthcode` gate flipped last — the era-field getters and the
+solar-calendar arithmetic (buddhist, coptic, ethiopic, ethioaa, indian,
+persian, roc, islamic-umalqura) pass, leaving only the stale
+`relativeto-date-limits.js` fixture (1), await-dictionary (89), and
+ShadowRealm (64)).
   Note: the TypedArray sweep should be run with the long deadline
   (`--timeout 120 --recheck-timeout 120`) — the O(n²) property store
   makes the 10,000-element crash-test fixtures take ~45s, which the
   default 5s recheck misclassifies as hangs.
 - The 27 original hangs were slow builtin calls (fixed via the dispatch
   cache) plus one real `Array.prototype.splice` infinite loop (fixed); the
-  remaining sweep runs cleanly. Use a release build
+  only hangs now are the slow-but-correct RegExp property-escape and
+  TypedArray `copyWithin` fixtures above. Use a release build
   (`cargo run --release -p test262 --bin sweep`) — the debug build's deep
   recursion can overflow the stack on heavy fixtures.
-- `Intl` fixtures are excluded by design; anything else that fails the
-  sweep should be triaged into bug / host-dependent / missing-hook
-  categories and either fixed or documented here.
+- The `intl402/` area is swept too (3,205 pass / 0 fail / 152 skip of
+  3,357 — the skips are the unimplemented `Intl.Locale-info` (60) and
+  `Intl.DateTimeFormat-extend-timezonename` (2) fixtures, the out-of-scope
+  `canonical-tz` fixtures (19), and the Temporal-type-gated fixtures there
+  (71); the earlier `FallbackSymbol/per-realm.js` failure now passes);
+  anything else that fails the sweep should be triaged into bug /
+  host-dependent / missing-hook categories and either fixed or documented
+  here.

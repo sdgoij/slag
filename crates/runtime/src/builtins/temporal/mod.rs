@@ -1404,7 +1404,6 @@ fn relative_to_object(agent: &mut Agent, item: &Value) -> Result<RelativeTo, JsE
         item,
         calendar_id.as_deref(),
         year,
-        true,
     )?;
     let (Some(year), Some(month), Some(day)) = (year, month, day) else {
         return Err(JsError::new(
