@@ -34,8 +34,11 @@ pub fn hebrew_months_before_year(year: i64) -> i64 {
 pub fn hebrew_elapsed_days(year: i64) -> i64 {
     let months = hebrew_months_before_year(year);
     let parts_elapsed = 204 + 793 * months.rem_euclid(1080);
-    let hours_elapsed = 5 + 12 * months + 793 * (months / 1080) + parts_elapsed / 1080;
-    let mut day = 1 + 29 * months + hours_elapsed / 24;
+    // The molad arithmetic floors the carries (negative years otherwise
+    // drift — the withCalendar/extreme-dates fixture pins the year −268058
+    // month starts).
+    let hours_elapsed = 5 + 12 * months + 793 * months.div_euclid(1080) + parts_elapsed / 1080;
+    let mut day = 1 + 29 * months + hours_elapsed.div_euclid(24);
     let parts = 1080 * hours_elapsed.rem_euclid(24) + parts_elapsed.rem_euclid(1080);
     let dow = day.rem_euclid(7);
     let leap = hebrew_leap_year(year);
@@ -204,19 +207,433 @@ fn days_in_islamic_month(year: i64, month: i64) -> i64 {
     }
 }
 
-/// The tabular Islamic date → fixed date.
+/// The tabular Islamic date → fixed date. The leap-day count runs euclidean
+/// (the negative years of the roundtrip anchors need floor semantics).
 fn islamic_to_fixed(year: i64, month: i64, day: i64, epoch: i64) -> i64 {
-    epoch - 1 + (year - 1) * 354 + (3 + 11 * year) / 30 + 29 * (month - 1) + month / 2 + day
+    epoch - 1
+        + (year - 1) * 354
+        + (3 + 11 * year).div_euclid(30)
+        + 29 * (month - 1)
+        + month / 2
+        + day
 }
 
 /// The fixed date → tabular Islamic date (the ISO → Islamic direction the
-/// DateTimeFormat calendar-field conversion uses).
+/// DateTimeFormat calendar-field conversion uses). The divisions run
+/// euclidean: the negative years (the roundtrip-from-property-bag anchor ISO
+/// 1-01-01 = islamic-civil -640 M05-18) need floor semantics.
 fn islamic_from_fixed(rd: i64, epoch: i64) -> (i64, i64, i64) {
-    let year = (30 * (rd - epoch) + 10646) / 10631;
+    let year = (30 * (rd - epoch) + 10646).div_euclid(10631);
     let prior = rd - islamic_to_fixed(year, 1, 1, epoch);
-    let month = (11 * prior + 330) / 325;
+    let month = (11 * prior + 330).div_euclid(325);
     let day = rd - islamic_to_fixed(year, month, 1, epoch) + 1;
     (year, month, day)
+}
+
+// --- The solar calendars (buddhist, coptic, ethiopic, ethioaa, indian,
+// --- persian) ---
+//
+// Fixed-date calendars: a year start (an epoch RD) plus month lengths. The
+// corpus pins the epochs through the roundtrip-from-property-bag anchors and
+// the leap rules through the inLeapYear/daysInYear fixtures; the persian
+// nowruz table is the Iranian calendar authority data the corpus pins for
+// AP 1206-1498, with the 33-year arithmetic cycle outside.
+
+/// The Coptic epoch: 1 Thout 1 = ISO 284-08-29 (RD).
+const COPTIC_EPOCH: i64 = 103_605;
+
+/// The Ethiopic anchor: year -7 M01-01 = ISO 0-08-27 (RD; the corpus's
+/// roundtrip anchor ISO 1-01-01 = ethiopic -7 M05-08 pins the epoch).
+const ETHIOPIC_BASE: i64 = -126;
+
+/// The Persian epoch: 1 Farvardin 1 AP = ISO 622-03-21 (RD).
+const PERSIAN_EPOCH: i64 = 226_895;
+
+/// The Buddhist calendar is the proleptic Gregorian year + 543 (the Thai
+/// solar calendar; the months and days are the ISO ones).
+fn buddhist_to_fixed(year: i64, month: i64, day: i64) -> i64 {
+    iso::iso_date_to_epoch_days(year - 543, month - 1, day) + RD_OFFSET
+}
+
+fn buddhist_from_fixed(rd: i64) -> (i64, i64, i64) {
+    let (y, m, d) = iso::epoch_days_to_iso_date(rd - RD_OFFSET);
+    (y + 543, m, d)
+}
+
+/// The Coptic calendar: 12 months of 30 days plus a 5/6-day epagomenal
+/// month; the leap years are 3 mod 4 (the inLeapYear fixture pins 1687,
+/// 1691, ...).
+fn coptic_leap_year(year: i64) -> bool {
+    year.rem_euclid(4) == 3
+}
+
+/// 1 Thout of year y (RD): 365 days per year plus the leap days of the
+/// earlier years.
+fn coptic_year_start(year: i64) -> i64 {
+    COPTIC_EPOCH + 365 * (year - 1) + year.div_euclid(4)
+}
+
+fn coptic_to_fixed(year: i64, month: i64, day: i64) -> i64 {
+    coptic_year_start(year) + 30 * (month - 1) + day - 1
+}
+
+fn coptic_from_fixed(rd: i64) -> (i64, i64, i64) {
+    let mut year = (4 * (rd - COPTIC_EPOCH) + 1463).div_euclid(1461);
+    while coptic_year_start(year) > rd {
+        year -= 1;
+    }
+    while coptic_year_start(year + 1) <= rd {
+        year += 1;
+    }
+    let prior = rd - coptic_year_start(year);
+    let month = (prior / 30).min(12) + 1;
+    let day = prior - 30 * (month - 1) + 1;
+    (year, month, day)
+}
+
+/// The Ethiopic calendar: the same 13-month structure as Coptic with the
+/// year field offset -7 from ISO (year -7 M01-01 = ISO 0-08-27); the year
+/// field is the Amete Alem numbering the corpus pins (ISO 2000 → year
+/// 1992, ISO 1 → year -7), and the era getters derive the am/aa era from it.
+fn ethiopic_year_start(year: i64) -> i64 {
+    ETHIOPIC_BASE + 365 * (year + 7) + year.div_euclid(4) + 2
+}
+
+fn ethiopic_to_fixed(year: i64, month: i64, day: i64) -> i64 {
+    ethiopic_year_start(year) + 30 * (month - 1) + day - 1
+}
+
+fn ethiopic_from_fixed(rd: i64) -> (i64, i64, i64) {
+    let mut year = (4 * (rd - ETHIOPIC_BASE) - 1).div_euclid(1461) - 7;
+    while ethiopic_year_start(year) > rd {
+        year -= 1;
+    }
+    while ethiopic_year_start(year + 1) <= rd {
+        year += 1;
+    }
+    let prior = rd - ethiopic_year_start(year);
+    let month = (prior / 30).min(12) + 1;
+    let day = prior - 30 * (month - 1) + 1;
+    (year, month, day)
+}
+
+/// The Ethiopic Amete Alem calendar: the ethiopic year field plus 5500 (the
+/// era-monthcode aa/am split: the year field < 1 is the aa era, ≥ 1 the am
+/// era, with aa eraYear = year + 5500).
+fn ethioaa_to_fixed(year: i64, month: i64, day: i64) -> i64 {
+    ethiopic_year_start(year - 5500) + 30 * (month - 1) + day - 1
+}
+
+fn ethioaa_from_fixed(rd: i64) -> (i64, i64, i64) {
+    let (y, m, d) = ethiopic_from_fixed(rd);
+    (y + 5500, m, d)
+}
+
+/// The Indian national (Saka) calendar: Chaitra 1 = ISO (year+78)-03-21 in
+/// a leap year, 03-22 otherwise; month 1 has 30/31 days (31 in leap years),
+/// months 2-6 have 31, months 7-12 have 30 (the daysInMonth fixture pins the
+/// leap day at 31 Chaitra).
+fn saka_leap_year(year: i64) -> bool {
+    iso::is_leap_year(year + 78)
+}
+
+fn saka_year_start(year: i64) -> i64 {
+    let (y, m, d) = if saka_leap_year(year) {
+        (year + 78, 3, 21)
+    } else {
+        (year + 78, 3, 22)
+    };
+    iso::iso_date_to_epoch_days(y, m - 1, d) + RD_OFFSET
+}
+
+fn saka_month_length(year: i64, month: i64) -> i64 {
+    match month {
+        1 => i64::from(saka_leap_year(year)) + 30,
+        2..=6 => 31,
+        _ => 30,
+    }
+}
+
+fn saka_to_fixed(year: i64, month: i64, day: i64) -> i64 {
+    saka_year_start(year) + (1..month).map(|m| saka_month_length(year, m)).sum::<i64>() + day - 1
+}
+
+fn saka_from_fixed(rd: i64) -> (i64, i64, i64) {
+    let (iy, im, id) = iso::epoch_days_to_iso_date(rd - RD_OFFSET);
+    let mut year = if (im, id) < (3, 21) { iy - 79 } else { iy - 78 };
+    while saka_year_start(year) > rd {
+        year -= 1;
+    }
+    while saka_year_start(year + 1) <= rd {
+        year += 1;
+    }
+    let prior = rd - saka_year_start(year);
+    let mut month = 1;
+    let mut rem = prior;
+    while month < 12 && rem >= saka_month_length(year, month) {
+        rem -= saka_month_length(year, month);
+        month += 1;
+    }
+    (year, month, rem + 1)
+}
+
+// The Persian (AP) calendar: the year starts at the nowruz the authority
+// data pins (the nowruz day of March for AP 1206-1498; the 33-year cycle
+// with 8 leap years outside). Months 1-6 have 31 days, 7-11 30, and 12 has
+// 29 (30 in leap years).
+
+const PERSIAN_TABLE_START: i64 = 1206;
+const PERSIAN_TABLE_END: i64 = 1498;
+
+/// The nowruz day of March for AP 1206-1498 (the persian-new-year-dates
+/// fixture: the Iranian calendar authority data; nowruz(Y) = ISO
+/// (Y+621)-03-DAY).
+const PERSIAN_NOWRUZ_DAY: [u8; 293] = [
+    22, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21,
+    21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 20, 21, 21, 21, 20, 21, 21, 21, 20, 21, 21,
+    21, 20, 21, 21, 21, 20, 21, 21, 21, 20, 21, 21, 21, 20, 21, 21, 21, 20, 21, 21, 21, 20, 20, 21,
+    21, 21, 21, 22, 22, 21, 21, 22, 22, 21, 21, 22, 22, 21, 21, 22, 22, 21, 21, 22, 22, 21, 21, 22,
+    22, 21, 21, 22, 22, 21, 21, 21, 22, 21, 21, 21, 22, 21, 21, 21, 22, 21, 21, 21, 22, 21, 21, 21,
+    22, 21, 21, 21, 22, 21, 21, 21, 22, 21, 21, 21, 22, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21,
+    21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21,
+    21, 20, 21, 21, 21, 20, 21, 21, 21, 20, 21, 21, 21, 20, 21, 21, 21, 20, 21, 21, 21, 20, 21, 21,
+    21, 20, 21, 21, 21, 20, 21, 21, 21, 20, 20, 21, 21, 20, 20, 21, 21, 20, 20, 21, 21, 20, 20, 21,
+    21, 20, 20, 21, 21, 20, 20, 21, 21, 20, 20, 21, 21, 20, 20, 21, 21, 20, 20, 20, 21, 20, 20, 20,
+    21, 20, 20, 20, 21, 20, 20, 20, 21, 20, 20, 20, 21, 20, 20, 20, 21, 20, 20, 20, 21, 20, 20, 20,
+    21, 20, 20, 20, 20, 20, 20, 20, 20, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21,
+    21, 21, 21, 21, 21,
+];
+
+/// The 33-year arithmetic cycle (8 leap years per cycle: the years 1, 5, 9,
+/// 13, 17, 22, 26, 30 of each cycle are leap).
+fn persian_leap_arithmetic(year: i64) -> bool {
+    (25 * year + 11).rem_euclid(33) < 8
+}
+
+fn persian_year_start_arithmetic(year: i64) -> i64 {
+    if year < 1 {
+        let mut rd = PERSIAN_EPOCH;
+        for k in (year..1).rev() {
+            rd -= 365 + i64::from(persian_leap_arithmetic(k));
+        }
+        rd
+    } else {
+        let cycles = (year - 1) / 33;
+        let mut rd = PERSIAN_EPOCH + cycles * 12_053;
+        for k in (cycles * 33 + 1)..year {
+            rd += 365 + i64::from(persian_leap_arithmetic(k));
+        }
+        rd
+    }
+}
+
+/// 1 Farvardin of the Persian year (RD): the authority table inside
+/// 1206-1498, the arithmetic cycle outside.
+fn persian_year_start(year: i64) -> i64 {
+    if (PERSIAN_TABLE_START..=PERSIAN_TABLE_END).contains(&year) {
+        let day = PERSIAN_NOWRUZ_DAY[(year - PERSIAN_TABLE_START) as usize] as i64;
+        iso::iso_date_to_epoch_days(year + 621, 2, day) + RD_OFFSET
+    } else {
+        persian_year_start_arithmetic(year)
+    }
+}
+
+fn persian_month_length(year: i64, month: i64) -> i64 {
+    match month {
+        1..=6 => 31,
+        7..=11 => 30,
+        _ => i64::from(persian_leap_year(year)) + 29,
+    }
+}
+
+/// A Persian year is leap when the next year's nowruz is one day later than
+/// the year's own (the authority table and the arithmetic cycle agree here).
+fn persian_leap_year(year: i64) -> bool {
+    persian_year_start(year + 1) - persian_year_start(year) == 366
+}
+
+fn persian_to_fixed(year: i64, month: i64, day: i64) -> i64 {
+    persian_year_start(year)
+        + (1..month)
+            .map(|m| persian_month_length(year, m))
+            .sum::<i64>()
+        + day
+        - 1
+}
+
+fn persian_from_fixed(rd: i64) -> (i64, i64, i64) {
+    let (iy, _, _) = iso::epoch_days_to_iso_date(rd - RD_OFFSET);
+    let mut year = iy - 621;
+    while persian_year_start(year) > rd {
+        year -= 1;
+    }
+    while persian_year_start(year + 1) <= rd {
+        year += 1;
+    }
+    let prior = rd - persian_year_start(year);
+    let mut month = 1;
+    let mut rem = prior;
+    while month < 12 && rem >= persian_month_length(year, month) {
+        rem -= persian_month_length(year, month);
+        month += 1;
+    }
+    (year, month, rem + 1)
+}
+
+// --- The islamic-umalqura calendar (the Umm al-Qura calendar: the real
+// --- astronomical month layouts for AH 1300-1500, from the ICU umalqura
+// --- table (each year a 12-bit mask: bit set = 30-day month, cleared = 29,
+// --- month 1 the high bit); outside the table the calendar falls back to
+// --- islamic-civil (the extreme-dates fixture pins the fallback roundtrips).
+// --- The anchor AH 1390 M01-01 = ISO 1970-03-09 (RD 719230); the corpus pin
+// --- ISO 2000-01-01 = AH 1420 M09-24 (roundtrip-from-property-bag) fixes it.
+
+const UMALQURA_TABLE_START: i64 = 1300;
+const UMALQURA_TABLE_END: i64 = 1500;
+const UMALQURA_ANCHOR_YEAR: i64 = 1390;
+/// ISO 1970-03-09 (RD): the corpus pin ISO 2000-01-01 = AH 1420 M09-24
+/// (roundtrip-from-property-bag) fixes the anchor.
+const UMALQURA_ANCHOR_RD: i64 = 719_230;
+
+/// The ICU umalqura month masks for AH 1300-1500 (year 1300 first): each
+/// mask bit 11..0 is the 30-day flag of months 1..12. The year totals match
+/// the daysInYear/inLeapYear corpus pins (1390-1469 has exactly 30 leap
+/// years) and the month positions match the month-boundary/basic fixtures.
+const UMALQURA_MONTHLENGTH: [u16; 201] = [
+    0x0AAA, 0x0D54, 0x0EC9, 0x06D4, 0x06EA, 0x036C, 0x0AAD, 0x0555, 0x06A9, 0x0792, 0x0BA9, 0x05D4,
+    0x0ADA, 0x055C, 0x0D2D, 0x0695, 0x074A, 0x0B54, 0x0B6A, 0x05AD, 0x04AE, 0x0A4F, 0x0517, 0x068B,
+    0x06A5, 0x0AD5, 0x02D6, 0x095B, 0x049D, 0x0A4D, 0x0D26, 0x0D95, 0x05AC, 0x09B6, 0x02BA, 0x0A5B,
+    0x052B, 0x0A95, 0x06CA, 0x0AE9, 0x02F4, 0x0976, 0x02B6, 0x0956, 0x0ACA, 0x0BA4, 0x0BD2, 0x05D9,
+    0x02DC, 0x096D, 0x054D, 0x0AA5, 0x0B52, 0x0BA5, 0x05B4, 0x09B6, 0x0557, 0x0297, 0x054B, 0x06A3,
+    0x0752, 0x0B65, 0x056A, 0x0AAB, 0x052B, 0x0C95, 0x0D4A, 0x0DA5, 0x05CA, 0x0AD6, 0x0957, 0x04AB,
+    0x094B, 0x0AA5, 0x0B52, 0x0B6A, 0x0575, 0x0276, 0x08B7, 0x045B, 0x0555, 0x05A9, 0x05B4, 0x09DA,
+    0x04DD, 0x026E, 0x0936, 0x0AAA, 0x0D54, 0x0DB2, 0x05D5, 0x02DA, 0x095B, 0x04AB, 0x0A55, 0x0B49,
+    0x0B64, 0x0B71, 0x05B4, 0x0AB5, 0x0A55, 0x0D25, 0x0E92, 0x0EC9, 0x06D4, 0x0AE9, 0x096B, 0x04AB,
+    0x0A93, 0x0D49, 0x0DA4, 0x0DB2, 0x0AB9, 0x04BA, 0x0A5B, 0x052B, 0x0A95, 0x0B2A, 0x0B55, 0x055C,
+    0x04BD, 0x023D, 0x091D, 0x0A95, 0x0B4A, 0x0B5A, 0x056D, 0x02B6, 0x093B, 0x049B, 0x0655, 0x06A9,
+    0x0754, 0x0B6A, 0x056C, 0x0AAD, 0x0555, 0x0B29, 0x0B92, 0x0BA9, 0x05D4, 0x0ADA, 0x055A, 0x0AAB,
+    0x0595, 0x0749, 0x0764, 0x0BAA, 0x05B5, 0x02B6, 0x0A56, 0x0E4D, 0x0B25, 0x0B52, 0x0B6A, 0x05AD,
+    0x02AE, 0x092F, 0x0497, 0x064B, 0x06A5, 0x06AC, 0x0AD6, 0x055D, 0x049D, 0x0A4D, 0x0D16, 0x0D95,
+    0x05AA, 0x05B5, 0x02DA, 0x095B, 0x04AD, 0x0595, 0x06CA, 0x06E4, 0x0AEA, 0x04F5, 0x02B6, 0x0956,
+    0x0AAA, 0x0B54, 0x0BD2, 0x05D9, 0x02EA, 0x096D, 0x04AD, 0x0A95, 0x0B4A, 0x0BA5, 0x05B2, 0x09B5,
+    0x04D6, 0x0A97, 0x0547, 0x0693, 0x0749, 0x0B55, 0x056A, 0x0A6B, 0x052B,
+];
+
+/// The month layouts (29/30 per month) of the umalqura table years.
+fn umalqura_month_lengths(year: i64) -> Option<[u8; 12]> {
+    if !(UMALQURA_TABLE_START..=UMALQURA_TABLE_END).contains(&year) {
+        return None;
+    }
+    let mask = UMALQURA_MONTHLENGTH[(year - UMALQURA_TABLE_START) as usize];
+    Some(std::array::from_fn(|i| {
+        if (mask >> (11 - i)) & 1 == 1 { 30 } else { 29 }
+    }))
+}
+
+/// The umalqura year length (355 in a leap year, 354 otherwise): the table
+/// years from the masks, the islamic-civil classification outside (the
+/// fallback calendar of the out-of-table years).
+fn umalqura_year_length(year: i64) -> Option<i64> {
+    if let Some(lens) = umalqura_month_lengths(year) {
+        Some(lens.iter().map(|&l| l as i64).sum())
+    } else {
+        Some(if islamic_leap_year(year) { 355 } else { 354 })
+    }
+}
+
+/// The umalqura month length (29/30): the table years from the masks, the
+/// islamic-civil month outside (the NonISODateSurpasses day balance and the
+/// era-boundary adds exercise out-of-table years).
+fn umalqura_days_in_month(year: i64, month: i64) -> Option<i64> {
+    if let Some(lens) = umalqura_month_lengths(year) {
+        if (1..=12).contains(&month) {
+            Some(lens[(month - 1) as usize] as i64)
+        } else {
+            None
+        }
+    } else if (1..=12).contains(&month) {
+        Some(days_in_islamic_month(year, month))
+    } else {
+        None
+    }
+}
+
+/// 1 Muharram of the umalqura year (RD): the anchor AH 1390 M01-01 = ISO
+/// 1970-01-01 plus the cumulative year lengths.
+fn umalqura_year_start(year: i64) -> Option<i64> {
+    if year == UMALQURA_ANCHOR_YEAR {
+        return Some(UMALQURA_ANCHOR_RD);
+    }
+    if year < UMALQURA_ANCHOR_YEAR {
+        let mut rd = UMALQURA_ANCHOR_RD;
+        for k in (year..UMALQURA_ANCHOR_YEAR).rev() {
+            rd -= umalqura_year_length(k)?;
+        }
+        Some(rd)
+    } else {
+        let mut rd = UMALQURA_ANCHOR_RD;
+        for k in UMALQURA_ANCHOR_YEAR..year {
+            rd += umalqura_year_length(k)?;
+        }
+        Some(rd)
+    }
+}
+
+/// The umalqura date → fixed date: the table inside [1300, 1500], the
+/// islamic-civil arithmetic outside (the extreme-dates fixture pins the
+/// fallback: the umalqura min/max roundtrips equal the civil ones).
+fn umalqura_to_fixed(year: i64, month: i64, day: i64) -> Option<i64> {
+    if (UMALQURA_TABLE_START..=UMALQURA_TABLE_END).contains(&year) {
+        let start = umalqura_year_start(year)?;
+        let lens = umalqura_month_lengths(year)?;
+        if (1..=12).contains(&month) && day >= 1 && day <= lens[(month - 1) as usize] as i64 {
+            Some(
+                start
+                    + lens[..(month - 1) as usize]
+                        .iter()
+                        .map(|&l| l as i64)
+                        .sum::<i64>()
+                    + day
+                    - 1,
+            )
+        } else {
+            None
+        }
+    } else {
+        Some(islamic_to_fixed(year, month, day, ISLAMIC_CIVIL_EPOCH))
+    }
+}
+
+fn umalqura_from_fixed(rd: i64) -> Option<(i64, i64, i64)> {
+    // The ISO span of the table years; outside it the civil fallback. The
+    // span is walked from the anchor through the accumulated year lengths.
+    let first = umalqura_year_start(UMALQURA_TABLE_START)?;
+    let last = umalqura_year_start(UMALQURA_TABLE_END + 1)?;
+    if !(first..last).contains(&rd) {
+        return Some(islamic_from_fixed(rd, ISLAMIC_CIVIL_EPOCH));
+    }
+    // Binary search the year whose span contains rd.
+    let mut lo = UMALQURA_TABLE_START;
+    let mut hi = UMALQURA_TABLE_END;
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        if umalqura_year_start(mid)? <= rd {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let year = lo;
+    let start = umalqura_year_start(year)?;
+    let lens = umalqura_month_lengths(year)?;
+    let prior = rd - start;
+    let mut month = 1;
+    let mut rem = prior;
+    while month < 12 && rem >= lens[(month - 1) as usize] as i64 {
+        rem -= lens[(month - 1) as usize] as i64;
+        month += 1;
+    }
+    Some((year, month, rem + 1))
 }
 
 // --- Chinese/Dangi (the lunisolar east-asian-traditional calendars) ---
@@ -537,8 +954,16 @@ pub fn calendar_date_to_iso(
         "islamic-civil" | "islamic-tbla" => {
             islamic_to_fixed(year, month, day, islamic_epoch(calendar)?)
         }
+        "islamic-umalqura" => umalqura_to_fixed(year, month, day)?,
         "hebrew" => hebrew_to_fixed(year, month, day),
         "chinese" | "dangi" => lunar_to_fixed(calendar, year, month, day)?,
+        "buddhist" => buddhist_to_fixed(year, month, day),
+        "roc" => iso::iso_date_to_epoch_days(year + 1911, month - 1, day) + RD_OFFSET,
+        "coptic" => coptic_to_fixed(year, month, day),
+        "ethiopic" => ethiopic_to_fixed(year, month, day),
+        "ethioaa" => ethioaa_to_fixed(year, month, day),
+        "indian" => saka_to_fixed(year, month, day),
+        "persian" => persian_to_fixed(year, month, day),
         _ => return None,
     };
     Some(iso::epoch_days_to_iso_date(rd - RD_OFFSET))
@@ -550,8 +975,19 @@ pub fn calendar_iso_to_date(calendar: &str, y: i64, m: i64, d: i64) -> Option<(i
     let rd = iso::iso_date_to_epoch_days(y, m - 1, d) + RD_OFFSET;
     match calendar {
         "islamic-civil" | "islamic-tbla" => Some(islamic_from_fixed(rd, islamic_epoch(calendar)?)),
+        "islamic-umalqura" => umalqura_from_fixed(rd),
         "hebrew" => Some(hebrew_from_fixed(rd)),
         "chinese" | "dangi" => Some(lunar_from_fixed(calendar, rd)),
+        "buddhist" => Some(buddhist_from_fixed(rd)),
+        "roc" => Some({
+            let (y, m, d) = iso::epoch_days_to_iso_date(rd - RD_OFFSET);
+            (y - 1911, m, d)
+        }),
+        "coptic" => Some(coptic_from_fixed(rd)),
+        "ethiopic" => Some(ethiopic_from_fixed(rd)),
+        "ethioaa" => Some(ethioaa_from_fixed(rd)),
+        "indian" => Some(saka_from_fixed(rd)),
+        "persian" => Some(persian_from_fixed(rd)),
         _ => None,
     }
 }
@@ -574,85 +1010,72 @@ pub fn hebrew_month_code(year: i64, month: i64) -> String {
 /// The calendar month number of a month/monthCode input (the month codes
 /// depend on the year's leap status for hebrew: M06-M12 shift by one in leap
 /// years, M05L is Adar I in leap years only). `None` when the input is
-/// invalid for the year.
+/// invalid for the year or the month and monthCode conflict (the
+/// calendarresolvefields-error-ordering fixtures pin the month/monthCode
+/// RangeError).
 pub fn resolve_calendar_month(
     calendar: &str,
     year: i64,
     month: Option<i64>,
     month_code: Option<&str>,
 ) -> Option<i64> {
+    // A provided monthCode resolves the month; a provided month must agree
+    // with it (the conflict is a RangeError for the caller).
+    let code_month = month_code.and_then(|code| resolve_calendar_month_code(calendar, year, code));
+    if let (Some(m), Some(cm)) = (month, code_month)
+        && m != cm
+    {
+        return None;
+    }
+    match month {
+        Some(m) => {
+            // No upper bound here: the callers regulate against the year's
+            // month count (constrain clamps, reject errors).
+            if m >= 1 { Some(m) } else { None }
+        }
+        None => code_month,
+    }
+}
+
+/// The calendar month number of a monthCode alone (the month codes depend on
+/// the year's leap status for hebrew; `None` when the code is malformed or
+/// does not exist in the year).
+fn resolve_calendar_month_code(calendar: &str, year: i64, code: &str) -> Option<i64> {
     if calendar == "hebrew" {
-        return match (month, month_code) {
-            // The numeric-month arm has no upper bound here: the callers
-            // regulate against the year's month count (constrain clamps,
-            // reject errors).
-            (Some(m), _) => {
-                if m >= 1 {
-                    Some(m)
+        return match code {
+            "M01" | "M02" | "M03" | "M04" | "M05" => code[1..].parse().ok(),
+            "M05L" => {
+                if hebrew_leap_year(year) {
+                    Some(6)
                 } else {
                     None
                 }
             }
-            (None, Some(code)) => match code {
-                "M01" | "M02" | "M03" | "M04" | "M05" => code[1..].parse().ok(),
-                "M05L" => {
-                    if hebrew_leap_year(year) {
-                        Some(6)
-                    } else {
-                        None
-                    }
-                }
-                "M06" => Some(if hebrew_leap_year(year) { 7 } else { 6 }),
-                "M07" => Some(if hebrew_leap_year(year) { 8 } else { 7 }),
-                "M08" => Some(if hebrew_leap_year(year) { 9 } else { 8 }),
-                "M09" => Some(if hebrew_leap_year(year) { 10 } else { 9 }),
-                "M10" => Some(if hebrew_leap_year(year) { 11 } else { 10 }),
-                "M11" => Some(if hebrew_leap_year(year) { 12 } else { 11 }),
-                "M12" => Some(if hebrew_leap_year(year) { 13 } else { 12 }),
-                _ => None,
-            },
+            "M06" => Some(if hebrew_leap_year(year) { 7 } else { 6 }),
+            "M07" => Some(if hebrew_leap_year(year) { 8 } else { 7 }),
+            "M08" => Some(if hebrew_leap_year(year) { 9 } else { 8 }),
+            "M09" => Some(if hebrew_leap_year(year) { 10 } else { 9 }),
+            "M10" => Some(if hebrew_leap_year(year) { 11 } else { 10 }),
+            "M11" => Some(if hebrew_leap_year(year) { 12 } else { 11 }),
+            "M12" => Some(if hebrew_leap_year(year) { 13 } else { 12 }),
             _ => None,
         };
     }
     if matches!(calendar, "chinese" | "dangi") {
-        return match (month, month_code) {
-            (Some(m), _) => {
-                if m >= 1 {
-                    Some(m)
-                } else {
-                    None
-                }
-            }
-            (None, Some(code)) => {
-                let (number, is_leap) = lunar_parse_code(code)?;
-                lunar_code_ordinal(number, is_leap, lunar_year_data(calendar, year).2)
-            }
-            _ => None,
-        };
+        let (number, is_leap) = lunar_parse_code(code)?;
+        return lunar_code_ordinal(number, is_leap, lunar_year_data(calendar, year).2);
     }
     // The pass-through calendars (iso8601, gregory, coptic, ...): M01-M12
     // (or M01-M13 for the 13-month calendars), bounded by the calendar's own
     // month count.
-    match (month, month_code) {
-        (Some(m), _) => {
-            let max = calendar_months_in_year(calendar, year).unwrap_or(12);
-            if (1..=max).contains(&m) {
-                Some(m)
-            } else {
-                None
-            }
+    if code.len() == 3 && code.starts_with('M') {
+        let n = code[1..].parse::<i64>().ok()?;
+        let max = calendar_months_in_year(calendar, year).unwrap_or(12);
+        if (1..=max).contains(&n) {
+            return Some(n);
         }
-        (None, Some(code)) if code.len() == 3 && code.starts_with('M') => {
-            let n = code[1..].parse::<i64>().ok()?;
-            let max = calendar_months_in_year(calendar, year).unwrap_or(12);
-            if (1..=max).contains(&n) {
-                Some(n)
-            } else {
-                None
-            }
-        }
-        _ => None,
     }
+    None
 }
 
 /// The calendar month number of a month/monthCode input, with the overflow
@@ -687,7 +1110,7 @@ pub fn resolve_calendar_month_with_overflow(
 pub fn calendar_months_in_year(calendar: &str, year: i64) -> Option<i64> {
     match calendar {
         "hebrew" => Some(hebrew_months_in_year(year)),
-        "islamic-civil" | "islamic-tbla" | "islamic-umalqura" => Some(12),
+        "islamic-civil" | "islamic-tbla" | "islamic-umalqura" | "indian" | "persian" => Some(12),
         "coptic" | "ethiopic" | "ethioaa" => Some(13),
         "chinese" | "dangi" => Some(lunar_months_in_year(lunar_year_data(calendar, year).2)),
         _ => None,
@@ -705,13 +1128,16 @@ pub fn calendar_days_in_month(calendar: &str, year: i64, month: i64) -> Option<i
         "hebrew" => Some(hebrew_month_length(year, month)),
         "islamic-civil" | "islamic-tbla" => Some(days_in_islamic_month(year, month)),
         "chinese" | "dangi" => lunar_days_in_month(calendar, year, month),
-        "coptic" | "ethiopic" | "ethioaa" => Some(if month == 13 { 6 } else { 30 }),
-        "islamic-umalqura" => Some(30),
-        "persian" | "indian" => Some(match month {
-            1..=6 => 31,
-            7..=11 => 30,
-            _ => 30,
+        "coptic" | "ethiopic" | "ethioaa" => Some(if month == 13 {
+            i64::from(coptic_leap_year(year)) + 5
+        } else {
+            30
         }),
+        "islamic-umalqura" => umalqura_days_in_month(year, month),
+        "buddhist" => Some(iso::days_in_month(year - 543, month)),
+        "roc" => Some(iso::days_in_month(year + 1911, month)),
+        "persian" => Some(persian_month_length(year, month)),
+        "indian" => Some(saka_month_length(year, month)),
         _ => None,
     }
 }
@@ -727,8 +1153,16 @@ pub fn calendar_year_month_to_iso(
         "islamic-civil" | "islamic-tbla" => {
             islamic_to_fixed(year, month, 1, islamic_epoch(calendar)?)
         }
+        "islamic-umalqura" => umalqura_to_fixed(year, month, 1)?,
         "hebrew" => hebrew_to_fixed(year, month, 1),
         "chinese" | "dangi" => lunar_to_fixed(calendar, year, month, 1)?,
+        "buddhist" => buddhist_to_fixed(year, month, 1),
+        "roc" => iso::iso_date_to_epoch_days(year + 1911, month - 1, 1) + RD_OFFSET,
+        "coptic" => coptic_to_fixed(year, month, 1),
+        "ethiopic" => ethiopic_to_fixed(year, month, 1),
+        "ethioaa" => ethioaa_to_fixed(year, month, 1),
+        "indian" => saka_to_fixed(year, month, 1),
+        "persian" => persian_to_fixed(year, month, 1),
         _ => return None,
     };
     let (y, m, d) = iso::epoch_days_to_iso_date(rd - RD_OFFSET);
@@ -753,41 +1187,85 @@ pub fn calendar_month_day_reference(
     if matches!(calendar, "chinese" | "dangi") {
         return lunar_month_day_reference(calendar, month, day, month_code, constrain);
     }
-    let year0 = match calendar {
-        "islamic-civil" | "islamic-tbla" => {
-            let epoch = islamic_epoch(calendar)?;
-            let rd_1972 = iso::iso_date_to_epoch_days(1972, 0, 1) + RD_OFFSET;
-            (30 * (rd_1972 - epoch) + 10646) / 10631
-        }
-        "hebrew" => {
-            let rd_1972 = iso::iso_date_to_epoch_days(1972, 0, 1) + RD_OFFSET;
-            (rd_1972 - HEBREW_EPOCH) * 19 / 6940 + 1
-        }
-        _ => return None,
-    };
-    // The month-day's ISO date lands in 1972 or the year before; scan the
-    // calendar years around the boundary (the estimate can be a year off)
-    // and take the latest date at or before ISO 1972. The month code
-    // resolves per year (M05L only exists in leap years; the leap-shifted
-    // months move their numerical position).
-    for year in (year0 - 2..=year0 + 2).rev() {
-        let month = if let Some(code) = month_code {
-            match resolve_calendar_month(calendar, year, None, Some(code)) {
-                Some(m) => m,
-                None => continue,
-            }
-        } else {
-            month
+    // NonISOMonthDayToISOReferenceDate: the latest ISO date in
+    // [1900-01-01, 1972-12-31] with the month code and day (else the earliest
+    // in [1973-01-01, 2035-12-31]). The scan runs over the calendar years
+    // bounded by the years containing ISO 1972-01-01 and ISO 1900-01-01; the
+    // ISO year checks filter the window edges.
+    let year0 = calendar_iso_to_date(calendar, 1972, 1, 1)?.0;
+    let low = calendar_iso_to_date(calendar, 1900, 1, 1)?.0;
+    let candidate = |year: i64| -> Option<(i64, i64, i64)> {
+        let month = match month_code {
+            Some(code) => resolve_calendar_month(calendar, year, None, Some(code))?,
+            None => month,
         };
         if day > calendar_days_in_month(calendar, year, month)? {
-            continue;
+            return None;
         }
-        let (y, m, d) = calendar_date_to_iso(calendar, year, month, day)?;
+        calendar_date_to_iso(calendar, year, month, day)
+    };
+    for year in (low - 1..=year0 + 2).rev() {
+        let Some((y, m, d)) = candidate(year) else {
+            continue;
+        };
+        if y < 1900 {
+            break;
+        }
         if y <= 1972 {
             return Some((y, m, d));
         }
     }
+    // No date in [1900, 1972]: the earliest in [1973, 2035].
+    let high = calendar_iso_to_date(calendar, 2035, 12, 31)?.0;
+    for year in year0 + 3..=high {
+        let Some((y, m, d)) = candidate(year) else {
+            continue;
+        };
+        if y >= 1973 {
+            return Some((y, m, d));
+        }
+        if y > 2035 {
+            return None;
+        }
+    }
     None
+}
+
+/// The maximum days in the month described by the month code across any year
+/// (NonISOMonthDayToISOReferenceDate: with no year the day is regulated
+/// against this maximum — every umalqura month can be 30, persian M01-M06 can
+/// be 31, coptic M13 at most 6 — before the reference search validates the
+/// day against the actual reference year).
+pub fn calendar_max_days_in_month(calendar: &str, month_code: &str) -> Option<i64> {
+    let code = month_code.strip_suffix('L').unwrap_or(month_code);
+    let n: i64 = code[1..].parse().ok()?;
+    match calendar {
+        // Tishrei/Heshvan/Kislev/Shevat/Nisan/Sivan/Av 30, Tevet/Adar
+        // II/Iyar/Tammuz/Elul 29, Adar I (M05L) 30.
+        "hebrew" => Some(match n {
+            1 | 2 | 3 | 5 | 7 | 9 | 11 => 30,
+            4 | 6 | 8 | 10 | 12 => 29,
+            _ => return None,
+        }),
+        // Odd months 30, even 29, M12 30 in a leap year.
+        "islamic-civil" | "islamic-tbla" => Some(if n == 12 || n % 2 == 1 { 30 } else { 29 }),
+        // The observational calendar: any month can be 30.
+        "islamic-umalqura" => Some(30),
+        "coptic" | "ethiopic" | "ethioaa" => Some(match n {
+            1..=12 => 30,
+            13 => 6,
+            _ => return None,
+        }),
+        "persian" | "indian" => Some(if n <= 6 { 31 } else { 30 }),
+        "chinese" | "dangi" => Some(30),
+        // The iso8601 and linear calendars: the ISO month maxima (M02 29).
+        _ => Some(match n {
+            2 => 29,
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            _ => return None,
+        }),
+    }
 }
 
 /// CalendarDateAdd (spec 12.3.5): add years/months with the calendar's own
@@ -887,17 +1365,149 @@ pub fn calendar_date_add(
             let rd = islamic_to_fixed(year, month, day, epoch) + days + 7 * weeks;
             Some(iso::epoch_days_to_iso_date(rd - RD_OFFSET))
         }
+        // The solar calendars (coptic/ethiopic/ethioaa with 13 months,
+        // persian/indian/umalqura with 12): convert to the calendar fields,
+        // balance the years/months against the year's own month count (the
+        // 13-month calendars cannot use the 12-month ISO balance), and
+        // constrain the day against the month length.
+        "coptic" | "ethiopic" | "ethioaa" | "persian" | "indian" | "islamic-umalqura" => {
+            solar_date_add(calendar, date, years, months, weeks, days, constrain)
+        }
         _ => iso::calendar_date_add(
             date.0, date.1, date.2, years, months, weeks, days, constrain,
         ),
     }
 }
 
-/// CalendarDateUntil (spec 12.3.9): the largest whole units between the two
-/// calendar dates. The iso8601 and linear calendars use the ISO arithmetic;
-/// the others run the same surpasses loop over `calendar_date_add` (the
-/// leap-month years and the months-in-year balance make the hebrew counts
-/// differ from the ISO ones).
+/// CalendarDateAdd for the 12/13-month solar calendars: the calendar fields
+/// of the date, the years/months balanced against the year's own month count,
+/// the day constrained against the month length, and the weeks/days applied
+/// as fixed-date arithmetic.
+#[allow(clippy::too_many_arguments)]
+fn solar_date_add(
+    calendar: &str,
+    date: (i64, i64, i64),
+    years: i64,
+    months: i64,
+    weeks: i64,
+    days: i64,
+    constrain: bool,
+) -> Option<(i64, i64, i64)> {
+    let (year, month, cd) = calendar_year_month_add(calendar, date, years, months)?;
+    let max = calendar_days_in_month(calendar, year, month)?;
+    let day = if cd > max {
+        if constrain {
+            max
+        } else {
+            return None;
+        }
+    } else {
+        cd
+    };
+    let (y, m, d) = calendar_date_to_iso(calendar, year, month, day)?;
+    let rd = iso::iso_date_to_epoch_days(y, m - 1, d) + RD_OFFSET + days + 7 * weeks;
+    Some(iso::epoch_days_to_iso_date(rd - RD_OFFSET))
+}
+
+/// The (calendar year, calendar month, source day) of the date plus the
+/// years/months: the calendar's own month logic (the hebrew M05L/M06
+/// resolution, the chinese leap-month codes, the 12-month balance of the
+/// tabular Islamic and solar calendars) with the source day kept
+/// unconstrained — the CalendarDateUntil years/months phase, which constrains
+/// the day only after the years and months are determined. A leap-month code
+/// missing from the target year keeps the source ordinal in the pure-years
+/// phase (the leap-months fixtures pin M04L + 1y as 12 months to M04 but
+/// 1y 1mo to M05) and folds in the months phase (the constrained add).
+fn calendar_year_month_add(
+    calendar: &str,
+    date: (i64, i64, i64),
+    years: i64,
+    months: i64,
+) -> Option<(i64, i64, i64)> {
+    let rd = iso::iso_date_to_epoch_days(date.0, date.1 - 1, date.2) + RD_OFFSET;
+    match calendar {
+        "hebrew" => {
+            let (hy, hm, hd) = hebrew_from_fixed(rd);
+            let code = hebrew_month_code(hy, hm);
+            let mut year = hy + years;
+            let resolved = resolve_calendar_month(calendar, year, None, Some(&code));
+            let month = match resolved {
+                Some(m) => m,
+                // The leap code missing from the target year (M05L in a
+                // common year): the pure-years phase keeps the source
+                // ordinal, the months phase folds to the regular month.
+                None if months == 0 => hm,
+                None => {
+                    resolve_calendar_month_with_overflow("hebrew", year, None, Some(&code), true)?
+                }
+            };
+            let mut month = month + months;
+            while month < 1 {
+                year -= 1;
+                month += hebrew_months_in_year(year);
+            }
+            while month > hebrew_months_in_year(year) {
+                month -= hebrew_months_in_year(year);
+                year += 1;
+            }
+            Some((year, month, hd))
+        }
+        "chinese" | "dangi" => {
+            let (ly, lm, ld) = lunar_from_fixed(calendar, rd);
+            let code = lunar_month_code(calendar, ly, lm);
+            let mut year = ly + years;
+            let resolved = resolve_calendar_month(calendar, year, None, Some(&code));
+            let month = match resolved {
+                Some(m) => m,
+                // The leap code missing from the target year (M04L in a
+                // common year): the pure-years phase keeps the source ordinal,
+                // the months phase folds to the regular month.
+                None if months == 0 => lm,
+                None => {
+                    resolve_calendar_month_with_overflow(calendar, year, None, Some(&code), true)?
+                }
+            };
+            let mut month = month + months;
+            while month < 1 {
+                year -= 1;
+                month += lunar_months_in_year(lunar_year_data(calendar, year).2);
+            }
+            while month > lunar_months_in_year(lunar_year_data(calendar, year).2) {
+                month -= lunar_months_in_year(lunar_year_data(calendar, year).2);
+                year += 1;
+            }
+            Some((year, month, ld))
+        }
+        "islamic-civil" | "islamic-tbla" => {
+            let (iy, im, id) = islamic_from_fixed(rd, islamic_epoch(calendar)?);
+            let (year, month) = iso::balance_iso_year_month(iy + years, im + months);
+            Some((year, month, id))
+        }
+        _ => {
+            let (cy, cm, cd) = calendar_iso_to_date(calendar, date.0, date.1, date.2)?;
+            let mut year = cy + years;
+            let mut month = cm + months;
+            while month < 1 {
+                year -= 1;
+                month += calendar_months_in_year(calendar, year)?;
+            }
+            while month > calendar_months_in_year(calendar, year)? {
+                month -= calendar_months_in_year(calendar, year)?;
+                year += 1;
+            }
+            Some((year, month, cd))
+        }
+    }
+}
+
+/// CalendarDateUntil (spec 12.3.9 / the era-monthcode NonISODateUntil): the
+/// largest whole units between the two calendar dates. The iso8601 and linear
+/// calendars use the ISO arithmetic; the others walk the candidate units with
+/// NonISODateSurpasses — the years candidate compares the target year with the
+/// source MONTH CODE (a leap month compares by its code position, so chinese
+/// M04L sits between M04 and M05), the months candidate folds a missing leap
+/// code, balances the months at day 1 and compares with the source day, and
+/// the weeks/days candidates balance the constrained day against the target.
 pub fn calendar_date_until(
     calendar: &str,
     one: (i64, i64, i64),
@@ -906,16 +1516,7 @@ pub fn calendar_date_until(
 ) -> (i64, i64, i64, i64) {
     if matches!(
         calendar,
-        "iso8601"
-            | "gregory"
-            | "buddhist"
-            | "japanese"
-            | "roc"
-            | "indian"
-            | "persian"
-            | "coptic"
-            | "ethiopic"
-            | "ethioaa"
+        "iso8601" | "gregory" | "buddhist" | "japanese" | "roc"
     ) {
         return iso::calendar_date_until(one, two, largest_unit);
     }
@@ -958,7 +1559,11 @@ pub fn calendar_date_until(
 }
 
 /// Whether adding the given units to `one` has crossed `two` in the sign
-/// direction (the CalendarDateUntil loop, with the overflow constrained).
+/// direction (the era-monthcode NonISODateSurpasses). The years/months
+/// candidates compare the calendar fields with the source day kept
+/// unconstrained (the intercalary-month fixtures pin "day is constrained after
+/// determining number of years and months added"); the weeks/days candidates
+/// balance the constrained day.
 #[allow(clippy::too_many_arguments)]
 fn calendar_date_surpasses(
     calendar: &str,
@@ -970,10 +1575,134 @@ fn calendar_date_surpasses(
     weeks: i64,
     days: i64,
 ) -> bool {
-    let Some(added) = calendar_date_add(calendar, one, years, months, weeks, days, true) else {
+    let Some((py, pm, pd)) = calendar_iso_to_date(calendar, one.0, one.1, one.2) else {
         return true;
     };
-    sign * iso::compare_iso_date(added, two) > 0
+    let Some((ty, tm, td)) = calendar_iso_to_date(calendar, two.0, two.1, two.2) else {
+        return true;
+    };
+    let code = calendar_month_code(calendar, py, pm);
+    let y0 = py + years;
+    // The years phase: the shifted year with the source month CODE and day
+    // against the target (the leap month compares by its code position).
+    if calendar_surpasses_code(sign, y0, &code, pd, ty, tm, td, calendar) {
+        return true;
+    }
+    // The months phase: the constrained month code's ordinal plus the months,
+    // balanced at day 1, compared with the source day.
+    let m0 =
+        resolve_calendar_month_with_overflow(calendar, y0, None, Some(&code), true).unwrap_or(pm);
+    let Some((my, mm, _)) = balance_non_iso_date(calendar, y0, m0 + months, 1) else {
+        return true;
+    };
+    if calendar_surpasses_ordinal(sign, my, mm, pd, ty, tm, td) {
+        return true;
+    }
+    if weeks == 0 && days == 0 {
+        return false;
+    }
+    // The weeks/days phases: the constrained day at the end of the
+    // months-added month, plus the weeks/days, balanced against the target.
+    let Some((ey, em, ed)) = balance_non_iso_date(calendar, my, mm + 1, 0) else {
+        return true;
+    };
+    let base = pd.min(ed);
+    let Some((by, bm, bd)) = balance_non_iso_date(calendar, ey, em, base + 7 * weeks + days) else {
+        return true;
+    };
+    calendar_surpasses_ordinal(sign, by, bm, bd, ty, tm, td)
+}
+
+/// Whether the (year, monthCode, day) candidate surpasses the target calendar
+/// fields (the spec's CompareSurpasses for the years phase: the month codes
+/// compare lexicographically, so a leap month sits between its neighbors).
+#[allow(clippy::too_many_arguments)]
+fn calendar_surpasses_code(
+    sign: i64,
+    year: i64,
+    code: &str,
+    day: i64,
+    ty: i64,
+    tm: i64,
+    td: i64,
+    calendar: &str,
+) -> bool {
+    if year != ty {
+        return sign * (year - ty) > 0;
+    }
+    let tcode = calendar_month_code(calendar, ty, tm);
+    match code.cmp(&tcode) {
+        std::cmp::Ordering::Less => sign < 0,
+        std::cmp::Ordering::Greater => sign > 0,
+        std::cmp::Ordering::Equal => sign * (day - td) > 0,
+    }
+}
+
+/// Whether the (year, ordinal month, day) candidate surpasses the target
+/// calendar fields (the spec's CompareSurpasses for the months/days phases).
+fn calendar_surpasses_ordinal(
+    sign: i64,
+    year: i64,
+    month: i64,
+    day: i64,
+    ty: i64,
+    tm: i64,
+    td: i64,
+) -> bool {
+    if year != ty {
+        return sign * (year - ty) > 0;
+    }
+    if month != tm {
+        return sign * (month - tm) > 0;
+    }
+    sign * (day - td) > 0
+}
+
+/// BalanceNonISODate (the era-monthcode spec): the potentially out-of-range
+/// month and day overflow into the next-highest unit against the calendar's
+/// own month count and month lengths.
+fn balance_non_iso_date(
+    calendar: &str,
+    year: i64,
+    month: i64,
+    day: i64,
+) -> Option<(i64, i64, i64)> {
+    let mut y = year;
+    let mut m = month;
+    let mut months_in_year = calendar_months_in_year(calendar, y)?;
+    while m <= 0 {
+        y -= 1;
+        months_in_year = calendar_months_in_year(calendar, y)?;
+        m += months_in_year;
+    }
+    while m > months_in_year {
+        m -= months_in_year;
+        y += 1;
+        months_in_year = calendar_months_in_year(calendar, y)?;
+    }
+    let mut d = day;
+    let mut days_in_month = calendar_days_in_month(calendar, y, m)?;
+    while d <= 0 {
+        m -= 1;
+        if m == 0 {
+            y -= 1;
+            months_in_year = calendar_months_in_year(calendar, y)?;
+            m = months_in_year;
+        }
+        days_in_month = calendar_days_in_month(calendar, y, m)?;
+        d += days_in_month;
+    }
+    while d > days_in_month {
+        d -= days_in_month;
+        m += 1;
+        if m > months_in_year {
+            y += 1;
+            months_in_year = calendar_months_in_year(calendar, y)?;
+            m = 1;
+        }
+        days_in_month = calendar_days_in_month(calendar, y, m)?;
+    }
+    Some((y, m, d))
 }
 
 /// The days in a calendar year (for the daysInYear getter).
@@ -981,10 +1710,25 @@ pub fn calendar_days_in_year(calendar: &str, year: i64) -> Option<i64> {
     match calendar {
         "hebrew" => Some(hebrew_year_length(year)),
         "islamic-civil" | "islamic-tbla" => Some(if islamic_leap_year(year) { 355 } else { 354 }),
+        "islamic-umalqura" => umalqura_year_length(year),
         "chinese" | "dangi" => {
             let (_, lens, leap) = lunar_year_data(calendar, year);
             Some(lens[..lunar_months_in_year(leap) as usize].iter().sum())
         }
+        "coptic" | "ethiopic" => Some(365 + i64::from(coptic_leap_year(year))),
+        "ethioaa" => Some(365 + i64::from(coptic_leap_year(year - 5500))),
+        "buddhist" => Some(if iso::is_leap_year(year - 543) {
+            366
+        } else {
+            365
+        }),
+        "roc" => Some(if iso::is_leap_year(year + 1911) {
+            366
+        } else {
+            365
+        }),
+        "persian" => Some(365 + i64::from(persian_leap_year(year))),
+        "indian" => Some(365 + i64::from(saka_leap_year(year))),
         _ => None,
     }
 }
@@ -994,7 +1738,14 @@ pub fn calendar_in_leap_year(calendar: &str, year: i64) -> Option<bool> {
     match calendar {
         "hebrew" => Some(hebrew_months_in_year(year) == 13),
         "islamic-civil" | "islamic-tbla" => Some(islamic_leap_year(year)),
+        "islamic-umalqura" => umalqura_year_length(year).map(|l| l == 355),
         "chinese" | "dangi" => Some(lunar_year_data(calendar, year).2.is_some()),
+        "coptic" | "ethiopic" => Some(coptic_leap_year(year)),
+        "ethioaa" => Some(coptic_leap_year(year - 5500)),
+        "buddhist" => Some(iso::is_leap_year(year - 543)),
+        "roc" => Some(iso::is_leap_year(year + 1911)),
+        "persian" => Some(persian_leap_year(year)),
+        "indian" => Some(saka_leap_year(year)),
         _ => None,
     }
 }
@@ -1009,10 +1760,25 @@ pub fn calendar_day_of_year(calendar: &str, year: i64, month: i64, day: i64) -> 
                 islamic_to_fixed(year, month, day, epoch) - islamic_to_fixed(year, 1, 1, epoch) + 1,
             )
         }
+        "islamic-umalqura" => {
+            let rd = umalqura_to_fixed(year, month, day)?;
+            Some(rd - umalqura_to_fixed(year, 1, 1)? + 1)
+        }
         "chinese" | "dangi" => {
             let rd = lunar_to_fixed(calendar, year, month, day)?;
             Some(rd - lunar_to_fixed(calendar, year, 1, 1)? + 1)
         }
+        "buddhist" => Some(
+            iso::iso_date_to_epoch_days(year - 543, month - 1, day)
+                - iso::iso_date_to_epoch_days(year - 543, 0, 1)
+                + 1,
+        ),
+        "coptic" | "ethiopic" => {
+            Some(coptic_to_fixed(year, month, day) - coptic_year_start(year) + 1)
+        }
+        "ethioaa" => Some(ethioaa_to_fixed(year, month, day) - ethioaa_to_fixed(year, 1, 1) + 1),
+        "persian" => Some(persian_to_fixed(year, month, day) - persian_year_start(year) + 1),
+        "indian" => Some(saka_to_fixed(year, month, day) - saka_year_start(year) + 1),
         _ => None,
     }
 }
@@ -1507,6 +2273,130 @@ mod tests {
                 iso::Unit::Year
             ),
             (1, 0, 0, 10)
+        );
+    }
+
+    #[test]
+    fn solar_calendar_roundtrip_anchors() {
+        // The roundtrip-from-property-bag anchors: ISO 2000-01-01 and
+        // ISO 1-01-01 in each solar calendar, plus the leap classifications
+        // the inLeapYear fixtures pin.
+        let anchors = [
+            ("buddhist", (2000, 1, 1), (2543, 1, 1)),
+            ("buddhist", (1, 1, 1), (544, 1, 1)),
+            ("coptic", (2000, 1, 1), (1716, 4, 22)),
+            ("coptic", (1, 1, 1), (-283, 5, 8)),
+            ("ethioaa", (2000, 1, 1), (7492, 4, 22)),
+            ("ethioaa", (1, 1, 1), (5493, 5, 8)),
+            ("ethiopic", (2000, 1, 1), (1992, 4, 22)),
+            ("ethiopic", (1, 1, 1), (-7, 5, 8)),
+            ("indian", (2000, 1, 1), (1921, 10, 11)),
+            ("indian", (1, 1, 1), (-78, 10, 11)),
+            ("persian", (2000, 1, 1), (1378, 10, 11)),
+            ("persian", (1, 1, 1), (-621, 10, 11)),
+            ("islamic-civil", (2000, 1, 1), (1420, 9, 24)),
+            ("islamic-civil", (1, 1, 1), (-640, 5, 18)),
+            ("islamic-umalqura", (2000, 1, 1), (1420, 9, 24)),
+            ("islamic-umalqura", (1, 1, 1), (-640, 5, 18)),
+        ];
+        for (calendar, iso_date, cal_date) in anchors {
+            assert_eq!(
+                calendar_iso_to_date(calendar, iso_date.0, iso_date.1, iso_date.2),
+                Some(cal_date),
+                "{calendar} ISO {iso_date:?}"
+            );
+            assert_eq!(
+                calendar_date_to_iso(calendar, cal_date.0, cal_date.1, cal_date.2),
+                Some(iso_date),
+                "{calendar} roundtrip {cal_date:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn solar_calendar_leap_years() {
+        // The inLeapYear fixtures: coptic 1687, 1691, ... (3 mod 4); indian
+        // 1894, 1898, ... ((y+78) Gregorian leap); ethioaa/ethiopic 7463,
+        // 7467, ... (3 mod 4 in the Amete Alem numbering).
+        assert!(calendar_in_leap_year("coptic", 1687) == Some(true));
+        assert!(calendar_in_leap_year("coptic", 1686) == Some(false));
+        assert!(calendar_in_leap_year("indian", 1894) == Some(true));
+        assert!(calendar_in_leap_year("indian", 1893) == Some(false));
+        assert!(calendar_in_leap_year("ethioaa", 7463) == Some(true));
+        assert!(calendar_in_leap_year("ethioaa", 7462) == Some(false));
+        assert!(calendar_in_leap_year("ethiopic", 7463) == Some(true));
+        assert!(calendar_in_leap_year("persian", 1395) == Some(true));
+        assert!(calendar_in_leap_year("persian", 1396) == Some(false));
+        // The coptic 13th month: 6 days in leap years, 5 otherwise.
+        assert_eq!(calendar_days_in_month("coptic", 1739, 13), Some(6));
+        assert_eq!(calendar_days_in_month("coptic", 1740, 13), Some(5));
+        // The indian leap day is 31 Chaitra (M01); common years have 30.
+        assert_eq!(calendar_days_in_month("indian", 1894, 1), Some(31));
+        assert_eq!(calendar_days_in_month("indian", 1895, 1), Some(30));
+        // The umalqura pinned month layouts (daysInMonth fixture).
+        assert_eq!(
+            calendar_days_in_month("islamic-umalqura", 1390, 1),
+            Some(29)
+        );
+        assert_eq!(
+            calendar_days_in_month("islamic-umalqura", 1390, 2),
+            Some(30)
+        );
+        assert_eq!(
+            calendar_days_in_month("islamic-umalqura", 1391, 1),
+            Some(29)
+        );
+        assert!(calendar_in_leap_year("islamic-umalqura", 1390) == Some(true));
+        assert!(calendar_in_leap_year("islamic-umalqura", 1391) == Some(false));
+    }
+
+    #[test]
+    fn persian_nowruz_dates() {
+        // The persian-new-year-dates fixture: 1 Farvardin of 1206-1498.
+        assert_eq!(
+            calendar_date_to_iso("persian", 1206, 1, 1),
+            Some(iso(1827, 3, 22))
+        );
+        assert_eq!(
+            calendar_date_to_iso("persian", 1301, 1, 1),
+            Some(iso(1922, 3, 22))
+        );
+        assert_eq!(
+            calendar_date_to_iso("persian", 1375, 1, 1),
+            Some(iso(1996, 3, 20))
+        );
+        assert_eq!(
+            calendar_date_to_iso("persian", 1399, 1, 1),
+            Some(iso(2020, 3, 20))
+        );
+        assert_eq!(
+            calendar_date_to_iso("persian", 1498, 1, 1),
+            Some(iso(2119, 3, 21))
+        );
+    }
+
+    #[test]
+    fn coptic_until_intercalary() {
+        // commonLast (1738 M13-05) → leapLast (1739 M13-06): 13 months + 1
+        // day; leapLast → common2Last (1740 M13-05): 12 months + 29 days.
+        let common_last = calendar_date_to_iso("coptic", 1738, 13, 5).unwrap();
+        let leap_last = calendar_date_to_iso("coptic", 1739, 13, 6).unwrap();
+        assert_eq!(
+            calendar_date_until("coptic", common_last, leap_last, iso::Unit::Month),
+            (0, 13, 0, 1)
+        );
+        assert_eq!(
+            calendar_date_until("coptic", common_last, leap_last, iso::Unit::Year),
+            (1, 0, 0, 1)
+        );
+        assert_eq!(
+            calendar_date_until("coptic", common_last, leap_last, iso::Unit::Day),
+            (0, 0, 0, 366)
+        );
+        let common2_last = calendar_date_to_iso("coptic", 1740, 13, 5).unwrap();
+        assert_eq!(
+            calendar_date_until("coptic", leap_last, common2_last, iso::Unit::Month),
+            (0, 12, 0, 29)
         );
     }
 }

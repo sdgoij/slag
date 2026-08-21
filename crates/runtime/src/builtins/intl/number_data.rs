@@ -159,9 +159,7 @@ pub const SUPPORTED_CALENDARS: &[&str] = &[
     "gregory",
     "hebrew",
     "indian",
-    "islamic",
     "islamic-civil",
-    "islamic-rgsa",
     "islamic-tbla",
     "islamic-umalqura",
     "iso8601",
@@ -600,7 +598,6 @@ pub const SUPPORTED_TIME_ZONES: &[&str] = &[
     "Europe/Malta",
     "Europe/Mariehamn",
     "Europe/Minsk",
-
     "Europe/Moscow",
     "Europe/Oslo",
     "Europe/Paris",

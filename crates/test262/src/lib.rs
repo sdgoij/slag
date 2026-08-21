@@ -12421,6 +12421,10 @@ var $DONE = function (error) {
         "Intl.Segmenter",
         "Intl.DurationFormat",
         "Intl-enumeration",
+        // The era-monthcode proposal (Cut 9): the era fields and the
+        // chinese/dangi month codes it exercises are implemented with the
+        // lunisolar calendars.
+        "Intl.Era-monthcode",
     ];
 
     /// The first unimplemented ECMA-402 feature a fixture tags, or `None`.

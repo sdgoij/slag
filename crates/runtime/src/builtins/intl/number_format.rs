@@ -2391,7 +2391,7 @@ fn unwrap_number_format(agent: &mut Agent, nf: &Value) -> Result<Value, JsError>
     if !agent.intl_number_format_data.contains_key(&obj.id())
         && ordinary_has_instance_number_format(agent, nf)
     {
-        let key = PropertyKey::Symbol(fallback_symbol());
+        let key = PropertyKey::Symbol(fallback_symbol(agent)?);
         let value = crate::context::get_property_key(agent, nf, &key, nf.clone())?;
         if value.is_undefined() {
             return Err(type_error(
@@ -2403,16 +2403,25 @@ fn unwrap_number_format(agent: &mut Agent, nf: &Value) -> Result<Value, JsError>
     Ok(nf.clone())
 }
 
-/// The %Intl%.[[FallbackSymbol]] (a private symbol with the description
-/// "IntlLegacyConstructedSymbol").
-pub(crate) fn fallback_symbol() -> crux::symbol::Symbol {
-    use std::sync::OnceLock;
-    static SYMBOL: OnceLock<crux::symbol::Symbol> = OnceLock::new();
-    SYMBOL
-        .get_or_init(|| {
-            crux::symbol::Symbol::new(Some(JsString::from_utf8("IntlLegacyConstructedSymbol")))
-        })
-        .clone()
+/// The %Intl%.[[FallbackSymbol]] of the current realm: a per-realm private
+/// symbol with the description "IntlLegacyConstructedSymbol", cached in the
+/// realm intrinsics (the FallbackSymbol/per-realm fixture pins that two
+/// realms get distinct symbols).
+pub(crate) fn fallback_symbol(agent: &Agent) -> Result<crux::symbol::Symbol, JsError> {
+    const INTL_FALLBACK_SYMBOL: &str = "%Intl.FallbackSymbol%";
+    let realm = agent.current_realm()?;
+    if let Some(value) = realm.intrinsics.get(INTL_FALLBACK_SYMBOL)
+        && let ValueKind::Symbol(sym) = value.kind()
+    {
+        return Ok(sym.as_ref().clone());
+    }
+    let symbol =
+        crux::symbol::Symbol::new(Some(JsString::from_utf8("IntlLegacyConstructedSymbol")));
+    realm.intrinsics.define(
+        INTL_FALLBACK_SYMBOL,
+        Value::Symbol(Handle::new(symbol.clone())),
+    );
+    Ok(symbol)
 }
 
 /// Install `Intl.NumberFormat` and its prototype (ECMA-402 §16).
@@ -2629,7 +2638,7 @@ fn construct_inner(
         if is_instance {
             let inner = create_instance(agent, Some(&proto), record)?;
             this_obj.define_property_key(
-                &PropertyKey::Symbol(fallback_symbol()),
+                &PropertyKey::Symbol(fallback_symbol(agent)?),
                 &PropertyDescriptor {
                     value: Some(inner.clone()),
                     writable: Some(false),

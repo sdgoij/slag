@@ -193,10 +193,38 @@ pub fn create_temporal_object(
     Ok(Value::Object(object))
 }
 
+/// Whether the calendar identifier is in the supported Temporal set (the
+/// era-monthcode available-calendars list): the from/islamic.js and
+/// future-calendar.js fixtures pin the RangeError for "islamic",
+/// "islamic-rgsa", and the not-yet-supported calendars.
+pub fn calendar_id_supported(calendar: &str) -> bool {
+    matches!(
+        calendar,
+        "buddhist"
+            | "chinese"
+            | "coptic"
+            | "dangi"
+            | "ethioaa"
+            | "ethiopic"
+            | "gregory"
+            | "hebrew"
+            | "indian"
+            | "islamic-civil"
+            | "islamic-tbla"
+            | "islamic-umalqura"
+            | "iso8601"
+            | "japanese"
+            | "persian"
+            | "roc"
+    )
+}
+
 /// CanonicalizeCalendar (ECMA-402 §6.9.2): lowercase the identifier, apply
 /// the two alias mappings (islamicc → islamic-civil, ethiopic-amete-alem →
-/// ethioaa), and validate the well-formed type-identifier form (each subtag
-/// 3-8 ASCII alphanumerics, `-`-separated). `None` when malformed.
+/// ethioaa), validate the well-formed type-identifier form (each subtag 3-8
+/// ASCII alphanumerics, `-`-separated), and require the supported set (the
+/// era-monthcode available-calendars list). `None` when malformed or
+/// unsupported.
 pub fn canonicalize_calendar_id(text: &str) -> Option<String> {
     let lower = text.to_ascii_lowercase();
     let canonical = match lower.as_str() {
@@ -209,7 +237,8 @@ pub fn canonicalize_calendar_id(text: &str) -> Option<String> {
     }
     if canonical.split('-').all(|subtag| {
         (3..=8).contains(&subtag.len()) && subtag.bytes().all(|b| b.is_ascii_alphanumeric())
-    }) {
+    }) && calendar_id_supported(&canonical)
+    {
         Some(canonical)
     } else {
         None

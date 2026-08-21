@@ -102,6 +102,41 @@ const ERA_NAMES: [&[&str; 2]; 3] = [
     &["B", "A"],
 ];
 
+/// The calendar era names: (calendar, era code) → [long, short, narrow]. The
+/// en locale only (the era names of the other calendars are not pinned by the
+/// corpus beyond distinct non-empty values).
+fn calendar_era_name(
+    calendar: &str,
+    code: &str,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    match (calendar, code) {
+        ("islamic-civil" | "islamic-tbla" | "islamic-umalqura", "bh") => {
+            Some(("Before Hijrah", "BH", "BH"))
+        }
+        ("islamic-civil" | "islamic-tbla" | "islamic-umalqura", "ah") => {
+            Some(("Anno Hegirae", "AH", "AH"))
+        }
+        ("roc", "broc") => Some(("Before R.O.C.", "B.R.O.C.", "B")),
+        ("roc", "roc") => Some(("Minguo", "Minguo", "M")),
+        ("japanese", "meiji") => Some(("Meiji", "Meiji", "M")),
+        ("japanese", "taisho") => Some(("Taisho", "Taisho", "T")),
+        ("japanese", "showa") => Some(("Showa", "Showa", "S")),
+        ("japanese", "heisei") => Some(("Heisei", "Heisei", "H")),
+        ("japanese", "reiwa") => Some(("Reiwa", "Reiwa", "R")),
+        ("buddhist", "be") => Some(("B.E.", "BE", "BE")),
+        ("coptic", "am") | ("hebrew", "am") => Some(("AM", "AM", "AM")),
+        ("ethioaa", "aa") => Some(("AA", "AA", "AA")),
+        ("ethiopic", "aa") => Some(("AA", "AA", "AA")),
+        ("ethiopic", "am") => Some(("AM", "AM", "AM")),
+        ("indian", "shaka") => Some(("Shaka", "Shaka", "Shaka")),
+        ("persian", "ap") => Some(("AP", "AP", "AP")),
+        // The bce/ce pair shares the gregorian names.
+        ("japanese" | "gregory", "bce") => Some(("Before Christ", "BC", "B")),
+        ("japanese" | "gregory", "ce") => Some(("Anno Domini", "AD", "A")),
+        _ => None,
+    }
+}
+
 /// The day period of an hour (0-23): morning, noon, afternoon, evening,
 /// night (the en-US CLDR ranges the corpus pins: 0-11 morning, 12 noon,
 /// 13-17 afternoon, 18-20 evening, 21-23 night).
@@ -389,6 +424,10 @@ fn resolve_locale_dtf(
             && !value.is_empty()
         {
             let value = crate::builtins::intl::bcp47::canonicalize_uvalue("ca", &value);
+            let value = match value.as_str() {
+                "islamic" | "islamic-rgsa" => "islamic-civil".to_string(),
+                other => other.to_string(),
+            };
             if supported_calendars().contains(&value.as_str()) {
                 ca = value.clone();
                 supported.push(("ca".to_string(), value));
@@ -413,8 +452,14 @@ fn resolve_locale_dtf(
     }
     // The option overrides: a supported option value replaces the
     // extension value and drops the corresponding keyword from the locale.
+    // The deprecated "islamic"/"islamic-rgsa" ids fall back to a supported
+    // calendar (the constructor-options-calendar-islamic-fallback fixture).
     if let Some(value) = calendar {
         let value = crate::builtins::intl::bcp47::canonicalize_uvalue("ca", value);
+        let value = match value.as_str() {
+            "islamic" | "islamic-rgsa" => "islamic-civil".to_string(),
+            other => other.to_string(),
+        };
         if supported_calendars().contains(&value.as_str()) && value != ca {
             ca = value;
             supported.retain(|(key, _)| key != "ca");
@@ -789,6 +834,14 @@ fn initialize(
             requested_bits |= 1024;
             explicit_bits |= 1024;
         }
+    }
+    // The chinese/dangi calendars have no eras: the era component is not
+    // used there (the formatToParts era fixture pins no era part even when
+    // era is requested). The explicit bits stay for the style-conflict
+    // check; the requested bits drop the era so no pattern gains a G field.
+    if matches!(calendar.as_str(), "chinese" | "dangi") {
+        fields.retain(|(name, _)| name != "era");
+        requested_bits &= !2;
     }
     // The non-gregorian calendars format with an era field (V8 adds the
     // era to the japanese/islamic/hebrew etc. patterns; the corpus only
@@ -1345,7 +1398,7 @@ fn format_with_pattern(
             }
             'G' => {
                 let width = field_length(&mut chars, c);
-                Some(("era", format_era(&local, width)))
+                Some(("era", format_era(&local, width, &record.calendar)))
             }
             'z' | 'v' | 'V' => {
                 let width = field_length(&mut chars, c);
@@ -1938,9 +1991,28 @@ fn format_day_period(local: &LocalTime, record: &DateTimeFormatRecord) -> String
     }
 }
 
-/// The era name of the gregorian era: short (`G`), long (`GGGG`), or
-/// narrow (`GGGGG`).
-fn format_era(local: &LocalTime, width: u32) -> String {
+/// The era name of the date: the calendar-specific era of the ISO date
+/// (the formatToParts era fixtures pin distinct eras per calendar), falling
+/// back to the gregorian BC/AD names.
+fn format_era(local: &LocalTime, width: u32, calendar: &str) -> String {
+    let era = crate::builtins::temporal::shell::calendar_date_era(
+        calendar,
+        local.year,
+        local.month as i64,
+        local.day as i64,
+    );
+    if let Some(code) = era
+        && let Some((long, short, narrow)) = calendar_era_name(calendar, code)
+    {
+        return if width >= 5 {
+            narrow
+        } else if width >= 4 {
+            long
+        } else {
+            short
+        }
+        .to_string();
+    }
     let era_index = if local.year <= 0 { 0 } else { 1 };
     let table = if width >= 5 {
         ERA_NAMES[2]
@@ -2209,9 +2281,9 @@ fn date_time_format_record(agent: &Agent, this: &Value) -> Result<DateTimeFormat
 }
 
 /// The `[[FallbackSymbol]]` used by the legacy constructor mode (shared
-/// with NumberFormat — it is `%Intl%.[[FallbackSymbol]]`).
-fn fallback_symbol() -> crux::symbol::Symbol {
-    number_format::fallback_symbol()
+/// with NumberFormat — it is `%Intl%.[[FallbackSymbol]]`, per-realm).
+fn fallback_symbol(agent: &Agent) -> Result<crux::symbol::Symbol, JsError> {
+    number_format::fallback_symbol(agent)
 }
 
 /// The dateTimeFormat record after the legacy-constructor unwrap.
@@ -2223,7 +2295,7 @@ fn unwrap_date_time_format(agent: &mut Agent, this: &Value) -> Result<Value, JsE
         if let Ok(inner) = crate::context::get_property_key(
             agent,
             &Value::Object(obj.clone()),
-            &PropertyKey::Symbol(fallback_symbol()),
+            &PropertyKey::Symbol(fallback_symbol(agent)?),
             Value::Object(obj.clone()),
         ) && as_object(&inner).is_some()
         {
@@ -3122,7 +3194,7 @@ fn construct_inner(
     {
         let inner = create_instance(agent, proto, record)?;
         this_obj.define_property_key(
-            &PropertyKey::Symbol(fallback_symbol()),
+            &PropertyKey::Symbol(fallback_symbol(agent)?),
             &PropertyDescriptor {
                 value: Some(inner.clone()),
                 writable: Some(false),
