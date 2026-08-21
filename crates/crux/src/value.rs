@@ -355,7 +355,7 @@ pub fn type_of(value: &Value) -> &'static str {
     }
     match value.tag() {
         TAG_UNDEFINED => "undefined",
-        TAG_NULL => "null",
+        TAG_NULL => "object",
         TAG_FALSE | TAG_TRUE => "boolean",
         TAG_BIGINT => "bigint",
         TAG_STRING => "string",
@@ -364,16 +364,7 @@ pub fn type_of(value: &Value) -> &'static str {
         TAG_OBJECT => match value.as_object() {
             Some(obj) => match &obj.kind {
                 crate::object::ObjectKind::IsHTMLDDA => "undefined",
-                crate::object::ObjectKind::Proxy(slots)
-                    if slots
-                        .target
-                        .borrow()
-                        .as_ref()
-                        .map(is_callable)
-                        .unwrap_or(false) =>
-                {
-                    "function"
-                }
+                crate::object::ObjectKind::Proxy(slots) if slots.callable.get() => "function",
                 crate::object::ObjectKind::Host(ops) if ops.is_callable() => "function",
                 _ => "object",
             },
@@ -432,7 +423,7 @@ mod tests {
     #[test]
     fn type_of_all_variants() {
         assert_eq!(type_of(&Value::Undefined), "undefined");
-        assert_eq!(type_of(&Value::Null), "null");
+        assert_eq!(type_of(&Value::Null), "object");
         assert_eq!(type_of(&Value::Boolean(true)), "boolean");
         assert_eq!(type_of(&number(1.0)), "number");
         assert_eq!(

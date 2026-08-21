@@ -67,6 +67,39 @@ pub fn class_definition_evaluation_with_keys(
     )
 }
 
+/// The VM path when the class scope was already established by `ClassBegin`
+/// (so closures created in the heritage/computed-key expressions share the
+/// environment whose class-name binding `build_class` initializes).
+#[allow(clippy::too_many_arguments)]
+pub fn class_definition_evaluation_with_scope(
+    agent: &mut Agent,
+    class: &Class,
+    class_binding: Option<crux::string::AtomId>,
+    class_env: EnvRef,
+    class_private_env: Handle<crate::context::PrivateEnvironment>,
+    outer_private_env: Option<Handle<crate::context::PrivateEnvironment>>,
+    outer_env: EnvRef,
+    heritage: Option<Value>,
+    keys: &[Option<PropertyKey>],
+) -> Result<Value, JsError> {
+    let scope = ClassScope {
+        class_env,
+        class_private_env,
+        outer_private_env,
+        outer_env,
+    };
+    let heritage = resolve_heritage(agent, heritage)?;
+    build_class(
+        agent,
+        class,
+        class_binding,
+        true,
+        scope,
+        heritage,
+        Some(keys),
+    )
+}
+
 /// The class scope environment, the class PrivateEnvironment, and the
 /// environments to restore once the definition completes (spec 15.7.14 steps
 /// 2-11).

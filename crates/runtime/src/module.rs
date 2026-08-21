@@ -1442,7 +1442,12 @@ fn execute_module_body(
         Err(error) => {
             agent.execution_context_stack.pop();
             module.status.replace(ModuleStatus::Evaluated);
-            return Err(error);
+            // A synchronous engine error (an unresolved identifier, a failed
+            // coercion, ...) carries its thrown value so runtime-phase
+            // negative expectations can check the error constructor (the
+            // explicit-throw path rejects the capability with the value).
+            let value = crate::promise::error_value(agent, &error);
+            return Err(error.with_value(value));
         }
     }
     Ok(())
