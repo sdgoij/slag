@@ -162,6 +162,18 @@ impl EnvRecord {
         }
     }
 
+    /// Whether the env has a non-empty [[DisposableResourceStack]] — the
+    /// cheap pre-check before [`Self::drain_disposable_resources`].
+    pub fn has_disposable_resources(&self) -> bool {
+        match self {
+            EnvRecord::Declarative(e) => e.has_disposable_resources(),
+            EnvRecord::Function(e) => e.declarative.has_disposable_resources(),
+            EnvRecord::Global(e) => e.declarative.has_disposable_resources(),
+            EnvRecord::Module(e) => e.declarative.has_disposable_resources(),
+            EnvRecord::Object(_) => false,
+        }
+    }
+
     /// Take the [[DisposableResourceStack]] for DisposeResources.
     pub fn drain_disposable_resources(&self) -> Vec<DisposableResource> {
         match self {
@@ -384,6 +396,12 @@ impl DeclarativeEnv {
     /// when the scope exits.
     pub fn add_disposable_resource(&self, resource: DisposableResource) {
         self.disposable_resources.borrow_mut().push(resource);
+    }
+
+    /// Whether the disposable-resource stack is non-empty — the cheap
+    /// pre-check before [`Self::drain_disposable_resources`].
+    pub fn has_disposable_resources(&self) -> bool {
+        !self.disposable_resources.borrow().is_empty()
     }
 
     /// Take the stack for disposal, leaving the environment with none.

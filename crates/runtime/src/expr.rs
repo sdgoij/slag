@@ -2025,6 +2025,98 @@ pub fn get_iterator(agent: &mut Agent, value: &Value) -> Result<IteratorRecord, 
     Ok(IteratorRecord { iterator, next })
 }
 
+/// The for-of iterator state at loop begin: the generic protocol record, or
+/// the fast index path over a plain Array with the stock `@@iterator` (the
+/// loop then re-reads `length` and each element per step, reproducing the
+/// stock Array iterator's observable behavior without the iterator object,
+/// the per-element `next()` call, or the result-object allocation).
+pub enum ForOfState {
+    Generic(IteratorRecord),
+    FastArray(Value),
+}
+
+/// GetIterator for a `for-of` head, with the dense-Array fast path: the
+/// `@@iterator` method is fetched and invoked exactly once (identical
+/// observable behavior to [`get_iterator`]); when the result is the stock
+/// `%Array.prototype.values%` iterator over a plain Array, the fast state is
+/// returned instead. Any shadowed `@@iterator`, patched `next`/`return` on
+/// the iterator chain, or non-plain-Array receiver keeps the generic record.
+pub fn for_of_begin(agent: &mut Agent, value: &Value) -> Result<ForOfState, JsError> {
+    let method = get_method(agent, value, "@@iterator")?;
+    let Some(method) = method else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Value is not iterable".into(),
+        ));
+    };
+    let iterator = crate::function::call(agent, &method, value.clone(), &[])?;
+    if !matches!(iterator.kind(), ValueKind::Object(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Iterator must be an object".into(),
+        ));
+    }
+    let next = get_property(
+        agent,
+        &iterator,
+        &JsString::from_utf8("next"),
+        iterator.clone(),
+    )?;
+    // The stock values-iterator state: over a plain Array (a proxy whose
+    // @@iterator resolves to the intrinsic would also create an entry — its
+    // element reads must go through the traps, so it stays generic), at
+    // index 0, in the value kind, with the intrinsic `next`.
+    let stock = match iterator.kind() {
+        ValueKind::Object(object) => {
+            agent
+                .array_iter_data
+                .get(&object.id())
+                .cloned()
+                .filter(|(array, index, kind)| {
+                    *index == 0
+                        && *kind == crate::builtins::array::ArrayIterationKind::Value as u32
+                        && matches!(
+                            array.kind(),
+                            ValueKind::Object(ref array_object)
+                                if matches!(array_object.kind, crux::object::ObjectKind::Array)
+                        )
+                })
+        }
+        _ => None,
+    };
+    let intrinsic_next = agent
+        .current_realm()
+        .ok()
+        .and_then(|realm| realm.intrinsics.get("%ArrayIteratorPrototype.next%"));
+    if let Some((array, _, _)) = stock
+        && intrinsic_next.as_ref() == Some(&next)
+        && !iterator_chain_has_return(agent, &iterator)?
+    {
+        return Ok(ForOfState::FastArray(array));
+    }
+    Ok(ForOfState::Generic(IteratorRecord { iterator, next }))
+}
+
+/// Whether a `return` property exists anywhere on `iterator`'s prototype
+/// chain (own properties only, accessors never invoked): IteratorClose in
+/// the generic path would call it on a break/return/error, so the for-of
+/// fast path must not engage when one is present.
+fn iterator_chain_has_return(agent: &mut Agent, iterator: &Value) -> Result<bool, JsError> {
+    let key = PropertyKey::from_utf8("return");
+    let mut probe = match iterator.kind() {
+        ValueKind::Object(object) => Some(object),
+        _ => None,
+    };
+    while let Some(object) = probe {
+        if object.get_own_property_key(&key)?.is_some() {
+            return Ok(true);
+        }
+        probe = object.prototype.borrow().clone();
+    }
+    let _ = agent;
+    Ok(false)
+}
+
 /// The iterator's `next` method: the cached method from GetIterator, or a
 /// TypeError when it is not callable (the error surfaces at the first call,
 /// spec 7.4.2-7.4.3).

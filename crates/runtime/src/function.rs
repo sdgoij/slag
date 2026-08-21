@@ -947,10 +947,7 @@ pub fn call(
 /// id. Realm builtins identify themselves by intrinsic identity (the
 /// `%eval%` dispatch pattern), so a builtin of one realm called from
 /// another must run with its own realm current.
-pub(crate) fn owning_realm(
-    agent: &mut Agent,
-    function: &Handle<Function>,
-) -> Option<Handle<Realm>> {
+pub fn owning_realm(agent: &mut Agent, function: &Handle<Function>) -> Option<Handle<Realm>> {
     if let Some(cached) = agent.function_realms.borrow().get(&function.id()).cloned() {
         return cached;
     }
@@ -992,7 +989,10 @@ fn realm_throwable(
     }
 }
 
-fn call_inner(
+/// Call `callee` with `this` and `args`, without the [`call`] with_agent
+/// window: the VM dispatch loop already recorded the agent for the duration
+/// of `run_inner`, so the two TLS swaps per call are redundant there.
+pub(crate) fn call_inner(
     agent: &mut Agent,
     callee: &Value,
     this: Value,
@@ -1451,62 +1451,46 @@ fn ordinary_call(
     this: Value,
     args: &[Value],
 ) -> Result<Value, JsError> {
-    let function_value = function.self_value();
     // Cut 3 fast path: the body's bindings are frame slots, so no function
     // environment, `this` binding, or declaration instantiation are needed —
     // the scope analysis certified the body references none of them. The
     // context's lexical environment is the closure's captured environment;
-    // outer/global reads resolve through it. Only the slots this branch
-    // reads are cloned — the slow path's `params`/`body` AST clones are
-    // skipped entirely for a fast call (the record borrow ends at the last
-    // field read, before the branch touches `agent` mutably).
-    let ir = agent
-        .ecma_functions
-        .get(&function.id())
-        .ok_or_else(|| {
+    // outer/global reads resolve through it. The record is fetched with a
+    // scoped borrow (a `.cloned()` would deep-copy the whole record — source
+    // text, params, body AST, compiled IR — on every call); only the slots
+    // each branch reads are cloned, and the slow path's `params`/`body` AST
+    // clones are skipped entirely for a fast call.
+    let (ir, old_env, realm, strict) = {
+        let record = agent.ecma_functions.get(&function.id()).ok_or_else(|| {
             JsError::new(
                 ErrorKind::TypeError,
                 "Function body is not registered".into(),
             )
-        })?
-        .ir
-        .clone();
+        })?;
+        (
+            record.ir.clone(),
+            record.environment.clone(),
+            record.realm.clone(),
+            record.strict,
+        )
+    };
     if let Some(ir) = &ir
         && ir.scope.is_some()
     {
-        let (old_env, realm, private_environment, strict, declaring_module) = {
-            let record = agent.ecma_functions.get(&function.id()).ok_or_else(|| {
-                JsError::new(
-                    ErrorKind::TypeError,
-                    "Function body is not registered".into(),
-                )
-            })?;
-            (
-                record.environment.clone(),
-                record.realm.clone(),
-                record.private_environment.clone(),
-                record.strict,
-                record.declaring_module.clone(),
-            )
-        };
-        let caller_script_or_module = agent
-            .running_context()
-            .ok()
-            .and_then(|context| context.script_or_module.clone());
-        let script_or_module = declaring_module
-            .map(crate::context::ScriptOrModule::Module)
-            .or(caller_script_or_module);
+        // The certified body observes only the closure environment (the
+        // body env), the realm (global access), and the frame for error
+        // stacks — its certification excludes `this`/`arguments`/
+        // `new.target`/eval/import/private names/Annex B, so the pushed
+        // context's `script_or_module`/`source`/`private_environment` (all
+        // cloned on the slow path) are never consulted here.
         agent.execution_context_stack.push(ExecutionContext {
-            function: Some(function_value.clone()),
+            function: Some(Value::Function(function.clone())),
             realm,
-            script_or_module,
+            script_or_module: None,
             lexical_environment: old_env.clone(),
             variable_environment: old_env.clone(),
-            private_environment,
-            source: agent
-                .running_context()
-                .ok()
-                .and_then(|context| context.source.clone()),
+            private_environment: None,
+            source: None,
             annex_b_hoistable: Default::default(),
         });
         let result = run_compiled_body(agent, strict, ir, args);
@@ -1524,6 +1508,7 @@ fn ordinary_call(
         agent.execution_context_stack.pop();
         return result;
     }
+    let function_value = function.self_value();
     // Copy only the slots a call reads; the record also holds per-function
     // data (source text, compiled IR, class fields) whose clones would
     // re-allocate on every call.

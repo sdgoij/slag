@@ -138,11 +138,15 @@ fn run_file(file: &str, args: &[String], options: &Options) -> Result<(), u8> {
         eprintln!("slag: {file}: {e}");
         1
     })?;
+    run_file_inner(file, args, options, &source)
+}
+
+fn run_file_inner(file: &str, args: &[String], options: &Options, source: &str) -> Result<(), u8> {
     if options.dump_tokens {
-        dump_tokens(&source)?;
+        dump_tokens(source)?;
     }
     if options.dump_ast {
-        dump_ast(&source)?;
+        dump_ast(source)?;
     }
     let mut context = Context::new().map_err(report)?;
     context.install_fs().map_err(report)?;
@@ -156,7 +160,7 @@ fn run_file(file: &str, args: &[String], options: &Options) -> Result<(), u8> {
         argv.extend(args.iter().cloned());
         context.install_process_argv(&argv).map_err(report)?;
     }
-    match context.eval(&source) {
+    match context.eval(source) {
         Ok(value) => {
             println!("{value}");
             Ok(())

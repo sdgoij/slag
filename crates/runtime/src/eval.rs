@@ -427,10 +427,12 @@ pub(crate) fn dispose_env_resources(
     env: &EnvRef,
     completion: Result<Completion, JsError>,
 ) -> Result<Completion, JsError> {
-    let resources = env.drain_disposable_resources();
-    if resources.is_empty() {
+    // The overwhelmingly common case (a body with no `using`) avoids the
+    // drain's `mem::take` entirely — a plain emptiness read.
+    if !env.has_disposable_resources() {
         return completion;
     }
+    let resources = env.drain_disposable_resources();
     let mut completion = completion;
     for resource in resources.iter().rev() {
         if resource.method.is_undefined() {

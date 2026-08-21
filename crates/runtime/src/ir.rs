@@ -494,6 +494,17 @@ pub enum Step {
     ForOfBind {
         left: ForBinding,
     },
+    /// The fast `for-of` head bind for a simple `var` ident whose binding
+    /// resolved to a frame slot (Cut 3) — the element is stored directly.
+    ForOfBindLocal {
+        slot: usize,
+    },
+    /// The fast `for-of` head bind for a simple `var` ident whose binding
+    /// resolved to the global object — the element is stored via the global
+    /// cell (mirroring `StoreGlobal`).
+    ForOfBindGlobal {
+        name: crux::AtomId,
+    },
     ForOfRestore,
     ForOfClose,
     AsyncForOfBegin {
@@ -830,6 +841,9 @@ type ForInState = (Handle<crux::object::JsObject>, Vec<(usize, Value)>, usize);
 /// call allocates nothing (the bench's simple-param functions are ≤ 8
 /// slots); larger layouts fall back to the heap.
 const INLINE_FRAME: usize = 8;
+/// The direct-mapped member-access cell count (P3): a power of two so the
+/// cache index is a mask.
+const MEMBER_CELLS: usize = 16;
 
 /// The fast-path frame storage: an inline buffer for small layouts, a `Vec`
 /// otherwise.
@@ -857,6 +871,19 @@ impl Frame {
     }
 }
 
+/// An active for-of loop's iterator state: the generic iterator protocol,
+/// or the fast index path over a plain Array with the stock `@@iterator`
+/// (see [`crate::expr::for_of_begin`]). The fast path re-reads the array's
+/// `length` and each element on every step — the stock Array iterator's
+/// observable behavior (spec %ArrayIteratorPrototype%.next steps 5-7) —
+/// without the iterator object, the per-element `next()` call, or the
+/// result-object allocation.
+#[derive(Debug)]
+pub enum ForOfEntry {
+    Generic(crate::expr::IteratorRecord),
+    Fast { array: Value, index: usize },
+}
+
 /// The resumable VM state. Saved across suspension by the driver.
 #[derive(Debug)]
 pub struct Vm {
@@ -879,6 +906,25 @@ pub struct Vm {
     /// a `next()` error propagates without closing the iterator (spec
     /// 14.7.6.2 uses `?`), unlike a body or head-binding error.
     pub for_of_stepping: bool,
+    /// Resolved global-object property slots for the script-level binding
+    /// fast path (`LoadGlobal`/`StoreGlobal`/`UpdateGlobal`/`IncGlobal`/…):
+    /// the property-vector position of each declared top-level name,
+    /// re-validated on every access against the stored key — an
+    /// insert/delete/redefinition shifts or replaces slots, and the fallback
+    /// then re-resolves.
+    pub global_cells: std::collections::HashMap<crux::AtomId, usize>,
+    /// Monomorphic member-access cells (P3): a small direct-mapped cache of
+    /// (object id, name atom) → property-vector slot, re-validated on every
+    /// access against the stored key — a structural change or redefinition
+    /// falls back to the full Get and re-resolves, and a hash collision
+    /// evicts (the hot shapes are one or two pairs per loop).
+    pub member_cells: [Option<(u64, crux::AtomId, usize)>; MEMBER_CELLS],
+    /// Numeric element cells: (object id, array index) → the element's
+    /// property-vector slot and stored key atom, re-validated on every
+    /// access. A Number key converts purely (ToPropertyKey of a number runs
+    /// no user code), so a canonical array index reads the element without
+    /// the number→string→intern round-trip.
+    pub array_element_cells: [Option<(u64, u64, crux::AtomId, usize)>; MEMBER_CELLS],
     /// Whether the innermost for-await-of is awaiting its `next()` promise
     /// (`AsyncForOfNext`): a rejection propagates without closing the
     /// iterator — the close is only for body abrupt completions (spec
@@ -893,7 +939,7 @@ pub struct Vm {
     /// re-checked against its own level at visit time (spec
     /// EnumerateObjectProperties).
     pub for_in_stack: Vec<ForInState>,
-    pub for_of_stack: Vec<crate::expr::IteratorRecord>,
+    pub for_of_stack: Vec<ForOfEntry>,
     pub async_for_of_stack: Vec<crate::expr::IteratorRecord>,
     /// The `(top, end)` step span of each active for-of/for-await-of loop: a
     /// `break`/`continue` whose target lies outside the span leaves the loop,
@@ -1012,6 +1058,9 @@ impl Vm {
             thrown: None,
             resume_abrupt: None,
             for_of_stepping: false,
+            global_cells: std::collections::HashMap::new(),
+            member_cells: [None; MEMBER_CELLS],
+            array_element_cells: [None; MEMBER_CELLS],
             async_for_of_stepping: false,
             destructure_stepping: false,
             for_in_stack: Vec::new(),
@@ -1114,6 +1163,240 @@ impl Vm {
         })
     }
 
+    /// The cached property-vector slot of the global object's own data
+    /// property for a declared top-level name — valid only while the stored
+    /// key still matches and the property is still data (an
+    /// insert/delete/redefinition or an accessor conversion falls back to the
+    /// reference path and re-resolves).
+    fn global_cell_slot(&self, agent: &Agent, name: crux::AtomId) -> Option<usize> {
+        let slot = *self.global_cells.get(&name)?;
+        let global = agent.running_context().ok()?.realm.global_object.clone();
+        let props = global.properties.borrow();
+        let (key, property) = props.get(slot)?;
+        (*key == PropertyKey::String(name)
+            && matches!(property.kind, crux::object::PropertyKind::Data { .. }))
+        .then_some(slot)
+    }
+
+    /// Resolve and cache the global-object slot for a declared top-level
+    /// name (own data property only; the reference path handles the rest).
+    fn resolve_global_cell(&mut self, agent: &Agent, name: crux::AtomId) {
+        let key = PropertyKey::String(name);
+        let Some(global) = agent
+            .running_context()
+            .ok()
+            .map(|context| context.realm.global_object.clone())
+        else {
+            return;
+        };
+        let props = global.properties.borrow();
+        if let Some(slot) = props.iter().position(|(stored, property)| {
+            *stored == key && matches!(property.kind, crux::object::PropertyKind::Data { .. })
+        }) {
+            self.global_cells.insert(name, slot);
+        }
+    }
+
+    /// Read a declared top-level `var` directly off the global object: the
+    /// cached slot when still valid, else the reference path (which
+    /// re-resolves the cache).
+    fn load_global_value(
+        &mut self,
+        agent: &mut Agent,
+        name: crux::AtomId,
+    ) -> Result<Value, JsError> {
+        if let Some(slot) = self.global_cell_slot(agent, name) {
+            let global = agent.running_context()?.realm.global_object.clone();
+            let props = global.properties.borrow();
+            if let Some((_, property)) = props.get(slot)
+                && let crux::object::PropertyKind::Data { value, .. } = &property.kind
+            {
+                return Ok(value.clone());
+            }
+        }
+        let reference = self.global_reference(agent, name)?;
+        let value = crate::context::get_value(agent, &reference)?;
+        self.resolve_global_cell(agent, name);
+        Ok(value)
+    }
+
+    /// Write a declared top-level `var`: the cached slot's data property
+    /// when still valid and writable, else the reference path (which
+    /// enforces the strict-mode non-writable error and re-resolves the
+    /// cache).
+    fn store_global_value(
+        &mut self,
+        agent: &mut Agent,
+        name: crux::AtomId,
+        value: Value,
+    ) -> Result<(), JsError> {
+        if let Some(slot) = self.global_cell_slot(agent, name) {
+            let global = agent.running_context()?.realm.global_object.clone();
+            let mut props = global.properties.borrow_mut();
+            if let Some((_, property)) = props.get_mut(slot)
+                && let crux::object::PropertyKind::Data {
+                    writable: true,
+                    value: cell,
+                } = &mut property.kind
+            {
+                *cell = value;
+                return Ok(());
+            }
+        }
+        let reference = self.global_reference(agent, name)?;
+        crate::context::put_value(agent, &reference, value)?;
+        self.resolve_global_cell(agent, name);
+        Ok(())
+    }
+
+    /// The direct-mapped cache index for (object id, name atom).
+    fn member_cell_index(object_id: u64, name: crux::AtomId) -> usize {
+        (object_id as usize ^ name as usize) & (MEMBER_CELLS - 1)
+    }
+
+    /// The cached read of `object.name` — an own data property on a plain
+    /// object at the direct-mapped slot, re-validated against the stored key
+    /// and property kind. `None` falls back to the full Get (which then
+    /// re-resolves the cache).
+    fn member_cell_get(&self, object: &Value, name: crux::AtomId) -> Option<Value> {
+        let ValueKind::Object(object) = object.kind() else {
+            return None;
+        };
+        if !matches!(
+            object.kind,
+            crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array
+        ) {
+            return None;
+        }
+        let index = Self::member_cell_index(object.id(), name);
+        let (cached_id, cached_name, slot) = self.member_cells[index]?;
+        if cached_id != object.id() || cached_name != name {
+            return None;
+        }
+        let props = object.properties.borrow();
+        let (key, property) = props.get(slot)?;
+        if *key != PropertyKey::String(name) {
+            return None;
+        }
+        match &property.kind {
+            crux::object::PropertyKind::Data { value, .. } => Some(value.clone()),
+            _ => None,
+        }
+    }
+
+    /// Resolve and cache the slot of `object`'s own data property for
+    /// `name` (only plain ordinary/array objects use the linear store).
+    fn resolve_member_cell(&mut self, object: &Value, name: crux::AtomId) {
+        let ValueKind::Object(object) = object.kind() else {
+            return;
+        };
+        if !matches!(
+            object.kind,
+            crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array
+        ) {
+            return;
+        }
+        let key = PropertyKey::String(name);
+        let props = object.properties.borrow();
+        if let Some(slot) = props.iter().position(|(stored, property)| {
+            *stored == key && matches!(property.kind, crux::object::PropertyKind::Data { .. })
+        }) {
+            let index = Self::member_cell_index(object.id(), name);
+            self.member_cells[index] = Some((object.id(), name, slot));
+        }
+    }
+
+    /// The direct-mapped cache index for (object id, array index).
+    fn array_element_index(object_id: u64, index: u64) -> usize {
+        (object_id as usize ^ index as usize) & (MEMBER_CELLS - 1)
+    }
+
+    /// The cached read of `object[index]` — an own data element of a plain
+    /// Array at the direct-mapped slot, re-validated against the stored key
+    /// atom. `None` falls back to the full Get (which then re-resolves).
+    fn array_element_get(&self, object: &Value, index: u64) -> Option<Value> {
+        let ValueKind::Object(object) = object.kind() else {
+            return None;
+        };
+        if !matches!(object.kind, crux::object::ObjectKind::Array) {
+            return None;
+        }
+        let cache_index = Self::array_element_index(object.id(), index);
+        let (cached_id, cached_index, atom, slot) = self.array_element_cells[cache_index]?;
+        if cached_id != object.id() || cached_index != index {
+            return None;
+        }
+        let props = object.properties.borrow();
+        let (key, property) = props.get(slot)?;
+        if *key != PropertyKey::String(atom) {
+            return None;
+        }
+        match &property.kind {
+            crux::object::PropertyKind::Data { value, .. } => Some(value.clone()),
+            _ => None,
+        }
+    }
+
+    /// Resolve and cache the slot of `object`'s own data element at `index`.
+    fn resolve_array_element(&mut self, object: &Value, index: u64) {
+        let ValueKind::Object(object) = object.kind() else {
+            return;
+        };
+        if !matches!(object.kind, crux::object::ObjectKind::Array) {
+            return;
+        }
+        let props = object.properties.borrow();
+        if let Some((atom, slot)) =
+            props
+                .iter()
+                .enumerate()
+                .find_map(|(position, (stored, property))| {
+                    if crux::object::array_index_of(stored) == Some(index)
+                        && matches!(property.kind, crux::object::PropertyKind::Data { .. })
+                    {
+                        match stored {
+                            PropertyKey::String(atom) => Some((*atom, position)),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                })
+        {
+            let cache_index = Self::array_element_index(object.id(), index);
+            self.array_element_cells[cache_index] = Some((object.id(), index, atom, slot));
+        }
+    }
+
+    /// The length of a plain Array — always the first property-vector entry
+    /// (the stock Array iterator re-reads it every step, so this matches).
+    /// Defensively falls back to the generic read.
+    fn array_length(agent: &mut Agent, array: &Value) -> Result<u64, JsError> {
+        let ValueKind::Object(obj) = array.kind() else {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "Array length of a non-object".into(),
+            ));
+        };
+        let props = obj.properties.borrow();
+        if let Some((_, property)) = props.first()
+            && let crux::object::PropertyKind::Data { value, .. } = &property.kind
+        {
+            let number = crate::context::to_number(agent, value)?;
+            return Ok(crux::convert::to_length(number));
+        }
+        let length_value = crate::context::get_property(
+            agent,
+            array,
+            &JsString::from_utf8("length"),
+            array.clone(),
+        )?;
+        Ok(crux::convert::to_length(crate::context::to_number(
+            agent,
+            &length_value,
+        )?))
+    }
+
     /// The fused relational-imm loop test on a declared top-level var: read
     /// the global binding, abstract-compare against the constant, jump to
     /// `target` when the test is false — exactly what
@@ -1126,8 +1409,7 @@ impl Vm {
         imm: f64,
         target: usize,
     ) -> Result<(), JsError> {
-        let reference = self.global_reference(agent, name)?;
-        let left = crate::context::get_value(agent, &reference)?;
+        let left = self.load_global_value(agent, name)?;
         let right = Value::Number(imm);
         let value = crate::expr::apply_binary(agent, op, &left, &right)?;
         if !crux::convert::to_boolean(&value) {
@@ -1286,8 +1568,10 @@ impl Vm {
     /// swallowed (spec 7.4.11 steps 6-7, mirroring the tree-walker's
     /// eval_for_of error paths).
     fn close_for_of_throw(&mut self, agent: &mut Agent) {
-        while let Some(iterator) = self.for_of_stack.pop() {
-            let _ = crate::expr::iterator_close_throw(agent, &iterator);
+        while let Some(entry) = self.for_of_stack.pop() {
+            if let ForOfEntry::Generic(iterator) = entry {
+                let _ = crate::expr::iterator_close_throw(agent, &iterator);
+            }
         }
         self.for_of_boundaries.clear();
         while let Some(iterator) = self.async_for_of_stack.pop() {
@@ -1300,6 +1584,17 @@ impl Vm {
     /// `return` replaces the return (spec 7.4.6), later closes swallow.
     fn close_for_of_return(&mut self, agent: &mut Agent) -> Result<(), JsError> {
         let mut first_error: Option<JsError> = None;
+        while let Some(entry) = self.for_of_stack.pop() {
+            if let ForOfEntry::Generic(iterator) = entry {
+                if first_error.is_none() {
+                    if let Err(e) = crate::expr::iterator_close(agent, &iterator) {
+                        first_error = Some(e);
+                    }
+                } else {
+                    let _ = crate::expr::iterator_close_throw(agent, &iterator);
+                }
+            }
+        }
         let close = |agent: &mut Agent,
                      stack: &mut Vec<crate::expr::IteratorRecord>,
                      first_error: &mut Option<JsError>|
@@ -1315,7 +1610,6 @@ impl Vm {
             }
             Ok(())
         };
-        close(agent, &mut self.for_of_stack, &mut first_error)?;
         close(agent, &mut self.async_for_of_stack, &mut first_error)?;
         self.for_of_boundaries.clear();
         self.async_for_of_boundaries.clear();
@@ -1333,7 +1627,7 @@ impl Vm {
             && (target < top || target > end)
         {
             self.for_of_boundaries.pop();
-            if let Some(iterator) = self.for_of_stack.pop() {
+            if let Some(ForOfEntry::Generic(iterator)) = self.for_of_stack.pop() {
                 iterator_close(agent, &iterator)?;
             }
         }
@@ -1511,14 +1805,12 @@ impl Vm {
                     *self.frame.get_mut(*slot) = value;
                 }
                 Step::LoadGlobal { name } => {
-                    let reference = self.global_reference(agent, *name)?;
-                    let value = crate::context::get_value(agent, &reference)?;
+                    let value = self.load_global_value(agent, *name)?;
                     self.stack.push(value);
                 }
                 Step::StoreGlobal { name } => {
                     let value = self.pop();
-                    let reference = self.global_reference(agent, *name)?;
-                    crate::context::put_value(agent, &reference, value)?;
+                    self.store_global_value(agent, *name, value)?;
                 }
                 Step::InitLocal { slot } => {
                     let value = self.pop();
@@ -1557,23 +1849,20 @@ impl Vm {
                     *self.frame.get_mut(*slot) = update_value(agent, &UpdateOp::Decrement, &old)?.1;
                 }
                 Step::UpdateGlobal { name, op, prefix } => {
-                    let reference = self.global_reference(agent, *name)?;
-                    let old = crate::context::get_value(agent, &reference)?;
+                    let old = self.load_global_value(agent, *name)?;
                     let (old_numeric, new) = update_value(agent, op, &old)?;
-                    crate::context::put_value(agent, &reference, new.clone())?;
+                    self.store_global_value(agent, *name, new.clone())?;
                     self.stack.push(if *prefix { new } else { old_numeric });
                 }
                 Step::IncGlobal { name } => {
-                    let reference = self.global_reference(agent, *name)?;
-                    let old = crate::context::get_value(agent, &reference)?;
+                    let old = self.load_global_value(agent, *name)?;
                     let new = update_value(agent, &UpdateOp::Increment, &old)?.1;
-                    crate::context::put_value(agent, &reference, new)?;
+                    self.store_global_value(agent, *name, new)?;
                 }
                 Step::DecGlobal { name } => {
-                    let reference = self.global_reference(agent, *name)?;
-                    let old = crate::context::get_value(agent, &reference)?;
+                    let old = self.load_global_value(agent, *name)?;
                     let new = update_value(agent, &UpdateOp::Decrement, &old)?.1;
-                    crate::context::put_value(agent, &reference, new)?;
+                    self.store_global_value(agent, *name, new)?;
                 }
                 Step::CreateFunction { function, strict } => {
                     let env = agent.running_context()?.lexical_environment.clone();
@@ -1661,12 +1950,19 @@ impl Vm {
                     if is_nullish(&object) {
                         return Err(nullish_error("Cannot read properties of null"));
                     }
-                    let value = crate::context::get_property(
-                        agent,
-                        &object,
-                        &crux::lookup(*name),
-                        object.clone(),
-                    )?;
+                    let value = match self.member_cell_get(&object, *name) {
+                        Some(value) => value,
+                        None => {
+                            let value = crate::context::get_property(
+                                agent,
+                                &object,
+                                &crux::lookup(*name),
+                                object.clone(),
+                            )?;
+                            self.resolve_member_cell(&object, *name);
+                            value
+                        }
+                    };
                     self.stack.push(value);
                 }
                 Step::GetMemberComputed => {
@@ -1675,10 +1971,50 @@ impl Vm {
                     if is_nullish(&object) {
                         return Err(nullish_error("Cannot read properties of null"));
                     }
-                    let key = crate::context::to_property_key(agent, &key)?;
-                    let value =
-                        crate::context::get_property_key(agent, &object, &key, object.clone())?;
-                    self.stack.push(value);
+                    // A Number key converts purely (ToPropertyKey of a number
+                    // runs no user code), so a canonical array index reads the
+                    // element directly — no number→string→intern round-trip.
+                    let numeric = match key.kind() {
+                        ValueKind::Number(number)
+                            if number.fract() == 0.0 && (0.0..4294967295.0).contains(&number) =>
+                        {
+                            Some(number as u64)
+                        }
+                        _ => None,
+                    };
+                    if let Some(index) = numeric
+                        && let Some(value) = self.array_element_get(&object, index)
+                    {
+                        self.stack.push(value);
+                    } else {
+                        let key = crate::context::to_property_key(agent, &key)?;
+                        let value = match &key {
+                            PropertyKey::String(atom) => match self.member_cell_get(&object, *atom)
+                            {
+                                Some(value) => value,
+                                None => {
+                                    let value = crate::context::get_property_key(
+                                        agent,
+                                        &object,
+                                        &key,
+                                        object.clone(),
+                                    )?;
+                                    self.resolve_member_cell(&object, *atom);
+                                    value
+                                }
+                            },
+                            _ => crate::context::get_property_key(
+                                agent,
+                                &object,
+                                &key,
+                                object.clone(),
+                            )?,
+                        };
+                        if let Some(index) = numeric {
+                            self.resolve_array_element(&object, index);
+                        }
+                        self.stack.push(value);
+                    }
                 }
                 Step::GetMemberComputedKeep => {
                     // Compound/update paths: the (object, key) pair was
@@ -3021,46 +3357,105 @@ impl Vm {
                 }
                 Step::ForOfBegin { top, end } => {
                     let rhs = self.pop();
-                    let iterator = get_iterator(agent, &rhs)?;
-                    self.for_of_stack.push(iterator);
+                    let entry = match crate::expr::for_of_begin(agent, &rhs)? {
+                        crate::expr::ForOfState::Generic(record) => ForOfEntry::Generic(record),
+                        crate::expr::ForOfState::FastArray(array) => {
+                            ForOfEntry::Fast { array, index: 0 }
+                        }
+                    };
+                    self.for_of_stack.push(entry);
                     self.for_of_boundaries.push((*top, *end));
                 }
                 Step::ForOfNext { done } => {
-                    let Some(iterator) = self.for_of_stack.last() else {
-                        return Err(JsError::new(
-                            ErrorKind::SyntaxError,
-                            "ForOfNext without a for-of".into(),
-                        ));
+                    // The innermost state is cloned out so the arm can mutate
+                    // the stacks while agent-side calls run.
+                    let fast = match self.for_of_stack.last() {
+                        Some(ForOfEntry::Fast { array, index }) => Some((array.clone(), *index)),
+                        _ => None,
                     };
-                    let iterator = iterator.clone();
-                    // A `next()` error propagates without closing the iterator
-                    // (spec 14.7.6.2 uses `?`): the flag stays set on the
-                    // error path so `run_inner` skips the close.
-                    self.for_of_stepping = true;
-                    match iterator_step(agent, &iterator) {
-                        Ok(Some(value)) => {
-                            self.for_of_stepping = false;
-                            self.stack.push(value);
-                        }
-                        Ok(None) => {
-                            self.for_of_stepping = false;
+                    if let Some((array, index)) = fast {
+                        // Re-read the length and the element every step (spec
+                        // %ArrayIteratorPrototype%.next steps 5-7): a body that
+                        // mutates the array is observed exactly as the stock
+                        // iterator would.
+                        let length = Self::array_length(agent, &array)?;
+                        if index as u64 >= length {
                             self.for_of_stack.pop();
                             self.for_of_boundaries.pop();
                             self.ip = *done;
+                        } else {
+                            // The element read goes through the numeric
+                            // direct-mapped cache (no per-element
+                            // number→string→intern round-trip); a hole or
+                            // structural change falls back to the full Get.
+                            let value = match self.array_element_get(&array, index as u64) {
+                                Some(value) => value,
+                                None => {
+                                    let value = crate::context::get_property_key(
+                                        agent,
+                                        &array,
+                                        &PropertyKey::from_utf8(&index.to_string()),
+                                        array.clone(),
+                                    )?;
+                                    self.resolve_array_element(&array, index as u64);
+                                    value
+                                }
+                            };
+                            if let Some(ForOfEntry::Fast { index: slot, .. }) =
+                                self.for_of_stack.last_mut()
+                            {
+                                *slot = index + 1;
+                            }
+                            self.stack.push(value);
                         }
-                        Err(error) => return Err(error),
+                    } else {
+                        let Some(iterator) = self.for_of_stack.last() else {
+                            return Err(JsError::new(
+                                ErrorKind::SyntaxError,
+                                "ForOfNext without a for-of".into(),
+                            ));
+                        };
+                        let ForOfEntry::Generic(iterator) = iterator else {
+                            unreachable!("fast entries are handled above")
+                        };
+                        let iterator = iterator.clone();
+                        // A `next()` error propagates without closing the iterator
+                        // (spec 14.7.6.2 uses `?`): the flag stays set on the
+                        // error path so `run_inner` skips the close.
+                        self.for_of_stepping = true;
+                        match iterator_step(agent, &iterator) {
+                            Ok(Some(value)) => {
+                                self.for_of_stepping = false;
+                                self.stack.push(value);
+                            }
+                            Ok(None) => {
+                                self.for_of_stepping = false;
+                                self.for_of_stack.pop();
+                                self.for_of_boundaries.pop();
+                                self.ip = *done;
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
                 }
                 Step::ForOfBind { left } => {
                     let value = self.pop();
                     self.for_binding_put(agent, left, value)?;
                 }
+                Step::ForOfBindLocal { slot } => {
+                    let value = self.pop();
+                    *self.frame.get_mut(*slot) = value;
+                }
+                Step::ForOfBindGlobal { name } => {
+                    let value = self.pop();
+                    self.store_global_value(agent, *name, value)?;
+                }
                 Step::ForOfRestore => {
                     self.restore_per_iteration(agent)?;
                 }
                 Step::ForOfClose => {
                     self.for_of_boundaries.pop();
-                    if let Some(iterator) = self.for_of_stack.pop() {
+                    if let Some(ForOfEntry::Generic(iterator)) = self.for_of_stack.pop() {
                         iterator_close(agent, &iterator)?;
                     }
                 }
@@ -4105,7 +4500,7 @@ impl Vm {
                 format!("{} is not a function", crux::value::type_of(&callee)),
             ));
         }
-        let result = crate::function::call(agent, &callee, this, &args)?;
+        let result = crate::function::call_inner(agent, &callee, this, &args)?;
         self.stack.push(result);
         Ok(())
     }
@@ -4147,7 +4542,7 @@ impl Vm {
                 format!("{} is not a function", crux::value::type_of(&callee)),
             ));
         }
-        let result = crate::function::call(agent, &callee, this, args)?;
+        let result = crate::function::call_inner(agent, &callee, this, args)?;
         self.stack.truncate(arg_start - 2);
         self.stack.push(result);
         Ok(())
@@ -6666,6 +7061,18 @@ impl Compiler {
             {
                 self.compile_destructure_assign(expr)?;
             }
+            // A simple `var` ident head binds directly at its compile-time
+            // location (frame slot / global cell), skipping the per-element
+            // binding-initialization machinery.
+            ForBinding::VarDecl {
+                kind: VarDeclKind::Var,
+                pattern: BindingPattern::Ident(name),
+                ..
+            } => match self.binding(*name) {
+                BindingLoc::Global => self.emit(Step::ForOfBindGlobal { name: *name }),
+                BindingLoc::Slot(slot) => self.emit(Step::ForOfBindLocal { slot }),
+                BindingLoc::Env => self.emit(Step::ForOfBind { left: left.clone() }),
+            },
             _ => self.emit(Step::ForOfBind { left: left.clone() }),
         }
         if lexical_head {

@@ -107,6 +107,98 @@ global-property access (cell/IC) and less per-call machinery (a fast
 call still pushes a full `ExecutionContext` and bumps ~10 `Rc`
 refcounts).
 
+### Node comparison and optimization plan (measured 2026-08-21)
+
+Fresh baseline (release, current tree, 3-run medians of `--bench`) with the
+same sources run through node v24.12.0 (warm, 3-run medians):
+
+| Benchmark | slag | node | ratio |
+|---|---|---|---|
+| arithmetic | 1.058s | 8.43ms | 125x |
+| property access | 1.318s | 1.31ms | 1006x |
+| string concat | 0.150s | 1.43ms | 105x |
+| array iteration | 13.25s | 59.4ms | 223x |
+| function calls | 1.829s | 1.33ms | 1375x |
+
+(The ratios are JIT-dominated — V8 inlines/constant-folds these shapes —
+so they rank the machinery-heavy paths rather than set a target; the gate
+remains the internal ≥5x.)
+
+Probe decomposition (release, interleaved 3-run medians) shows where the
+time goes:
+
+- **Array iteration is 75% of the bench suite** (13.25s of ~17.6s). An
+  empty for-of body costs 12.98s — ~11s (83%) is the iterator machinery
+  (iterator object + 1M `next()` calls + 1M result-object allocations);
+  the same workload with an index loop is 2.00s (~6x headroom).
+- **Arithmetic is bound by the global path**: top-level `n += i * 2` is
+  1.05s vs 0.135s for the same loop in a fast-certified function (frame
+  slots); the empty top-level loop is ~0.57s. A global-var cell (cached
+  global-object slot per name) is the documented lever.
+- **Function calls** (1.83s) pay the full `ExecutionContext` push/pop and
+  ~10 Rc refcount bumps per 1M calls.
+
+Ranked plan (each behind the usual zero-regression + clippy validation):
+
+1. **P0 — dense-array for-of fast path** — *landed*: a plain Array with the
+   stock `@@iterator` iterates by index (new `expr::for_of_begin` guard +
+   `ForOfEntry::Fast` in the Vm), re-reading `length` and each element per
+   step so a body that mutates the array is observed exactly as the stock
+   iterator would; any shadowed/patched `@@iterator`/`next`/`return`, a
+   proxy, or a non-Array receiver falls back to the generic protocol. Array
+   iteration measured **13.25s → 2.70s (~4.9x)**; full sweeps at zero
+   regressions (language 23,690/0/34 unchanged; built-ins 23,432/0/154 —
+   eight marginal RegExp property-escape fixtures stopped timing out).
+2. **P1 — global var cells** — *landed*: the `Vm` caches the global
+   object's property-vector slot per declared top-level name (`global_cells`
+   + `load_global_value`/`store_global_value`), re-validated on every access
+   against the stored key — an insert/delete/redefinition shifts or
+   replaces slots, and the reference path re-resolves (strict non-writable
+   errors, accessors, and missing bindings all fall through). Measured:
+   arithmetic 1.06s → **0.19s**, property access 1.32s → **0.35s**, string
+   concat 0.15s → **0.08s**, function calls 1.83s → **0.69s** (array
+   iteration unchanged at 2.7s); full sweeps at zero regressions
+   (language 23,690/0/34 unchanged; built-ins 23,436/0/154 — four more
+   marginal RegExp fixtures stopped timing out).
+3. **P2 — lightweight call path** — *landed*: the certified fast body's
+   pushed `ExecutionContext` drops the `script_or_module`/`source`/
+   `private_environment` clones (its certification excludes the only
+   readers — eval/import/private/Annex B/function-creation), the record is
+   fetched with one scoped borrow per branch (a `.cloned()` would
+   deep-copy the whole record per call), the VM call steps call
+   `function::call_inner` directly (the agent is already set for the
+   duration of `run_inner`, so the two TLS swaps are redundant), and
+   `dispose_env_resources` skips its drain via a cheap emptiness read.
+   Measured: function calls 1.83s → **0.63s**; full sweeps at zero
+   regressions (language 23,690/0/34 unchanged; built-ins 23,426/0/154 —
+   the pass/hang delta vs the P1 run is the marginal RegExp property-escape
+   timeout boundary, all new hangs in the known slow set).
+4. **P3 — property-access IC** — *landed*: a small direct-mapped cache on
+   the `Vm` (`member_cells`, 16 entries, `(object id, name atom) → slot`)
+   serves `GetMemberName`/`GetMemberComputed` own-data reads — the slot is
+   re-validated on every access against the stored key and property kind, so
+   a structural change, redefinition, accessor conversion, or hash collision
+   falls back to the full Get and re-resolves. Measured: property access
+   1.32s → **0.24s**; full sweeps at zero regressions (language
+   23,690/0/34 unchanged; built-ins 23,429/0/154, all hangs in the known
+   slow set).
+5. **Numeric-key array fast path** — *landed with P3*: a second direct-mapped
+   cache (`array_element_cells`, `(object id, index) → slot`) serves
+   `GetMemberComputed` for canonical Number indices and the dense-Array
+   for-of fast path — a Number key converts purely (ToPropertyKey of a
+   number runs no user code), so the element reads without the
+   number→string→intern round-trip; the for-of fast path also inlines the
+   length read (`array_length`, the array's `length` is always the first
+   property-vector entry) and compiles a simple `var` head to
+   `ForOfBindGlobal`/`ForOfBindLocal` instead of the per-element
+   binding-initialization. Measured: array iteration 2.71s → **2.29s**, and
+   the variable-index `a[j]` shape ~550ms → ~240ms; full sweeps at zero
+   regressions (built-ins 23,438/0/154).
+
+Methodology note: per-process timing is load-sensitive on this machine
+(5.5x spurious swings observed), so only interleaved multi-run medians or
+the in-process `--bench` harness count.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
