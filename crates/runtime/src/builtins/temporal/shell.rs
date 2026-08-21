@@ -779,12 +779,13 @@ fn calendar_year_getter(
     kind: RecordKind,
 ) -> Result<Value, JsError> {
     let record = require_record(agent, this, kind)?;
-    let iso_year = match (&record, kind) {
-        (TemporalRecord::PlainDate(d), RecordKind::PlainDate) => d[0],
-        (TemporalRecord::PlainDateTime(dt), RecordKind::PlainDateTime) => dt[0],
-        (TemporalRecord::YearMonth(ym), RecordKind::YearMonth) => ym[0],
+    let (iso_year, iso_month, iso_day) = match (&record, kind) {
+        (TemporalRecord::PlainDate(d), RecordKind::PlainDate) => (d[0], d[1], d[2]),
+        (TemporalRecord::PlainDateTime(dt), RecordKind::PlainDateTime) => (dt[0], dt[1], dt[2]),
+        (TemporalRecord::YearMonth(ym), RecordKind::YearMonth) => (ym[0], ym[1], ym[2]),
         (TemporalRecord::ZonedDateTime(ns, tz), RecordKind::ZonedDateTime) => {
-            zoned_local(agent, *ns, &tz.to_string_lossy())?.0
+            let local = zoned_local(agent, *ns, &tz.to_string_lossy())?;
+            (local.0, local.1, local.2)
         }
         _ => {
             return Err(JsError::new(
@@ -795,7 +796,7 @@ fn calendar_year_getter(
     };
     let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
     Ok(Value::Number(
-        calendar_year_fields(&calendar, iso_year).0 as f64,
+        calendar_year_fields(&calendar, iso_year, iso_month, iso_day).0 as f64,
     ))
 }
 
@@ -829,10 +830,10 @@ pub fn dispatch_call(
         return Some(calendar_year_getter(agent, this, RecordKind::PlainDate));
     }
     if field("%Temporal.PlainDate.prototype.month%") {
-        return Some(field_number(agent, this, RecordKind::PlainDate, 1));
+        return Some(plain_date_calendar_field(agent, this, "month"));
     }
     if field("%Temporal.PlainDate.prototype.day%") {
-        return Some(field_number(agent, this, RecordKind::PlainDate, 2));
+        return Some(plain_date_calendar_field(agent, this, "day"));
     }
     if field("%Temporal.PlainDate.prototype.dayOfWeek%") {
         return Some(plain_date_day_of_week(agent, this));
@@ -883,9 +884,6 @@ pub fn dispatch_call(
         return Some(calendar_year_getter(agent, this, RecordKind::ZonedDateTime));
     }
     for (idx, name) in [
-        (0, "year"),
-        (1, "month"),
-        (2, "day"),
         (3, "hour"),
         (4, "minute"),
         (5, "second"),
@@ -910,6 +908,8 @@ pub fn dispatch_call(
     for (name, key) in [
         ("era", "%Temporal.ZonedDateTime.prototype.era%"),
         ("eraYear", "%Temporal.ZonedDateTime.prototype.eraYear%"),
+        ("month", "%Temporal.ZonedDateTime.prototype.month%"),
+        ("day", "%Temporal.ZonedDateTime.prototype.day%"),
         ("dayOfWeek", "%Temporal.ZonedDateTime.prototype.dayOfWeek%"),
         ("dayOfYear", "%Temporal.ZonedDateTime.prototype.dayOfYear%"),
         (
@@ -952,10 +952,9 @@ pub fn dispatch_call(
     if field("%Temporal.PlainDateTime.prototype.year%") {
         return Some(calendar_year_getter(agent, this, RecordKind::PlainDateTime));
     }
+    // The PlainDateTime time fields (the date part's month/day route through
+    // the calendar getters above; year through calendar_year_getter).
     for (idx, name) in [
-        (0, "year"),
-        (1, "month"),
-        (2, "day"),
         (3, "hour"),
         (4, "minute"),
         (5, "second"),
@@ -991,6 +990,8 @@ pub fn dispatch_call(
     for (name, key) in [
         ("era", "%Temporal.PlainDateTime.prototype.era%"),
         ("eraYear", "%Temporal.PlainDateTime.prototype.eraYear%"),
+        ("month", "%Temporal.PlainDateTime.prototype.month%"),
+        ("day", "%Temporal.PlainDateTime.prototype.day%"),
         ("dayOfWeek", "%Temporal.PlainDateTime.prototype.dayOfWeek%"),
         ("dayOfYear", "%Temporal.PlainDateTime.prototype.dayOfYear%"),
         (
@@ -1031,13 +1032,13 @@ pub fn dispatch_call(
         return Some(calendar_year_getter(agent, this, RecordKind::YearMonth));
     }
     if field("%Temporal.PlainYearMonth.prototype.month%") {
-        return Some(field_number(agent, this, RecordKind::YearMonth, 1));
+        return Some(year_month_calendar_field(agent, this, "month"));
     }
     if field("%Temporal.PlainYearMonth.prototype.monthCode%") {
         return Some(month_code(agent, this, RecordKind::YearMonth, 1));
     }
     if field("%Temporal.PlainYearMonth.prototype.day%") {
-        return Some(field_number(agent, this, RecordKind::YearMonth, 2));
+        return Some(year_month_calendar_field(agent, this, "day"));
     }
     if field("%Temporal.PlainYearMonth.prototype.calendarId%") {
         return Some(calendar_id(agent, this, RecordKind::YearMonth));
@@ -1071,7 +1072,7 @@ pub fn dispatch_call(
         return Some(month_code(agent, this, RecordKind::MonthDay, 1));
     }
     if field("%Temporal.PlainMonthDay.prototype.day%") {
-        return Some(field_number(agent, this, RecordKind::MonthDay, 2));
+        return Some(plain_month_day_day(agent, this));
     }
     if field("%Temporal.PlainMonthDay.prototype.calendarId%") {
         return Some(calendar_id(agent, this, RecordKind::MonthDay));
@@ -1814,11 +1815,12 @@ fn month_code(
     kind: RecordKind,
     month_index: usize,
 ) -> Result<Value, JsError> {
-    let month = match require_record(agent, this, kind)? {
-        TemporalRecord::PlainDate(d) => d[month_index],
-        TemporalRecord::PlainDateTime(dt) => dt[month_index],
-        TemporalRecord::YearMonth(ym) => ym[month_index],
-        TemporalRecord::MonthDay(md) => md[month_index],
+    let record = require_record(agent, this, kind)?;
+    let (year, month, day) = match &record {
+        TemporalRecord::PlainDate(d) => (d[0], d[month_index], d[2]),
+        TemporalRecord::PlainDateTime(dt) => (dt[0], dt[month_index], dt[2]),
+        TemporalRecord::YearMonth(ym) => (ym[0], ym[month_index], ym[2]),
+        TemporalRecord::MonthDay(md) => (md[0], md[month_index], md[2]),
         _ => {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -1826,6 +1828,16 @@ fn month_code(
             ));
         }
     };
+    // The hebrew month code depends on the date's hebrew month and the
+    // year's leap status (M05L Adar I; the M06-M12 shift in leap years).
+    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
+    if calendar == "hebrew"
+        && let Some((hy, hm, _)) = calendar::calendar_iso_to_date(&calendar, year, month, day)
+    {
+        return Ok(Value::String(Handle::new(JsString::from_utf8(
+            &calendar::hebrew_month_code(hy, hm),
+        ))));
+    }
     Ok(Value::String(Handle::new(JsString::from_utf8(&format!(
         "M{month:02}"
     )))))
@@ -1927,10 +1939,20 @@ fn zoned_offset_ns(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     Ok(Value::Number(offset as f64))
 }
 
-/// The local monthCode getter.
+/// The local monthCode getter (hebrew routes through the calendar month
+/// code; the other calendars' codes are the ISO month number).
 fn zoned_month_code(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     let (ns, tz) = zoned_parts(agent, this)?;
     let local = zoned_local(agent, ns, &tz)?;
+    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
+    if calendar == "hebrew"
+        && let Some((hy, hm, _)) =
+            calendar::calendar_iso_to_date(&calendar, local.0, local.1, local.2)
+    {
+        return Ok(Value::String(Handle::new(JsString::from_utf8(
+            &calendar::hebrew_month_code(hy, hm),
+        ))));
+    }
     Ok(Value::String(Handle::new(JsString::from_utf8(&format!(
         "M{:02}",
         local.1
@@ -2451,7 +2473,8 @@ pub fn to_plain_date_time(
         let year = read_era_fields(agent, item, calendar.as_deref(), year, true)?;
         let opts = super::get_options_object(options)?;
         let constrain = super::get_temporal_overflow_option(agent, &opts)? == Overflow::Constrain;
-        let (y, m, d) = resolve_date_fields(year, month, month_code, day, constrain)?;
+        let (y, m, d) =
+            resolve_date_fields(year, month, month_code, day, constrain, calendar.as_deref())?;
         // CalendarDateFromFields for the tabular Islamic calendars.
         let (y, m, d) = if let Some(calendar) = calendar.as_deref()
             && let Some((cy, cm, cd)) = calendar::calendar_date_to_iso(calendar, y, m, d)
@@ -2906,6 +2929,7 @@ pub fn to_zoned(agent: &mut Agent, item: &Value, options: &Value) -> Result<Valu
             fields.month_code,
             fields.day,
             constrain,
+            calendar.as_deref(),
         )?;
         // CalendarDateFromFields for the tabular Islamic calendars.
         let (y, m, d) = if let Some(calendar) = calendar.as_deref()
@@ -3682,16 +3706,21 @@ fn plain_date_time_with(
     let (py, pm, pmc, pd, pt) = read_date_time_fields(agent, &item, true)?;
     let options = super::get_options_object(&options)?;
     let constrain = super::get_temporal_overflow_option(agent, &options)? == Overflow::Constrain;
-    // CalendarMergeFields for iso8601: the same month/monthCode dedup as
-    // PlainDate.with, applied to the existing date and time fields.
-    let year = py.or(Some(dt[0]));
+    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
+    // CalendarMergeFields: the same month/monthCode dedup as PlainDate.with,
+    // applied over the existing date fields in calendar terms.
+    let (cy, cm, cd) = calendar::calendar_iso_to_date(&calendar, dt[0], dt[1], dt[2])
+        .unwrap_or((dt[0], dt[1], dt[2]));
+    let year = py.or(Some(cy));
     let month = pm;
     let month_code = pmc.or(if pm.is_some() {
         None
+    } else if calendar == "hebrew" {
+        Some(calendar::hebrew_month_code(cy, cm))
     } else {
-        Some(format!("M{:02}", dt[1]))
+        Some(format!("M{cm:02}"))
     });
-    let day = pd.or(Some(dt[2]));
+    let day = pd.or(Some(cd));
     let mut t = [dt[3], dt[4], dt[5], dt[6], dt[7], dt[8]];
     for (i, value) in pt.iter().enumerate() {
         if let Some(v) = value {
@@ -3700,7 +3729,10 @@ fn plain_date_time_with(
     }
     // InterpretTemporalDateTimeFields: the date resolves through the calendar
     // and the time is regulated with the overflow option.
-    let (y, m, d) = resolve_date_fields(year, month, month_code, day, constrain)?;
+    let (y, m, d) = resolve_date_fields(year, month, month_code, day, constrain, Some(&calendar))?;
+    // CalendarDateFromFields: the resolved fields are calendar fields for the
+    // non-ISO calendars and must convert back to the ISO date.
+    let (y, m, d) = calendar::calendar_date_to_iso(&calendar, y, m, d).unwrap_or((y, m, d));
     regulate_time(&mut t, constrain)?;
     if !iso::iso_date_time_within_limits(y, m, d, t[0], t[1], t[2], t[3], t[4], t[5]) {
         return Err(JsError::new(
@@ -3708,12 +3740,13 @@ fn plain_date_time_with(
             "date-time out of range".into(),
         ));
     }
-    create_temporal_object(
+    let value = create_temporal_object(
         agent,
         &Value::Undefined,
         PLAIN_DATE_TIME_PROTO,
         TemporalRecord::PlainDateTime([y, m, d, t[0], t[1], t[2], t[3], t[4], t[5]]),
-    )
+    )?;
+    with_calendar(agent, value, Some(&calendar))
 }
 
 /// spec 5.5.3 `withPlainTime` (ToTimeRecordOrMidnight).
@@ -3793,10 +3826,10 @@ fn plain_date_time_add_subtract(
     let total = time_record_ns([dt[3], dt[4], dt[5], dt[6], dt[7], dt[8]]) + internal.time;
     let delta_days = total.div_euclid(iso::NS_PER_DAY) as i64;
     let t = balance_time_ns(total);
-    let date = iso::calendar_date_add(
-        dt[0],
-        dt[1],
-        dt[2],
+    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
+    let date = calendar::calendar_date_add(
+        &calendar,
+        (dt[0], dt[1], dt[2]),
         internal.date[0] as i64,
         internal.date[1] as i64,
         internal.date[2] as i64,
@@ -3968,6 +4001,7 @@ fn plain_date_time_until_since(
     if let Some(maximum) = smallest.max_rounding_increment() {
         super::duration::validate_rounding_increment(rounding_increment, maximum, false)?;
     }
+    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
     let diff = super::duration::difference_plain_date_time_with_rounding(
         (
             dt[0], dt[1], dt[2], dt[3], dt[4], dt[5], dt[6], dt[7], dt[8],
@@ -3977,6 +4011,7 @@ fn plain_date_time_until_since(
         rounding_increment,
         smallest,
         rounding_mode,
+        Some(&calendar),
     )?;
     let mut fields = super::temporal_duration_from_internal(diff.date, diff.time, largest)?;
     if since {
@@ -4211,16 +4246,21 @@ fn zoned_with(
     let disambiguation = super::get_temporal_disambiguation_option(agent, &options)?;
     let offset_opt = super::get_temporal_offset_option(agent, &options, "prefer")?;
     let constrain = super::get_temporal_overflow_option(agent, &options)? == Overflow::Constrain;
-    // CalendarMergeFields for iso8601: the partial month/monthCode dedup of
-    // PlainDateTime.with over the existing date, time, and offset fields.
-    let year = py.or(Some(local.0));
+    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
+    // CalendarMergeFields: the partial month/monthCode dedup of
+    // PlainDateTime.with over the existing date fields in calendar terms.
+    let (cy, cm, cd) = calendar::calendar_iso_to_date(&calendar, local.0, local.1, local.2)
+        .unwrap_or((local.0, local.1, local.2));
+    let year = py.or(Some(cy));
     let month = pm;
     let month_code = pmc.or(if pm.is_some() {
         None
+    } else if calendar == "hebrew" {
+        Some(calendar::hebrew_month_code(cy, cm))
     } else {
-        Some(format!("M{:02}", local.1))
+        Some(format!("M{cm:02}"))
     });
-    let day = pd.or(Some(local.2));
+    let day = pd.or(Some(cd));
     let mut t = [local.3, local.4, local.5, local.6, local.7, local.8];
     for (i, value) in pt.iter().enumerate() {
         if let Some(v) = value {
@@ -4230,7 +4270,10 @@ fn zoned_with(
     let offset_text = poffset
         .clone()
         .unwrap_or_else(|| iso::format_offset_nanoseconds(offset_ns));
-    let (y, m, d) = resolve_date_fields(year, month, month_code, day, constrain)?;
+    let (y, m, d) = resolve_date_fields(year, month, month_code, day, constrain, Some(&calendar))?;
+    // CalendarDateFromFields: the resolved fields are calendar fields for the
+    // non-ISO calendars and must convert back to the ISO date.
+    let (y, m, d) = calendar::calendar_date_to_iso(&calendar, y, m, d).unwrap_or((y, m, d));
     regulate_time(&mut t, constrain)?;
     let dt = [y, m, d, t[0], t[1], t[2], t[3], t[4], t[5]];
     let new_offset_ns = iso::parse_date_time_utc_offset(&offset_text)
@@ -4244,7 +4287,8 @@ fn zoned_with(
         &disambiguation,
         false,
     )?;
-    create_zoned(agent, epoch, &tz)
+    let value = create_zoned(agent, epoch, &tz)?;
+    with_calendar(agent, value, Some(&calendar))
 }
 
 /// spec 6.5.6 `withPlainTime` (ToTemporalTimeRecord over the instance's local
@@ -4350,10 +4394,10 @@ fn zoned_add_subtract(
     // AddZonedDateTime: CalendarDateAdd on the local date (the days fold into
     // the calendar add), then GetEpochNanosecondsFor for the new wall time.
     let local = zoned_local(agent, ns, &tz)?;
-    let date = iso::calendar_date_add(
-        local.0,
-        local.1,
-        local.2,
+    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
+    let date = calendar::calendar_date_add(
+        &calendar,
+        (local.0, local.1, local.2),
         internal.date[0] as i64,
         internal.date[1] as i64,
         internal.date[2] as i64,
@@ -4577,6 +4621,7 @@ fn zoned_until_since(
     if let Some(maximum) = smallest.max_rounding_increment() {
         super::duration::validate_rounding_increment(rounding_increment, maximum, false)?;
     }
+    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
     let diff = super::duration::difference_zoned_date_time_with_rounding(
         ns,
         ons,
@@ -4585,6 +4630,7 @@ fn zoned_until_since(
         rounding_increment,
         smallest,
         rounding_mode,
+        Some(&calendar),
     )?;
     // spec 6.5.9 step 9: the result balances up to hours, not the settings
     // largestUnit (24 hours does not become 1 day in a 25-hour day — test262
@@ -5152,6 +5198,7 @@ fn resolve_date_fields(
     month_code: Option<String>,
     day: Option<i64>,
     constrain: bool,
+    calendar: Option<&str>,
 ) -> Result<(i64, i64, i64), JsError> {
     let (Some(year), Some(day)) = (year, day) else {
         return Err(JsError::new(
@@ -5159,13 +5206,53 @@ fn resolve_date_fields(
             "year and day are required".into(),
         ));
     };
-    let month = super::resolve_iso_month(month, month_code)?;
+    let had_month = month.is_some() || month_code.is_some();
+    let month = match calendar {
+        Some(cal) => calendar::resolve_calendar_month_with_overflow(
+            cal,
+            year,
+            month,
+            month_code.as_deref(),
+            constrain,
+        ),
+        None => super::resolve_iso_month(month, month_code)?,
+    };
     let Some(month) = month else {
         return Err(JsError::new(
-            ErrorKind::TypeError,
-            "month or monthCode is required".into(),
+            if had_month {
+                ErrorKind::RangeError
+            } else {
+                ErrorKind::TypeError
+            },
+            if had_month {
+                "invalid month".into()
+            } else {
+                "month or monthCode is required".into()
+            },
         ));
     };
+    if let Some(cal) = calendar {
+        // The month is bounded by the year's month count (constrain clamps
+        // the 13th month of a common hebrew year to Elul).
+        if let Some(max) = calendar::calendar_months_in_year(cal, year) {
+            let month = if constrain { month.min(max) } else { month };
+            if month > max {
+                return Err(JsError::new(ErrorKind::RangeError, "invalid date".into()));
+            }
+        }
+        // The calendar months with length data regulate the day against
+        // their own length (the ISO regulation would mis-handle
+        // hebrew/islamic).
+        if let Some(max) = calendar::calendar_days_in_month(cal, year, month) {
+            if day > max {
+                if constrain {
+                    return Ok((year, month, max));
+                }
+                return Err(JsError::new(ErrorKind::RangeError, "invalid date".into()));
+            }
+            return Ok((year, month, day));
+        }
+    }
     let (year, month, day) = iso::regulate_iso_date(year, month, day, constrain);
     if !iso::is_valid_iso_date(year, month, day) {
         return Err(JsError::new(ErrorKind::RangeError, "invalid date".into()));
@@ -5185,7 +5272,8 @@ fn date_from_merged_fields(
     constrain: bool,
     calendar: Option<String>,
 ) -> Result<Value, JsError> {
-    let (year, month, day) = resolve_date_fields(year, month, month_code, day, constrain)?;
+    let (year, month, day) =
+        resolve_date_fields(year, month, month_code, day, constrain, calendar.as_deref())?;
     // CalendarDateFromFields for the tabular Islamic calendars (the
     // canonicalize-calendar fixtures: 1445-12-25 → 2024-07-02).
     let (year, month, day) = if let Some(calendar) = calendar.as_deref()
@@ -5217,19 +5305,22 @@ fn plain_date_with(
     let (py, pm, pmc, pd) = prepare_partial_date_fields(agent, &item)?;
     let options = super::get_options_object(&options)?;
     let constrain = super::get_temporal_overflow_option(agent, &options)? == Overflow::Constrain;
-    // CalendarMergeFields for iso8601 over {year, monthCode, day}: a provided
+    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
+    // The existing fields in calendar terms (the ISO fields are not the
+    // calendar fields of a non-ISO date). CalendarMergeFields: a provided
     // month drops the monthCode and a provided monthCode drops the month
-    // (fieldKeysToIgnore); every other existing field is kept. Both partial
-    // fields stay present so a month/monthCode conflict is detected.
-    let year = py.or(Some(y));
+    // (fieldKeysToIgnore); every other existing field is kept.
+    let (cy, cm, cd) = calendar::calendar_iso_to_date(&calendar, y, m, d).unwrap_or((y, m, d));
+    let year = py.or(Some(cy));
     let month = pm;
     let month_code = pmc.or(if pm.is_some() {
         None
+    } else if calendar == "hebrew" {
+        Some(calendar::hebrew_month_code(cy, cm))
     } else {
-        Some(format!("M{m:02}"))
+        Some(format!("M{cm:02}"))
     });
-    let day = pd.or(Some(d));
-    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
+    let day = pd.or(Some(cd));
     date_from_merged_fields(
         agent,
         year,
@@ -5271,10 +5362,10 @@ fn plain_date_add_subtract(
     let constrain = super::get_temporal_overflow_option(agent, &options)? == Overflow::Constrain;
     let internal = super::to_internal_duration_record_with_24_hour_days(&duration)?;
     let days = (internal.time / iso::NS_PER_DAY) as i64;
-    let result = iso::calendar_date_add(
-        y,
-        m,
-        d,
+    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
+    let result = calendar::calendar_date_add(
+        &calendar,
+        (y, m, d),
         internal.date[0] as i64,
         internal.date[1] as i64,
         internal.date[2] as i64,
@@ -5343,6 +5434,7 @@ fn plain_date_until_since(
     // DifferenceTemporalPlainDate (spec 3.5.16): CalendarDateUntil plus
     // rounding at midnight. No date-time range validation runs for the
     // no-rounding case, so the edge dates stay valid untils.
+    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
     let diff = difference_plain_date(
         (y, m, d),
         (o[0], o[1], o[2]),
@@ -5350,6 +5442,7 @@ fn plain_date_until_since(
         rounding_increment,
         smallest,
         rounding_mode,
+        &calendar,
     )?;
     let mut fields = super::temporal_duration_from_internal(diff.date, diff.time, Unit::Day)?;
     if since {
@@ -5358,8 +5451,9 @@ fn plain_date_until_since(
     super::create_temporal_duration(agent, &fields, &Value::Undefined)
 }
 
-/// spec 3.5.16 DifferenceTemporalPlainDate's core: CalendarDateUntil with
-/// rounding relative to the midnight datetimes of the two dates.
+/// spec 3.5.16 DifferenceTemporalPlainDate's core: CalendarDateUntil (with
+/// the instance's calendar) plus rounding at midnight.
+#[allow(clippy::too_many_arguments)]
 fn difference_plain_date(
     one: (i64, i64, i64),
     two: (i64, i64, i64),
@@ -5367,6 +5461,7 @@ fn difference_plain_date(
     increment: i64,
     smallest: Unit,
     mode: RoundingMode,
+    calendar: &str,
 ) -> Result<super::InternalDuration, JsError> {
     if one == two {
         return Ok(super::InternalDuration {
@@ -5374,7 +5469,7 @@ fn difference_plain_date(
             time: 0,
         });
     }
-    let diff = iso::calendar_date_until(one, two, largest);
+    let diff = calendar::calendar_date_until(calendar, one, two, largest);
     let mut duration = super::InternalDuration {
         date: [diff.0 as f64, diff.1 as f64, diff.2 as f64, diff.3 as f64],
         time: 0,
@@ -5593,10 +5688,15 @@ fn plain_date_time_calendar_field(
 /// keep the ISO year with the ce/bce eras, roc offsets by 1911 (broc for
 /// years before 1). The other calendars report era None here (their era
 /// surfaces need their calendar arithmetic).
-fn calendar_year_fields(calendar: &str, iso_year: i64) -> (i64, Option<&'static str>, Option<i64>) {
+fn calendar_year_fields(
+    calendar: &str,
+    y: i64,
+    m: i64,
+    d: i64,
+) -> (i64, Option<&'static str>, Option<i64>) {
     match calendar {
         "roc" => {
-            let year = iso_year - 1911;
+            let year = y - 1911;
             if year < 1 {
                 (year, Some("broc"), Some(1 - year))
             } else {
@@ -5604,13 +5704,18 @@ fn calendar_year_fields(calendar: &str, iso_year: i64) -> (i64, Option<&'static 
             }
         }
         "gregory" | "japanese" => {
-            if iso_year < 1 {
-                (iso_year, Some("bce"), Some(1 - iso_year))
+            if y < 1 {
+                (y, Some("bce"), Some(1 - y))
             } else {
-                (iso_year, Some("ce"), Some(iso_year))
+                (y, Some("ce"), Some(y))
             }
         }
-        _ => (iso_year, None, None),
+        "hebrew" => {
+            // The Anno Mundi year of the ISO date (the era is always "am").
+            let (hy, _, _) = calendar::calendar_iso_to_date(calendar, y, m, d).unwrap_or((y, m, d));
+            (hy, Some("am"), Some(hy))
+        }
+        _ => (y, None, None),
     }
 }
 
@@ -5621,7 +5726,13 @@ fn calendar_field_value(
     d: i64,
     name: &str,
 ) -> Result<Value, JsError> {
-    let (cal_year, era, era_year) = calendar_year_fields(calendar, y);
+    let (cal_year, era, era_year) = calendar_year_fields(calendar, y, m, d);
+    // The calendar month/day of the ISO date (hebrew and the tabular Islamic
+    // calendars differ from the ISO fields; the rest pass through).
+    let (cal_month, cal_day) = match calendar::calendar_iso_to_date(calendar, y, m, d) {
+        Some((_, cm, cd)) => (cm, cd),
+        None => (m, d),
+    };
     let value = match name {
         "era" => match era {
             Some(era) => Value::String(Handle::new(JsString::from_utf8(era))),
@@ -5632,8 +5743,13 @@ fn calendar_field_value(
             None => Value::Undefined,
         },
         "year" => Value::Number(cal_year as f64),
+        "month" => Value::Number(cal_month as f64),
+        "day" => Value::Number(cal_day as f64),
         "dayOfWeek" => Value::Number(iso::iso_day_of_week(y, m, d) as f64),
-        "dayOfYear" => Value::Number(iso::iso_day_of_year(y, m, d) as f64),
+        "dayOfYear" => Value::Number(
+            calendar::calendar_day_of_year(calendar, cal_year, cal_month, cal_day)
+                .unwrap_or_else(|| iso::iso_day_of_year(y, m, d)) as f64,
+        ),
         // The week fields are defined for the iso8601 calendar only; the
         // other calendars' weekOfYear/yearOfWeek are undefined (the corpus's
         // construct-non-utc-non-iso.js pins gregory's undefined).
@@ -5644,38 +5760,52 @@ fn calendar_field_value(
                 Value::Undefined
             }
         }
-        "monthsInYear" => Value::Number(12.0),
+        "monthsInYear" => Value::Number(
+            calendar::calendar_months_in_year(calendar, cal_year).unwrap_or(12) as f64,
+        ),
         "daysInWeek" => Value::Number(7.0),
-        "daysInMonth" => Value::Number(iso::days_in_month(y, m) as f64),
-        "daysInYear" => Value::Number(if iso::is_leap_year(y) { 366.0 } else { 365.0 }),
-        _ => Value::Boolean(iso::is_leap_year(y)),
+        "daysInMonth" => Value::Number(
+            calendar::calendar_days_in_month(calendar, cal_year, cal_month)
+                .unwrap_or_else(|| iso::days_in_month(y, m)) as f64,
+        ),
+        "daysInYear" => Value::Number(
+            calendar::calendar_days_in_year(calendar, cal_year)
+                .unwrap_or_else(|| if iso::is_leap_year(y) { 366 } else { 365 }) as f64,
+        ),
+        _ => Value::Boolean(
+            calendar::calendar_in_leap_year(calendar, cal_year)
+                .unwrap_or_else(|| iso::is_leap_year(y)),
+        ),
     };
     Ok(value)
 }
 
-/// The ISO calendar's derived PlainYearMonth getters.
+/// The calendar day of a PlainMonthDay's reference date (the stored ISO
+/// date converts back through the calendar).
+fn plain_month_day_day(agent: &Agent, this: &Value) -> Result<Value, JsError> {
+    let [y, m, d, ..] = match require_record(agent, this, RecordKind::MonthDay)? {
+        TemporalRecord::MonthDay(md) => md,
+        _ => unreachable!(),
+    };
+    calendar_field_value(
+        &super::temporal_calendar_id(agent, this).to_string_lossy(),
+        y,
+        m,
+        d,
+        "day",
+    )
+}
+
+/// The derived PlainYearMonth getters (computed from the stored ISO
+/// year-month and its reference day, so the calendar month of the first day
+/// resolves for the non-ISO calendars).
 fn year_month_calendar_field(agent: &Agent, this: &Value, name: &str) -> Result<Value, JsError> {
-    let [y, m, ..] = match require_record(agent, this, RecordKind::YearMonth)? {
+    let [y, m, d, ..] = match require_record(agent, this, RecordKind::YearMonth)? {
         TemporalRecord::YearMonth(ym) => ym,
         _ => unreachable!(),
     };
     let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
-    let (_, era, era_year) = calendar_year_fields(&calendar, y);
-    let value = match name {
-        "era" => match era {
-            Some(era) => Value::String(Handle::new(JsString::from_utf8(era))),
-            None => Value::Undefined,
-        },
-        "eraYear" => match era_year {
-            Some(era_year) => Value::Number(era_year as f64),
-            None => Value::Undefined,
-        },
-        "daysInMonth" => Value::Number(iso::days_in_month(y, m) as f64),
-        "daysInYear" => Value::Number(if iso::is_leap_year(y) { 366.0 } else { 365.0 }),
-        "monthsInYear" => Value::Number(12.0),
-        _ => Value::Boolean(iso::is_leap_year(y)),
-    };
-    Ok(value)
+    calendar_field_value(&calendar, y, m, d, name)
 }
 
 /// ISO-8601 week of year and its associated year (the polyfill's
@@ -5877,6 +6007,7 @@ fn resolve_year_month(
     month: Option<i64>,
     month_code: Option<String>,
     constrain: bool,
+    calendar: Option<&str>,
 ) -> Result<(i64, i64), JsError> {
     let Some(year) = year else {
         return Err(JsError::new(
@@ -5884,13 +6015,48 @@ fn resolve_year_month(
             "year is required".into(),
         ));
     };
-    let month = super::resolve_iso_month(month, month_code)?;
+    let had_month = month.is_some() || month_code.is_some();
+    let month = match calendar {
+        Some(cal) => calendar::resolve_calendar_month_with_overflow(
+            cal,
+            year,
+            month,
+            month_code.as_deref(),
+            constrain,
+        ),
+        None => super::resolve_iso_month(month, month_code)?,
+    };
     let Some(month) = month else {
+        // A provided month/monthCode that does not resolve in the year is a
+        // RangeError (an invalid calendar month); a missing month is a
+        // TypeError (the reference-day-hebrew reject case pins the former).
         return Err(JsError::new(
-            ErrorKind::TypeError,
-            "month or monthCode is required".into(),
+            if had_month {
+                ErrorKind::RangeError
+            } else {
+                ErrorKind::TypeError
+            },
+            if had_month {
+                "invalid month".into()
+            } else {
+                "month or monthCode is required".into()
+            },
         ));
     };
+    if let Some(cal) = calendar {
+        // The calendar bounds: the year-month must be within the calendar's
+        // month count (reject) or constrained to it.
+        if let Some(max) = calendar::calendar_months_in_year(cal, year) {
+            let month = if constrain { month.min(max) } else { month };
+            if month > max {
+                return Err(JsError::new(
+                    ErrorKind::RangeError,
+                    "invalid year-month".into(),
+                ));
+            }
+            return Ok((year, month));
+        }
+    }
     let (year, month, _) = iso::regulate_iso_date(year, month, 1, constrain);
     if !iso::is_valid_iso_date(year, month, 1)
         || !(-271_821..=275_760).contains(&year)
@@ -5914,29 +6080,118 @@ fn resolve_month_day(
     month_code: Option<String>,
     day: Option<i64>,
     constrain: bool,
+    calendar: Option<&str>,
 ) -> Result<(i64, i64), JsError> {
     let Some(day) = day else {
         return Err(JsError::new(ErrorKind::TypeError, "day is required".into()));
     };
-    let month = super::resolve_iso_month(month, month_code)?;
-    let Some(month) = month else {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "month or monthCode is required".into(),
-        ));
-    };
-    // monthDayToISOReferenceDate: RegulateISODate with the provided reference
-    // year (1972 by default), so reject validates the day against that year
-    // and constrain clamps it; the result is stored with the 1972 reference.
     let ref_year = year.unwrap_or(1972);
-    let (_, month, day) = iso::regulate_iso_date(ref_year, month, day, constrain);
-    if !iso::is_valid_iso_date(ref_year, month, day) {
-        return Err(JsError::new(
-            ErrorKind::RangeError,
-            "invalid month-day".into(),
-        ));
+    if let Some(cal) = calendar {
+        let had_month = month.is_some() || month_code.is_some();
+        // The calendar year of the ISO reference year (the day constraint
+        // validates against that context's month lengths); an explicit year
+        // is already a calendar year.
+        let cal_ref_year = if year.is_some() {
+            ref_year
+        } else {
+            calendar::calendar_iso_to_date(cal, ref_year, 6, 1)
+                .map(|(cy, _, _)| cy)
+                .unwrap_or(ref_year)
+        };
+        let month = if year.is_some() {
+            // With an explicit year the code regulates against that year
+            // (M05L in a common year constrains to Adar).
+            calendar::resolve_calendar_month_with_overflow(
+                cal,
+                ref_year,
+                month,
+                month_code.as_deref(),
+                constrain,
+            )
+        } else if month_code.is_some() {
+            // No year: the code resolves without the leap validation (M05L
+            // keeps its Adar I position); the caller's reference search
+            // validates it against the candidate years.
+            calendar::resolve_calendar_month(cal, cal_ref_year, month, month_code.as_deref()).or(
+                match month_code.as_deref() {
+                    Some("M05L") => Some(6),
+                    _ => None,
+                },
+            )
+        } else {
+            calendar::resolve_calendar_month(cal, cal_ref_year, month, month_code.as_deref())
+        };
+        let Some(month) = month else {
+            return Err(JsError::new(
+                if had_month {
+                    ErrorKind::RangeError
+                } else {
+                    ErrorKind::TypeError
+                },
+                if had_month {
+                    "invalid month".into()
+                } else {
+                    "month or monthCode is required".into()
+                },
+            ));
+        };
+        // The month is bounded by the year's month count (a numeric month
+        // past the year's end constrains to the last month).
+        if let Some(max) = calendar::calendar_months_in_year(cal, cal_ref_year) {
+            let month = if constrain { month.min(max) } else { month };
+            if month > max {
+                return Err(JsError::new(
+                    ErrorKind::RangeError,
+                    "invalid month-day".into(),
+                ));
+            }
+        }
+        // Regulate the day against the month length in the reference context
+        // (reject validates, constrain clamps); the result keeps the
+        // reference-year month-day for the caller's reference-date search.
+        if let Some(max) = calendar::calendar_days_in_month(cal, cal_ref_year, month) {
+            if day > max {
+                if constrain {
+                    return Ok((month, max));
+                }
+                return Err(JsError::new(
+                    ErrorKind::RangeError,
+                    "invalid month-day".into(),
+                ));
+            }
+            return Ok((month, day));
+        }
+        let (_, month, day) = iso::regulate_iso_date(ref_year, month, day, constrain);
+        if !iso::is_valid_iso_date(ref_year, month, day) {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "invalid month-day".into(),
+            ));
+        }
+        Ok((month, day))
+    } else {
+        let month = match super::resolve_iso_month(month, month_code)? {
+            Some(m) => m,
+            None => {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "month or monthCode is required".into(),
+                ));
+            }
+        };
+        // monthDayToISOReferenceDate: RegulateISODate with the provided
+        // reference year (1972 by default), so reject validates the day
+        // against that year and constrain clamps it; the result is stored
+        // with the 1972 reference.
+        let (_, month, day) = iso::regulate_iso_date(ref_year, month, day, constrain);
+        if !iso::is_valid_iso_date(ref_year, month, day) {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "invalid month-day".into(),
+            ));
+        }
+        Ok((month, day))
     }
-    Ok((month, day))
 }
 
 /// spec 6.3.3 `with` (CalendarMergeFields over {monthCode, year}).
@@ -5960,22 +6215,32 @@ fn plain_year_month_with(
     let (pm, pmc, py) = read_year_month_fields(agent, &item, true)?;
     let options = super::get_options_object(&options)?;
     let constrain = super::get_temporal_overflow_option(agent, &options)? == Overflow::Constrain;
-    // CalendarMergeFields for iso8601: the partial month/monthCode dedup over
-    // the existing {monthCode, year}.
-    let year = py.or(Some(ym[0]));
+    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
+    // CalendarMergeFields: the partial month/monthCode dedup over the
+    // existing year-month in calendar terms (the stored ISO year-month is
+    // the reference date of the calendar month's first day).
+    let (cy, cm, _) = calendar::calendar_iso_to_date(&calendar, ym[0], ym[1], ym[2])
+        .unwrap_or((ym[0], ym[1], ym[2]));
+    let year = py.or(Some(cy));
     let month = pm;
     let month_code = pmc.or(if pm.is_some() {
         None
+    } else if calendar == "hebrew" {
+        Some(calendar::hebrew_month_code(cy, cm))
     } else {
-        Some(format!("M{:02}", ym[1]))
+        Some(format!("M{cm:02}"))
     });
-    let (y, m) = resolve_year_month(year, month, month_code, constrain)?;
-    create_temporal_object(
+    let (y, m) = resolve_year_month(year, month, month_code, constrain, Some(&calendar))?;
+    // The result keeps the reference day: the ISO year-month of the resolved
+    // month's first day.
+    let (y, m, d) = calendar::calendar_year_month_to_iso(&calendar, y, m).unwrap_or((y, m, 1));
+    let value = create_temporal_object(
         agent,
         &Value::Undefined,
         PLAIN_YEAR_MONTH_PROTO,
-        TemporalRecord::YearMonth([y, m, 1]),
-    )
+        TemporalRecord::YearMonth([y, m, d]),
+    )?;
+    with_calendar(agent, value, Some(&calendar))
 }
 
 /// spec 6.3.5 `add` / 6.3.6 `subtract` (AddDurationToYearMonth: only years
@@ -6006,12 +6271,13 @@ fn plain_year_month_add_subtract(
     // CalendarDateFromFields over the first-of-month reference date
     // (RejectDateRange: the YearMonth edges sit outside the PlainDate range).
     check_reference_date(ym[0], ym[1])?;
-    // The reference day is 1; CalendarDateAdd with years+months, then
-    // CalendarYearMonthFromFields over the result.
-    let date = iso::calendar_date_add(
-        ym[0],
-        ym[1],
-        1,
+    // CalendarDateAdd with years+months from the stored reference date, then
+    // CalendarYearMonthFromFields over the result (the ISO year-month of the
+    // added month's first day, with the reference day).
+    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
+    let date = calendar::calendar_date_add(
+        &calendar,
+        (ym[0], ym[1], ym[2]),
         duration[0] as i64,
         duration[1] as i64,
         0,
@@ -6019,12 +6285,17 @@ fn plain_year_month_add_subtract(
         constrain,
     )
     .ok_or_else(|| JsError::new(ErrorKind::RangeError, "date out of range".into()))?;
-    let (y, m) = resolve_year_month(Some(date.0), Some(date.1), None, constrain)?;
+    let (y, m, d) = match calendar::calendar_iso_to_date(&calendar, date.0, date.1, date.2) {
+        Some((cy, cm, _)) => {
+            calendar::calendar_year_month_to_iso(&calendar, cy, cm).unwrap_or((date.0, date.1, 1))
+        }
+        None => (date.0, date.1, 1),
+    };
     create_temporal_object(
         agent,
         &Value::Undefined,
         PLAIN_YEAR_MONTH_PROTO,
-        TemporalRecord::YearMonth([y, m, 1]),
+        TemporalRecord::YearMonth([y, m, d]),
     )
 }
 
@@ -6114,9 +6385,16 @@ fn plain_year_month_until_since(
     // range).
     check_reference_date(ym[0], ym[1])?;
     check_reference_date(o[0], o[1])?;
-    // CalendarDateUntil at the first-of-month reference days, with the day
-    // (and week) fields zeroed; rounding runs at midnight when needed.
-    let date_diff = iso::calendar_date_until((ym[0], ym[1], 1), (o[0], o[1], 1), largest);
+    // CalendarDateUntil at the stored reference dates (the day of the
+    // non-ISO year-months is the first-of-month reference day), with the
+    // week fields zeroed; rounding runs at midnight when needed.
+    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
+    let date_diff = calendar::calendar_date_until(
+        &calendar,
+        (ym[0], ym[1], ym[2]),
+        (o[0], o[1], o[2]),
+        largest,
+    );
     let mut duration = super::InternalDuration {
         date: [date_diff.0 as f64, date_diff.1 as f64, 0.0, 0.0],
         time: 0,
@@ -6201,6 +6479,7 @@ fn plain_year_month_to_plain_date(
         Some(format!("M{:02}", ym[1])),
         Some(day),
         true,
+        Some(&super::temporal_calendar_id(agent, this).to_string_lossy()),
     )?;
     create_plain_date(agent, (y, m, d), &Value::Undefined)
 }
@@ -6235,22 +6514,39 @@ fn plain_month_day_with(
     }
     let options = super::get_options_object(&options)?;
     let constrain = super::get_temporal_overflow_option(agent, &options)? == Overflow::Constrain;
-    // CalendarMergeFields for iso8601 over {monthCode, day}; the reference
-    // year from the partial participates only in the overflow regulation.
+    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
+    // CalendarMergeFields over the existing month-day in calendar terms (the
+    // stored ISO reference date); the reference year from the partial
+    // participates only in the overflow regulation.
+    let (cy, cm, cd) = calendar::calendar_iso_to_date(&calendar, md[0], md[1], md[2])
+        .unwrap_or((md[0], md[1], md[2]));
     let month = pm;
     let month_code = pmc.or(if pm.is_some() {
         None
+    } else if calendar == "hebrew" {
+        Some(calendar::hebrew_month_code(cy, cm))
     } else {
-        Some(format!("M{:02}", md[1]))
+        Some(format!("M{cm:02}"))
     });
-    let day = pd.or(Some(md[2]));
-    let (m, d) = resolve_month_day(py, month, month_code, day, constrain)?;
-    create_temporal_object(
+    let day = pd.or(Some(cd));
+    let (m, d) = resolve_month_day(
+        py,
+        month,
+        month_code.clone(),
+        day,
+        constrain,
+        Some(&calendar),
+    )?;
+    // The result stores the ISO reference date of the resolved month-day.
+    let (y, m, d) = calendar::calendar_month_day_reference(&calendar, m, d, month_code.as_deref())
+        .unwrap_or((1972, m, d));
+    let value = create_temporal_object(
         agent,
         &Value::Undefined,
         PLAIN_MONTH_DAY_PROTO,
-        TemporalRecord::MonthDay([1972, m, d]),
-    )
+        TemporalRecord::MonthDay([y, m, d]),
+    )?;
+    with_calendar(agent, value, Some(&calendar))
 }
 
 /// spec 6.4.4 `equals`.
@@ -6318,6 +6614,7 @@ fn plain_month_day_to_plain_date(
         Some(format!("M{:02}", md[1])),
         Some(md[2]),
         true,
+        Some(&calendar.to_string_lossy()),
     )?;
     let value = create_plain_date(agent, (y, m, d), &Value::Undefined)?;
     super::set_temporal_calendar(agent, &value, Some(&calendar.to_string_lossy()));
@@ -6508,7 +6805,7 @@ pub fn to_plain_year_month(
         // the identity). The parsed reference day is kept (test262
         // equals/canonicalize-calendar.js pins "2024-06-08[u-ca=islamicc]"
         // with reference day 8).
-        let (y, m) = resolve_year_month(Some(parsed.year), Some(parsed.month), None, true)?;
+        let (y, m) = resolve_year_month(Some(parsed.year), Some(parsed.month), None, true, None)?;
         let value = create_temporal_object(
             agent,
             &Value::Undefined,
@@ -6525,7 +6822,7 @@ pub fn to_plain_year_month(
         let year = read_era_fields(agent, item, calendar.as_deref(), year, true)?;
         let opts = super::get_options_object(options)?;
         let constrain = super::get_temporal_overflow_option(agent, &opts)? == Overflow::Constrain;
-        let (y, m) = resolve_year_month(year, month, month_code, constrain)?;
+        let (y, m) = resolve_year_month(year, month, month_code, constrain, calendar.as_deref())?;
         // CalendarYearMonthFromFields for the tabular Islamic calendars: the
         // ISO year-month of the month's first day with its reference day
         // (1445-12 → 2024-06 with reference day 8).
@@ -6605,11 +6902,30 @@ pub fn to_plain_month_day(
             super::canonicalize_calendar_id(parsed.calendar.as_deref().unwrap_or("iso8601"));
         let opts = super::get_options_object(options)?;
         super::get_temporal_overflow_option(agent, &opts)?;
+        // The calendar month-day of the parsed ISO date, stored as the ISO
+        // reference date in the latest ISO year at or before 1972 (the
+        // reference-date-noniso-calendar fixture pins 2023-01-01[u-ca=hebrew]
+        // -> M04-08 with the 1972 reference year).
+        let (y, m, d) = if let Some(cal) = calendar.as_deref()
+            && let Some((cal_y, cm, cd)) =
+                calendar::calendar_iso_to_date(cal, parsed.year, parsed.month, parsed.day)
+            && let Some((cy, cm2, cd2)) = {
+                let code = if cal == "hebrew" {
+                    Some(calendar::hebrew_month_code(cal_y, cm))
+                } else {
+                    None
+                };
+                calendar::calendar_month_day_reference(cal, cm, cd, code.as_deref())
+            } {
+            (cy, cm2, cd2)
+        } else {
+            (1972, parsed.month, parsed.day)
+        };
         let value = create_temporal_object(
             agent,
             &Value::Undefined,
             PLAIN_MONTH_DAY_PROTO,
-            TemporalRecord::MonthDay([1972, parsed.month, parsed.day]),
+            TemporalRecord::MonthDay([y, m, d]),
         )?;
         return with_calendar(agent, value, calendar.as_deref());
     }
@@ -6634,15 +6950,23 @@ pub fn to_plain_month_day(
         }
         let opts = super::get_options_object(options)?;
         let constrain = super::get_temporal_overflow_option(agent, &opts)? == Overflow::Constrain;
-        let (m, d) = resolve_month_day(year, month, month_code, day, constrain)?;
-        // CalendarMonthDayFromFields for the tabular Islamic calendars: the
-        // reference date in the latest ISO year at or before 1972 (M12-25 →
-        // 1972-02-11), or the explicit year's date.
+        let (m, d) = resolve_month_day(
+            year,
+            month,
+            month_code.clone(),
+            day,
+            constrain,
+            calendar.as_deref(),
+        )?;
+        // CalendarMonthDayFromFields: the month-day is stored as the ISO
+        // reference date in the latest ISO year at or before 1972 where it
+        // exists (the explicit year participates only in the overflow
+        // regulation above; reference-year-1972 pins the 1972 reference even
+        // for year 5781).
         let (y, m, d) = if let Some(calendar) = calendar.as_deref()
-            && let Some((cy, cm, cd)) = match year {
-                Some(y) => calendar::calendar_date_to_iso(calendar, y, m, d),
-                None => calendar::calendar_month_day_reference(calendar, m, d),
-            } {
+            && let Some((cy, cm, cd)) =
+                calendar::calendar_month_day_reference(calendar, m, d, month_code.as_deref())
+        {
             (cy, cm, cd)
         } else {
             (1972, m, d)

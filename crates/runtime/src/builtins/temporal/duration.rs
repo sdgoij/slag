@@ -562,6 +562,7 @@ fn round(agent: &mut Agent, this: &Value, round_to: &Value) -> Result<Value, JsE
                 rounding_increment,
                 smallest,
                 rounding_mode,
+                None,
             )?;
             let largest_out = if largest.category() == iso::Category::Date {
                 Unit::Hour
@@ -594,6 +595,7 @@ fn round(agent: &mut Agent, this: &Value, round_to: &Value) -> Result<Value, JsE
                 rounding_increment,
                 smallest,
                 rounding_mode,
+                None,
             )?;
             let result =
                 super::temporal_duration_from_internal(internal.date, internal.time, largest)?;
@@ -715,6 +717,7 @@ fn total(agent: &mut Agent, this: &Value, total_of: &Value) -> Result<Value, JsE
                     1,
                     Unit::Nanosecond,
                     RoundingMode::Trunc,
+                    None,
                 )?;
                 nudge_to_calendar_unit_total(
                     internal_duration_sign(&diff),
@@ -742,6 +745,7 @@ fn total(agent: &mut Agent, this: &Value, total_of: &Value) -> Result<Value, JsE
                     1,
                     Unit::Nanosecond,
                     RoundingMode::Trunc,
+                    None,
                 )?;
                 nudge_to_calendar_unit_total(
                     internal_duration_sign(&diff),
@@ -800,7 +804,7 @@ fn total(agent: &mut Agent, this: &Value, total_of: &Value) -> Result<Value, JsE
                 // origin → target difference with the calendar first, then
                 // total the balanced duration — nudging the raw duration can
                 // straddle a window boundary and produce a spurious fraction.
-                let diff = difference_iso_date_time(origin, target, unit);
+                let diff = difference_iso_date_time(origin, target, unit, None);
                 nudge_to_calendar_unit_total(
                     internal_duration_sign(&diff),
                     diff,
@@ -951,11 +955,14 @@ fn add_time_to_midnight(
     Ok(([h, min, s, ms, us, ns], date))
 }
 
-/// spec 5.5.12 DifferenceISODateTime (plain, no time zone).
+/// spec 5.5.12 DifferenceISODateTime (plain, no time zone; the calendar
+/// picks the date-part arithmetic for the non-ISO calendars, None is the
+/// iso8601 context).
 pub fn difference_iso_date_time(
     one: IsoDateTime,
     two: IsoDateTime,
     largest_unit: Unit,
+    calendar: Option<&str>,
 ) -> super::InternalDuration {
     let t1 = time_record_ns((one.3, one.4, one.5, one.6, one.7, one.8));
     let t2 = time_record_ns((two.3, two.4, two.5, two.6, two.7, two.8));
@@ -973,8 +980,12 @@ pub fn difference_iso_date_time(
         time_duration -= time_sign * iso::NS_PER_DAY;
     }
     let date_largest = iso::larger_of_two_units(Unit::Day, largest_unit);
-    let date_difference =
-        iso::calendar_date_until((one.0, one.1, one.2), adjusted_date, date_largest);
+    let date_difference = super::calendar::calendar_date_until(
+        calendar.unwrap_or("iso8601"),
+        (one.0, one.1, one.2),
+        adjusted_date,
+        date_largest,
+    );
     let mut date_difference = [
         date_difference.0 as f64,
         date_difference.1 as f64,
@@ -998,7 +1009,8 @@ fn time_record_ns(t: (i64, i64, i64, i64, i64, i64)) -> i128 {
         + ns as i128
 }
 
-/// spec 5.5.13 DifferencePlainDateTimeWithRounding.
+/// spec 5.5.13 DifferencePlainDateTimeWithRounding (the calendar for the
+/// date-part arithmetic; None is the iso8601 context).
 #[allow(clippy::too_many_arguments)]
 pub fn difference_plain_date_time_with_rounding(
     one: IsoDateTime,
@@ -1007,6 +1019,7 @@ pub fn difference_plain_date_time_with_rounding(
     rounding_increment: i64,
     smallest_unit: Unit,
     rounding_mode: RoundingMode,
+    calendar: Option<&str>,
 ) -> Result<super::InternalDuration, JsError> {
     if iso::compare_iso_date((one.0, one.1, one.2), (two.0, two.1, two.2)) == 0
         && time_record_ns((one.3, one.4, one.5, one.6, one.7, one.8))
@@ -1027,7 +1040,7 @@ pub fn difference_plain_date_time_with_rounding(
             "date-time out of range".into(),
         ));
     }
-    let mut diff = difference_iso_date_time(one, two, largest_unit);
+    let mut diff = difference_iso_date_time(one, two, largest_unit, calendar);
     if smallest_unit == Unit::Nanosecond && rounding_increment == 1 {
         return Ok(diff);
     }
@@ -1060,6 +1073,7 @@ fn difference_zoned_date_time(
     ns2: i128,
     tz: &str,
     largest_unit: Unit,
+    calendar: Option<&str>,
 ) -> Result<super::InternalDuration, JsError> {
     if ns1 == ns2 {
         return Ok(super::InternalDuration {
@@ -1112,7 +1126,8 @@ fn difference_zoned_date_time(
         day_correction += 1;
     }
     let date_largest = iso::larger_of_two_units(Unit::Day, largest_unit);
-    let date_difference = iso::calendar_date_until(
+    let date_difference = super::calendar::calendar_date_until(
+        calendar.unwrap_or("iso8601"),
         (y1, m1, d1),
         (intermediate.0, intermediate.1, intermediate.2),
         date_largest,
@@ -1128,7 +1143,9 @@ fn difference_zoned_date_time(
     })
 }
 
-/// spec 6.5.7 DifferenceZonedDateTimeWithRounding.
+/// spec 6.5.7 DifferenceZonedDateTimeWithRounding (the calendar for the
+/// date-part arithmetic; None is the iso8601 context).
+#[allow(clippy::too_many_arguments)]
 pub fn difference_zoned_date_time_with_rounding(
     ns1: i128,
     ns2: i128,
@@ -1137,6 +1154,7 @@ pub fn difference_zoned_date_time_with_rounding(
     rounding_increment: i64,
     smallest_unit: Unit,
     rounding_mode: RoundingMode,
+    calendar: Option<&str>,
 ) -> Result<super::InternalDuration, JsError> {
     if largest_unit.category() == iso::Category::Time {
         let time = ns2 - ns1;
@@ -1147,7 +1165,7 @@ pub fn difference_zoned_date_time_with_rounding(
             time,
         });
     }
-    let mut diff = difference_zoned_date_time(ns1, ns2, tz, largest_unit)?;
+    let mut diff = difference_zoned_date_time(ns1, ns2, tz, largest_unit, calendar)?;
     if smallest_unit == Unit::Nanosecond && rounding_increment == 1 {
         return Ok(diff);
     }
