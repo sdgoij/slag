@@ -1828,14 +1828,15 @@ fn month_code(
             ));
         }
     };
-    // The hebrew month code depends on the date's hebrew month and the
-    // year's leap status (M05L Adar I; the M06-M12 shift in leap years).
+    // The hebrew/chinese/dangi month code depends on the date's calendar
+    // month and the year's leap status (M05L Adar I; the chinese leap month
+    // codes M{n}L and the shifted M06-M12 in hebrew leap years).
     let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
-    if calendar == "hebrew"
-        && let Some((hy, hm, _)) = calendar::calendar_iso_to_date(&calendar, year, month, day)
+    if matches!(calendar.as_ref(), "hebrew" | "chinese" | "dangi")
+        && let Some((cy, cm, _)) = calendar::calendar_iso_to_date(&calendar, year, month, day)
     {
         return Ok(Value::String(Handle::new(JsString::from_utf8(
-            &calendar::hebrew_month_code(hy, hm),
+            &calendar::calendar_month_code(&calendar, cy, cm),
         ))));
     }
     Ok(Value::String(Handle::new(JsString::from_utf8(&format!(
@@ -1939,18 +1940,18 @@ fn zoned_offset_ns(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     Ok(Value::Number(offset as f64))
 }
 
-/// The local monthCode getter (hebrew routes through the calendar month
-/// code; the other calendars' codes are the ISO month number).
+/// The local monthCode getter (hebrew/chinese/dangi route through the
+/// calendar month code; the other calendars' codes are the ISO month number).
 fn zoned_month_code(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     let (ns, tz) = zoned_parts(agent, this)?;
     let local = zoned_local(agent, ns, &tz)?;
     let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
-    if calendar == "hebrew"
-        && let Some((hy, hm, _)) =
+    if matches!(calendar.as_ref(), "hebrew" | "chinese" | "dangi")
+        && let Some((cy, cm, _)) =
             calendar::calendar_iso_to_date(&calendar, local.0, local.1, local.2)
     {
         return Ok(Value::String(Handle::new(JsString::from_utf8(
-            &calendar::hebrew_month_code(hy, hm),
+            &calendar::calendar_month_code(&calendar, cy, cm),
         ))));
     }
     Ok(Value::String(Handle::new(JsString::from_utf8(&format!(
@@ -3715,10 +3716,8 @@ fn plain_date_time_with(
     let month = pm;
     let month_code = pmc.or(if pm.is_some() {
         None
-    } else if calendar == "hebrew" {
-        Some(calendar::hebrew_month_code(cy, cm))
     } else {
-        Some(format!("M{cm:02}"))
+        Some(calendar::calendar_month_code(&calendar, cy, cm))
     });
     let day = pd.or(Some(cd));
     let mut t = [dt[3], dt[4], dt[5], dt[6], dt[7], dt[8]];
@@ -3850,6 +3849,7 @@ fn plain_date_time_add_subtract(
         PLAIN_DATE_TIME_PROTO,
         TemporalRecord::PlainDateTime([date.0, date.1, date.2, t[0], t[1], t[2], t[3], t[4], t[5]]),
     )
+    .and_then(|value| with_calendar(agent, value, Some(&calendar)))
 }
 
 /// spec 5.5.5 `round` (RoundISODateTime; day is a valid smallestUnit with a
@@ -4255,10 +4255,8 @@ fn zoned_with(
     let month = pm;
     let month_code = pmc.or(if pm.is_some() {
         None
-    } else if calendar == "hebrew" {
-        Some(calendar::hebrew_month_code(cy, cm))
     } else {
-        Some(format!("M{cm:02}"))
+        Some(calendar::calendar_month_code(&calendar, cy, cm))
     });
     let day = pd.or(Some(cd));
     let mut t = [local.3, local.4, local.5, local.6, local.7, local.8];
@@ -4389,7 +4387,10 @@ fn zoned_add_subtract(
                 "result is out of range".into(),
             ));
         }
-        return create_zoned(agent, end_ns, &tz);
+        return create_zoned(agent, end_ns, &tz).and_then(|value| {
+            let calendar = super::temporal_calendar_id(agent, this);
+            with_calendar(agent, value, Some(&calendar.to_string_lossy()))
+        });
     }
     // AddZonedDateTime: CalendarDateAdd on the local date (the days fold into
     // the calendar add), then GetEpochNanosecondsFor for the new wall time.
@@ -4426,7 +4427,10 @@ fn zoned_add_subtract(
             "result is out of range".into(),
         ));
     }
-    create_zoned(agent, end_ns, &tz)
+    create_zoned(agent, end_ns, &tz).and_then(|value| {
+        let calendar = super::temporal_calendar_id(agent, this);
+        with_calendar(agent, value, Some(&calendar.to_string_lossy()))
+    })
 }
 
 /// spec 6.5.12 `round` (day or time units; the day case rounds the progress
@@ -4719,14 +4723,17 @@ fn zoned_to_plain_time(agent: &mut Agent, this: &Value) -> Result<Value, JsError
 fn zoned_to_plain_date_time(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     let (ns, tz) = zoned_parts(agent, this)?;
     let local = zoned_local(agent, ns, &tz)?;
-    create_temporal_object(
+    let value = create_temporal_object(
         agent,
         &Value::Undefined,
         PLAIN_DATE_TIME_PROTO,
         TemporalRecord::PlainDateTime([
             local.0, local.1, local.2, local.3, local.4, local.5, local.6, local.7, local.8,
         ]),
-    )
+    )?;
+    let calendar = super::temporal_calendar_id(agent, this);
+    super::set_temporal_calendar(agent, &value, Some(&calendar.to_string_lossy()));
+    Ok(value)
 }
 
 // ---------------------------------------------------------------------------
@@ -5217,7 +5224,7 @@ fn resolve_date_fields(
         ),
         None => super::resolve_iso_month(month, month_code)?,
     };
-    let Some(month) = month else {
+    let Some(mut month) = month else {
         return Err(JsError::new(
             if had_month {
                 ErrorKind::RangeError
@@ -5234,11 +5241,13 @@ fn resolve_date_fields(
     if let Some(cal) = calendar {
         // The month is bounded by the year's month count (constrain clamps
         // the 13th month of a common hebrew year to Elul).
-        if let Some(max) = calendar::calendar_months_in_year(cal, year) {
-            let month = if constrain { month.min(max) } else { month };
-            if month > max {
+        if let Some(max) = calendar::calendar_months_in_year(cal, year)
+            && month > max
+        {
+            if !constrain {
                 return Err(JsError::new(ErrorKind::RangeError, "invalid date".into()));
             }
+            month = max;
         }
         // The calendar months with length data regulate the day against
         // their own length (the ISO regulation would mis-handle
@@ -5315,10 +5324,8 @@ fn plain_date_with(
     let month = pm;
     let month_code = pmc.or(if pm.is_some() {
         None
-    } else if calendar == "hebrew" {
-        Some(calendar::hebrew_month_code(cy, cm))
     } else {
-        Some(format!("M{cm:02}"))
+        Some(calendar::calendar_month_code(&calendar, cy, cm))
     });
     let day = pd.or(Some(cd));
     date_from_merged_fields(
@@ -5373,7 +5380,8 @@ fn plain_date_add_subtract(
         constrain,
     )
     .ok_or_else(|| JsError::new(ErrorKind::RangeError, "date out of range".into()))?;
-    create_plain_date(agent, result, &Value::Undefined)
+    let value = create_plain_date(agent, result, &Value::Undefined)?;
+    with_calendar(agent, value, Some(&calendar))
 }
 
 /// spec 3.5.14 `until` / 3.5.15 `since` (DifferenceTemporalPlainDate).
@@ -5714,6 +5722,12 @@ fn calendar_year_fields(
             // The Anno Mundi year of the ISO date (the era is always "am").
             let (hy, _, _) = calendar::calendar_iso_to_date(calendar, y, m, d).unwrap_or((y, m, d));
             (hy, Some("am"), Some(hy))
+        }
+        // The chinese/dangi year is the related ISO year of the sui containing
+        // the date (no era; the corpus's era-less calendars report none).
+        "chinese" | "dangi" => {
+            let (cy, _, _) = calendar::calendar_iso_to_date(calendar, y, m, d).unwrap_or((y, m, d));
+            (cy, None, None)
         }
         _ => (y, None, None),
     }
@@ -6110,18 +6124,20 @@ fn resolve_month_day(
             )
         } else if month_code.is_some() {
             // No year: the code resolves without the leap validation (M05L
-            // keeps its Adar I position); the caller's reference search
-            // validates it against the candidate years.
-            calendar::resolve_calendar_month(cal, cal_ref_year, month, month_code.as_deref()).or(
-                match month_code.as_deref() {
-                    Some("M05L") => Some(6),
+            // keeps its Adar I position, M03L its leap ordinal); the caller's
+            // reference search validates it against the candidate years.
+            calendar::resolve_calendar_month(cal, cal_ref_year, month, month_code.as_deref())
+                .or_else(|| match (cal, month_code.as_deref()) {
+                    ("hebrew", Some("M05L")) => Some(6),
+                    ("chinese" | "dangi", Some(code)) if code.ends_with('L') => {
+                        code[1..3].parse::<i64>().ok().map(|n| n + 1)
+                    }
                     _ => None,
-                },
-            )
+                })
         } else {
             calendar::resolve_calendar_month(cal, cal_ref_year, month, month_code.as_deref())
         };
-        let Some(month) = month else {
+        let Some(mut month) = month else {
             return Err(JsError::new(
                 if had_month {
                     ErrorKind::RangeError
@@ -6137,18 +6153,35 @@ fn resolve_month_day(
         };
         // The month is bounded by the year's month count (a numeric month
         // past the year's end constrains to the last month).
-        if let Some(max) = calendar::calendar_months_in_year(cal, cal_ref_year) {
-            let month = if constrain { month.min(max) } else { month };
-            if month > max {
+        if let Some(max) = calendar::calendar_months_in_year(cal, cal_ref_year)
+            && month > max
+        {
+            if !constrain {
                 return Err(JsError::new(
                     ErrorKind::RangeError,
                     "invalid month-day".into(),
                 ));
             }
+            month = max;
         }
         // Regulate the day against the month length in the reference context
         // (reject validates, constrain clamps); the result keeps the
         // reference-year month-day for the caller's reference-date search.
+        // A bare chinese/dangi month-day clamps against the lunar maximum
+        // (30): the reference search validates the day against the actual
+        // reference year, so the 29/30 variation must not pre-clamp it.
+        if matches!(cal, "chinese" | "dangi") && year.is_none() {
+            if day > 30 {
+                if constrain {
+                    return Ok((month, 30));
+                }
+                return Err(JsError::new(
+                    ErrorKind::RangeError,
+                    "invalid month-day".into(),
+                ));
+            }
+            return Ok((month, day));
+        }
         if let Some(max) = calendar::calendar_days_in_month(cal, cal_ref_year, month) {
             if day > max {
                 if constrain {
@@ -6225,10 +6258,8 @@ fn plain_year_month_with(
     let month = pm;
     let month_code = pmc.or(if pm.is_some() {
         None
-    } else if calendar == "hebrew" {
-        Some(calendar::hebrew_month_code(cy, cm))
     } else {
-        Some(format!("M{cm:02}"))
+        Some(calendar::calendar_month_code(&calendar, cy, cm))
     });
     let (y, m) = resolve_year_month(year, month, month_code, constrain, Some(&calendar))?;
     // The result keeps the reference day: the ISO year-month of the resolved
@@ -6297,6 +6328,7 @@ fn plain_year_month_add_subtract(
         PLAIN_YEAR_MONTH_PROTO,
         TemporalRecord::YearMonth([y, m, d]),
     )
+    .and_then(|value| with_calendar(agent, value, Some(&calendar)))
 }
 
 /// spec 6.3.10 `until` / 6.3.11 `since` (DifferenceTemporalPlainYearMonth:
@@ -6473,14 +6505,23 @@ fn plain_year_month_to_plain_date(
         }
         _ => super::to_positive_integer_with_truncation(agent, &value)?,
     };
+    // The stored ISO year-month is the reference date of the calendar month's
+    // first day: convert it to the calendar fields first, then resolve with
+    // the provided day (CalendarDateFromFields over {year, monthCode, day}).
+    let calendar = super::temporal_calendar_id(agent, this).to_string_lossy();
+    let (cy, cm, _) = calendar::calendar_iso_to_date(&calendar, ym[0], ym[1], ym[2])
+        .unwrap_or((ym[0], ym[1], ym[2]));
     let (y, m, d) = resolve_date_fields(
-        Some(ym[0]),
+        Some(cy),
         None,
-        Some(format!("M{:02}", ym[1])),
+        Some(calendar::calendar_month_code(&calendar, cy, cm)),
         Some(day),
         true,
-        Some(&super::temporal_calendar_id(agent, this).to_string_lossy()),
+        Some(&calendar),
     )?;
+    // The resolved calendar fields convert back to the ISO date (the
+    // CalendarDateFromFields contract shared with the date from-fields path).
+    let (y, m, d) = calendar::calendar_date_to_iso(&calendar, y, m, d).unwrap_or((y, m, d));
     create_plain_date(agent, (y, m, d), &Value::Undefined)
 }
 
@@ -6523,10 +6564,8 @@ fn plain_month_day_with(
     let month = pm;
     let month_code = pmc.or(if pm.is_some() {
         None
-    } else if calendar == "hebrew" {
-        Some(calendar::hebrew_month_code(cy, cm))
     } else {
-        Some(format!("M{cm:02}"))
+        Some(calendar::calendar_month_code(&calendar, cy, cm))
     });
     let day = pd.or(Some(cd));
     let (m, d) = resolve_month_day(
@@ -6537,9 +6576,25 @@ fn plain_month_day_with(
         constrain,
         Some(&calendar),
     )?;
-    // The result stores the ISO reference date of the resolved month-day.
-    let (y, m, d) = calendar::calendar_month_day_reference(&calendar, m, d, month_code.as_deref())
-        .unwrap_or((1972, m, d));
+    // The result stores the ISO reference date of the resolved month-day (a
+    // chinese/dangi reject overflow with a month-day that never occurs in the
+    // reference window throws; the other calendars fall back to 1972).
+    let (y, m, d) = match calendar::calendar_month_day_reference(
+        &calendar,
+        m,
+        d,
+        month_code.as_deref(),
+        constrain,
+    ) {
+        Some(date) => date,
+        None if matches!(calendar.as_str(), "chinese" | "dangi") => {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "invalid month-day".into(),
+            ));
+        }
+        None => (1972, m, d),
+    };
     let value = create_temporal_object(
         agent,
         &Value::Undefined,
@@ -6905,17 +6960,18 @@ pub fn to_plain_month_day(
         // The calendar month-day of the parsed ISO date, stored as the ISO
         // reference date in the latest ISO year at or before 1972 (the
         // reference-date-noniso-calendar fixture pins 2023-01-01[u-ca=hebrew]
-        // -> M04-08 with the 1972 reference year).
+        // -> M04-08 with the 1972 reference year). This step always runs
+        // with constrain (the spec's note in CalendarMonthDayFromFields).
         let (y, m, d) = if let Some(cal) = calendar.as_deref()
             && let Some((cal_y, cm, cd)) =
                 calendar::calendar_iso_to_date(cal, parsed.year, parsed.month, parsed.day)
             && let Some((cy, cm2, cd2)) = {
-                let code = if cal == "hebrew" {
-                    Some(calendar::hebrew_month_code(cal_y, cm))
+                let code = if matches!(cal, "hebrew" | "chinese" | "dangi") {
+                    Some(calendar::calendar_month_code(cal, cal_y, cm))
                 } else {
                     None
                 };
-                calendar::calendar_month_day_reference(cal, cm, cd, code.as_deref())
+                calendar::calendar_month_day_reference(cal, cm, cd, code.as_deref(), true)
             } {
             (cy, cm2, cd2)
         } else {
@@ -6958,16 +7014,37 @@ pub fn to_plain_month_day(
             constrain,
             calendar.as_deref(),
         )?;
+        // The reference search resolves the month code of the resolved
+        // month-day (a leap month resolved from a numeric month keeps its
+        // leap code — chinese-calendar-dates pins 2001-M04L-15 → 1963).
+        let reference_code = month_code.clone().or_else(|| {
+            let cal = calendar.as_deref()?;
+            year.map(|y| calendar::calendar_month_code(cal, y, m))
+        });
         // CalendarMonthDayFromFields: the month-day is stored as the ISO
         // reference date in the latest ISO year at or before 1972 where it
         // exists (the explicit year participates only in the overflow
         // regulation above; reference-year-1972 pins the 1972 reference even
-        // for year 5781).
-        let (y, m, d) = if let Some(calendar) = calendar.as_deref()
-            && let Some((cy, cm, cd)) =
-                calendar::calendar_month_day_reference(calendar, m, d, month_code.as_deref())
-        {
-            (cy, cm, cd)
+        // for year 5781). A chinese/dangi reject overflow with a month-day
+        // that never occurs in the window throws (the leap-month fixtures);
+        // the other calendars fall back to 1972.
+        let (y, m, d) = if let Some(calendar) = calendar.as_deref() {
+            match calendar::calendar_month_day_reference(
+                calendar,
+                m,
+                d,
+                reference_code.as_deref(),
+                constrain,
+            ) {
+                Some(date) => date,
+                None if matches!(calendar, "chinese" | "dangi") => {
+                    return Err(JsError::new(
+                        ErrorKind::RangeError,
+                        "invalid month-day".into(),
+                    ));
+                }
+                None => (1972, m, d),
+            }
         } else {
             (1972, m, d)
         };

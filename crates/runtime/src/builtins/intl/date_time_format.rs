@@ -793,8 +793,13 @@ fn initialize(
     // The non-gregorian calendars format with an era field (V8 adds the
     // era to the japanese/islamic/hebrew etc. patterns; the corpus only
     // pins that some calendars use a different pattern than gregory). The
-    // iso8601 calendar formats like gregory (no era).
-    if calendar != "gregory" && calendar != "iso8601" && !fields.iter().any(|(n, _)| n == "era") {
+    // iso8601, chinese, and dangi calendars have no era (the chinese year
+    // renders as relatedYear + yearName).
+    if !matches!(
+        calendar.as_str(),
+        "gregory" | "iso8601" | "chinese" | "dangi"
+    ) && !fields.iter().any(|(n, _)| n == "era")
+    {
         fields.push(("era".to_string(), "short".to_string()));
         requested_bits |= 2;
     }
@@ -840,7 +845,8 @@ fn initialize(
         }
     }
     // The pattern selection.
-    let (pattern, pattern12, _field_bits) = if date_style.is_some() || time_style.is_some() {
+    let (mut pattern, mut pattern12, _field_bits) = if date_style.is_some() || time_style.is_some()
+    {
         style_pattern(
             date_style.as_deref(),
             time_style.as_deref(),
@@ -895,6 +901,34 @@ fn initialize(
         fields = effective;
         match_format(&fields, bits, &hc, fractional_second_digits)
     };
+    // The chinese/dangi year renders as the relatedYear + yearName fields
+    // (the calendar's year name); the zh locale appends its 年 suffix (the
+    // related-year-zh fixtures pin "2019己亥年" / [relatedYear, yearName,
+    // literal 年]).
+    if matches!(calendar.as_str(), "chinese" | "dangi") {
+        let suffix = if locale.starts_with("zh") { "年" } else { "" };
+        let replace = |p: &str| -> String {
+            let mut out = String::new();
+            let mut in_year = false;
+            for c in p.chars() {
+                if c == 'y' {
+                    if !in_year {
+                        out.push_str("rU");
+                        out.push_str(suffix);
+                        in_year = true;
+                    }
+                } else {
+                    in_year = false;
+                    out.push(c);
+                }
+            }
+            out
+        };
+        pattern = replace(&pattern);
+        if let Some(p12) = pattern12.take() {
+            pattern12 = Some(replace(&p12));
+        }
+    }
     let _ = format_matcher;
     Ok(DateTimeFormatRecord {
         locale,
@@ -1232,6 +1266,16 @@ fn format_with_pattern(
                 "year",
                 format_field_year(&local, field_length(&mut chars, c), ns, &record.calendar),
             )),
+            // The chinese/dangi relatedYear (the ISO year of the calendar
+            // year's start) and yearName (the sexagenary cycle name).
+            'r' => Some((
+                "relatedYear",
+                format_number(related_year(&record.calendar, &local), 1, ns),
+            )),
+            'U' => Some((
+                "yearName",
+                sexagenary_name(related_year(&record.calendar, &local)),
+            )),
             'M' | 'L' => Some((
                 "month",
                 format_field_month(&local, field_length(&mut chars, c), ns, &record.calendar),
@@ -1239,7 +1283,7 @@ fn format_with_pattern(
             'd' => Some((
                 "day",
                 format_number(
-                    local.day as i64,
+                    calendar_day(&record.calendar, &local),
                     if field_length(&mut chars, c) >= 2 {
                         2
                     } else {
@@ -1745,6 +1789,46 @@ const ISLAMIC_MONTH_NAMES: [[&str; 12]; 3] = [
     ],
 ];
 
+/// The calendar fields of the local time (the ISO fields for the
+/// pass-through calendars, the chinese/dangi month/day otherwise).
+fn calendar_fields(calendar: &str, local: &LocalTime) -> (i64, i64, i64) {
+    match crate::builtins::temporal::calendar::calendar_iso_to_date(
+        calendar,
+        local.year,
+        local.month as i64,
+        local.day as i64,
+    ) {
+        Some((y, m, d)) => (y, m, d),
+        None => (local.year, local.month as i64, local.day as i64),
+    }
+}
+
+/// The calendar day of the local time (the chinese/dangi month-days differ
+/// from the ISO days: 2000-01-01 is chinese M11-25).
+fn calendar_day(calendar: &str, local: &LocalTime) -> i64 {
+    calendar_fields(calendar, local).2
+}
+
+/// The chinese/dangi related year: the ISO year of the calendar year's start
+/// (the chinese year itself; ISO 2000-01-01 is chinese year 1999 → 1999).
+fn related_year(calendar: &str, local: &LocalTime) -> i64 {
+    calendar_fields(calendar, local).0
+}
+
+/// The sexagenary (60-year cycle) name of a chinese/dangi year: the
+/// heavenly-stem and earthly-branch characters (the corpus pins the zh forms,
+/// e.g. 2019 → 己亥).
+fn sexagenary_name(year: i64) -> String {
+    const STEMS: [&str; 10] = ["甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸"];
+    const BRANCHES: [&str; 12] = [
+        "子", "丑", "寅", "卯", "辰", "巳", "午", "未", "申", "酉", "戌", "亥",
+    ];
+    let y = year - 4;
+    let stem = y.rem_euclid(10) as usize;
+    let branch = y.rem_euclid(12) as usize;
+    format!("{}{}", STEMS[stem], BRANCHES[branch])
+}
+
 /// The year with 2-digit (the last two digits) or full formatting.
 fn format_field_year(local: &LocalTime, width: u32, ns: &str, calendar: &str) -> String {
     let year = match crate::builtins::temporal::calendar::calendar_iso_to_date(
@@ -1775,16 +1859,29 @@ fn format_field_year(local: &LocalTime, width: u32, ns: &str, calendar: &str) ->
 }
 
 fn format_field_month(local: &LocalTime, width: u32, ns: &str, calendar: &str) -> String {
-    let (month, names): (i64, &[[&str; 12]; 3]) =
-        match crate::builtins::temporal::calendar::calendar_iso_to_date(
-            calendar,
-            local.year,
-            local.month as i64,
-            local.day as i64,
-        ) {
-            Some((_, m, _)) => (m, &ISLAMIC_MONTH_NAMES),
-            None => (local.month as i64, &MONTH_NAMES),
-        };
+    // The month number: the month code's number for chinese/dangi (the leap
+    // month shifts the later months' ordinals: M11 is ordinal 12 in 2099),
+    // the ordinal for the other calendars.
+    let month: i64 = match crate::builtins::temporal::calendar::calendar_iso_to_date(
+        calendar,
+        local.year,
+        local.month as i64,
+        local.day as i64,
+    ) {
+        Some((cy, cm, _)) if matches!(calendar, "chinese" | "dangi") => {
+            crate::builtins::temporal::calendar::calendar_month_code(calendar, cy, cm)
+                .trim_start_matches('M')
+                .parse()
+                .unwrap_or(cm)
+        }
+        Some((_, cm, _)) => cm,
+        None => local.month as i64,
+    };
+    let names: &[[&str; 12]; 3] = if matches!(calendar, "islamic-civil" | "islamic-tbla") {
+        &ISLAMIC_MONTH_NAMES
+    } else {
+        &MONTH_NAMES
+    };
     let index = (month - 1) as usize;
     match width {
         1 => format_number(month, 1, ns),

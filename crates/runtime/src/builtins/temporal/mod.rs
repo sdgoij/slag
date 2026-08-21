@@ -7,6 +7,7 @@ pub mod calendar;
 pub mod duration;
 pub mod instant;
 pub mod iso;
+pub mod lunar_tables;
 pub mod shell;
 
 use crux::error::{ErrorKind, JsError};
