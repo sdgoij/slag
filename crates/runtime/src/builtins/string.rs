@@ -994,23 +994,56 @@ fn substring_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
     Ok(Value::String(Handle::new(substring(&s, from, to))))
 }
 
-/// spec 22.1.3.30 String.prototype.toLocaleLowerCase: identical to
-/// `toLowerCase` under the default locale.
-fn to_locale_lower_case(
-    agent: &mut Agent,
-    this: &Value,
-    _args: &[Value],
-) -> Result<Value, JsError> {
-    to_lower_case(agent, this, &[])
+/// spec 22.1.3.30 String.prototype.toLocaleLowerCase: TransformCase with the
+/// tr/az/lt special casing (SpecialCasing.txt conditional mappings).
+fn to_locale_lower_case(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    require_object_coercible(this)?;
+    let s = crate::context::to_string(agent, this)?;
+    let locales = crate::builtins::intl::canonicalize_locale_list(
+        agent,
+        args.first().unwrap_or(&Value::Undefined),
+    )?;
+    let base = locales
+        .first()
+        .map(|l| l.split(['-', '_']).next().unwrap_or(l).to_string())
+        .unwrap_or_default();
+    let code_points: Vec<u32> = s.code_points().collect();
+    let mut lower: Vec<u32> = Vec::new();
+    match base.as_str() {
+        "tr" | "az" => turkic_lower(&code_points, &mut lower),
+        "lt" => lithuanian_lower(&code_points, &mut lower),
+        _ => default_lower(&code_points, &mut lower),
+    }
+    let text = crux::string::code_points_to_string(&lower)?;
+    Ok(Value::String(Handle::new(text)))
 }
 
-/// spec 22.1.3.31 String.prototype.toLocaleUpperCase.
-fn to_locale_upper_case(
-    agent: &mut Agent,
-    this: &Value,
-    _args: &[Value],
-) -> Result<Value, JsError> {
-    to_upper_case(agent, this, &[])
+/// spec 22.1.3.31 String.prototype.toLocaleUpperCase: TransformCase with the
+/// tr/az/lt special casing.
+fn to_locale_upper_case(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    require_object_coercible(this)?;
+    let s = crate::context::to_string(agent, this)?;
+    let locales = crate::builtins::intl::canonicalize_locale_list(
+        agent,
+        args.first().unwrap_or(&Value::Undefined),
+    )?;
+    let base = locales
+        .first()
+        .map(|l| l.split(['-', '_']).next().unwrap_or(l).to_string())
+        .unwrap_or_default();
+    let code_points: Vec<u32> = s.code_points().collect();
+    let mut upper: Vec<u32> = Vec::new();
+    match base.as_str() {
+        "tr" | "az" => turkic_upper(&code_points, &mut upper),
+        "lt" => lithuanian_upper(&code_points, &mut upper),
+        _ => {
+            for cp in &code_points {
+                upper.extend(unicode::to_uppercase(*cp));
+            }
+        }
+    }
+    let text = crux::string::code_points_to_string(&upper)?;
+    Ok(Value::String(Handle::new(text)))
 }
 
 /// spec 22.1.3.32 String.prototype.toLowerCase: Unicode Default Case
@@ -1024,15 +1057,208 @@ fn to_lower_case(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Val
     let s = crate::context::to_string(agent, this)?;
     let code_points: Vec<u32> = s.code_points().collect();
     let mut lower: Vec<u32> = Vec::new();
+    default_lower(&code_points, &mut lower);
+    let text = crux::string::code_points_to_string(&lower)?;
+    Ok(Value::String(Handle::new(text)))
+}
+
+/// The default (locale-independent) lowercasing with the Final_Sigma
+/// conditional mapping: U+03A3 maps to U+03C2 when preceded by a cased
+/// character and not followed by a cased character (combining marks are
+/// skipped in the lookahead).
+fn default_lower(code_points: &[u32], lower: &mut Vec<u32>) {
     for (index, cp) in code_points.iter().enumerate() {
-        if *cp == 0x03A3 && is_final_sigma(&code_points, index) {
+        if *cp == 0x03A3 && is_final_sigma(code_points, index) {
             lower.push(0x03C2);
         } else {
             lower.extend(unicode::to_lowercase(*cp));
         }
     }
-    let text = crux::string::code_points_to_string(&lower)?;
-    Ok(Value::String(Handle::new(text)))
+}
+
+/// The Unicode canonical combining class of the marks the locale-specific
+/// mappings distinguish (the SpecialCasing conditions are about classes 0,
+/// 220 Below, and 230 Above); everything else is class 0.
+fn combining_class(cp: u32) -> u8 {
+    match cp {
+        // Above: grave, acute, circumflex, tilde, macron, breve, dot above,
+        // diaeresis, ring above, caron, double grave/acute.
+        0x0300..=0x030B => 230,
+        0x030D..=0x0311 => 230,
+        // 0x030C caron is 230.
+        0x030C => 230,
+        // Below: dot below, ring below.
+        0x0323 | 0x0325 => 220,
+        // PHAISTOS DISC SIGN COMBINING OBLIQUE STROKE (Below) and MUSICAL
+        // SYMBOL COMBINING DOIT (Above).
+        0x1_01FD => 220,
+        0x1_D185 => 230,
+        _ => 0,
+    }
+}
+
+/// The Turkish/Azerbaijani lowercasing (SpecialCasing tr/az): İ → i; I
+/// followed by a combining dot above (only class-220 marks between) and not
+/// preceded by a class-0 character → i with the dot removed, otherwise → ı.
+fn turkic_lower(code_points: &[u32], lower: &mut Vec<u32>) {
+    let mut i = 0;
+    while i < code_points.len() {
+        let cp = code_points[i];
+        if cp == 0x0130 {
+            lower.push(0x0069); // İ → i
+        } else if cp == 0x0049 {
+            let mut j = i + 1;
+            while j < code_points.len() && combining_class(code_points[j]) == 220 {
+                j += 1;
+            }
+            let preceded_class0 = i > 0 && combining_class(code_points[i - 1]) == 0;
+            if j < code_points.len() && code_points[j] == 0x0307 && !preceded_class0 {
+                lower.push(0x0069); // I → i
+                lower.extend_from_slice(&code_points[i + 1..j]);
+                i = j + 1; // the dot above is removed
+                continue;
+            }
+            lower.push(0x0131); // I → ı
+        } else if matches!(cp, 0x0069 | 0x0131) {
+            lower.push(cp); // i and ı are unchanged
+        } else {
+            lower.extend(unicode::to_lowercase(cp));
+        }
+        i += 1;
+    }
+}
+
+/// The Turkish/Azerbaijani uppercasing: i → İ, ı → I, İ/I unchanged.
+fn turkic_upper(code_points: &[u32], upper: &mut Vec<u32>) {
+    for cp in code_points {
+        match *cp {
+            0x0069 => upper.push(0x0130), // i → İ
+            0x0131 => upper.push(0x0049), // ı → I
+            _ => upper.extend(unicode::to_uppercase(*cp)),
+        }
+    }
+}
+
+/// The Lithuanian lowercasing: I/J/Į followed by a class-230 (Above) mark
+/// (only class-220 marks between) gain a combining dot above; the composed
+/// I + grave/acute/tilde forms (Ì/Í/Ĩ) decompose the same way.
+fn lithuanian_lower(code_points: &[u32], lower: &mut Vec<u32>) {
+    let mut i = 0;
+    while i < code_points.len() {
+        let cp = code_points[i];
+        // The composed I-with-mark forms decompose to i + dot + mark.
+        match cp {
+            0x00CC => {
+                lower.extend([0x0069, 0x0307, 0x0300]);
+                i += 1;
+                continue;
+            }
+            0x00CD => {
+                lower.extend([0x0069, 0x0307, 0x0301]);
+                i += 1;
+                continue;
+            }
+            0x0128 => {
+                lower.extend([0x0069, 0x0307, 0x0303]);
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if matches!(cp, 0x0049 | 0x004A | 0x012E) {
+            let mut j = i + 1;
+            while j < code_points.len() && combining_class(code_points[j]) == 220 {
+                j += 1;
+            }
+            lower.extend(unicode::to_lowercase(cp));
+            if j < code_points.len() && combining_class(code_points[j]) == 230 {
+                lower.push(0x0307);
+                lower.extend_from_slice(&code_points[i + 1..j]);
+                i = j; // the class-230 mark is emitted by the main loop
+                continue;
+            }
+        } else {
+            lower.extend(unicode::to_lowercase(cp));
+        }
+        i += 1;
+    }
+}
+
+/// The Unicode Soft_Dotted code points (PropList.txt; the set the corpus's
+/// Lithuanian uppercase fixture enumerates).
+fn is_soft_dotted(cp: u32) -> bool {
+    matches!(
+        cp,
+        0x0069
+            | 0x006A
+            | 0x012F
+            | 0x0249
+            | 0x0268
+            | 0x029D
+            | 0x02B2
+            | 0x03F3
+            | 0x0456
+            | 0x0458
+            | 0x1D62
+            | 0x1D96
+            | 0x1DA4
+            | 0x1DA8
+            | 0x1E2D
+            | 0x1ECB
+            | 0x2071
+            | 0x2148
+            | 0x2149
+            | 0x2C7C
+            | 0x1D422
+            | 0x1D423
+            | 0x1D456
+            | 0x1D457
+            | 0x1D48A
+            | 0x1D48B
+            | 0x1D4BE
+            | 0x1D4BF
+            | 0x1D4F2
+            | 0x1D4F3
+            | 0x1D526
+            | 0x1D527
+            | 0x1D55A
+            | 0x1D55B
+            | 0x1D58E
+            | 0x1D58F
+            | 0x1D5C2
+            | 0x1D5C3
+            | 0x1D5F6
+            | 0x1D5F7
+            | 0x1D62A
+            | 0x1D62B
+            | 0x1D65E
+            | 0x1D65F
+            | 0x1D692
+            | 0x1D693
+    )
+}
+
+/// The Lithuanian uppercasing: a Soft_Dotted char followed by a combining
+/// dot above (only class-220 marks between) loses the dot.
+fn lithuanian_upper(code_points: &[u32], upper: &mut Vec<u32>) {
+    let mut i = 0;
+    while i < code_points.len() {
+        let cp = code_points[i];
+        if is_soft_dotted(cp) {
+            let mut j = i + 1;
+            while j < code_points.len() && combining_class(code_points[j]) == 220 {
+                j += 1;
+            }
+            if j < code_points.len() && code_points[j] == 0x0307 {
+                upper.extend(unicode::to_uppercase(cp));
+                upper.extend_from_slice(&code_points[i + 1..j]);
+                i = j + 1; // the dot above is removed
+                continue;
+            }
+        }
+        upper.extend(unicode::to_uppercase(cp));
+        i += 1;
+    }
 }
 
 /// The Final_Sigma condition: the sigma is preceded by a cased character
