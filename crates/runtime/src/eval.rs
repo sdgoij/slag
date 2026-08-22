@@ -39,6 +39,12 @@ pub fn eval_program(
     let body = crate::ir::compile_statements(&program.body, strict, fast_script)?;
     let env = agent.running_context()?.lexical_environment.clone();
     let mut vm = crate::ir::Vm::new(env.clone(), strict);
+    // Cut 16: a slotified script's declared vars live in the frame — the
+    // prologue already loaded them from the global object, so no argument
+    // copies are needed.
+    if let Some(scope) = &body.scope {
+        vm.setup_frame(scope, &[]);
+    }
     let completion = match vm.start(agent, &body)? {
         crate::ir::VmOutcome::Completed(completion) => completion,
         crate::ir::VmOutcome::Suspended(_) => {
@@ -2919,16 +2925,24 @@ mod tests {
                 .iter()
                 .any(|s| matches!(s, crate::ir::Step::InitLocal { .. }))
         );
-        // Cut 4: the loop test and update fuse into slot ops.
+        // Cut 4/15: the loop test fuses into a slot op and the update
+        // into the fused canonical-loop head.
         assert!(
             ir.steps
                 .iter()
                 .any(|s| matches!(s, crate::ir::Step::JumpIfLtImm { .. }))
         );
         assert!(
-            ir.steps
-                .iter()
-                .any(|s| matches!(s, crate::ir::Step::Inc { .. }))
+            ir.steps.iter().any(|s| {
+                matches!(
+                    s,
+                    crate::ir::Step::FastLoopHead {
+                        var: crate::ir::FastLoopVar::Slot(_),
+                        ..
+                    }
+                )
+            }),
+            "the fused canonical loop head must own the increment"
         );
         assert!(
             !ir.steps
@@ -3156,9 +3170,16 @@ mod tests {
                 .any(|s| matches!(s, crate::ir::Step::JumpIfLtImm { .. }))
         );
         assert!(
-            ir.steps
-                .iter()
-                .any(|s| matches!(s, crate::ir::Step::Inc { .. }))
+            ir.steps.iter().any(|s| {
+                matches!(
+                    s,
+                    crate::ir::Step::FastLoopHead {
+                        var: crate::ir::FastLoopVar::Slot(_),
+                        ..
+                    }
+                )
+            }),
+            "the fused canonical loop head must own the increment"
         );
         assert!(
             !ir.steps
@@ -3245,15 +3266,29 @@ mod tests {
                 .iter()
                 .any(|s| matches!(s, crate::ir::Step::StoreGlobal { .. }))
         );
+        // Cut 16: a closed-world script's declared vars are frame slots —
+        // the loop's test fuses against a slot and the global sync steps
+        // are the prologue/epilogue.
         assert!(
             body.steps
                 .iter()
-                .any(|s| matches!(s, crate::ir::Step::JumpIfLtGlobalImm { .. }))
+                .any(|s| matches!(s, crate::ir::Step::JumpIfLtImm { .. }))
         );
         assert!(
-            body.steps
-                .iter()
-                .any(|s| matches!(s, crate::ir::Step::IncGlobal { .. }))
+            body.steps.iter().any(|s| {
+                matches!(
+                    s,
+                    crate::ir::Step::FastLoopHead {
+                        var: crate::ir::FastLoopVar::Slot(_),
+                        ..
+                    }
+                )
+            }),
+            "the fused canonical loop head must own the slot increment"
+        );
+        assert!(
+            body.scope.is_some(),
+            "a closed-world script must get frame slots"
         );
         assert!(
             !body

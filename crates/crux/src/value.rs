@@ -88,11 +88,13 @@ impl Value {
         !self.is_double() && self.tag() == TAG_UNINITIALIZED
     }
 
+    #[inline]
     pub fn Boolean(b: bool) -> Value {
         let tag = if b { TAG_TRUE } else { TAG_FALSE };
         Value(TAG_PREFIX | (tag << 44), std::marker::PhantomData)
     }
 
+    #[inline]
     pub fn Number(n: f64) -> Value {
         let bits = n.to_bits();
         // Colliding quiet NaNs (top 16 bits 0x7FF8) would read as a tag.
@@ -145,15 +147,18 @@ impl Value {
         )
     }
 
+    #[inline]
     fn tag(&self) -> u64 {
         (self.0 >> 44) & 0xF
     }
 
+    #[inline]
     fn payload(&self) -> u64 {
         self.0 & PAYLOAD_MASK
     }
 
     /// Whether the bits hold a double (anything outside the tag region).
+    #[inline]
     fn is_double(&self) -> bool {
         self.0 & TAG_MASK != TAG_PREFIX
     }
@@ -198,42 +203,52 @@ impl Value {
         }
     }
 
+    #[inline]
     pub fn is_undefined(&self) -> bool {
         !self.is_double() && self.tag() == TAG_UNDEFINED
     }
 
+    #[inline]
     pub fn is_null(&self) -> bool {
         !self.is_double() && self.tag() == TAG_NULL
     }
 
+    #[inline]
     pub fn is_boolean(&self) -> bool {
         !self.is_double() && matches!(self.tag(), TAG_FALSE | TAG_TRUE)
     }
 
+    #[inline]
     pub fn is_number(&self) -> bool {
         self.is_double()
     }
 
+    #[inline]
     pub fn is_bigint(&self) -> bool {
         !self.is_double() && self.tag() == TAG_BIGINT
     }
 
+    #[inline]
     pub fn is_string(&self) -> bool {
         !self.is_double() && self.tag() == TAG_STRING
     }
 
+    #[inline]
     pub fn is_symbol(&self) -> bool {
         !self.is_double() && self.tag() == TAG_SYMBOL
     }
 
+    #[inline]
     pub fn is_object(&self) -> bool {
         !self.is_double() && self.tag() == TAG_OBJECT
     }
 
+    #[inline]
     pub fn is_function(&self) -> bool {
         !self.is_double() && self.tag() == TAG_FUNCTION
     }
 
+    #[inline]
     pub fn as_number(&self) -> Option<f64> {
         if self.is_double() {
             Some(f64::from_bits(self.0))
@@ -277,6 +292,7 @@ impl Value {
 }
 
 impl Clone for Value {
+    #[inline]
     fn clone(&self) -> Value {
         if self.is_uninitialized() {
             return Value::uninitialized();
@@ -296,6 +312,7 @@ impl Clone for Value {
 }
 
 impl Drop for Value {
+    #[inline]
     fn drop(&mut self) {
         if self.is_double() {
             return;

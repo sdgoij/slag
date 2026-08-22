@@ -608,6 +608,22 @@ pub enum Step {
         imm: f64,
         target: usize,
     },
+    /// The fused canonical loop's per-iteration head (Cut 15): `for (var i
+    /// = INIT; i <op> LIMIT; i++/i--)` on a fast binding — the increment,
+    /// the next test, and the back-jump run in one step (the body dispatches
+    /// inline), replacing the `IncGlobal`+`JumpIfLtGlobalImm`+`Jump`
+    /// sequence with a single dispatch. The loop's first test is the
+    /// existing `JumpIfLtGlobalImm` before the body.
+    FastLoopHead {
+        var: FastLoopVar,
+        op: BinaryOp,
+        imm: f64,
+        inc: UpdateOp,
+        /// Back to the body start when the test passes.
+        body_start: usize,
+        /// Continue at when the test fails.
+        after: usize,
+    },
     /// A `break` statement: route through any pending finallys, then jump to
     /// `target` (spec 14.14.4).
     Break {
@@ -986,6 +1002,27 @@ impl EnvStack {
             }
         }
     }
+}
+
+/// The binding a fused canonical loop reads, tests, and increments: a frame
+/// slot or a declared top-level var (the certified fast paths — see
+/// [`Step::FastLoop`]).
+#[derive(Debug, Clone, Copy)]
+pub enum FastLoopVar {
+    Slot(usize),
+    Global(crux::AtomId),
+}
+
+/// The shape of a fused canonical loop (Cut 15): the counter binding, the
+/// test operator + limit, and the update operator (`compile_fast_loop`'s
+/// result).
+struct FastLoopShape {
+    var: FastLoopVar,
+    loc: BindingLoc,
+    name: crux::AtomId,
+    op: BinaryOp,
+    imm: f64,
+    inc: UpdateOp,
 }
 
 /// The resumable VM state. Saved across suspension by the driver.
@@ -1641,6 +1678,84 @@ impl Vm {
         let value = crate::expr::apply_binary(agent, op, &left, &right)?;
         if !crux::convert::to_boolean(&value) {
             self.ip = target;
+        }
+        Ok(())
+    }
+
+    /// The fused canonical loop's test `var <op> imm` (see `Step::FastLoop`):
+    /// a Number counter compares directly (JS relational semantics for two
+    /// numbers — NaN is false, matching Rust's f64 comparisons); a
+    /// non-number falls back to the general `apply_binary` boolean.
+    fn fast_loop_test(
+        &mut self,
+        agent: &mut Agent,
+        var: FastLoopVar,
+        op: BinaryOp,
+        imm: f64,
+    ) -> Result<bool, JsError> {
+        let value = match var {
+            FastLoopVar::Slot(slot) => {
+                let value = self.frame.get(slot).clone();
+                if value.is_uninitialized() {
+                    return Err(JsError::new(
+                        ErrorKind::ReferenceError,
+                        "Cannot access a binding before initialization".into(),
+                    ));
+                }
+                value
+            }
+            FastLoopVar::Global(name) => self.load_global_value(agent, name)?,
+        };
+        if let Some(num) = value.as_number() {
+            return Ok(match op {
+                BinaryOp::LessThan => num < imm,
+                BinaryOp::LessEqual => num <= imm,
+                BinaryOp::GreaterThan => num > imm,
+                BinaryOp::GreaterEqual => num >= imm,
+                _ => unreachable!("FastLoop with a non-relational op"),
+            });
+        }
+        Ok(crux::convert::to_boolean(&crate::expr::apply_binary(
+            agent,
+            op,
+            &value,
+            &Value::Number(imm),
+        )?))
+    }
+
+    /// The fused canonical loop's increment `var++`/`var--` (see
+    /// `Step::FastLoop`): a Number counter updates in place; other values go
+    /// through the general `++`/`--` machinery.
+    fn fast_loop_inc(
+        &mut self,
+        agent: &mut Agent,
+        var: FastLoopVar,
+        inc: UpdateOp,
+    ) -> Result<(), JsError> {
+        match var {
+            FastLoopVar::Slot(slot) => {
+                let old = self.frame.get(slot).clone();
+                if old.is_uninitialized() {
+                    return Err(JsError::new(
+                        ErrorKind::ReferenceError,
+                        "Cannot access a binding before initialization".into(),
+                    ));
+                }
+                let new = if let Some(num) = old.as_number() {
+                    let delta = if matches!(inc, UpdateOp::Increment) {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    Value::Number(num + delta)
+                } else {
+                    update_value(agent, &inc, &old)?.1
+                };
+                *self.frame.get_mut(slot) = new;
+            }
+            FastLoopVar::Global(name) => {
+                self.update_global(agent, name, inc, true)?;
+            }
         }
         Ok(())
     }
@@ -3868,6 +3983,24 @@ impl Vm {
                 Step::JumpIfGeGlobalImm { name, imm, target } => {
                     self.jump_if_rel_global(agent, BinaryOp::GreaterEqual, *name, *imm, *target)?
                 }
+                Step::FastLoopHead {
+                    var,
+                    op,
+                    imm,
+                    inc,
+                    body_start,
+                    after,
+                } => {
+                    // The fused canonical loop head: increment, re-test, and
+                    // jump back (or out) in one dispatch — the body dispatches
+                    // inline in the main loop.
+                    self.fast_loop_inc(agent, *var, *inc)?;
+                    if !self.fast_loop_test(agent, *var, *op, *imm)? {
+                        self.ip = *after;
+                    } else {
+                        self.ip = *body_start;
+                    }
+                }
                 Step::JumpIfTrue(target) => {
                     let value = self.pop();
                     if crux::convert::to_boolean(&value) {
@@ -6028,6 +6161,9 @@ enum Fixup {
         name: crux::AtomId,
         imm: f64,
     },
+    /// The fused canonical loop head's jump targets (Cut 15): both labels
+    /// resolve at compile end like the jump fixups.
+    FastLoopHead(usize, usize, usize),
     Break(usize, usize),
     Continue(usize, usize),
     JumpIfChainShort(usize, usize),
@@ -6297,6 +6433,46 @@ impl Compiler {
         }
     }
 
+    /// The fused canonical loop (Cut 15): `for (var i = INIT; i <op>
+    /// LIMIT; i++/i--)` on a fast binding (the test and update name the
+    /// same frame slot or declared top-level var) — the loop's per-iteration
+    /// head (increment + re-test + back-jump) becomes one `Step::FastLoopHead`
+    /// instead of `IncGlobal` + `JumpIfLtGlobalImm` + `Jump`, while the body
+    /// dispatches inline. `None` when the shape doesn't qualify and the
+    /// regular loop must be emitted.
+    fn compile_fast_loop(
+        &mut self,
+        test: &Expr,
+        update: Option<&Expr>,
+    ) -> Result<Option<FastLoopShape>, JsError> {
+        let Some(update) = update else {
+            return Ok(None);
+        };
+        let Some((op, loc, name, imm)) = self.fused_rel_test(test) else {
+            return Ok(None);
+        };
+        let Some((inc_loc, inc_name, inc_op)) = self.fused_update(update) else {
+            return Ok(None);
+        };
+        let var = match (loc, inc_loc) {
+            (BindingLoc::Slot(slot), BindingLoc::Slot(inc_slot)) if slot == inc_slot => {
+                FastLoopVar::Slot(slot)
+            }
+            (BindingLoc::Global, BindingLoc::Global) if name == inc_name => {
+                FastLoopVar::Global(name)
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(FastLoopShape {
+            var,
+            loc,
+            name,
+            op,
+            imm,
+            inc: inc_op,
+        }))
+    }
+
     fn new_label(&mut self) -> usize {
         let label = self.next_label;
         self.next_label += 1;
@@ -6554,6 +6730,15 @@ impl Compiler {
                         BinaryOp::GreaterEqual => Step::JumpIfGeGlobalImm { name, imm, target },
                         _ => unreachable!("JumpIfRelGlobalImm fixup with a non-relational op"),
                     };
+                }
+                Fixup::FastLoopHead(index, body_label, after_label) => {
+                    if let Step::FastLoopHead {
+                        body_start, after, ..
+                    } = &mut self.steps[index]
+                    {
+                        *body_start = self.labels[&body_label];
+                        *after = self.labels[&after_label];
+                    }
                 }
                 Fixup::Break(index, label) => {
                     self.steps[index] = Step::Break {
@@ -7238,6 +7423,51 @@ impl Compiler {
         self.place(test_label);
         match test {
             Some(test) => {
+                // The fused canonical loop: `for (var i = INIT; i <op>
+                // LIMIT; i++)` with a simple body — one dispatch per
+                // iteration (test + nested body + increment). Lexical heads
+                // stay on the regular path (per-iteration freshness).
+                let fast_head = match init {
+                    None => true,
+                    Some(ForInit::Expr(_)) => true,
+                    Some(ForInit::VarDecl { kind, .. }) => *kind == VarDeclKind::Var,
+                };
+                if fast_head
+                    && let Some(FastLoopShape {
+                        var,
+                        loc,
+                        name,
+                        op,
+                        imm,
+                        inc,
+                    }) = self.compile_fast_loop(test, update)?
+                {
+                    // The fused canonical loop: the initial test (the
+                    // existing fused step), the inline body, then the
+                    // per-iteration head — increment, re-test, and the
+                    // back-jump in one dispatch. The continue target is the
+                    // head (a `continue` skips to the increment).
+                    self.emit_fused_rel_test(op, loc, name, imm, end_label);
+                    let body_start = self.new_label();
+                    self.place(body_start);
+                    self.compile_statement(body)?;
+                    self.place(continue_label);
+                    let index = self.steps.len();
+                    self.emit(Step::FastLoopHead {
+                        var,
+                        op,
+                        imm,
+                        inc,
+                        body_start,
+                        after: end_label,
+                    });
+                    self.fixups
+                        .push(Fixup::FastLoopHead(index, body_start, end_label));
+                    self.place(end_label);
+                    self.emit(Step::NormalizeCompletion);
+                    self.scope_stack.pop();
+                    return Ok(());
+                }
                 if let Some((op, loc, name, imm)) = self.fused_rel_test(test) {
                     // Cut 4/5: the loop test `binding <op> imm` fuses with
                     // the false-jump (LoadLocal/LoadGlobal + BinaryImm +
@@ -9513,23 +9743,52 @@ pub fn compile_statements(
     strict: bool,
     fast_script: bool,
 ) -> Result<CompiledBody, JsError> {
-    let script_globals = if fast_script {
-        analyze_script_scope(stmts)
+    let (slots, script_globals) = if fast_script {
+        match analyze_script_scope(stmts) {
+            Some((slots, globals)) => (slots, Some(globals)),
+            None => (None, None),
+        }
     } else {
-        None
+        (None, None)
     };
     let mut compiler = Compiler {
+        scope: slots.as_ref().map(|slots| slots.scope.clone()),
         script_globals,
         strict,
         ..Compiler::default()
     };
+    // Cut 16: a slotified script's prologue loads each declared var's
+    // current global value into its frame slot — a re-evaluation in the
+    // same realm must see the previous evaluation's value (var
+    // redeclaration keeps the property) — then the script's reads/writes
+    // touch only the borrow-free frame.
+    if let Some(slots) = &slots {
+        for (slot, name) in slots.names.iter().enumerate() {
+            compiler.emit(Step::LoadGlobal { name: *name });
+            compiler.emit(Step::InitLocal { slot });
+        }
+    }
     compiler.compile_statements(stmts)?;
+    // The epilogue writes every assigned slot back to the global object (a
+    // normal completion only — an uncaught throw exits the realm, so the
+    // stale frame is unobservable). A declared-but-never-assigned var (e.g.
+    // a read-only global like `Infinity`) is left alone — its slot only
+    // mirrors the global it was prologue-loaded from.
+    if let Some(slots) = &slots {
+        for (slot, name) in slots.names.iter().enumerate() {
+            if !slots.assigned.contains(name) {
+                continue;
+            }
+            compiler.emit(Step::LoadLocal { slot });
+            compiler.emit(Step::StoreGlobal { name: *name });
+        }
+    }
     compiler.resolve();
     Ok(CompiledBody {
         steps: compiler.steps,
         handlers: compiler.handlers,
         strict,
-        scope: None,
+        scope: compiler.scope,
         env_constant: !compiler.env_changing,
         script_globals: compiler.script_globals,
     })
@@ -9825,19 +10084,285 @@ impl FastScopeScan {
 // this path — modules bind into the module environment, and eval bodies
 // can see (and shadow) the caller's lexical environment.
 
-/// The declared var/function names of a certified script, or `None` when a
-/// construct could change binding resolution (a `with`, a `try`/`catch`
-/// whose parameter shadows a same-named global, a `switch` with lexical
-/// cases, a `for-in`/`for-of`, or a direct `eval` call).
-fn analyze_script_scope(stmts: &[Stmt]) -> Option<HashSet<String>> {
+/// The declared var names of a certified script, laid out as frame slots
+/// (Cut 16): the script runs with its vars in the borrow-free frame, and
+/// the prologue/epilogue sync them to the global object. The per-access
+/// cost drops from the global fast path (direct-mapped probe + `Rc` clone
+/// of the global handle + `RefCell` borrow + key compare) to a plain frame
+/// read/write — V8's model for non-escaping script vars (context slots).
+struct ScriptSlots {
+    scope: ScopeInfo,
+    /// Slot order → declared name (the prologue/epilogue sync steps).
+    names: Vec<crux::AtomId>,
+    /// The vars the script assigns (initializer, `=`/compound, `++`/`--`,
+    /// for-of head): only these need the epilogue write-back — a declared
+    /// read-only global like `Infinity` must not be written just because it
+    /// was declared.
+    assigned: HashSet<crux::AtomId>,
+}
+
+/// Analyze a top-level script for the certified binding paths: the
+/// `ScriptSlots` layout when the script is a closed world whose declared
+/// vars can live in frame slots, or the plain declared-name set when the
+/// script qualifies only for direct global-object access (today's path —
+/// anything that could observe the global object mid-script). `None` when
+/// a construct could change binding resolution entirely (a `with`, a
+/// `try`/`catch` whose parameter shadows a same-named global, a `switch`
+/// with lexical cases, a `for-in`/`for-of`, or a direct `eval` call).
+fn analyze_script_scope(stmts: &[Stmt]) -> Option<(Option<ScriptSlots>, HashSet<String>)> {
     if !script_scan_allows(stmts) {
         return None;
     }
-    let mut globals: HashSet<String> = HashSet::new();
+    let mut names = Vec::new();
     for name in crate::script::top_level_var_declared_names(stmts) {
-        globals.insert(name.to_string_lossy());
+        names.push(crux::intern_utf8(&name.to_string_lossy()));
     }
-    Some(globals)
+    let globals: HashSet<String> = names
+        .iter()
+        .map(|name| crux::lookup(*name).to_string_lossy())
+        .collect();
+    let slots = {
+        let mut assigned = HashSet::new();
+        script_slots_allows(stmts, &mut assigned).then(|| {
+            let mut scan = FastScopeScan::default();
+            for name in &names {
+                scan.slots.insert(*name, scan.next_slot);
+                scan.tdz.push(false);
+                scan.next_slot += 1;
+            }
+            ScriptSlots {
+                scope: ScopeInfo {
+                    frame_size: scan.next_slot,
+                    arity: 0,
+                    slots: scan.slots,
+                    tdz_store: scan.tdz,
+                },
+                names,
+                assigned,
+            }
+        })
+    };
+    Some((slots, globals))
+}
+
+/// Whether the script is a closed world for frame-slot vars (Cut 16): no
+/// callable can observe the real global object while the slots are
+/// authoritative (their staleness window is the whole script). Reject
+/// function/class declarations, `call`/`new` expressions, `this`, closures
+/// (function/arrow/class expressions and object methods/getters/setters),
+/// and any `globalThis`-family identifier (a member access on it reaches
+/// the real global object). Also collects the vars the script assigns
+/// (initializers, `=`/compound assignments, `++`/`--`, for-of heads) — only
+/// those need the epilogue write-back: a declared var like `Infinity` is a
+/// read-only global property that must not be written just because it was
+/// declared.
+fn script_slots_allows(stmts: &[Stmt], assigned: &mut HashSet<crux::AtomId>) -> bool {
+    stmts
+        .iter()
+        .all(|stmt| script_slots_stmt_allows(stmt, assigned))
+}
+
+fn script_slots_stmt_allows(stmt: &Stmt, assigned: &mut HashSet<crux::AtomId>) -> bool {
+    match &stmt.kind {
+        StmtKind::Block(block) => script_slots_allows(&block.stmts, assigned),
+        StmtKind::Empty | StmtKind::Debugger | StmtKind::Break(_) | StmtKind::Continue(_) => true,
+        StmtKind::Expr(expr) => script_slots_expr_allows(expr, assigned),
+        StmtKind::VarDecl { decls, .. } => decls.iter().all(|decl| {
+            // A destructuring pattern resolves through the environment
+            // machinery, bypassing the frame slots — such a script must stay
+            // on the global path. A var with an initializer assigns its
+            // binding.
+            let ident_ok = matches!(
+                &decl.pattern,
+                BindingPattern::Ident(name) if {
+                    if decl.init.is_some() {
+                        assigned.insert(*name);
+                    }
+                    true
+                }
+            );
+            ident_ok
+                && decl
+                    .init
+                    .as_ref()
+                    .is_none_or(|init| script_slots_expr_allows(init, assigned))
+        }),
+        StmtKind::If {
+            test,
+            consequent,
+            alternate,
+        } => {
+            script_slots_expr_allows(test, assigned)
+                && script_slots_stmt_allows(consequent, assigned)
+                && alternate
+                    .as_deref()
+                    .is_none_or(|stmt| script_slots_stmt_allows(stmt, assigned))
+        }
+        StmtKind::While { test, body } | StmtKind::DoWhile { body, test } => {
+            script_slots_expr_allows(test, assigned) && script_slots_stmt_allows(body, assigned)
+        }
+        StmtKind::For {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            let init_ok = match init {
+                None => true,
+                Some(ForInit::Expr(expr)) => script_slots_expr_allows(expr, assigned),
+                Some(ForInit::VarDecl { decls, .. }) => decls.iter().all(|decl| {
+                    let ident_ok = matches!(
+                        &decl.pattern,
+                        BindingPattern::Ident(name) if {
+                            if decl.init.is_some() {
+                                assigned.insert(*name);
+                            }
+                            true
+                        }
+                    );
+                    ident_ok
+                        && decl
+                            .init
+                            .as_ref()
+                            .is_none_or(|init| script_slots_expr_allows(init, assigned))
+                }),
+            };
+            init_ok
+                && test
+                    .as_ref()
+                    .is_none_or(|expr| script_slots_expr_allows(expr, assigned))
+                && update
+                    .as_ref()
+                    .is_none_or(|expr| script_slots_expr_allows(expr, assigned))
+                && script_slots_stmt_allows(body, assigned)
+        }
+        StmtKind::Return(expr) => expr
+            .as_ref()
+            .is_none_or(|expr| script_slots_expr_allows(expr, assigned)),
+        StmtKind::Throw(expr) => script_slots_expr_allows(expr, assigned),
+        StmtKind::Labeled { body, .. } => script_slots_stmt_allows(body, assigned),
+        StmtKind::ForOf {
+            left, right, body, ..
+        } => {
+            // The for-of head binds each element — an assignment.
+            if let ForBinding::VarDecl {
+                pattern: BindingPattern::Ident(name),
+                ..
+            } = left
+            {
+                assigned.insert(*name);
+            }
+            script_slots_expr_allows(right, assigned) && script_slots_stmt_allows(body, assigned)
+        }
+        // Rejected by `script_scan_allows` before this walker runs (the
+        // whole script falls back to the env path); kept exhaustive.
+        StmtKind::FunctionDecl(_)
+        | StmtKind::ClassDecl(_)
+        | StmtKind::With { .. }
+        | StmtKind::Try { .. }
+        | StmtKind::Switch { .. }
+        | StmtKind::ForIn { .. }
+        | StmtKind::UsingDecl { .. } => false,
+    }
+}
+
+fn script_slots_expr_allows(expr: &Expr, assigned: &mut HashSet<crux::AtomId>) -> bool {
+    match &expr.kind {
+        ExprKind::Ident(name) => {
+            let text = crux::lookup(*name).to_string_lossy();
+            !matches!(
+                text.as_str(),
+                "globalThis" | "global" | "window" | "self" | "top" | "parent" | "frames"
+            )
+        }
+        ExprKind::This
+        | ExprKind::Super
+        | ExprKind::Function(_)
+        | ExprKind::Arrow { .. }
+        | ExprKind::Class(_) => false,
+        ExprKind::Call(_) | ExprKind::New(_) => false,
+        ExprKind::Object(object) => object.props.iter().all(|prop| match prop {
+            ObjectProperty::Method { .. }
+            | ObjectProperty::Get { .. }
+            | ObjectProperty::Set { .. } => false,
+            ObjectProperty::Init { key, value, .. } => {
+                let key_ok = match key {
+                    PropertyName::Ident(_) | PropertyName::Str(_) | PropertyName::Number(_) => true,
+                    PropertyName::Computed(key_expr) => {
+                        script_slots_expr_allows(key_expr, assigned)
+                    }
+                };
+                key_ok && script_slots_expr_allows(value, assigned)
+            }
+            ObjectProperty::Spread(expr) => script_slots_expr_allows(expr, assigned),
+        }),
+        ExprKind::Literal(_) => true,
+        ExprKind::Array(array) => array.elements.iter().all(|element| match element {
+            ArrayElement::Hole => true,
+            ArrayElement::Expr(expr) | ArrayElement::Spread(expr) => {
+                script_slots_expr_allows(expr, assigned)
+            }
+        }),
+        ExprKind::Paren(inner) => script_slots_expr_allows(inner, assigned),
+        ExprKind::Unary { operand, .. } => script_slots_expr_allows(operand, assigned),
+        ExprKind::Update { target, .. } => {
+            record_assign_target(target, assigned);
+            script_slots_expr_allows(target, assigned)
+        }
+        ExprKind::Binary { left, right, .. } => {
+            script_slots_expr_allows(left, assigned) && script_slots_expr_allows(right, assigned)
+        }
+        ExprKind::Logical { left, right, .. } => {
+            script_slots_expr_allows(left, assigned) && script_slots_expr_allows(right, assigned)
+        }
+        ExprKind::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            script_slots_expr_allows(test, assigned)
+                && script_slots_expr_allows(consequent, assigned)
+                && script_slots_expr_allows(alternate, assigned)
+        }
+        ExprKind::Assign { target, value, .. } => {
+            record_assign_target(target, assigned);
+            script_slots_expr_allows(target, assigned) && script_slots_expr_allows(value, assigned)
+        }
+        ExprKind::Member(member) => {
+            let object_ok = script_slots_expr_allows(&member.object, assigned);
+            let key_ok = match &member.property {
+                MemberProperty::Computed(key) => script_slots_expr_allows(key, assigned),
+                _ => true,
+            };
+            object_ok && key_ok
+        }
+        ExprKind::Template(template) => template
+            .exprs
+            .iter()
+            .all(|expr| script_slots_expr_allows(expr, assigned)),
+        ExprKind::Sequence(exprs) => exprs
+            .iter()
+            .all(|expr| script_slots_expr_allows(expr, assigned)),
+        ExprKind::PrivateIn { .. }
+        | ExprKind::TaggedTemplate { .. }
+        | ExprKind::Yield { .. }
+        | ExprKind::Await(_)
+        | ExprKind::MetaProperty { .. }
+        | ExprKind::ImportCall { .. } => false,
+    }
+}
+
+/// Record the name an assignment/update writes: an identifier target (or a
+/// parenthesized identifier); member/array targets write properties, not
+/// the object's binding.
+fn record_assign_target(expr: &Expr, assigned: &mut HashSet<crux::AtomId>) {
+    match &expr.kind {
+        ExprKind::Ident(name) => {
+            assigned.insert(*name);
+        }
+        ExprKind::Paren(inner) => record_assign_target(inner, assigned),
+        _ => {}
+    }
 }
 
 fn script_scan_allows(stmts: &[Stmt]) -> bool {

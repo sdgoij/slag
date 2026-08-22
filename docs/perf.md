@@ -457,6 +457,80 @@ The path from the current ~10ns/step to V8's ~1ns/step is therefore:
    test + body + increment with one dispatch per iteration (the
    dispatch-loop extraction this requires is the mechanical part).
 
+**Cell-backed globals were implemented and reverted (measured
+regression).** A `GlobalCell { value, writable, valid }` was attached to
+`Property`, every ordinary set/define kept it in sync (or invalidated it
+on a redefine — V8's hole), and the fast path read/wrote the cell with
+no property-vector borrow; two variants were A/B'd: a mirror write
+keeping `Data.value` fresh (the fast write then paid TWO validation
+passes) and a cell-authoritative variant with the slow reads routed
+through the cell (`Property::value`, `to_descriptor`, `ordinary_get`,
+`get_property`'s fast path, `member_cell_get`). Both regressed: the
+empty loop head 48ns → 50-59ns and arithmetic 70ms → 78-96ms. The
+reasons: the `RefCell` borrow this engine replaces is ~2ns on a hot
+cache line (V8's heap has no borrow flags), the cell adds an `Rc`
+indirection plus `valid`/`writable` checks per access, the 16-byte
+`Property` growth widens every property vector, and the mirror variant
+doubled the write path. The validated-slot fast path (probe + borrow +
+key match) remains the best fit for this object model; the V8 cell
+advantage is specific to its GC-managed, borrow-free heap.
+
+### Cut 15/16 — fused loop head, script var slots, inline Value ops (measured 2026-08-22)
+
+Fresh 3-run medians of `--bench` (release):
+
+| Benchmark | Cut 14 | now |
+|---|---|---|
+| arithmetic | 70ms | 43ms |
+| property access | 116ms | 83ms |
+| string concat | 55ms | 43ms |
+| array iteration | 255ms | 233ms |
+| function calls | 280ms | 276ms |
+| suite | ~780ms | ~680ms |
+
+1. **Fused canonical loop head (`Step::FastLoopHead`)** — the
+   `for (var i = INIT; i <op> LIMIT; i++/i--)` on one fast binding now
+   runs increment + re-test + back-jump in a single dispatch (the body
+   dispatches inline), replacing `IncGlobal` + `JumpIfLtGlobalImm` +
+   `Jump`. Measured: **no gain on its own** — the savings (2 of 3
+   dispatches) are inside noise; the per-iteration cost was the global
+   load/store work, not the dispatch count. Kept (it removes steps and
+   composes with the slot work below).
+2. **Certified-script var slots (`ScriptSlots`)** — the closed-world
+   script's declared `var`s live in frame slots for the whole run
+   (borrow-free; the prologue loads each var's current global value,
+   the epilogue writes back the assigned ones). The per-access cost
+   drops from the global fast path (direct-mapped probe + `Rc` clone
+   of the global handle + `RefCell` borrow + key compare) to a plain
+   frame read/write — the V8 context-slot model for non-escaping
+   script vars. Qualification is a closed-world scan: no
+   function/class decls, no `call`/`new`, no `this`/closures, no
+   `globalThis`-family identifiers, no destructuring patterns (a
+   declared-but-never-assigned read-only global like `Infinity` gets
+   no write-back). Scripts failing the scan keep the Cut 14 global
+   path unchanged.
+3. **`#[inline]` on the NaN-boxed `Value` hot surface** (crux) —
+   `is_double`/`tag`/`is_uninitialized`/`as_number`/`is_number`/
+   `Boolean`/`Number` plus `Clone::clone` and `Drop::drop`. With no
+   LTO, every cross-crate call was a real call on the hottest path;
+   this was the largest single win (~25-30% on the loop rows: empty
+   loop 50 → 37ms, arithmetic 97 → 64ms before the slot change
+   compounded).
+
+Conformance: zero regressions — language 23,690/0/34, built-ins
+23,255/0/154 (403 hangs: the known RegExp property-escape + TypedArray
+set, unchanged in kind; the count is the performance signal at the 30s
+ceiling, see the RegExp table item in Deferred milestones), annexB
+1,086/0/0.
+
+Remaining `--bench` levers, in measured order: (1) the accumulator
+loop counter (the head is still ~15 ops/iteration round-tripping the
+frame; V8 keeps the counter in a register), (2) array-iteration fast
+path (the array row's 233ms is the per-element for-of `next()` call
+machinery), (3) the per-call machinery (Vm::new + ExecutionContext
+push + TLS re-entry — the Cut 12 frame-stack-split analysis), (4) the
+RegExp property-escape match table (the built-ins hang set).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
