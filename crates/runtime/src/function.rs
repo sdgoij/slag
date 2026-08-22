@@ -1571,7 +1571,27 @@ fn ordinary_call(
             source: None,
             annex_b_hoistable: Default::default(),
         });
-        let result = run_compiled_body(agent, strict, ir, args);
+        // Cut 3 continuation (this slots): a non-arrow certified body gets
+        // the OrdinaryCallBindThis result — strict keeps the call's `this`
+        // as-is; sloppy coerces undefined/null to the global object and
+        // boxes primitives.
+        let this_value = if scope.this_slot.is_some() {
+            if strict {
+                this
+            } else {
+                match this.kind() {
+                    ValueKind::Undefined | ValueKind::Null => {
+                        let global = agent.running_context()?.realm.global_object.clone();
+                        Value::Object(global)
+                    }
+                    ValueKind::Object(_) | ValueKind::Function(_) => this,
+                    _ => crate::context::to_object(agent, &this)?,
+                }
+            }
+        } else {
+            Value::Undefined
+        };
+        let result = run_compiled_body(agent, strict, ir, args, Some(this_value));
         // A kind-only engine error escapes the body with the function's realm
         // context still current; surface it as that realm's error object now,
         // so a caller from another realm sees the right constructor (mirrors
@@ -1679,7 +1699,7 @@ fn ordinary_call(
             &function_env,
         )?;
         match ir {
-            Some(ir) => run_compiled_body(agent, strict, &ir, args),
+            Some(ir) => run_compiled_body(agent, strict, &ir, args, None),
             None => evaluate_body(agent, &body, strict),
         }
     })();
@@ -1731,6 +1751,7 @@ fn run_compiled_body(
     strict: bool,
     ir: &std::rc::Rc<crate::ir::CompiledBody>,
     args: &[Value],
+    this_value: Option<Value>,
 ) -> Result<Value, JsError> {
     let body_env = agent.running_context()?.lexical_environment.clone();
     let mut vm = Vm::new(body_env.clone(), strict);
@@ -1748,6 +1769,13 @@ fn run_compiled_body(
         && scope.arguments_slot.is_some()
     {
         vm.call_args = args.to_vec();
+    }
+    // Cut 3 continuation (this slots): the call filled the body's `this`
+    // slot with the OrdinaryCallBindThis result.
+    if let Some(scope) = &ir.scope
+        && let (Some(slot), Some(this_value)) = (scope.this_slot, this_value)
+    {
+        *vm.frame.get_mut(slot) = this_value;
     }
     let outcome = vm.start(agent, ir);
     let completion = match outcome {
@@ -1978,6 +2006,11 @@ fn ordinary_construct(
                     // argument list.
                     if scope.arguments_slot.is_some() {
                         vm.call_args = args.to_vec();
+                    }
+                    // Cut 3 continuation (this slots): the constructed
+                    // `this` lands in the body's `this` slot.
+                    if let Some(slot) = scope.this_slot {
+                        *vm.frame.get_mut(slot) = this.clone();
                     }
                 }
                 let outcome = vm.start(agent, ir);

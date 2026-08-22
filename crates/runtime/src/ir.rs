@@ -791,6 +791,11 @@ pub struct ScopeInfo {
     /// `arguments` — the certified call fills it at entry. Sloppy and arrow
     /// bodies (lexical `arguments`) stay on the env path.
     pub arguments_slot: Option<usize>,
+    /// The frame slot holding the body's `this` value (Cut 3 continuation):
+    /// `Some` when a non-arrow body references `this` — the certified call
+    /// fills it with the OrdinaryCallBindThis result. Arrow bodies (lexical
+    /// `this`) stay on the env path.
+    pub this_slot: Option<usize>,
 }
 
 impl ScopeInfo {
@@ -1009,7 +1014,7 @@ impl Frame {
     }
 
     #[inline]
-    fn get_mut(&mut self, slot: usize) -> &mut Value {
+    pub(crate) fn get_mut(&mut self, slot: usize) -> &mut Value {
         match self {
             Frame::Inline(buf) => &mut buf[slot],
             Frame::Heap(vec) => &mut vec[slot],
@@ -8308,7 +8313,15 @@ impl Compiler {
                 Ok(())
             }
             ExprKind::This => {
-                self.emit(Step::ThisValue);
+                // Cut 3 continuation (this slots): a certified non-arrow
+                // body reads `this` from its dedicated frame slot (the call
+                // filled it with the OrdinaryCallBindThis result); the env
+                // path reads the running context's this binding.
+                if let Some(slot) = self.scope.as_ref().and_then(|scope| scope.this_slot) {
+                    self.emit(Step::LoadLocal { slot });
+                } else {
+                    self.emit(Step::ThisValue);
+                }
                 Ok(())
             }
             ExprKind::Super => Err(JsError::new(
@@ -10293,8 +10306,10 @@ fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
     }
     let allow_arguments =
         function.strict && function.this_mode != crate::function::ThisMode::Lexical;
+    let allow_this = function.this_mode != crate::function::ThisMode::Lexical;
     let mut scan = FastScopeScan {
         allow_arguments,
+        allow_this,
         ..FastScopeScan::default()
     };
     // A strict non-arrow body's own `arguments` reads are unmapped-arguments
@@ -10363,6 +10378,17 @@ fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
     } else {
         None
     };
+    // The body's `this` value is a frame slot the certified call fills with
+    // the OrdinaryCallBindThis result; `this` is not a name, so it has no
+    // `slots`-map entry.
+    let this_slot = if scan.observes_this {
+        let slot = scan.next_slot;
+        scan.tdz.push(false);
+        scan.next_slot += 1;
+        Some(slot)
+    } else {
+        None
+    };
     let frame_size = scan.next_slot;
     Some(ScopeInfo {
         frame_size,
@@ -10375,6 +10401,7 @@ fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
         context_param: scan.context_param,
         context_slots: scan.context_slots,
         arguments_slot,
+        this_slot,
     })
 }
 
@@ -11136,6 +11163,13 @@ struct FastScopeScan {
     /// The body references `arguments`: it gets an `arguments` slot the
     /// certified call fills with the unmapped arguments object.
     observes_arguments: bool,
+    /// Whether the body is a non-arrow function whose own `this` reads are
+    /// the call's `this` value (Cut 3 continuation; arrows' `this` is
+    /// lexical).
+    allow_this: bool,
+    /// The body references `this`: it gets a `this` slot the certified call
+    /// fills with the OrdinaryCallBindThis result.
+    observes_this: bool,
 }
 
 impl FastScopeScan {
@@ -11363,8 +11397,19 @@ impl FastScopeScan {
             }
             ExprKind::Template(template) => template.exprs.iter().all(|e| self.expr(e, depth)),
             ExprKind::Sequence(exprs) => exprs.iter().all(|e| self.expr(e, depth)),
-            ExprKind::This
-            | ExprKind::Super
+
+            ExprKind::This => {
+                // Cut 3 continuation (this slots): a non-arrow body's own
+                // `this` reads get a `this` slot the certified call fills
+                // with the OrdinaryCallBindThis result; an arrow's `this` is
+                // lexical.
+                if !self.allow_this {
+                    return false;
+                }
+                self.observes_this = true;
+                true
+            }
+            ExprKind::Super
             | ExprKind::Class(_)
             | ExprKind::PrivateIn { .. }
             | ExprKind::TaggedTemplate { .. }
@@ -11477,6 +11522,7 @@ fn analyze_script_scope(stmts: &[Stmt]) -> Option<(Option<ScriptSlots>, HashSet<
                     context_param: Vec::new(),
                     context_slots: HashMap::new(),
                     arguments_slot: None,
+                    this_slot: None,
                 },
                 names,
                 assigned,

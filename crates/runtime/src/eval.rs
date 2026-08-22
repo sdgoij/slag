@@ -3153,6 +3153,52 @@ mod tests {
     }
 
     #[test]
+    fn fast_path_this_slot() {
+        // Cut 3 continuation (this slots): a non-arrow body referencing
+        // `this` certifies with a `this` slot the call fills with the
+        // OrdinaryCallBindThis result.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.run_script("function m() { return this.x; }").unwrap();
+        let ir = compiled_body_of(&mut agent, "m");
+        assert!(
+            ir.scope.is_some(),
+            "a `this` body must keep the certified frame path"
+        );
+        // Method call: the receiver lands in the `this` slot.
+        assert_eq!(
+            run("var o = { x: 5, m: function() { return this.x; } }; o.m()").unwrap(),
+            Value::Number(5.0)
+        );
+        // Plain call, sloppy: `this` coerces to the global object.
+        assert_eq!(
+            run("function f() { return this; } typeof f()").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("object")))
+        );
+        // Plain call, strict: `this` stays undefined.
+        assert_eq!(
+            run("function g() { 'use strict'; return this; } g() === undefined").unwrap(),
+            Value::Boolean(true)
+        );
+        // Construct: the constructed object lands in the `this` slot.
+        assert_eq!(
+            run("function C(x) { this.x = x; } var c = new C(42); c.x").unwrap(),
+            Value::Number(42.0)
+        );
+        // Class methods certify too (strict, non-arrow).
+        assert_eq!(
+            run("class A { constructor(v) { this.v = v; } m() { return this.v; } } new A(7).m()")
+                .unwrap(),
+            Value::Number(7.0)
+        );
+        // An arrow's `this` is lexical — stays on the env path.
+        assert_eq!(
+            run("function outer() { return () => this.x; } outer.call({ x: 9 })()").unwrap(),
+            Value::Number(9.0)
+        );
+    }
+
+    #[test]
     fn fast_path_var_hoists_to_undefined() {
         assert_eq!(
             run("function g() { return x; var x = 1; } g()").unwrap(),
@@ -3292,13 +3338,16 @@ mod tests {
             run("function m() { return this.x; } m.call({ x: 9 })").unwrap(),
             Value::Number(9.0)
         );
+        // Cut 3 continuation: a non-arrow `this` body now certifies with a
+        // `this` slot (see fast_path_this_slot); the behavior above is
+        // unchanged. An arrow's lexical `this` still bails.
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
-        agent.run_script("function m() { return this.x; }").unwrap();
-        let ir = compiled_body_of(&mut agent, "m");
+        agent.run_script("var f = () => this.x;").unwrap();
+        let ir = compiled_body_of(&mut agent, "f");
         assert!(
             ir.scope.is_none(),
-            "a `this` body must stay on the env path"
+            "an arrow `this` body must stay on the env path"
         );
     }
 

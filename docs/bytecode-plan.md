@@ -31,7 +31,11 @@ path), nested context chains (depth > 1 resolves through the env),
 **mapped** arguments (the unmapped strict slice landed: a strict body's
 own `arguments` reads get a frame slot the certified call fills with
 the unmapped arguments object), Annex B, the body accumulator model,
-slot-arg calls, and the Cut 5 encoding work remain open.
+slot-arg calls, and the Cut 5 encoding work remain open. `this` slots
+have also landed (a non-arrow body referencing `this` gets a frame
+slot the certified call fills with the OrdinaryCallBindThis result —
+methods, constructors, and class methods now certify); arrows' lexical
+`this` stays on the env path.
 
 ---
 
