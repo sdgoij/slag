@@ -1181,6 +1181,17 @@ impl EnvStack {
         }
     }
 
+    /// Re-point the stack at a fresh base, dropping the previous run's
+    /// entries (the Vm pool reuses the stack across calls).
+    fn reset(&mut self, base: EnvRef) {
+        for slot in &mut self.inline {
+            *slot = None;
+        }
+        self.inline[0] = Some(base);
+        self.heap.clear();
+        self.len = 1;
+    }
+
     #[inline]
     fn push(&mut self, env: EnvRef) {
         if self.len < ENV_INLINE {
@@ -1477,6 +1488,54 @@ impl Vm {
             args_base_stack: Vec::new(),
             call_args: Vec::new(),
         }
+    }
+
+    /// Reset a pooled Vm for a new run (the per-call reuse): the Vec
+    /// stacks keep their capacity, the inline env stack is re-pointed, and
+    /// the frame is left stale — `setup_frame` overwrites every slot below
+    /// `frame_size` on the next run, and a `frame_size`-0 body never reads
+    /// it (the pool hands a Vm out only after its previous run finished).
+    pub fn reset(&mut self, lexical_env: EnvRef, strict: bool) {
+        self.ip = 0;
+        self.stack.clear();
+        self.args.clear();
+        self.lexical_env = lexical_env.clone();
+        self.env_stack.reset(lexical_env);
+        self.body_context = None;
+        self.global = None;
+        self.completion = Value::Undefined;
+        self.try_stack.clear();
+        self.pending.clear();
+        self.thrown = None;
+        self.resume_abrupt = None;
+        self.for_of_stepping = false;
+        self.async_for_of_stepping = false;
+        self.destructure_stepping = false;
+        self.for_in_stack.clear();
+        self.for_of_stack.clear();
+        self.async_for_of_stack.clear();
+        self.for_of_boundaries.clear();
+        self.async_for_of_boundaries.clear();
+        self.destructure_stack.clear();
+        self.destructure_done.clear();
+        self.destructure_obj_stack.clear();
+        self.destructure_assign_keys.clear();
+        self.destructure_excluded.clear();
+        self.yield_star_stack.clear();
+        self.class_stack.clear();
+        self.switch_disc = None;
+        self.chain_short = false;
+        self.pending_disposal = None;
+        self.pending_catch_disposal = None;
+        self.strict = strict;
+        self.completion_is_empty = true;
+        self.acc = Value::Undefined;
+        self.completion_stack.clear();
+        self.list_stack.clear();
+        self.var_ref_stack.clear();
+        self.array_index_stack.clear();
+        self.args_base_stack.clear();
+        self.call_args.clear();
     }
 
     fn pop(&mut self) -> Value {

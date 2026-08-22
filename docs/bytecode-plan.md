@@ -59,12 +59,20 @@ initialized with its closure at body entry (`FunctionDeclInit` — spec
 10.2.11), the declaration statement is empty (15.2.6), and a body whose
 closures capture the declared name allocates it a capture-context slot
 (the mutual-recursion shape: two declarations capturing each other
-resolve through the context). The certified construct fast path runs a
-certified constructor body against its captured environment — not the
-empty lexical env `function_declaration_instantiation` installs on the
-running context — so closures created inside the constructor record the
-capture context as their `[[Environment]]` (a `LoadContextSlot` at depth
-0 against the empty env read its slot 0, the TDZ marker). Annex B
+resolve through the context). The certified construct fast path now
+mirrors the certified call: a base constructor with a certified body and
+no instance fields or private methods borrows the record (no
+`FunctionEnv`, no `function_declaration_instantiation`, no
+`initialize_instance_elements`), builds `this` with
+OrdinaryCreateFromConstructor, and applies the base-constructor return
+rule (an object return wins, else `this`) to the body completion. The
+body runs against its captured environment — not the empty lexical env
+the slow path's `function_declaration_instantiation` installs — so
+closures created inside the constructor record the capture context as
+their `[[Environment]]` (a `LoadContextSlot` at depth 0 against the
+empty env would read its slot 0, the TDZ marker). Class constructors
+with instance fields/private methods and derived constructors keep the
+slow path. Annex B
 block-level function declarations certify too (Cut 6 first slice): a
 sloppy body's block function declaration binds a block-scoped binding in
 a frame slot — initialized with the instantiated closure at block entry

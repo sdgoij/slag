@@ -38,25 +38,32 @@ pub fn eval_program(
 ) -> Result<Value, JsError> {
     let body = crate::ir::compile_statements(&program.body, strict, fast_script)?;
     let env = agent.running_context()?.lexical_environment.clone();
-    let mut vm = crate::ir::Vm::new(env.clone(), strict);
+    let mut vm = agent.take_vm(env.clone(), strict);
     // Cut 16: a slotified script's declared vars live in the frame — the
     // prologue already loaded them from the global object, so no argument
     // copies are needed.
     if let Some(scope) = &body.scope {
         vm.setup_frame(scope, &[]);
     }
-    let completion = match vm.start(agent, &body)? {
-        crate::ir::VmOutcome::Completed(completion) => completion,
-        crate::ir::VmOutcome::Suspended(_) => {
+    let completion = match vm.start(agent, &body) {
+        Ok(crate::ir::VmOutcome::Completed(completion)) => completion,
+        Ok(crate::ir::VmOutcome::Suspended(_)) => {
+            agent.return_vm(vm);
             return Err(JsError::new(
                 ErrorKind::SyntaxError,
                 "yield/await in a script top level".into(),
             ));
         }
+        Err(error) => {
+            agent.return_vm(vm);
+            return Err(error);
+        }
     };
     // The script's `using` resources are disposed when the list completes
     // (spec 14.2.3 step 6), like the walked statement list.
-    let completion = dispose_env_resources(agent, &env, Ok(completion))?;
+    let result = dispose_env_resources(agent, &env, Ok(completion));
+    agent.return_vm(vm);
+    let completion = result?;
     completion_to_result(completion)
 }
 

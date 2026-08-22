@@ -76,6 +76,11 @@ pub struct Agent {
     pub(crate) member_cells: [Option<(u64, crux::AtomId, usize)>; crate::ir::MEMBER_CELLS],
     pub(crate) array_element_cells:
         [Option<(u64, u64, crux::AtomId, usize)>; crate::ir::MEMBER_CELLS],
+    /// The free-list of Vms for per-call reuse: `run_compiled_body`, the
+    /// construct fast path, and the script/eval paths take one, run, and
+    /// return it — a pooled Vm is never handed to a suspended
+    /// generator/async state (those own their Vm).
+    pub(crate) vm_pool: Vec<crate::ir::Vm>,
     pub(crate) promise_jobs: VecDeque<Job>,
     pub(crate) generic_jobs: VecDeque<Job>,
     pub(crate) timeout_jobs: VecDeque<(Instant, Job)>,
@@ -432,6 +437,7 @@ impl Agent {
             global_cells: [None; crate::ir::GLOBAL_CELLS],
             member_cells: [None; crate::ir::MEMBER_CELLS],
             array_element_cells: [None; crate::ir::MEMBER_CELLS],
+            vm_pool: Vec::new(),
             promise_jobs: VecDeque::new(),
             generic_jobs: VecDeque::new(),
             timeout_jobs: VecDeque::new(),
@@ -545,6 +551,28 @@ impl Agent {
                 "No running execution context".into(),
             )
         })
+    }
+
+    /// A Vm for a new run: a pooled one reset for this env/strict, or a
+    /// fresh allocation when the pool is empty.
+    pub(crate) fn take_vm(
+        &mut self,
+        lexical_env: crate::env::EnvRef,
+        strict: bool,
+    ) -> crate::ir::Vm {
+        match self.vm_pool.pop() {
+            Some(mut vm) => {
+                vm.reset(lexical_env, strict);
+                vm
+            }
+            None => crate::ir::Vm::new(lexical_env, strict),
+        }
+    }
+
+    /// Return a Vm to the pool after its run finished (the next run reuses
+    /// its Vec capacities and inline frame).
+    pub(crate) fn return_vm(&mut self, vm: crate::ir::Vm) {
+        self.vm_pool.push(vm);
     }
 
     /// spec 9.7.1 AgentSignifier.

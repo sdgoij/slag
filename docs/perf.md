@@ -595,6 +595,68 @@ property-escape + TypedArray hang cluster); workspace tests 4311/0
 including a new fast-path step-stream test asserting the certified
 steps.
 
+### Cut 19 — per-call Vm reuse (measured 2026-08-22)
+
+The per-call machinery's construction cost: every call to a compiled
+body built a fresh `Vm` (~30 fields, ~20 empty `Vec`s, the 8-slot
+inline frame, the inline env stack) and tore it down. The agent now
+keeps a free-list of `Vm`s (`vm_pool`); the ordinary call, construct
+fast path, and script/eval paths take one, run, and return it — the
+reset clears the Vec stacks in place (capacity kept), re-points the
+inline env stack, and leaves the frame stale (the next run's
+`setup_frame` overwrites every slot below `frame_size`; a
+`frame_size`-0 body never reads it). Suspended generator/async/module
+states still own their Vm (never pooled), so no Vm aliases a live
+suspension.
+
+Measured (3-run medians, vs the immediately-prior tree):
+
+| Row | before | after |
+|---|---|---|
+| function calls | ~300ms | **270ms** (-10%) |
+| closure capture | ~312ms | **264ms** (-15%) |
+| construct churn | ~549ms | **454ms** (-17%) |
+| per-iteration | ~52ms | 49ms |
+
+Arithmetic/property/concat/array flat (they don't call). The calls row
+is still ~11x node `--jitless` — the per-call `ExecutionContext`
+push/pop, the record fetch, and the dispatch-loop entry remain; the
+structural fix is the Cut 12 frame-stack-split (one dispatch loop over
+a frame stack, no per-call Vm/context). Conformance at baseline:
+language 23,690/0/34, annexB 1,086/0/0, built-ins 23,202/0/154 (known
+hang cluster); workspace tests 4311/0.
+
+### Cut 20 — certified-construct fast path (measured 2026-08-23)
+
+`ordinary_construct` now mirrors the certified call: a base constructor
+with a certified body (empty `context_names`), no instance fields, and
+no private methods skips the whole slow path — no `FunctionEnv`, no
+`function_declaration_instantiation`, no `initialize_instance_elements`,
+and the record is borrowed, not deep-cloned (the params/body AST clones
+the slow path pays per construct disappear). `this` comes from
+`construct_this_object` (OrdinaryCreateFromConstructor, extracted from
+the slow path), the slim `ExecutionContext` matches the certified
+call's (`script_or_module`/`source`/`private_environment` are never
+consulted by a certified body), and the base-constructor return rule
+(object/function return wins, else `this`) is applied directly to the
+body completion. Class constructors with instance fields/private
+methods and derived constructors keep the slow path — the
+`fields`/`private_methods` guards stand in for the skipped
+instance-element machinery.
+
+Measured (5-run medians, vs the Cut 19 tree):
+
+| Row | before | after |
+|---|---|---|
+| construct churn | 454ms | **198ms** (-56%) |
+
+Calls/closure/per-iteration/arithmetic flat (they don't construct). The
+construct row is now ~36x node `--jitless` (was ~82x) — the remaining
+cost is the `this`-object allocation, the slim context push/pop, and
+the dispatch-loop entry, all addressed by the Cut 12 frame-stack-split.
+Conformance at baseline: language 23,690/0/34, annexB 1,086/0/0,
+built-ins 23,201/0/154 (known hang cluster); workspace tests 4311/0.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

@@ -21,7 +21,7 @@ use crate::env::{EnvRef, new_declarative_environment, new_function_environment};
 use crate::eval::eval_statement_list;
 use crate::expr::eval_expr;
 use crate::flow::Completion;
-use crate::ir::{Vm, VmOutcome};
+use crate::ir::VmOutcome;
 use crate::realm::Realm;
 use crate::script::{
     bound_names, is_constant_declaration, top_level_lexically_declared_names,
@@ -1775,7 +1775,7 @@ fn run_compiled_body(
     this_value: Option<Value>,
 ) -> Result<Value, JsError> {
     let body_env = agent.running_context()?.lexical_environment.clone();
-    let mut vm = Vm::new(body_env.clone(), strict);
+    let mut vm = agent.take_vm(body_env.clone(), strict);
     // Cut 3 continuation (per-iteration loop heads): the certified body's
     // capture context is fixed for the run — the per-iteration loop
     // machinery copies fresh head bindings from it.
@@ -1804,10 +1804,10 @@ fn run_compiled_body(
     {
         *vm.frame.get_mut(slot) = this_value;
     }
-    let outcome = vm.start(agent, ir);
-    let completion = match outcome {
+    let completion = match vm.start(agent, ir) {
         Ok(VmOutcome::Completed(completion)) => completion,
         Ok(VmOutcome::Suspended(_)) => {
+            agent.return_vm(vm);
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "ordinary function suspended unexpectedly".into(),
@@ -1816,9 +1816,14 @@ fn run_compiled_body(
         // The body env's `using` resources dispose on an abrupt error too
         // (spec 14.2.3 step 6, mirroring the walker's eval_statement_list);
         // a throwing disposal folds into the error as a SuppressedError.
-        Err(error) => return Err(body_error_after_disposal(agent, &body_env, error)),
+        Err(error) => {
+            agent.return_vm(vm);
+            return Err(body_error_after_disposal(agent, &body_env, error));
+        }
     };
-    let completion = crate::eval::dispose_env_resources(agent, &body_env, Ok(completion))?;
+    let result = crate::eval::dispose_env_resources(agent, &body_env, Ok(completion));
+    agent.return_vm(vm);
+    let completion = result?;
     body_completion_to_value(completion)
 }
 
@@ -1979,12 +1984,153 @@ fn is_revoked_proxy(value: &Value) -> bool {
     )
 }
 
+/// OrdinaryCreateFromConstructor (spec 10.2.4): the `this` object of a base
+/// constructor call — newTarget's `prototype` (an object — including a
+/// function value), falling back to %Object.prototype% when it isn't an
+/// object (S13.2.2_A3_T1).
+fn construct_this_object(agent: &mut Agent, new_target: &Value) -> Result<Value, JsError> {
+    let prototype = crate::context::get_property(
+        agent,
+        new_target,
+        &JsString::from_utf8("prototype"),
+        new_target.clone(),
+    )?;
+    let proto = match crate::context::as_object(&prototype) {
+        Some(obj) => Some(obj),
+        None => {
+            // GetFunctionRealm (spec 10.2.5): a revoked Proxy throws.
+            if is_revoked_proxy(new_target) {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "Cannot perform operation on a revoked Proxy".into(),
+                ));
+            }
+            crate::context::get_function_realm(agent, new_target)?
+                .intrinsics
+                .get("%Object.prototype%")
+                .and_then(|value| crate::context::as_object(&value))
+        }
+    };
+    Ok(Value::Object(JsObject::ordinary_object_create(proto)))
+}
+
 fn ordinary_construct(
     agent: &mut Agent,
     function: &Handle<Function>,
     args: &[Value],
     new_target: &Value,
 ) -> Result<Value, JsError> {
+    // Certified base-constructor fast path (the construct mirror of the
+    // certified call): a capture-free certified body needs no FunctionEnv,
+    // no declaration instantiation, and no instance-field machinery — its
+    // bindings are frame slots and `this` lands in the slot. The record is
+    // borrowed, not deep-cloned, so the params/body AST clones the slow
+    // path pays per construct disappear. Class constructors with instance
+    // fields/private methods keep the slow path (initialize_instance_elements).
+    let certified = {
+        let data = agent.ecma_functions.get(&function.id()).ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                "Function body is not registered".into(),
+            )
+        })?;
+        if data.this_mode != ThisMode::Lexical
+            && data.constructor_kind == ConstructorKind::Base
+            && data.fields.is_empty()
+            && data.private_methods.is_empty()
+        {
+            data.ir.clone().and_then(|ir| {
+                ir.scope
+                    .as_ref()
+                    .is_some_and(|scope| scope.context_names.is_empty())
+                    .then_some((
+                        ir,
+                        data.environment.clone(),
+                        data.realm.clone(),
+                        data.strict,
+                    ))
+            })
+        } else {
+            None
+        }
+    };
+    if let Some((ir, environment, realm, strict)) = certified {
+        let this = construct_this_object(agent, new_target)?;
+        let function_value = function.self_value();
+        // The body observes only the closure environment, the realm, and
+        // the frame — mirror the certified call's context (script_or_module,
+        // source, and private_environment are never consulted).
+        agent.execution_context_stack.push(ExecutionContext {
+            function: Some(function_value.clone()),
+            realm,
+            script_or_module: None,
+            lexical_environment: environment.clone(),
+            variable_environment: environment.clone(),
+            private_environment: None,
+            source: None,
+            annex_b_hoistable: Default::default(),
+        });
+        let result = (|| -> Result<Value, JsError> {
+            let body_env = agent.running_context()?.lexical_environment.clone();
+            let mut vm = agent.take_vm(body_env.clone(), strict);
+            // Closures created inside the body record the function's
+            // captured environment — the running context's lexical env here
+            // (set above) is that environment, so a depth-0 static
+            // context-chain read lands on the right context.
+            vm.body_context = Some(environment.clone());
+            vm.lexical_env = environment.clone();
+            if let Some(scope) = &ir.scope {
+                vm.setup_frame(scope, args);
+                // Cut 3 continuation (unmapped arguments slice): the body's
+                // `Step::CreateArguments` needs the call's full argument list.
+                if scope.arguments_slot.is_some() {
+                    vm.call_args = args.to_vec();
+                }
+                // Cut 3 continuation (this slots): the constructed `this`
+                // lands in the body's `this` slot.
+                if let Some(slot) = scope.this_slot {
+                    *vm.frame.get_mut(slot) = this.clone();
+                }
+            }
+            let completion = match vm.start(agent, &ir) {
+                Ok(VmOutcome::Completed(completion)) => completion,
+                Ok(VmOutcome::Suspended(_)) => {
+                    agent.return_vm(vm);
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "constructor body suspended unexpectedly".into(),
+                    ));
+                }
+                Err(error) => {
+                    agent.return_vm(vm);
+                    return Err(body_error_after_disposal(agent, &body_env, error));
+                }
+            };
+            let result = crate::eval::dispose_env_resources(agent, &body_env, Ok(completion));
+            agent.return_vm(vm);
+            let completion = result?;
+            // spec 10.2.1 [[Construct]] steps 15-21 (base): an object
+            // return wins; anything else falls back to `this`.
+            match completion {
+                Completion::Return(value) => match value.kind() {
+                    ValueKind::Object(_) | ValueKind::Function(_) => Ok(value),
+                    _ => Ok(this),
+                },
+                Completion::Normal(_) | Completion::Empty => Ok(this),
+                Completion::Throw(value) => Err(JsError::new(
+                    ErrorKind::TypeError,
+                    format!("Uncaught {value:?}"),
+                )
+                .with_value(value)),
+                Completion::Break { .. } | Completion::Continue { .. } => Err(JsError::new(
+                    ErrorKind::SyntaxError,
+                    "Illegal break/continue statement".into(),
+                )),
+            }
+        })();
+        agent.execution_context_stack.pop();
+        return result;
+    }
     let data = agent
         .ecma_functions
         .get(&function.id())
@@ -2007,32 +2153,7 @@ fn ordinary_construct(
     let this = if derived {
         Value::Undefined
     } else {
-        // OrdinaryCreateFromConstructor (spec 10.2.4): newTarget's
-        // `prototype` (an object — including a function value), falling back
-        // to %Object.prototype% when it isn't an object (S13.2.2_A3_T1).
-        let prototype = crate::context::get_property(
-            agent,
-            new_target,
-            &JsString::from_utf8("prototype"),
-            new_target.clone(),
-        )?;
-        let proto = match crate::context::as_object(&prototype) {
-            Some(obj) => Some(obj),
-            None => {
-                // GetFunctionRealm (spec 10.2.5): a revoked Proxy throws.
-                if is_revoked_proxy(new_target) {
-                    return Err(JsError::new(
-                        ErrorKind::TypeError,
-                        "Cannot perform operation on a revoked Proxy".into(),
-                    ));
-                }
-                crate::context::get_function_realm(agent, new_target)?
-                    .intrinsics
-                    .get("%Object.prototype%")
-                    .and_then(|value| crate::context::as_object(&value))
-            }
-        };
-        Value::Object(JsObject::ordinary_object_create(proto))
+        construct_this_object(agent, new_target)?
     };
     let function_value = function.self_value();
     let old_env = data.environment.clone();
@@ -2110,7 +2231,7 @@ fn ordinary_construct(
                     .is_none_or(|scope| scope.context_names.is_empty()) =>
             {
                 let body_env = agent.running_context()?.lexical_environment.clone();
-                let mut vm = Vm::new(body_env.clone(), data.strict);
+                let mut vm = agent.take_vm(body_env.clone(), data.strict);
                 // Cut 3 continuation (nested context chains): a certified
                 // body's static context-chain reads resolve against its
                 // captured environment (its own capture context when it has
@@ -2145,18 +2266,23 @@ fn ordinary_construct(
                         *vm.frame.get_mut(slot) = this.clone();
                     }
                 }
-                let outcome = vm.start(agent, ir);
-                let completion = match outcome {
+                let completion = match vm.start(agent, ir) {
                     Ok(VmOutcome::Completed(completion)) => completion,
                     Ok(VmOutcome::Suspended(_)) => {
+                        agent.return_vm(vm);
                         return Err(JsError::new(
                             ErrorKind::TypeError,
                             "constructor body suspended unexpectedly".into(),
                         ));
                     }
-                    Err(error) => return Err(body_error_after_disposal(agent, &body_env, error)),
+                    Err(error) => {
+                        agent.return_vm(vm);
+                        return Err(body_error_after_disposal(agent, &body_env, error));
+                    }
                 };
-                crate::eval::dispose_env_resources(agent, &body_env, Ok(completion))?
+                let result = crate::eval::dispose_env_resources(agent, &body_env, Ok(completion));
+                agent.return_vm(vm);
+                result?
             }
             _ => eval_statement_list(agent, &data.body.stmts, data.strict)?,
         };
