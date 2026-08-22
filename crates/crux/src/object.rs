@@ -286,6 +286,11 @@ pub struct JsObject {
     /// Whether this object is an immutable prototype exotic object (spec
     /// 9.4.7): `[[SetPrototypeOf]]` accepts only a SameValue prototype.
     immutable_prototype: Cell<bool>,
+    /// A generation counter bumped by any own-property or prototype change
+    /// (Cut 22): the write-side chain cache re-validates a cached "the chain
+    /// holds no accessor/non-writable for this key" verdict against the
+    /// chain links' generations, so a mutation invalidates it exactly.
+    generation: Cell<u32>,
     /// Own properties in insertion order (the [[OwnPropertyKeys]] string
     /// order for ordinary objects).
     pub properties: RefCell<Vec<(PropertyKey, Property)>>,
@@ -356,6 +361,7 @@ impl JsObject {
             prototype: RefCell::new(prototype),
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
+            generation: Cell::new(0),
             properties: RefCell::new(Vec::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
@@ -438,6 +444,7 @@ impl JsObject {
             prototype: RefCell::new(prototype),
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
+            generation: Cell::new(0),
             properties: RefCell::new(Vec::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
@@ -467,6 +474,7 @@ impl JsObject {
             prototype: RefCell::new(prototype),
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
+            generation: Cell::new(0),
             properties: RefCell::new(Vec::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
@@ -500,6 +508,7 @@ impl JsObject {
             prototype: RefCell::new(prototype),
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
+            generation: Cell::new(0),
             properties: RefCell::new(Vec::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
@@ -529,6 +538,7 @@ impl JsObject {
             prototype: RefCell::new(None),
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
+            generation: Cell::new(0),
             properties: RefCell::new(Vec::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
@@ -552,6 +562,7 @@ impl JsObject {
             prototype: RefCell::new(prototype),
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
+            generation: Cell::new(0),
             properties: RefCell::new(Vec::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
@@ -657,6 +668,7 @@ impl JsObject {
             prototype: RefCell::new(None),
             extensible: Cell::new(false),
             immutable_prototype: Cell::new(false),
+            generation: Cell::new(0),
             properties: RefCell::new(Vec::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
@@ -706,6 +718,7 @@ impl JsObject {
             prototype: RefCell::new(prototype),
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
+            generation: Cell::new(0),
             properties: RefCell::new(Vec::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
@@ -799,6 +812,7 @@ impl JsObject {
             prototype: RefCell::new(prototype),
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
+            generation: Cell::new(0),
             properties: RefCell::new(Vec::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
@@ -934,6 +948,7 @@ impl JsObject {
             }
         }
         *self.prototype.borrow_mut() = proto;
+        self.bump_generation();
         Ok(true)
     }
 
@@ -1448,6 +1463,10 @@ impl JsObject {
         key: &PropertyKey,
         desc: &PropertyDescriptor,
     ) -> Result<bool, JsError> {
+        // Any own-property change invalidates the write-side chain cache
+        // verdicts that include this object as a chain link (Cut 22). A
+        // no-op define over-bumps — only cache hits are lost.
+        self.bump_generation();
         match &self.kind {
             ObjectKind::Proxy(slots) => return crate::proxy::define_own_property(slots, key, desc),
             ObjectKind::IntegerIndexed(slots) => {
@@ -1536,6 +1555,41 @@ impl JsObject {
             ));
         }
         Ok(())
+    }
+
+    /// The write-side chain-cache generation (Cut 22): bumped by any
+    /// own-property or prototype change, so a cached "the chain holds no
+    /// accessor/non-writable for this key" verdict can be re-validated
+    /// against the chain links' generations.
+    pub fn generation(&self) -> u32 {
+        self.generation.get()
+    }
+
+    fn bump_generation(&self) {
+        self.generation.set(self.generation.get().wrapping_add(1));
+    }
+
+    /// CreateDataProperty (spec 7.3.4) fast path (Cut 22): the caller has
+    /// verified the key is absent, the receiver is extensible, and the
+    /// prototype chain holds no accessor/non-writable for it — append the
+    /// writable data property directly, skipping the descriptor/validate
+    /// machinery. Returns false when the receiver is not extensible (the
+    /// caller then falls back to the full [[Set]]).
+    pub fn fresh_data_define(&self, key: &PropertyKey, value: Value) -> bool {
+        if !self.extensible.get() {
+            return false;
+        }
+        let mut props = self.properties.borrow_mut();
+        let position = props.len();
+        props.push((key.clone(), Property::data(value, true, true, true)));
+        drop(props);
+        // The lazy index's incremental maintenance (an append shifts
+        // nothing, so the new key maps to its pushed position).
+        if let Some(index) = &mut *self.property_index.borrow_mut() {
+            index.insert(key.clone(), position);
+        }
+        self.bump_generation();
+        true
     }
 
     /// PrivateFieldAdd/PrivateMethodOrAccessorAdd storage (spec 10.2.10,
@@ -1635,6 +1689,7 @@ impl JsObject {
                         if props[index].1.configurable {
                             props.remove(index);
                             *self.property_index.borrow_mut() = None;
+                            self.bump_generation();
                             true
                         } else {
                             false
@@ -1664,6 +1719,7 @@ impl JsObject {
                 if props[index].1.configurable {
                     props.remove(index);
                     *self.property_index.borrow_mut() = None;
+                    self.bump_generation();
                     true
                 } else {
                     false

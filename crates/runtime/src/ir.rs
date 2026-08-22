@@ -513,6 +513,14 @@ pub enum Step {
     ForOfNext {
         done: usize,
     },
+    /// The fused for-of protocol step + slot head bind (Cut 21): the
+    /// element writes the frame slot directly — one less dispatch and no
+    /// value-stack round-trip per element. The generic iterator path
+    /// writes the slot the same way.
+    ForOfNextBindLocal {
+        slot: usize,
+        done: usize,
+    },
     ForOfBind {
         left: ForBinding,
     },
@@ -1108,6 +1116,9 @@ const INLINE_FRAME: usize = 8;
 /// The direct-mapped member-access cell count (P3): a power of two so the
 /// cache index is a mask.
 pub(crate) const MEMBER_CELLS: usize = 16;
+/// The write-side chain-cache entry (Cut 22): (prototype id, key atom,
+/// walked-chain length, per-link generations).
+pub(crate) type MemberStoreCell = (u64, crux::AtomId, u32, [u32; 4]);
 /// The direct-mapped global-var cell count: a power of two so the cache
 /// index is a mask. Bigger than the member cells because a script's
 /// top-level names (`n`, `i`, `s`, ...) all probe this table; a collision
@@ -1151,6 +1162,14 @@ impl Frame {
 pub enum ForOfEntry {
     Generic(crate::expr::IteratorRecord),
     Fast { array: Value, index: usize },
+}
+
+/// Where the for-of protocol step's element lands (Cut 21): the value
+/// stack (the general shape, followed by a separate bind step) or a frame
+/// slot directly (the fused bind).
+enum ForOfNextTarget {
+    Stack,
+    Slot(usize),
 }
 
 /// The scope-environment stack: a small inline buffer for the common
@@ -1844,6 +1863,142 @@ impl Vm {
             crux::object::PropertyKind::Data { value, .. } => Some(value.clone()),
             _ => None,
         }
+    }
+
+    /// The direct-mapped cache index for the write-side chain cache.
+    fn member_store_cell_index(proto_id: u64, atom: crux::AtomId) -> usize {
+        (proto_id as usize ^ atom as usize) & (MEMBER_CELLS - 1)
+    }
+
+    /// The write-side chain-cache probe (Cut 22): re-validates a cached
+    /// "the chain from this prototype holds no accessor/non-writable for
+    /// this key" verdict by walking the chain links and comparing their
+    /// generations — a mutation anywhere bumps a generation and misses.
+    fn member_store_cell_probe(
+        agent: &mut Agent,
+        proto: &Handle<crux::object::JsObject>,
+        atom: crux::AtomId,
+    ) -> bool {
+        let index = Self::member_store_cell_index(proto.id(), atom);
+        let Some((cached_proto, cached_atom, len, gens)) = agent.member_store_cells[index] else {
+            return false;
+        };
+        if cached_proto != proto.id() || cached_atom != atom {
+            return false;
+        }
+        // The walk starts at the prototype itself (the first recorded link)
+        // and compares every link's generation — a mutation anywhere in the
+        // chain bumps one and misses.
+        let mut link = Some(proto.clone());
+        for &expected in gens.iter().take(len as usize) {
+            let Some(current) = link else { return false };
+            if current.generation() != expected {
+                return false;
+            }
+            link = current.get_prototype_of().ok().flatten();
+        }
+        true
+    }
+
+    /// Resolve and cache the "chain is safe" verdict for (receiver, key):
+    /// walk the chain from the receiver's prototype, recording each
+    /// Ordinary/Array link's generation. Safe means every link either lacks
+    /// the key or holds a writable data property — where [[Set]] stops and
+    /// defines on the receiver (spec 10.1.9.4). `false` = not cacheable (an
+    /// exotic link, an accessor, or a non-writable data property) — the
+    /// caller falls back to the full [[Set]].
+    fn member_store_cell_resolve(
+        agent: &mut Agent,
+        receiver: &crux::object::JsObject,
+        key: &PropertyKey,
+        atom: crux::AtomId,
+    ) -> bool {
+        let Some(proto) = receiver.get_prototype_of().ok().flatten() else {
+            // No chain: [[Set]] always defines on the receiver (handled
+            // directly by the caller, no cache needed).
+            return true;
+        };
+        if !matches!(
+            proto.kind,
+            crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array
+        ) {
+            return false;
+        }
+        let mut gens = [0u32; 4];
+        let mut len = 0usize;
+        let mut link = Some(proto.clone());
+        while let Some(current) = link {
+            if len >= 4 {
+                return false;
+            }
+            if !matches!(
+                current.kind,
+                crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array
+            ) {
+                return false;
+            }
+            match current.get_own_property_key(key).ok().flatten() {
+                Some(prop) => match &prop.kind {
+                    crux::object::PropertyKind::Data { writable, .. } if *writable => {
+                        // The writable-data stop: [[Set]] defines on the
+                        // receiver; the stop link's generation is recorded
+                        // so a later accessor conversion invalidates.
+                        gens[len] = current.generation();
+                        len += 1;
+                        break;
+                    }
+                    _ => return false, // an accessor or non-writable data
+                },
+                None => {
+                    gens[len] = current.generation();
+                    len += 1;
+                    link = current.get_prototype_of().ok().flatten();
+                }
+            }
+        }
+        let index = Self::member_store_cell_index(proto.id(), atom);
+        agent.member_store_cells[index] = Some((proto.id(), atom, len as u32, gens));
+        true
+    }
+
+    /// The fresh-property write fast path (Cut 22): a plain ordinary
+    /// receiver with the key absent and a cache-verified accessor-free
+    /// chain defines the new property directly — no [[Set]] chain walk, no
+    /// descriptor/validate machinery. Returns false to fall back to the
+    /// full [[Set]].
+    fn fast_fresh_store(
+        &mut self,
+        agent: &mut Agent,
+        object: &Value,
+        key: &PropertyKeyName,
+        value: &Value,
+    ) -> Result<bool, JsError> {
+        let PropertyKeyName::Name(atom) = key else {
+            return Ok(false);
+        };
+        let receiver = match object.kind() {
+            ValueKind::Object(obj) => obj,
+            ValueKind::Function(f) => f.object.clone(),
+            _ => return Ok(false),
+        };
+        if !matches!(receiver.kind, crux::object::ObjectKind::Ordinary) {
+            return Ok(false);
+        }
+        let property_key = PropertyKey::String(*atom);
+        if receiver.get_own_property_key(&property_key)?.is_some() {
+            // An existing property: the in-place update path handles it.
+            return Ok(false);
+        }
+        let Some(proto) = receiver.get_prototype_of()? else {
+            // No chain: [[Set]] always defines on the receiver.
+            return Ok(receiver.fresh_data_define(&property_key, value.clone()));
+        };
+        if !Self::member_store_cell_probe(agent, &proto, *atom)
+            && !Self::member_store_cell_resolve(agent, &receiver, &property_key, *atom)
+        {
+            return Ok(false);
+        }
+        Ok(receiver.fresh_data_define(&property_key, value.clone()))
     }
 
     /// Resolve and cache the slot of `object`'s own data property for
@@ -4206,76 +4361,10 @@ impl Vm {
                     self.for_of_boundaries.push((*top, *end));
                 }
                 Step::ForOfNext { done } => {
-                    // The innermost state is cloned out so the arm can mutate
-                    // the stacks while agent-side calls run.
-                    let fast = match self.for_of_stack.last() {
-                        Some(ForOfEntry::Fast { array, index }) => Some((array.clone(), *index)),
-                        _ => None,
-                    };
-                    if let Some((array, index)) = fast {
-                        // Re-read the length and the element every step (spec
-                        // %ArrayIteratorPrototype%.next steps 5-7): a body that
-                        // mutates the array is observed exactly as the stock
-                        // iterator would.
-                        let length = Self::array_length(agent, &array)?;
-                        if index as u64 >= length {
-                            self.for_of_stack.pop();
-                            self.for_of_boundaries.pop();
-                            self.ip = *done;
-                        } else {
-                            // The element read goes through the numeric
-                            // direct-mapped cache (no per-element
-                            // number→string→intern round-trip); a hole or
-                            // structural change falls back to the full Get.
-                            let value = match Self::array_element_get(agent, &array, index as u64) {
-                                Some(value) => value,
-                                None => {
-                                    let value = crate::context::get_property_key(
-                                        agent,
-                                        &array,
-                                        &PropertyKey::from_utf8(&index.to_string()),
-                                        array.clone(),
-                                    )?;
-                                    Self::resolve_array_element(agent, &array, index as u64);
-                                    value
-                                }
-                            };
-                            if let Some(ForOfEntry::Fast { index: slot, .. }) =
-                                self.for_of_stack.last_mut()
-                            {
-                                *slot = index + 1;
-                            }
-                            self.stack.push(value);
-                        }
-                    } else {
-                        let Some(iterator) = self.for_of_stack.last() else {
-                            return Err(JsError::new(
-                                ErrorKind::SyntaxError,
-                                "ForOfNext without a for-of".into(),
-                            ));
-                        };
-                        let ForOfEntry::Generic(iterator) = iterator else {
-                            unreachable!("fast entries are handled above")
-                        };
-                        let iterator = iterator.clone();
-                        // A `next()` error propagates without closing the iterator
-                        // (spec 14.7.6.2 uses `?`): the flag stays set on the
-                        // error path so `run_inner` skips the close.
-                        self.for_of_stepping = true;
-                        match iterator_step(agent, &iterator) {
-                            Ok(Some(value)) => {
-                                self.for_of_stepping = false;
-                                self.stack.push(value);
-                            }
-                            Ok(None) => {
-                                self.for_of_stepping = false;
-                                self.for_of_stack.pop();
-                                self.for_of_boundaries.pop();
-                                self.ip = *done;
-                            }
-                            Err(error) => return Err(error),
-                        }
-                    }
+                    self.for_of_next(agent, *done, ForOfNextTarget::Stack)?;
+                }
+                Step::ForOfNextBindLocal { slot, done } => {
+                    self.for_of_next(agent, *done, ForOfNextTarget::Slot(*slot))?;
                 }
                 Step::ForOfBind { left } => {
                     let value = self.pop();
@@ -5387,10 +5476,22 @@ impl Vm {
         op: AssignOp,
     ) -> Result<(), JsError> {
         match op {
-            AssignOp::Assign
-            | AssignOp::AndAssign
-            | AssignOp::OrAssign
-            | AssignOp::NullishAssign => {
+            AssignOp::Assign => {
+                // Cut 22: a fresh-property write on a plain object with a
+                // cache-verified accessor-free chain defines directly — no
+                // [[Set]] chain walk, no descriptor/validate machinery (the
+                // per-construct `this.x = x` hot path). Falls back on any
+                // doubt (an existing property, an exotic receiver or chain
+                // link, an accessor/non-writable in the chain).
+                if self.fast_fresh_store(agent, &object, &key, &value)? {
+                    self.stack.push(value);
+                    return Ok(());
+                }
+                let reference = member_reference(&object, &key, self.strict);
+                crate::context::put_value(agent, &reference, value.clone())?;
+                self.stack.push(value);
+            }
+            AssignOp::AndAssign | AssignOp::OrAssign | AssignOp::NullishAssign => {
                 let reference = member_reference(&object, &key, self.strict);
                 crate::context::put_value(agent, &reference, value.clone())?;
                 self.stack.push(value);
@@ -5532,6 +5633,90 @@ impl Vm {
         let result = crate::function::call_inner(agent, &callee, this, args)?;
         self.stack.truncate(arg_start - 2);
         self.stack.push(result);
+        Ok(())
+    }
+
+    /// The for-of iteration step (spec 14.7.6.2, `%ArrayIteratorPrototype%.next`
+    /// for the fast path): advances the innermost for-of entry and lands the
+    /// element on the value stack (the general shape) or in a frame slot
+    /// directly (the fused bind, Cut 21). The dense fast path re-reads the
+    /// length and the element every step so a body that mutates the array is
+    /// observed exactly as the stock iterator would.
+    fn for_of_next(
+        &mut self,
+        agent: &mut Agent,
+        done: usize,
+        target: ForOfNextTarget,
+    ) -> Result<(), JsError> {
+        // The innermost state is cloned out so the arm can mutate the stacks
+        // while agent-side calls run.
+        let fast = match self.for_of_stack.last() {
+            Some(ForOfEntry::Fast { array, index }) => Some((array.clone(), *index)),
+            _ => None,
+        };
+        if let Some((array, index)) = fast {
+            let length = Self::array_length(agent, &array)?;
+            if index as u64 >= length {
+                self.for_of_stack.pop();
+                self.for_of_boundaries.pop();
+                self.ip = done;
+            } else {
+                // The element read goes through the numeric direct-mapped
+                // cache (no per-element number→string→intern round-trip); a
+                // hole or structural change falls back to the full Get.
+                let value = match Self::array_element_get(agent, &array, index as u64) {
+                    Some(value) => value,
+                    None => {
+                        let value = crate::context::get_property_key(
+                            agent,
+                            &array,
+                            &PropertyKey::from_utf8(&index.to_string()),
+                            array.clone(),
+                        )?;
+                        Self::resolve_array_element(agent, &array, index as u64);
+                        value
+                    }
+                };
+                if let Some(ForOfEntry::Fast { index: slot, .. }) = self.for_of_stack.last_mut() {
+                    *slot = index + 1;
+                }
+                match target {
+                    ForOfNextTarget::Stack => self.stack.push(value),
+                    ForOfNextTarget::Slot(slot) => *self.frame.get_mut(slot) = value,
+                }
+            }
+        } else {
+            let Some(iterator) = self.for_of_stack.last() else {
+                return Err(JsError::new(
+                    ErrorKind::SyntaxError,
+                    "ForOfNext without a for-of".into(),
+                ));
+            };
+            let ForOfEntry::Generic(iterator) = iterator else {
+                unreachable!("fast entries are handled above")
+            };
+            let iterator = iterator.clone();
+            // A `next()` error propagates without closing the iterator
+            // (spec 14.7.6.2 uses `?`): the flag stays set on the error path
+            // so `run_inner` skips the close.
+            self.for_of_stepping = true;
+            match iterator_step(agent, &iterator) {
+                Ok(Some(value)) => {
+                    self.for_of_stepping = false;
+                    match target {
+                        ForOfNextTarget::Stack => self.stack.push(value),
+                        ForOfNextTarget::Slot(slot) => *self.frame.get_mut(slot) = value,
+                    }
+                }
+                Ok(None) => {
+                    self.for_of_stepping = false;
+                    self.for_of_stack.pop();
+                    self.for_of_boundaries.pop();
+                    self.ip = done;
+                }
+                Err(error) => return Err(error),
+            }
+        }
         Ok(())
     }
 
@@ -6830,6 +7015,7 @@ enum Fixup {
     Exit(usize, usize),
     ForInNext(usize, usize),
     ForOfNext(usize, usize),
+    ForOfNextBindLocal(usize, usize),
     DestructureUndef(usize, usize),
     AsyncForOfNext(usize, usize),
     SwitchTest(usize, usize),
@@ -7682,6 +7868,11 @@ impl Compiler {
                     self.steps[index] = Step::ForOfNext {
                         done: self.labels[&label],
                     };
+                }
+                Fixup::ForOfNextBindLocal(index, label) => {
+                    if let Step::ForOfNextBindLocal { done, .. } = &mut self.steps[index] {
+                        *done = self.labels[&label];
+                    }
                 }
                 Fixup::DestructureUndef(index, label) => {
                     self.steps[index] = Step::DestructureUndef {
@@ -8709,13 +8900,34 @@ impl Compiler {
         self.resolve_labeled_continue(continue_label, scope);
         self.place(top_label);
         let step_index = self.steps.len();
-        self.emit(emit_next.clone());
-        match &emit_next {
-            Step::ForInNext { .. } => self.fixups.push(Fixup::ForInNext(step_index, done_label)),
-            Step::ForOfNext { .. } => self.fixups.push(Fixup::ForOfNext(step_index, done_label)),
-            _ => unreachable!("the certified loop protocol step is ForInNext or ForOfNext"),
+        // Cut 21: a for-of head bound to a frame slot fuses the protocol
+        // step and the bind — the element writes the slot directly, one less
+        // dispatch and no value-stack round-trip per element (the dense-array
+        // bench inner-loop hot path).
+        let fused_slot = match &emit_next {
+            Step::ForOfNext { .. } => match self.binding(*name) {
+                BindingLoc::Slot(slot) => Some(slot),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(slot) = fused_slot {
+            self.emit(Step::ForOfNextBindLocal { slot, done: 0 });
+            self.fixups
+                .push(Fixup::ForOfNextBindLocal(step_index, done_label));
+        } else {
+            self.emit(emit_next.clone());
+            match &emit_next {
+                Step::ForInNext { .. } => {
+                    self.fixups.push(Fixup::ForInNext(step_index, done_label))
+                }
+                Step::ForOfNext { .. } => {
+                    self.fixups.push(Fixup::ForOfNext(step_index, done_label))
+                }
+                _ => unreachable!("the certified loop protocol step is ForInNext or ForOfNext"),
+            }
+            self.emit_certified_for_bind(*name, *kind);
         }
-        self.emit_certified_for_bind(*name, *kind);
         self.compile_statement(body)?;
         self.place(continue_label);
         if lexical && captured {

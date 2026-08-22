@@ -1578,8 +1578,20 @@ fn ordinary_call(
             Some(context) => context,
             None => old_env.clone(),
         };
+        // The context's `function` is read only by a sloppy body's mapped
+        // `arguments` creation (`Step::CreateArguments`, for `callee`); every
+        // other certified-path reader is excluded by certification (SuperCall
+        // is derived-only), so the clone is skipped unless the body uses
+        // `arguments` in sloppy mode.
+        // The context's `function` is read only by a sloppy body's mapped
+        // `arguments` creation (`Step::CreateArguments`, for `callee`); every
+        // other certified-path reader is excluded by certification (SuperCall
+        // is derived-only), so the clone is skipped unless the body uses
+        // `arguments` in sloppy mode.
+        let context_function =
+            (scope.arguments_slot.is_some() && !strict).then(|| Value::Function(function.clone()));
         agent.execution_context_stack.push(ExecutionContext {
-            function: Some(Value::Function(function.clone())),
+            function: context_function,
             realm,
             script_or_module: None,
             // A certified body reads only the lexical environment (its
@@ -2060,8 +2072,18 @@ fn ordinary_construct(
         // The body observes only the closure environment, the realm, and
         // the frame — mirror the certified call's context (script_or_module,
         // source, and private_environment are never consulted).
+        // The context's `function` is read only by a sloppy body's mapped
+        // `arguments` creation (Step::CreateArguments, for `callee`); every
+        // other certified-path reader is excluded by certification, so the
+        // clone is skipped unless the body uses `arguments` in sloppy mode.
+        let context_function = (ir
+            .scope
+            .as_ref()
+            .is_some_and(|scope| scope.arguments_slot.is_some())
+            && !strict)
+            .then(|| function_value.clone());
         agent.execution_context_stack.push(ExecutionContext {
-            function: Some(function_value.clone()),
+            function: context_function,
             realm,
             script_or_module: None,
             lexical_environment: environment.clone(),

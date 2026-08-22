@@ -657,6 +657,75 @@ the dispatch-loop entry, all addressed by the Cut 12 frame-stack-split.
 Conformance at baseline: language 23,690/0/34, annexB 1,086/0/0,
 built-ins 23,201/0/154 (known hang cluster); workspace tests 4311/0.
 
+### Cut 21 — certified-call context trim and fused for-of slot binds (2026-08-23)
+
+Two per-call/per-element trims on the certified path, both strictly
+less work with no semantic change (gains sit at the machine's bench
+noise floor — ~10-20ns per call/element):
+
+1. **Certified-call context trim** — the `ExecutionContext` pushed per
+   certified call cloned the running function (`function` field). The
+   only certified-path reader of that field is a sloppy body's mapped
+   `arguments` creation (`Step::CreateArguments`, for `callee`); every
+   other reader is excluded by certification (SuperCall is
+derived-only). The clone is now made only when the body uses
+`arguments` in sloppy mode — the bench call/closure/construct shapes
+push `None`.
+2. **Fused for-of step + slot bind** — a certified for-of whose ident
+   head resolves to a frame slot emits `ForOfNextBindLocal` instead of
+   `ForOfNext` + `ForOfBindLocal`: the element writes the slot
+directly, one less dispatch and no value-stack round-trip per element
+(the generic iterator path lands the slot the same way). The `--bench`
+array row is a script, whose for-of is a separate pre-existing path,
+so the row does not move; the win is function bodies (`for (const v of
+arr)` in a certified body).
+
+Measured (5-run medians, release): all `--bench` rows within noise
+(function calls ~255ms, closure capture ~256ms, construct churn ~192ms
+— the trims are ~1-2% each here; the empty-call probe is flat).
+Conformance at baseline: language 23,690/0/34, annexB 1,086/0/0,
+built-ins 23,216/0/154 (442 hangs, the known load-tied cluster);
+workspace tests 4311/0.
+
+### Cut 22 — write-side chain cache: fresh-property stores define directly (measured 2026-08-23)
+
+The construct decomposition showed `this.x = x` at ~470-640ns: a store
+on a fresh object runs the full `[[Set]]` — own-scan miss, prototype
+chain walk (re-entrant scans + Rc clones per link), then the
+descriptor/validate machinery before appending. The walk only matters
+when the chain holds an accessor or a non-writable data property for
+the key — a writable-data link stops `[[Set]]` at the same "define on
+the receiver" outcome, absent links just continue.
+
+A small direct-mapped Agent cache (`member_store_cells`) now records
+"the chain from this prototype holds no accessor/non-writable for this
+key", re-validated exactly against the chain links' generations: every
+own-property mutation (define/delete) and prototype change bumps a
+per-object `generation` counter, so a hit re-walks the chain reading
+only the links' generations (2-3 clones + compares) instead of the full
+property scans. On a verified hit — and only for a plain Ordinary
+receiver whose own scan misses — the store appends the writable data
+property directly (`fresh_data_define`), skipping the descriptor/
+validate machinery too. Any doubt (an exotic receiver or chain link, an
+accessor/non-writable anywhere, a non-extensible receiver, an existing
+own property) falls back to the full `[[Set]]`.
+
+Measured (5-run medians, release, vs the Cut 20/21 tree):
+
+| Row | before | after |
+|---|---|---|
+| construct churn | ~192ms | **~152ms** (-21%) |
+| `{}`+store 1M (probe) | ~730ms | **~355ms** |
+
+The fresh-object store drops ~470ns → ~95ns; `this.x = x` in the
+constructor drops to ~170ns. Calls/closure/array flat. Conformance at
+baseline: language 23,690/0/34, annexB 1,086/0/0, built-ins
+23,216/0/154 (442 hangs, the known load-tied cluster); workspace tests
+4311/0. The remaining construct cost is the `this`-object allocation
+(~260ns), the read of `o.x` on a fresh object (~200ns — the GET cache
+is object-id-keyed), and the call machinery — the shapes work the
+write-side cache is a slice of.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

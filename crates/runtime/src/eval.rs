@@ -3137,23 +3137,26 @@ mod tests {
         let ir = compiled_body_of(&mut agent, "f");
         assert!(ir.scope.is_some(), "a var for-of head must certify");
         assert!(
-            ir.steps
-                .iter()
-                .any(|s| matches!(s, crate::ir::Step::ForOfNext { .. })),
+            ir.steps.iter().any(|s| matches!(
+                s,
+                crate::ir::Step::ForOfNext { .. } | crate::ir::Step::ForOfNextBindLocal { .. }
+            )),
             "the loop must run the iteration protocol"
         );
         assert!(
             ir.steps
                 .iter()
-                .any(|s| matches!(s, crate::ir::Step::ForOfBindLocal { .. })),
-            "the var head must bind the frame slot directly"
+                .any(|s| matches!(s, crate::ir::Step::ForOfNextBindLocal { .. })),
+            "a slot head fuses the protocol step and the bind (Cut 21)"
         );
         assert!(
             !ir.steps.iter().any(|s| matches!(
                 s,
-                crate::ir::Step::ForOfBind { .. } | crate::ir::Step::LoadIdent { .. }
+                crate::ir::Step::ForOfBindLocal { .. }
+                    | crate::ir::Step::ForOfBind { .. }
+                    | crate::ir::Step::LoadIdent { .. }
             )),
-            "no env-machinery bind or env walk"
+            "the fused bind replaces the separate step; no env machinery"
         );
         assert!(
             ir.env_constant,

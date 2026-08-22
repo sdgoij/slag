@@ -76,6 +76,11 @@ pub struct Agent {
     pub(crate) member_cells: [Option<(u64, crux::AtomId, usize)>; crate::ir::MEMBER_CELLS],
     pub(crate) array_element_cells:
         [Option<(u64, u64, crux::AtomId, usize)>; crate::ir::MEMBER_CELLS],
+    /// The write-side chain cache (Cut 22): "the chain from this prototype
+    /// holds no accessor/non-writable for this key" — the key's own
+    /// property is absent on the receiver, so the store defines on it
+    /// directly. Re-validated against the chain links' generations.
+    pub(crate) member_store_cells: [Option<crate::ir::MemberStoreCell>; crate::ir::MEMBER_CELLS],
     /// The free-list of Vms for per-call reuse: `run_compiled_body`, the
     /// construct fast path, and the script/eval paths take one, run, and
     /// return it — a pooled Vm is never handed to a suspended
@@ -437,6 +442,7 @@ impl Agent {
             global_cells: [None; crate::ir::GLOBAL_CELLS],
             member_cells: [None; crate::ir::MEMBER_CELLS],
             array_element_cells: [None; crate::ir::MEMBER_CELLS],
+            member_store_cells: [None; crate::ir::MEMBER_CELLS],
             vm_pool: Vec::new(),
             promise_jobs: VecDeque::new(),
             generic_jobs: VecDeque::new(),
