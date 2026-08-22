@@ -531,6 +531,37 @@ machinery), (3) the per-call machinery (Vm::new + ExecutionContext
 push + TLS re-entry — the Cut 12 frame-stack-split analysis), (4) the
 RegExp property-escape match table (the built-ins hang set).
 
+### Cut 17 — accumulator loop counter (measured 2026-08-22)
+
+`Vm` gained an `acc` field; a canonical loop whose counter is a frame
+slot and whose body only reads it (or assigns/updates it in statement
+position — a body scan certifies this) runs with the counter in `acc`
+for the loop's duration: `FastLoopBind` loads it once, the head
+(`FastLoopHead { var: Acc }`) increments and re-tests it in place, the
+body's redirected reads/writes use `PushAcc`/`PopAcc`/`IncAcc`/`DecAcc`,
+and `FastLoopStore` writes it back at the exit (`break` lands on the
+store). This is the V8 register-counter model for the loop head.
+
+Measured: **~0 (within noise)** — arithmetic 43→43ms, empty loop
+37→36ms. The frame-slot access the accumulator replaces was already
+cheap; the per-iteration floor is the ~15-op head machinery (dispatch
++ `Value` inc/test round-trip: clone, `is_uninitialized`, `as_number`,
+`Value::Number` construction) at ~2ns/op. Kept anyway: it removes the
+frame round-trip, composes with the register-machine work, and is
+conformance-clean.
+
+The real head cut requires the counter to live as a raw `f64` (no
+`Value` round-trip per iteration) with a specialized step — the
+register machine below — or a cheaper dispatch loop.
+
+Remaining `--bench` levers, in measured order: (1) the raw-f64 loop
+counter (specialized steps, no `Value` inc/test machinery), (2)
+array-iteration fast path (the array row's 233ms is the per-element
+for-of `next()` call machinery), (3) the per-call machinery (Vm::new +
+ExecutionContext push + TLS re-entry — the Cut 12 frame-stack-split
+analysis), (4) the RegExp property-escape match table (the built-ins
+hang set).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

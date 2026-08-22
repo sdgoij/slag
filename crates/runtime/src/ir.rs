@@ -624,6 +624,33 @@ pub enum Step {
         /// Continue at when the test fails.
         after: usize,
     },
+    /// The fused canonical loop's counter prologue (Cut 17): load the
+    /// binding's current value into the VM accumulator (`FastLoopVar::Acc`
+    /// heads then work on it). Emitted once, after the loop init.
+    FastLoopBind {
+        var: FastLoopVar,
+    },
+    /// The fused canonical loop's counter epilogue (Cut 17): write the
+    /// accumulator back to the binding. Emitted once at the loop exit — on
+    /// the `end_label` path, so a `break` lands on it too (a mid-loop
+    /// `continue` skips it; a `return`/uncaught throw leaves the frame
+    /// dead, so the stale binding is unobservable).
+    FastLoopStore {
+        var: FastLoopVar,
+    },
+    /// Push the fused loop counter (`Vm::acc`) onto the value stack: the
+    /// body's redirected reads of the counter.
+    PushAcc,
+    /// Pop the value stack into the fused loop counter: the body's
+    /// redirected `counter = expr` assignments.
+    PopAcc,
+    /// Increment the fused loop counter in place (no stack effect): the
+    /// body's redirected statement-position `counter++` (the statement's
+    /// `SetCompletion` discards the pushed old value, so `Update`
+    /// compiles to `PushAcc; IncAcc`).
+    IncAcc,
+    /// Decrement the fused loop counter in place (see `IncAcc`).
+    DecAcc,
     /// A `break` statement: route through any pending finallys, then jump to
     /// `target` (spec 14.14.4).
     Break {
@@ -1005,12 +1032,16 @@ impl EnvStack {
 }
 
 /// The binding a fused canonical loop reads, tests, and increments: a frame
-/// slot or a declared top-level var (the certified fast paths — see
-/// [`Step::FastLoop`]).
+/// slot, a declared top-level var, or (Cut 17) the VM accumulator — the
+/// counter of a canonical loop whose body only reads it or assigns it in
+/// statement position lives in `Vm::acc` for the loop's duration, so the
+/// head and body never round-trip the frame/global per iteration (the V8
+/// register-counter model).
 #[derive(Debug, Clone, Copy)]
 pub enum FastLoopVar {
     Slot(usize),
     Global(crux::AtomId),
+    Acc,
 }
 
 /// The shape of a fused canonical loop (Cut 15): the counter binding, the
@@ -1107,6 +1138,13 @@ pub struct Vm {
     /// (spec 6.2.2.3): no value-producing statement has run since the last
     /// reset. Only the top-level script path observes it.
     pub completion_is_empty: bool,
+    /// The fused canonical loop's counter (Cut 17): the loop head and the
+    /// body's redirected reads/writes touch only this field, so the
+    /// counter never round-trips the frame/global per iteration. Only the
+    /// `FastLoop*`/`PushAcc`/`PopAcc`/`IncAcc`/`DecAcc` steps read or write
+    /// it; every other step uses the value stack, so the counter survives
+    /// arbitrary body code between head dispatches.
+    acc: Value,
     /// Completion-register saves for the `finally` blocks currently running
     /// (nested finallys push in order).
     completion_stack: Vec<(Value, bool)>,
@@ -1206,6 +1244,7 @@ impl Vm {
             pending_catch_disposal: None,
             strict,
             completion_is_empty: true,
+            acc: Value::Undefined,
             completion_stack: Vec::new(),
             list_stack: Vec::new(),
             var_ref_stack: Vec::new(),
@@ -1705,6 +1744,10 @@ impl Vm {
                 value
             }
             FastLoopVar::Global(name) => self.load_global_value(agent, name)?,
+            // Cut 17: the counter lives in the accumulator (a certified
+            // body's counter is never uninitialized — the loop init ran
+            // before `FastLoopBind`).
+            FastLoopVar::Acc => self.acc.clone(),
         };
         if let Some(num) = value.as_number() {
             return Ok(match op {
@@ -1756,6 +1799,47 @@ impl Vm {
             FastLoopVar::Global(name) => {
                 self.update_global(agent, name, inc, true)?;
             }
+            // Cut 17: the counter lives in the accumulator — a Number
+            // updates in place, anything else goes through the general
+            // `++`/`--` machinery.
+            FastLoopVar::Acc => {
+                let old = self.acc.clone();
+                let new = if let Some(num) = old.as_number() {
+                    let delta = if matches!(inc, UpdateOp::Increment) {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    Value::Number(num + delta)
+                } else {
+                    update_value(agent, &inc, &old)?.1
+                };
+                self.acc = new;
+            }
+        }
+        Ok(())
+    }
+
+    /// The fused canonical loop's counter prologue (Cut 17): load the
+    /// binding's current value into the accumulator (`Step::FastLoopBind`).
+    fn fast_loop_bind(&mut self, agent: &mut Agent, var: FastLoopVar) -> Result<(), JsError> {
+        let value = match var {
+            FastLoopVar::Slot(slot) => self.frame.get(slot).clone(),
+            FastLoopVar::Global(name) => self.load_global_value(agent, name)?,
+            FastLoopVar::Acc => unreachable!("FastLoopBind on the accumulator itself"),
+        };
+        self.acc = value;
+        Ok(())
+    }
+
+    /// The fused canonical loop's counter epilogue (Cut 17): write the
+    /// accumulator back to the binding (`Step::FastLoopStore`).
+    fn fast_loop_store(&mut self, agent: &mut Agent, var: FastLoopVar) -> Result<(), JsError> {
+        let value = self.acc.clone();
+        match var {
+            FastLoopVar::Slot(slot) => *self.frame.get_mut(slot) = value,
+            FastLoopVar::Global(name) => self.store_global_value(agent, name, value)?,
+            FastLoopVar::Acc => unreachable!("FastLoopStore on the accumulator itself"),
         }
         Ok(())
     }
@@ -4000,6 +4084,36 @@ impl Vm {
                     } else {
                         self.ip = *body_start;
                     }
+                }
+                Step::FastLoopBind { var } => {
+                    self.fast_loop_bind(agent, *var)?;
+                }
+                Step::FastLoopStore { var } => {
+                    self.fast_loop_store(agent, *var)?;
+                }
+                Step::PushAcc => {
+                    self.stack.push(self.acc.clone());
+                }
+                Step::PopAcc => {
+                    self.acc = self.pop();
+                }
+                Step::IncAcc => {
+                    let old = self.acc.clone();
+                    let new = if let Some(num) = old.as_number() {
+                        Value::Number(num + 1.0)
+                    } else {
+                        update_value(agent, &UpdateOp::Increment, &old)?.1
+                    };
+                    self.acc = new;
+                }
+                Step::DecAcc => {
+                    let old = self.acc.clone();
+                    let new = if let Some(num) = old.as_number() {
+                        Value::Number(num - 1.0)
+                    } else {
+                        update_value(agent, &UpdateOp::Decrement, &old)?.1
+                    };
+                    self.acc = new;
                 }
                 Step::JumpIfTrue(target) => {
                     let value = self.pop();
@@ -6250,6 +6364,13 @@ struct Compiler {
     /// global object (`LoadGlobal`/`StoreGlobal`), skipping the env-chain
     /// walk. `None` (and `ScopeInfo` above) means the environment path.
     script_globals: Option<HashSet<String>>,
+    /// The fused canonical loop's counter name (Cut 17): while compiling the
+    /// body of an accumulator loop, the name resolves to `BindingLoc::Acc`,
+    /// so its reads/assignments/updates touch `Vm::acc` instead of the
+    /// slot/global (the body scan guarantees only those shapes occur).
+    /// `None` when no accumulator loop is open; nested canonical loops skip
+    /// the accumulator (one shared `Vm::acc`).
+    acc_binding: Option<crux::AtomId>,
     /// Whether any emitted step switches the lexical environment (block/
     /// loop/catch/with envs): when false the body's env is constant for its
     /// whole run, so the dispatch loop skips the per-step context sync.
@@ -6257,11 +6378,13 @@ struct Compiler {
 }
 
 /// Where a binding lives for emission purposes: a frame slot (fast body),
-/// a declared top-level var (fast script), or the environment machinery.
+/// a declared top-level var (fast script), the fused loop counter in the
+/// VM accumulator (Cut 17), or the environment machinery.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum BindingLoc {
     Slot(usize),
     Global,
+    Acc,
     Env,
 }
 
@@ -6272,9 +6395,12 @@ impl Compiler {
     }
 
     /// Where a binding resolves: the frame (fast body), the global object
-    /// (certified fast script), or the environment machinery.
+    /// (certified fast script), the fused loop counter in the accumulator
+    /// (Cut 17), or the environment machinery.
     fn binding(&self, name: crux::AtomId) -> BindingLoc {
-        if let Some(slot) = self.slot_of(name) {
+        if self.acc_binding == Some(name) {
+            BindingLoc::Acc
+        } else if let Some(slot) = self.slot_of(name) {
             BindingLoc::Slot(slot)
         } else if self
             .script_globals
@@ -6299,12 +6425,14 @@ impl Compiler {
         }
     }
 
-    /// Emit the load for a fast binding: a frame slot read or a direct
-    /// global-object read (both are guaranteed to resolve).
+    /// Emit the load for a fast binding: a frame slot read, a direct
+    /// global-object read, or the fused loop counter (all are guaranteed to
+    /// resolve).
     fn emit_load(&mut self, loc: BindingLoc, name: crux::AtomId) {
         match loc {
             BindingLoc::Slot(slot) => self.emit(Step::LoadLocal { slot }),
             BindingLoc::Global => self.emit(Step::LoadGlobal { name }),
+            BindingLoc::Acc => self.emit(Step::PushAcc),
             BindingLoc::Env => unreachable!("emit_load on the environment path"),
         }
     }
@@ -6316,6 +6444,7 @@ impl Compiler {
         match loc {
             BindingLoc::Slot(slot) => self.emit(Step::StoreLocal { slot }),
             BindingLoc::Global => self.emit(Step::StoreGlobal { name }),
+            BindingLoc::Acc => self.emit(Step::PopAcc),
             BindingLoc::Env => unreachable!("emit_dup_store on the environment path"),
         }
     }
@@ -6363,7 +6492,10 @@ impl Compiler {
             && let ExprKind::Literal(syntax::ast::Literal::Number(n)) = &right.kind
         {
             match self.binding(*name) {
-                BindingLoc::Env => None,
+                // A nested loop's test over an active accumulator counter
+                // must not fuse (there is no `JumpIf*AccImm` step); the
+                // general test reads the accumulator instead.
+                BindingLoc::Env | BindingLoc::Acc => None,
                 loc => Some((*op, loc, *name, *n)),
             }
         } else {
@@ -6381,7 +6513,10 @@ impl Compiler {
             && let ExprKind::Ident(name) = &target.kind
         {
             match self.binding(*name) {
-                BindingLoc::Env => None,
+                // A nested loop's update over an active accumulator counter
+                // must not fuse (the general `Update` path reads/writes the
+                // accumulator).
+                BindingLoc::Env | BindingLoc::Acc => None,
                 loc => Some((loc, *name, *op)),
             }
         } else {
@@ -6429,6 +6564,7 @@ impl Compiler {
                     imm,
                 });
             }
+            BindingLoc::Acc => unreachable!("emit_fused_rel_test on the accumulator"),
             BindingLoc::Env => unreachable!("emit_fused_rel_test on the environment path"),
         }
     }
@@ -6471,6 +6607,17 @@ impl Compiler {
             imm,
             inc: inc_op,
         }))
+    }
+
+    /// Whether the loop body can run with its counter in the VM accumulator
+    /// (Cut 17): the counter appears only as (a) a plain read, (b) a simple
+    /// `counter = expr` assignment whose expression is a statement, or (c) a
+    /// `counter++`/`counter--` whose expression is a statement. Anything
+    /// else — value-position assignments/updates, compound assigns, var-decl
+    /// or for-head rebinds — would read/write through the binding, which is
+    /// stale mid-loop.
+    fn acc_body_safe(&self, body: &Stmt, name: crux::AtomId) -> bool {
+        acc_stmt_safe(body, name)
     }
 
     fn new_label(&mut self) -> usize {
@@ -7017,14 +7164,15 @@ impl Compiler {
                                     self.begin_named_initializer(*name, init);
                                     self.compile_expr(init)?;
                                     if crate::function::is_anonymous_function_definition(init) {
-                                        // NamedEvaluation (spec 14.2.2 step
-                                        // 2.d): `var f = function () {}`
-                                        // names the function after the
-                                        // binding.
                                         self.emit(Step::SetFunctionName { name: *name });
                                     }
                                     self.emit(Step::StoreGlobal { name: *name });
                                     continue;
+                                }
+                                // A declaration of an active accumulator
+                                // counter is rejected by the loop-body scan.
+                                BindingLoc::Acc => {
+                                    unreachable!("a loop body cannot redeclare its counter")
                                 }
                                 BindingLoc::Env => {}
                             }
@@ -7331,6 +7479,12 @@ impl Compiler {
                                         self.emit(Step::StoreGlobal { name: *name });
                                         continue;
                                     }
+                                    // A for-head over an active accumulator
+                                    // counter is rejected by the loop-body
+                                    // scan.
+                                    BindingLoc::Acc => {
+                                        unreachable!("a nested for-head cannot rebind its counter")
+                                    }
                                     BindingLoc::Env => {}
                                 }
                             }
@@ -7442,6 +7596,50 @@ impl Compiler {
                         inc,
                     }) = self.compile_fast_loop(test, update)?
                 {
+                    // Cut 17: when the counter is a frame slot (never a
+                    // global — the stale-global window would be observable
+                    // through calls/`globalThis` in non-slotified scripts)
+                    // and can live in the VM accumulator for the loop's
+                    // duration (no enclosing accumulator loop, and the body
+                    // only reads it or assigns/updates it in statement
+                    // position), the head works on the accumulator — no
+                    // frame round-trip per iteration.
+                    if matches!(var, FastLoopVar::Slot(_))
+                        && self.acc_binding.is_none()
+                        && self.acc_body_safe(body, name)
+                    {
+                        // The counter prologue loads the binding (just
+                        // written by the loop init) into the accumulator
+                        // before the initial test, so a zero-iteration loop
+                        // still stores the init value back.
+                        self.emit(Step::FastLoopBind { var });
+                        self.emit_fused_rel_test(op, loc, name, imm, end_label);
+                        let body_start = self.new_label();
+                        self.place(body_start);
+                        let saved = self.acc_binding.replace(name);
+                        self.compile_statement(body)?;
+                        self.acc_binding = saved;
+                        self.place(continue_label);
+                        let index = self.steps.len();
+                        self.emit(Step::FastLoopHead {
+                            var: FastLoopVar::Acc,
+                            op,
+                            imm,
+                            inc,
+                            body_start,
+                            after: end_label,
+                        });
+                        self.fixups
+                            .push(Fixup::FastLoopHead(index, body_start, end_label));
+                        // The store sits on the `end_label` path, so a
+                        // `break` writes the counter back too (a `continue`
+                        // skips it via the head's back-jump).
+                        self.place(end_label);
+                        self.emit(Step::FastLoopStore { var });
+                        self.emit(Step::NormalizeCompletion);
+                        self.scope_stack.pop();
+                        return Ok(());
+                    }
                     // The fused canonical loop: the initial test (the
                     // existing fused step), the inline body, then the
                     // per-iteration head — increment, re-test, and the
@@ -7498,6 +7696,9 @@ impl Compiler {
                     (BindingLoc::Slot(slot), UpdateOp::Decrement) => Step::Dec { slot },
                     (BindingLoc::Global, UpdateOp::Increment) => Step::IncGlobal { name },
                     (BindingLoc::Global, UpdateOp::Decrement) => Step::DecGlobal { name },
+                    (BindingLoc::Acc, _) => {
+                        unreachable!("fused_update on the accumulator (the scan rejects it)")
+                    }
                     (BindingLoc::Env, _) => unreachable!("fused_update on the environment path"),
                 };
                 self.emit(step);
@@ -7652,6 +7853,9 @@ impl Compiler {
             } => match self.binding(*name) {
                 BindingLoc::Global => self.emit(Step::ForOfBindGlobal { name: *name }),
                 BindingLoc::Slot(slot) => self.emit(Step::ForOfBindLocal { slot }),
+                // A for-of head over an active accumulator counter is
+                // rejected by the loop-body scan.
+                BindingLoc::Acc => unreachable!("a for-of head cannot bind its counter"),
                 BindingLoc::Env => self.emit(Step::ForOfBind { left: left.clone() }),
             },
             _ => self.emit(Step::ForOfBind { left: left.clone() }),
@@ -7917,6 +8121,8 @@ impl Compiler {
                     // Cut 5 fast script: a declared top-level var, read
                     // directly off the global object.
                     BindingLoc::Global => self.emit(Step::LoadGlobal { name: *name }),
+                    // Cut 17: the fused loop counter lives in the accumulator.
+                    BindingLoc::Acc => self.emit(Step::PushAcc),
                     BindingLoc::Env => self.emit(Step::LoadIdent { name: *name }),
                 }
                 Ok(())
@@ -7980,6 +8186,12 @@ impl Compiler {
                             }
                             BindingLoc::Global => {
                                 self.emit(Step::LoadGlobal { name: *name });
+                                self.emit(Step::TypeofTop);
+                            }
+                            // Cut 17: `typeof` of the fused loop counter is
+                            // a read of the accumulator.
+                            BindingLoc::Acc => {
+                                self.emit(Step::PushAcc);
                                 self.emit(Step::TypeofTop);
                             }
                             BindingLoc::Env => {
@@ -8341,6 +8553,19 @@ impl Compiler {
                         });
                         return Ok(());
                     }
+                    BindingLoc::Acc => {
+                        // Cut 17: the fused loop counter lives in the
+                        // accumulator — push the old value (the statement's
+                        // `SetCompletion` discards it) and update the
+                        // accumulator in place.
+                        self.emit(Step::PushAcc);
+                        self.emit(if matches!(op, UpdateOp::Increment) {
+                            Step::IncAcc
+                        } else {
+                            Step::DecAcc
+                        });
+                        return Ok(());
+                    }
                     BindingLoc::Env => {}
                 }
                 // The assignment target's reference resolves before the RHS:
@@ -8462,14 +8687,15 @@ impl Compiler {
         match &target.kind {
             ExprKind::Ident(name) => {
                 match self.binding(*name) {
-                    loc @ (BindingLoc::Slot(_) | BindingLoc::Global) => {
-                        // Cut 3/5 fast path: the target is a frame slot or a
-                        // declared top-level var; no reference machinery
-                        // (there is no `with` to observe the
-                        // resolve-before-RHS rule, and function-literal
-                        // initializers bail the fast path so `set_name`
-                        // cannot trigger). The `Dup` before the store leaves
-                        // the assigned value as the expression's result.
+                    loc @ (BindingLoc::Slot(_) | BindingLoc::Global | BindingLoc::Acc) => {
+                        // Cut 3/5 fast path: the target is a frame slot, a
+                        // declared top-level var, or the fused loop counter;
+                        // no reference machinery (there is no `with` to
+                        // observe the resolve-before-RHS rule, and
+                        // function-literal initializers bail the fast path
+                        // so `set_name` cannot trigger). The `Dup` before the
+                        // store leaves the assigned value as the expression's
+                        // result.
                         match op {
                             AssignOp::Assign => {
                                 self.begin_named_initializer(*name, value);
@@ -10362,6 +10588,201 @@ fn record_assign_target(expr: &Expr, assigned: &mut HashSet<crux::AtomId>) {
         }
         ExprKind::Paren(inner) => record_assign_target(inner, assigned),
         _ => {}
+    }
+}
+
+// ---- Cut 17: accumulator loop counter body scan ----
+
+/// The identifier an assignment/update writes, unwrapping parentheses
+/// (`(i) = 5` and `(i)++` update the covered reference).
+fn acc_target_name(target: &Expr) -> Option<crux::AtomId> {
+    match &target.kind {
+        ExprKind::Ident(name) => Some(*name),
+        ExprKind::Paren(inner) => acc_target_name(inner),
+        _ => None,
+    }
+}
+
+/// Whether a statement subtree uses the loop counter safely for the
+/// accumulator (see `Compiler::acc_body_safe`).
+fn acc_stmt_safe(stmt: &Stmt, name: crux::AtomId) -> bool {
+    match &stmt.kind {
+        StmtKind::Block(block) => block.stmts.iter().all(|s| acc_stmt_safe(s, name)),
+        StmtKind::Empty | StmtKind::Debugger | StmtKind::Break(_) | StmtKind::Continue(_) => true,
+        StmtKind::Expr(expr) => acc_expr_safe(expr, name, true),
+        StmtKind::VarDecl { decls, .. } => decls.iter().all(|decl| {
+            // A declaration (or re-declaration) of the counter rebinds it
+            // through the slot, which is stale mid-loop.
+            !matches!(&decl.pattern, BindingPattern::Ident(n) if *n == name)
+                && decl
+                    .init
+                    .as_ref()
+                    .is_none_or(|init| acc_expr_safe(init, name, false))
+        }),
+        StmtKind::If {
+            test,
+            consequent,
+            alternate,
+        } => {
+            acc_expr_safe(test, name, false)
+                && acc_stmt_safe(consequent, name)
+                && alternate.as_deref().is_none_or(|s| acc_stmt_safe(s, name))
+        }
+        StmtKind::While { test, body } | StmtKind::DoWhile { body, test } => {
+            acc_expr_safe(test, name, false) && acc_stmt_safe(body, name)
+        }
+        StmtKind::For {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            let init_ok = match init {
+                None => true,
+                Some(ForInit::Expr(expr)) => acc_expr_safe(expr, name, false),
+                Some(ForInit::VarDecl { decls, .. }) => decls.iter().all(|decl| {
+                    !matches!(&decl.pattern, BindingPattern::Ident(n) if *n == name)
+                        && decl
+                            .init
+                            .as_ref()
+                            .is_none_or(|init| acc_expr_safe(init, name, false))
+                }),
+            };
+            init_ok
+                && test
+                    .as_ref()
+                    .is_none_or(|expr| acc_expr_safe(expr, name, false))
+                && update
+                    .as_ref()
+                    .is_none_or(|expr| acc_expr_safe(expr, name, false))
+                && acc_stmt_safe(body, name)
+        }
+        StmtKind::Return(expr) => expr
+            .as_ref()
+            .is_none_or(|expr| acc_expr_safe(expr, name, false)),
+        StmtKind::Throw(expr) => acc_expr_safe(expr, name, false),
+        StmtKind::Labeled { body, .. } => acc_stmt_safe(body, name),
+        StmtKind::ForOf {
+            left, right, body, ..
+        } => {
+            // A for-of head over the counter rebinds it per element.
+            !matches!(
+                left,
+                ForBinding::VarDecl {
+                    pattern: BindingPattern::Ident(n),
+                    ..
+                } if *n == name
+            ) && acc_expr_safe(right, name, false)
+                && acc_stmt_safe(body, name)
+        }
+        // Rejected by the certified-body/script scans before the accumulator
+        // can fire (a slot counter implies a certified body); kept
+        // exhaustive.
+        StmtKind::FunctionDecl(_)
+        | StmtKind::ClassDecl(_)
+        | StmtKind::With { .. }
+        | StmtKind::Try { .. }
+        | StmtKind::Switch { .. }
+        | StmtKind::ForIn { .. }
+        | StmtKind::UsingDecl { .. } => false,
+    }
+}
+
+/// Whether an expression subtree uses the loop counter safely for the
+/// accumulator. `statement` marks the expression's position: a simple
+/// `counter = expr` or `counter++`/`counter--` is allowed only as a
+/// statement (the loop protocol discards its value; in value position the
+/// compiled `PopAcc`/`IncAcc` would not produce the expression's result).
+fn acc_expr_safe(expr: &Expr, name: crux::AtomId, statement: bool) -> bool {
+    match &expr.kind {
+        // A read of the counter is always safe (any expression position).
+        ExprKind::Ident(_) => true,
+        ExprKind::Paren(inner) => acc_expr_safe(inner, name, statement),
+        ExprKind::Assign {
+            target, value, op, ..
+        } => {
+            let target_ok = match acc_target_name(target) {
+                Some(target_name) => target_name != name || (statement && *op == AssignOp::Assign),
+                None => true,
+            };
+            target_ok && acc_expr_safe(target, name, false) && acc_expr_safe(value, name, false)
+        }
+        ExprKind::Update { target, .. } => {
+            let target_ok = match acc_target_name(target) {
+                Some(target_name) => target_name != name || statement,
+                None => true,
+            };
+            target_ok && acc_expr_safe(target, name, false)
+        }
+        ExprKind::Array(array) => array.elements.iter().all(|element| match element {
+            ArrayElement::Hole => true,
+            ArrayElement::Expr(e) | ArrayElement::Spread(e) => acc_expr_safe(e, name, false),
+        }),
+        ExprKind::Object(object) => object.props.iter().all(|prop| match prop {
+            ObjectProperty::Method { .. }
+            | ObjectProperty::Get { .. }
+            | ObjectProperty::Set { .. } => false,
+            ObjectProperty::Init { key, value, .. } => {
+                let key_ok = match key {
+                    PropertyName::Ident(_) | PropertyName::Str(_) | PropertyName::Number(_) => true,
+                    PropertyName::Computed(key_expr) => acc_expr_safe(key_expr, name, false),
+                };
+                key_ok && acc_expr_safe(value, name, false)
+            }
+            ObjectProperty::Spread(e) => acc_expr_safe(e, name, false),
+        }),
+        ExprKind::Literal(_) => true,
+        ExprKind::Unary { operand, .. } => acc_expr_safe(operand, name, false),
+        ExprKind::Binary { left, right, .. } => {
+            acc_expr_safe(left, name, false) && acc_expr_safe(right, name, false)
+        }
+        ExprKind::Logical { left, right, .. } => {
+            acc_expr_safe(left, name, false) && acc_expr_safe(right, name, false)
+        }
+        ExprKind::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            acc_expr_safe(test, name, false)
+                && acc_expr_safe(consequent, name, false)
+                && acc_expr_safe(alternate, name, false)
+        }
+        ExprKind::Member(member) => {
+            let object_ok = acc_expr_safe(&member.object, name, false);
+            let key_ok = match &member.property {
+                MemberProperty::Computed(key) => acc_expr_safe(key, name, false),
+                _ => true,
+            };
+            object_ok && key_ok
+        }
+        ExprKind::Call(call) => {
+            acc_expr_safe(&call.callee, name, false)
+                && call.args.iter().all(|arg| match arg {
+                    Argument::Expr(e) | Argument::Spread(e) => acc_expr_safe(e, name, false),
+                })
+        }
+        ExprKind::New(new) => {
+            acc_expr_safe(&new.callee, name, false)
+                && new.args.iter().all(|arg| match arg {
+                    Argument::Expr(e) | Argument::Spread(e) => acc_expr_safe(e, name, false),
+                })
+        }
+        ExprKind::Template(template) => {
+            template.exprs.iter().all(|e| acc_expr_safe(e, name, false))
+        }
+        ExprKind::Sequence(exprs) => exprs.iter().all(|e| acc_expr_safe(e, name, false)),
+        ExprKind::This
+        | ExprKind::Super
+        | ExprKind::Function(_)
+        | ExprKind::Arrow { .. }
+        | ExprKind::Class(_)
+        | ExprKind::PrivateIn { .. }
+        | ExprKind::TaggedTemplate { .. }
+        | ExprKind::Yield { .. }
+        | ExprKind::Await(_)
+        | ExprKind::MetaProperty { .. }
+        | ExprKind::ImportCall { .. } => false,
     }
 }
 

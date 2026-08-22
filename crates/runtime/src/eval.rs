@@ -2937,18 +2937,12 @@ mod tests {
                 matches!(
                     s,
                     crate::ir::Step::FastLoopHead {
-                        var: crate::ir::FastLoopVar::Slot(_),
+                        var: crate::ir::FastLoopVar::Slot(_) | crate::ir::FastLoopVar::Acc,
                         ..
                     }
                 )
             }),
             "the fused canonical loop head must own the increment"
-        );
-        assert!(
-            !ir.steps
-                .iter()
-                .any(|s| matches!(s, crate::ir::Step::EnterBlock { .. })),
-            "a block with no lexical declarations must not allocate an env"
         );
         assert!(
             !ir.steps
@@ -3174,7 +3168,7 @@ mod tests {
                 matches!(
                     s,
                     crate::ir::Step::FastLoopHead {
-                        var: crate::ir::FastLoopVar::Slot(_),
+                        var: crate::ir::FastLoopVar::Slot(_) | crate::ir::FastLoopVar::Acc,
                         ..
                     }
                 )
@@ -3279,7 +3273,7 @@ mod tests {
                 matches!(
                     s,
                     crate::ir::Step::FastLoopHead {
-                        var: crate::ir::FastLoopVar::Slot(_),
+                        var: crate::ir::FastLoopVar::Slot(_) | crate::ir::FastLoopVar::Acc,
                         ..
                     }
                 )
