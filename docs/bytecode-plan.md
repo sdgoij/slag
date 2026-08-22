@@ -10,7 +10,11 @@ Status: **Cuts 1-4's first slices landed and validated** (zero conformance
 regressions each), and the perf gate is now **closed**: every `--bench` row
 is ≥ 5x the corrected 2026-08-18 baseline (arithmetic 2.52s → ~43ms,
 property 3.22s → ~83ms, string 0.88s → ~43ms, array 15.42s → ~233ms,
-function calls 5.73s → ~293ms; see `docs/perf.md`). Cut 3 gives simple-param
+function calls 5.73s → ~293ms; see `docs/perf.md`). Three rows were
+added to `--bench` (2026-08-22) covering the continuation's certified
+shapes the original five predate: `closure capture` (~320ms),
+`per-iteration` (~51ms), and `construct churn` (~452ms). Cut 3 gives
+simple-param
 functions and arrows compile-time binding resolution — params and `var`s
 become fixed frame slots, so identifier ops emit
 `LoadLocal`/`StoreLocal`/`InitLocal`/`UpdateLocal` instead of the

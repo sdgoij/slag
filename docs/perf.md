@@ -562,6 +562,16 @@ ExecutionContext push + TLS re-entry — the Cut 12 frame-stack-split
 analysis), (4) the RegExp property-escape match table (the built-ins
 hang set).
 
+Three rows were added to `--bench` (2026-08-22) to cover the Cut 3
+continuation certification shapes the original five predate: `closure
+capture` (1M calls through a closure reading its enclosing body's
+captured binding — the context-chain slices, ~320ms), `per-iteration`
+(100k calls to closures created over a `for (let i ...)` head — the
+per-iteration machinery, ~51ms), and `construct churn` (100k `new C`
+on a constructor reading `this` — the this slots + construct fast
+path, ~452ms). The 2026-08-18 gate baselines above cover only the
+original five rows.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

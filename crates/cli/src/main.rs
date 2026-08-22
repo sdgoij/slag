@@ -357,6 +357,13 @@ fn input_complete(source: &str) -> bool {
 /// the real loop rather than a re-declaration error. The timings are only
 /// comparable within a build profile; see `docs/perf.md` for the benchmark
 /// gates.
+///
+/// The last three rows exercise the Cut 3 continuation certification
+/// shapes the first five predate: a closure reading an enclosing body's
+/// captured binding (the context-chain slices), closures over a `for`
+/// `let` head (the per-iteration machinery), and a constructor reading
+/// `this` (the this slots + construct fast path). The `for (let i ...)`
+/// head lives inside a function so re-evaluation stays legal.
 fn run_benchmarks(context: &mut Context) -> Result<(), u8> {
     let benchmarks: &[(&str, &str)] = &[
         (
@@ -378,6 +385,18 @@ fn run_benchmarks(context: &mut Context) -> Result<(), u8> {
         (
             "function calls",
             "function f(x) { return x + 1; } var n = 0; for (var i = 0; i < 1_000_000; i++) { n = f(n); } n",
+        ),
+        (
+            "closure capture",
+            "function make(base) { var x = base; return (y) => x + y; } var f = make(2); var n = 0; for (var i = 0; i < 1_000_000; i++) { n = f(n); } n",
+        ),
+        (
+            "per-iteration",
+            "function makeFns() { var fns = []; for (let i = 0; i < 16; i++) { fns.push(() => i); } return fns; } var fns = makeFns(); var n = 0; for (var j = 0; j < 100_000; j++) { n += fns[j & 15](); } n",
+        ),
+        (
+            "construct churn",
+            "function C(x) { this.x = x; } var n = 0; for (var i = 0; i < 100_000; i++) { var o = new C(i); n += o.x; } n",
         ),
     ];
     println!("slag {VERSION} micro-benchmarks");
