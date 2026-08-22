@@ -35,6 +35,17 @@ pub type SetEntry = Option<Value>;
 #[derive(Debug)]
 pub struct Agent {
     pub execution_context_stack: Vec<ExecutionContext>,
+    /// The IC caches shared by every Vm run in this agent (the global-var
+    /// cells and the P3 member/element cells). They lived on the Vm before,
+    /// so every function call and script evaluation started cold and
+    /// re-zeroed ~900 bytes of cache; they are re-validated on every access
+    /// (against the current realm's global object and each object's property
+    /// vector), so sharing them across Vms — and across realms — is exact
+    /// and warms a nested call to its caller's shapes.
+    pub(crate) global_cells: std::collections::HashMap<crux::AtomId, usize>,
+    pub(crate) member_cells: [Option<(u64, crux::AtomId, usize)>; crate::ir::MEMBER_CELLS],
+    pub(crate) array_element_cells:
+        [Option<(u64, u64, crux::AtomId, usize)>; crate::ir::MEMBER_CELLS],
     pub(crate) promise_jobs: VecDeque<Job>,
     pub(crate) generic_jobs: VecDeque<Job>,
     pub(crate) timeout_jobs: VecDeque<(Instant, Job)>,
@@ -384,6 +395,9 @@ impl Agent {
         crate::function::ensure_ecma_hook();
         Self {
             execution_context_stack: Vec::new(),
+            global_cells: std::collections::HashMap::new(),
+            member_cells: [None; crate::ir::MEMBER_CELLS],
+            array_element_cells: [None; crate::ir::MEMBER_CELLS],
             promise_jobs: VecDeque::new(),
             generic_jobs: VecDeque::new(),
             timeout_jobs: VecDeque::new(),

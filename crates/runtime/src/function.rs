@@ -1026,7 +1026,11 @@ pub(crate) fn call_inner(
     match callee.kind() {
         ValueKind::Function(function) => match &function.kind {
             crux::function::FunctionKind::EcmaScript => {
-                if let Some(data) = agent.ecma_functions.get(&function.id())
+                // Fetch the record once (the fast path in `ordinary_call`
+                // would otherwise re-fetch it — a HashMap hit per call);
+                // the fields the fast path reads are cloned out here.
+                let data = agent.ecma_functions.get(&function.id());
+                if let Some(data) = data
                     && data.is_class_constructor
                 {
                     // spec 10.2.1: [[IsClassConstructor]] is true, so the
@@ -1039,7 +1043,6 @@ pub(crate) fn call_inner(
                     );
                     return Err(realm_throwable(agent, error, data.realm.clone())?);
                 }
-                let data = agent.ecma_functions.get(&function.id());
                 // A function created inside a class field initializer runs
                 // its body with the "Eval Inside Initializer" context (spec
                 // 19.2.1.1: `func.[[ClassFieldInitializerName]]`). Only
@@ -1049,6 +1052,17 @@ pub(crate) fn call_inner(
                 let is_async_gen = data.is_some_and(|data| data.is_async && data.is_generator);
                 let is_async = data.is_some_and(|data| data.is_async);
                 let is_generator = data.is_some_and(|data| data.is_generator);
+                // The fast path reads the record's `ir`/`environment`/`realm`/
+                // `strict`; clone them while the borrow is live so
+                // `ordinary_call` skips its own lookup for certified bodies.
+                let fast = data.map(|data| {
+                    (
+                        data.ir.clone(),
+                        data.environment.clone(),
+                        data.realm.clone(),
+                        data.strict,
+                    )
+                });
                 let saved_depth = agent.field_initializer_depth;
                 agent.field_initializer_depth = if marked { saved_depth + 1 } else { 0 };
                 let result = if is_async_gen {
@@ -1058,7 +1072,7 @@ pub(crate) fn call_inner(
                 } else if is_generator {
                     crate::generator::call_generator(agent, &function, this, args)
                 } else {
-                    ordinary_call(agent, &function, this, args)
+                    ordinary_call(agent, &function, this, args, fast)
                 };
                 agent.field_initializer_depth = saved_depth;
                 result
@@ -1479,6 +1493,16 @@ pub fn is_constructor(agent: &Agent, value: &Value) -> bool {
     }
 }
 
+/// The record fields the certified fast path reads, pre-fetched by
+/// `call_inner` so `ordinary_call` skips a second `ecma_functions` lookup.
+/// `None` only when the record is missing, which errors in `ordinary_call`.
+type FastCallData = Option<(
+    Option<std::rc::Rc<crate::ir::CompiledBody>>,
+    EnvRef,
+    Handle<Realm>,
+    bool,
+)>;
+
 /// PrepareForOrdinaryCall (spec 10.2.1.2) + OrdinaryCallBindThis (10.2.1.1)
 /// + OrdinaryCallEvaluateBody: the full `[[Call]]` of an ordinary function.
 fn ordinary_call(
@@ -1486,6 +1510,7 @@ fn ordinary_call(
     function: &Handle<Function>,
     this: Value,
     args: &[Value],
+    fast: FastCallData,
 ) -> Result<Value, JsError> {
     // Cut 3 fast path: the body's bindings are frame slots, so no function
     // environment, `this` binding, or declaration instantiation are needed —
@@ -1496,19 +1521,22 @@ fn ordinary_call(
     // text, params, body AST, compiled IR — on every call); only the slots
     // each branch reads are cloned, and the slow path's `params`/`body` AST
     // clones are skipped entirely for a fast call.
-    let (ir, old_env, realm, strict) = {
-        let record = agent.ecma_functions.get(&function.id()).ok_or_else(|| {
-            JsError::new(
-                ErrorKind::TypeError,
-                "Function body is not registered".into(),
+    let (ir, old_env, realm, strict) = match fast {
+        Some(fast) => fast,
+        None => {
+            let record = agent.ecma_functions.get(&function.id()).ok_or_else(|| {
+                JsError::new(
+                    ErrorKind::TypeError,
+                    "Function body is not registered".into(),
+                )
+            })?;
+            (
+                record.ir.clone(),
+                record.environment.clone(),
+                record.realm.clone(),
+                record.strict,
             )
-        })?;
-        (
-            record.ir.clone(),
-            record.environment.clone(),
-            record.realm.clone(),
-            record.strict,
-        )
+        }
     };
     if let Some(ir) = &ir
         && ir.scope.is_some()
@@ -1523,8 +1551,12 @@ fn ordinary_call(
             function: Some(Value::Function(function.clone())),
             realm,
             script_or_module: None,
+            // A certified body reads only the lexical environment (its
+            // certification rejects the `variable_environment` readers —
+            // Annex B function hoisting and direct eval), so both slots can
+            // share one clone.
             lexical_environment: old_env.clone(),
-            variable_environment: old_env.clone(),
+            variable_environment: old_env,
             private_environment: None,
             source: None,
             annex_b_hoistable: Default::default(),

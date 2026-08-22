@@ -714,6 +714,12 @@ pub struct CompiledBody {
     /// The fast-path frame layout, when the scope analysis certified the
     /// body (see [`ScopeInfo`]). `None` = the environment-machinery path.
     pub scope: Option<ScopeInfo>,
+    /// Whether the body's `lexical_env` never changes during its run: a
+    /// certified body's blocks contribute no env (every lexical declaration
+    /// is a frame slot) and it has no `with`/`try`/`switch`/`for-in`/
+    /// `for-of`/`using`, so the dispatch loop's per-step context-env sync is
+    /// a no-op and can be skipped.
+    pub env_constant: bool,
     /// The certified top-level fast path (script-level bindings): the
     /// declared `var`/function names a script reads and writes directly on
     /// the global object, skipping the env-chain walk. `None` = the
@@ -843,7 +849,7 @@ type ForInState = (Handle<crux::object::JsObject>, Vec<(usize, Value)>, usize);
 const INLINE_FRAME: usize = 8;
 /// The direct-mapped member-access cell count (P3): a power of two so the
 /// cache index is a mask.
-const MEMBER_CELLS: usize = 16;
+pub(crate) const MEMBER_CELLS: usize = 16;
 
 /// The fast-path frame storage: an inline buffer for small layouts, a `Vec`
 /// otherwise.
@@ -906,25 +912,6 @@ pub struct Vm {
     /// a `next()` error propagates without closing the iterator (spec
     /// 14.7.6.2 uses `?`), unlike a body or head-binding error.
     pub for_of_stepping: bool,
-    /// Resolved global-object property slots for the script-level binding
-    /// fast path (`LoadGlobal`/`StoreGlobal`/`UpdateGlobal`/`IncGlobal`/…):
-    /// the property-vector position of each declared top-level name,
-    /// re-validated on every access against the stored key — an
-    /// insert/delete/redefinition shifts or replaces slots, and the fallback
-    /// then re-resolves.
-    pub global_cells: std::collections::HashMap<crux::AtomId, usize>,
-    /// Monomorphic member-access cells (P3): a small direct-mapped cache of
-    /// (object id, name atom) → property-vector slot, re-validated on every
-    /// access against the stored key — a structural change or redefinition
-    /// falls back to the full Get and re-resolves, and a hash collision
-    /// evicts (the hot shapes are one or two pairs per loop).
-    pub member_cells: [Option<(u64, crux::AtomId, usize)>; MEMBER_CELLS],
-    /// Numeric element cells: (object id, array index) → the element's
-    /// property-vector slot and stored key atom, re-validated on every
-    /// access. A Number key converts purely (ToPropertyKey of a number runs
-    /// no user code), so a canonical array index reads the element without
-    /// the number→string→intern round-trip.
-    pub array_element_cells: [Option<(u64, u64, crux::AtomId, usize)>; MEMBER_CELLS],
     /// Whether the innermost for-await-of is awaiting its `next()` promise
     /// (`AsyncForOfNext`): a rejection propagates without closing the
     /// iterator — the close is only for body abrupt completions (spec
@@ -1058,9 +1045,6 @@ impl Vm {
             thrown: None,
             resume_abrupt: None,
             for_of_stepping: false,
-            global_cells: std::collections::HashMap::new(),
-            member_cells: [None; MEMBER_CELLS],
-            array_element_cells: [None; MEMBER_CELLS],
             async_for_of_stepping: false,
             destructure_stepping: false,
             for_in_stack: Vec::new(),
@@ -1184,8 +1168,8 @@ impl Vm {
     /// key still matches and the property is still data (an
     /// insert/delete/redefinition or an accessor conversion falls back to the
     /// reference path and re-resolves).
-    fn global_cell_slot(&self, agent: &Agent, name: crux::AtomId) -> Option<usize> {
-        let slot = *self.global_cells.get(&name)?;
+    fn global_cell_slot(agent: &Agent, name: crux::AtomId) -> Option<usize> {
+        let slot = *agent.global_cells.get(&name)?;
         let global = agent.running_context().ok()?.realm.global_object.clone();
         let props = global.properties.borrow();
         let (key, property) = props.get(slot)?;
@@ -1196,7 +1180,7 @@ impl Vm {
 
     /// Resolve and cache the global-object slot for a declared top-level
     /// name (own data property only; the reference path handles the rest).
-    fn resolve_global_cell(&mut self, agent: &Agent, name: crux::AtomId) {
+    fn resolve_global_cell(agent: &mut Agent, name: crux::AtomId) {
         let key = PropertyKey::String(name);
         let Some(global) = agent
             .running_context()
@@ -1209,7 +1193,7 @@ impl Vm {
         if let Some(slot) = props.iter().position(|(stored, property)| {
             *stored == key && matches!(property.kind, crux::object::PropertyKind::Data { .. })
         }) {
-            self.global_cells.insert(name, slot);
+            agent.global_cells.insert(name, slot);
         }
     }
 
@@ -1221,7 +1205,7 @@ impl Vm {
         agent: &mut Agent,
         name: crux::AtomId,
     ) -> Result<Value, JsError> {
-        if let Some(slot) = self.global_cell_slot(agent, name) {
+        if let Some(slot) = Self::global_cell_slot(agent, name) {
             let global = agent.running_context()?.realm.global_object.clone();
             let props = global.properties.borrow();
             if let Some((_, property)) = props.get(slot)
@@ -1232,7 +1216,7 @@ impl Vm {
         }
         let reference = self.global_reference(agent, name)?;
         let value = crate::context::get_value(agent, &reference)?;
-        self.resolve_global_cell(agent, name);
+        Self::resolve_global_cell(agent, name);
         Ok(value)
     }
 
@@ -1246,7 +1230,7 @@ impl Vm {
         name: crux::AtomId,
         value: Value,
     ) -> Result<(), JsError> {
-        if let Some(slot) = self.global_cell_slot(agent, name) {
+        if let Some(slot) = Self::global_cell_slot(agent, name) {
             let global = agent.running_context()?.realm.global_object.clone();
             let mut props = global.properties.borrow_mut();
             if let Some((_, property)) = props.get_mut(slot)
@@ -1261,7 +1245,7 @@ impl Vm {
         }
         let reference = self.global_reference(agent, name)?;
         crate::context::put_value(agent, &reference, value)?;
-        self.resolve_global_cell(agent, name);
+        Self::resolve_global_cell(agent, name);
         Ok(())
     }
 
@@ -1274,7 +1258,7 @@ impl Vm {
     /// object at the direct-mapped slot, re-validated against the stored key
     /// and property kind. `None` falls back to the full Get (which then
     /// re-resolves the cache).
-    fn member_cell_get(&self, object: &Value, name: crux::AtomId) -> Option<Value> {
+    fn member_cell_get(agent: &Agent, object: &Value, name: crux::AtomId) -> Option<Value> {
         let ValueKind::Object(object) = object.kind() else {
             return None;
         };
@@ -1285,7 +1269,7 @@ impl Vm {
             return None;
         }
         let index = Self::member_cell_index(object.id(), name);
-        let (cached_id, cached_name, slot) = self.member_cells[index]?;
+        let (cached_id, cached_name, slot) = agent.member_cells[index]?;
         if cached_id != object.id() || cached_name != name {
             return None;
         }
@@ -1302,7 +1286,7 @@ impl Vm {
 
     /// Resolve and cache the slot of `object`'s own data property for
     /// `name` (only plain ordinary/array objects use the linear store).
-    fn resolve_member_cell(&mut self, object: &Value, name: crux::AtomId) {
+    fn resolve_member_cell(agent: &mut Agent, object: &Value, name: crux::AtomId) {
         let ValueKind::Object(object) = object.kind() else {
             return;
         };
@@ -1320,7 +1304,7 @@ impl Vm {
                 && matches!(property.kind, crux::object::PropertyKind::Data { .. })
             {
                 let index = Self::member_cell_index(object.id(), name);
-                self.member_cells[index] = Some((object.id(), name, slot));
+                agent.member_cells[index] = Some((object.id(), name, slot));
             }
         }
     }
@@ -1333,7 +1317,7 @@ impl Vm {
     /// The cached read of `object[index]` — an own data element of a plain
     /// Array at the direct-mapped slot, re-validated against the stored key
     /// atom. `None` falls back to the full Get (which then re-resolves).
-    fn array_element_get(&self, object: &Value, index: u64) -> Option<Value> {
+    fn array_element_get(agent: &Agent, object: &Value, index: u64) -> Option<Value> {
         let ValueKind::Object(object) = object.kind() else {
             return None;
         };
@@ -1341,7 +1325,7 @@ impl Vm {
             return None;
         }
         let cache_index = Self::array_element_index(object.id(), index);
-        let (cached_id, cached_index, atom, slot) = self.array_element_cells[cache_index]?;
+        let (cached_id, cached_index, atom, slot) = agent.array_element_cells[cache_index]?;
         if cached_id != object.id() || cached_index != index {
             return None;
         }
@@ -1357,7 +1341,7 @@ impl Vm {
     }
 
     /// Resolve and cache the slot of `object`'s own data element at `index`.
-    fn resolve_array_element(&mut self, object: &Value, index: u64) {
+    fn resolve_array_element(agent: &mut Agent, object: &Value, index: u64) {
         let ValueKind::Object(object) = object.kind() else {
             return;
         };
@@ -1378,7 +1362,7 @@ impl Vm {
                 && matches!(property.kind, crux::object::PropertyKind::Data { .. })
             {
                 let cache_index = Self::array_element_index(object.id(), index);
-                self.array_element_cells[cache_index] = Some((object.id(), index, atom, slot));
+                agent.array_element_cells[cache_index] = Some((object.id(), index, atom, slot));
             }
         }
     }
@@ -1786,8 +1770,12 @@ impl Vm {
             // Steps that read the running context (resolve_binding, member
             // helpers, closure creation) see the VM's lexical environment
             // through the context; the sync is skipped when it has not
-            // changed since the last step (an `Rc` pointer comparison).
-            if let Ok(context) = agent.running_context_mut()
+            // changed since the last step (an `Rc` pointer comparison). A
+            // certified body's env is constant (every binding is a frame
+            // slot, no `with`/`try`/`switch`/`for-in`/`for-of`/`using`), so
+            // the whole sync is skipped for it.
+            if !body.env_constant
+                && let Ok(context) = agent.running_context_mut()
                 && !std::rc::Rc::ptr_eq(&context.lexical_environment, &self.lexical_env)
             {
                 context.lexical_environment = self.lexical_env.clone();
@@ -1965,7 +1953,7 @@ impl Vm {
                     if is_nullish(&object) {
                         return Err(nullish_error("Cannot read properties of null"));
                     }
-                    let value = match self.member_cell_get(&object, *name) {
+                    let value = match Self::member_cell_get(agent, &object, *name) {
                         Some(value) => value,
                         None => {
                             let value = crate::context::get_property(
@@ -1974,7 +1962,7 @@ impl Vm {
                                 &crux::lookup(*name),
                                 object.clone(),
                             )?;
-                            self.resolve_member_cell(&object, *name);
+                            Self::resolve_member_cell(agent, &object, *name);
                             value
                         }
                     };
@@ -1998,26 +1986,27 @@ impl Vm {
                         _ => None,
                     };
                     if let Some(index) = numeric
-                        && let Some(value) = self.array_element_get(&object, index)
+                        && let Some(value) = Self::array_element_get(agent, &object, index)
                     {
                         self.stack.push(value);
                     } else {
                         let key = crate::context::to_property_key(agent, &key)?;
                         let value = match &key {
-                            PropertyKey::String(atom) => match self.member_cell_get(&object, *atom)
-                            {
-                                Some(value) => value,
-                                None => {
-                                    let value = crate::context::get_property_key(
-                                        agent,
-                                        &object,
-                                        &key,
-                                        object.clone(),
-                                    )?;
-                                    self.resolve_member_cell(&object, *atom);
-                                    value
+                            PropertyKey::String(atom) => {
+                                match Self::member_cell_get(agent, &object, *atom) {
+                                    Some(value) => value,
+                                    None => {
+                                        let value = crate::context::get_property_key(
+                                            agent,
+                                            &object,
+                                            &key,
+                                            object.clone(),
+                                        )?;
+                                        Self::resolve_member_cell(agent, &object, *atom);
+                                        value
+                                    }
                                 }
-                            },
+                            }
                             _ => crate::context::get_property_key(
                                 agent,
                                 &object,
@@ -2026,7 +2015,7 @@ impl Vm {
                             )?,
                         };
                         if let Some(index) = numeric {
-                            self.resolve_array_element(&object, index);
+                            Self::resolve_array_element(agent, &object, index);
                         }
                         self.stack.push(value);
                     }
@@ -3423,7 +3412,7 @@ impl Vm {
                             // direct-mapped cache (no per-element
                             // number→string→intern round-trip); a hole or
                             // structural change falls back to the full Get.
-                            let value = match self.array_element_get(&array, index as u64) {
+                            let value = match Self::array_element_get(agent, &array, index as u64) {
                                 Some(value) => value,
                                 None => {
                                     let value = crate::context::get_property_key(
@@ -3432,7 +3421,7 @@ impl Vm {
                                         &PropertyKey::from_utf8(&index.to_string()),
                                         array.clone(),
                                     )?;
-                                    self.resolve_array_element(&array, index as u64);
+                                    Self::resolve_array_element(agent, &array, index as u64);
                                     value
                                 }
                             };
@@ -5149,6 +5138,19 @@ fn super_reference(
 }
 
 fn is_eval_function(agent: &Agent, value: &Value) -> Result<bool, JsError> {
+    // `%eval%` is a builtin function; a non-function value or a compiled
+    // EcmaScript callee can never be it, so the intrinsics lookup (a HashMap
+    // hit per call) is skipped for the hot path. Only agent-dependent
+    // builtins reach the lookup.
+    match value.kind() {
+        ValueKind::Function(function)
+            if matches!(function.kind, crux::function::FunctionKind::EcmaScript) =>
+        {
+            return Ok(false);
+        }
+        ValueKind::Function(_) => {}
+        _ => return Ok(false),
+    }
     let realm = agent.current_realm()?;
     Ok(realm.intrinsics.get("%eval%").as_ref() == Some(value))
 }
@@ -5946,13 +5948,29 @@ impl Compiler {
         }
     }
 
-    /// Whether a block with no lexical declarations contributes no
-    /// environment — true on the fast body (Cut 3) and the fast script
-    /// (script-level bindings): the per-iteration env allocation in hot
-    /// loops disappears.
+    /// Whether a block contributes no environment — true when the block has
+    /// no lexical declarations, or (certified bodies only) when every lexical
+    /// declaration binds to a frame slot: the scope analysis guarantees the
+    /// bindings are never consulted through an env (no closures/eval/with),
+    /// so the per-iteration/per-block env allocation in hot loops disappears
+    /// and `lexical_env` stays constant for the body.
     fn fast_block(&self, stmts: &[Stmt]) -> bool {
-        (self.scope.is_some() || self.script_globals.is_some())
-            && Self::block_decls(stmts).is_empty()
+        if self.scope.is_some() {
+            return Self::block_decls(stmts).iter().all(|decl| {
+                if let StmtKind::VarDecl { decls, .. } = &decl.kind {
+                    decls.iter().all(|decl| {
+                        matches!(
+                            &decl.pattern,
+                            BindingPattern::Ident(name) if self.slot_of(*name).is_some()
+                        )
+                    })
+                } else {
+                    // Using/class/function declarations always need an env.
+                    false
+                }
+            });
+        }
+        self.script_globals.is_some() && Self::block_decls(stmts).is_empty()
     }
 
     /// A loop test of the shape `binding <op> NumberLiteral` on the fast
@@ -9223,11 +9241,13 @@ pub fn compile_body(function: &EcmaFunction) -> Result<CompiledBody, JsError> {
     };
     compiler.compile_statements(&function.body.stmts)?;
     compiler.resolve();
+    let env_constant = compiler.scope.is_some();
     Ok(CompiledBody {
         steps: compiler.steps,
         handlers: compiler.handlers,
         strict: function.strict,
         scope: compiler.scope,
+        env_constant,
         script_globals: None,
     })
 }
@@ -9260,6 +9280,7 @@ pub fn compile_statements(
         handlers: compiler.handlers,
         strict,
         scope: None,
+        env_constant: false,
         script_globals: compiler.script_globals,
     })
 }

@@ -273,6 +273,74 @@ TypedArray copyWithin handful) is build-bound (~6.7s fixture build, ~1µs
 per element write + a per-char property-escape table scan per regex
 test); a precomputed match table per property is the deferred fix.
 
+### Cut 12 — per-call dispatch: env-constant sync skip, single record fetch, shared IC caches (measured 2026-08-22)
+
+Fresh 3-run medians of `--bench` (release, interleaved with the A/B
+builds below):
+
+| Benchmark | Cut 11 | Cut 12 |
+|---|---|---|
+| arithmetic | 183ms | 178ms |
+| property access | 241ms | 237ms |
+| string concat | 58ms | 59ms |
+| array iteration | 317ms | 312ms |
+| function calls | 625ms | 431ms |
+
+Function calls 625ms → 431ms (~1.45x) on the way to the 40x-vs-Node
+`--jitless` gap (16ms); suite ~1.47s → ~1.21s.
+
+The function-call path was decomposed per call (Cut 12 stage 1):
+
+1. **Certified-body env constancy** — a certified body's `lexical_env`
+   never changes (every binding is a frame slot; no `with`/`try`/
+   `switch`/`for-in`/`for-of`/`using`), so the dispatch loop skips its
+   per-step `running_context_mut` + `Rc::ptr_eq` sync for it
+   (`CompiledBody::env_constant`). `fast_block` was extended from
+   empty blocks to any block whose lexical declarations are all frame
+   slots, so `let`/`const` blocks in certified bodies stop allocating
+   envs.
+2. **Single `ecma_functions` fetch** — `call_inner` fetches the record
+   once and hands the certified fast path its fields (ir/environment/
+   realm/strict) as `FastCallData`, dropping the second HashMap hit per
+   EcmaScript call; `is_eval_function` skips the intrinsics lookup for
+   non-function and EcmaScript callees (`%eval%` is a builtin);
+   `with_agent` is a no-op when the agent is already current (nested
+   certified `run_inner` entries), removing the redundant TLS swap.
+3. **Agent-shared IC caches** — the global-var cells and the P3
+   member/element cells moved off the per-call `Vm` onto the `Agent`.
+   They were re-created (and ~900 bytes re-zeroed) by every `Vm::new`,
+   so each function call and script evaluation started cold; they are
+   re-validated against the current realm's global and each object's
+   property vector on every access, so sharing them across Vms — and
+   across realms — is exact. A function's member accesses now hit its
+   caller's warmed cells: a 1M-call `f(o) { return o.a }` probe
+   0.61s → 0.52s (~15%), and a global-member-through-call probe
+   1.08s → 0.93s (~14%), at zero cost to pure-call shapes.
+
+   The originally planned stage 2b — running a certified callee on the
+   caller's `Vm` (a frame-stack split, saving/restoring the ~35
+   body-specific fields around the recursive dispatch run) — was
+   implemented and A/B'd: it warmed the member shapes (~10%) but cost
+   ~6% on pure-call and recursion shapes (the save/restore of ~35
+   fields outweighs the `Vm::new` init it replaces, now that the cell
+   zeroing is gone). The agent-shared caches deliver the warmth at zero
+   per-call cost, so the split was reverted. The certified context push
+   also shares one `EnvRef` between `lexical_environment` and
+   `variable_environment` (a certified body never reads the latter).
+
+Conformance after Cut 12: zero regressions across the sweeps (language
+23,690/0/34; built-ins 23,272/0/154 — the 386 hangs are the known
+RegExp property-escape + TypedArray copyWithin set; annexB 1,086/0/0).
+
+The remaining function-call cost (~330ns for an `empty()` call, 2M
+calls) is the certified call machinery: the `ExecutionContext` push
+(~4-6 Rc clones), the `Vm::new`/drop of the frame + env-stack Vec (a
+16-byte alloc per call), `setup_frame`, and the `ecma_functions`
+HashMap hit. The next lever is eliminating the per-call `Vm` (a
+grow-down value stack with a frame boundary, keeping the certified
+callee's control stacks isolated), or caching the certified record's
+fields on the function object.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

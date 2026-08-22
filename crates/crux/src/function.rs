@@ -52,8 +52,14 @@ pub fn install_ecma_hook(hook: EcmaHook) {
 /// Run `body` with `agent` recorded as the current agent. Crux code that
 /// invokes an ECMAScript function (proxy traps, object coercion) consults the
 /// recorded pointer inside this window; `agent` must stay alive for the whole
-/// of `body`, which is synchronous.
+/// of `body`, which is synchronous. A nested `run_inner` (a certified callee
+/// run in the caller's Vm) re-enters with the same pointer, so the swap is
+/// skipped when the agent is already current.
 pub fn with_agent<T>(agent: *mut (), body: impl FnOnce() -> T) -> T {
+    let already = CURRENT_AGENT.with(|slot| *slot.borrow() == agent);
+    if already {
+        return body();
+    }
     let previous = CURRENT_AGENT.with(|slot| slot.replace(agent));
     let result = body();
     CURRENT_AGENT.with(|slot| slot.replace(previous));
