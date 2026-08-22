@@ -422,11 +422,29 @@ impl DeclarativeEnv {
         }
     }
 
-    pub fn is_parameter(&self, name: &JsString) -> bool {
+    fn is_parameter(&self, name: &JsString) -> bool {
         self.bindings
             .borrow()
             .iter()
             .any(|(n, b)| n == name && b.parameter)
+    }
+
+    /// The value of the binding at `index` (the certified body's capture
+    /// context): `None` is the TDZ marker (a `let`/`const` binding that has
+    /// not been initialized).
+    pub fn slot_value(&self, index: usize) -> Option<Value> {
+        self.bindings
+            .borrow()
+            .get(index)
+            .and_then(|(_, b)| b.value.clone())
+    }
+
+    /// Write the binding at `index` — the certified body's compile-time
+    /// checks already enforce const and TDZ, so no validation here.
+    pub fn set_slot(&self, index: usize, value: Value) {
+        if let Some((_, b)) = self.bindings.borrow_mut().get_mut(index) {
+            b.value = Some(value);
+        }
     }
 
     fn has_binding(&self, name: &JsString) -> bool {

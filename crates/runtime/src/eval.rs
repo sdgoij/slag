@@ -3012,9 +3012,10 @@ mod tests {
     }
 
     #[test]
-    fn fast_path_capturing_closure_bails() {
-        // A closure that reads or writes a body binding must bail the whole
-        // body to the env path (the frame slot is not in any environment).
+    fn fast_path_capturing_closure_uses_context() {
+        // Cut 3 continuation: a closure that reads or writes a body binding
+        // now certifies — the binding moves into the per-call capture
+        // context the closure reaches through the environment.
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
         agent
@@ -3022,22 +3023,35 @@ mod tests {
             .unwrap();
         let ir = compiled_body_of(&mut agent, "f");
         assert!(
-            ir.scope.is_none(),
-            "a capturing closure must bail to the env path"
+            ir.scope.is_some(),
+            "a capturing closure must keep the body certified"
         );
-        assert_eq!(
-            run("function cap() { var x = 5; return function() { return x; }; } cap()()").unwrap(),
-            Value::Number(5.0)
+        assert!(
+            ir.steps
+                .iter()
+                .any(|s| { matches!(s, crate::ir::Step::InitContextSlot { .. }) }),
+            "the captured binding must initialize through the capture context"
         );
-        // An assignment to a body binding is a capture too.
+        // The counter-factory shape: the closure mutates the captured var.
         assert_eq!(
-            run("function w() { var x = 1; return function() { x = 5; return x; }; } w()()")
+            run("function counter() { var c = 0; return function() { c++; return c; }; } var f = counter(); f() + f() * 10")
                 .unwrap(),
-            Value::Number(5.0)
+            Value::Number(21.0)
+        );
+        // A captured param initializes from the call argument.
+        assert_eq!(
+            run("function make(x) { return (y) => x + y; } make(5)(7)").unwrap(),
+            Value::Number(12.0)
+        );
+        // Two closures sharing one captured binding stay in sync.
+        assert_eq!(
+            run("function s() { var x = 1; var f = () => x; var g = () => { x = x + 1; return x; }; return f() + g() + f() * 10; } s()")
+                .unwrap(),
+            Value::Number(23.0)
         );
         // A closure shadowing a body name with its own declaration is fine.
         assert_eq!(
-            run("function s() { var x = 1; return function() { var x = 2; return x; }; } s()()")
+            run("function shadow() { var x = 1; return function() { var x = 2; return x; }; } shadow()()")
                 .unwrap(),
             Value::Number(2.0)
         );
@@ -3046,6 +3060,41 @@ mod tests {
         assert_eq!(
             run("function t() { return () => this.v; } t.call({ v: 7 })()").unwrap(),
             Value::Number(7.0)
+        );
+    }
+
+    #[test]
+    fn fast_path_captured_let_tdz_and_loop_heads() {
+        // A captured `let` starts in the TDZ: the closure called before the
+        // init throws the ReferenceError.
+        assert!(matches!(
+            run("function f() { var g = () => x; return g; let x = 5; } f()()"),
+            Err(error) if error.kind == crux::ErrorKind::ReferenceError
+        ));
+        // A closure inside a loop capturing the loop-head `let` needs a
+        // fresh context per iteration — deferred — the body bails to the
+        // env path and keeps the per-iteration semantics.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script("function f() { var a = []; for (let i = 0; i < 3; i++) { a.push(() => i); } return a; }")
+            .unwrap();
+        let ir = compiled_body_of(&mut agent, "f");
+        assert!(
+            ir.scope.is_none(),
+            "a loop-head capture must bail to the env path"
+        );
+        assert_eq!(
+            run("function f() { var a = []; for (let i = 0; i < 3; i++) { a.push(() => i); } return a[0]() + a[1]() * 10 + a[2]() * 100; } f()")
+                .unwrap(),
+            Value::Number(210.0)
+        );
+        // A captured `var` in a loop shares one binding (all closures see
+        // the final value — the per-iteration freshness is lexical-only).
+        assert_eq!(
+            run("function v() { var a = []; for (var i = 0; i < 3; i++) { a.push(() => i); } return a[0]() + a[1]() * 10 + a[2]() * 100; } v()")
+                .unwrap(),
+            Value::Number(333.0)
         );
     }
 

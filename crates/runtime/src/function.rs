@@ -1539,7 +1539,7 @@ fn ordinary_call(
         }
     };
     if let Some(ir) = &ir
-        && ir.scope.is_some()
+        && let Some(scope) = &ir.scope
     {
         // The certified body observes only the closure environment (the
         // body env), the realm (global access), and the frame for error
@@ -1547,6 +1547,16 @@ fn ordinary_call(
         // `new.target`/eval/import/private names/Annex B, so the pushed
         // context's `script_or_module`/`source`/`private_environment` (all
         // cloned on the slow path) are never consulted here.
+        //
+        // Cut 3 continuation: a body whose closures capture bindings runs
+        // with a capture context — a declarative environment holding the
+        // captured bindings (captured params initialized with the call
+        // arguments) — so the closures can reach them after the call
+        // returns. Bodies without capture keep the plain closure env.
+        let body_env = match scope.new_body_context(&old_env, args, strict)? {
+            Some(context) => context,
+            None => old_env.clone(),
+        };
         agent.execution_context_stack.push(ExecutionContext {
             function: Some(Value::Function(function.clone())),
             realm,
@@ -1555,8 +1565,8 @@ fn ordinary_call(
             // certification rejects the `variable_environment` readers —
             // Annex B function hoisting and direct eval), so both slots can
             // share one clone.
-            lexical_environment: old_env.clone(),
-            variable_environment: old_env,
+            lexical_environment: body_env.clone(),
+            variable_environment: body_env,
             private_environment: None,
             source: None,
             annex_b_hoistable: Default::default(),
@@ -1897,7 +1907,15 @@ fn ordinary_construct(
             &function_env,
         )?;
         let completed = match &data.ir {
-            Some(ir) => {
+            // A captured binding needs the capture context the construct
+            // path does not build (its function env holds `this`); such a
+            // body stays on the walked env path.
+            Some(ir)
+                if ir
+                    .scope
+                    .as_ref()
+                    .is_none_or(|scope| scope.context_names.is_empty()) =>
+            {
                 let body_env = agent.running_context()?.lexical_environment.clone();
                 let mut vm = Vm::new(body_env.clone(), data.strict);
                 if let Some(scope) = &ir.scope {
@@ -1916,7 +1934,7 @@ fn ordinary_construct(
                 };
                 crate::eval::dispose_env_resources(agent, &body_env, Ok(completion))?
             }
-            None => eval_statement_list(agent, &data.body.stmts, data.strict)?,
+            _ => eval_statement_list(agent, &data.body.stmts, data.strict)?,
         };
         // spec 10.2.1 [[Construct]] steps 15-21: an object return wins; a base
         // constructor falls back to `this`; a derived constructor returns the

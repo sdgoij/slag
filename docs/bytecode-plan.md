@@ -18,11 +18,17 @@ per-read environment-chain walk — and the follow-on script-level binding
 mechanism (fast scripts) slots top-level `var`s too. Cut 4 fuses the loop
 test and update into slot ops, adds a primitive fast path to the
 relational evaluator, and (the continuation's first slice) runs a
-canonical loop's counter in the VM accumulator. The Cut 3 continuation's
-first slice landed: a certified body may create a **capture-free** closure
-(its own body compiles separately); contexts, closure capture, lexical
-blocks, `arguments`, mapped arguments, Annex B, the body accumulator
-model, slot-arg calls, and the Cut 5 encoding work remain open.
+canonical loop's counter in the VM accumulator. The Cut 3 continuation
+has landed in slices: a certified body may create closures — first
+capture-free, then (the latest slice) **capturing** closures, whose
+captured bindings move into a per-call declarative context environment
+the body accesses by index (`LoadContextSlot`/`StoreContextSlot`/
+`InitContextSlot`/`UpdateContextSlot`) and the closures reach through
+the environment walk. Deferred from the continuation: per-iteration
+loop-head contexts (a closure capturing a loop-head `let` bails to the
+env path), nested context chains (depth > 1 resolves through the env),
+`arguments`, mapped arguments, Annex B, the body accumulator model,
+slot-arg calls, and the Cut 5 encoding work remain open.
 
 ---
 
