@@ -3135,15 +3135,36 @@ mod tests {
             run("function h() { 'use strict'; return arguments.callee; } h()"),
             Err(error) if error.kind == crux::ErrorKind::TypeError
         ));
-        // Sloppy bodies need the mapped object — deferred to the env path.
+        // Sloppy simple-param bodies get the mapped object aliasing their
+        // formals through the capture context (see fast_path_mapped_arguments).
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
         agent
             .run_script("function s(a) { return arguments[0]; }")
             .unwrap();
+        let ir = compiled_body_of(&mut agent, "s");
         assert!(
-            compiled_body_of(&mut agent, "s").scope.is_none(),
-            "sloppy arguments must stay on the env path"
+            ir.scope.is_some(),
+            "sloppy arguments must keep the body certified"
+        );
+        assert!(
+            ir.steps.iter().any(|s| matches!(
+                s,
+                crate::ir::Step::CreateArguments {
+                    mapped: Some(_),
+                    ..
+                }
+            )),
+            "the certified body must create the mapped arguments object at entry"
+        );
+        // A `var arguments` body bails: the env path decides whether an
+        // arguments object exists at all.
+        agent
+            .run_script("function v(a) { var arguments; return arguments[0]; }")
+            .unwrap();
+        assert!(
+            compiled_body_of(&mut agent, "v").scope.is_none(),
+            "a `var arguments` body must stay on the env path"
         );
         // An arrow's `arguments` is lexical — stays on the env path.
         assert_eq!(
@@ -3357,15 +3378,75 @@ mod tests {
             run("function a() { return arguments[0]; } a(7)").unwrap(),
             Value::Number(7.0)
         );
+        // Cut 3 continuation: a sloppy simple-param `arguments` body now
+        // certifies with the mapped object (see fast_path_mapped_arguments);
+        // a `var arguments` body still bails — the env path decides whether
+        // an arguments object exists at all.
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
         agent
-            .run_script("function a() { return arguments[0]; }")
+            .run_script("function a() { var arguments; return arguments[0]; }")
             .unwrap();
         let ir = compiled_body_of(&mut agent, "a");
         assert!(
             ir.scope.is_none(),
-            "an `arguments` body must stay on the env path"
+            "a `var arguments` body must stay on the env path"
+        );
+        assert_eq!(
+            run("function a() { var arguments; return arguments[0]; } a(7)").unwrap(),
+            Value::Number(7.0)
+        );
+    }
+
+    #[test]
+    fn fast_path_mapped_arguments() {
+        // Cut 3 continuation (mapped arguments slice): a sloppy simple-param
+        // body observing `arguments` certifies with every param captured —
+        // the mapped object's accessors and the body's `LoadContextSlot`s
+        // share the capture-context bindings, so `arguments[i]` aliases the
+        // parameter both ways.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script("function f(a, b) { arguments[0] = 9; return a + b + arguments.length; }")
+            .unwrap();
+        let ir = compiled_body_of(&mut agent, "f");
+        assert!(
+            ir.scope.is_some(),
+            "sloppy mapped arguments must keep the body certified"
+        );
+        assert!(
+            ir.steps.iter().any(|s| matches!(
+                s,
+                crate::ir::Step::CreateArguments {
+                    mapped: Some(formals),
+                    ..
+                } if formals.len() == 2
+            )),
+            "the certified body must create the mapped object with the formals"
+        );
+        // `arguments[0] = 9` writes the parameter binding (9 + 2 + 2).
+        assert_eq!(
+            run("function f(a, b) { arguments[0] = 9; return a + b + arguments.length; } f(1, 2)")
+                .unwrap(),
+            Value::Number(13.0)
+        );
+        // The other direction: `a = 8` is visible through `arguments[0]`.
+        assert_eq!(
+            run("function g(a) { a = 8; return arguments[0]; } g(1)").unwrap(),
+            Value::Number(8.0)
+        );
+        // Beyond-arity arguments land in the object without mapping.
+        assert_eq!(
+            run("function h(a) { return arguments.length * 10 + arguments[1]; } h(1, 2, 3)")
+                .unwrap(),
+            Value::Number(32.0)
+        );
+        // The sloppy `callee` is the function itself (the strict accessor
+        // throws — covered in fast_path_strict_arguments_unmapped).
+        assert_eq!(
+            run("function k() { return arguments.callee === k; } k()").unwrap(),
+            Value::Boolean(true)
         );
     }
 

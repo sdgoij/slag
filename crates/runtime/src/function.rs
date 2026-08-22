@@ -1841,6 +1841,91 @@ pub(crate) fn create_unmapped_arguments_object(
     Ok(value)
 }
 
+/// CreateMappedArgumentsObject (spec 10.4.4.2): the sloppy-mode arguments
+/// object aliasing the formal parameters — `arguments[i]` reads/writes the
+/// parameter binding through per-name getter/setter accessors (MakeArgGetter/
+/// MakeArgSetter) over `env`. The certified body's capture context is that
+/// env, so the accessors and the body's `LoadContextSlot`s observe the same
+/// values. Joins @@iterator to %Array.prototype.values% (a Phase 8 join the
+/// crux creation site cannot make), mirroring the unmapped path.
+pub(crate) fn create_mapped_arguments_object(
+    agent: &mut Agent,
+    func: Value,
+    args: &[Value],
+    formals: &[JsString],
+    env: EnvRef,
+) -> Result<Value, JsError> {
+    let realm = agent.current_realm()?;
+    let arguments_prototype = realm
+        .intrinsics
+        .get("%Object.prototype%")
+        .and_then(|value| crate::context::as_object(&value));
+    let make_getter = {
+        let env = env.clone();
+        move |name: &JsString| -> Value {
+            let env = env.clone();
+            let name = name.clone();
+            Value::Function(
+                Function::create_builtin(
+                    None,
+                    0,
+                    Box::new(move |_, _| env.get_binding_value(&name, false)),
+                    None,
+                    None,
+                )
+                .unwrap_or_else(|_| Function::new(None)),
+            )
+        }
+    };
+    let make_setter = {
+        let env = env.clone();
+        move |name: &JsString| -> Value {
+            let env = env.clone();
+            let name = name.clone();
+            Value::Function(
+                Function::create_builtin(
+                    None,
+                    0,
+                    Box::new(move |_, value| {
+                        let value = value.first().cloned().unwrap_or(Value::Undefined);
+                        env.set_mutable_binding(&name, value, false)?;
+                        Ok(Value::Undefined)
+                    }),
+                    None,
+                    None,
+                )
+                .unwrap_or_else(|_| Function::new(None)),
+            )
+        }
+    };
+    let value = Value::Object(JsObject::mapped_arguments_object_create(
+        arguments_prototype,
+        func,
+        formals,
+        args,
+        make_getter,
+        make_setter,
+    )?);
+    if let Some(obj) = crate::context::as_object(&value)
+        && let Some(values) = realm.intrinsics.get("%Array.prototype.values%")
+    {
+        obj.define_property_key(
+            &crux::property::PropertyKey::Symbol(
+                crux::symbol::well_known("iterator").as_ref().clone(),
+            ),
+            &crux::property::PropertyDescriptor {
+                value: Some(values),
+                writable: Some(true),
+                get: None,
+                set: None,
+                enumerable: Some(false),
+                configurable: Some(true),
+            },
+        )?;
+    }
+    Ok(value)
+}
+
 /// Dispose a body environment after an abrupt engine error, folding disposal
 /// errors into the error (spec 9.4.3) and returning the resulting error.
 fn body_error_after_disposal(agent: &mut Agent, env: &EnvRef, error: JsError) -> JsError {
@@ -2266,48 +2351,13 @@ pub(crate) fn function_declaration_instantiation(
                     thrower,
                 )?)
             } else {
-                let env = function_env.clone();
-                let make_getter = move |name: &JsString| -> Value {
-                    let env = env.clone();
-                    let name = name.clone();
-                    Value::Function(
-                        Function::create_builtin(
-                            None,
-                            0,
-                            Box::new(move |_, _| env.get_binding_value(&name, false)),
-                            None,
-                            None,
-                        )
-                        .unwrap_or_else(|_| Function::new(None)),
-                    )
-                };
-                let env = function_env.clone();
-                let make_setter = move |name: &JsString| -> Value {
-                    let env = env.clone();
-                    let name = name.clone();
-                    Value::Function(
-                        Function::create_builtin(
-                            None,
-                            0,
-                            Box::new(move |_, value| {
-                                let value = value.first().cloned().unwrap_or(Value::Undefined);
-                                env.set_mutable_binding(&name, value, false)?;
-                                Ok(Value::Undefined)
-                            }),
-                            None,
-                            None,
-                        )
-                        .unwrap_or_else(|_| Function::new(None)),
-                    )
-                };
-                Value::Object(JsObject::mapped_arguments_object_create(
-                    arguments_prototype.clone(),
+                create_mapped_arguments_object(
+                    agent,
                     function_value.clone(),
-                    &param_names,
                     args,
-                    make_getter,
-                    make_setter,
-                )?)
+                    &param_names,
+                    function_env.clone(),
+                )?
             }
         } else {
             Value::Undefined

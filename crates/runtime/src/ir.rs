@@ -674,12 +674,15 @@ pub enum Step {
         op: UpdateOp,
         prefix: bool,
     },
-    /// Fill the strict body's `arguments` slot (Cut 3 continuation,
-    /// unmapped slice): build the unmapped arguments object from the call's
-    /// arguments and store it into the frame slot. Emitted once at body
-    /// entry.
+    /// Fill the body's `arguments` slot (Cut 3 continuation): build the
+    /// arguments object from the call's arguments and store it into the
+    /// frame slot. Emitted once at body entry. `mapped` is `Some(formals)`
+    /// for a sloppy simple-param body — the mapped object aliases the
+    /// formal parameters through the capture context — and `None` for the
+    /// strict unmapped object.
     CreateArguments {
         slot: usize,
+        mapped: Option<Vec<crux::AtomId>>,
     },
     /// A `break` statement: route through any pending finallys, then jump to
     /// `target` (spec 14.14.4).
@@ -786,11 +789,18 @@ pub struct ScopeInfo {
     pub context_param: Vec<Option<usize>>,
     /// Binding name → context slot (mirrors `context_names`).
     pub context_slots: HashMap<crux::AtomId, usize>,
-    /// The frame slot holding the strict body's `arguments` object (Cut 3
-    /// continuation, unmapped slice): `Some` when the body references
-    /// `arguments` — the certified call fills it at entry. Sloppy and arrow
-    /// bodies (lexical `arguments`) stay on the env path.
+    /// The frame slot holding the body's `arguments` object (Cut 3
+    /// continuation): `Some` when the body references `arguments` — the
+    /// certified call fills it at entry. Arrow bodies (lexical `arguments`)
+    /// stay on the env path.
     pub arguments_slot: Option<usize>,
+    /// Cut 3 continuation (mapped arguments slice): the formal parameter
+    /// names of a sloppy simple-param body observing `arguments` — `Some`
+    /// when the body gets the mapped arguments object (every param is
+    /// captured, so the object's accessors and the body's
+    /// `LoadContextSlot`s share the capture-context bindings). `None` for
+    /// strict unmapped and non-arguments bodies.
+    pub arguments_formals: Option<Vec<crux::AtomId>>,
     /// The frame slot holding the body's `this` value (Cut 3 continuation):
     /// `Some` when a non-arrow body references `this` — the certified call
     /// fills it with the OrdinaryCallBindThis result. Arrow bodies (lexical
@@ -4261,11 +4271,33 @@ impl Vm {
                     context_env(&self.lexical_env).set_slot(*index, new.clone());
                     self.stack.push(if *prefix { new } else { old_numeric });
                 }
-                Step::CreateArguments { slot } => {
-                    // Cut 3 continuation (unmapped slice): the strict body's
-                    // arguments object, built from the call's arguments.
-                    let value =
-                        crate::function::create_unmapped_arguments_object(agent, &self.call_args)?;
+                Step::CreateArguments { slot, mapped } => {
+                    // Cut 3 continuation: the strict body's unmapped
+                    // arguments object, built from the call's arguments; a
+                    // sloppy simple-param body gets the mapped object
+                    // aliasing its formals through the capture context.
+                    let value = match mapped {
+                        Some(formals) => {
+                            let func = agent
+                                .running_context()?
+                                .function
+                                .clone()
+                                .unwrap_or(Value::Undefined);
+                            let formals: Vec<JsString> =
+                                formals.iter().map(|id| crux::lookup(*id)).collect();
+                            crate::function::create_mapped_arguments_object(
+                                agent,
+                                func,
+                                &self.call_args,
+                                &formals,
+                                self.lexical_env.clone(),
+                            )?
+                        }
+                        None => crate::function::create_unmapped_arguments_object(
+                            agent,
+                            &self.call_args,
+                        )?,
+                    };
                     *self.frame.get_mut(*slot) = value;
                 }
                 Step::JumpIfTrue(target) => {
@@ -10167,13 +10199,16 @@ pub fn compile_body(function: &EcmaFunction) -> Result<CompiledBody, JsError> {
         strict: function.strict,
         ..Compiler::default()
     };
-    // Cut 3 continuation (unmapped arguments slice): the strict body's
-    // `arguments` slot is filled at entry — the object needs the realm's
-    // intrinsics and the call's arguments, so it cannot be compiled inline.
+    // Cut 3 continuation: the body's `arguments` slot is filled at entry —
+    // the object needs the realm's intrinsics and the call's arguments, so
+    // it cannot be compiled inline.
     if let Some(scope) = &compiler.scope
         && let Some(slot) = scope.arguments_slot
     {
-        compiler.emit(Step::CreateArguments { slot });
+        compiler.emit(Step::CreateArguments {
+            slot,
+            mapped: scope.arguments_formals.clone(),
+        });
     }
     compiler.compile_statements(&function.body.stmts)?;
     compiler.resolve();
@@ -10293,10 +10328,12 @@ pub fn debug_print_body(body: &CompiledBody) {
 // `let`/`const` declarations (each lexical binding gets a unique frame
 // slot that starts in the TDZ and is referenced only inside its declaring
 // scope; `const` is never reassigned), side-effect-free array/object
-// literals, no closures, no `eval`/`with`, no `this`/`arguments`/
-// `new.target`/`super`, no `try`/`switch`/`for-in`/`for-of`/destructuring,
-// no tagged templates. Anything else returns `None` and the body compiles
-// through the existing environment machinery (the correctness backstop).
+// literals, no closures, no `eval`/`with`, no `new.target`/`super`, no
+// `try`/`switch`/`for-in`/`for-of`/destructuring, no tagged templates. A
+// non-arrow body's `this`/`arguments` reads get frame slots the certified
+// call fills (this slot, unmapped/mapped arguments object). Anything else
+// returns `None` and the body compiles through the existing environment
+// machinery (the correctness backstop).
 
 /// Lay out the frame for a fast-path body, or return `None` when the body
 /// needs the environment path.
@@ -10304,21 +10341,23 @@ fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
     if function.is_async || function.is_generator {
         return None;
     }
-    let allow_arguments =
-        function.strict && function.this_mode != crate::function::ThisMode::Lexical;
+    // A non-arrow body's own `arguments` reads are arguments-object reads:
+    // strict gets the unmapped object, sloppy the mapped one (aliasing the
+    // simple params — a body whose `var`/param shapes differ stays on the
+    // env path). An arrow's `arguments` is lexical. The strict binding is
+    // const-like: an assignment to `arguments` bails the body (the slot
+    // path has no const enforcement; the parser rejects it in strict
+    // anyway).
+    let allow_arguments = function.this_mode != crate::function::ThisMode::Lexical;
     let allow_this = function.this_mode != crate::function::ThisMode::Lexical;
+    let arguments_id = crux::intern_utf8("arguments");
     let mut scan = FastScopeScan {
         allow_arguments,
         allow_this,
         ..FastScopeScan::default()
     };
-    // A strict non-arrow body's own `arguments` reads are unmapped-arguments
-    // reads (the body gets an `arguments` slot the certified call fills); a
-    // sloppy body would need the mapped object — deferred — and an arrow's
-    // `arguments` is lexical. The binding is const-like: an assignment to
-    // `arguments` bails the body (the slot path has no const enforcement).
-    if allow_arguments {
-        scan.consts.insert(crux::intern_utf8("arguments"));
+    if allow_arguments && function.strict {
+        scan.consts.insert(arguments_id);
     }
     // Params: every param keeps a dense frame slot (`setup_frame` copies
     // `args[0..arity]` by position); a captured param *additionally* gets a
@@ -10366,12 +10405,50 @@ fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
     if !scan.stmts(&function.body.stmts, 0) {
         return None;
     }
-    // The strict body's `arguments` binding is a frame slot filled at entry
-    // by `Step::CreateArguments` (the object needs the realm intrinsics and
-    // the call's arguments); it is never the TDZ marker.
+    // Cut 3 continuation (mapped arguments slice): a sloppy body observing
+    // `arguments` needs the mapped object aliasing its simple params — every
+    // param moves into the capture context (the mapped object's accessors
+    // read/write the same bindings the body's `LoadContextSlot` steps use;
+    // the dead frame slot keeps `setup_frame`'s dense param copy intact). A
+    // body that declares a binding named `arguments` (var/let/const/
+    // function/catch/param — the parser already forbids strict) bails: the
+    // env path's declaration instantiation decides whether an arguments
+    // object exists at all. Duplicate param names bail too — the capture
+    // context cannot hold two bindings with one name.
+    let arguments_formals = if scan.observes_arguments && !function.strict {
+        if scan.bindings.contains(&arguments_id) {
+            return None;
+        }
+        let mut seen: HashSet<crux::AtomId> = HashSet::new();
+        let mut formals = Vec::new();
+        for (position, param) in function.params.iter().enumerate() {
+            let BindingPattern::Ident(name) = param.pattern else {
+                unreachable!("the param loop checked the pattern")
+            };
+            if !seen.insert(name) {
+                return None;
+            }
+            formals.push(name);
+            if !scan.captured.contains(&name) {
+                scan.captured.insert(name);
+                scan.context_slots.insert(name, scan.context_names.len());
+                scan.context_names.push(name);
+                scan.context_tdz.push(false);
+                scan.context_const.push(false);
+                scan.context_param.push(Some(position));
+            }
+        }
+        Some(formals)
+    } else {
+        None
+    };
+    // The body's `arguments` binding is a frame slot filled at entry by
+    // `Step::CreateArguments` (strict unmapped or sloppy mapped — the object
+    // needs the realm intrinsics and the call's arguments); it is never the
+    // TDZ marker.
     let arguments_slot = if scan.observes_arguments {
         let slot = scan.next_slot;
-        scan.slots.insert(crux::intern_utf8("arguments"), slot);
+        scan.slots.insert(arguments_id, slot);
         scan.tdz.push(false);
         scan.next_slot += 1;
         Some(slot)
@@ -10401,6 +10478,7 @@ fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
         context_param: scan.context_param,
         context_slots: scan.context_slots,
         arguments_slot,
+        arguments_formals,
         this_slot,
     })
 }
@@ -11522,6 +11600,7 @@ fn analyze_script_scope(stmts: &[Stmt]) -> Option<(Option<ScriptSlots>, HashSet<
                     context_param: Vec::new(),
                     context_slots: HashMap::new(),
                     arguments_slot: None,
+                    arguments_formals: None,
                     this_slot: None,
                 },
                 names,
