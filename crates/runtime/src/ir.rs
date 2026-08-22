@@ -10020,6 +10020,42 @@ pub fn compile_statements(
     })
 }
 
+/// Render a compiled body for `--print-bytecode` (the Cut 5 debugging
+/// tool): the binding layout header, then one line per step. Jump targets
+/// are the already-resolved step indices (the fixups were applied at
+/// compile end).
+pub fn debug_print_body(body: &CompiledBody) {
+    if let Some(scope) = &body.scope {
+        println!(
+            "frame: {} slots, arity {}, {} tdz marks",
+            scope.frame_size,
+            scope.arity,
+            scope.tdz_store.len()
+        );
+        let mut slots: Vec<_> = scope.slots.iter().collect();
+        slots.sort_by_key(|(_, slot)| **slot);
+        for (name, slot) in slots {
+            println!("  slot {slot}: {}", crux::lookup(*name).to_string_lossy());
+        }
+    }
+    if let Some(globals) = &body.script_globals {
+        let mut names: Vec<&String> = globals.iter().collect();
+        names.sort();
+        println!(
+            "script globals: {}",
+            names
+                .iter()
+                .map(|name| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    println!("env_constant: {}", body.env_constant);
+    for (index, step) in body.steps.iter().enumerate() {
+        println!("{index:4}: {step:?}");
+    }
+}
+
 // ---- Cut 3 scope analysis ----
 //
 // Certify a function body for the frame-slot fast path and lay out its

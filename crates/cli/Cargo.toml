@@ -11,6 +11,7 @@ name = "slag"
 path = "src/main.rs"
 
 [dependencies]
+crux = { path = "../crux" }
 lexer = { path = "../lexer" }
 parser = { path = "../parser" }
 runtime = { path = "../runtime", features = ["fs"] }

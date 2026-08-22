@@ -7,8 +7,9 @@
 //!   quits).
 //!
 //! Flags: `--version`/`-V`, `--help`/`-h`, `--dump-ast`, `--dump-tokens`,
-//! `--bench` (run the micro-benchmark suite), and the accepted-no-op knobs
-//! `--print-bytecode`, `--stack-size N`, `--max-old-space N`, `--harmony-*`.
+//! `--bench` (run the micro-benchmark suite), `--print-bytecode` (print the
+//! compiled step stream), and the accepted-no-op knobs `--stack-size N`,
+//! `--max-old-space N`, `--harmony-*`.
 
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
@@ -105,7 +106,7 @@ fn run(command: Command) -> Result<(), u8> {
             eprintln!("  --help, -h");
             eprintln!("  --dump-ast, --dump-tokens");
             eprintln!("  --bench");
-            eprintln!("  --print-bytecode          (no-op)");
+            eprintln!("  --print-bytecode");
             eprintln!("  --stack-size N            (no-op)");
             eprintln!("  --max-old-space N         (no-op)");
             eprintln!("  --harmony-*               (no-op)");
@@ -147,6 +148,9 @@ fn run_file_inner(file: &str, args: &[String], options: &Options, source: &str) 
     }
     if options.dump_ast {
         dump_ast(source)?;
+    }
+    if options.print_bytecode {
+        dump_bytecode(source)?;
     }
     let mut context = Context::new().map_err(report)?;
     context.install_fs().map_err(report)?;
@@ -199,6 +203,31 @@ fn dump_ast(source: &str) -> Result<(), u8> {
         Ok(program) => {
             println!("{program:#?}");
             Ok(())
+        }
+        Err(error) => {
+            eprintln!("slag: parse: {error}");
+            Err(1)
+        }
+    }
+}
+
+/// Parse `source` as a fast script, compile it, and print the bytecode
+/// (`--print-bytecode`; the `docs/bytecode-plan.md` Cut 5 debugging tool).
+fn dump_bytecode(source: &str) -> Result<(), u8> {
+    match parser::parse_script(source) {
+        Ok(program) => {
+            let strict =
+                runtime::script::script_is_strict(&crux::JsString::from_utf8(source), &program);
+            match runtime::ir::compile_statements(&program.body, strict, true) {
+                Ok(body) => {
+                    runtime::ir::debug_print_body(&body);
+                    Ok(())
+                }
+                Err(error) => {
+                    eprintln!("slag: compile: {error}");
+                    Err(1)
+                }
+            }
         }
         Err(error) => {
             eprintln!("slag: parse: {error}");
