@@ -18,7 +18,7 @@
 //! Options:
 //!   --jobs N             concurrent batches (default: available parallelism)
 //!   --batch N            fixtures per batch (default: 32)
-//!   --timeout SECS       per-batch deadline (default: 30)
+//!   --timeout SECS       per-batch deadline (default: 15)
 //!   --recheck-timeout S  per-fixture hang-recheck deadline (default: 5)
 //!   --sample N           at most N fixtures per top-level directory
 //!   --filter GLOB        only fixtures whose relative path matches (`*`, `?`)
@@ -159,7 +159,7 @@ area: language | built-ins | annexB | intl402 | all (default: all)
 options:
   --jobs N             concurrent batches (default: available parallelism)
   --batch N            fixtures per batch (default: 32)
-  --timeout SECS       per-batch deadline (default: 30)
+  --timeout SECS       per-batch deadline (default: 15)
   --recheck-timeout S  per-fixture hang-recheck deadline (default: 5)
   --sample N           at most N fixtures per top-level directory
   --filter GLOB        only fixtures whose relative path matches (* and ?)
@@ -173,7 +173,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
             .map(|n| n.get())
             .unwrap_or(4),
         batch: 32,
-        timeout: Duration::from_secs(30),
+        timeout: Duration::from_secs(15),
         recheck_timeout: Duration::from_secs(5),
         sample: None,
         filter: None,

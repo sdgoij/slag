@@ -45,7 +45,7 @@ pub fn eval_expr(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Value, 
         ExprKind::Object(literal) => eval_object_literal(agent, literal, strict),
         ExprKind::Function(f) => {
             let env = agent.running_context()?.lexical_environment.clone();
-            crate::function::instantiate_function_expression(agent, f, env, strict)
+            crate::function::instantiate_function_expression(agent, f, env, strict, Vec::new())
         }
         ExprKind::Arrow {
             is_async,
@@ -60,6 +60,7 @@ pub fn eval_expr(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Value, 
                 body.clone(),
                 env,
                 strict,
+                Vec::new(),
             )
         }
         ExprKind::Class(class) => {

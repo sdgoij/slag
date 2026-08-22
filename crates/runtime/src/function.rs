@@ -160,6 +160,12 @@ pub struct EcmaFunction {
     /// step IR, and ordinary calls/constructs run it on the VM. Shared so
     /// the per-call record read does not copy the steps.
     pub ir: Option<std::rc::Rc<crate::ir::CompiledBody>>,
+    /// The enclosing certified bodies' capture-context layouts (Cut 3
+    /// continuation, nested context chains), innermost first: the body's
+    /// references to those captured names compile to static context-chain
+    /// reads instead of env walks. Empty when the enclosing chain is
+    /// uncertified.
+    pub outer_chain: Vec<Vec<crux::AtomId>>,
 }
 
 /// FunctionBodyContainsUseStrict (spec 15.2.1): a `"use strict"` directive in
@@ -385,19 +391,18 @@ pub fn instantiate_function(
     f: &syntax::ast::Function,
     environment: EnvRef,
     enclosing_strict: bool,
+    outer_chain: Vec<Vec<crux::AtomId>>,
 ) -> Result<Value, JsError> {
-    instantiate_function_with_source(agent, f, environment, enclosing_strict, None)
+    instantiate_function_with_source(agent, f, environment, enclosing_strict, None, outer_chain)
 }
 
-/// Like `instantiate_function`, with an explicit source text (module
-/// declarations instantiate before the module context is pushed, so the
-/// running context cannot provide it).
 pub fn instantiate_function_with_source(
     agent: &mut Agent,
     f: &syntax::ast::Function,
     environment: EnvRef,
     enclosing_strict: bool,
     source: Option<JsString>,
+    outer_chain: Vec<Vec<crux::AtomId>>,
 ) -> Result<Value, JsError> {
     let source = source.or_else(|| capture_source(agent, f.span));
     let body = shared_function_body(agent, f, source.as_ref());
@@ -411,6 +416,7 @@ pub fn instantiate_function_with_source(
         DefinitionKind::function(f.is_async, f.is_generator),
         source,
         None,
+        outer_chain,
     )
 }
 
@@ -491,6 +497,7 @@ pub fn instantiate_method(
         DefinitionKind::method(f.is_async, f.is_generator),
         source,
         None,
+        Vec::new(),
     )
 }
 
@@ -514,6 +521,7 @@ pub fn instantiate_accessor(
         DefinitionKind::method(false, false),
         None,
         None,
+        Vec::new(),
     )
 }
 
@@ -573,6 +581,7 @@ fn instantiate_class_constructor_with(
         },
         None,
         None,
+        Vec::new(),
     )?;
     if default_derived
         && let Some(function) = function.as_function()
@@ -610,6 +619,7 @@ fn register_function(
     kind: DefinitionKind,
     source: Option<JsString>,
     strict: Option<bool>,
+    outer_chain: Vec<Vec<crux::AtomId>>,
 ) -> Result<Value, JsError> {
     // `strict` overrides the body-directive check (CreateDynamicFunction
     // computes it against its assembled source, which the running context
@@ -653,6 +663,7 @@ fn register_function(
         source,
         declaring_module,
         ir: None,
+        outer_chain,
     };
     // Every body compiles to the step IR; the VM executes ordinary bodies
     // the same way it runs the resumable kinds.
@@ -814,13 +825,20 @@ pub fn instantiate_function_expression(
     f: &syntax::ast::Function,
     environment: EnvRef,
     enclosing_strict: bool,
+    outer_chain: Vec<Vec<crux::AtomId>>,
 ) -> Result<Value, JsError> {
     let Some(name) = f.name else {
-        return instantiate_function(agent, f, environment, enclosing_strict);
+        return instantiate_function(agent, f, environment, enclosing_strict, outer_chain);
     };
     let name = crux::lookup(name);
     let scope = new_declarative_environment(Some(environment));
-    let value = instantiate_function(agent, f, scope.clone(), enclosing_strict)?;
+    // The self-binding scope is transparent to the static context-chain
+    // walk: it holds only the function's own name, so a reference to an
+    // enclosing body's captured binding must reach past it.
+    if let crate::env::EnvRecord::Declarative(declarative) = &*scope {
+        declarative.mark_context_transparent();
+    }
+    let value = instantiate_function(agent, f, scope.clone(), enclosing_strict, outer_chain)?;
     // spec 15.2.5 step 6: the self-binding is a non-strict immutable binding,
     // so a sloppy-mode assignment to the function's own name is ignored.
     scope.create_immutable_binding(&name, false)?;
@@ -859,6 +877,7 @@ pub fn instantiate_dynamic_function(
         DefinitionKind::function(f.is_async, f.is_generator),
         source,
         Some(strict),
+        Vec::new(),
     )?;
     // GetPrototypeFromConstructor wins over the default %Function.prototype%.
     let ValueKind::Function(function) = value.kind() else {
@@ -877,6 +896,7 @@ pub fn instantiate_arrow(
     body: ArrowBody,
     environment: EnvRef,
     enclosing_strict: bool,
+    outer_chain: Vec<Vec<crux::AtomId>>,
 ) -> Result<Value, JsError> {
     let body = match body {
         ArrowBody::Expr(expr) => {
@@ -918,6 +938,7 @@ pub fn instantiate_arrow(
         source: None,
         declaring_module: None,
         ir: None,
+        outer_chain,
     };
     data.ir = Some(std::rc::Rc::new(crate::ir::compile_body(&data)?));
     let function = Function::new(None);
@@ -1553,7 +1574,7 @@ fn ordinary_call(
         // captured bindings (captured params initialized with the call
         // arguments) — so the closures can reach them after the call
         // returns. Bodies without capture keep the plain closure env.
-        let body_env = match scope.new_body_context(&old_env, args, strict)? {
+        let body_env = match scope.new_body_context(&old_env, args)? {
             Some(context) => context,
             None => old_env.clone(),
         };
@@ -2090,6 +2111,14 @@ fn ordinary_construct(
             {
                 let body_env = agent.running_context()?.lexical_environment.clone();
                 let mut vm = Vm::new(body_env.clone(), data.strict);
+                // Cut 3 continuation (nested context chains): a certified
+                // body's static context-chain reads resolve against its
+                // captured environment (its own capture context when it has
+                // one, the enclosing body's context otherwise) — the running
+                // env at construct can be an unrelated caller.
+                if ir.scope.is_some() {
+                    vm.body_context = Some(data.environment.clone());
+                }
                 if let Some(scope) = &ir.scope {
                     vm.setup_frame(scope, args);
                     // Cut 3 continuation (unmapped arguments slice): the
@@ -2520,7 +2549,7 @@ pub(crate) fn function_declaration_instantiation(
     }
     for f in funcs {
         let name = crux::lookup(f.name.unwrap());
-        let func_obj = instantiate_function(agent, f, lexical_env.clone(), strict)?;
+        let func_obj = instantiate_function(agent, f, lexical_env.clone(), strict, Vec::new())?;
         variable_env.set_mutable_binding(&name, func_obj, false)?;
     }
 

@@ -369,6 +369,12 @@ pub struct DeclarativeEnv {
     /// catch parameter's name (Annex B.3.5), so the eval var-vs-lexical walk
     /// skips it.
     pub is_catch_param: std::cell::Cell<bool>,
+    /// Transparent to the static context-chain walk: the per-iteration
+    /// environments (fresh copies holding only the loop-head names) and the
+    /// named-function-expression self-binding scope (instantiation
+    /// scaffolding holding only the function's own name). The walk skips
+    /// these when resolving an enclosing body's capture context.
+    pub context_transparent: std::cell::Cell<bool>,
 }
 
 impl DeclarativeEnv {
@@ -379,6 +385,7 @@ impl DeclarativeEnv {
             disposable_resources: RefCell::new(Vec::new()),
             annex_b_functions: RefCell::new(Vec::new()),
             is_catch_param: std::cell::Cell::new(false),
+            context_transparent: std::cell::Cell::new(false),
         }
     }
 
@@ -437,6 +444,24 @@ impl DeclarativeEnv {
             .borrow()
             .get(index)
             .and_then(|(_, b)| b.value.clone())
+    }
+
+    /// Whether the binding at `index` is mutable: the static context-chain
+    /// store/update steps check this for an *outer* binding (the certified
+    /// body's own const writes are compile-rejected, but a nested closure's
+    /// write to an enclosing const must still throw).
+    pub fn slot_mutable(&self, index: usize) -> bool {
+        self.bindings
+            .borrow()
+            .get(index)
+            .is_some_and(|(_, b)| b.mutable)
+    }
+
+    /// Mark this environment as transparent to the static context-chain
+    /// walk (a loop's per-iteration copy or a named function expression's
+    /// self-binding scope — see [`DeclarativeEnv::context_transparent`]).
+    pub fn mark_context_transparent(&self) {
+        self.context_transparent.set(true);
     }
 
     /// Write the binding at `index` — the certified body's compile-time

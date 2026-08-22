@@ -540,8 +540,13 @@ pub(crate) fn eval_function_declaration(
         if !variable_env.has_binding(&name)? || variable_env.is_parameter_binding(&name) {
             return Ok(());
         }
-        let func_obj =
-            crate::function::instantiate_function(agent, f, lexical_env.clone(), strict)?;
+        let func_obj = crate::function::instantiate_function(
+            agent,
+            f,
+            lexical_env.clone(),
+            strict,
+            Vec::new(),
+        )?;
         variable_env.set_mutable_binding(&name, func_obj, false)?;
         return Ok(());
     }
@@ -718,6 +723,7 @@ pub(crate) fn block_declaration_instantiation_iter<'a>(
                             f,
                             block_env.clone(),
                             strict,
+                            Vec::new(),
                         )?;
                         block_env.initialize_binding(&name, func_obj)?;
                     }
@@ -3229,6 +3235,110 @@ mod tests {
             run("function f() { var a = []; for (let i = 0; i < 2; i++) { let y = i + 10; a.push(() => i + y); } return a[0]() + a[1]() * 100; } f()")
                 .unwrap(),
             Value::Number(1210.0)
+        );
+    }
+
+    #[test]
+    fn fast_path_nested_context_chain() {
+        // Cut 3 continuation (nested context chains): a certified closure's
+        // references to an enclosing certified body's captured bindings
+        // compile to static context-chain reads (`LoadContextSlot { depth ≥
+        // 1 }`) instead of env walks.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script("function make(x) { return (y) => x + y; }")
+            .unwrap();
+        let ir = compiled_body_of(&mut agent, "make");
+        assert!(ir.scope.is_some(), "the body must certify");
+        // The closure records make's capture context: its `x` reference
+        // compiles to a static context-chain read instead of an env walk.
+        let x = crux::intern_utf8("x");
+        assert!(
+            ir.steps.iter().any(|s| {
+                matches!(
+                    s,
+                    crate::ir::Step::CreateArrow { outer_chain, .. }
+                        if outer_chain.len() == 1 && outer_chain[0] == vec![x]
+                )
+            }),
+            "the closure must record make's capture context"
+        );
+        assert_eq!(
+            run("function make(x) { return (y) => x + y; } make(5)(7)").unwrap(),
+            Value::Number(12.0)
+        );
+        // A closure with its own captures reads the outer binding one hop
+        // deeper (depth 1: its own context first).
+        assert_eq!(
+            run("function f() { var x = 10; return function (a) { var own = a * 2; return () => x + own; }; } f(1)(2)()")
+                .unwrap(),
+            Value::Number(14.0)
+        );
+        // A depth-2 chain: outer -> middle -> inner reading the outermost
+        // capture through both contexts.
+        assert_eq!(
+            run("function o() { let b = 100; return function m() { let d = 10; return function i(y) { return b + d + y; }; }; } o()()(1)")
+                .unwrap(),
+            Value::Number(111.0)
+        );
+        // A named function expression's self-binding scope is transparent to
+        // the chain walk.
+        assert_eq!(
+            run("function f() { let n = 42; return function inner() { return n; }; } f()()")
+                .unwrap(),
+            Value::Number(42.0)
+        );
+        // A nested closure can write an enclosing mutable binding.
+        assert_eq!(
+            run("function f() { var c = 0; return () => { c += 10; return c; }; } var g = f(); g() + g() * 10")
+                .unwrap(),
+            Value::Number(210.0)
+        );
+        // Writing an enclosing `const` throws (the static store checks
+        // immutability; sloppy bodies throw too, per spec 16.1.8).
+        assert!(matches!(
+            run("function f() { const k = 5; return () => { k = 9; }; } f()()"),
+            Err(error) if error.kind == crux::ErrorKind::TypeError
+        ));
+        assert!(matches!(
+            run("function f() { const k = 5; return () => { k++; }; } f()()"),
+            Err(error) if error.kind == crux::ErrorKind::TypeError
+        ));
+        // The chain walk reaches past a per-iteration env: a closure created
+        // inside a certified loop reads a non-head capture statically.
+        assert_eq!(
+            run("function f() { var t = 0; var a = []; for (let i = 0; i < 3; i++) { t += i; a.push(() => i + t); } return a[0]() + a[1]() * 10 + a[2]() * 100; } f()")
+                .unwrap(),
+            Value::Number(543.0)
+        );
+        // The env-path boundary: an uncertified middle body breaks the static
+        // chain; the env walk keeps the resolution correct.
+        assert_eq!(
+            run("function f() { var x = 7; return (function () { try { throw 1; } catch (e) { return () => x * 2; } })()(); } f()")
+                .unwrap(),
+            Value::Number(14.0)
+        );
+        // A closure referencing a name that is not an enclosing capture
+        // resolves globally, not through the chain.
+        assert_eq!(
+            run("function f() { return () => Math.max(1, 2); } f()()").unwrap(),
+            Value::Number(2.0)
+        );
+        // A closure referencing bindings from two different enclosing levels
+        // (the test262 Atomics harness shape): each resolves to its own
+        // body's context on the chain.
+        assert_eq!(
+            run("function t(f) { var bad = [function(v) { return -1; }]; for (var i = 0; i < bad.length; ++i) { var gen = bad[i]; try { f(gen); } catch (e) { e.message += ' (idx ' + gen + '.)'; throw e; } } } function outer(TA) { let view = TA; t(function(gen) { let run = function() { return gen(view); }; if (run() !== -1) throw new Error('bad'); }); } outer(0)")
+                .unwrap(),
+            Value::Undefined
+        );
+        // An intermediate body with no captures of its own contributes no
+        // context hop: the innermost closure reaches past it.
+        assert_eq!(
+            run("function capParam(a) { return function () { return (b) => a + b; }; } capParam(5)()(3)")
+                .unwrap(),
+            Value::Number(8.0)
         );
     }
 

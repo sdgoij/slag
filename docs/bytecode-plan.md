@@ -42,9 +42,16 @@ context, the body's own reads/writes of a captured head go through
 per-iteration steps, and the closures capture the fresh env. A closure
 capturing a lexical binding *declared inside* a loop body still bails
 (its per-iteration block scope is not flattenable into the capture
-context). Deferred from the continuation: nested context chains (depth
-> 1 resolves through the env), Annex B, the body accumulator model,
-slot-arg calls, and the Cut 5 encoding work remain open.
+context). Nested context chains have landed: a certified closure's
+references to an enclosing certified body's captured bindings compile
+to static `LoadContextSlot { depth ≥ 1 }` reads instead of env walks —
+the enclosing bodies' capture-context layouts thread through the
+closure-creation steps (innermost first, per-iteration head names open
+at the creation site excluded), and the runtime walk skips the
+per-iteration envs and named-function-expression self-binding scopes
+(the only non-context hops on a certified chain). Deferred from the
+continuation: Annex B, the body accumulator model, slot-arg calls, and
+the Cut 5 encoding work remain open.
 
 ---
 
@@ -416,13 +423,15 @@ implementation* for the VM itself.
   speed later (the Cut 3 continuation + §8 risk register). A certified
   body may create capture-free closures (the continuation's first slice).
   **This list has since shrunk**: `this` slots, unmapped strict
-  `arguments`, mapped sloppy `arguments`, capture-based closures, and
+  `arguments`, mapped sloppy `arguments`, capture-based closures,
   per-iteration loop-head contexts (a closure capturing a `for`-head
-  `let` runs the loop through per-iteration envs) landed in later slices
-  (`docs/perf.md` Cuts 17+); still deferred are loop-body-scoped
-  captures (a closure capturing a lexical binding declared inside a
-  loop body bails — its per-iteration block scope is not flattenable),
-  nested context chains, and Annex B.
+  `let` runs the loop through per-iteration envs), and nested context
+  chains (a certified closure's references to enclosing certified
+  bodies' captured bindings compile to static context-chain reads)
+  landed in later slices (`docs/perf.md` Cuts 17+); still deferred are
+  loop-body-scoped captures (a closure capturing a lexical binding
+  declared inside a loop body bails — its per-iteration block scope is
+  not flattenable), and Annex B.
 
 ### Correctness notes (why the slice is right)
 

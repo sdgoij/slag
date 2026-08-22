@@ -330,17 +330,25 @@ pub enum Step {
     /// Create a function expression's closure against the current lexical
     /// environment (spec 15.2.5). `strict` is the enclosing code's
     /// strictness, inherited when the body has no directive of its own.
+    /// `outer_chain` (Cut 3 continuation, nested context chains) is the
+    /// capture-context layout of each enclosing certified body, innermost
+    /// first (each entry = the body's captured names; per-iteration head
+    /// names open at this creation site are excluded): the closure's
+    /// references to those bindings compile to static context-chain reads.
     CreateFunction {
         function: Box<syntax::ast::Function>,
         strict: bool,
+        outer_chain: Vec<Vec<crux::AtomId>>,
     },
     /// Create an arrow function's closure: `[[ThisMode]]` is lexical and
-    /// there is no `prototype` (spec 15.3.2).
+    /// there is no `prototype` (spec 15.3.2). `outer_chain` is as in
+    /// `CreateFunction`.
     CreateArrow {
         is_async: bool,
         params: Vec<syntax::ast::BindingElement>,
         body: syntax::ast::ArrowBody,
         strict: bool,
+        outer_chain: Vec<Vec<crux::AtomId>>,
     },
     /// `new.target` (spec 13.3.5.3): the active constructor, or *undefined*
     /// at the script level.
@@ -654,12 +662,18 @@ pub enum Step {
     /// The certified body's capture context (Cut 3 continuation): push the
     /// value of the captured binding at `index` (the per-call declarative
     /// environment holds the bindings; a `None` value is the TDZ marker).
+    /// `depth` is the static context-chain depth (0 = the body's own
+    /// capture context; nested closure bodies resolve enclosing bodies'
+    /// contexts through it), skipping per-iteration envs.
     LoadContextSlot {
+        depth: usize,
         index: usize,
     },
-    /// Pop into the captured binding at `index` (an assignment: the
-    /// current value must not be the TDZ marker).
+    /// Pop into the captured binding at `depth`/`index` (an assignment: the
+    /// current value must not be the TDZ marker, and an outer immutable
+    /// binding throws).
     StoreContextSlot {
+        depth: usize,
         index: usize,
     },
     /// Pop into the captured binding at `index` (the first write: no
@@ -667,9 +681,10 @@ pub enum Step {
     InitContextSlot {
         index: usize,
     },
-    /// Read the captured binding at `index`, apply `++`/`--`, store, and
-    /// push the old (postfix) or new (prefix) value.
+    /// Read the captured binding at `depth`/`index`, apply `++`/`--`, store,
+    /// and push the old (postfix) or new (prefix) value.
     UpdateContextSlot {
+        depth: usize,
         index: usize,
         op: UpdateOp,
         prefix: bool,
@@ -863,7 +878,6 @@ impl ScopeInfo {
         &self,
         outer: &EnvRef,
         args: &[Value],
-        strict: bool,
     ) -> Result<Option<EnvRef>, JsError> {
         if self.context_names.is_empty() {
             return Ok(None);
@@ -872,7 +886,11 @@ impl ScopeInfo {
         for (index, name) in self.context_names.iter().enumerate() {
             let text = crux::lookup(*name);
             if self.context_const[index] {
-                env.create_immutable_binding(&text, strict)?;
+                // Const bindings are created strict unconditionally (spec
+                // 16.1.8: CreateImmutableBinding(dn, true) for const
+                // declarations), so a sloppy nested closure's write to an
+                // enclosing `const` still throws like the env path.
+                env.create_immutable_binding(&text, true)?;
             } else {
                 env.create_mutable_binding(&text, false)?;
             }
@@ -2432,10 +2450,18 @@ impl Vm {
                 Step::DecGlobal { name } => {
                     self.update_global(agent, *name, UpdateOp::Decrement, true)?;
                 }
-                Step::CreateFunction { function, strict } => {
+                Step::CreateFunction {
+                    function,
+                    strict,
+                    outer_chain,
+                } => {
                     let env = agent.running_context()?.lexical_environment.clone();
                     let value = crate::function::instantiate_function_expression(
-                        agent, function, env, *strict,
+                        agent,
+                        function,
+                        env,
+                        *strict,
+                        outer_chain.clone(),
                     )?;
                     self.stack.push(value);
                 }
@@ -2444,6 +2470,7 @@ impl Vm {
                     params,
                     body,
                     strict,
+                    outer_chain,
                 } => {
                     let env = agent.running_context()?.lexical_environment.clone();
                     let value = crate::function::instantiate_arrow(
@@ -2453,6 +2480,7 @@ impl Vm {
                         body.clone(),
                         env,
                         *strict,
+                        outer_chain.clone(),
                     )?;
                     self.stack.push(value);
                 }
@@ -3829,6 +3857,9 @@ impl Vm {
                     // The per-iteration environment replaces the lexical
                     // environment without joining the stack; the loop's exit
                     // restores the loop environment directly.
+                    if let EnvRecord::Declarative(declarative) = &*env {
+                        declarative.mark_context_transparent();
+                    }
                     self.lexical_env = env;
                 }
                 Step::EnterPerIteration { names } => {
@@ -3848,6 +3879,9 @@ impl Vm {
                         let value = source.get_binding_value(name, false)?;
                         env.create_mutable_binding(name, false)?;
                         env.initialize_binding(name, value)?;
+                    }
+                    if let EnvRecord::Declarative(declarative) = &*env {
+                        declarative.mark_context_transparent();
                     }
                     self.lexical_env = env.clone();
                     self.env_stack.push(env);
@@ -4318,12 +4352,14 @@ impl Vm {
                     };
                     self.acc = new;
                 }
-                Step::LoadContextSlot { index } => {
+                Step::LoadContextSlot { depth, index } => {
                     // Cut 3 continuation: the certified body's capture
                     // context (its lexical environment outside a
                     // per-iteration loop, where the lexical env holds only
-                    // the loop head names).
-                    let value = context_env(&self.body_context_env()).slot_value(*index);
+                    // the loop head names); `depth` resolves an enclosing
+                    // certified body's context along the chain.
+                    let env = self.context_chain_env(*depth)?;
+                    let value = context_env(&env).slot_value(*index);
                     match value {
                         Some(value) => self.stack.push(value),
                         None => {
@@ -4334,37 +4370,57 @@ impl Vm {
                         }
                     }
                 }
-                Step::StoreContextSlot { index } => {
+                Step::StoreContextSlot { depth, index } => {
                     let value = self.pop();
+                    let env = self.context_chain_env(*depth)?;
+                    let declarative = context_env(&env);
                     // An assignment to a binding still in the TDZ throws.
-                    if context_env(&self.body_context_env())
-                        .slot_value(*index)
-                        .is_none()
-                    {
+                    if declarative.slot_value(*index).is_none() {
                         return Err(JsError::new(
                             ErrorKind::ReferenceError,
                             "Cannot access a binding before initialization".into(),
                         ));
                     }
-                    context_env(&self.body_context_env()).set_slot(*index, value);
+                    // The certified body's own const writes are rejected by
+                    // the scan, but a nested closure's write to an enclosing
+                    // `const` is only checked here: throw like the env path.
+                    if !declarative.slot_mutable(*index) {
+                        return Err(JsError::new(
+                            ErrorKind::TypeError,
+                            "Assignment to constant variable".into(),
+                        ));
+                    }
+                    declarative.set_slot(*index, value);
                 }
                 Step::InitContextSlot { index } => {
                     let value = self.pop();
-                    context_env(&self.body_context_env()).set_slot(*index, value);
+                    let env = self.context_chain_env(0)?;
+                    context_env(&env).set_slot(*index, value);
                 }
-                Step::UpdateContextSlot { index, op, prefix } => {
-                    let body_context = self.body_context_env();
-                    let old = {
-                        let env = context_env(&body_context);
-                        env.slot_value(*index).ok_or_else(|| {
-                            JsError::new(
-                                ErrorKind::ReferenceError,
-                                "Cannot access a binding before initialization".into(),
-                            )
-                        })?
-                    };
+                Step::UpdateContextSlot {
+                    depth,
+                    index,
+                    op,
+                    prefix,
+                } => {
+                    let env = self.context_chain_env(*depth)?;
+                    let declarative = context_env(&env);
+                    let old = declarative.slot_value(*index).ok_or_else(|| {
+                        JsError::new(
+                            ErrorKind::ReferenceError,
+                            "Cannot access a binding before initialization".into(),
+                        )
+                    })?;
+                    // An enclosing `const` (only reachable from a nested
+                    // closure) must reject the update like the env path.
+                    if !declarative.slot_mutable(*index) {
+                        return Err(JsError::new(
+                            ErrorKind::TypeError,
+                            "Assignment to constant variable".into(),
+                        ));
+                    }
                     let (old_numeric, new) = update_value(agent, op, &old)?;
-                    context_env(&body_context).set_slot(*index, new.clone());
+                    declarative.set_slot(*index, new.clone());
                     self.stack.push(if *prefix { new } else { old_numeric });
                 }
                 Step::CreateArguments { slot, mapped } => {
@@ -5457,6 +5513,41 @@ impl Vm {
         self.body_context
             .clone()
             .unwrap_or_else(|| self.lexical_env.clone())
+    }
+
+    /// The capture context at static context-chain `depth` (Cut 3
+    /// continuation, nested context chains): depth 0 = the body's own
+    /// capture context; depth ≥ 1 walks out through the enclosing certified
+    /// bodies' contexts. Per-iteration environments are skipped — they hold
+    /// only the loop-head names, so a capture-free closure created inside a
+    /// loop still reaches its enclosing body's context.
+    fn context_chain_env(&self, depth: usize) -> Result<EnvRef, JsError> {
+        let mut env = self.body_context_env();
+        loop {
+            if !is_context_transparent(&env) {
+                break;
+            }
+            env = env.outer().ok_or_else(|| {
+                JsError::new(
+                    ErrorKind::ReferenceError,
+                    "No outer environment for a capture-context binding".into(),
+                )
+            })?;
+        }
+        for _ in 0..depth {
+            loop {
+                env = env.outer().ok_or_else(|| {
+                    JsError::new(
+                        ErrorKind::ReferenceError,
+                        "No outer environment for a capture-context binding".into(),
+                    )
+                })?;
+                if !is_context_transparent(&env) {
+                    break;
+                }
+            }
+        }
+        Ok(env)
     }
 
     /// The control-transfer machinery: route through pending finallys, then
@@ -6686,6 +6777,12 @@ struct Compiler {
     /// steps — the head inits compile before the entry step, so they keep
     /// the context-slot path.
     per_iteration_heads: Vec<Vec<crux::AtomId>>,
+    /// The enclosing certified bodies' capture-context layouts (Cut 3
+    /// continuation, nested context chains), innermost first: a reference to
+    /// one of their captured names resolves to a static context-chain read
+    /// (`LoadContextSlot { depth ≥ 1 }`) instead of the env walk. Empty when
+    /// the enclosing chain is uncertified.
+    outer_chain: Vec<Vec<crux::AtomId>>,
     /// Whether any emitted step switches the lexical environment (block/
     /// loop/catch/with envs): when false the body's env is constant for its
     /// whole run, so the dispatch loop skips the per-step context sync.
@@ -6696,10 +6793,13 @@ struct Compiler {
 /// the capture context (a binding a closure in the body captures, Cut 3
 /// continuation), a declared top-level var (fast script), the fused loop
 /// counter in the VM accumulator (Cut 17), or the environment machinery.
+/// A `Context` carries the static context-chain depth (0 = the body's own
+/// capture context; a nested closure body resolving an enclosing body's
+/// captured binding has depth ≥ 1).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum BindingLoc {
     Slot(usize),
-    Context(usize),
+    Context(usize, usize),
     Global,
     Acc,
     Env,
@@ -6712,14 +6812,15 @@ impl Compiler {
     }
 
     /// Where a binding resolves: the frame (fast body), the capture context
-    /// (Cut 3 continuation), the global object (certified fast script), the
-    /// fused loop counter in the accumulator (Cut 17), or the environment
-    /// machinery.
+    /// (Cut 3 continuation — own context at depth 0, an enclosing certified
+    /// body's context at depth ≥ 1), the global object (certified fast
+    /// script), the fused loop counter in the accumulator (Cut 17), or the
+    /// environment machinery.
     fn binding(&self, name: crux::AtomId) -> BindingLoc {
         if self.acc_binding == Some(name) {
             BindingLoc::Acc
         } else if let Some(index) = self.scope.as_ref().and_then(|scope| scope.context_of(name)) {
-            BindingLoc::Context(index)
+            BindingLoc::Context(0, index)
         } else if let Some(slot) = self.slot_of(name) {
             BindingLoc::Slot(slot)
         } else if self
@@ -6728,9 +6829,67 @@ impl Compiler {
             .is_some_and(|globals| globals.contains(&crux::lookup(name).to_string_lossy()))
         {
             BindingLoc::Global
+        } else if let Some((depth, index)) = self.outer_context(name) {
+            BindingLoc::Context(depth, index)
         } else {
             BindingLoc::Env
         }
+    }
+
+    /// The enclosing certified bodies' capture-context layouts (Cut 3
+    /// continuation, nested context chains): entry `k` holds the captured
+    /// names of the certified body `k` scopes out (0 = the immediately
+    /// enclosing one), with the per-iteration head names that were open at
+    /// each body's own creation site excluded. Threaded through the closure
+    /// creation steps from the enclosing compilers; empty when the enclosing
+    /// chain is not certified.
+    fn outer_context(&self, name: crux::AtomId) -> Option<(usize, usize)> {
+        let scope = self.scope.as_ref()?;
+        // The walk base is the closure's own capture context (1 hop) when
+        // the body has one; the per-iteration envs on the chain are skipped
+        // at runtime, so each enclosing body contributes exactly one hop.
+        let base = usize::from(!scope.context_names.is_empty());
+        for (depth, names) in self.outer_chain.iter().enumerate() {
+            if let Some(index) = names.iter().position(|n| *n == name) {
+                return Some((base + depth, index));
+            }
+        }
+        None
+    }
+
+    /// The entry this certified body contributes to a closure created here:
+    /// its captured names minus the per-iteration head names whose loops are
+    /// open at the creation site (those resolve through the per-iteration
+    /// env, not the capture context's stale slot).
+    fn own_context_entry(&self) -> Vec<crux::AtomId> {
+        let Some(scope) = self.scope.as_ref() else {
+            return Vec::new();
+        };
+        let mut names = scope.context_names.clone();
+        for heads in &self.per_iteration_heads {
+            for head in heads {
+                names.retain(|name| *name != *head);
+            }
+        }
+        names
+    }
+
+    /// The context chain to record on a closure created here: this body's
+    /// own entry first (the innermost enclosing context), then the inherited
+    /// enclosing certified bodies' entries. A body with an empty capture
+    /// context contributes no runtime hop, so its entry is omitted — or
+    /// empty entirely when this body is uncertified (the chain is broken,
+    /// references resolve through the env walk).
+    fn closure_outer_chain(&self) -> Vec<Vec<crux::AtomId>> {
+        let Some(scope) = self.scope.as_ref() else {
+            return Vec::new();
+        };
+        let mut chain = Vec::with_capacity(self.outer_chain.len() + 1);
+        if !scope.context_names.is_empty() {
+            chain.push(self.own_context_entry());
+        }
+        chain.extend(self.outer_chain.iter().cloned());
+        chain
     }
 
     /// The per-iteration env slot of a captured for-head binding (Cut 3
@@ -6770,12 +6929,15 @@ impl Compiler {
             // Cut 3 continuation: a captured for-head binding reads the
             // current per-iteration env (a fresh copy per iteration) — a
             // closure in the body observes the per-iteration value, not the
-            // capture context's.
-            BindingLoc::Context(index) => {
-                if let Some((depth, index)) = self.per_iteration(name) {
+            // capture context's. Other captured bindings (own or an
+            // enclosing body's) read the static context chain.
+            BindingLoc::Context(depth, index) => {
+                if depth == 0
+                    && let Some((depth, index)) = self.per_iteration(name)
+                {
                     self.emit(Step::LoadPerIteration { depth, index });
                 } else {
-                    self.emit(Step::LoadContextSlot { index });
+                    self.emit(Step::LoadContextSlot { depth, index });
                 }
             }
             BindingLoc::Global => self.emit(Step::LoadGlobal { name }),
@@ -6790,11 +6952,13 @@ impl Compiler {
         self.emit(Step::Dup);
         match loc {
             BindingLoc::Slot(slot) => self.emit(Step::StoreLocal { slot }),
-            BindingLoc::Context(index) => {
-                if let Some((depth, index)) = self.per_iteration(name) {
+            BindingLoc::Context(depth, index) => {
+                if depth == 0
+                    && let Some((depth, index)) = self.per_iteration(name)
+                {
                     self.emit(Step::StorePerIteration { depth, index });
                 } else {
-                    self.emit(Step::StoreContextSlot { index });
+                    self.emit(Step::StoreContextSlot { depth, index });
                 }
             }
             BindingLoc::Global => self.emit(Step::StoreGlobal { name }),
@@ -6859,7 +7023,7 @@ impl Compiler {
                 // a captured binding must not fuse (there is no
                 // `JumpIf*AccImm`/`JumpIf*ContextImm` step); the general
                 // test reads them instead.
-                BindingLoc::Env | BindingLoc::Acc | BindingLoc::Context(_) => None,
+                BindingLoc::Env | BindingLoc::Acc | BindingLoc::Context(_, _) => None,
                 loc => Some((*op, loc, *name, *n)),
             }
         } else {
@@ -6880,7 +7044,7 @@ impl Compiler {
                 // A nested loop's update over an active accumulator counter
                 // or a captured binding must not fuse (the general `Update`
                 // path reads/writes them).
-                BindingLoc::Env | BindingLoc::Acc | BindingLoc::Context(_) => None,
+                BindingLoc::Env | BindingLoc::Acc | BindingLoc::Context(_, _) => None,
                 loc => Some((loc, *name, *op)),
             }
         } else {
@@ -6929,7 +7093,7 @@ impl Compiler {
                 });
             }
             BindingLoc::Acc => unreachable!("emit_fused_rel_test on the accumulator"),
-            BindingLoc::Context(_) => {
+            BindingLoc::Context(_, _) => {
                 unreachable!("emit_fused_rel_test on a captured binding")
             }
             BindingLoc::Env => unreachable!("emit_fused_rel_test on the environment path"),
@@ -7528,7 +7692,7 @@ impl Compiler {
                                     self.emit(Step::InitLocal { slot });
                                     continue;
                                 }
-                                BindingLoc::Context(index) => {
+                                BindingLoc::Context(0, index) => {
                                     self.begin_named_initializer(*name, init);
                                     self.compile_expr(init)?;
                                     self.emit(Step::InitContextSlot { index });
@@ -7542,6 +7706,11 @@ impl Compiler {
                                     }
                                     self.emit(Step::StoreGlobal { name: *name });
                                     continue;
+                                }
+                                // A declaration's name is bound in this body,
+                                // never an enclosing body's capture.
+                                BindingLoc::Context(_, _) => {
+                                    unreachable!("a declaration cannot bind an outer context")
                                 }
                                 // A declaration of an active accumulator
                                 // counter is rejected by the loop-body scan.
@@ -7851,7 +8020,7 @@ impl Compiler {
                                         self.emit(Step::InitLocal { slot });
                                         continue;
                                     }
-                                    BindingLoc::Context(index) => {
+                                    BindingLoc::Context(0, index) => {
                                         self.compile_expr(init)?;
                                         self.emit(Step::InitContextSlot { index });
                                         continue;
@@ -7866,6 +8035,11 @@ impl Compiler {
                                     // scan.
                                     BindingLoc::Acc => {
                                         unreachable!("a nested for-head cannot rebind its counter")
+                                    }
+                                    // A `var` head's name is bound in this
+                                    // body, never an enclosing body's capture.
+                                    BindingLoc::Context(_, _) => {
+                                        unreachable!("a for-head cannot bind an outer context")
                                     }
                                     BindingLoc::Env => {}
                                 }
@@ -7905,7 +8079,7 @@ impl Compiler {
                         matches!(
                             &decl.pattern,
                             BindingPattern::Ident(name)
-                                if matches!(self.binding(*name), BindingLoc::Context(_))
+                                if matches!(self.binding(*name), BindingLoc::Context(0, _))
                         )
                     });
                     if all_slots {
@@ -7949,7 +8123,7 @@ impl Compiler {
                                 BindingLoc::Slot(slot) => {
                                     self.emit(Step::InitLocal { slot });
                                 }
-                                BindingLoc::Context(index) => {
+                                BindingLoc::Context(0, index) => {
                                     self.emit(Step::InitContextSlot { index });
                                     heads.push(name);
                                 }
@@ -8134,7 +8308,7 @@ impl Compiler {
                     (BindingLoc::Acc, _) => {
                         unreachable!("fused_update on the accumulator (the scan rejects it)")
                     }
-                    (BindingLoc::Context(_), _) => {
+                    (BindingLoc::Context(_, _), _) => {
                         unreachable!("fused_update on a captured binding (the scan rejects it)")
                     }
                     (BindingLoc::Env, _) => unreachable!("fused_update on the environment path"),
@@ -8299,7 +8473,7 @@ impl Compiler {
                 // A for-of head over a captured binding resolves through the
                 // environment like the env path (the binding is in the
                 // capture context).
-                BindingLoc::Context(_) => self.emit(Step::ForOfBind { left: left.clone() }),
+                BindingLoc::Context(_, _) => self.emit(Step::ForOfBind { left: left.clone() }),
                 // A for-of head over an active accumulator counter is
                 // rejected by the loop-body scan.
                 BindingLoc::Acc => unreachable!("a for-of head cannot bind its counter"),
@@ -8567,12 +8741,16 @@ impl Compiler {
                     BindingLoc::Slot(slot) => self.emit(Step::LoadLocal { slot }),
                     // Cut 3 continuation: the binding is captured — read
                     // the capture context (or the current per-iteration env
-                    // for a captured for-head inside its loop).
-                    BindingLoc::Context(index) => {
-                        if let Some((depth, index)) = self.per_iteration(*name) {
+                    // for a captured for-head inside its loop; an enclosing
+                    // body's captured binding reads the static context
+                    // chain).
+                    BindingLoc::Context(depth, index) => {
+                        if depth == 0
+                            && let Some((depth, index)) = self.per_iteration(*name)
+                        {
                             self.emit(Step::LoadPerIteration { depth, index });
                         } else {
-                            self.emit(Step::LoadContextSlot { index });
+                            self.emit(Step::LoadContextSlot { depth, index });
                         }
                     }
                     // Cut 5 fast script: a declared top-level var, read
@@ -8601,9 +8779,11 @@ impl Compiler {
                 "super is not valid here".into(),
             )),
             ExprKind::Function(function) => {
+                let outer_chain = self.closure_outer_chain();
                 self.emit(Step::CreateFunction {
                     function: Box::new(function.clone()),
                     strict: self.strict || self.class_depth > 0,
+                    outer_chain,
                 });
                 Ok(())
             }
@@ -8612,11 +8792,13 @@ impl Compiler {
                 params,
                 body,
             } => {
+                let outer_chain = self.closure_outer_chain();
                 self.emit(Step::CreateArrow {
                     is_async: *is_async,
                     params: params.clone(),
                     body: body.clone(),
                     strict: self.strict || self.class_depth > 0,
+                    outer_chain,
                 });
                 Ok(())
             }
@@ -8655,12 +8837,15 @@ impl Compiler {
                             }
                             // Cut 3 continuation: `typeof` of a captured
                             // binding reads the capture context (or the
-                            // current per-iteration env inside its loop).
-                            BindingLoc::Context(index) => {
-                                if let Some((depth, index)) = self.per_iteration(*name) {
+                            // current per-iteration env inside its loop, or
+                            // an enclosing body's context on the chain).
+                            BindingLoc::Context(depth, index) => {
+                                if depth == 0
+                                    && let Some((depth, index)) = self.per_iteration(*name)
+                                {
                                     self.emit(Step::LoadPerIteration { depth, index });
                                 } else {
-                                    self.emit(Step::LoadContextSlot { index });
+                                    self.emit(Step::LoadContextSlot { depth, index });
                                 }
                                 self.emit(Step::TypeofTop);
                             }
@@ -9042,11 +9227,14 @@ impl Compiler {
                         });
                         return Ok(());
                     }
-                    BindingLoc::Context(index) => {
+                    BindingLoc::Context(depth, index) => {
                         // Cut 3 continuation: the update reads and writes
                         // the capture context (or the current per-iteration
-                        // env for a captured for-head inside its loop).
-                        if let Some((depth, index)) = self.per_iteration(*name) {
+                        // env for a captured for-head inside its loop, or an
+                        // enclosing body's context on the chain).
+                        if depth == 0
+                            && let Some((depth, index)) = self.per_iteration(*name)
+                        {
                             self.emit(Step::UpdatePerIteration {
                                 depth,
                                 index,
@@ -9055,6 +9243,7 @@ impl Compiler {
                             });
                         } else {
                             self.emit(Step::UpdateContextSlot {
+                                depth,
                                 index,
                                 op: *op,
                                 prefix,
@@ -9184,7 +9373,7 @@ impl Compiler {
             ExprKind::Ident(name) => {
                 match self.binding(*name) {
                     loc @ (BindingLoc::Slot(_)
-                    | BindingLoc::Context(_)
+                    | BindingLoc::Context(_, _)
                     | BindingLoc::Global
                     | BindingLoc::Acc) => {
                         // Cut 3/17 fast paths: the target is a frame slot,
@@ -10408,6 +10597,15 @@ fn context_env(env: &EnvRef) -> &DeclarativeEnv {
     }
 }
 
+/// Whether an env is transparent to the static context-chain walk: a
+/// per-iteration copy (holds only the loop-head names) or a named function
+/// expression's self-binding scope (holds only the function's own name) —
+/// a reference to an enclosing body's captured binding must reach past
+/// them.
+fn is_context_transparent(env: &EnvRef) -> bool {
+    matches!(&**env, EnvRecord::Declarative(e) if e.context_transparent.get())
+}
+
 fn is_compound_assign(op: &AssignOp) -> bool {
     matches!(
         op,
@@ -10452,6 +10650,7 @@ pub fn compile_body(function: &EcmaFunction) -> Result<CompiledBody, JsError> {
         is_async_generator: function.is_generator && function.is_async,
         scope,
         strict: function.strict,
+        outer_chain: function.outer_chain.clone(),
         ..Compiler::default()
     };
     // Cut 3 continuation: the body's `arguments` slot is filled at entry —
