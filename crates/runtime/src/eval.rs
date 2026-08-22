@@ -3428,27 +3428,138 @@ mod tests {
                 .unwrap(),
             Value::Number(8.0)
         );
-        // Block-level declarations bail to the env path (Annex B creates two
-        // bindings) and keep their hoisting behavior.
+        // Block-level declarations now certify via Annex B (two bindings:
+        // the block binding + the hoisted var — see
+        // fast_path_annex_b_block_functions).
+        assert_eq!(
+            run("function f() { { function g() { return 1; } } return g(); } f()").unwrap(),
+            Value::Number(1.0)
+        );
+    }
+
+    #[test]
+    fn fast_path_annex_b_block_functions() {
+        // Cut 6 first slice (Annex B): a block-level function declaration
+        // in a sloppy body certifies — the block binding is a frame slot
+        // initialized at block entry (14.2.3), and when the hoist applies
+        // (B.3.3.4) the function-scoped var binding is reset to *undefined*
+        // at block entry (B.3.2.1) and the declaration statement copies the
+        // block binding's current value into it (B.3.3.3). Statement-
+        // position declarations and captured names stay on the env path.
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
         agent
             .run_script("function f() { { function g() { return 1; } } return g(); }")
             .unwrap();
-        let bir = compiled_body_of(&mut agent, "f");
+        let ir = compiled_body_of(&mut agent, "f");
+        assert!(ir.scope.is_some(), "the body must certify");
+        let scope = ir.scope.as_ref().unwrap();
+        assert_eq!(scope.annex_b.len(), 1, "the block function gets an entry");
+        let entry = &scope.annex_b[0];
         assert!(
-            bir.scope.is_none(),
-            "a block-level declaration must stay on the env path"
+            entry.var_slot.is_some(),
+            "the sloppy plain declaration hoists"
         );
         assert!(
-            bir.steps
+            !ir.steps
                 .iter()
-                .any(|s| matches!(s, crate::ir::Step::FunctionDecl { .. })),
-            "the env path evaluates the declaration in place"
+                .any(|s| matches!(s, crate::ir::Step::EnterBlock { .. })),
+            "the block must stay env-free"
         );
+        assert!(
+            ir.steps.iter().any(|s| matches!(
+                s,
+                crate::ir::Step::FunctionDeclInit {
+                    frame_slot: Some(slot),
+                    ..
+                } if *slot == entry.block_slot
+            )),
+            "the block entry initializes the block binding"
+        );
+        assert!(
+            ir.steps.iter().any(|s| matches!(
+                s,
+                crate::ir::Step::LoadLocal { slot } if *slot == entry.block_slot
+            )),
+            "the declaration statement copies the block binding"
+        );
+        // The hoisted var binding is visible outside the block.
         assert_eq!(
             run("function f() { { function g() { return 1; } } return g(); } f()").unwrap(),
             Value::Number(1.0)
+        );
+        // An early block exit leaves the var binding undefined.
+        assert_eq!(
+            run("function f() { L: { break L; function g() {} } return typeof g; } f()").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("undefined")))
+        );
+        // Writing the block binding does not leak into the var binding (the
+        // declaration statement already copied the block value).
+        assert_eq!(
+            run("function f() { { function g() {} g = 5; } return typeof g; } f()").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("function")))
+        );
+        // A strict body's block declaration is block-scoped only.
+        assert_eq!(
+            run(
+                "function f() { 'use strict'; { function g() { return 1; } return typeof g; } } f()"
+            )
+            .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("function")))
+        );
+        assert_eq!(
+            run(
+                "function f() { 'use strict'; { function g() { return 1; } } return typeof g; } f()"
+            )
+            .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("undefined")))
+        );
+        // A top-level lexical conflict suppresses the hoist.
+        assert_eq!(
+            run("function f() { let g = 1; { function g() { return 2; } var inside = g(); } return [inside, g].join(','); } f()")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("2,1")))
+        );
+        // A parameter conflict suppresses the hoist too.
+        assert_eq!(
+            run("function f(g) { { function g() { return 3; } var inside = g(); } return [inside, g].join(','); } f(1)")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("3,1")))
+        );
+        // Duplicate block declarations: the second is dead (14.2.3).
+        assert_eq!(
+            run("function f() { { function g() { return 1; } function g() { return 2; } return g(); } } f()")
+                .unwrap(),
+            Value::Number(1.0)
+        );
+        // Sibling blocks with the same name each bind their own declaration
+        // (the already-bound check is per block); the last declaration's
+        // copy wins for the var binding.
+        assert_eq!(
+            run("function f() { var updated; (function () { { function g() { return 'first declaration'; } } { function g() { return 'second declaration'; } } updated = g; }()); return updated(); } f()")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("second declaration")))
+        );
+        // A closure capturing the block fn stays on the env path.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script("function f() { var a = []; { function g() { return 3; } a.push(() => g); } return a[0]()(); }")
+            .unwrap();
+        let cir = compiled_body_of(&mut agent, "f");
+        assert!(
+            cir.scope.is_none(),
+            "a captured block fn must stay on the env path"
+        );
+        assert_eq!(
+            run("function f() { var a = []; { function g() { return 3; } a.push(() => g); } return a[0]()(); } f()")
+                .unwrap(),
+            Value::Number(3.0)
+        );
+        // A statement-position declaration stays on the env path.
+        assert_eq!(
+            run("function f() { if (true) function g() {} return typeof g; } f()").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("function")))
         );
     }
 

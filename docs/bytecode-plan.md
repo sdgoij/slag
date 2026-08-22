@@ -60,10 +60,21 @@ certified constructor body against its captured environment — not the
 empty lexical env `function_declaration_instantiation` installs on the
 running context — so closures created inside the constructor record the
 capture context as their `[[Environment]]` (a `LoadContextSlot` at depth
-0 against the empty env read its slot 0, the TDZ marker). Deferred from
-the continuation: block-level and statement-position function
-declarations (Annex B, two bindings), the body accumulator model,
-slot-arg calls, and the Cut 5 encoding work remain open.
+0 against the empty env read its slot 0, the TDZ marker). Annex B
+block-level function declarations certify too (Cut 6 first slice): a
+sloppy body's block function declaration binds a block-scoped binding in
+a frame slot — initialized with the instantiated closure at block entry
+(14.2.3, no TDZ) — and, when the hoist applies (B.3.3.4: a sloppy plain
+declaration with no top-level-lexical/parameter/enclosing-lexical
+conflict, checked body-wide and per block), the function-scoped var
+binding — reset to *undefined* at block entry (B.3.2.1) and copied from
+the block binding's current value by the declaration statement (B.3.3.3).
+References resolve by block nesting (the compile-time Annex B stack).
+Statement-position declarations (bare `if (x) function f() {}`) and
+captured block-function names stay on the env path. Deferred from the
+continuation: statement-position function declarations, the body
+accumulator model, slot-arg calls, and the Cut 5 encoding work remain
+open.
 
 ---
 
@@ -279,7 +290,12 @@ function calls ≤1.15s, property access ≤0.64s.
 2. **Annex B block function declarations**: a function declared in a block
    in sloppy mode binds both a block-scoped `let`-like binding and the
    enclosing `var` (with the Annex B hoist). The slot model must allocate
-   both.
+   both. **First slice landed (Cut 6)**: a certified body's block-level
+   declarations get a block slot (initialized at block entry) and — when
+   the hoist applies — a function-scoped var slot (reset at block entry,
+   copied by the declaration statement); references resolve by block
+   nesting. Statement-position declarations and captured names remain on
+   the env path.
 3. **TDZ**: the marker must round-trip through the value stack (a TDZ read
    in an expression, a TDZ value passed around without being read). The
    marker is a distinct `Value` bit pattern — it must never escape into
@@ -443,10 +459,13 @@ implementation* for the VM itself.
   landed in later slices (`docs/perf.md` Cuts 17+): loop-body-scoped
   captures are still deferred (a closure capturing a lexical binding
   declared inside a loop body bails — its per-iteration block scope is
-  not flattenable), and top-level function declarations now certify
+  not flattenable), top-level function declarations now certify
   (hoisted `FunctionDeclInit` at body entry, the declaration statement
-  empty; block-level and statement-position forms — Annex B, two
-  bindings — still bail).
+  empty), and Annex B **block-level** declarations certify too (block
+  binding in a frame slot initialized at block entry + the hoisted var
+  binding, reset at block entry and copied by the declaration
+  statement — Cut 6 first slice); statement-position declarations
+  (bare `if (x) function f() {}`) still bail.
 
 ### Correctness notes (why the slice is right)
 

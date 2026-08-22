@@ -867,6 +867,29 @@ pub struct ScopeInfo {
     /// fills it with the OrdinaryCallBindThis result. Arrow bodies (lexical
     /// `this`) stay on the env path.
     pub this_slot: Option<usize>,
+    /// Cut 6 first slice (Annex B): the body's block-level function
+    /// declarations, in declaration order. Each binds a block-scoped
+    /// binding in `block_slot` (initialized with the instantiated closure
+    /// at block entry — 14.2.3, no TDZ) and, when the hoist applies, the
+    /// function-scoped var binding in `var_slot` (reset to `undefined` at
+    /// block entry; the declaration statement copies the block binding's
+    /// current value into it — B.3.3.3). `var_slot` is `None` for a
+    /// declaration with no hoist (a strict body, an async/generator
+    /// declaration, or a top-level-lexical/parameter/enclosing-lexical
+    /// conflict — B.3.3.4): it is block-scoped only. `span` pairs each
+    /// entry with its `FunctionDecl` statement during compilation.
+    pub annex_b: Vec<AnnexBFunction>,
+}
+
+/// An Annex B block-level function declaration in a certified body (Cut 6
+/// first slice): see [`ScopeInfo::annex_b`].
+#[derive(Debug, Clone)]
+pub struct AnnexBFunction {
+    pub name: crux::AtomId,
+    pub span: crux::Span,
+    pub function: Box<syntax::ast::Function>,
+    pub block_slot: usize,
+    pub var_slot: Option<usize>,
 }
 
 impl ScopeInfo {
@@ -6821,6 +6844,11 @@ struct Compiler {
     /// steps — the head inits compile before the entry step, so they keep
     /// the context-slot path.
     per_iteration_heads: Vec<Vec<crux::AtomId>>,
+    /// The `ScopeInfo::annex_b` indices of the Annex B block functions whose
+    /// blocks are currently being compiled (Cut 6 first slice), innermost
+    /// last: while compiling inside a declaring block, a reference to the
+    /// name resolves to the block binding's slot instead of the var slot.
+    annex_b_stack: Vec<Vec<usize>>,
     /// The enclosing certified bodies' capture-context layouts (Cut 3
     /// continuation, nested context chains), innermost first: a reference to
     /// one of their captured names resolves to a static context-chain read
@@ -6863,6 +6891,11 @@ impl Compiler {
     fn binding(&self, name: crux::AtomId) -> BindingLoc {
         if self.acc_binding == Some(name) {
             BindingLoc::Acc
+        } else if let Some(block_slot) = self.annex_b_block_slot(name) {
+            // Cut 6 first slice: inside a declaring block, an Annex B
+            // block function's name resolves to the block binding — the
+            // var binding is the function-scoped fallback outside.
+            BindingLoc::Slot(block_slot)
         } else if let Some(index) = self.scope.as_ref().and_then(|scope| scope.context_of(name)) {
             BindingLoc::Context(0, index)
         } else if let Some(slot) = self.slot_of(name) {
@@ -6878,6 +6911,58 @@ impl Compiler {
         } else {
             BindingLoc::Env
         }
+    }
+
+    /// The block binding of an Annex B block function whose declaring block
+    /// is open (Cut 6 first slice): the innermost enclosing block that
+    /// declares the name wins.
+    fn annex_b_block_slot(&self, name: crux::AtomId) -> Option<usize> {
+        let scope = self.scope.as_ref()?;
+        self.annex_b_stack
+            .iter()
+            .rev()
+            .flat_map(|indices| indices.iter().rev().copied())
+            .map(|index| &scope.annex_b[index])
+            .find(|entry| entry.name == name)
+            .map(|entry| entry.block_slot)
+    }
+
+    /// The `ScopeInfo::annex_b` indices of the Annex B block functions
+    /// declared directly in `stmts` (Cut 6 first slice): the block-entry
+    /// init steps and the compile-time reference stack use them.
+    fn annex_b_block_entries(&self, stmts: &[Stmt]) -> Vec<usize> {
+        let Some(scope) = self.scope.as_ref() else {
+            return Vec::new();
+        };
+        scope
+            .annex_b
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                stmts
+                    .iter()
+                    .any(|stmt| {
+                        matches!(&stmt.kind, StmtKind::FunctionDecl(f) if f.span == entry.span)
+                    })
+                    .then_some(index)
+            })
+            .collect()
+    }
+
+    /// The Annex B hoist copy of the given declaration statement (Cut 6
+    /// first slice): `(block_slot, var_slot)` when the statement is a live
+    /// hoisted block function of the innermost open block — the statement
+    /// copies the block binding into the var binding (B.3.3.3). `None` for
+    /// a top-level declaration, a dead block duplicate, or a non-hoisted
+    /// block declaration (all empty statements).
+    fn annex_b_copy_target(&self, function: &syntax::ast::Function) -> Option<(usize, usize)> {
+        let scope = self.scope.as_ref()?;
+        let index = self.annex_b_stack.last()?.iter().copied().find(|&index| {
+            let entry = &scope.annex_b[index];
+            entry.span == function.span && entry.var_slot.is_some()
+        })?;
+        let entry = &scope.annex_b[index];
+        Some((entry.block_slot, entry.var_slot?))
     }
 
     /// The enclosing certified bodies' capture-context layouts (Cut 3
@@ -7037,8 +7122,12 @@ impl Compiler {
                         _ => false,
                     })
                 } else {
-                    // Using/class/function declarations always need an env.
-                    false
+                    // A block function declaration in a certified body is an
+                    // Annex B declaration the scope analysis allocated (Cut 6
+                    // first slice): a block slot + optional var slot, no env.
+                    // Class and `using` declarations never certify (the scan
+                    // bails the body).
+                    matches!(decl.kind, StmtKind::FunctionDecl(_))
                 }
             });
         }
@@ -7698,11 +7787,49 @@ impl Compiler {
             StmtKind::Block(block) => {
                 self.emit(Step::ListBegin);
                 if self.fast_block(&block.stmts) {
-                    // Cut 3: a fast body's block has no lexical declarations,
-                    // so it contributes no environment (the per-iteration env
-                    // allocation in hot loops disappears). The scope count is
-                    // untouched, so control-transfer unwinds stay balanced.
+                    // Cut 3: a fast body's block has no lexical declarations
+                    // that need an environment, so it contributes no
+                    // environment (the per-iteration env allocation in hot
+                    // loops disappears). The scope count is untouched, so
+                    // control-transfer unwinds stay balanced.
+                    //
+                    // Cut 6 first slice: an Annex B block function
+                    // declaration keeps the block env-free — the block
+                    // binding is a frame slot initialized at block entry
+                    // (14.2.3) with the hoisted var reset to *undefined*
+                    // (B.3.2.1) first, and the declaration statement copies
+                    // the block binding into the var binding (B.3.3.3).
+                    let indices = self.annex_b_block_entries(&block.stmts);
+                    self.annex_b_stack.push(indices.clone());
+                    for &index in &indices {
+                        let (name, function, block_slot, var_slot) = {
+                            let scope = self
+                                .scope
+                                .as_ref()
+                                .expect("Annex B entries imply a certified body");
+                            let entry = &scope.annex_b[index];
+                            (
+                                entry.name,
+                                entry.function.clone(),
+                                entry.block_slot,
+                                entry.var_slot,
+                            )
+                        };
+                        if let Some(var_slot) = var_slot {
+                            self.emit(Step::Push(Value::Undefined));
+                            self.emit(Step::InitLocal { slot: var_slot });
+                        }
+                        let outer_chain = self.closure_outer_chain();
+                        self.emit(Step::FunctionDeclInit {
+                            name,
+                            function,
+                            frame_slot: Some(block_slot),
+                            context_slot: None,
+                            outer_chain,
+                        });
+                    }
                     self.compile_statements(&block.stmts)?;
+                    self.annex_b_stack.pop();
                 } else {
                     self.emit(Step::EnterBlock {
                         decls: Self::block_decls(&block.stmts),
@@ -8017,7 +8144,7 @@ impl Compiler {
                 }
             }
             StmtKind::Empty | StmtKind::Debugger => {}
-            StmtKind::FunctionDecl(_) => {
+            StmtKind::FunctionDecl(function) => {
                 if self.scope.is_none() {
                     // A certified body's top-level declarations were
                     // initialized at entry (`FunctionDeclInit`); the
@@ -8027,6 +8154,13 @@ impl Compiler {
                     self.emit(Step::FunctionDecl {
                         stmt: Box::new(stmt.clone()),
                     });
+                } else if let Some((block_slot, var_slot)) = self.annex_b_copy_target(function) {
+                    // Cut 6 first slice: an Annex B block function — the
+                    // declaration statement copies the block binding (its
+                    // current value) into the hoisted var binding; the
+                    // block binding itself was initialized at block entry.
+                    self.emit(Step::LoadLocal { slot: block_slot });
+                    self.emit(Step::InitLocal { slot: var_slot });
                 }
             }
         }
@@ -10950,6 +11084,20 @@ fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
             scan.context_param.push(Some(position));
         }
     }
+    // Cut 6 first slice (Annex B): the body's strictness, its top-level
+    // lexical names, and the body-wide hoist decisions — the enclosing-
+    // lexical conflict check must see the whole body, not the incremental
+    // walk (a `let` after a block function suppresses its hoist too).
+    scan.strict = function.strict;
+    scan.top_lexicals = crate::script::top_level_lexically_declared_names(&function.body.stmts)
+        .into_iter()
+        .map(|name| crux::intern_utf8(&name.to_string_lossy()))
+        .collect();
+    if !function.strict {
+        for (_, span, hoistable) in crate::script::annex_b_function_hoists(&function.body.stmts) {
+            scan.hoist_spans.insert((span.start, span.end), hoistable);
+        }
+    }
     if !scan.stmts(&function.body.stmts, 0) {
         return None;
     }
@@ -11039,6 +11187,7 @@ fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
         arguments_slot,
         arguments_formals,
         this_slot,
+        annex_b: scan.annex_b,
     })
 }
 
@@ -11771,6 +11920,26 @@ struct FastScopeScan {
     /// The body references `this`: it gets a `this` slot the certified call
     /// fills with the OrdinaryCallBindThis result.
     observes_this: bool,
+    /// Whether the body is strict (Cut 6 first slice): a strict body's
+    /// block function declarations are block-scoped only — no Annex B var
+    /// hoist.
+    strict: bool,
+    /// The body's top-level lexical declaration names (let/const/class/
+    /// using): an Annex B block function whose name collides stays
+    /// block-scoped (B.3.3.4 step 2).
+    top_lexicals: HashSet<crux::AtomId>,
+    /// The body-wide Annex B hoist decision per declaration span
+    /// (script::annex_b_function_hoists): `false` when the name collides
+    /// with a lexical in any enclosing statement list (order-independent).
+    hoist_spans: HashMap<(u32, u32), bool>,
+    /// The live Annex B block functions allocated so far, in declaration
+    /// order (Carried to the ScopeInfo for the compiler).
+    annex_b: Vec<AnnexBFunction>,
+    /// The names bound in each open block statement (Cut 6 first slice):
+    /// the already-bound check is per block — a `let` or function
+    /// declaration in a sibling block does not suppress this block's
+    /// declaration (B.3.2.1 step 3 checks the block env's own bindings).
+    block_names_stack: Vec<HashSet<crux::AtomId>>,
 }
 
 impl FastScopeScan {
@@ -11780,7 +11949,12 @@ impl FastScopeScan {
 
     fn stmt(&mut self, stmt: &Stmt, depth: usize) -> bool {
         match &stmt.kind {
-            StmtKind::Block(block) => self.stmts(&block.stmts, depth + 1),
+            StmtKind::Block(block) => {
+                self.block_names_stack.push(HashSet::new());
+                let result = self.stmts(&block.stmts, depth + 1);
+                self.block_names_stack.pop();
+                result
+            }
             StmtKind::Empty | StmtKind::Debugger | StmtKind::Break(_) | StmtKind::Continue(_) => {
                 true
             }
@@ -11825,26 +11999,98 @@ impl FastScopeScan {
                 // A top-level function declaration binds a function-scoped
                 // name like a `var` (initialized to the function value at
                 // entry — spec 10.2.11), so it certifies; the declaration
-                // statement itself is empty (15.2.6). Block-level and
-                // statement-position declarations (Annex B, two bindings)
-                // stay on the env path.
-                if depth != 0 || function.statement_position {
+                // statement itself is empty (15.2.6).
+                if depth == 0 {
+                    if function.statement_position {
+                        return false;
+                    }
+                    let Some(name) = function.name else {
+                        return false;
+                    };
+                    if self.captured.contains(&name) && !self.context_slots.contains_key(&name) {
+                        self.context_slots.insert(name, self.context_names.len());
+                        self.context_names.push(name);
+                        self.context_tdz.push(false);
+                        self.context_const.push(false);
+                        self.context_param.push(None);
+                    } else if !self.captured.contains(&name) && !self.slots.contains_key(&name) {
+                        let slot = self.next_slot;
+                        self.tdz.push(false);
+                        self.next_slot += 1;
+                        self.slots.insert(name, slot);
+                    }
+                    return true;
+                }
+                // Cut 6 first slice (Annex B): a block-level function
+                // declaration binds a block-scoped binding (initialized at
+                // block entry) and, when the hoist applies, the
+                // function-scoped var binding. Statement-position
+                // declarations (bare `if (x) function f() {}`) and
+                // declarations whose name a closure captures (the per-block
+                // binding must be reachable through the env chain) stay on
+                // the env path.
+                if function.statement_position {
                     return false;
                 }
                 let Some(name) = function.name else {
                     return false;
                 };
-                if self.captured.contains(&name) && !self.context_slots.contains_key(&name) {
-                    self.context_slots.insert(name, self.context_names.len());
-                    self.context_names.push(name);
-                    self.context_tdz.push(false);
-                    self.context_const.push(false);
-                    self.context_param.push(None);
-                } else if !self.captured.contains(&name) && !self.slots.contains_key(&name) {
-                    let slot = self.next_slot;
-                    self.tdz.push(false);
-                    self.next_slot += 1;
-                    self.slots.insert(name, slot);
+                if self.captured.contains(&name) {
+                    return false;
+                }
+                // Already bound in this block (an earlier function
+                // declaration, or a same-block lexical): the declaration is
+                // dead (14.2.3) — no block binding, no hoist. The check is
+                // per block: a sibling block's binding does not apply.
+                if self
+                    .block_names_stack
+                    .last()
+                    .is_some_and(|names| names.contains(&name))
+                {
+                    return true;
+                }
+                // The hoist (B.3.3.4): a sloppy plain declaration whose
+                // name is not a top-level lexical, a parameter, or any
+                // enclosing statement list's lexical. The var binding
+                // reuses an existing function-scoped slot (`var` or a
+                // top-level function declaration of the same name) or gets
+                // a fresh one.
+                let var_slot = if !self.strict
+                    && !function.is_async
+                    && !function.is_generator
+                    && !self.top_lexicals.contains(&name)
+                    && !self.param_position.contains_key(&name)
+                    && self
+                        .hoist_spans
+                        .get(&(function.span.start, function.span.end))
+                        .copied()
+                        .unwrap_or(false)
+                {
+                    match self.slots.get(&name) {
+                        Some(slot) => Some(*slot),
+                        None => {
+                            let slot = self.next_slot;
+                            self.tdz.push(false);
+                            self.next_slot += 1;
+                            self.slots.insert(name, slot);
+                            Some(slot)
+                        }
+                    }
+                } else {
+                    None
+                };
+                let block_slot = self.next_slot;
+                self.tdz.push(false);
+                self.next_slot += 1;
+                self.annex_b.push(AnnexBFunction {
+                    name,
+                    span: function.span,
+                    function: Box::new(function.clone()),
+                    block_slot,
+                    var_slot,
+                });
+                if let Some(top) = self.block_names_stack.last_mut() {
+                    top.insert(name);
                 }
                 true
             }
@@ -11876,6 +12122,12 @@ impl FastScopeScan {
                 self.declared_depth.insert(name, depth);
                 if *kind == VarDeclKind::Const {
                     self.consts.insert(name);
+                }
+                // Cut 6 first slice: a same-block lexical makes a later
+                // block function declaration dead (the block env already
+                // binds the name).
+                if let Some(top) = self.block_names_stack.last_mut() {
+                    top.insert(name);
                 }
                 // A binding declared inside an open loop body is fresh per
                 // iteration (the body block re-creates each iteration): a
@@ -12144,6 +12396,7 @@ fn analyze_script_scope(stmts: &[Stmt]) -> Option<(Option<ScriptSlots>, HashSet<
                     arguments_slot: None,
                     arguments_formals: None,
                     this_slot: None,
+                    annex_b: Vec::new(),
                 },
                 names,
                 assigned,
