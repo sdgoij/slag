@@ -341,6 +341,45 @@ grow-down value stack with a frame boundary, keeping the certified
 callee's control stacks isolated), or caching the certified record's
 fields on the function object.
 
+### Cut 13 — identity hashing, empty-frame skip, inline env stack (measured 2026-08-22)
+
+Three per-call costs from the `empty()` decomposition (~330ns/call after
+Cut 12):
+
+1. **Identity hasher for `ecma_functions`** — the keys are already-
+   unique u64 function ids, so std's SipHash (default) burned ~20ns per
+   `Call` hashing them; a 15-line `IdentityHasher` (wrap in
+   `BuildHasherDefault`) turns that into an identity fold. The HashMap
+   still probes and compares keys, so collisions are handled exactly as
+   before.
+2. **Skip `setup_frame` for zero-slot frames** — a certified body with
+   no bindings (`frame_size == 0`, e.g. `empty()`) never reads the
+   frame; `Vm::new` already left the inline buffer in place, so the
+   slot-by-slot setup (with its per-slot TDZ checks) is skipped.
+3. **Inline `EnvStack`** — the per-call `Vm` allocated a one-element
+   `Vec` for the scope-environment stack in `Vm::new` (a heap
+   round-trip every call, and again on every `EnterBlock` push). The
+   stack is now an 8-entry inline `[Option<EnvRef>; 8]` with a heap
+   fallback for deep nesting, so the base env and shallow block envs
+   cost no allocation at all. The two disposable-resource drains were
+   rewritten against the new storage (the `CatchBind` drain is
+   destructive, so it truncates after collecting).
+
+Measured (release, `empty()` 2M calls — isolates the call path; the
+machine was load-shifted ~5-8% for the bench runs): 330ns → ~280ns per
+call; the `--bench` function-calls row ~420-440ms under load (was
+~431ms baseline). Zero conformance regressions (language 23,690/0/34;
+built-ins 23,268/0/154 — 390 hangs, the known RegExp property-escape +
+TypedArray copyWithin set; annexB 1,086/0/0).
+
+The remaining ~280ns/call is the `ExecutionContext` push (~4-6 Rc
+clones), the `Vm::new`/drop of the remaining fields, and the certified
+record's field clones. A grow-down value stack with the caller's Vm
+(the frame-stack split) was A/B'd at Cut 12 and regressed; the next
+candidates are caching the certified record's hot fields on the
+function object (a direct-mapped id → (ir, env, realm, strict) cache
+on the Agent) and trimming the context push.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

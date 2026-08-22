@@ -890,6 +890,99 @@ pub enum ForOfEntry {
     Fast { array: Value, index: usize },
 }
 
+/// The scope-environment stack: a small inline buffer for the common
+/// shallow nesting (a body env plus a couple of block/try envs), falling
+/// back to a heap `Vec` for deeply nested scopes. The per-call `Vm`
+/// previously allocated a one-element `Vec` here — a heap round-trip on
+/// every call — so the base env now lands in the inline buffer instead.
+#[derive(Debug)]
+pub(crate) struct EnvStack {
+    inline: [Option<EnvRef>; ENV_INLINE],
+    heap: Vec<EnvRef>,
+    len: usize,
+}
+
+/// The inline capacity of [`EnvStack`] (the Vm is re-created per call, so
+/// this is a direct size/alloc tradeoff; deep scopes spill to the heap).
+const ENV_INLINE: usize = 8;
+
+impl EnvStack {
+    /// A stack holding only the body environment.
+    fn with_base(env: EnvRef) -> Self {
+        let mut inline = std::array::from_fn(|_| None);
+        inline[0] = Some(env);
+        Self {
+            inline,
+            heap: Vec::new(),
+            len: 1,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, env: EnvRef) {
+        if self.len < ENV_INLINE {
+            self.inline[self.len] = Some(env);
+        } else {
+            self.heap.push(env);
+        }
+        self.len += 1;
+    }
+
+    #[inline]
+    fn pop(&mut self) -> Option<EnvRef> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        if self.len < ENV_INLINE {
+            self.inline[self.len].take()
+        } else {
+            self.heap.pop()
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Truncate to `depth` entries from the bottom.
+    fn truncate(&mut self, depth: usize) {
+        if depth >= self.len {
+            return;
+        }
+        if depth >= ENV_INLINE {
+            self.heap.truncate(depth - ENV_INLINE);
+        } else {
+            self.heap.clear();
+            for slot in &mut self.inline[depth..ENV_INLINE] {
+                *slot = None;
+            }
+        }
+        self.len = depth;
+    }
+
+    /// The entry at `index` from the bottom.
+    fn get(&self, index: usize) -> Option<&EnvRef> {
+        if index < ENV_INLINE {
+            self.inline[index].as_ref()
+        } else {
+            self.heap.get(index - ENV_INLINE)
+        }
+    }
+
+    /// Drain every env's disposable resources, innermost first, into
+    /// `resources` (spec 9.4.3: an error escaping the body disposes the
+    /// active scopes' `using` resources in reverse registration order).
+    fn drain_disposables(&self, resources: &mut Vec<crate::env::DisposableResource>) {
+        for index in (0..self.len).rev() {
+            if let Some(env) = self.get(index) {
+                resources.extend(env.drain_disposable_resources().into_iter().rev());
+            }
+        }
+    }
+}
+
 /// The resumable VM state. Saved across suspension by the driver.
 #[derive(Debug)]
 pub struct Vm {
@@ -900,7 +993,7 @@ pub struct Vm {
     pub(crate) frame: Frame,
     pub args: Vec<Value>,
     pub lexical_env: EnvRef,
-    pub env_stack: Vec<EnvRef>,
+    pub(crate) env_stack: EnvStack,
     pub completion: Value,
     pub try_stack: Vec<TryFrame>,
     /// Pending control transfers awaiting their finally (a stack: nested
@@ -1038,7 +1131,7 @@ impl Vm {
             frame: Frame::Inline(std::array::from_fn(|_| Value::Undefined)),
             args: Vec::new(),
             lexical_env: lexical_env.clone(),
-            env_stack: vec![lexical_env],
+            env_stack: EnvStack::with_base(lexical_env),
             completion: Value::Undefined,
             try_stack: Vec::new(),
             pending: Vec::new(),
@@ -1718,12 +1811,8 @@ impl Vm {
                             // active scopes' `using` resources (innermost first),
                             // folding a throwing disposal into the error (the
                             // tree-walker's statement lists do the same).
-                            let resources: Vec<crate::env::DisposableResource> = self
-                                .env_stack
-                                .iter()
-                                .rev()
-                                .flat_map(|env| env.drain_disposable_resources().into_iter().rev())
-                                .collect();
+                            let mut resources = Vec::new();
+                            self.env_stack.drain_disposables(&mut resources);
                             if !resources.is_empty() {
                                 let thrown = crate::promise::error_value(agent, &error);
                                 if let Some(outcome) = self.start_scope_disposal(
@@ -3081,12 +3170,14 @@ impl Vm {
                     // value (spec 9.4.3 on the try block's abrupt
                     // completion), so the catch observes the folded error.
                     if let Some((saved_env, depth)) = self.pending_catch_disposal.take() {
-                        let resources: Vec<crate::env::DisposableResource> = self
-                            .env_stack
-                            .drain(depth..)
-                            .rev()
-                            .flat_map(|env| env.drain_disposable_resources().into_iter().rev())
-                            .collect();
+                        let mut resources = Vec::new();
+                        for index in (depth..self.env_stack.len()).rev() {
+                            if let Some(env) = self.env_stack.get(index) {
+                                resources
+                                    .extend(env.drain_disposable_resources().into_iter().rev());
+                            }
+                        }
+                        self.env_stack.truncate(depth);
                         if !resources.is_empty() {
                             let thrown = self.thrown.take().unwrap_or(Value::Undefined);
                             let completion = Completion::Throw(thrown);

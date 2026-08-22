@@ -33,6 +33,36 @@ pub type SetEntry = Option<Value>;
 /// The surrounding agent: the execution context stack, the job queues, and
 /// the Agent Record fields of spec 9.7.
 #[derive(Debug)]
+/// A no-op hasher for the identity-keyed tables: the keys are already-
+/// unique u64 ids (function/object identity), so hashing them with SipHash
+/// — std's default — costs ~20ns per `Call` for zero distribution benefit.
+/// The HashMap still probes and compares keys, so collisions are handled
+/// exactly as before.
+#[derive(Default)]
+pub struct IdentityHasher(u64);
+
+impl std::hash::Hasher for IdentityHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        let mut buf = [0u8; 8];
+        for (dst, src) in buf.iter_mut().zip(bytes) {
+            *dst = *src;
+        }
+        self.0 = u64::from_ne_bytes(buf);
+    }
+    fn write_u64(&mut self, i: u64) {
+        self.0 = i;
+    }
+    fn write_u32(&mut self, i: u32) {
+        self.0 = i as u64;
+    }
+    fn write_usize(&mut self, i: usize) {
+        self.0 = i as u64;
+    }
+}
+
 pub struct Agent {
     pub execution_context_stack: Vec<ExecutionContext>,
     /// The IC caches shared by every Vm run in this agent (the global-var
@@ -74,7 +104,11 @@ pub struct Agent {
     /// The ECMAScript-function bodies keyed by function identity (the spec
     /// 10.2.1 slots [[Environment]], [[FormalParameters]], [[ECMAScriptCode]],
     /// [[ThisMode]], [[HomeObject]] live here, Phase 7).
-    pub ecma_functions: std::collections::HashMap<u64, crate::function::EcmaFunction>,
+    pub ecma_functions: std::collections::HashMap<
+        u64,
+        crate::function::EcmaFunction,
+        std::hash::BuildHasherDefault<IdentityHasher>,
+    >,
     /// The Promise Records keyed by promise-object identity (spec 27.2.1).
     pub promises: std::collections::HashMap<u64, RefCell<crate::promise::PromiseData>>,
     /// The resolving functions created by CreateResolvingFunctions, keyed by
@@ -414,7 +448,7 @@ impl Agent {
             global_symbol_registry: RefCell::new(Vec::new()),
             module_async_evaluation_count: 0,
             module_eval_stack: Vec::new(),
-            ecma_functions: std::collections::HashMap::new(),
+            ecma_functions: std::collections::HashMap::default(),
             promises: std::collections::HashMap::new(),
             promise_resolvers: std::collections::HashMap::new(),
             promise_compound: std::collections::HashMap::new(),

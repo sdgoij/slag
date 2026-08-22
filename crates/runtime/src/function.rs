@@ -1724,7 +1724,12 @@ fn run_compiled_body(
 ) -> Result<Value, JsError> {
     let body_env = agent.running_context()?.lexical_environment.clone();
     let mut vm = Vm::new(body_env.clone(), strict);
-    if let Some(scope) = &ir.scope {
+    // A certified body with no bindings (frame_size 0) never reads the
+    // frame — `Vm::new` already left the inline buffer in place — so the
+    // slot-by-slot setup is skipped entirely.
+    if let Some(scope) = &ir.scope
+        && scope.frame_size > 0
+    {
         vm.setup_frame(scope, args);
     }
     let outcome = vm.start(agent, ir);
