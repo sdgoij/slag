@@ -70,11 +70,17 @@ conflict, checked body-wide and per block), the function-scoped var
 binding — reset to *undefined* at block entry (B.3.2.1) and copied from
 the block binding's current value by the declaration statement (B.3.3.3).
 References resolve by block nesting (the compile-time Annex B stack).
-Statement-position declarations (bare `if (x) function f() {}`) and
-captured block-function names stay on the env path. Deferred from the
-continuation: statement-position function declarations, the body
-accumulator model, slot-arg calls, and the Cut 5 encoding work remain
-open.
+Statement-position declarations (`if (x) function f() {}`) certify too
+(Cut 6 continuation): the hoisted var binding is the only observable
+binding — the env path's transient block env is unobservable — so the
+statement instantiates the closure into its slot (or the capture
+context when a closure captures the name); a dead declaration (a
+parameter/lexical conflict) compiles to nothing. A reference to a
+lexical `for`-head binding outside its open loop bails the body (the
+flat slot would leak the loop's value — the env path makes it
+unresolvable). Captured block-function names stay on the env path.
+Deferred from the continuation: the body accumulator model, slot-arg
+calls, and the Cut 5 encoding work remain open.
 
 ---
 
@@ -290,12 +296,13 @@ function calls ≤1.15s, property access ≤0.64s.
 2. **Annex B block function declarations**: a function declared in a block
    in sloppy mode binds both a block-scoped `let`-like binding and the
    enclosing `var` (with the Annex B hoist). The slot model must allocate
-   both. **First slice landed (Cut 6)**: a certified body's block-level
-   declarations get a block slot (initialized at block entry) and — when
-   the hoist applies — a function-scoped var slot (reset at block entry,
-   copied by the declaration statement); references resolve by block
-   nesting. Statement-position declarations and captured names remain on
-   the env path.
+   both. **Landed (Cut 6)**: a certified body's block-level declarations
+   get a block slot (initialized at block entry) and — when the hoist
+   applies — a function-scoped var slot (reset at block entry, copied by
+   the declaration statement); references resolve by block nesting.
+   Statement-position declarations (`if (x) function f() {}`) certify too
+   (the hoisted var slot is the only observable binding); captured
+   block-function names remain on the env path.
 3. **TDZ**: the marker must round-trip through the value stack (a TDZ read
    in an expression, a TDZ value passed around without being read). The
    marker is a distinct `Value` bit pattern — it must never escape into
@@ -461,11 +468,13 @@ implementation* for the VM itself.
   declared inside a loop body bails — its per-iteration block scope is
   not flattenable), top-level function declarations now certify
   (hoisted `FunctionDeclInit` at body entry, the declaration statement
-  empty), and Annex B **block-level** declarations certify too (block
-  binding in a frame slot initialized at block entry + the hoisted var
-  binding, reset at block entry and copied by the declaration
-  statement — Cut 6 first slice); statement-position declarations
-  (bare `if (x) function f() {}`) still bail.
+  empty), and Annex B is complete: block-level declarations certify
+  (block binding in a frame slot initialized at block entry + the
+  hoisted var binding, reset at block entry and copied by the
+  declaration statement) and statement-position declarations certify
+  (the hoisted var slot is the only observable binding). A reference to
+  a lexical `for`-head binding outside its loop bails (the flat slot
+  would leak it).
 
 ### Correctness notes (why the slice is right)
 

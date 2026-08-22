@@ -879,6 +879,15 @@ pub struct ScopeInfo {
     /// conflict — B.3.3.4): it is block-scoped only. `span` pairs each
     /// entry with its `FunctionDecl` statement during compilation.
     pub annex_b: Vec<AnnexBFunction>,
+    /// Cut 6 continuation (Annex B): the body's statement-position function
+    /// declarations (`if (x) function f() {}`), which the hoist applies to.
+    /// The statement instantiates the closure into the hoisted var
+    /// binding's slot — the env path's transient block environment is
+    /// unobservable, so no block binding exists. A dead declaration (a
+    /// parameter or lexical conflict, or an async/generator form) is not
+    /// listed: it compiles to nothing. `span` pairs each entry with its
+    /// `FunctionDecl` statement.
+    pub statement_fns: Vec<AnnexBStatementFn>,
 }
 
 /// An Annex B block-level function declaration in a certified body (Cut 6
@@ -890,6 +899,16 @@ pub struct AnnexBFunction {
     pub function: Box<syntax::ast::Function>,
     pub block_slot: usize,
     pub var_slot: Option<usize>,
+}
+
+/// An Annex B statement-position function declaration in a certified body
+/// (Cut 6 continuation): see [`ScopeInfo::statement_fns`].
+#[derive(Debug, Clone)]
+pub struct AnnexBStatementFn {
+    pub name: crux::AtomId,
+    pub span: crux::Span,
+    pub frame_slot: Option<usize>,
+    pub context_slot: Option<usize>,
 }
 
 impl ScopeInfo {
@@ -6965,6 +6984,17 @@ impl Compiler {
         Some((entry.block_slot, entry.var_slot?))
     }
 
+    /// The hoisted Annex B statement-position declaration matching the
+    /// given statement (Cut 6 continuation), when the body certified one
+    /// for it.
+    fn statement_fn(&self, function: &syntax::ast::Function) -> Option<&AnnexBStatementFn> {
+        let scope = self.scope.as_ref()?;
+        scope
+            .statement_fns
+            .iter()
+            .find(|entry| entry.span == function.span)
+    }
+
     /// The enclosing certified bodies' capture-context layouts (Cut 3
     /// continuation, nested context chains): entry `k` holds the captured
     /// names of the certified body `k` scopes out (0 = the immediately
@@ -8154,6 +8184,22 @@ impl Compiler {
                     self.emit(Step::FunctionDecl {
                         stmt: Box::new(stmt.clone()),
                     });
+                } else if function.statement_position {
+                    // Cut 6 continuation (Annex B): a statement-position
+                    // declaration instantiates the closure into the hoisted
+                    // var binding's slot — the transient block env of the
+                    // env path is unobservable. A dead declaration (no
+                    // entry) is empty.
+                    if let Some(entry) = self.statement_fn(function) {
+                        let outer_chain = self.closure_outer_chain();
+                        self.emit(Step::FunctionDeclInit {
+                            name: entry.name,
+                            function: Box::new(function.clone()),
+                            frame_slot: entry.frame_slot,
+                            context_slot: entry.context_slot,
+                            outer_chain,
+                        });
+                    }
                 } else if let Some((block_slot, var_slot)) = self.annex_b_copy_target(function) {
                     // Cut 6 first slice: an Annex B block function — the
                     // declaration statement copies the block binding (its
@@ -11188,6 +11234,7 @@ fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
         arguments_formals,
         this_slot,
         annex_b: scan.annex_b,
+        statement_fns: scan.statement_fns,
     })
 }
 
@@ -11935,11 +11982,22 @@ struct FastScopeScan {
     /// The live Annex B block functions allocated so far, in declaration
     /// order (Carried to the ScopeInfo for the compiler).
     annex_b: Vec<AnnexBFunction>,
+    /// The hoisted Annex B statement-position function declarations (Cut 6
+    /// continuation): (span → entry) for the statement's compile.
+    statement_fns: Vec<AnnexBStatementFn>,
     /// The names bound in each open block statement (Cut 6 first slice):
     /// the already-bound check is per block — a `let` or function
     /// declaration in a sibling block does not suppress this block's
     /// declaration (B.3.2.1 step 3 checks the block env's own bindings).
     block_names_stack: Vec<HashSet<crux::AtomId>>,
+    /// The for-head lexical names, keyed by the for statement's depth: a
+    /// reference outside the open loop (after the statement, or in a
+    /// sibling scope) would leak the flat slot, so the scan rejects it.
+    for_head_lexicals: HashMap<crux::AtomId, usize>,
+    /// The for-head lexicals of the loops currently being scanned (the
+    /// head exprs and body are inside the loop's scope; the same depth
+    /// after the loop is not).
+    open_for_heads: Vec<HashSet<crux::AtomId>>,
 }
 
 impl FastScopeScan {
@@ -11979,6 +12037,22 @@ impl FastScopeScan {
                 update,
                 body,
             } => {
+                // A lexical for-head binding is scoped to the for statement
+                // itself (its head exprs and body): a reference at the same
+                // depth after the loop would leak the flat slot, so the
+                // scan rejects it (the body bails to the env path).
+                let mut head_names = HashSet::new();
+                if let Some(ForInit::VarDecl { kind, decls, .. }) = init
+                    && *kind != VarDeclKind::Var
+                {
+                    for decl in decls {
+                        if let BindingPattern::Ident(name) = decl.pattern {
+                            head_names.insert(name);
+                            self.for_head_lexicals.insert(name, depth);
+                        }
+                    }
+                }
+                self.open_for_heads.push(head_names);
                 let init_ok = match init {
                     None => true,
                     Some(ForInit::Expr(expr)) => self.expr(expr, depth),
@@ -11990,6 +12064,7 @@ impl FastScopeScan {
                     && update.as_ref().is_none_or(|u| self.expr(u, depth))
                     && self.stmt(body, depth + 1);
                 self.open_loop_body_depths.pop();
+                self.open_for_heads.pop();
                 result
             }
             StmtKind::Return(expr) => expr.as_ref().is_none_or(|e| self.expr(e, depth)),
@@ -12021,6 +12096,63 @@ impl FastScopeScan {
                     }
                     return true;
                 }
+                // Cut 6 continuation (Annex B): a statement-position
+                // function declaration (`if (x) function f() {}`) — the
+                // hoisted var binding is the only observable binding (the
+                // env path's transient block env is unobservable), so the
+                // statement instantiates the closure into its slot. The
+                // hoist conditions match the block-level form; a dead
+                // declaration (parameter/lexical conflict, async/generator)
+                // compiles to nothing.
+                if function.statement_position {
+                    let Some(name) = function.name else {
+                        return false;
+                    };
+                    let hoisted = !self.strict
+                        && !function.is_async
+                        && !function.is_generator
+                        && !self.top_lexicals.contains(&name)
+                        && !self.param_position.contains_key(&name)
+                        && self
+                            .hoist_spans
+                            .get(&(function.span.start, function.span.end))
+                            .copied()
+                            .unwrap_or(false);
+                    if hoisted {
+                        // A captured name's var binding lives in the capture
+                        // context (like any captured var); otherwise the
+                        // function-scoped frame slot (reused when a `var` or
+                        // top-level declaration already claims it).
+                        let (frame_slot, context_slot) = if self.captured.contains(&name)
+                            && !self.context_slots.contains_key(&name)
+                        {
+                            let index = self.context_names.len();
+                            self.context_slots.insert(name, index);
+                            self.context_names.push(name);
+                            self.context_tdz.push(false);
+                            self.context_const.push(false);
+                            self.context_param.push(None);
+                            (None, Some(index))
+                        } else if self.captured.contains(&name) {
+                            (None, self.context_slots.get(&name).copied())
+                        } else if !self.slots.contains_key(&name) {
+                            let slot = self.next_slot;
+                            self.tdz.push(false);
+                            self.next_slot += 1;
+                            self.slots.insert(name, slot);
+                            (Some(slot), None)
+                        } else {
+                            (self.slots.get(&name).copied(), None)
+                        };
+                        self.statement_fns.push(AnnexBStatementFn {
+                            name,
+                            span: function.span,
+                            frame_slot,
+                            context_slot,
+                        });
+                    }
+                    return true;
+                }
                 // Cut 6 first slice (Annex B): a block-level function
                 // declaration binds a block-scoped binding (initialized at
                 // block entry) and, when the hoist applies, the
@@ -12029,9 +12161,6 @@ impl FastScopeScan {
                 // declarations whose name a closure captures (the per-block
                 // binding must be reachable through the env chain) stay on
                 // the env path.
-                if function.statement_position {
-                    return false;
-                }
                 let Some(name) = function.name else {
                     return false;
                 };
@@ -12202,6 +12331,15 @@ impl FastScopeScan {
                     }
                     self.observes_arguments = true;
                     return true;
+                }
+                // A for-head lexical is scoped to its loop: a reference
+                // outside the open loop (after the statement, or in a
+                // sibling scope) would leak the flat slot — bail to the env
+                // path.
+                if self.for_head_lexicals.contains_key(name)
+                    && !self.open_for_heads.iter().any(|set| set.contains(name))
+                {
+                    return false;
                 }
                 self.declared_depth
                     .get(name)
@@ -12397,6 +12535,7 @@ fn analyze_script_scope(stmts: &[Stmt]) -> Option<(Option<ScriptSlots>, HashSet<
                     arguments_formals: None,
                     this_slot: None,
                     annex_b: Vec::new(),
+                    statement_fns: Vec::new(),
                 },
                 names,
                 assigned,

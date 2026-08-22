@@ -3556,11 +3556,91 @@ mod tests {
                 .unwrap(),
             Value::Number(3.0)
         );
-        // A statement-position declaration stays on the env path.
+        // A statement-position declaration now certifies too (see
+        // fast_path_annex_b_statement_functions).
         assert_eq!(
             run("function f() { if (true) function g() {} return typeof g; } f()").unwrap(),
             Value::String(Handle::new(JsString::from_utf8("function")))
         );
+    }
+
+    #[test]
+    fn fast_path_annex_b_statement_functions() {
+        // Cut 6 continuation (Annex B): a statement-position function
+        // declaration (`if (x) function f() {}`) certifies — the hoisted
+        // var binding is the only observable binding (the env path's
+        // transient block env is unobservable), so the statement
+        // instantiates the closure into its slot. A dead declaration (a
+        // parameter conflict, or a branch that never runs) leaves the var
+        // binding untouched.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script("function f() { if (true) function g() { return 1; } return g(); }")
+            .unwrap();
+        let ir = compiled_body_of(&mut agent, "f");
+        assert!(ir.scope.is_some(), "the body must certify");
+        let scope = ir.scope.as_ref().unwrap();
+        assert_eq!(
+            scope.statement_fns.len(),
+            1,
+            "the statement-position declaration gets an entry"
+        );
+        assert!(
+            ir.steps.iter().any(|s| matches!(
+                s,
+                crate::ir::Step::FunctionDeclInit {
+                    frame_slot: Some(_),
+                    ..
+                }
+            )),
+            "the statement instantiates the closure into the var slot"
+        );
+        assert!(
+            !ir.steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::FunctionDecl { .. })),
+            "the env path is not used"
+        );
+        // The var binding holds the function after the branch runs.
+        assert_eq!(
+            run("function f() { if (true) function g() { return 42; } return g(); } f()").unwrap(),
+            Value::Number(42.0)
+        );
+        // A branch that never runs leaves the var binding undefined.
+        assert_eq!(
+            run("function f() { if (false) function g() { return 1; } return typeof g; } f()")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("undefined")))
+        );
+        // A parameter name is never overwritten (B.3.2).
+        assert_eq!(
+            run("function f(g) { if (true) function g() { return 3; } return g; } f(1)").unwrap(),
+            Value::Number(1.0)
+        );
+        // A closure capturing the hoisted var binding reads it from the
+        // capture context.
+        assert_eq!(
+            run("function f() { var a = []; if (true) function g() { return 5; } a.push(() => g); return a[0]()(); } f()")
+                .unwrap(),
+            Value::Number(5.0)
+        );
+    }
+
+    #[test]
+    fn fast_path_for_head_lexical_scopes_to_the_loop() {
+        // A lexical `for`-head binding is scoped to the for statement: a
+        // reference after the loop would leak the flat slot (the loop left
+        // the head's value in it), so the scan bails the body to the env
+        // path where the binding is unresolvable.
+        assert_eq!(
+            run("function f() { for (let i = 0; i < 1; i++) {} return typeof i; } f()").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("undefined")))
+        );
+        assert!(matches!(
+            run("function f() { for (let i = 0; i < 1; i++) {} return i; } f()"),
+            Err(error) if error.kind == crux::ErrorKind::ReferenceError
+        ));
     }
 
     #[test]
