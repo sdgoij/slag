@@ -72,7 +72,7 @@ pub struct Agent {
     /// (against the current realm's global object and each object's property
     /// vector), so sharing them across Vms — and across realms — is exact
     /// and warms a nested call to its caller's shapes.
-    pub(crate) global_cells: std::collections::HashMap<crux::AtomId, usize>,
+    pub(crate) global_cells: [Option<(crux::AtomId, usize)>; crate::ir::GLOBAL_CELLS],
     pub(crate) member_cells: [Option<(u64, crux::AtomId, usize)>; crate::ir::MEMBER_CELLS],
     pub(crate) array_element_cells:
         [Option<(u64, u64, crux::AtomId, usize)>; crate::ir::MEMBER_CELLS],
@@ -429,7 +429,7 @@ impl Agent {
         crate::function::ensure_ecma_hook();
         Self {
             execution_context_stack: Vec::new(),
-            global_cells: std::collections::HashMap::new(),
+            global_cells: [None; crate::ir::GLOBAL_CELLS],
             member_cells: [None; crate::ir::MEMBER_CELLS],
             array_element_cells: [None; crate::ir::MEMBER_CELLS],
             promise_jobs: VecDeque::new(),

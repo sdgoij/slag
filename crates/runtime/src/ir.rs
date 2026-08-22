@@ -850,6 +850,11 @@ const INLINE_FRAME: usize = 8;
 /// The direct-mapped member-access cell count (P3): a power of two so the
 /// cache index is a mask.
 pub(crate) const MEMBER_CELLS: usize = 16;
+/// The direct-mapped global-var cell count: a power of two so the cache
+/// index is a mask. Bigger than the member cells because a script's
+/// top-level names (`n`, `i`, `s`, ...) all probe this table; a collision
+/// evicts and the reference path re-resolves.
+pub(crate) const GLOBAL_CELLS: usize = 32;
 
 /// The fast-path frame storage: an inline buffer for small layouts, a `Vec`
 /// otherwise.
@@ -994,6 +999,11 @@ pub struct Vm {
     pub args: Vec<Value>,
     pub lexical_env: EnvRef,
     pub(crate) env_stack: EnvStack,
+    /// The running context's realm global object, resolved on first access
+    /// and reused for the whole body run (a body's realm cannot change while
+    /// its own steps run — nested calls push their own contexts). Avoids the
+    /// per-access context-stack walk and handle clone.
+    pub(crate) global: Option<Handle<crux::object::JsObject>>,
     pub completion: Value,
     pub try_stack: Vec<TryFrame>,
     /// Pending control transfers awaiting their finally (a stack: nested
@@ -1132,6 +1142,7 @@ impl Vm {
             args: Vec::new(),
             lexical_env: lexical_env.clone(),
             env_stack: EnvStack::with_base(lexical_env),
+            global: None,
             completion: Value::Undefined,
             try_stack: Vec::new(),
             pending: Vec::new(),
@@ -1228,6 +1239,21 @@ impl Vm {
                 "Cannot access a binding before initialization".into(),
             ));
         }
+        if let Some(num) = left.as_number() {
+            // JS relational semantics for two numbers: NaN comparisons are
+            // false, matching Rust's f64 comparisons.
+            let pass = match op {
+                BinaryOp::LessThan => num < imm,
+                BinaryOp::LessEqual => num <= imm,
+                BinaryOp::GreaterThan => num > imm,
+                BinaryOp::GreaterEqual => num >= imm,
+                _ => unreachable!("JumpIfRelImm with a non-relational op"),
+            };
+            if !pass {
+                self.ip = target;
+            }
+            return Ok(());
+        }
         let right = Value::Number(imm);
         let value = crate::expr::apply_binary(agent, op, &left, &right)?;
         if !crux::convert::to_boolean(&value) {
@@ -1236,16 +1262,31 @@ impl Vm {
         Ok(())
     }
 
+    /// The running context's realm global object, cached on first access
+    /// (see the `Vm::global` field): the top-level fast path's reference
+    /// target and the global-cell validation base.
+    fn global_object(
+        &mut self,
+        agent: &mut Agent,
+    ) -> Result<Handle<crux::object::JsObject>, JsError> {
+        if let Some(global) = &self.global {
+            return Ok(global.clone());
+        }
+        let global = agent.running_context()?.realm.global_object.clone();
+        self.global = Some(global.clone());
+        Ok(global)
+    }
+
     /// The top-level fast path's reference for a declared global var: a
     /// value reference against the realm's global object (the global
     /// environment's binding object), so `get_value`/`put_value` run the
     /// exact property machinery the env path uses after its resolve walk.
     fn global_reference(
-        &self,
-        agent: &Agent,
+        &mut self,
+        agent: &mut Agent,
         name: crux::AtomId,
     ) -> Result<crate::context::Reference, JsError> {
-        let global = agent.running_context()?.realm.global_object.clone();
+        let global = self.global_object(agent)?;
         let global_value = Value::Object(global);
         Ok(crate::context::Reference {
             base: crate::context::ReferenceBase::Value(global_value.clone()),
@@ -1256,19 +1297,9 @@ impl Vm {
         })
     }
 
-    /// The cached property-vector slot of the global object's own data
-    /// property for a declared top-level name — valid only while the stored
-    /// key still matches and the property is still data (an
-    /// insert/delete/redefinition or an accessor conversion falls back to the
-    /// reference path and re-resolves).
-    fn global_cell_slot(agent: &Agent, name: crux::AtomId) -> Option<usize> {
-        let slot = *agent.global_cells.get(&name)?;
-        let global = agent.running_context().ok()?.realm.global_object.clone();
-        let props = global.properties.borrow();
-        let (key, property) = props.get(slot)?;
-        (*key == PropertyKey::String(name)
-            && matches!(property.kind, crux::object::PropertyKind::Data { .. }))
-        .then_some(slot)
+    /// The direct-mapped cache index for a global-var name atom.
+    fn global_cell_index(name: crux::AtomId) -> usize {
+        name as usize & (GLOBAL_CELLS - 1)
     }
 
     /// Resolve and cache the global-object slot for a declared top-level
@@ -1286,22 +1317,25 @@ impl Vm {
         if let Some(slot) = props.iter().position(|(stored, property)| {
             *stored == key && matches!(property.kind, crux::object::PropertyKind::Data { .. })
         }) {
-            agent.global_cells.insert(name, slot);
+            agent.global_cells[Self::global_cell_index(name)] = Some((name, slot));
         }
     }
 
     /// Read a declared top-level `var` directly off the global object: the
-    /// cached slot when still valid, else the reference path (which
-    /// re-resolves the cache).
+    /// cached slot when still valid (a direct-mapped probe + key match),
+    /// else the reference path (which re-resolves the cache).
     fn load_global_value(
         &mut self,
         agent: &mut Agent,
         name: crux::AtomId,
     ) -> Result<Value, JsError> {
-        if let Some(slot) = Self::global_cell_slot(agent, name) {
-            let global = agent.running_context()?.realm.global_object.clone();
+        if let Some((cached_name, slot)) = agent.global_cells[Self::global_cell_index(name)]
+            && cached_name == name
+        {
+            let global = self.global_object(agent)?;
             let props = global.properties.borrow();
-            if let Some((_, property)) = props.get(slot)
+            if let Some((key, property)) = props.get(slot)
+                && *key == PropertyKey::String(name)
                 && let crux::object::PropertyKind::Data { value, .. } = &property.kind
             {
                 return Ok(value.clone());
@@ -1323,10 +1357,13 @@ impl Vm {
         name: crux::AtomId,
         value: Value,
     ) -> Result<(), JsError> {
-        if let Some(slot) = Self::global_cell_slot(agent, name) {
-            let global = agent.running_context()?.realm.global_object.clone();
+        if let Some((cached_name, slot)) = agent.global_cells[Self::global_cell_index(name)]
+            && cached_name == name
+        {
+            let global = self.global_object(agent)?;
             let mut props = global.properties.borrow_mut();
-            if let Some((_, property)) = props.get_mut(slot)
+            if let Some((key, property)) = props.get_mut(slot)
+                && *key == PropertyKey::String(name)
                 && let crux::object::PropertyKind::Data {
                     writable: true,
                     value: cell,
@@ -1340,6 +1377,77 @@ impl Vm {
         crate::context::put_value(agent, &reference, value)?;
         Self::resolve_global_cell(agent, name);
         Ok(())
+    }
+
+    /// The `++`/`--` fast path on a declared top-level `var`: read, update,
+    /// and write through one direct-mapped probe and one property-vector
+    /// borrow — the composed load/store takes two of each. Returns the
+    /// prefix result (the new value) or the postfix result (the ToNumeric
+    /// old value). Falls back to the composed path on a stale cell or a
+    /// non-writable property (whose strict-mode error the reference path
+    /// enforces).
+    fn update_global(
+        &mut self,
+        agent: &mut Agent,
+        name: crux::AtomId,
+        op: UpdateOp,
+        prefix: bool,
+    ) -> Result<Value, JsError> {
+        if let Some((cached_name, slot)) = agent.global_cells[Self::global_cell_index(name)]
+            && cached_name == name
+        {
+            let global = self.global_object(agent)?;
+            let mut props = global.properties.borrow_mut();
+            if let Some((key, property)) = props.get_mut(slot)
+                && *key == PropertyKey::String(name)
+                && let crux::object::PropertyKind::Data {
+                    writable: true,
+                    value: cell,
+                } = &mut property.kind
+            {
+                let old = cell.clone();
+                // A Number counter avoids the `to_numeric` call entirely
+                // (its result for a Number is the value itself, so the
+                // postfix result is `old` unchanged).
+                let (new, result) = if let Some(num) = old.as_number() {
+                    let delta = if matches!(op, UpdateOp::Increment) {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    (Value::Number(num + delta), old)
+                } else {
+                    let old_numeric = crux::convert::to_numeric(&old)?;
+                    let new = match old_numeric.kind() {
+                        ValueKind::Number(n) => {
+                            let delta = if matches!(op, UpdateOp::Increment) {
+                                1.0
+                            } else {
+                                -1.0
+                            };
+                            Value::Number(n + delta)
+                        }
+                        ValueKind::BigInt(b) => {
+                            let one = crux::BigInt::from(1i64);
+                            let delta = if matches!(op, UpdateOp::Increment) {
+                                one
+                            } else {
+                                crux::bigint::unary_minus(&one)
+                            };
+                            Value::BigInt(Handle::new(crux::bigint::add(&b, &delta)))
+                        }
+                        _ => unreachable!(),
+                    };
+                    (new, old_numeric)
+                };
+                *cell = new.clone();
+                return Ok(if prefix { new } else { result });
+            }
+        }
+        let old = self.load_global_value(agent, name)?;
+        let (old_numeric, new) = update_value(agent, &op, &old)?;
+        self.store_global_value(agent, name, new.clone())?;
+        Ok(if prefix { new } else { old_numeric })
     }
 
     /// The direct-mapped cache index for (object id, name atom).
@@ -1492,7 +1600,9 @@ impl Vm {
     /// The fused relational-imm loop test on a declared top-level var: read
     /// the global binding, abstract-compare against the constant, jump to
     /// `target` when the test is false — exactly what
-    /// `LoadGlobal; BinaryImm; JumpIfFalse` computes.
+    /// `LoadGlobal; BinaryImm; JumpIfFalse` computes. The common shape (a
+    /// Number counter vs a numeric limit) compares directly off the cell
+    /// with no `apply_binary` round-trip.
     fn jump_if_rel_global(
         &mut self,
         agent: &mut Agent,
@@ -1501,6 +1611,31 @@ impl Vm {
         imm: f64,
         target: usize,
     ) -> Result<(), JsError> {
+        if let Some((cached_name, slot)) = agent.global_cells[Self::global_cell_index(name)]
+            && cached_name == name
+        {
+            let global = self.global_object(agent)?;
+            let props = global.properties.borrow();
+            if let Some((key, property)) = props.get(slot)
+                && *key == PropertyKey::String(name)
+                && let crux::object::PropertyKind::Data { value, .. } = &property.kind
+                && let Some(num) = value.as_number()
+            {
+                // JS relational semantics for two numbers: NaN comparisons
+                // are false, matching Rust's f64 comparisons.
+                let pass = match op {
+                    BinaryOp::LessThan => num < imm,
+                    BinaryOp::LessEqual => num <= imm,
+                    BinaryOp::GreaterThan => num > imm,
+                    BinaryOp::GreaterEqual => num >= imm,
+                    _ => unreachable!("JumpIfRelGlobalImm with a non-relational op"),
+                };
+                if !pass {
+                    self.ip = target;
+                }
+                return Ok(());
+            }
+        }
         let left = self.load_global_value(agent, name)?;
         let right = Value::Number(imm);
         let value = crate::expr::apply_binary(agent, op, &left, &right)?;
@@ -1840,21 +1975,19 @@ impl Vm {
     ) -> Result<VmOutcome, JsError> {
         loop {
             let steps = &body.steps;
-            if self.ip >= steps.len() {
-                // Fell off the end: the body completes with the statement-list
-                // completion — empty when the last statement produced no value.
-                return Ok(VmOutcome::Completed(if self.completion_is_empty {
-                    Completion::Empty
-                } else {
-                    Completion::Normal(self.completion.clone())
-                }));
-            }
-            let step = steps.get(self.ip).ok_or_else(|| {
-                JsError::new(
-                    ErrorKind::SyntaxError,
-                    "Instruction pointer out of bounds".into(),
-                )
-            })?;
+            let step = match steps.get(self.ip) {
+                Some(step) => step,
+                None => {
+                    // Fell off the end: the body completes with the
+                    // statement-list completion — empty when the last
+                    // statement produced no value.
+                    return Ok(VmOutcome::Completed(if self.completion_is_empty {
+                        Completion::Empty
+                    } else {
+                        Completion::Normal(self.completion.clone())
+                    }));
+                }
+            };
             self.ip += 1;
             // Steps that read the running context (resolve_binding, member
             // helpers, closure creation) see the VM's lexical environment
@@ -1941,20 +2074,14 @@ impl Vm {
                     *self.frame.get_mut(*slot) = update_value(agent, &UpdateOp::Decrement, &old)?.1;
                 }
                 Step::UpdateGlobal { name, op, prefix } => {
-                    let old = self.load_global_value(agent, *name)?;
-                    let (old_numeric, new) = update_value(agent, op, &old)?;
-                    self.store_global_value(agent, *name, new.clone())?;
-                    self.stack.push(if *prefix { new } else { old_numeric });
+                    let value = self.update_global(agent, *name, *op, *prefix)?;
+                    self.stack.push(value);
                 }
                 Step::IncGlobal { name } => {
-                    let old = self.load_global_value(agent, *name)?;
-                    let new = update_value(agent, &UpdateOp::Increment, &old)?.1;
-                    self.store_global_value(agent, *name, new)?;
+                    self.update_global(agent, *name, UpdateOp::Increment, true)?;
                 }
                 Step::DecGlobal { name } => {
-                    let old = self.load_global_value(agent, *name)?;
-                    let new = update_value(agent, &UpdateOp::Decrement, &old)?.1;
-                    self.store_global_value(agent, *name, new)?;
+                    self.update_global(agent, *name, UpdateOp::Decrement, true)?;
                 }
                 Step::CreateFunction { function, strict } => {
                     let env = agent.running_context()?.lexical_environment.clone();
@@ -2033,8 +2160,22 @@ impl Vm {
                 }
                 Step::BinaryImm { op, imm } => {
                     let left = self.pop();
-                    let right = Value::Number(*imm);
-                    let value = crate::expr::apply_binary(agent, *op, &left, &right)?;
+                    // The number-number arithmetic shape inlines `apply_binary`
+                    // (two tag checks + a direct op) — the general evaluator
+                    // adds a call and the RHS tag check for no semantic gain.
+                    let value = if let Some(num) = left.as_number() {
+                        match op {
+                            BinaryOp::Sub => Value::Number(num - *imm),
+                            BinaryOp::Mul => Value::Number(num * *imm),
+                            BinaryOp::Div => Value::Number(num / *imm),
+                            BinaryOp::Rem => Value::Number(num % *imm),
+                            _ => {
+                                crate::expr::apply_binary(agent, *op, &left, &Value::Number(*imm))?
+                            }
+                        }
+                    } else {
+                        crate::expr::apply_binary(agent, *op, &left, &Value::Number(*imm))?
+                    };
                     self.stack.push(value);
                 }
                 Step::GetMemberName { name } => {
@@ -5973,6 +6114,10 @@ struct Compiler {
     /// global object (`LoadGlobal`/`StoreGlobal`), skipping the env-chain
     /// walk. `None` (and `ScopeInfo` above) means the environment path.
     script_globals: Option<HashSet<String>>,
+    /// Whether any emitted step switches the lexical environment (block/
+    /// loop/catch/with envs): when false the body's env is constant for its
+    /// whole run, so the dispatch loop skips the per-step context sync.
+    env_changing: bool,
 }
 
 /// Where a binding lives for emission purposes: a frame slot (fast body),
@@ -6163,6 +6308,20 @@ impl Compiler {
     }
 
     fn emit(&mut self, step: Step) {
+        // A step that switches the lexical environment (block/loop/catch/
+        // with envs) makes the body's env non-constant: the dispatch loop
+        // must keep syncing the running context for it.
+        if matches!(
+            &step,
+            Step::EnterBlock { .. }
+                | Step::EnterLoopEnv { .. }
+                | Step::EnterIterTdzEnv { .. }
+                | Step::PerIteration { .. }
+                | Step::EnterWith
+                | Step::CatchBind { .. }
+        ) {
+            self.env_changing = true;
+        }
         self.steps.push(step);
     }
 
@@ -9371,7 +9530,7 @@ pub fn compile_statements(
         handlers: compiler.handlers,
         strict,
         scope: None,
-        env_constant: false,
+        env_constant: !compiler.env_changing,
         script_globals: compiler.script_globals,
     })
 }

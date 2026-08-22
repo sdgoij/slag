@@ -380,6 +380,83 @@ candidates are caching the certified record's hot fields on the
 function object (a direct-mapped id → (ir, env, realm, strict) cache
 on the Agent) and trimming the context push.
 
+### Cut 14 — global-cell fast path and V8-interpreter study (measured 2026-08-22)
+
+The `--bench` rows are all top-level loops over declared global `var`s
+(`n`, `i`, `s`, `o`, `f`), so the global-access path and the loop head
+dominated every row. Fresh 3-run medians of `--bench` (release,
+interleaved with probes):
+
+| Benchmark | before | after |
+|---|---|---|
+| arithmetic | ~196ms | 70ms |
+| property access | ~247ms | 116ms |
+| string concat | ~60ms | 55ms |
+| array iteration | ~320ms | 255ms |
+| function calls | ~440ms | 280ms |
+
+Per-iteration decomposition (1M iterations): the empty loop head
+(`i < 1M` test + `i++` + jump) was ~180ns and is now ~48ns; the
+`n += i*2` body adds ~25ns. The wins:
+
+1. **Direct-mapped global cells** — `global_cells` was a `HashMap`
+   (even identity-hashed, ~10ns probe); it is now a 32-entry
+   `[Option<(AtomId, usize)>]` array indexed by `name & 31`, and the
+   `load`/`store`/`update` fast paths probe it with a single compare.
+   The per-access context-stack walk + realm-global clone is gone too:
+   the `Vm` caches the running context's global object on first access
+   (a body's realm cannot change while its own steps run).
+2. **Fused global update** (`++`/`--`) — `IncGlobal`/`DecGlobal`/
+   `UpdateGlobal` previously composed `load_global_value` +
+   `store_global_value` (two probes, two `RefCell` borrows); they now
+   read/update/write through one borrow, with a Number fast path that
+   skips the `to_numeric` call.
+3. **Number loop test** — `jump_if_rel_global`/`jump_if_rel_imm`
+   compare a Number counter against the numeric limit directly off the
+   cell/slot (Rust's NaN-false semantics match JS), falling back to
+   `apply_binary` only for non-number counters.
+4. **Env-constant scripts** — `compile_statements` set
+   `env_constant: false` unconditionally, so every fast-script step
+   paid the running-context sync (a `last_mut` + `Rc::ptr_eq`). The
+   `Compiler` now tracks whether any emitted step switches the lexical
+   environment (`EnterBlock`/loop/catch/with envs) and sets
+   `env_constant` accordingly; the bench scripts are env-constant, so
+   the per-step sync is skipped.
+5. **Dispatch cleanup + inline arithmetic** — the loop's double
+   bounds check became a single `get`, and `BinaryImm` inlines the
+   number-number arithmetic path (two tag checks + a direct op) for
+   Sub/Mul/Div/Rem, falling back to `apply_binary`.
+
+Conformance: zero regressions (language 23,690/0/34; built-ins
+23,259/0/154 — 399 hangs, the known RegExp property-escape +
+TypedArray copyWithin set; annexB 1,086/0/0).
+
+**The V8 `--jitless` study** (the vendored checkout in `v8/`): V8's
+ignition interpreter runs the same loops at ~11-16ms/1M (~1ns per
+bytecode) because (a) the dispatch is a computed-goto jump table over
+minimal assembly handlers, (b) global loads are **PropertyCell**
+indirections — the feedback vector holds a weak cell pointer, the cell
+holds the value, so a read is two loads with no per-access validation
+(a redefinition replaces the cell and marks the old one with a hole),
+and (c) the interpreter is an accumulator machine — binary ops read
+one operand from the accumulator and one from a register, with no
+stack push/pop per step.
+
+The path from the current ~10ns/step to V8's ~1ns/step is therefore:
+1. **Cell-backed global bindings** — hold the script's declared `var`s
+   behind a stable `PropertyCell`-like object (value lives in the
+   cell; redefinition replaces it), so a global load/store is a cached
+   cell pointer + one field load — no `RefCell` borrow, no key
+   re-validation. This is the single biggest remaining lever for the
+   global-path benches.
+2. **Accumulator/register execution** — drop the per-step value-stack
+   push/pop for the common unary/binary shapes: operand and result
+   registers encoded in the step, like ignition's accumulator.
+3. **Fused loop step** — recognize the canonical
+   `for (var i = INIT; i <op> LIMIT; i++) BODY` shape and run the
+   test + body + increment with one dispatch per iteration (the
+   dispatch-loop extraction this requires is the mechanical part).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
