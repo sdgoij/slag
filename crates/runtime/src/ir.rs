@@ -437,6 +437,20 @@ pub enum Step {
     FunctionDecl {
         stmt: Box<Stmt>,
     },
+    /// Initialize a top-level function declaration's certified binding at
+    /// body entry (the declaration is hoisted — spec 10.2.11): instantiate
+    /// the closure against the capture context and store it into the frame
+    /// slot or capture-context slot the binding was allocated to. The
+    /// declaration statement itself is then empty (15.2.6). `outer_chain` is
+    /// the closure's enclosing certified context chain (see
+    /// `CreateFunction`).
+    FunctionDeclInit {
+        name: crux::AtomId,
+        function: Box<syntax::ast::Function>,
+        frame_slot: Option<usize>,
+        context_slot: Option<usize>,
+        outer_chain: Vec<Vec<crux::AtomId>>,
+    },
     /// Reset the statement-completion register to an empty completion (spec
     /// 6.2.2.3): the current statement's completion starts empty.
     ResetCompletion,
@@ -2505,6 +2519,36 @@ impl Vm {
                         )?;
                     } else {
                         crate::eval::eval_function_declaration(agent, function, self.strict)?;
+                    }
+                }
+                Step::FunctionDeclInit {
+                    function,
+                    frame_slot,
+                    context_slot,
+                    outer_chain,
+                    ..
+                } => {
+                    // A certified body's hoisted top-level function
+                    // declaration: instantiate the closure against the
+                    // capture context (the binding was created by the
+                    // certified layout) and store it.
+                    let env = agent.running_context()?.lexical_environment.clone();
+                    let value = crate::function::instantiate_function(
+                        agent,
+                        function,
+                        env,
+                        self.strict,
+                        outer_chain.clone(),
+                    )?;
+                    if let Some(slot) = frame_slot {
+                        *self.frame.get_mut(*slot) = value;
+                    } else if let Some(index) = context_slot {
+                        let env = self.context_chain_env(0)?;
+                        context_env(&env).set_slot(*index, value);
+                    } else {
+                        unreachable!(
+                            "FunctionDeclInit without a binding slot (the scan allocated one)"
+                        );
                     }
                 }
                 Step::Push(value) => self.stack.push(value.clone()),
@@ -7974,9 +8018,16 @@ impl Compiler {
             }
             StmtKind::Empty | StmtKind::Debugger => {}
             StmtKind::FunctionDecl(_) => {
-                self.emit(Step::FunctionDecl {
-                    stmt: Box::new(stmt.clone()),
-                });
+                if self.scope.is_none() {
+                    // A certified body's top-level declarations were
+                    // initialized at entry (`FunctionDeclInit`); the
+                    // declaration statement itself is empty (15.2.6). The
+                    // env path evaluates it in place (incl. the Annex B
+                    // forms).
+                    self.emit(Step::FunctionDecl {
+                        stmt: Box::new(stmt.clone()),
+                    });
+                }
             }
         }
         Ok(())
@@ -10664,6 +10715,31 @@ pub fn compile_body(function: &EcmaFunction) -> Result<CompiledBody, JsError> {
             mapped: scope.arguments_formals.clone(),
         });
     }
+    // A certified body's top-level function declarations are hoisted: each
+    // binding is initialized with its closure at entry (spec 10.2.11), and
+    // the declaration statement itself evaluates to nothing (15.2.6).
+    if compiler.scope.is_some() {
+        for stmt in &function.body.stmts {
+            if let StmtKind::FunctionDecl(function) = &stmt.kind
+                && function.name.is_some()
+            {
+                let name = function.name.unwrap();
+                let (frame_slot, context_slot) = match compiler.binding(name) {
+                    BindingLoc::Slot(slot) => (Some(slot), None),
+                    BindingLoc::Context(0, index) => (None, Some(index)),
+                    _ => continue,
+                };
+                let outer_chain = compiler.closure_outer_chain();
+                compiler.emit(Step::FunctionDeclInit {
+                    name,
+                    function: Box::new(function.clone()),
+                    frame_slot,
+                    context_slot,
+                    outer_chain,
+                });
+            }
+        }
+    }
     compiler.compile_statements(&function.body.stmts)?;
     compiler.resolve();
     // A per-iteration loop switches the lexical environment each iteration,
@@ -10774,7 +10850,22 @@ pub fn debug_print_body(body: &CompiledBody) {
     }
     println!("env_constant: {}", body.env_constant);
     for (index, step) in body.steps.iter().enumerate() {
-        println!("{index:4}: {step:?}");
+        // A `FunctionDeclInit` carries the whole declaration AST; print just
+        // the binding so the step stream stays readable.
+        if let Step::FunctionDeclInit {
+            name,
+            frame_slot,
+            context_slot,
+            ..
+        } = step
+        {
+            println!(
+                "{index:4}: FunctionDeclInit({} -> frame {frame_slot:?}, context {context_slot:?})",
+                crux::lookup(*name).to_string_lossy()
+            );
+        } else {
+            println!("{index:4}: {step:?}");
+        }
     }
 }
 
@@ -11730,10 +11821,36 @@ impl FastScopeScan {
             StmtKind::Return(expr) => expr.as_ref().is_none_or(|e| self.expr(e, depth)),
             StmtKind::Throw(expr) => self.expr(expr, depth),
             StmtKind::Labeled { body, .. } => self.stmt(body, depth),
+            StmtKind::FunctionDecl(function) => {
+                // A top-level function declaration binds a function-scoped
+                // name like a `var` (initialized to the function value at
+                // entry — spec 10.2.11), so it certifies; the declaration
+                // statement itself is empty (15.2.6). Block-level and
+                // statement-position declarations (Annex B, two bindings)
+                // stay on the env path.
+                if depth != 0 || function.statement_position {
+                    return false;
+                }
+                let Some(name) = function.name else {
+                    return false;
+                };
+                if self.captured.contains(&name) && !self.context_slots.contains_key(&name) {
+                    self.context_slots.insert(name, self.context_names.len());
+                    self.context_names.push(name);
+                    self.context_tdz.push(false);
+                    self.context_const.push(false);
+                    self.context_param.push(None);
+                } else if !self.captured.contains(&name) && !self.slots.contains_key(&name) {
+                    let slot = self.next_slot;
+                    self.tdz.push(false);
+                    self.next_slot += 1;
+                    self.slots.insert(name, slot);
+                }
+                true
+            }
             StmtKind::ForIn { .. }
             | StmtKind::ForOf { .. }
             | StmtKind::UsingDecl { .. }
-            | StmtKind::FunctionDecl(_)
             | StmtKind::ClassDecl(_)
             | StmtKind::Try { .. }
             | StmtKind::Switch { .. }

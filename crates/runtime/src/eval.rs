@@ -3343,6 +3343,116 @@ mod tests {
     }
 
     #[test]
+    fn fast_path_function_declarations() {
+        // A top-level function declaration certifies: the name is hoisted and
+        // initialized with the closure at body entry (spec 10.2.11), and the
+        // declaration statement itself is empty (15.2.6). Block-level and
+        // statement-position declarations (Annex B, two bindings) stay on the
+        // env path.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script("function f() { function g() { return 42; } return g(); }")
+            .unwrap();
+        let ir = compiled_body_of(&mut agent, "f");
+        assert!(ir.scope.is_some(), "the body must certify");
+        assert!(
+            ir.steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::FunctionDeclInit { .. })),
+            "the hoisted declaration must be initialized at entry"
+        );
+        assert!(
+            !ir.steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::FunctionDecl { .. })),
+            "the declaration statement must be empty in a certified body"
+        );
+        // A forward reference (hoisting) and recursion through the declared
+        // name.
+        assert_eq!(
+            run("function f() { var x = g; function g(n) { return n <= 1 ? 1 : n * g(n - 1); } return x(5); } f()")
+                .unwrap(),
+            Value::Number(120.0)
+        );
+        // var + function sharing a name: the var initializer's assignment
+        // overwrites the hoisted function in statement order.
+        assert_eq!(
+            run("function f() { var g = 1; function g() { return 2; } return g; } f()").unwrap(),
+            Value::Number(1.0)
+        );
+        // Mutual recursion: both names are captured, so the scan allocates
+        // context slots and each closure resolves the other through the
+        // capture context.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script("function f() { function even(n) { return n === 0 ? true : odd(n - 1); } function odd(n) { return n === 0 ? false : even(n - 1); } return even(3); }")
+            .unwrap();
+        let mir = compiled_body_of(&mut agent, "f");
+        assert!(mir.scope.is_some(), "mutual recursion must certify");
+        let mut init_slots: Vec<Option<usize>> = mir
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                crate::ir::Step::FunctionDeclInit { context_slot, .. } => Some(*context_slot),
+                _ => None,
+            })
+            .collect();
+        init_slots.sort();
+        assert_eq!(
+            init_slots,
+            vec![Some(0), Some(1)],
+            "both declarations must live in the capture context"
+        );
+        assert_eq!(
+            run("function f() { function even(n) { return n === 0 ? true : odd(n - 1); } function odd(n) { return n === 0 ? false : even(n - 1); } return even(10); } f()")
+                .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            run("function f() { function even(n) { return n === 0 ? true : odd(n - 1); } function odd(n) { return n === 0 ? false : even(n - 1); } return odd(7); } f()")
+                .unwrap(),
+            Value::Boolean(true)
+        );
+        // A closure capturing the declared name reads it from the capture
+        // context after the body returns.
+        assert_eq!(
+            run("function f() { var a = []; function g() { return 9; } a.push(() => g); return a[0]()(); } f()")
+                .unwrap(),
+            Value::Number(9.0)
+        );
+        // A nested certified closure inside the declared function.
+        assert_eq!(
+            run("function f() { function g(x) { return (y) => x + y; } return g(5)(3); } f()")
+                .unwrap(),
+            Value::Number(8.0)
+        );
+        // Block-level declarations bail to the env path (Annex B creates two
+        // bindings) and keep their hoisting behavior.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script("function f() { { function g() { return 1; } } return g(); }")
+            .unwrap();
+        let bir = compiled_body_of(&mut agent, "f");
+        assert!(
+            bir.scope.is_none(),
+            "a block-level declaration must stay on the env path"
+        );
+        assert!(
+            bir.steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::FunctionDecl { .. })),
+            "the env path evaluates the declaration in place"
+        );
+        assert_eq!(
+            run("function f() { { function g() { return 1; } } return g(); } f()").unwrap(),
+            Value::Number(1.0)
+        );
+    }
+
+    #[test]
     fn fast_path_strict_arguments_unmapped() {
         // Cut 3 continuation (unmapped arguments slice): a strict body's
         // own `arguments` reads get a frame slot the certified call fills

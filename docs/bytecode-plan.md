@@ -49,9 +49,21 @@ the enclosing bodies' capture-context layouts thread through the
 closure-creation steps (innermost first, per-iteration head names open
 at the creation site excluded), and the runtime walk skips the
 per-iteration envs and named-function-expression self-binding scopes
-(the only non-context hops on a certified chain). Deferred from the
-continuation: Annex B, the body accumulator model, slot-arg calls, and
-the Cut 5 encoding work remain open.
+(the only non-context hops on a certified chain). Top-level function
+declarations in a certified body certify too: the hoisted name is
+initialized with its closure at body entry (`FunctionDeclInit` — spec
+10.2.11), the declaration statement is empty (15.2.6), and a body whose
+closures capture the declared name allocates it a capture-context slot
+(the mutual-recursion shape: two declarations capturing each other
+resolve through the context). The certified construct fast path runs a
+certified constructor body against its captured environment — not the
+empty lexical env `function_declaration_instantiation` installs on the
+running context — so closures created inside the constructor record the
+capture context as their `[[Environment]]` (a `LoadContextSlot` at depth
+0 against the empty env read its slot 0, the TDZ marker). Deferred from
+the continuation: block-level and statement-position function
+declarations (Annex B, two bindings), the body accumulator model,
+slot-arg calls, and the Cut 5 encoding work remain open.
 
 ---
 
@@ -428,10 +440,13 @@ implementation* for the VM itself.
   `let` runs the loop through per-iteration envs), and nested context
   chains (a certified closure's references to enclosing certified
   bodies' captured bindings compile to static context-chain reads)
-  landed in later slices (`docs/perf.md` Cuts 17+); still deferred are
-  loop-body-scoped captures (a closure capturing a lexical binding
+  landed in later slices (`docs/perf.md` Cuts 17+): loop-body-scoped
+  captures are still deferred (a closure capturing a lexical binding
   declared inside a loop body bails — its per-iteration block scope is
-  not flattenable), and Annex B.
+  not flattenable), and top-level function declarations now certify
+  (hoisted `FunctionDeclInit` at body entry, the declaration statement
+  empty; block-level and statement-position forms — Annex B, two
+  bindings — still bail).
 
 ### Correctness notes (why the slice is right)
 

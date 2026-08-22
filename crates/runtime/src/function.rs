@@ -2118,6 +2118,18 @@ fn ordinary_construct(
                 // env at construct can be an unrelated caller.
                 if ir.scope.is_some() {
                     vm.body_context = Some(data.environment.clone());
+                    // Closures created inside the certified body record the
+                    // running context's lexical environment; the empty
+                    // lexical env `function_declaration_instantiation`
+                    // installed would misplace their static context-chain
+                    // base (a depth-0 read hits the empty env's slot 0 — the
+                    // TDZ marker). A certified body never observes the
+                    // FunctionEnv's `this`/`arguments` through the env
+                    // (closures reading them bail the scan), so the
+                    // function's captured environment is the right base for
+                    // both the VM walk and the execution context.
+                    vm.lexical_env = data.environment.clone();
+                    agent.running_context_mut()?.lexical_environment = data.environment.clone();
                 }
                 if let Some(scope) = &ir.scope {
                     vm.setup_frame(scope, args);
