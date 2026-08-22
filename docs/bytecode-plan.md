@@ -83,6 +83,20 @@ parameter/lexical conflict) compiles to nothing. A reference to a
 lexical `for`-head binding outside its open loop bails the body (the
 flat slot would leak the loop's value — the env path makes it
 unresolvable). Captured block-function names stay on the env path.
+The last big certification gap — **`for-in`/`for-of` heads** (risk
+register item 7) — has landed: a body containing a for-in/for-of with
+an ident head certifies. A `var` head binds the slot/global/context
+directly per element/key; an uncaptured lexical head re-inits its flat
+slot per iteration (its per-iteration freshness is unobservable without
+closures); a captured lexical head runs the per-iteration machinery —
+`EnterPerIteration` opens the first fresh env, each iteration's bind
+writes it via `StorePerIteration`, the body's reads go through
+per-iteration steps, and `PerIteration` re-copies at the continue point
+— so the body's closures observe each iteration's value (spec
+14.7.5.6). The head's TDZ environment is skipped: the head's
+slot/context TDZ marker reproduces an RHS reference's
+`ReferenceError`. Destructuring heads, expression targets, `using`
+heads, and async for-of keep the whole body on the env path.
 Deferred from the continuation: the body accumulator model, slot-arg
 calls, and the Cut 5 encoding work remain open.
 
@@ -325,7 +339,14 @@ function calls ≤1.15s, property access ≤0.64s.
    only reads frame slots.
 7. **`for-in`/`for-of` heads**: `ForBinding::VarDecl` for lexical heads
    creates per-iteration bindings — must allocate slots/contexts, not env
-   records, when fast.
+   records, when fast. **Landed (the continuation's last gap)**: an ident
+   head certifies — `var` heads bind the slot/global/context directly,
+   uncaptured lexical heads re-init a flat slot per iteration, captured
+   lexical heads run the per-iteration env machinery
+   (`EnterPerIteration` + `StorePerIteration` + `PerIteration`, the
+   body's closures observing each iteration's value);
+   destructuring/expr/`using` heads and async for-of stay on the env
+   path.
 
 ## 9. Runtime integration points (exact)
 
@@ -476,7 +497,11 @@ implementation* for the VM itself.
   (block binding in a frame slot initialized at block entry + the
   hoisted var binding, reset at block entry and copied by the
   declaration statement) and statement-position declarations certify
-  (the hoisted var slot is the only observable binding). A reference to
+  (the hoisted var slot is the only observable binding). For-in/for-of
+  heads certify too (ident heads: a `var` head binds directly, a
+  captured lexical head runs per-iteration envs, an uncaptured lexical
+  head a flat slot; destructuring/expr/`using` heads and async for-of
+  stay on the env path). A reference to
   a lexical `for`-head binding outside its loop bails (the flat slot
   would leak it).
 

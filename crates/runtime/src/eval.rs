@@ -3116,6 +3116,136 @@ mod tests {
     }
 
     #[test]
+    fn fast_path_for_of_in_heads_certify() {
+        // A `var` for-of head certifies like a `For` head (Cut 3 gap item
+        // 7): the element binds the frame slot directly, no per-iteration
+        // environment.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script(
+                "function f() { var s = 0; for (var v of [1, 2, 3]) { s += v; } return s; }",
+            )
+            .unwrap();
+        let ir = compiled_body_of(&mut agent, "f");
+        assert!(ir.scope.is_some(), "a var for-of head must certify");
+        assert!(
+            ir.steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::ForOfNext { .. })),
+            "the loop must run the iteration protocol"
+        );
+        assert!(
+            ir.steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::ForOfBindLocal { .. })),
+            "the var head must bind the frame slot directly"
+        );
+        assert!(
+            !ir.steps.iter().any(|s| matches!(
+                s,
+                crate::ir::Step::ForOfBind { .. } | crate::ir::Step::LoadIdent { .. }
+            )),
+            "no env-machinery bind or env walk"
+        );
+        assert!(
+            ir.env_constant,
+            "an uncaptured var for-of head contributes no env"
+        );
+        assert_eq!(
+            run("function f() { var s = 0; for (var v of [1, 2, 3]) { s += v; } return s; } f()")
+                .unwrap(),
+            Value::Number(6.0)
+        );
+
+        // An uncaptured lexical head certifies too: the flat slot is
+        // re-initialized per iteration (its freshness is unobservable
+        // without closures, which the scan rejects).
+        agent
+            .run_script(
+                "function g() { var s = 0; for (let v of [1, 2, 3]) { s += v * 2; } return s; }",
+            )
+            .unwrap();
+        let ir = compiled_body_of(&mut agent, "g");
+        assert!(
+            ir.scope.is_some(),
+            "an uncaptured let for-of head must certify"
+        );
+        assert!(
+            ir.env_constant,
+            "an uncaptured lexical head contributes no env"
+        );
+        assert_eq!(
+            run(
+                "function g() { var s = 0; for (let v of [1, 2, 3]) { s += v * 2; } return s; } g()"
+            )
+            .unwrap(),
+            Value::Number(12.0)
+        );
+
+        // A captured lexical head uses the per-iteration machinery: fresh
+        // copies the body's closures observe (spec 14.7.5.6).
+        agent
+            .run_script("function h() { var a = []; for (let v of [10, 20, 30]) { a.push(() => v); } return a; }")
+            .unwrap();
+        let ir = compiled_body_of(&mut agent, "h");
+        assert!(
+            ir.scope.is_some(),
+            "a captured let for-of head must keep the body certified"
+        );
+        assert!(
+            ir.steps.iter().any(|s| matches!(
+                s,
+                crate::ir::Step::EnterPerIteration { .. }
+                    | crate::ir::Step::StorePerIteration { .. }
+            )),
+            "a captured for-of head must run per-iteration envs"
+        );
+        assert!(
+            !ir.env_constant,
+            "the per-iteration env machinery is env-changing"
+        );
+        assert_eq!(
+            run("function h() { var a = []; for (let v of [10, 20, 30]) { a.push(() => v); } return a[0]() + a[1]() + a[2](); } h()")
+                .unwrap(),
+            Value::Number(60.0)
+        );
+
+        // A for-in var head certifies.
+        agent
+            .run_script("function k() { var s = 0; for (var key in { a: 1, b: 2 }) { s += key.length; } return s; }")
+            .unwrap();
+        let ir = compiled_body_of(&mut agent, "k");
+        assert!(ir.scope.is_some(), "a var for-in head must certify");
+        assert!(
+            ir.steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::ForInNext { .. })),
+            "for-in must run the enumeration protocol"
+        );
+        assert_eq!(
+            run("function k() { var s = 0; for (var key in { a: 1, b: 2 }) { s += key.length; } return s; } k()")
+                .unwrap(),
+            Value::Number(2.0)
+        );
+
+        // A destructuring head keeps the whole body on the env path.
+        agent
+            .run_script("function d() { var s = 0; for (var [a, b] of [[1, 2]]) { s += a + b; } return s; }")
+            .unwrap();
+        let ir = compiled_body_of(&mut agent, "d");
+        assert!(
+            ir.scope.is_none(),
+            "a destructuring for-of head must keep the env path"
+        );
+        assert_eq!(
+            run("function d() { var s = 0; for (var [a, b] of [[1, 2]]) { s += a + b; } return s; } d()")
+                .unwrap(),
+            Value::Number(3.0)
+        );
+    }
+
+    #[test]
     fn fast_path_per_iteration_loop_heads() {
         // Body reads/writes of a captured head go through the per-iteration
         // env; a write before the closure creation is what the closure sees

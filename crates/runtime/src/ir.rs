@@ -972,9 +972,11 @@ pub struct CompiledBody {
     pub scope: Option<ScopeInfo>,
     /// Whether the body's `lexical_env` never changes during its run: a
     /// certified body's blocks contribute no env (every lexical declaration
-    /// is a frame slot) and it has no `with`/`try`/`switch`/`for-in`/
-    /// `for-of`/`using`, so the dispatch loop's per-step context-env sync is
-    /// a no-op and can be skipped.
+    /// is a frame slot), its for-of/for-in heads bind direct slots/contexts
+    /// (a captured lexical head opens the per-iteration env machinery, so
+    /// those bodies are not env-constant), and it has no
+    /// `with`/`try`/`switch`/`using`, so the dispatch loop's per-step
+    /// context-env sync is a no-op and can be skipped.
     pub env_constant: bool,
     /// The certified top-level fast path (script-level bindings): the
     /// declared `var`/function names a script reads and writes directly on
@@ -8566,6 +8568,168 @@ impl Compiler {
         Ok(())
     }
 
+    /// The certified for-of/for-in head bind: the element/key (already on
+    /// the stack) writes its binding directly. A `var` head writes the
+    /// slot/global/context binding; an uncaptured lexical head re-inits its
+    /// flat slot each iteration (the write is the initialization, so no TDZ
+    /// check); a captured lexical head writes the current per-iteration env
+    /// (a fresh copy the body's closures observe).
+    fn emit_certified_for_bind(&mut self, name: crux::AtomId, kind: VarDeclKind) {
+        let lexical = kind != VarDeclKind::Var;
+        match self.binding(name) {
+            BindingLoc::Slot(slot) => self.emit(Step::ForOfBindLocal { slot }),
+            BindingLoc::Global => self.emit(Step::ForOfBindGlobal { name }),
+            BindingLoc::Context(0, _) if lexical => {
+                let (depth, index) = match self.per_iteration(name) {
+                    Some(loc) => loc,
+                    None => unreachable!("a captured lexical for-of/in head is registered"),
+                };
+                self.emit(Step::StorePerIteration { depth, index });
+            }
+            BindingLoc::Context(0, index) => self.emit(Step::InitContextSlot { index }),
+            _ => unreachable!(
+                "a certified for-of/in head binds a slot, global, or the capture context"
+            ),
+        }
+    }
+
+    /// The shared certified for-of/for-in loop shape (the scan guarantees
+    /// an Ident VarDecl head): the element/key binds directly to the head's
+    /// slot/context/global — no TDZ environment (the head's slot/context
+    /// marker reproduces the RHS TDZ), and no per-iteration environments
+    /// unless a body closure captures the head (then each iteration's
+    /// binding is a fresh copy the closures observe, mirroring the
+    /// certified `For`).
+    ///
+    /// `per_iteration` names are the captured lexical head names (empty for
+    /// var/uncaptured heads); the caller emits the iteration-protocol step
+    /// that pushes each element/key.
+    fn compile_certified_for_loop(
+        &mut self,
+        left: &ForBinding,
+        body: &Stmt,
+        emit_next: Step,
+        protocol_entered: bool,
+    ) -> Result<(usize, usize), JsError> {
+        let ForBinding::VarDecl { kind, pattern, .. } = left else {
+            unreachable!("the certified scan only allows Ident VarDecl for-of/in heads")
+        };
+        let BindingPattern::Ident(name) = pattern else {
+            unreachable!("the certified scan only allows Ident for-of/in heads")
+        };
+        let lexical = *kind != VarDeclKind::Var;
+        let captured = matches!(self.binding(*name), BindingLoc::Context(0, _));
+        let mut per_iteration: Vec<JsString> = Vec::new();
+        if lexical && captured {
+            // The capture-context slot is TDZ'd at entry and EnterPerIteration
+            // copies it, so pre-init it with undefined — the only TDZ window
+            // (the RHS) already ran, and the first bind overwrites it.
+            let BindingLoc::Context(0, index) = self.binding(*name) else {
+                unreachable!("a captured lexical head is in the capture context")
+            };
+            self.emit(Step::Push(Value::Undefined));
+            self.emit(Step::InitContextSlot { index });
+            self.scope_count += 1;
+            self.per_iteration_heads.push(vec![*name]);
+            per_iteration.push(crux::lookup(*name));
+            self.emit(Step::EnterPerIteration {
+                names: per_iteration.clone(),
+            });
+        }
+        let top_label = self.new_label();
+        let end_label = self.new_label();
+        let continue_label = self.new_label();
+        let done_label = self.new_label();
+        let scope = self.scope_count;
+        self.scope_stack.push(Scope::Iteration {
+            open: scope,
+            closed: scope,
+            continue_target: continue_label,
+            break_target: end_label,
+        });
+        self.resolve_labeled_continue(continue_label, scope);
+        self.place(top_label);
+        let step_index = self.steps.len();
+        self.emit(emit_next.clone());
+        match &emit_next {
+            Step::ForInNext { .. } => self.fixups.push(Fixup::ForInNext(step_index, done_label)),
+            Step::ForOfNext { .. } => self.fixups.push(Fixup::ForOfNext(step_index, done_label)),
+            _ => unreachable!("the certified loop protocol step is ForInNext or ForOfNext"),
+        }
+        self.emit_certified_for_bind(*name, *kind);
+        self.compile_statement(body)?;
+        self.place(continue_label);
+        if lexical && captured {
+            self.emit(Step::PerIteration {
+                names: per_iteration.clone(),
+            });
+        }
+        self.jump(top_label);
+        self.place(end_label);
+        if lexical && captured {
+            self.emit(Step::LeaveBlock);
+        }
+        if protocol_entered {
+            self.emit(Step::ForOfClose);
+        }
+        self.emit(Step::NormalizeCompletion);
+        self.place(done_label);
+        if lexical && captured {
+            self.emit(Step::LeaveBlock);
+        }
+        self.emit(Step::NormalizeCompletion);
+        self.scope_stack.pop();
+        if lexical && captured {
+            self.scope_count -= 1;
+            self.per_iteration_heads.pop();
+        }
+        Ok((top_label, end_label))
+    }
+
+    fn compile_certified_for_in(
+        &mut self,
+        left: &ForBinding,
+        right: &Expr,
+        body: &Stmt,
+    ) -> Result<(), JsError> {
+        // Annex B.2.6: `for (var a = init in expr)` — the initializer runs
+        // once and binds `a` before the RHS is evaluated (sloppy mode only).
+        if let ForBinding::VarDecl {
+            init: Some(init_expr),
+            ..
+        } = left
+        {
+            let ForBinding::VarDecl { kind, pattern, .. } = left else {
+                unreachable!("Annex B for-in heads are VarDecl")
+            };
+            let BindingPattern::Ident(name) = pattern else {
+                unreachable!("the certified scan only allows Ident for-in heads")
+            };
+            self.compile_expr(init_expr)?;
+            self.emit_certified_for_bind(*name, *kind);
+        }
+        self.compile_expr(right)?;
+        self.emit(Step::ForInBegin);
+        self.compile_certified_for_loop(left, body, Step::ForInNext { done: 0 }, false)?;
+        Ok(())
+    }
+
+    fn compile_certified_for_of(
+        &mut self,
+        left: &ForBinding,
+        right: &Expr,
+        body: &Stmt,
+    ) -> Result<(), JsError> {
+        self.compile_expr(right)?;
+        self.emit(Step::ForOfBegin { top: 0, end: 0 });
+        let begin_index = self.steps.len() - 1;
+        let (top, end) =
+            self.compile_certified_for_loop(left, body, Step::ForOfNext { done: 0 }, true)?;
+        self.fixups
+            .push(Fixup::ForOfBoundary(begin_index, top, end));
+        Ok(())
+    }
+
     fn compile_for_in(
         &mut self,
         left: &ForBinding,
@@ -8573,6 +8737,14 @@ impl Compiler {
         body: &Stmt,
     ) -> Result<(), JsError> {
         self.emit(Step::ResetCompletion);
+        // Certified body: the scan accepted an Ident VarDecl head (any other
+        // head shape would have bailed it) — bind directly, skipping the TDZ
+        // environment (the head's slot/context marker reproduces the RHS
+        // TDZ) and the per-iteration environments unless a body closure
+        // captures the head.
+        if self.scope.is_some() {
+            return self.compile_certified_for_in(left, right, body);
+        }
         // Annex B.2.6: `for (var a = init in expr)` — the initializer runs
         // once and binds `a` before the RHS is evaluated (sloppy mode only).
         if let ForBinding::VarDecl {
@@ -8650,6 +8822,11 @@ impl Compiler {
         body: &Stmt,
     ) -> Result<(), JsError> {
         self.emit(Step::ResetCompletion);
+        // Certified body: the scan accepted an Ident VarDecl head (see
+        // `compile_for_in`).
+        if self.scope.is_some() {
+            return self.compile_certified_for_of(left, right, body);
+        }
         let tdz = self.enter_iter_tdz_env(left);
         self.compile_expr(right)?;
         self.leave_iter_tdz_env(tdz);
@@ -12223,9 +12400,97 @@ impl FastScopeScan {
                 }
                 true
             }
-            StmtKind::ForIn { .. }
-            | StmtKind::ForOf { .. }
-            | StmtKind::UsingDecl { .. }
+            StmtKind::ForIn {
+                left, right, body, ..
+            }
+            | StmtKind::ForOf {
+                left, right, body, ..
+            } => {
+                // Cut 3 continuation (for-of/for-in heads): a certified head
+                // is a plain Ident VarDecl (var/let/const) whose binding is a
+                // flat slot or the capture context, written per iteration.
+                // Destructuring heads, expression targets (member/ident
+                // assignment references), and `using` heads bind through the
+                // environment machinery and keep the whole body on the env
+                // path.
+                if matches!(&stmt.kind, StmtKind::ForOf { is_await: true, .. }) {
+                    return false;
+                }
+                let (kind, pattern, init) = match left {
+                    ForBinding::VarDecl {
+                        kind,
+                        pattern,
+                        init,
+                    } => (*kind, pattern, init.as_ref()),
+                    ForBinding::Expr(_) => return false,
+                };
+                if matches!(kind, VarDeclKind::Using | VarDeclKind::AwaitUsing) {
+                    return false;
+                }
+                let BindingPattern::Ident(name) = pattern else {
+                    return false;
+                };
+                let lexical = kind != VarDeclKind::Var;
+                if lexical {
+                    // A lexical head binding is scoped to the loop and must
+                    // be unique (the flat slot/context layout cannot tell
+                    // two scopes apart), mirroring `decls`.
+                    if self.slots.contains_key(name) || self.context_slots.contains_key(name) {
+                        return false;
+                    }
+                    self.declared_depth.insert(*name, depth);
+                    if kind == VarDeclKind::Const {
+                        self.consts.insert(*name);
+                    }
+                    if self.captured.contains(name) && !self.context_slots.contains_key(name) {
+                        self.context_slots.insert(*name, self.context_names.len());
+                        self.context_names.push(*name);
+                        self.context_tdz.push(true);
+                        self.context_const.push(kind == VarDeclKind::Const);
+                        self.context_param.push(None);
+                    } else if !self.captured.contains(name) && !self.slots.contains_key(name) {
+                        let slot = self.next_slot;
+                        self.tdz.push(true);
+                        self.next_slot += 1;
+                        self.slots.insert(*name, slot);
+                    }
+                    // The head is scoped to the loop: a reference outside
+                    // the open loop would leak the flat slot.
+                    self.for_head_lexicals.insert(*name, depth);
+                    let mut head_names = HashSet::new();
+                    head_names.insert(*name);
+                    self.open_for_heads.push(head_names);
+                    self.open_loop_body_depths.push(depth + 1);
+                    let result = init.is_none_or(|init| self.expr(init, depth))
+                        && self.expr(right, depth)
+                        && self.stmt(body, depth + 1);
+                    self.open_loop_body_depths.pop();
+                    self.open_for_heads.pop();
+                    result
+                } else {
+                    // A `var` head is function-scoped (hoisted): reuse the
+                    // existing slot/context binding or allocate one.
+                    if self.captured.contains(name) && !self.context_slots.contains_key(name) {
+                        self.context_slots.insert(*name, self.context_names.len());
+                        self.context_names.push(*name);
+                        self.context_tdz.push(false);
+                        self.context_const.push(false);
+                        self.context_param.push(None);
+                    } else if !self.captured.contains(name) && !self.slots.contains_key(name) {
+                        let slot = self.next_slot;
+                        self.tdz.push(false);
+                        self.next_slot += 1;
+                        self.slots.insert(*name, slot);
+                    }
+                    self.open_loop_body_depths.push(depth + 1);
+                    let result = init.is_none_or(|init| self.expr(init, depth))
+                        && self.expr(right, depth)
+                        && self.stmt(body, depth + 1);
+                    self.open_loop_body_depths.pop();
+                    result
+                }
+            }
+            StmtKind::UsingDecl { .. }
             | StmtKind::ClassDecl(_)
             | StmtKind::Try { .. }
             | StmtKind::Switch { .. }

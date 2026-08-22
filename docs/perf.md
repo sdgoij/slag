@@ -572,6 +572,29 @@ on a constructor reading `this` — the this slots + construct fast
 path, ~452ms). The 2026-08-18 gate baselines above cover only the
 original five rows.
 
+### Cut 18 — for-of/for-in heads certification (2026-08-22)
+
+The last certification gap from `bytecode-plan.md` §8 item 7: a body
+containing a `for-in`/`for-of` with an ident head now takes the fast
+path instead of bailing to the env path. A `var` head binds the
+slot/global/context directly per element/key; an uncaptured lexical
+head re-inits its flat slot per iteration; a captured lexical head runs
+the per-iteration env machinery (fresh copies the body's closures
+observe, mirroring the certified `For`). The head's TDZ environment is
+skipped — the slot/context marker reproduces the RHS `ReferenceError`.
+Destructuring/expr/`using` heads and async for-of keep the env path.
+
+Measured: the existing `--bench` rows don't move — they are scripts,
+and the script path already certified `var`-head for-of (the dense
+array fast path binds the head via `ForOfBindGlobal`/`ForOfBindLocal`).
+The win is real-world function bodies: `for (const x of arr)` /
+`for (let k in obj)` loops inside functions no longer kick the whole
+body onto the env path. Conformance at baseline: language 23,690/0/34,
+annexB 1,086/0/0, built-ins 23,216/0/154 (the known RegExp
+property-escape + TypedArray hang cluster); workspace tests 4311/0
+including a new fast-path step-stream test asserting the certified
+steps.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
