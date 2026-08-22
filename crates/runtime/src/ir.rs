@@ -674,6 +674,38 @@ pub enum Step {
         op: UpdateOp,
         prefix: bool,
     },
+    /// Create the first per-iteration environment of a certified lexical
+    /// for-head whose bindings a body closure captures (Cut 3
+    /// continuation): fresh bindings initialized from the capture context's
+    /// head slots, pushed on the env stack so the loop's exit/break
+    /// `LeaveBlock` pops it. Later iterations re-use the env-path
+    /// `PerIteration` step (floating envs; the stack top stays the first
+    /// one).
+    EnterPerIteration {
+        names: Vec<JsString>,
+    },
+    /// Push the per-iteration binding at `depth` outers from the current
+    /// per-iteration env (0 = this loop's env), slot `index` in that env's
+    /// head-name layout.
+    LoadPerIteration {
+        depth: usize,
+        index: usize,
+    },
+    /// Pop into the per-iteration binding at `depth`/`index` (see
+    /// `LoadPerIteration`; the per-iteration bindings are always
+    /// initialized by the fresh-copy machinery, so no TDZ check).
+    StorePerIteration {
+        depth: usize,
+        index: usize,
+    },
+    /// Read the per-iteration binding at `depth`/`index`, apply `++`/`--`,
+    /// store, and push the old (postfix) or new (prefix) value.
+    UpdatePerIteration {
+        depth: usize,
+        index: usize,
+        op: UpdateOp,
+        prefix: bool,
+    },
     /// Fill the body's `arguments` slot (Cut 3 continuation): build the
     /// arguments object from the call's arguments and store it into the
     /// frame slot. Emitted once at body entry. `mapped` is `Some(formals)`
@@ -1174,6 +1206,10 @@ pub struct Vm {
     pub args: Vec<Value>,
     pub lexical_env: EnvRef,
     pub(crate) env_stack: EnvStack,
+    /// The certified body's capture context (Cut 3 continuation): the env
+    /// holding the body's captured bindings, fixed for the run. The
+    /// per-iteration loop machinery copies fresh head bindings from it.
+    pub(crate) body_context: Option<EnvRef>,
     /// The running context's realm global object, resolved on first access
     /// and reused for the whole body run (a body's realm cannot change while
     /// its own steps run — nested calls push their own contexts). Avoids the
@@ -1329,6 +1365,7 @@ impl Vm {
             args: Vec::new(),
             lexical_env: lexical_env.clone(),
             env_stack: EnvStack::with_base(lexical_env),
+            body_context: None,
             global: None,
             completion: Value::Undefined,
             try_stack: Vec::new(),
@@ -3794,6 +3831,59 @@ impl Vm {
                     // restores the loop environment directly.
                     self.lexical_env = env;
                 }
+                Step::EnterPerIteration { names } => {
+                    // Cut 3 continuation (per-iteration loop heads): the
+                    // first per-iteration env of a certified loop — fresh
+                    // bindings copied from the capture context's head slots,
+                    // pushed on the env stack so the loop's exit/break
+                    // `LeaveBlock` pops it and restores the capture context.
+                    // Later iterations re-use `PerIteration` above (the
+                    // copies then come from the previous per-iteration env).
+                    let source = self
+                        .body_context
+                        .clone()
+                        .unwrap_or_else(|| self.lexical_env.clone());
+                    let env = new_declarative_environment(Some(self.lexical_env.clone()));
+                    for name in names {
+                        let value = source.get_binding_value(name, false)?;
+                        env.create_mutable_binding(name, false)?;
+                        env.initialize_binding(name, value)?;
+                    }
+                    self.lexical_env = env.clone();
+                    self.env_stack.push(env);
+                }
+                Step::LoadPerIteration { depth, index } => {
+                    let env = self.per_iteration_env(*depth)?;
+                    let value = context_env(&env).slot_value(*index).ok_or_else(|| {
+                        JsError::new(
+                            ErrorKind::ReferenceError,
+                            "Cannot access a binding before initialization".into(),
+                        )
+                    })?;
+                    self.stack.push(value);
+                }
+                Step::StorePerIteration { depth, index } => {
+                    let value = self.pop();
+                    let env = self.per_iteration_env(*depth)?;
+                    context_env(&env).set_slot(*index, value);
+                }
+                Step::UpdatePerIteration {
+                    depth,
+                    index,
+                    op,
+                    prefix,
+                } => {
+                    let env = self.per_iteration_env(*depth)?;
+                    let old = context_env(&env).slot_value(*index).ok_or_else(|| {
+                        JsError::new(
+                            ErrorKind::ReferenceError,
+                            "Cannot access a binding before initialization".into(),
+                        )
+                    })?;
+                    let (old_numeric, new) = update_value(agent, op, &old)?;
+                    context_env(&env).set_slot(*index, new.clone());
+                    self.stack.push(if *prefix { new } else { old_numeric });
+                }
                 Step::EnterLoopEnv { kind, decls } => {
                     let old_env = self.lexical_env.clone();
                     let env = new_declarative_environment(Some(old_env));
@@ -4230,8 +4320,10 @@ impl Vm {
                 }
                 Step::LoadContextSlot { index } => {
                     // Cut 3 continuation: the certified body's capture
-                    // context is its lexical environment.
-                    let value = context_env(&self.lexical_env).slot_value(*index);
+                    // context (its lexical environment outside a
+                    // per-iteration loop, where the lexical env holds only
+                    // the loop head names).
+                    let value = context_env(&self.body_context_env()).slot_value(*index);
                     match value {
                         Some(value) => self.stack.push(value),
                         None => {
@@ -4245,21 +4337,25 @@ impl Vm {
                 Step::StoreContextSlot { index } => {
                     let value = self.pop();
                     // An assignment to a binding still in the TDZ throws.
-                    if context_env(&self.lexical_env).slot_value(*index).is_none() {
+                    if context_env(&self.body_context_env())
+                        .slot_value(*index)
+                        .is_none()
+                    {
                         return Err(JsError::new(
                             ErrorKind::ReferenceError,
                             "Cannot access a binding before initialization".into(),
                         ));
                     }
-                    context_env(&self.lexical_env).set_slot(*index, value);
+                    context_env(&self.body_context_env()).set_slot(*index, value);
                 }
                 Step::InitContextSlot { index } => {
                     let value = self.pop();
-                    context_env(&self.lexical_env).set_slot(*index, value);
+                    context_env(&self.body_context_env()).set_slot(*index, value);
                 }
                 Step::UpdateContextSlot { index, op, prefix } => {
+                    let body_context = self.body_context_env();
                     let old = {
-                        let env = context_env(&self.lexical_env);
+                        let env = context_env(&body_context);
                         env.slot_value(*index).ok_or_else(|| {
                             JsError::new(
                                 ErrorKind::ReferenceError,
@@ -4268,7 +4364,7 @@ impl Vm {
                         })?
                     };
                     let (old_numeric, new) = update_value(agent, op, &old)?;
-                    context_env(&self.lexical_env).set_slot(*index, new.clone());
+                    context_env(&body_context).set_slot(*index, new.clone());
                     self.stack.push(if *prefix { new } else { old_numeric });
                 }
                 Step::CreateArguments { slot, mapped } => {
@@ -5334,6 +5430,33 @@ impl Vm {
         }
         self.lexical_env = env.outer().unwrap_or(env);
         Ok(())
+    }
+
+    /// The declarative per-iteration env `depth` outers from the current
+    /// env (0 = the loop's own): the compiler emits `depth` as the number
+    /// of enclosing per-iteration envs, so the walk stays inside the env
+    /// chain of declarative per-iteration envs (each fresh per iteration).
+    fn per_iteration_env(&self, depth: usize) -> Result<EnvRef, JsError> {
+        let mut env = self.lexical_env.clone();
+        for _ in 0..depth {
+            env = env.outer().ok_or_else(|| {
+                JsError::new(
+                    ErrorKind::ReferenceError,
+                    "No outer environment for a per-iteration binding".into(),
+                )
+            })?;
+        }
+        Ok(env)
+    }
+
+    /// The certified body's capture context (Cut 3 continuation): the env
+    /// holding the captured bindings. The context-slot steps target it
+    /// directly — inside a per-iteration loop the lexical env is the loop's
+    /// fresh per-iteration env, which holds only the head names.
+    fn body_context_env(&self) -> EnvRef {
+        self.body_context
+            .clone()
+            .unwrap_or_else(|| self.lexical_env.clone())
     }
 
     /// The control-transfer machinery: route through pending finallys, then
@@ -6556,6 +6679,13 @@ struct Compiler {
     /// `None` when no accumulator loop is open; nested canonical loops skip
     /// the accumulator (one shared `Vm::acc`).
     acc_binding: Option<crux::AtomId>,
+    /// The captured for-head names of the per-iteration loops currently
+    /// being compiled (Cut 3 continuation), innermost last: while a loop
+    /// body compiles, its captured head bindings resolve to per-iteration
+    /// env steps (`LoadPerIteration` etc.) instead of the capture-context
+    /// steps — the head inits compile before the entry step, so they keep
+    /// the context-slot path.
+    per_iteration_heads: Vec<Vec<crux::AtomId>>,
     /// Whether any emitted step switches the lexical environment (block/
     /// loop/catch/with envs): when false the body's env is constant for its
     /// whole run, so the dispatch loop skips the per-step context sync.
@@ -6603,6 +6733,22 @@ impl Compiler {
         }
     }
 
+    /// The per-iteration env slot of a captured for-head binding (Cut 3
+    /// continuation): `(depth, index)` — walk `depth` outers from the
+    /// current per-iteration env (0 = this loop's env), then read slot
+    /// `index` in that env's head-name layout. `None` outside a per-iteration
+    /// loop body (the head inits compile before the first env exists and
+    /// keep the capture-context path).
+    fn per_iteration(&self, name: crux::AtomId) -> Option<(usize, usize)> {
+        let total = self.per_iteration_heads.len();
+        for (position, heads) in self.per_iteration_heads.iter().enumerate().rev() {
+            if let Some(index) = heads.iter().position(|head| *head == name) {
+                return Some((total - 1 - position, index));
+            }
+        }
+        None
+    }
+
     /// Prepare to evaluate an initializer that may be an anonymous class
     /// expression: record the inferred binding name so the class definition
     /// names itself before its static field initializers run (spec 15.7.14
@@ -6621,7 +6767,17 @@ impl Compiler {
     fn emit_load(&mut self, loc: BindingLoc, name: crux::AtomId) {
         match loc {
             BindingLoc::Slot(slot) => self.emit(Step::LoadLocal { slot }),
-            BindingLoc::Context(index) => self.emit(Step::LoadContextSlot { index }),
+            // Cut 3 continuation: a captured for-head binding reads the
+            // current per-iteration env (a fresh copy per iteration) — a
+            // closure in the body observes the per-iteration value, not the
+            // capture context's.
+            BindingLoc::Context(index) => {
+                if let Some((depth, index)) = self.per_iteration(name) {
+                    self.emit(Step::LoadPerIteration { depth, index });
+                } else {
+                    self.emit(Step::LoadContextSlot { index });
+                }
+            }
             BindingLoc::Global => self.emit(Step::LoadGlobal { name }),
             BindingLoc::Acc => self.emit(Step::PushAcc),
             BindingLoc::Env => unreachable!("emit_load on the environment path"),
@@ -6634,7 +6790,13 @@ impl Compiler {
         self.emit(Step::Dup);
         match loc {
             BindingLoc::Slot(slot) => self.emit(Step::StoreLocal { slot }),
-            BindingLoc::Context(index) => self.emit(Step::StoreContextSlot { index }),
+            BindingLoc::Context(index) => {
+                if let Some((depth, index)) = self.per_iteration(name) {
+                    self.emit(Step::StorePerIteration { depth, index });
+                } else {
+                    self.emit(Step::StoreContextSlot { index });
+                }
+            }
             BindingLoc::Global => self.emit(Step::StoreGlobal { name }),
             BindingLoc::Acc => self.emit(Step::PopAcc),
             BindingLoc::Env => unreachable!("emit_dup_store on the environment path"),
@@ -6643,19 +6805,28 @@ impl Compiler {
 
     /// Whether a block contributes no environment — true when the block has
     /// no lexical declarations, or (certified bodies only) when every lexical
-    /// declaration binds to a frame slot: the scope analysis guarantees the
-    /// bindings are never consulted through an env (no closures/eval/with),
-    /// so the per-iteration/per-block env allocation in hot loops disappears
-    /// and `lexical_env` stays constant for the body.
+    /// declaration binds to a frame slot or the capture context: the scope
+    /// analysis guarantees the bindings are never consulted through an env
+    /// (no closures/eval/with), so the per-iteration/per-block env
+    /// allocation in hot loops disappears and `lexical_env` stays constant
+    /// for the body.
     fn fast_block(&self, stmts: &[Stmt]) -> bool {
         if self.scope.is_some() {
             return Self::block_decls(stmts).iter().all(|decl| {
                 if let StmtKind::VarDecl { decls, .. } = &decl.kind {
-                    decls.iter().all(|decl| {
-                        matches!(
-                            &decl.pattern,
-                            BindingPattern::Ident(name) if self.slot_of(*name).is_some()
-                        )
+                    decls.iter().all(|decl| match &decl.pattern {
+                        // A captured binding also contributes no env: a
+                        // block env would shadow the capture context and
+                        // break `LoadContextSlot` (the flat slot/context
+                        // layout is what the certified model consults).
+                        BindingPattern::Ident(name) => {
+                            self.slot_of(*name).is_some()
+                                || self
+                                    .scope
+                                    .as_ref()
+                                    .is_some_and(|scope| scope.context_of(*name).is_some())
+                        }
+                        _ => false,
                     })
                 } else {
                     // Using/class/function declarations always need an env.
@@ -6836,6 +7007,7 @@ impl Compiler {
                 | Step::EnterLoopEnv { .. }
                 | Step::EnterIterTdzEnv { .. }
                 | Step::PerIteration { .. }
+                | Step::EnterPerIteration { .. }
                 | Step::EnterWith
                 | Step::CatchBind { .. }
         ) {
@@ -7651,6 +7823,9 @@ impl Compiler {
         self.emit(Step::ResetCompletion);
         let mut has_loop_env = false;
         let mut per_iteration: Vec<JsString> = Vec::new();
+        // The certified per-iteration path emits `EnterPerIteration` for the
+        // first env (the env path emits `PerIteration` after `EnterLoopEnv`).
+        let mut per_iteration_entered = false;
         match init {
             None => {}
             Some(ForInit::Expr(expr)) => {
@@ -7715,13 +7890,22 @@ impl Compiler {
                     // A lexical head whose bindings are certified frame
                     // slots (no closures — the per-iteration freshness is
                     // unobservable) initializes the slots directly, skipping
-                    // the per-iteration environment machinery. Anything else
-                    // keeps the env path below.
+                    // the per-iteration environment machinery. A head
+                    // binding a body closure captures runs through
+                    // per-iteration envs (fresh copies the closures
+                    // observe); anything else keeps the env path below.
                     let all_slots = decls.iter().all(|decl| {
                         matches!(
                             &decl.pattern,
                             BindingPattern::Ident(name)
                                 if matches!(self.binding(*name), BindingLoc::Slot(_))
+                        )
+                    });
+                    let has_context = decls.iter().any(|decl| {
+                        matches!(
+                            &decl.pattern,
+                            BindingPattern::Ident(name)
+                                if matches!(self.binding(*name), BindingLoc::Context(_))
                         )
                     });
                     if all_slots {
@@ -7741,6 +7925,46 @@ impl Compiler {
                             };
                             self.emit(Step::InitLocal { slot });
                         }
+                    } else if has_context {
+                        // Cut 3 continuation (per-iteration loop heads): a
+                        // closure in the body captures the head binding, so
+                        // each iteration needs a fresh env holding it. The
+                        // head inits write the capture-context slots the
+                        // first per-iteration env copies from; the body's
+                        // own reads/writes of the captured head go through
+                        // the per-iteration env (the non-captured heads in
+                        // the same head list stay frame slots — their
+                        // freshness is unobservable).
+                        let mut heads: Vec<crux::AtomId> = Vec::new();
+                        for decl in decls {
+                            if let Some(init) = &decl.init {
+                                self.compile_expr(init)?;
+                            } else {
+                                self.emit(Step::Push(Value::Undefined));
+                            }
+                            let BindingPattern::Ident(name) = decl.pattern else {
+                                unreachable!("the certified scan only allows ident heads")
+                            };
+                            match self.binding(name) {
+                                BindingLoc::Slot(slot) => {
+                                    self.emit(Step::InitLocal { slot });
+                                }
+                                BindingLoc::Context(index) => {
+                                    self.emit(Step::InitContextSlot { index });
+                                    heads.push(name);
+                                }
+                                _ => unreachable!(
+                                    "a certified lexical head binds a slot or the capture context"
+                                ),
+                            }
+                        }
+                        per_iteration_entered = true;
+                        let names: Vec<JsString> =
+                            heads.iter().map(|id| crux::lookup(*id)).collect();
+                        self.scope_count += 1;
+                        has_loop_env = true;
+                        self.per_iteration_heads.push(heads);
+                        per_iteration.extend(names);
                     } else {
                         self.emit(Step::EnterLoopEnv {
                             kind: *kind,
@@ -7764,7 +7988,11 @@ impl Compiler {
                 }
             }
         }
-        if !per_iteration.is_empty() {
+        if per_iteration_entered {
+            self.emit(Step::EnterPerIteration {
+                names: per_iteration.clone(),
+            });
+        } else if !per_iteration.is_empty() {
             self.emit(Step::PerIteration {
                 names: per_iteration.clone(),
             });
@@ -7918,6 +8146,11 @@ impl Compiler {
             }
         }
         self.jump(test_label);
+        if per_iteration_entered {
+            // The loop body compiled with the captured-head names resolving
+            // to per-iteration env steps; the machinery is closed now.
+            self.per_iteration_heads.pop();
+        }
         self.place(end_label);
         self.emit(Step::NormalizeCompletion);
         self.scope_stack.pop();
@@ -8333,8 +8566,15 @@ impl Compiler {
                     // Cut 3 fast path: the binding is a frame slot.
                     BindingLoc::Slot(slot) => self.emit(Step::LoadLocal { slot }),
                     // Cut 3 continuation: the binding is captured — read
-                    // the capture context.
-                    BindingLoc::Context(index) => self.emit(Step::LoadContextSlot { index }),
+                    // the capture context (or the current per-iteration env
+                    // for a captured for-head inside its loop).
+                    BindingLoc::Context(index) => {
+                        if let Some((depth, index)) = self.per_iteration(*name) {
+                            self.emit(Step::LoadPerIteration { depth, index });
+                        } else {
+                            self.emit(Step::LoadContextSlot { index });
+                        }
+                    }
                     // Cut 5 fast script: a declared top-level var, read
                     // directly off the global object.
                     BindingLoc::Global => self.emit(Step::LoadGlobal { name: *name }),
@@ -8414,9 +8654,14 @@ impl Compiler {
                                 self.emit(Step::TypeofTop);
                             }
                             // Cut 3 continuation: `typeof` of a captured
-                            // binding reads the capture context.
+                            // binding reads the capture context (or the
+                            // current per-iteration env inside its loop).
                             BindingLoc::Context(index) => {
-                                self.emit(Step::LoadContextSlot { index });
+                                if let Some((depth, index)) = self.per_iteration(*name) {
+                                    self.emit(Step::LoadPerIteration { depth, index });
+                                } else {
+                                    self.emit(Step::LoadContextSlot { index });
+                                }
                                 self.emit(Step::TypeofTop);
                             }
                             // Cut 17: `typeof` of the fused loop counter is
@@ -8799,12 +9044,22 @@ impl Compiler {
                     }
                     BindingLoc::Context(index) => {
                         // Cut 3 continuation: the update reads and writes
-                        // the capture context.
-                        self.emit(Step::UpdateContextSlot {
-                            index,
-                            op: *op,
-                            prefix,
-                        });
+                        // the capture context (or the current per-iteration
+                        // env for a captured for-head inside its loop).
+                        if let Some((depth, index)) = self.per_iteration(*name) {
+                            self.emit(Step::UpdatePerIteration {
+                                depth,
+                                index,
+                                op: *op,
+                                prefix,
+                            });
+                        } else {
+                            self.emit(Step::UpdateContextSlot {
+                                index,
+                                op: *op,
+                                prefix,
+                            });
+                        }
                         return Ok(());
                     }
                     BindingLoc::Env => {}
@@ -10212,7 +10467,10 @@ pub fn compile_body(function: &EcmaFunction) -> Result<CompiledBody, JsError> {
     }
     compiler.compile_statements(&function.body.stmts)?;
     compiler.resolve();
-    let env_constant = compiler.scope.is_some();
+    // A per-iteration loop switches the lexical environment each iteration,
+    // so the per-step context sync must run (closures created in the loop
+    // body capture the per-iteration env, not the capture context).
+    let env_constant = compiler.scope.is_some() && !compiler.env_changing;
     Ok(CompiledBody {
         steps: compiler.steps,
         handlers: compiler.handlers,
@@ -10403,6 +10661,17 @@ fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
         }
     }
     if !scan.stmts(&function.body.stmts, 0) {
+        return None;
+    }
+    // A closure capturing a lexical binding declared inside a loop body
+    // observes its per-iteration freshness (the body block re-creates each
+    // iteration); the certified per-iteration machinery covers only the
+    // loop-head names, so such a body stays on the env path.
+    if scan
+        .captured
+        .iter()
+        .any(|name| scan.loop_body_lexicals.contains(name))
+    {
         return None;
     }
     // Cut 3 continuation (mapped arguments slice): a sloppy body observing
@@ -10670,13 +10939,9 @@ fn collect_captures(
         StmtKind::Labeled { body, .. } => {
             collect_captures(&[body.as_ref().clone()], bindings, captured)
         }
-        StmtKind::FunctionDecl(function) => closure_allows(
-            &function.params,
-            &function.body.stmts,
-            bindings,
-            captured,
-            &[],
-        ),
+        StmtKind::FunctionDecl(function) => {
+            closure_allows(&function.params, &function.body.stmts, bindings, captured)
+        }
         StmtKind::ForIn {
             left, right, body, ..
         }
@@ -10739,29 +11004,21 @@ fn collect_expr_captures(
     captured: &mut HashSet<crux::AtomId>,
 ) -> bool {
     match &expr.kind {
-        ExprKind::Function(function) => closure_allows(
-            &function.params,
-            &function.body.stmts,
-            bindings,
-            captured,
-            &[],
-        ),
+        ExprKind::Function(function) => {
+            closure_allows(&function.params, &function.body.stmts, bindings, captured)
+        }
         ExprKind::Arrow { params, body, .. } => {
-            closure_arrow_allows(params, body, bindings, captured, &[])
+            closure_arrow_allows(params, body, bindings, captured)
         }
         ExprKind::Object(object) => object.props.iter().all(|prop| match prop {
-            ObjectProperty::Method { function, .. } => closure_allows(
-                &function.params,
-                &function.body.stmts,
-                bindings,
-                captured,
-                &[],
-            ),
+            ObjectProperty::Method { function, .. } => {
+                closure_allows(&function.params, &function.body.stmts, bindings, captured)
+            }
             ObjectProperty::Get { body, .. } => {
-                closure_allows(&[], &body.stmts, bindings, captured, &[])
+                closure_allows(&[], &body.stmts, bindings, captured)
             }
             ObjectProperty::Set { body, .. } => {
-                closure_allows(&[], &body.stmts, bindings, captured, &[])
+                closure_allows(&[], &body.stmts, bindings, captured)
             }
             ObjectProperty::Init { key, value, .. } => {
                 let key_ok = match key {
@@ -10867,16 +11124,15 @@ fn closure_allows(
     stmts: &[Stmt],
     bindings: &HashSet<crux::AtomId>,
     captured: &mut HashSet<crux::AtomId>,
-    loop_heads: &[crux::AtomId],
 ) -> bool {
     params.iter().all(|param| {
         param
             .init
             .as_ref()
-            .is_none_or(|init| closure_expr_allows(init, bindings, captured, loop_heads))
+            .is_none_or(|init| closure_expr_allows(init, bindings, captured))
     }) && stmts
         .iter()
-        .all(|stmt| closure_stmt_allows(stmt, bindings, captured, loop_heads))
+        .all(|stmt| closure_stmt_allows(stmt, bindings, captured))
 }
 
 fn closure_arrow_allows(
@@ -10884,19 +11140,18 @@ fn closure_arrow_allows(
     body: &ArrowBody,
     bindings: &HashSet<crux::AtomId>,
     captured: &mut HashSet<crux::AtomId>,
-    loop_heads: &[crux::AtomId],
 ) -> bool {
     params.iter().all(|param| {
         param
             .init
             .as_ref()
-            .is_none_or(|init| closure_expr_allows(init, bindings, captured, loop_heads))
+            .is_none_or(|init| closure_expr_allows(init, bindings, captured))
     }) && match body {
-        ArrowBody::Expr(expr) => closure_expr_allows(expr, bindings, captured, loop_heads),
+        ArrowBody::Expr(expr) => closure_expr_allows(expr, bindings, captured),
         ArrowBody::Block(block) => block
             .stmts
             .iter()
-            .all(|s| closure_stmt_allows(s, bindings, captured, loop_heads)),
+            .all(|s| closure_stmt_allows(s, bindings, captured)),
     }
 }
 
@@ -10904,22 +11159,21 @@ fn closure_stmt_allows(
     stmt: &Stmt,
     bindings: &HashSet<crux::AtomId>,
     captured: &mut HashSet<crux::AtomId>,
-    loop_heads: &[crux::AtomId],
 ) -> bool {
     match &stmt.kind {
         StmtKind::Block(block) => block
             .stmts
             .iter()
-            .all(|s| closure_stmt_allows(s, bindings, captured, loop_heads)),
+            .all(|s| closure_stmt_allows(s, bindings, captured)),
         StmtKind::Empty | StmtKind::Debugger | StmtKind::Break(_) | StmtKind::Continue(_) => true,
-        StmtKind::Expr(expr) => closure_expr_allows(expr, bindings, captured, loop_heads),
+        StmtKind::Expr(expr) => closure_expr_allows(expr, bindings, captured),
         StmtKind::VarDecl { decls, .. } | StmtKind::UsingDecl { decls, .. } => {
             decls.iter().all(|decl| {
                 // The declared names are bound here (shadowing); only the
                 // initializers are references.
                 decl.init
                     .as_ref()
-                    .is_none_or(|init| closure_expr_allows(init, bindings, captured, loop_heads))
+                    .is_none_or(|init| closure_expr_allows(init, bindings, captured))
             })
         }
         StmtKind::If {
@@ -10927,15 +11181,15 @@ fn closure_stmt_allows(
             consequent,
             alternate,
         } => {
-            closure_expr_allows(test, bindings, captured, loop_heads)
-                && closure_stmt_allows(consequent, bindings, captured, loop_heads)
+            closure_expr_allows(test, bindings, captured)
+                && closure_stmt_allows(consequent, bindings, captured)
                 && alternate
                     .as_deref()
-                    .is_none_or(|a| closure_stmt_allows(a, bindings, captured, loop_heads))
+                    .is_none_or(|a| closure_stmt_allows(a, bindings, captured))
         }
         StmtKind::While { test, body } | StmtKind::DoWhile { body, test } => {
-            closure_expr_allows(test, bindings, captured, loop_heads)
-                && closure_stmt_allows(body, bindings, captured, loop_heads)
+            closure_expr_allows(test, bindings, captured)
+                && closure_stmt_allows(body, bindings, captured)
         }
         StmtKind::For {
             init,
@@ -10945,36 +11199,30 @@ fn closure_stmt_allows(
         } => {
             let init_ok = match init {
                 None => true,
-                Some(ForInit::Expr(expr)) => {
-                    closure_expr_allows(expr, bindings, captured, loop_heads)
-                }
+                Some(ForInit::Expr(expr)) => closure_expr_allows(expr, bindings, captured),
                 Some(ForInit::VarDecl { decls, .. }) => decls.iter().all(|decl| {
-                    decl.init.as_ref().is_none_or(|init| {
-                        closure_expr_allows(init, bindings, captured, loop_heads)
-                    })
+                    decl.init
+                        .as_ref()
+                        .is_none_or(|init| closure_expr_allows(init, bindings, captured))
                 }),
             };
             init_ok
                 && test
                     .as_ref()
-                    .is_none_or(|t| closure_expr_allows(t, bindings, captured, loop_heads))
+                    .is_none_or(|t| closure_expr_allows(t, bindings, captured))
                 && update
                     .as_ref()
-                    .is_none_or(|u| closure_expr_allows(u, bindings, captured, loop_heads))
-                && closure_stmt_allows(body, bindings, captured, loop_heads)
+                    .is_none_or(|u| closure_expr_allows(u, bindings, captured))
+                && closure_stmt_allows(body, bindings, captured)
         }
         StmtKind::Return(expr) => expr
             .as_ref()
-            .is_none_or(|e| closure_expr_allows(e, bindings, captured, loop_heads)),
-        StmtKind::Throw(expr) => closure_expr_allows(expr, bindings, captured, loop_heads),
-        StmtKind::Labeled { body, .. } => closure_stmt_allows(body, bindings, captured, loop_heads),
-        StmtKind::FunctionDecl(function) => closure_allows(
-            &function.params,
-            &function.body.stmts,
-            bindings,
-            captured,
-            loop_heads,
-        ),
+            .is_none_or(|e| closure_expr_allows(e, bindings, captured)),
+        StmtKind::Throw(expr) => closure_expr_allows(expr, bindings, captured),
+        StmtKind::Labeled { body, .. } => closure_stmt_allows(body, bindings, captured),
+        StmtKind::FunctionDecl(function) => {
+            closure_allows(&function.params, &function.body.stmts, bindings, captured)
+        }
         StmtKind::ForIn {
             left, right, body, ..
         }
@@ -10982,14 +11230,14 @@ fn closure_stmt_allows(
             left, right, body, ..
         } => {
             let left_ok = match left {
-                ForBinding::Expr(expr) => closure_expr_allows(expr, bindings, captured, loop_heads),
+                ForBinding::Expr(expr) => closure_expr_allows(expr, bindings, captured),
                 ForBinding::VarDecl { init, .. } => init
                     .as_ref()
-                    .is_none_or(|init| closure_expr_allows(init, bindings, captured, loop_heads)),
+                    .is_none_or(|init| closure_expr_allows(init, bindings, captured)),
             };
             left_ok
-                && closure_expr_allows(right, bindings, captured, loop_heads)
-                && closure_stmt_allows(body, bindings, captured, loop_heads)
+                && closure_expr_allows(right, bindings, captured)
+                && closure_stmt_allows(body, bindings, captured)
         }
         StmtKind::Try {
             block,
@@ -10999,19 +11247,19 @@ fn closure_stmt_allows(
             block
                 .stmts
                 .iter()
-                .all(|s| closure_stmt_allows(s, bindings, captured, loop_heads))
+                .all(|s| closure_stmt_allows(s, bindings, captured))
                 && handler.as_ref().is_none_or(|handler| {
                     // The catch parameter is bound; its body walks.
                     handler
                         .body
                         .stmts
                         .iter()
-                        .all(|s| closure_stmt_allows(s, bindings, captured, loop_heads))
+                        .all(|s| closure_stmt_allows(s, bindings, captured))
                 })
                 && finalizer.as_ref().is_none_or(|f| {
                     f.stmts
                         .iter()
-                        .all(|s| closure_stmt_allows(s, bindings, captured, loop_heads))
+                        .all(|s| closure_stmt_allows(s, bindings, captured))
                 })
         }
         StmtKind::Switch {
@@ -11019,15 +11267,15 @@ fn closure_stmt_allows(
             cases,
             ..
         } => {
-            closure_expr_allows(discriminant, bindings, captured, loop_heads)
+            closure_expr_allows(discriminant, bindings, captured)
                 && cases.iter().all(|case| {
                     case.test
                         .as_ref()
-                        .is_none_or(|t| closure_expr_allows(t, bindings, captured, loop_heads))
+                        .is_none_or(|t| closure_expr_allows(t, bindings, captured))
                         && case
                             .consequent
                             .iter()
-                            .all(|s| closure_stmt_allows(s, bindings, captured, loop_heads))
+                            .all(|s| closure_stmt_allows(s, bindings, captured))
                 })
         }
         StmtKind::ClassDecl(_) | StmtKind::With { .. } => false,
@@ -11038,22 +11286,18 @@ fn closure_expr_allows(
     expr: &Expr,
     bindings: &HashSet<crux::AtomId>,
     captured: &mut HashSet<crux::AtomId>,
-    loop_heads: &[crux::AtomId],
 ) -> bool {
     match &expr.kind {
         // A read or write of a body binding is a capture: the body
         // context-allocates it. `arguments` is the special binding the fast
-        // path never creates.
+        // path never creates. A lexical for-head binding is captured like
+        // any other — the loop's per-iteration env gives the closure the
+        // fresh-per-iteration value it needs.
         ExprKind::Ident(name) => {
             if crux::lookup(*name) == JsString::from_utf8("arguments") {
                 return false;
             }
             if bindings.contains(name) {
-                // A loop-head lexical binding needs a fresh context per
-                // iteration — deferred — so the whole body bails.
-                if loop_heads.contains(name) {
-                    return false;
-                }
                 captured.insert(*name);
             }
             true
@@ -11062,78 +11306,66 @@ fn closure_expr_allows(
         ExprKind::Array(array) => array.elements.iter().all(|element| match element {
             ArrayElement::Hole => true,
             ArrayElement::Expr(e) | ArrayElement::Spread(e) => {
-                closure_expr_allows(e, bindings, captured, loop_heads)
+                closure_expr_allows(e, bindings, captured)
             }
         }),
         ExprKind::Object(object) => object.props.iter().all(|prop| match prop {
             // A method/getter/setter is a nested closure: a body-binding
             // reference inside it is a capture too.
-            ObjectProperty::Method { function, .. } => closure_allows(
-                &function.params,
-                &function.body.stmts,
-                bindings,
-                captured,
-                loop_heads,
-            ),
+            ObjectProperty::Method { function, .. } => {
+                closure_allows(&function.params, &function.body.stmts, bindings, captured)
+            }
             ObjectProperty::Get { body, .. } => {
-                closure_allows(&[], &body.stmts, bindings, captured, loop_heads)
+                closure_allows(&[], &body.stmts, bindings, captured)
             }
             ObjectProperty::Set { body, .. } => {
                 // The setter's parameter is bound in the closure.
-                closure_allows(&[], &body.stmts, bindings, captured, loop_heads)
+                closure_allows(&[], &body.stmts, bindings, captured)
             }
             ObjectProperty::Init { key, value, .. } => {
                 let key_ok = match key {
                     // A property key is not a reference.
                     PropertyName::Ident(_) | PropertyName::Str(_) | PropertyName::Number(_) => true,
-                    PropertyName::Computed(e) => {
-                        closure_expr_allows(e, bindings, captured, loop_heads)
-                    }
+                    PropertyName::Computed(e) => closure_expr_allows(e, bindings, captured),
                 };
-                key_ok && closure_expr_allows(value, bindings, captured, loop_heads)
+                key_ok && closure_expr_allows(value, bindings, captured)
             }
-            ObjectProperty::Spread(e) => closure_expr_allows(e, bindings, captured, loop_heads),
+            ObjectProperty::Spread(e) => closure_expr_allows(e, bindings, captured),
         }),
-        ExprKind::Paren(inner) => closure_expr_allows(inner, bindings, captured, loop_heads),
-        ExprKind::Unary { operand, .. } => {
-            closure_expr_allows(operand, bindings, captured, loop_heads)
-        }
-        ExprKind::Update { target, .. } => {
-            closure_expr_allows(target, bindings, captured, loop_heads)
-        }
+        ExprKind::Paren(inner) => closure_expr_allows(inner, bindings, captured),
+        ExprKind::Unary { operand, .. } => closure_expr_allows(operand, bindings, captured),
+        ExprKind::Update { target, .. } => closure_expr_allows(target, bindings, captured),
         ExprKind::Binary { left, right, .. } => {
-            closure_expr_allows(left, bindings, captured, loop_heads)
-                && closure_expr_allows(right, bindings, captured, loop_heads)
+            closure_expr_allows(left, bindings, captured)
+                && closure_expr_allows(right, bindings, captured)
         }
         ExprKind::Logical { left, right, .. } => {
-            closure_expr_allows(left, bindings, captured, loop_heads)
-                && closure_expr_allows(right, bindings, captured, loop_heads)
+            closure_expr_allows(left, bindings, captured)
+                && closure_expr_allows(right, bindings, captured)
         }
         ExprKind::Conditional {
             test,
             consequent,
             alternate,
         } => {
-            closure_expr_allows(test, bindings, captured, loop_heads)
-                && closure_expr_allows(consequent, bindings, captured, loop_heads)
-                && closure_expr_allows(alternate, bindings, captured, loop_heads)
+            closure_expr_allows(test, bindings, captured)
+                && closure_expr_allows(consequent, bindings, captured)
+                && closure_expr_allows(alternate, bindings, captured)
         }
         ExprKind::Assign { target, value, .. } => {
             // An assignment target is a reference (writing a body binding is
             // a capture).
-            closure_expr_allows(target, bindings, captured, loop_heads)
-                && closure_expr_allows(value, bindings, captured, loop_heads)
+            closure_expr_allows(target, bindings, captured)
+                && closure_expr_allows(value, bindings, captured)
         }
         ExprKind::Member(member) => {
             if matches!(member.property, MemberProperty::Private(_)) {
                 return false;
             }
-            let object_ok = closure_expr_allows(&member.object, bindings, captured, loop_heads);
+            let object_ok = closure_expr_allows(&member.object, bindings, captured);
             let key_ok = match &member.property {
                 // A property name is not a reference.
-                MemberProperty::Computed(key) => {
-                    closure_expr_allows(key, bindings, captured, loop_heads)
-                }
+                MemberProperty::Computed(key) => closure_expr_allows(key, bindings, captured),
                 _ => true,
             };
             object_ok && key_ok
@@ -11145,37 +11377,33 @@ fn closure_expr_allows(
             ) {
                 return false;
             }
-            closure_expr_allows(&call.callee, bindings, captured, loop_heads)
+            closure_expr_allows(&call.callee, bindings, captured)
                 && call.args.iter().all(|arg| match arg {
                     Argument::Expr(e) | Argument::Spread(e) => {
-                        closure_expr_allows(e, bindings, captured, loop_heads)
+                        closure_expr_allows(e, bindings, captured)
                     }
                 })
         }
         ExprKind::New(new) => {
-            closure_expr_allows(&new.callee, bindings, captured, loop_heads)
+            closure_expr_allows(&new.callee, bindings, captured)
                 && new.args.iter().all(|arg| match arg {
                     Argument::Expr(e) | Argument::Spread(e) => {
-                        closure_expr_allows(e, bindings, captured, loop_heads)
+                        closure_expr_allows(e, bindings, captured)
                     }
                 })
         }
         ExprKind::Template(template) => template
             .exprs
             .iter()
-            .all(|e| closure_expr_allows(e, bindings, captured, loop_heads)),
+            .all(|e| closure_expr_allows(e, bindings, captured)),
         ExprKind::Sequence(exprs) => exprs
             .iter()
-            .all(|e| closure_expr_allows(e, bindings, captured, loop_heads)),
-        ExprKind::Function(function) => closure_allows(
-            &function.params,
-            &function.body.stmts,
-            bindings,
-            captured,
-            loop_heads,
-        ),
+            .all(|e| closure_expr_allows(e, bindings, captured)),
+        ExprKind::Function(function) => {
+            closure_allows(&function.params, &function.body.stmts, bindings, captured)
+        }
         ExprKind::Arrow { params, body, .. } => {
-            closure_arrow_allows(params, body, bindings, captured, loop_heads)
+            closure_arrow_allows(params, body, bindings, captured)
         }
         // `yield`/`await` suspend the closure itself, never the enclosing
         // body, so they are fine here — their operands still walk. The rest
@@ -11184,9 +11412,7 @@ fn closure_expr_allows(
             argument: Some(argument),
             ..
         }
-        | ExprKind::Await(argument) => {
-            closure_expr_allows(argument, bindings, captured, loop_heads)
-        }
+        | ExprKind::Await(argument) => closure_expr_allows(argument, bindings, captured),
         ExprKind::Yield { argument: None, .. } => true,
         ExprKind::This
         | ExprKind::Super
@@ -11215,6 +11441,17 @@ struct FastScopeScan {
     /// The block depth each lexical binding was declared at: a reference
     /// must sit at an equal or deeper depth (inside its scope).
     declared_depth: HashMap<crux::AtomId, usize>,
+    /// The block depths of the loop bodies currently being scanned: a
+    /// lexical binding declared at or below one (a loop-body declaration)
+    /// is fresh per iteration (spec 14.7.4.3 — the body block re-creates
+    /// each iteration), which the certified per-iteration machinery covers
+    /// only for the loop-head names.
+    open_loop_body_depths: Vec<usize>,
+    /// The lexical bindings declared inside an open loop body: a closure
+    /// capturing one bails the body to the env path (the per-iteration
+    /// freshness of a body-block scope is not flattenable into the capture
+    /// context).
+    loop_body_lexicals: HashSet<crux::AtomId>,
     /// Every name bound anywhere in the body (see `collect_body_bindings`):
     /// the closure-capture check tests references against this complete
     /// set, not the incremental `slots`.
@@ -11231,10 +11468,6 @@ struct FastScopeScan {
     context_tdz: Vec<bool>,
     context_const: Vec<bool>,
     context_param: Vec<Option<usize>>,
-    /// The lexical `for`-head bindings of the currently open loops: a
-    /// closure inside the loop that captures one needs a fresh context per
-    /// iteration, which this slice defers — such a body bails.
-    open_loop_heads: Vec<crux::AtomId>,
     /// Whether the body is a strict non-arrow function whose own `arguments`
     /// reads are the unmapped arguments object (Cut 3 continuation).
     allow_arguments: bool,
@@ -11287,25 +11520,12 @@ impl FastScopeScan {
                     Some(ForInit::Expr(expr)) => self.expr(expr, depth),
                     Some(ForInit::VarDecl { kind, decls }) => self.decls(kind, decls, depth),
                 };
-                // A lexical for-head binding captured by a closure inside
-                // the loop needs a fresh context per iteration (deferred):
-                // track the open loop's head names so the closure check can
-                // bail.
-                let head_start = self.open_loop_heads.len();
-                if let Some(ForInit::VarDecl { kind, decls }) = init
-                    && *kind != VarDeclKind::Var
-                {
-                    for decl in decls {
-                        if let BindingPattern::Ident(name) = &decl.pattern {
-                            self.open_loop_heads.push(*name);
-                        }
-                    }
-                }
+                self.open_loop_body_depths.push(depth + 1);
                 let result = init_ok
                     && test.as_ref().is_none_or(|t| self.expr(t, depth))
                     && update.as_ref().is_none_or(|u| self.expr(u, depth))
                     && self.stmt(body, depth + 1);
-                self.open_loop_heads.truncate(head_start);
+                self.open_loop_body_depths.pop();
                 result
             }
             StmtKind::Return(expr) => expr.as_ref().is_none_or(|e| self.expr(e, depth)),
@@ -11340,6 +11560,18 @@ impl FastScopeScan {
                 self.declared_depth.insert(name, depth);
                 if *kind == VarDeclKind::Const {
                     self.consts.insert(name);
+                }
+                // A binding declared inside an open loop body is fresh per
+                // iteration (the body block re-creates each iteration): a
+                // closure capturing it must stay on the env path — the
+                // certified per-iteration machinery covers only the
+                // loop-head names.
+                if self
+                    .open_loop_body_depths
+                    .iter()
+                    .any(|&body_depth| depth >= body_depth)
+                {
+                    self.loop_body_lexicals.insert(name);
                 }
             }
             // A captured binding lives in the capture context; a `var`
@@ -11498,27 +11730,21 @@ impl FastScopeScan {
             ExprKind::Function(function) => {
                 // Cut 3 continuation (closure capture): a closure created by
                 // a certified body — its references to body bindings are
-                // captures (the body context-allocates them); a reference to
-                // an open loop-head lexical binding or a construct that
-                // observes the body's absent `this`/`arguments`/`new.target`/
-                // `super` (arrows inherit them lexically; a direct `eval`/
-                // `with` can see the body's names) bails the body. Its own
-                // body compiles separately.
+                // captures (the body context-allocates them); a construct
+                // that observes the body's absent `this`/`arguments`/
+                // `new.target`/`super` (arrows inherit them lexically; a
+                // direct `eval`/`with` can see the body's names) bails the
+                // body. Its own body compiles separately.
                 closure_allows(
                     &function.params,
                     &function.body.stmts,
                     &self.bindings,
                     &mut self.captured,
-                    &self.open_loop_heads,
                 )
             }
-            ExprKind::Arrow { params, body, .. } => closure_arrow_allows(
-                params,
-                body,
-                &self.bindings,
-                &mut self.captured,
-                &self.open_loop_heads,
-            ),
+            ExprKind::Arrow { params, body, .. } => {
+                closure_arrow_allows(params, body, &self.bindings, &mut self.captured)
+            }
         }
     }
 

@@ -3071,9 +3071,9 @@ mod tests {
             run("function f() { var g = () => x; return g; let x = 5; } f()()"),
             Err(error) if error.kind == crux::ErrorKind::ReferenceError
         ));
-        // A closure inside a loop capturing the loop-head `let` needs a
-        // fresh context per iteration — deferred — the body bails to the
-        // env path and keeps the per-iteration semantics.
+        // A closure inside a loop capturing the loop-head `let` certifies:
+        // the loop runs per-iteration envs holding a fresh copy per
+        // iteration, which the closures capture (spec 14.7.4.3).
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
         agent
@@ -3081,8 +3081,19 @@ mod tests {
             .unwrap();
         let ir = compiled_body_of(&mut agent, "f");
         assert!(
-            ir.scope.is_none(),
-            "a loop-head capture must bail to the env path"
+            ir.scope.is_some(),
+            "a loop-head capture must keep the body certified"
+        );
+        assert!(
+            ir.steps.iter().any(|s| {
+                matches!(
+                    s,
+                    crate::ir::Step::EnterPerIteration { .. }
+                        | crate::ir::Step::LoadPerIteration { .. }
+                        | crate::ir::Step::UpdatePerIteration { .. }
+                )
+            }),
+            "the certified body must run per-iteration envs for the head"
         );
         assert_eq!(
             run("function f() { var a = []; for (let i = 0; i < 3; i++) { a.push(() => i); } return a[0]() + a[1]() * 10 + a[2]() * 100; } f()")
@@ -3095,6 +3106,129 @@ mod tests {
             run("function v() { var a = []; for (var i = 0; i < 3; i++) { a.push(() => i); } return a[0]() + a[1]() * 10 + a[2]() * 100; } v()")
                 .unwrap(),
             Value::Number(333.0)
+        );
+    }
+
+    #[test]
+    fn fast_path_per_iteration_loop_heads() {
+        // Body reads/writes of a captured head go through the per-iteration
+        // env; a write before the closure creation is what the closure sees
+        // (within an iteration the binding is shared).
+        assert_eq!(
+            run("function f() { var a = []; for (let i = 0; i < 3; i++) { i = i * 10; a.push(() => i); } return a[0]() + a[1]() * 10; } f()")
+                .unwrap(),
+            Value::Number(100.0)
+        );
+        // The update targets the next iteration's copy: the test sees the
+        // incremented value.
+        assert_eq!(
+            run(
+                "function f() { var s = 0; for (let i = 0; i < 3; i++) { s += i; } return s; } f()"
+            )
+            .unwrap(),
+            Value::Number(3.0)
+        );
+        // Nested loops capture both heads; the outer head resolves through
+        // the inner per-iteration env's outer chain.
+        assert_eq!(
+            run("function f() { var a = []; for (let i = 0; i < 2; i++) { for (let j = 0; j < 2; j++) { a.push(() => i + j); } } return a[0]() + a[1]() + a[2]() + a[3](); } f()")
+                .unwrap(),
+            Value::Number(4.0)
+        );
+        // A mixed head: the captured name gets a per-iteration env, the
+        // non-captured name stays a frame slot.
+        assert_eq!(
+            run("function f() { var a = []; var s = 0; for (let i = 0, k = 100; i < 3; i++, k++) { s += k; a.push(() => i); } return a[0]() + a[1]() * 10 + a[2]() * 100 + s; } f()")
+                .unwrap(),
+            Value::Number(513.0)
+        );
+        // break and continue unwind the per-iteration env correctly.
+        assert_eq!(
+            run("function f() { var a = []; for (let i = 0; i < 10; i++) { if (i === 2) break; a.push(() => i); } return a[0]() + a[1]() * 10; } f()")
+                .unwrap(),
+            Value::Number(10.0)
+        );
+        assert_eq!(
+            run("function f() { var a = []; for (let i = 0; i < 4; i++) { if (i === 2) continue; a.push(() => i); } return a[0]() + a[1]() * 10 + a[2]() * 100; } f()")
+                .unwrap(),
+            Value::Number(310.0)
+        );
+        // A labeled break from a nested block (the block contributes no env
+        // even though the body has captured bindings).
+        assert_eq!(
+            run("function f() { var a = []; outer: for (let i = 0; i < 5; i++) { { if (i === 1) break outer; } a.push(() => i); } return a[0](); } f()")
+                .unwrap(),
+            Value::Number(0.0)
+        );
+        // The head init can reference a frame-slot binding (a param): the
+        // init compiles to bytecode, not the tree-walker.
+        assert_eq!(
+            run("function f(n) { var a = []; for (let i = n; i < n + 2; i++) { a.push(() => i); } return a[0]() + a[1]() * 10; } f(5)")
+                .unwrap(),
+            Value::Number(65.0)
+        );
+        // Escaped closures keep per-iteration values after the call.
+        assert_eq!(
+            run("function f() { var a = []; for (let i = 0; i < 3; i++) { a.push(() => i); } return a; } var g = f(); g[0]() + g[1]() * 10 + g[2]() * 100")
+                .unwrap(),
+            Value::Number(210.0)
+        );
+        // A closure that writes the head mutates its own iteration's env.
+        assert_eq!(
+            run("function f() { var a = []; for (let i = 0; i < 3; i++) { a.push(() => { i++; return i; }); } return a; } var h = f(); h[0]() + h[1]() * 10 + h[2]() * 100")
+                .unwrap(),
+            Value::Number(321.0)
+        );
+        // A zero-iteration loop leaves no closures and restores the capture
+        // context (a later captured binding read must still work).
+        assert_eq!(
+            run("function f() { var a = []; for (let i = 0; i < 0; i++) { a.push(() => i); } var x = 1; var g = () => x; return a.length + g(); } f()")
+                .unwrap(),
+            Value::Number(1.0)
+        );
+    }
+
+    #[test]
+    fn fast_path_block_captured_let_needs_no_block_env() {
+        // A block-level `let` captured by a closure must not create a block
+        // env (it would shadow the capture context and break the flat
+        // context-slot layout): the block contributes no env, the binding
+        // lives in the capture context.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script("function f() { let x = 1; { let y = 2; return () => x + y; } }")
+            .unwrap();
+        let ir = compiled_body_of(&mut agent, "f");
+        assert!(ir.scope.is_some(), "the body must stay certified");
+        assert!(
+            !ir.steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::EnterBlock { .. })),
+            "a captured block let must not allocate a block env"
+        );
+        assert_eq!(
+            run("function f() { let x = 1; { let y = 2; return () => x + y; } } f()()").unwrap(),
+            Value::Number(3.0)
+        );
+        // A captured lexical declared inside a loop body is fresh per
+        // iteration (the body block re-creates each iteration) — the
+        // certified per-iteration machinery covers only loop-head names, so
+        // such a body stays on the env path and keeps the freshness.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script("function g() { var a = []; for (let i = 0; i < 2; i++) { let y = i + 10; a.push(() => i + y); } return a; }")
+            .unwrap();
+        let irg = compiled_body_of(&mut agent, "g");
+        assert!(
+            irg.scope.is_none(),
+            "a loop-body capture must bail to the env path"
+        );
+        assert_eq!(
+            run("function f() { var a = []; for (let i = 0; i < 2; i++) { let y = i + 10; a.push(() => i + y); } return a[0]() + a[1]() * 100; } f()")
+                .unwrap(),
+            Value::Number(1210.0)
         );
     }
 

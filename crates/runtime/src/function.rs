@@ -1755,6 +1755,12 @@ fn run_compiled_body(
 ) -> Result<Value, JsError> {
     let body_env = agent.running_context()?.lexical_environment.clone();
     let mut vm = Vm::new(body_env.clone(), strict);
+    // Cut 3 continuation (per-iteration loop heads): the certified body's
+    // capture context is fixed for the run — the per-iteration loop
+    // machinery copies fresh head bindings from it.
+    if ir.scope.is_some() {
+        vm.body_context = Some(body_env.clone());
+    }
     // A certified body with no bindings (frame_size 0) never reads the
     // frame — `Vm::new` already left the inline buffer in place — so the
     // slot-by-slot setup is skipped entirely.

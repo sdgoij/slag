@@ -32,12 +32,19 @@ stays on the env path); a body's own `arguments` reads get a frame slot
 the certified call fills — the unmapped object for strict bodies, and
 (the latest slice) the **mapped** object for sloppy simple-param bodies,
 aliasing the formals through the capture context (`arguments[i]` reads
-and writes the same bindings the body's `LoadContextSlot`s use).
-Deferred from the continuation: per-iteration loop-head contexts (a
-closure capturing a loop-head `let` bails to the env path), nested
-context chains (depth > 1 resolves through the env), Annex B, the body
-accumulator model, slot-arg calls, and the Cut 5 encoding work remain
-open.
+and writes the same bindings the body's `LoadContextSlot`s use). The
+per-iteration loop-head contexts slice has landed too: a body whose
+closure captures a lexical `for`-head binding now certifies — the loop
+runs a fresh per-iteration environment per iteration (the existing
+`PerIteration` copy machinery, with a new `EnterPerIteration` creating
+the first env on the env stack), the head inits write the capture
+context, the body's own reads/writes of a captured head go through
+per-iteration steps, and the closures capture the fresh env. A closure
+capturing a lexical binding *declared inside* a loop body still bails
+(its per-iteration block scope is not flattenable into the capture
+context). Deferred from the continuation: nested context chains (depth
+> 1 resolves through the env), Annex B, the body accumulator model,
+slot-arg calls, and the Cut 5 encoding work remain open.
 
 ---
 
@@ -409,9 +416,13 @@ implementation* for the VM itself.
   speed later (the Cut 3 continuation + §8 risk register). A certified
   body may create capture-free closures (the continuation's first slice).
   **This list has since shrunk**: `this` slots, unmapped strict
-  `arguments`, mapped sloppy `arguments`, and capture-based closures
-  landed in later slices (`docs/perf.md` Cuts 17+); still deferred are
-  per-iteration loop-head contexts, nested context chains, and Annex B.
+  `arguments`, mapped sloppy `arguments`, capture-based closures, and
+  per-iteration loop-head contexts (a closure capturing a `for`-head
+  `let` runs the loop through per-iteration envs) landed in later slices
+  (`docs/perf.md` Cuts 17+); still deferred are loop-body-scoped
+  captures (a closure capturing a lexical binding declared inside a
+  loop body bails — its per-iteration block scope is not flattenable),
+  nested context chains, and Annex B.
 
 ### Correctness notes (why the slice is right)
 
