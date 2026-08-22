@@ -165,10 +165,9 @@ fn run_file_inner(file: &str, args: &[String], options: &Options, source: &str) 
         context.install_process_argv(&argv).map_err(report)?;
     }
     match context.eval(source) {
-        Ok(value) => {
-            println!("{value}");
-            Ok(())
-        }
+        // A script file's completion value is not printed (matching node et
+        // al.); the REPL prints its own results.
+        Ok(_) => Ok(()),
         Err(error) => {
             eprintln!("slag: {error}");
             Err(1)
