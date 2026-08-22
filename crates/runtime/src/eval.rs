@@ -2980,6 +2980,76 @@ mod tests {
     }
 
     #[test]
+    fn fast_path_capture_free_closure_certifies() {
+        // Cut 3 continuation: a closure that captures nothing from the body
+        // can be created by a certified body (its own body compiles
+        // separately).
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script("function f() { return function() { return 42; }; }")
+            .unwrap();
+        let ir = compiled_body_of(&mut agent, "f");
+        assert!(
+            ir.scope.is_some(),
+            "a capture-free closure must not bail the body"
+        );
+        assert!(
+            ir.steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::CreateFunction { .. })),
+            "the certified body must create the closure"
+        );
+        assert_eq!(
+            run("function f() { return function() { return 42; }; } f()()").unwrap(),
+            Value::Number(42.0)
+        );
+        // A closure whose free name resolves globally is fine too.
+        assert_eq!(
+            run("function g() { return function() { return Math.max(1, 2); }; } g()()").unwrap(),
+            Value::Number(2.0)
+        );
+    }
+
+    #[test]
+    fn fast_path_capturing_closure_bails() {
+        // A closure that reads or writes a body binding must bail the whole
+        // body to the env path (the frame slot is not in any environment).
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script("function f() { var x = 5; return function() { return x; }; }")
+            .unwrap();
+        let ir = compiled_body_of(&mut agent, "f");
+        assert!(
+            ir.scope.is_none(),
+            "a capturing closure must bail to the env path"
+        );
+        assert_eq!(
+            run("function cap() { var x = 5; return function() { return x; }; } cap()()").unwrap(),
+            Value::Number(5.0)
+        );
+        // An assignment to a body binding is a capture too.
+        assert_eq!(
+            run("function w() { var x = 1; return function() { x = 5; return x; }; } w()()")
+                .unwrap(),
+            Value::Number(5.0)
+        );
+        // A closure shadowing a body name with its own declaration is fine.
+        assert_eq!(
+            run("function s() { var x = 1; return function() { var x = 2; return x; }; } s()()")
+                .unwrap(),
+            Value::Number(2.0)
+        );
+        // An arrow's lexical `this` observes the body's absence of `this`,
+        // so it bails and the this binding survives.
+        assert_eq!(
+            run("function t() { return () => this.v; } t.call({ v: 7 })()").unwrap(),
+            Value::Number(7.0)
+        );
+    }
+
+    #[test]
     fn fast_path_var_hoists_to_undefined() {
         assert_eq!(
             run("function g() { return x; var x = 1; } g()").unwrap(),

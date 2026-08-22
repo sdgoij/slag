@@ -6,18 +6,23 @@ algorithm, the runtime integration points, and the quantified path to the
 perf.md gate. The reference is the V8 checkout in `v8/` — the file/function
 names below are the exact places to read.
 
-Status: **Cut 1, Cut 2, Cut 3's first slice, and Cut 4's first slice
-landed and validated** (zero conformance regressions each). Cut 3 gives
-simple-param functions and arrows compile-time binding resolution — params
-and `var`s become fixed frame slots, so identifier ops emit
+Status: **Cuts 1-4's first slices landed and validated** (zero conformance
+regressions each), and the perf gate is now **closed**: every `--bench` row
+is ≥ 5x the corrected 2026-08-18 baseline (arithmetic 2.52s → ~43ms,
+property 3.22s → ~83ms, string 0.88s → ~43ms, array 15.42s → ~233ms,
+function calls 5.73s → ~293ms; see `docs/perf.md`). Cut 3 gives simple-param
+functions and arrows compile-time binding resolution — params and `var`s
+become fixed frame slots, so identifier ops emit
 `LoadLocal`/`StoreLocal`/`InitLocal`/`UpdateLocal` instead of the
-per-read environment-chain walk — but contexts, lexical blocks,
-`arguments`, and Annex B are deferred to the continuation (§13). Cut 4
-fuses the loop test and update into slot ops and adds a primitive fast
-path to the relational evaluator (§7). The function-calls bench is ~2.2x
-faster; the arithmetic bench needs the top-level-var mechanism (the
-continuation) and the accumulator model (Cut 4 continuation), so the gate
-(hot-path ≥ 5x) is still open.
+per-read environment-chain walk — and the follow-on script-level binding
+mechanism (fast scripts) slots top-level `var`s too. Cut 4 fuses the loop
+test and update into slot ops, adds a primitive fast path to the
+relational evaluator, and (the continuation's first slice) runs a
+canonical loop's counter in the VM accumulator. The Cut 3 continuation's
+first slice landed: a certified body may create a **capture-free** closure
+(its own body compiles separately); contexts, closure capture, lexical
+blocks, `arguments`, mapped arguments, Annex B, the body accumulator
+model, slot-arg calls, and the Cut 5 encoding work remain open.
 
 ---
 
@@ -379,12 +384,15 @@ implementation* for the VM itself.
 
 ### Known limitations of the slice (documented, not bugs)
 
-- Top-level `var` bindings are not slots (top level stays `scope: None`),
-  so the arithmetic/property/concat benches don't move yet — that's a
-  separate mechanism (script-level bindings), the follow-on to Cut 3.
-- `arguments`, `this`, closures, `let`/`const` blocks, mapped arguments,
-  Annex B — all bail to the env path; correctness preserved, speed later
-  (the Cut 3 continuation + §8 risk register).
+- Top-level `var` bindings are not slots at this slice (top level stays
+  `scope: None`), so the arithmetic/property/concat benches don't move yet
+  — that's a separate mechanism (script-level bindings), the follow-on to
+  Cut 3, **which has since landed** (`docs/perf.md` Cuts 5-16: fast
+  scripts + script var slots closed the gate).
+- `arguments`, `this`, closures **that capture a body binding**, mapped
+  arguments, Annex B — all bail to the env path; correctness preserved,
+  speed later (the Cut 3 continuation + §8 risk register). A certified
+  body may create capture-free closures (the continuation's first slice).
 
 ### Correctness notes (why the slice is right)
 
