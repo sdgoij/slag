@@ -1742,6 +1742,13 @@ fn run_compiled_body(
     {
         vm.setup_frame(scope, args);
     }
+    // Cut 3 continuation (unmapped arguments slice): the body's
+    // `Step::CreateArguments` needs the call's full argument list.
+    if let Some(scope) = &ir.scope
+        && scope.arguments_slot.is_some()
+    {
+        vm.call_args = args.to_vec();
+    }
     let outcome = vm.start(agent, ir);
     let completion = match outcome {
         Ok(VmOutcome::Completed(completion)) => completion,
@@ -1758,6 +1765,52 @@ fn run_compiled_body(
     };
     let completion = crate::eval::dispose_env_resources(agent, &body_env, Ok(completion))?;
     body_completion_to_value(completion)
+}
+
+/// CreateUnmappedArgumentsObject (spec 10.4.4.9): the strict-mode arguments
+/// object — indexed properties + `length`, with a throwing `callee`
+/// accessor. The certified body's `Step::CreateArguments` uses it (Cut 3
+/// continuation, unmapped slice).
+pub(crate) fn create_unmapped_arguments_object(
+    agent: &mut Agent,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    let realm = agent.current_realm()?;
+    let arguments_prototype = realm
+        .intrinsics
+        .get("%Object.prototype%")
+        .and_then(|value| crate::context::as_object(&value));
+    let thrower = realm.intrinsics.get("%ThrowTypeError%").ok_or_else(|| {
+        JsError::new(
+            ErrorKind::TypeError,
+            "%ThrowTypeError% intrinsic missing".into(),
+        )
+    })?;
+    let value = Value::Object(JsObject::unmapped_arguments_object_create(
+        arguments_prototype,
+        args,
+        thrower,
+    )?);
+    // spec 10.4.4.9: @@iterator is %Array.prototype.values% (a Phase 8
+    // join the crux creation site cannot make).
+    if let Some(obj) = crate::context::as_object(&value)
+        && let Some(values) = realm.intrinsics.get("%Array.prototype.values%")
+    {
+        obj.define_property_key(
+            &crux::property::PropertyKey::Symbol(
+                crux::symbol::well_known("iterator").as_ref().clone(),
+            ),
+            &crux::property::PropertyDescriptor {
+                value: Some(values),
+                writable: Some(true),
+                get: None,
+                set: None,
+                enumerable: Some(false),
+                configurable: Some(true),
+            },
+        )?;
+    }
+    Ok(value)
 }
 
 /// Dispose a body environment after an abrupt engine error, folding disposal
@@ -1920,6 +1973,12 @@ fn ordinary_construct(
                 let mut vm = Vm::new(body_env.clone(), data.strict);
                 if let Some(scope) = &ir.scope {
                     vm.setup_frame(scope, args);
+                    // Cut 3 continuation (unmapped arguments slice): the
+                    // body's `Step::CreateArguments` needs the call's full
+                    // argument list.
+                    if scope.arguments_slot.is_some() {
+                        vm.call_args = args.to_vec();
+                    }
                 }
                 let outcome = vm.start(agent, ir);
                 let completion = match outcome {

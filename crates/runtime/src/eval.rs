@@ -3099,6 +3099,60 @@ mod tests {
     }
 
     #[test]
+    fn fast_path_strict_arguments_unmapped() {
+        // Cut 3 continuation (unmapped arguments slice): a strict body's
+        // own `arguments` reads get a frame slot the certified call fills
+        // with the unmapped arguments object.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script("function f() { 'use strict'; return arguments.length; }")
+            .unwrap();
+        let ir = compiled_body_of(&mut agent, "f");
+        assert!(
+            ir.scope.is_some(),
+            "strict arguments must keep the body certified"
+        );
+        assert!(
+            ir.steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::CreateArguments { .. })),
+            "the certified body must create the arguments object at entry"
+        );
+        assert_eq!(
+            run("function f() { 'use strict'; return arguments.length + arguments[0] + arguments[1]; } f(1, 2)")
+                .unwrap(),
+            Value::Number(5.0)
+        );
+        // Beyond-arity arguments land in the object too.
+        assert_eq!(
+            run("function g(a) { 'use strict'; return arguments.length * 10 + arguments[1]; } g(1, 2, 3)")
+                .unwrap(),
+            Value::Number(32.0)
+        );
+        // The strict `callee` accessor throws.
+        assert!(matches!(
+            run("function h() { 'use strict'; return arguments.callee; } h()"),
+            Err(error) if error.kind == crux::ErrorKind::TypeError
+        ));
+        // Sloppy bodies need the mapped object — deferred to the env path.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script("function s(a) { return arguments[0]; }")
+            .unwrap();
+        assert!(
+            compiled_body_of(&mut agent, "s").scope.is_none(),
+            "sloppy arguments must stay on the env path"
+        );
+        // An arrow's `arguments` is lexical — stays on the env path.
+        assert_eq!(
+            run("function outer() { return () => arguments[0]; } outer(5)()").unwrap(),
+            Value::Number(5.0)
+        );
+    }
+
+    #[test]
     fn fast_path_var_hoists_to_undefined() {
         assert_eq!(
             run("function g() { return x; var x = 1; } g()").unwrap(),

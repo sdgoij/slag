@@ -25,9 +25,12 @@ captured bindings move into a per-call declarative context environment
 the body accesses by index (`LoadContextSlot`/`StoreContextSlot`/
 `InitContextSlot`/`UpdateContextSlot`) and the closures reach through
 the environment walk. Deferred from the continuation: per-iteration
-loop-head contexts (a closure capturing a loop-head `let` bails to the
-env path), nested context chains (depth > 1 resolves through the env),
-`arguments`, mapped arguments, Annex B, the body accumulator model,
+Deferred from the continuation: per-iteration loop-head
+contexts (a closure capturing a loop-head `let` bails to the env
+path), nested context chains (depth > 1 resolves through the env),
+**mapped** arguments (the unmapped strict slice landed: a strict body's
+own `arguments` reads get a frame slot the certified call fills with
+the unmapped arguments object), Annex B, the body accumulator model,
 slot-arg calls, and the Cut 5 encoding work remain open.
 
 ---

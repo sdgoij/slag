@@ -674,6 +674,13 @@ pub enum Step {
         op: UpdateOp,
         prefix: bool,
     },
+    /// Fill the strict body's `arguments` slot (Cut 3 continuation,
+    /// unmapped slice): build the unmapped arguments object from the call's
+    /// arguments and store it into the frame slot. Emitted once at body
+    /// entry.
+    CreateArguments {
+        slot: usize,
+    },
     /// A `break` statement: route through any pending finallys, then jump to
     /// `target` (spec 14.14.4).
     Break {
@@ -779,6 +786,11 @@ pub struct ScopeInfo {
     pub context_param: Vec<Option<usize>>,
     /// Binding name → context slot (mirrors `context_names`).
     pub context_slots: HashMap<crux::AtomId, usize>,
+    /// The frame slot holding the strict body's `arguments` object (Cut 3
+    /// continuation, unmapped slice): `Some` when the body references
+    /// `arguments` — the certified call fills it at entry. Sloppy and arrow
+    /// bodies (lexical `arguments`) stay on the env path.
+    pub arguments_slot: Option<usize>,
 }
 
 impl ScopeInfo {
@@ -1240,6 +1252,11 @@ pub struct Vm {
     /// The argument-vector boundary of each in-progress call (nested calls
     /// push in order); the call step pops it and takes the appended slice.
     args_base_stack: Vec<usize>,
+    /// The call's arguments for the active body (Cut 3 continuation,
+    /// unmapped arguments slice): set by the certified call when the body
+    /// has an `arguments` slot, read by `Step::CreateArguments`. Distinct
+    /// from `args` — the in-flight argument-construction stack.
+    pub(crate) call_args: Vec<Value>,
 }
 
 /// The per-class-definition state while the resumable VM evaluates a
@@ -1330,6 +1347,7 @@ impl Vm {
             var_ref_stack: Vec::new(),
             array_index_stack: Vec::new(),
             args_base_stack: Vec::new(),
+            call_args: Vec::new(),
         }
     }
 
@@ -4237,6 +4255,13 @@ impl Vm {
                     let (old_numeric, new) = update_value(agent, op, &old)?;
                     context_env(&self.lexical_env).set_slot(*index, new.clone());
                     self.stack.push(if *prefix { new } else { old_numeric });
+                }
+                Step::CreateArguments { slot } => {
+                    // Cut 3 continuation (unmapped slice): the strict body's
+                    // arguments object, built from the call's arguments.
+                    let value =
+                        crate::function::create_unmapped_arguments_object(agent, &self.call_args)?;
+                    *self.frame.get_mut(*slot) = value;
                 }
                 Step::JumpIfTrue(target) => {
                     let value = self.pop();
@@ -10129,6 +10154,14 @@ pub fn compile_body(function: &EcmaFunction) -> Result<CompiledBody, JsError> {
         strict: function.strict,
         ..Compiler::default()
     };
+    // Cut 3 continuation (unmapped arguments slice): the strict body's
+    // `arguments` slot is filled at entry — the object needs the realm's
+    // intrinsics and the call's arguments, so it cannot be compiled inline.
+    if let Some(scope) = &compiler.scope
+        && let Some(slot) = scope.arguments_slot
+    {
+        compiler.emit(Step::CreateArguments { slot });
+    }
     compiler.compile_statements(&function.body.stmts)?;
     compiler.resolve();
     let env_constant = compiler.scope.is_some();
@@ -10258,7 +10291,20 @@ fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
     if function.is_async || function.is_generator {
         return None;
     }
-    let mut scan = FastScopeScan::default();
+    let allow_arguments =
+        function.strict && function.this_mode != crate::function::ThisMode::Lexical;
+    let mut scan = FastScopeScan {
+        allow_arguments,
+        ..FastScopeScan::default()
+    };
+    // A strict non-arrow body's own `arguments` reads are unmapped-arguments
+    // reads (the body gets an `arguments` slot the certified call fills); a
+    // sloppy body would need the mapped object — deferred — and an arrow's
+    // `arguments` is lexical. The binding is const-like: an assignment to
+    // `arguments` bails the body (the slot path has no const enforcement).
+    if allow_arguments {
+        scan.consts.insert(crux::intern_utf8("arguments"));
+    }
     // Params: every param keeps a dense frame slot (`setup_frame` copies
     // `args[0..arity]` by position); a captured param *additionally* gets a
     // context binding initialized with its argument (its frame slot is
@@ -10305,6 +10351,18 @@ fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
     if !scan.stmts(&function.body.stmts, 0) {
         return None;
     }
+    // The strict body's `arguments` binding is a frame slot filled at entry
+    // by `Step::CreateArguments` (the object needs the realm intrinsics and
+    // the call's arguments); it is never the TDZ marker.
+    let arguments_slot = if scan.observes_arguments {
+        let slot = scan.next_slot;
+        scan.slots.insert(crux::intern_utf8("arguments"), slot);
+        scan.tdz.push(false);
+        scan.next_slot += 1;
+        Some(slot)
+    } else {
+        None
+    };
     let frame_size = scan.next_slot;
     Some(ScopeInfo {
         frame_size,
@@ -10316,6 +10374,7 @@ fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
         context_const: scan.context_const,
         context_param: scan.context_param,
         context_slots: scan.context_slots,
+        arguments_slot,
     })
 }
 
@@ -11071,6 +11130,12 @@ struct FastScopeScan {
     /// closure inside the loop that captures one needs a fresh context per
     /// iteration, which this slice defers — such a body bails.
     open_loop_heads: Vec<crux::AtomId>,
+    /// Whether the body is a strict non-arrow function whose own `arguments`
+    /// reads are the unmapped arguments object (Cut 3 continuation).
+    allow_arguments: bool,
+    /// The body references `arguments`: it gets an `arguments` slot the
+    /// certified call fills with the unmapped arguments object.
+    observes_arguments: bool,
 }
 
 impl FastScopeScan {
@@ -11213,11 +11278,22 @@ impl FastScopeScan {
             // environment machinery. A lexical reference must sit inside
             // its declaring scope (equal or deeper block depth).
             ExprKind::Ident(name) => {
-                crux::lookup(*name) != JsString::from_utf8("arguments")
-                    && self
-                        .declared_depth
-                        .get(name)
-                        .is_none_or(|&declared| depth >= declared)
+                let text = crux::lookup(*name);
+                if text == JsString::from_utf8("arguments") {
+                    // Cut 3 continuation (unmapped slice): a strict
+                    // non-arrow body's own `arguments` reads get an
+                    // `arguments` slot the certified call fills; a sloppy
+                    // body needs the mapped object (deferred) and an arrow's
+                    // `arguments` is lexical.
+                    if !self.allow_arguments {
+                        return false;
+                    }
+                    self.observes_arguments = true;
+                    return true;
+                }
+                self.declared_depth
+                    .get(name)
+                    .is_none_or(|&declared| depth >= declared)
             }
             ExprKind::Paren(inner) => self.expr(inner, depth),
             ExprKind::Unary { operand, .. } => self.expr(operand, depth),
@@ -11400,6 +11476,7 @@ fn analyze_script_scope(stmts: &[Stmt]) -> Option<(Option<ScriptSlots>, HashSet<
                     context_const: Vec::new(),
                     context_param: Vec::new(),
                     context_slots: HashMap::new(),
+                    arguments_slot: None,
                 },
                 names,
                 assigned,
