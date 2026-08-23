@@ -825,6 +825,49 @@ pub enum Step {
     ImportMeta,
 }
 
+/// A register instruction for a *leaf* body (Cut 35 slice 1). The step path
+/// round-trips the value stack for every expression; these ops target a
+/// single accumulator (`Vm.acc`) plus the leaf's frame segment, capture
+/// context, and (for per-iteration reads) lexical env directly, with no
+/// stack traffic. A register body touches only those four state pieces, so
+/// its inline run (`run_leaf_regs`) saves and restores a fraction of the
+/// step path's fields. `lower_leaf_ops` emits these only for the
+/// left-leaning straight-line shapes the hot leaf bodies produce — anything
+/// else stays on the step path.
+#[derive(Debug, Clone)]
+pub enum LeafOp {
+    /// acc = frame[slot]; the `tdz` bit mirrors `Step::LoadLocal`'s
+    /// uninitialized-binding check (a `let`/`const` slot before its
+    /// initializer).
+    LoadReg { slot: usize, tdz: bool },
+    /// acc = the leaf's capture-context slot (depth-0 `LoadContextSlot`).
+    LoadContext { index: usize },
+    /// acc = the leaf's per-iteration slot (depth-0 `LoadPerIteration`).
+    LoadPerIter { index: usize },
+    /// acc = value.
+    LoadConst(Value),
+    /// acc = acc op frame[slot], with the number-number inline
+    /// `Step::BinaryImm` mirrors.
+    BinReg {
+        op: BinaryOp,
+        slot: usize,
+        tdz: bool,
+    },
+    /// acc = acc op context[slot].
+    BinContext { op: BinaryOp, index: usize },
+    /// acc = acc op per-iteration[slot].
+    BinPerIter { op: BinaryOp, index: usize },
+    /// acc = acc op imm (the `Step::BinaryImm` number-number inline).
+    BinImm { op: BinaryOp, imm: f64 },
+    /// acc = acc op value.
+    BinConst { op: BinaryOp, value: Value },
+    /// frame[slot] = acc; the `tdz` bit mirrors `Step::StoreLocal`'s
+    /// assignment-to-uninitialized check.
+    StoreReg { slot: usize, tdz: bool },
+    /// Complete with `Completion::Return(acc)`.
+    ReturnAcc,
+}
+
 /// A `try` region's handler: the covered ranges and the catch/finally
 /// targets (step indices).
 #[derive(Debug, Clone, Copy)]
@@ -1029,6 +1072,11 @@ pub struct CompiledBody {
     /// touches `body_context`/`lexical_env`, so the inline run skips the
     /// body-context creation and the save/restore of both fields.
     pub leaf_uses_env: bool,
+    /// Cut 35 slice 1: the register form of this leaf body, when every step
+    /// lowered to a [`LeafOp`] (`None` = run the step path). A register body
+    /// touches only `acc`, the frame segment, and the env fields, so its
+    /// inline run is both faster to dispatch and cheaper to save/restore.
+    pub leaf_ops: Option<Box<[LeafOp]>>,
     /// The certified top-level fast path (script-level bindings): the
     /// declared `var`/function names a script reads and writes directly on
     /// the global object, skipping the env-chain walk. `None` = the
@@ -5805,6 +5853,7 @@ impl Vm {
     /// pending finallys, try frames, or env stack. The per-iteration and
     /// destructure flags are false at any call step by construction (they
     /// are only set around the iterator steps that run on nested Vms).
+    #[inline]
     fn can_inline_leaf(&self) -> bool {
         self.try_stack.is_empty()
             && self.pending.is_empty()
@@ -5832,6 +5881,21 @@ impl Vm {
         args: &[Value],
     ) -> Result<Completion, JsError> {
         let scope = ir.scope.as_ref().expect("a leaf is certified");
+        // Cut 35 slice 1: a body lowered to register ops runs on the
+        // dedicated executor, which touches far fewer fields (no `ip`, no
+        // completion, no `strict`, no `chain_short`/array-index/arguments
+        // state — its ops only address the accumulator, the frame segment,
+        // and the env fields).
+        if let Some(ops) = ir.leaf_ops.as_deref() {
+            return self.run_leaf_regs(
+                agent,
+                ops,
+                ir,
+                environment,
+                this_value,
+                LeafFrame::Pushed(args),
+            );
+        }
         // Cut 34: the leaf's frame is a flat segment on the value stack, so
         // the caller's `frame` is never swapped — no 256-byte copy per call.
         // Slots `0..frame_size` are pushed in order (this slot, params,
@@ -5939,37 +6003,293 @@ impl Vm {
         }
     }
 
-    /// The leaf-inline call path: OrdinaryCallBindThis (a non-arrow leaf's
-    /// `this` slot) + OrdinaryCallEvaluateBody, mirroring `ordinary_call`'s
-    /// certified fast path without the context push.
-    fn run_leaf_call(
+    /// The register-leaf run core (Cut 35 slice 1): like `run_leaf_body`,
+    /// but for a body lowered to [`LeafOp`]s. A register body touches only
+    /// the accumulator, its frame segment on the value stack, and (for
+    /// captured reads) `body_context`/`lexical_env` — never the `ip`, the
+    /// completion, `strict`, `chain_short`, the array-index stack, or the
+    /// arguments slice — so the save/restore shrinks to those fields and
+    /// the dispatch is the small dedicated `run_leaf_ops` match. The frame
+    /// segment layout and the env swap mirror the step path; errors
+    /// propagate raw to the caller's `run_inner` exactly like a throwing
+    /// step-path leaf.
+    #[inline(always)]
+    fn run_leaf_regs(
         &mut self,
         agent: &mut Agent,
-        ir: &std::rc::Rc<CompiledBody>,
+        ops: &[LeafOp],
+        ir: &CompiledBody,
         environment: Option<EnvRef>,
-        strict: bool,
-        this: Value,
-        args: &[Value],
-    ) -> Result<Value, JsError> {
-        let scope = ir.scope.as_ref().expect("a leaf is certified");
-        let this_value = if scope.this_slot.is_some() {
-            if strict {
-                this
+        this_value: Value,
+        // The frame source (Cut 35 slice 1): `Alias(base)` overlays the
+        // frame on the caller's argument region at `stack[base..]` — every
+        // frame slot is a present parameter, so no copy and no push;
+        // `Pushed(args)` builds the frame from the copied arguments at the
+        // stack top (missing arguments stay `undefined`, spec 10.2.11).
+        frame: LeafFrame<'_>,
+    ) -> Result<Completion, JsError> {
+        let scope = ir.scope.as_ref().expect("a register body is certified");
+        let (frame_base, args, aliased) = match frame {
+            LeafFrame::Alias(base) => (base, &[][..], true),
+            LeafFrame::Pushed(args) => (self.stack.len(), args, false),
+        };
+        if !aliased {
+            for slot in 0..scope.frame_size {
+                let value = if Some(slot) == scope.this_slot {
+                    this_value.clone()
+                } else if slot < scope.arity {
+                    // Missing arguments stay `undefined` (spec 10.2.11).
+                    args.get(slot).cloned().unwrap_or(Value::Undefined)
+                } else if scope.tdz_store.get(slot).copied().unwrap_or(false) {
+                    Value::uninitialized()
+                } else {
+                    Value::Undefined
+                };
+                self.stack.push(value);
+            }
+        }
+        let caller_leaf_frame_base = self.leaf_frame_base;
+        self.leaf_frame_base = Some(frame_base);
+        let caller_acc = std::mem::replace(&mut self.acc, Value::Undefined);
+        // Cut 28/30 mirror: a per-iteration-reading leaf resolves its
+        // `lexical_env` against its own env; a context-reading leaf resolves
+        // `body_context`. A register body with neither never touches either
+        // field, so both swaps are skipped. (A leaf's own capture context is
+        // always empty — leaves create no closures — so `new_body_context`
+        // returns `None` and `args` is unused for the env setup.)
+        let (caller_body_context, caller_lexical_env) = if let Some(environment) = environment {
+            let body_env = match scope.new_body_context(&environment, args)? {
+                Some(context) => context,
+                None => environment,
+            };
+            if ir.leaf_needs_env {
+                (
+                    self.body_context.replace(body_env.clone()),
+                    Some(std::mem::replace(&mut self.lexical_env, body_env)),
+                )
             } else {
-                match this.kind() {
-                    ValueKind::Undefined | ValueKind::Null => {
-                        // Same-realm guard: the caller's global is the leaf's.
-                        let global = self.global_object(agent)?;
-                        Value::Object(global)
-                    }
-                    ValueKind::Object(_) | ValueKind::Function(_) => this,
-                    _ => crate::context::to_object(agent, &this)?,
-                }
+                (self.body_context.replace(body_env), None)
             }
         } else {
-            Value::Undefined
+            debug_assert!(!ir.leaf_uses_env);
+            (None, None)
         };
-        let completion = self.run_leaf_body(agent, ir, environment, strict, this_value, args)?;
+        let outcome = self.run_leaf_ops(agent, ops, frame_base);
+        self.leaf_frame_base = caller_leaf_frame_base;
+        // An aliased frame lives in the caller's argument region, which the
+        // caller truncates; only a pushed frame is unwound here.
+        if !aliased {
+            self.stack.truncate(frame_base);
+        }
+        self.acc = caller_acc;
+        if let Some(saved_env) = caller_body_context {
+            self.body_context = Some(saved_env);
+        }
+        if let Some(saved_env) = caller_lexical_env {
+            self.lexical_env = saved_env;
+        }
+        outcome
+    }
+
+    /// The register dispatch loop. The frame segment starts at
+    /// `stack[frame_base]` (slot `slot` lives at `frame_base + slot`); `acc`
+    /// is the implicit result register, read and written by every op. Every
+    /// op mirrors the equivalent step's semantics exactly (including the
+    /// `Step::BinaryImm` number-number inline). A lowering always ends in
+    /// `ReturnAcc`; the fall-off default completes `Empty` like the step
+    /// path's end-of-steps completion.
+    #[inline(always)]
+    fn run_leaf_ops(
+        &mut self,
+        agent: &mut Agent,
+        ops: &[LeafOp],
+        frame_base: usize,
+    ) -> Result<Completion, JsError> {
+        for op in ops {
+            match op {
+                LeafOp::LoadReg { slot, tdz } => {
+                    let value = self.stack[frame_base + slot].clone();
+                    if *tdz && value.is_uninitialized() {
+                        return Err(JsError::new(
+                            ErrorKind::ReferenceError,
+                            "Cannot access a binding before initialization".into(),
+                        ));
+                    }
+                    self.acc = value;
+                }
+                LeafOp::LoadContext { index } => {
+                    // `context_chain_env(0)` mirror: skip the
+                    // context-transparent envs (a named function expression's
+                    // self-binding scope, a per-iteration copy) that hold
+                    // only scaffolding, so the read lands on the capture
+                    // context holding the binding.
+                    let mut env = self.body_context_env();
+                    while is_context_transparent(&env) {
+                        env = env.outer().ok_or_else(|| {
+                            JsError::new(
+                                ErrorKind::ReferenceError,
+                                "No outer environment for a capture-context binding".into(),
+                            )
+                        })?;
+                    }
+                    let value = context_env(&env).slot_value(*index).ok_or_else(|| {
+                        JsError::new(
+                            ErrorKind::ReferenceError,
+                            "Cannot access a binding before initialization".into(),
+                        )
+                    })?;
+                    self.acc = value;
+                }
+                LeafOp::LoadPerIter { index } => {
+                    // Depth 0: the leaf's own `lexical_env` (the inline run
+                    // swapped it to the leaf's per-iteration env).
+                    let value = context_env(&self.lexical_env)
+                        .slot_value(*index)
+                        .ok_or_else(|| {
+                            JsError::new(
+                                ErrorKind::ReferenceError,
+                                "Cannot access a binding before initialization".into(),
+                            )
+                        })?;
+                    self.acc = value;
+                }
+                LeafOp::LoadConst(value) => self.acc = value.clone(),
+                LeafOp::BinReg { op, slot, tdz } => {
+                    if *tdz && self.stack[frame_base + slot].is_uninitialized() {
+                        return Err(JsError::new(
+                            ErrorKind::ReferenceError,
+                            "Cannot access a binding before initialization".into(),
+                        ));
+                    }
+                    self.acc = crate::expr::apply_binary(
+                        agent,
+                        *op,
+                        &self.acc,
+                        &self.stack[frame_base + slot],
+                    )?;
+                }
+                LeafOp::BinContext { op, index } => {
+                    // The `context_chain_env(0)` transparent-env walk (see
+                    // `LoadContext`).
+                    let mut env = self.body_context_env();
+                    while is_context_transparent(&env) {
+                        env = env.outer().ok_or_else(|| {
+                            JsError::new(
+                                ErrorKind::ReferenceError,
+                                "No outer environment for a capture-context binding".into(),
+                            )
+                        })?;
+                    }
+                    let right = context_env(&env).slot_value(*index).ok_or_else(|| {
+                        JsError::new(
+                            ErrorKind::ReferenceError,
+                            "Cannot access a binding before initialization".into(),
+                        )
+                    })?;
+                    self.acc = crate::expr::apply_binary(agent, *op, &self.acc, &right)?;
+                }
+                LeafOp::BinPerIter { op, index } => {
+                    let right = context_env(&self.lexical_env)
+                        .slot_value(*index)
+                        .ok_or_else(|| {
+                            JsError::new(
+                                ErrorKind::ReferenceError,
+                                "Cannot access a binding before initialization".into(),
+                            )
+                        })?;
+                    self.acc = crate::expr::apply_binary(agent, *op, &self.acc, &right)?;
+                }
+                LeafOp::BinImm { op, imm } => {
+                    // The number-number arithmetic shape inlines
+                    // `apply_binary` (two tag checks + a direct op) — the
+                    // general evaluator adds a call and the RHS tag check
+                    // for no semantic gain (mirrors `Step::BinaryImm`).
+                    let value = if let Some(num) = self.acc.as_number() {
+                        match op {
+                            BinaryOp::Sub => Value::Number(num - imm),
+                            BinaryOp::Mul => Value::Number(num * imm),
+                            BinaryOp::Div => Value::Number(num / imm),
+                            BinaryOp::Rem => Value::Number(num % imm),
+                            _ => crate::expr::apply_binary(
+                                agent,
+                                *op,
+                                &self.acc,
+                                &Value::Number(*imm),
+                            )?,
+                        }
+                    } else {
+                        crate::expr::apply_binary(agent, *op, &self.acc, &Value::Number(*imm))?
+                    };
+                    self.acc = value;
+                }
+                LeafOp::BinConst { op, value } => {
+                    // `x + (1)` compiles to Push(1)/Binary, not BinaryImm;
+                    // a const Number right operand inlines the same shape.
+                    let value =
+                        if let (Some(num), Some(imm)) = (self.acc.as_number(), value.as_number()) {
+                            match op {
+                                BinaryOp::Sub => Value::Number(num - imm),
+                                BinaryOp::Mul => Value::Number(num * imm),
+                                BinaryOp::Div => Value::Number(num / imm),
+                                BinaryOp::Rem => Value::Number(num % imm),
+                                _ => crate::expr::apply_binary(agent, *op, &self.acc, value)?,
+                            }
+                        } else {
+                            crate::expr::apply_binary(agent, *op, &self.acc, value)?
+                        };
+                    self.acc = value;
+                }
+                LeafOp::StoreReg { slot, tdz } => {
+                    if *tdz && self.stack[frame_base + slot].is_uninitialized() {
+                        return Err(JsError::new(
+                            ErrorKind::ReferenceError,
+                            "Cannot access a binding before initialization".into(),
+                        ));
+                    }
+                    self.stack[frame_base + slot] = self.acc.clone();
+                }
+                LeafOp::ReturnAcc => {
+                    return Ok(Completion::Return(self.acc.clone()));
+                }
+            }
+        }
+        Ok(Completion::Empty)
+    }
+
+    /// OrdinaryCallBindThis for a certified body (Cut 3 continuation): a
+    /// non-arrow body's `this` slot gets the call's `this` — strict keeps it
+    /// as-is; sloppy coerces undefined/null to the global object and boxes
+    /// primitives. An arrow (lexical `this`) has no slot; the value is
+    /// unused.
+    fn bind_this_value(
+        &mut self,
+        agent: &mut Agent,
+        scope: &ScopeInfo,
+        strict: bool,
+        this: Value,
+    ) -> Result<Value, JsError> {
+        if scope.this_slot.is_none() {
+            return Ok(Value::Undefined);
+        }
+        if strict {
+            return Ok(this);
+        }
+        match this.kind() {
+            ValueKind::Undefined | ValueKind::Null => {
+                // Same-realm guard: the caller's global is the leaf's.
+                let global = self.global_object(agent)?;
+                Ok(Value::Object(global))
+            }
+            ValueKind::Object(_) | ValueKind::Function(_) => Ok(this),
+            _ => crate::context::to_object(agent, &this),
+        }
+    }
+
+    /// The leaf-call completion to a value (the `do_call_fast` inline path):
+    /// a `return` wins, a fall-off yields `undefined`, a thrown value
+    /// surfaces as the engine error the outer `run_inner` would have
+    /// produced, and an escaped break/continue is illegal.
+    fn leaf_completion_result(completion: Completion) -> Result<Value, JsError> {
         match completion {
             Completion::Return(value) => Ok(value),
             Completion::Normal(_) | Completion::Empty => Ok(Value::Undefined),
@@ -6059,10 +6379,57 @@ impl Vm {
             } else {
                 None
             };
-            let mut args_buf = [Value::Undefined; 3];
-            args_buf[..argc].clone_from_slice(&self.stack[arg_start..n]);
-            let result =
-                self.run_leaf_call(agent, &ir, environment, strict, this, &args_buf[..argc])?;
+            // Cut 35 slice 1: a register leaf runs on the small dedicated
+            // executor with no `run_leaf_call`/`run_leaf_body` indirection
+            // and no completion round-trip (a register body always completes
+            // with `Return`); a step-path leaf runs through `run_leaf_body`
+            // as before.
+            let scope = ir.scope.as_ref().expect("a leaf is certified");
+            let this_value = self.bind_this_value(agent, scope, strict, this)?;
+            let completion = if let Some(ops) = ir.leaf_ops.as_deref() {
+                // Alias the frame onto the caller's argument region when
+                // every frame slot is a present parameter (no `this` slot,
+                // no var/TDZ slots): `f(x)`, `f(x, y)` with all args
+                // supplied — no argument copy, no frame push. Otherwise push
+                // the frame from the copied arguments.
+                let arg_base = (scope.this_slot.is_none()
+                    && scope.frame_size == scope.arity
+                    && argc >= scope.frame_size)
+                    .then_some(arg_start);
+                if let Some(base) = arg_base {
+                    self.run_leaf_regs(
+                        agent,
+                        ops,
+                        &ir,
+                        environment,
+                        this_value,
+                        LeafFrame::Alias(base),
+                    )?
+                } else {
+                    let mut args_buf = [Value::Undefined; 3];
+                    args_buf[..argc].clone_from_slice(&self.stack[arg_start..n]);
+                    self.run_leaf_regs(
+                        agent,
+                        ops,
+                        &ir,
+                        environment,
+                        this_value,
+                        LeafFrame::Pushed(&args_buf[..argc]),
+                    )?
+                }
+            } else {
+                let mut args_buf = [Value::Undefined; 3];
+                args_buf[..argc].clone_from_slice(&self.stack[arg_start..n]);
+                self.run_leaf_body(
+                    agent,
+                    &ir,
+                    environment,
+                    strict,
+                    this_value,
+                    &args_buf[..argc],
+                )?
+            };
+            let result = Self::leaf_completion_result(completion)?;
             self.stack.truncate(arg_start - 2);
             self.stack.push(result);
             return Ok(());
@@ -12115,6 +12482,155 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
     })
 }
 
+/// One value on the lowering's shadow stack: a `Load*`/`Push` result. `Acc`
+/// is the value currently held by the register executor's accumulator (the
+/// only value that can sit at the bottom of a binary pair).
+#[derive(Clone)]
+enum RegOperand {
+    Acc,
+    Reg { slot: usize, tdz: bool },
+    Ctx { index: usize },
+    PerIter { index: usize },
+    Const(Value),
+}
+
+/// The frame source for a register-leaf run (Cut 35 slice 1): the caller's
+/// argument region aliased directly, or a pushed frame built from the
+/// copied arguments.
+#[derive(Clone, Copy)]
+enum LeafFrame<'a> {
+    /// Overlay the frame on the caller's argument region at `stack[base..]`
+    /// (every frame slot is a present parameter — no copy, no push).
+    Alias(usize),
+    /// Build the frame at the stack top from `args` (missing arguments stay
+    /// `undefined`, spec 10.2.11).
+    Pushed(&'a [Value]),
+}
+
+/// Load an operand into the accumulator (a no-op when it is already there).
+fn load_operand(ops: &mut Vec<LeafOp>, operand: RegOperand) -> bool {
+    match operand {
+        RegOperand::Acc => true,
+        RegOperand::Reg { slot, tdz } => {
+            ops.push(LeafOp::LoadReg { slot, tdz });
+            true
+        }
+        RegOperand::Ctx { index } => {
+            ops.push(LeafOp::LoadContext { index });
+            true
+        }
+        RegOperand::PerIter { index } => {
+            ops.push(LeafOp::LoadPerIter { index });
+            true
+        }
+        RegOperand::Const(value) => {
+            ops.push(LeafOp::LoadConst(value));
+            true
+        }
+    }
+}
+
+/// Lower a leaf body's straight-line step stream to register ops (Cut 35
+/// slice 1). `None` means a step has no register form, the shadow stack
+/// holds a value the single-accumulator model cannot address (a right-leaning
+/// `a + (b + c)` temp, a `Dup`/`Pop`, a dead `return` followed by code), or
+/// the body falls off the end — such bodies keep the step path. The accepted
+/// shapes are the left-leaning evaluation orders the hot leaf bodies produce:
+/// `return x + 1`, `return x + y` with a captured or per-iteration operand,
+/// statement stores feeding a final `return`, and the per-iteration/context
+/// reads of the closure bench. The `tdz` bits are precomputed from the scope
+/// layout so the executor skips the check for plain `var`/param slots.
+fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
+    let mut ops = Vec::new();
+    let mut stack: Vec<RegOperand> = Vec::new();
+    for (index, step) in steps.iter().enumerate() {
+        match step {
+            Step::Push(value) => stack.push(RegOperand::Const(value.clone())),
+            Step::LoadLocal { slot } => {
+                let tdz = scope.tdz_store.get(*slot).copied().unwrap_or(false);
+                stack.push(RegOperand::Reg { slot: *slot, tdz });
+            }
+            Step::LoadContextSlot { depth: 0, index } => {
+                stack.push(RegOperand::Ctx { index: *index });
+            }
+            Step::LoadPerIteration { depth: 0, index } => {
+                stack.push(RegOperand::PerIter { index: *index });
+            }
+            Step::Binary(op) => {
+                let right = stack.pop()?;
+                let left = stack.pop()?;
+                if !load_operand(&mut ops, left) {
+                    return None;
+                }
+                match right {
+                    RegOperand::Reg { slot, tdz } => {
+                        ops.push(LeafOp::BinReg { op: *op, slot, tdz });
+                    }
+                    RegOperand::Ctx { index } => {
+                        ops.push(LeafOp::BinContext { op: *op, index });
+                    }
+                    RegOperand::PerIter { index } => {
+                        ops.push(LeafOp::BinPerIter { op: *op, index });
+                    }
+                    RegOperand::Const(value) => {
+                        ops.push(LeafOp::BinConst { op: *op, value });
+                    }
+                    // A computed right operand lives in the accumulator
+                    // alone; a second value cannot be held.
+                    RegOperand::Acc => return None,
+                }
+                stack.push(RegOperand::Acc);
+            }
+            Step::BinaryImm { op, imm } => {
+                let left = stack.pop()?;
+                if !load_operand(&mut ops, left) {
+                    return None;
+                }
+                ops.push(LeafOp::BinImm { op: *op, imm: *imm });
+                stack.push(RegOperand::Acc);
+            }
+            Step::StoreLocal { slot } | Step::FusedStoreLocal { slot } => {
+                let value = stack.pop()?;
+                if !load_operand(&mut ops, value) {
+                    return None;
+                }
+                let tdz = scope.tdz_store.get(*slot).copied().unwrap_or(false);
+                ops.push(LeafOp::StoreReg { slot: *slot, tdz });
+            }
+            Step::InitLocal { slot } => {
+                let value = stack.pop()?;
+                if !load_operand(&mut ops, value) {
+                    return None;
+                }
+                ops.push(LeafOp::StoreReg {
+                    slot: *slot,
+                    tdz: false,
+                });
+            }
+            Step::Return => {
+                // A leaf body's `return` is its last statement; dead code
+                // after it (hoisted-var initializers) keeps the step path.
+                if index + 1 != steps.len() {
+                    return None;
+                }
+                let value = stack.pop()?;
+                if !load_operand(&mut ops, value) {
+                    return None;
+                }
+                ops.push(LeafOp::ReturnAcc);
+                if !stack.is_empty() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    if !matches!(ops.last(), Some(LeafOp::ReturnAcc)) {
+        return None;
+    }
+    Some(ops.into_boxed_slice())
+}
+
 /// Compile a function body for resumable execution.
 pub fn compile_body(function: &EcmaFunction) -> Result<CompiledBody, JsError> {
     let scope = analyze_scope(function);
@@ -12193,6 +12709,14 @@ pub fn compile_body(function: &EcmaFunction) -> Result<CompiledBody, JsError> {
                     | Step::UpdateContextSlot { .. }
             )
         });
+    let leaf_ops = if leaf {
+        lower_leaf_ops(
+            &compiler.steps,
+            compiler.scope.as_ref().expect("a leaf is certified"),
+        )
+    } else {
+        None
+    };
     Ok(CompiledBody {
         steps: compiler.steps,
         handlers: compiler.handlers,
@@ -12202,6 +12726,7 @@ pub fn compile_body(function: &EcmaFunction) -> Result<CompiledBody, JsError> {
         leaf,
         leaf_needs_env,
         leaf_uses_env,
+        leaf_ops,
         script_globals: None,
     })
 }
@@ -12269,6 +12794,7 @@ pub fn compile_statements(
         leaf: false,
         leaf_needs_env: false,
         leaf_uses_env: false,
+        leaf_ops: None,
         script_globals: compiler.script_globals,
     })
 }

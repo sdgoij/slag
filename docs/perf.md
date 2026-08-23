@@ -1124,6 +1124,64 @@ individually — load-dependent classification wobble, not regressions.
 Conformance at baseline otherwise: language 23,690/0/34, annexB 1,086/0/0;
 workspace tests 4312/0.
 
+### Cut 35 slice 1 — register-encoded leaf bodies (measured 2026-08-23)
+
+The first slice of the register-bytecode plan (Cut 3): the hot leaf bodies
+(`return x + 1`, `(y) => x + y`, `() => i`) lower to a dedicated register
+op set (`LeafOp`) and run on a small executor (`run_leaf_regs`/
+`run_leaf_ops`) instead of the step dispatch loop:
+
+- **A `LeafOp` set over a single accumulator** (`Vm.acc`) plus the leaf's
+  frame segment, capture context, and (for per-iteration reads) lexical
+  env: `LoadReg`/`LoadContext`/`LoadPerIter`/`LoadConst`, the binary ops
+  (`BinReg`/`BinContext`/`BinPerIter`/`BinImm`/`BinConst`, with the
+  `BinaryImm` number-number inline), `StoreReg`, and `ReturnAcc`. The
+  lowering (`lower_leaf_ops`) accepts only the left-leaning straight-line
+  shapes the hot bodies produce; anything else keeps the step path
+  (conservative — a register body is a strict subset).
+- **A minimal save/restore**: a register body touches only `acc`, the
+  frame, and the env fields — never `ip`, completion, `strict`,
+  `chain_short`, the array-index stack, or the arguments slice — so the
+  per-call swap shrinks to two fields plus (for captured reads) the two
+  env slots.
+- **The call path flattens**: `do_call_fast` runs a register leaf directly
+  on `run_leaf_regs` (no `run_leaf_call`/`run_leaf_body` indirection, no
+  completion round-trip — a register body always completes `Return`); the
+  `OrdinaryCallBindThis` logic moved to a shared `bind_this_value` helper.
+- **Frame aliasing** (when every frame slot is a present parameter — no
+  `this` slot, no var/TDZ slots, all args supplied): the frame overlays
+  the caller's argument region on the value stack (`LeafFrame::Alias`), so
+  there is no argument copy and no frame push; the caller's truncate
+  discards the aliased slots. Missing-arg/this-slot bodies push the frame
+  from a copied buffer (`LeafFrame::Pushed`) as before.
+- **Context reads mirror `context_chain_env`**: `LoadContext`/`BinContext`
+  skip context-transparent envs (a named function expression's
+  self-binding scope, a per-iteration copy) before reading the capture
+  context — the step path's depth-0 walk, reproduced exactly.
+
+Measured (release, vs Cut 34; calm machine, 5-run medians):
+
+| Row | before | after |
+|---|---|---|
+| function calls | ~148ms | **~101ms** |
+| closure capture | ~157ms | **~105ms** |
+| per-iteration | ~20.6ms | ~16.6ms |
+| construct churn | ~78ms | ~78ms |
+
+Calls drop 148→~101ms (-32%) and closure 157→~105ms (-33%), landing on
+(or just above) the sub-100ms target; the isolated leaf call cost is
+~50ns (was ~100ns for the step path, ~74ns after the flatten). Construct
+churn is unchanged — `this.x = x` bodies use member machinery, not yet
+register-encoded (a later slice). Per-iteration drops too (the
+`() => i` body is now two register ops). The 67-case behavior probe
+(`scratch/leaf_regs_probe.js`) covers the register path, the aliased and
+pushed frames, captured/per-iteration reads, throwing binaries, and
+caller-with-try/for-of state — all pass. Conformance: language
+23,724/0/34, annexB 1,086/0/0, built-ins 23,812/0/154 with 440 >15s
+hangs in the known slow RegExp-property-escape / Temporal-argument-
+limits / detached-typed-array classes, all sampled individually PASS
+(load-dependent batch classification); workspace tests 4312/0.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

@@ -1,6 +1,6 @@
 ---
 name: slag-bytecode-vm
-description: "Load when working on Slag's bytecode VM and compiler (crates/runtime/src/ir.rs) — the Step enum, the Vm dispatch loop, compile_expr/compile_statement lowering, or the compiled-path stack protocol. Documents the non-obvious traps: optional-call short-path stack discipline, assignment-reference timing, super base capture before key conversion, destructure/for-of close semantics, template cache keys, the leaf-inline caller-Vm contract, and the bench-noise reality."
+description: "Load when working on Slag's bytecode VM and compiler (crates/runtime/src/ir.rs) — the Step enum, the Vm dispatch loop, compile_expr/compile_statement lowering, the LeafOp register executor, or the compiled-path stack protocol. Documents the non-obvious traps: optional-call short-path stack discipline, assignment-reference timing, super base capture before key conversion, destructure/for-of close semantics, template cache keys, the leaf-inline caller-Vm contract, the register-leaf lowering/aliasing contracts, and the bench-noise reality."
 ---
 
 # Slag bytecode VM traps
@@ -131,6 +131,53 @@ is a certified leaf whose `new` must throw "not a constructor" — the
 language-area sweep fixture
 `expressions/object/method-definition/name-invoke-ctor.js` caught exactly
 this. Edge-case matrix: `scratch/leaf_inline_probes.js` (gitignored).
+
+## 8. Register leaf bodies (Cut 35 slice 1)
+
+A leaf body whose steps all lower to `LeafOp`s (`CompiledBody::leaf_ops`
+is `Some`) runs on a dedicated register executor (`run_leaf_regs` /
+`run_leaf_ops`) instead of the step dispatch loop. The register model is a
+single accumulator (`Vm.acc`) plus the leaf's frame segment, capture
+context, and (for per-iteration reads) lexical env — no value-stack
+push/pop, no `ip`, no completion, no `strict`, no `chain_short`/array-index/
+arguments state.
+
+- **`lower_leaf_ops` accepts only left-leaning straight-line shapes**: a
+  binary's left operand must be the accumulated value and its right a
+  directly-addressable operand (frame slot, depth-0 context slot, depth-0
+  per-iteration slot, or const). A right-leaning `a + (b + c)` temp, a
+  `Dup`/`Pop`, a `return` followed by dead code, any jump/branch, any
+  depth ≥ 1 context read, or a fall-off body → `None` (step path). This is
+  a strict subset — when in doubt, a body stays on the step path.
+- **`LoadContext`/`BinContext` must skip context-transparent envs**: the
+  step path's `context_chain_env(0)` walks out past a named function
+  expression's self-binding scope (holds the function itself at slot 0)
+  and per-iteration copies before reading the capture context. Missing
+  this walk, a `return (x) => x + a` inside `function mid() {...}` reads
+  `mid` instead of `a` (the self-binding env's slot 0).
+- **The frame can alias the caller's argument region**: `LeafFrame::Alias`
+  when `this_slot.is_none()`, `frame_size == arity` (every slot a param),
+  and `argc >= frame_size` — no argument copy, no frame push, and the
+  post-run truncate is skipped (the caller discards the aliased slots).
+  `LeafFrame::Pushed` covers the rest (missing args → `undefined`, `this`
+  slot, var/TDZ slots). A register body's `StoreReg` may write the aliased
+  slots — the writes are discarded by the caller's truncate.
+- **`do_call_fast` runs register leaves directly**: no
+  `run_leaf_call`/`run_leaf_body` indirection and no completion
+  round-trip (a register body always completes `Return`); the
+  `OrdinaryCallBindThis` logic is the shared `bind_this_value` helper. The
+  construct path (`run_leaf_construct`) still routes through
+  `run_leaf_body` → `run_leaf_regs` with `LeafFrame::Pushed` (it needs the
+  completion for the base-constructor object-return rule).
+- **A leaf's capture context is always empty** (leaves create no closures,
+  so nothing is captured into them), so `new_body_context` always returns
+  `None` for a register body and the env setup never uses the arguments —
+  which is what makes the aliased path safe passing no argument slice.
+- Errors propagate raw to the caller's `run_inner` exactly like a
+  step-path leaf (a register body may throw from `apply_binary`/TDZ
+  checks). Register-op semantics mirror the step semantics 1:1 — when you
+  extend `LeafOp`, extend both `lower_leaf_ops` and `run_leaf_ops` and
+  keep the mirror exact.
 
 ## Bench reality (Cut 2)
 
