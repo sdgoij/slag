@@ -956,6 +956,73 @@ improved ~5ms net. Conformance at baseline: language 23,690/0/34, annexB
 1,086/0/0, built-ins 23,211/0/154 (447 >15s hangs, the known slow class);
 workspace tests 4311/0. The suite is now ~0.69s (from ~0.72s).
 
+### Cut 29 — leaf-inline env clone only on the per-iteration path (measured 2026-08-23)
+
+Cut 28 made the inline leaf run swap `lexical_env` to the leaf's env when
+the leaf contains per-iteration steps. To keep the moved `body_env` alive
+for that swap it changed `self.body_context.replace(body_env)` to
+`body_env.clone()` — a clone executed on EVERY leaf call, even the common
+leaf with no per-iteration reads. `EnvRef` is an `Rc<EnvRecord>`, so the
+unconditional clone was two refcount atomics per call (fetch-add on clone,
+fetch-sub on drop) — ~20-25ms on each call-family row.
+
+The save sequence now clones only on the `leaf_needs_env` path: the false
+branch restores the pre-Cut-28 move into `body_context`, the true branch
+clones once for the swap (the branch itself is fully predictable and costs
+nothing measurable).
+
+Measured (release, vs the pre-fix tree):
+
+| Row | before | after |
+|---|---|---|
+| function calls | ~190ms | **~166ms** |
+| closure capture | ~186ms | **~168ms** |
+| per-iteration | ~27ms | ~23ms |
+| construct churn | ~84ms | ~80ms |
+
+The call rows are back at the Cut 26 floor while per-iteration keeps its
+Cut 28 win — the call family (calls + closure + per-iteration) is ~357ms vs
+~403ms pre-fix. Conformance at baseline: language 23,690/0/34, annexB
+1,086/0/0, built-ins 23,211/0/154 (447 >15s hangs, the known slow class);
+workspace tests 4311/0. The suite is now ~0.68s.
+
+### Cut 30 — skip the environment entirely for env-free leaves (measured 2026-08-23)
+
+The inline leaf run still built a body context and swapped
+`body_context`/`lexical_env` for every leaf, even one whose steps never
+read an environment. `steps_are_leaf` guarantees a leaf can only touch
+an env through context-slot steps (`LoadContextSlot` etc. resolve
+`body_context`) or per-iteration steps (resolve `lexical_env`) — every
+other env-reading step (identifiers, closures, env machinery, super,
+`this`) is excluded. A new `CompiledBody::leaf_uses_env` flag records
+whether the steps contain either family; when false, `run_leaf_body`
+skips the body-context creation and both swaps entirely (with a
+`debug_assert` on the invariant that an env-free leaf gets no env).
+
+The call sites also cloned the callee's `[[Environment]]` per call
+unconditionally (the borrow of the `ecma_functions` map can't coexist
+with `&mut agent` in `run_inner_inner`, so the owned handle is
+required) — now cloned only for a `leaf_uses_env` leaf, and passed BY
+VALUE so the no-capture body moves it straight into `body_context`
+(the Cut 29 clone was one of two Rc clones on the closure path).
+
+Measured (release, vs the Cut 29 tree; the machine was load-noisy, so
+medians over 6-7 runs):
+
+| Row | before | after |
+|---|---|---|
+| function calls | ~172ms | **~165ms** |
+| closure capture | ~183ms | ~172ms |
+| per-iteration | ~23ms | ~22ms |
+| construct churn | ~81ms | ~78ms |
+
+Calls dropped ~8-9ms from the env skip plus ~4ms from the lazy call-site
+clone; closure lost the second of its two per-call clones (the residual
+delta is mostly load noise). The call family is now ~360ms and the suite
+~0.67s. Conformance at baseline: language 23,690/0/34, annexB 1,086/0/0,
+built-ins 23,211/0/154 (447 >15s hangs, the known slow class); workspace
+tests 4311/0.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

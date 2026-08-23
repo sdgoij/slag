@@ -1012,6 +1012,12 @@ pub struct CompiledBody {
     /// for the duration only when this is true (the common leaf never
     /// touches the caller's env).
     pub leaf_needs_env: bool,
+    /// Cut 30: whether the leaf reads an environment at all — any
+    /// context-slot step (`LoadContextSlot` etc. resolve `body_context`)
+    /// or per-iteration step (`leaf_needs_env`). A leaf with neither never
+    /// touches `body_context`/`lexical_env`, so the inline run skips the
+    /// body-context creation and the save/restore of both fields.
+    pub leaf_uses_env: bool,
     /// The certified top-level fast path (script-level bindings): the
     /// declared `var`/function names a script reads and writes directly on
     /// the global object, skipping the env-chain walk. `None` = the
@@ -3761,9 +3767,15 @@ impl Vm {
                         && agent.realms.borrow().len() == 1
                     {
                         let ir = data.ir.clone().expect("checked Some above");
-                        let environment = data.environment.clone();
                         let strict = data.strict;
-                        self.run_leaf_construct(agent, &ir, &environment, strict, &callee, &args)?
+                        // Cut 30: clone the callee's env only for a leaf
+                        // that reads one (see `do_call_fast`).
+                        let environment = if ir.leaf_uses_env {
+                            Some(data.environment.clone())
+                        } else {
+                            None
+                        };
+                        self.run_leaf_construct(agent, &ir, environment, strict, &callee, &args)?
                     } else {
                         crate::function::construct(agent, &callee, &args, &callee)?
                     };
@@ -5743,16 +5755,12 @@ impl Vm {
         &mut self,
         agent: &mut Agent,
         ir: &std::rc::Rc<CompiledBody>,
-        environment: &EnvRef,
+        environment: Option<EnvRef>,
         strict: bool,
         this_value: Value,
         args: &[Value],
     ) -> Result<Completion, JsError> {
         let scope = ir.scope.as_ref().expect("a leaf is certified");
-        let body_env = match scope.new_body_context(environment, args)? {
-            Some(context) => context,
-            None => environment.clone(),
-        };
         let mut frame = leaf_frame(scope, args);
         if let Some(slot) = scope.this_slot {
             *frame.get_mut(slot) = this_value;
@@ -5765,15 +5773,29 @@ impl Vm {
         let caller_acc = std::mem::replace(&mut self.acc, Value::Undefined);
         let caller_strict = self.strict;
         self.strict = strict;
-        let caller_body_context = self.body_context.replace(body_env.clone());
-        // Cut 28: a leaf that reads captured per-iteration heads
-        // (`LoadPerIteration` etc.) resolves them against its own env; the
-        // common leaf (no per-iteration reads) leaves the caller's env
-        // untouched.
-        let caller_lexical_env = if ir.leaf_needs_env {
-            Some(std::mem::replace(&mut self.lexical_env, body_env))
+        // Cut 28/30: a leaf that reads captured per-iteration heads
+        // (`LoadPerIteration` etc.) resolves them against its own env; a
+        // leaf with context-slot steps resolves them against its own
+        // `body_context`. A leaf with neither never touches an env, so the
+        // body-context creation and both swaps are skipped. Clone the env
+        // only when both `body_context` and `lexical_env` need it — the
+        // unconditional clone cost every leaf call two `Rc` atomics (Cut 29).
+        let (caller_body_context, caller_lexical_env) = if let Some(environment) = environment {
+            let body_env = match scope.new_body_context(&environment, args)? {
+                Some(context) => context,
+                None => environment,
+            };
+            if ir.leaf_needs_env {
+                (
+                    self.body_context.replace(body_env.clone()),
+                    Some(std::mem::replace(&mut self.lexical_env, body_env)),
+                )
+            } else {
+                (self.body_context.replace(body_env), None)
+            }
         } else {
-            None
+            debug_assert!(!ir.leaf_uses_env);
+            (None, None)
         };
         let caller_chain_short = self.chain_short;
         self.chain_short = false;
@@ -5804,7 +5826,9 @@ impl Vm {
         self.completion_is_empty = caller_completion_is_empty;
         self.acc = caller_acc;
         self.strict = caller_strict;
-        self.body_context = caller_body_context;
+        if let Some(saved_env) = caller_body_context {
+            self.body_context = Some(saved_env);
+        }
         if let Some(saved_env) = caller_lexical_env {
             self.lexical_env = saved_env;
         }
@@ -5834,7 +5858,7 @@ impl Vm {
         &mut self,
         agent: &mut Agent,
         ir: &std::rc::Rc<CompiledBody>,
-        environment: &EnvRef,
+        environment: Option<EnvRef>,
         strict: bool,
         this: Value,
         args: &[Value],
@@ -5881,7 +5905,7 @@ impl Vm {
         &mut self,
         agent: &mut Agent,
         ir: &std::rc::Rc<CompiledBody>,
-        environment: &EnvRef,
+        environment: Option<EnvRef>,
         strict: bool,
         new_target: &Value,
         args: &[Value],
@@ -5943,12 +5967,19 @@ impl Vm {
             && agent.realms.borrow().len() == 1
         {
             let ir = data.ir.clone().expect("checked Some above");
-            let environment = data.environment.clone();
             let strict = data.strict;
+            // Clone the callee's env only for a leaf that reads one (Cut 30):
+            // an env-free leaf never touches `body_context`/`lexical_env`, so
+            // the per-call `Rc` clone is skipped.
+            let environment = if ir.leaf_uses_env {
+                Some(data.environment.clone())
+            } else {
+                None
+            };
             let mut args_buf = [Value::Undefined; 3];
             args_buf[..argc].clone_from_slice(&self.stack[arg_start..n]);
             let result =
-                self.run_leaf_call(agent, &ir, &environment, strict, this, &args_buf[..argc])?;
+                self.run_leaf_call(agent, &ir, environment, strict, this, &args_buf[..argc])?;
             self.stack.truncate(arg_start - 2);
             self.stack.push(result);
             return Ok(());
@@ -11994,6 +12025,18 @@ pub fn compile_body(function: &EcmaFunction) -> Result<CompiledBody, JsError> {
                 | Step::UpdatePerIteration { .. }
         )
     });
+    // A leaf reads an environment iff it has context-slot steps
+    // (resolve `body_context`) or per-iteration steps (resolve
+    // `lexical_env`); with neither, `run_leaf_body` skips the env work.
+    let leaf_uses_env = leaf_needs_env
+        || compiler.steps.iter().any(|step| {
+            matches!(
+                step,
+                Step::LoadContextSlot { .. }
+                    | Step::StoreContextSlot { .. }
+                    | Step::UpdateContextSlot { .. }
+            )
+        });
     Ok(CompiledBody {
         steps: compiler.steps,
         handlers: compiler.handlers,
@@ -12002,6 +12045,7 @@ pub fn compile_body(function: &EcmaFunction) -> Result<CompiledBody, JsError> {
         env_constant,
         leaf,
         leaf_needs_env,
+        leaf_uses_env,
         script_globals: None,
     })
 }
@@ -12068,6 +12112,7 @@ pub fn compile_statements(
         // path never sees them.
         leaf: false,
         leaf_needs_env: false,
+        leaf_uses_env: false,
         script_globals: compiler.script_globals,
     })
 }
