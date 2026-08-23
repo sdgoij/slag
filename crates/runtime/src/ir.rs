@@ -346,6 +346,17 @@ pub enum Step {
         argc: u8,
         direct_eval: bool,
     },
+    /// Cut 35 slice 4: like `CallFastGlobal` but the callee comes from a
+    /// frame slot (a certified-value var holding a certified closure): the
+    /// receiver push and the slot load fuse into the call step. A slot read
+    /// is side-effect-free, so the only ordering hazard vs spec 13.4.3 is an
+    /// argument that WRITES the callee's slot — the compiler fuses only when
+    /// no argument expression assigns the name (a certified script's args
+    /// can write a declared var only directly).
+    CallFastSlot {
+        slot: usize,
+        argc: u8,
+    },
     SuperCall,
     Construct,
     TaggedTemplate(syntax::ast::TemplateLiteral),
@@ -3856,6 +3867,9 @@ impl Vm {
                 } => {
                     self.do_call_fast_global(agent, *name, *argc as usize, *direct_eval)?;
                 }
+                Step::CallFastSlot { slot, argc } => {
+                    self.do_call_fast_slot(agent, *slot, *argc as usize)?;
+                }
                 Step::SuperCall => {
                     let base = self.args_base_stack.pop().ok_or_else(|| {
                         JsError::new(
@@ -6394,6 +6408,22 @@ impl Vm {
         self.fast_call_core(agent, argc, direct_eval, callee, Value::Undefined, 0)
     }
 
+    /// The `CallFastSlot` handler (Cut 35 slice 4): like
+    /// `do_call_fast_global`, but the callee comes from a frame slot — a
+    /// certified-value var holding a certified closure. The slot read is a
+    /// plain frame access (side-effect-free), and the compiler fused only
+    /// when no argument can write the slot, so the callee-after-args order
+    /// is unobservable.
+    fn do_call_fast_slot(
+        &mut self,
+        agent: &mut Agent,
+        slot: usize,
+        argc: usize,
+    ) -> Result<(), JsError> {
+        let callee = self.frame_get(slot).clone();
+        self.fast_call_core(agent, argc, false, callee, Value::Undefined, 0)
+    }
+
     /// The shared fast-call core: `callee`/`this` as values, the arguments
     /// as the top `argc` stack values, `below` values under them to truncate
     /// with the arguments on completion. Covers the leaf-inline path (Cut
@@ -7980,6 +8010,13 @@ struct Compiler {
     /// global object (`LoadGlobal`/`StoreGlobal`), skipping the env-chain
     /// walk. `None` (and `ScopeInfo` above) means the environment path.
     script_globals: Option<HashSet<String>>,
+    /// The certified script's assigned names (Cut 35 slice 4): the
+    /// `CallFastGlobal` fuse requires the callee to be never-assigned (its
+    /// global binding is then stable for the whole script — reading it
+    /// after the args matches reading it before). Collected with function
+    /// bodies, so an uncertified function's write to a declared name counts.
+    /// `None` outside the certified-script path (the fuse never fires).
+    script_assigned: Option<HashSet<crux::AtomId>>,
     /// The fused canonical loop's counter name (Cut 17): while compiling the
     /// body of an accumulator loop, the name resolves to `BindingLoc::Acc`,
     /// so its reads/assignments/updates touch `Vm::acc` instead of the
@@ -12096,38 +12133,78 @@ impl Compiler {
             self.emit(Step::PopVarReference);
             return Ok(());
         }
-        // Cut 35 slice 2: a declared global-named callee with an undefined
-        // receiver fuses the receiver push and the callee load into the
-        // call step (2 fewer dispatches per call in a hot loop). Requires
-        // no `?.` on the call, no `with`, no `eval`, and no enclosing
-        // optional chain (`chain_depth == 0` — the guard would be dead
-        // anyway, so there is no short-circuit path to skip the call).
+        // Cut 35 slice 2/4: a plain named callee with an undefined receiver
+        // fuses the receiver push and the callee load into the call step (2
+        // fewer dispatches per call in a hot loop). Requires no `?.` on the
+        // call, no `with`, no `eval`, and no enclosing optional chain
+        // (`chain_depth == 0` — the guard would be dead anyway, so there is
+        // no short-circuit path to skip the call).
         //
         // The callee's GetValue (spec 13.4.3 step 2) moves after the
-        // arguments (step 4): the handler reads the global cell once the
-        // args are on the stack. Unobservable for a declared var's data
-        // property — the only divergence is a declared global redefined as
-        // an accessor, which the certified-script model (the direct-mapped
-        // global-cell cache) already treats as out of scope.
+        // arguments (step 4): the handler reads the global cell / frame slot
+        // once the args are on the stack. Unobservable for a declared var's
+        // data property or a frame slot — except when an argument WRITES the
+        // callee: a certified script's args can write a declared var only
+        // directly, so a global callee (a certified function, never
+        // assigned) is always safe, and a slot callee fuses only when no
+        // argument expression assigns its name.
         if !call.optional
             && !direct_eval
             && self.chain_depth == 0
             && let ExprKind::Ident(name) = &callee.kind
-            && matches!(self.binding(*name), BindingLoc::Global)
             && call.args.len() <= 2
             && call.args.iter().all(|a| matches!(a, Argument::Expr(_)))
         {
-            for argument in &call.args {
-                if let Argument::Expr(expr) = argument {
-                    self.compile_expr(expr)?;
+            let step =
+                match self.binding(*name) {
+                    // A global callee fuses only when its binding is never
+                    // assigned anywhere in the script (its global value is then
+                    // stable — the certified gate guarantees this on the frame
+                    // path, and the assigned set covers the global-only path,
+                    // including writes inside function bodies) and no argument
+                    // can run arbitrary code (a builtin like
+                    // `Object.defineProperty(globalThis, ...)` could rewrite the
+                    // global callee).
+                    BindingLoc::Global
+                        if !self
+                            .script_assigned
+                            .as_ref()
+                            .is_some_and(|assigned| assigned.contains(name))
+                            && !call.args.iter().any(
+                                |a| matches!(a, Argument::Expr(e) if expr_contains_call(e)),
+                            ) =>
+                    {
+                        Some(Step::CallFastGlobal {
+                            name: *name,
+                            argc: call.args.len() as u8,
+                            direct_eval: false,
+                        })
+                    }
+                    // A slot callee (certified-value var — frame path only): the
+                    // slot read is side-effect-free, so the only ordering hazard
+                    // is an argument that WRITES the slot, which a certified
+                    // script's args can do only directly.
+                    BindingLoc::Slot(slot)
+                        if !call.args.iter().any(
+                            |a| matches!(a, Argument::Expr(e) if expr_assigns_name(e, *name)),
+                        ) =>
+                    {
+                        Some(Step::CallFastSlot {
+                            slot,
+                            argc: call.args.len() as u8,
+                        })
+                    }
+                    _ => None,
+                };
+            if let Some(step) = step {
+                for argument in &call.args {
+                    if let Argument::Expr(expr) = argument {
+                        self.compile_expr(expr)?;
+                    }
                 }
+                self.emit(step);
+                return Ok(());
             }
-            self.emit(Step::CallFastGlobal {
-                name: *name,
-                argc: call.args.len() as u8,
-                direct_eval: false,
-            });
-            return Ok(());
         }
         self.emit(Step::Push(Value::Undefined));
         self.compile_expr(&call.callee)?;
@@ -12451,6 +12528,7 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
             Step::Call { .. }
                 | Step::CallFast { .. }
                 | Step::CallFastGlobal { .. }
+                | Step::CallFastSlot { .. }
                 | Step::Construct
                 | Step::SuperCall
                 | Step::TaggedTemplate(_)
@@ -12844,17 +12922,18 @@ pub fn compile_statements(
     strict: bool,
     fast_script: bool,
 ) -> Result<CompiledBody, JsError> {
-    let (slots, script_globals) = if fast_script {
+    let (slots, script_globals, script_assigned) = if fast_script {
         match analyze_script_scope(stmts) {
-            Some((slots, globals)) => (slots, Some(globals)),
-            None => (None, None),
+            Some((slots, globals, assigned)) => (slots, Some(globals), Some(assigned)),
+            None => (None, None, None),
         }
     } else {
-        (None, None)
+        (None, None, None)
     };
     let mut compiler = Compiler {
         scope: slots.as_ref().map(|slots| slots.scope.clone()),
         script_globals,
+        script_assigned,
         strict,
         ..Compiler::default()
     };
@@ -14575,13 +14654,22 @@ fn collect_assigned_stmt(stmt: &Stmt, assigned: &mut HashSet<crux::AtomId>) {
         | StmtKind::Debugger
         | StmtKind::Break(_)
         | StmtKind::Continue(_)
-        | StmtKind::FunctionDecl(_)
         | StmtKind::ClassDecl(_)
         | StmtKind::With { .. }
         | StmtKind::Try { .. }
         | StmtKind::Switch { .. }
         | StmtKind::ForIn { .. }
         | StmtKind::UsingDecl { .. } => {}
+        // A function body can assign a declared name (an uncertified
+        // function's write lands on the global object) — the prepass must
+        // walk it so the fused-call never-assigned check sees the write.
+        StmtKind::FunctionDecl(function) => collect_assigned_stmts(&function.body.stmts, assigned),
+    }
+}
+
+fn collect_assigned_stmts(stmts: &[Stmt], assigned: &mut HashSet<crux::AtomId>) {
+    for stmt in stmts {
+        collect_assigned_stmt(stmt, assigned);
     }
 }
 
@@ -14669,15 +14757,18 @@ fn collect_assigned_expr(expr: &Expr, assigned: &mut HashSet<crux::AtomId>) {
                 }
             }
         }
-        // A function/arrow body runs inside the script's slot window only
-        // when certified, and a certified body cannot assign a declared name
-        // (the body scan rejects it) — nothing to collect there.
+        // A function/arrow body can assign a declared name (an uncertified
+        // closure's write lands on the global object) — walk it for the
+        // fused-call never-assigned check.
+        ExprKind::Function(function) => collect_assigned_stmts(&function.body.stmts, assigned),
+        ExprKind::Arrow { body, .. } => match body {
+            syntax::ast::ArrowBody::Expr(expr) => collect_assigned_expr(expr, assigned),
+            syntax::ast::ArrowBody::Block(block) => collect_assigned_stmts(&block.stmts, assigned),
+        },
         ExprKind::Ident(_)
         | ExprKind::Literal(_)
         | ExprKind::This
         | ExprKind::Super
-        | ExprKind::Function(_)
-        | ExprKind::Arrow { .. }
         | ExprKind::Class(_)
         | ExprKind::TaggedTemplate { .. }
         | ExprKind::PrivateIn { .. }
@@ -15444,6 +15535,156 @@ fn assign_target_name(expr: &Expr) -> Option<crux::AtomId> {
     }
 }
 
+/// Whether evaluating `expr` can write the named variable — directly, via
+/// an assignment/update target. A certified script's expressions can write
+/// a declared var only this way (certified calls never touch the slots), so
+/// this is the full check for the `CallFastSlot` ordering guarantee.
+fn expr_assigns_name(expr: &Expr, name: crux::AtomId) -> bool {
+    match &expr.kind {
+        ExprKind::Paren(inner) => expr_assigns_name(inner, name),
+        ExprKind::Assign { target, value, .. } => {
+            assign_target_name(target) == Some(name)
+                || expr_assigns_name(target, name)
+                || expr_assigns_name(value, name)
+        }
+        ExprKind::Update { target, .. } => {
+            assign_target_name(target) == Some(name) || expr_assigns_name(target, name)
+        }
+        ExprKind::Unary { operand, .. } => expr_assigns_name(operand, name),
+        ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
+            expr_assigns_name(left, name) || expr_assigns_name(right, name)
+        }
+        ExprKind::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            expr_assigns_name(test, name)
+                || expr_assigns_name(consequent, name)
+                || expr_assigns_name(alternate, name)
+        }
+        ExprKind::Member(member) => {
+            expr_assigns_name(&member.object, name)
+                || match &member.property {
+                    MemberProperty::Computed(key) => expr_assigns_name(key, name),
+                    _ => false,
+                }
+        }
+        ExprKind::Array(array) => array.elements.iter().any(|element| match element {
+            ArrayElement::Hole => false,
+            ArrayElement::Expr(e) | ArrayElement::Spread(e) => expr_assigns_name(e, name),
+        }),
+        ExprKind::Object(object) => object.props.iter().any(|prop| match prop {
+            ObjectProperty::Method { .. }
+            | ObjectProperty::Get { .. }
+            | ObjectProperty::Set { .. } => false,
+            ObjectProperty::Init { key, value, .. } => {
+                (match key {
+                    PropertyName::Ident(_) | PropertyName::Str(_) | PropertyName::Number(_) => {
+                        false
+                    }
+                    PropertyName::Computed(key_expr) => expr_assigns_name(key_expr, name),
+                }) || expr_assigns_name(value, name)
+            }
+            ObjectProperty::Spread(e) => expr_assigns_name(e, name),
+        }),
+        ExprKind::Template(template) => template.exprs.iter().any(|e| expr_assigns_name(e, name)),
+        ExprKind::Sequence(exprs) => exprs.iter().any(|e| expr_assigns_name(e, name)),
+        ExprKind::Call(call) => {
+            expr_assigns_name(&call.callee, name)
+                || call.args.iter().any(|arg| match arg {
+                    Argument::Expr(e) | Argument::Spread(e) => expr_assigns_name(e, name),
+                })
+        }
+        ExprKind::New(new) => {
+            expr_assigns_name(&new.callee, name)
+                || new.args.iter().any(|arg| match arg {
+                    Argument::Expr(e) | Argument::Spread(e) => expr_assigns_name(e, name),
+                })
+        }
+        ExprKind::Ident(_)
+        | ExprKind::Literal(_)
+        | ExprKind::This
+        | ExprKind::Super
+        | ExprKind::Function(_)
+        | ExprKind::Arrow { .. }
+        | ExprKind::Class(_)
+        | ExprKind::TaggedTemplate { .. }
+        | ExprKind::PrivateIn { .. }
+        | ExprKind::Yield { .. }
+        | ExprKind::Await(_)
+        | ExprKind::MetaProperty { .. }
+        | ExprKind::ImportCall { .. } => false,
+    }
+}
+
+/// Whether the expression contains a call-like node (`Call`, `New`, tagged
+/// template) anywhere — such a node can run arbitrary code (a builtin that
+/// writes the global callee, an uncertified function that assigns it), so a
+/// fused callee-after-args read is unsafe with one in the arguments.
+fn expr_contains_call(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Paren(inner) => expr_contains_call(inner),
+        ExprKind::Unary { operand, .. } => expr_contains_call(operand),
+        ExprKind::Update { target, .. } => expr_contains_call(target),
+        ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
+            expr_contains_call(left) || expr_contains_call(right)
+        }
+        ExprKind::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            expr_contains_call(test)
+                || expr_contains_call(consequent)
+                || expr_contains_call(alternate)
+        }
+        ExprKind::Assign { target, value, .. } => {
+            expr_contains_call(target) || expr_contains_call(value)
+        }
+        ExprKind::Member(member) => {
+            expr_contains_call(&member.object)
+                || match &member.property {
+                    MemberProperty::Computed(key) => expr_contains_call(key),
+                    _ => false,
+                }
+        }
+        ExprKind::Array(array) => array.elements.iter().any(|element| match element {
+            ArrayElement::Hole => false,
+            ArrayElement::Expr(e) | ArrayElement::Spread(e) => expr_contains_call(e),
+        }),
+        ExprKind::Object(object) => object.props.iter().any(|prop| match prop {
+            ObjectProperty::Method { .. }
+            | ObjectProperty::Get { .. }
+            | ObjectProperty::Set { .. } => false,
+            ObjectProperty::Init { key, value, .. } => {
+                (match key {
+                    PropertyName::Ident(_) | PropertyName::Str(_) | PropertyName::Number(_) => {
+                        false
+                    }
+                    PropertyName::Computed(key_expr) => expr_contains_call(key_expr),
+                }) || expr_contains_call(value)
+            }
+            ObjectProperty::Spread(e) => expr_contains_call(e),
+        }),
+        ExprKind::Template(template) => template.exprs.iter().any(expr_contains_call),
+        ExprKind::Sequence(exprs) => exprs.iter().any(expr_contains_call),
+        ExprKind::Call(_) | ExprKind::New(_) | ExprKind::TaggedTemplate { .. } => true,
+        ExprKind::Ident(_)
+        | ExprKind::Literal(_)
+        | ExprKind::This
+        | ExprKind::Super
+        | ExprKind::Function(_)
+        | ExprKind::Arrow { .. }
+        | ExprKind::Class(_)
+        | ExprKind::PrivateIn { .. }
+        | ExprKind::Yield { .. }
+        | ExprKind::Await(_)
+        | ExprKind::MetaProperty { .. }
+        | ExprKind::ImportCall { .. } => false,
+    }
+}
+
 /// `ScriptSlots` layout when the script is a closed world whose declared
 /// vars can live in frame slots, or the plain declared-name set when the
 /// script qualifies only for direct global-object access (today's path —
@@ -15451,7 +15692,9 @@ fn assign_target_name(expr: &Expr) -> Option<crux::AtomId> {
 /// a construct could change binding resolution entirely (a `with`, a
 /// `try`/`catch` whose parameter shadows a same-named global, a `switch`
 /// with lexical cases, a `for-in`/`for-of`, or a direct `eval` call).
-fn analyze_script_scope(stmts: &[Stmt]) -> Option<(Option<ScriptSlots>, HashSet<String>)> {
+fn analyze_script_scope(
+    stmts: &[Stmt],
+) -> Option<(Option<ScriptSlots>, HashSet<String>, HashSet<crux::AtomId>)> {
     if !script_scan_allows(stmts) {
         return None;
     }
@@ -15504,10 +15747,10 @@ fn analyze_script_scope(stmts: &[Stmt]) -> Option<(Option<ScriptSlots>, HashSet<
                 statement_fns: Vec::new(),
             },
             names: slot_names,
-            assigned,
+            assigned: assigned.clone(),
         })
     };
-    Some((slots, globals))
+    Some((slots, globals, assigned))
 }
 
 /// Whether the script is a closed world for frame-slot vars (Cut 16): no

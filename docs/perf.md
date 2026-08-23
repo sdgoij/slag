@@ -1299,6 +1299,39 @@ Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
 conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
 23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
 
+### Cut 35 slice 4 — fused slot-callee calls (measured 2026-08-23)
+
+`CallFastSlot` extends the fused-call shape to a callee held in a frame
+slot (a certified-value var like `var f = make(2)`): the receiver push and
+the slot load fuse into the call step, so the closure loop runs entirely
+on frame/acc — `FastLoopBind`/`FastLoopHead{Acc}` + `LoadLocal` +
+`CallFastSlot` + `FusedStoreLocal`, zero global-object access per
+iteration. The closure row converges with the calls row:
+
+| Row | slice 3 | slice 4 |
+|---|---|---|
+| function calls | ~65ms | ~65ms |
+| closure capture | ~80ms | **~67ms** |
+
+**Ordering fix for the global fuse**: the probe for the slot fuse exposed
+that `CallFastGlobal` (slice 2) had the same spec-13.4.3 ordering hazard
+on the *global-only* path — the fuse fires for any declared global callee
+there, so `f(f = g)` called the NEW `f` instead of loading the callee
+before the args. The global fuse now requires the callee name to be
+**never assigned anywhere in the script** (the assigned prepass walks
+function bodies, so an uncertified function's write to the name counts)
+and **no call-like node in the arguments** (a builtin like
+`Object.defineProperty(globalThis, ...)` could rewrite the global callee).
+A slot callee needs only the direct-arg-write check (a certified script's
+args can write a declared var only directly; a frame-slot read is
+side-effect-free). The 15-case probe (`scratch/callfast_slot_probe.js`)
+covers the arg-writes-callee, arg-increments-callee, nested-assignment,
+indirect-call-write, and getter-write ordering cases — all pass.
+
+Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
+conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
+23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

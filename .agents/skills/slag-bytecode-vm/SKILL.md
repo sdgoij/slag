@@ -198,6 +198,17 @@ carry `script_globals`, so the fuse never fires inside function bodies).
   certified-script model (direct-mapped `global_cells` cache) treats as
   out of scope. If you extend the fused shape, keep this tradeoff in
   mind — a fixture could someday catch it.
+- **The global fuse requires the callee NEVER-ASSIGNED and no call-like
+  args** (the slice-2 probe caught `f(f = g)` calling the NEW `f` on the
+  global-only path): the compiler checks the script's assigned set
+  (prepass, now walking function bodies so an uncertified function's
+  write to the name counts) and that no argument contains a
+  `Call`/`New`/tagged template (a builtin like
+  `Object.defineProperty(globalThis, ...)` could rewrite the global
+  callee). `CallFastSlot` (a frame-slot callee — a certified-value var)
+  needs only the direct-arg-write check (`expr_assigns_name`): a
+  certified script's args can write a declared var only directly, and a
+  slot read is side-effect-free.
 - **`compile_call_args_guarded` skips the guard at `chain_depth == 0`**:
   `chain_short` is set only inside a chain and cleared by the outermost
   chain node's `ClearChainShort`, so the `JumpIfChainShort`/`Jump` pair is
