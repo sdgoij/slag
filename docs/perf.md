@@ -726,6 +726,31 @@ baseline: language 23,690/0/34, annexB 1,086/0/0, built-ins
 is object-id-keyed), and the call machinery — the shapes work the
 write-side cache is a slice of.
 
+### Cut 23 — proto-keyed read-cell fallback (measured 2026-08-23)
+
+The read of a field on a fresh object (a constructor's new `this`) was
+~200ns: the `member_cells` GET cache is object-id-keyed, so every fresh
+object missed and fell to the full Get. Fresh instances of the same
+constructor share their prototype's shape — `x` sits at the same slot
+in every `new C()` — so `resolve_member_cell` now also records the slot
+under `(prototype id, name)` (`member_proto_cells`), and
+`member_cell_get` falls back to that entry on an object-id miss,
+validated per access against the instance's own property vector (a
+divergent layout misses and re-resolves, exactly like `member_cells`).
+
+Measured (medians, release, vs Cut 22):
+
+| Row | before | after |
+|---|---|---|
+| construct churn | ~152ms | **~135ms** |
+| `new C(i)`+read probe | ~104ms | **~94ms** |
+| `{x:i}`+read 1M probe | ~633ms | **~503ms** |
+
+The fresh-object field read drops ~185ns → ~55ns. Property/array/calls
+flat. Conformance at baseline: language 23,690/0/34, annexB 1,086/0/0,
+built-ins 23,213/0/154 (445 hangs, known load-tied cluster); workspace
+tests 4311/0.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

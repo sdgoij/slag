@@ -74,6 +74,12 @@ pub struct Agent {
     /// and warms a nested call to its caller's shapes.
     pub(crate) global_cells: [Option<(crux::AtomId, usize)>; crate::ir::GLOBAL_CELLS],
     pub(crate) member_cells: [Option<(u64, crux::AtomId, usize)>; crate::ir::MEMBER_CELLS],
+    /// The proto-keyed read-cell fallback (Cut 23): `(prototype id, name) →
+    /// slot` — fresh objects (a constructor's new `this`) share the
+    /// prototype's shape, so the slot cached for the prototype is validated
+    /// against each object's own property vector on access (a divergent
+    /// layout misses and re-resolves). Self-validating like `member_cells`.
+    pub(crate) member_proto_cells: [Option<(u64, crux::AtomId, usize)>; crate::ir::MEMBER_CELLS],
     pub(crate) array_element_cells:
         [Option<(u64, u64, crux::AtomId, usize)>; crate::ir::MEMBER_CELLS],
     /// The write-side chain cache (Cut 22): "the chain from this prototype
@@ -441,6 +447,7 @@ impl Agent {
             execution_context_stack: Vec::new(),
             global_cells: [None; crate::ir::GLOBAL_CELLS],
             member_cells: [None; crate::ir::MEMBER_CELLS],
+            member_proto_cells: [None; crate::ir::MEMBER_CELLS],
             array_element_cells: [None; crate::ir::MEMBER_CELLS],
             member_store_cells: [None; crate::ir::MEMBER_CELLS],
             vm_pool: Vec::new(),

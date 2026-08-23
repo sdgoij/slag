@@ -1850,10 +1850,34 @@ impl Vm {
             return None;
         }
         let index = Self::member_cell_index(object.id(), name);
-        let (cached_id, cached_name, slot) = agent.member_cells[index]?;
-        if cached_id != object.id() || cached_name != name {
-            return None;
-        }
+        let slot = match agent.member_cells[index] {
+            Some((cached_id, cached_name, slot))
+                if cached_id == object.id() && cached_name == name =>
+            {
+                slot
+            }
+            _ => {
+                // Cut 23 (proto-keyed fallback): fresh objects (a
+                // constructor's new `this`) share their prototype's shape,
+                // so the slot cached for the prototype is validated against
+                // this object's own vector below — a divergent layout
+                // misses and re-resolves.
+                let proto_handle = object.get_prototype_of().ok()?;
+                let proto = proto_handle.as_ref()?;
+                if !matches!(
+                    proto.kind,
+                    crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array
+                ) {
+                    return None;
+                }
+                let proto_index = Self::member_cell_index(proto.id(), name);
+                let (cached_proto, cached_name, slot) = agent.member_proto_cells[proto_index]?;
+                if cached_proto != proto.id() || cached_name != name {
+                    return None;
+                }
+                slot
+            }
+        };
         let props = object.properties.borrow();
         let (key, property) = props.get(slot)?;
         if *key != PropertyKey::String(name) {
@@ -2022,6 +2046,18 @@ impl Vm {
             {
                 let index = Self::member_cell_index(object.id(), name);
                 agent.member_cells[index] = Some((object.id(), name, slot));
+                // Cut 23: cache the slot for the prototype too — fresh
+                // instances of the same shape hit the proto-keyed fallback
+                // in `member_cell_get` (validated per access).
+                if let Ok(Some(proto)) = object.get_prototype_of()
+                    && matches!(
+                        proto.kind,
+                        crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array
+                    )
+                {
+                    let proto_index = Self::member_cell_index(proto.id(), name);
+                    agent.member_proto_cells[proto_index] = Some((proto.id(), name, slot));
+                }
             }
         }
     }
