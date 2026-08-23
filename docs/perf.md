@@ -1023,6 +1023,30 @@ delta is mostly load noise). The call family is now ~360ms and the suite
 built-ins 23,211/0/154 (447 >15s hangs, the known slow class); workspace
 tests 4311/0.
 
+### Cut 31 — raise the rope flatten cap (measured 2026-08-23)
+
+The string-concat row (`s += 'x'` × 100k, building a 100k-unit rope)
+flattened the whole accumulated left side every 64 appends
+(`ROPE_MAX_DEPTH`), copying ~156 MB of units over the run. The cap
+only bounds drop/flatten recursion, so raising it 64 → 1024 cuts the
+flatten copies ~16× (to ~10 MB) while the ≤1024-frame recursion stays
+well inside the default 8 MB stack. (Right-append chains like `'x' + s`
+were already unbounded — the cap only ever protected left-append
+chains — so the hazard surface is unchanged.)
+
+Measured (release, vs Cut 30):
+
+| Row | before | after |
+|---|---|---|
+| string concat | ~46ms | **~20ms** (-57%) |
+
+All other rows flat; the suite is ~0.64-0.66s. Semantics are unchanged
+(the flatten is an internal representation detail — strings are
+immutable), but the shared rope machinery warranted the full sweep.
+Conformance at baseline: language 23,690/0/34, annexB 1,086/0/0,
+built-ins 23,211/0/154 (447 >15s hangs, the known slow class); workspace
+tests 4311/0.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

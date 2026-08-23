@@ -45,7 +45,10 @@ const CONCAT_FLAT_THRESHOLD: usize = 16;
 /// The deepest a rope may grow before concat flattens the left side. The
 /// amortized cost is one re-flatten of the accumulated string per `cap`
 /// appends (quadratic with a tiny constant), and drop recursion stays bounded.
-const ROPE_MAX_DEPTH: usize = 64;
+/// 64 kept the left-append flatten cost at ~n²/128 units; 1024 drops it ~16×
+/// while the drop/flatten recursion (≤ cap frames) stays comfortably inside
+/// the default 8 MB stack.
+const ROPE_MAX_DEPTH: usize = 1024;
 
 impl JsString {
     pub fn from_utf16(units: &[u16]) -> Self {
