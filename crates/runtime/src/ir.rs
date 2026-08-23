@@ -1330,12 +1330,60 @@ pub(crate) const LEAF_CACHE: usize = 16;
 /// A cached leaf-inline record: everything the inline call path reads off
 /// the `ecma_functions` record, captured so the per-call HashMap lookup is
 /// skipped on a hit.
+#[derive(Clone)]
 pub(crate) struct LeafEntry {
     pub ir: std::rc::Rc<CompiledBody>,
     pub strict: bool,
     /// The function's [[Environment]], kept only when the leaf reads an
     /// environment (`CompiledBody::leaf_uses_env`).
     pub environment: Option<EnvRef>,
+}
+
+/// The global call-site leaf cache entry (Cut 35 slice 12): a resolved
+/// [`LeafEntry`] for a stable global callee, valid while the global object
+/// keeps its identity and generation (every global-object mutation bumps,
+/// slice 11). The compiler's never-assigned + no-call-like-args guard makes
+/// the callee stable for the script's duration, so the per-call
+/// cell-load/kind/realms/lookup validation chain is skipped on a hit.
+pub(crate) struct GlobalLeafCell {
+    pub name: crux::AtomId,
+    pub global_id: u64,
+    pub global_generation: u32,
+    pub entry: LeafEntry,
+}
+
+/// The slot-callee leaf cache entry (Cut 35 slice 12): a resolved
+/// [`LeafEntry`] for a frame-slot callee (a certified-value var holding a
+/// certified closure). The slot's current value is validated by its heap
+/// payload — the same closure keeps the same allocation — and the held
+/// `callee` keeps that closure alive, so a payload match means the cached
+/// entry (ir + closure env) is exactly the callee's. The slot index is the
+/// direct-mapped key; a different body's same-index slot misses on the
+/// payload.
+pub(crate) struct SlotLeafCell {
+    pub payload: u64,
+    /// Held for its drop side effect: the strong ref keeps the callee's
+    /// closure allocation alive, so its payload can never be reused while
+    /// the cache entry exists (the payload compare is then exact). Never
+    /// read.
+    #[allow(dead_code)]
+    pub callee: Value,
+    pub entry: LeafEntry,
+}
+
+/// The direct-mapped slot-callee leaf cache size (Cut 35 slice 12): a
+/// power of two so the index is a mask.
+pub(crate) const SLOT_LEAF_CELLS: usize = 64;
+
+/// The leaf-inline cache site (Cut 35 slice 12): which per-call-site
+/// cache, if any, the resolved leaf entry is written to on the first
+/// call. `Global` (a stable global callee, validated by the global
+/// object's generation), `Slot` (a frame-slot callee, validated by its
+/// heap payload), or none (`CallFast`'s `[this, callee]` stack shape).
+pub(crate) enum LeafCacheSite {
+    Global { name: crux::AtomId },
+    Slot { index: usize, callee: Value },
+    None,
 }
 
 /// The fast-path frame storage: an inline buffer for small layouts, a `Vec`
@@ -6711,7 +6759,15 @@ impl Vm {
         // The shared core: `below` values under the argument region (2 for
         // `CallFast`'s `[this, callee]`) are removed with the arguments when
         // the result replaces the call site.
-        self.fast_call_core(agent, argc, direct_eval, callee, this, 2)
+        self.fast_call_core(
+            agent,
+            argc,
+            direct_eval,
+            callee,
+            this,
+            2,
+            LeafCacheSite::None,
+        )
     }
 
     /// The `CallFastGlobal` handler (Cut 35 slice 2): the callee comes from
@@ -6725,8 +6781,37 @@ impl Vm {
         argc: usize,
         direct_eval: bool,
     ) -> Result<(), JsError> {
+        // Cut 35 slice 12: the call-site leaf cache hit — a stable global
+        // callee (the compiler's never-assigned + no-call-like-args guard)
+        // keeps its resolved leaf entry across calls while the global
+        // object's identity and generation are unchanged, skipping the
+        // cell load, kind check, realm check, and leaf lookup every
+        // iteration.
+        let index = Self::global_cell_index(name);
+        let cached = agent.global_leaf_cells[index]
+            .as_ref()
+            .filter(|cell| cell.name == name)
+            .map(|cell| (cell.global_id, cell.global_generation, cell.entry.clone()));
+        if let Some((global_id, global_generation, entry)) = cached {
+            let global = self.global_object(agent)?;
+            if global.id() == global_id
+                && global.generation() == global_generation
+                && self.can_inline_leaf()
+                && agent.realms.borrow().len() == 1
+            {
+                return self.run_inline_leaf(agent, argc, Value::Undefined, entry, 0);
+            }
+        }
         let callee = self.load_global_value(agent, name)?;
-        self.fast_call_core(agent, argc, direct_eval, callee, Value::Undefined, 0)
+        self.fast_call_core(
+            agent,
+            argc,
+            direct_eval,
+            callee,
+            Value::Undefined,
+            0,
+            LeafCacheSite::Global { name },
+        )
     }
 
     /// The `CallFastSlot` handler (Cut 35 slice 4): like
@@ -6741,14 +6826,117 @@ impl Vm {
         slot: usize,
         argc: usize,
     ) -> Result<(), JsError> {
-        let callee = self.frame_get(slot).clone();
-        self.fast_call_core(agent, argc, false, callee, Value::Undefined, 0)
+        let callee = self.frame_get(slot);
+        // Cut 35 slice 12: the slot-callee leaf cache hit — the frame slot
+        // holds the same closure (its heap payload matches the cached one,
+        // which the held `callee` keeps alive), so the resolved entry is
+        // reused without the kind check, realm check, or leaf lookup.
+        if let Some(payload) = callee.heap_payload()
+            && let Some(cell) = agent.slot_leaf_cells[slot & (SLOT_LEAF_CELLS - 1)].as_ref()
+            && cell.payload == payload
+            && self.can_inline_leaf()
+            && agent.realms.borrow().len() == 1
+        {
+            let entry = cell.entry.clone();
+            return self.run_inline_leaf(agent, argc, Value::Undefined, entry, 0);
+        }
+        let callee = callee.clone();
+        self.fast_call_core(
+            agent,
+            argc,
+            false,
+            callee.clone(),
+            Value::Undefined,
+            0,
+            LeafCacheSite::Slot {
+                index: slot & (SLOT_LEAF_CELLS - 1),
+                callee,
+            },
+        )
+    }
+
+    /// The shared leaf-inline run (Cut 25/34/35): bind `this`, run the
+    /// leaf's register or step-path body against the argument region on the
+    /// stack top, and replace the call site (`below` values under the
+    /// arguments are truncated with them) with the result. Shared by
+    /// `fast_call_core` and the global call-site leaf cache (Cut 35
+    /// slice 12). Takes the entry by value so a cached entry needs no
+    /// further clone.
+    #[inline(always)]
+    fn run_inline_leaf(
+        &mut self,
+        agent: &mut Agent,
+        argc: usize,
+        this_value: Value,
+        entry: LeafEntry,
+        below: usize,
+    ) -> Result<(), JsError> {
+        let n = self.stack.len();
+        let arg_start = n - argc;
+        let ir = entry.ir;
+        let strict = entry.strict;
+        let environment = entry.environment;
+        // Cut 35 slice 1: a register leaf runs on the small dedicated
+        // executor with no `run_leaf_call`/`run_leaf_body` indirection
+        // and no completion round-trip (a register body always completes
+        // with `Return`); a step-path leaf runs through `run_leaf_body`
+        // as before.
+        let scope = ir.scope.as_ref().expect("a leaf is certified");
+        let this_value = self.bind_this_value(agent, scope, strict, this_value)?;
+        let completion = if let Some(ops) = ir.leaf_ops.as_deref() {
+            // Alias the frame onto the caller's argument region when
+            // every frame slot is a present parameter (no `this` slot,
+            // no var/TDZ slots): `f(x)`, `f(x, y)` with all args
+            // supplied — no argument copy, no frame push. Otherwise push
+            // the frame from the copied arguments.
+            let arg_base = (scope.this_slot.is_none()
+                && scope.frame_size == scope.arity
+                && argc >= scope.frame_size)
+                .then_some(arg_start);
+            if let Some(base) = arg_base {
+                self.run_leaf_regs(
+                    agent,
+                    ops,
+                    &ir,
+                    environment,
+                    this_value,
+                    LeafFrame::Alias(base),
+                )?
+            } else {
+                let mut args_buf = [Value::Undefined; 3];
+                args_buf[..argc].clone_from_slice(&self.stack[arg_start..n]);
+                self.run_leaf_regs(
+                    agent,
+                    ops,
+                    &ir,
+                    environment,
+                    this_value,
+                    LeafFrame::Pushed(&args_buf[..argc]),
+                )?
+            }
+        } else {
+            let mut args_buf = [Value::Undefined; 3];
+            args_buf[..argc].clone_from_slice(&self.stack[arg_start..n]);
+            self.run_leaf_body(
+                agent,
+                &ir,
+                environment,
+                strict,
+                this_value,
+                &args_buf[..argc],
+            )?
+        };
+        let result = Self::leaf_completion_result(completion)?;
+        self.stack.truncate(arg_start - below);
+        self.stack.push(result);
+        Ok(())
     }
 
     /// The shared fast-call core: `callee`/`this` as values, the arguments
     /// as the top `argc` stack values, `below` values under them to truncate
     /// with the arguments on completion. Covers the leaf-inline path (Cut
     /// 25/34/35), direct eval, and the general call.
+    #[allow(clippy::too_many_arguments)]
     fn fast_call_core(
         &mut self,
         agent: &mut Agent,
@@ -6757,6 +6945,7 @@ impl Vm {
         callee: Value,
         this: Value,
         below: usize,
+        leaf_cache: LeafCacheSite,
     ) -> Result<(), JsError> {
         let n = self.stack.len();
         let arg_start = n - argc;
@@ -6776,68 +6965,43 @@ impl Vm {
             // cache, skipping the `ecma_functions` HashMap lookup on a hit.
             && let Some(entry) = agent.leaf_lookup(function.id())
         {
-            let ir = entry.ir.clone();
-            let strict = entry.strict;
-            // Clone the callee's env only for a leaf that reads one (Cut 30).
-            let environment = if ir.leaf_uses_env {
-                entry.environment.clone()
-            } else {
-                None
+            // Clone the entry fields up front so the `leaf_lookup` borrow
+            // of the agent ends before the cache write or the run.
+            let entry = LeafEntry {
+                ir: entry.ir.clone(),
+                strict: entry.strict,
+                environment: entry.environment.clone(),
             };
-            // Cut 35 slice 1: a register leaf runs on the small dedicated
-            // executor with no `run_leaf_call`/`run_leaf_body` indirection
-            // and no completion round-trip (a register body always completes
-            // with `Return`); a step-path leaf runs through `run_leaf_body`
-            // as before.
-            let scope = ir.scope.as_ref().expect("a leaf is certified");
-            let this_value = self.bind_this_value(agent, scope, strict, this)?;
-            let completion = if let Some(ops) = ir.leaf_ops.as_deref() {
-                // Alias the frame onto the caller's argument region when
-                // every frame slot is a present parameter (no `this` slot,
-                // no var/TDZ slots): `f(x)`, `f(x, y)` with all args
-                // supplied — no argument copy, no frame push. Otherwise push
-                // the frame from the copied arguments.
-                let arg_base = (scope.this_slot.is_none()
-                    && scope.frame_size == scope.arity
-                    && argc >= scope.frame_size)
-                    .then_some(arg_start);
-                if let Some(base) = arg_base {
-                    self.run_leaf_regs(
-                        agent,
-                        ops,
-                        &ir,
-                        environment,
-                        this_value,
-                        LeafFrame::Alias(base),
-                    )?
-                } else {
-                    let mut args_buf = [Value::Undefined; 3];
-                    args_buf[..argc].clone_from_slice(&self.stack[arg_start..n]);
-                    self.run_leaf_regs(
-                        agent,
-                        ops,
-                        &ir,
-                        environment,
-                        this_value,
-                        LeafFrame::Pushed(&args_buf[..argc]),
-                    )?
+            match leaf_cache {
+                LeafCacheSite::Global { name } => {
+                    // Cache the resolved entry for the next call (the
+                    // callee is stable under the compiler's guard; the
+                    // generation re-validates any global mutation).
+                    let index = Self::global_cell_index(name);
+                    let cached = entry.clone();
+                    let global = self.global_object(agent)?;
+                    agent.global_leaf_cells[index] = Some(GlobalLeafCell {
+                        name,
+                        global_id: global.id(),
+                        global_generation: global.generation(),
+                        entry: cached,
+                    });
                 }
-            } else {
-                let mut args_buf = [Value::Undefined; 3];
-                args_buf[..argc].clone_from_slice(&self.stack[arg_start..n]);
-                self.run_leaf_body(
-                    agent,
-                    &ir,
-                    environment,
-                    strict,
-                    this_value,
-                    &args_buf[..argc],
-                )?
-            };
-            let result = Self::leaf_completion_result(completion)?;
-            self.stack.truncate(arg_start - below);
-            self.stack.push(result);
-            return Ok(());
+                LeafCacheSite::Slot { index, callee } => {
+                    // The held `callee` keeps the closure alive, so its
+                    // payload can never be reused while the entry exists.
+                    let cached = entry.clone();
+                    agent.slot_leaf_cells[index] = Some(SlotLeafCell {
+                        payload: callee
+                            .heap_payload()
+                            .expect("a leaf callee is a heap function value"),
+                        callee,
+                        entry: cached,
+                    });
+                }
+                LeafCacheSite::None => {}
+            }
+            return self.run_inline_leaf(agent, argc, this, entry, below);
         }
         let args = &self.stack[arg_start..n];
         if is_eval_function(agent, &callee)? {

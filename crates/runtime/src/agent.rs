@@ -87,6 +87,16 @@ pub struct Agent {
     /// vector), so sharing them across Vms — and across realms — is exact
     /// and warms a nested call to its caller's shapes.
     pub(crate) global_cells: [Option<(crux::AtomId, usize)>; crate::ir::GLOBAL_CELLS],
+    /// The global call-site leaf cache (Cut 35 slice 12): name → the
+    /// resolved leaf entry for a stable global callee, valid while the
+    /// global object's identity and generation are unchanged. Boxed so the
+    /// Agent's hot-field cache footprint stays small (the Cut 27 lesson).
+    pub(crate) global_leaf_cells: Box<[Option<crate::ir::GlobalLeafCell>; crate::ir::GLOBAL_CELLS]>,
+    /// The slot-callee leaf cache (Cut 35 slice 12): frame-slot index → the
+    /// resolved leaf entry for the closure held there, validated by the
+    /// callee's heap payload (the held `callee` keeps it alive). Boxed per
+    /// the Cut 27 lesson.
+    pub(crate) slot_leaf_cells: Box<[Option<crate::ir::SlotLeafCell>; crate::ir::SLOT_LEAF_CELLS]>,
     pub(crate) member_cells: [Option<(u64, crux::AtomId, usize)>; crate::ir::MEMBER_CELLS],
     /// The fronting read-side value cache (Cut 35 slice 11): (id, name,
     /// generation, value) — a hit returns the value with no property-vector
@@ -496,6 +506,8 @@ impl Agent {
         Self {
             execution_context_stack: Vec::new(),
             global_cells: [None; crate::ir::GLOBAL_CELLS],
+            global_leaf_cells: Box::new(std::array::from_fn(|_| None)),
+            slot_leaf_cells: Box::new(std::array::from_fn(|_| None)),
             member_cells: [None; crate::ir::MEMBER_CELLS],
             member_value_cells: Box::new(std::array::from_fn(|_| None)),
             member_proto_cells: [None; crate::ir::MEMBER_CELLS],

@@ -157,6 +157,21 @@ impl Value {
         self.0 & PAYLOAD_MASK
     }
 
+    /// The payload bits of a heap value — the leaked Rc pointer (shifted),
+    /// the raw identity of the underlying allocation. `None` for a double
+    /// (whose bits are not a payload). The runtime compares heap-value
+    /// identity without dereferencing (Cut 35 slice 12's slot-callee leaf
+    /// cache); sound because the comparison only ever sees live values, and
+    /// two live allocations never share an address.
+    #[inline]
+    pub fn heap_payload(&self) -> Option<u64> {
+        if self.is_double() {
+            None
+        } else {
+            Some(self.0 & PAYLOAD_MASK)
+        }
+    }
+
     /// Whether the bits hold a double (anything outside the tag region).
     #[inline]
     fn is_double(&self) -> bool {

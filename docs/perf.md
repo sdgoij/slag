@@ -1575,6 +1575,43 @@ Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
 conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
 23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
 
+### Cut 35 slice 12 — call-site leaf caches (measured 2026-08-23)
+
+After slice 10, the remaining bench rows' cost was the CALL: the pure
+loop is ~25ms/1M iterations; `n = f(n)` adds ~50ms. The per-call
+machinery was dominated by the callee validation chain — the global
+cell load + borrow, `callee.kind()`, the realm check, and the
+`leaf_lookup` (~20ns) — plus the leaf run. Two per-call-site leaf
+caches skip the chain on a hit:
+
+- **`global_leaf_cells`** — name → the resolved `LeafEntry` for a stable
+  global callee, validated by the global object's identity and
+  generation (every global-object mutation bumps, slice 11). The
+  compiler's never-assigned + no-call-like-args guard makes the callee
+  stable for the script's duration, so the cell load, kind check, realm
+  check, and lookup are skipped. The leaf-run core is extracted into
+  `run_inline_leaf` (shared by `fast_call_core` and both cache-hit
+  paths).
+- **`slot_leaf_cells`** — frame-slot index → the resolved entry for the
+  closure held there, validated by the callee's heap payload
+  (`Value::heap_payload`, a new crux accessor — the raw leaked-Rc
+  pointer). The cache holds the callee itself, keeping the closure's
+  allocation alive, so a payload match can never be a stale address
+  reuse — the cached ir + closure env are exactly the callee's. A slot
+  reassigned to a different closure (or a non-function) misses on the
+  payload and re-resolves.
+
+Measured: function calls ~71 -> ~60ms, closure capture ~72 -> ~66ms;
+the other rows unchanged. The 10-case probe (`scratch/slice12_probe.js`)
+covers the basic sums, two closures with distinct captures, alternating
+callees mid-loop, a `globalThis` reassignment invalidating the global
+cache, a builtin callee through a slot, env-free and env-reading leaves,
+recursion through a slot call, a non-callable slot, and two-arg leaves.
+
+Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
+conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
+23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

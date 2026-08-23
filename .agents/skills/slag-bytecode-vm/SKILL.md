@@ -241,9 +241,22 @@ arguments state.
   `*slot = value` on `props`), it MUST bump — a stale cached value would
   be returned otherwise. The extra bumps cost the write-side chain cache
   and for-of caches spurious misses (re-validated, correct), never stale
-  verdicts. `GetMemberNameLocal` reads its frame slot by reference and
+  `GetMemberNameLocal` reads its frame slot by reference and
   tries `member_cell_get` before cloning the value for the full fallback
   (one fewer refcount bump per hit).
+- **Call-site leaf caches** (Cut 35 slice 12): `fast_call_core`'s
+  leaf-run block is extracted into `run_inline_leaf` (takes the
+  `LeafEntry` by value), and the resolved entry is cached per call site
+  on the first call. The global cache (`global_leaf_cells`, name →
+  entry) is validated by the global object's identity + generation —
+  sound only because slice 11 made every global mutation bump. The slot
+  cache (`slot_leaf_cells`, frame-slot index → entry) is validated by
+  the callee's `heap_payload` (the raw leaked-Rc pointer): the cache
+  holds the callee Value so the closure's allocation can never be
+  recycled, making a payload match exact — a reassigned slot misses and
+  re-resolves. Both cache-hit paths must re-check `can_inline_leaf` and
+  `realms` per call (they are per-call-site state, not callee
+  properties). `Value::heap_payload` is `None` for doubles.
 - Errors propagate raw to the caller's `run_inner` exactly like a
   step-path leaf (a register body may throw from `apply_binary`/TDZ
   checks). Register-op semantics mirror the step semantics 1:1 — when you
