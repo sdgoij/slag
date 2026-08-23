@@ -886,6 +886,15 @@ pub enum LeafOp {
     /// frame[slot] = acc; the `tdz` bit mirrors `Step::StoreLocal`'s
     /// assignment-to-uninitialized check.
     StoreReg { slot: usize, tdz: bool },
+    /// Write `value` onto the object in the accumulator under `name` (the
+    /// plain-assign member store, `Step::AssignMemberName` with a plain
+    /// `=`): runs `assign_member`, which can trigger a setter — the same
+    /// agent-side machinery the step path invokes (the pushed result is
+    /// discarded by the frame truncate).
+    StoreMemberName {
+        name: crux::AtomId,
+        value: RegOperand,
+    },
     /// Complete with `Completion::Return(acc)`.
     ReturnAcc,
 }
@@ -6280,12 +6289,80 @@ impl Vm {
                     }
                     self.stack[frame_base + slot] = self.acc.clone();
                 }
+                LeafOp::StoreMemberName { name, value } => {
+                    // The object is the accumulator; the value comes from the
+                    // operand. Mirrors `Step::AssignMemberName` with a plain
+                    // `=`: the nullish check, then `assign_member` (whose
+                    // pushed result the frame truncate discards).
+                    let object = self.acc.clone();
+                    if is_nullish(&object) {
+                        return Err(nullish_error("Cannot set properties of null"));
+                    }
+                    let value = self.leaf_operand_value(frame_base, value)?;
+                    self.assign_member(
+                        agent,
+                        object,
+                        PropertyKeyName::Name(*name),
+                        None,
+                        value,
+                        AssignOp::Assign,
+                    )?;
+                }
                 LeafOp::ReturnAcc => {
                     return Ok(Completion::Return(self.acc.clone()));
                 }
             }
         }
         Ok(Completion::Empty)
+    }
+
+    /// Load a register operand to a value for a store op, mirroring the
+    /// `LoadReg`/`LoadContext`/`LoadPerIter`/`LoadConst` ops' semantics
+    /// (including the TDZ and context-transparent-env walks).
+    fn leaf_operand_value(
+        &self,
+        frame_base: usize,
+        operand: &RegOperand,
+    ) -> Result<Value, JsError> {
+        match operand {
+            RegOperand::Acc => Ok(self.acc.clone()),
+            RegOperand::Reg { slot, tdz } => {
+                let value = self.stack[frame_base + slot].clone();
+                if *tdz && value.is_uninitialized() {
+                    return Err(JsError::new(
+                        ErrorKind::ReferenceError,
+                        "Cannot access a binding before initialization".into(),
+                    ));
+                }
+                Ok(value)
+            }
+            RegOperand::Ctx { index } => {
+                let mut env = self.body_context_env();
+                while is_context_transparent(&env) {
+                    env = env.outer().ok_or_else(|| {
+                        JsError::new(
+                            ErrorKind::ReferenceError,
+                            "No outer environment for a capture-context binding".into(),
+                        )
+                    })?;
+                }
+                context_env(&env).slot_value(*index).ok_or_else(|| {
+                    JsError::new(
+                        ErrorKind::ReferenceError,
+                        "Cannot access a binding before initialization".into(),
+                    )
+                })
+            }
+            RegOperand::PerIter { index } => context_env(&self.lexical_env)
+                .slot_value(*index)
+                .ok_or_else(|| {
+                    JsError::new(
+                        ErrorKind::ReferenceError,
+                        "Cannot access a binding before initialization".into(),
+                    )
+                }),
+            RegOperand::Const(value) => Ok(value.clone()),
+        }
     }
 
     /// OrdinaryCallBindThis for a certified body (Cut 3 continuation): a
@@ -12664,9 +12741,11 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
 
 /// One value on the lowering's shadow stack: a `Load*`/`Push` result. `Acc`
 /// is the value currently held by the register executor's accumulator (the
-/// only value that can sit at the bottom of a binary pair).
-#[derive(Clone)]
-enum RegOperand {
+/// only value that can sit at the bottom of a binary pair). Carried by
+/// [`LeafOp::StoreMemberName`] for the value operand (the binary ops encode
+/// the operand source in their variants instead).
+#[derive(Debug, Clone)]
+pub enum RegOperand {
     Acc,
     Reg { slot: usize, tdz: bool },
     Ctx { index: usize },
@@ -12787,6 +12866,30 @@ fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
                     tdz: false,
                 });
             }
+            Step::AssignMemberName {
+                name,
+                op: AssignOp::Assign,
+            } => {
+                // `this.x = x` / `o.x = v` (plain `=` only; compound stays on
+                // the step path): the object is the accumulator, the value a
+                // direct operand. A computed value (`Acc` — from a binary
+                // like `this.y = a + b`) cannot be held while the object
+                // load overwrites the accumulator — the same restriction as
+                // the binary ops' right operand.
+                let value = stack.pop()?;
+                let object = stack.pop()?;
+                if matches!(value, RegOperand::Acc) {
+                    return None;
+                }
+                if !load_operand(&mut ops, object) {
+                    return None;
+                }
+                ops.push(LeafOp::StoreMemberName { name: *name, value });
+            }
+            // A statement's completion is only read at the body's end, where
+            // the register path's `Empty` maps identically to the step path's
+            // `Normal` for leaf calls and constructs — nothing to emit.
+            Step::SetCompletion => {}
             Step::Return => {
                 // A leaf body's `return` is its last statement; dead code
                 // after it (hoisted-var initializers) keeps the step path.
@@ -12805,7 +12908,17 @@ fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
             _ => return None,
         }
     }
-    if !matches!(ops.last(), Some(LeafOp::ReturnAcc)) {
+    match ops.last() {
+        // A `return` body completes `Return`; a fall-off body (statement
+        // stores, an empty body) completes `Empty` — the leaf callers map
+        // both identically, so only the stack must be clean.
+        Some(LeafOp::ReturnAcc)
+        | Some(LeafOp::StoreReg { .. })
+        | Some(LeafOp::StoreMemberName { .. })
+        | None => {}
+        _ => return None,
+    }
+    if !stack.is_empty() {
         return None;
     }
     Some(ops.into_boxed_slice())

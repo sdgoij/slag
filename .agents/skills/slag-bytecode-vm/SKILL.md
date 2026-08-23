@@ -173,6 +173,15 @@ arguments state.
   so nothing is captured into them), so `new_body_context` always returns
   `None` for a register body and the env setup never uses the arguments —
   which is what makes the aliased path safe passing no argument slice.
+- **`StoreMemberName` rejects an `Acc` value** (Cut 35 slice 6): a
+  computed-value store like `this.y = a + b` computes the value into the
+  accumulator, and the object load would then overwrite it — the same
+  restriction as the binary ops' right operand. The `Function/S15.3.5_A3_T2`
+  fixture (`new Function("arg1,arg2", "...; this.y=arg1+arg2;...")`)
+  wrote the object into `y` until the rejection was added. `SetCompletion`
+  is skipped by the lowering (the register path's `Empty` maps identically
+  to the step path's `Normal` for leaf callers), and a body ending in a
+  store — or empty — now lowers (fall-off completes `Empty`).
 - Errors propagate raw to the caller's `run_inner` exactly like a
   step-path leaf (a register body may throw from `apply_binary`/TDZ
   checks). Register-op semantics mirror the step semantics 1:1 — when you

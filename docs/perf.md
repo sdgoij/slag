@@ -1362,6 +1362,46 @@ Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
 conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
 23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
 
+### Cut 35 slice 6 — register member stores (measured 2026-08-23)
+
+The register op set grows a `StoreMemberName` (the object in the
+accumulator, the value a direct operand) and the lowering accepts plain
+member-assign bodies (`this.x = x`, `o.x = v`), so member-store leaves —
+including the construct body — run on the register executor instead of
+the step path:
+
+- **Lowering**: `Step::AssignMemberName` with a plain `=` pops the value
+  and object operands, loads the object into the accumulator, and emits
+  `StoreMemberName { name, value }`; `Step::SetCompletion` is skipped (the
+  register path's `Empty` maps identically to the step path's `Normal` for
+  leaf calls and constructs); a body ending in a store or empty now lowers
+  (a fall-off completes `Empty`). Compound assigns and computed-value
+  stores stay on the step path.
+- **The Acc-clobber trap**: `this.y = a + b` computes the value into the
+  accumulator, then the object load would overwrite it — the lowering
+  rejects a `RegOperand::Acc` value (the binary ops' right-operand
+  restriction). Missed it initially; `Function/S15.3.5_A3_T2`
+  (`new Function("arg1,arg2", "...; this.y=arg1+arg2;...")`) wrote the
+  object into `y` until the rejection was added.
+- **Executor**: the op mirrors `Step::AssignMemberName` — the nullish
+  check, then `assign_member` (which can run a setter — same agent-side
+  machinery the step path invokes; the pushed result is discarded by the
+  frame truncate). A `leaf_operand_value` helper loads the value operand
+  with the `LoadReg`/`LoadContext`/`LoadPerIter`/`LoadConst` semantics
+  (TDZ and transparent-env walks included).
+
+Measured: the construct row is unchanged (~35ms — the member write was
+never the bottleneck; the machinery and dispatch were, and the register
+path shaves the dispatch). The win is the machinery itself: member-store
+leaves (calls and constructs) now run on the register executor. The
+14-case probe (`scratch/store_member_regs_probe.js`) covers plain/const/
+computed-value stores, two-store bodies, store-then-return, compound
+assigns (step path), captured-object stores, and the bench shape.
+
+Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
+conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
+23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
