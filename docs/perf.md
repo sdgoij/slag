@@ -1810,6 +1810,40 @@ Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
 conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
 23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
 
+### Cut 35 slice 21 — dedicated loop-counter field (measured 2026-08-23)
+
+The accumulator-path fast loop kept its counter in `Vm::acc`, so every
+register-lowered loop body had to save and restore the accumulator and,
+when the body read the counter, push the counter onto the value stack for
+`LoadCounter` to pop. The counter now lives in a dedicated
+`Vm::loop_counter` field: `FastLoopBind`/`FastLoopHead`/`FastLoopStore`
+and the `PushAcc`/`PopAcc`/`IncAcc`/`DecAcc` steps read/write the field
+(`FastLoopVar::Acc` is renamed `Counter`), `RunRegBody` no longer
+saves/restores the accumulator or pushes the counter (its ops clobber the
+accumulator freely), and `LoadCounter` reads the field directly — the
+`push_counter` machinery is gone.
+
+**The containment point is `run_leaf_body`**: a leaf-inline body can itself
+contain a fast loop (`steps_are_leaf` allows the fast-loop steps), so the
+caller's counter is saved/restored across the leaf run exactly like the
+accumulator — without it, a leaf's `FastLoopBind` would clobber the
+caller's live counter.
+
+Measured: ~0-2ms on the counter-reading rows (alternating-order min-of-3
+isolation — the removed save/restore + push/pop sit near the noise floor;
+full-bench medians are flat). The win is structural: the counter never
+round-trips the value stack, and the field is the prerequisite for a
+raw-f64 counter (removing the head's Value ops). The 18-case probe
+(`scratch/slice21_probe.js`) covers the bench shape, countdowns,
+break/continue, nested loops, leaf-with-loop containment (including a
+throwing leaf and two-level nesting), string counters, counter
+writes/incs in the body, the for-of inner body reading the outer counter,
+and closure bodies.
+
+Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
+conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
+23,812/0/154 with 440 >15s hangs in the known slow classes (unchanged).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

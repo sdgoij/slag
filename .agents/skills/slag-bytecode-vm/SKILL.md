@@ -419,6 +419,30 @@ ops reject jumps), so the do-while applies there unconditionally; the
 `RunRegBody` truncation keeps the prologue fetch (it precedes
 `body_steps`), so the patched `back` stays valid.
 
+## 12. The dedicated loop-counter field must be contained at leaf runs (Cut 35 slice 21)
+
+`Vm::loop_counter` holds the accumulator-path fast loop's counter (since
+slice 21; previously `Vm::acc`). `steps_are_leaf` ALLOWS the fast-loop
+steps (`FastLoopHead`/`RunRegBody`/`PushAcc`/... are not in the exclusion
+list), so a leaf-inline body can itself contain a fast loop that runs on
+the CALLER's Vm. `run_leaf_body` saves and restores `loop_counter`
+alongside `acc` — a leaf's `FastLoopBind` overwrites the field, its
+`FastLoopStore` writes it back to the leaf's own binding, and the restore
+brings the caller's live counter back. If you touch the leaf save/restore
+set, `loop_counter` must stay in it; the probe
+(`scratch/slice21_probe.js` checks 7-9) covers a leaf-with-loop called
+from a fast loop, two-level nesting, and a throwing leaf (the error path
+restores too).
+
+- A register body (`RunRegBody`) no longer touches the field's storage:
+  `LoadCounter` reads it directly (no entry push), and the body ops clobber
+  the accumulator freely. The old `push_counter` field is gone — do not
+  reintroduce a stack round-trip for counter reads.
+- `FastLoopVar::Acc` is renamed `Counter` (it means "the dedicated field").
+  `FastLoopBind`/`FastLoopStore` are emitted with the SLOT/Global var (they
+  move the counter between the field and the binding); `Counter` appears
+  only in `FastLoopHead`.
+
 ## Bench reality (Cut 2)
 
 `cargo run -p cli --release -- --bench` bounces ±15% on this machine (the

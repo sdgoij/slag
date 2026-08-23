@@ -2988,7 +2988,7 @@ mod tests {
                 matches!(
                     s,
                     crate::ir::Step::FastLoopHead {
-                        var: crate::ir::FastLoopVar::Slot(_) | crate::ir::FastLoopVar::Acc,
+                        var: crate::ir::FastLoopVar::Slot(_) | crate::ir::FastLoopVar::Counter,
                         ..
                     }
                 )
@@ -4194,7 +4194,7 @@ mod tests {
                 matches!(
                     s,
                     crate::ir::Step::FastLoopHead {
-                        var: crate::ir::FastLoopVar::Slot(_) | crate::ir::FastLoopVar::Acc,
+                        var: crate::ir::FastLoopVar::Slot(_) | crate::ir::FastLoopVar::Counter,
                         ..
                     }
                 )
@@ -4299,7 +4299,7 @@ mod tests {
                 matches!(
                     s,
                     crate::ir::Step::FastLoopHead {
-                        var: crate::ir::FastLoopVar::Slot(_) | crate::ir::FastLoopVar::Acc,
+                        var: crate::ir::FastLoopVar::Slot(_) | crate::ir::FastLoopVar::Counter,
                         ..
                     }
                 )

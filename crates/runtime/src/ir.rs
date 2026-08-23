@@ -726,8 +726,9 @@ pub enum Step {
         after: usize,
     },
     /// The fused canonical loop's counter prologue (Cut 17): load the
-    /// binding's current value into the VM accumulator (`FastLoopVar::Acc`
-    /// heads then work on it). Emitted once, after the loop init.
+    /// binding's current value into the `Vm::loop_counter` field
+    /// (`FastLoopVar::Counter` heads then work on it). Emitted once, after
+    /// the loop init.
     FastLoopBind {
         var: FastLoopVar,
     },
@@ -741,18 +742,15 @@ pub enum Step {
     },
     /// Run a register-lowered loop body (Cut 35 slice 9): the ops address
     /// the current frame — the script's inline frame here (the leaf path
-    /// uses the stack segment via `leaf_frame_base`) — with the caller's
-    /// accumulator saved and restored around the run (the accumulator-loop
-    /// counter). The body's transient stack use (a member store's pushed
-    /// result) is truncated to the entry length; the completion is left
-    /// untouched (the loop machinery owns the loop's completion).
+    /// uses the stack segment via `leaf_frame_base`) — with the
+    /// accumulator as scratch. Since Cut 35 slice 21 the loop counter
+    /// lives in the dedicated `Vm::loop_counter` field, so the body needs
+    /// no save/restore or entry push. The body's transient stack use (a
+    /// member store's pushed result) is truncated to the entry length; the
+    /// completion is left untouched (the loop machinery owns the loop's
+    /// completion).
     RunRegBody {
         ops: Box<[LeafOp]>,
-        /// Cut 35 slice 16: the body reads the accumulator-loop counter
-        /// (`Step::PushAcc` lowered to a `LoadCounter`), so the saved
-        /// counter is pushed onto the value stack at entry for the op to
-        /// pop. The transient push is removed by the exit truncate.
-        push_counter: bool,
     },
     /// Push the fused loop counter (`Vm::acc`) onto the value stack: the
     /// body's redirected reads of the counter.
@@ -1665,7 +1663,10 @@ impl EnvStack {
 pub enum FastLoopVar {
     Slot(usize),
     Global(crux::AtomId),
-    Acc,
+    /// The dedicated `Vm::loop_counter` field (Cut 17/35 slice 21): the
+    /// accumulator-path head's counter lives here, never in the frame or
+    /// the register accumulator.
+    Counter,
 }
 
 /// The shape of a fused canonical loop (Cut 15): the counter binding, the
@@ -1771,13 +1772,20 @@ pub struct Vm {
     /// (spec 6.2.2.3): no value-producing statement has run since the last
     /// reset. Only the top-level script path observes it.
     pub completion_is_empty: bool,
-    /// The fused canonical loop's counter (Cut 17): the loop head and the
-    /// body's redirected reads/writes touch only this field, so the
-    /// counter never round-trips the frame/global per iteration. Only the
-    /// `FastLoop*`/`PushAcc`/`PopAcc`/`IncAcc`/`DecAcc` steps read or write
-    /// it; every other step uses the value stack, so the counter survives
-    /// arbitrary body code between head dispatches.
+    /// The register executor's accumulator: the implicit result register of
+    /// the leaf ops and the register-loop bodies (`RunRegBody` clobbers it
+    /// freely — it is NOT the loop counter since Cut 35 slice 21). Callers
+    /// that need a value across a register run save it.
     acc: Value,
+    /// The fused canonical loop's counter (Cut 17; dedicated field, Cut 35
+    /// slice 21): the loop head and the body's redirected reads/writes
+    /// touch only this field, so the counter never round-trips the
+    /// frame/global — or the accumulator — per iteration. Only the
+    /// `FastLoop*`/`PushAcc`/`PopAcc`/`IncAcc`/`DecAcc` steps and the
+    /// `LoadCounter` op read or write it; every other step uses the value
+    /// stack or the accumulator, so the counter survives arbitrary body
+    /// code between head dispatches without a save/restore.
+    loop_counter: Value,
     /// Completion-register saves for the `finally` blocks currently running
     /// (nested finallys push in order).
     completion_stack: Vec<(Value, bool)>,
@@ -1885,6 +1893,7 @@ impl Vm {
             strict,
             completion_is_empty: true,
             acc: Value::Undefined,
+            loop_counter: Value::Undefined,
             completion_stack: Vec::new(),
             list_stack: Vec::new(),
             var_ref_stack: Vec::new(),
@@ -1935,6 +1944,7 @@ impl Vm {
         self.strict = strict;
         self.completion_is_empty = true;
         self.acc = Value::Undefined;
+        self.loop_counter = Value::Undefined;
         self.completion_stack.clear();
         self.list_stack.clear();
         self.var_ref_stack.clear();
@@ -2687,10 +2697,10 @@ impl Vm {
                 value
             }
             FastLoopVar::Global(name) => self.load_global_value(agent, name)?,
-            // Cut 17: the counter lives in the accumulator (a certified
-            // body's counter is never uninitialized — the loop init ran
-            // before `FastLoopBind`).
-            FastLoopVar::Acc => self.acc.clone(),
+            // Cut 17: the counter lives in the dedicated `loop_counter`
+            // field (Cut 35 slice 21; a certified body's counter is never
+            // uninitialized — the loop init ran before `FastLoopBind`).
+            FastLoopVar::Counter => self.loop_counter.clone(),
         };
         if let Some(num) = value.as_number() {
             return Ok(match op {
@@ -2742,11 +2752,11 @@ impl Vm {
             FastLoopVar::Global(name) => {
                 self.update_global(agent, name, inc, true)?;
             }
-            // Cut 17: the counter lives in the accumulator — a Number
-            // updates in place, anything else goes through the general
-            // `++`/`--` machinery.
-            FastLoopVar::Acc => {
-                let old = self.acc.clone();
+            // Cut 17: the counter lives in the dedicated `loop_counter`
+            // field — a Number updates in place, anything else goes
+            // through the general `++`/`--` machinery.
+            FastLoopVar::Counter => {
+                let old = self.loop_counter.clone();
                 let new = if let Some(num) = old.as_number() {
                     let delta = if matches!(inc, UpdateOp::Increment) {
                         1.0
@@ -2757,32 +2767,33 @@ impl Vm {
                 } else {
                     update_value(agent, &inc, &old)?.1
                 };
-                self.acc = new;
+                self.loop_counter = new;
             }
         }
         Ok(())
     }
 
     /// The fused canonical loop's counter prologue (Cut 17): load the
-    /// binding's current value into the accumulator (`Step::FastLoopBind`).
+    /// binding's current value into the `loop_counter` field
+    /// (`Step::FastLoopBind`).
     fn fast_loop_bind(&mut self, agent: &mut Agent, var: FastLoopVar) -> Result<(), JsError> {
         let value = match var {
             FastLoopVar::Slot(slot) => self.frame_get(slot).clone(),
             FastLoopVar::Global(name) => self.load_global_value(agent, name)?,
-            FastLoopVar::Acc => unreachable!("FastLoopBind on the accumulator itself"),
+            FastLoopVar::Counter => unreachable!("FastLoopBind on the counter field itself"),
         };
-        self.acc = value;
+        self.loop_counter = value;
         Ok(())
     }
 
     /// The fused canonical loop's counter epilogue (Cut 17): write the
-    /// accumulator back to the binding (`Step::FastLoopStore`).
+    /// `loop_counter` field back to the binding (`Step::FastLoopStore`).
     fn fast_loop_store(&mut self, agent: &mut Agent, var: FastLoopVar) -> Result<(), JsError> {
-        let value = self.acc.clone();
+        let value = self.loop_counter.clone();
         match var {
             FastLoopVar::Slot(slot) => *self.frame_get_mut(slot) = value,
             FastLoopVar::Global(name) => self.store_global_value(agent, name, value)?,
-            FastLoopVar::Acc => unreachable!("FastLoopStore on the accumulator itself"),
+            FastLoopVar::Counter => unreachable!("FastLoopStore on the counter field itself"),
         }
         Ok(())
     }
@@ -5120,55 +5131,52 @@ impl Vm {
                 Step::FastLoopStore { var } => {
                     self.fast_loop_store(agent, *var)?;
                 }
-                Step::RunRegBody { ops, push_counter } => {
+                Step::RunRegBody { ops } => {
                     // The register body addresses the current frame (the
                     // script's inline frame — `leaf_frame_base` is `None`
-                    // here, so `frame_get` uses the `Frame`), saves and
-                    // restores the accumulator (the accumulator-loop
-                    // counter), and truncates its transient stack use. The
-                    // body's completion is discarded — the loop machinery
-                    // owns the loop's completion — but a throwing op
-                    // (TDZ, a setter, a coercion) propagates after the
-                    // restore, like a throwing leaf.
+                    // here, so `frame_get` uses the `Frame`) and truncates
+                    // its transient stack use. Since Cut 35 slice 21 the
+                    // loop counter lives in the dedicated `loop_counter`
+                    // field (the ops clobber the accumulator freely; a
+                    // counter-reading body's `LoadCounter` reads the
+                    // field), so no save/restore or entry push is needed.
+                    // The body's completion is discarded — the loop
+                    // machinery owns the loop's completion — but a throwing
+                    // op (TDZ, a setter, a coercion) propagates after the
+                    // truncate, like a throwing leaf.
                     let stack_len = self.stack.len();
-                    let caller_acc = std::mem::replace(&mut self.acc, Value::Undefined);
-                    // Cut 35 slice 16: a counter-reading body pops the
-                    // pushed counter via its `LoadCounter` op; the exit
-                    // truncate removes it if an op throws first.
-                    if *push_counter {
-                        self.stack.push(caller_acc.clone());
-                    }
                     let outcome = self.run_leaf_ops(agent, ops);
                     self.stack.truncate(stack_len);
-                    self.acc = caller_acc;
                     match outcome {
                         Ok(_) => {}
                         Err(error) => return Err(error),
                     }
                 }
                 Step::PushAcc => {
-                    self.stack.push(self.acc.clone());
+                    // Cut 35 slice 21: the fused loop counter lives in the
+                    // dedicated `loop_counter` field, not the accumulator.
+                    self.stack.push(self.loop_counter.clone());
                 }
                 Step::PopAcc => {
-                    self.acc = self.pop();
+                    self.loop_counter = self.pop();
                 }
                 Step::IncAcc => {
-                    let old = self.acc.clone();
+                    let old = self.loop_counter.clone();
                     let new = if let Some(num) = old.as_number() {
                         Value::Number(num + 1.0)
                     } else {
                         update_value(agent, &UpdateOp::Increment, &old)?.1
                     };
-                    self.acc = new;
+                    self.loop_counter = new;
                 }
                 Step::DecAcc => {
-                    let old = self.acc.clone();
+                    let old = self.loop_counter.clone();
                     let new = if let Some(num) = old.as_number() {
                         Value::Number(num - 1.0)
                     } else {
                         update_value(agent, &UpdateOp::Decrement, &old)?.1
                     };
-                    self.acc = new;
+                    self.loop_counter = new;
                 }
                 Step::LoadContextSlot { depth, index } => {
                     // Cut 3 continuation: the certified body's capture
@@ -6373,6 +6381,12 @@ impl Vm {
         let caller_completion_is_empty = self.completion_is_empty;
         self.completion_is_empty = true;
         let caller_acc = std::mem::replace(&mut self.acc, Value::Undefined);
+        // Cut 35 slice 21: a leaf's own fast loop uses the shared
+        // `loop_counter` field — save the caller's counter across the run
+        // (the leaf's `FastLoopBind` overwrites it, `FastLoopStore` writes
+        // it back to the leaf's own binding, and the restore below brings
+        // the caller's counter back).
+        let caller_loop_counter = std::mem::replace(&mut self.loop_counter, Value::Undefined);
         let caller_strict = self.strict;
         self.strict = strict;
         // Cut 28/30: a leaf that reads captured per-iteration heads
@@ -6430,6 +6444,7 @@ impl Vm {
         self.completion = caller_completion;
         self.completion_is_empty = caller_completion_is_empty;
         self.acc = caller_acc;
+        self.loop_counter = caller_loop_counter;
         self.strict = caller_strict;
         if let Some(saved_env) = caller_body_context {
             self.body_context = Some(saved_env);
@@ -6598,9 +6613,10 @@ impl Vm {
                     self.acc = value;
                 }
                 LeafOp::LoadCounter => {
-                    // Cut 35 slice 16: the accumulator-loop counter pushed
-                    // by `RunRegBody` at entry.
-                    self.acc = self.pop();
+                    // Cut 35 slice 16/21: the accumulator-loop counter now
+                    // lives in the dedicated `loop_counter` field — read it
+                    // directly (no entry push/pop since slice 21).
+                    self.acc = self.loop_counter.clone();
                 }
                 LeafOp::LoadConst(value) => self.acc = value.clone(),
                 LeafOp::BinReg { op, slot, tdz } => {
@@ -10612,21 +10628,15 @@ impl Compiler {
                             .as_ref()
                             .and_then(|scope| lower_leaf_ops(&self.steps[body_steps..], scope))
                         {
-                            // Cut 35 slice 16: a body that reads the counter
-                            // (a `PushAcc`) gets the saved counter pushed at
-                            // entry for its `LoadCounter` to pop.
-                            let push_counter = self.steps[body_steps..]
-                                .iter()
-                                .any(|s| matches!(s, Step::PushAcc));
                             self.steps.truncate(body_steps);
                             self.fixups.truncate(body_fixups);
-                            self.emit(Step::RunRegBody { ops, push_counter });
+                            self.emit(Step::RunRegBody { ops });
                         }
                         self.acc_binding = saved;
                         self.place(continue_label);
                         let index = self.steps.len();
                         self.emit(Step::FastLoopHead {
-                            var: FastLoopVar::Acc,
+                            var: FastLoopVar::Counter,
                             op,
                             imm,
                             inc,
@@ -10870,14 +10880,12 @@ impl Compiler {
             .and_then(|scope| lower_leaf_ops(&self.steps[body_steps..], scope))
         {
             // Cut 35 slice 16: a body that reads the counter (a `PushAcc`)
-            // gets the saved counter pushed at entry for its `LoadCounter`
-            // to pop.
-            let push_counter = self.steps[body_steps..]
-                .iter()
-                .any(|s| matches!(s, Step::PushAcc));
+            // lowers to a `LoadCounter` that reads the dedicated
+            // `loop_counter` field directly (no entry push since Cut 35
+            // slice 21).
             self.steps.truncate(body_steps);
             self.fixups.truncate(body_fixups);
-            self.emit(Step::RunRegBody { ops, push_counter });
+            self.emit(Step::RunRegBody { ops });
         }
         self.place(continue_label);
         if lexical && captured {
