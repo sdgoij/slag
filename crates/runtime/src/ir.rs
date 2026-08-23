@@ -88,6 +88,17 @@ pub enum Step {
     StoreLocal {
         slot: usize,
     },
+    /// Cut 34: store to a frame slot AND set the statement completion to the
+    /// stored value in one step — a statement-position assignment's result
+    /// is otherwise dup'd purely so `SetCompletion` can pop it. Same TDZ
+    /// check as `StoreLocal`.
+    FusedStoreLocal {
+        slot: usize,
+    },
+    /// Cut 34: the `FusedStoreLocal` analogue for a declared top-level var.
+    FusedStoreGlobal {
+        name: crux::AtomId,
+    },
     /// Pop into a frame slot, no TDZ check (the declaration's first write).
     InitLocal {
         slot: usize,
@@ -1157,6 +1168,25 @@ pub(crate) type MemberStoreCell = (u64, crux::AtomId, u32, [u32; 4]);
 /// evicts and the reference path re-resolves.
 pub(crate) const GLOBAL_CELLS: usize = 32;
 
+/// The direct-mapped leaf-inline cache (Cut 34): the per-function data
+/// `do_call_fast` needs to run a leaf inline — the compiled ir, strictness,
+/// and (for a leaf that reads an environment) the closure env — keyed by
+/// function id. Function ids are never reused, so a hit needs no generation
+/// check. Boxed so the Agent's hot-field cache footprint stays small (the
+/// Cut 27 lesson: an inline copy regressed the leaf path).
+pub(crate) const LEAF_CACHE: usize = 16;
+
+/// A cached leaf-inline record: everything the inline call path reads off
+/// the `ecma_functions` record, captured so the per-call HashMap lookup is
+/// skipped on a hit.
+pub(crate) struct LeafEntry {
+    pub ir: std::rc::Rc<CompiledBody>,
+    pub strict: bool,
+    /// The function's [[Environment]], kept only when the leaf reads an
+    /// environment (`CompiledBody::leaf_uses_env`).
+    pub environment: Option<EnvRef>,
+}
+
 /// The fast-path frame storage: an inline buffer for small layouts, a `Vec`
 /// otherwise.
 #[derive(Clone, Debug)]
@@ -1377,6 +1407,11 @@ pub struct Vm {
     /// The fast-path frame (Cut 3): named-binding slots for the active body,
     /// sized by `ScopeInfo::frame_size`. Empty on the environment path.
     pub(crate) frame: Frame,
+    /// Cut 34: while a leaf runs inline on this Vm, its frame is a flat
+    /// segment on the value stack starting at this index — the caller's
+    /// `frame` stays in place (no 256-byte swap per call). `None` outside a
+    /// leaf run.
+    pub(crate) leaf_frame_base: Option<usize>,
     pub args: Vec<Value>,
     pub lexical_env: EnvRef,
     pub(crate) env_stack: EnvStack,
@@ -1536,6 +1571,7 @@ impl Vm {
             ip: 0,
             stack: Vec::new(),
             frame: Frame::Inline(std::array::from_fn(|_| Value::Undefined)),
+            leaf_frame_base: None,
             args: Vec::new(),
             lexical_env: lexical_env.clone(),
             env_stack: EnvStack::with_base(lexical_env),
@@ -1585,6 +1621,7 @@ impl Vm {
     pub fn reset(&mut self, lexical_env: EnvRef, strict: bool) {
         self.ip = 0;
         self.stack.clear();
+        self.leaf_frame_base = None;
         self.args.clear();
         self.lexical_env = lexical_env.clone();
         self.env_stack.reset(lexical_env);
@@ -1640,6 +1677,26 @@ impl Vm {
         self.frame = leaf_frame(scope, args);
     }
 
+    /// Cut 34: the active frame slot — the leaf's flat stack segment when a
+    /// leaf runs inline (`leaf_frame_base`), else the caller's `frame`. The
+    /// branch is fully predictable on both paths (the base is `None` for
+    /// every non-leaf body).
+    #[inline]
+    fn frame_get(&self, slot: usize) -> &Value {
+        match self.leaf_frame_base {
+            Some(base) => &self.stack[base + slot],
+            None => Frame::get(&self.frame, slot),
+        }
+    }
+
+    #[inline]
+    fn frame_get_mut(&mut self, slot: usize) -> &mut Value {
+        match self.leaf_frame_base {
+            Some(base) => &mut self.stack[base + slot],
+            None => Frame::get_mut(&mut self.frame, slot),
+        }
+    }
+
     /// The fused relational-imm loop test (Cut 4): read the slot (TDZ-checked
     /// like `LoadLocal`), abstract-compare against the constant with the
     /// general binary evaluator, and jump to `target` when the test is false
@@ -1652,7 +1709,7 @@ impl Vm {
         imm: f64,
         target: usize,
     ) -> Result<(), JsError> {
-        let left = self.frame.get(slot).clone();
+        let left = self.frame_get(slot).clone();
         if left.is_uninitialized() {
             return Err(JsError::new(
                 ErrorKind::ReferenceError,
@@ -2267,7 +2324,7 @@ impl Vm {
     ) -> Result<bool, JsError> {
         let value = match var {
             FastLoopVar::Slot(slot) => {
-                let value = self.frame.get(slot).clone();
+                let value = self.frame_get(slot).clone();
                 if value.is_uninitialized() {
                     return Err(JsError::new(
                         ErrorKind::ReferenceError,
@@ -2310,7 +2367,7 @@ impl Vm {
     ) -> Result<(), JsError> {
         match var {
             FastLoopVar::Slot(slot) => {
-                let old = self.frame.get(slot).clone();
+                let old = self.frame_get(slot).clone();
                 if old.is_uninitialized() {
                     return Err(JsError::new(
                         ErrorKind::ReferenceError,
@@ -2327,7 +2384,7 @@ impl Vm {
                 } else {
                     update_value(agent, &inc, &old)?.1
                 };
-                *self.frame.get_mut(slot) = new;
+                *self.frame_get_mut(slot) = new;
             }
             FastLoopVar::Global(name) => {
                 self.update_global(agent, name, inc, true)?;
@@ -2357,7 +2414,7 @@ impl Vm {
     /// binding's current value into the accumulator (`Step::FastLoopBind`).
     fn fast_loop_bind(&mut self, agent: &mut Agent, var: FastLoopVar) -> Result<(), JsError> {
         let value = match var {
-            FastLoopVar::Slot(slot) => self.frame.get(slot).clone(),
+            FastLoopVar::Slot(slot) => self.frame_get(slot).clone(),
             FastLoopVar::Global(name) => self.load_global_value(agent, name)?,
             FastLoopVar::Acc => unreachable!("FastLoopBind on the accumulator itself"),
         };
@@ -2370,7 +2427,7 @@ impl Vm {
     fn fast_loop_store(&mut self, agent: &mut Agent, var: FastLoopVar) -> Result<(), JsError> {
         let value = self.acc.clone();
         match var {
-            FastLoopVar::Slot(slot) => *self.frame.get_mut(slot) = value,
+            FastLoopVar::Slot(slot) => *self.frame_get_mut(slot) = value,
             FastLoopVar::Global(name) => self.store_global_value(agent, name, value)?,
             FastLoopVar::Acc => unreachable!("FastLoopStore on the accumulator itself"),
         }
@@ -2742,7 +2799,7 @@ impl Vm {
                     self.stack.push(value);
                 }
                 Step::LoadLocal { slot } => {
-                    let value = self.frame.get(*slot).clone();
+                    let value = self.frame_get(*slot).clone();
                     if value.is_uninitialized() {
                         return Err(JsError::new(
                             ErrorKind::ReferenceError,
@@ -2753,13 +2810,31 @@ impl Vm {
                 }
                 Step::StoreLocal { slot } => {
                     let value = self.pop();
-                    if self.frame.get(*slot).is_uninitialized() {
+                    if self.frame_get(*slot).is_uninitialized() {
                         return Err(JsError::new(
                             ErrorKind::ReferenceError,
                             "Cannot access a binding before initialization".into(),
                         ));
                     }
-                    *self.frame.get_mut(*slot) = value;
+                    *self.frame_get_mut(*slot) = value;
+                }
+                Step::FusedStoreLocal { slot } => {
+                    let value = self.pop();
+                    if self.frame_get(*slot).is_uninitialized() {
+                        return Err(JsError::new(
+                            ErrorKind::ReferenceError,
+                            "Cannot access a binding before initialization".into(),
+                        ));
+                    }
+                    *self.frame_get_mut(*slot) = value.clone();
+                    self.completion = value;
+                    self.completion_is_empty = false;
+                }
+                Step::FusedStoreGlobal { name } => {
+                    let value = self.pop();
+                    self.store_global_value(agent, *name, value.clone())?;
+                    self.completion = value;
+                    self.completion_is_empty = false;
                 }
                 Step::LoadGlobal { name } => {
                     let value = self.load_global_value(agent, *name)?;
@@ -2771,10 +2846,10 @@ impl Vm {
                 }
                 Step::InitLocal { slot } => {
                     let value = self.pop();
-                    *self.frame.get_mut(*slot) = value;
+                    *self.frame_get_mut(*slot) = value;
                 }
                 Step::UpdateLocal { slot, op, prefix } => {
-                    let old = self.frame.get(*slot).clone();
+                    let old = self.frame_get(*slot).clone();
                     if old.is_uninitialized() {
                         return Err(JsError::new(
                             ErrorKind::ReferenceError,
@@ -2782,28 +2857,28 @@ impl Vm {
                         ));
                     }
                     let (old_numeric, new) = update_value(agent, op, &old)?;
-                    *self.frame.get_mut(*slot) = new.clone();
+                    *self.frame_get_mut(*slot) = new.clone();
                     self.stack.push(if *prefix { new } else { old_numeric });
                 }
                 Step::Inc { slot } => {
-                    let old = self.frame.get(*slot).clone();
+                    let old = self.frame_get(*slot).clone();
                     if old.is_uninitialized() {
                         return Err(JsError::new(
                             ErrorKind::ReferenceError,
                             "Cannot access a binding before initialization".into(),
                         ));
                     }
-                    *self.frame.get_mut(*slot) = update_value(agent, &UpdateOp::Increment, &old)?.1;
+                    *self.frame_get_mut(*slot) = update_value(agent, &UpdateOp::Increment, &old)?.1;
                 }
                 Step::Dec { slot } => {
-                    let old = self.frame.get(*slot).clone();
+                    let old = self.frame_get(*slot).clone();
                     if old.is_uninitialized() {
                         return Err(JsError::new(
                             ErrorKind::ReferenceError,
                             "Cannot access a binding before initialization".into(),
                         ));
                     }
-                    *self.frame.get_mut(*slot) = update_value(agent, &UpdateOp::Decrement, &old)?.1;
+                    *self.frame_get_mut(*slot) = update_value(agent, &UpdateOp::Decrement, &old)?.1;
                 }
                 Step::UpdateGlobal { name, op, prefix } => {
                     let value = self.update_global(agent, *name, *op, *prefix)?;
@@ -2901,7 +2976,7 @@ impl Vm {
                         per_iteration_chain.clone(),
                     )?;
                     if let Some(slot) = frame_slot {
-                        *self.frame.get_mut(*slot) = value;
+                        *self.frame_get_mut(*slot) = value;
                     } else if let Some(index) = context_slot {
                         let env = self.context_chain_env(0)?;
                         context_env(&env).set_slot(*index, value);
@@ -4501,7 +4576,7 @@ impl Vm {
                 }
                 Step::ForOfBindLocal { slot } => {
                     let value = self.pop();
-                    *self.frame.get_mut(*slot) = value;
+                    *self.frame_get_mut(*slot) = value;
                 }
                 Step::ForOfBindGlobal { name } => {
                     let value = self.pop();
@@ -4815,7 +4890,7 @@ impl Vm {
                             &self.call_args,
                         )?,
                     };
-                    *self.frame.get_mut(*slot) = value;
+                    *self.frame_get_mut(*slot) = value;
                 }
                 Step::JumpIfTrue(target) => {
                     let value = self.pop();
@@ -5757,12 +5832,30 @@ impl Vm {
         args: &[Value],
     ) -> Result<Completion, JsError> {
         let scope = ir.scope.as_ref().expect("a leaf is certified");
-        let mut frame = leaf_frame(scope, args);
-        if let Some(slot) = scope.this_slot {
-            *frame.get_mut(slot) = this_value;
+        // Cut 34: the leaf's frame is a flat segment on the value stack, so
+        // the caller's `frame` is never swapped — no 256-byte copy per call.
+        // Slots `0..frame_size` are pushed in order (this slot, params,
+        // `var`s as undefined, `let`/`const` in the TDZ) and addressed via
+        // `leaf_frame_base`; the leaf's own stack use grows above them and
+        // the post-run truncate unwinds everything.
+        let frame_base = self.stack.len();
+        let frame_size = scope.frame_size;
+        for slot in 0..frame_size {
+            let value = if Some(slot) == scope.this_slot {
+                this_value.clone()
+            } else if slot < scope.arity {
+                // Missing arguments stay `undefined` (spec 10.2.11).
+                args.get(slot).cloned().unwrap_or(Value::Undefined)
+            } else if scope.tdz_store.get(slot).copied().unwrap_or(false) {
+                Value::uninitialized()
+            } else {
+                Value::Undefined
+            };
+            self.stack.push(value);
         }
         let caller_ip = self.ip;
-        let caller_frame = std::mem::replace(&mut self.frame, frame);
+        let caller_leaf_frame_base = self.leaf_frame_base;
+        self.leaf_frame_base = Some(frame_base);
         let caller_completion = std::mem::replace(&mut self.completion, Value::Undefined);
         let caller_completion_is_empty = self.completion_is_empty;
         self.completion_is_empty = true;
@@ -5795,10 +5888,12 @@ impl Vm {
         };
         let caller_chain_short = self.chain_short;
         self.chain_short = false;
-        let stack_len = self.stack.len();
-        let list_len = self.list_stack.len();
-        let completion_stack_len = self.completion_stack.len();
-        let var_ref_stack_len = self.var_ref_stack.len();
+        // The value stack is unwound to `frame_base` after the run. The
+        // list/completion/var-ref stacks need no save/restore: a leaf's
+        // steps never touch them (the statement-list, finally, and
+        // reference machinery is excluded from leaves). The array-index
+        // stack CAN grow (`ArrayBegin` is leaf-eligible — a leaf may build
+        // an array literal), so its length is preserved.
         let array_index_stack_len = self.array_index_stack.len();
         // The body's `Step::CreateArguments` reads the call's argument slice
         // (strict unmapped only — the sloppy mapped form disqualifies a
@@ -5817,7 +5912,8 @@ impl Vm {
         // would run those against the leaf's empty stacks/tables.
         let outcome = self.run_inner_inner(agent, ir);
         self.ip = caller_ip;
-        self.frame = caller_frame;
+        self.leaf_frame_base = caller_leaf_frame_base;
+        self.stack.truncate(frame_base);
         self.completion = caller_completion;
         self.completion_is_empty = caller_completion_is_empty;
         self.acc = caller_acc;
@@ -5829,10 +5925,6 @@ impl Vm {
             self.lexical_env = saved_env;
         }
         self.chain_short = caller_chain_short;
-        self.stack.truncate(stack_len);
-        self.list_stack.truncate(list_len);
-        self.completion_stack.truncate(completion_stack_len);
-        self.var_ref_stack.truncate(var_ref_stack_len);
         self.array_index_stack.truncate(array_index_stack_len);
         if let Some(call_args) = caller_call_args {
             self.call_args = call_args;
@@ -5950,22 +6042,20 @@ impl Vm {
         if self.can_inline_leaf()
             && let ValueKind::Function(function) = callee.kind()
             && matches!(function.kind, crux::function::FunctionKind::EcmaScript)
-            && let Some(data) = agent.ecma_functions.get(&function.id())
-            // Cut 33: the record-derived eligibility (certified leaf body,
-            // ordinary callable) is cached at ir-compile time.
-            && data.leaf_inline
             // The leaf runs with the caller's realm current: cross-realm
             // calls dispatch with the callee's realm, which the inline path
             // cannot.
             && agent.realms.borrow().len() == 1
+            // Cut 33/34: the record-derived eligibility and the per-call
+            // data (ir, strictness, closure env) come from a direct-mapped
+            // cache, skipping the `ecma_functions` HashMap lookup on a hit.
+            && let Some(entry) = agent.leaf_lookup(function.id())
         {
-            let ir = data.ir.clone().expect("checked Some above");
-            let strict = data.strict;
-            // Clone the callee's env only for a leaf that reads one (Cut 30):
-            // an env-free leaf never touches `body_context`/`lexical_env`, so
-            // the per-call `Rc` clone is skipped.
+            let ir = entry.ir.clone();
+            let strict = entry.strict;
+            // Clone the callee's env only for a leaf that reads one (Cut 30).
             let environment = if ir.leaf_uses_env {
-                Some(data.environment.clone())
+                entry.environment.clone()
             } else {
                 None
             };
@@ -6051,7 +6141,7 @@ impl Vm {
                 }
                 match target {
                     ForOfNextTarget::Stack => self.stack.push(value),
-                    ForOfNextTarget::Slot(slot) => *self.frame.get_mut(slot) = value,
+                    ForOfNextTarget::Slot(slot) => *self.frame_get_mut(slot) = value,
                 }
             }
         } else {
@@ -6074,7 +6164,7 @@ impl Vm {
                     self.for_of_stepping = false;
                     match target {
                         ForOfNextTarget::Stack => self.stack.push(value),
-                        ForOfNextTarget::Slot(slot) => *self.frame.get_mut(slot) = value,
+                        ForOfNextTarget::Slot(slot) => *self.frame_get_mut(slot) = value,
                     }
                 }
                 Ok(None) => {
@@ -7505,6 +7595,17 @@ struct Compiler {
     /// loop/catch/with envs): when false the body's env is constant for its
     /// whole run, so the dispatch loop skips the per-step context sync.
     env_changing: bool,
+    /// Cut 34: whether the expression being compiled is a statement-position
+    /// expression (its value is the statement completion). A fast-binding
+    /// assignment at the top expression depth (`expr_depth == 1`) then
+    /// stores AND sets the completion in one step (`FusedStore*`), skipping
+    /// the result `Dup` + `SetCompletion`; `fused_completion` records that
+    /// the statement's completion was already set.
+    statement_expr: bool,
+    fused_completion: bool,
+    /// Cut 34: the `compile_expr` nesting depth, so `statement_expr` reaches
+    /// only the statement's own assignment, not a nested one in an operand.
+    expr_depth: usize,
 }
 
 /// Where a binding lives for emission purposes: a frame slot (fast body),
@@ -7789,6 +7890,29 @@ impl Compiler {
                 self.emit(Step::LoadPerIteration { depth, index })
             }
             BindingLoc::Env => unreachable!("emit_load on the environment path"),
+        }
+    }
+
+    /// Cut 34: the store for a statement-position assignment — a fast
+    /// frame-slot/global target at the top expression depth fuses the store
+    /// and the statement-completion write (`FusedStore*`), skipping the
+    /// result `Dup` that `SetCompletion` would otherwise pop. Context/acc
+    /// targets and nested assignments fall back to the dup-store.
+    fn emit_statement_store(&mut self, loc: BindingLoc, name: crux::AtomId) {
+        if self.statement_expr && self.expr_depth == 1 {
+            match loc {
+                BindingLoc::Slot(slot) => {
+                    self.emit(Step::FusedStoreLocal { slot });
+                    self.fused_completion = true;
+                }
+                BindingLoc::Global => {
+                    self.emit(Step::FusedStoreGlobal { name });
+                    self.fused_completion = true;
+                }
+                _ => self.emit_dup_store(loc, name),
+            }
+        } else {
+            self.emit_dup_store(loc, name);
         }
     }
 
@@ -8583,8 +8707,21 @@ impl Compiler {
                 self.emit(Step::ListEnd);
             }
             StmtKind::Expr(expr) => {
+                // Cut 34: a statement-position assignment to a fast binding
+                // stores AND sets the statement completion in one step
+                // (`FusedStore*`), so no result `Dup` for `SetCompletion` to
+                // pop. Any other expression still leaves its value for
+                // `SetCompletion`.
+                let prev = self.statement_expr;
+                self.statement_expr = true;
+                self.fused_completion = false;
                 self.compile_expr(expr)?;
-                self.emit(Step::SetCompletion);
+                self.statement_expr = prev;
+                if self.fused_completion {
+                    self.fused_completion = false;
+                } else {
+                    self.emit(Step::SetCompletion);
+                }
             }
             StmtKind::VarDecl { kind, decls, .. } => {
                 let declaration = *kind != VarDeclKind::Var;
@@ -9866,7 +10003,18 @@ impl Compiler {
         Ok(())
     }
 
+    /// Compile an expression, tracking the nesting depth (Cut 34): the
+    /// statement-position `statement_expr` fusion applies only to the
+    /// statement's own assignment (`expr_depth == 1`), never a nested
+    /// assignment in an operand.
     fn compile_expr(&mut self, expr: &Expr) -> Result<(), JsError> {
+        self.expr_depth += 1;
+        let result = self.compile_expr_inner(expr);
+        self.expr_depth -= 1;
+        result
+    }
+
+    fn compile_expr_inner(&mut self, expr: &Expr) -> Result<(), JsError> {
         match &expr.kind {
             ExprKind::Paren(inner) => self.compile_expr(inner),
             ExprKind::Sequence(exprs) => {
@@ -10566,7 +10714,7 @@ impl Compiler {
                                     // binding — the env path does this too.
                                     self.emit(Step::SetFunctionName { name: *name });
                                 }
-                                self.emit_dup_store(loc, *name);
+                                self.emit_statement_store(loc, *name);
                             }
                             AssignOp::AndAssign | AssignOp::OrAssign | AssignOp::NullishAssign => {
                                 self.emit_load(loc, *name);
@@ -10583,6 +10731,9 @@ impl Compiler {
                                     // applies on the executed path only.
                                     self.emit(Step::SetFunctionName { name: *name });
                                 }
+                                // Both paths leave a value (the old binding
+                                // on the short circuit), so the result `Dup`
+                                // is always needed.
                                 self.emit_dup_store(loc, *name);
                                 self.place(end_label);
                             }
@@ -10590,7 +10741,7 @@ impl Compiler {
                                 self.emit_load(loc, *name);
                                 self.compile_expr(value)?;
                                 self.emit(Step::Binary(crate::expr::compound_binary(*op)));
-                                self.emit_dup_store(loc, *name);
+                                self.emit_statement_store(loc, *name);
                             }
                         }
                         Ok(())

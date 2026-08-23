@@ -119,6 +119,11 @@ pub struct Agent {
     /// does not bloat the Agent struct's hot-field cache footprint (an
     /// inline copy regressed the leaf-call path by ~10ns/call).
     pub(crate) for_of_array_cells: Box<[Option<(u64, u32, u64)>; crate::ir::MEMBER_CELLS]>,
+    /// The leaf-inline cache (Cut 34): function id → the record data
+    /// `do_call_fast` needs (compiled ir, strictness, closure env), so a hot
+    /// leaf call skips the `ecma_functions` HashMap lookup. Boxed per the
+    /// Cut 27 lesson.
+    pub(crate) leaf_cache: Box<[Option<(u64, crate::ir::LeafEntry)>; crate::ir::LEAF_CACHE]>,
     /// The cached `prototype` read of each constructor function (Cut 26):
     /// `new C()` runs OrdinaryCreateFromConstructor's property read per
     /// construct; the value is re-validated against the function object's
@@ -491,6 +496,7 @@ impl Agent {
             member_store_cells: [None; crate::ir::MEMBER_CELLS],
             for_of_fast_cells: std::array::from_fn(|_| None),
             for_of_array_cells: Box::new([None; crate::ir::MEMBER_CELLS]),
+            leaf_cache: Box::new(std::array::from_fn(|_| None)),
             construct_prototypes: RefCell::new(std::collections::HashMap::new()),
             vm_pool: Vec::new(),
             promise_jobs: VecDeque::new(),
@@ -628,6 +634,40 @@ impl Agent {
     /// its Vec capacities and inline frame).
     pub(crate) fn return_vm(&mut self, vm: crate::ir::Vm) {
         self.vm_pool.push(vm);
+    }
+
+    /// The leaf-inline record for `id` (Cut 34): a direct-mapped cache over
+    /// the `ecma_functions` map, so a hot leaf call skips the HashMap lookup.
+    /// A miss resolves from the map and caches the entry (only for a
+    /// leaf-inlineable function); function ids are never reused, so a hit
+    /// needs no generation check.
+    pub(crate) fn leaf_lookup(&mut self, id: u64) -> Option<&crate::ir::LeafEntry> {
+        let index = id.wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize & (crate::ir::LEAF_CACHE - 1);
+        let slot = &mut self.leaf_cache[index];
+        if let Some((cached_id, _)) = slot
+            && *cached_id == id
+        {
+            return slot.as_ref().map(|(_, entry)| entry);
+        }
+        let data = self.ecma_functions.get(&id)?;
+        if !data.leaf_inline {
+            return None;
+        }
+        let ir = data.ir.clone().expect("leaf_inline implies a compiled ir");
+        let environment = if ir.leaf_uses_env {
+            Some(data.environment.clone())
+        } else {
+            None
+        };
+        *slot = Some((
+            id,
+            crate::ir::LeafEntry {
+                ir,
+                strict: data.strict,
+                environment,
+            },
+        ));
+        slot.as_ref().map(|(_, entry)| entry)
     }
 
     /// spec 9.7.1 AgentSignifier.

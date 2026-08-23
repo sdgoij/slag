@@ -1080,6 +1080,50 @@ noise-floor-win precedent. Conformance at baseline: language 23,690/0/34,
 annexB 1,086/0/0, built-ins 23,211/0/154 (447 >15s hangs, the known slow
 class); workspace tests 4312/0.
 
+### Cut 34 — leaf frames on the value stack, a leaf-record cache, and fused statement stores (measured 2026-08-23)
+
+Three changes to the leaf-inline call path and the loop-body statements:
+
+- **The leaf's frame is now a flat segment on the value stack**
+  (`Vm::leaf_frame_base`) instead of a swapped `[Value; 8]` inline frame:
+  the caller's `frame` is never copied out-and-back, and only the live
+  slots (frame_size, not 8) are pushed — the ~256-byte swap and the
+  128-byte zero-fill are gone. The frame accessors route through
+  `frame_get`/`frame_get_mut`, which branch on the base (fully predictable
+  on both paths).
+- **A Boxed direct-mapped leaf-record cache** (`Agent::leaf_cache`,
+  16 entries keyed by function id — ids are never reused, so no generation
+  check): `do_call_fast` reads the compiled ir, strictness, and closure env
+  from the cache instead of the `ecma_functions` HashMap on every call.
+  Boxed per the Cut 27 lesson (an inline copy bloat the Agent's hot-field
+  footprint).
+- **`FusedStoreLocal`/`FusedStoreGlobal`**: a statement-position assignment
+  to a fast binding stores AND sets the statement completion in one step,
+  killing the `Dup` + `StoreLocal` + `SetCompletion` trio (2 fewer steps
+  per assignment statement in a loop). The `statement_expr`/`expr_depth`
+  compiler fields scope the fusion to the statement's own assignment (a
+  nested assignment in an operand still leaves its value).
+
+Measured (release, vs Cut 33; the machine was load-noisy, so the spread
+is wide — the calm-period medians):
+
+| Row | before | after |
+|---|---|---|
+| function calls | ~165-190ms | **~145ms** |
+| closure capture | ~167ms | **~152ms** |
+| per-iteration | ~22ms | ~21ms |
+| construct churn | ~78ms | ~78ms |
+
+Calls and closure both drop ~15-40ms (the frame segment is the bulk; the
+cache and fused store are noise-floor). The remaining ~50ns/call is the
+leaf dispatch + eligibility floor of the interpreter design — getting
+calls/closure under 100ms would need a JIT or a leaner dispatch. The
+built-ins sweep showed 10 more >15s hangs (457 vs 447), all in the known
+slow RegExp-property-escape/decodeURI classes and all passing when sampled
+individually — load-dependent classification wobble, not regressions.
+Conformance at baseline otherwise: language 23,690/0/34, annexB 1,086/0/0;
+workspace tests 4312/0.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
