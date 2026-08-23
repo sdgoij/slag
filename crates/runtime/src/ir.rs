@@ -920,6 +920,41 @@ pub enum LeafOp {
     /// fast-array and property-key machinery. The key may not be `Acc` —
     /// the object load would clobber it.
     GetMemberComputed { key: RegOperand },
+    /// acc = the frame slot's `name` property (Cut 35 slice 10: the fused
+    /// `LoadLocal` + `GetMemberName` for a frame-slot object — one dispatch
+    /// against the slot, skipping the separate load). The `tdz` bit mirrors
+    /// `LoadReg`'s uninitialized-binding check before the read.
+    GetMemberNameLocal {
+        object_slot: usize,
+        tdz: bool,
+        name: crux::AtomId,
+    },
+    /// acc = the frame slot's `key` property (the fused `LoadLocal` +
+    /// `GetMemberComputed` for a frame-slot object). The key is a direct
+    /// operand (`Reg`/`Ctx`/`PerIter`/`Const`) — a computed or spilled key
+    /// is rejected by the lowering.
+    GetMemberComputedLocal {
+        object_slot: usize,
+        tdz: bool,
+        key: RegOperand,
+    },
+    /// Push the accumulator onto the value stack (Cut 35 slice 10): a body
+    /// with more live values than the single accumulator can hold spills the
+    /// accumulator's value, reuses the accumulator, and pops the spilled
+    /// value back via `BinAccPop`. The push/pop pairs balance inside the
+    /// body; every caller truncates the stack on completion or error.
+    PushAcc,
+    /// acc = pop() op acc — the spilled left operand combined with the
+    /// accumulator right operand (a body that spilled the first operand of
+    /// a binary while computing the second).
+    BinAccPop { op: BinaryOp },
+    /// acc = frame[slot] op acc — a frame-slot left operand combined with
+    /// the accumulator right operand. The slot is read at the combine,
+    /// after the accumulator value was computed; that is safe only for
+    /// `tdz=false` slots, because a member read's getters cannot reach the
+    /// body's own frame slots and the accepted shapes write no slot between
+    /// the load and the combine (the lowering rejects `tdz=true` slots).
+    BinLeftReg { op: BinaryOp, slot: usize },
     /// Complete with `Completion::Return(acc)`.
     ReturnAcc,
 }
@@ -6284,8 +6319,8 @@ impl Vm {
                             "Cannot access a binding before initialization".into(),
                         ));
                     }
-                    self.acc =
-                        crate::expr::apply_binary(agent, *op, &self.acc, self.frame_get(*slot))?;
+                    let right = self.frame_get(*slot).clone();
+                    self.acc = Self::binary_inline(agent, *op, &self.acc, &right)?;
                 }
                 LeafOp::BinContext { op, index } => {
                     // The `context_chain_env(0)` transparent-env walk (see
@@ -6405,12 +6440,75 @@ impl Vm {
                     let key = self.leaf_operand_value(key)?;
                     self.acc = self.get_member_computed(agent, object, key)?;
                 }
+                LeafOp::GetMemberNameLocal {
+                    object_slot,
+                    tdz,
+                    name,
+                } => {
+                    let object = self.frame_get(*object_slot).clone();
+                    if *tdz && object.is_uninitialized() {
+                        return Err(JsError::new(
+                            ErrorKind::ReferenceError,
+                            "Cannot access a binding before initialization".into(),
+                        ));
+                    }
+                    self.acc = self.get_member_name(agent, object, *name)?;
+                }
+                LeafOp::GetMemberComputedLocal {
+                    object_slot,
+                    tdz,
+                    key,
+                } => {
+                    let object = self.frame_get(*object_slot).clone();
+                    if *tdz && object.is_uninitialized() {
+                        return Err(JsError::new(
+                            ErrorKind::ReferenceError,
+                            "Cannot access a binding before initialization".into(),
+                        ));
+                    }
+                    let key = self.leaf_operand_value(key)?;
+                    self.acc = self.get_member_computed(agent, object, key)?;
+                }
+                LeafOp::PushAcc => self.stack.push(self.acc.clone()),
+                LeafOp::BinAccPop { op } => {
+                    let left = self.pop();
+                    self.acc = Self::binary_inline(agent, *op, &left, &self.acc)?;
+                }
+                LeafOp::BinLeftReg { op, slot } => {
+                    let left = self.frame_get(*slot).clone();
+                    self.acc = Self::binary_inline(agent, *op, &left, &self.acc)?;
+                }
                 LeafOp::ReturnAcc => {
                     return Ok(Completion::Return(self.acc.clone()));
                 }
             }
         }
         Ok(Completion::Empty)
+    }
+
+    /// The number-number arithmetic inline shared by the register binary ops
+    /// (Cut 35 slice 10): two tag checks + a direct op for the arithmetic
+    /// shapes, falling back to the general `apply_binary` for anything else
+    /// (mirrors `Step::BinaryImm`'s inline). The Add case is `apply_binary`'s
+    /// own number-number fast path, inlined to skip the call.
+    #[inline]
+    fn binary_inline(
+        agent: &mut Agent,
+        op: BinaryOp,
+        left: &Value,
+        right: &Value,
+    ) -> Result<Value, JsError> {
+        if let (Some(left), Some(right)) = (left.as_number(), right.as_number()) {
+            match op {
+                BinaryOp::Add => return Ok(Value::Number(left + right)),
+                BinaryOp::Sub => return Ok(Value::Number(left - right)),
+                BinaryOp::Mul => return Ok(Value::Number(left * right)),
+                BinaryOp::Div => return Ok(Value::Number(left / right)),
+                BinaryOp::Rem => return Ok(Value::Number(left % right)),
+                _ => {}
+            }
+        }
+        crate::expr::apply_binary(agent, op, left, right)
     }
 
     /// Load a register operand to a value for a store op, mirroring the
@@ -6455,6 +6553,12 @@ impl Vm {
                     )
                 }),
             RegOperand::Const(value) => Ok(value.clone()),
+            // The lowering rejects spilled keys/values; a reaching spill
+            // would be a compiler bug.
+            RegOperand::Spilled => Err(JsError::new(
+                ErrorKind::SyntaxError,
+                "spilled register operand cannot be re-loaded".into(),
+            )),
         }
     }
 
@@ -12873,9 +12977,19 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
 #[derive(Debug, Clone)]
 pub enum RegOperand {
     Acc,
-    Reg { slot: usize, tdz: bool },
-    Ctx { index: usize },
-    PerIter { index: usize },
+    /// The value was spilled onto the value stack by `PushAcc` (Cut 35
+    /// slice 10): it is consumed by `BinAccPop`'s pop, not by any load.
+    Spilled,
+    Reg {
+        slot: usize,
+        tdz: bool,
+    },
+    Ctx {
+        index: usize,
+    },
+    PerIter {
+        index: usize,
+    },
     Const(Value),
 }
 
@@ -12912,6 +13026,18 @@ fn load_operand(ops: &mut Vec<LeafOp>, operand: RegOperand) -> bool {
             ops.push(LeafOp::LoadConst(value));
             true
         }
+        // A spilled value sits on the value stack; only `BinAccPop` can
+        // bring it back.
+        RegOperand::Spilled => false,
+    }
+}
+
+/// Spill a live accumulator value (the top of the shadow stack) onto the
+/// value stack so an op can overwrite the accumulator (Cut 35 slice 10).
+fn spill_live_acc(ops: &mut Vec<LeafOp>, stack: &mut [RegOperand]) {
+    if matches!(stack.last(), Some(RegOperand::Acc)) {
+        ops.push(LeafOp::PushAcc);
+        *stack.last_mut().unwrap() = RegOperand::Spilled;
     }
 }
 
@@ -12944,27 +13070,49 @@ fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
             Step::Binary(op) => {
                 let right = stack.pop()?;
                 let left = stack.pop()?;
-                if !load_operand(&mut ops, left) {
-                    return None;
+                if matches!(right, RegOperand::Acc) {
+                    // The right operand is the accumulator's live value. A
+                    // spilled left operand combines by popping it back
+                    // (`BinAccPop`); a frame-slot left operand reads the
+                    // slot at the combine (`BinLeftReg`) — safe only for
+                    // `tdz=false` slots, since the slot is read after the
+                    // accumulator value was computed (a member read's
+                    // getters cannot reach the body's own frame slots, and
+                    // the accepted shapes write no slot between the load
+                    // and the combine). Anything else (a second computed
+                    // value, a captured/constant left) cannot be held.
+                    match left {
+                        RegOperand::Spilled => ops.push(LeafOp::BinAccPop { op: *op }),
+                        RegOperand::Reg { slot, tdz: false } => {
+                            ops.push(LeafOp::BinLeftReg { op: *op, slot })
+                        }
+                        _ => return None,
+                    }
+                    stack.push(RegOperand::Acc);
+                } else {
+                    if !load_operand(&mut ops, left) {
+                        return None;
+                    }
+                    match right {
+                        RegOperand::Reg { slot, tdz } => {
+                            ops.push(LeafOp::BinReg { op: *op, slot, tdz });
+                        }
+                        RegOperand::Ctx { index } => {
+                            ops.push(LeafOp::BinContext { op: *op, index });
+                        }
+                        RegOperand::PerIter { index } => {
+                            ops.push(LeafOp::BinPerIter { op: *op, index });
+                        }
+                        RegOperand::Const(value) => {
+                            ops.push(LeafOp::BinConst { op: *op, value });
+                        }
+                        // A computed or spilled right operand cannot be
+                        // held while the left operand loads into the
+                        // accumulator.
+                        RegOperand::Acc | RegOperand::Spilled => return None,
+                    }
+                    stack.push(RegOperand::Acc);
                 }
-                match right {
-                    RegOperand::Reg { slot, tdz } => {
-                        ops.push(LeafOp::BinReg { op: *op, slot, tdz });
-                    }
-                    RegOperand::Ctx { index } => {
-                        ops.push(LeafOp::BinContext { op: *op, index });
-                    }
-                    RegOperand::PerIter { index } => {
-                        ops.push(LeafOp::BinPerIter { op: *op, index });
-                    }
-                    RegOperand::Const(value) => {
-                        ops.push(LeafOp::BinConst { op: *op, value });
-                    }
-                    // A computed right operand lives in the accumulator
-                    // alone; a second value cannot be held.
-                    RegOperand::Acc => return None,
-                }
-                stack.push(RegOperand::Acc);
             }
             Step::BinaryImm { op, imm } => {
                 let left = stack.pop()?;
@@ -13004,7 +13152,7 @@ fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
                 // the binary ops' right operand.
                 let value = stack.pop()?;
                 let object = stack.pop()?;
-                if matches!(value, RegOperand::Acc) {
+                if matches!(value, RegOperand::Acc | RegOperand::Spilled) {
                     return None;
                 }
                 if !load_operand(&mut ops, object) {
@@ -13022,7 +13170,9 @@ fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
                 let value = stack.pop()?;
                 let key = stack.pop()?;
                 let object = stack.pop()?;
-                if matches!(key, RegOperand::Acc) || matches!(value, RegOperand::Acc) {
+                if matches!(key, RegOperand::Acc | RegOperand::Spilled)
+                    || matches!(value, RegOperand::Acc | RegOperand::Spilled)
+                {
                     return None;
                 }
                 if !load_operand(&mut ops, object) {
@@ -13031,28 +13181,66 @@ fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
                 ops.push(LeafOp::StoreMemberComputed { key, value });
             }
             Step::GetMemberName { name } => {
-                // `o.x` (in value position): the object is the accumulator,
-                // the read lands in it.
+                // `o.x` (in value position): a frame-slot object fuses the
+                // load into the read (`GetMemberNameLocal`, one dispatch);
+                // any other object loads into the accumulator first. A live
+                // accumulator below the object (the `o.a + o.b` shape) is
+                // spilled so the read can overwrite it.
                 let object = stack.pop()?;
-                if !load_operand(&mut ops, object) {
-                    return None;
+                match object {
+                    RegOperand::Reg { slot, tdz } => {
+                        spill_live_acc(&mut ops, &mut stack);
+                        ops.push(LeafOp::GetMemberNameLocal {
+                            object_slot: slot,
+                            tdz,
+                            name: *name,
+                        });
+                    }
+                    object => {
+                        if !matches!(object, RegOperand::Acc) {
+                            spill_live_acc(&mut ops, &mut stack);
+                        }
+                        if !load_operand(&mut ops, object) {
+                            return None;
+                        }
+                        ops.push(LeafOp::GetMemberName { name: *name });
+                    }
                 }
-                ops.push(LeafOp::GetMemberName { name: *name });
                 stack.push(RegOperand::Acc);
             }
             Step::GetMemberComputed => {
-                // `o[k]`: the object is the accumulator, the key a direct
-                // operand (a computed key — `Acc` — cannot be held while the
-                // object load overwrites the accumulator).
+                // `o[k]`: a frame-slot object fuses the load into the read
+                // (`GetMemberComputedLocal`, one dispatch). Any other object
+                // loads into the accumulator first, so a computed key cannot
+                // be held then; a spilled key cannot be re-read; and a live
+                // accumulator below the object is spilled before the load.
+                // (An `Acc` key is rejected even in the fused form: with a
+                // live accumulator below it, the spill would push the key,
+                // not the live value.)
                 let key = stack.pop()?;
                 let object = stack.pop()?;
-                if matches!(key, RegOperand::Acc) {
+                if matches!(key, RegOperand::Acc | RegOperand::Spilled) {
                     return None;
                 }
-                if !load_operand(&mut ops, object) {
-                    return None;
+                match object {
+                    RegOperand::Reg { slot, tdz } => {
+                        spill_live_acc(&mut ops, &mut stack);
+                        ops.push(LeafOp::GetMemberComputedLocal {
+                            object_slot: slot,
+                            tdz,
+                            key,
+                        });
+                    }
+                    object => {
+                        if !matches!(object, RegOperand::Acc) {
+                            spill_live_acc(&mut ops, &mut stack);
+                        }
+                        if !load_operand(&mut ops, object) {
+                            return None;
+                        }
+                        ops.push(LeafOp::GetMemberComputed { key });
+                    }
                 }
-                ops.push(LeafOp::GetMemberComputed { key });
                 stack.push(RegOperand::Acc);
             }
             // A statement's completion is only read at the body's end, where

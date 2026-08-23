@@ -1485,6 +1485,59 @@ Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
 conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
 23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
 
+### Cut 35 slice 10 — fused member reads and register spills (measured 2026-08-23)
+
+The property-access row (`n += o.a + o.b`) had a two-member-read body that
+`lower_leaf_ops` rejected: the single accumulator cannot hold the three
+live values (`n` must combine after `o.a + o.b`), so it ran as 10 step
+dispatches per iteration. Three additions make it a six-op register body
+in one `RunRegBody` dispatch:
+
+- **Fused reads** — `LeafOp::GetMemberNameLocal { object_slot, tdz, name }`
+  and `GetMemberComputedLocal { object_slot, tdz, key }` load the object
+  straight from the frame slot and run the shared `get_member_name` /
+  `get_member_computed` in one dispatch (the lowering fuses any `Reg`
+  object operand, with the slot's `tdz` bit carried through).
+- **Spills** — `LeafOp::PushAcc` pushes the live accumulator value onto
+  the value stack when an op needs to overwrite it; `LeafOp::BinAccPop`
+  pops it back as the left operand of a binary. The push/pop pairs
+  balance inside the body and every caller truncates the stack on
+  completion or error, so a spill is just one stack round-trip.
+- **The frame-left combine** — `LeafOp::BinLeftReg { op, slot }` computes
+  `frame[slot] op acc` for a combine whose left operand is a frame slot
+  and whose right is the accumulator's live value. The slot is read at
+  the combine, after the accumulator value was computed; that is safe
+  only for `tdz=false` slots (the lowering rejects `tdz=true`), because a
+  member read's getters cannot reach the body's own frame slots and the
+  accepted shapes write no slot between the load and the combine. It also
+  preserves the operand order (`n + sum`, never `sum + n`) — the string
+  concat probe checks the exact value.
+
+The new shadow-stack entry `RegOperand::Spilled` marks a value pushed by
+`PushAcc`; it is consumed only by `BinAccPop` (any load of a spilled
+operand rejects the body, keeping it on the step path). The binary ops
+now share a `binary_inline` helper that inlines the number-number
+arithmetic (`Step::BinaryImm`'s inline) to skip the `apply_binary` call.
+
+The property body `n += o.a + o.b` lowers to `[GetMemberNameLocal(o, a),
+PushAcc, GetMemberNameLocal(o, b), BinAccPop(Add), BinLeftReg(Add, n),
+StoreReg(n)]` — three dispatches per iteration (body + loop head + loop
+store) instead of twelve. The combine rule also admits `y + o.a` and
+`n += o.a + y` (a frame-slot left with a computed right).
+
+Measured: property access ~87 -> ~72ms; the other rows unchanged. The
+18-case probe (`scratch/slice10_probe.js`) covers the sums, the string
+concat order, getter mutation observed by the second read, a throwing
+getter, the frame-left and frame-right combines, computed reads, chained
+reads, the TDZ rejection (a `tdz=true` left operand stays on the step
+path and throws before the read), nullish throws, exotic objects,
+undefined operands, valueOf coercion order, accumulator-loop counter
+preservation, and nested loops.
+
+Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
+conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
+23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

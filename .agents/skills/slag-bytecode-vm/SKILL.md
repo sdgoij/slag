@@ -205,6 +205,30 @@ arguments state.
   script path through the inline `Frame` — so the same ops serve both. A
   body with a jump/`PushAcc`/two-read shape stays on the step path; the
   accumulator-loop counter survives via the step's save/restore.
+- **Fused member reads + spills** (Cut 35 slice 10): `GetMemberNameLocal`/
+  `GetMemberComputedLocal` fuse a frame-slot object into the read (one
+  dispatch, `tdz` carried); `PushAcc` spills the live accumulator onto the
+  value stack when an op must overwrite it; `BinAccPop` pops it back as
+  the binary's left operand; `BinLeftReg` computes `frame[slot] op acc`
+  for a combine whose left is a frame slot and whose right is the
+  accumulator's live value. The shadow stack gained `RegOperand::Spilled`
+  (consumed only by `BinAccPop`; any other load of a spilled operand
+  rejects the body). `n += o.a + o.b` now lowers to a six-op body in one
+  dispatch.
+- **`BinLeftReg` reads the frame slot at the combine — after the
+  accumulator value was computed** (Cut 35 slice 10). That is safe ONLY
+  for `tdz=false` slots: a member read's getters cannot reach the body's
+  own frame slots (they run in other functions with no handle on this
+  frame), and the accepted shapes write no slot between the load and the
+  combine. The lowering rejects `tdz=true` slots (the step path must
+  throw the TDZ ReferenceError before the reads run). The op preserves
+  operand order (`n + sum`, never `sum + n`) — the string-concat probe
+  catches a swap. A captured/constant left with a computed right (`x +
+  o.a` with `x` captured) still cannot lower: the capture context is
+  reachable by other closures, so its slot can be mutated by a getter.
+  The spill is only emitted when the value below the popped object is a
+  live `Acc` — a computed `Acc` key is rejected in the fused computed
+  read because the spill would push the key, not the live value.
 - Errors propagate raw to the caller's `run_inner` exactly like a
   step-path leaf (a register body may throw from `apply_binary`/TDZ
   checks). Register-op semantics mirror the step semantics 1:1 — when you
