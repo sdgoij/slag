@@ -1718,8 +1718,32 @@ string concat, countdowns, and break/continue.
 
 Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
 conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
-23,812/0/154 with 448 >15s hangs in the known slow classes (the +1 is
-load wobble, all RegExp/Temporal).
+23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
+
+### Cut 35 slice 17 — fused slot-callee call-store (measured 2026-08-23)
+
+The calls/closure rows' loop bodies were `LoadLocal(arg) + CallFastSlot +
+FusedStoreLocal` — three dispatches plus the argument and result stack
+round-trips per iteration. `emit_statement_store` now recognizes the tail
+pattern (the args' `LoadLocal`s followed by a real `CallFastSlot` — whose
+guards already passed — and a slot store) and replaces it with
+`Step::CallFastSlotStore { callee_slot, arg_slots, store_slot }`: the arg
+slots are read in order with their `LoadLocal` TDZ checks, the
+slot-callee call runs through the existing machinery (the transient arg
+push is truncated by the call core), and the result stores with the
+`FusedStoreLocal` TDZ check. The pattern only matches plain slot args, so
+member/nested/compound shapes keep the step path unchanged.
+
+The `n = f(n)` body becomes one dispatch: function calls ~59 -> ~57ms,
+closure capture ~65 -> ~60ms. The 14-case probe
+(`scratch/slice17_probe.js`) covers the sums, 0/1/2-arg shapes, the
+arg == store-slot order, member and global callees (no fusion), nested
+calls, compound assigns, expression-position assigns, TDZ targets and
+args, throwing and non-callable callees.
+
+Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
+conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
+23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
 
 ## Deferred milestones
 

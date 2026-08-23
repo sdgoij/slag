@@ -296,6 +296,16 @@ arguments state.
   operand loader cannot pop there). The two `RunRegBody` emission sites
   scan the body slice for `Step::PushAcc` to set the flag — if you add a
   third site, mirror that.
+- **The slot-callee call-store fusion** (Cut 35 slice 17):
+  `emit_statement_store` recognizes the tail pattern `LoadLocal(args),
+  CallFastSlot, FusedStoreLocal` and replaces it with
+  `CallFastSlotStore` (arg slots read in order with `LoadLocal` TDZ
+  checks, the slot-callee call via `do_call_fast_slot`, the result
+  stored with the `FusedStoreLocal` TDZ check). The pattern only fires
+  on a real `CallFastSlot` emission (its guards already passed) with
+  plain slot args — member/nested/compound/expression-position shapes
+  keep the step path. `CallFastSlotStore` is excluded from
+  `steps_are_leaf` like the other call steps.
 - Errors propagate raw to the caller's `run_inner` exactly like a
   step-path leaf (a register body may throw from `apply_binary`/TDZ
   checks). Register-op semantics mirror the step semantics 1:1 — when you

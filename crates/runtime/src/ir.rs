@@ -357,6 +357,17 @@ pub enum Step {
         slot: usize,
         argc: u8,
     },
+    /// Cut 35 slice 17: the fused `x = f(args)` for a slot callee with
+    /// plain slot args — the arg loads, the slot-callee call, and the
+    /// store in one step (the `n = f(n)` bench body drops from three
+    /// dispatches to one). The arg slots are read in order with their
+    /// `LoadLocal` TDZ checks, the callee comes from its slot, and the
+    /// result stores to the target with the `FusedStoreLocal` TDZ check.
+    CallFastSlotStore {
+        callee_slot: usize,
+        arg_slots: Vec<usize>,
+        store_slot: usize,
+    },
     SuperCall,
     Construct,
     TaggedTemplate(syntax::ast::TemplateLiteral),
@@ -4047,6 +4058,37 @@ impl Vm {
                 }
                 Step::CallFastSlot { slot, argc } => {
                     self.do_call_fast_slot(agent, *slot, *argc as usize)?;
+                }
+                Step::CallFastSlotStore {
+                    callee_slot,
+                    arg_slots,
+                    store_slot,
+                } => {
+                    // Cut 35 slice 17: the fused `x = f(args)` — read the
+                    // arg slots in order (their `LoadLocal` TDZ checks),
+                    // run the slot-callee call (the transient arg push is
+                    // truncated by the call core), and store the result to
+                    // the target with the `FusedStoreLocal` TDZ check. The
+                    // evaluation order matches the unfused steps exactly.
+                    for &slot in arg_slots {
+                        let value = self.frame_get(slot).clone();
+                        if value.is_uninitialized() {
+                            return Err(JsError::new(
+                                ErrorKind::ReferenceError,
+                                "Cannot access a binding before initialization".into(),
+                            ));
+                        }
+                        self.stack.push(value);
+                    }
+                    self.do_call_fast_slot(agent, *callee_slot, arg_slots.len())?;
+                    let result = self.pop();
+                    if self.frame_get(*store_slot).is_uninitialized() {
+                        return Err(JsError::new(
+                            ErrorKind::ReferenceError,
+                            "Cannot access a binding before initialization".into(),
+                        ));
+                    }
+                    *self.frame_get_mut(*store_slot) = result;
                 }
                 Step::SuperCall => {
                     let base = self.args_base_stack.pop().ok_or_else(|| {
@@ -9010,9 +9052,47 @@ impl Compiler {
     fn emit_statement_store(&mut self, loc: BindingLoc, name: crux::AtomId) {
         if self.statement_expr && self.expr_depth == 1 {
             match loc {
-                BindingLoc::Slot(slot) => {
-                    self.emit(Step::FusedStoreLocal { slot });
-                    self.fused_completion = true;
+                BindingLoc::Slot(store_slot) => {
+                    // Cut 35 slice 17: `x = f(args)` where the tail is the
+                    // args' `LoadLocal`s + a `CallFastSlot` fuses the arg
+                    // loads, the call, and the store into one step. The
+                    // pattern only matches an actual `CallFastSlot`
+                    // emission (its guards already passed) with plain slot
+                    // args, so the semantics are unchanged.
+                    let fused = if let Some(Step::CallFastSlot { slot, argc }) = self.steps.last()
+                        && let argc = *argc as usize
+                        && self.steps.len() > argc
+                        && (0..argc).all(|i| {
+                            matches!(self.steps[self.steps.len() - 2 - i], Step::LoadLocal { .. })
+                        }) {
+                        let callee_slot = *slot;
+                        // The arg slots in compile order (the last-pushed
+                        // arg sits directly before the call).
+                        let arg_slots = (0..argc)
+                            .rev()
+                            .map(|i| {
+                                let Step::LoadLocal { slot } = self.steps[self.steps.len() - 2 - i]
+                                else {
+                                    unreachable!("checked above")
+                                };
+                                slot
+                            })
+                            .collect();
+                        self.steps.truncate(self.steps.len() - argc - 1);
+                        self.emit(Step::CallFastSlotStore {
+                            callee_slot,
+                            arg_slots,
+                            store_slot,
+                        });
+                        self.fused_completion = true;
+                        true
+                    } else {
+                        false
+                    };
+                    if !fused {
+                        self.emit(Step::FusedStoreLocal { slot: store_slot });
+                        self.fused_completion = true;
+                    }
                 }
                 BindingLoc::Global => {
                     self.emit(Step::FusedStoreGlobal { name });
@@ -13225,6 +13305,7 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
                 | Step::CallFast { .. }
                 | Step::CallFastGlobal { .. }
                 | Step::CallFastSlot { .. }
+                | Step::CallFastSlotStore { .. }
                 | Step::Construct
                 | Step::SuperCall
                 | Step::TaggedTemplate(_)
