@@ -3004,6 +3004,93 @@ mod tests {
     }
 
     #[test]
+    fn slice22_acc_counter_gates_to_number_inits_and_stores() {
+        fn head_var(agent: &mut Agent, src: &str, name: &str) -> crate::ir::FastLoopVar {
+            agent.run_script(src).unwrap();
+            let ir = compiled_body_of(agent, name);
+            ir.steps
+                .iter()
+                .find_map(|s| match s {
+                    crate::ir::Step::FastLoopHead { var, .. } => Some(*var),
+                    _ => None,
+                })
+                .expect("a fused loop head")
+        }
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        // Number inits (plain, negative-literal, parenthesized) and a
+        // Number-literal body write stay on the acc path.
+        assert!(matches!(
+            head_var(
+                &mut agent,
+                "function a() { var n = 0; for (var i = 0; i < 100; i++) { n += i; } return n; }",
+                "a"
+            ),
+            crate::ir::FastLoopVar::Counter
+        ));
+        assert!(matches!(
+            head_var(
+                &mut agent,
+                "function b() { var n = 0; for (var i = -5; i < 100; i++) { n += i; } return n; }",
+                "b"
+            ),
+            crate::ir::FastLoopVar::Counter
+        ));
+        assert!(matches!(
+            head_var(
+                &mut agent,
+                "function c() { var n = 0; for (var i = (2); i < 100; i++) { if (i === 3) { i = 5; } n += i; } return n; }",
+                "c"
+            ),
+            crate::ir::FastLoopVar::Counter
+        ));
+        // A multi-decl head's LAST counter initializer decides.
+        assert!(matches!(
+            head_var(
+                &mut agent,
+                "function g() { var n = 0; for (var i = 5, i = 3; i < 100; i++) { n += i; } return n; }",
+                "g"
+            ),
+            crate::ir::FastLoopVar::Counter
+        ));
+        // A String init, a String body write, a BigInt init, and a
+        // multi-decl head whose last counter init is not a Number fall back
+        // to the slot path.
+        assert!(matches!(
+            head_var(
+                &mut agent,
+                "function d() { var n = 0; for (var i = \"0\"; i < 100; i++) { n += i; } return n; }",
+                "d"
+            ),
+            crate::ir::FastLoopVar::Slot(_)
+        ));
+        assert!(matches!(
+            head_var(
+                &mut agent,
+                "function e() { var n = 0; for (var i = 0; i < 100; i++) { if (i === 3) { i = \"x\"; } n += i; } return n; }",
+                "e"
+            ),
+            crate::ir::FastLoopVar::Slot(_)
+        ));
+        assert!(matches!(
+            head_var(
+                &mut agent,
+                "function f() { var n = 0; for (var i = 5n; i < 100; i++) { n += i; } return n; }",
+                "f"
+            ),
+            crate::ir::FastLoopVar::Slot(_)
+        ));
+        assert!(matches!(
+            head_var(
+                &mut agent,
+                "function h() { var n = 0; for (var i = 5, i = \"x\"; i < 100; i++) { n += i; } return n; }",
+                "h"
+            ),
+            crate::ir::FastLoopVar::Slot(_)
+        ));
+    }
+
+    #[test]
     fn fast_path_arrow_binds_params_to_slots() {
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();

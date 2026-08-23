@@ -443,6 +443,43 @@ restores too).
   move the counter between the field and the binding); `Counter` appears
   only in `FastLoopHead`.
 
+## 13. The loop counter is a raw f64 — the acc-path gates admit only Numbers (Cut 35 slice 22)
+
+`Vm::loop_counter` is an `f64` since slice 22 (previously a `Value`): the
+head's test is a direct f64 compare (JS relational semantics for two
+numbers — NaN compares false, matching Rust) and the increment is
+`self.loop_counter += delta`; `LoadCounter`/`PushAcc`/`FastLoopStore`
+wrap the field into a `Value` once per read/write, never per head
+dispatch. This is the FIRST structural lever that measured a real win
+since the step-fusion floor: 5M-iteration isolated A/B (alternating
+order, min-of-3, 14 runs per binary against the slice-21 tree) shows the
+empty-head loop 59→35ms and the counter-read/arith rows 165→132/122ms.
+
+**The soundness trap — an f64 cannot hold a non-Number, and the old Value
+field kept them verbatim.** Two compile gates now restrict the acc path,
+and every rejected shape falls back to the fused SLOT path (behaviorally
+identical — the general machinery coerces):
+
+- `for_init_counter_number` (the init): must be provably a Number — a
+  numeric literal, `+expr` (always Number or throws, and the throw
+  propagates before the store), or `-expr` on a provably-Number operand
+  (unary minus on a BigInt yields a BigInt — excluded). A missing init,
+  an expression head, or a multi-decl head whose LAST counter
+  initializer isn't a Number (each initializer compiles in order, the
+  last write wins) is rejected. There is NO conversion at `FastLoopBind`:
+  binding a String init to `ToNumber` would make the body read the
+  coerced number instead of the raw String — wrong on the first
+  iteration.
+- `acc_expr_safe`'s statement-position `counter = expr`: the RHS must be
+  provably a Number (same `expr_is_number` set). `i = i`/`i = i + 1`/
+  `i = "x"`/`i = 1n` all reject to the slot path; `i = 5` stays on the
+  acc path.
+
+The runtime carries `debug_assert!(value.is_number())` on the gated
+bind/store conversions (`unwrap_or(0.0)` in release — a gate bug must
+never panic the process). `run_leaf_body` still saves/restores the field
+(now a plain f64 copy), and `Vm::new`/`reset` seed `0.0`.
+
 ## Bench reality (Cut 2)
 
 `cargo run -p cli --release -- --bench` bounces ±15% on this machine (the
@@ -470,12 +507,15 @@ The dispatch is a jump table: removing a dispatch per iteration measures
 ZERO (fusing the `FastLoopHead` into the register body — slice 19,
 reverted — and fusing the global `CallFastGlobal`+store into one step —
 slice 20 — both measured ~0ms on 5M-iteration A/B runs). The remaining
-per-iteration costs are REAL WORK: the loop head's inc+test is ~11ns/iter
+per-iteration costs are REAL WORK: the loop head's inc+test was ~11ns/iter
 (the empty 1M `var` loop is ~12ms regardless of the dispatch count), and
 the leaf-call core (cache check + frame setup + `run_leaf_ops` + truncate)
-is ~20ns. Don't propose another step-fusion slice expecting a win; the
-levers left are structural (a dedicated counter field removing the acc
-save/restore, or a call ABI reading args straight from frame slots).
+is ~20ns. Don't propose another step-fusion slice expecting a win. The
+structural levers DID move numbers: the raw-f64 loop counter (slice 22)
+cut the head and counter-read rows by ~5-9ns/iter (5M-iteration A/B:
+empty-head 59→35ms, counter-read 166→132ms) — the first real win since
+the floor — and the remaining lever is the call ABI reading args straight
+from frame slots.
 
 **A/B bench methodology: alternate the order.** The machine drifts within
 seconds (a base-then-new pair can show a consistent +2-5ms "regression"

@@ -1844,6 +1844,55 @@ Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
 conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
 23,812/0/154 with 440 >15s hangs in the known slow classes (unchanged).
 
+### Cut 35 slice 22 — raw-f64 loop counter (measured 2026-08-23)
+
+The `Vm::loop_counter` field is now an `f64` instead of a `Value`. The
+loop head's per-iteration work was the Value round-trip — clone the
+counter, `as_number()`, compare for the test; clone, `as_number()`,
+`Value::Number(x + delta)` for the increment — and the body's
+`LoadCounter` wrapped the field back into a Value. With the raw float the
+test is a direct f64 compare (NaN semantics match JS: both compare
+false), the increment is `self.loop_counter += delta`, and `LoadCounter`/
+`PushAcc`/`FastLoopStore` wrap once per read/write instead of per head
+dispatch.
+
+**Soundness — the acc-path gates must admit only Numbers.** An f64 cannot
+hold a String/BigInt, and the loop protocol lets a non-Number counter
+(which the old Value field kept verbatim) flow through `FastLoopBind`
+(the init) and `PopAcc` (a statement-position `counter = expr`). Two new
+compile gates restrict the acc path: `for_init_counter_number` requires
+the loop init to be a provably-Number expression (a numeric literal,
+`+expr` — always Number or throws before the store — or `-expr` on a
+provably-Number operand, excluding BigInts; a missing/expression/multi-
+decl head with a non-Number last counter initializer is rejected), and
+`acc_expr_safe`'s statement-position `counter = expr` case now requires a
+provably-Number RHS. Everything rejected falls back to the fused slot
+path, which is behaviorally identical (it coerces via the general
+machinery) — the gates are a pure eligibility restriction, never a
+semantics change. The runtime keeps `debug_assert!`s on the gated
+bind/store conversions.
+
+The leaf containment point is unchanged: `run_leaf_body` saves/restores
+the field across a leaf run (now a plain f64 copy). `Vm::new`/`reset`
+seed the field with `0.0`; no code reads it outside an active fast loop.
+
+Measured: a real win — the first structural lever to move since the
+step-fusion floor. 5M-iteration alternating-order min-of-3 isolation
+(14 runs per binary, base = the slice-21 tree at `89bba88`): empty-head
+loop 59→35ms, counter-read body 166→132ms, arith row 165→122ms
+(≈5-9ns/iter off the head and counter read; consistent across both
+pair orders, far above the ±2-5ms order bias). The 25-case probe
+(`scratch/slice22_probe.js`) covers the bench shapes, countdowns,
+break/continue, nested loops, leaf containment (including a throwing
+leaf), the Number-literal/write gates, and the slot-path fallbacks for
+String/BigInt inits and writes (all behaviorally identical).
+
+Validation: clippy `-D warnings` clean, workspace tests green (4313/0),
+conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
+23,812/0/154 with 447 >15s hangs (all in the known slow classes;
+7 property-escapes more than slice 21's 440, 1 less non-whitespace —
+load-classification wobble, no added fail/crash paths).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

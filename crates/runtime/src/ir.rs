@@ -752,8 +752,8 @@ pub enum Step {
     RunRegBody {
         ops: Box<[LeafOp]>,
     },
-    /// Push the fused loop counter (`Vm::acc`) onto the value stack: the
-    /// body's redirected reads of the counter.
+    /// Push the fused loop counter (the dedicated `Vm::loop_counter` field)
+    /// onto the value stack: the body's redirected reads of the counter.
     PushAcc,
     /// Pop the value stack into the fused loop counter: the body's
     /// redirected `counter = expr` assignments.
@@ -1665,7 +1665,8 @@ pub enum FastLoopVar {
     Global(crux::AtomId),
     /// The dedicated `Vm::loop_counter` field (Cut 17/35 slice 21): the
     /// accumulator-path head's counter lives here, never in the frame or
-    /// the register accumulator.
+    /// the register accumulator. The field is a raw `f64` (Cut 35 slice
+    /// 22), so the acc-path gates must admit only Number inits and stores.
     Counter,
 }
 
@@ -1778,14 +1779,19 @@ pub struct Vm {
     /// that need a value across a register run save it.
     acc: Value,
     /// The fused canonical loop's counter (Cut 17; dedicated field, Cut 35
-    /// slice 21): the loop head and the body's redirected reads/writes
-    /// touch only this field, so the counter never round-trips the
-    /// frame/global — or the accumulator — per iteration. Only the
-    /// `FastLoop*`/`PushAcc`/`PopAcc`/`IncAcc`/`DecAcc` steps and the
-    /// `LoadCounter` op read or write it; every other step uses the value
-    /// stack or the accumulator, so the counter survives arbitrary body
-    /// code between head dispatches without a save/restore.
-    loop_counter: Value,
+    /// slice 21; raw `f64` since Cut 35 slice 22): the loop head and the
+    /// body's redirected reads/writes touch only this field, so the counter
+    /// never round-trips the frame/global — or the accumulator — per
+    /// iteration. Only the `FastLoop*`/`PushAcc`/`PopAcc`/`IncAcc`/`DecAcc`
+    /// steps and the `LoadCounter` op read or write it; every other step
+    /// uses the value stack or the accumulator, so the counter survives
+    /// arbitrary body code between head dispatches without a save/restore.
+    /// The raw f64 is sound because the acc-path compile gates admit only
+    /// Number values — the loop init (`for_init_counter_number`) and the
+    /// body's statement-position `counter = expr` (`expr_is_number`) must
+    /// be provably Number — so the head's test and increment are plain
+    /// float ops, never the Value round-trip.
+    loop_counter: f64,
     /// Completion-register saves for the `finally` blocks currently running
     /// (nested finallys push in order).
     completion_stack: Vec<(Value, bool)>,
@@ -1893,7 +1899,7 @@ impl Vm {
             strict,
             completion_is_empty: true,
             acc: Value::Undefined,
-            loop_counter: Value::Undefined,
+            loop_counter: 0.0,
             completion_stack: Vec::new(),
             list_stack: Vec::new(),
             var_ref_stack: Vec::new(),
@@ -1944,7 +1950,7 @@ impl Vm {
         self.strict = strict;
         self.completion_is_empty = true;
         self.acc = Value::Undefined;
-        self.loop_counter = Value::Undefined;
+        self.loop_counter = 0.0;
         self.completion_stack.clear();
         self.list_stack.clear();
         self.var_ref_stack.clear();
@@ -2685,6 +2691,19 @@ impl Vm {
         op: BinaryOp,
         imm: f64,
     ) -> Result<bool, JsError> {
+        // The dedicated field holds the loop's Number counter (the acc-path
+        // gates admit only Number inits/stores) — compare the raw f64
+        // directly (JS relational semantics for two numbers: NaN compares
+        // false, matching Rust's f64 comparisons).
+        if matches!(var, FastLoopVar::Counter) {
+            return Ok(match op {
+                BinaryOp::LessThan => self.loop_counter < imm,
+                BinaryOp::LessEqual => self.loop_counter <= imm,
+                BinaryOp::GreaterThan => self.loop_counter > imm,
+                BinaryOp::GreaterEqual => self.loop_counter >= imm,
+                _ => unreachable!("FastLoop with a non-relational op"),
+            });
+        }
         let value = match var {
             FastLoopVar::Slot(slot) => {
                 let value = self.frame_get(slot).clone();
@@ -2697,10 +2716,7 @@ impl Vm {
                 value
             }
             FastLoopVar::Global(name) => self.load_global_value(agent, name)?,
-            // Cut 17: the counter lives in the dedicated `loop_counter`
-            // field (Cut 35 slice 21; a certified body's counter is never
-            // uninitialized — the loop init ran before `FastLoopBind`).
-            FastLoopVar::Counter => self.loop_counter.clone(),
+            FastLoopVar::Counter => unreachable!("handled above"),
         };
         if let Some(num) = value.as_number() {
             return Ok(match op {
@@ -2753,21 +2769,15 @@ impl Vm {
                 self.update_global(agent, name, inc, true)?;
             }
             // Cut 17: the counter lives in the dedicated `loop_counter`
-            // field — a Number updates in place, anything else goes
-            // through the general `++`/`--` machinery.
+            // field — a raw f64 (Cut 35 slice 22) that only ever holds
+            // Numbers, so the increment is a plain float op.
             FastLoopVar::Counter => {
-                let old = self.loop_counter.clone();
-                let new = if let Some(num) = old.as_number() {
-                    let delta = if matches!(inc, UpdateOp::Increment) {
-                        1.0
-                    } else {
-                        -1.0
-                    };
-                    Value::Number(num + delta)
+                let delta = if matches!(inc, UpdateOp::Increment) {
+                    1.0
                 } else {
-                    update_value(agent, &inc, &old)?.1
+                    -1.0
                 };
-                self.loop_counter = new;
+                self.loop_counter += delta;
             }
         }
         Ok(())
@@ -2775,21 +2785,26 @@ impl Vm {
 
     /// The fused canonical loop's counter prologue (Cut 17): load the
     /// binding's current value into the `loop_counter` field
-    /// (`Step::FastLoopBind`).
+    /// (`Step::FastLoopBind`). The acc-path gate requires the init to be a
+    /// Number, so the field takes the value's numeric form.
     fn fast_loop_bind(&mut self, agent: &mut Agent, var: FastLoopVar) -> Result<(), JsError> {
         let value = match var {
             FastLoopVar::Slot(slot) => self.frame_get(slot).clone(),
             FastLoopVar::Global(name) => self.load_global_value(agent, name)?,
             FastLoopVar::Counter => unreachable!("FastLoopBind on the counter field itself"),
         };
-        self.loop_counter = value;
+        debug_assert!(
+            value.is_number(),
+            "the acc-path loop init is gated to a Number"
+        );
+        self.loop_counter = value.as_number().unwrap_or(0.0);
         Ok(())
     }
 
     /// The fused canonical loop's counter epilogue (Cut 17): write the
     /// `loop_counter` field back to the binding (`Step::FastLoopStore`).
     fn fast_loop_store(&mut self, agent: &mut Agent, var: FastLoopVar) -> Result<(), JsError> {
-        let value = self.loop_counter.clone();
+        let value = Value::Number(self.loop_counter);
         match var {
             FastLoopVar::Slot(slot) => *self.frame_get_mut(slot) = value,
             FastLoopVar::Global(name) => self.store_global_value(agent, name, value)?,
@@ -5154,29 +5169,30 @@ impl Vm {
                 }
                 Step::PushAcc => {
                     // Cut 35 slice 21: the fused loop counter lives in the
-                    // dedicated `loop_counter` field, not the accumulator.
-                    self.stack.push(self.loop_counter.clone());
+                    // dedicated `loop_counter` field, not the accumulator;
+                    // slice 22 made the field an f64, so the stack value is
+                    // a Number wrap.
+                    self.stack.push(Value::Number(self.loop_counter));
                 }
                 Step::PopAcc => {
-                    self.loop_counter = self.pop();
+                    // Cut 35 slice 22: the acc-path `counter = expr` gate
+                    // admits only provably-Number RHSes, so the popped value
+                    // is a Number.
+                    let value = self.pop();
+                    debug_assert!(
+                        value.is_number(),
+                        "the acc-path counter store is gated to a Number"
+                    );
+                    self.loop_counter = value.as_number().unwrap_or(0.0);
                 }
                 Step::IncAcc => {
-                    let old = self.loop_counter.clone();
-                    let new = if let Some(num) = old.as_number() {
-                        Value::Number(num + 1.0)
-                    } else {
-                        update_value(agent, &UpdateOp::Increment, &old)?.1
-                    };
-                    self.loop_counter = new;
+                    // The field is a raw f64 holding a Number (the acc-path
+                    // gates admit only Number inits/stores) — plain float
+                    // arithmetic, no Value round-trip.
+                    self.loop_counter += 1.0;
                 }
                 Step::DecAcc => {
-                    let old = self.loop_counter.clone();
-                    let new = if let Some(num) = old.as_number() {
-                        Value::Number(num - 1.0)
-                    } else {
-                        update_value(agent, &UpdateOp::Decrement, &old)?.1
-                    };
-                    self.loop_counter = new;
+                    self.loop_counter -= 1.0;
                 }
                 Step::LoadContextSlot { depth, index } => {
                     // Cut 3 continuation: the certified body's capture
@@ -6385,8 +6401,10 @@ impl Vm {
         // `loop_counter` field — save the caller's counter across the run
         // (the leaf's `FastLoopBind` overwrites it, `FastLoopStore` writes
         // it back to the leaf's own binding, and the restore below brings
-        // the caller's counter back).
-        let caller_loop_counter = std::mem::replace(&mut self.loop_counter, Value::Undefined);
+        // the caller's counter back). Since slice 22 the field is a raw
+        // f64, so the save/restore is a plain copy.
+        let caller_loop_counter = self.loop_counter;
+        self.loop_counter = 0.0;
         let caller_strict = self.strict;
         self.strict = strict;
         // Cut 28/30: a leaf that reads captured per-iteration heads
@@ -6615,8 +6633,10 @@ impl Vm {
                 LeafOp::LoadCounter => {
                     // Cut 35 slice 16/21: the accumulator-loop counter now
                     // lives in the dedicated `loop_counter` field — read it
-                    // directly (no entry push/pop since slice 21).
-                    self.acc = self.loop_counter.clone();
+                    // directly (no entry push/pop since slice 21); the field
+                    // is an f64 since slice 22, so the accumulator takes the
+                    // Number wrap.
+                    self.acc = Value::Number(self.loop_counter);
                 }
                 LeafOp::LoadConst(value) => self.acc = value.clone(),
                 LeafOp::BinReg { op, slot, tdz } => {
@@ -10603,6 +10623,10 @@ impl Compiler {
                     // frame round-trip per iteration.
                     if matches!(var, FastLoopVar::Slot(_))
                         && self.acc_binding.is_none()
+                        // Cut 35 slice 22: the acc-path counter lives in an
+                        // f64 field, so the init must be a Number (the slot
+                        // path handles non-Number counters).
+                        && for_init_counter_number(init, name)
                         && self.acc_body_safe(body, name)
                     {
                         // The counter prologue loads the binding (just
@@ -17167,6 +17191,47 @@ fn acc_target_name(target: &Expr) -> Option<crux::AtomId> {
     }
 }
 
+/// Whether an expression provably evaluates to a Number (Cut 35 slice 22):
+/// the accumulator-path loop counter lives in an `f64` field, so every
+/// value that enters it must be a Number. A numeric literal qualifies, as
+/// does `+expr` (it always yields a Number — or throws, and the throw
+/// propagates before the store, never a BigInt), and `-expr` whose operand
+/// is itself provably a Number (unary minus on a BigInt would yield a
+/// BigInt). Everything else — idents, strings, calls, binary `+` (string
+/// concat) — is rejected, falling back to the slot path.
+fn expr_is_number(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Literal(syntax::ast::Literal::Number(_)) => true,
+        ExprKind::Unary {
+            op: UnaryOp::Plus, ..
+        } => true,
+        ExprKind::Unary {
+            op: UnaryOp::Minus,
+            operand,
+        } => expr_is_number(operand),
+        ExprKind::Paren(inner) => expr_is_number(inner),
+        _ => false,
+    }
+}
+
+/// Whether the loop init provably stores a Number into the counter binding
+/// (Cut 35 slice 22): `FastLoopBind` moves the init into the f64
+/// `loop_counter` field, so the init must be a Number. A missing init, an
+/// expression head, or a `var` head that doesn't write the counter leaves
+/// the slot's pre-loop value unknown. When multiple declarations bind the
+/// counter, the last one's initializer wins (each initializer compiles in
+/// order), so only it needs the Number check.
+fn for_init_counter_number(init: Option<&ForInit>, name: crux::AtomId) -> bool {
+    match init {
+        Some(ForInit::VarDecl { decls, .. }) => decls
+            .iter()
+            .rev()
+            .find(|decl| matches!(&decl.pattern, BindingPattern::Ident(n) if *n == name))
+            .is_some_and(|decl| decl.init.as_ref().is_some_and(expr_is_number)),
+        _ => false,
+    }
+}
+
 /// Whether a statement subtree uses the loop counter safely for the
 /// accumulator (see `Compiler::acc_body_safe`).
 fn acc_stmt_safe(stmt: &Stmt, name: crux::AtomId) -> bool {
@@ -17266,7 +17331,18 @@ fn acc_expr_safe(expr: &Expr, name: crux::AtomId, statement: bool) -> bool {
             target, value, op, ..
         } => {
             let target_ok = match acc_target_name(target) {
-                Some(target_name) => target_name != name || (statement && *op == AssignOp::Assign),
+                Some(target_name) => {
+                    target_name != name
+                        || (statement
+                            && *op == AssignOp::Assign
+                            // Cut 35 slice 22: the acc-path counter lives
+                            // in an f64 field, so a statement-position
+                            // `counter = expr` may enter the field only with
+                            // a provably-Number expression (a String/BigInt
+                            // result would corrupt the raw counter — those
+                            // loops fall back to the slot path).
+                            && expr_is_number(value))
+                }
                 None => true,
             };
             target_ok && acc_expr_safe(target, name, false) && acc_expr_safe(value, name, false)
