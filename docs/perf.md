@@ -751,6 +751,39 @@ flat. Conformance at baseline: language 23,690/0/34, annexB 1,086/0/0,
 built-ins 23,213/0/154 (445 hangs, known load-tied cluster); workspace
 tests 4311/0.
 
+### Cut 24 — for-of fast-verdict cache: skip the iterator-method chain walk (measured 2026-08-23)
+
+An array-iteration probe showed `for_of_begin` at ~1.5µs per call —
+160ms of the 237ms array row. Every for-of entry ran `get_method`
+(a full `@@iterator` read: two prototype-chain walks + accessor scan)
+plus three intrinsics lookups and the iterator-infra checks, even for
+a plain Array that had been iterated a million times already.
+
+`for_of_begin` now takes the fast path without `get_method`: a plain
+Array with no own `@@iterator` whose prototype is the realm's
+%Array.prototype%, plus a gen-validated cached "the Array-iteration
+infrastructure is stock" verdict — %Array.prototype%.@@iterator is the
+intrinsic, %ArrayIteratorPrototype% has the stock `next`, and no
+`return` on the AIP chain. The verdict stores the three shared
+objects' generation counters (Cut 22's mechanism): a probe re-reads
+them (~3 Rc clones + compares); any mutation — `a[Symbol.iterator]`
+patched, `Array.prototype[Symbol.iterator]` replaced, a `return` added
+to the chain — bumps one and re-resolves the full check. Custom-proto
+arrays and every other doubt fall to the unchanged generic path.
+
+Measured (5-run medians, release, vs Cut 23):
+
+| Row | before | after |
+|---|---|---|
+| array iteration | ~237ms | **~121ms** (-48%) |
+| for-of begin+done 100k (probe) | ~160ms | **~49ms** |
+
+The begin is now ~490ns/outer-iteration (from ~1.5µs), the rest the
+step machinery. Construct/property/calls flat. Conformance at
+baseline: language 23,690/0/34, annexB 1,086/0/0, built-ins
+23,216/0/154 (442 hangs, known load-tied cluster); workspace tests
+4311/0. The suite is now ~1.01s (from ~1.15s before this cut).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

@@ -2045,6 +2045,30 @@ pub enum ForOfState {
 /// `next`/`return` on the iterator chain, or non-plain-Array receiver keeps
 /// the generic record.
 pub fn for_of_begin(agent: &mut Agent, value: &Value) -> Result<ForOfState, JsError> {
+    // Cut 24: the fast-path verdict without the `get_method` chain walk —
+    // a plain Array with no own @@iterator whose prototype is the realm's
+    // %Array.prototype%, plus a gen-validated cached "the iterator
+    // infrastructure is stock" verdict. Any doubt falls to the existing
+    // generic path below (get_method included), which is unchanged.
+    if let Some(realm) = agent.current_realm().ok()
+        && let ValueKind::Object(object) = value.kind()
+        && matches!(object.kind, crux::object::ObjectKind::Array)
+        && object
+            .get_own_property_key(&PropertyKey::Symbol(
+                crux::symbol::well_known("iterator").as_ref().clone(),
+            ))?
+            .is_none()
+        && let Some(ap_value) = realm.intrinsics.get("%Array.prototype%")
+        && let ValueKind::Object(array_proto) = ap_value.kind()
+        && object
+            .get_prototype_of()?
+            .as_ref()
+            .is_some_and(|proto| proto.id() == array_proto.id())
+        && (for_of_fast_probe(agent, &array_proto)
+            || for_of_fast_resolve(agent, &array_proto)?.is_some())
+    {
+        return Ok(ForOfState::FastArray(value.clone()));
+    }
     let method = get_method(agent, value, "@@iterator")?;
     let Some(method) = method else {
         return Err(JsError::new(
@@ -2156,6 +2180,76 @@ fn iterator_chain_has_return(agent: &mut Agent, iterator: &Value) -> Result<bool
     }
     let _ = agent;
     Ok(false)
+}
+
+/// The for-of fast-verdict probe (Cut 24): the cached "the Array-iteration
+/// infrastructure is stock" verdict holds while the three shared objects'
+/// generations match — a mutation anywhere (Array.prototype's @@iterator
+/// patched, %ArrayIteratorPrototype%.next replaced, a `return` added to
+/// the chain) bumps one and re-resolves.
+fn for_of_fast_probe(agent: &mut Agent, array_proto: &crux::object::JsObject) -> bool {
+    let index = array_proto.id() as usize & (crate::ir::MEMBER_CELLS - 1);
+    let Some(verdict) = agent.for_of_fast_cells[index].as_ref() else {
+        return false;
+    };
+    if verdict.array_proto.0 != array_proto.id()
+        || verdict.array_proto.1 != array_proto.generation()
+    {
+        return false;
+    }
+    verdict.aip.1 == verdict.aip_handle.generation()
+        && verdict.object_proto.1 == verdict.object_proto_handle.generation()
+}
+
+/// Resolve and cache the for-of fast verdict (Cut 24): %Array.prototype%'s
+/// own @@iterator is the stock intrinsic, %ArrayIteratorPrototype% has the
+/// stock `next`, and no `return` on the AIP → %Object.prototype% chain.
+/// `Some(())` = stock (now cached); `None` = not (the caller falls to the
+/// generic path).
+fn for_of_fast_resolve(
+    agent: &mut Agent,
+    array_proto: &crux::object::JsObject,
+) -> Result<Option<()>, JsError> {
+    let Some(realm) = agent.current_realm().ok() else {
+        return Ok(None);
+    };
+    let iterator_key = PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone());
+    let stock = realm.intrinsics.get("%Array.prototype[Symbol.iterator]%");
+    let Some(ap_iterator) = array_proto.get_own_property_key(&iterator_key)? else {
+        return Ok(None);
+    };
+    if ap_iterator.value().as_ref() != stock.as_ref() {
+        return Ok(None);
+    }
+    let Some(aip_value) = realm.intrinsics.get("%ArrayIteratorPrototype%") else {
+        return Ok(None);
+    };
+    let ValueKind::Object(aip) = aip_value.kind() else {
+        return Ok(None);
+    };
+    let intrinsic_next = realm.intrinsics.get("%ArrayIteratorPrototype.next%");
+    let next_is_stock = match aip.get_own_property_key(&PropertyKey::from_utf8("next"))? {
+        Some(property) => property.value().as_ref() == intrinsic_next.as_ref(),
+        None => false,
+    };
+    if !next_is_stock || iterator_chain_has_return(agent, &aip_value)? {
+        return Ok(None);
+    }
+    let Some(object_proto_value) = realm.intrinsics.get("%Object.prototype%") else {
+        return Ok(None);
+    };
+    let ValueKind::Object(object_proto) = object_proto_value.kind() else {
+        return Ok(None);
+    };
+    let index = array_proto.id() as usize & (crate::ir::MEMBER_CELLS - 1);
+    agent.for_of_fast_cells[index] = Some(crate::agent::ForOfFastVerdict {
+        array_proto: (array_proto.id(), array_proto.generation()),
+        aip: (aip.id(), aip.generation()),
+        aip_handle: aip,
+        object_proto: (object_proto.id(), object_proto.generation()),
+        object_proto_handle: object_proto,
+    });
+    Ok(Some(()))
 }
 
 /// The iterator's `next` method: the cached method from GetIterator, or a

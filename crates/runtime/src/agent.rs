@@ -63,6 +63,20 @@ impl std::hash::Hasher for IdentityHasher {
     }
 }
 
+/// The cached "the Array-iteration infrastructure is stock" verdict (Cut
+/// 24): %Array.prototype%'s own @@iterator is the intrinsic,
+/// %ArrayIteratorPrototype% has the stock `next`, and no `return` on the
+/// AIP → %Object.prototype% chain. The handles are kept so a probe can
+/// re-read the generations; any mutation bumps one and re-resolves the
+/// full check.
+pub(crate) struct ForOfFastVerdict {
+    pub array_proto: (u64, u32),
+    pub aip: (u64, u32),
+    pub aip_handle: Handle<crux::object::JsObject>,
+    pub object_proto: (u64, u32),
+    pub object_proto_handle: Handle<crux::object::JsObject>,
+}
+
 pub struct Agent {
     pub execution_context_stack: Vec<ExecutionContext>,
     /// The IC caches shared by every Vm run in this agent (the global-var
@@ -87,6 +101,12 @@ pub struct Agent {
     /// property is absent on the receiver, so the store defines on it
     /// directly. Re-validated against the chain links' generations.
     pub(crate) member_store_cells: [Option<crate::ir::MemberStoreCell>; crate::ir::MEMBER_CELLS],
+    /// The for-of fast-verdict cache (Cut 24): "the Array-iteration
+    /// infrastructure is stock" — %Array.prototype%'s own @@iterator is the
+    /// intrinsic, %ArrayIteratorPrototype% has the stock `next`, and no
+    /// `return` on the AIP chain. Re-validated against the three shared
+    /// objects' generations.
+    pub(crate) for_of_fast_cells: [Option<ForOfFastVerdict>; crate::ir::MEMBER_CELLS],
     /// The free-list of Vms for per-call reuse: `run_compiled_body`, the
     /// construct fast path, and the script/eval paths take one, run, and
     /// return it — a pooled Vm is never handed to a suspended
@@ -450,6 +470,7 @@ impl Agent {
             member_proto_cells: [None; crate::ir::MEMBER_CELLS],
             array_element_cells: [None; crate::ir::MEMBER_CELLS],
             member_store_cells: [None; crate::ir::MEMBER_CELLS],
+            for_of_fast_cells: std::array::from_fn(|_| None),
             vm_pool: Vec::new(),
             promise_jobs: VecDeque::new(),
             generic_jobs: VecDeque::new(),
