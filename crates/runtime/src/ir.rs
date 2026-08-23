@@ -986,6 +986,15 @@ pub struct CompiledBody {
     /// `with`/`try`/`switch`/`using`, so the dispatch loop's per-step
     /// context-env sync is a no-op and can be skipped.
     pub env_constant: bool,
+    /// Cut 25: whether the certified body is a *leaf* — no calls, no
+    /// closure creation, no reference/environment/iterator machinery, no
+    /// sloppy mapped `arguments` — so a call to it can run in place on the
+    /// CALLER's Vm (no execution-context push, no pool round-trip, no frame
+    /// re-alloc): `do_call_fast` inlines it when the caller's shared stacks
+    /// are empty. A leaf cannot recurse (it contains no calls), so the
+    /// flat save/restore of the few fields it touches is safe. See
+    /// `docs/perf.md` Cut 25.
+    pub leaf: bool,
     /// The certified top-level fast path (script-level bindings): the
     /// declared `var`/function names a script reads and writes directly on
     /// the global object, skipping the env-chain walk. `None` = the
@@ -1148,6 +1157,42 @@ impl Frame {
             Frame::Inline(buf) => &mut buf[slot],
             Frame::Heap(vec) => &mut vec[slot],
         }
+    }
+}
+
+/// Build a certified body's frame: params in slots `0..arity` (source
+/// order), `var`s undefined, `let`/`const` slots in the TDZ. Shared by
+/// `Vm::setup_frame` and the Cut 25 leaf-inline (which swaps it in for the
+/// duration of the leaf's run).
+fn leaf_frame(scope: &ScopeInfo, args: &[Value]) -> Frame {
+    if scope.frame_size <= INLINE_FRAME {
+        let mut buf = std::array::from_fn(|index| {
+            // A `let`/`const` slot starts in the TDZ (`LoadLocal`/`StoreLocal`
+            // check the marker); params and `var`s start `undefined`.
+            if scope.tdz_store.get(index).copied().unwrap_or(false) {
+                Value::uninitialized()
+            } else {
+                Value::Undefined
+            }
+        });
+        for (index, arg) in args.iter().take(scope.arity).enumerate() {
+            buf[index] = arg.clone();
+        }
+        Frame::Inline(buf)
+    } else {
+        let mut slots: Vec<Value> = (0..scope.frame_size)
+            .map(|index| {
+                if scope.tdz_store[index] {
+                    Value::uninitialized()
+                } else {
+                    Value::Undefined
+                }
+            })
+            .collect();
+        for (index, arg) in args.iter().take(scope.arity).enumerate() {
+            slots[index] = arg.clone();
+        }
+        Frame::Heap(slots)
     }
 }
 
@@ -1569,35 +1614,7 @@ impl Vm {
     /// `function_declaration_instantiation` for a body whose references the
     /// scope analysis certified.
     pub fn setup_frame(&mut self, scope: &ScopeInfo, args: &[Value]) {
-        self.frame = if scope.frame_size <= INLINE_FRAME {
-            let mut buf = std::array::from_fn(|index| {
-                // A `let`/`const` slot starts in the TDZ (`LoadLocal`/`StoreLocal`
-                // check the marker); params and `var`s start `undefined`.
-                if scope.tdz_store.get(index).copied().unwrap_or(false) {
-                    Value::uninitialized()
-                } else {
-                    Value::Undefined
-                }
-            });
-            for (index, arg) in args.iter().take(scope.arity).enumerate() {
-                buf[index] = arg.clone();
-            }
-            Frame::Inline(buf)
-        } else {
-            let mut slots: Vec<Value> = (0..scope.frame_size)
-                .map(|index| {
-                    if scope.tdz_store[index] {
-                        Value::uninitialized()
-                    } else {
-                        Value::Undefined
-                    }
-                })
-                .collect();
-            for (index, arg) in args.iter().take(scope.arity).enumerate() {
-                slots[index] = arg.clone();
-            }
-            Frame::Heap(slots)
-        };
+        self.frame = leaf_frame(scope, args);
     }
 
     /// The fused relational-imm loop test (Cut 4): read the slot (TDZ-checked
@@ -3681,7 +3698,32 @@ impl Vm {
                         )
                     })?;
                     let args = self.args.split_off(base);
-                    let result = crate::function::construct(agent, &callee, &args, &callee)?;
+                    // Cut 25: inline a certified base-constructor leaf the
+                    // way `do_call_fast` inlines a leaf call — the certified
+                    // construct path's checks (base kind, no fields/private
+                    // methods) gate it, plus the same clean-site/single-realm
+                    // guard.
+                    let result = if self.can_inline_leaf()
+                        && let ValueKind::Function(function) = callee.kind()
+                        && matches!(function.kind, crux::function::FunctionKind::EcmaScript)
+                        && let Some(data) = agent.ecma_functions.get(&function.id())
+                        && let Some(ir) = &data.ir
+                        && ir.leaf
+                        && data.this_mode != crate::function::ThisMode::Lexical
+                        && (!data.is_method || data.is_class_constructor)
+                        && data.constructor_kind == crate::function::ConstructorKind::Base
+                        && data.fields.is_empty()
+                        && data.private_methods.is_empty()
+                        && !data.class_field_initializer
+                        && agent.realms.borrow().len() == 1
+                    {
+                        let ir = data.ir.clone().expect("checked Some above");
+                        let environment = data.environment.clone();
+                        let strict = data.strict;
+                        self.run_leaf_construct(agent, &ir, &environment, strict, &callee, &args)?
+                    } else {
+                        crate::function::construct(agent, &callee, &args, &callee)?
+                    };
                     self.stack.push(result);
                 }
                 Step::TaggedTemplate(template) => {
@@ -5629,6 +5671,188 @@ impl Vm {
         Ok(())
     }
 
+    /// Cut 25: whether the call-site state lets a leaf run in place on this
+    /// Vm. The shared stacks the abrupt-completion machinery
+    /// (`control_transfer`/`throw_machinery`) walks must be empty, so a
+    /// leaf's own `return`/`throw`/`break`/`continue` resolves against
+    /// nothing but its own steps — it cannot touch the caller's iterators,
+    /// pending finallys, try frames, or env stack. The per-iteration and
+    /// destructure flags are false at any call step by construction (they
+    /// are only set around the iterator steps that run on nested Vms).
+    fn can_inline_leaf(&self) -> bool {
+        self.try_stack.is_empty()
+            && self.pending.is_empty()
+            && self.for_of_stack.is_empty()
+            && self.for_of_boundaries.is_empty()
+            && self.for_in_stack.is_empty()
+            && self.async_for_of_stack.is_empty()
+            && self.destructure_stack.is_empty()
+            && self.env_stack.len() == 1
+    }
+
+    /// The shared leaf-run core (Cut 25): swap the caller's run state for
+    /// the leaf's and dispatch its steps on this Vm — no execution-context
+    /// push, no pool round-trip, no frame re-alloc. Every field the leaf can
+    /// touch is saved and restored on both the normal and the error path, so
+    /// a throwing leaf unwinds exactly like a nested call (the caller's
+    /// `run_inner` sees the error with the caller's `ip` restored).
+    fn run_leaf_body(
+        &mut self,
+        agent: &mut Agent,
+        ir: &std::rc::Rc<CompiledBody>,
+        environment: &EnvRef,
+        strict: bool,
+        this_value: Value,
+        args: &[Value],
+    ) -> Result<Completion, JsError> {
+        let scope = ir.scope.as_ref().expect("a leaf is certified");
+        let body_env = match scope.new_body_context(environment, args)? {
+            Some(context) => context,
+            None => environment.clone(),
+        };
+        let mut frame = leaf_frame(scope, args);
+        if let Some(slot) = scope.this_slot {
+            *frame.get_mut(slot) = this_value;
+        }
+        let caller_ip = self.ip;
+        let caller_frame = std::mem::replace(&mut self.frame, frame);
+        let caller_completion = std::mem::replace(&mut self.completion, Value::Undefined);
+        let caller_completion_is_empty = self.completion_is_empty;
+        self.completion_is_empty = true;
+        let caller_acc = std::mem::replace(&mut self.acc, Value::Undefined);
+        let caller_strict = self.strict;
+        self.strict = strict;
+        let caller_body_context = self.body_context.replace(body_env);
+        let caller_chain_short = self.chain_short;
+        self.chain_short = false;
+        let stack_len = self.stack.len();
+        let list_len = self.list_stack.len();
+        let completion_stack_len = self.completion_stack.len();
+        let var_ref_stack_len = self.var_ref_stack.len();
+        let array_index_stack_len = self.array_index_stack.len();
+        // The body's `Step::CreateArguments` reads the call's argument slice
+        // (strict unmapped only — the sloppy mapped form disqualifies a
+        // leaf); a body without an `arguments` slot leaves the caller's
+        // slice untouched.
+        let caller_call_args = if scope.arguments_slot.is_some() {
+            Some(std::mem::replace(&mut self.call_args, args.to_vec()))
+        } else {
+            None
+        };
+        self.ip = 0;
+        // `run_inner_inner`, not `run_inner`: a leaf error must propagate
+        // raw to the caller's `run_inner`, which applies the caller's
+        // handler coverage, iterator close, and disposal with the caller's
+        // body and the restored `ip`. `run_inner`'s own error machinery
+        // would run those against the leaf's empty stacks/tables.
+        let outcome = self.run_inner_inner(agent, ir);
+        self.ip = caller_ip;
+        self.frame = caller_frame;
+        self.completion = caller_completion;
+        self.completion_is_empty = caller_completion_is_empty;
+        self.acc = caller_acc;
+        self.strict = caller_strict;
+        self.body_context = caller_body_context;
+        self.chain_short = caller_chain_short;
+        self.stack.truncate(stack_len);
+        self.list_stack.truncate(list_len);
+        self.completion_stack.truncate(completion_stack_len);
+        self.var_ref_stack.truncate(var_ref_stack_len);
+        self.array_index_stack.truncate(array_index_stack_len);
+        if let Some(call_args) = caller_call_args {
+            self.call_args = call_args;
+        }
+        match outcome {
+            Ok(VmOutcome::Completed(completion)) => Ok(completion),
+            Ok(VmOutcome::Suspended(_)) => Err(JsError::new(
+                ErrorKind::TypeError,
+                "ordinary function suspended unexpectedly".into(),
+            )),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The leaf-inline call path: OrdinaryCallBindThis (a non-arrow leaf's
+    /// `this` slot) + OrdinaryCallEvaluateBody, mirroring `ordinary_call`'s
+    /// certified fast path without the context push.
+    fn run_leaf_call(
+        &mut self,
+        agent: &mut Agent,
+        ir: &std::rc::Rc<CompiledBody>,
+        environment: &EnvRef,
+        strict: bool,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, JsError> {
+        let scope = ir.scope.as_ref().expect("a leaf is certified");
+        let this_value = if scope.this_slot.is_some() {
+            if strict {
+                this
+            } else {
+                match this.kind() {
+                    ValueKind::Undefined | ValueKind::Null => {
+                        // Same-realm guard: the caller's global is the leaf's.
+                        let global = self.global_object(agent)?;
+                        Value::Object(global)
+                    }
+                    ValueKind::Object(_) | ValueKind::Function(_) => this,
+                    _ => crate::context::to_object(agent, &this)?,
+                }
+            }
+        } else {
+            Value::Undefined
+        };
+        let completion = self.run_leaf_body(agent, ir, environment, strict, this_value, args)?;
+        match completion {
+            Completion::Return(value) => Ok(value),
+            Completion::Normal(_) | Completion::Empty => Ok(Value::Undefined),
+            Completion::Throw(value) => Err(JsError::new(
+                ErrorKind::TypeError,
+                format!("Uncaught {value:?}"),
+            )
+            .with_value(value)),
+            Completion::Break { .. } | Completion::Continue { .. } => Err(JsError::new(
+                ErrorKind::SyntaxError,
+                "Illegal break/continue statement".into(),
+            )),
+        }
+    }
+
+    /// The leaf-inline construct path (Cut 25): OrdinaryCreateFromConstructor
+    /// plus the base-constructor return rule — an object `return` wins,
+    /// anything else yields `this` — mirroring `ordinary_construct`'s
+    /// certified fast path without the context push.
+    fn run_leaf_construct(
+        &mut self,
+        agent: &mut Agent,
+        ir: &std::rc::Rc<CompiledBody>,
+        environment: &EnvRef,
+        strict: bool,
+        new_target: &Value,
+        args: &[Value],
+    ) -> Result<Value, JsError> {
+        let this = crate::function::construct_this_object(agent, new_target)?;
+        let completion = self.run_leaf_body(agent, ir, environment, strict, this.clone(), args)?;
+        // spec 10.2.1 [[Construct]] steps 15-21 (base): an object return
+        // wins; anything else falls back to `this`.
+        match completion {
+            Completion::Return(value) => match value.kind() {
+                ValueKind::Object(_) | ValueKind::Function(_) => Ok(value),
+                _ => Ok(this),
+            },
+            Completion::Normal(_) | Completion::Empty => Ok(this),
+            Completion::Throw(value) => Err(JsError::new(
+                ErrorKind::TypeError,
+                format!("Uncaught {value:?}"),
+            )
+            .with_value(value)),
+            Completion::Break { .. } | Completion::Continue { .. } => Err(JsError::new(
+                ErrorKind::SyntaxError,
+                "Illegal break/continue statement".into(),
+            )),
+        }
+    }
+
     /// The fast-call path (`CallFast`): the 0-2 arguments are already on the
     /// value stack above `[this, callee]`. The arguments slice is read in
     /// place — no argument-vector build, no per-call `Vec` allocation — and
@@ -5644,6 +5868,36 @@ impl Vm {
         let arg_start = n - argc;
         let callee = self.stack[arg_start - 1].clone();
         let this = self.stack[arg_start - 2].clone();
+        // Cut 25: inline a certified leaf call onto this Vm. The eligibility
+        // checks are the cheap ones first; the record lookup is what the
+        // general path pays anyway. A leaf is never eval (a builtin) and
+        // always callable, so the eval/type checks below are skipped.
+        if self.can_inline_leaf()
+            && let ValueKind::Function(function) = callee.kind()
+            && matches!(function.kind, crux::function::FunctionKind::EcmaScript)
+            && let Some(data) = agent.ecma_functions.get(&function.id())
+            && let Some(ir) = &data.ir
+            && ir.leaf
+            // The class-constructor TypeError and the field-initializer
+            // context are the general path's job.
+            && !data.is_class_constructor
+            && !data.class_field_initializer
+            // The leaf runs with the caller's realm current: cross-realm
+            // calls dispatch with the callee's realm, which the inline path
+            // cannot.
+            && agent.realms.borrow().len() == 1
+        {
+            let ir = data.ir.clone().expect("checked Some above");
+            let environment = data.environment.clone();
+            let strict = data.strict;
+            let mut args_buf = [Value::Undefined; 3];
+            args_buf[..argc].clone_from_slice(&self.stack[arg_start..n]);
+            let result =
+                self.run_leaf_call(agent, &ir, &environment, strict, this, &args_buf[..argc])?;
+            self.stack.truncate(arg_start - 2);
+            self.stack.push(result);
+            return Ok(());
+        }
         let args = &self.stack[arg_start..n];
         if is_eval_function(agent, &callee)? {
             let source = args.first().cloned().unwrap_or(Value::Undefined);
@@ -11358,6 +11612,154 @@ fn labeled_continue_target(body: &Stmt) -> Option<(usize, usize)> {
     if is_loop { Some((usize::MAX, 0)) } else { None }
 }
 
+/// Cut 25: whether `step` is safe to run on the CALLER's Vm (a certified
+/// body whose every step allows it is a *leaf* — see [`CompiledBody::leaf`]).
+/// Every step that re-enters the VM with a fresh frame (calls/constructs),
+/// reads the running execution context — the caller's, when inlined — or
+/// touches a VM stack the caller's abrupt-completion machinery walks
+/// (try/pending/for-of/for-in/destructure/env) disqualifies the body. The
+/// remaining steps touch only the value stack, the frame, the capture
+/// context, the global cache, and the completion register, all of which the
+/// inline run saves and restores.
+fn steps_are_leaf(steps: &[Step]) -> bool {
+    steps.iter().all(|step| {
+        !matches!(
+            step,
+            // Re-entry: a nested call/construct/tagged template runs on its
+            // own Vm. A leaf must contain none, so it cannot recurse.
+            Step::Call { .. }
+                | Step::CallFast { .. }
+                | Step::Construct
+                | Step::SuperCall
+                | Step::TaggedTemplate(_)
+                | Step::ImportCall { .. }
+                | Step::ImportMeta
+                | Step::ArgsBase
+                | Step::ArgsPush
+                | Step::ArgsSpread
+                // The running execution context's env: an inlined body sees
+                // the caller's env, so every reference-resolution and
+                // reference-machinery step is out.
+                | Step::LoadIdent { .. }
+                | Step::ResolveVarIdent { .. }
+                | Step::GetVarReference
+                | Step::GetVarReferenceThis
+                | Step::PutVarReference
+                | Step::PutVarReferenceOp { .. }
+                | Step::UpdateVarReference { .. }
+                | Step::PopVarReference
+                | Step::DeleteIdent { .. }
+                | Step::TypeofIdent { .. }
+                | Step::UpdateIdent { .. }
+                | Step::ResolveMemberRefName { .. }
+                | Step::ResolveMemberRefComputed
+                | Step::ResolvePrivateRef { .. }
+                | Step::ResolveSuperRefName { .. }
+                | Step::ResolveSuperRefComputed
+                | Step::GetSuperBase
+                | Step::GetSuperName { .. }
+                | Step::GetSuperComputedKeep
+                | Step::AssignSuperName { .. }
+                | Step::AssignSuperComputed { .. }
+                | Step::DeleteSuper
+                | Step::PrivateIn { .. }
+                | Step::UpdateSuperName { .. }
+                | Step::UpdateSuperComputed { .. }
+                | Step::UpdatePrivate { .. }
+                | Step::AssignPrivate { .. }
+                | Step::NewTarget
+                | Step::ThisValue
+                // Closure creation captures the running context's env.
+                | Step::CreateFunction { .. }
+                | Step::CreateArrow { .. }
+                | Step::FunctionDecl { .. }
+                | Step::FunctionDeclInit { .. }
+                | Step::ObjectMethodName { .. }
+                | Step::ObjectMethodComputed { .. }
+                | Step::ObjectAccessorName { .. }
+                | Step::ObjectAccessorComputed { .. }
+                | Step::SetFunctionName { .. }
+                // Environment machinery (block/with/try/using/per-iteration
+                // envs): writes the env stack the caller's unwinds walk.
+                | Step::EnterBlock { .. }
+                | Step::LeaveBlock
+                | Step::EnterWith
+                | Step::EnterTry { .. }
+                | Step::Exit { .. }
+                | Step::CatchBind { .. }
+                | Step::FinallyEnd
+                | Step::PerIteration { .. }
+                | Step::EnterLoopEnv { .. }
+                | Step::EnterIterTdzEnv { .. }
+                | Step::LeaveIterTdzEnv
+                | Step::EnterPerIteration { .. }
+                | Step::LoadPerIteration { .. }
+                | Step::StorePerIteration { .. }
+                | Step::UpdatePerIteration { .. }
+                | Step::UsingInit { .. }
+                | Step::DeclInit { .. }
+                // Iterator machinery: protocol calls plus the for-of/for-in
+                // stacks the caller's break/return/throw paths close.
+                | Step::ForInBegin
+                | Step::ForInNext { .. }
+                | Step::ForInBind { .. }
+                | Step::ForInRestore
+                | Step::ForOfBegin { .. }
+                | Step::ForOfNext { .. }
+                | Step::ForOfNextBindLocal { .. }
+                | Step::ForOfBind { .. }
+                | Step::ForOfBindLocal { .. }
+                | Step::ForOfBindGlobal { .. }
+                | Step::ForOfRestore
+                | Step::ForOfClose
+                | Step::AsyncForOfBegin { .. }
+                | Step::AsyncForOfNext
+                | Step::AsyncForOfTest { .. }
+                | Step::AsyncForOfBind { .. }
+                | Step::AsyncForOfRestore
+                | Step::AsyncForOfClose
+                | Step::ObjectSpread
+                | Step::ArraySpread
+                | Step::Destructure { .. }
+                | Step::DestructureBegin
+                | Step::DestructureNext
+                | Step::DestructureUndef { .. }
+                | Step::DestructureRest
+                | Step::DestructureObjCoercible
+                | Step::DestructureObjKey { .. }
+                | Step::DestructureObjKeyComputed
+                | Step::DestructureObjKeyStore
+                | Step::DestructureObjKeyGet
+                | Step::DestructureObjRest { .. }
+                | Step::DestructureClose
+                | Step::DestructureObjEnd
+                // Suspension.
+                | Step::Yield { .. }
+                | Step::Await
+                | Step::YieldStarBegin
+                | Step::YieldStarNext { .. }
+                | Step::YieldStarResume { .. }
+                | Step::AsyncYieldStarBegin
+                | Step::AsyncYieldStarNext { .. }
+                | Step::AsyncYieldStarInspect { .. }
+                | Step::AsyncYieldStarResume { .. }
+                // Control machinery the inline run cannot reproduce (never
+                // certified, listed for completeness).
+                | Step::SwitchDisc
+                | Step::SwitchTest { .. }
+                | Step::ClassBegin { .. }
+                | Step::ClassHeritage
+                | Step::ClassKeyToPropertyKey
+                | Step::ClassFinish { .. }
+                | Step::RegExpLiteral { .. }
+                // Sloppy mapped arguments reads the running context's
+                // `function` (the caller's, when inlined); the strict
+                // unmapped object reads only the call's argument slice.
+                | Step::CreateArguments { mapped: Some(_), .. }
+        )
+    })
+}
+
 /// Compile a function body for resumable execution.
 pub fn compile_body(function: &EcmaFunction) -> Result<CompiledBody, JsError> {
     let scope = analyze_scope(function);
@@ -11410,12 +11812,14 @@ pub fn compile_body(function: &EcmaFunction) -> Result<CompiledBody, JsError> {
     // so the per-step context sync must run (closures created in the loop
     // body capture the per-iteration env, not the capture context).
     let env_constant = compiler.scope.is_some() && !compiler.env_changing;
+    let leaf = compiler.scope.is_some() && steps_are_leaf(&compiler.steps);
     Ok(CompiledBody {
         steps: compiler.steps,
         handlers: compiler.handlers,
         strict: function.strict,
         scope: compiler.scope,
         env_constant,
+        leaf,
         script_globals: None,
     })
 }
@@ -11478,6 +11882,9 @@ pub fn compile_statements(
         strict,
         scope: compiler.scope,
         env_constant: !compiler.env_changing,
+        // Scripts are never the callee of a call, so the leaf-inline fast
+        // path never sees them.
+        leaf: false,
         script_globals: compiler.script_globals,
     })
 }

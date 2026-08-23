@@ -1,6 +1,6 @@
 ---
 name: slag-bytecode-vm
-description: "Load when working on Slag's bytecode VM and compiler (crates/runtime/src/ir.rs) — the Step enum, the Vm dispatch loop, compile_expr/compile_statement lowering, or the compiled-path stack protocol. Documents the non-obvious traps: optional-call short-path stack discipline, assignment-reference timing, super base capture before key conversion, destructure/for-of close semantics, template cache keys, and the bench-noise reality."
+description: "Load when working on Slag's bytecode VM and compiler (crates/runtime/src/ir.rs) — the Step enum, the Vm dispatch loop, compile_expr/compile_statement lowering, or the compiled-path stack protocol. Documents the non-obvious traps: optional-call short-path stack discipline, assignment-reference timing, super base capture before key conversion, destructure/for-of close semantics, template cache keys, the leaf-inline caller-Vm contract, and the bench-noise reality."
 ---
 
 # Slag bytecode VM traps
@@ -84,6 +84,53 @@ build, no `Vec` alloc). `compile_arguments(args, allow_fast)` returns
 still pop from `args_base_stack`. `BinaryImm { op, imm }` is emitted only
 when the RHS is a `Number` literal (a `Str`/`Null`/`Boolean` RHS goes
 through coercions and must stay a generic `Binary`).
+
+## 7. Leaf-inline runs on the CALLER'S Vm (Cut 25)
+
+`CompiledBody::leaf` marks a certified body whose steps let a call to it
+run in place on the caller's Vm (`do_call_fast` / `Step::Construct` →
+`run_leaf_body`): no execution-context push, no pool round-trip, no frame
+re-alloc (~82ns/call). Three contracts keep it correct; break any of them
+and you get wrong behavior only when an uncertified caller with try/with/
+for-of/destructure state calls a leaf:
+
+- **`steps_are_leaf` must exclude every step that reads the running
+  execution context or writes a shared VM stack.** An inlined body sees
+  the CALLER'S env (`CreateFunction`/`CreateArrow` capture
+  `running_context()?.lexical_environment` — a leaf closure would capture
+  the caller's bindings), so all reference machinery (`LoadIdent`,
+  `Resolve*Ref*`/`GetVarReference`/`Put*VarReference`), `NewTarget`,
+  super/private steps, env-machinery steps, and sloppy mapped
+  `CreateArguments` (reads the context's `function`; strict unmapped is
+  fine — it reads only `call_args`) are out. When you ADD a new Step,
+  decide its leaf safety explicitly — the default for anything touching
+  `agent.running_context()` or `try_stack`/`pending`/`for_of_*`/
+  `for_in_stack`/`destructure_*`/`env_stack` is exclusion.
+- **`can_inline_leaf` guards the call site, not the body**: the caller's
+  try/pending/for-of/for-in/destructure stacks must be empty and
+  `env_stack.len() == 1`. This is what makes the leaf's own
+  `Return`/`Throw`/`Break`/`Continue` safe — they route through
+  `control_transfer`/`throw_machinery`, which walk the SHARED stacks with
+  the LEAF's (empty) handler table; with caller frames present,
+  `find_finally_frame`'s `?` short-circuits and the close helpers would
+  close the caller's iterators.
+- **Run via `run_inner_inner`, never `run_inner`**: a leaf error must
+  propagate raw to the caller's `run_inner`, which applies handler
+  coverage, iterator close, and disposal with the caller's body and the
+  restored `ip`. `run_inner`'s own error machinery would run those
+  against the leaf's empty stacks/tables and close iterators that the
+  caller's try was about to catch.
+
+The inline save/restores every field the leaf can touch (`ip`, frame swap,
+stack/list/completion/var_ref/array_index stack lengths, `completion`,
+`acc`, `strict`, `body_context`, `chain_short`, `call_args`) on BOTH paths;
+`self.global` needs no save because the path is gated on a single realm
+(cross-realm dispatches fall through to `call_inner`). Construct inlining
+needs the certified-construct conditions PLUS `is_method`: `{ method() {} }
+is a certified leaf whose `new` must throw "not a constructor" — the
+language-area sweep fixture
+`expressions/object/method-definition/name-invoke-ctor.js` caught exactly
+this. Edge-case matrix: `scratch/leaf_inline_probes.js` (gitignored).
 
 ## Bench reality (Cut 2)
 

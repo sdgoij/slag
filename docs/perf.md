@@ -784,6 +784,59 @@ baseline: language 23,690/0/34, annexB 1,086/0/0, built-ins
 23,216/0/154 (442 hangs, known load-tied cluster); workspace tests
 4311/0. The suite is now ~1.01s (from ~1.15s before this cut).
 
+### Cut 25 — certified leaf calls inline on the caller's Vm (measured 2026-08-23)
+
+A call-family decomposition (Cut 20 follow-up) put ~85-115ns of pure
+machinery on every certified call: the execution-context push (~40ns),
+`take_vm`/`return_vm` pool round-trip with the 25-field reset (~30-50ns),
+the redundant nested `with_agent` TLS pair, the `running_context` env
+clone, and the record lookup's triple `Rc` clone. A `f(x) { return x + 1 }`
+call paid all of it. Cut 12's naive fix (save/restore all 35 VM fields per
+call) lost ~6% — the full-frame copy dominated.
+
+The re-attempt inlines only *certified leaves*: a certified body whose
+compiled steps contain no re-entry (no `Call`/`CallFast`/`Construct`/
+`SuperCall`/`TaggedTemplate`), no running-context read (no `LoadIdent`,
+reference machinery, `this`-value, `new.target`, super, closure creation
+— the leaf's closures would capture the CALLER's env), no environment or
+iterator machinery, and no sloppy mapped `arguments` (its object reads the
+context's `function`). Such a body cannot recurse, so the inline run is a
+flat save/restore of the handful of fields a leaf can touch — `ip`, the
+frame (swapped, not copied), the value-stack length, `completion`/
+`completion_is_empty`, `acc`, `strict`, `body_context`, `chain_short`, the
+`list`/`completion`/`var_ref`/`array_index` stack lengths, and `call_args`
+(when the leaf observes `arguments`) — plus the pre-existing clean-site
+guard: the caller's `try`/`pending`/for-of/for-in/destructure stacks and
+env stack must be empty, so the leaf's own `return`/`throw`/`break`/
+`continue` resolve against nothing but its own steps (they run through
+`run_inner_inner` directly, so a leaf error propagates raw to the caller's
+`run_inner`, which applies the caller's handler coverage, iterator close,
+and disposal with the caller's `ip` restored — exactly a nested call's
+path). A leaf runs with the caller's realm current, so the path is gated
+on a single realm. The construct shape (`new C(x)`) inlines the same way:
+`construct_this_object` + the base-constructor return rule, gated on the
+certified-construct conditions (base kind, no fields/private methods) plus
+`is_method`.
+
+Measured (5-run medians, release, vs Cut 24):
+
+| Row | before | after |
+|---|---|---|
+| function calls | ~256ms | **~174ms** (-32%) |
+| closure capture | ~255ms | **~172ms** (-33%) |
+| construct churn | ~135ms | **~118ms** (-13%) |
+
+Calls and closure dropped ~82ms each (the per-call machinery is now
+~90ns/call instead of ~197ns); construct drops the same pool/context
+round-trip. Arithmetic/property/array/per-iteration flat. Conformance at
+baseline: language 23,690/0/34, annexB 1,086/0/0, built-ins 23,656/0/154
+(2 load-tied hangs — the `Script_-_Balinese`/`Myanmar` property-escape
+generates pass individually); workspace tests 4311/0. The suite is now
+~0.83s (from ~1.01s). One construct-path gap found and fixed by the
+sweep: an object-literal method (`{ method() {} }`) is a certified leaf
+whose `new` must throw "not a constructor" — the inline construct path
+now checks `is_method`.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

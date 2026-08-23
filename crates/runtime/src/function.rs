@@ -2000,7 +2000,10 @@ fn is_revoked_proxy(value: &Value) -> bool {
 /// constructor call — newTarget's `prototype` (an object — including a
 /// function value), falling back to %Object.prototype% when it isn't an
 /// object (S13.2.2_A3_T1).
-fn construct_this_object(agent: &mut Agent, new_target: &Value) -> Result<Value, JsError> {
+pub(crate) fn construct_this_object(
+    agent: &mut Agent,
+    new_target: &Value,
+) -> Result<Value, JsError> {
     let prototype = crate::context::get_property(
         agent,
         new_target,
