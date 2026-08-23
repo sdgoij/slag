@@ -41,6 +41,12 @@ impl Realm {
 #[derive(Debug, Default)]
 pub struct Intrinsics {
     entries: RefCell<HashMap<JsString, Value>>,
+    /// Cut 26: the realm's %Object.prototype% handle, cached after the first
+    /// resolution — the intrinsics table is populated at bootstrap and never
+    /// reassigned, so the handle is stable for the realm's life. Object
+    /// literals (`ObjectBegin`) and constructor `this` fallbacks read it per
+    /// object creation.
+    object_prototype: RefCell<Option<Value>>,
 }
 
 impl Intrinsics {
@@ -49,6 +55,17 @@ impl Intrinsics {
             .borrow()
             .get(&JsString::from_utf8(name))
             .cloned()
+    }
+
+    /// The realm's %Object.prototype% value, cached after the first
+    /// resolution (see the struct field).
+    pub fn object_prototype(&self) -> Option<Value> {
+        if let Some(value) = self.object_prototype.borrow().as_ref() {
+            return Some(value.clone());
+        }
+        let value = self.get("%Object.prototype%")?;
+        *self.object_prototype.borrow_mut() = Some(value.clone());
+        Some(value)
     }
 
     pub fn define(&self, name: &str, value: Value) {

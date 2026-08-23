@@ -107,6 +107,13 @@ pub struct Agent {
     /// `return` on the AIP chain. Re-validated against the three shared
     /// objects' generations.
     pub(crate) for_of_fast_cells: [Option<ForOfFastVerdict>; crate::ir::MEMBER_CELLS],
+    /// The cached `prototype` read of each constructor function (Cut 26):
+    /// `new C()` runs OrdinaryCreateFromConstructor's property read per
+    /// construct; the value is re-validated against the function object's
+    /// generation counter (Cut 22's mechanism — a redefine/delete bumps
+    /// it), so a hot construct loop pays a HashMap probe instead of the
+    /// full property path.
+    pub(crate) construct_prototypes: RefCell<std::collections::HashMap<u64, (u32, Value)>>,
     /// The free-list of Vms for per-call reuse: `run_compiled_body`, the
     /// construct fast path, and the script/eval paths take one, run, and
     /// return it — a pooled Vm is never handed to a suspended
@@ -471,6 +478,7 @@ impl Agent {
             array_element_cells: [None; crate::ir::MEMBER_CELLS],
             member_store_cells: [None; crate::ir::MEMBER_CELLS],
             for_of_fast_cells: std::array::from_fn(|_| None),
+            construct_prototypes: RefCell::new(std::collections::HashMap::new()),
             vm_pool: Vec::new(),
             promise_jobs: VecDeque::new(),
             generic_jobs: VecDeque::new(),

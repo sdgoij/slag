@@ -837,6 +837,49 @@ sweep: an object-literal method (`{ method() {} }`) is a certified leaf
 whose `new` must throw "not a constructor" — the inline construct path
 now checks `is_method`.
 
+### Cut 26 — construct-this prototype cache and function-object member cells (measured 2026-08-23)
+
+A construct-path decomposition (the `new C(i)` bench row) showed the
+per-construct cost split three ways: OrdinaryCreateFromConstructor's
+`prototype` read ran the full property path (~280ns — own-scan + chain
+walk), the fresh object's creation paid the `%Object.prototype%`
+intrinsics HashMap lookup per create, and — a surprise — every own-data
+read on a FUNCTION value took ~310ns vs ~60ns on a plain object: the
+P3 member cells only accepted `ValueKind::Object`, so a function's
+`length`/`name`/`prototype`/custom properties fell through to the full
+Get on every access.
+
+- **Function member cells**: `member_cell_get`/`resolve_member_cell` now
+  serve `ValueKind::Function` values through the function's underlying
+  ordinary object (same slot→key→kind re-validation, same proto-keyed
+  fallback) — `C.prototype`-style reads cache like any own data read.
+- **Construct-this prototype cache**: `construct_this_object` caches the
+  constructor's `prototype` read per function id on the agent, re-validated
+  against the function object's generation counter (Cut 22's mechanism — a
+  redefine/delete bumps it, so a stale entry re-reads). Proxies and other
+  exotic newTargets stay on the uncached path (their `prototype` read can
+  run traps).
+- **`%Object.prototype%` intrinsics cache**: `Intrinsics::object_prototype`
+  resolves the realm's `%Object.prototype%` once (the intrinsics table is
+  fixed at bootstrap) and serves `ObjectBegin` and the construct fallback
+  from a cached handle.
+
+Measured (5-run medians, release, vs Cut 25):
+
+| Row | before | after |
+|---|---|---|
+| construct churn | ~118ms | **~82ms** (-30%) |
+| function calls | ~174ms | ~162ms |
+| closure capture | ~172ms | ~165ms |
+
+Function-property probe reads dropped ~310→~90ns; the object-literal
+probe ~320→~140ns. Calls/closure moved a few ms (noise band);
+arith/property/array/per-iteration flat. Conformance at baseline: language
+23,690/0/34, annexB 1,086/0/0, built-ins 23,651/0/154 (7 load-tied
+`RegExp/property-escapes/generated/*` hangs, the known slow set — the
+15s sweep-timeout rule classifies them as real hangs); workspace tests
+4311/0. The suite is now ~0.77s (from ~0.83s).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

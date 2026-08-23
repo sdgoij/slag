@@ -1852,20 +1852,43 @@ impl Vm {
         (object_id as usize ^ name as usize) & (MEMBER_CELLS - 1)
     }
 
+    /// The object part of a value whose own properties the member cells can
+    /// serve: plain/array objects and functions (a function's own data
+    /// properties — `length`/`name`/`prototype` — live in the ordinary
+    /// object's property vector, so `C.prototype` caches like any own data
+    /// read). Every other kind (typed arrays, proxies, boxed primitives)
+    /// stays on the full Get path.
+    fn cell_object(value: &Value) -> Option<Handle<crux::object::JsObject>> {
+        match value.kind() {
+            ValueKind::Object(object)
+                if matches!(
+                    object.kind,
+                    crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array
+                ) =>
+            {
+                Some(object.clone())
+            }
+            ValueKind::Function(function) => {
+                let object = &function.object;
+                if matches!(
+                    object.kind,
+                    crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array
+                ) {
+                    Some(object.clone())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// The cached read of `object.name` — an own data property on a plain
     /// object at the direct-mapped slot, re-validated against the stored key
     /// and property kind. `None` falls back to the full Get (which then
     /// re-resolves the cache).
     fn member_cell_get(agent: &Agent, object: &Value, name: crux::AtomId) -> Option<Value> {
-        let ValueKind::Object(object) = object.kind() else {
-            return None;
-        };
-        if !matches!(
-            object.kind,
-            crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array
-        ) {
-            return None;
-        }
+        let object = Self::cell_object(object)?;
         let index = Self::member_cell_index(object.id(), name);
         let slot = match agent.member_cells[index] {
             Some((cached_id, cached_name, slot))
@@ -2045,15 +2068,9 @@ impl Vm {
     /// Resolve and cache the slot of `object`'s own data property for
     /// `name` (only plain ordinary/array objects use the linear store).
     fn resolve_member_cell(agent: &mut Agent, object: &Value, name: crux::AtomId) {
-        let ValueKind::Object(object) = object.kind() else {
+        let Some(object) = Self::cell_object(object) else {
             return;
         };
-        if !matches!(
-            object.kind,
-            crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array
-        ) {
-            return;
-        }
         let key = PropertyKey::String(name);
         if let Some(slot) = object.property_slot(&key) {
             let props = object.properties.borrow();
@@ -3786,7 +3803,7 @@ impl Vm {
                     let proto = agent
                         .current_realm()?
                         .intrinsics
-                        .get("%Object.prototype%")
+                        .object_prototype()
                         .and_then(|value| crate::context::as_object(&value));
                     let object = crux::object::JsObject::ordinary_object_create(proto);
                     self.stack.push(Value::Object(object));

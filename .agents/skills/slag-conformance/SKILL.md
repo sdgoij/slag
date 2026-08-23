@@ -16,13 +16,15 @@ over the vendored test262 submodule. The engine's own test suite is
   — a stale binary silently measures old code. If results look wrong, check
   the binary's timestamp against `crates/**/*.rs` before debugging the engine.
 - Full area: `target/release/sweep.exe language --jobs 8 --batch 32
-  --timeout 120 --recheck-timeout 120 --json > out.json` (areas:
+  --timeout 15 --recheck-timeout 15 --json > out.json` (areas:
   `language` | `built-ins` | `annexB` | `all`). The JSON has
   `total/pass/fail/skip/crash/hang` plus `failures` and `hangs` arrays;
   the `failures` array holds fail AND crash entries (the summary `fail`
-  and `crash` counts are separate). Use the long deadlines — the default
-  recheck is too short for the O(n²) crash-test fixtures and misclassifies
-  them as hangs.
+  and `crash` counts are separate). HARD RULE: never pass a timeout above
+  15 seconds — anything that cannot finish within 15 seconds is by
+  definition too slow, and a fixture classified as a `hang` under the 15s
+  deadline is a real result (re-run it individually only to confirm it is
+  genuinely slow, never to reclassify it away).
 - Cluster: `--list FILE` where every line is an AREA-ROOT-RELATIVE path
   (`import/import-defer/x.js`, never `language/import/…`). Generate the
   list with a frontmatter-aware walk (Python or `tools/skip_tally.js` style

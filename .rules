@@ -30,6 +30,15 @@ See the following skills for full details:
 - **Testing requirements**: `minix-testing` skill
 - **Commit message format**: `git-commit-messages` skill
 
+## Sweep timeouts
+
+**Hard rule: never run a test262 sweep with a timeout above 15 seconds.**
+Use `--timeout 15 --recheck-timeout 15` (or the default). Anything that
+cannot finish in 15 seconds is by definition too slow — a `hang` under the
+15s deadline is a real result, not something to reclassify with a longer
+deadline. (Overrides the older "use long deadlines" advice in the
+`slag-conformance` skill, which is updated to match.)
+
 ## Boot process dependencies
 
 VM is now a boot process (`/sbin/vm` at slot 8) and manages all `brk()`

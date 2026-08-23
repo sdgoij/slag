@@ -2004,12 +2004,41 @@ pub(crate) fn construct_this_object(
     agent: &mut Agent,
     new_target: &Value,
 ) -> Result<Value, JsError> {
-    let prototype = crate::context::get_property(
-        agent,
-        new_target,
-        &JsString::from_utf8("prototype"),
-        new_target.clone(),
-    )?;
+    // Cut 26: cache the constructor's `prototype` read per function id,
+    // re-validated against the function object's generation counter (Cut
+    // 22's mechanism — a redefine/delete bumps it, so a stale entry misses
+    // and re-reads). The construct bench's `new C(i)` ran the full property
+    // path (own-scan + chain walk) per construct; a proxy or other exotic
+    // newTarget stays on the uncached path (its `prototype` read can run
+    // traps).
+    let prototype = if let ValueKind::Function(function) = new_target.kind() {
+        let generation = function.object.generation();
+        if let Some(&(cached_generation, ref cached)) =
+            agent.construct_prototypes.borrow().get(&function.id())
+            && cached_generation == generation
+        {
+            cached.clone()
+        } else {
+            let value = crate::context::get_property(
+                agent,
+                new_target,
+                &JsString::from_utf8("prototype"),
+                new_target.clone(),
+            )?;
+            agent
+                .construct_prototypes
+                .borrow_mut()
+                .insert(function.id(), (generation, value.clone()));
+            value
+        }
+    } else {
+        crate::context::get_property(
+            agent,
+            new_target,
+            &JsString::from_utf8("prototype"),
+            new_target.clone(),
+        )?
+    };
     let proto = match crate::context::as_object(&prototype) {
         Some(obj) => Some(obj),
         None => {
@@ -2022,7 +2051,7 @@ pub(crate) fn construct_this_object(
             }
             crate::context::get_function_realm(agent, new_target)?
                 .intrinsics
-                .get("%Object.prototype%")
+                .object_prototype()
                 .and_then(|value| crate::context::as_object(&value))
         }
     };
