@@ -196,6 +196,15 @@ arguments state.
   member-cell cache, fast array element read, property-key conversion).
   Reads compose with the other register ops (`return o.x + 1` lowers),
   and getters run through the same agent-side machinery on this Vm.
+- **`RunRegBody` runs register-lowered LOOP bodies** (Cut 35 slice 9): the
+  certified canonical `for` and for-of/in bodies lower via
+  `lower_leaf_ops` (the value-free `ListBegin`/`ListEnd`/reset/normalize
+  wrappers are skipped) and run in one dispatch against the current
+  frame. The register ops address slots via `frame_get`/`frame_set` — the
+  leaf path resolves through `leaf_frame_base` (the stack segment), the
+  script path through the inline `Frame` — so the same ops serve both. A
+  body with a jump/`PushAcc`/two-read shape stays on the step path; the
+  accumulator-loop counter survives via the step's save/restore.
 - Errors propagate raw to the caller's `run_inner` exactly like a
   step-path leaf (a register body may throw from `apply_binary`/TDZ
   checks). Register-op semantics mirror the step semantics 1:1 — when you

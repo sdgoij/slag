@@ -1454,6 +1454,37 @@ Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
 conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
 23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
 
+### Cut 35 slice 9 — register loop bodies (measured 2026-08-23)
+
+The remaining bench rows were already on the frame path — the costs were
+script-level step dispatches in the loop bodies. `Step::RunRegBody` runs a
+register-lowered loop body against the current frame in one dispatch: the
+ops address the frame through `frame_get`/`frame_set` (the register
+ops were refactored off the explicit stack base — the leaf path resolves
+via `leaf_frame_base`, the script path via the inline `Frame`), the
+accumulator is saved and restored around the run (the accumulator-loop
+counter), the transient stack use is truncated to the entry length, and
+the body's completion is left to the loop machinery (a throwing op
+propagates after the restore).
+
+The compiler emits `RunRegBody` in the certified canonical `for` and the
+for-of/in loop bodies when `lower_leaf_ops` accepts the body steps (the
+value-free `ListBegin`/`ListEnd`/reset/normalize wrappers are now
+skipped by the lowering too, so a block-wrapped leaf body lowers as
+well). The array-iteration inner body (`n += v`) becomes `[LoadReg(n),
+BinReg(Add, v), StoreReg(n)]` in one dispatch; bodies with jumps
+(break/continue), `PushAcc` counter reads, or two-member-read shapes
+(`o.a + o.b`) stay on the step path.
+
+Measured: array iteration ~71 -> ~60.5ms; the other rows unchanged. The
+16-case probe (`scratch/run_reg_body_probe.js`) covers the counter
+preservation, non-lowering fallbacks, the throwing-body error path,
+nested loops, string-append bodies, and member-store loop bodies.
+
+Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
+conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
+23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

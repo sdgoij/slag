@@ -711,6 +711,16 @@ pub enum Step {
     FastLoopStore {
         var: FastLoopVar,
     },
+    /// Run a register-lowered loop body (Cut 35 slice 9): the ops address
+    /// the current frame — the script's inline frame here (the leaf path
+    /// uses the stack segment via `leaf_frame_base`) — with the caller's
+    /// accumulator saved and restored around the run (the accumulator-loop
+    /// counter). The body's transient stack use (a member store's pushed
+    /// result) is truncated to the entry length; the completion is left
+    /// untouched (the loop machinery owns the loop's completion).
+    RunRegBody {
+        ops: Box<[LeafOp]>,
+    },
     /// Push the fused loop counter (`Vm::acc`) onto the value stack: the
     /// body's redirected reads of the counter.
     PushAcc,
@@ -4795,6 +4805,26 @@ impl Vm {
                 Step::FastLoopStore { var } => {
                     self.fast_loop_store(agent, *var)?;
                 }
+                Step::RunRegBody { ops } => {
+                    // The register body addresses the current frame (the
+                    // script's inline frame — `leaf_frame_base` is `None`
+                    // here, so `frame_get` uses the `Frame`), saves and
+                    // restores the accumulator (the accumulator-loop
+                    // counter), and truncates its transient stack use. The
+                    // body's completion is discarded — the loop machinery
+                    // owns the loop's completion — but a throwing op
+                    // (TDZ, a setter, a coercion) propagates after the
+                    // restore, like a throwing leaf.
+                    let stack_len = self.stack.len();
+                    let caller_acc = std::mem::replace(&mut self.acc, Value::Undefined);
+                    let outcome = self.run_leaf_ops(agent, ops);
+                    self.stack.truncate(stack_len);
+                    self.acc = caller_acc;
+                    match outcome {
+                        Ok(_) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
                 Step::PushAcc => {
                     self.stack.push(self.acc.clone());
                 }
@@ -6172,7 +6202,7 @@ impl Vm {
             debug_assert!(!ir.leaf_uses_env);
             (None, None)
         };
-        let outcome = self.run_leaf_ops(agent, ops, frame_base);
+        let outcome = self.run_leaf_ops(agent, ops);
         self.leaf_frame_base = caller_leaf_frame_base;
         // An aliased frame lives in the caller's argument region, which the
         // caller truncates; only a pushed frame is unwound here.
@@ -6197,16 +6227,11 @@ impl Vm {
     /// `ReturnAcc`; the fall-off default completes `Empty` like the step
     /// path's end-of-steps completion.
     #[inline(always)]
-    fn run_leaf_ops(
-        &mut self,
-        agent: &mut Agent,
-        ops: &[LeafOp],
-        frame_base: usize,
-    ) -> Result<Completion, JsError> {
+    fn run_leaf_ops(&mut self, agent: &mut Agent, ops: &[LeafOp]) -> Result<Completion, JsError> {
         for op in ops {
             match op {
                 LeafOp::LoadReg { slot, tdz } => {
-                    let value = self.stack[frame_base + slot].clone();
+                    let value = self.frame_get(*slot).clone();
                     if *tdz && value.is_uninitialized() {
                         return Err(JsError::new(
                             ErrorKind::ReferenceError,
@@ -6253,18 +6278,14 @@ impl Vm {
                 }
                 LeafOp::LoadConst(value) => self.acc = value.clone(),
                 LeafOp::BinReg { op, slot, tdz } => {
-                    if *tdz && self.stack[frame_base + slot].is_uninitialized() {
+                    if *tdz && self.frame_get(*slot).is_uninitialized() {
                         return Err(JsError::new(
                             ErrorKind::ReferenceError,
                             "Cannot access a binding before initialization".into(),
                         ));
                     }
-                    self.acc = crate::expr::apply_binary(
-                        agent,
-                        *op,
-                        &self.acc,
-                        &self.stack[frame_base + slot],
-                    )?;
+                    self.acc =
+                        crate::expr::apply_binary(agent, *op, &self.acc, self.frame_get(*slot))?;
                 }
                 LeafOp::BinContext { op, index } => {
                     // The `context_chain_env(0)` transparent-env walk (see
@@ -6338,13 +6359,13 @@ impl Vm {
                     self.acc = value;
                 }
                 LeafOp::StoreReg { slot, tdz } => {
-                    if *tdz && self.stack[frame_base + slot].is_uninitialized() {
+                    if *tdz && self.frame_get(*slot).is_uninitialized() {
                         return Err(JsError::new(
                             ErrorKind::ReferenceError,
                             "Cannot access a binding before initialization".into(),
                         ));
                     }
-                    self.stack[frame_base + slot] = self.acc.clone();
+                    *self.frame_get_mut(*slot) = self.acc.clone();
                 }
                 LeafOp::StoreMemberName { name, value } => {
                     // The object is the accumulator; the value comes from the
@@ -6355,7 +6376,7 @@ impl Vm {
                     if is_nullish(&object) {
                         return Err(nullish_error("Cannot set properties of null"));
                     }
-                    let value = self.leaf_operand_value(frame_base, value)?;
+                    let value = self.leaf_operand_value(value)?;
                     self.assign_member(
                         agent,
                         object,
@@ -6371,8 +6392,8 @@ impl Vm {
                     // load would have clobbered it). Shares the fast-array
                     // and property-key machinery with the step path.
                     let object = self.acc.clone();
-                    let key = self.leaf_operand_value(frame_base, key)?;
-                    let value = self.leaf_operand_value(frame_base, value)?;
+                    let key = self.leaf_operand_value(key)?;
+                    let value = self.leaf_operand_value(value)?;
                     self.assign_computed_plain(agent, object, key, value)?;
                 }
                 LeafOp::GetMemberName { name } => {
@@ -6381,7 +6402,7 @@ impl Vm {
                 }
                 LeafOp::GetMemberComputed { key } => {
                     let object = self.acc.clone();
-                    let key = self.leaf_operand_value(frame_base, key)?;
+                    let key = self.leaf_operand_value(key)?;
                     self.acc = self.get_member_computed(agent, object, key)?;
                 }
                 LeafOp::ReturnAcc => {
@@ -6395,15 +6416,11 @@ impl Vm {
     /// Load a register operand to a value for a store op, mirroring the
     /// `LoadReg`/`LoadContext`/`LoadPerIter`/`LoadConst` ops' semantics
     /// (including the TDZ and context-transparent-env walks).
-    fn leaf_operand_value(
-        &self,
-        frame_base: usize,
-        operand: &RegOperand,
-    ) -> Result<Value, JsError> {
+    fn leaf_operand_value(&self, operand: &RegOperand) -> Result<Value, JsError> {
         match operand {
             RegOperand::Acc => Ok(self.acc.clone()),
             RegOperand::Reg { slot, tdz } => {
-                let value = self.stack[frame_base + slot].clone();
+                let value = self.frame_get(*slot).clone();
                 if *tdz && value.is_uninitialized() {
                     return Err(JsError::new(
                         ErrorKind::ReferenceError,
@@ -9933,7 +9950,24 @@ impl Compiler {
                         let body_start = self.new_label();
                         self.place(body_start);
                         let saved = self.acc_binding.replace(name);
+                        let body_steps = self.steps.len();
+                        let body_fixups = self.fixups.len();
                         self.compile_statement(body)?;
+                        // Cut 35 slice 9: a body that lowers to register ops
+                        // runs on the register executor in one dispatch
+                        // (`RunRegBody` saves/restores the accumulator
+                        // counter). `lower_leaf_ops` rejects any jump/
+                        // env/control step, so a break/continue/with/etc.
+                        // keeps the step path.
+                        if let Some(ops) = self
+                            .scope
+                            .as_ref()
+                            .and_then(|scope| lower_leaf_ops(&self.steps[body_steps..], scope))
+                        {
+                            self.steps.truncate(body_steps);
+                            self.fixups.truncate(body_fixups);
+                            self.emit(Step::RunRegBody { ops });
+                        }
                         self.acc_binding = saved;
                         self.place(continue_label);
                         let index = self.steps.len();
@@ -10152,7 +10186,23 @@ impl Compiler {
             }
             self.emit_certified_for_bind(*name, *kind);
         }
+        let body_steps = self.steps.len();
+        let body_fixups = self.fixups.len();
         self.compile_statement(body)?;
+        // Cut 35 slice 9: a body that lowers to register ops runs on the
+        // register executor in one dispatch (`RunRegBody` saves/restores
+        // the enclosing accumulator-loop counter). `lower_leaf_ops` rejects
+        // any jump/env/control step, so a break/continue/etc. keeps the
+        // step path.
+        if let Some(ops) = self
+            .scope
+            .as_ref()
+            .and_then(|scope| lower_leaf_ops(&self.steps[body_steps..], scope))
+        {
+            self.steps.truncate(body_steps);
+            self.fixups.truncate(body_fixups);
+            self.emit(Step::RunRegBody { ops });
+        }
         self.place(continue_label);
         if lexical && captured {
             self.emit(Step::PerIteration {
@@ -13007,8 +13057,14 @@ fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
             }
             // A statement's completion is only read at the body's end, where
             // the register path's `Empty` maps identically to the step path's
-            // `Normal` for leaf calls and constructs — nothing to emit.
-            Step::SetCompletion => {}
+            // `Normal` for leaf calls and constructs — nothing to emit. The
+            // statement-list and reset/normalize wrappers (a block body, a
+            // loop body) carry no values, so they are skipped too.
+            Step::SetCompletion
+            | Step::ListBegin
+            | Step::ListEnd
+            | Step::ResetCompletion
+            | Step::NormalizeCompletion => {}
             Step::Return => {
                 // A leaf body's `return` is its last statement; dead code
                 // after it (hoisted-var initializers) keeps the step path.
