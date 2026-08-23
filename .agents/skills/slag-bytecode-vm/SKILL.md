@@ -257,6 +257,16 @@ arguments state.
   re-resolves. Both cache-hit paths must re-check `can_inline_leaf` and
   `realms` per call (they are per-call-site state, not callee
   properties). `Value::heap_payload` is `None` for doubles.
+- **The array element and length reads are generation-validated** (Cut 35
+  slice 13): `array_element_get` fronts its slot cache with (id, index,
+  generation, value) and `array_length` with (id, generation, length) —
+  a generation match skips the property-vector borrow and validation.
+  Sound for the same reason as the member value cache: slice 11 made
+  every array mutation (in-place element writes via `set_key`/
+  `array_element_write`, dense appends, length updates, defines,
+  deletes) bump the generation. The for-of fast path re-reads the
+  length and each element every step (stock iterator semantics), so
+  these caches are what make the array-iteration row fast.
 - Errors propagate raw to the caller's `run_inner` exactly like a
   step-path leaf (a register body may throw from `apply_binary`/TDZ
   checks). Register-op semantics mirror the step semantics 1:1 — when you

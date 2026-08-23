@@ -1298,6 +1298,26 @@ const INLINE_FRAME: usize = 8;
 /// The direct-mapped member-access cell count (P3): a power of two so the
 /// cache index is a mask.
 pub(crate) const MEMBER_CELLS: usize = 16;
+/// The read-side array-element value cache entry (Cut 35 slice 13): the
+/// cached value of `array[index]` at the array's generation — a generation
+/// match means no own-property change since the read (slice 11 bumps every
+/// mutation, including in-place element writes), so the value is current
+/// without re-borrowing the property vector.
+pub(crate) struct ArrayElementValueCell {
+    pub id: u64,
+    pub index: u64,
+    pub generation: u32,
+    pub value: Value,
+}
+/// The array-length cache entry (Cut 35 slice 13): the cached length of a
+/// plain Array at its generation — the for-of fast path re-reads the length
+/// every step, and a generation match skips the property-vector borrow and
+/// the number conversion.
+pub(crate) struct ArrayLengthCell {
+    pub id: u64,
+    pub generation: u32,
+    pub length: u64,
+}
 /// The write-side chain-cache entry (Cut 22): (prototype id, key atom,
 /// walked-chain length, per-link generations).
 pub(crate) type MemberStoreCell = (u64, crux::AtomId, u32, [u32; 4]);
@@ -2411,7 +2431,9 @@ impl Vm {
     /// The cached read of `object[index]` — an own data element of a plain
     /// Array at the direct-mapped slot, re-validated against the stored key
     /// atom. `None` falls back to the full Get (which then re-resolves).
-    fn array_element_get(agent: &Agent, object: &Value, index: u64) -> Option<Value> {
+    /// The fronting value cache (Cut 35 slice 13) returns the element with
+    /// no property-vector borrow when the array's generation matches.
+    fn array_element_get(agent: &mut Agent, object: &Value, index: u64) -> Option<Value> {
         let ValueKind::Object(object) = object.kind() else {
             return None;
         };
@@ -2419,6 +2441,13 @@ impl Vm {
             return None;
         }
         let cache_index = Self::array_element_index(object.id(), index);
+        if let Some(cell) = agent.array_element_value_cells[cache_index].as_ref()
+            && cell.id == object.id()
+            && cell.index == index
+            && cell.generation == object.generation()
+        {
+            return Some(cell.value.clone());
+        }
         let (cached_id, cached_index, atom, slot) = agent.array_element_cells[cache_index]?;
         if cached_id != object.id() || cached_index != index {
             return None;
@@ -2429,7 +2458,16 @@ impl Vm {
             return None;
         }
         match &property.kind {
-            crux::object::PropertyKind::Data { value, .. } => Some(value.clone()),
+            crux::object::PropertyKind::Data { value, .. } => {
+                let value = value.clone();
+                agent.array_element_value_cells[cache_index] = Some(ArrayElementValueCell {
+                    id: object.id(),
+                    index,
+                    generation: object.generation(),
+                    value: value.clone(),
+                });
+                Some(value)
+            }
             _ => None,
         }
     }
@@ -2453,17 +2491,30 @@ impl Vm {
             let props = object.properties.borrow();
             if let Some((stored, property)) = props.get(slot)
                 && *stored == PropertyKey::String(atom)
-                && matches!(property.kind, crux::object::PropertyKind::Data { .. })
+                && let crux::object::PropertyKind::Data { value, .. } = &property.kind
             {
                 let cache_index = Self::array_element_index(object.id(), index);
                 agent.array_element_cells[cache_index] = Some((object.id(), index, atom, slot));
+                agent.array_element_value_cells[cache_index] = Some(ArrayElementValueCell {
+                    id: object.id(),
+                    index,
+                    generation: object.generation(),
+                    value: value.clone(),
+                });
             }
         }
     }
 
+    /// The direct-mapped cache index for an array's length.
+    fn array_length_index(object_id: u64) -> usize {
+        object_id as usize & (MEMBER_CELLS - 1)
+    }
+
     /// The length of a plain Array — always the first property-vector entry
     /// (the stock Array iterator re-reads it every step, so this matches).
-    /// Defensively falls back to the generic read.
+    /// The fronting length cache (Cut 35 slice 13) skips the borrow and
+    /// number conversion when the array's generation matches. Defensively
+    /// falls back to the generic read.
     fn array_length(agent: &mut Agent, array: &Value) -> Result<u64, JsError> {
         let ValueKind::Object(obj) = array.kind() else {
             return Err(JsError::new(
@@ -2471,12 +2522,25 @@ impl Vm {
                 "Array length of a non-object".into(),
             ));
         };
+        let cache_index = Self::array_length_index(obj.id());
+        if let Some(cell) = agent.array_length_cells[cache_index].as_ref()
+            && cell.id == obj.id()
+            && cell.generation == obj.generation()
+        {
+            return Ok(cell.length);
+        }
         let props = obj.properties.borrow();
         if let Some((_, property)) = props.first()
             && let crux::object::PropertyKind::Data { value, .. } = &property.kind
         {
             let number = crate::context::to_number(agent, value)?;
-            return Ok(crux::convert::to_length(number));
+            let length = crux::convert::to_length(number);
+            agent.array_length_cells[cache_index] = Some(ArrayLengthCell {
+                id: obj.id(),
+                generation: obj.generation(),
+                length,
+            });
+            return Ok(length);
         }
         let length_value = crate::context::get_property(
             agent,

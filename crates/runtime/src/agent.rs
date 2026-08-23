@@ -104,6 +104,16 @@ pub struct Agent {
     /// footprint stays small (the Cut 27 lesson).
     pub(crate) member_value_cells:
         Box<[Option<crate::ir::MemberValueCell>; crate::ir::MEMBER_CELLS]>,
+    /// The fronting array-element value cache (Cut 35 slice 13): (id, index,
+    /// generation, value) — a hit returns the element with no
+    /// property-vector borrow. Boxed per the Cut 27 lesson.
+    pub(crate) array_element_value_cells:
+        Box<[Option<crate::ir::ArrayElementValueCell>; crate::ir::MEMBER_CELLS]>,
+    /// The array-length cache (Cut 35 slice 13): (id, generation, length) —
+    /// a hit skips the borrow and number conversion the for-of fast path
+    /// pays every step. Boxed per the Cut 27 lesson.
+    pub(crate) array_length_cells:
+        Box<[Option<crate::ir::ArrayLengthCell>; crate::ir::MEMBER_CELLS]>,
     /// The proto-keyed read-cell fallback (Cut 23): `(prototype id, name) →
     /// slot` — fresh objects (a constructor's new `this`) share the
     /// prototype's shape, so the slot cached for the prototype is validated
@@ -510,6 +520,8 @@ impl Agent {
             slot_leaf_cells: Box::new(std::array::from_fn(|_| None)),
             member_cells: [None; crate::ir::MEMBER_CELLS],
             member_value_cells: Box::new(std::array::from_fn(|_| None)),
+            array_element_value_cells: Box::new(std::array::from_fn(|_| None)),
+            array_length_cells: Box::new(std::array::from_fn(|_| None)),
             member_proto_cells: [None; crate::ir::MEMBER_CELLS],
             array_element_cells: [None; crate::ir::MEMBER_CELLS],
             member_store_cells: [None; crate::ir::MEMBER_CELLS],

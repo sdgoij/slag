@@ -1612,6 +1612,33 @@ Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
 conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
 23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
 
+### Cut 35 slice 13 — generation-validated array element and length caches (measured 2026-08-23)
+
+The for-of fast path re-reads the array's length and each element every
+step (the stock iterator semantics), each read doing a `kind()` + a
+property-vector borrow + a validation. Slice 11's generation coverage
+(in-place element writes, dense appends, and the length updates all
+bump) makes both reads cacheable by generation:
+
+- **`array_element_value_cells`** — (array id, index, generation, value)
+  fronts `array_element_get`: a generation match returns the element with
+  no borrow or key/kind re-check. `resolve_array_element` fills it on
+  every resolve, and the computed member-read path (`a[i]`) shares the
+  same fast read.
+- **`array_length_cells`** — (array id, generation, length) fronts
+  `array_length`: a generation match skips the borrow and the number
+  conversion the for-of head pays every step.
+
+Measured: array iteration ~58 -> ~44ms; the other rows unchanged. The
+10-case probe (`scratch/slice13_probe.js`) covers the sums, in-place
+and push mutations observed by the same loop, direct length sets,
+holes, two-array cache separation, `a[i]` computed reads, mutations
+between passes, truncate-and-grow, and sparse arrays.
+
+Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
+conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
+23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
