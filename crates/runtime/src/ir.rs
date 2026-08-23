@@ -895,6 +895,12 @@ pub enum LeafOp {
         name: crux::AtomId,
         value: RegOperand,
     },
+    /// Write `value` onto the object in the accumulator under the computed
+    /// `key` (the plain-assign computed member store, `Step::AssignMemberComputed`
+    /// with a plain `=`): the shared `assign_computed_plain` fast-array and
+    /// property-key machinery. Neither operand may be `Acc` — the object
+    /// load would clobber it.
+    StoreMemberComputed { key: RegOperand, value: RegOperand },
     /// Complete with `Completion::Return(acc)`.
     ReturnAcc,
 }
@@ -3292,37 +3298,21 @@ impl Vm {
                     };
                     let key = self.pop();
                     let object = self.pop();
-                    if is_nullish(&object) {
-                        return Err(nullish_error("Cannot set properties of null"));
-                    }
-                    // Fast element write: a canonical Number index on a plain
-                    // Array (a Number key converts purely — ToPropertyKey runs
-                    // no user code), so the write skips the
-                    // number→string→intern round-trip and the [[Set]] chain
-                    // machinery; `array_element_write` falls back to the full
-                    // path on any doubt (accessor, non-writable length, proxy
-                    // on the chain, non-dense index, ...).
-                    if matches!(op, AssignOp::Assign)
-                        && let ValueKind::Number(number) = key.kind()
-                        && number.fract() == 0.0
-                        && (0.0..4294967295.0).contains(&number)
-                        && let ValueKind::Object(object_ref) = object.kind()
-                        && matches!(object_ref.kind, crux::object::ObjectKind::Array)
-                        && object_ref
-                            .array_element_write(number as u64, value.clone())?
-                            .is_some()
-                    {
-                        self.stack.push(value);
-                    } else {
+                    if let Some(old) = old {
+                        if is_nullish(&object) {
+                            return Err(nullish_error("Cannot set properties of null"));
+                        }
                         let key = crate::context::to_property_key(agent, &key)?;
                         self.assign_member(
                             agent,
                             object,
-                            PropertyKeyName::Key(key.clone()),
-                            old,
+                            PropertyKeyName::Key(key),
+                            Some(old),
                             value,
                             *op,
                         )?;
+                    } else {
+                        self.assign_computed_plain(agent, object, key, value)?;
                     }
                 }
                 Step::AssignSuperName { name, op } => {
@@ -5759,6 +5749,48 @@ impl Vm {
         Ok(())
     }
 
+    /// The plain-assign computed member store (spec 13.15.4): the shared
+    /// body of the `AssignMemberComputed` step's plain `=` path and the
+    /// register `StoreMemberComputed` op. The nullish check, the fast array
+    /// element write (a canonical Number index on a plain Array — the
+    /// number→string→intern and [[Set]] chain machinery are skipped;
+    /// `array_element_write` falls back on any doubt), then the
+    /// property-key conversion and `assign_member`. Pushes the assigned
+    /// value (the step path's result; the register frame truncate discards
+    /// it).
+    fn assign_computed_plain(
+        &mut self,
+        agent: &mut Agent,
+        object: Value,
+        key: Value,
+        value: Value,
+    ) -> Result<(), JsError> {
+        if is_nullish(&object) {
+            return Err(nullish_error("Cannot set properties of null"));
+        }
+        if let ValueKind::Number(number) = key.kind()
+            && number.fract() == 0.0
+            && (0.0..4294967295.0).contains(&number)
+            && let ValueKind::Object(object_ref) = object.kind()
+            && matches!(object_ref.kind, crux::object::ObjectKind::Array)
+            && object_ref
+                .array_element_write(number as u64, value.clone())?
+                .is_some()
+        {
+            self.stack.push(value);
+            return Ok(());
+        }
+        let key = crate::context::to_property_key(agent, &key)?;
+        self.assign_member(
+            agent,
+            object,
+            PropertyKeyName::Key(key),
+            None,
+            value,
+            AssignOp::Assign,
+        )
+    }
+
     fn assign_member(
         &mut self,
         agent: &mut Agent,
@@ -6307,6 +6339,16 @@ impl Vm {
                         value,
                         AssignOp::Assign,
                     )?;
+                }
+                LeafOp::StoreMemberComputed { key, value } => {
+                    // The object is the accumulator; the key and value come
+                    // from the operands (neither may be `Acc` — the object
+                    // load would have clobbered it). Shares the fast-array
+                    // and property-key machinery with the step path.
+                    let object = self.acc.clone();
+                    let key = self.leaf_operand_value(frame_base, key)?;
+                    let value = self.leaf_operand_value(frame_base, value)?;
+                    self.assign_computed_plain(agent, object, key, value)?;
                 }
                 LeafOp::ReturnAcc => {
                     return Ok(Completion::Return(self.acc.clone()));
@@ -12886,6 +12928,24 @@ fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
                 }
                 ops.push(LeafOp::StoreMemberName { name: *name, value });
             }
+            Step::AssignMemberComputed {
+                op: AssignOp::Assign,
+            } => {
+                // `o[k] = v` (plain `=` only; compound stays on the step
+                // path): the object is the accumulator, the key and value
+                // direct operands. A computed key or value (`Acc`) cannot be
+                // held while the object load overwrites the accumulator.
+                let value = stack.pop()?;
+                let key = stack.pop()?;
+                let object = stack.pop()?;
+                if matches!(key, RegOperand::Acc) || matches!(value, RegOperand::Acc) {
+                    return None;
+                }
+                if !load_operand(&mut ops, object) {
+                    return None;
+                }
+                ops.push(LeafOp::StoreMemberComputed { key, value });
+            }
             // A statement's completion is only read at the body's end, where
             // the register path's `Empty` maps identically to the step path's
             // `Normal` for leaf calls and constructs — nothing to emit.
@@ -12915,6 +12975,7 @@ fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
         Some(LeafOp::ReturnAcc)
         | Some(LeafOp::StoreReg { .. })
         | Some(LeafOp::StoreMemberName { .. })
+        | Some(LeafOp::StoreMemberComputed { .. })
         | None => {}
         _ => return None,
     }

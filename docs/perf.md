@@ -1402,6 +1402,33 @@ Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
 conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
 23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
 
+### Cut 35 slice 7 — register computed member stores (measured 2026-08-23)
+
+`LeafOp::StoreMemberComputed` extends the register member-store to
+computed keys: `o[k] = v` (plain `=` only) lowers with the object in the
+accumulator and the key + value as direct operands, and the executor
+shares the step path's machinery through an extracted
+`assign_computed_plain` helper — the nullish check, the fast array
+element write (canonical Number index on a plain Array, skipping the
+number→string→intern and [[Set]] chain work), then `to_property_key` +
+`assign_member`. The `AssignMemberComputed` step's plain `=` branch now
+calls the same helper, so the mirror stays exact.
+
+A computed key or value (`RegOperand::Acc`) keeps the body on the step
+path — the object load would clobber the accumulator (the same
+restriction as the binary ops and `StoreMemberName`). Compound computed
+assigns (`o[k] += v`) stay on the step path.
+
+Measured: construct churn ~35 -> ~33.5ms (the machinery + the step
+refactor; mostly noise at this scale). The 14-case probe
+(`scratch/store_member_computed_probe.js`) covers param/const keys and
+values, the array fast path, computed-key/value step-path fallbacks,
+compound assigns, construct `this[K] = x`, and the hot array-fill loop.
+
+Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
+conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
+23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

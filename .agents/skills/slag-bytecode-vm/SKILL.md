@@ -182,6 +182,13 @@ arguments state.
   is skipped by the lowering (the register path's `Empty` maps identically
   to the step path's `Normal` for leaf callers), and a body ending in a
   store — or empty — now lowers (fall-off completes `Empty`).
+- **`StoreMemberComputed` shares the step path's machinery** (Cut 35 slice
+  7): `o[k] = v` lowers with the key + value as operands (neither may be
+  `Acc` — the object load clobbers), and both the op and the
+  `AssignMemberComputed` step's plain `=` branch call the extracted
+  `assign_computed_plain` (nullish check, fast array element write,
+  `to_property_key` + `assign_member`) — extend the helper, not the two
+  call sites separately.
 - Errors propagate raw to the caller's `run_inner` exactly like a
   step-path leaf (a register body may throw from `apply_binary`/TDZ
   checks). Register-op semantics mirror the step semantics 1:1 — when you
