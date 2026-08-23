@@ -335,6 +335,17 @@ pub enum Step {
         argc: u8,
         direct_eval: bool,
     },
+    /// Cut 35 slice 2: a plain global-named callee called with an undefined
+    /// receiver (`f(x)` with `f` a declared script global, no `with`): the
+    /// receiver push and the callee load fuse into the call step — the
+    /// arguments are the top `argc` stack values, the callee is loaded from
+    /// the global cell inside the handler, and `this` is `undefined` (spec
+    /// 13.4.3). Two fewer dispatches per call in a hot loop.
+    CallFastGlobal {
+        name: crux::AtomId,
+        argc: u8,
+        direct_eval: bool,
+    },
     SuperCall,
     Construct,
     TaggedTemplate(syntax::ast::TemplateLiteral),
@@ -3838,6 +3849,13 @@ impl Vm {
                 Step::CallFast { argc, direct_eval } => {
                     self.do_call_fast(agent, *argc as usize, *direct_eval)?;
                 }
+                Step::CallFastGlobal {
+                    name,
+                    argc,
+                    direct_eval,
+                } => {
+                    self.do_call_fast_global(agent, *name, *argc as usize, *direct_eval)?;
+                }
                 Step::SuperCall => {
                     let base = self.args_base_stack.pop().ok_or_else(|| {
                         JsError::new(
@@ -6355,6 +6373,42 @@ impl Vm {
         let arg_start = n - argc;
         let callee = self.stack[arg_start - 1].clone();
         let this = self.stack[arg_start - 2].clone();
+        // The shared core: `below` values under the argument region (2 for
+        // `CallFast`'s `[this, callee]`) are removed with the arguments when
+        // the result replaces the call site.
+        self.fast_call_core(agent, argc, direct_eval, callee, this, 2)
+    }
+
+    /// The `CallFastGlobal` handler (Cut 35 slice 2): the callee comes from
+    /// the global cell and `this` is `undefined` — the compiler emitted no
+    /// receiver push or callee load, so the argument region is the top
+    /// `argc` values with nothing below it.
+    fn do_call_fast_global(
+        &mut self,
+        agent: &mut Agent,
+        name: crux::AtomId,
+        argc: usize,
+        direct_eval: bool,
+    ) -> Result<(), JsError> {
+        let callee = self.load_global_value(agent, name)?;
+        self.fast_call_core(agent, argc, direct_eval, callee, Value::Undefined, 0)
+    }
+
+    /// The shared fast-call core: `callee`/`this` as values, the arguments
+    /// as the top `argc` stack values, `below` values under them to truncate
+    /// with the arguments on completion. Covers the leaf-inline path (Cut
+    /// 25/34/35), direct eval, and the general call.
+    fn fast_call_core(
+        &mut self,
+        agent: &mut Agent,
+        argc: usize,
+        direct_eval: bool,
+        callee: Value,
+        this: Value,
+        below: usize,
+    ) -> Result<(), JsError> {
+        let n = self.stack.len();
+        let arg_start = n - argc;
         // Cut 25: inline a certified leaf call onto this Vm. The eligibility
         // checks are the cheap ones first; the record lookup is what the
         // general path pays anyway. A leaf is never eval (a builtin) and
@@ -6430,7 +6484,7 @@ impl Vm {
                 )?
             };
             let result = Self::leaf_completion_result(completion)?;
-            self.stack.truncate(arg_start - 2);
+            self.stack.truncate(arg_start - below);
             self.stack.push(result);
             return Ok(());
         }
@@ -6440,13 +6494,13 @@ impl Vm {
             // The `eval` builtin (spec 18.2.1 step 1): a non-string argument
             // is returned unchanged — only a primitive string is parsed.
             if !matches!(source.kind(), ValueKind::String(_)) {
-                self.stack.truncate(arg_start - 2);
+                self.stack.truncate(arg_start - below);
                 self.stack.push(source);
                 return Ok(());
             }
             let source = crux::convert::to_string(&source)?;
             let result = crate::script::perform_eval(agent, &source, self.strict, direct_eval)?;
-            self.stack.truncate(arg_start - 2);
+            self.stack.truncate(arg_start - below);
             self.stack.push(result);
             return Ok(());
         }
@@ -6457,7 +6511,7 @@ impl Vm {
             ));
         }
         let result = crate::function::call_inner(agent, &callee, this, args)?;
-        self.stack.truncate(arg_start - 2);
+        self.stack.truncate(arg_start - below);
         self.stack.push(result);
         Ok(())
     }
@@ -8617,15 +8671,35 @@ impl Compiler {
 
     /// Compile a call's arguments and the call step, skipping both when an
     /// upstream `?.` short-circuited: the whole chain is `undefined` (spec
-    /// 13.4.3).
+    /// 13.4.3). When no optional chain is open the guard is provably dead
+    /// (`chain_short` is set only inside a chain and cleared on leaving it,
+    /// and a parenthesized callee's own `?.` is cleared before the call) — a
+    /// plain `f(n)` in a hot loop would otherwise dispatch the guard's
+    /// `JumpIfChainShort`/`Jump` pair every iteration.
     fn compile_call_args_guarded(
         &mut self,
         args: &[Argument],
         direct_eval: bool,
     ) -> Result<(), JsError> {
+        if self.chain_depth == 0 {
+            return self.compile_call_args(args, direct_eval);
+        }
         let short = self.new_label();
         let end = self.new_label();
         self.jump_if_chain_short(short);
+        self.compile_call_args(args, direct_eval)?;
+        self.jump(end);
+        self.place(short);
+        self.emit(Step::Pop);
+        self.emit(Step::Pop);
+        self.emit(Step::Push(Value::Undefined));
+        self.place(end);
+        Ok(())
+    }
+
+    /// The argument compilation + call step (fast 0-2 args or the vector
+    /// form), shared by the guarded and unguarded call paths.
+    fn compile_call_args(&mut self, args: &[Argument], direct_eval: bool) -> Result<(), JsError> {
         match self.compile_arguments(args, true)? {
             Some(argc) => self.emit(Step::CallFast {
                 argc: argc as u8,
@@ -8633,12 +8707,6 @@ impl Compiler {
             }),
             None => self.emit(Step::Call { direct_eval }),
         }
-        self.jump(end);
-        self.place(short);
-        self.emit(Step::Pop);
-        self.emit(Step::Pop);
-        self.emit(Step::Push(Value::Undefined));
-        self.place(end);
         Ok(())
     }
 
@@ -12028,6 +12096,39 @@ impl Compiler {
             self.emit(Step::PopVarReference);
             return Ok(());
         }
+        // Cut 35 slice 2: a declared global-named callee with an undefined
+        // receiver fuses the receiver push and the callee load into the
+        // call step (2 fewer dispatches per call in a hot loop). Requires
+        // no `?.` on the call, no `with`, no `eval`, and no enclosing
+        // optional chain (`chain_depth == 0` — the guard would be dead
+        // anyway, so there is no short-circuit path to skip the call).
+        //
+        // The callee's GetValue (spec 13.4.3 step 2) moves after the
+        // arguments (step 4): the handler reads the global cell once the
+        // args are on the stack. Unobservable for a declared var's data
+        // property — the only divergence is a declared global redefined as
+        // an accessor, which the certified-script model (the direct-mapped
+        // global-cell cache) already treats as out of scope.
+        if !call.optional
+            && !direct_eval
+            && self.chain_depth == 0
+            && let ExprKind::Ident(name) = &callee.kind
+            && matches!(self.binding(*name), BindingLoc::Global)
+            && call.args.len() <= 2
+            && call.args.iter().all(|a| matches!(a, Argument::Expr(_)))
+        {
+            for argument in &call.args {
+                if let Argument::Expr(expr) = argument {
+                    self.compile_expr(expr)?;
+                }
+            }
+            self.emit(Step::CallFastGlobal {
+                name: *name,
+                argc: call.args.len() as u8,
+                direct_eval: false,
+            });
+            return Ok(());
+        }
         self.emit(Step::Push(Value::Undefined));
         self.compile_expr(&call.callee)?;
         if call.optional {
@@ -12349,6 +12450,7 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
             // own Vm. A leaf must contain none, so it cannot recurse.
             Step::Call { .. }
                 | Step::CallFast { .. }
+                | Step::CallFastGlobal { .. }
                 | Step::Construct
                 | Step::SuperCall
                 | Step::TaggedTemplate(_)
@@ -14381,6 +14483,967 @@ struct ScriptSlots {
 }
 
 /// Analyze a top-level script for the certified binding paths: the
+/// The vars the script assigns (initializers, `=`/compound assignments,
+/// `++`/`--`, for-of heads) — the epilogue write-back set (Cut 16).
+/// Collected as a prepass: the certified-function analysis needs it to
+/// reject assignments to certified names, and the slot scan needs it
+/// read-only. Mirrors the assignments the slot scan records; a destructuring
+/// pattern keeps the script off the frame path either way, so only Ident
+/// targets are collected.
+fn collect_script_assigned(stmts: &[Stmt], assigned: &mut HashSet<crux::AtomId>) {
+    for stmt in stmts {
+        collect_assigned_stmt(stmt, assigned);
+    }
+}
+
+fn collect_assigned_stmt(stmt: &Stmt, assigned: &mut HashSet<crux::AtomId>) {
+    match &stmt.kind {
+        StmtKind::Block(block) => collect_script_assigned(&block.stmts, assigned),
+        StmtKind::Expr(expr) => collect_assigned_expr(expr, assigned),
+        StmtKind::VarDecl { decls, .. } => {
+            for decl in decls {
+                if let BindingPattern::Ident(name) = &decl.pattern
+                    && decl.init.is_some()
+                {
+                    assigned.insert(*name);
+                }
+            }
+        }
+        StmtKind::If {
+            test,
+            consequent,
+            alternate,
+        } => {
+            collect_assigned_expr(test, assigned);
+            collect_assigned_stmt(consequent, assigned);
+            if let Some(alternate) = alternate {
+                collect_assigned_stmt(alternate, assigned);
+            }
+        }
+        StmtKind::While { test, body } | StmtKind::DoWhile { body, test } => {
+            collect_assigned_expr(test, assigned);
+            collect_assigned_stmt(body, assigned);
+        }
+        StmtKind::For {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            match init {
+                Some(ForInit::Expr(expr)) => collect_assigned_expr(expr, assigned),
+                Some(ForInit::VarDecl { decls, .. }) => {
+                    for decl in decls {
+                        if let BindingPattern::Ident(name) = &decl.pattern
+                            && decl.init.is_some()
+                        {
+                            assigned.insert(*name);
+                        }
+                    }
+                }
+                None => {}
+            }
+            if let Some(test) = test {
+                collect_assigned_expr(test, assigned);
+            }
+            if let Some(update) = update {
+                collect_assigned_expr(update, assigned);
+            }
+            collect_assigned_stmt(body, assigned);
+        }
+        StmtKind::Return(expr) => {
+            if let Some(expr) = expr {
+                collect_assigned_expr(expr, assigned);
+            }
+        }
+        StmtKind::Throw(expr) => collect_assigned_expr(expr, assigned),
+        StmtKind::Labeled { body, .. } => collect_assigned_stmt(body, assigned),
+        StmtKind::ForOf {
+            left, right, body, ..
+        } => {
+            if let ForBinding::VarDecl {
+                pattern: BindingPattern::Ident(name),
+                ..
+            } = left
+            {
+                assigned.insert(*name);
+            }
+            collect_assigned_expr(right, assigned);
+            collect_assigned_stmt(body, assigned);
+        }
+        StmtKind::Empty
+        | StmtKind::Debugger
+        | StmtKind::Break(_)
+        | StmtKind::Continue(_)
+        | StmtKind::FunctionDecl(_)
+        | StmtKind::ClassDecl(_)
+        | StmtKind::With { .. }
+        | StmtKind::Try { .. }
+        | StmtKind::Switch { .. }
+        | StmtKind::ForIn { .. }
+        | StmtKind::UsingDecl { .. } => {}
+    }
+}
+
+fn collect_assigned_expr(expr: &Expr, assigned: &mut HashSet<crux::AtomId>) {
+    match &expr.kind {
+        ExprKind::Paren(inner) => collect_assigned_expr(inner, assigned),
+        ExprKind::Unary { operand, .. } => collect_assigned_expr(operand, assigned),
+        ExprKind::Update { target, .. } => {
+            record_assign_target(target, assigned);
+            collect_assigned_expr(target, assigned);
+        }
+        ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
+            collect_assigned_expr(left, assigned);
+            collect_assigned_expr(right, assigned);
+        }
+        ExprKind::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            collect_assigned_expr(test, assigned);
+            collect_assigned_expr(consequent, assigned);
+            collect_assigned_expr(alternate, assigned);
+        }
+        ExprKind::Assign { target, value, .. } => {
+            record_assign_target(target, assigned);
+            collect_assigned_expr(target, assigned);
+            collect_assigned_expr(value, assigned);
+        }
+        ExprKind::Member(member) => {
+            collect_assigned_expr(&member.object, assigned);
+            if let MemberProperty::Computed(key) = &member.property {
+                collect_assigned_expr(key, assigned);
+            }
+        }
+        ExprKind::Array(array) => {
+            for element in &array.elements {
+                match element {
+                    ArrayElement::Hole => {}
+                    ArrayElement::Expr(e) | ArrayElement::Spread(e) => {
+                        collect_assigned_expr(e, assigned)
+                    }
+                }
+            }
+        }
+        ExprKind::Object(object) => {
+            for prop in &object.props {
+                match prop {
+                    ObjectProperty::Method { .. }
+                    | ObjectProperty::Get { .. }
+                    | ObjectProperty::Set { .. } => {}
+                    ObjectProperty::Init { key, value, .. } => {
+                        if let PropertyName::Computed(key_expr) = key {
+                            collect_assigned_expr(key_expr, assigned);
+                        }
+                        collect_assigned_expr(value, assigned);
+                    }
+                    ObjectProperty::Spread(e) => collect_assigned_expr(e, assigned),
+                }
+            }
+        }
+        ExprKind::Template(template) => {
+            for e in &template.exprs {
+                collect_assigned_expr(e, assigned);
+            }
+        }
+        ExprKind::Sequence(exprs) => {
+            for e in exprs {
+                collect_assigned_expr(e, assigned);
+            }
+        }
+        ExprKind::Call(call) => {
+            collect_assigned_expr(&call.callee, assigned);
+            for arg in &call.args {
+                match arg {
+                    Argument::Expr(e) | Argument::Spread(e) => collect_assigned_expr(e, assigned),
+                }
+            }
+        }
+        ExprKind::New(new) => {
+            collect_assigned_expr(&new.callee, assigned);
+            for arg in &new.args {
+                match arg {
+                    Argument::Expr(e) | Argument::Spread(e) => collect_assigned_expr(e, assigned),
+                }
+            }
+        }
+        // A function/arrow body runs inside the script's slot window only
+        // when certified, and a certified body cannot assign a declared name
+        // (the body scan rejects it) — nothing to collect there.
+        ExprKind::Ident(_)
+        | ExprKind::Literal(_)
+        | ExprKind::This
+        | ExprKind::Super
+        | ExprKind::Function(_)
+        | ExprKind::Arrow { .. }
+        | ExprKind::Class(_)
+        | ExprKind::TaggedTemplate { .. }
+        | ExprKind::PrivateIn { .. }
+        | ExprKind::Yield { .. }
+        | ExprKind::Await(_)
+        | ExprKind::MetaProperty { .. }
+        | ExprKind::ImportCall { .. } => {}
+    }
+}
+
+/// The top-level function-declaration names that are "global-blind" (Cut 35
+/// slice 3): a fixpoint — a function certifies when its body never observes
+/// the global object given the already-certified names (a body may read a
+/// certified name's stable entry-instantiated global binding, so a function
+/// whose body calls/reads another certifies after it). Recursion never
+/// certifies (a function cannot read its own name in the pass before it is
+/// certified). An assigned name is never a candidate: its global binding
+/// could change, so reading it is unsafe.
+fn certified_functions(
+    names: &[crux::AtomId],
+    assigned: &HashSet<crux::AtomId>,
+    stmts: &[Stmt],
+) -> HashSet<crux::AtomId> {
+    let declared: HashSet<crux::AtomId> = names.iter().copied().collect();
+    let mut candidates: Vec<&syntax::ast::Function> = Vec::new();
+    for stmt in stmts {
+        if let StmtKind::FunctionDecl(function) = &stmt.kind
+            && let Some(name) = function.name
+            && !assigned.contains(&name)
+        {
+            candidates.push(function);
+        }
+    }
+    let mut certified: HashSet<crux::AtomId> = HashSet::new();
+    loop {
+        let mut changed = false;
+        for function in &candidates {
+            let Some(name) = function.name else {
+                continue;
+            };
+            if certified.contains(&name) {
+                continue;
+            }
+            if certified_fn_allows(function, &declared, &certified) {
+                certified.insert(name);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    certified
+}
+
+/// Whether a top-level function declaration is "global-blind": its body can
+/// never observe the global object while the script's frame slots are
+/// authoritative. The body may read/write only its own params and locals,
+/// undeclared names (real, never-stale global properties), and the stable
+/// entry-instantiated bindings of other certified functions; it may not
+/// reference any other declared var (a stale slot on the global object),
+/// call anything else, or create closures. Conservative — a shape that could
+/// observe the global object keeps the whole script on the global path.
+fn certified_fn_allows(
+    function: &syntax::ast::Function,
+    declared: &HashSet<crux::AtomId>,
+    certified: &HashSet<crux::AtomId>,
+) -> bool {
+    if function.is_async || function.is_generator || function.statement_position {
+        return false;
+    }
+    certified_stmts_allows(&function.body.stmts, declared, certified)
+}
+
+fn certified_stmts_allows(
+    stmts: &[Stmt],
+    declared: &HashSet<crux::AtomId>,
+    certified: &HashSet<crux::AtomId>,
+) -> bool {
+    stmts
+        .iter()
+        .all(|stmt| certified_stmt_allows(stmt, declared, certified))
+}
+
+fn certified_stmt_allows(
+    stmt: &Stmt,
+    declared: &HashSet<crux::AtomId>,
+    certified: &HashSet<crux::AtomId>,
+) -> bool {
+    match &stmt.kind {
+        StmtKind::Block(block) => certified_stmts_allows(&block.stmts, declared, certified),
+        StmtKind::Empty | StmtKind::Debugger | StmtKind::Break(_) | StmtKind::Continue(_) => true,
+        StmtKind::Expr(expr) => certified_expr_allows(expr, declared, certified),
+        StmtKind::VarDecl { kind, decls } => {
+            *kind == VarDeclKind::Var
+                && decls.iter().all(|decl| {
+                    matches!(&decl.pattern, BindingPattern::Ident(_))
+                        && decl
+                            .init
+                            .as_ref()
+                            .is_none_or(|init| certified_expr_allows(init, declared, certified))
+                })
+        }
+        StmtKind::If {
+            test,
+            consequent,
+            alternate,
+        } => {
+            certified_expr_allows(test, declared, certified)
+                && certified_stmt_allows(consequent, declared, certified)
+                && alternate
+                    .as_deref()
+                    .is_none_or(|stmt| certified_stmt_allows(stmt, declared, certified))
+        }
+        StmtKind::While { test, body } | StmtKind::DoWhile { body, test } => {
+            certified_expr_allows(test, declared, certified)
+                && certified_stmt_allows(body, declared, certified)
+        }
+        StmtKind::For {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            let init_ok = match init {
+                None => true,
+                Some(ForInit::Expr(expr)) => certified_expr_allows(expr, declared, certified),
+                Some(ForInit::VarDecl { kind, decls }) => {
+                    *kind == VarDeclKind::Var
+                        && decls.iter().all(|decl| {
+                            matches!(&decl.pattern, BindingPattern::Ident(_))
+                                && decl.init.as_ref().is_none_or(|init| {
+                                    certified_expr_allows(init, declared, certified)
+                                })
+                        })
+                }
+            };
+            init_ok
+                && test
+                    .as_ref()
+                    .is_none_or(|expr| certified_expr_allows(expr, declared, certified))
+                && update
+                    .as_ref()
+                    .is_none_or(|expr| certified_expr_allows(expr, declared, certified))
+                && certified_stmt_allows(body, declared, certified)
+        }
+        StmtKind::Return(expr) => expr
+            .as_ref()
+            .is_none_or(|expr| certified_expr_allows(expr, declared, certified)),
+        StmtKind::Throw(expr) => certified_expr_allows(expr, declared, certified),
+        StmtKind::Labeled { body, .. } => certified_stmt_allows(body, declared, certified),
+        StmtKind::ForOf {
+            left, right, body, ..
+        } => {
+            matches!(
+                left,
+                ForBinding::VarDecl {
+                    pattern: BindingPattern::Ident(_),
+                    ..
+                }
+            ) && certified_expr_allows(right, declared, certified)
+                && certified_stmt_allows(body, declared, certified)
+        }
+        // Nested functions/closures/classes, `with`, `try`, `switch`,
+        // `for-in`, `using`: a shape that could observe the global object.
+        StmtKind::FunctionDecl(_)
+        | StmtKind::ClassDecl(_)
+        | StmtKind::With { .. }
+        | StmtKind::Try { .. }
+        | StmtKind::Switch { .. }
+        | StmtKind::ForIn { .. }
+        | StmtKind::UsingDecl { .. } => false,
+    }
+}
+
+fn certified_expr_allows(
+    expr: &Expr,
+    declared: &HashSet<crux::AtomId>,
+    certified: &HashSet<crux::AtomId>,
+) -> bool {
+    match &expr.kind {
+        ExprKind::Ident(name) => {
+            let text = crux::lookup(*name).to_string_lossy();
+            if matches!(
+                text.as_str(),
+                "globalThis" | "global" | "window" | "self" | "top" | "parent" | "frames"
+            ) {
+                return false;
+            }
+            // A declared name reads the stale slot on the global object —
+            // unless it is a certified function's stable global binding.
+            !declared.contains(name) || certified.contains(name)
+        }
+        ExprKind::Literal(_) => true,
+        ExprKind::Paren(inner) => certified_expr_allows(inner, declared, certified),
+        ExprKind::Unary { operand, .. } => certified_expr_allows(operand, declared, certified),
+        ExprKind::Update { target, .. } => certified_expr_allows(target, declared, certified),
+        ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
+            certified_expr_allows(left, declared, certified)
+                && certified_expr_allows(right, declared, certified)
+        }
+        ExprKind::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            certified_expr_allows(test, declared, certified)
+                && certified_expr_allows(consequent, declared, certified)
+                && certified_expr_allows(alternate, declared, certified)
+        }
+        ExprKind::Assign { target, value, .. } => {
+            certified_expr_allows(target, declared, certified)
+                && certified_expr_allows(value, declared, certified)
+        }
+        ExprKind::Member(member) => {
+            certified_expr_allows(&member.object, declared, certified)
+                && match &member.property {
+                    MemberProperty::Computed(key) => {
+                        certified_expr_allows(key, declared, certified)
+                    }
+                    _ => true,
+                }
+        }
+        ExprKind::Array(array) => array.elements.iter().all(|element| match element {
+            ArrayElement::Hole => true,
+            ArrayElement::Expr(e) | ArrayElement::Spread(e) => {
+                certified_expr_allows(e, declared, certified)
+            }
+        }),
+        ExprKind::Object(object) => object.props.iter().all(|prop| match prop {
+            ObjectProperty::Method { .. }
+            | ObjectProperty::Get { .. }
+            | ObjectProperty::Set { .. } => false,
+            ObjectProperty::Init { key, value, .. } => {
+                let key_ok = match key {
+                    PropertyName::Ident(_) | PropertyName::Str(_) | PropertyName::Number(_) => true,
+                    PropertyName::Computed(key_expr) => {
+                        certified_expr_allows(key_expr, declared, certified)
+                    }
+                };
+                key_ok && certified_expr_allows(value, declared, certified)
+            }
+            ObjectProperty::Spread(e) => certified_expr_allows(e, declared, certified),
+        }),
+        ExprKind::Template(template) => template
+            .exprs
+            .iter()
+            .all(|expr| certified_expr_allows(expr, declared, certified)),
+        ExprKind::Sequence(exprs) => exprs
+            .iter()
+            .all(|expr| certified_expr_allows(expr, declared, certified)),
+        // A certified closure (global-blind body) may be created and escape
+        // — calling it later reads only its captured env, never the global
+        // object. `this`/`super`/uncertified closures/classes are out.
+        ExprKind::Function(function) => certified_fn_allows(function, declared, certified),
+        ExprKind::Arrow { is_async, body, .. } => {
+            certified_arrow_allows(*is_async, body, declared, certified)
+        }
+        ExprKind::This
+        | ExprKind::Super
+        | ExprKind::Call(_)
+        | ExprKind::New(_)
+        | ExprKind::Class(_)
+        | ExprKind::TaggedTemplate { .. }
+        | ExprKind::PrivateIn { .. }
+        | ExprKind::Yield { .. }
+        | ExprKind::Await(_)
+        | ExprKind::MetaProperty { .. }
+        | ExprKind::ImportCall { .. } => false,
+    }
+}
+
+/// A certified arrow/function-expression closure: the same body scan as a
+/// certified declaration. `Function` expressions go through
+/// `certified_fn_allows` (same struct shape); an arrow's body may be a
+/// bare expression.
+fn certified_arrow_allows(
+    is_async: bool,
+    body: &syntax::ast::ArrowBody,
+    declared: &HashSet<crux::AtomId>,
+    certified: &HashSet<crux::AtomId>,
+) -> bool {
+    if is_async {
+        return false;
+    }
+    match body {
+        syntax::ast::ArrowBody::Expr(expr) => certified_expr_allows(expr, declared, certified),
+        syntax::ast::ArrowBody::Block(block) => {
+            certified_stmts_allows(&block.stmts, declared, certified)
+        }
+    }
+}
+
+/// Whether an expression evaluates to a "certified value": holding or
+/// calling it cannot observe the frame-slot globals. A certified closure, a
+/// literal, or a certified-call result (the callee's return is certified).
+/// Used for the certified-return analysis and the top-level call gate (a
+/// var assigned a certified value may be called).
+fn certified_value_expr(
+    expr: &Expr,
+    declared: &HashSet<crux::AtomId>,
+    certified: &HashSet<crux::AtomId>,
+    return_certs: &HashMap<crux::AtomId, bool>,
+    var_certs: &HashMap<crux::AtomId, bool>,
+) -> bool {
+    match &expr.kind {
+        ExprKind::Literal(_) => true,
+        ExprKind::Paren(inner) => {
+            certified_value_expr(inner, declared, certified, return_certs, var_certs)
+        }
+        ExprKind::Function(function) => certified_fn_allows(function, declared, certified),
+        ExprKind::Arrow { is_async, body, .. } => {
+            certified_arrow_allows(*is_async, body, declared, certified)
+        }
+        ExprKind::Ident(name) => var_certs.get(name).copied().unwrap_or(false),
+        ExprKind::Call(call) => match &call.callee.kind {
+            ExprKind::Ident(name) => {
+                certified.contains(name) && return_certs.get(name).copied().unwrap_or(false)
+            }
+            _ => false,
+        },
+        ExprKind::Unary { operand, .. } => {
+            certified_value_expr(operand, declared, certified, return_certs, var_certs)
+        }
+        ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
+            certified_value_expr(left, declared, certified, return_certs, var_certs)
+                && certified_value_expr(right, declared, certified, return_certs, var_certs)
+        }
+        ExprKind::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            certified_value_expr(test, declared, certified, return_certs, var_certs)
+                && certified_value_expr(consequent, declared, certified, return_certs, var_certs)
+                && certified_value_expr(alternate, declared, certified, return_certs, var_certs)
+        }
+        ExprKind::Array(array) => array.elements.iter().all(|element| match element {
+            ArrayElement::Hole => true,
+            ArrayElement::Expr(e) | ArrayElement::Spread(e) => {
+                certified_value_expr(e, declared, certified, return_certs, var_certs)
+            }
+        }),
+        ExprKind::Object(object) => object.props.iter().all(|prop| match prop {
+            ObjectProperty::Method { .. }
+            | ObjectProperty::Get { .. }
+            | ObjectProperty::Set { .. } => false,
+            ObjectProperty::Init { key, value, .. } => {
+                let key_ok = match key {
+                    PropertyName::Ident(_) | PropertyName::Str(_) | PropertyName::Number(_) => true,
+                    PropertyName::Computed(key_expr) => {
+                        certified_expr_allows(key_expr, declared, certified)
+                    }
+                };
+                key_ok && certified_value_expr(value, declared, certified, return_certs, var_certs)
+            }
+            ObjectProperty::Spread(e) => {
+                certified_value_expr(e, declared, certified, return_certs, var_certs)
+            }
+        }),
+        ExprKind::Template(template) => template
+            .exprs
+            .iter()
+            .all(|e| certified_value_expr(e, declared, certified, return_certs, var_certs)),
+        ExprKind::Sequence(exprs) => exprs
+            .iter()
+            .all(|e| certified_value_expr(e, declared, certified, return_certs, var_certs)),
+        _ => false,
+    }
+}
+
+/// The certified-return set (Cut 35 slice 3): a certified top-level
+/// function's return value is certified when every `return` in its body is
+/// a certified value (a literal, a certified closure, or a call to a
+/// certified-return function). Fixpoint over the certified declarations —
+/// the return value never feeds back into the body certification, so this
+/// settles after the function set does. `var_certs` is never consulted: a
+/// certified body cannot read a declared var, so an `Ident` return is a
+/// param/local (unknown — uncertified).
+fn certified_return_certs(
+    stmts: &[Stmt],
+    declared: &HashSet<crux::AtomId>,
+    certified: &HashSet<crux::AtomId>,
+) -> HashMap<crux::AtomId, bool> {
+    let decls: Vec<&syntax::ast::Function> = stmts
+        .iter()
+        .filter_map(|stmt| match &stmt.kind {
+            StmtKind::FunctionDecl(function)
+                if function.name.is_some_and(|name| certified.contains(&name)) =>
+            {
+                Some(function)
+            }
+            _ => None,
+        })
+        .collect();
+    let mut certs: HashMap<crux::AtomId, bool> = certified.iter().map(|n| (*n, false)).collect();
+    loop {
+        let mut changed = false;
+        for function in &decls {
+            let Some(name) = function.name else {
+                continue;
+            };
+            if certs[&name] {
+                continue;
+            }
+            if fn_returns_certified(function, declared, certified, &certs) {
+                certs.insert(name, true);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    certs
+}
+
+fn fn_returns_certified(
+    function: &syntax::ast::Function,
+    declared: &HashSet<crux::AtomId>,
+    certified: &HashSet<crux::AtomId>,
+    return_certs: &HashMap<crux::AtomId, bool>,
+) -> bool {
+    let var_certs = HashMap::new();
+    returns_all_certified(
+        &function.body.stmts,
+        declared,
+        certified,
+        return_certs,
+        &var_certs,
+    )
+}
+
+fn returns_all_certified(
+    stmts: &[Stmt],
+    declared: &HashSet<crux::AtomId>,
+    certified: &HashSet<crux::AtomId>,
+    return_certs: &HashMap<crux::AtomId, bool>,
+    var_certs: &HashMap<crux::AtomId, bool>,
+) -> bool {
+    for stmt in stmts {
+        let ok = match &stmt.kind {
+            StmtKind::Block(block) => {
+                returns_all_certified(&block.stmts, declared, certified, return_certs, var_certs)
+            }
+            StmtKind::If {
+                consequent,
+                alternate,
+                ..
+            } => {
+                returns_all_certified(
+                    std::slice::from_ref(consequent.as_ref()),
+                    declared,
+                    certified,
+                    return_certs,
+                    var_certs,
+                ) && alternate.as_deref().is_none_or(|stmt| {
+                    returns_all_certified(
+                        std::slice::from_ref(stmt),
+                        declared,
+                        certified,
+                        return_certs,
+                        var_certs,
+                    )
+                })
+            }
+            StmtKind::While { body, .. } | StmtKind::DoWhile { body, .. } => returns_all_certified(
+                std::slice::from_ref(body),
+                declared,
+                certified,
+                return_certs,
+                var_certs,
+            ),
+            StmtKind::For { body, .. } => returns_all_certified(
+                std::slice::from_ref(body),
+                declared,
+                certified,
+                return_certs,
+                var_certs,
+            ),
+            StmtKind::Labeled { body, .. } => returns_all_certified(
+                std::slice::from_ref(body),
+                declared,
+                certified,
+                return_certs,
+                var_certs,
+            ),
+            StmtKind::Return(expr) => expr.as_ref().is_none_or(|expr| {
+                certified_value_expr(expr, declared, certified, return_certs, var_certs)
+            }),
+            _ => true,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+/// The vars assigned a certified value (Cut 35 slice 3): a top-level
+/// `name = <certified value>` (initializer or plain `=` with an identifier
+/// target) makes the var's value safe to call — a certified closure, a
+/// literal, or a certified-call result. Multiple assignments AND (any
+/// uncertified assignment makes the var unknown); compound/`++`/`--`
+/// assignments mark the var unknown. Source order, so `var g = f` after
+/// `var f = make(2)` sees `f`'s cert.
+fn collect_var_certs(
+    stmts: &[Stmt],
+    declared: &HashSet<crux::AtomId>,
+    certified: &HashSet<crux::AtomId>,
+    return_certs: &HashMap<crux::AtomId, bool>,
+    var_certs: &mut HashMap<crux::AtomId, bool>,
+) {
+    for stmt in stmts {
+        var_certs_stmt(stmt, declared, certified, return_certs, var_certs);
+    }
+}
+
+fn var_certs_stmt(
+    stmt: &Stmt,
+    declared: &HashSet<crux::AtomId>,
+    certified: &HashSet<crux::AtomId>,
+    return_certs: &HashMap<crux::AtomId, bool>,
+    var_certs: &mut HashMap<crux::AtomId, bool>,
+) {
+    match &stmt.kind {
+        StmtKind::Block(block) => {
+            collect_var_certs(&block.stmts, declared, certified, return_certs, var_certs)
+        }
+        StmtKind::Expr(expr) => var_certs_expr(expr, declared, certified, return_certs, var_certs),
+        StmtKind::VarDecl { decls, .. } => {
+            for decl in decls {
+                if let BindingPattern::Ident(name) = &decl.pattern
+                    && let Some(init) = &decl.init
+                {
+                    let cert =
+                        certified_value_expr(init, declared, certified, return_certs, var_certs);
+                    var_certs
+                        .entry(*name)
+                        .and_modify(|c| *c &= cert)
+                        .or_insert(cert);
+                }
+            }
+        }
+        StmtKind::If {
+            test,
+            consequent,
+            alternate,
+        } => {
+            var_certs_expr(test, declared, certified, return_certs, var_certs);
+            var_certs_stmt(consequent, declared, certified, return_certs, var_certs);
+            if let Some(alternate) = alternate {
+                var_certs_stmt(alternate, declared, certified, return_certs, var_certs);
+            }
+        }
+        StmtKind::While { test, body } | StmtKind::DoWhile { body, test } => {
+            var_certs_expr(test, declared, certified, return_certs, var_certs);
+            var_certs_stmt(body, declared, certified, return_certs, var_certs);
+        }
+        StmtKind::For {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            match init {
+                Some(ForInit::Expr(expr)) => {
+                    var_certs_expr(expr, declared, certified, return_certs, var_certs)
+                }
+                Some(ForInit::VarDecl { decls, .. }) => {
+                    for decl in decls {
+                        if let BindingPattern::Ident(name) = &decl.pattern
+                            && let Some(init) = &decl.init
+                        {
+                            let cert = certified_value_expr(
+                                init,
+                                declared,
+                                certified,
+                                return_certs,
+                                var_certs,
+                            );
+                            var_certs
+                                .entry(*name)
+                                .and_modify(|c| *c &= cert)
+                                .or_insert(cert);
+                        }
+                    }
+                }
+                None => {}
+            }
+            if let Some(test) = test {
+                var_certs_expr(test, declared, certified, return_certs, var_certs);
+            }
+            if let Some(update) = update {
+                var_certs_expr(update, declared, certified, return_certs, var_certs);
+            }
+            var_certs_stmt(body, declared, certified, return_certs, var_certs);
+        }
+        StmtKind::Return(expr) => {
+            if let Some(expr) = expr {
+                var_certs_expr(expr, declared, certified, return_certs, var_certs);
+            }
+        }
+        StmtKind::Throw(expr) => var_certs_expr(expr, declared, certified, return_certs, var_certs),
+        StmtKind::Labeled { body, .. } => {
+            var_certs_stmt(body, declared, certified, return_certs, var_certs)
+        }
+        StmtKind::ForOf { right, body, .. } => {
+            var_certs_expr(right, declared, certified, return_certs, var_certs);
+            var_certs_stmt(body, declared, certified, return_certs, var_certs);
+        }
+        StmtKind::Empty
+        | StmtKind::Debugger
+        | StmtKind::Break(_)
+        | StmtKind::Continue(_)
+        | StmtKind::FunctionDecl(_)
+        | StmtKind::ClassDecl(_)
+        | StmtKind::With { .. }
+        | StmtKind::Try { .. }
+        | StmtKind::Switch { .. }
+        | StmtKind::ForIn { .. }
+        | StmtKind::UsingDecl { .. } => {}
+    }
+}
+
+fn var_certs_expr(
+    expr: &Expr,
+    declared: &HashSet<crux::AtomId>,
+    certified: &HashSet<crux::AtomId>,
+    return_certs: &HashMap<crux::AtomId, bool>,
+    var_certs: &mut HashMap<crux::AtomId, bool>,
+) {
+    match &expr.kind {
+        ExprKind::Paren(inner) => {
+            var_certs_expr(inner, declared, certified, return_certs, var_certs)
+        }
+        ExprKind::Unary { operand, .. } => {
+            var_certs_expr(operand, declared, certified, return_certs, var_certs)
+        }
+        ExprKind::Update { target, .. } => {
+            if let Some(name) = assign_target_name(target) {
+                var_certs.insert(name, false);
+            }
+            var_certs_expr(target, declared, certified, return_certs, var_certs);
+        }
+        ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
+            var_certs_expr(left, declared, certified, return_certs, var_certs);
+            var_certs_expr(right, declared, certified, return_certs, var_certs);
+        }
+        ExprKind::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            var_certs_expr(test, declared, certified, return_certs, var_certs);
+            var_certs_expr(consequent, declared, certified, return_certs, var_certs);
+            var_certs_expr(alternate, declared, certified, return_certs, var_certs);
+        }
+        ExprKind::Assign {
+            target, value, op, ..
+        } => {
+            if let Some(name) = assign_target_name(target) {
+                let cert = if *op == AssignOp::Assign {
+                    certified_value_expr(value, declared, certified, return_certs, var_certs)
+                } else {
+                    // A compound assignment produces an unknown value.
+                    false
+                };
+                var_certs
+                    .entry(name)
+                    .and_modify(|c| *c &= cert)
+                    .or_insert(cert);
+            }
+            var_certs_expr(target, declared, certified, return_certs, var_certs);
+            var_certs_expr(value, declared, certified, return_certs, var_certs);
+        }
+        ExprKind::Member(member) => {
+            var_certs_expr(&member.object, declared, certified, return_certs, var_certs);
+            if let MemberProperty::Computed(key) = &member.property {
+                var_certs_expr(key, declared, certified, return_certs, var_certs);
+            }
+        }
+        ExprKind::Array(array) => {
+            for element in &array.elements {
+                match element {
+                    ArrayElement::Hole => {}
+                    ArrayElement::Expr(e) | ArrayElement::Spread(e) => {
+                        var_certs_expr(e, declared, certified, return_certs, var_certs)
+                    }
+                }
+            }
+        }
+        ExprKind::Object(object) => {
+            for prop in &object.props {
+                match prop {
+                    ObjectProperty::Method { .. }
+                    | ObjectProperty::Get { .. }
+                    | ObjectProperty::Set { .. } => {}
+                    ObjectProperty::Init { key, value, .. } => {
+                        if let PropertyName::Computed(key_expr) = key {
+                            var_certs_expr(key_expr, declared, certified, return_certs, var_certs);
+                        }
+                        var_certs_expr(value, declared, certified, return_certs, var_certs);
+                    }
+                    ObjectProperty::Spread(e) => {
+                        var_certs_expr(e, declared, certified, return_certs, var_certs)
+                    }
+                }
+            }
+        }
+        ExprKind::Template(template) => {
+            for e in &template.exprs {
+                var_certs_expr(e, declared, certified, return_certs, var_certs);
+            }
+        }
+        ExprKind::Sequence(exprs) => {
+            for e in exprs {
+                var_certs_expr(e, declared, certified, return_certs, var_certs);
+            }
+        }
+        ExprKind::Call(call) => {
+            var_certs_expr(&call.callee, declared, certified, return_certs, var_certs);
+            for arg in &call.args {
+                match arg {
+                    Argument::Expr(e) | Argument::Spread(e) => {
+                        var_certs_expr(e, declared, certified, return_certs, var_certs)
+                    }
+                }
+            }
+        }
+        ExprKind::New(new) => {
+            var_certs_expr(&new.callee, declared, certified, return_certs, var_certs);
+            for arg in &new.args {
+                match arg {
+                    Argument::Expr(e) | Argument::Spread(e) => {
+                        var_certs_expr(e, declared, certified, return_certs, var_certs)
+                    }
+                }
+            }
+        }
+        ExprKind::Ident(_)
+        | ExprKind::Literal(_)
+        | ExprKind::This
+        | ExprKind::Super
+        | ExprKind::Function(_)
+        | ExprKind::Arrow { .. }
+        | ExprKind::Class(_)
+        | ExprKind::TaggedTemplate { .. }
+        | ExprKind::PrivateIn { .. }
+        | ExprKind::Yield { .. }
+        | ExprKind::Await(_)
+        | ExprKind::MetaProperty { .. }
+        | ExprKind::ImportCall { .. } => {}
+    }
+}
+
+/// The identifier target of an assignment/update, if it writes a plain
+/// variable (parentheses are transparent).
+fn assign_target_name(expr: &Expr) -> Option<crux::AtomId> {
+    match &expr.kind {
+        ExprKind::Ident(name) => Some(*name),
+        ExprKind::Paren(inner) => assign_target_name(inner),
+        _ => None,
+    }
+}
+
 /// `ScriptSlots` layout when the script is a closed world whose declared
 /// vars can live in frame slots, or the plain declared-name set when the
 /// script qualifies only for direct global-object access (today's path —
@@ -14400,35 +15463,48 @@ fn analyze_script_scope(stmts: &[Stmt]) -> Option<(Option<ScriptSlots>, HashSet<
         .iter()
         .map(|name| crux::lookup(*name).to_string_lossy())
         .collect();
+    // Cut 35 slice 3: the assigned set is a prepass (the slot scan and the
+    // certified-function analysis both need it), and the certified top-level
+    // functions stay on the global object — their stable entry-instantiated
+    // bindings — instead of taking a frame slot.
+    let mut assigned = HashSet::new();
+    collect_script_assigned(stmts, &mut assigned);
+    let declared: HashSet<crux::AtomId> = names.iter().copied().collect();
+    let certified = certified_functions(&names, &assigned, stmts);
+    let return_certs = certified_return_certs(stmts, &declared, &certified);
+    let mut var_certs = HashMap::new();
+    collect_var_certs(stmts, &declared, &certified, &return_certs, &mut var_certs);
     let slots = {
-        let mut assigned = HashSet::new();
-        script_slots_allows(stmts, &mut assigned).then(|| {
-            let mut scan = FastScopeScan::default();
-            for name in &names {
-                scan.slots.insert(*name, scan.next_slot);
-                scan.tdz.push(false);
-                scan.next_slot += 1;
-            }
-            ScriptSlots {
-                scope: ScopeInfo {
-                    frame_size: scan.next_slot,
-                    arity: 0,
-                    slots: scan.slots,
-                    tdz_store: scan.tdz,
-                    context_names: Vec::new(),
-                    context_tdz: Vec::new(),
-                    context_const: Vec::new(),
-                    context_param: Vec::new(),
-                    context_slots: HashMap::new(),
-                    arguments_slot: None,
-                    arguments_formals: None,
-                    this_slot: None,
-                    annex_b: Vec::new(),
-                    statement_fns: Vec::new(),
-                },
-                names,
-                assigned,
-            }
+        let mut scan = FastScopeScan::default();
+        let slot_names: Vec<crux::AtomId> = names
+            .iter()
+            .copied()
+            .filter(|name| !certified.contains(name))
+            .collect();
+        for name in &slot_names {
+            scan.slots.insert(*name, scan.next_slot);
+            scan.tdz.push(false);
+            scan.next_slot += 1;
+        }
+        script_slots_allows(stmts, &certified, &var_certs).then(|| ScriptSlots {
+            scope: ScopeInfo {
+                frame_size: scan.next_slot,
+                arity: 0,
+                slots: scan.slots,
+                tdz_store: scan.tdz,
+                context_names: Vec::new(),
+                context_tdz: Vec::new(),
+                context_const: Vec::new(),
+                context_param: Vec::new(),
+                context_slots: HashMap::new(),
+                arguments_slot: None,
+                arguments_formals: None,
+                this_slot: None,
+                annex_b: Vec::new(),
+                statement_fns: Vec::new(),
+            },
+            names: slot_names,
+            assigned,
         })
     };
     Some((slots, globals))
@@ -14437,58 +15513,56 @@ fn analyze_script_scope(stmts: &[Stmt]) -> Option<(Option<ScriptSlots>, HashSet<
 /// Whether the script is a closed world for frame-slot vars (Cut 16): no
 /// callable can observe the real global object while the slots are
 /// authoritative (their staleness window is the whole script). Reject
-/// function/class declarations, `call`/`new` expressions, `this`, closures
-/// (function/arrow/class expressions and object methods/getters/setters),
-/// and any `globalThis`-family identifier (a member access on it reaches
-/// the real global object). Also collects the vars the script assigns
-/// (initializers, `=`/compound assignments, `++`/`--`, for-of heads) — only
-/// those need the epilogue write-back: a declared var like `Infinity` is a
-/// read-only global property that must not be written just because it was
-/// declared.
-fn script_slots_allows(stmts: &[Stmt], assigned: &mut HashSet<crux::AtomId>) -> bool {
+/// `call`/`new` expressions (except direct calls to a certified function),
+/// uncertified function declarations, `this`, closures (function/arrow/
+/// class expressions and object methods/getters/setters), and any
+/// `globalThis`-family identifier (a member access on it reaches the real
+/// global object). `assigned` (the epilogue write-back set) is collected
+/// by the prepass; `certified` is the global-blind function set (Cut 35
+/// slice 3).
+fn script_slots_allows(
+    stmts: &[Stmt],
+    certified: &HashSet<crux::AtomId>,
+    var_certs: &HashMap<crux::AtomId, bool>,
+) -> bool {
     stmts
         .iter()
-        .all(|stmt| script_slots_stmt_allows(stmt, assigned))
+        .all(|stmt| script_slots_stmt_allows(stmt, certified, var_certs))
 }
 
-fn script_slots_stmt_allows(stmt: &Stmt, assigned: &mut HashSet<crux::AtomId>) -> bool {
+fn script_slots_stmt_allows(
+    stmt: &Stmt,
+    certified: &HashSet<crux::AtomId>,
+    var_certs: &HashMap<crux::AtomId, bool>,
+) -> bool {
     match &stmt.kind {
-        StmtKind::Block(block) => script_slots_allows(&block.stmts, assigned),
+        StmtKind::Block(block) => script_slots_allows(&block.stmts, certified, var_certs),
         StmtKind::Empty | StmtKind::Debugger | StmtKind::Break(_) | StmtKind::Continue(_) => true,
-        StmtKind::Expr(expr) => script_slots_expr_allows(expr, assigned),
+        StmtKind::Expr(expr) => script_slots_expr_allows(expr, certified, var_certs),
         StmtKind::VarDecl { decls, .. } => decls.iter().all(|decl| {
             // A destructuring pattern resolves through the environment
             // machinery, bypassing the frame slots — such a script must stay
-            // on the global path. A var with an initializer assigns its
-            // binding.
-            let ident_ok = matches!(
-                &decl.pattern,
-                BindingPattern::Ident(name) if {
-                    if decl.init.is_some() {
-                        assigned.insert(*name);
-                    }
-                    true
-                }
-            );
-            ident_ok
+            // on the global path.
+            matches!(&decl.pattern, BindingPattern::Ident(_))
                 && decl
                     .init
                     .as_ref()
-                    .is_none_or(|init| script_slots_expr_allows(init, assigned))
+                    .is_none_or(|init| script_slots_expr_allows(init, certified, var_certs))
         }),
         StmtKind::If {
             test,
             consequent,
             alternate,
         } => {
-            script_slots_expr_allows(test, assigned)
-                && script_slots_stmt_allows(consequent, assigned)
+            script_slots_expr_allows(test, certified, var_certs)
+                && script_slots_stmt_allows(consequent, certified, var_certs)
                 && alternate
                     .as_deref()
-                    .is_none_or(|stmt| script_slots_stmt_allows(stmt, assigned))
+                    .is_none_or(|stmt| script_slots_stmt_allows(stmt, certified, var_certs))
         }
         StmtKind::While { test, body } | StmtKind::DoWhile { body, test } => {
-            script_slots_expr_allows(test, assigned) && script_slots_stmt_allows(body, assigned)
+            script_slots_expr_allows(test, certified, var_certs)
+                && script_slots_stmt_allows(body, certified, var_certs)
         }
         StmtKind::For {
             init,
@@ -14498,55 +15572,52 @@ fn script_slots_stmt_allows(stmt: &Stmt, assigned: &mut HashSet<crux::AtomId>) -
         } => {
             let init_ok = match init {
                 None => true,
-                Some(ForInit::Expr(expr)) => script_slots_expr_allows(expr, assigned),
+                Some(ForInit::Expr(expr)) => script_slots_expr_allows(expr, certified, var_certs),
                 Some(ForInit::VarDecl { decls, .. }) => decls.iter().all(|decl| {
-                    let ident_ok = matches!(
-                        &decl.pattern,
-                        BindingPattern::Ident(name) if {
-                            if decl.init.is_some() {
-                                assigned.insert(*name);
-                            }
-                            true
-                        }
-                    );
-                    ident_ok
+                    matches!(&decl.pattern, BindingPattern::Ident(_))
                         && decl
                             .init
                             .as_ref()
-                            .is_none_or(|init| script_slots_expr_allows(init, assigned))
+                            .is_none_or(|init| script_slots_expr_allows(init, certified, var_certs))
                 }),
             };
             init_ok
                 && test
                     .as_ref()
-                    .is_none_or(|expr| script_slots_expr_allows(expr, assigned))
+                    .is_none_or(|expr| script_slots_expr_allows(expr, certified, var_certs))
                 && update
                     .as_ref()
-                    .is_none_or(|expr| script_slots_expr_allows(expr, assigned))
-                && script_slots_stmt_allows(body, assigned)
+                    .is_none_or(|expr| script_slots_expr_allows(expr, certified, var_certs))
+                && script_slots_stmt_allows(body, certified, var_certs)
         }
         StmtKind::Return(expr) => expr
             .as_ref()
-            .is_none_or(|expr| script_slots_expr_allows(expr, assigned)),
-        StmtKind::Throw(expr) => script_slots_expr_allows(expr, assigned),
-        StmtKind::Labeled { body, .. } => script_slots_stmt_allows(body, assigned),
+            .is_none_or(|expr| script_slots_expr_allows(expr, certified, var_certs)),
+        StmtKind::Throw(expr) => script_slots_expr_allows(expr, certified, var_certs),
+        StmtKind::Labeled { body, .. } => script_slots_stmt_allows(body, certified, var_certs),
         StmtKind::ForOf {
             left, right, body, ..
         } => {
-            // The for-of head binds each element — an assignment.
-            if let ForBinding::VarDecl {
-                pattern: BindingPattern::Ident(name),
-                ..
-            } = left
-            {
-                assigned.insert(*name);
-            }
-            script_slots_expr_allows(right, assigned) && script_slots_stmt_allows(body, assigned)
+            // The for-of head binds each element — an assignment (collected
+            // by the prepass).
+            matches!(
+                left,
+                ForBinding::VarDecl {
+                    pattern: BindingPattern::Ident(_),
+                    ..
+                }
+            ) && script_slots_expr_allows(right, certified, var_certs)
+                && script_slots_stmt_allows(body, certified, var_certs)
         }
-        // Rejected by `script_scan_allows` before this walker runs (the
-        // whole script falls back to the env path); kept exhaustive.
-        StmtKind::FunctionDecl(_)
-        | StmtKind::ClassDecl(_)
+        // Cut 35 slice 3: a certified (global-blind) top-level function
+        // declaration cannot observe the slotified globals, so it no longer
+        // disqualifies the frame path. `script_scan_allows` already rejects
+        // `with`/`try`/`switch`/`for-in`/`using` (the whole script falls
+        // back to the env path); the rest are kept exhaustive.
+        StmtKind::FunctionDecl(function) => {
+            function.name.is_some_and(|name| certified.contains(&name))
+        }
+        StmtKind::ClassDecl(_)
         | StmtKind::With { .. }
         | StmtKind::Try { .. }
         | StmtKind::Switch { .. }
@@ -14555,7 +15626,11 @@ fn script_slots_stmt_allows(stmt: &Stmt, assigned: &mut HashSet<crux::AtomId>) -
     }
 }
 
-fn script_slots_expr_allows(expr: &Expr, assigned: &mut HashSet<crux::AtomId>) -> bool {
+fn script_slots_expr_allows(
+    expr: &Expr,
+    certified: &HashSet<crux::AtomId>,
+    var_certs: &HashMap<crux::AtomId, bool>,
+) -> bool {
     match &expr.kind {
         ExprKind::Ident(name) => {
             let text = crux::lookup(*name).to_string_lossy();
@@ -14569,7 +15644,28 @@ fn script_slots_expr_allows(expr: &Expr, assigned: &mut HashSet<crux::AtomId>) -
         | ExprKind::Function(_)
         | ExprKind::Arrow { .. }
         | ExprKind::Class(_) => false,
-        ExprKind::Call(_) | ExprKind::New(_) => false,
+        ExprKind::Call(call) => {
+            // Cut 35 slice 3: a direct call to a certified (global-blind)
+            // top-level function — or a var assigned a certified value (a
+            // certified closure, a certified-call result) — cannot observe
+            // the slotified globals: a certified function's global binding
+            // is stable (never assigned) and its body never reads a slot
+            // var; a certified-value var's current value comes from the
+            // slot, which is the script's own up-to-date copy.
+            let callee_ok = match &call.callee.kind {
+                ExprKind::Ident(name) => {
+                    certified.contains(name) || var_certs.get(name).copied().unwrap_or(false)
+                }
+                _ => false,
+            };
+            callee_ok
+                && call.args.iter().all(|arg| match arg {
+                    Argument::Expr(e) | Argument::Spread(e) => {
+                        script_slots_expr_allows(e, certified, var_certs)
+                    }
+                })
+        }
+        ExprKind::New(_) => false,
         ExprKind::Object(object) => object.props.iter().all(|prop| match prop {
             ObjectProperty::Method { .. }
             | ObjectProperty::Get { .. }
@@ -14578,49 +15674,50 @@ fn script_slots_expr_allows(expr: &Expr, assigned: &mut HashSet<crux::AtomId>) -
                 let key_ok = match key {
                     PropertyName::Ident(_) | PropertyName::Str(_) | PropertyName::Number(_) => true,
                     PropertyName::Computed(key_expr) => {
-                        script_slots_expr_allows(key_expr, assigned)
+                        script_slots_expr_allows(key_expr, certified, var_certs)
                     }
                 };
-                key_ok && script_slots_expr_allows(value, assigned)
+                key_ok && script_slots_expr_allows(value, certified, var_certs)
             }
-            ObjectProperty::Spread(expr) => script_slots_expr_allows(expr, assigned),
+            ObjectProperty::Spread(expr) => script_slots_expr_allows(expr, certified, var_certs),
         }),
         ExprKind::Literal(_) => true,
         ExprKind::Array(array) => array.elements.iter().all(|element| match element {
             ArrayElement::Hole => true,
             ArrayElement::Expr(expr) | ArrayElement::Spread(expr) => {
-                script_slots_expr_allows(expr, assigned)
+                script_slots_expr_allows(expr, certified, var_certs)
             }
         }),
-        ExprKind::Paren(inner) => script_slots_expr_allows(inner, assigned),
-        ExprKind::Unary { operand, .. } => script_slots_expr_allows(operand, assigned),
-        ExprKind::Update { target, .. } => {
-            record_assign_target(target, assigned);
-            script_slots_expr_allows(target, assigned)
-        }
+        ExprKind::Paren(inner) => script_slots_expr_allows(inner, certified, var_certs),
+        ExprKind::Unary { operand, .. } => script_slots_expr_allows(operand, certified, var_certs),
+        ExprKind::Update { target, .. } => script_slots_expr_allows(target, certified, var_certs),
         ExprKind::Binary { left, right, .. } => {
-            script_slots_expr_allows(left, assigned) && script_slots_expr_allows(right, assigned)
+            script_slots_expr_allows(left, certified, var_certs)
+                && script_slots_expr_allows(right, certified, var_certs)
         }
         ExprKind::Logical { left, right, .. } => {
-            script_slots_expr_allows(left, assigned) && script_slots_expr_allows(right, assigned)
+            script_slots_expr_allows(left, certified, var_certs)
+                && script_slots_expr_allows(right, certified, var_certs)
         }
         ExprKind::Conditional {
             test,
             consequent,
             alternate,
         } => {
-            script_slots_expr_allows(test, assigned)
-                && script_slots_expr_allows(consequent, assigned)
-                && script_slots_expr_allows(alternate, assigned)
+            script_slots_expr_allows(test, certified, var_certs)
+                && script_slots_expr_allows(consequent, certified, var_certs)
+                && script_slots_expr_allows(alternate, certified, var_certs)
         }
         ExprKind::Assign { target, value, .. } => {
-            record_assign_target(target, assigned);
-            script_slots_expr_allows(target, assigned) && script_slots_expr_allows(value, assigned)
+            script_slots_expr_allows(target, certified, var_certs)
+                && script_slots_expr_allows(value, certified, var_certs)
         }
         ExprKind::Member(member) => {
-            let object_ok = script_slots_expr_allows(&member.object, assigned);
+            let object_ok = script_slots_expr_allows(&member.object, certified, var_certs);
             let key_ok = match &member.property {
-                MemberProperty::Computed(key) => script_slots_expr_allows(key, assigned),
+                MemberProperty::Computed(key) => {
+                    script_slots_expr_allows(key, certified, var_certs)
+                }
                 _ => true,
             };
             object_ok && key_ok
@@ -14628,10 +15725,10 @@ fn script_slots_expr_allows(expr: &Expr, assigned: &mut HashSet<crux::AtomId>) -
         ExprKind::Template(template) => template
             .exprs
             .iter()
-            .all(|expr| script_slots_expr_allows(expr, assigned)),
+            .all(|expr| script_slots_expr_allows(expr, certified, var_certs)),
         ExprKind::Sequence(exprs) => exprs
             .iter()
-            .all(|expr| script_slots_expr_allows(expr, assigned)),
+            .all(|expr| script_slots_expr_allows(expr, certified, var_certs)),
         ExprKind::PrivateIn { .. }
         | ExprKind::TaggedTemplate { .. }
         | ExprKind::Yield { .. }

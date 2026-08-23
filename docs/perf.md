@@ -1182,6 +1182,123 @@ hangs in the known slow RegExp-property-escape / Temporal-argument-
 limits / detached-typed-array classes, all sampled individually PASS
 (load-dependent batch classification); workspace tests 4312/0.
 
+### Cut 35 slice 2 — fused global calls + dead-guard skip (measured 2026-08-23)
+
+The second slice attacks the call site itself, two dispatches at a time:
+
+- **`CallFastGlobal`** — a plain call to a declared top-level `var`/function
+  global with an `undefined` receiver (`f(x)`, no `?.`, no `with`, no
+  `eval`, not inside an optional chain, ≤ 2 plain args) fuses the receiver
+  push and the callee load into the call step: the handler reads the
+  global cell and passes `undefined` as `this` instead of the stack
+  round-trip (`Push(undefined)` + `LoadGlobal` + `CallFast` → one step).
+  The read goes through the existing `load_global_value` cache, and the
+  leaf-inline path still runs (the frame aliases the argument region the
+  same way). The compile-time guard is a certified-script-only shape —
+  function bodies (`compile_body`) carry no `script_globals`, so the fuse
+  never fires inside them.
+- **The `chain_depth == 0` guard skip** — `compile_call_args_guarded` no
+  longer emits the `JumpIfChainShort`/`Jump` pair when no optional chain
+  is open: `chain_short` is set only inside a chain and cleared by the
+  outermost chain node's `ClearChainShort`, so a guard at `chain_depth ==
+  0` is provably dead. This also removes the guard from paren'd chain
+  callees (`(a?.b)()`, `(a?.(x))(y)`), where the chain ends at the paren
+  and the call must run on the chain's value (throwing on `undefined`)
+  rather than being skipped.
+
+Measured (release, 6-run medians; the earlier rows' ~98/103ms baselines
+were the same guard-skip + register-leaf build):
+
+| Row | before | after |
+|---|---|---|
+| function calls | ~98ms | **~86ms** |
+| closure capture | ~103ms | **~90ms** |
+| per-iteration | ~15.8ms | ~15.9ms |
+| construct churn | ~77ms | ~74ms |
+
+Both global-call rows drop ~12-13% (every run below the old baseline;
+per-iteration/construct call member targets or `new`, so they are
+unaffected). Isolated call cost is unchanged (the leaf body already ran at
+~50ns); the saving is the two dispatches per call in the loop.
+
+**Known tradeoff**: spec 13.4.3 step 2 (`GetValue` of the callee) runs
+before step 4 (the arguments), but the fused handler reads the global cell
+only after the args are on the stack — so a declared global redefined as
+an accessor with side effects would observe the reversed order. This is
+unobservable for the certified-script model the fuse requires (declared
+top-level vars are data properties; the direct-mapped `global_cells` cache
+already trusts them), and no fixture exercises it — the full sweep stays
+clean.
+
+Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
+conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
+23,812/0/154 with 447 >15s hangs in the known slow classes (load-
+dependent count); the 20-case fused-call probe
+(`scratch/callfast_global_probe.js`) covers zero/one/two-arg leaves,
+sloppy/strict `this`, non-leaf and recursive globals, reassigned callees,
+and the non-fused fallbacks (3 args, spread, member, local).
+
+### Cut 35 slice 3 — certified functions on the frame-slot path (measured 2026-08-23)
+
+The Cut 16 frame-slot path (declared vars live in frame slots, the loop
+counter in the accumulator) rejected any script containing a function
+declaration or call — a callable could observe the stale global object
+while the slots are authoritative. Slice 3 extends it to scripts whose
+callables are provably **global-blind** (`analyze_script_scope` +
+`certified_functions` in `ir.rs`):
+
+- **Certified functions** (fixpoint): a top-level function declaration
+  certifies when its body never references a declared var (except another
+  certified function's stable entry-instantiated global binding), never
+  calls an uncertified function, and contains no `this`/`super`/closures
+  that could observe the global object, `eval`, `with`, `try`, `switch`,
+  `for-in`, `using`, or `globalThis`-family identifiers. A body may read
+  params/locals and undeclared names (real, never-stale global
+  properties). Recursion never certifies; an assigned function name is
+  never a candidate.
+- **Certified values**: a certified closure (global-blind function/arrow
+  expression), a literal, or a certified-call result (the callee's return
+  value is itself certified — fixpoint over the declarations' `return`s).
+  A var assigned a certified value (`var f = make(2)`) may be called at
+  the top level; multiple assignments AND, compound/`++`/`--` marks the
+  var unknown.
+- **Certified functions stay global bindings** (never slotted): their
+  stable entry-instantiated function objects live on the global object
+  (`global_declaration_instantiation` hoists them), so a certified body
+  reading another certified function's name is safe, and top-level calls
+  to them still fuse (`CallFastGlobal`). The `FunctionDecl` statement
+  compiles to nothing on the frame path (the entry instantiation did the
+  work).
+
+Measured (release, 6-run medians vs the slice-2 build):
+
+| Row | slice 2 | slice 3 |
+|---|---|---|
+| function calls | ~86ms | **~65ms** |
+| closure capture | ~90ms | **~80ms** |
+| arithmetic | ~38ms | ~35ms |
+| per-iteration | ~15.9ms | ~15.3ms |
+| construct churn | ~74ms | ~74ms |
+
+Both call rows drop further — the calls loop becomes `FastLoopBind`/
+`FastLoopHead{Acc}` + `LoadLocal` + `CallFastGlobal` + `FusedStoreLocal`
+(one global-cell callee read per iteration), the closure loop runs
+entirely on frame/acc (`LoadLocal f` + `CallFast`, zero global access).
+
+**The gate is all-or-nothing per script**: any uncertified function or
+call keeps the whole script on the global path (the frame-slot staleness
+window is unobservable only when every callable is global-blind). The
+15-case probe (`scratch/certified_fns_probe.js`) covers the stale-read
+regression (a function reading a declared var must see the live value,
+not the stale slot), `globalThis`/closure/`this` bodies, certified-
+function-to-certified-function calls, recursion, reassigned names,
+certified-value vars (single and re-assigned), and uncertified-value
+assignments — all pass.
+
+Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
+conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
+23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

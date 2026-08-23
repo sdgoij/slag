@@ -1,6 +1,6 @@
 ---
 name: slag-bytecode-vm
-description: "Load when working on Slag's bytecode VM and compiler (crates/runtime/src/ir.rs) — the Step enum, the Vm dispatch loop, compile_expr/compile_statement lowering, the LeafOp register executor, or the compiled-path stack protocol. Documents the non-obvious traps: optional-call short-path stack discipline, assignment-reference timing, super base capture before key conversion, destructure/for-of close semantics, template cache keys, the leaf-inline caller-Vm contract, the register-leaf lowering/aliasing contracts, and the bench-noise reality."
+description: "Load when working on Slag's bytecode VM and compiler (crates/runtime/src/ir.rs) — the Step enum, the Vm dispatch loop, compile_expr/compile_statement lowering, the LeafOp register executor, the certified-function frame-slot gate, or the compiled-path stack protocol. Documents the non-obvious traps: optional-call short-path stack discipline, assignment-reference timing, super base capture before key conversion, destructure/for-of close semantics, template cache keys, the leaf-inline caller-Vm contract, the register-leaf lowering/aliasing contracts, the fused global-call ordering tradeoff, the frame-slot certification gate, and the bench-noise reality."
 ---
 
 # Slag bytecode VM traps
@@ -178,6 +178,69 @@ arguments state.
   checks). Register-op semantics mirror the step semantics 1:1 — when you
   extend `LeafOp`, extend both `lower_leaf_ops` and `run_leaf_ops` and
   keep the mirror exact.
+
+## 9. Fused global calls reorder GetValue after the arguments (Cut 35 slice 2)
+
+`CallFastGlobal` (compiler branch in `compile_call`, handler
+`do_call_fast_global`) fuses a plain call to a declared top-level
+`var`/function global into one step: the receiver push and the callee load
+vanish, the handler reads the global cell (`load_global_value`) and passes
+`undefined` as `this`. The compile-time guard is narrow — no `?.`, no
+`with`, no `eval` identifier, `chain_depth == 0`, ≤ 2 plain args, and
+`binding(name) == BindingLoc::Global` (only certified top-level scripts
+carry `script_globals`, so the fuse never fires inside function bodies).
+
+- **The callee GetValue runs AFTER the arguments** (spec 13.4.3 evaluates
+  the callee in step 2, the args in step 4): the fused handler reads the
+  global cell only once the args are on the stack. This is unobservable
+  for a declared var's data property; the divergence needs a declared
+  global redefined as an accessor with side effects, which the
+  certified-script model (direct-mapped `global_cells` cache) treats as
+  out of scope. If you extend the fused shape, keep this tradeoff in
+  mind — a fixture could someday catch it.
+- **`compile_call_args_guarded` skips the guard at `chain_depth == 0`**:
+  `chain_short` is set only inside a chain and cleared by the outermost
+  chain node's `ClearChainShort`, so the `JumpIfChainShort`/`Jump` pair is
+  dead outside a chain. The skip also covers paren'd chain callees
+  (`(a?.b)()`, `(a?.(x))(y)`): the chain ends at the paren, so the call
+  must RUN on the chain's value (throwing on `undefined`) — a stale guard
+  there would wrongly skip it.
+
+## 10. The frame-slot gate certifies global-blind callables (Cut 35 slice 3)
+
+A slotified script (Cut 16: declared vars live in frame slots, the loop
+counter in the accumulator, epilogue write-back) is a stale-global window:
+while the slots are authoritative, the global object holds the initial
+values, so ANY callable that can observe the global object (read/write a
+declared var, touch `globalThis`, run `eval`/`with`, escape a closure)
+forces the whole script back onto the global path. Slice 3 certifies
+callables that provably cannot observe it:
+
+- `certified_functions` (fixpoint over the top-level function
+declarations): a body may read/write only its params, locals, undeclared
+names (real global properties — never stale), and the stable
+entry-instantiated bindings of other certified functions (whose names are
+never assigned); it may create certified closures (function/arrow
+expressions with global-blind bodies) and call certified functions, but
+no `this`/`super`/`eval`/`with`/`try`/`switch`/`for-in`/`using`/
+`globalThis`-family names, no uncertified calls. Recursion never
+certifies; an assigned name is never a candidate.
+- `certified_value_expr` + `collect_var_certs` extend the top-level call
+gate to vars holding a certified value: a certified closure, a literal,
+or a certified-call result (the callee's return is itself certified —
+`certified_return_certs` fixpoint over the declarations' `return`s).
+Multiple assignments AND; compound/`++`/`--` marks the var unknown.
+- **Certified functions stay GLOBAL bindings** — never slotted: their
+  stable entry-instantiated function objects sit on the global object
+  (`global_declaration_instantiation` hoists them), so `binding()` returns
+  `Global`, top-level calls fuse (`CallFastGlobal`), and the `FunctionDecl`
+  statement compiles to nothing on the frame path.
+- **The gate is all-or-nothing per script** and the analyses are purely
+  syntactic (they run in `analyze_script_scope` before compilation, with
+the assigned set collected by a prepass). When you extend it, the danger
+is a WRONG CERTIFICATION (a stale-global read inside a certified body) —
+the 15-case probe `scratch/certified_fns_probe.js` has the regression
+cases; the full sweep is the backstop.
 
 ## Bench reality (Cut 2)
 
