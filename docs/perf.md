@@ -1429,6 +1429,31 @@ Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
 conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
 23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
 
+### Cut 35 slice 8 — register member reads (measured 2026-08-23)
+
+`LeafOp::GetMemberName` / `LeafOp::GetMemberComputed` extend the register
+member ops to reads: `return o.x` / `return o[k]` bodies lower with the
+object in the accumulator (and the computed key as a direct operand),
+and the executor shares the step path's machinery through extracted
+`get_member_name` / `get_member_computed` helpers — the nullish check,
+the direct-mapped member-cell cache, the fast array element read (a
+canonical Number index on a plain Array), then the property-key
+conversion + property machinery. Both `GetMemberName` and
+`GetMemberComputed` steps now call the same helpers, so the mirror stays
+exact. A computed key (`RegOperand::Acc`) keeps the body on the step
+path — the object load would clobber the accumulator.
+
+The read ops compose with the existing register ops: `return o.x + 1`
+lowers to `[LoadReg, GetMemberName, BinConst, ReturnAcc]`. The 14-case
+probe (`scratch/member_read_regs_probe.js`) covers named/computed/
+const-key reads, the array fast path, getters, nested reads, missing
+properties, nullish throws, read-then-store bodies, and the
+read-compute-read shape.
+
+Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
+conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
+23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

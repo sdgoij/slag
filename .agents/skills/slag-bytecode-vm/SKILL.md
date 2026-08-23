@@ -189,6 +189,13 @@ arguments state.
   `assign_computed_plain` (nullish check, fast array element write,
   `to_property_key` + `assign_member`) — extend the helper, not the two
   call sites separately.
+- **`GetMemberName`/`GetMemberComputed` reads** (Cut 35 slice 8): `o.x` /
+  `o[k]` in value position lower with the object in the accumulator (the
+  computed key a direct operand, never `Acc`), sharing the step path's
+  `get_member_name`/`get_member_computed` helpers (nullish check,
+  member-cell cache, fast array element read, property-key conversion).
+  Reads compose with the other register ops (`return o.x + 1` lowers),
+  and getters run through the same agent-side machinery on this Vm.
 - Errors propagate raw to the caller's `run_inner` exactly like a
   step-path leaf (a register body may throw from `apply_binary`/TDZ
   checks). Register-op semantics mirror the step semantics 1:1 — when you

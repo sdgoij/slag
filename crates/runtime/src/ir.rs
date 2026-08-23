@@ -901,6 +901,15 @@ pub enum LeafOp {
     /// property-key machinery. Neither operand may be `Acc` — the object
     /// load would clobber it.
     StoreMemberComputed { key: RegOperand, value: RegOperand },
+    /// acc = the accumulator object's `name` property (the named member
+    /// read, `Step::GetMemberName`): the shared `get_member_name` nullish
+    /// check + member-cell cache machinery.
+    GetMemberName { name: crux::AtomId },
+    /// acc = the accumulator object's `key` property (the computed member
+    /// read, `Step::GetMemberComputed`): the shared `get_member_computed`
+    /// fast-array and property-key machinery. The key may not be `Acc` —
+    /// the object load would clobber it.
+    GetMemberComputed { key: RegOperand },
     /// Complete with `Completion::Return(acc)`.
     ReturnAcc,
 }
@@ -3121,75 +3130,14 @@ impl Vm {
                 }
                 Step::GetMemberName { name } => {
                     let object = self.pop();
-                    if is_nullish(&object) {
-                        return Err(nullish_error("Cannot read properties of null"));
-                    }
-                    let value = match Self::member_cell_get(agent, &object, *name) {
-                        Some(value) => value,
-                        None => {
-                            let value = crate::context::get_property(
-                                agent,
-                                &object,
-                                &crux::lookup(*name),
-                                object.clone(),
-                            )?;
-                            Self::resolve_member_cell(agent, &object, *name);
-                            value
-                        }
-                    };
+                    let value = self.get_member_name(agent, object, *name)?;
                     self.stack.push(value);
                 }
                 Step::GetMemberComputed => {
                     let key = self.pop();
                     let object = self.pop();
-                    if is_nullish(&object) {
-                        return Err(nullish_error("Cannot read properties of null"));
-                    }
-                    // A Number key converts purely (ToPropertyKey of a number
-                    // runs no user code), so a canonical array index reads the
-                    // element directly — no number→string→intern round-trip.
-                    let numeric = match key.kind() {
-                        ValueKind::Number(number)
-                            if number.fract() == 0.0 && (0.0..4294967295.0).contains(&number) =>
-                        {
-                            Some(number as u64)
-                        }
-                        _ => None,
-                    };
-                    if let Some(index) = numeric
-                        && let Some(value) = Self::array_element_get(agent, &object, index)
-                    {
-                        self.stack.push(value);
-                    } else {
-                        let key = crate::context::to_property_key(agent, &key)?;
-                        let value = match &key {
-                            PropertyKey::String(atom) => {
-                                match Self::member_cell_get(agent, &object, *atom) {
-                                    Some(value) => value,
-                                    None => {
-                                        let value = crate::context::get_property_key(
-                                            agent,
-                                            &object,
-                                            &key,
-                                            object.clone(),
-                                        )?;
-                                        Self::resolve_member_cell(agent, &object, *atom);
-                                        value
-                                    }
-                                }
-                            }
-                            _ => crate::context::get_property_key(
-                                agent,
-                                &object,
-                                &key,
-                                object.clone(),
-                            )?,
-                        };
-                        if let Some(index) = numeric {
-                            Self::resolve_array_element(agent, &object, index);
-                        }
-                        self.stack.push(value);
-                    }
+                    let value = self.get_member_computed(agent, object, key)?;
+                    self.stack.push(value);
                 }
                 Step::GetMemberComputedKeep => {
                     // Compound/update paths: the (object, key) pair was
@@ -5791,6 +5739,83 @@ impl Vm {
         )
     }
 
+    /// The shared named member read (the `GetMemberName` step and the
+    /// register `GetMemberName` op): the nullish check, the direct-mapped
+    /// member-cell cache, then the property machinery (a getter runs on
+    /// this Vm — the leaf callers handle the nested state exactly like the
+    /// step path). Returns the value; the step path pushes it, the register
+    /// op stores it in the accumulator.
+    fn get_member_name(
+        &self,
+        agent: &mut Agent,
+        object: Value,
+        name: crux::AtomId,
+    ) -> Result<Value, JsError> {
+        if is_nullish(&object) {
+            return Err(nullish_error("Cannot read properties of null"));
+        }
+        match Self::member_cell_get(agent, &object, name) {
+            Some(value) => Ok(value),
+            None => {
+                let value = crate::context::get_property(
+                    agent,
+                    &object,
+                    &crux::lookup(name),
+                    object.clone(),
+                )?;
+                Self::resolve_member_cell(agent, &object, name);
+                Ok(value)
+            }
+        }
+    }
+
+    /// The shared computed member read (the `GetMemberComputed` step and
+    /// the register `GetMemberComputed` op): nullish check, the fast array
+    /// element read (a canonical Number index on a plain Array), then the
+    /// property-key conversion + member-cell/property machinery.
+    fn get_member_computed(
+        &self,
+        agent: &mut Agent,
+        object: Value,
+        key: Value,
+    ) -> Result<Value, JsError> {
+        if is_nullish(&object) {
+            return Err(nullish_error("Cannot read properties of null"));
+        }
+        // A Number key converts purely (ToPropertyKey of a number runs no
+        // user code), so a canonical array index reads the element directly.
+        let numeric = match key.kind() {
+            ValueKind::Number(number)
+                if number.fract() == 0.0 && (0.0..4294967295.0).contains(&number) =>
+            {
+                Some(number as u64)
+            }
+            _ => None,
+        };
+        if let Some(index) = numeric
+            && let Some(value) = Self::array_element_get(agent, &object, index)
+        {
+            return Ok(value);
+        }
+        let key = crate::context::to_property_key(agent, &key)?;
+        let value = match &key {
+            PropertyKey::String(atom) => match Self::member_cell_get(agent, &object, *atom) {
+                Some(value) => value,
+                None => {
+                    let value =
+                        crate::context::get_property_key(agent, &object, &key, object.clone())?;
+                    Self::resolve_member_cell(agent, &object, *atom);
+                    value
+                }
+            },
+            _ => crate::context::get_property_key(agent, &object, &key, object.clone())?,
+        };
+        if let Some(index) = numeric {
+            Self::resolve_array_element(agent, &object, index);
+        }
+        Ok(value)
+    }
+
     fn assign_member(
         &mut self,
         agent: &mut Agent,
@@ -6349,6 +6374,15 @@ impl Vm {
                     let key = self.leaf_operand_value(frame_base, key)?;
                     let value = self.leaf_operand_value(frame_base, value)?;
                     self.assign_computed_plain(agent, object, key, value)?;
+                }
+                LeafOp::GetMemberName { name } => {
+                    let object = self.acc.clone();
+                    self.acc = self.get_member_name(agent, object, *name)?;
+                }
+                LeafOp::GetMemberComputed { key } => {
+                    let object = self.acc.clone();
+                    let key = self.leaf_operand_value(frame_base, key)?;
+                    self.acc = self.get_member_computed(agent, object, key)?;
                 }
                 LeafOp::ReturnAcc => {
                     return Ok(Completion::Return(self.acc.clone()));
@@ -12945,6 +12979,31 @@ fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
                     return None;
                 }
                 ops.push(LeafOp::StoreMemberComputed { key, value });
+            }
+            Step::GetMemberName { name } => {
+                // `o.x` (in value position): the object is the accumulator,
+                // the read lands in it.
+                let object = stack.pop()?;
+                if !load_operand(&mut ops, object) {
+                    return None;
+                }
+                ops.push(LeafOp::GetMemberName { name: *name });
+                stack.push(RegOperand::Acc);
+            }
+            Step::GetMemberComputed => {
+                // `o[k]`: the object is the accumulator, the key a direct
+                // operand (a computed key — `Acc` — cannot be held while the
+                // object load overwrites the accumulator).
+                let key = stack.pop()?;
+                let object = stack.pop()?;
+                if matches!(key, RegOperand::Acc) {
+                    return None;
+                }
+                if !load_operand(&mut ops, object) {
+                    return None;
+                }
+                ops.push(LeafOp::GetMemberComputed { key });
+                stack.push(RegOperand::Acc);
             }
             // A statement's completion is only read at the body's end, where
             // the register path's `Empty` maps identically to the step path's
