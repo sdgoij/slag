@@ -3756,14 +3756,10 @@ impl Vm {
                         && let ValueKind::Function(function) = callee.kind()
                         && matches!(function.kind, crux::function::FunctionKind::EcmaScript)
                         && let Some(data) = agent.ecma_functions.get(&function.id())
-                        && let Some(ir) = &data.ir
-                        && ir.leaf
-                        && data.this_mode != crate::function::ThisMode::Lexical
-                        && (!data.is_method || data.is_class_constructor)
-                        && data.constructor_kind == crate::function::ConstructorKind::Base
-                        && data.fields.is_empty()
-                        && data.private_methods.is_empty()
-                        && !data.class_field_initializer
+                        // Cut 33: the certified base-constructor leaf verdict
+                        // (leaf body, base kind, no fields/private methods) is
+                        // cached at ir-compile time.
+                        && data.construct_inline
                         && agent.realms.borrow().len() == 1
                     {
                         let ir = data.ir.clone().expect("checked Some above");
@@ -5955,12 +5951,9 @@ impl Vm {
             && let ValueKind::Function(function) = callee.kind()
             && matches!(function.kind, crux::function::FunctionKind::EcmaScript)
             && let Some(data) = agent.ecma_functions.get(&function.id())
-            && let Some(ir) = &data.ir
-            && ir.leaf
-            // The class-constructor TypeError and the field-initializer
-            // context are the general path's job.
-            && !data.is_class_constructor
-            && !data.class_field_initializer
+            // Cut 33: the record-derived eligibility (certified leaf body,
+            // ordinary callable) is cached at ir-compile time.
+            && data.leaf_inline
             // The leaf runs with the caller's realm current: cross-realm
             // calls dispatch with the callee's realm, which the inline path
             // cannot.

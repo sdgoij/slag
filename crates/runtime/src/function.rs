@@ -160,6 +160,14 @@ pub struct EcmaFunction {
     /// step IR, and ordinary calls/constructs run it on the VM. Shared so
     /// the per-call record read does not copy the steps.
     pub ir: Option<std::rc::Rc<crate::ir::CompiledBody>>,
+    /// Cut 33: the cached leaf-inline verdict for `do_call_fast` — the
+    /// record-derived eligibility (certified leaf body, ordinary callable)
+    /// is immutable once the ir compiles, so the per-call check reads one
+    /// bool instead of re-walking the ir/flag chain.
+    pub leaf_inline: bool,
+    /// Cut 33: the cached construct-inline verdict for `Step::Construct`
+    /// (certified leaf + base constructor + no fields/private methods).
+    pub construct_inline: bool,
     /// The enclosing certified bodies' capture-context layouts (Cut 3
     /// continuation, nested context chains), innermost first: the body's
     /// references to those captured names compile to static context-chain
@@ -175,6 +183,34 @@ pub struct EcmaFunction {
     /// heads compile to static `LoadPerIteration` reads (resolved against
     /// the closure's own `lexical_env` at run time) instead of env walks.
     pub per_iteration_chain: Vec<(Vec<crux::AtomId>, usize)>,
+}
+
+/// Record the compiled step IR and the immutable leaf/construct inline
+/// verdicts derived from it (Cut 33): `do_call_fast` and `Step::Construct`
+/// read the cached bools instead of re-walking the ir/flag checks on every
+/// call.
+impl EcmaFunction {
+    /// The construct-inline verdict from the CURRENT record state — read
+    /// again after `build_class` populates `fields`/`private_methods`
+    /// (which arrive after registration, so `set_compiled` cannot see
+    /// them).
+    pub(crate) fn compute_construct_inline(&self) -> bool {
+        self.ir.as_ref().is_some_and(|ir| {
+            ir.leaf
+                && self.this_mode != ThisMode::Lexical
+                && (!self.is_method || self.is_class_constructor)
+                && self.constructor_kind == ConstructorKind::Base
+                && self.fields.is_empty()
+                && self.private_methods.is_empty()
+                && !self.class_field_initializer
+        })
+    }
+
+    fn set_compiled(&mut self, ir: std::rc::Rc<crate::ir::CompiledBody>) {
+        self.leaf_inline = ir.leaf && !self.is_class_constructor && !self.class_field_initializer;
+        self.ir = Some(ir);
+        self.construct_inline = self.compute_construct_inline();
+    }
 }
 
 /// FunctionBodyContainsUseStrict (spec 15.2.1): a `"use strict"` directive in
@@ -689,12 +725,14 @@ fn register_function(
         source,
         declaring_module,
         ir: None,
+        leaf_inline: false,
+        construct_inline: false,
         outer_chain,
         per_iteration_chain: Vec::new(),
     };
     // Every body compiles to the step IR; the VM executes ordinary bodies
     // the same way it runs the resumable kinds.
-    data.ir = Some(std::rc::Rc::new(crate::ir::compile_body(&data)?));
+    data.set_compiled(std::rc::Rc::new(crate::ir::compile_body(&data)?));
     let function = Function::new(name.clone());
     agent.ecma_functions.insert(function.id(), data);
     set_function_properties(&function, &params, name.as_ref())?;
@@ -982,10 +1020,12 @@ pub fn instantiate_arrow(
         source: None,
         declaring_module: None,
         ir: None,
+        leaf_inline: false,
+        construct_inline: false,
         outer_chain,
         per_iteration_chain,
     };
-    data.ir = Some(std::rc::Rc::new(crate::ir::compile_body(&data)?));
+    data.set_compiled(std::rc::Rc::new(crate::ir::compile_body(&data)?));
     let function = Function::new(None);
     let params = data.params.clone();
     agent.ecma_functions.insert(function.id(), data);

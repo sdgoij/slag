@@ -1047,6 +1047,39 @@ Conformance at baseline: language 23,690/0/34, annexB 1,086/0/0,
 built-ins 23,211/0/154 (447 >15s hangs, the known slow class); workspace
 tests 4311/0.
 
+### Cut 33 — cache the leaf/construct inline verdicts on the function record (measured 2026-08-23)
+
+The leaf-inline eligibility checks in `do_call_fast` and `Step::Construct`
+re-walked the callee record per call: the `ir` Option, `ir.leaf`, and the
+`is_class_constructor`/`class_field_initializer`/`this_mode`/`is_method`/
+`constructor_kind`/`fields`/`private_methods` flags. All of those are
+immutable once the ir compiles, so the record now caches the two verdicts
+(`leaf_inline`, `construct_inline`) at ir-compile time and the hot paths
+read one bool.
+
+One trap: a class constructor's `fields`/`private_methods` are populated
+by `build_class` AFTER registration, so the cached construct verdict
+computed at compile time was stale (a default class constructor with an
+empty leaf body looked inlineable before its fields arrived) — the
+verdict is recomputed when `build_class` sets them. The runtime class
+tests caught it.
+
+Measured (release, vs Cut 31; the machine was load-noisy, medians over
+6 runs):
+
+| Row | before | after |
+|---|---|---|
+| function calls | ~170ms | ~175ms |
+| closure capture | ~169ms | ~173ms |
+| per-iteration | ~22ms | ~22ms |
+| construct churn | ~80ms | ~78ms |
+
+The delta is inside the noise floor (the change is strictly-less-work:
+~4-6 fewer record checks per call), consistent with the Cut 21
+noise-floor-win precedent. Conformance at baseline: language 23,690/0/34,
+annexB 1,086/0/0, built-ins 23,211/0/154 (447 >15s hangs, the known slow
+class); workspace tests 4312/0.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

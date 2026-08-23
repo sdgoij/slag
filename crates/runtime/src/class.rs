@@ -535,6 +535,11 @@ fn build_class(
         data.fields = fields;
         data.private_methods = instance_private_methods;
         data.private_environment = Some(class_private_env.clone());
+        // Cut 33: fields/private methods arrive after registration, so the
+        // cached construct-inline verdict (computed with the empty vectors)
+        // is stale — a constructor with fields/private methods must not
+        // inline.
+        data.construct_inline = data.compute_construct_inline();
     }
 
     // Initialize the class binding in the class scope (spec step 36).
