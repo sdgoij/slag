@@ -553,8 +553,12 @@ pub enum Step {
     },
     LeaveIterTdzEnv,
     ForInBegin,
+    /// Cut 35 slice 18: `back` is where a successful fetch continues — the
+    /// do-while loop shape's body start (the certified paths) or the next
+    /// step (the generic paths, matching the old fall-through).
     ForInNext {
         done: usize,
+        back: usize,
     },
     ForInBind {
         left: ForBinding,
@@ -566,14 +570,17 @@ pub enum Step {
     },
     ForOfNext {
         done: usize,
+        back: usize,
     },
     /// The fused for-of protocol step + slot head bind (Cut 21): the
     /// element writes the frame slot directly — one less dispatch and no
     /// value-stack round-trip per element. The generic iterator path
-    /// writes the slot the same way.
+    /// writes the slot the same way. `back` is the do-while body start
+    /// (Cut 35 slice 18).
     ForOfNextBindLocal {
         slot: usize,
         done: usize,
+        back: usize,
     },
     ForOfBind {
         left: ForBinding,
@@ -4825,7 +4832,7 @@ impl Vm {
                         self.for_in_stack.push((obj, keys, 0));
                     }
                 }
-                Step::ForInNext { done } => {
+                Step::ForInNext { done, back } => {
                     let Some((obj, keys, index)) = self.for_in_stack.last_mut() else {
                         return Err(JsError::new(
                             ErrorKind::SyntaxError,
@@ -4844,7 +4851,11 @@ impl Vm {
                             break;
                         }
                     }
-                    if !pushed {
+                    if pushed {
+                        // Cut 35 slice 18: continue at the do-while body
+                        // start (no back-jump per iteration).
+                        self.ip = *back;
+                    } else {
                         self.for_in_stack.pop();
                         self.ip = *done;
                     }
@@ -4867,11 +4878,11 @@ impl Vm {
                     self.for_of_stack.push(entry);
                     self.for_of_boundaries.push((*top, *end));
                 }
-                Step::ForOfNext { done } => {
-                    self.for_of_next(agent, *done, ForOfNextTarget::Stack)?;
+                Step::ForOfNext { done, back } => {
+                    self.for_of_next(agent, *done, *back, ForOfNextTarget::Stack)?;
                 }
-                Step::ForOfNextBindLocal { slot, done } => {
-                    self.for_of_next(agent, *done, ForOfNextTarget::Slot(*slot))?;
+                Step::ForOfNextBindLocal { slot, done, back } => {
+                    self.for_of_next(agent, *done, *back, ForOfNextTarget::Slot(*slot))?;
                 }
                 Step::ForOfBind { left } => {
                     let value = self.pop();
@@ -7244,11 +7255,14 @@ impl Vm {
     /// element on the value stack (the general shape) or in a frame slot
     /// directly (the fused bind, Cut 21). The dense fast path re-reads the
     /// length and the element every step so a body that mutates the array is
-    /// observed exactly as the stock iterator would.
+    /// observed exactly as the stock iterator would. On a successful fetch,
+    /// `back` is where the loop continues (the do-while body start, Cut 35
+    /// slice 18 — no per-element back-jump); on exhaustion, `done`.
     fn for_of_next(
         &mut self,
         agent: &mut Agent,
         done: usize,
+        back: usize,
         target: ForOfNextTarget,
     ) -> Result<(), JsError> {
         // The innermost state is cloned out so the arm can mutate the stacks
@@ -7287,6 +7301,7 @@ impl Vm {
                     ForOfNextTarget::Stack => self.stack.push(value),
                     ForOfNextTarget::Slot(slot) => *self.frame_get_mut(slot) = value,
                 }
+                self.ip = back;
             }
         } else {
             let Some(iterator) = self.for_of_stack.last() else {
@@ -7310,6 +7325,7 @@ impl Vm {
                         ForOfNextTarget::Stack => self.stack.push(value),
                         ForOfNextTarget::Slot(slot) => *self.frame_get_mut(slot) = value,
                     }
+                    self.ip = back;
                 }
                 Ok(None) => {
                     self.for_of_stepping = false;
@@ -9632,9 +9648,9 @@ impl Compiler {
                     };
                 }
                 Fixup::ForInNext(index, label) => {
-                    self.steps[index] = Step::ForInNext {
-                        done: self.labels[&label],
-                    };
+                    if let Step::ForInNext { done, .. } = &mut self.steps[index] {
+                        *done = self.labels[&label];
+                    }
                 }
                 Fixup::ForOfBoundary(index, top, end) => {
                     self.steps[index] = Step::ForOfBegin {
@@ -9649,9 +9665,9 @@ impl Compiler {
                     };
                 }
                 Fixup::ForOfNext(index, label) => {
-                    self.steps[index] = Step::ForOfNext {
-                        done: self.labels[&label],
-                    };
+                    if let Step::ForOfNext { done, .. } = &mut self.steps[index] {
+                        *done = self.labels[&label];
+                    }
                 }
                 Fixup::ForOfNextBindLocal(index, label) => {
                     if let Step::ForOfNextBindLocal { done, .. } = &mut self.steps[index] {
@@ -10737,7 +10753,11 @@ impl Compiler {
             _ => None,
         };
         if let Some(slot) = fused_slot {
-            self.emit(Step::ForOfNextBindLocal { slot, done: 0 });
+            self.emit(Step::ForOfNextBindLocal {
+                slot,
+                done: 0,
+                back: 0,
+            });
             self.fixups
                 .push(Fixup::ForOfNextBindLocal(step_index, done_label));
         } else {
@@ -10752,6 +10772,18 @@ impl Compiler {
                 _ => unreachable!("the certified loop protocol step is ForInNext or ForOfNext"),
             }
             self.emit_certified_for_bind(*name, *kind);
+        }
+        // Cut 35 slice 18: the do-while back target — the step right after
+        // the fetch (the head bind, or the body start when fused). Both the
+        // prologue fetch and the per-iteration fetch at the loop bottom
+        // share it, so a successful fetch continues straight at the bind /
+        // body start with no per-element back-jump.
+        let back = step_index + 1;
+        match &mut self.steps[step_index] {
+            Step::ForInNext { back: target, .. }
+            | Step::ForOfNext { back: target, .. }
+            | Step::ForOfNextBindLocal { back: target, .. } => *target = back,
+            _ => unreachable!("the certified loop protocol step is ForInNext or ForOfNext"),
         }
         let body_steps = self.steps.len();
         let body_fixups = self.fixups.len();
@@ -10782,7 +10814,33 @@ impl Compiler {
                 names: per_iteration.clone(),
             });
         }
-        self.jump(top_label);
+        // Cut 35 slice 18: the do-while back edge — the per-iteration fetch
+        // at the loop bottom re-runs the protocol step in place of the old
+        // `Jump(top_label)`, so a straight-line body has no per-element jump
+        // dispatch. Its `back` targets the head bind / body start above; a
+        // `continue` falls into the copy (captured heads) and the fetch.
+        let loop_fetch = self.steps.len();
+        if let Some(slot) = fused_slot {
+            self.emit(Step::ForOfNextBindLocal {
+                slot,
+                done: 0,
+                back,
+            });
+            self.fixups
+                .push(Fixup::ForOfNextBindLocal(loop_fetch, done_label));
+        } else {
+            match &emit_next {
+                Step::ForInNext { .. } => {
+                    self.emit(Step::ForInNext { done: 0, back });
+                    self.fixups.push(Fixup::ForInNext(loop_fetch, done_label));
+                }
+                Step::ForOfNext { .. } => {
+                    self.emit(Step::ForOfNext { done: 0, back });
+                    self.fixups.push(Fixup::ForOfNext(loop_fetch, done_label));
+                }
+                _ => unreachable!("the certified loop protocol step is ForInNext or ForOfNext"),
+            }
+        }
         self.place(end_label);
         if lexical && captured {
             self.emit(Step::LeaveBlock);
@@ -10828,7 +10886,7 @@ impl Compiler {
         }
         self.compile_expr(right)?;
         self.emit(Step::ForInBegin);
-        self.compile_certified_for_loop(left, body, Step::ForInNext { done: 0 }, false)?;
+        self.compile_certified_for_loop(left, body, Step::ForInNext { done: 0, back: 0 }, false)?;
         Ok(())
     }
 
@@ -10841,8 +10899,12 @@ impl Compiler {
         self.compile_expr(right)?;
         self.emit(Step::ForOfBegin { top: 0, end: 0 });
         let begin_index = self.steps.len() - 1;
-        let (top, end) =
-            self.compile_certified_for_loop(left, body, Step::ForOfNext { done: 0 }, true)?;
+        let (top, end) = self.compile_certified_for_loop(
+            left,
+            body,
+            Step::ForOfNext { done: 0, back: 0 },
+            true,
+        )?;
         self.fixups
             .push(Fixup::ForOfBoundary(begin_index, top, end));
         Ok(())
@@ -10909,7 +10971,10 @@ impl Compiler {
         self.resolve_labeled_continue(continue_label, scope);
         self.place(top_label);
         let step_index = self.steps.len();
-        self.emit(Step::ForInNext { done: 0 });
+        self.emit(Step::ForInNext {
+            done: 0,
+            back: step_index + 1,
+        });
         self.fixups.push(Fixup::ForInNext(step_index, done_label));
         self.emit(Step::ForInBind { left: left.clone() });
         if lexical_head {
@@ -10976,7 +11041,10 @@ impl Compiler {
         self.resolve_labeled_continue(continue_label, scope);
         self.place(top_label);
         let step_index = self.steps.len();
-        self.emit(Step::ForOfNext { done: 0 });
+        self.emit(Step::ForOfNext {
+            done: 0,
+            back: step_index + 1,
+        });
         self.fixups.push(Fixup::ForOfNext(step_index, done_label));
         // A destructuring head is compiled as steps (member targets and
         // defaults with `yield`/`await` need the resumable machinery).

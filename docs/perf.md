@@ -1745,6 +1745,45 @@ Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
 conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
 23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
 
+### Cut 35 slice 18 — do-while for-of/for-in loop shape (measured 2026-08-23)
+
+The certified for-of loop was `[ForOfNextBindLocal; body; Jump(top)]` —
+three dispatches per element, the back-jump being one of them. The
+protocol steps gained a `back` target and the loop is now a do-while:
+
+```
+34: ForOfNextBindLocal { slot: 2, done: 39, back: 35 }   // prologue fetch
+35: RunRegBody { ops: [...], push_counter: false }         // body start
+36: ForOfNextBindLocal { slot: 2, done: 39, back: 35 }   // loop-bottom fetch
+37: ForOfClose
+...
+39: NormalizeCompletion                                  // done
+```
+
+The per-iteration fetch at the loop bottom **is** the back edge: on a
+successful fetch `ip = back` (the head bind / body start), so a
+straight-line body has no per-element `Jump` dispatch. The prologue
+fetch and the loop-bottom fetch are separate steps with the same
+`done`/`back`; `continue` targets the per-iteration copy (captured
+heads) or the loop-bottom fetch itself, exactly the old back-edge
+ordering. The generic (uncertified) paths keep the `Jump` — their
+`back` is just the next step (no behavior change) — and the for-of/
+for-in `ForOfBoundary` span is unchanged.
+
+The array-iteration row drops ~2-8ms (interleaved same-load baseline,
+median ~-5) with every other row flat: the array bench inner loop is
+now 2 dispatches per element (fetch + `RunRegBody`). The 30-case probe
+(`scratch/slice18_probe.js`) covers dense/hole/sparse arrays, continue,
+break, labeled break, per-iteration captures with continue/break,
+nested for-of, bodies with calls, generic iterators (Set/string),
+for-in with deletion and continue, array mutation during iteration,
+zero-iteration loops, and the uncertified paths (destructuring heads,
+`with`-forced, lexical-head restore).
+
+Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
+conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
+23,812/0/154 with 440 >15s hangs in the known slow classes (unchanged).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

@@ -386,6 +386,39 @@ is a WRONG CERTIFICATION (a stale-global read inside a certified body) —
 the 15-case probe `scratch/certified_fns_probe.js` has the regression
 cases; the full sweep is the backstop.
 
+## 11. The certified for-of/for-in do-while back edge (Cut 35 slice 18)
+
+The certified loop was `[Fetch; body; Jump(top)]` — the back-jump was one
+of the three per-element dispatches. The protocol steps
+(`ForInNext`/`ForOfNext`/`ForOfNextBindLocal`) now carry `back`, and the
+loop shape is a do-while: the prologue fetch at `top`, the body, then a
+**duplicate fetch at the loop bottom that IS the back edge** (its `back`
+targets the head bind / body start above). A straight-line body has no
+per-element jump dispatch (the array row drops ~2-8ms).
+
+- **`back` = the step right after the PROLOGUE fetch** (`step_index + 1`):
+  the head bind when not fused, the body start when fused. Pointing it at
+the body start for a NON-fused head leaves every element on the value
+stack (the bind never runs) and grows the stack per iteration.
+- **The `continue` target is the per-iteration copy (captured heads) or
+the loop-bottom fetch itself** — the copy must run between the body and
+the fetch, exactly the old `Jump(top)` ordering. A `continue` falls into
+the copy/fetch and re-runs it.
+- **`resolve`'s `Fixup::ForInNext`/`Fixup::ForOfNext` must pattern-match
+`{ done, .. }`** to preserve the compiler-patched `back` — reconstructing
+the variant would reset it to 0. `ForOfNextBindLocal` already did this.
+- **The generic (uncertified) paths keep the `Jump`**; their `back` is
+just the next step (fall-through equivalent, no behavior change) because
+their back-edge restore steps (`ForOfRestore`/`ForInRestore`) must still
+run per iteration.
+- **The `ForOfBoundary` span `[top, end]` is unchanged** — the loop-bottom
+fetch sits inside it, so `close_for_of_upto` (external transfers) behaves
+identically.
+- A body that lowers to `RunRegBody` can't contain a continue (register
+ops reject jumps), so the do-while applies there unconditionally; the
+`RunRegBody` truncation keeps the prologue fetch (it precedes
+`body_steps`), so the patched `back` stays valid.
+
 ## Bench reality (Cut 2)
 
 `cargo run -p cli --release -- --bench` bounces ±15% on this machine (the
