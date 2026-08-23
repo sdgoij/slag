@@ -2361,6 +2361,42 @@ mod tests {
     }
 
     #[test]
+    fn mid_chain_optional_member_keeps_short_circuiting() {
+        // A `?.` in the middle of a chain short-circuits the WHOLE chain:
+        // the links after it (plain members, calls, indexes) are skipped, not
+        // evaluated against the chain value (spec 13.4.3). Regression: the
+        // object chain's depth bookkeeping cleared the short-circuit flag
+        // before the next link's guard, so `a?.b.m` read `.m` of the chain
+        // value (a TypeError) instead of yielding *undefined*.
+        assert_eq!(
+            run("let o = { a: null }; o.a?.b.m").unwrap(),
+            Value::Undefined
+        );
+        assert_eq!(
+            run("let o = { a: null }; o.a?.b.m(1)").unwrap(),
+            Value::Undefined
+        );
+        assert_eq!(
+            run("let o = { a: null }; o.a?.b[0].x").unwrap(),
+            Value::Undefined
+        );
+        assert_eq!(
+            run("let o = { a: { b: 5 } }; o.a?.b").unwrap(),
+            Value::Number(5.0)
+        );
+        // Parentheses terminate the chain: the member/call on the
+        // parenthesized value always runs (throwing on a nullish result).
+        assert!(run("let o = { a: null }; (o.a?.b).c").is_err());
+        assert!(run("let o = { a: null }; (o.a?.b)()").is_err());
+        // The short-circuit flag must not leak past the statement: a later
+        // guarded call still runs.
+        assert_eq!(
+            run("let o = { a: null }; let g = () => 3; o.a?.b; g() + 1").unwrap(),
+            Value::Number(4.0)
+        );
+    }
+
+    #[test]
     fn chained_member_and_method_this() {
         assert_eq!(
             run("let o = { a: { b: { c: 3 } } }; o.a.b.c").unwrap(),

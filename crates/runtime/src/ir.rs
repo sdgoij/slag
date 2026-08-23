@@ -7332,7 +7332,11 @@ fn expr_may_short_circuit(expr: &Expr) -> bool {
     match &expr.kind {
         ExprKind::Member(member) => member.optional || expr_may_short_circuit(&member.object),
         ExprKind::Call(call) => call.optional || expr_may_short_circuit(&call.callee),
-        ExprKind::Paren(inner) => expr_may_short_circuit(inner),
+        // Parentheses terminate an optional chain (spec 13.4.3): a member
+        // access or call on a parenthesized value always runs, even when the
+        // chain inside the parens short-circuited — `(a?.b).c` reads `.c` of
+        // the chain result (throwing on nullish), it does not short-circuit.
+        ExprKind::Paren(_) => false,
         ExprKind::New(new) => expr_may_short_circuit(&new.callee),
         ExprKind::TaggedTemplate { tag, .. } => expr_may_short_circuit(tag),
         _ => false,
@@ -8085,15 +8089,23 @@ impl Compiler {
     }
 
     /// Enter an optional-chain node: the outermost node of a chain that may
-    /// short-circuit emits the runtime clear when it finishes.
-    fn enter_chain(&mut self, expr: &Expr) {
+    /// short-circuit emits the runtime clear when it finishes. Returns
+    /// whether the node contributes a chain depth — the paired
+    /// [`Compiler::leave_chain`] needs it, because a nested non-optional
+    /// member between chain links (`a.b?.c`'s `a.b`) must not consume the
+    /// enclosing chain's depth (that premature clear was the `a?.b.m` bug:
+    /// the flag was cleared before the `.m` guard).
+    fn enter_chain(&mut self, expr: &Expr) -> bool {
         if expr_may_short_circuit(expr) {
             self.chain_depth += 1;
+            true
+        } else {
+            false
         }
     }
 
-    fn leave_chain(&mut self) {
-        if self.chain_depth > 0 {
+    fn leave_chain(&mut self, entered: bool) {
+        if entered {
             self.chain_depth -= 1;
             if self.chain_depth == 0 {
                 self.emit(Step::ClearChainShort);
@@ -10078,9 +10090,9 @@ impl Compiler {
                 Ok(())
             }
             ExprKind::Call(call) => {
-                self.enter_chain(expr);
+                let entered = self.enter_chain(expr);
                 self.compile_call(call)?;
-                self.leave_chain();
+                self.leave_chain(entered);
                 Ok(())
             }
             ExprKind::New(new) => {
@@ -10096,9 +10108,9 @@ impl Compiler {
                 Ok(())
             }
             ExprKind::Member(member) => {
-                self.enter_chain(expr);
+                let entered = self.enter_chain(expr);
                 self.compile_member(member)?;
-                self.leave_chain();
+                self.leave_chain(entered);
                 Ok(())
             }
             ExprKind::TaggedTemplate { tag, quasi } => {
