@@ -893,6 +893,26 @@ pub enum LeafOp {
     BinImm { op: BinaryOp, imm: f64 },
     /// acc = acc op value.
     BinConst { op: BinaryOp, value: Value },
+    /// acc = frame[slot] op imm (Cut 35 slice 14: the fused `LoadReg` +
+    /// `BinImm` for a frame-slot left operand — one dispatch, skipping the
+    /// intermediate accumulator write). The `tdz` bit mirrors `LoadReg`'s
+    /// uninitialized-binding check before the read.
+    BinImmLocal {
+        op: BinaryOp,
+        slot: usize,
+        tdz: bool,
+        imm: f64,
+    },
+    /// acc = context[index] op frame[slot] (Cut 35 slice 14: the fused
+    /// `LoadContext` + `BinReg` for a captured left and a frame-slot right
+    /// — one dispatch). Runs the context-transparent env walk like
+    /// `LoadContext` and the `tdz` check like `BinReg`.
+    BinCtxReg {
+        op: BinaryOp,
+        index: usize,
+        slot: usize,
+        tdz: bool,
+    },
     /// frame[slot] = acc; the `tdz` bit mirrors `Step::StoreLocal`'s
     /// assignment-to-uninitialized check.
     StoreReg { slot: usize, tdz: bool },
@@ -6544,6 +6564,53 @@ impl Vm {
                             crate::expr::apply_binary(agent, *op, &self.acc, value)?
                         };
                     self.acc = value;
+                }
+                LeafOp::BinImmLocal { op, slot, tdz, imm } => {
+                    // The fused `LoadReg` + `BinImm` (Cut 35 slice 14): the
+                    // frame-slot read (with its `tdz` check) then the
+                    // number-number inline.
+                    if *tdz && self.frame_get(*slot).is_uninitialized() {
+                        return Err(JsError::new(
+                            ErrorKind::ReferenceError,
+                            "Cannot access a binding before initialization".into(),
+                        ));
+                    }
+                    let left = self.frame_get(*slot).clone();
+                    self.acc = Self::binary_inline(agent, *op, &left, &Value::Number(*imm))?;
+                }
+                LeafOp::BinCtxReg {
+                    op,
+                    index,
+                    slot,
+                    tdz,
+                } => {
+                    // The `context_chain_env(0)` transparent-env walk (see
+                    // `LoadContext`), then the frame-slot read with its
+                    // `tdz` check — the step path's evaluation order
+                    // (captured left first, frame right second).
+                    let mut env = self.body_context_env();
+                    while is_context_transparent(&env) {
+                        env = env.outer().ok_or_else(|| {
+                            JsError::new(
+                                ErrorKind::ReferenceError,
+                                "No outer environment for a capture-context binding".into(),
+                            )
+                        })?;
+                    }
+                    let left = context_env(&env).slot_value(*index).ok_or_else(|| {
+                        JsError::new(
+                            ErrorKind::ReferenceError,
+                            "Cannot access a binding before initialization".into(),
+                        )
+                    })?;
+                    if *tdz && self.frame_get(*slot).is_uninitialized() {
+                        return Err(JsError::new(
+                            ErrorKind::ReferenceError,
+                            "Cannot access a binding before initialization".into(),
+                        ));
+                    }
+                    let right = self.frame_get(*slot).clone();
+                    self.acc = Self::binary_inline(agent, *op, &left, &right)?;
                 }
                 LeafOp::StoreReg { slot, tdz } => {
                     if *tdz && self.frame_get(*slot).is_uninitialized() {
@@ -13365,36 +13432,69 @@ fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
                     }
                     stack.push(RegOperand::Acc);
                 } else {
-                    if !load_operand(&mut ops, left) {
-                        return None;
+                    match (left, right) {
+                        // Cut 35 slice 14: a captured left with a
+                        // frame-slot right fuses into one op (the
+                        // `(y) => x + y` leaf: `LoadContext` + `BinReg` —
+                        // the env walk and the slot read have no side
+                        // effects between them, so the order is unchanged).
+                        (RegOperand::Ctx { index }, RegOperand::Reg { slot, tdz }) => {
+                            ops.push(LeafOp::BinCtxReg {
+                                op: *op,
+                                index,
+                                slot,
+                                tdz,
+                            });
+                            stack.push(RegOperand::Acc);
+                        }
+                        (left, right) => {
+                            if !load_operand(&mut ops, left) {
+                                return None;
+                            }
+                            match right {
+                                RegOperand::Reg { slot, tdz } => {
+                                    ops.push(LeafOp::BinReg { op: *op, slot, tdz });
+                                }
+                                RegOperand::Ctx { index } => {
+                                    ops.push(LeafOp::BinContext { op: *op, index });
+                                }
+                                RegOperand::PerIter { index } => {
+                                    ops.push(LeafOp::BinPerIter { op: *op, index });
+                                }
+                                RegOperand::Const(value) => {
+                                    ops.push(LeafOp::BinConst { op: *op, value });
+                                }
+                                // A computed or spilled right operand
+                                // cannot be held while the left operand
+                                // loads into the accumulator.
+                                RegOperand::Acc | RegOperand::Spilled => return None,
+                            }
+                            stack.push(RegOperand::Acc);
+                        }
                     }
-                    match right {
-                        RegOperand::Reg { slot, tdz } => {
-                            ops.push(LeafOp::BinReg { op: *op, slot, tdz });
-                        }
-                        RegOperand::Ctx { index } => {
-                            ops.push(LeafOp::BinContext { op: *op, index });
-                        }
-                        RegOperand::PerIter { index } => {
-                            ops.push(LeafOp::BinPerIter { op: *op, index });
-                        }
-                        RegOperand::Const(value) => {
-                            ops.push(LeafOp::BinConst { op: *op, value });
-                        }
-                        // A computed or spilled right operand cannot be
-                        // held while the left operand loads into the
-                        // accumulator.
-                        RegOperand::Acc | RegOperand::Spilled => return None,
-                    }
-                    stack.push(RegOperand::Acc);
                 }
             }
             Step::BinaryImm { op, imm } => {
                 let left = stack.pop()?;
-                if !load_operand(&mut ops, left) {
-                    return None;
+                match left {
+                    RegOperand::Reg { slot, tdz } => {
+                        // Cut 35 slice 14: a frame-slot left fuses into the
+                        // immediate binary (the `return x + 1` leaf: one
+                        // dispatch, skipping the load).
+                        ops.push(LeafOp::BinImmLocal {
+                            op: *op,
+                            slot,
+                            tdz,
+                            imm: *imm,
+                        });
+                    }
+                    left => {
+                        if !load_operand(&mut ops, left) {
+                            return None;
+                        }
+                        ops.push(LeafOp::BinImm { op: *op, imm: *imm });
+                    }
                 }
-                ops.push(LeafOp::BinImm { op: *op, imm: *imm });
                 stack.push(RegOperand::Acc);
             }
             Step::StoreLocal { slot } | Step::FusedStoreLocal { slot } => {

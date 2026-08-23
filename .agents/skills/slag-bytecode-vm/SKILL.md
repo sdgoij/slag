@@ -267,6 +267,16 @@ arguments state.
   deletes) bump the generation. The for-of fast path re-reads the
   length and each element every step (stock iterator semantics), so
   these caches are what make the array-iteration row fast.
+- **Leaf binary fusions** (Cut 35 slice 14): `BinImmLocal` fuses
+  `LoadReg`+`BinImm` (a frame-slot left with an immediate — `return x
+  + 1`) and `BinCtxReg` fuses `LoadContext`+`BinReg` (a captured left
+  with a frame-slot right — `(y) => x + y`), each one dispatch with the
+  `tdz`/env-walk semantics of the parts preserved. Safe because the
+  two reads (env + frame) have no side effects between them, so the
+  step path's evaluation order is unchanged. The `Binary` arm's `else`
+  is a `match (left, right)` with the fused case first — add further
+  fused source pairs there (e.g. `Reg`+`Reg`) rather than emitting
+  `load_operand` + `Bin*`.
 - Errors propagate raw to the caller's `run_inner` exactly like a
   step-path leaf (a register body may throw from `apply_binary`/TDZ
   checks). Register-op semantics mirror the step semantics 1:1 — when you

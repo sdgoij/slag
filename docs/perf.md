@@ -1639,6 +1639,35 @@ Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
 conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
 23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
 
+### Cut 35 slice 14 — fused leaf binary operands (measured 2026-08-23)
+
+Two more leaf-op fusions cut the leaf bodies' op count:
+
+- **`BinImmLocal { op, slot, tdz, imm }`** — `return x + 1` fuses the
+  `LoadReg` + `BinImm` pair into one dispatch (the frame-slot read with
+  its `tdz` check, then the number-number inline).
+- **`BinCtxReg { op, index, slot, tdz }`** — `(y) => x + y` fuses the
+  `LoadContext` + `BinReg` pair (the context-transparent env walk, then
+  the frame-slot read — the two reads have no side effects between
+  them, so the evaluation order is unchanged). The lowering emits it
+  for a captured left with a frame-slot right; the `Binary` arm's
+  `else` branch is now a `match (left, right)` with the fused case
+  first.
+
+The calls and closure leaf bodies drop from three ops to two
+(`BinImmLocal`+`ReturnAcc` / `BinCtxReg`+`ReturnAcc`). Measured mins
+(heavy machine load during this slice made the full-suite medians
+unreliable; the load inflates the memory-heavy rows): function calls
+~60 -> ~59ms, closure capture ~66 -> ~65ms; the other rows unchanged.
+The 12-case probe (`scratch/slice14_probe.js`) covers the number and
+string operands, valueOf coercion order, the context-transparent walk,
+per-iteration + param shapes, non-fused two-param leaves, TDZ left
+operands, and the mul/sub/div immediate forms.
+
+Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
+conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
+23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
