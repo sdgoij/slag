@@ -1332,6 +1332,36 @@ Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
 conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
 23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
 
+### Cut 35 slice 5 — global-cell cache thrash (measured 2026-08-23)
+
+The construct-churn row stayed ~74ms through every call-path slice, and
+isolated measurements of the same loop showed ~36ms. The gap was the
+bench itself: the 32-entry direct-mapped `global_cells` cache (Cut 5)
+thrashes once a realm accumulates ~30+ globals (the bench runs each row
+twice in one realm, and the host globals add more). The construct row's
+`C`/`i`/`n`/`o` collided with the earlier rows' names, so every
+`LoadGlobal`/`StoreGlobal`/`FastLoopHead` took the reference path
+instead of the cached probe — about 2x the loop cost, ~420ns/construct
+of pure cache misses. The calls row's names happened not to collide, so
+it never showed the effect.
+
+Fixing the diagnosis: `GLOBAL_CELLS` 32 -> 256 removes the thrash
+(direct-mapped, so a miss still falls back to the reference path — a
+bigger table just makes collisions rare). The construct row drops
+74 -> ~36ms with every other row unchanged; real-world global-heavy
+scripts (many evals in one realm, host globals, libraries defining many
+top-level names) get the same relief.
+
+The construct row is now ~360ns/construct: the body (`this.x = x` =
+`LoadLocal` + `AssignMemberName`) was already a certified leaf running
+through `run_leaf_construct` (both steps pass `steps_are_leaf` — member
+steps are not excluded), so the cost is the loop + object creation +
+construct dispatch, not the member write.
+
+Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
+conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
+23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

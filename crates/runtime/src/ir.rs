@@ -1236,7 +1236,7 @@ pub(crate) type MemberStoreCell = (u64, crux::AtomId, u32, [u32; 4]);
 /// index is a mask. Bigger than the member cells because a script's
 /// top-level names (`n`, `i`, `s`, ...) all probe this table; a collision
 /// evicts and the reference path re-resolves.
-pub(crate) const GLOBAL_CELLS: usize = 32;
+pub(crate) const GLOBAL_CELLS: usize = 256;
 
 /// The direct-mapped leaf-inline cache (Cut 34): the per-function data
 /// `do_call_fast` needs to run a leaf inline — the compiled ir, strictness,

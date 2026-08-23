@@ -263,6 +263,18 @@ loop machinery (dispatch + env resolution) dominates, so encoding fusion
 moves numbers within noise, and the perf.md ≥5x gate needs structural work
 (registers/accumulator, i.e. the plan's Cut 3), not more step fusion.
 
+**The direct-mapped caches thrash with many keys — a realm-wide
+measurement artifact (Cut 35 slice 5).** The bench evaluates each row
+twice in ONE realm, so by the construct row ~30+ globals exist and the
+32-entry `global_cells` cache (Cut 5) collides: the construct row's
+`C`/`i`/`n`/`o` took the reference path on every access and the row
+measured ~74ms vs ~36ms standalone for the identical loop. A bigger
+`GLOBAL_CELLS` (256) fixed it; a row that measures slow only inside the
+bench, but fast standalone, is a cache-collision artifact — check the
+cache sizes before optimizing the machinery. The other direct-mapped
+tables (`MEMBER_CELLS`, `LEAF_CACHE`, the for-of/element cells) are 16
+entries and have the same failure mode at scale.
+
 ## Validation loop
 
 `cargo clippy --workspace --all-targets -- -D warnings` clean, then
