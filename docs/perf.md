@@ -1693,6 +1693,34 @@ Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
 conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
 23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
 
+### Cut 35 slice 16 — register-encode the accumulator-loop counter read (measured 2026-08-23)
+
+The arithmetic row (`n += i * 2`) was the last step-path bench: its body
+reads the accumulator-loop counter (`Step::PushAcc`), which the register
+model could not express, so it ran as 5 body steps + the loop head per
+iteration. The counter read now lowers:
+
+- **`RunRegBody { ops, push_counter }`** — when the body reads the
+  counter, the saved counter is pushed onto the value stack at entry.
+- **`LeafOp::LoadCounter`** — acc = pop() (the pushed counter).
+- The lowering maps `Step::PushAcc` to a `RegOperand::Counter` shadow
+  entry consumed by `load_operand` (at most one per body — the counter
+  is pushed once; a second read keeps the step path). A counter as a
+  store key/value or a binary right operand is rejected (the operand
+  loader cannot express a pop there).
+
+The arithmetic body becomes `[LoadCounter, BinImm, BinLeftReg,
+StoreReg]` in one dispatch: arithmetic ~37.5 -> ~33ms. The 12-case probe
+(`scratch/slice16_probe.js`) covers the bench sum, the counter as a
+store/right-operand (step-path fallbacks), float counters, the
+loop-exit counter value, nested loops, two-read bodies, factorial,
+string concat, countdowns, and break/continue.
+
+Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
+conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
+23,812/0/154 with 448 >15s hangs in the known slow classes (the +1 is
+load wobble, all RegExp/Temporal).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

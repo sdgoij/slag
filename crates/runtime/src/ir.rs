@@ -720,6 +720,11 @@ pub enum Step {
     /// untouched (the loop machinery owns the loop's completion).
     RunRegBody {
         ops: Box<[LeafOp]>,
+        /// Cut 35 slice 16: the body reads the accumulator-loop counter
+        /// (`Step::PushAcc` lowered to a `LoadCounter`), so the saved
+        /// counter is pushed onto the value stack at entry for the op to
+        /// pop. The transient push is removed by the exit truncate.
+        push_counter: bool,
     },
     /// Push the fused loop counter (`Vm::acc`) onto the value stack: the
     /// body's redirected reads of the counter.
@@ -876,6 +881,10 @@ pub enum LeafOp {
     LoadContext { index: usize },
     /// acc = the leaf's per-iteration slot (depth-0 `LoadPerIteration`).
     LoadPerIter { index: usize },
+    /// acc = the accumulator-loop counter (Cut 35 slice 16: a body's
+    /// `Step::PushAcc` read lowered to a pop — `RunRegBody` pushed the
+    /// saved counter onto the value stack at entry).
+    LoadCounter,
     /// acc = value.
     LoadConst(Value),
     /// acc = acc op frame[slot], with the number-number inline
@@ -5020,7 +5029,7 @@ impl Vm {
                 Step::FastLoopStore { var } => {
                     self.fast_loop_store(agent, *var)?;
                 }
-                Step::RunRegBody { ops } => {
+                Step::RunRegBody { ops, push_counter } => {
                     // The register body addresses the current frame (the
                     // script's inline frame — `leaf_frame_base` is `None`
                     // here, so `frame_get` uses the `Frame`), saves and
@@ -5032,6 +5041,12 @@ impl Vm {
                     // restore, like a throwing leaf.
                     let stack_len = self.stack.len();
                     let caller_acc = std::mem::replace(&mut self.acc, Value::Undefined);
+                    // Cut 35 slice 16: a counter-reading body pops the
+                    // pushed counter via its `LoadCounter` op; the exit
+                    // truncate removes it if an op throws first.
+                    if *push_counter {
+                        self.stack.push(caller_acc.clone());
+                    }
                     let outcome = self.run_leaf_ops(agent, ops);
                     self.stack.truncate(stack_len);
                     self.acc = caller_acc;
@@ -6491,6 +6506,11 @@ impl Vm {
                         })?;
                     self.acc = value;
                 }
+                LeafOp::LoadCounter => {
+                    // Cut 35 slice 16: the accumulator-loop counter pushed
+                    // by `RunRegBody` at entry.
+                    self.acc = self.pop();
+                }
                 LeafOp::LoadConst(value) => self.acc = value.clone(),
                 LeafOp::BinReg { op, slot, tdz } => {
                     if *tdz && self.frame_get(*slot).is_uninitialized() {
@@ -6792,6 +6812,12 @@ impl Vm {
             RegOperand::Spilled => Err(JsError::new(
                 ErrorKind::SyntaxError,
                 "spilled register operand cannot be re-loaded".into(),
+            )),
+            // The lowering rejects a counter as a store key/value (it would
+            // need a stack pop, which the operand loader cannot express).
+            RegOperand::Counter => Err(JsError::new(
+                ErrorKind::SyntaxError,
+                "counter register operand cannot be re-loaded".into(),
             )),
         }
     }
@@ -10419,9 +10445,15 @@ impl Compiler {
                             .as_ref()
                             .and_then(|scope| lower_leaf_ops(&self.steps[body_steps..], scope))
                         {
+                            // Cut 35 slice 16: a body that reads the counter
+                            // (a `PushAcc`) gets the saved counter pushed at
+                            // entry for its `LoadCounter` to pop.
+                            let push_counter = self.steps[body_steps..]
+                                .iter()
+                                .any(|s| matches!(s, Step::PushAcc));
                             self.steps.truncate(body_steps);
                             self.fixups.truncate(body_fixups);
-                            self.emit(Step::RunRegBody { ops });
+                            self.emit(Step::RunRegBody { ops, push_counter });
                         }
                         self.acc_binding = saved;
                         self.place(continue_label);
@@ -10654,9 +10686,15 @@ impl Compiler {
             .as_ref()
             .and_then(|scope| lower_leaf_ops(&self.steps[body_steps..], scope))
         {
+            // Cut 35 slice 16: a body that reads the counter (a `PushAcc`)
+            // gets the saved counter pushed at entry for its `LoadCounter`
+            // to pop.
+            let push_counter = self.steps[body_steps..]
+                .iter()
+                .any(|s| matches!(s, Step::PushAcc));
             self.steps.truncate(body_steps);
             self.fixups.truncate(body_fixups);
-            self.emit(Step::RunRegBody { ops });
+            self.emit(Step::RunRegBody { ops, push_counter });
         }
         self.place(continue_label);
         if lexical && captured {
@@ -13331,6 +13369,11 @@ pub enum RegOperand {
     /// The value was spilled onto the value stack by `PushAcc` (Cut 35
     /// slice 10): it is consumed by `BinAccPop`'s pop, not by any load.
     Spilled,
+    /// The accumulator-loop counter (Cut 35 slice 16): the body read it
+    /// via `Step::PushAcc`; `RunRegBody` pushed it onto the value stack at
+    /// entry, and a `LoadCounter` pops it. At most one read per body (the
+    /// counter is pushed once).
+    Counter,
     Reg {
         slot: usize,
         tdz: bool,
@@ -13380,6 +13423,11 @@ fn load_operand(ops: &mut Vec<LeafOp>, operand: RegOperand) -> bool {
         // A spilled value sits on the value stack; only `BinAccPop` can
         // bring it back.
         RegOperand::Spilled => false,
+        // The counter was pushed by `RunRegBody`; `LoadCounter` pops it.
+        RegOperand::Counter => {
+            ops.push(LeafOp::LoadCounter);
+            true
+        }
     }
 }
 
@@ -13405,9 +13453,20 @@ fn spill_live_acc(ops: &mut Vec<LeafOp>, stack: &mut [RegOperand]) {
 fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
     let mut ops = Vec::new();
     let mut stack: Vec<RegOperand> = Vec::new();
+    // Cut 35 slice 16: at most one accumulator-loop counter read per body
+    // (`RunRegBody` pushes the counter once; a second `LoadCounter` would
+    // pop past it).
+    let mut counter_reads = 0;
     for (index, step) in steps.iter().enumerate() {
         match step {
             Step::Push(value) => stack.push(RegOperand::Const(value.clone())),
+            Step::PushAcc => {
+                if counter_reads > 0 {
+                    return None;
+                }
+                counter_reads += 1;
+                stack.push(RegOperand::Counter);
+            }
             Step::LoadLocal { slot } => {
                 let tdz = scope.tdz_store.get(*slot).copied().unwrap_or(false);
                 stack.push(RegOperand::Reg { slot: *slot, tdz });
@@ -13473,10 +13532,12 @@ fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
                                 RegOperand::Const(value) => {
                                     ops.push(LeafOp::BinConst { op: *op, value });
                                 }
-                                // A computed or spilled right operand
-                                // cannot be held while the left operand
-                                // loads into the accumulator.
-                                RegOperand::Acc | RegOperand::Spilled => return None,
+                                // A computed, spilled, or counter right
+                                // operand cannot be held while the left
+                                // operand loads into the accumulator.
+                                RegOperand::Acc | RegOperand::Spilled | RegOperand::Counter => {
+                                    return None;
+                                }
                             }
                             stack.push(RegOperand::Acc);
                         }
@@ -13536,7 +13597,10 @@ fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
                 // the binary ops' right operand.
                 let value = stack.pop()?;
                 let object = stack.pop()?;
-                if matches!(value, RegOperand::Acc | RegOperand::Spilled) {
+                if matches!(
+                    value,
+                    RegOperand::Acc | RegOperand::Spilled | RegOperand::Counter
+                ) {
                     return None;
                 }
                 if !load_operand(&mut ops, object) {
@@ -13554,9 +13618,13 @@ fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
                 let value = stack.pop()?;
                 let key = stack.pop()?;
                 let object = stack.pop()?;
-                if matches!(key, RegOperand::Acc | RegOperand::Spilled)
-                    || matches!(value, RegOperand::Acc | RegOperand::Spilled)
-                {
+                if matches!(
+                    key,
+                    RegOperand::Acc | RegOperand::Spilled | RegOperand::Counter
+                ) || matches!(
+                    value,
+                    RegOperand::Acc | RegOperand::Spilled | RegOperand::Counter
+                ) {
                     return None;
                 }
                 if !load_operand(&mut ops, object) {
@@ -13603,7 +13671,10 @@ fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
                 // not the live value.)
                 let key = stack.pop()?;
                 let object = stack.pop()?;
-                if matches!(key, RegOperand::Acc | RegOperand::Spilled) {
+                if matches!(
+                    key,
+                    RegOperand::Acc | RegOperand::Spilled | RegOperand::Counter
+                ) {
                     return None;
                 }
                 match object {

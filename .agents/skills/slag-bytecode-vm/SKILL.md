@@ -284,9 +284,18 @@ arguments state.
   `ecma_functions` HashMap. A construct-inline body is always a leaf,
   so the leaf cache's filter is correct; arrows/classes/derived
   constructors are not `construct_inline` and fall to the general
-  machinery. If you extend `LeafEntry`, update both the agent
+  `fast_call_core`. If you extend `LeafEntry`, update both the agent
   `leaf_lookup` population and the slice-12 cache-write clone in
   `fast_call_core`.
+- **The accumulator-loop counter read lowers too** (Cut 35 slice 16):
+  `RunRegBody` gained `push_counter` (the saved counter is pushed at
+  entry) and `LeafOp::LoadCounter` pops it; `Step::PushAcc` lowers to a
+  `RegOperand::Counter` shadow entry consumed by `load_operand`. At most
+  one counter read per body (the counter is pushed once), and a counter
+  in a store key/value or binary right position is rejected (the
+  operand loader cannot pop there). The two `RunRegBody` emission sites
+  scan the body slice for `Step::PushAcc` to set the flag — if you add a
+  third site, mirror that.
 - Errors propagate raw to the caller's `run_inner` exactly like a
   step-path leaf (a register body may throw from `apply_binary`/TDZ
   checks). Register-op semantics mirror the step semantics 1:1 — when you
