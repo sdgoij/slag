@@ -696,6 +696,9 @@ impl Agent {
                 ir,
                 strict: data.strict,
                 environment,
+                // Cut 35 slice 15: the `Construct` step shares this cache,
+                // so the construct-inline verdict rides along.
+                construct_inline: data.construct_inline,
             },
         ));
         slot.as_ref().map(|(_, entry)| entry)

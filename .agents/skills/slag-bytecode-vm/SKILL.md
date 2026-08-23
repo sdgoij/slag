@@ -277,6 +277,16 @@ arguments state.
   is a `match (left, right)` with the fused case first — add further
   fused source pairs there (e.g. `Reg`+`Reg`) rather than emitting
   `load_operand` + `Bin*`.
+- **The `Construct` step shares the leaf cache** (Cut 35 slice 15): the
+  certified construct-inline verdict (`construct_inline` — leaf body,
+  base kind, no fields/private methods) rides on `LeafEntry`, and the
+  `Construct` handler reads `leaf_lookup` instead of the
+  `ecma_functions` HashMap. A construct-inline body is always a leaf,
+  so the leaf cache's filter is correct; arrows/classes/derived
+  constructors are not `construct_inline` and fall to the general
+  machinery. If you extend `LeafEntry`, update both the agent
+  `leaf_lookup` population and the slice-12 cache-write clone in
+  `fast_call_core`.
 - Errors propagate raw to the caller's `run_inner` exactly like a
   step-path leaf (a register body may throw from `apply_binary`/TDZ
   checks). Register-op semantics mirror the step semantics 1:1 — when you

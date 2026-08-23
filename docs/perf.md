@@ -1668,6 +1668,31 @@ Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
 conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
 23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
 
+### Cut 35 slice 15 — construct-inline lookup through the leaf cache (measured 2026-08-23)
+
+The `Construct` step's certified fast path looked up the callee in the
+`ecma_functions` HashMap on every construct — unlike the call path,
+which reads a direct-mapped leaf cache. Since a construct-inline body
+is a leaf (the `construct_inline` verdict — leaf body, base kind, no
+fields/private methods — is cached at ir-compile time), the shared
+[`LeafEntry`] now carries that flag, `leaf_lookup` captures it from the
+record, and the `Construct` handler reads the leaf cache like
+`do_call_fast` — one direct-mapped probe instead of a HashMap lookup
+per construct. Non-construct-inline callees (arrows, classes, derived
+constructors) fall through to the general machinery unchanged.
+
+Measured (heavy machine load through this slice — the memory-heavy
+rows are inflated and the construct win is at the noise floor):
+construct churn ~36ms, ~1ms from the lookup removal. The 10-case probe
+(`scratch/slice15_probe.js`) covers the bench sum, object-return wins,
+primitive-return fallbacks, non-leaf and captured-env constructors,
+arrows (TypeError), classes, derived classes with super, new.target,
+and prototype-chain instanceof.
+
+Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
+conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
+23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

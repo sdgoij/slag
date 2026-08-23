@@ -1377,6 +1377,11 @@ pub(crate) struct LeafEntry {
     /// The function's [[Environment]], kept only when the leaf reads an
     /// environment (`CompiledBody::leaf_uses_env`).
     pub environment: Option<EnvRef>,
+    /// The certified base-constructor leaf verdict (Cut 35 slice 15): the
+    /// `Construct` step shares the leaf cache, so a construct-inlineable
+    /// callee skips the `ecma_functions` HashMap lookup it paid per
+    /// construct.
+    pub construct_inline: bool,
 }
 
 /// The global call-site leaf cache entry (Cut 35 slice 12): a resolved
@@ -4070,23 +4075,26 @@ impl Vm {
                     // way `do_call_fast` inlines a leaf call — the certified
                     // construct path's checks (base kind, no fields/private
                     // methods) gate it, plus the same clean-site/single-realm
-                    // guard.
+                    // guard. Cut 35 slice 15: the record comes from the
+                    // shared leaf cache (the construct-inline verdict rides
+                    // along), skipping the `ecma_functions` HashMap lookup
+                    // the construct path paid per construct.
                     let result = if self.can_inline_leaf()
                         && let ValueKind::Function(function) = callee.kind()
                         && matches!(function.kind, crux::function::FunctionKind::EcmaScript)
-                        && let Some(data) = agent.ecma_functions.get(&function.id())
+                        && agent.realms.borrow().len() == 1
+                        && let Some(entry) = agent.leaf_lookup(function.id())
                         // Cut 33: the certified base-constructor leaf verdict
                         // (leaf body, base kind, no fields/private methods) is
                         // cached at ir-compile time.
-                        && data.construct_inline
-                        && agent.realms.borrow().len() == 1
+                        && entry.construct_inline
                     {
-                        let ir = data.ir.clone().expect("checked Some above");
-                        let strict = data.strict;
+                        let ir = entry.ir.clone();
+                        let strict = entry.strict;
                         // Cut 30: clone the callee's env only for a leaf
                         // that reads one (see `do_call_fast`).
                         let environment = if ir.leaf_uses_env {
-                            Some(data.environment.clone())
+                            entry.environment.clone()
                         } else {
                             None
                         };
@@ -7102,6 +7110,7 @@ impl Vm {
                 ir: entry.ir.clone(),
                 strict: entry.strict,
                 environment: entry.environment.clone(),
+                construct_inline: entry.construct_inline,
             };
             match leaf_cache {
                 LeafCacheSite::Global { name } => {
