@@ -441,6 +441,25 @@ cache sizes before optimizing the machinery. The other direct-mapped
 tables (`MEMBER_CELLS`, `LEAF_CACHE`, the for-of/element cells) are 16
 entries and have the same failure mode at scale.
 
+**Step fusion has hit the floor (Cut 35 slices 19-20, measured 2026-08-23).**
+The dispatch is a jump table: removing a dispatch per iteration measures
+ZERO (fusing the `FastLoopHead` into the register body — slice 19,
+reverted — and fusing the global `CallFastGlobal`+store into one step —
+slice 20 — both measured ~0ms on 5M-iteration A/B runs). The remaining
+per-iteration costs are REAL WORK: the loop head's inc+test is ~11ns/iter
+(the empty 1M `var` loop is ~12ms regardless of the dispatch count), and
+the leaf-call core (cache check + frame setup + `run_leaf_ops` + truncate)
+is ~20ns. Don't propose another step-fusion slice expecting a win; the
+levers left are structural (a dedicated counter field removing the acc
+save/restore, or a call ABI reading args straight from frame slots).
+
+**A/B bench methodology: alternate the order.** The machine drifts within
+seconds (a base-then-new pair can show a consistent +2-5ms "regression"
+that is pure order bias — this mis-attributed slice 19's zero to code
+bloat). Interleave base/new per pair and cancel the order; use a
+5M-iteration isolated timer (not the full bench) to amplify the signal
+above the load noise.
+
 ## Validation loop
 
 `cargo clippy --workspace --all-targets -- -D warnings` clean, then

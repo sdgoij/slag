@@ -1784,6 +1784,32 @@ Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
 conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
 23,812/0/154 with 440 >15s hangs in the known slow classes (unchanged).
 
+### Cut 35 slice 20 — fused global-callee call-store (measured 2026-08-23)
+
+The calls row's statement-position call was the one unfused call shape:
+`n = f(n)` with `f` a global function declaration compiled to
+`ListBegin; LoadLocal; CallFastGlobal; FusedStoreLocal; ListEnd` — the
+slice-17 slot-callee fusion skipped global callees. `emit_statement_store`
+now recognizes the same tail shape with a `CallFastGlobal` (the slice-2
+fused call, `direct_eval` always false) and emits
+`CallFastGlobalStore { name, arg_slots, store_slot }` — the arg loads, the
+global-callee call (through the slice-12 global leaf cache), and the slot
+store in one step, mirroring `CallFastSlotStore` exactly (arg TDZ checks,
+the store's `FusedStoreLocal` TDZ check).
+
+Measured: ~0-2ms on the calls row (alternating-order A/B, 5M-iteration
+isolation — the engine's dispatch is jump-table cheap, so the 2 saved
+dispatches sit below the noise floor). The change is a structural
+unification (both callee kinds now fuse) with zero regression. The 16-case
+probe (`scratch/slice20_probe.js`) covers 0/1/2-arg global callees,
+arg==store-slot order, two-slot shapes, member/compound/expression-position
+fallbacks, TDZ args/targets, throwing callees, multiple call sites, and
+the slot-callee path (unchanged).
+
+Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
+conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
+23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

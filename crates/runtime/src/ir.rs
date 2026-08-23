@@ -368,6 +368,16 @@ pub enum Step {
         arg_slots: Vec<usize>,
         store_slot: usize,
     },
+    /// Cut 35 slice 20: the fused `x = f(args)` for a global callee with
+    /// plain slot args — the arg loads, the global-callee call (the
+    /// slice-2 fused call + the slice-12 global leaf cache), and the store
+    /// in one step, mirroring `CallFastSlotStore`. The direct-eval flag is
+    /// always false (the global-call fuse excludes the `eval` identifier).
+    CallFastGlobalStore {
+        name: crux::AtomId,
+        arg_slots: Vec<usize>,
+        store_slot: usize,
+    },
     SuperCall,
     Construct,
     TaggedTemplate(syntax::ast::TemplateLiteral),
@@ -4088,6 +4098,34 @@ impl Vm {
                         self.stack.push(value);
                     }
                     self.do_call_fast_slot(agent, *callee_slot, arg_slots.len())?;
+                    let result = self.pop();
+                    if self.frame_get(*store_slot).is_uninitialized() {
+                        return Err(JsError::new(
+                            ErrorKind::ReferenceError,
+                            "Cannot access a binding before initialization".into(),
+                        ));
+                    }
+                    *self.frame_get_mut(*store_slot) = result;
+                }
+                Step::CallFastGlobalStore {
+                    name,
+                    arg_slots,
+                    store_slot,
+                } => {
+                    // Cut 35 slice 20: the fused `x = f(args)` for a global
+                    // callee — same shape as `CallFastSlotStore` through
+                    // `do_call_fast_global` (the global leaf cache).
+                    for &slot in arg_slots {
+                        let value = self.frame_get(slot).clone();
+                        if value.is_uninitialized() {
+                            return Err(JsError::new(
+                                ErrorKind::ReferenceError,
+                                "Cannot access a binding before initialization".into(),
+                            ));
+                        }
+                        self.stack.push(value);
+                    }
+                    self.do_call_fast_global(agent, *name, arg_slots.len(), false)?;
                     let result = self.pop();
                     if self.frame_get(*store_slot).is_uninitialized() {
                         return Err(JsError::new(
@@ -9075,12 +9113,45 @@ impl Compiler {
                     // pattern only matches an actual `CallFastSlot`
                     // emission (its guards already passed) with plain slot
                     // args, so the semantics are unchanged.
-                    let fused = if let Some(Step::CallFastSlot { slot, argc }) = self.steps.last()
+                    let fused = if let Some(Step::CallFastGlobal {
+                        name,
+                        argc,
+                        direct_eval: false,
+                    }) = self.steps.last()
                         && let argc = *argc as usize
                         && self.steps.len() > argc
                         && (0..argc).all(|i| {
                             matches!(self.steps[self.steps.len() - 2 - i], Step::LoadLocal { .. })
                         }) {
+                        // Cut 35 slice 20: the global-callee variant of the
+                        // slot-callee fusion above (a global function
+                        // declaration's call site, the calls bench shape).
+                        let arg_slots = (0..argc)
+                            .rev()
+                            .map(|i| {
+                                let Step::LoadLocal { slot } = self.steps[self.steps.len() - 2 - i]
+                                else {
+                                    unreachable!("checked above")
+                                };
+                                slot
+                            })
+                            .collect();
+                        let name = *name;
+                        self.steps.truncate(self.steps.len() - argc - 1);
+                        self.emit(Step::CallFastGlobalStore {
+                            name,
+                            arg_slots,
+                            store_slot,
+                        });
+                        self.fused_completion = true;
+                        true
+                    } else if let Some(Step::CallFastSlot { slot, argc }) = self.steps.last()
+                        && let argc = *argc as usize
+                        && self.steps.len() > argc
+                        && (0..argc).all(|i| {
+                            matches!(self.steps[self.steps.len() - 2 - i], Step::LoadLocal { .. })
+                        })
+                    {
                         let callee_slot = *slot;
                         // The arg slots in compile order (the last-pushed
                         // arg sits directly before the call).
@@ -13374,6 +13445,7 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
                 | Step::CallFastGlobal { .. }
                 | Step::CallFastSlot { .. }
                 | Step::CallFastSlotStore { .. }
+                | Step::CallFastGlobalStore { .. }
                 | Step::Construct
                 | Step::SuperCall
                 | Step::TaggedTemplate(_)
