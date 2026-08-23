@@ -107,6 +107,18 @@ pub struct Agent {
     /// `return` on the AIP chain. Re-validated against the three shared
     /// objects' generations.
     pub(crate) for_of_fast_cells: [Option<ForOfFastVerdict>; crate::ir::MEMBER_CELLS],
+    /// The per-array for-of fast verdict (Cut 27): (array id, array
+    /// generation, prototype id) — "this array iterates by index" (plain
+    /// Array, no own @@iterator, prototype is the stock %Array.prototype%
+    /// whose iterator infrastructure the Cut 24 verdict certified). The
+    /// array generation catches an own @@iterator addition and proto
+    /// changes (Cut 22's mechanism bumps it); the prototype's own mutations
+    /// are re-validated per access through `for_of_fast_probe`. A hit skips
+    /// the own-property scan, the intrinsics lookups, and the proto walk
+    /// the bench's 100k begins ran each time. Boxed so the 16-entry table
+    /// does not bloat the Agent struct's hot-field cache footprint (an
+    /// inline copy regressed the leaf-call path by ~10ns/call).
+    pub(crate) for_of_array_cells: Box<[Option<(u64, u32, u64)>; crate::ir::MEMBER_CELLS]>,
     /// The cached `prototype` read of each constructor function (Cut 26):
     /// `new C()` runs OrdinaryCreateFromConstructor's property read per
     /// construct; the value is re-validated against the function object's
@@ -478,6 +490,7 @@ impl Agent {
             array_element_cells: [None; crate::ir::MEMBER_CELLS],
             member_store_cells: [None; crate::ir::MEMBER_CELLS],
             for_of_fast_cells: std::array::from_fn(|_| None),
+            for_of_array_cells: Box::new([None; crate::ir::MEMBER_CELLS]),
             construct_prototypes: RefCell::new(std::collections::HashMap::new()),
             vm_pool: Vec::new(),
             promise_jobs: VecDeque::new(),

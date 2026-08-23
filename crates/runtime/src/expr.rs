@@ -45,7 +45,14 @@ pub fn eval_expr(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Value, 
         ExprKind::Object(literal) => eval_object_literal(agent, literal, strict),
         ExprKind::Function(f) => {
             let env = agent.running_context()?.lexical_environment.clone();
-            crate::function::instantiate_function_expression(agent, f, env, strict, Vec::new())
+            crate::function::instantiate_function_expression(
+                agent,
+                f,
+                env,
+                strict,
+                Vec::new(),
+                Vec::new(),
+            )
         }
         ExprKind::Arrow {
             is_async,
@@ -60,6 +67,7 @@ pub fn eval_expr(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Value, 
                 body.clone(),
                 env,
                 strict,
+                Vec::new(),
                 Vec::new(),
             )
         }
@@ -2045,6 +2053,29 @@ pub enum ForOfState {
 /// `next`/`return` on the iterator chain, or non-plain-Array receiver keeps
 /// the generic record.
 pub fn for_of_begin(agent: &mut Agent, value: &Value) -> Result<ForOfState, JsError> {
+    // Cut 27: per-array fast-verdict cell — the Cut 24 checks below re-ran
+    // the own-@@iterator scan, the intrinsics lookups, and the proto walk
+    // per begin (the bench begins the same array 100k times). The cell
+    // records (array id, array generation, prototype id); a hit skips every
+    // check except the cheap gen-validated stock-iterator probe (the
+    // prototype's own mutations bump ITS generation, which the probe
+    // re-validates). The array generation covers an own @@iterator addition
+    // and proto changes (Cut 22's mechanism bumps it).
+    if let ValueKind::Object(object) = value.kind()
+        && matches!(object.kind, crux::object::ObjectKind::Array)
+    {
+        let index = object.id() as usize & (crate::ir::MEMBER_CELLS - 1);
+        if let Some((cached_array, cached_generation, cached_proto)) =
+            agent.for_of_array_cells[index]
+            && cached_array == object.id()
+            && cached_generation == object.generation()
+            && let Ok(Some(proto)) = object.get_prototype_of()
+            && proto.id() == cached_proto
+            && for_of_fast_probe(agent, &proto)
+        {
+            return Ok(ForOfState::FastArray(value.clone()));
+        }
+    }
     // Cut 24: the fast-path verdict without the `get_method` chain walk —
     // a plain Array with no own @@iterator whose prototype is the realm's
     // %Array.prototype%, plus a gen-validated cached "the iterator
@@ -2067,6 +2098,9 @@ pub fn for_of_begin(agent: &mut Agent, value: &Value) -> Result<ForOfState, JsEr
         && (for_of_fast_probe(agent, &array_proto)
             || for_of_fast_resolve(agent, &array_proto)?.is_some())
     {
+        let index = object.id() as usize & (crate::ir::MEMBER_CELLS - 1);
+        agent.for_of_array_cells[index] =
+            Some((object.id(), object.generation(), array_proto.id()));
         return Ok(ForOfState::FastArray(value.clone()));
     }
     let method = get_method(agent, value, "@@iterator")?;

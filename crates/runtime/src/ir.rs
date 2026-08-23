@@ -339,6 +339,10 @@ pub enum Step {
         function: Box<syntax::ast::Function>,
         strict: bool,
         outer_chain: Vec<Vec<crux::AtomId>>,
+        /// Cut 28: the per-iteration head layouts of the certified loops
+        /// open at this creation site (see
+        /// [`crate::function::EcmaFunction::per_iteration_chain`]).
+        per_iteration_chain: Vec<(Vec<crux::AtomId>, usize)>,
     },
     /// Create an arrow function's closure: `[[ThisMode]]` is lexical and
     /// there is no `prototype` (spec 15.3.2). `outer_chain` is as in
@@ -349,6 +353,8 @@ pub enum Step {
         body: syntax::ast::ArrowBody,
         strict: bool,
         outer_chain: Vec<Vec<crux::AtomId>>,
+        /// Cut 28: see [`Step::CreateFunction`].
+        per_iteration_chain: Vec<(Vec<crux::AtomId>, usize)>,
     },
     /// `new.target` (spec 13.3.5.3): the active constructor, or *undefined*
     /// at the script level.
@@ -450,6 +456,10 @@ pub enum Step {
         frame_slot: Option<usize>,
         context_slot: Option<usize>,
         outer_chain: Vec<Vec<crux::AtomId>>,
+        /// Cut 28: the inherited per-iteration chain (see
+        /// [`Step::CreateFunction`]); the declaration instantiates at body
+        /// entry, before this body's own loops start.
+        per_iteration_chain: Vec<(Vec<crux::AtomId>, usize)>,
     },
     /// Reset the statement-completion register to an empty completion (spec
     /// 6.2.2.3): the current statement's completion starts empty.
@@ -995,6 +1005,13 @@ pub struct CompiledBody {
     /// flat save/restore of the few fields it touches is safe. See
     /// `docs/perf.md` Cut 25.
     pub leaf: bool,
+    /// Cut 28: whether the leaf reads captured per-iteration heads — its
+    /// steps contain `LoadPerIteration`/`StorePerIteration`/
+    /// `UpdatePerIteration`, which resolve against the leaf's own
+    /// `lexical_env`. The inline run sets `lexical_env` to the leaf's env
+    /// for the duration only when this is true (the common leaf never
+    /// touches the caller's env).
+    pub leaf_needs_env: bool,
     /// The certified top-level fast path (script-level bindings): the
     /// declared `var`/function names a script reads and writes directly on
     /// the global object, skipping the env-chain walk. `None` = the
@@ -2796,6 +2813,7 @@ impl Vm {
                     function,
                     strict,
                     outer_chain,
+                    per_iteration_chain,
                 } => {
                     let env = agent.running_context()?.lexical_environment.clone();
                     let value = crate::function::instantiate_function_expression(
@@ -2804,6 +2822,7 @@ impl Vm {
                         env,
                         *strict,
                         outer_chain.clone(),
+                        per_iteration_chain.clone(),
                     )?;
                     self.stack.push(value);
                 }
@@ -2813,6 +2832,7 @@ impl Vm {
                     body,
                     strict,
                     outer_chain,
+                    per_iteration_chain,
                 } => {
                     let env = agent.running_context()?.lexical_environment.clone();
                     let value = crate::function::instantiate_arrow(
@@ -2823,6 +2843,7 @@ impl Vm {
                         env,
                         *strict,
                         outer_chain.clone(),
+                        per_iteration_chain.clone(),
                     )?;
                     self.stack.push(value);
                 }
@@ -2854,12 +2875,16 @@ impl Vm {
                     frame_slot,
                     context_slot,
                     outer_chain,
+                    per_iteration_chain,
                     ..
                 } => {
                     // A certified body's hoisted top-level function
                     // declaration: instantiate the closure against the
                     // capture context (the binding was created by the
-                    // certified layout) and store it.
+                    // certified layout) and store it. The declaration runs
+                    // at body entry, so it sees only the INHERITED
+                    // per-iteration chain (the loops inside this body have
+                    // not started).
                     let env = agent.running_context()?.lexical_environment.clone();
                     let value = crate::function::instantiate_function(
                         agent,
@@ -2867,6 +2892,7 @@ impl Vm {
                         env,
                         self.strict,
                         outer_chain.clone(),
+                        per_iteration_chain.clone(),
                     )?;
                     if let Some(slot) = frame_slot {
                         *self.frame.get_mut(*slot) = value;
@@ -5739,7 +5765,16 @@ impl Vm {
         let caller_acc = std::mem::replace(&mut self.acc, Value::Undefined);
         let caller_strict = self.strict;
         self.strict = strict;
-        let caller_body_context = self.body_context.replace(body_env);
+        let caller_body_context = self.body_context.replace(body_env.clone());
+        // Cut 28: a leaf that reads captured per-iteration heads
+        // (`LoadPerIteration` etc.) resolves them against its own env; the
+        // common leaf (no per-iteration reads) leaves the caller's env
+        // untouched.
+        let caller_lexical_env = if ir.leaf_needs_env {
+            Some(std::mem::replace(&mut self.lexical_env, body_env))
+        } else {
+            None
+        };
         let caller_chain_short = self.chain_short;
         self.chain_short = false;
         let stack_len = self.stack.len();
@@ -5770,6 +5805,9 @@ impl Vm {
         self.acc = caller_acc;
         self.strict = caller_strict;
         self.body_context = caller_body_context;
+        if let Some(saved_env) = caller_lexical_env {
+            self.lexical_env = saved_env;
+        }
         self.chain_short = caller_chain_short;
         self.stack.truncate(stack_len);
         self.list_stack.truncate(list_len);
@@ -7428,6 +7466,13 @@ struct Compiler {
     /// (`LoadContextSlot { depth ≥ 1 }`) instead of the env walk. Empty when
     /// the enclosing chain is uncertified.
     outer_chain: Vec<Vec<crux::AtomId>>,
+    /// Cut 28: the inherited per-iteration head layouts — `(head names, env
+    /// hop offset)` — of the certified loops open when THIS body was created
+    /// (see
+    /// [`crate::function::EcmaFunction::per_iteration_chain`]). A reference
+    /// to one of those heads compiles to a static `LoadPerIteration` read
+    /// against the body's own `lexical_env` instead of an env walk.
+    per_iteration_chain: Vec<(Vec<crux::AtomId>, usize)>,
     /// Whether any emitted step switches the lexical environment (block/
     /// loop/catch/with envs): when false the body's env is constant for its
     /// whole run, so the dispatch loop skips the per-step context sync.
@@ -7445,6 +7490,11 @@ struct Compiler {
 enum BindingLoc {
     Slot(usize),
     Context(usize, usize),
+    /// Cut 28: a captured per-iteration head of an enclosing certified
+    /// loop — `(depth, index)` into the closure's own captured per-iteration
+    /// env chain (see `Compiler::captured_per_iteration`). Emits the
+    /// per-iteration steps against the closure's `lexical_env`.
+    CapturedIteration(usize, usize),
     Global,
     Acc,
     Env,
@@ -7458,7 +7508,8 @@ impl Compiler {
 
     /// Where a binding resolves: the frame (fast body), the capture context
     /// (Cut 3 continuation — own context at depth 0, an enclosing certified
-    /// body's context at depth ≥ 1), the global object (certified fast
+    /// body's context at depth ≥ 1), a captured per-iteration head of an
+    /// enclosing certified loop (Cut 28), the global object (certified fast
     /// script), the fused loop counter in the accumulator (Cut 17), or the
     /// environment machinery.
     fn binding(&self, name: crux::AtomId) -> BindingLoc {
@@ -7479,11 +7530,60 @@ impl Compiler {
             .is_some_and(|globals| globals.contains(&crux::lookup(name).to_string_lossy()))
         {
             BindingLoc::Global
+        } else if let Some((depth, index)) = self.captured_per_iteration(name) {
+            // Cut 28: a captured per-iteration head — checked before the
+            // context chain (the head names are stripped from the enclosing
+            // entries).
+            BindingLoc::CapturedIteration(depth, index)
         } else if let Some((depth, index)) = self.outer_context(name) {
             BindingLoc::Context(depth, index)
         } else {
             BindingLoc::Env
         }
+    }
+
+    /// Cut 28: the static read/write location of a captured per-iteration
+    /// head (a binding of a certified `for (let i...)` loop that was open
+    /// when this body was created): `(depth, index)` — `depth` = the
+    /// closure's own capture-context hop (its `body_context` wraps its
+    /// [[Environment]] when it has captures) plus the chain entry's recorded
+    /// env hop offset; `index` = the head's position in that loop's
+    /// per-iteration env layout. `None` falls back to the env walk.
+    fn captured_per_iteration(&self, name: crux::AtomId) -> Option<(usize, usize)> {
+        let base = usize::from(
+            self.scope
+                .as_ref()
+                .is_some_and(|scope| !scope.context_names.is_empty()),
+        );
+        for (heads, depth) in &self.per_iteration_chain {
+            if let Some(index) = heads.iter().position(|head| *head == name) {
+                return Some((base + depth, index));
+            }
+        }
+        None
+    }
+
+    /// Cut 28: the per-iteration chain to record on a closure created here —
+    /// this body's open per-iteration loops (innermost first, each one env
+    /// hop past the closure's [[Environment]]), then the inherited chain
+    /// shifted by this body's own capture-context hop (a closure created in
+    /// this body captures its running env — the capture context when it has
+    /// one).
+    fn closure_per_iteration_chain(&self) -> Vec<(Vec<crux::AtomId>, usize)> {
+        let mut chain =
+            Vec::with_capacity(self.per_iteration_heads.len() + self.per_iteration_chain.len());
+        for (position, heads) in self.per_iteration_heads.iter().enumerate() {
+            chain.push((heads.clone(), position));
+        }
+        let hop = usize::from(
+            self.scope
+                .as_ref()
+                .is_some_and(|scope| !scope.context_names.is_empty()),
+        );
+        for (heads, depth) in &self.per_iteration_chain {
+            chain.push((heads.clone(), depth + hop));
+        }
+        chain
     }
 
     /// The block binding of an Annex B block function whose declaring block
@@ -7655,6 +7755,11 @@ impl Compiler {
             }
             BindingLoc::Global => self.emit(Step::LoadGlobal { name }),
             BindingLoc::Acc => self.emit(Step::PushAcc),
+            // Cut 28: a captured per-iteration head reads the closure's own
+            // captured per-iteration env (its `lexical_env` at run time).
+            BindingLoc::CapturedIteration(depth, index) => {
+                self.emit(Step::LoadPerIteration { depth, index })
+            }
             BindingLoc::Env => unreachable!("emit_load on the environment path"),
         }
     }
@@ -7676,6 +7781,9 @@ impl Compiler {
             }
             BindingLoc::Global => self.emit(Step::StoreGlobal { name }),
             BindingLoc::Acc => self.emit(Step::PopAcc),
+            BindingLoc::CapturedIteration(depth, index) => {
+                self.emit(Step::StorePerIteration { depth, index })
+            }
             BindingLoc::Env => unreachable!("emit_dup_store on the environment path"),
         }
     }
@@ -7740,7 +7848,10 @@ impl Compiler {
                 // a captured binding must not fuse (there is no
                 // `JumpIf*AccImm`/`JumpIf*ContextImm` step); the general
                 // test reads them instead.
-                BindingLoc::Env | BindingLoc::Acc | BindingLoc::Context(_, _) => None,
+                BindingLoc::Env
+                | BindingLoc::Acc
+                | BindingLoc::Context(_, _)
+                | BindingLoc::CapturedIteration(_, _) => None,
                 loc => Some((*op, loc, *name, *n)),
             }
         } else {
@@ -7761,7 +7872,10 @@ impl Compiler {
                 // A nested loop's update over an active accumulator counter
                 // or a captured binding must not fuse (the general `Update`
                 // path reads/writes them).
-                BindingLoc::Env | BindingLoc::Acc | BindingLoc::Context(_, _) => None,
+                BindingLoc::Env
+                | BindingLoc::Acc
+                | BindingLoc::Context(_, _)
+                | BindingLoc::CapturedIteration(_, _) => None,
                 loc => Some((loc, *name, *op)),
             }
         } else {
@@ -7810,7 +7924,7 @@ impl Compiler {
                 });
             }
             BindingLoc::Acc => unreachable!("emit_fused_rel_test on the accumulator"),
-            BindingLoc::Context(_, _) => {
+            BindingLoc::Context(_, _) | BindingLoc::CapturedIteration(_, _) => {
                 unreachable!("emit_fused_rel_test on a captured binding")
             }
             BindingLoc::Env => unreachable!("emit_fused_rel_test on the environment path"),
@@ -8409,12 +8523,14 @@ impl Compiler {
                             self.emit(Step::InitLocal { slot: var_slot });
                         }
                         let outer_chain = self.closure_outer_chain();
+                        let per_iteration_chain = self.closure_per_iteration_chain();
                         self.emit(Step::FunctionDeclInit {
                             name,
                             function,
                             frame_slot: Some(block_slot),
                             context_slot: None,
                             outer_chain,
+                            per_iteration_chain,
                         });
                     }
                     self.compile_statements(&block.stmts)?;
@@ -8469,7 +8585,7 @@ impl Compiler {
                                 }
                                 // A declaration's name is bound in this body,
                                 // never an enclosing body's capture.
-                                BindingLoc::Context(_, _) => {
+                                BindingLoc::Context(_, _) | BindingLoc::CapturedIteration(_, _) => {
                                     unreachable!("a declaration cannot bind an outer context")
                                 }
                                 // A declaration of an active accumulator
@@ -8751,12 +8867,14 @@ impl Compiler {
                     // entry) is empty.
                     if let Some(entry) = self.statement_fn(function) {
                         let outer_chain = self.closure_outer_chain();
+                        let per_iteration_chain = self.closure_per_iteration_chain();
                         self.emit(Step::FunctionDeclInit {
                             name: entry.name,
                             function: Box::new(function.clone()),
                             frame_slot: entry.frame_slot,
                             context_slot: entry.context_slot,
                             outer_chain,
+                            per_iteration_chain,
                         });
                     }
                 } else if let Some((block_slot, var_slot)) = self.annex_b_copy_target(function) {
@@ -8828,7 +8946,8 @@ impl Compiler {
                                     }
                                     // A `var` head's name is bound in this
                                     // body, never an enclosing body's capture.
-                                    BindingLoc::Context(_, _) => {
+                                    BindingLoc::Context(_, _)
+                                    | BindingLoc::CapturedIteration(_, _) => {
                                         unreachable!("a for-head cannot bind an outer context")
                                     }
                                     BindingLoc::Env => {}
@@ -9098,7 +9217,7 @@ impl Compiler {
                     (BindingLoc::Acc, _) => {
                         unreachable!("fused_update on the accumulator (the scan rejects it)")
                     }
-                    (BindingLoc::Context(_, _), _) => {
+                    (BindingLoc::Context(_, _) | BindingLoc::CapturedIteration(_, _), _) => {
                         unreachable!("fused_update on a captured binding (the scan rejects it)")
                     }
                     (BindingLoc::Env, _) => unreachable!("fused_update on the environment path"),
@@ -9463,6 +9582,9 @@ impl Compiler {
                 // A for-of head over an active accumulator counter is
                 // rejected by the loop-body scan.
                 BindingLoc::Acc => unreachable!("a for-of head cannot bind its counter"),
+                BindingLoc::CapturedIteration(_, _) => {
+                    self.emit(Step::ForOfBind { left: left.clone() })
+                }
                 BindingLoc::Env => self.emit(Step::ForOfBind { left: left.clone() }),
             },
             _ => self.emit(Step::ForOfBind { left: left.clone() }),
@@ -9744,6 +9866,11 @@ impl Compiler {
                     BindingLoc::Global => self.emit(Step::LoadGlobal { name: *name }),
                     // Cut 17: the fused loop counter lives in the accumulator.
                     BindingLoc::Acc => self.emit(Step::PushAcc),
+                    // Cut 28: a captured per-iteration head reads the
+                    // closure's own captured per-iteration env.
+                    BindingLoc::CapturedIteration(depth, index) => {
+                        self.emit(Step::LoadPerIteration { depth, index })
+                    }
                     BindingLoc::Env => self.emit(Step::LoadIdent { name: *name }),
                 }
                 Ok(())
@@ -9766,10 +9893,12 @@ impl Compiler {
             )),
             ExprKind::Function(function) => {
                 let outer_chain = self.closure_outer_chain();
+                let per_iteration_chain = self.closure_per_iteration_chain();
                 self.emit(Step::CreateFunction {
                     function: Box::new(function.clone()),
                     strict: self.strict || self.class_depth > 0,
                     outer_chain,
+                    per_iteration_chain,
                 });
                 Ok(())
             }
@@ -9779,12 +9908,14 @@ impl Compiler {
                 body,
             } => {
                 let outer_chain = self.closure_outer_chain();
+                let per_iteration_chain = self.closure_per_iteration_chain();
                 self.emit(Step::CreateArrow {
                     is_async: *is_async,
                     params: params.clone(),
                     body: body.clone(),
                     strict: self.strict || self.class_depth > 0,
                     outer_chain,
+                    per_iteration_chain,
                 });
                 Ok(())
             }
@@ -9839,6 +9970,12 @@ impl Compiler {
                             // a read of the accumulator.
                             BindingLoc::Acc => {
                                 self.emit(Step::PushAcc);
+                                self.emit(Step::TypeofTop);
+                            }
+                            // Cut 28: a captured per-iteration head reads
+                            // the closure's own captured per-iteration env.
+                            BindingLoc::CapturedIteration(depth, index) => {
+                                self.emit(Step::LoadPerIteration { depth, index });
                                 self.emit(Step::TypeofTop);
                             }
                             BindingLoc::Env => {
@@ -10237,6 +10374,17 @@ impl Compiler {
                         }
                         return Ok(());
                     }
+                    BindingLoc::CapturedIteration(depth, index) => {
+                        // Cut 28: the update reads and writes the closure's
+                        // own captured per-iteration env.
+                        self.emit(Step::UpdatePerIteration {
+                            depth,
+                            index,
+                            op: *op,
+                            prefix,
+                        });
+                        return Ok(());
+                    }
                     BindingLoc::Env => {}
                 }
                 // The assignment target's reference resolves before the RHS:
@@ -10360,6 +10508,7 @@ impl Compiler {
                 match self.binding(*name) {
                     loc @ (BindingLoc::Slot(_)
                     | BindingLoc::Context(_, _)
+                    | BindingLoc::CapturedIteration(_, _)
                     | BindingLoc::Global
                     | BindingLoc::Acc) => {
                         // Cut 3/17 fast paths: the target is a frame slot,
@@ -11710,11 +11859,13 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
                 | Step::EnterIterTdzEnv { .. }
                 | Step::LeaveIterTdzEnv
                 | Step::EnterPerIteration { .. }
-                | Step::LoadPerIteration { .. }
-                | Step::StorePerIteration { .. }
-                | Step::UpdatePerIteration { .. }
                 | Step::UsingInit { .. }
                 | Step::DeclInit { .. }
+                // The per-iteration READS are leaf-safe (Cut 28): a closure
+                // body's `LoadPerIteration`/`StorePerIteration`/
+                // `UpdatePerIteration` target its own captured per-iteration
+                // env through `lexical_env`, which the inline run sets; the
+                // env-CREATING steps above stay excluded.
                 // Iterator machinery: protocol calls plus the for-of/for-in
                 // stacks the caller's break/return/throw paths close.
                 | Step::ForInBegin
@@ -11785,6 +11936,7 @@ pub fn compile_body(function: &EcmaFunction) -> Result<CompiledBody, JsError> {
         scope,
         strict: function.strict,
         outer_chain: function.outer_chain.clone(),
+        per_iteration_chain: function.per_iteration_chain.clone(),
         ..Compiler::default()
     };
     // Cut 3 continuation: the body's `arguments` slot is filled at entry —
@@ -11819,6 +11971,10 @@ pub fn compile_body(function: &EcmaFunction) -> Result<CompiledBody, JsError> {
                     frame_slot,
                     context_slot,
                     outer_chain,
+                    // The hoisted declaration instantiates at body entry,
+                    // before this body's own loops start, so it inherits
+                    // only the enclosing chain.
+                    per_iteration_chain: compiler.per_iteration_chain.clone(),
                 });
             }
         }
@@ -11830,6 +11986,14 @@ pub fn compile_body(function: &EcmaFunction) -> Result<CompiledBody, JsError> {
     // body capture the per-iteration env, not the capture context).
     let env_constant = compiler.scope.is_some() && !compiler.env_changing;
     let leaf = compiler.scope.is_some() && steps_are_leaf(&compiler.steps);
+    let leaf_needs_env = compiler.steps.iter().any(|step| {
+        matches!(
+            step,
+            Step::LoadPerIteration { .. }
+                | Step::StorePerIteration { .. }
+                | Step::UpdatePerIteration { .. }
+        )
+    });
     Ok(CompiledBody {
         steps: compiler.steps,
         handlers: compiler.handlers,
@@ -11837,6 +12001,7 @@ pub fn compile_body(function: &EcmaFunction) -> Result<CompiledBody, JsError> {
         scope: compiler.scope,
         env_constant,
         leaf,
+        leaf_needs_env,
         script_globals: None,
     })
 }
@@ -11902,6 +12067,7 @@ pub fn compile_statements(
         // Scripts are never the callee of a call, so the leaf-inline fast
         // path never sees them.
         leaf: false,
+        leaf_needs_env: false,
         script_globals: compiler.script_globals,
     })
 }

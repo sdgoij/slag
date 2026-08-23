@@ -166,6 +166,15 @@ pub struct EcmaFunction {
     /// reads instead of env walks. Empty when the enclosing chain is
     /// uncertified.
     pub outer_chain: Vec<Vec<crux::AtomId>>,
+    /// Cut 28: the per-iteration loop-head layouts of the certified loops
+    /// open at this function's creation site — `(head names, env hop
+    /// offset)`, innermost first, where the offset is the number of
+    /// environment hops from the closure's [[Environment]] to that loop's
+    /// per-iteration env. A closure created inside a certified `for (let
+    /// i...)` loop captures the per-iteration env; its references to those
+    /// heads compile to static `LoadPerIteration` reads (resolved against
+    /// the closure's own `lexical_env` at run time) instead of env walks.
+    pub per_iteration_chain: Vec<(Vec<crux::AtomId>, usize)>,
 }
 
 /// FunctionBodyContainsUseStrict (spec 15.2.1): a `"use strict"` directive in
@@ -392,8 +401,17 @@ pub fn instantiate_function(
     environment: EnvRef,
     enclosing_strict: bool,
     outer_chain: Vec<Vec<crux::AtomId>>,
+    per_iteration_chain: Vec<(Vec<crux::AtomId>, usize)>,
 ) -> Result<Value, JsError> {
-    instantiate_function_with_source(agent, f, environment, enclosing_strict, None, outer_chain)
+    instantiate_function_with_source(
+        agent,
+        f,
+        environment,
+        enclosing_strict,
+        None,
+        outer_chain,
+        per_iteration_chain,
+    )
 }
 
 pub fn instantiate_function_with_source(
@@ -403,10 +421,11 @@ pub fn instantiate_function_with_source(
     enclosing_strict: bool,
     source: Option<JsString>,
     outer_chain: Vec<Vec<crux::AtomId>>,
+    per_iteration_chain: Vec<(Vec<crux::AtomId>, usize)>,
 ) -> Result<Value, JsError> {
     let source = source.or_else(|| capture_source(agent, f.span));
     let body = shared_function_body(agent, f, source.as_ref());
-    register_function(
+    let value = register_function(
         agent,
         default_binding_display_name(f.name.map(crux::lookup)),
         f.params.clone(),
@@ -417,7 +436,14 @@ pub fn instantiate_function_with_source(
         source,
         None,
         outer_chain,
-    )
+    )?;
+    if !per_iteration_chain.is_empty()
+        && let Some(function) = value.as_function()
+        && let Some(data) = agent.ecma_functions.get_mut(&function.id())
+    {
+        data.per_iteration_chain = per_iteration_chain;
+    }
+    Ok(value)
 }
 
 /// Instantiate a function declaration or expression whose body AST is shared
@@ -664,6 +690,7 @@ fn register_function(
         declaring_module,
         ir: None,
         outer_chain,
+        per_iteration_chain: Vec::new(),
     };
     // Every body compiles to the step IR; the VM executes ordinary bodies
     // the same way it runs the resumable kinds.
@@ -826,9 +853,17 @@ pub fn instantiate_function_expression(
     environment: EnvRef,
     enclosing_strict: bool,
     outer_chain: Vec<Vec<crux::AtomId>>,
+    per_iteration_chain: Vec<(Vec<crux::AtomId>, usize)>,
 ) -> Result<Value, JsError> {
     let Some(name) = f.name else {
-        return instantiate_function(agent, f, environment, enclosing_strict, outer_chain);
+        return instantiate_function(
+            agent,
+            f,
+            environment,
+            enclosing_strict,
+            outer_chain,
+            per_iteration_chain,
+        );
     };
     let name = crux::lookup(name);
     let scope = new_declarative_environment(Some(environment));
@@ -838,7 +873,14 @@ pub fn instantiate_function_expression(
     if let crate::env::EnvRecord::Declarative(declarative) = &*scope {
         declarative.mark_context_transparent();
     }
-    let value = instantiate_function(agent, f, scope.clone(), enclosing_strict, outer_chain)?;
+    let value = instantiate_function(
+        agent,
+        f,
+        scope.clone(),
+        enclosing_strict,
+        outer_chain,
+        per_iteration_chain,
+    )?;
     // spec 15.2.5 step 6: the self-binding is a non-strict immutable binding,
     // so a sloppy-mode assignment to the function's own name is ignored.
     scope.create_immutable_binding(&name, false)?;
@@ -889,6 +931,7 @@ pub fn instantiate_dynamic_function(
 
 /// Instantiate an arrow function: `[[ThisMode]]` is ~lexical~ and there is
 /// no `prototype` (spec 15.3.2).
+#[allow(clippy::too_many_arguments)]
 pub fn instantiate_arrow(
     agent: &mut Agent,
     is_async: bool,
@@ -897,6 +940,7 @@ pub fn instantiate_arrow(
     environment: EnvRef,
     enclosing_strict: bool,
     outer_chain: Vec<Vec<crux::AtomId>>,
+    per_iteration_chain: Vec<(Vec<crux::AtomId>, usize)>,
 ) -> Result<Value, JsError> {
     let body = match body {
         ArrowBody::Expr(expr) => {
@@ -939,6 +983,7 @@ pub fn instantiate_arrow(
         declaring_module: None,
         ir: None,
         outer_chain,
+        per_iteration_chain,
     };
     data.ir = Some(std::rc::Rc::new(crate::ir::compile_body(&data)?));
     let function = Function::new(None);
@@ -2741,7 +2786,14 @@ pub(crate) fn function_declaration_instantiation(
     }
     for f in funcs {
         let name = crux::lookup(f.name.unwrap());
-        let func_obj = instantiate_function(agent, f, lexical_env.clone(), strict, Vec::new())?;
+        let func_obj = instantiate_function(
+            agent,
+            f,
+            lexical_env.clone(),
+            strict,
+            Vec::new(),
+            Vec::new(),
+        )?;
         variable_env.set_mutable_binding(&name, func_obj, false)?;
     }
 

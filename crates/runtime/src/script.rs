@@ -592,6 +592,7 @@ pub fn global_declaration_instantiation(
             global_env.clone(),
             strict,
             Vec::new(),
+            Vec::new(),
         )?;
         global_env.create_global_function_binding(&name, func_obj, false)?;
     }
@@ -932,7 +933,8 @@ fn eval_declaration_instantiation(
         };
         let name = lookup(func_name);
         let env = agent.running_context()?.lexical_environment.clone();
-        let func_obj = crate::function::instantiate_function(agent, f, env, strict, Vec::new())?;
+        let func_obj =
+            crate::function::instantiate_function(agent, f, env, strict, Vec::new(), Vec::new())?;
         if variable_env_is_global {
             // Eval-created global functions are deletable.
             variable_env.create_global_function_binding(&name, func_obj, true)?;

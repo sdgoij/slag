@@ -880,6 +880,82 @@ arith/property/array/per-iteration flat. Conformance at baseline: language
 15s sweep-timeout rule classifies them as real hangs); workspace tests
 4311/0. The suite is now ~0.77s (from ~0.83s).
 
+### Cut 27 — per-array for-of fast verdict (measured 2026-08-23)
+
+An array-row decomposition (the `for (var v of a)` bench row) split the
+cost between the for-of BEGIN (100k outer iterations × ~490ns ≈ 49ms —
+the Cut 24 fast path still ran the own-`@@iterator` property scan, the
+`%Array.prototype%` intrinsics lookup, and the prototype walk per begin)
+and the per-element step machinery (~60ms for 1M `ForOfNext`s). The begin
+dominated: the same array was re-verified 100k times.
+
+`for_of_begin` now probes a per-array fast-verdict cell — (array id, array
+generation, prototype id) — before the Cut 24 checks: a hit skips every
+check except the cheap gen-validated stock-iterator probe. The array
+generation (Cut 22's mechanism) catches an own `@@iterator` addition and
+proto changes; the prototype's own mutations bump ITS generation, which
+`for_of_fast_probe` re-validates per access. The cell is populated when
+the full check passes; a miss re-runs the checks and re-resolves.
+
+Measured (5-run medians, release, vs Cut 26):
+
+| Row | before | after |
+|---|---|---|
+| array iteration | ~118ms | **~76ms** (-36%) |
+| for-of begin 100k (probe) | ~49ms | **~3ms** |
+
+The begin is now ~30ns/outer-iteration (from ~490ns). All other rows
+flat. Conformance: language 23,690/0/34, annexB 1,086/0/0 at baseline;
+built-ins 23,211/0/154 with 447 hangs — under the 15s sweep-timeout rule
+every one is the >15s slow class (435 RegExp property-escapes generates,
+5 CharacterClassEscapes, 4 Temporal argument-string-limits, 3 TypedArray
+detached-coercion), all previously passing under the old 120s deadline
+(sampled individually: they complete, just over 15s); zero new failures
+it. Workspace tests 4311/0. The suite is now ~0.72s (from
+~0.77s).
+
+### Cut 28 — static reads for captured per-iteration heads (measured 2026-08-23)
+
+The per-iteration bench row (`fns[j & 15]()` over arrows created in a
+certified `for (let i...)` loop) paid a full env-chain walk per call: the
+arrow's `i` reference compiled to `LoadIdent` (the per-iteration heads are
+deliberately stripped from the closure's outer-chain entries — the capture
+context's head slot is stale between iterations), so every call resolved
+`i` through the runtime environment. The arrows were also NOT leaf-
+eligible, so they paid the full certified-call machinery on top.
+
+A closure created inside a certified per-iteration loop captures the
+per-iteration env directly, and that env is its `lexical_env` at run time
+— so the read can be static. The closure's metadata now carries a
+`per_iteration_chain` (the `(head names, env hop offset)` of the loops open
+at its creation site, threaded through `EcmaFunction` →
+`CreateArrow`/`CreateFunction` → `compile_body`); `binding` resolves those
+heads to the existing `LoadPerIteration`/`StorePerIteration`/
+`UpdatePerIteration` steps (depth = the closure's own capture-context hop +
+the chain entry's offset), and the per-iteration steps became leaf-eligible
+(the inline run sets `lexical_env` to the leaf's env only when the leaf has
+such steps — `CompiledBody::leaf_needs_env`). Nested loops, closures-in-
+closures, and multi-head loops are covered by the depth bookkeeping; every
+uncertain case still falls back to the env walk.
+
+Measured (5-run medians, release, vs Cut 27):
+
+| Row | before | after |
+|---|---|---|
+| per-iteration | ~47ms | **~23ms** (-51%) |
+| function calls | ~162ms | ~172ms |
+| closure capture | ~168ms | ~174ms |
+
+One regression found and fixed during the cut: the Cut 27
+`for_of_array_cells` (16 × 24-byte inline entries) bloated the Agent
+struct's hot-field cache footprint and slowed the leaf-call path ~10ns/call
+(isolated by A/B: shrinking the field restored the identity-leaf probe
+166→165ms); the cache is now `Box`ed so the Agent holds an 8-byte pointer
+instead. The call-family total (calls + closure + per-iteration) still
+improved ~5ms net. Conformance at baseline: language 23,690/0/34, annexB
+1,086/0/0, built-ins 23,211/0/154 (447 >15s hangs, the known slow class);
+workspace tests 4311/0. The suite is now ~0.69s (from ~0.72s).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

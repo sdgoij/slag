@@ -553,6 +553,7 @@ pub(crate) fn eval_function_declaration(
             lexical_env.clone(),
             strict,
             Vec::new(),
+            Vec::new(),
         )?;
         variable_env.set_mutable_binding(&name, func_obj, false)?;
         return Ok(());
@@ -730,6 +731,7 @@ pub(crate) fn block_declaration_instantiation_iter<'a>(
                             f,
                             block_env.clone(),
                             strict,
+                            Vec::new(),
                             Vec::new(),
                         )?;
                         block_env.initialize_binding(&name, func_obj)?;
