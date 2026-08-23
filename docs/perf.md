@@ -1538,6 +1538,43 @@ Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
 conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
 23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
 
+### Cut 35 slice 11 — generation-validated member value cache (measured 2026-08-23)
+
+The property row's per-read cost after slice 10 was the member-cell
+re-validation: `member_cell_get` re-borrowed the property vector and
+re-checked the stored key and property kind on every read (~20ns/read).
+Two changes remove most of it:
+
+- **The generation now catches in-place value updates** (`crates/crux`):
+  `set_key`'s in-place write, `array_element_write`'s in-place element
+  write and dense append, and `array_define_own_property`'s dense append
+  (which updates `length` in place) all bump the object generation — the
+  only own-property mutations that previously missed it. The write-side
+  chain cache and for-of caches only ever re-validate on a mismatch, so
+  the extra bumps cost misses, never correctness.
+- **`member_value_cells`** — a fronting read cache of (object id, name,
+  generation, value): a generation match means no own-property change
+  since the read, so the value is returned with no borrow, no key/kind
+  re-check. `member_cell_get` fills it on every slot-cache hit and
+  `resolve_member_cell` on every resolve; the Cut 23 proto-keyed fallback
+  still re-validates against the object's own vector, so fresh instances
+  keep working. The `GetMemberNameLocal` op also reads its frame slot by
+  reference and tries `member_cell_get` before cloning the value for the
+  full fallback, skipping one refcount bump per hit.
+
+The two-member-read property body now costs roughly the loop + two
+cached clones instead of two borrow+revalidations: property access
+~72 -> ~44ms (2x vs the slice-9 baseline ~87ms). The other rows are
+unchanged. The 14-case probe (`scratch/slice11_probe.js`) covers in-place
+updates of the cached and sibling properties, delete/defineProperty/
+data-to-accessor conversions, mid-loop mutations, two-object and
+five-name cache behavior, getter non-caching, array element/length
+writes, and prototype-chain shadowing.
+
+Validation: clippy `-D warnings` clean, workspace tests green (4312/0),
+conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
+23,812/0/154 with 447 >15s hangs in the known slow classes (unchanged).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

@@ -88,6 +88,12 @@ pub struct Agent {
     /// and warms a nested call to its caller's shapes.
     pub(crate) global_cells: [Option<(crux::AtomId, usize)>; crate::ir::GLOBAL_CELLS],
     pub(crate) member_cells: [Option<(u64, crux::AtomId, usize)>; crate::ir::MEMBER_CELLS],
+    /// The fronting read-side value cache (Cut 35 slice 11): (id, name,
+    /// generation, value) — a hit returns the value with no property-vector
+    /// borrow or re-validation. Boxed so the Agent's hot-field cache
+    /// footprint stays small (the Cut 27 lesson).
+    pub(crate) member_value_cells:
+        Box<[Option<crate::ir::MemberValueCell>; crate::ir::MEMBER_CELLS]>,
     /// The proto-keyed read-cell fallback (Cut 23): `(prototype id, name) →
     /// slot` — fresh objects (a constructor's new `this`) share the
     /// prototype's shape, so the slot cached for the prototype is validated
@@ -491,6 +497,7 @@ impl Agent {
             execution_context_stack: Vec::new(),
             global_cells: [None; crate::ir::GLOBAL_CELLS],
             member_cells: [None; crate::ir::MEMBER_CELLS],
+            member_value_cells: Box::new(std::array::from_fn(|_| None)),
             member_proto_cells: [None; crate::ir::MEMBER_CELLS],
             array_element_cells: [None; crate::ir::MEMBER_CELLS],
             member_store_cells: [None; crate::ir::MEMBER_CELLS],

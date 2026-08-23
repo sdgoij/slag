@@ -1161,6 +1161,7 @@ impl JsObject {
                 } = &mut property.kind
             {
                 *slot_value = value;
+                self.bump_generation();
                 return Ok(Some(()));
             }
             return Ok(None);
@@ -1213,6 +1214,7 @@ impl JsObject {
             {
                 *slot = Value::Number((index + 1) as f64);
             }
+            self.bump_generation();
             return Ok(Some(()));
         }
         if self.create_data_property_key(&key, value)? {
@@ -1382,6 +1384,10 @@ impl JsObject {
                 && *writable
             {
                 *slot = value;
+                // An in-place value update is an own-property change: bump
+                // the generation so the read-side value cache (Cut 35
+                // slice 11) re-validates its cached value.
+                self.bump_generation();
                 return Ok(true);
             }
             drop(props);
@@ -2289,6 +2295,7 @@ fn array_define_own_property(
             {
                 *slot = Value::Number(index as f64 + 1.0);
             }
+            array.bump_generation();
             return Ok(true);
         }
         if !array.ordinary_define_own_property(key, desc)? {

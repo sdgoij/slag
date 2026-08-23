@@ -229,6 +229,21 @@ arguments state.
   The spill is only emitted when the value below the popped object is a
   live `Acc` — a computed `Acc` key is rejected in the fused computed
   read because the spill would push the key, not the live value.
+- **The member value cache is generation-validated** (Cut 35 slice 11):
+  `member_cell_get` fronts its slot cache with (object id, name,
+  generation, value) — a generation match returns the value with no
+  property-vector borrow. This is sound ONLY because every own-property
+  mutation of an Ordinary/Array object bumps the generation, including
+  the in-place paths that previously missed it: `set_key`'s in-place
+  write, `array_element_write`'s element write and dense append, and
+  `array_define_own_property`'s dense append (`length` update). If you
+  add a new path that mutates a property-vector entry in place (a
+  `*slot = value` on `props`), it MUST bump — a stale cached value would
+  be returned otherwise. The extra bumps cost the write-side chain cache
+  and for-of caches spurious misses (re-validated, correct), never stale
+  verdicts. `GetMemberNameLocal` reads its frame slot by reference and
+  tries `member_cell_get` before cloning the value for the full fallback
+  (one fewer refcount bump per hit).
 - Errors propagate raw to the caller's `run_inner` exactly like a
   step-path leaf (a register body may throw from `apply_binary`/TDZ
   checks). Register-op semantics mirror the step semantics 1:1 — when you

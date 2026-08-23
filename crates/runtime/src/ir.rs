@@ -1301,6 +1301,18 @@ pub(crate) const MEMBER_CELLS: usize = 16;
 /// The write-side chain-cache entry (Cut 22): (prototype id, key atom,
 /// walked-chain length, per-link generations).
 pub(crate) type MemberStoreCell = (u64, crux::AtomId, u32, [u32; 4]);
+/// The read-side value-cache entry (Cut 35 slice 11): the cached value of
+/// `object.name` at the object's generation — a generation match means no
+/// own-property change since the read (every mutation path bumps,
+/// including `set_key`'s in-place value update), so the value is current
+/// without re-borrowing the property vector.
+#[derive(Clone)]
+pub(crate) struct MemberValueCell {
+    pub id: u64,
+    pub name: crux::AtomId,
+    pub generation: u32,
+    pub value: Value,
+}
 /// The direct-mapped global-var cell count: a power of two so the cache
 /// index is a mask. Bigger than the member cells because a script's
 /// top-level names (`n`, `i`, `s`, ...) all probe this table; a collision
@@ -2085,7 +2097,10 @@ impl Vm {
                     crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array
                 ) =>
             {
-                Some(object.clone())
+                // `kind()` already reconstructed the handle; move it out
+                // rather than cloning again (the hot member-read path pays
+                // this per read).
+                Some(object)
             }
             ValueKind::Function(function) => {
                 let object = &function.object;
@@ -2105,10 +2120,20 @@ impl Vm {
     /// The cached read of `object.name` — an own data property on a plain
     /// object at the direct-mapped slot, re-validated against the stored key
     /// and property kind. `None` falls back to the full Get (which then
-    /// re-resolves the cache).
-    fn member_cell_get(agent: &Agent, object: &Value, name: crux::AtomId) -> Option<Value> {
+    /// re-resolves the cache). The fronting value cache (Cut 35 slice 11)
+    /// returns the value with no property-vector borrow when the object's
+    /// generation matches the cached read (every own-property mutation path
+    /// bumps the generation, including `set_key`'s in-place value update).
+    fn member_cell_get(agent: &mut Agent, object: &Value, name: crux::AtomId) -> Option<Value> {
         let object = Self::cell_object(object)?;
         let index = Self::member_cell_index(object.id(), name);
+        if let Some(cell) = agent.member_value_cells[index].as_ref()
+            && cell.id == object.id()
+            && cell.name == name
+            && cell.generation == object.generation()
+        {
+            return Some(cell.value.clone());
+        }
         let slot = match agent.member_cells[index] {
             Some((cached_id, cached_name, slot))
                 if cached_id == object.id() && cached_name == name =>
@@ -2143,7 +2168,16 @@ impl Vm {
             return None;
         }
         match &property.kind {
-            crux::object::PropertyKind::Data { value, .. } => Some(value.clone()),
+            crux::object::PropertyKind::Data { value, .. } => {
+                let value = value.clone();
+                agent.member_value_cells[index] = Some(MemberValueCell {
+                    id: object.id(),
+                    name,
+                    generation: object.generation(),
+                    value: value.clone(),
+                });
+                Some(value)
+            }
             _ => None,
         }
     }
@@ -2295,10 +2329,16 @@ impl Vm {
             let props = object.properties.borrow();
             if let Some((stored, property)) = props.get(slot)
                 && *stored == key
-                && matches!(property.kind, crux::object::PropertyKind::Data { .. })
+                && let crux::object::PropertyKind::Data { value, .. } = &property.kind
             {
                 let index = Self::member_cell_index(object.id(), name);
                 agent.member_cells[index] = Some((object.id(), name, slot));
+                agent.member_value_cells[index] = Some(MemberValueCell {
+                    id: object.id(),
+                    name,
+                    generation: object.generation(),
+                    value: value.clone(),
+                });
                 // Cut 23: cache the slot for the prototype too — fresh
                 // instances of the same shape hit the proto-keyed fallback
                 // in `member_cell_get` (validated per access).
@@ -6445,14 +6485,21 @@ impl Vm {
                     tdz,
                     name,
                 } => {
-                    let object = self.frame_get(*object_slot).clone();
+                    // The hot path reads the frame slot by reference (no
+                    // value clone) and tries the shared member-cell read
+                    // first; only a miss clones the value for the full
+                    // `get_member_name` fallback.
+                    let object = self.frame_get(*object_slot);
                     if *tdz && object.is_uninitialized() {
                         return Err(JsError::new(
                             ErrorKind::ReferenceError,
                             "Cannot access a binding before initialization".into(),
                         ));
                     }
-                    self.acc = self.get_member_name(agent, object, *name)?;
+                    self.acc = match Self::member_cell_get(agent, object, *name) {
+                        Some(value) => value,
+                        None => self.get_member_name(agent, object.clone(), *name)?,
+                    };
                 }
                 LeafOp::GetMemberComputedLocal {
                     object_slot,
