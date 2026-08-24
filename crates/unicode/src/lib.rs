@@ -8,7 +8,10 @@
 
 use unicode_normalization::UnicodeNormalization;
 
-mod derived_regexp_tables;
+#[allow(clippy::unreadable_literal)]
+mod derived_regexp_tables {
+    include!(concat!(env!("OUT_DIR"), "/derived_regexp_tables.rs"));
+}
 pub mod tz;
 pub mod tz_data;
 

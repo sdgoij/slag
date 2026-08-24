@@ -1728,9 +1728,9 @@ propagation. The `byteConversionValues` (19: Float16) and
 before that, taking the totals from 41,838 to 42,042 pass. The regExpUtils
 cluster closed next (586/586, taking the totals from 43,107 to 43,693):
 the `/v`-flag unicodeSets machinery was completed — the full binary-property
-and property-of-strings tables are now derived from the pinned test262
-fixtures (`tools/gen_regexp_unicode_tables.py` →
-`crates/unicode/src/derived_regexp_tables.rs`), the `gc=`/binary/script
+and property-of-strings tables are now derived at build time from the pinned
+test262 fixtures (`crates/unicode/build.rs` → `derived_regexp_tables.rs`),
+the `gc=`/binary/script
 aliases (`AHex`, `Alpha`, `IDC`, `Qaac`, …) and the `LC`/`Cased_Letter`
 cased-letter union were added, Common/Inherited/Unknown scripts and lone
 surrogates are returned by `script()`/`script_extensions()` (so

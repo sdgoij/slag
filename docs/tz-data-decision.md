@@ -72,15 +72,16 @@ version you don't control.
 
 ### B. Corpus-derived tables (the established Slag pattern)
 
-The `gen_regexp_unicode_tables` precedent: the fixtures ARE the data spec;
-a generator extracts/compiles the data, and the generated `.rs` is
-dogfooded through the engine.
+The `crates/unicode/build.rs` precedent: the fixtures ARE the data spec;
+a build script derives the tables at build time from the pinned corpus
+(erroring if the submodule is missing).
 
 - **Data source**: a vendored minimal IANA subset — the ~160 zone files +
   the `backward` link file from tzdata 2023a — pinned alongside the test262
   submodule (the same era the corpus encodes).
-- **Generator**: `tools/gen_tz_tables.py` (following
-  `tools/gen_regexp_unicode_tables.py`) parses the tzdata text format
+- **Generator**: `tools/gen_tz_tables.py` (following the
+  `crates/unicode/build.rs` corpus-derivation pattern) parses the tzdata
+  text format
   (Zone/Rule/Link lines, a stable ~30-year-old format) and writes
   `crates/unicode/src/tz_data.rs`.
 - **Runtime table**: per-zone sorted transition array
@@ -200,8 +201,8 @@ flattened blob already in the cargo cache (`tools/tzdata/` now vendors the
 
 ## 6. Recommendation
 
-**Derived tables + a vendored minimal tzdata 2023a subset**, generator in
-`tools/` following the `gen_regexp_unicode_tables` precedent, tables in
+**Derived tables + a vendored minimal tzdata 2023a subset**, generator
+following the `crates/unicode/build.rs` corpus-derivation pattern, tables in
 `crates/unicode/src/tz_data.rs`. Start with the 4-zone spike to validate
 the era pin and the table format against the corpus's exact offsets before
 generating the rest. The external-crate route is now effectively a data

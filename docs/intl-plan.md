@@ -81,8 +81,9 @@ This drives the strategy:
   datagen pipeline), and its output is not guaranteed to byte-match the
   corpus's ICU-era expectations.
 - **Corpus-derived data** — the established Slag pattern
-  (`gen_regexp_unicode_tables.py` generates `\p{...}` tables *from the
-  fixtures* because the fixtures ARE the data spec). Intl is the same
+  (`crates/unicode/build.rs` derives the `\p{...}` tables *from the pinned
+  fixtures at build time* because the fixtures ARE the data spec; it errors
+  if the test262 submodule is missing). Intl is the same
   shape at larger scale: the **algorithms** are spec'd exactly (rounding,
   pattern application, plural selection, list joining) and get real
   implementations; the **data** (separators, digits, plural rules, date
@@ -90,9 +91,9 @@ This drives the strategy:
   ~40 fixture locales.
 
 **Recommendation: real algorithms + corpus/CLDR-derived data tables.**
-A generator (following the `gen_regexp_unicode_tables` precedent — the
-`.py` is the tool, the `.js` is the dogfooded benchmark) extracts the
-data from (a) the fixtures' expected outputs and (b) a vendored minimal
+A generator (following the `crates/unicode/build.rs` precedent — a build
+script that derives tables from the pinned fixtures at build time) extracts
+the data from (a) the fixtures' expected outputs and (b) a vendored minimal
 CLDR subset pinned to the era the fixtures encode. The decision is
 validated by a **spike at the start of Cut 2** (below): hand-write the
 NumberFormat data for 6 locales and measure how far derived data goes
@@ -111,7 +112,8 @@ allowed external data dependency.
   intrinsic registers the namespace object and constructors.
 - `crates/unicode/` grows the Intl data modules (numbering systems,
   plural rules, date patterns, collation, display names) plus the
-  generated tables; the generator lives in `tools/`.
+  generated tables; the generator is a `build.rs` (the corpus-derived
+  pattern, erroring if the pinned submodule is missing).
 - `Agent`/`Realm` gain the internal slots the components need
   (the existing `temporal_data` map is the pattern for
   `[[InitializedNumberFormat]]`-style records).
@@ -254,8 +256,9 @@ months), sub-minute offset matching, and a few edge singles.
 - Unit tests asserting corpus-shaped outputs (e.g. the
   `format-significant-digits` table for one locale) live in
   `crates/runtime/src/builtins/intl/`.
-- The data generator is dogfooded through the engine (the `.js` variant)
-  like `gen_regexp_unicode_tables`.
+- The data generator follows the `crates/unicode/build.rs` corpus-derived
+  pattern: tables generated at build time from the pinned fixtures, with
+  the corpus as the regression net.
 
 ## 7. Non-goals
 

@@ -4,8 +4,8 @@
 //! `format-significant-digits.js`, `notation-compact-en-US.js`,
 //! `signDisplay-currency-de-DE.js`, `formatRange/pt-PT.js`); these tables
 //! are the exact entries the corpus exercises — the fixtures ARE the data
-//! spec (the same pattern as `crates/unicode/src/derived_regexp_tables.rs`
-//! and the Cut 1 `data.rs`).
+//! spec (the same pattern as the `crates/unicode/build.rs` corpus-derived
+//! tables and the Cut 1 `data.rs`).
 
 /// The ECMA-402 §16.5.5 Table 30 numbering systems with simple digit
 /// mappings, as `(name, first_codepoint)`: the digits are the ten code
