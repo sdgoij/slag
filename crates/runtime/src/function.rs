@@ -1109,7 +1109,7 @@ pub(crate) fn call_inner(
     // push it, re-enter, and restore. With a single realm the current realm
     // is always the owning one, so the (cached) owning-realm lookup is
     // skipped on every call.
-    if agent.realms.borrow().len() > 1
+    if agent.realm_count.get() > 1
         && let ValueKind::Function(function) = callee.kind()
         && let Some(owning) = owning_realm(agent, &function)
         && owning.global_object.id() != agent.current_realm()?.global_object.id()

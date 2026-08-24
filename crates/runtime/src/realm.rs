@@ -126,6 +126,7 @@ pub fn initialize_host_defined_realm(agent: &Agent) -> Result<Handle<Realm>, JsE
     });
     set_default_global_bindings(&realm)?;
     agent.realms.borrow_mut().push(realm.clone());
+    agent.realm_count.set(agent.realm_count.get() + 1);
     Ok(realm)
 }
 

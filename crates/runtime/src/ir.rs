@@ -2071,6 +2071,26 @@ impl Vm {
         Ok(global)
     }
 
+    /// Whether the current realm's global object matches `(id, generation)`
+    /// (the global-leaf-cache validation, Cut 35 slice 25): the cached
+    /// handle on this Vm is read in place (no clone — `global_object`
+    /// clones its return every call); the first call resolves and caches
+    /// it.
+    fn global_matches(
+        &mut self,
+        agent: &mut Agent,
+        id: u64,
+        generation: u32,
+    ) -> Result<bool, JsError> {
+        if let Some(global) = &self.global {
+            return Ok(global.id() == id && global.generation() == generation);
+        }
+        let global = agent.running_context()?.realm.global_object.clone();
+        let matches = global.id() == id && global.generation() == generation;
+        self.global = Some(global);
+        Ok(matches)
+    }
+
     /// The top-level fast path's reference for a declared global var: a
     /// value reference against the realm's global object (the global
     /// environment's binding object), so `get_value`/`put_value` run the
@@ -4228,7 +4248,7 @@ impl Vm {
                     let result = if self.can_inline_leaf()
                         && let ValueKind::Function(function) = callee.kind()
                         && matches!(function.kind, crux::function::FunctionKind::EcmaScript)
-                        && agent.realms.borrow().len() == 1
+                        && agent.realm_count.get() == 1
                         && let Some(entry) = agent.leaf_lookup(function.id())
                         // Cut 33: the certified base-constructor leaf verdict
                         // (leaf body, base kind, no fields/private methods) is
@@ -6420,7 +6440,11 @@ impl Vm {
         let caller_completion = std::mem::replace(&mut self.completion, Value::Undefined);
         let caller_completion_is_empty = self.completion_is_empty;
         self.completion_is_empty = true;
-        let caller_acc = std::mem::replace(&mut self.acc, Value::Undefined);
+        // Cut 35 slice 25: no accumulator save/restore — `acc` is read only
+        // by the register executor, and every leaf-inline call site sits in
+        // a step-path body where the caller's `acc` is dead (the step path
+        // never reads it); a step-path leaf's own loops (`RunRegBody`)
+        // clobber it freely.
         // Cut 35 slice 21: a leaf's own fast loop uses the shared
         // `loop_counter` field — save the caller's counter across the run
         // (the leaf's `FastLoopBind` overwrites it, `FastLoopStore` writes
@@ -6485,7 +6509,6 @@ impl Vm {
         self.stack.truncate(frame_base);
         self.completion = caller_completion;
         self.completion_is_empty = caller_completion_is_empty;
-        self.acc = caller_acc;
         self.loop_counter = caller_loop_counter;
         self.strict = caller_strict;
         if let Some(saved_env) = caller_body_context {
@@ -6572,7 +6595,11 @@ impl Vm {
         if !matches!(frame, LeafFrame::CallerSlots { .. }) {
             self.leaf_frame_base = Some(frame_base);
         }
-        let caller_acc = std::mem::replace(&mut self.acc, Value::Undefined);
+        // Cut 35 slice 25: no accumulator save/restore — `acc` is read only
+        // by the register executor, and every leaf-inline call site sits in
+        // a step-path body where the caller's `acc` is dead (the step path
+        // never reads it); the leaf's first op loads the accumulator from
+        // scratch.
         // Cut 28/30 mirror: a per-iteration-reading leaf resolves its
         // `lexical_env` against its own env; a context-reading leaf resolves
         // `body_context`. A register body with neither never touches either
@@ -6604,7 +6631,6 @@ impl Vm {
         if !aliased {
             self.stack.truncate(frame_base);
         }
-        self.acc = caller_acc;
         if let Some(saved_env) = caller_body_context {
             self.body_context = Some(saved_env);
         }
@@ -7126,16 +7152,26 @@ impl Vm {
         // cell load, kind check, realm check, and leaf lookup every
         // iteration.
         let index = Self::global_cell_index(name);
-        let cached = agent.global_leaf_cells[index]
-            .as_ref()
-            .filter(|cell| cell.name == name)
-            .map(|cell| (cell.global_id, cell.global_generation, cell.entry.clone()));
-        if let Some((global_id, global_generation, entry)) = cached {
-            let global = self.global_object(agent)?;
-            if global.id() == global_id
-                && global.generation() == global_generation
+        // Cut 35 slice 12: the call-site leaf cache hit — a stable global
+        // callee (the compiler's never-assigned + no-call-like-args guard)
+        // keeps its resolved leaf entry across calls while the global
+        // object's identity and generation are unchanged, skipping the
+        // cell load, kind check, realm check, and leaf lookup every
+        // iteration. Cut 35 slice 25: the cell's fields are checked in
+        // place (no tuple) and the entry is cloned only once the global/
+        // caller checks pass; the global comparison reads the cached
+        // handle without cloning it.
+        if let Some(cell) = agent.global_leaf_cells[index].as_ref()
+            && cell.name == name
+        {
+            // Clone the entry while the cell borrow is live (the immutable
+            // `agent` borrow must end before the `&mut agent` checks/run);
+            // the clone is a single Rc bump for the common no-env leaf.
+            let entry = cell.entry.clone();
+            let (global_id, global_generation) = (cell.global_id, cell.global_generation);
+            if self.global_matches(agent, global_id, global_generation)?
                 && self.can_inline_leaf()
-                && agent.realms.borrow().len() == 1
+                && agent.realm_count.get() == 1
             {
                 return self.run_inline_leaf(
                     agent,
@@ -7189,7 +7225,7 @@ impl Vm {
             && let Some(cell) = agent.slot_leaf_cells[slot & (SLOT_LEAF_CELLS - 1)].as_ref()
             && cell.payload == payload
             && self.can_inline_leaf()
-            && agent.realms.borrow().len() == 1
+            && agent.realm_count.get() == 1
         {
             let entry = cell.entry.clone();
             return self.run_inline_leaf(agent, argc, Value::Undefined, entry, 0, caller_arg_base);
@@ -7247,7 +7283,14 @@ impl Vm {
         // with `Return`); a step-path leaf runs through `run_leaf_body`
         // as before. Both paths converge on one result-placement tail.
         let scope = ir.scope.as_ref().expect("a leaf is certified");
-        let this_value = self.bind_this_value(agent, scope, strict, this_value)?;
+        // Cut 35 slice 25: the common leaf has no `this` slot — skip the
+        // `bind_this_value` call entirely (its first check would return
+        // `undefined` anyway).
+        let this_value = if scope.this_slot.is_none() {
+            Value::Undefined
+        } else {
+            self.bind_this_value(agent, scope, strict, this_value)?
+        };
         // The call site: where the result replaces the call. A fused
         // call-store site (Cut 35 slice 23) passes `caller_arg_base` and
         // pushes nothing (its args live in the caller's frame); the other
@@ -7349,7 +7392,7 @@ impl Vm {
             // The leaf runs with the caller's realm current: cross-realm
             // calls dispatch with the callee's realm, which the inline path
             // cannot.
-            && agent.realms.borrow().len() == 1
+            && agent.realm_count.get() == 1
             // Cut 33/34: the record-derived eligibility and the per-call
             // data (ir, strictness, closure env) come from a direct-mapped
             // cache, skipping the `ecma_functions` HashMap lookup on a hit.

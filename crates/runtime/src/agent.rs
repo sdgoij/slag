@@ -505,6 +505,13 @@ pub struct Agent {
     /// host creates via `$262.createRealm`), so a realm's builtin called
     /// from another realm can dispatch with its own realm current.
     pub realms: RefCell<Vec<Handle<Realm>>>,
+    /// The realm count as a plain `Cell` (Cut 35 slice 25): the leaf-inline
+    /// eligibility checks read `realms.len()` on every call, and the
+    /// RefCell borrow was measurable there; `realms` is only ever pushed
+    /// (via `initialize_host_defined_realm`) and never popped or cleared,
+    /// so a count cell stays exact, and `Cell` permits the write through
+    /// the `&Agent` like `RefCell` does.
+    pub realm_count: std::cell::Cell<usize>,
     /// Memoized owning-realm lookup: function id → the realm whose
     /// intrinsic table holds it (`None` for non-intrinsic functions).
     pub function_realms: RefCell<std::collections::HashMap<u64, Option<Handle<Realm>>>>,
@@ -621,6 +628,7 @@ impl Agent {
             set_iter_data: std::collections::HashMap::new(),
             field_initializer_depth: 0,
             realms: RefCell::new(Vec::new()),
+            realm_count: std::cell::Cell::new(0),
             function_realms: RefCell::new(std::collections::HashMap::new()),
         }
     }

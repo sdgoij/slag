@@ -561,7 +561,38 @@ argument aliasing (slice 23) cut the fused call rows by ~6-10ns/call
 (5M: `n = f(n)` 254→223ms, closure-capture 303→253ms) — the first real
 wins since the floor. The result-store side of the fused call (the
 callee writing the target slot directly instead of the pop+store round
-trip) is the natural next lever.
+trip) was measured and REVERTED (slice 24, 2026-08-24): the direct
+store needed `result_target`/bool plumbing through `run_inline_leaf`
+and the store's TDZ check moved into the inlined tail, and the
+5M-iteration probe showed a ~1.3ns/call REGRESSION on both call rows
+(new ~237ms vs base ~229ms, consistent in both pair orders) — the
+amortized Vec push+pop were cheaper than the plumbing to remove them.
+Don't propose removing the result round trip again. The leaf-call core's
+plumbing was then shaved (slice 25, 2026-08-24): the cache-hit global
+validation reads the cached handle without cloning it (`global_matches`),
+`bind_this_value` is skipped for the common no-`this`-slot leaf, the
+`realms.borrow().len() == 1` check is a plain `Agent::realm_count`
+`Cell` (exact: `realms` is only ever pushed), and the accumulator
+save/restore is gone from `run_leaf_regs`/`run_leaf_body` — ~-1.6ns/call
+on the call rows (z 198→190ms, f1 228→220ms). What remains in the core
+is real work (`run_leaf_ops` dispatches + the required frame/completion/
+env saves).
+
+## 15. `Vm::acc` is dead at every leaf-inline call site (Cut 35 slice 25)
+
+`run_leaf_regs` and `run_leaf_body` no longer save/restore the
+accumulator: `acc` is read ONLY by the register executor (`run_leaf_ops`
+— the `LeafOp` match), the step path never reads it, and every
+leaf-inline call site (the `CallFast*`/fused-store/`Construct` steps)
+sits in a step-path body where the caller's `acc` is dead. A register
+body's first op always loads the accumulator from scratch (the lowering
+starts from a load), so no leaf reads a pre-existing `acc`. If you add a
+step that reads `acc`, or a leaf-inline caller that can hold a live
+`acc`, the saves must come back. The `loop_counter` save in
+`run_leaf_body` stays (a step-path leaf's own fast loop must not
+clobber the caller's live counter); `run_leaf_regs` never needs it (a
+register body cannot contain a loop — the register lowering rejects
+jumps).
 
 **A/B bench methodology: alternate the order.** The machine drifts within
 seconds (a base-then-new pair can show a consistent +2-5ms "regression"

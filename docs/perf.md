@@ -1944,6 +1944,48 @@ Validation: clippy `-D warnings` clean, workspace tests green (4315/0),
 conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
 23,812/0/154 with 447 >15s hangs (identical set to slice 22).
 
+### Cut 35 slice 24 — result-store direct write (measured 2026-08-24, REVERTED)
+
+The other half of the fused call round trip: `run_inline_leaf` wrote the
+leaf's result straight to the target slot (`result_target` + a `bool`
+return so the caller skipped its pop) instead of the `stack.push` →
+handler `pop()` → store. Measured a ~1.3ns/call REGRESSION on both call
+rows (5M-iteration probe, consistent in both pair orders): the
+amortized Vec push+pop cost less than the plumbing (the param, the bool,
+and the store's TDZ check moved into the inlined tail) needed to remove
+them. Reverted before commit — the result round trip is not a lever.
+
+### Cut 35 slice 25 — leaf-call core plumbing (measured 2026-08-24)
+
+Decomposed the ~17ns leaf-call core (5M-iteration probe: `z() { return
+1; }` 40.4ns/call minus the 23.7ns no-call loop) into the body ops
+(~3ns each) and the machinery, then shaved four pieces:
+
+- **`global_matches`** — the global-leaf-cache validation read the cached
+  global handle in place instead of `global_object`'s per-call Rc clone.
+- **`bind_this_value` skipped for no-`this`-slot leaves** — the common
+  leaf's call now returns `undefined` without the call.
+- **`Agent::realm_count`** — the `realms.borrow().len() == 1` check (five
+  call sites) is a plain `Cell<usize>`, exact because `realms` is only
+  ever pushed (via `initialize_host_defined_realm`) and never popped.
+- **The accumulator save/restore removed from `run_leaf_regs` and
+  `run_leaf_body`** — `Vm::acc` is read only by the register executor,
+  and every leaf-inline call site sits in a step-path body where the
+  caller's `acc` is dead (the step path never reads it; the leaf's first
+  op loads the accumulator from scratch). The loop-counter save stays
+  (a leaf's own fast loop must not clobber the caller's live counter).
+
+Measured: ~-1.6ns/call on both the zero-arg and `n = f(n)` rows
+(5M-iteration probe, alternating both pair orders: z 198→190ms, f1
+228→220ms) — the first core-plumbing win. The remaining core cost is
+`run_leaf_ops`' dispatches (the actual body work) plus the frame/
+completion/env saves, which are required.
+
+Validation: clippy `-D warnings` clean, workspace tests green (4316/0),
+conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
+23,812/0/154 with 447 >15s hangs (identical set to slice 23 — the acc
+removal is a semantic claim the full sweep backs).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
