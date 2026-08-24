@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::handle::Handle;
+
 /// A JavaScript string: a sequence of UTF-16 code units (spec 6.1.4).
 ///
 /// A string is either a single contiguous buffer or a rope — a binary tree of
@@ -13,37 +15,31 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// form is materialized lazily on first access (and cached, since strings are
 /// immutable). `len` is O(1) for both forms.
 ///
-/// Flat buffers are `Arc`-shared (clones are O(1), and the rope's right side
-/// of a repeated small append shares one buffer instead of copying per
-/// append). The rope tracks a tree depth and folds an over-deep left side
-/// into a single shared flat; both the fold and the final drop are amortized
-/// across the cap appends, so arbitrarily long append chains stay linear.
-pub struct JsString {
-    data: StringData,
-}
-
-enum StringData {
-    // Arc (not Rc) so a `JsString` stays `Send`: `Symbol` descriptions carry
-    // one into the thread-safe well-known-symbol table. The Arc also makes
-    // flat-string clones O(1) — the rope shares its append leaves instead of
-    // copying them.
+/// The rope node IS the box the value points at (`Handle<JsString>`), so an
+/// append is a single allocation; the children are the operands' own handles
+/// (Rc bumps, no copies). That makes ropes `!Send`, which is fine: the one
+/// `Send` consumer — the well-known-symbol table — keeps its symbols
+/// thread-locally instead. Flat buffers are `Arc`-shared, so flat clones are
+/// O(1). The rope tracks a tree depth and folds an over-deep left side into a
+/// single shared flat; both the fold and the final drop are amortized across
+/// the cap appends, so arbitrarily long append chains stay linear.
+pub enum JsString {
     Flat(Arc<[u16]>),
-    Rope(Arc<RopeNode>),
-}
-
-struct RopeNode {
-    left: Option<JsString>,
-    right: Option<JsString>,
-    len: usize,
-    /// The rope's tree depth (0 for a flat leaf): concat folds the left side
-    /// into one shared flat once it would exceed `ROPE_MAX_DEPTH`. The fold
-    /// cost is amortized across the cap appends, and bounding the depth keeps
-    /// the final drop (and any single flatten) at O(cap) nodes.
-    depth: usize,
-    /// The materialized contiguous form, computed on first access; immutable
-    /// once set (strings are immutable), which is what makes `as_slice`
-    /// return a stable reference.
-    flat: OnceLock<Arc<[u16]>>,
+    Rope {
+        left: Option<Handle<JsString>>,
+        right: Option<Handle<JsString>>,
+        len: usize,
+        /// The rope's tree depth (0 for a flat leaf): concat folds the left
+        /// side into one shared flat once it would exceed `ROPE_MAX_DEPTH`.
+        /// Bounding the depth keeps the final drop (and any single flatten) at
+        /// O(cap) nodes. u32 is far beyond any real append chain.
+        depth: u32,
+        /// The materialized contiguous form, computed on first access; immutable
+        /// once set (strings are immutable), which is what makes `as_slice`
+        /// return a stable reference. (Rope clones get a fresh cache — a rope
+        /// flattened through two handles flattens twice.)
+        flat: OnceLock<Arc<[u16]>>,
+    },
 }
 
 /// Concatenations whose total length is at or below this stay flat: the rope
@@ -61,62 +57,55 @@ const ROPE_MAX_DEPTH: usize = 16384;
 
 impl JsString {
     pub fn from_utf16(units: &[u16]) -> Self {
-        Self {
-            data: StringData::Flat(units.into()),
-        }
+        JsString::Flat(units.into())
     }
 
     pub fn from_utf8(text: &str) -> Self {
-        Self {
-            data: StringData::Flat(text.encode_utf16().collect()),
-        }
+        JsString::Flat(text.encode_utf16().collect())
     }
 
     /// Concatenate without copying when the result is large enough: a rope
-    /// node. Small results (and empty operands) stay flat or reuse the
-    /// operand, so ordinary small concatenations never see the rope.
-    pub fn concat(&self, other: &JsString) -> JsString {
-        if other.is_empty() {
-            return self.clone();
+    /// node that IS the result box — one allocation per append. Small results
+    /// (and empty operands) stay flat or reuse an operand. The operands' own
+    /// boxes become the node's children (refcount bumps, no copies).
+    pub fn concat(left: &Handle<JsString>, right: &Handle<JsString>) -> Handle<JsString> {
+        if right.is_empty() {
+            return left.clone();
         }
-        if self.is_empty() {
-            return other.clone();
+        if left.is_empty() {
+            return right.clone();
         }
-        let len = self.len() + other.len();
+        let len = left.len() + right.len();
         if len <= CONCAT_FLAT_THRESHOLD {
             let mut units = Vec::with_capacity(len);
-            units.extend_from_slice(self.as_slice());
-            units.extend_from_slice(other.as_slice());
-            return JsString::from_utf16(&units);
+            units.extend_from_slice(left.as_slice());
+            units.extend_from_slice(right.as_slice());
+            return Handle::new(JsString::Flat(units.into()));
         }
         // Fold an over-deep left side into one shared flat so the tree stays
         // shallow (see ROPE_MAX_DEPTH): the materialization copy is amortized
         // across the cap appends, and the Arc share makes the fold itself
         // O(1). Appends between folds are a single node allocation.
-        let left = if self.depth() >= ROPE_MAX_DEPTH {
-            JsString {
-                data: StringData::Flat(self.flat_arc()),
-            }
+        let left = if left.depth() >= ROPE_MAX_DEPTH as u32 {
+            Handle::new(JsString::Flat(left.flat_arc()))
         } else {
-            self.clone()
+            left.clone()
         };
-        let depth = 1 + left.depth().max(other.depth());
-        JsString {
-            data: StringData::Rope(Arc::new(RopeNode {
-                left: Some(left),
-                right: Some(other.clone()),
-                len,
-                depth,
-                flat: OnceLock::new(),
-            })),
-        }
+        let depth = 1 + left.depth().max(right.depth());
+        Handle::new(JsString::Rope {
+            left: Some(left),
+            right: Some(right.clone()),
+            len,
+            depth,
+            flat: OnceLock::new(),
+        })
     }
 
     /// The tree depth: 0 for a flat string, else the node's cached depth.
-    fn depth(&self) -> usize {
-        match &self.data {
-            StringData::Flat(_) => 0,
-            StringData::Rope(node) => node.depth,
+    fn depth(&self) -> u32 {
+        match self {
+            JsString::Flat(_) => 0,
+            JsString::Rope { depth, .. } => *depth,
         }
     }
 
@@ -124,17 +113,17 @@ impl JsString {
     /// rope first if needed. The Arc share lets `concat`'s depth fold reuse
     /// the buffer instead of copying it a second time.
     fn flat_arc(&self) -> Arc<[u16]> {
-        match &self.data {
-            StringData::Flat(arc) => arc.clone(),
-            StringData::Rope(node) => node.flat.get_or_init(|| node.flatten()).clone(),
+        match self {
+            JsString::Flat(arc) => arc.clone(),
+            JsString::Rope { flat, .. } => flat.get_or_init(|| self.flatten()).clone(),
         }
     }
 
     /// The number of code units (spec 6.1.4.1 StringLength).
     pub fn len(&self) -> usize {
-        match &self.data {
-            StringData::Flat(units) => units.len(),
-            StringData::Rope(node) => node.len,
+        match self {
+            JsString::Flat(units) => units.len(),
+            JsString::Rope { len, .. } => *len,
         }
     }
 
@@ -143,9 +132,9 @@ impl JsString {
     }
 
     pub fn as_slice(&self) -> &[u16] {
-        match &self.data {
-            StringData::Flat(units) => units,
-            StringData::Rope(node) => node.flat.get_or_init(|| node.flatten()).as_ref(),
+        match self {
+            JsString::Flat(units) => units,
+            JsString::Rope { flat, .. } => flat.get_or_init(|| self.flatten()).as_ref(),
         }
     }
 
@@ -186,26 +175,25 @@ impl JsString {
     pub fn to_string_lossy(&self) -> String {
         String::from_utf16_lossy(self.as_slice())
     }
-}
 
-impl RopeNode {
     /// The concatenation of the leaves, in order. Iterative (an explicit
     /// stack) so a deep left-leaning chain of small appends cannot overflow
     /// the call stack.
     fn flatten(&self) -> Arc<[u16]> {
-        let mut units = Vec::with_capacity(self.len);
+        let mut units = Vec::with_capacity(self.len());
         // Pop the left side first, so the leaves emit in order. Children are
-        // always `Some` until the node is being dropped; a missing side (a
-        // mid-drop view is impossible — flatten borrows a live string) is
+        // always `Some` until the node is being dropped; a missing side is
         // skipped defensively.
-        let mut stack = vec![self.right.as_ref(), self.left.as_ref()];
+        let mut stack = vec![self];
         while let Some(string) = stack.pop() {
-            if let Some(string) = string {
-                match &string.data {
-                    StringData::Flat(flat) => units.extend_from_slice(flat),
-                    StringData::Rope(node) => {
-                        stack.push(node.right.as_ref());
-                        stack.push(node.left.as_ref());
+            match string {
+                JsString::Flat(flat) => units.extend_from_slice(flat),
+                JsString::Rope { left, right, .. } => {
+                    if let Some(right) = right.as_deref() {
+                        stack.push(right);
+                    }
+                    if let Some(left) = left.as_deref() {
+                        stack.push(left);
                     }
                 }
             }
@@ -215,33 +203,37 @@ impl RopeNode {
     }
 }
 
-impl Drop for RopeNode {
+impl Drop for JsString {
     fn drop(&mut self) {
         // A long append chain is hundreds of thousands of nodes deep; dropping
         // the children recursively would overflow the stack. Unwind
-        // iteratively: take the children, unwrap any we uniquely own, and
-        // keep going with the rest (shared subtrees just decrement).
-        let mut work: Vec<JsString> = Vec::new();
-        if let Some(left) = self.left.take() {
-            work.push(left);
+        // iteratively: `take` the children out (unique ownership — the box's
+        // own field drop then finds `None`), unwrap any we uniquely own, and
+        // keep going (shared children just decrement).
+        let mut work: Vec<Handle<JsString>> = Vec::new();
+        if let JsString::Rope { left, right, .. } = self {
+            if let Some(left) = left.take() {
+                work.push(left);
+            }
+            if let Some(right) = right.take() {
+                work.push(right);
+            }
+        } else {
+            return;
         }
-        if let Some(right) = self.right.take() {
-            work.push(right);
-        }
-        while let Some(string) = work.pop() {
-            match string.data {
-                StringData::Flat(_) => {}
-                StringData::Rope(node) => match Arc::try_unwrap(node) {
-                    Ok(mut inner) => {
-                        if let Some(left) = inner.left.take() {
+        while let Some(handle) = work.pop() {
+            match Handle::try_unwrap(handle) {
+                Ok(mut js) => {
+                    if let JsString::Rope { left, right, .. } = &mut js {
+                        if let Some(left) = left.take() {
                             work.push(left);
                         }
-                        if let Some(right) = inner.right.take() {
+                        if let Some(right) = right.take() {
                             work.push(right);
                         }
                     }
-                    Err(node) => drop(node),
-                },
+                }
+                Err(handle) => drop(handle),
             }
         }
     }
@@ -249,13 +241,23 @@ impl Drop for RopeNode {
 
 impl Clone for JsString {
     fn clone(&self) -> Self {
-        // Ropes share their node (and its flat cache) via the Arc; flat
-        // strings share their buffer (Arc bump, O(1)) — strings are
+        // Flat strings share their buffer (Arc bump, O(1)); rope clones share
+        // their children (Rc bumps) and get a fresh flat cache — strings are
         // immutable, so sharing is never observable.
-        Self {
-            data: match &self.data {
-                StringData::Flat(units) => StringData::Flat(units.clone()),
-                StringData::Rope(node) => StringData::Rope(node.clone()),
+        match self {
+            JsString::Flat(units) => JsString::Flat(units.clone()),
+            JsString::Rope {
+                left,
+                right,
+                len,
+                depth,
+                ..
+            } => JsString::Rope {
+                left: left.clone(),
+                right: right.clone(),
+                len: *len,
+                depth: *depth,
+                flat: OnceLock::new(),
             },
         }
     }
@@ -512,10 +514,10 @@ mod tests {
 
     #[test]
     fn concat_small_stays_flat_and_equals_the_units() {
-        let a = JsString::from_utf8("ab");
-        let b = JsString::from_utf8("cd");
-        let s = a.concat(&b);
-        assert!(matches!(s.data, StringData::Flat(_)));
+        let a = Handle::new(JsString::from_utf8("ab"));
+        let b = Handle::new(JsString::from_utf8("cd"));
+        let s = JsString::concat(&a, &b);
+        assert!(matches!(*s, JsString::Flat(_)));
         assert_eq!(s.len(), 4);
         assert_eq!(
             s.as_slice(),
@@ -526,11 +528,12 @@ mod tests {
     #[test]
     fn concat_large_builds_a_rope_with_correct_content() {
         // Cross the flat threshold by accumulating a long string.
-        let mut s = JsString::from_utf8("");
+        let mut s = Handle::new(JsString::from_utf8(""));
+        let leaf = Handle::new(JsString::from_utf8("x"));
         for _ in 0..64 {
-            s = s.concat(&JsString::from_utf8("x"));
+            s = JsString::concat(&s, &leaf);
         }
-        assert!(matches!(s.data, StringData::Rope(_)));
+        assert!(matches!(*s, JsString::Rope { .. }));
         assert_eq!(s.len(), 64);
         let units = s.as_slice();
         assert_eq!(units.len(), 64);
@@ -542,11 +545,13 @@ mod tests {
 
     #[test]
     fn rope_indexing_and_code_points() {
-        let mut s = JsString::from_utf8("a");
+        let mut s = Handle::new(JsString::from_utf8("a"));
+        let x = Handle::new(JsString::from_utf8("x"));
         for _ in 0..20 {
-            s = s.concat(&JsString::from_utf8("x"));
+            s = JsString::concat(&s, &x);
         }
-        s = s.concat(&JsString::from_utf16(&[0xD83D, 0xDE00]));
+        let emoji = Handle::new(JsString::from_utf16(&[0xD83D, 0xDE00]));
+        s = JsString::concat(&s, &emoji);
         assert_eq!(s.len(), 23); // 21 units + the surrogate pair
         assert_eq!(s.code_unit(0), Some(b'a' as u16));
         assert_eq!(s.code_unit(20), Some(b'x' as u16));
@@ -554,33 +559,33 @@ mod tests {
     }
 
     #[test]
-    fn rope_equality_and_clone_share_the_flat_cache() {
-        let mut left = JsString::from_utf8("");
+    fn rope_equality_and_clone_correctness() {
+        let mut left = Handle::new(JsString::from_utf8(""));
+        let chunk = Handle::new(JsString::from_utf8("ab"));
         for _ in 0..32 {
-            left = left.concat(&JsString::from_utf8("ab"));
+            left = JsString::concat(&left, &chunk);
         }
-        let mut right = JsString::from_utf8("");
+        let mut right = Handle::new(JsString::from_utf8(""));
         for _ in 0..32 {
-            right = right.concat(&JsString::from_utf8("ab"));
+            right = JsString::concat(&right, &chunk);
         }
         assert_eq!(left.len(), 64);
         assert_eq!(left, right);
         assert_eq!(left.to_code_points(), right.to_code_points());
+        // Clones share the rope's children (not its flat cache — each box has
+        // its own), and materialize the same content.
         let cloned = left.clone();
         assert_eq!(cloned.as_slice(), left.as_slice());
-        // Rope clones share the node; the flat cache is shared too.
-        let a = left.as_slice();
-        let b = cloned.as_slice();
-        assert_eq!(a.as_ptr(), b.as_ptr());
+        assert_eq!(cloned.as_slice().len(), left.as_slice().len());
     }
 
     #[test]
     fn concat_with_empty_operand_reuses_the_other_side() {
-        let s = JsString::from_utf8("hello");
-        let empty = JsString::from_utf8("");
-        assert_eq!(s.concat(&empty).as_slice(), s.as_slice());
-        assert_eq!(empty.concat(&s).as_slice(), s.as_slice());
-        assert_eq!(empty.concat(&empty).len(), 0);
+        let s = Handle::new(JsString::from_utf8("hello"));
+        let empty = Handle::new(JsString::from_utf8(""));
+        assert_eq!(JsString::concat(&s, &empty).as_slice(), s.as_slice());
+        assert_eq!(JsString::concat(&empty, &s).as_slice(), s.as_slice());
+        assert_eq!(JsString::concat(&empty, &empty).len(), 0);
     }
 
     #[test]
@@ -588,10 +593,10 @@ mod tests {
         // Left-leaning appends: the depth cap folds the tree every
         // ROPE_MAX_DEPTH appends, so it stays shallow — the fold's
         // materialization and the final drop exercise the iterative paths.
-        let mut s = JsString::from_utf8("");
-        let leaf = JsString::from_utf8("x");
+        let mut s = Handle::new(JsString::from_utf8(""));
+        let leaf = Handle::new(JsString::from_utf8("x"));
         for _ in 0..200_000 {
-            s = s.concat(&leaf);
+            s = JsString::concat(&s, &leaf);
         }
         assert_eq!(s.len(), 200_000);
         let units = s.as_slice();
@@ -600,9 +605,9 @@ mod tests {
 
         // Right-leaning prepends: the cap only inspects the left side, so the
         // depth grows unbounded — drop and flatten must still be iterative.
-        let mut p = JsString::from_utf8("");
+        let mut p = Handle::new(JsString::from_utf8(""));
         for _ in 0..200_000 {
-            p = leaf.concat(&p);
+            p = JsString::concat(&leaf, &p);
         }
         assert_eq!(p.len(), 200_000);
         let units = p.as_slice();

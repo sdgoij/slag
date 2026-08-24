@@ -2125,11 +2125,69 @@ VM-side call and Rc churn:
 Measured (1M-iteration leaf probes, interleaved base/new): the
 empty-append probe (`s += ''`, the is-empty fast path — no node build)
 went 63 → ~56ms (~7ns/iter: the call + Rc round-trips removed), and the
-full-append probe's min went 191 → 182ms. The bench row moved 16.7 →
+and the full-append probe's min went 191 → 182ms. The bench row moved 16.7 →
 ~16.5ms (within the ±5% drift band — the isolated probes carry the
 signal). Validation: clippy `-D warnings` clean, workspace tests 4316/0,
 full sweeps at baseline (language 23,724/0/34, annexB 1,086/0/0,
 built-ins 23,812/0/154 + 447 hangs).
+
+### Cut 35 slice 30 — merge the rope node into the string box (measured 2026-08-24)
+
+`JsString` becomes a single enum: `Flat(Arc<[u16]>)` or
+`Rope { left/right: Option<Handle<JsString>>, len, depth: u32, flat }`.
+The rope node IS the box the value points at, so an append is **one
+allocation** (was: an `Rc<JsString>` wrapper + an `Arc<RopeNode>`), and
+`concat` now takes `&Handle<JsString>` and returns `Handle<JsString>` —
+the operands' own boxes become the node's children (Rc bumps, no
+copies). The empty-operand paths return the operand handle with no
+allocation at all. Sizes: the box went 16 → 48 bytes (enum + u32 depth),
+so each append allocates 64B instead of ~144B across two boxes.
+
+Consequences handled:
+
+- **`!Send`.** Rc children make `JsString` non-`Send`; the only `Send`
+  consumer was the well-known-symbol table, which is now `thread_local`
+  (per-agent — the spec wants per-realm symbols anyway).
+- **Iterative drop.** The `Drop` impl `take`s the children (Rc has a null
+  niche, so `Option<Handle>` is still 8 bytes) and unwraps uniquely-
+  owned subtrees with a worklist; cloning children instead of taking
+  them silently degraded to recursive field-drop deallocation (the first
+  cut overflowed the stack at 200k nodes — the take-based version is
+  what ships).
+- **Flat-cache sharing lost.** Rope clones get fresh `flat` caches (a
+  shared rope flattened through two handles flattens twice); the
+  `rope_equality_and_clone_share_the_flat_cache` test became
+  `rope_equality_and_clone_correctness` (content, not pointer,
+  equality).
+- **`large_enum_variant` lints.** The 16 → 48B `JsString` grew every AST
+  node embedding it, crossing clippy's threshold on `ExportDecl`
+  (`crates/syntax/src/ast.rs`) and `StaticElement` (`class.rs`) — both
+  got targeted `#[allow]`s with comments (boxing the AST strings is
+  deferred; the AST is transient compiler input).
+
+Measured (release, interleaved 3-run medians vs the slice-29 binary):
+
+| Row | before | after |
+|---|---|---|
+| string concat | 17.6ms | **12.0ms** (-32%) |
+| string concat 1M probe | ~210ms | **~132ms** (-37%) |
+| empty-append 1M probe | ~56ms | **~38ms** (-32%) |
+
+All other bench rows within ±2.3% (function calls +2.3%, closure
+capture +1.6% — a residual code-layout cost of the bigger string code;
+per-iteration -6.8% was within noise). One trap surfaced and fixed
+during measurement: `binary_inline`'s string-string `Add` inline
+**bloated every register-op call site's icache** (the concat body is
+large) — the call and closure rows measured +3-6ns/call until the
+string path moved to a `#[inline(never)]` `concat_strings` helper. The
+slice-29 `Value::as_string_ref` borrow is gone (dead): the Handle-based
+`concat` needs the `as_string` handles.
+
+Validation: clippy `-D warnings` clean (the two allows above),
+workspace tests 4316/0, full sweeps at baseline (language 23,724/0/34,
+annexB 1,086/0/0, built-ins 23,812/0/154 + 447 hangs). The remaining
+string-concat gap vs node jitless (1.4ms → ~8.6x) is the loop machinery
+plus the allocation itself — the next lever is the arena/GC milestone.
 
 ## Deferred milestones
 

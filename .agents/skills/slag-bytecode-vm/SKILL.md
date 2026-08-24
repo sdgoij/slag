@@ -553,14 +553,30 @@ consistent — the fused shapes (`BinImmLocal`/`BinCtxReg`/`BinAccPop`/
 two numbers is a plain float op, so the inlines are exact. The
 `BinContext`/`BinPerIter` arms route through `binary_inline` too.
 
-**The string-string `Add` case is inlined the same way (Cut 35 slice
-29).** `binary_inline` and `apply_binary`'s Add arm concatenate two
-strings via the rope directly; use `Value::as_string_ref` (a borrow — no
-`as_string` Rc reconstruct-and-clone round-trip) on both sides. When you
-add a new `LeafOp` with a binary shape, route it through `binary_inline`
-(not a bare `apply_binary` call) so the number AND string fast paths
-automatically apply — `BinConst` was the last straggler and the bench's
-`s += 'x'` body (LoadReg/BinConst/StoreReg) needed it to see the win.
+**The string-string `Add` case is handled the same way (Cut 35 slices
+29-30).** `binary_inline`'s Add arm routes two strings to the rope concat
+via a `#[inline(never)]` `concat_strings` helper. Two traps: (1) do NOT
+inline the concat body into `binary_inline` — it's large and gets
+replicated at every register-op call site, costing +3-6ns/call on the
+closure/call rows (icache); (2) the rope `concat` takes
+`&Handle<JsString>` and returns `Handle<JsString>` (the node IS the
+box), so use `Value::as_string` (the Rc round-trip) rather than a
+borrow — `as_string_ref` was removed as dead. Route new binary leaf ops
+through `binary_inline` (not a bare `apply_binary` call) so the number
+AND string fast paths automatically apply — `BinConst` was the last
+straggler and the bench's `s += 'x'` body needed it to see the win.
+
+**The string box IS the rope node (Cut 35 slice 30).** `JsString` is one
+enum — `Flat(Arc<[u16]>)` or `Rope { left/right:
+Option<Handle<JsString>>, len, depth, flat }` — so an append is a single
+allocation; the children are the operands' own `Handle`s (Rc bumps).
+That makes `JsString` `!Send` (the well-known-symbol table went
+`thread_local` — per-agent anyway) and its `Drop` must be iterative
+(`Option::take` + `Rc::try_unwrap` worklist — cloning the children
+instead silently recurses at dealloc and overflows the stack). Rope
+clones get fresh flat caches (no sharing). The 48-byte enum also trips
+clippy's `large_enum_variant` on AST nodes embedding it (`ExportDecl`,
+`StaticElement`) — targeted allows with comments.
 
 ## Bench reality (Cut 2)
 

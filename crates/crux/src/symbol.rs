@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
 
 use crate::handle::Handle;
 use crate::string::JsString;
@@ -52,18 +51,26 @@ pub const WELL_KNOWN_SYMBOLS: &[&str] = &[
 ];
 
 /// Returns the canonical well-known symbol for `name` (the short name, e.g.
-/// "unscopables"), creating it on first use. The table stores the symbol
-/// value; handles are produced per call and compare by id.
+/// "unscopables"), creating it on first use. The table is thread-local: each
+/// agent gets its own set (well-known symbols are per-realm), and a thread-
+/// local table keeps `JsString` (whose rope children are `Rc`) free of a
+/// `Send` requirement.
 pub fn well_known(name: &str) -> Handle<Symbol> {
-    static TABLE: OnceLock<Mutex<HashMap<String, Symbol>>> = OnceLock::new();
-    let symbol = TABLE
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .entry(name.to_string())
-        .or_insert_with(|| Symbol::new(Some(JsString::from_utf8(&format!("Symbol.{name}")))))
-        .clone();
-    Handle::new(symbol)
+    thread_local! {
+        static TABLE: std::cell::RefCell<HashMap<String, Handle<Symbol>>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+    TABLE.with(|table| {
+        table
+            .borrow_mut()
+            .entry(name.to_string())
+            .or_insert_with(|| {
+                Handle::new(Symbol::new(Some(JsString::from_utf8(&format!(
+                    "Symbol.{name}"
+                )))))
+            })
+            .clone()
+    })
 }
 
 /// %Symbol.unscopables%: consulted by `with`-statement environment records

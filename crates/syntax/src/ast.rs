@@ -64,6 +64,13 @@ pub enum ExportName {
 }
 
 /// An `export` declaration (spec 16.2.3).
+///
+/// The `Declaration(Stmt)` variant is inherently much larger than the others
+/// (a `Stmt` embeds `JsString` literals — 48 bytes since the rope merged into
+/// the string box — plus spans and expression subtrees); boxing the strings
+/// inside `Stmt` would ripple through the parser and every AST consumer for
+/// no runtime win (the AST is transient compiler input).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExportDecl {
     /// `export { a, b as c };` — local names.

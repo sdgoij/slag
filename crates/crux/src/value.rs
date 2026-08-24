@@ -291,22 +291,6 @@ impl Value {
         unsafe { self.take_ref(TAG_STRING) }
     }
 
-    /// The string when `self` is a String value, borrowed without the Rc
-    /// round-trip of `as_string`. The reference is valid for `&self`'s
-    /// lifetime: the leaked box the payload points at stays alive as long as
-    /// the value does.
-    #[inline]
-    pub fn as_string_ref(&self) -> Option<&JsString> {
-        if !self.is_double() && self.tag() == TAG_STRING {
-            let ptr = (self.payload() << 4) as usize as *const JsString;
-            // SAFETY: `box_heap` leaked a live Rc box whose allocation outlives
-            // the value (and hence this borrow of it).
-            unsafe { Some(&*ptr) }
-        } else {
-            None
-        }
-    }
-
     pub fn as_symbol(&self) -> Option<Handle<Symbol>> {
         unsafe { self.take_ref(TAG_SYMBOL) }
     }

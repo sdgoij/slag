@@ -596,7 +596,11 @@ fn build_class(
 }
 
 /// A static class element awaiting evaluation after the class binding is
-/// initialized (spec 15.7.14 steps 41-44).
+/// initialized (spec 15.7.14 steps 41-44). The `Field` variant carries an
+/// `Expr` (which embeds 48-byte `JsString` literals), dwarfing `Block`;
+/// splitting the two into separate collections is not worth the churn for a
+/// transient evaluation queue.
+#[allow(clippy::large_enum_variant)]
 enum StaticElement {
     Field {
         key: Option<PropertyKey>,

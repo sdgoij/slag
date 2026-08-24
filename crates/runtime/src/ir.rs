@@ -6933,9 +6933,10 @@ impl Vm {
     /// shapes, falling back to the general `apply_binary` for anything else
     /// (mirrors `Step::BinaryImm`'s inline). The Add case is `apply_binary`'s
     /// own number-number fast path, inlined to skip the call; the
-    /// string-string Add case (Cut 35 slice 29) inlines `apply_binary`'s rope
-    /// concat the same way, borrowing the operands without the `as_string`
-    /// Rc round-trip.
+    /// string-string Add case (Cut 35 slice 29) routes the rope concat through
+    /// a cold helper — inlining the concat body at every register-op call
+    /// site bloats the number loops' icache (measured ~3-6ns/call on the
+    /// closure and call rows, Cut 35 slice 30).
     #[inline]
     fn binary_inline(
         agent: &mut Agent,
@@ -6955,11 +6956,22 @@ impl Vm {
             }
         }
         if op == BinaryOp::Add
-            && let (Some(left), Some(right)) = (left.as_string_ref(), right.as_string_ref())
+            && let Some(value) = Self::concat_strings(left, right)
         {
-            return Ok(Value::String(Handle::new(JsString::concat(left, right))));
+            return Ok(value);
         }
         crate::expr::apply_binary(agent, op, left, right)
+    }
+
+    /// The string-string `Add` fast path: the rope concat, kept out of the
+    /// inline (a cold call — strings are not the register ops' hot shape).
+    #[inline(never)]
+    fn concat_strings(left: &Value, right: &Value) -> Option<Value> {
+        if let (Some(left), Some(right)) = (left.as_string(), right.as_string()) {
+            Some(Value::String(JsString::concat(&left, &right)))
+        } else {
+            None
+        }
     }
 
     /// Load a register operand to a value for a store op, mirroring the
