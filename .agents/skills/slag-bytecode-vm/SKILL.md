@@ -553,6 +553,15 @@ consistent — the fused shapes (`BinImmLocal`/`BinCtxReg`/`BinAccPop`/
 two numbers is a plain float op, so the inlines are exact. The
 `BinContext`/`BinPerIter` arms route through `binary_inline` too.
 
+**The string-string `Add` case is inlined the same way (Cut 35 slice
+29).** `binary_inline` and `apply_binary`'s Add arm concatenate two
+strings via the rope directly; use `Value::as_string_ref` (a borrow — no
+`as_string` Rc reconstruct-and-clone round-trip) on both sides. When you
+add a new `LeafOp` with a binary shape, route it through `binary_inline`
+(not a bare `apply_binary` call) so the number AND string fast paths
+automatically apply — `BinConst` was the last straggler and the bench's
+`s += 'x'` body (LoadReg/BinConst/StoreReg) needed it to see the win.
+
 ## Bench reality (Cut 2)
 
 `cargo run -p cli --release -- --bench` bounces ±15% on this machine (the

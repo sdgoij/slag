@@ -1251,10 +1251,11 @@ pub(crate) fn apply_binary(
             // ToPrimitive/ToString round-trips (the Sputnik decodeURI
             // fixtures concatenate millions of small strings). The rope
             // concat appends without copying once the string is large.
-            if let (Some(left_text), Some(right_text)) = (left.as_string(), right.as_string()) {
+            if let (Some(left_text), Some(right_text)) =
+                (left.as_string_ref(), right.as_string_ref())
+            {
                 return Ok(Value::String(Handle::new(JsString::concat(
-                    &left_text,
-                    &right_text,
+                    left_text, right_text,
                 ))));
             }
             let left_prim = crate::context::to_primitive(agent, left, ToPrimitiveHint::Default)?;

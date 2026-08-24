@@ -6776,22 +6776,10 @@ impl Vm {
                 }
                 LeafOp::BinConst { op, value } => {
                     // `x + (1)` compiles to Push(1)/Binary, not BinaryImm;
-                    // a const Number right operand inlines the same shape.
-                    let value =
-                        if let (Some(num), Some(imm)) = (self.acc.as_number(), value.as_number()) {
-                            match op {
-                                BinaryOp::Add => Value::Number(num + imm),
-                                BinaryOp::Sub => Value::Number(num - imm),
-                                BinaryOp::Mul => Value::Number(num * imm),
-                                BinaryOp::Div => Value::Number(num / imm),
-                                BinaryOp::Rem => Value::Number(num % imm),
-                                BinaryOp::Exp => Value::Number(num.powf(imm)),
-                                _ => crate::expr::apply_binary(agent, *op, &self.acc, value)?,
-                            }
-                        } else {
-                            crate::expr::apply_binary(agent, *op, &self.acc, value)?
-                        };
-                    self.acc = value;
+                    // a const Number right operand inlines the same shape, and
+                    // a const String right operand takes the string-string
+                    // concat inline (Cut 35 slice 29).
+                    self.acc = Self::binary_inline(agent, *op, &self.acc, value)?;
                 }
                 LeafOp::BinImmLocal { op, slot, tdz, imm } => {
                     // The fused `LoadReg` + `BinImm` (Cut 35 slice 14): the
@@ -6944,7 +6932,10 @@ impl Vm {
     /// (Cut 35 slice 10): two tag checks + a direct op for the arithmetic
     /// shapes, falling back to the general `apply_binary` for anything else
     /// (mirrors `Step::BinaryImm`'s inline). The Add case is `apply_binary`'s
-    /// own number-number fast path, inlined to skip the call.
+    /// own number-number fast path, inlined to skip the call; the
+    /// string-string Add case (Cut 35 slice 29) inlines `apply_binary`'s rope
+    /// concat the same way, borrowing the operands without the `as_string`
+    /// Rc round-trip.
     #[inline]
     fn binary_inline(
         agent: &mut Agent,
@@ -6962,6 +6953,11 @@ impl Vm {
                 BinaryOp::Exp => return Ok(Value::Number(left.powf(right))),
                 _ => {}
             }
+        }
+        if op == BinaryOp::Add
+            && let (Some(left), Some(right)) = (left.as_string_ref(), right.as_string_ref())
+        {
+            return Ok(Value::String(Handle::new(JsString::concat(left, right))));
         }
         crate::expr::apply_binary(agent, op, left, right)
     }

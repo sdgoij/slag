@@ -2103,6 +2103,34 @@ allocation on top of the VM's leaf-register body. The structural next
 lever is a `Value::String` representation that avoids the per-append Rc
 box.
 
+### Cut 35 slice 29 — inline the string-string concat in `binary_inline` (measured 2026-08-24)
+
+A leaf-path decomposition of the string row (1M-iteration probes): the
+loop/register machinery is ~30ns/iter, the VM's concat path (the
+`apply_binary` call + two `as_string` Rc round-trips + the result
+`Handle`) added ~28ns, and the rope concat itself is ~57ns base plus up
+to ~50ns of fold overhead at the 100k bench scale. Slice 29 removes the
+VM-side call and Rc churn:
+
+- `binary_inline` now inlines the (String, String) `Add` case — the rope
+  concat — skipping the `apply_binary` call (the number-number inline
+  from slices 10/26 was already there; this is the string counterpart).
+- New `Value::as_string_ref` borrows the string without `as_string`'s Rc
+  reconstruct-and-clone round-trip; `apply_binary`'s string fast path and
+  the new inline both use it.
+- `LeafOp::BinConst` now routes through `binary_inline` (replacing its
+  duplicated number inline), so the bench body's `s += 'x'` (LoadReg,
+  BinConst String(x), StoreReg) takes the string fast path.
+
+Measured (1M-iteration leaf probes, interleaved base/new): the
+empty-append probe (`s += ''`, the is-empty fast path — no node build)
+went 63 → ~56ms (~7ns/iter: the call + Rc round-trips removed), and the
+full-append probe's min went 191 → 182ms. The bench row moved 16.7 →
+~16.5ms (within the ±5% drift band — the isolated probes carry the
+signal). Validation: clippy `-D warnings` clean, workspace tests 4316/0,
+full sweeps at baseline (language 23,724/0/34, annexB 1,086/0/0,
+built-ins 23,812/0/154 + 447 hangs).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
