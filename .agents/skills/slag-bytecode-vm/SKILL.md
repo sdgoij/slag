@@ -523,6 +523,36 @@ Rust-side probe, both worktrees).
   (the `pre_call` base: `stack.len()` for a fused site, `stack.len() -
   argc` otherwise).
 
+## 15. `Vm::acc` is dead at every leaf-inline call site (Cut 35 slice 25)
+
+`run_leaf_regs` and `run_leaf_body` no longer save/restore the
+accumulator: `acc` is read ONLY by the register executor (`run_leaf_ops`
+— the `LeafOp` match), the step path never reads it, and every
+leaf-inline call site (the `CallFast*`/fused-store/`Construct` steps)
+sits in a step-path body where the caller's `acc` is dead. A register
+body's first op always loads the accumulator from scratch (the lowering
+starts from a load), so no leaf reads a pre-existing `acc`. If you add a
+step that reads `acc`, or a leaf-inline caller that can hold a live
+`acc`, the saves must come back. The `loop_counter` save in
+`run_leaf_body` stays (a step-path leaf's own fast loop must not
+clobber the caller's live counter); `run_leaf_regs` never needs it (a
+register body cannot contain a loop — the register lowering rejects
+jumps).
+
+## 16. The number-number binary inline must cover the full arithmetic set (Cut 35 slice 26)
+
+`run_leaf_ops`' `BinImm`/`BinConst`, the step `BinaryImm`, and
+`binary_inline` all inline `apply_binary` for two numbers (skipping the
+coercion call). `Sub`/`Mul`/`Div`/`Rem` were covered everywhere, but
+`Add` — the most common op — was missing from the acc-combine arms and
+`Exp` from all of them, so `(x + 1) + 1` chains went through the general
+evaluator (~7ns/op vs ~3.7ns inlined). When you extend the inline sites,
+keep all six arithmetic ops (`Add`/`Sub`/`Mul`/`Div`/`Rem`/`Exp`)
+consistent — the fused shapes (`BinImmLocal`/`BinCtxReg`/`BinAccPop`/
+`BinLeftReg`) already had `Add` via `binary_inline`; `apply_binary` for
+two numbers is a plain float op, so the inlines are exact. The
+`BinContext`/`BinPerIter` arms route through `binary_inline` too.
+
 ## Bench reality (Cut 2)
 
 `cargo run -p cli --release -- --bench` bounces ±15% on this machine (the
@@ -578,21 +608,18 @@ on the call rows (z 198→190ms, f1 228→220ms). What remains in the core
 is real work (`run_leaf_ops` dispatches + the required frame/completion/
 env saves).
 
-## 15. `Vm::acc` is dead at every leaf-inline call site (Cut 35 slice 25)
-
-`run_leaf_regs` and `run_leaf_body` no longer save/restore the
-accumulator: `acc` is read ONLY by the register executor (`run_leaf_ops`
-— the `LeafOp` match), the step path never reads it, and every
-leaf-inline call site (the `CallFast*`/fused-store/`Construct` steps)
-sits in a step-path body where the caller's `acc` is dead. A register
-body's first op always loads the accumulator from scratch (the lowering
-starts from a load), so no leaf reads a pre-existing `acc`. If you add a
-step that reads `acc`, or a leaf-inline caller that can hold a live
-`acc`, the saves must come back. The `loop_counter` save in
-`run_leaf_body` stays (a step-path leaf's own fast loop must not
-clobber the caller's live counter); `run_leaf_regs` never needs it (a
-register body cannot contain a loop — the register lowering rejects
-jumps).
+**External picture vs node --jitless (measured 2026-08-24).** The Cut 11
+interp-vs-interp ratios (12-40x) collapsed to 2.1-13.3x across all 8
+bench rows; function calls (the old 40x standout) is 2.4x after slices
+23/25, array iteration is the closest row at 2.1x. The remaining gaps are
+the non-core machinery: string concat 13.3x (node's cons-string ropes)
+and construct churn 12.9x (fast allocation) lead, then per-iteration 6.8x
+(closure call/env). Measure node per-row in a clean context (`new
+Function`, warmup then timed call) — an eval-in-shared-global harness
+under-states V8's JIT badly (node array iteration measured 62ms vs 0.6ms
+clean) and its jitless numbers too (88ms vs 25ms: the accumulated global
+`var`s push the global object to dictionary mode). Cut 11's node numbers
+reproduce only with the clean harness.
 
 **A/B bench methodology: alternate the order.** The machine drifts within
 seconds (a base-then-new pair can show a consistent +2-5ms "regression"

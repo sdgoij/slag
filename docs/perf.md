@@ -1986,6 +1986,74 @@ conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
 23,812/0/154 with 447 >15s hangs (identical set to slice 23 — the acc
 removal is a semantic claim the full sweep backs).
 
+### Cut 35 slice 26 — inline number-number `Add`/`Exp` (measured 2026-08-24)
+
+The register-op dispatch (`run_leaf_ops`) and the step path's
+`BinaryImm` both inline the number-number arithmetic shape for
+`Sub`/`Mul`/`Div`/`Rem` — but not `Add` or `Exp`, so the most common
+combine (`x + 1`, and every acc-combine `(x + 1) + 1` chain) fell to
+the general `apply_binary` call. The `binary_inline` helper (the fused
+`BinImmLocal`/`BinCtxReg`/`BinAccPop` shapes) already had `Add` — the
+acc-combine arms were inconsistent. All four inline sites now cover the
+full arithmetic set (`Add`/`Sub`/`Mul`/`Div`/`Rem`/`Exp`); `apply_binary`
+for two numbers is a plain float op, so the inlines are exact, and the
+captured/per-iteration binary arms (`BinContext`/`BinPerIter`) now route
+through `binary_inline` for the same reason.
+
+Measured with a body-op slope (5M-iteration probe, `return x + 1 + 1 +
+…` with increasing `+1` counts): each acc-combine `+1` op dropped from
+~7ns to ~3.7ns — the ops2/ops3/ops4 rows fell 249→229, 283→248,
+323→266ms. The bench rows do not move (they already use the inlined
+fused shapes — `i * 2` is `Mul`, `n + i*2` and `o.a + o.b` combine via
+`binary_inline`); the win is the generic `+`/`**` arithmetic bodies.
+
+Validation: clippy `-D warnings` clean, workspace tests green (4315/0),
+conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
+23,812/0/154 with 447 >15s hangs (identical set to slice 25).
+
+### Cut 35 slice 27 — micro-benchmark vs Node re-measurement (measured 2026-08-24)
+
+Re-ran the Cut 11 comparison against Node v24.12.0 (same sources, same
+warmup-then-time-2nd-run methodology, all 8 rows). Node runs each row in
+a clean per-row context (`new Function`, warmup call then timed call —
+`scratch/bench_node2.js`); that is what reproduces Cut 11's node numbers
+(arith 10.2/11ms, array 24.9/26ms, calls 16.1/16ms jitless). Medians of 3
+interleaved runs of each binary (order rotated per round to cancel the
+machine drift):
+
+| Benchmark | slag | node (jit) | node (--jitless) | slag vs jitless |
+|---|---|---|---|---|
+| arithmetic | 26.1ms | 0.6ms | 10.4ms | 2.5x |
+| property access | 57.8ms | 0.3ms | 14.9ms | 3.9x |
+| string concat | 18.4ms | 0.5ms | 1.4ms | 13.3x |
+| array iteration | 52.5ms | 0.6ms | 24.6ms | 2.1x |
+| function calls | 44.3ms | 1.1ms | 18.6ms | 2.4x |
+| closure capture | 52.9ms | 0.9ms | 18.6ms | 2.8x |
+| per-iteration | 16.9ms | 0.2ms | 2.5ms | 6.8x |
+| construct churn | 38.6ms | 1.7ms | 3.0ms | 12.9x |
+
+All 8 rows report `ok=true` on both engines. Since Cut 11 (measured
+2026-08-21, jitless ratios 12-40x) the interpreter core has closed most
+of the gap: function calls 2.4x (the old 40x standout, closed by the
+caller-frame arg reads of slice 23 and the leaf-call plumbing shave of
+slice 25), arithmetic 2.5x, closure capture 2.8x, property access 3.9x,
+array iteration 2.1x — the closest row. The remaining gaps are the
+non-core machinery: string concat 13.3x and construct churn 12.9x lead
+(node's cons-string ropes and fast allocation are hard interpreter
+targets), then per-iteration 6.8x (closure call/env reads).
+
+Harness trap: an earlier attempt eval'd each source in a shared global
+scope (mirroring how the slag `--bench` rows share one context) and
+measured node array iteration at 62ms jit / 88ms jitless — "beating"
+node's JIT with slag's 52ms. That under-states V8: the timed 2nd eval is
+a fresh compilation TurboFan has not finished tiering, and the
+accumulated global `var`s push the global object to dictionary mode (the
+same shared-context artifact class as slag's own slice-5 cache thrash).
+Cut 11's node numbers reproduce only with the clean per-row harness, so
+that is the comparison used here. Note the asymmetry: slag's `--bench`
+keeps all 8 rows in one context while node is per-row clean; the
+`--jitless` column is the design-relevant interp-vs-interp picture.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

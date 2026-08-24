@@ -3440,10 +3440,12 @@ impl Vm {
                     // adds a call and the RHS tag check for no semantic gain.
                     let value = if let Some(num) = left.as_number() {
                         match op {
+                            BinaryOp::Add => Value::Number(num + *imm),
                             BinaryOp::Sub => Value::Number(num - *imm),
                             BinaryOp::Mul => Value::Number(num * *imm),
                             BinaryOp::Div => Value::Number(num / *imm),
                             BinaryOp::Rem => Value::Number(num % *imm),
+                            BinaryOp::Exp => Value::Number(num.powf(*imm)),
                             _ => {
                                 crate::expr::apply_binary(agent, *op, &left, &Value::Number(*imm))?
                             }
@@ -6734,7 +6736,7 @@ impl Vm {
                             "Cannot access a binding before initialization".into(),
                         )
                     })?;
-                    self.acc = crate::expr::apply_binary(agent, *op, &self.acc, &right)?;
+                    self.acc = Self::binary_inline(agent, *op, &self.acc, &right)?;
                 }
                 LeafOp::BinPerIter { op, index } => {
                     let right = context_env(&self.lexical_env)
@@ -6745,7 +6747,7 @@ impl Vm {
                                 "Cannot access a binding before initialization".into(),
                             )
                         })?;
-                    self.acc = crate::expr::apply_binary(agent, *op, &self.acc, &right)?;
+                    self.acc = Self::binary_inline(agent, *op, &self.acc, &right)?;
                 }
                 LeafOp::BinImm { op, imm } => {
                     // The number-number arithmetic shape inlines
@@ -6754,10 +6756,12 @@ impl Vm {
                     // for no semantic gain (mirrors `Step::BinaryImm`).
                     let value = if let Some(num) = self.acc.as_number() {
                         match op {
+                            BinaryOp::Add => Value::Number(num + imm),
                             BinaryOp::Sub => Value::Number(num - imm),
                             BinaryOp::Mul => Value::Number(num * imm),
                             BinaryOp::Div => Value::Number(num / imm),
                             BinaryOp::Rem => Value::Number(num % imm),
+                            BinaryOp::Exp => Value::Number(num.powf(*imm)),
                             _ => crate::expr::apply_binary(
                                 agent,
                                 *op,
@@ -6776,10 +6780,12 @@ impl Vm {
                     let value =
                         if let (Some(num), Some(imm)) = (self.acc.as_number(), value.as_number()) {
                             match op {
+                                BinaryOp::Add => Value::Number(num + imm),
                                 BinaryOp::Sub => Value::Number(num - imm),
                                 BinaryOp::Mul => Value::Number(num * imm),
                                 BinaryOp::Div => Value::Number(num / imm),
                                 BinaryOp::Rem => Value::Number(num % imm),
+                                BinaryOp::Exp => Value::Number(num.powf(imm)),
                                 _ => crate::expr::apply_binary(agent, *op, &self.acc, value)?,
                             }
                         } else {
@@ -6953,6 +6959,7 @@ impl Vm {
                 BinaryOp::Mul => return Ok(Value::Number(left * right)),
                 BinaryOp::Div => return Ok(Value::Number(left / right)),
                 BinaryOp::Rem => return Ok(Value::Number(left % right)),
+                BinaryOp::Exp => return Ok(Value::Number(left.powf(right))),
                 _ => {}
             }
         }
