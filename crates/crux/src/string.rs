@@ -12,29 +12,38 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// is large enough that repeated copying would dominate, and the contiguous
 /// form is materialized lazily on first access (and cached, since strings are
 /// immutable). `len` is O(1) for both forms.
+///
+/// Flat buffers are `Arc`-shared (clones are O(1), and the rope's right side
+/// of a repeated small append shares one buffer instead of copying per
+/// append). The rope tracks a tree depth and folds an over-deep left side
+/// into a single shared flat; both the fold and the final drop are amortized
+/// across the cap appends, so arbitrarily long append chains stay linear.
 pub struct JsString {
     data: StringData,
 }
 
 enum StringData {
-    Flat(Box<[u16]>),
     // Arc (not Rc) so a `JsString` stays `Send`: `Symbol` descriptions carry
-    // one into the thread-safe well-known-symbol table.
+    // one into the thread-safe well-known-symbol table. The Arc also makes
+    // flat-string clones O(1) — the rope shares its append leaves instead of
+    // copying them.
+    Flat(Arc<[u16]>),
     Rope(Arc<RopeNode>),
 }
 
 struct RopeNode {
-    left: JsString,
-    right: JsString,
+    left: Option<JsString>,
+    right: Option<JsString>,
     len: usize,
-    /// The rope's tree depth (0 for a flat leaf): concat flattens the left
-    /// side once it would exceed `ROPE_MAX_DEPTH`, keeping the tree shallow
-    /// so a chain of small appends cannot overflow the stack on drop.
+    /// The rope's tree depth (0 for a flat leaf): concat folds the left side
+    /// into one shared flat once it would exceed `ROPE_MAX_DEPTH`. The fold
+    /// cost is amortized across the cap appends, and bounding the depth keeps
+    /// the final drop (and any single flatten) at O(cap) nodes.
     depth: usize,
     /// The materialized contiguous form, computed on first access; immutable
     /// once set (strings are immutable), which is what makes `as_slice`
     /// return a stable reference.
-    flat: OnceLock<Box<[u16]>>,
+    flat: OnceLock<Arc<[u16]>>,
 }
 
 /// Concatenations whose total length is at or below this stay flat: the rope
@@ -42,13 +51,13 @@ struct RopeNode {
 /// string is large enough that repeated copies would dominate.
 const CONCAT_FLAT_THRESHOLD: usize = 16;
 
-/// The deepest a rope may grow before concat flattens the left side. The
-/// amortized cost is one re-flatten of the accumulated string per `cap`
-/// appends (quadratic with a tiny constant), and drop recursion stays bounded.
-/// 64 kept the left-append flatten cost at ~n²/128 units; 1024 drops it ~16×
-/// while the drop/flatten recursion (≤ cap frames) stays comfortably inside
-/// the default 8 MB stack.
-const ROPE_MAX_DEPTH: usize = 1024;
+/// The deepest a rope may grow before concat folds the accumulated left side
+/// into a single shared flat. The fold copies the accumulated string, so the
+/// total is ~n²/(2·cap) units — at cap 16384 that is ~305k units (0.6 MB) for
+/// a 100k-unit append chain and ~30M units (60 MB) for a 1M-unit chain,
+/// versus a cap-sized final tree of ~cap nodes to drop either way. (The fold
+/// shares the materialized flat via the Arc — O(1) after the one copy.)
+const ROPE_MAX_DEPTH: usize = 16384;
 
 impl JsString {
     pub fn from_utf16(units: &[u16]) -> Self {
@@ -80,18 +89,22 @@ impl JsString {
             units.extend_from_slice(other.as_slice());
             return JsString::from_utf16(&units);
         }
-        // Flatten an over-deep left side so the tree stays shallow (see
-        // ROPE_MAX_DEPTH): the copy cost is amortized across the cap appends.
+        // Fold an over-deep left side into one shared flat so the tree stays
+        // shallow (see ROPE_MAX_DEPTH): the materialization copy is amortized
+        // across the cap appends, and the Arc share makes the fold itself
+        // O(1). Appends between folds are a single node allocation.
         let left = if self.depth() >= ROPE_MAX_DEPTH {
-            JsString::from_utf16(self.as_slice())
+            JsString {
+                data: StringData::Flat(self.flat_arc()),
+            }
         } else {
             self.clone()
         };
         let depth = 1 + left.depth().max(other.depth());
         JsString {
             data: StringData::Rope(Arc::new(RopeNode {
-                left,
-                right: other.clone(),
+                left: Some(left),
+                right: Some(other.clone()),
                 len,
                 depth,
                 flat: OnceLock::new(),
@@ -104,6 +117,16 @@ impl JsString {
         match &self.data {
             StringData::Flat(_) => 0,
             StringData::Rope(node) => node.depth,
+        }
+    }
+
+    /// The materialized contiguous form as a shared buffer, materializing the
+    /// rope first if needed. The Arc share lets `concat`'s depth fold reuse
+    /// the buffer instead of copying it a second time.
+    fn flat_arc(&self) -> Arc<[u16]> {
+        match &self.data {
+            StringData::Flat(arc) => arc.clone(),
+            StringData::Rope(node) => node.flat.get_or_init(|| node.flatten()).clone(),
         }
     }
 
@@ -122,7 +145,7 @@ impl JsString {
     pub fn as_slice(&self) -> &[u16] {
         match &self.data {
             StringData::Flat(units) => units,
-            StringData::Rope(node) => node.flat.get_or_init(|| node.flatten()),
+            StringData::Rope(node) => node.flat.get_or_init(|| node.flatten()).as_ref(),
         }
     }
 
@@ -169,27 +192,66 @@ impl RopeNode {
     /// The concatenation of the leaves, in order. Iterative (an explicit
     /// stack) so a deep left-leaning chain of small appends cannot overflow
     /// the call stack.
-    fn flatten(&self) -> Box<[u16]> {
+    fn flatten(&self) -> Arc<[u16]> {
         let mut units = Vec::with_capacity(self.len);
-        // Pop the left side first, so the leaves emit in order.
-        let mut stack = vec![&self.right.data, &self.left.data];
-        while let Some(data) = stack.pop() {
-            match data {
-                StringData::Flat(flat) => units.extend_from_slice(flat),
-                StringData::Rope(node) => {
-                    stack.push(&node.right.data);
-                    stack.push(&node.left.data);
+        // Pop the left side first, so the leaves emit in order. Children are
+        // always `Some` until the node is being dropped; a missing side (a
+        // mid-drop view is impossible — flatten borrows a live string) is
+        // skipped defensively.
+        let mut stack = vec![self.right.as_ref(), self.left.as_ref()];
+        while let Some(string) = stack.pop() {
+            if let Some(string) = string {
+                match &string.data {
+                    StringData::Flat(flat) => units.extend_from_slice(flat),
+                    StringData::Rope(node) => {
+                        stack.push(node.right.as_ref());
+                        stack.push(node.left.as_ref());
+                    }
                 }
             }
         }
-        units.into_boxed_slice()
+        // Vec → Arc reuses the buffer (exact capacity), no second copy.
+        Arc::from(units)
+    }
+}
+
+impl Drop for RopeNode {
+    fn drop(&mut self) {
+        // A long append chain is hundreds of thousands of nodes deep; dropping
+        // the children recursively would overflow the stack. Unwind
+        // iteratively: take the children, unwrap any we uniquely own, and
+        // keep going with the rest (shared subtrees just decrement).
+        let mut work: Vec<JsString> = Vec::new();
+        if let Some(left) = self.left.take() {
+            work.push(left);
+        }
+        if let Some(right) = self.right.take() {
+            work.push(right);
+        }
+        while let Some(string) = work.pop() {
+            match string.data {
+                StringData::Flat(_) => {}
+                StringData::Rope(node) => match Arc::try_unwrap(node) {
+                    Ok(mut inner) => {
+                        if let Some(left) = inner.left.take() {
+                            work.push(left);
+                        }
+                        if let Some(right) = inner.right.take() {
+                            work.push(right);
+                        }
+                    }
+                    Err(node) => drop(node),
+                },
+            }
+        }
     }
 }
 
 impl Clone for JsString {
     fn clone(&self) -> Self {
         // Ropes share their node (and its flat cache) via the Arc; flat
-        // strings copy the buffer, as before.
+        // strings share their buffer (Arc bump, O(1)) — strings are
+        // immutable, so sharing is never observable.
         Self {
             data: match &self.data {
                 StringData::Flat(units) => StringData::Flat(units.clone()),
@@ -519,5 +581,32 @@ mod tests {
         assert_eq!(s.concat(&empty).as_slice(), s.as_slice());
         assert_eq!(empty.concat(&s).as_slice(), s.as_slice());
         assert_eq!(empty.concat(&empty).len(), 0);
+    }
+
+    #[test]
+    fn deep_append_chain_drops_and_flattens_iteratively() {
+        // Left-leaning appends: the depth cap folds the tree every
+        // ROPE_MAX_DEPTH appends, so it stays shallow — the fold's
+        // materialization and the final drop exercise the iterative paths.
+        let mut s = JsString::from_utf8("");
+        let leaf = JsString::from_utf8("x");
+        for _ in 0..200_000 {
+            s = s.concat(&leaf);
+        }
+        assert_eq!(s.len(), 200_000);
+        let units = s.as_slice();
+        assert_eq!(units.len(), 200_000);
+        assert!(units.iter().all(|&u| u == b'x' as u16));
+
+        // Right-leaning prepends: the cap only inspects the left side, so the
+        // depth grows unbounded — drop and flatten must still be iterative.
+        let mut p = JsString::from_utf8("");
+        for _ in 0..200_000 {
+            p = leaf.concat(&p);
+        }
+        assert_eq!(p.len(), 200_000);
+        let units = p.as_slice();
+        assert_eq!(units.len(), 200_000);
+        assert!(units.iter().all(|&u| u == b'x' as u16));
     }
 }

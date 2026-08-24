@@ -612,7 +612,8 @@ env saves).
 interp-vs-interp ratios (12-40x) collapsed to 2.1-13.3x across all 8
 bench rows; function calls (the old 40x standout) is 2.4x after slices
 23/25, array iteration is the closest row at 2.1x. The remaining gaps are
-the non-core machinery: string concat 13.3x (node's cons-string ropes)
+the non-core machinery: string concat ~12x after slice 28 (the rope
+append/fold work — node's cons-string ropes)
 and construct churn 12.9x (fast allocation) lead, then per-iteration 6.8x
 (closure call/env). Measure node per-row in a clean context (`new
 Function`, warmup then timed call) — an eval-in-shared-global harness

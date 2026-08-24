@@ -2054,6 +2054,55 @@ that is the comparison used here. Note the asymmetry: slag's `--bench`
 keeps all 8 rows in one context while node is per-row clean; the
 `--jitless` column is the design-relevant interp-vs-interp picture.
 
+### Cut 35 slice 28 — rope appends: iterative drop, Arc-shared flats, higher fold cap (measured 2026-08-24)
+
+The string-concat row builds a 100k-unit rope via `s += 'x'`. Its cost
+split into the append machinery (an `Rc<JsString>` wrapper + rope node +
+right-operand box per append) and the depth-cap flatten: `concat` folded
+the *entire accumulated left side* into a fresh flat every
+`ROPE_MAX_DEPTH` (1024) appends, copying ~n²/(2·cap) units — ~10 MB at
+100k, ~1 GB at 1M (the 1M probe took ~480 ms, ~3× the machinery floor).
+The cap existed only to bound drop recursion.
+
+Three changes to `crates/crux/src/string.rs`:
+
+- **Iterative drop.** `RopeNode` children are now `Option<JsString>` and
+  `Drop` unwinds the tree with an explicit worklist
+  (`Arc::try_unwrap` on uniquely-owned subtrees, decrementing shared
+  ones), so arbitrarily deep chains — including the right-leaning
+  prepend chains the cap never protected — free without stack recursion.
+- **Arc-shared flat buffers.** `Flat(Arc<[u16]>)` makes `JsString` clones
+  O(1): the rope's per-append `right` operand (a 1-unit box every
+  iteration) is now an Arc bump, and the depth fold shares the
+  materialized flat instead of copying it a second time.
+- **Higher fold cap (1024 → 16384).** The cap now exists purely for the
+  amortized fold-vs-drop tradeoff: folding every 16384 appends copies
+  ~n²/32768 units (~0.6 MB at 100k, ~60 MB at 1M) and bounds the final
+  tree to ~cap nodes, so dropping a 100k chain went from ~7 ms (100k
+  individual node frees, the uncapped version) to <1 ms.
+
+Measured (release, 3-run interleaved medians vs the slice-26 base
+binary):
+
+| Row | before | after |
+|---|---|---|
+| string concat | 18.6ms | **16.7ms** (-10%) |
+| string concat 1M probe | ~480ms | **~230ms** (2.1x) |
+
+All other bench rows flat (property-access +3.4% and per-iteration +2.8%
+were within the ±5% drift band — a tight interleaved re-check of
+property access showed no regression). Semantics are unchanged (strings
+are immutable; the fold/flatten are internal representation), but the
+shared rope machinery warranted the full sweep: language 23,724/0/34,
+annexB 1,086/0/0, built-ins 23,812/0/154 with 447 >15s hangs — identical
+to baseline. Workspace tests 4316/0, clippy `-D warnings` clean.
+
+The remaining gap vs node jitless (1.4ms → ~12x) is the append machinery
+itself (~165ns/iter): the per-append `Rc<JsString>` wrapper and node
+allocation on top of the VM's leaf-register body. The structural next
+lever is a `Value::String` representation that avoids the per-append Rc
+box.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
