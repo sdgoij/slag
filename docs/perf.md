@@ -1893,6 +1893,57 @@ conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
 7 property-escapes more than slice 21's 440, 1 less non-whitespace —
 load-classification wobble, no added fail/crash paths).
 
+### Cut 35 slice 23 — caller-frame argument aliasing (measured 2026-08-24)
+
+The fused `CallFastGlobalStore`/`CallFastSlotStore` steps (slices 17/20)
+pushed each argument from a caller frame slot onto the value stack, then
+the leaf-inline callee either re-read it from that stack region (`Alias`)
+or copied it into a pushed frame (`Pushed`). The argument round-trip —
+clone + Vec push, stack read, pop — was the fused call core's largest
+remaining per-call cost after slice 22.
+
+Slice 23 reads the arguments straight from the caller's frame slots. A
+register leaf whose frame is exactly its parameters — `frame_size ==
+arity`, no `this`/`arguments`/`var` slots, and no parameter is ever
+assigned (the new `ScopeInfo::args_alias` gate, computed in
+`analyze_scope` via the assigned-name collection, which walks nested
+closures too) — runs with a new `LeafFrame::CallerSlots { base }`: the
+caller's `leaf_frame_base` stays active, a new `Vm::leaf_frame_offset`
+addresses its slots directly, and nothing is pushed or unwound. The
+fused steps keep their TDZ checks (moved ahead of the call, no push) and
+pass the args' base; the call core uses the aliasing on a cache hit and
+materializes the args on the stack on any fallback (param write, var
+slot, `this`, `arguments`, a step-path leaf, a non-leaf — behavior
+identical to the pre-slice path).
+
+**The debug-stack trap**: the first cut inlined the CallerSlots run as a
+second `run_leaf_regs` call site inside `run_inline_leaf`, and with
+`#[inline(always)]` the whole register dispatcher got duplicated into
+`fast_call_core`'s per-recursion-level debug frame — a step-path leaf
+recursion (the `fast_path_function_declarations` test's `g(5)`) that
+passed at the default test-thread stack in the base now overflowed
+(needed `RUST_MIN_STACK` 4MB). `run_inline_leaf` was restructured to a
+single `run_leaf_regs` call site (the frame source is decided first, one
+result-placement tail with a `pre_call` base) — the test passes at the
+default stack again and the release win is unchanged.
+
+Measured — the call rows drop ~12-16%: a release Rust-side timing probe
+(min-of-5 evals of the exact bench sources, same agent, identical in
+both worktrees) shows `n = f(n)` 5M at 254→223ms and the closure-capture
+row at 303→253ms (~6.4ns/call and ~9.9ns/call off the fused call core).
+The `--bench` harness confirms the direction but swings with load.
+
+The 13-case probe (`scratch/slice23_probe.js`) covers the bench shapes,
+two-param leaves, param-write/var-slot/`this`/step-path/non-leaf
+fallbacks, the closure-capture shape, extra args, a `let` TDZ arg, and
+an arg slot distinct from the target slot. New unit tests assert
+`ScopeInfo::args_alias` across the gate (including a closure writing a
+captured param) and the fused-site behavior.
+
+Validation: clippy `-D warnings` clean, workspace tests green (4315/0),
+conformance language 23,724/0/34, annexB 1,086/0/0, built-ins
+23,812/0/154 with 447 >15s hangs (identical set to slice 22).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

@@ -480,6 +480,49 @@ bind/store conversions (`unwrap_or(0.0)` in release — a gate bug must
 never panic the process). `run_leaf_body` still saves/restores the field
 (now a plain f64 copy), and `Vm::new`/`reset` seed `0.0`.
 
+## 14. Fused call args read straight from the caller's frame slots (Cut 35 slice 23)
+
+The fused `CallFastGlobalStore`/`CallFastSlotStore` steps used to push
+each argument from a caller frame slot onto the value stack, then the
+leaf-inline callee re-read it from that stack region. Since slice 23 the
+steps TDZ-check the slots and pass their base to the call core; a
+**register leaf whose frame is exactly its parameters** runs with
+`LeafFrame::CallerSlots { base }` — the caller's `leaf_frame_base` stays
+active and a new `Vm::leaf_frame_offset` addresses its slots directly
+(no push, no aliased stack region, nothing unwound). This is the second
+structural lever to measure a real win: the call rows drop ~12-16%
+(`n = f(n)` 5M 254→223ms, closure-capture 303→253ms on a min-of-5
+Rust-side probe, both worktrees).
+
+- **The gate is `ScopeInfo::args_alias`**: `frame_size == arity` (no
+  `this`/`arguments`/`var` slots) AND no param is ever assigned — the
+  assigned-name collection walks nested closures too (a closure writing
+  a captured param writes the binding). The runtime also requires
+  `ir.leaf_ops` (register body) and `argc == frame_size`.
+- **Read-only is what makes the alias sound**: the callee's `StoreReg`
+  can only target a param (the frame IS the params), and the gate makes
+  those impossible, so the aliased region is never written. A
+  param-writing leaf, a var-slot leaf, `this`, `arguments`, a step-path
+  leaf, or a non-leaf falls back to materializing the args on the stack
+  and the normal Alias/Pushed/step paths — behaviorally identical.
+- **The fused steps keep their TDZ checks** (moved ahead of the call —
+  the callee would otherwise read an uninitialized caller slot). The
+  `CallFastGlobal`/`CallFastSlot` (non-store) steps still pass `None`
+  (their args are compiler-pushed stack values).
+- **`leaf_frame_offset` is never active across a nested call**: a
+  `CallerSlots` leaf contains no call steps (it's a register leaf), so
+  the offset needs no save/restore in `run_leaf_body` or the construct
+  path. `run_leaf_regs` saves/restores it like `leaf_frame_base`.
+- **Do NOT add a second `run_leaf_regs` call site in `run_inline_leaf`**
+  (the debug-stack trap): with `#[inline(always)]`, the whole register
+  dispatcher gets duplicated into `fast_call_core`'s per-recursion-level
+  debug frame — a step-path leaf recursion (`fast_path_function_
+  declarations`' `g(5)`) that passed at the default test-thread stack
+  overflowed and needed `RUST_MIN_STACK` 4MB. Decide the `LeafFrame`
+  first, keep ONE `run_leaf_regs` call and ONE result-placement tail
+  (the `pre_call` base: `stack.len()` for a fused site, `stack.len() -
+  argc` otherwise).
+
 ## Bench reality (Cut 2)
 
 `cargo run -p cli --release -- --bench` bounces ±15% on this machine (the
@@ -513,9 +556,12 @@ the leaf-call core (cache check + frame setup + `run_leaf_ops` + truncate)
 is ~20ns. Don't propose another step-fusion slice expecting a win. The
 structural levers DID move numbers: the raw-f64 loop counter (slice 22)
 cut the head and counter-read rows by ~5-9ns/iter (5M-iteration A/B:
-empty-head 59→35ms, counter-read 166→132ms) — the first real win since
-the floor — and the remaining lever is the call ABI reading args straight
-from frame slots.
+empty-head 59→35ms, counter-read 166→132ms), and the caller-frame
+argument aliasing (slice 23) cut the fused call rows by ~6-10ns/call
+(5M: `n = f(n)` 254→223ms, closure-capture 303→253ms) — the first real
+wins since the floor. The result-store side of the fused call (the
+callee writing the target slot directly instead of the pop+store round
+trip) is the natural next lever.
 
 **A/B bench methodology: alternate the order.** The machine drifts within
 seconds (a base-then-new pair can show a consistent +2-5ms "regression"

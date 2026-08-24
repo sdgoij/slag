@@ -1085,6 +1085,14 @@ pub struct ScopeInfo {
     /// fills it with the OrdinaryCallBindThis result. Arrow bodies (lexical
     /// `this`) stay on the env path.
     pub this_slot: Option<usize>,
+    /// Cut 35 slice 23: whether the frame is exactly the parameters, all
+    /// present and never assigned — the frame holds only simple params
+    /// (`frame_size == arity`, no `this`/`arguments`/`var` slots) and no
+    /// statement assigns a param. A register leaf with this flag can read
+    /// its args straight from the caller's frame slots at a fused call
+    /// site (no argument push, no aliased stack region); `StoreReg` to a
+    /// param is impossible, so the aliased region is read-only.
+    pub args_alias: bool,
     /// Cut 6 first slice (Annex B): the body's block-level function
     /// declarations, in declaration order. Each binds a block-scoped
     /// binding in `block_slot` (initialized with the instantiated closure
@@ -1695,6 +1703,14 @@ pub struct Vm {
     /// `frame` stays in place (no 256-byte swap per call). `None` outside a
     /// leaf run.
     pub(crate) leaf_frame_base: Option<usize>,
+    /// Cut 35 slice 23: an offset applied to `frame_get`/`frame_set` while
+    /// a `LeafFrame::CallerSlots` register leaf runs — its frame IS the
+    /// caller's frame at `base..` (the caller's `leaf_frame_base` stays
+    /// active, and the offset addresses its slots directly). Zero for every
+    /// other frame source, so the extra add is a predictable no-op. A
+    /// `CallerSlots` leaf contains no call steps, so the offset is never
+    /// active across a nested call.
+    leaf_frame_offset: usize,
     pub args: Vec<Value>,
     pub lexical_env: EnvRef,
     pub(crate) env_stack: EnvStack,
@@ -1867,6 +1883,7 @@ impl Vm {
             stack: Vec::new(),
             frame: Frame::Inline(std::array::from_fn(|_| Value::Undefined)),
             leaf_frame_base: None,
+            leaf_frame_offset: 0,
             args: Vec::new(),
             lexical_env: lexical_env.clone(),
             env_stack: EnvStack::with_base(lexical_env),
@@ -1918,6 +1935,7 @@ impl Vm {
         self.ip = 0;
         self.stack.clear();
         self.leaf_frame_base = None;
+        self.leaf_frame_offset = 0;
         self.args.clear();
         self.lexical_env = lexical_env.clone();
         self.env_stack.reset(lexical_env);
@@ -1980,6 +1998,7 @@ impl Vm {
     /// every non-leaf body).
     #[inline]
     fn frame_get(&self, slot: usize) -> &Value {
+        let slot = slot + self.leaf_frame_offset;
         match self.leaf_frame_base {
             Some(base) => &self.stack[base + slot],
             None => Frame::get(&self.frame, slot),
@@ -1988,6 +2007,7 @@ impl Vm {
 
     #[inline]
     fn frame_get_mut(&mut self, slot: usize) -> &mut Value {
+        let slot = slot + self.leaf_frame_offset;
         match self.leaf_frame_base {
             Some(base) => &mut self.stack[base + slot],
             None => Frame::get_mut(&mut self.frame, slot),
@@ -4097,33 +4117,35 @@ impl Vm {
                     argc,
                     direct_eval,
                 } => {
-                    self.do_call_fast_global(agent, *name, *argc as usize, *direct_eval)?;
+                    self.do_call_fast_global(agent, *name, None, *argc as usize, *direct_eval)?;
                 }
                 Step::CallFastSlot { slot, argc } => {
-                    self.do_call_fast_slot(agent, *slot, *argc as usize)?;
+                    self.do_call_fast_slot(agent, *slot, None, *argc as usize)?;
                 }
                 Step::CallFastSlotStore {
                     callee_slot,
                     arg_slots,
                     store_slot,
                 } => {
-                    // Cut 35 slice 17: the fused `x = f(args)` — read the
-                    // arg slots in order (their `LoadLocal` TDZ checks),
-                    // run the slot-callee call (the transient arg push is
-                    // truncated by the call core), and store the result to
+                    // Cut 35 slice 17: the fused `x = f(args)` — TDZ-check
+                    // the arg slots in order (their `LoadLocal` checks),
+                    // run the slot-callee call, and store the result to
                     // the target with the `FusedStoreLocal` TDZ check. The
                     // evaluation order matches the unfused steps exactly.
+                    // Cut 35 slice 23: the args stay in the caller's frame
+                    // — the callee may read them straight from there (no
+                    // stack push); the call core materializes them on a
+                    // miss or fallback.
+                    let arg_base = arg_slots.first().copied();
                     for &slot in arg_slots {
-                        let value = self.frame_get(slot).clone();
-                        if value.is_uninitialized() {
+                        if self.frame_get(slot).is_uninitialized() {
                             return Err(JsError::new(
                                 ErrorKind::ReferenceError,
                                 "Cannot access a binding before initialization".into(),
                             ));
                         }
-                        self.stack.push(value);
                     }
-                    self.do_call_fast_slot(agent, *callee_slot, arg_slots.len())?;
+                    self.do_call_fast_slot(agent, *callee_slot, arg_base, arg_slots.len())?;
                     let result = self.pop();
                     if self.frame_get(*store_slot).is_uninitialized() {
                         return Err(JsError::new(
@@ -4140,18 +4162,20 @@ impl Vm {
                 } => {
                     // Cut 35 slice 20: the fused `x = f(args)` for a global
                     // callee — same shape as `CallFastSlotStore` through
-                    // `do_call_fast_global` (the global leaf cache).
+                    // `do_call_fast_global` (the global leaf cache). The
+                    // arg slots are TDZ-checked here and passed by caller-
+                    // frame base (Cut 35 slice 23) so the callee can read
+                    // them without a stack push.
+                    let arg_base = arg_slots.first().copied();
                     for &slot in arg_slots {
-                        let value = self.frame_get(slot).clone();
-                        if value.is_uninitialized() {
+                        if self.frame_get(slot).is_uninitialized() {
                             return Err(JsError::new(
                                 ErrorKind::ReferenceError,
                                 "Cannot access a binding before initialization".into(),
                             ));
                         }
-                        self.stack.push(value);
                     }
-                    self.do_call_fast_global(agent, *name, arg_slots.len(), false)?;
+                    self.do_call_fast_global(agent, *name, arg_base, arg_slots.len(), false)?;
                     let result = self.pop();
                     if self.frame_get(*store_slot).is_uninitialized() {
                         return Err(JsError::new(
@@ -6511,8 +6535,19 @@ impl Vm {
         frame: LeafFrame<'_>,
     ) -> Result<Completion, JsError> {
         let scope = ir.scope.as_ref().expect("a register body is certified");
+        // Cut 35 slice 23: capture the caller's offset BEFORE the frame
+        // match may set it (`CallerSlots` writes the base into the field).
+        let caller_leaf_frame_offset = self.leaf_frame_offset;
         let (frame_base, args, aliased) = match frame {
             LeafFrame::Alias(base) => (base, &[][..], true),
+            LeafFrame::CallerSlots { base } => {
+                // Cut 35 slice 23: the frame IS the caller's frame at
+                // `base..` — keep the caller's `leaf_frame_base` active and
+                // offset into it; nothing is pushed, so nothing is unwound
+                // on exit.
+                self.leaf_frame_offset = base;
+                (0, &[][..], true)
+            }
             LeafFrame::Pushed(args) => (self.stack.len(), args, false),
         };
         if !aliased {
@@ -6531,7 +6566,12 @@ impl Vm {
             }
         }
         let caller_leaf_frame_base = self.leaf_frame_base;
-        self.leaf_frame_base = Some(frame_base);
+        // Cut 35 slice 23: `CallerSlots` keeps the caller's base (the
+        // offset addresses its slots); the other variants overlay a stack
+        // segment of their own.
+        if !matches!(frame, LeafFrame::CallerSlots { .. }) {
+            self.leaf_frame_base = Some(frame_base);
+        }
         let caller_acc = std::mem::replace(&mut self.acc, Value::Undefined);
         // Cut 28/30 mirror: a per-iteration-reading leaf resolves its
         // `lexical_env` against its own env; a context-reading leaf resolves
@@ -6558,6 +6598,7 @@ impl Vm {
         };
         let outcome = self.run_leaf_ops(agent, ops);
         self.leaf_frame_base = caller_leaf_frame_base;
+        self.leaf_frame_offset = caller_leaf_frame_offset;
         // An aliased frame lives in the caller's argument region, which the
         // caller truncates; only a pushed frame is unwound here.
         if !aliased {
@@ -7065,11 +7106,16 @@ impl Vm {
     /// The `CallFastGlobal` handler (Cut 35 slice 2): the callee comes from
     /// the global cell and `this` is `undefined` — the compiler emitted no
     /// receiver push or callee load, so the argument region is the top
-    /// `argc` values with nothing below it.
+    /// `argc` values with nothing below it. `caller_arg_base` (Cut 35
+    /// slice 23): a fused call-store site passes the arguments' base in the
+    /// caller's frame instead of on the stack — the callee may read them
+    /// straight from the caller's slots; `None` for the stack-argument
+    /// steps.
     fn do_call_fast_global(
         &mut self,
         agent: &mut Agent,
         name: crux::AtomId,
+        caller_arg_base: Option<usize>,
         argc: usize,
         direct_eval: bool,
     ) -> Result<(), JsError> {
@@ -7091,7 +7137,21 @@ impl Vm {
                 && self.can_inline_leaf()
                 && agent.realms.borrow().len() == 1
             {
-                return self.run_inline_leaf(agent, argc, Value::Undefined, entry, 0);
+                return self.run_inline_leaf(
+                    agent,
+                    argc,
+                    Value::Undefined,
+                    entry,
+                    0,
+                    caller_arg_base,
+                );
+            }
+        }
+        // The cache missed: materialize the caller-frame arguments (the
+        // fused step no longer pushed them), then the general core.
+        if let Some(base) = caller_arg_base {
+            for i in 0..argc {
+                self.stack.push(self.frame_get(base + i).clone());
             }
         }
         let callee = self.load_global_value(agent, name)?;
@@ -7111,11 +7171,13 @@ impl Vm {
     /// certified-value var holding a certified closure. The slot read is a
     /// plain frame access (side-effect-free), and the compiler fused only
     /// when no argument can write the slot, so the callee-after-args order
-    /// is unobservable.
+    /// is unobservable. `caller_arg_base` is the Cut 35 slice 23 caller-
+    /// frame argument base (see `do_call_fast_global`).
     fn do_call_fast_slot(
         &mut self,
         agent: &mut Agent,
         slot: usize,
+        caller_arg_base: Option<usize>,
         argc: usize,
     ) -> Result<(), JsError> {
         let callee = self.frame_get(slot);
@@ -7130,9 +7192,14 @@ impl Vm {
             && agent.realms.borrow().len() == 1
         {
             let entry = cell.entry.clone();
-            return self.run_inline_leaf(agent, argc, Value::Undefined, entry, 0);
+            return self.run_inline_leaf(agent, argc, Value::Undefined, entry, 0, caller_arg_base);
         }
         let callee = callee.clone();
+        if let Some(base) = caller_arg_base {
+            for i in 0..argc {
+                self.stack.push(self.frame_get(base + i).clone());
+            }
+        }
         self.fast_call_core(
             agent,
             argc,
@@ -7154,6 +7221,13 @@ impl Vm {
     /// `fast_call_core` and the global call-site leaf cache (Cut 35
     /// slice 12). Takes the entry by value so a cached entry needs no
     /// further clone.
+    ///
+    /// Cut 35 slice 23: `caller_arg_base` marks a fused call-store site
+    /// whose arguments live in the CALLER's frame slots (the fused steps no
+    /// longer push them) — a read-only-param register leaf reads them
+    /// straight from the caller's frame (`LeafFrame::CallerSlots`, no stack
+    /// traffic); anything else materializes them on the stack first and
+    /// runs the normal frame path.
     #[inline(always)]
     fn run_inline_leaf(
         &mut self,
@@ -7162,9 +7236,8 @@ impl Vm {
         this_value: Value,
         entry: LeafEntry,
         below: usize,
+        caller_arg_base: Option<usize>,
     ) -> Result<(), JsError> {
-        let n = self.stack.len();
-        let arg_start = n - argc;
         let ir = entry.ir;
         let strict = entry.strict;
         let environment = entry.environment;
@@ -7172,42 +7245,67 @@ impl Vm {
         // executor with no `run_leaf_call`/`run_leaf_body` indirection
         // and no completion round-trip (a register body always completes
         // with `Return`); a step-path leaf runs through `run_leaf_body`
-        // as before.
+        // as before. Both paths converge on one result-placement tail.
         let scope = ir.scope.as_ref().expect("a leaf is certified");
         let this_value = self.bind_this_value(agent, scope, strict, this_value)?;
-        let completion = if let Some(ops) = ir.leaf_ops.as_deref() {
-            // Alias the frame onto the caller's argument region when
-            // every frame slot is a present parameter (no `this` slot,
-            // no var/TDZ slots): `f(x)`, `f(x, y)` with all args
-            // supplied — no argument copy, no frame push. Otherwise push
-            // the frame from the copied arguments.
-            let arg_base = (scope.this_slot.is_none()
-                && scope.frame_size == scope.arity
-                && argc >= scope.frame_size)
-                .then_some(arg_start);
-            if let Some(base) = arg_base {
-                self.run_leaf_regs(
-                    agent,
-                    ops,
-                    &ir,
-                    environment,
-                    this_value,
-                    LeafFrame::Alias(base),
-                )?
-            } else {
-                let mut args_buf = [Value::Undefined; 3];
-                args_buf[..argc].clone_from_slice(&self.stack[arg_start..n]);
-                self.run_leaf_regs(
-                    agent,
-                    ops,
-                    &ir,
-                    environment,
-                    this_value,
-                    LeafFrame::Pushed(&args_buf[..argc]),
-                )?
-            }
+        // The call site: where the result replaces the call. A fused
+        // call-store site (Cut 35 slice 23) passes `caller_arg_base` and
+        // pushes nothing (its args live in the caller's frame); the other
+        // callers' args are already on the stack.
+        let pre_call = if caller_arg_base.is_some() {
+            self.stack.len()
         } else {
-            let mut args_buf = [Value::Undefined; 3];
+            self.stack.len() - argc
+        };
+        let mut args_buf = [Value::Undefined; 3];
+        let completion = if let Some(ops) = ir.leaf_ops.as_deref() {
+            // Cut 35 slice 23: at a fused call-store site, a register leaf
+            // whose params are exactly the frame, all present, and never
+            // assigned reads them straight from the caller's frame slots
+            // (`LeafFrame::CallerSlots` — no push, no aliased stack
+            // region; the fused step already TDZ-checked the slots).
+            // Everything else materializes the args and runs the normal
+            // frame path (Alias or Pushed) below.
+            let frame = if let Some(base) = caller_arg_base
+                && scope.args_alias
+                && argc == scope.frame_size
+            {
+                LeafFrame::CallerSlots { base }
+            } else {
+                if let Some(base) = caller_arg_base {
+                    for i in 0..argc {
+                        self.stack.push(self.frame_get(base + i).clone());
+                    }
+                }
+                let n = self.stack.len();
+                let arg_start = n - argc;
+                // Alias the frame onto the caller's argument region when
+                // every frame slot is a present parameter (no `this` slot,
+                // no var/TDZ slots): `f(x)`, `f(x, y)` with all args
+                // supplied — no argument copy, no frame push. Otherwise
+                // push the frame from the copied arguments.
+                let arg_base = (scope.this_slot.is_none()
+                    && scope.frame_size == scope.arity
+                    && argc >= scope.frame_size)
+                    .then_some(arg_start);
+                if let Some(base) = arg_base {
+                    LeafFrame::Alias(base)
+                } else {
+                    args_buf[..argc].clone_from_slice(&self.stack[arg_start..n]);
+                    LeafFrame::Pushed(&args_buf[..argc])
+                }
+            };
+            self.run_leaf_regs(agent, ops, &ir, environment, this_value, frame)?
+        } else {
+            // Step-path leaf: materialize the fused site's args (if any),
+            // then the step body on the copied arguments.
+            if let Some(base) = caller_arg_base {
+                for i in 0..argc {
+                    self.stack.push(self.frame_get(base + i).clone());
+                }
+            }
+            let n = self.stack.len();
+            let arg_start = n - argc;
             args_buf[..argc].clone_from_slice(&self.stack[arg_start..n]);
             self.run_leaf_body(
                 agent,
@@ -7219,7 +7317,7 @@ impl Vm {
             )?
         };
         let result = Self::leaf_completion_result(completion)?;
-        self.stack.truncate(arg_start - below);
+        self.stack.truncate(pre_call - below);
         self.stack.push(result);
         Ok(())
     }
@@ -7294,7 +7392,7 @@ impl Vm {
                 }
                 LeafCacheSite::None => {}
             }
-            return self.run_inline_leaf(agent, argc, this, entry, below);
+            return self.run_inline_leaf(agent, argc, this, entry, below, None);
         }
         let args = &self.stack[arg_start..n];
         if is_eval_function(agent, &callee)? {
@@ -13648,6 +13746,11 @@ enum LeafFrame<'a> {
     /// Overlay the frame on the caller's argument region at `stack[base..]`
     /// (every frame slot is a present parameter — no copy, no push).
     Alias(usize),
+    /// Cut 35 slice 23: the frame IS the caller's frame at `base..` — the
+    /// caller's `leaf_frame_base` stays active and `leaf_frame_offset`
+    /// addresses its slots directly (a read-only-param register leaf: no
+    /// copy, no push, nothing to unwind).
+    CallerSlots { base: usize },
     /// Build the frame at the stack top from `args` (missing arguments stay
     /// `undefined`, spec 10.2.11).
     Pushed(&'a [Value]),
@@ -14387,6 +14490,23 @@ fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
         None
     };
     let frame_size = scan.next_slot;
+    // Cut 35 slice 23: the params are exactly the frame and none is ever
+    // assigned — the body has no `this`/`arguments`/`var` slots (each
+    // would push `frame_size` past `arity`) and the assigned-name
+    // collection (which walks nested closures too — a closure writing a
+    // captured param writes the binding) hits no param. A register leaf
+    // with this flag can read its args straight from the caller's frame
+    // slots at a fused call site.
+    let args_alias = frame_size == arity && {
+        let mut assigned = HashSet::new();
+        collect_assigned_stmts(&function.body.stmts, &mut assigned);
+        !function.params.iter().any(|param| {
+            let BindingPattern::Ident(name) = param.pattern else {
+                unreachable!("the param loop checked the pattern")
+            };
+            assigned.contains(&name)
+        })
+    };
     Some(ScopeInfo {
         frame_size,
         arity,
@@ -14400,6 +14520,7 @@ fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
         arguments_slot,
         arguments_formals,
         this_slot,
+        args_alias,
         annex_b: scan.annex_b,
         statement_fns: scan.statement_fns,
     })
@@ -16928,6 +17049,7 @@ fn analyze_script_scope(
                 arguments_slot: None,
                 arguments_formals: None,
                 this_slot: None,
+                args_alias: false,
                 annex_b: Vec::new(),
                 statement_fns: Vec::new(),
             },

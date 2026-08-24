@@ -3004,6 +3004,84 @@ mod tests {
     }
 
     #[test]
+    fn slice23_args_alias_gates_read_only_params() {
+        fn args_alias(agent: &mut Agent, src: &str, name: &str) -> bool {
+            agent.run_script(src).unwrap();
+            let ir = compiled_body_of(agent, name);
+            ir.scope.as_ref().expect("certified").args_alias
+        }
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        // Read-only params qualify.
+        assert!(args_alias(
+            &mut agent,
+            "function a(x) { return x + 1; }",
+            "a"
+        ));
+        assert!(args_alias(
+            &mut agent,
+            "function b(a, b) { return a + b; }",
+            "b"
+        ));
+        // A param write, a `var` slot, `this`, and `arguments` disqualify.
+        assert!(!args_alias(
+            &mut agent,
+            "function c(x) { x = x + 1; return x; }",
+            "c"
+        ));
+        assert!(!args_alias(
+            &mut agent,
+            "function d(x) { var t = 2; return x + t; }",
+            "d"
+        ));
+        assert!(!args_alias(
+            &mut agent,
+            "function e(x) { return this.u + x; }",
+            "e"
+        ));
+        assert!(!args_alias(
+            &mut agent,
+            "function g(x) { return arguments.length + x; }",
+            "g"
+        ));
+        // A closure inside the body writing the param counts as a write.
+        assert!(!args_alias(
+            &mut agent,
+            "function h(x) { var c = () => { x = 1; }; return x; }",
+            "h"
+        ));
+    }
+
+    #[test]
+    fn slice23_caller_slot_args_behave() {
+        // The fused call-store shape with a read-only-param register leaf
+        // reads the arg from the caller's frame slot.
+        assert_eq!(
+            run("function f(x) { return x + 1; } var n = 0; for (var i = 0; i < 1000; i++) { n = f(n); } n")
+                .unwrap(),
+            Value::Number(1000.0)
+        );
+        // A param-WRITING callee must not corrupt the caller's variable.
+        assert_eq!(
+            run("function w(x) { x = x + 1; return x; } var n = 0; for (var i = 0; i < 1000; i++) { n = w(n); } n")
+                .unwrap(),
+            Value::Number(1000.0)
+        );
+        // The arg slot is a different variable than the target.
+        assert_eq!(
+            run("function f(x) { return x + 1; } var m = 10; var n = 0; for (var i = 0; i < 1000; i++) { n = f(m); } n + m")
+                .unwrap(),
+            Value::Number(21.0)
+        );
+        // A slot-callee (certified-value var) closure with a read-only param.
+        assert_eq!(
+            run("var g = function (x) { return x + 2; }; var n = 0; for (var i = 0; i < 1000; i++) { n = g(n); } n")
+                .unwrap(),
+            Value::Number(2000.0)
+        );
+    }
+
+    #[test]
     fn slice22_acc_counter_gates_to_number_inits_and_stores() {
         fn head_var(agent: &mut Agent, src: &str, name: &str) -> crate::ir::FastLoopVar {
             agent.run_script(src).unwrap();
