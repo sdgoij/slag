@@ -1,0 +1,217 @@
+# GC milestone: implementation plan
+
+This is the engineering spec for replacing the `Rc`-based ownership model
+with a garbage-collected heap (PLAN.md §4.3 step 2, Phase 18 item 2, and the
+deferred milestone in `docs/perf.md`). The regression net is the same one
+every milestone uses: `cargo clippy --workspace --all-targets -- -D warnings`
+clean, `cargo test --workspace` green, and the full release test262 sweep at
+zero regressions on the previously-passing union, at every cut.
+
+Status: GC-0 (spike + baseline) done — `--gc-stress` no-op, leak harness,
+and the Weak-* fixture enumeration are landed with the measured baseline
+(see GC-0). The observable spec surface (`WeakRef`, `FinalizationRegistry`,
+`keptAlive`, `WeakMap`/`WeakSet` keying) is implemented and tested; only the
+collector is missing.
+
+## 1. What the milestone buys
+
+- **Correctness** — closes the documented `Rc` cycle leaks (long-running
+  processes leak; `WeakRef.deref()` never returns `undefined`;
+  FinalizationRegistry cleanup never fires; WeakMap/WeakSet entries are
+  never collected).
+- **Performance** — `Value` becomes `Copy` (a plain NaN-boxed `u64`), the
+  stated prerequisite for the three remaining allocation-bound benchmark
+  rows (construct churn ~12.9x, string concat ~8.6x, per-iteration closures
+  ~6.8x behind V8 `--jitless`; the `docs/perf.md` 2–4x target for those rows
+  is explicitly "after GC").
+- **Fidelity** — the Weak-* fixtures that currently pass *because nothing
+  dies* become real assertions.
+
+## 2. The current model (what is being replaced)
+
+- `Handle<T> = std::rc::Rc<T>` (`crates/crux/src/handle.rs`) — the documented
+  seam; the arena swap is supposed to happen behind this alias.
+- `Value(u64, PhantomData<Rc<()>>)` (`crates/crux/src/value.rs`) — NaN-boxed;
+  the box holds a raw `Rc` pointer; the `PhantomData` makes it `!Copy`,
+  `!Send`, `!Sync` (agent-local by construction).
+- `ValueKind` holds `Handle<BigInt>` / `Handle<JsString>` / `Handle<Symbol>` /
+  `Handle<JsObject>` / `Handle<Function>`; objects, realms, and environments
+  are all `Handle<T>` everywhere in `crux` + `runtime`.
+- `JsString` is `Flat(Arc<[u16]>)` or `Rope { left/right: Handle<JsString>, …
+  , flat: OnceLock<Arc<[u16]>> }` — rope children are handles; the flat cache
+  is an external `Arc`.
+- `SharedBuffer` is deliberately `Rc<RefCell<Vec<u8>>>` (single agent) or
+  `Arc<[AtomicU64]>` (`workers` feature) — shared-memory buffers stay
+  refcounted, never GC-managed.
+- Weak semantics are stubs: the agent's `weak_ref_targets` map is *strong*
+  (nothing dies), `finalization_registries` cells never enqueue, WeakMap/
+  WeakSet entries are strong.
+
+## 3. Roots the collector must trace
+
+Precise (JS-visible) roots, per PLAN §4.3 plus the code:
+
+- `Agent::execution_context_stack` (each `ExecutionContext`'s realm,
+  lexical/variable/private environments, function, source)
+- Realm, global environment, intrinsics table, global object
+- Job queues (`promise_jobs`, `generic_jobs`, `timeout_jobs` — the closures
+  capture `Value`s)
+- Module records and pending Promise reactions
+- Every live `Vm`: `stack: Vec<Value>`, `frame: Frame`, `leaf_frame_base`
+  leaf segments, the destructure stacks (the VM holds raw `Value`s)
+- The agent's IC value caches (`member_value_cells`,
+  `array_element_value_cells`, `array_length_value_cells`, …) — trace or
+  invalidate on collection; the index-only caches (`global_cells`,
+  `member_cells`, …) need no tracing
+- `weak_ref_targets` / `finalization_registries` (as weak tables after
+  GC-4), `error_stack`/`error_data`, annex-B hoistables
+- The `ffi`/`jsc` opaque-ref tables: a `JSValueRef` held by host C code must
+  pin its object (thread-local handle tables become roots)
+
+Rust-side locals and closure captures holding `Handle<T>` are handled by the
+rooting strategy below, not by precise tracing.
+
+## 4. Preflight decisions
+
+### D1 — Collector: custom arena + mark-sweep (recommended)
+
+PLAN §4.3 step 3 says to evaluate existing crates (`gc`, `broom`) before
+committing. Recommendation: a **custom arena (`Vec<Slot>` + free list) and a
+mark-sweep collector**, modeled on the `gc` crate's design (thread-local
+heap, conservative stack scan), because the codebase needs ephemeron-aware
+WeakMap/WeakSet, a `--gc-stress` mode, and precise tracing of the VM value
+stacks — none of which a general crate provides off the shelf, and the
+project's self-contained ethos rules out a large dependency. Final decision
+is made at the end of GC-0.
+
+### D2 — Rooting: conservative native-stack scan (recommended)
+
+A precise collector cannot see the thousands of Rust locals and closure
+captures that hold handles. Explicit Ruffle-style `root()`/`unroot()` would
+be an invasive API change across the whole runtime. Recommendation: trace
+the JS-visible roots precisely, and **conservatively scan the native stack
+for arena indices** (`gc`-crate approach). Imprecise is safe: it may retain
+garbage, never use-after-free. The `Value` tagging must make object indices
+recognizable to the scanner (decided in GC-1).
+
+## 5. Cuts (each ends clippy-clean + workspace-green + zero sweep regressions)
+
+### GC-0 — spike and baseline (no engine change) — DONE
+
+- `--gc-stress` plumbed as a documented no-op (`crates/cli`, accepted
+  alongside `--stack-size` / `--max-old-space` / `--harmony-*`), with a
+  parse test.
+- Leak-detection harness landed: `cargo run --release -p cli --bin leak
+  <cycle|chain>` runs a workload in-process and samples the working set
+  (`crates/cli/src/bin/leak.rs`; `tasklist` on Windows, `/proc/self/status`
+  elsewhere). **Baseline (Rc model, 200k iterations):**
+
+  | workload | start | end | growth |
+  |---|---|---|---|
+  | `cycle` (`o.self = o`) | 8,676 KB | 146,812 KB | **+138,136 KB** (linear, ~0.69 KB/iter — one leaked object graph per iteration) |
+  | `chain` (8-node acyclic list) | 8,400 KB | 8,612 KB | +212 KB (flat — Rc frees acyclic memory) |
+
+- **Weak-* fixture enumeration:** the pinned corpus has **no
+  collection-forcing fixtures** — all 302 (29 `WeakRef` + 47
+  `FinalizationRegistry` + 141 `WeakMap` + 85 `WeakSet`) are API-surface
+  tests and pass today; zero use a `$262.gc()`-style hook and none assert
+  `deref() === undefined` or cleanup firing. GC-3/GC-4 validation is
+  therefore: existing tests stay green, new runtime unit tests exercise
+  collection through a force-gc test hook, and the `--gc-stress` sweep gate
+  passes — there is no corpus fixture set to un-skip.
+- **Decisions recorded:** D1 — custom arena + mark-sweep, modeled on the
+  `gc` crate (thread-local heap, conservative stack scan); D2 — precise
+  tracing of the JS-visible roots plus a conservative native-stack scan
+  for Rust-held handles.
+- Gate: harness runs, baseline recorded — met (above).
+
+### GC-1 — arena heap, `Handle` as index, `Value` becomes `Copy`, first collector (the big cut)
+
+**Slice 1 — the crux heap module (landed).** `crates/crux/src/heap.rs`:
+`Trace` trait, `Gc<T>` (`Copy`, `!Send`/`!Sync`, derefs straight to its box),
+`GcCell<T>` interior mutability, and a thread-local mark-sweep `Heap`
+(cells are `GcBox<T>` with a mark bit, registered in the live set; collect
+marks from the passed roots and sweeps the rest). Cycle collection, root
+retention, idempotence, and acyclic reclamation are unit-tested. Precise
+roots only for now — the runtime roots and the conservative native-stack
+scan land in the following slices.
+
+**Remaining slices.** Thread-local arena; `Handle<T>` becomes a `Copy` index with `Deref` through
+  a thread-local accessor so the existing `handle.field` call sites survive;
+  `RefCell` fields move to a GC-cell equivalent.
+- `Value` drops `PhantomData<Rc<()>>` → `Copy` (a plain `u64`), kept
+  agent-local with a `!Send` marker. This is the perf unlock.
+- Mark-sweep from the precise roots + conservative stack scan; sweep pushes
+  dead cells to the free list.
+- Ropes: children become GC handles; the `OnceLock<Arc<[u16]>>` flat cache
+  stays an external `Arc`. `SharedBuffer` stays `Rc`/`Arc`.
+- Closes the cycle leaks — the headline correctness win.
+- Gate: full release sweep 0 regressions; cyclic workload memory bounded.
+
+### GC-2 — root audit and `--gc-stress` hardening
+
+- Audit every agent/runtime structure holding `Value`s (the §3 list), tracing
+  or invalidating each. `--gc-stress` (collect on every allocation) turns any
+  missed root into a caught failure.
+- Gate: `--gc-stress` clean across the sweep; leak harness bounded.
+
+### GC-3 — ephemeron-aware WeakMap / WeakSet
+
+- Replace the strong entry storage with key→value ephemeron semantics
+  (mark-sweep fixpoint). Un-skip the collection fixtures.
+- Gate: fixtures pass; `--gc-stress` clean.
+
+### GC-4 — WeakRef and FinalizationRegistry activation
+
+- `weak_ref_targets` becomes a true weak table (`deref()` returns
+  `undefined` post-collection; `KeepDuringJob` semantics); registry cells
+  enqueue cleanup jobs via `HostEnqueueFinalizationRegistryCleanupJob` with
+  correct `heldValue` / unregister-token lifetimes.
+- Un-skip those fixtures.
+- Gate: fixtures pass; `--gc-stress` clean.
+
+### GC-5 — the perf payoff
+
+- Re-measure the three allocation-bound rows (construct churn, string
+  concat, per-iteration closures). `Copy` values + arena handles remove Rc
+  clone/alloc traffic from closure captures and constructs.
+- Gate: those rows into the `docs/perf.md` 2–4x band.
+
+### GC-6 — threads, workers, and the C-API surface
+
+- Confirm `Value` stays `!Send` (agent-local), the `workers` feature
+  (SharedArrayBuffer `Arc<[AtomicU64]>`) still compiles, and the `jsc`/`ffi`
+  handle tables root host-held refs correctly.
+- Gate: workers tests green.
+
+## 6. Risk register
+
+1. **GC-1 is a genuinely big cut.** PLAN's "the `Handle<T>` API is kept so
+   the swap is mostly internal" is optimistic: `Value`'s `!Copy`-ness is
+   load-bearing across the VM, and moving from `Rc` ownership to arena
+   indices changes what "holding a handle" means in job closures and IC
+   caches. This is why GC-2 (`--gc-stress`) must land immediately after
+   GC-1 — it is the net that catches missed roots.
+2. **Job-queue closures capture `Value`s.** The `FnOnce(&mut Agent)` closures
+   are opaque to a precise collector; they must either stay rooted (kept
+   alive for the job's short lifetime) or be converted to carry traceable
+   records. Decide in GC-1, verify in GC-2.
+3. **Conservative scan imprecision.** May retain garbage (fine); must never
+   misidentify a non-index as an index (the `Value` tag bits decide this).
+4. **Interior mutability.** `Rc<RefCell<…>>` patterns on hot objects need a
+   GC-cell equivalent without re-borrow panics on the sweep path.
+5. **Perf regression risk.** Arena derefs go through a thread-local indirection;
+   the `Copy`-value win must outweigh it. GC-5 measures; if a hot path
+   regresses, the frame-slot/leaf-inline contracts (see the
+   `slag-bytecode-vm` skill) are the places to recover it.
+
+## 7. Validation per cut
+
+- `cargo clippy --workspace --all-targets -- -D warnings` clean;
+  `cargo test --workspace` green.
+- Full release sweep at zero regressions on the previously-passing union.
+- From GC-2 on: `--gc-stress` clean across the sweep, and the leak harness
+  shows bounded live-object counts on cyclic workloads (`cycle` flattens).
+- GC-3/GC-4 keep the existing 302 Weak-* fixtures green (none force
+  collection in the pinned corpus; see GC-0) and add runtime unit tests
+  that exercise collection through a force-gc test hook.

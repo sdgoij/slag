@@ -137,6 +137,7 @@ reclassifies them as passes. The full methodology and triage live in
 - `PLAN.md` — the implementation plan, per-phase spec coverage, and status
 - `docs/conformance.md` — conformance methodology, results, and triage
 - `docs/readiness.md` — honest readiness and market-entry assessment
+- `docs/gc-plan.md` — the GC milestone plan (arena heap + mark-sweep, cut-by-cut)
 - `docs/intl-plan.md` — the ECMA-402 (Intl) implementation plan and cut status
 - `docs/memory-model.md` — ECMAScript ch. 28 shared-memory model
 - `docs/perf.md` — performance milestones and deferred work

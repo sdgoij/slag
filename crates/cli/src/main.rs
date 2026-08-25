@@ -20,14 +20,15 @@ use runtime::embed::Context;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// CLI knobs. The performance flags are accepted for CLI compatibility; the
-/// tree-walker interpreter has no bytecode or GC knobs yet (see
-/// `docs/perf.md`), so they are no-ops.
+/// GC knobs (`--gc-stress`, `--max-old-space`) are no-ops until the GC
+/// milestone lands (see `docs/gc-plan.md`).
 #[derive(Debug, Default, Clone, PartialEq)]
 struct Options {
     dump_ast: bool,
     dump_tokens: bool,
     bench: bool,
     print_bytecode: bool,
+    gc_stress: bool,
     stack_size: Option<u64>,
     max_old_space: Option<u64>,
 }
@@ -65,6 +66,7 @@ fn parse(args: &[String]) -> Command {
                 index += 1;
                 options.max_old_space = args.get(index).and_then(|value| value.parse().ok());
             }
+            "--gc-stress" => options.gc_stress = true,
             flag if flag.starts_with("--harmony") => {}
             flag if flag.starts_with('-') && flag != "-" => {
                 eprintln!("slag: unknown flag {flag}");
@@ -109,6 +111,7 @@ fn run(command: Command) -> Result<(), u8> {
             eprintln!("  --print-bytecode");
             eprintln!("  --stack-size N            (no-op)");
             eprintln!("  --max-old-space N         (no-op)");
+            eprintln!("  --gc-stress               (no-op)");
             eprintln!("  --harmony-*               (no-op)");
             Err(2)
         }
@@ -476,6 +479,19 @@ mod tests {
         assert_eq!(
             parse(&["--harmony-something".into()]),
             Command::Repl(Options::default())
+        );
+    }
+
+    #[test]
+    fn gc_stress_flag_is_an_accepted_noop() {
+        // The flag parses and sets the knob; the collector (and the stress
+        // mode) lands with the GC milestone (docs/gc-plan.md GC-1/GC-2).
+        assert_eq!(
+            parse(&["--gc-stress".into()]),
+            Command::Repl(Options {
+                gc_stress: true,
+                ..Options::default()
+            })
         );
     }
 
