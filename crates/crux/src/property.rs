@@ -14,6 +14,14 @@ pub enum PropertyKey {
     Symbol(Symbol),
 }
 
+impl crate::heap::Trace for PropertyKey {
+    fn trace(&self, visit: &mut dyn FnMut(crate::heap::GcAny)) {
+        if let PropertyKey::Symbol(symbol) = self {
+            symbol.trace(visit);
+        }
+    }
+}
+
 impl PropertyKey {
     pub fn from_utf8(text: &str) -> Self {
         Self::String(intern_utf8(text))

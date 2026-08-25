@@ -10,6 +10,7 @@ use std::rc::Rc;
 use crux::error::{ErrorKind, JsError};
 use crux::function::Function;
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::string::JsString;
 use crux::value::{Value, ValueKind, is_callable, is_constructor};
 
@@ -36,6 +37,21 @@ impl std::fmt::Debug for PromiseState {
     }
 }
 
+impl Trace for PromiseState {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        match self {
+            PromiseState::Pending {
+                fulfill_reactions,
+                reject_reactions,
+            } => {
+                fulfill_reactions.trace(visit);
+                reject_reactions.trace(visit);
+            }
+            PromiseState::Fulfilled(value) | PromiseState::Rejected(value) => value.trace(visit),
+        }
+    }
+}
+
 /// The agent-side Promise Record: the [[PromiseState]] plus the reaction
 /// lists.
 #[derive(Debug)]
@@ -44,6 +60,12 @@ pub struct PromiseData {
     /// [[IsHandled]]: whether any reaction was attached (unhandled-rejection
     /// tracking).
     pub is_handled: bool,
+}
+
+impl Trace for PromiseData {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.state.trace(visit);
+    }
 }
 
 /// A resolving function record (spec 27.2.1.3.1): which promise it resolves
@@ -55,6 +77,12 @@ pub struct ResolverData {
     /// functions of one capability (spec 27.2.1.3.1).
     pub already_resolved: std::rc::Rc<std::cell::Cell<bool>>,
     pub is_reject: bool,
+}
+
+impl Trace for ResolverData {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.promise.trace(visit);
+    }
 }
 
 /// A PromiseReaction Record (spec 27.2.1.5).
@@ -79,6 +107,18 @@ impl std::fmt::Debug for PromiseReaction {
     }
 }
 
+impl Trace for PromiseReaction {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.capability.trace(visit);
+        // JobCallback (job.rs) has no Trace impl of its own; trace its Value
+        // fields directly.
+        if let Some(handler) = &self.handler {
+            handler.callback.trace(visit);
+            handler.host_defined.trace(visit);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReactionKind {
     Fulfill,
@@ -94,8 +134,8 @@ pub struct PromiseCapability {
     pub reject: Value,
 }
 
-impl crux::heap::Trace for PromiseCapability {
-    fn trace(&self, visit: &mut dyn FnMut(crux::heap::GcAny)) {
+impl Trace for PromiseCapability {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         self.promise.trace(visit);
         self.resolve.trace(visit);
         self.reject.trace(visit);
@@ -204,7 +244,7 @@ pub fn create_resolving_functions(agent: &mut Agent, promise: &Value) -> (Value,
                 ))
             }),
             None,
-            function_proto
+            function_proto,
         )
         .expect("builtin creation cannot fail");
         agent.promise_resolvers.insert(

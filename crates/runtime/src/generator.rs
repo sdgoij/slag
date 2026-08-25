@@ -7,6 +7,7 @@ use std::rc::Rc;
 use crux::error::{ErrorKind, JsError};
 use crux::function::Function;
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::object::JsObject;
 use crux::property::PropertyDescriptor;
 use crux::string::JsString;
@@ -49,6 +50,16 @@ pub struct GeneratorState {
     /// step 1), and the VM runs against this environment on the first
     /// `next()`.
     pub body_env: Option<EnvRef>,
+}
+
+impl Trace for GeneratorState {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.vm.trace(visit);
+        self.context.trace(visit);
+        self.function.trace(visit);
+        self.realm.trace(visit);
+        self.body_env.trace(visit);
+    }
 }
 
 pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {

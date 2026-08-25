@@ -9,6 +9,7 @@ use std::rc::Rc;
 use crux::error::{ErrorKind, JsError};
 use crux::function::Function;
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
@@ -94,6 +95,39 @@ impl CompoundState {
     }
 }
 
+impl Trace for CompoundState {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        match self {
+            CompoundState::All {
+                values,
+                resolve,
+                reject,
+                ..
+            } => {
+                values.trace(visit);
+                resolve.trace(visit);
+                reject.trace(visit);
+            }
+            CompoundState::AllSettled {
+                results, resolve, ..
+            } => {
+                results.trace(visit);
+                resolve.trace(visit);
+            }
+            CompoundState::Any {
+                errors,
+                resolve,
+                reject,
+                ..
+            } => {
+                errors.trace(visit);
+                resolve.trace(visit);
+                reject.trace(visit);
+            }
+        }
+    }
+}
+
 /// The closures `Promise.prototype.finally` creates (spec 27.2.5.3).
 #[derive(Debug)]
 pub enum FinallyState {
@@ -109,6 +143,26 @@ pub enum FinallyState {
     ValueThunk { value: Value },
     /// `() => { throw reason }` (the thrower).
     Thrower { reason: Value },
+}
+
+impl Trace for FinallyState {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        match self {
+            FinallyState::ThenFinally {
+                on_finally,
+                constructor,
+            }
+            | FinallyState::CatchFinally {
+                on_finally,
+                constructor,
+            } => {
+                on_finally.trace(visit);
+                constructor.trace(visit);
+            }
+            FinallyState::ValueThunk { value } => value.trace(visit),
+            FinallyState::Thrower { reason } => reason.trace(visit),
+        }
+    }
 }
 
 pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
@@ -264,10 +318,9 @@ fn install_statics(realm: &Handle<Realm>, ctor: &Handle<Function>) -> Result<(),
             None,
             None,
         )?;
-        realm.intrinsics.define(
-            &format!("%Promise.{name}%"),
-            Value::Function(method),
-        );
+        realm
+            .intrinsics
+            .define(&format!("%Promise.{name}%"), Value::Function(method));
         ctor.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -764,7 +817,7 @@ fn promise_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
             1,
             Box::new(placeholder("all handler")),
             None,
-            fn_proto
+            fn_proto,
         )?;
         agent.promise_compound.insert(
             closure.id(),
@@ -897,7 +950,7 @@ fn promise_all_settled(agent: &mut Agent, this: &Value, args: &[Value]) -> Resul
                 1,
                 Box::new(placeholder("allSettled handler")),
                 None,
-                fn_proto
+                fn_proto,
             )?;
             agent.promise_compound.insert(
                 closure.id(),
@@ -1047,7 +1100,7 @@ fn promise_any(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
             1,
             Box::new(placeholder("any handler")),
             None,
-            fn_proto
+            fn_proto,
         )?;
         agent.promise_compound.insert(
             closure.id(),

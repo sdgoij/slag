@@ -312,6 +312,15 @@ pub enum ScriptOrModule {
     Module(Handle<crate::module::SourceTextModule>),
 }
 
+impl Trace for ScriptOrModule {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        match self {
+            ScriptOrModule::Script(script) => script.trace(visit),
+            ScriptOrModule::Module(module) => module.trace(visit),
+        }
+    }
+}
+
 /// An execution context (spec 9.4 tables): the Function, Realm,
 /// ScriptOrModule, LexicalEnvironment, VariableEnvironment, and
 /// PrivateEnvironment components.
@@ -330,6 +339,18 @@ pub struct ExecutionContext {
     /// is applicable in this execution, keyed by function span, consulted by
     /// B.3.2.1 at block entry.
     pub annex_b_hoistable: std::cell::RefCell<std::collections::HashSet<(u32, u32)>>,
+}
+
+impl Trace for ExecutionContext {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.function.trace(visit);
+        self.realm.trace(visit);
+        self.script_or_module.trace(visit);
+        self.lexical_environment.trace(visit);
+        self.variable_environment.trace(visit);
+        self.private_environment.trace(visit);
+        self.source.trace(visit);
+    }
 }
 
 /// A PrivateEnvironment Record (spec 9.2.1): the Private Names declared by
@@ -433,6 +454,26 @@ pub struct Reference {
     /// The Private Name's id for `this.#x` references; `name` is unused
     /// when set (private access is not a property reference).
     pub private_name: Option<u64>,
+}
+
+impl Trace for ReferenceBase {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        match self {
+            ReferenceBase::Environment(env) => env.trace(visit),
+            ReferenceBase::Value(value) => value.trace(visit),
+            ReferenceBase::Unresolvable => {}
+        }
+    }
+}
+
+impl Trace for Reference {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.base.trace(visit);
+        self.name.trace(visit);
+        if let Some(value) = &self.this_value {
+            value.trace(visit);
+        }
+    }
 }
 
 /// The property key of a reference.

@@ -5,6 +5,7 @@
 //! by `try`/`catch` as the thrown value.
 
 use crux::error::JsError;
+use crux::heap::{GcAny, Trace};
 use crux::string::AtomId;
 use crux::value::Value;
 
@@ -29,6 +30,22 @@ pub enum Completion {
     },
     Return(Value),
     Throw(Value),
+}
+
+impl Trace for Completion {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        match self {
+            Completion::Normal(value) | Completion::Return(value) | Completion::Throw(value) => {
+                value.trace(visit)
+            }
+            Completion::Break { value, .. } | Completion::Continue { value, .. } => {
+                if let Some(value) = value {
+                    value.trace(visit);
+                }
+            }
+            Completion::Empty => {}
+        }
+    }
 }
 
 impl Completion {

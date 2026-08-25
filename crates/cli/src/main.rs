@@ -20,8 +20,8 @@ use runtime::embed::Context;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// CLI knobs. The performance flags are accepted for CLI compatibility; the
-/// GC knobs (`--gc-stress`, `--max-old-space`) are no-ops until the GC
-/// milestone lands (see `docs/gc-plan.md`).
+/// GC knobs (`--gc-stress` is live since GC-1 slice 3; `--max-old-space` is
+/// still a no-op) are documented in `docs/gc-plan.md`.
 #[derive(Debug, Default, Clone, PartialEq)]
 struct Options {
     dump_ast: bool,
@@ -111,7 +111,7 @@ fn run(command: Command) -> Result<(), u8> {
             eprintln!("  --print-bytecode");
             eprintln!("  --stack-size N            (no-op)");
             eprintln!("  --max-old-space N         (no-op)");
-            eprintln!("  --gc-stress               (no-op)");
+            eprintln!("  --gc-stress               collect at every safe point");
             eprintln!("  --harmony-*               (no-op)");
             Err(2)
         }
@@ -123,9 +123,10 @@ fn run(command: Command) -> Result<(), u8> {
         Command::Repl(options) => {
             if options.bench {
                 let mut context = Context::new().map_err(report)?;
+                context.set_gc_stress(options.gc_stress);
                 return run_benchmarks(&mut context);
             }
-            repl()
+            repl(&options)
         }
     }
 }
@@ -156,6 +157,7 @@ fn run_file_inner(file: &str, args: &[String], options: &Options, source: &str) 
         dump_bytecode(source)?;
     }
     let mut context = Context::new().map_err(report)?;
+    context.set_gc_stress(options.gc_stress);
     context.install_fs().map_err(report)?;
     if !args.is_empty() {
         let mut argv = vec![
@@ -240,8 +242,9 @@ fn dump_bytecode(source: &str) -> Result<(), u8> {
 
 /// The REPL: read lines, continue while the input is syntactically
 /// incomplete, evaluate complete inputs, and print the completion value.
-fn repl() -> Result<(), u8> {
+fn repl(options: &Options) -> Result<(), u8> {
     let mut context = Context::new().map_err(report)?;
+    context.set_gc_stress(options.gc_stress);
     println!("slag {VERSION} REPL (type .exit or Ctrl-D to quit)");
     let stdin = io::stdin();
     let mut buffer = String::new();
@@ -484,8 +487,8 @@ mod tests {
 
     #[test]
     fn gc_stress_flag_is_an_accepted_noop() {
-        // The flag parses and sets the knob; the collector (and the stress
-        // mode) lands with the GC milestone (docs/gc-plan.md GC-1/GC-2).
+        // The flag parses and sets the knob; GC-1 slice 3 made the stress
+        // mode live (collect at every safe point).
         assert_eq!(
             parse(&["--gc-stress".into()]),
             Command::Repl(Options {

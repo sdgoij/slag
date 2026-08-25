@@ -13,6 +13,7 @@
 use crux::error::{ErrorKind, JsError};
 use crux::function::{Function, NativeFn};
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
@@ -63,6 +64,12 @@ pub struct CollatorRecord {
     pub variant: CollationVariant,
     /// The cached [[BoundCompare]] function value.
     pub bound_compare: Option<Value>,
+}
+
+impl Trace for CollatorRecord {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.bound_compare.trace(visit);
+    }
 }
 
 /// The collation variant for a locale/usage/collation triple.

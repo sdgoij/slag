@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 
 use crux::error::{ErrorKind, JsError};
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::property::PropertyKey;
 use crux::string::JsString;
 use crux::value::{Value, ValueKind, is_callable};
@@ -913,6 +914,34 @@ pub enum Step {
     ImportMeta,
 }
 
+impl Trace for Step {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        match self {
+            Step::Push(value) => value.trace(visit),
+            Step::RegExpLiteral { pattern, flags } => {
+                pattern.trace(visit);
+                flags.trace(visit);
+            }
+            Step::PushStr(text) => text.trace(visit),
+            Step::ConcatStrConst(text) => text.trace(visit),
+            Step::PerIteration { names }
+            | Step::EnterIterTdzEnv { names }
+            | Step::EnterPerIteration { names } => names.trace(visit),
+            Step::DestructureObjKey {
+                key: crux::property::PropertyKey::Symbol(symbol),
+            } => symbol.trace(visit),
+            Step::DestructureObjRest { excluded } => {
+                for key in excluded {
+                    if let crux::property::PropertyKey::Symbol(symbol) = key {
+                        symbol.trace(visit);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// A register instruction for a *leaf* body (Cut 35 slice 1). The step path
 /// round-trips the value stack for every expression; these ops target a
 /// single accumulator (`Vm.acc`) plus the leaf's frame segment, capture
@@ -1265,12 +1294,24 @@ pub struct CompiledBody {
     pub script_globals: Option<HashSet<String>>,
 }
 
+impl Trace for CompiledBody {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.steps.trace(visit);
+    }
+}
+
 /// A runtime `try` frame.
 #[derive(Debug)]
 pub struct TryFrame {
     pub handler: usize,
     pub saved_env: EnvRef,
     pub env_depth: usize,
+}
+
+impl Trace for TryFrame {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.saved_env.trace(visit);
+    }
 }
 
 /// A pending control transfer a `finally` finishes after it runs.
@@ -1301,6 +1342,21 @@ pub enum PendingControl {
         env: EnvRef,
         depth: usize,
     },
+}
+
+impl Trace for PendingControl {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        match self {
+            PendingControl::Return { value, env, .. }
+            | PendingControl::Throw { value, env, .. } => {
+                value.trace(visit);
+                env.trace(visit);
+            }
+            PendingControl::Normal { env, .. }
+            | PendingControl::Break { env, .. }
+            | PendingControl::Continue { env, .. } => env.trace(visit),
+        }
+    }
 }
 
 /// The `(env, depth)` a pending control restores to when its finally
@@ -1343,6 +1399,14 @@ pub enum Resume {
 pub enum ResumeAbrupt {
     Throw(Value),
     Return(Value),
+}
+
+impl Trace for ResumeAbrupt {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        match self {
+            ResumeAbrupt::Throw(value) | ResumeAbrupt::Return(value) => value.trace(visit),
+        }
+    }
 }
 
 /// The result of a VM run.
@@ -1425,6 +1489,13 @@ pub(crate) struct ArrayElementValueCell {
     pub generation: u32,
     pub value: Value,
 }
+
+impl Trace for ArrayElementValueCell {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.value.trace(visit);
+    }
+}
+
 /// The array-length cache entry (Cut 35 slice 13): the cached length of a
 /// plain Array at its generation — the for-of fast path re-reads the length
 /// every step, and a generation match skips the property-vector borrow and
@@ -1449,6 +1520,13 @@ pub(crate) struct MemberValueCell {
     pub generation: u32,
     pub value: Value,
 }
+
+impl Trace for MemberValueCell {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.value.trace(visit);
+    }
+}
+
 /// The direct-mapped global-var cell count: a power of two so the cache
 /// index is a mask. Bigger than the member cells because a script's
 /// top-level names (`n`, `i`, `s`, ...) all probe this table; a collision
@@ -1480,6 +1558,14 @@ pub(crate) struct LeafEntry {
     pub construct_inline: bool,
 }
 
+impl Trace for LeafEntry {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        // `ir` is native `Rc` data — `Step`'s constants (flat strings,
+        // bigints, primitives) hold no GC edges — so only the env is traced.
+        self.environment.trace(visit);
+    }
+}
+
 /// The global call-site leaf cache entry (Cut 35 slice 12): a resolved
 /// [`LeafEntry`] for a stable global callee, valid while the global object
 /// keeps its identity and generation (every global-object mutation bumps,
@@ -1491,6 +1577,12 @@ pub(crate) struct GlobalLeafCell {
     pub global_id: u64,
     pub global_generation: u32,
     pub entry: LeafEntry,
+}
+
+impl Trace for GlobalLeafCell {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.entry.trace(visit);
+    }
 }
 
 /// The slot-callee leaf cache entry (Cut 35 slice 12): a resolved
@@ -1510,6 +1602,13 @@ pub(crate) struct SlotLeafCell {
     #[allow(dead_code)]
     pub callee: Value,
     pub entry: LeafEntry,
+}
+
+impl Trace for SlotLeafCell {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.callee.trace(visit);
+        self.entry.trace(visit);
+    }
 }
 
 /// The direct-mapped slot-callee leaf cache size (Cut 35 slice 12): a
@@ -1533,6 +1632,19 @@ pub(crate) enum LeafCacheSite {
 pub(crate) enum Frame {
     Inline([Value; INLINE_FRAME]),
     Heap(Vec<Value>),
+}
+
+impl Trace for Frame {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        match self {
+            Frame::Inline(buf) => {
+                for value in buf {
+                    value.trace(visit);
+                }
+            }
+            Frame::Heap(vec) => vec.trace(visit),
+        }
+    }
 }
 
 impl Frame {
@@ -1620,6 +1732,15 @@ pub(crate) struct EnvStack {
     inline: [Option<EnvRef>; ENV_INLINE],
     heap: Vec<EnvRef>,
     len: usize,
+}
+
+impl Trace for EnvStack {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        for env in &self.inline {
+            env.trace(visit);
+        }
+        self.heap.trace(visit);
+    }
 }
 
 /// The inline capacity of [`EnvStack`] (the Vm is re-created per call, so
@@ -1881,6 +2002,95 @@ pub struct Vm {
     /// has an `arguments` slot, read by `Step::CreateArguments`. Distinct
     /// from `args` — the in-flight argument-construction stack.
     pub(crate) call_args: Vec<Value>,
+}
+
+impl Trace for Vm {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.stack.trace(visit);
+        self.frame.trace(visit);
+        self.args.trace(visit);
+        self.lexical_env.trace(visit);
+        self.env_stack.trace(visit);
+        self.body_context.trace(visit);
+        self.global.trace(visit);
+        self.completion.trace(visit);
+        self.try_stack.trace(visit);
+        self.pending.trace(visit);
+        self.thrown.trace(visit);
+        self.resume_abrupt.trace(visit);
+        // The suspended-loop/iteration stacks hold live values and iterator
+        // records across a suspension (a pooled Vm is reset before reuse, so
+        // tracing an idle Vm's empty stacks is a no-op).
+        for (object, keys, _) in &self.for_in_stack {
+            object.trace(visit);
+            for (_, key) in keys {
+                key.trace(visit);
+            }
+        }
+        self.for_of_stack.trace(visit);
+        self.async_for_of_stack.trace(visit);
+        self.destructure_stack.trace(visit);
+        self.destructure_obj_stack.trace(visit);
+        self.destructure_assign_keys.trace(visit);
+        self.yield_star_stack.trace(visit);
+        self.class_stack.trace(visit);
+        self.switch_disc.trace(visit);
+        self.pending_disposal.trace(visit);
+        if let Some((env, _)) = &self.pending_catch_disposal {
+            env.trace(visit);
+        }
+        self.acc.trace(visit);
+        for (value, _) in &self.completion_stack {
+            value.trace(visit);
+        }
+        for (value, _) in &self.list_stack {
+            value.trace(visit);
+        }
+        self.var_ref_stack.trace(visit);
+        self.call_args.trace(visit);
+    }
+}
+
+impl Trace for ForOfEntry {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        match self {
+            ForOfEntry::Generic(iterator) => iterator.trace(visit),
+            ForOfEntry::Fast { array, .. } => array.trace(visit),
+        }
+    }
+}
+
+impl Trace for YieldStarState {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.iterator.trace(visit);
+        self.received.trace(visit);
+    }
+}
+
+impl Trace for ClassEvalState {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.class_env.trace(visit);
+        self.class_private_env.trace(visit);
+        self.outer_private_env.trace(visit);
+        self.outer_env.trace(visit);
+        self.heritage.trace(visit);
+    }
+}
+
+impl Trace for DisposalResume {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        if let DisposalResume::DeliverCatch { saved_env, .. } = self {
+            saved_env.trace(visit);
+        }
+    }
+}
+
+impl Trace for PendingDisposal {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.resources.trace(visit);
+        self.completion.trace(visit);
+        self.resume.trace(visit);
+    }
 }
 
 /// The per-class-definition state while the resumable VM evaluates a

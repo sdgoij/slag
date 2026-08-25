@@ -7,6 +7,7 @@
 use crux::error::{ErrorKind, JsError};
 use crux::function::Function;
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::object::JsObject;
 use crux::property::PropertyDescriptor;
 use crux::string::JsString;
@@ -103,6 +104,15 @@ pub struct ClassField {
     pub environment: EnvRef,
 }
 
+impl Trace for ClassField {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        if let crux::property::PropertyKey::Symbol(symbol) = &self.name {
+            symbol.trace(visit);
+        }
+        self.environment.trace(visit);
+    }
+}
+
 /// The spec 10.2.1 internal slots of an ordinary ECMAScript function,
 /// registered per function object.
 #[derive(Debug, Clone)]
@@ -183,6 +193,24 @@ pub struct EcmaFunction {
     /// heads compile to static `LoadPerIteration` reads (resolved against
     /// the closure's own `lexical_env` at run time) instead of env walks.
     pub per_iteration_chain: Vec<(Vec<crux::AtomId>, usize)>,
+}
+
+impl Trace for EcmaFunction {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.name.trace(visit);
+        self.environment.trace(visit);
+        self.home_object.trace(visit);
+        self.fields.trace(visit);
+        self.private_methods.trace(visit);
+        self.private_environment.trace(visit);
+        self.super_constructor.trace(visit);
+        self.realm.trace(visit);
+        self.source.trace(visit);
+        self.declaring_module.trace(visit);
+        // The compiled body embeds literal `Value`s (strings, bigints) in
+        // its steps; they are heap edges.
+        self.ir.trace(visit);
+    }
 }
 
 /// Record the compiled step IR and the immutable leaf/construct inline

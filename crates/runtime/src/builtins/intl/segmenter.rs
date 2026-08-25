@@ -10,6 +10,7 @@ use crux::convert::{to_integer_or_infinity, to_number};
 use crux::error::{ErrorKind, JsError};
 use crux::function::{Function, NativeFn};
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
@@ -56,6 +57,18 @@ pub struct SegmentIteratorRecord {
     pub segmenter_id: u64,
     pub string: JsString,
     pub next_index: u64,
+}
+
+impl Trace for SegmentsRecord {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.string.trace(visit);
+    }
+}
+
+impl Trace for SegmentIteratorRecord {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.string.trace(visit);
+    }
 }
 
 /// Intl.Segmenter (ECMA-402 §19.1.1): locale resolution, then the
@@ -118,7 +131,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         0,
         placeholder("Intl.Segmenter"),
         Some(placeholder("Intl.Segmenter")),
-        function_proto
+        function_proto,
     )?;
     proto.define_property(
         &JsString::from_utf8("constructor"),
@@ -136,7 +149,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         1,
         placeholder("segment"),
         None,
-        function_proto
+        function_proto,
     )?;
     realm
         .intrinsics
@@ -157,12 +170,11 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         0,
         placeholder("resolvedOptions"),
         None,
-        function_proto
+        function_proto,
     )?;
-    realm.intrinsics.define(
-        SEGMENTER_RESOLVED_OPTIONS,
-        Value::Function(resolved),
-    );
+    realm
+        .intrinsics
+        .define(SEGMENTER_RESOLVED_OPTIONS, Value::Function(resolved));
     proto.define_property(
         &JsString::from_utf8("resolvedOptions"),
         &PropertyDescriptor {
@@ -205,12 +217,11 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         1,
         placeholder("supportedLocalesOf"),
         None,
-        function_proto
+        function_proto,
     )?;
-    realm.intrinsics.define(
-        SEGMENTER_SUPPORTED_LOCALES_OF,
-        Value::Function(supported),
-    );
+    realm
+        .intrinsics
+        .define(SEGMENTER_SUPPORTED_LOCALES_OF, Value::Function(supported));
     ctor.define_property(
         &JsString::from_utf8("supportedLocalesOf"),
         &PropertyDescriptor {
@@ -223,9 +234,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         },
     )?;
     realm.intrinsics.define(SEGMENTER_PROTO, proto_value);
-    realm
-        .intrinsics
-        .define(SEGMENTER, Value::Function(ctor));
+    realm.intrinsics.define(SEGMENTER, Value::Function(ctor));
     if let Some(obj) = as_object(intl_value) {
         obj.define_property(
             &JsString::from_utf8("Segmenter"),
@@ -248,7 +257,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         1,
         placeholder("containing"),
         None,
-        function_proto
+        function_proto,
     )?;
     realm
         .intrinsics
@@ -269,7 +278,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         0,
         placeholder("[Symbol.iterator]"),
         None,
-        function_proto
+        function_proto,
     )?;
     realm
         .intrinsics
@@ -301,7 +310,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         0,
         placeholder("next"),
         None,
-        function_proto
+        function_proto,
     )?;
     realm
         .intrinsics

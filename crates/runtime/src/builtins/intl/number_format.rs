@@ -11,6 +11,7 @@ use crux::BigInt;
 use crux::error::{ErrorKind, JsError};
 use crux::function::{Function, NativeFn};
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
@@ -111,6 +112,12 @@ pub struct NumberFormatRecord {
     pub trailing_zero_display: u8,
     /// The cached [[BoundFormat]] function value.
     pub bound_format: Option<Value>,
+}
+
+impl Trace for NumberFormatRecord {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.bound_format.trace(visit);
+    }
 }
 
 /// An Intl mathematical value (ECMA-402 §16.5.16): a mathematical value

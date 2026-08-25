@@ -13,6 +13,7 @@ use crux::convert::to_boolean;
 use crux::error::{ErrorKind, JsError};
 use crux::function::Function;
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
@@ -48,6 +49,13 @@ pub struct AsyncIteratorRecord {
     pub next: Value,
 }
 
+impl Trace for AsyncIteratorRecord {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.iterator.trace(visit);
+        self.next.trace(visit);
+    }
+}
+
 /// The mode of an async-iterator helper.
 #[derive(Debug)]
 pub enum HelperMode {
@@ -69,6 +77,20 @@ pub enum HelperMode {
     },
 }
 
+impl Trace for HelperMode {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        match self {
+            HelperMode::Map { mapper } => mapper.trace(visit),
+            HelperMode::Filter { filterer } => filterer.trace(visit),
+            HelperMode::Take { .. } | HelperMode::Drop { .. } => {}
+            HelperMode::FlatMap { mapper, inner } => {
+                mapper.trace(visit);
+                inner.trace(visit);
+            }
+        }
+    }
+}
+
 /// The state of an async-iterator-helper object, keyed by object identity.
 #[derive(Debug)]
 pub struct HelperState {
@@ -77,12 +99,27 @@ pub struct HelperState {
     pub mode: HelperMode,
 }
 
+impl Trace for HelperState {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.iterator.trace(visit);
+        self.mode.trace(visit);
+    }
+}
+
 /// The driver of an eager async helper, keyed by driver-object identity.
 #[derive(Debug)]
 pub struct EagerState {
     pub record: AsyncIteratorRecord,
     pub mode: EagerMode,
     pub capability: PromiseCapability,
+}
+
+impl Trace for EagerState {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.record.trace(visit);
+        self.mode.trace(visit);
+        self.capability.trace(visit);
+    }
 }
 
 /// The eager helper modes.
@@ -108,6 +145,26 @@ pub enum EagerMode {
     Find {
         f: Value,
     },
+}
+
+impl Trace for EagerMode {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        match self {
+            EagerMode::Reduce {
+                reducer,
+                accumulator,
+                ..
+            } => {
+                reducer.trace(visit);
+                accumulator.trace(visit);
+            }
+            EagerMode::ToArray { values } => values.trace(visit),
+            EagerMode::ForEach { f }
+            | EagerMode::Some { f }
+            | EagerMode::Every { f }
+            | EagerMode::Find { f } => f.trace(visit),
+        }
+    }
 }
 
 /// The continuation of an await in an async-iterator helper driver.
@@ -137,6 +194,14 @@ pub enum AwaitEntry {
         object_id: u64,
         is_reject: bool,
     },
+}
+
+impl Trace for AwaitEntry {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        if let AwaitEntry::FilterKeep { value, .. } = self {
+            value.trace(visit);
+        }
+    }
 }
 
 pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {

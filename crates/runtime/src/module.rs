@@ -32,14 +32,26 @@ use crate::realm::Realm;
 
 /// The wait state of an `import.defer(...).then(...)` promise: (remaining,
 /// capability resolve, capability reject, module).
-pub type DeferredWait = (
-    std::rc::Rc<std::cell::RefCell<u32>>,
-    Value,
-    Value,
-    Handle<crate::module::SourceTextModule>,
-    Value,
-    Value,
+#[derive(Debug, Clone)]
+pub struct DeferredWait(
+    pub std::rc::Rc<std::cell::RefCell<u32>>,
+    pub Value,
+    pub Value,
+    pub Handle<crate::module::SourceTextModule>,
+    pub Value,
+    pub Value,
 );
+
+impl Trace for DeferredWait {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        // `.0` is the remaining-dependency counter (a plain u32).
+        self.1.trace(visit);
+        self.2.trace(visit);
+        self.3.trace(visit);
+        self.4.trace(visit);
+        self.5.trace(visit);
+    }
+}
 
 /// The status of a Source Text Module Record (spec 16.2.1.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,8 +145,48 @@ impl Trace for SourceTextModule {
         if let Some(namespace) = &*self.deferred_namespace.borrow() {
             namespace.trace(visit);
         }
-        // `code` is the parsed AST (plain data); the source JsString is only
-        // reachable through `code`'s spans, which the AST owns by value.
+        // The module source and the module-record strings (specifiers,
+        // import attributes, export names) are JsStrings: a rope's children
+        // are heap edges. `code` is the parsed AST (plain data) — its
+        // strings are parse-produced flats with no heap edges.
+        self.source.trace(visit);
+        for (specifier, attributes, _) in &self.requested_modules {
+            specifier.trace(visit);
+            for (key, value) in attributes {
+                if let AttributeKey::Str(name) = key {
+                    name.trace(visit);
+                }
+                value.trace(visit);
+            }
+        }
+        for (specifier, entry, _) in &self.import_entries {
+            specifier.trace(visit);
+            if let ImportEntry::Named { imported, .. } = entry
+                && let ExportName::Str(name) = imported
+            {
+                name.trace(visit);
+            }
+        }
+        for entry in self
+            .local_export_entries
+            .iter()
+            .chain(&self.indirect_export_entries)
+            .chain(&self.star_export_entries)
+        {
+            if let Some(name) = &entry.export_name
+                && let ExportName::Str(name) = name
+            {
+                name.trace(visit);
+            }
+            if let Some(request) = &entry.module_request {
+                request.trace(visit);
+            }
+            if let Some(name) = &entry.import_name
+                && let ExportName::Str(name) = name
+            {
+                name.trace(visit);
+            }
+        }
     }
 }
 
@@ -147,6 +199,10 @@ impl Trace for SourceTextModule {
 pub struct HostModuleSource {
     pub bytes: Vec<u8>,
     pub(crate) kind: ModuleKind,
+}
+
+impl Trace for HostModuleSource {
+    fn trace(&self, _visit: &mut dyn FnMut(GcAny)) {}
 }
 
 impl Agent {
@@ -1750,7 +1806,7 @@ fn deferred_module_then(
             let wait_id = NEXT_DEFERRED_WAIT.fetch_add(1, Ordering::Relaxed);
             agent.deferred_module_waits.insert(
                 wait_id,
-                (
+                DeferredWait(
                     remaining.clone(),
                     on_fulfilled.clone(),
                     on_rejected.clone(),
@@ -1860,7 +1916,7 @@ pub fn dispatch_deferred_module_wait(
         .get(&function.id())
         .copied()?;
     Some((|| -> Result<Value, JsError> {
-        let Some((remaining, on_fulfilled, on_rejected, module, resolve, reject)) =
+        let Some(DeferredWait(remaining, on_fulfilled, on_rejected, module, resolve, reject)) =
             agent.deferred_module_waits.get(&wait_id).cloned()
         else {
             return Ok(Value::Undefined);

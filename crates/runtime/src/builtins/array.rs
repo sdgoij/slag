@@ -12,6 +12,7 @@ use crux::convert::{
 use crux::error::{ErrorKind, JsError};
 use crux::function::{Function, NativeFn};
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::object::{JsObject, ObjectKind};
 use crux::ops::{is_strictly_equal, same_value_zero};
 use crux::property::{PropertyDescriptor, PropertyKey};
@@ -1942,6 +1943,20 @@ pub struct FromAsyncState {
     pub k: u64,
     pub capability: PromiseCapability,
     pub(crate) phase: FromAsyncPhase,
+}
+
+impl Trace for FromAsyncState {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.array.trace(visit);
+        self.items.trace(visit);
+        self.mapfn.trace(visit);
+        self.this_arg.trace(visit);
+        if let Some(record) = &self.iterator {
+            record.iterator.trace(visit);
+            record.next.trace(visit);
+        }
+        self.capability.trace(visit);
+    }
 }
 
 /// AsyncIteratorClose with a throw completion (spec 27.1.4.1 steps 6-7),

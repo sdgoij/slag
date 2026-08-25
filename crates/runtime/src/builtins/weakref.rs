@@ -11,6 +11,7 @@ use std::rc::Rc;
 use crux::error::{ErrorKind, JsError};
 use crux::function::{Function, NativeFn};
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::object::JsObject;
 use crux::ops::same_value;
 use crux::property::{PropertyDescriptor, PropertyKey};
@@ -45,6 +46,21 @@ pub struct FrCell {
 pub struct FinalizationData {
     pub callback: Value,
     pub cells: Vec<FrCell>,
+}
+
+impl Trace for FrCell {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.target.trace(visit);
+        self.held_value.trace(visit);
+        self.unregister_token.trace(visit);
+    }
+}
+
+impl Trace for FinalizationData {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.callback.trace(visit);
+        self.cells.trace(visit);
+    }
 }
 
 fn placeholder(name: &'static str) -> NativeFn {
@@ -201,9 +217,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(key, Value::Function(method));
+        realm.intrinsics.define(key, Value::Function(method));
         fr_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {

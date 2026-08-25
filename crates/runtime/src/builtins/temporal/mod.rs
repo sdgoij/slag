@@ -13,6 +13,7 @@ pub mod shell;
 use crux::error::{ErrorKind, JsError};
 use crux::function::{Function, NativeFn};
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::object::JsObject;
 use crux::property::PropertyDescriptor;
 use crux::string::JsString;
@@ -45,6 +46,14 @@ pub enum TemporalRecord {
     PlainDateTime([i64; 9]),
     YearMonth([i64; 3]),
     MonthDay([i64; 3]),
+}
+
+impl Trace for TemporalRecord {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        if let TemporalRecord::ZonedDateTime(_, tz) = self {
+            tz.trace(visit);
+        }
+    }
 }
 
 pub fn placeholder(name: &'static str) -> NativeFn {
@@ -1660,9 +1669,7 @@ fn install_now(temporal: &Handle<JsObject>, realm: &Handle<Realm>) -> Result<(),
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         now.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {

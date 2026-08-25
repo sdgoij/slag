@@ -8,6 +8,7 @@
 
 use crux::error::{ErrorKind, JsError};
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::value::{Value, is_callable};
 
 use crate::agent::Agent;
@@ -43,6 +44,12 @@ impl std::fmt::Debug for Job {
         f.debug_struct("Job")
             .field("realm", &self.realm)
             .finish_non_exhaustive()
+    }
+}
+
+impl Trace for Job {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.realm.trace(visit);
     }
 }
 

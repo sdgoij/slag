@@ -8,6 +8,7 @@ use crux::convert::{to_boolean, to_index};
 use crux::error::{ErrorKind, JsError};
 use crux::function::{Function, NativeFn};
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
@@ -33,6 +34,12 @@ pub struct DataViewState {
     pub buffer_object: Value,
     pub byte_length: Option<usize>,
     pub byte_offset: usize,
+}
+
+impl Trace for DataViewState {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.buffer_object.trace(visit);
+    }
 }
 
 /// The element types a DataView can address (spec 25.4.3 table): all of the

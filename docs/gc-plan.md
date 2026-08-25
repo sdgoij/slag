@@ -136,17 +136,15 @@ retention, idempotence, and acyclic reclamation are unit-tested. Precise
 roots only for now — the runtime roots and the conservative native-stack
 scan land in the following slices.
 
-**Remaining slices.** Thread-local arena; `Handle<T>` becomes a `Copy` index with `Deref` through
-  a thread-local accessor so the existing `handle.field` call sites survive;
-  `RefCell` fields move to a GC-cell equivalent.
+**Remaining slices (after slice 3).** Thread-local arena refinement — `Handle<T>`
+  as a `Copy` index with `Deref` through a thread-local accessor (handles are
+  still direct box pointers today); `RefCell` fields move to a GC-cell
+equivalent; the sweep pushes dead cells to a free list instead of `Box`-
+freed allocations.
 - `Value` drops `PhantomData<Rc<()>>` → `Copy` (a plain `u64`), kept
-  agent-local with a `!Send` marker. This is the perf unlock.
-- Mark-sweep from the precise roots + conservative stack scan; sweep pushes
-  dead cells to the free list.
-- Ropes: children become GC handles; the `OnceLock<Arc<[u16]>>` flat cache
-  stays an external `Arc`. `SharedBuffer` stays `Rc`/`Arc`.
-- Closes the cycle leaks — the headline correctness win.
-- Gate: full release sweep 0 regressions; cyclic workload memory bounded.
+  agent-local with a `!Send` marker. This is the perf unlock (GC-5).
+- Ropes: children are GC handles already (slice 2); the `OnceLock<Arc<[u16]>>`
+  flat cache stays an external `Arc`. `SharedBuffer` stays `Rc`/`Arc`.
 
 **Slice 2 — the `Handle` flip (landed).** `Handle<T>` is now `Gc<T>`: a `Copy`
 pointer into the (still-unwired) GC heap, behind the same alias so call sites
@@ -181,6 +179,47 @@ state: `cycle` grows unboundedly (≈690 MB @ 200k iters, as under `Rc`), and
 `chain` now grows too (≈2.4 GB @ 200k iters) — the tracing heap reclaims
 nothing until slice 3 wires collection, so the old `Rc`-era "acyclic
 structures free on drop" property is gone until then.
+
+**Slice 3 — collector wiring (landed).** The heap now collects from the
+precise JS-visible roots plus a conservative native-stack scan:
+
+- **`Agent::trace_roots`** (`crates/runtime/src/agent.rs`) visits every
+  `Value`/`Handle`/`JsString`/`Symbol` the agent holds directly — the
+  execution-context stack, the realm/module tables, the promise/async/
+  generator/iterator/disposable auxiliary states, the IC value caches, the
+  pooled `Vm`s, `kept_alive`, the Weak-* tables (strong until GC-3/4), and
+  the leaf caches. The 14 heap types' `Trace` impls (slice 2) plus ~35 new
+  auxiliary `Trace` impls (job, promise, async, module, Intl/Temporal
+  records, `Vm` and its suspended stacks, `EcmaFunction` incl. the compiled
+  body's embedded literal `Value`s, `Completion`, `Reference`, …) cover the
+  reachable graph.
+- **Conservative native-stack scan** (`Heap::collect_with_stack`): every
+  word in the current thread's committed stack region is matched against the
+  live box set — a raw `Gc<T>` word or a NaN-boxed `Value` payload
+  (`Value::encoded_box_address`) — so Rust locals and closure captures
+  survive. Stack bounds come from `GetCurrentThreadStackLimits` (Windows)
+  or `/proc/self/maps` (Linux); other platforms run precise-roots-only.
+- **Marking is iterative** (an explicit worklist): a deep rope or prototype
+  chain cannot overflow the native stack (the recursive first cut crashed
+  the `String.prototype.repeat`/`replace` sweep fixtures).
+- **Trigger**: `Agent::maybe_collect` fires at safe points — script
+  boundaries and job-queue drains with no pending jobs (job closures are
+  opaque to tracing) — when the live count doubles past the post-collection
+  baseline, and at every safe point under `--gc-stress` (wired through the
+  CLI, no longer a no-op).
+
+**Status.** All three gates met: `cargo test --workspace` green (~4,325
+pass incl. the 3,324 test262 fixture tests), clippy `-D warnings` clean,
+and the full release sweep is 48,023 pass / 0 fail / 158 skip / 441 hang
+with **0 failures and 0 crashes** (baseline 48,006 / 0 / 158 / 458 — the
+hang→pass delta is the documented load-dependent wobble). The leak harness
+now bounds both workloads: `cycle` oscillates ~9–13 MB @ 200k iters
+(previously +690 MB linear) and `chain` ~9–13 MB (previously +2.4 GB) —
+the cycle leaks are closed, the headline correctness win. The root set was
+hardened during bring-up: the compiled-body literal `Value`s in
+`EcmaFunction.ir` and the `Vm` suspended stacks were the gaps the first
+sweeps caught. GC-2 (`--gc-stress` across the sweep) is the remaining net
+for missed roots.
 
 ### GC-2 — root audit and `--gc-stress` hardening
 

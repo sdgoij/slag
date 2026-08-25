@@ -5,13 +5,14 @@
 //! spec 9.7 table. Single-threaded: [[CanBlock]] is false, so
 //! AgentCanSuspend() is false.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use crux::error::{ErrorKind, JsError};
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::string::JsString;
 use crux::symbol::Symbol;
 use crux::value::Value;
@@ -75,6 +76,13 @@ pub(crate) struct ForOfFastVerdict {
     pub aip_handle: Handle<crux::object::JsObject>,
     pub object_proto: (u64, u32),
     pub object_proto_handle: Handle<crux::object::JsObject>,
+}
+
+impl Trace for ForOfFastVerdict {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.aip_handle.trace(visit);
+        self.object_proto_handle.trace(visit);
+    }
 }
 
 pub struct Agent {
@@ -515,6 +523,12 @@ pub struct Agent {
     /// Memoized owning-realm lookup: function id → the realm whose
     /// intrinsic table holds it (`None` for non-intrinsic functions).
     pub function_realms: RefCell<std::collections::HashMap<u64, Option<Handle<Realm>>>>,
+    /// GC-1 slice 3: collect at every safe point when set (the `--gc-stress`
+    /// mode; docs/gc-plan.md GC-2 hardens the root audit under it).
+    pub gc_stress: Cell<bool>,
+    /// The live-box count after the last collection, for the growth
+    /// threshold that decides when a safe point collects.
+    pub last_collected_live: Cell<usize>,
 }
 
 impl Agent {
@@ -630,6 +644,8 @@ impl Agent {
             realms: RefCell::new(Vec::new()),
             realm_count: std::cell::Cell::new(0),
             function_realms: RefCell::new(std::collections::HashMap::new()),
+            gc_stress: Cell::new(false),
+            last_collected_live: Cell::new(0),
         }
     }
 
@@ -814,6 +830,10 @@ impl Agent {
             }
             break;
         }
+        // GC-1 slice 3: the queue drain is a quiescent point (no job
+        // closures hold values); a threshold-triggered collection here is
+        // safe and bounds the cycle leaks.
+        self.maybe_collect();
         Ok(())
     }
 
@@ -831,8 +851,166 @@ impl Agent {
         crux::function::with_agent(self as *mut Agent as *mut (), || {
             let realm = self.current_realm()?;
             let script = crate::script::parse_script(source, realm)?;
-            crate::script::script_evaluation(self, &script)
+            let result = crate::script::script_evaluation(self, &script);
+            // GC-1 slice 3: a script boundary with no pending jobs is a
+            // quiescent point — every live value is reachable from the
+            // traced agent roots or the native stack, so a threshold-
+            // triggered collection there cannot free a box a queued job
+            // closure (opaque to tracing) still captures.
+            if self.job_queues_empty() {
+                self.maybe_collect();
+            }
+            result
         })
+    }
+
+    /// GC-1 slice 3: every `Value`/`Handle`/`JsString`/`Symbol` the agent
+    /// holds directly — the JS-visible roots of docs/gc-plan.md §3. The
+    /// conservative native-stack scan covers Rust-held handles; this covers
+    /// the agent's own tables (which live in heap-allocated buffers the
+    /// stack scan cannot see). Index-only caches and primitive tables need
+    /// no tracing.
+    pub(crate) fn trace_roots(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.execution_context_stack.trace(visit);
+        // The IC value caches hold Values; the index-only caches re-resolve
+        // from the (traced) objects and need no tracing.
+        for cell in self.member_value_cells.iter() {
+            cell.trace(visit);
+        }
+        for cell in self.array_element_value_cells.iter() {
+            cell.trace(visit);
+        }
+        for cell in self.for_of_fast_cells.iter() {
+            cell.trace(visit);
+        }
+        for cell in self.global_leaf_cells.iter() {
+            cell.trace(visit);
+        }
+        for cell in self.slot_leaf_cells.iter() {
+            cell.trace(visit);
+        }
+        for (_, entry) in self.leaf_cache.iter().flatten() {
+            entry.trace(visit);
+        }
+        for (_, (_, value)) in self.construct_prototypes.borrow().iter() {
+            value.trace(visit);
+        }
+        self.vm_pool.trace(visit);
+        self.promise_jobs.trace(visit);
+        self.generic_jobs.trace(visit);
+        for (_, job) in &self.timeout_jobs {
+            job.trace(visit);
+        }
+        self.kept_alive.trace(visit);
+        self.global_symbol_registry.trace(visit);
+        self.module_eval_stack.trace(visit);
+        self.ecma_functions.trace(visit);
+        self.promises.trace(visit);
+        self.promise_resolvers.trace(visit);
+        self.promise_compound.trace(visit);
+        self.promise_finally.trace(visit);
+        self.async_resume.trace(visit);
+        self.async_from_sync.trace(visit);
+        self.async_from_sync_continuations.trace(visit);
+        self.generators.trace(visit);
+        self.async_generators.trace(visit);
+        self.async_generator_awaits.trace(visit);
+        self.iterator_helpers.trace(visit);
+        self.wrapped_iterators.trace(visit);
+        self.async_iterator_helpers.trace(visit);
+        self.async_iterator_awaits.trace(visit);
+        self.async_iterator_eager.trace(visit);
+        self.async_iterator_pending.trace(visit);
+        self.disposable_stacks.trace(visit);
+        self.disposable_async_drivers.trace(visit);
+        self.disposable_async_caps.trace(visit);
+        self.async_body_disposal.trace(visit);
+        // `host_modules` is keyed by JsString: keys are heap edges too.
+        for (key, value) in self.host_modules.borrow().iter() {
+            key.trace(visit);
+            value.trace(visit);
+        }
+        self.module_namespaces.trace(visit);
+        self.deferred_namespaces.trace(visit);
+        self.module_sources.trace(visit);
+        self.import_namespace_resolvers.trace(visit);
+        self.deferred_module_waits.trace(visit);
+        self.deferred_module_thens.trace(visit);
+        self.symbol_data.trace(visit);
+        self.bigint_data.trace(visit);
+        self.intl_number_format_data.trace(visit);
+        self.intl_plural_rules_data.trace(visit);
+        self.intl_date_time_format_data.trace(visit);
+        self.intl_collator_data.trace(visit);
+        self.intl_segments_data.trace(visit);
+        self.intl_segment_iterator_data.trace(visit);
+        self.temporal_data.trace(visit);
+        self.temporal_calendars.trace(visit);
+        self.regexp_data.trace(visit);
+        for (value, text, _, _, _) in self.regexp_string_iter_data.values() {
+            value.trace(visit);
+            text.trace(visit);
+        }
+        for (text, _) in self.string_iter_data.values() {
+            text.trace(visit);
+        }
+        self.error_stack.trace(visit);
+        self.weak_ref_targets.trace(visit);
+        self.finalization_registries.trace(visit);
+        for (value, _, _) in self.array_iter_data.values() {
+            value.trace(visit);
+        }
+        for (state, _) in self.array_from_async.values() {
+            state.trace(visit);
+        }
+        for (value, _, _) in self.wait_async.values() {
+            value.trace(visit);
+        }
+        self.dataview_data.trace(visit);
+        self.raw_json_data.trace(visit);
+        self.map_data.trace(visit);
+        self.set_data.trace(visit);
+        self.weak_map_data.trace(visit);
+        self.weak_set_data.trace(visit);
+        for iter_data in self.map_iter_data.values() {
+            let (value, _, _) = &*iter_data.borrow();
+            value.trace(visit);
+        }
+        for iter_data in self.set_iter_data.values() {
+            let (value, _, _) = &*iter_data.borrow();
+            value.trace(visit);
+        }
+        self.realms.trace(visit);
+        self.function_realms.trace(visit);
+    }
+
+    /// GC-1 slice 3: gather the precise roots and mark-sweep with the
+    /// conservative native-stack scan. Must run at a quiescent point (no
+    /// job closures in flight, no active RefCell borrows on the traced
+    /// tables).
+    pub fn collect_garbage(&mut self) {
+        let mut roots: Vec<GcAny> = Vec::new();
+        self.trace_roots(&mut |any| roots.push(any));
+        crux::heap::with_heap_mut(|heap| heap.collect_with_stack(&roots));
+        self.last_collected_live
+            .set(crux::heap::with_heap(|heap| heap.live_count()));
+    }
+
+    /// The safe-point collection trigger: collect when the heap has grown
+    /// past twice the post-collection live count (or every safe point in
+    /// `--gc-stress` mode).
+    pub(crate) fn maybe_collect(&mut self) {
+        let live = crux::heap::with_heap(|heap| heap.live_count());
+        let threshold = self.last_collected_live.get().max(1024).saturating_mul(2);
+        if self.gc_stress.get() || live > threshold {
+            self.collect_garbage();
+        }
+    }
+
+    /// Toggle the `--gc-stress` mode: collect at every safe point instead of
+    /// only on heap growth. Settable through `&Agent` (the cell).
+    pub fn set_gc_stress(&self, enabled: bool) {
+        self.gc_stress.set(enabled);
     }
 }
 

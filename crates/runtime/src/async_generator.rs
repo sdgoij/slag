@@ -14,6 +14,7 @@ use std::rc::Rc;
 use crux::error::{ErrorKind, JsError};
 use crux::function::Function;
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::object::JsObject;
 use crux::property::PropertyDescriptor;
 use crux::string::JsString;
@@ -53,6 +54,17 @@ pub struct AsyncGeneratorRequest {
     pub capability: PromiseCapability,
 }
 
+impl Trace for AsyncGeneratorRequest {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        match &self.completion {
+            Resume::Normal(value) | Resume::Throw(value) | Resume::Return(value) => {
+                value.trace(visit);
+            }
+        }
+        self.capability.trace(visit);
+    }
+}
+
 /// The agent-side async generator record: the [[AsyncGeneratorState]], the
 /// request queue, and the resumable VM plus its execution context. The
 /// request currently being driven is kept in `current` while the body awaits.
@@ -72,6 +84,18 @@ pub struct AsyncGeneratorState {
     /// EvaluateAsyncGeneratorBody step 1), and the VM runs against this
     /// environment on the first request.
     pub body_env: Option<EnvRef>,
+}
+
+impl Trace for AsyncGeneratorState {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.queue.trace(visit);
+        self.current.trace(visit);
+        self.vm.trace(visit);
+        self.context.trace(visit);
+        self.function.trace(visit);
+        self.realm.trace(visit);
+        self.body_env.trace(visit);
+    }
 }
 
 /// What an await-resume closure of an async generator body does when the
@@ -94,6 +118,12 @@ pub struct AsyncGeneratorAwaitEntry {
     pub object_id: u64,
     pub is_reject: bool,
     pub kind: AwaitKind,
+}
+
+impl Trace for AsyncGeneratorAwaitEntry {
+    fn trace(&self, _visit: &mut dyn FnMut(GcAny)) {
+        // Plain data only: the object id, the rejection flag, and the kind.
+    }
 }
 
 pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {

@@ -9,6 +9,7 @@ use crux::convert::{to_boolean, to_length, to_number, to_string, to_uint32};
 use crux::error::{ErrorKind, JsError};
 use crux::function::{Function, NativeFn};
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::object::JsObject;
 use crux::ops::same_value;
 use crux::property::{PropertyDescriptor, PropertyKey};
@@ -57,6 +58,13 @@ pub struct RegExpState {
     /// The NewTarget that allocated this instance (spec [[RegExpConstructor]]);
     /// RegExp.prototype.compile brand-checks it against %RegExp%.
     pub constructor: Value,
+}
+
+impl Trace for RegExpState {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.source.trace(visit);
+        self.constructor.trace(visit);
+    }
 }
 
 fn placeholder(name: &'static str) -> NativeFn {

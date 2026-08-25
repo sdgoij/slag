@@ -10,6 +10,7 @@
 use crux::error::{ErrorKind, JsError};
 use crux::function::{Function, NativeFn};
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
@@ -56,6 +57,12 @@ pub struct PluralRulesRecord {
 impl PluralRulesRecord {
     fn type_name(&self) -> &'static str {
         if self.ordinal { "ordinal" } else { "cardinal" }
+    }
+}
+
+impl Trace for PluralRulesRecord {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.number_format.trace(visit);
     }
 }
 

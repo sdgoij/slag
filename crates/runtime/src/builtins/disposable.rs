@@ -10,6 +10,7 @@ use std::rc::Rc;
 use crux::error::{ErrorKind, JsError};
 use crux::function::Function;
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
@@ -46,6 +47,13 @@ pub struct DisposableResource {
     pub call: DisposalCall,
 }
 
+impl Trace for DisposableResource {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.value.trace(visit);
+        self.method.trace(visit);
+    }
+}
+
 /// [[DisposableState]] and [[DisposeCapability]] of a stack instance. The
 /// `is_async` flag brands the stack so a sync method rejects an async
 /// instance and vice versa (RequireInternalSlot).
@@ -54,6 +62,12 @@ pub struct DisposableStackData {
     pub disposed: bool,
     pub resources: Vec<DisposableResource>,
     pub is_async: bool,
+}
+
+impl Trace for DisposableStackData {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.resources.trace(visit);
+    }
 }
 
 /// The driver of an in-flight `disposeAsync`.
@@ -72,6 +86,12 @@ pub struct AsyncDisposalDriver {
     /// The single trailing `Await(undefined)` for a stack whose resources
     /// were all null/undefined (spec 27.4.1.3 step 4).
     pub final_await: bool,
+}
+
+impl Trace for AsyncDisposalDriver {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.completion.trace(visit);
+    }
 }
 
 pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
@@ -1025,6 +1045,22 @@ pub enum AsyncBodySettlement {
     },
 }
 
+impl Trace for AsyncBodySettlement {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        match self {
+            AsyncBodySettlement::Function { resolve, reject } => {
+                resolve.trace(visit);
+                reject.trace(visit);
+            }
+            AsyncBodySettlement::Module { module, state } => {
+                module.trace(visit);
+                state.trace(visit);
+            }
+            AsyncBodySettlement::Generator { .. } => {}
+        }
+    }
+}
+
 /// The driver of an in-flight awaited disposal of an async body's `using`
 /// resources (spec 9.4.3 DisposeResources with async-dispose hints).
 #[derive(Debug)]
@@ -1033,6 +1069,14 @@ pub struct AsyncBodyDisposalDriver {
     pub index: usize,
     pub completion: crate::flow::Completion,
     pub settlement: AsyncBodySettlement,
+}
+
+impl Trace for AsyncBodyDisposalDriver {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.resources.trace(visit);
+        self.completion.trace(visit);
+        self.settlement.trace(visit);
+    }
 }
 
 /// Dispose an async body's `using` resources before its promise settles: the

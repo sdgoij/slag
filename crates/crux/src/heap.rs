@@ -18,9 +18,11 @@
 //! the conservative native-stack scan land in the following GC-1 slices.
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
+use std::rc::Rc;
 
 /// A value whose object graph the collector can trace. Fields holding `Gc<T>`
 /// must visit them in `trace`.
@@ -197,19 +199,73 @@ impl<T> DerefMut for GcCell<T> {
     }
 }
 
-impl<T: Trace> Trace for Option<Gc<T>> {
+impl<T: Trace> Trace for Option<T> {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
-        if let Some(gc) = self {
-            gc.trace(visit);
+        if let Some(value) = self {
+            value.trace(visit);
         }
     }
 }
 
-impl<T: Trace> Trace for Vec<Gc<T>> {
+impl<T: Trace> Trace for Vec<T> {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
-        for gc in self {
-            gc.trace(visit);
+        for value in self {
+            value.trace(visit);
         }
+    }
+}
+
+impl<T: Trace> Trace for VecDeque<T> {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        for value in self {
+            value.trace(visit);
+        }
+    }
+}
+
+impl<K: Eq + std::hash::Hash + 'static, V: Trace, S: std::hash::BuildHasher + 'static> Trace
+    for HashMap<K, V, S>
+{
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        for value in self.values() {
+            value.trace(visit);
+        }
+    }
+}
+
+impl<T: Trace> Trace for RefCell<T> {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.borrow().trace(visit);
+    }
+}
+
+impl<T: Trace> Trace for Rc<T> {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.as_ref().trace(visit);
+    }
+}
+
+impl<A: Trace, B: Trace> Trace for (A, B) {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.0.trace(visit);
+        self.1.trace(visit);
+    }
+}
+
+impl<A: Trace, B: Trace, C: Trace> Trace for (A, B, C) {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.0.trace(visit);
+        self.1.trace(visit);
+        self.2.trace(visit);
+    }
+}
+
+impl<A: Trace, B: Trace, C: Trace, D: Trace> Trace for (A, B, C, D) {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.0.trace(visit);
+        self.1.trace(visit);
+        self.2.trace(visit);
+        self.3.trace(visit);
     }
 }
 
@@ -261,10 +317,120 @@ impl Heap {
     }
 
     /// Mark-sweep from `roots`. Reachable boxes are kept (and unmarked for the
-    /// next cycle); everything else is dropped and its memory freed.
+    /// next cycle); everything else is dropped and its memory freed. Marking
+    /// is iterative (an explicit worklist), so a deeply nested object graph
+    /// (a long rope, a deep prototype chain) cannot overflow the native
+    /// stack.
     pub fn collect(&mut self, roots: &[GcAny]) {
-        for root in roots {
-            self.mark(*root);
+        let work = roots.to_vec();
+        self.collect_from_work(work);
+    }
+}
+
+/// The current thread's committed stack region `[low, high)`, or `None`
+/// when the platform cannot provide it (the collector then relies on the
+/// precise roots alone). The conservative native-stack scan marks every live
+/// box whose address appears as a stack word, so Rust locals and closure
+/// captures holding `Gc<T>` or `Value` survive collection.
+#[cfg(windows)]
+fn stack_bounds() -> Option<(usize, usize)> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        // Windows 8+; works for the main thread and worker threads alike.
+        fn GetCurrentThreadStackLimits(low: *mut usize, high: *mut usize) -> i32;
+    }
+    let mut low = 0usize;
+    let mut high = 0usize;
+    // SAFETY: kernel32 writes the two locals; both pointers are valid for
+    // writes and the function always initializes them before returning.
+    let ok = unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
+    if ok != 0 && low != 0 && high > low {
+        Some((low, high))
+    } else {
+        None
+    }
+}
+
+/// Linux: the committed anonymous mapping containing the current stack
+/// pointer (the main thread's `[stack]` entry and worker-thread stacks both
+/// appear in `/proc/self/maps`; the guard page is a separate `---p` mapping,
+/// excluded by the read-permission check).
+#[cfg(target_os = "linux")]
+fn stack_bounds() -> Option<(usize, usize)> {
+    let sp = &0usize as *const usize as usize;
+    let text = std::fs::read_to_string("/proc/self/maps").ok()?;
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(range), Some(perms)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if !perms.contains('r') {
+            // Guard pages (`---p`) fault on read; skip them.
+            continue;
+        }
+        let Some((start, end)) = range.split_once('-') else {
+            continue;
+        };
+        let (Ok(start), Ok(end)) = (
+            usize::from_str_radix(start, 16),
+            usize::from_str_radix(end, 16),
+        ) else {
+            continue;
+        };
+        if start <= sp && sp < end {
+            return Some((start, end));
+        }
+    }
+    None
+}
+
+/// Platforms without a stack-bounds source: no conservative scan.
+#[cfg(not(any(windows, target_os = "linux")))]
+fn stack_bounds() -> Option<(usize, usize)> {
+    None
+}
+
+impl Heap {
+    /// Mark-sweep with a conservative native-stack scan: every live box
+    /// whose address appears on the current thread's stack (a raw `Gc<T>`
+    /// local or an encoded `Value` payload) is marked before the precise
+    /// `roots` are traced, then the sweep frees everything unmarked. The
+    /// scan is the safety net for Rust-held handles that no precise root
+    /// can see; it may retain garbage, never free a reachable box.
+    pub fn collect_with_stack(&mut self, roots: &[GcAny]) {
+        // Address → fat pointer: the scan recovers a box address from a
+        // stack word and needs the `dyn Trace` vtable to mark through it.
+        let by_addr: HashMap<usize, *mut GcBox<dyn Trace>> = self
+            .live
+            .iter()
+            .map(|ptr| (*ptr as *const u8 as usize, *ptr))
+            .collect();
+        let sp = &by_addr as *const HashMap<usize, *mut GcBox<dyn Trace>> as usize;
+        let mut work: Vec<GcAny> = roots.to_vec();
+        if let Some((_low, high)) = stack_bounds()
+            && high > sp
+        {
+            self.scan_stack(sp, high, &by_addr, &mut work);
+        }
+        self.collect_from_work(work);
+    }
+
+    /// The mark phase shared by [`Heap::collect`] and
+    /// [`Heap::collect_with_stack`]: drain `work` (the roots plus any boxes
+    /// the conservative stack scan found) iteratively, then sweep.
+    fn collect_from_work(&mut self, mut work: Vec<GcAny>) {
+        // SAFETY: every `GcAny` in `work` is a registered box (a root from a
+        // live `Gc<T>`'s `Trace` impl, or an address the scan looked up in
+        // the live set); the mark bit breaks cycles.
+        while let Some(any) = work.pop() {
+            unsafe {
+                let ptr = any.0;
+                if (*ptr).mark.get() {
+                    continue;
+                }
+                (*ptr).mark.set(true);
+                (*ptr).data.trace(&mut |child| work.push(child));
+            }
         }
         let mut keep = Vec::with_capacity(self.live.len());
         for ptr in self.live.drain(..) {
@@ -283,16 +449,37 @@ impl Heap {
         self.live = keep;
     }
 
-    fn mark(&self, any: GcAny) {
-        // SAFETY: `any` came from a live `Gc<T>`'s `Trace` impl, so the box
-        // is allocated; the mark bit breaks cycles in the traversal.
-        unsafe {
-            let ptr = any.0;
-            if (*ptr).mark.get() {
-                return;
+    /// Scan every word in the current thread's live stack region
+    /// `[sp, high)` and push boxes whose address appears there onto `work`.
+    /// `by_addr` maps every registered box address to its fat pointer; an
+    /// address can only be marked when it is a real box, so coincidental
+    /// stack values at worst retain a reachable box (imprecise, never
+    /// unsafe).
+    fn scan_stack(
+        &self,
+        sp: usize,
+        high: usize,
+        by_addr: &HashMap<usize, *mut GcBox<dyn Trace>>,
+        work: &mut Vec<GcAny>,
+    ) {
+        let mut addr = sp;
+        while addr < high {
+            // SAFETY: `[sp, high)` is the current thread's committed stack
+            // (platform stack_bounds guarantees readability); reads are
+            // unaligned so the exact frame layout does not matter.
+            let word = unsafe { std::ptr::read_unaligned::<usize>(addr as *const usize) };
+            if let Some(&ptr) = by_addr.get(&word) {
+                // SAFETY: `ptr` is a registered, live box; the scan only
+                // pushes boxes already in the live set.
+                work.push(GcAny(ptr));
+            } else if let Some(box_addr) = crate::value::Value::encoded_box_address(word as u64)
+                && let Some(&ptr) = by_addr.get(&box_addr)
+            {
+                // SAFETY: `ptr` is a registered, live box decoded from a
+                // tagged Value; the scan only pushes boxes already live.
+                work.push(GcAny(ptr));
             }
-            (*ptr).mark.set(true);
-            (*ptr).data.trace(&mut |child| self.mark(child));
+            addr += std::mem::size_of::<usize>();
         }
     }
 }
@@ -392,5 +579,41 @@ mod tests {
             start - 1,
             "only the root survives"
         );
+    }
+
+    #[test]
+    fn stack_scan_roots_local_gc_handles() {
+        let start = with_heap(|heap| heap.live_count());
+        let a = Gc::new(Node::default());
+        let b = Gc::new(Node::default());
+        a.next.borrow_mut().replace(b);
+        b.next.borrow_mut().replace(a);
+        // The cycle is reachable only through the stack locals; the
+        // conservative scan must keep it alive with no explicit roots.
+        // (black_box takes the addresses, forcing both locals to stack
+        // slots the scan can see.)
+        std::hint::black_box(&a);
+        std::hint::black_box(&b);
+        with_heap_mut(|heap| heap.collect_with_stack(&[]));
+        assert!(a.next.borrow().is_some());
+        assert!(b.next.borrow().is_some());
+        assert_eq!(with_heap(|heap| heap.live_count()), start + 2);
+        let _ = std::hint::black_box((a, b));
+    }
+
+    #[test]
+    fn stack_scan_roots_encoded_value_payloads() {
+        use crate::Handle;
+        use crate::string::JsString;
+        use crate::value::{Value, ValueKind};
+        let start = with_heap(|heap| heap.live_count());
+        let value = Value::String(Handle::new(JsString::from_utf8("stack-scanned")));
+        // `value` is the only reference; taking its address spills it to a
+        // stack slot the scan can see (a `Value` is a NaN-boxed word).
+        std::hint::black_box(&value);
+        with_heap_mut(|heap| heap.collect_with_stack(&[]));
+        assert!(matches!(value.kind(), ValueKind::String(_)));
+        assert_eq!(with_heap(|heap| heap.live_count()), start + 1);
+        let _ = std::hint::black_box(&value);
     }
 }

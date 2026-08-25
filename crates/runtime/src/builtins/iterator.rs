@@ -14,6 +14,7 @@ use crux::convert::{to_boolean, to_integer_or_infinity};
 use crux::error::{ErrorKind, JsError};
 use crux::function::Function;
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
@@ -104,6 +105,32 @@ pub enum HelperMode {
     },
 }
 
+impl Trace for HelperMode {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        match self {
+            HelperMode::Map { mapper } => mapper.trace(visit),
+            HelperMode::Filter { filterer } => filterer.trace(visit),
+            HelperMode::Take { .. } | HelperMode::Drop { .. } => {}
+            HelperMode::FlatMap { mapper, inner } => {
+                mapper.trace(visit);
+                inner.trace(visit);
+            }
+            HelperMode::Chunks { buffer, .. } => buffer.trace(visit),
+            HelperMode::Windows { buffer, .. } => buffer.trace(visit),
+            HelperMode::Concat { items, active, .. } => {
+                items.trace(visit);
+                active.trace(visit);
+            }
+            HelperMode::Zip {
+                columns, padding, ..
+            } => {
+                columns.trace(visit);
+                padding.trace(visit);
+            }
+        }
+    }
+}
+
 /// The `Iterator.zip`/`zipKeyed` mode option (spec 27.1.4.4.1 step 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZipMode {
@@ -128,6 +155,13 @@ pub struct HelperState {
     pub mode: HelperMode,
 }
 
+impl Trace for HelperState {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.iterator.trace(visit);
+        self.mode.trace(visit);
+    }
+}
+
 /// A not-yet-opened `Iterator.concat` iterable (spec 27.1.4.3 step 2.d).
 #[derive(Debug, Clone)]
 pub struct ConcatItem {
@@ -135,11 +169,24 @@ pub struct ConcatItem {
     pub open_method: Value,
 }
 
+impl Trace for ConcatItem {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.iterable.trace(visit);
+        self.open_method.trace(visit);
+    }
+}
+
 /// The state of a `%WrapForValidIterator%` object (`Iterator.from` on a flat
 /// iterable), keyed by object identity.
 #[derive(Debug)]
 pub struct WrappedIteratorState {
     pub record: IteratorRecord,
+}
+
+impl Trace for WrappedIteratorState {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.record.trace(visit);
+    }
 }
 
 pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
@@ -233,9 +280,7 @@ fn define_method(
         // post-pass links null-prototyped intrinsic functions.
         None,
     )?;
-    realm
-        .intrinsics
-        .define(key, Value::Function(method));
+    realm.intrinsics.define(key, Value::Function(method));
     proto.define_property(
         &JsString::from_utf8(name),
         &PropertyDescriptor {
@@ -398,14 +443,12 @@ fn install_prototype_methods(
         None,
         None,
     )?;
-    realm.intrinsics.define(
-        "%Iterator.prototype.constructor-get%",
-        Value::Function(get),
-    );
-    realm.intrinsics.define(
-        "%Iterator.prototype.constructor-set%",
-        Value::Function(set),
-    );
+    realm
+        .intrinsics
+        .define("%Iterator.prototype.constructor-get%", Value::Function(get));
+    realm
+        .intrinsics
+        .define("%Iterator.prototype.constructor-set%", Value::Function(set));
     proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
@@ -429,10 +472,9 @@ fn install_statics(realm: &Handle<Realm>, ctor: &Handle<Function>) -> Result<(),
             None,
             None,
         )?;
-        realm.intrinsics.define(
-            &format!("%Iterator.{name}%"),
-            Value::Function(method),
-        );
+        realm
+            .intrinsics
+            .define(&format!("%Iterator.{name}%"), Value::Function(method));
         ctor.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {

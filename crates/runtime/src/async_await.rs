@@ -8,6 +8,7 @@ use std::rc::Rc;
 use crux::error::{ErrorKind, JsError};
 use crux::function::Function;
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::object::JsObject;
 use crux::string::JsString;
 use crux::value::{Value, ValueKind, is_callable};
@@ -36,6 +37,17 @@ pub struct AsyncFunctionState {
     pub module: Option<crux::handle::Handle<crate::module::SourceTextModule>>,
 }
 
+impl Trace for AsyncFunctionState {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.vm.trace(visit);
+        self.context.trace(visit);
+        self.promise.trace(visit);
+        self.resolve.trace(visit);
+        self.reject.trace(visit);
+        self.module.trace(visit);
+    }
+}
+
 /// The method of the AsyncFromSyncIterator (spec 27.1.4.3-5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AsyncFromSyncMethod {
@@ -51,11 +63,30 @@ pub struct AsyncFromSyncEntry {
     pub method: AsyncFromSyncMethod,
 }
 
+impl Trace for IteratorRecord {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.iterator.trace(visit);
+        self.next.trace(visit);
+    }
+}
+
+impl Trace for AsyncFromSyncEntry {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.sync.trace(visit);
+    }
+}
+
 /// An async-function await-resume handler's state.
 #[derive(Debug, Clone)]
 pub struct ResumeHandler {
     pub state: Rc<RefCell<AsyncFunctionState>>,
     pub is_reject: bool,
+}
+
+impl Trace for ResumeHandler {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.state.trace(visit);
+    }
 }
 
 impl AsyncFromSyncMethod {
@@ -467,6 +498,13 @@ pub struct AsyncFromSyncContinuationEntry {
     pub done: bool,
     pub is_reject: bool,
     pub close_on_rejection: bool,
+}
+
+impl Trace for AsyncFromSyncContinuationEntry {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.capability.trace(visit);
+        self.sync.trace(visit);
+    }
 }
 
 /// Run one AsyncFromSyncIterator method (spec 27.1.5.2): call the sync

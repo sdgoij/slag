@@ -11,6 +11,7 @@
 use crux::error::{ErrorKind, JsError};
 use crux::function::{Function, NativeFn};
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
@@ -319,6 +320,12 @@ pub struct DateTimeFormatRecord {
     pub fractional_second_digits: Option<u32>,
     /// The cached [[BoundFormat]] function value.
     pub bound_format: Option<Value>,
+}
+
+impl Trace for DateTimeFormatRecord {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.bound_format.trace(visit);
+    }
 }
 
 impl DateTimeFormatRecord {

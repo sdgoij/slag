@@ -177,6 +177,21 @@ impl Value {
         }
     }
 
+    /// If `bits` is a tagged heap value (an encoded box pointer), the box
+    /// address; `None` for doubles and the non-heap tags. The conservative
+    /// native-stack scan (heap.rs) uses this to recognize `Value` locals
+    /// whose payload is the only reference to a box.
+    #[inline]
+    pub(crate) fn encoded_box_address(bits: u64) -> Option<usize> {
+        if bits & TAG_MASK == TAG_PREFIX {
+            let tag = (bits >> 44) & 0xF;
+            if (TAG_BIGINT..=TAG_FUNCTION).contains(&tag) {
+                return Some(((bits & PAYLOAD_MASK) << 4) as usize);
+            }
+        }
+        None
+    }
+
     /// Whether the bits hold a double (anything outside the tag region).
     #[inline]
     fn is_double(&self) -> bool {
