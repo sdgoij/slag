@@ -1642,9 +1642,10 @@ The harness's skip taxonomy (also used by the sweep):
 | `features: [ShadowRealm]` | ShadowRealm is a stage-3 proposal, not part of ECMA-262 ES2026. |
 | `features: [source-phase-imports]` | `import.source()` is a stage-3 proposal, not part of ECMA-262 ES2026. |
 | `features: [import-defer]` / `[import-bytes]` / `[import-text]` | `import.defer(...)` / `import(..., { with: { type: "bytes" } })` / `import(..., { with: { type: "text" } })` are stage-3 proposals, not part of ECMA-262 ES2026. |
-| `includes: [tcoHelper]` | TCO fixtures require proper tail calls; skipped even by V8/JSC. |
+| `includes: [tcoHelper]` | (closed: proper tail calls now pass all 34 `tco-*` fixtures — see the Full-suite sweep section.) |
 | Unsupported `includes:` | Fixtures needing harness helpers beyond `assert.js`, `compareArray.js`, `detachArrayBuffer.js`, `isConstructor.js`, `propertyHelper.js`, `testAtomics.js`, `testTypedArray.js` are not run. |
 | Stale fixture | `Temporal/Duration/prototype/total/relativeto-date-limits.js` asserts a +1s boundary that is in range per the current spec (matching node v24), so it is skipped in `run_fixture`. |
+| CRLF checkout artifact | On a Windows checkout with `core.autocrlf`, git rewrites the pinned test262 submodule's LF text files to CRLF, so the byte-exact fixtures (`import/import-bytes/bytes-from-{js,json,txt}` and `Function/prototype/toString/line-terminator-normalisation-LF`) read `\r\n` where the corpus asserts `\n`. They are skipped in `run_fixture` only when the working tree is actually CRLF — a clean LF checkout runs them. |
 
 ## Expected non-runnable tests
 
@@ -1677,10 +1678,22 @@ Temporal era-monthcode gate and the ECMA-402 Intl integration.
 
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
-| language | 23,724 | 23,690 | 0 | 34 | 0 | 100.0% |
+| language | 23,724 | 23,724 | 0 | 0 | 0 | 100.0% |
 | built-ins | 23,812 | 23,424 | 0 | 154 | 234 | 99.01% |
 | annexB | 1,086 | 1,086 | 0 | 0 | 0 | 100.0% |
-| **Total** | **48,622** | **48,200** | **0** | **188** | **234** | **99.52%** |
+| **Total** | **48,622** | **48,234** | **0** | **154** | **234** | **99.52%** |
+
+(On this Windows tree the pinned test262 submodule is checked out CRLF,
+which taints 4 byte-exact fixtures: the 3 `import/import-bytes`
+byte-count fixtures and `line-terminator-normalisation-LF.js` read `\r\n`
+where the corpus asserts `\n`. They are **filtered in `run_fixture`** with
+a CRLF-conditional skip (see the skip taxonomy) — on a clean LF checkout
+they pass and the skip no-ops; the submodule itself is a read-only input
+and is kept as-is. The TCO-era direct-eval fix (`return eval(x)` tail
+calls now route through `perform_eval` with the caller's environment
+intact) closed the 7 eval/private-name fixtures TCO had uncovered; the
+release sweep is 48,006 pass / **0 fail** / 158 skip / 458 hang
+at the 15s deadline.)
 
 (The built-ins row is the measured release-build state (`--jobs 8 --timeout
 120 --recheck-timeout 120`) with the **ZonedDateTime cluster un-skipped**
@@ -1706,19 +1719,25 @@ Temporal-featured fixtures from skip to pass (the 16 Duration
 remaining 42 `toLocaleString` (Intl) content-skips closed with the
 ECMA-402 integration, leaving the one stale fixture.)
 
-(Runnable = pass + fail + hang; the 188 skips are the
-TCO (`tcoHelper`) fixtures (34), the out-of-scope
+(Runnable = pass + fail + hang; the 154 skips are the out-of-scope
 await-dictionary (89) and ShadowRealm (64) proposal
 fixtures, and the one stale Temporal fixture.) The
+TCO cluster closed last (34/34 — proper tail calls, the one spec feature
+V8 and JSC still skip: a return in the innermost try's own
+catch-without-finally or finally clause replaces the frame, with the
+try's handler already consumed and the pending control discarded by the
+frame reset; a return in a try Block or under any enclosing try stays a
+normal call so the catch/finally still runs). The
 module loader was un-skipped (the `flags: [module]`
 fixtures now run through the real source-text-module machinery — parse,
 link, DFS evaluation, top-level await, dynamic import, and `import.meta`),
 then the source-phase-imports (`import.source()`), import-defer
 (`import.defer()`), import-bytes, and import-text proposal clusters were
-un-skipped too: the language row went from 23,184/540 to 23,690/34, and the
-built-ins row from 18,323/5,489 to 18,331/5,481, with the only language
-skips now the 34 TCO fixtures (proper tail calls — V8 and JSC skip them
-too). The import-defer work closed last (114/114 in the cluster): deferred
+un-skipped too: the language row went from 23,184/540 to 23,724/0 — the
+last skips were the 34 TCO fixtures, closed by the proper-tail-call
+implementation (frame replacement in `Vm::run_inner`, returns in the
+innermost try's catch/finally clause eligible — see below), and the
+built-ins row from 18,323/5,489 to 18,331/5,481. The import-defer work closed last (114/114 in the cluster): deferred
 namespaces trigger synchronous evaluation on export access with
 `PerformPromiseThen`-based async dependency aggregation,
 `IsModuleSCCEvaluated`-aware readiness, and full evaluation-error
@@ -2023,9 +2042,9 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 
 ## Open items
 
-- All three areas now measure **100% of runnable**: 23,690 + 23,424 + 1,086
+- All three areas now measure **100% of runnable**: 23,724 + 23,424 + 1,086
   pass / 0 fail / 0 crash of 23,724 + 23,812 + 1,086 fixtures
-  (the `tcoHelper` includes (34), the await-dictionary (89) and ShadowRealm
+  (the await-dictionary (89) and ShadowRealm
   (64) proposal fixtures, and one stale Temporal fixture
   skipped; the 234 built-ins hangs are slow-but-correct fixtures the
   recheck misclassifies, `--timeout 120 --recheck-timeout 120`, release
@@ -2046,8 +2065,13 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
   machinery, see the Full-suite sweep section), and the atomics cluster
   closed last (119/119 — the `$262.agent` worker-thread host API, the
   *"ok"* notify semantics for `Atomics.wait`, and the cross-thread
-  `waitAsync` resolution), leaving the 34 language skips as the TCO
-  fixtures only (48,200 pass / 188 skip / 234 slow-but-correct hang
+  `waitAsync` resolution), closing the TCO cluster last (34/34 — proper
+  tail calls, the one spec feature V8 and JSC still skip: returns in the
+  innermost try's catch-without-finally or finally clause frame-replace,
+  with the try's handler already consumed and the pending control
+  discarded by the frame reset; a return in a try Block or under any
+  enclosing try stays a normal call so the catch/finally still runs)
+  (48,234 pass / 154 skip / 234 slow-but-correct hang
 total now; the Temporal clusters — Duration, Instant, Now, the namespace,
 toStringTag, the five Plain clusters, and ZonedDateTime — and
 `Date.prototype.toTemporalInstant` have all been un-skipped since, and the

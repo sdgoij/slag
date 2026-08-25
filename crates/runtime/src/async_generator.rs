@@ -677,6 +677,12 @@ fn drive(
         }
     };
     match outcome {
+        // `run_inner`'s driver consumes tail calls internally; an escaped one
+        // is an internal invariant violation.
+        VmOutcome::TailCall(_) => Err(JsError::new(
+            ErrorKind::TypeError,
+            "tail call escaped the async-generator driver".into(),
+        )),
         VmOutcome::Suspended(Suspension::Yield {
             value,
             delegate: true,

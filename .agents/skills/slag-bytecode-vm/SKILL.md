@@ -1,10 +1,48 @@
 ---
 name: slag-bytecode-vm
-description: "Load when working on Slag's bytecode VM and compiler (crates/runtime/src/ir.rs) — the Step enum, the Vm dispatch loop, compile_expr/compile_statement lowering, the LeafOp register executor, the certified-function frame-slot gate, or the compiled-path stack protocol. Documents the non-obvious traps: optional-call short-path stack discipline, assignment-reference timing, super base capture before key conversion, destructure/for-of close semantics, template cache keys, the leaf-inline caller-Vm contract, the register-leaf lowering/aliasing contracts, the fused global-call ordering tradeoff, the frame-slot certification gate, and the bench-noise reality."
+description: "Load when working on Slag's bytecode VM and compiler (crates/runtime/src/ir.rs) — the Step enum, the Vm dispatch loop, compile_expr/compile_statement lowering, the LeafOp register executor, the certified-function frame-slot gate, or the compiled-path stack protocol. Documents the non-obvious traps: optional-call short-path stack discipline, assignment-reference timing, super base capture before key conversion, destructure/for-of close semantics, template cache keys, the leaf-inline caller-Vm contract, the register-leaf lowering/aliasing contracts, the fused global-call ordering tradeoff, the frame-slot certification gate, the TCO frame-replacement protocol (incl. the try/catch/finally eligibility gate and the slow-path env reset), and the bench-noise reality."
 ---
 
 # Slag bytecode VM traps
 
+## Proper tail calls (34/34 `tco-*` fixtures)
+
+TCO is a driver-level frame replacement: the compiler emits a `TailCall*`
+step for a `return <call>` whose call is in tail position, and
+`run_inner`'s driver loops on `VmOutcome::TailCall(next)` (swapping
+`CurrentBody`) instead of recursing — `tail_prepare_ordinary` pops the
+caller's execution context, pushes the callee's, and reuses THIS Vm via
+`self.reset(...)`. The non-ordinary/uncertified callee falls back to
+`call_inner` + `return_completion`. Two traps cost real debugging time:
+
+- **The slow-path env reset must use the RUNNING CONTEXT's lexical env,
+  not `function_env`** (Set-method regression, `set-like-class-order`):
+  `tail_prepare_ordinary`'s uncertified branch calls
+  `function_declaration_instantiation`, which for a SLOPPY body creates a
+  fresh declarative wrapper over the function env (holding the `let`
+  bindings) and installs it as the running context's lexical env. Resetting
+  the Vm with `function_env` lets the dispatch loop's per-step context sync
+  clobber the context env back to `function_env`, so `let x = v`
+  (`Step::DeclInit` → `binding_initialization` → `initialize_binding`)
+  throws `Binding "x" does not exist`. Reset with
+  `agent.running_context()?.lexical_environment` after instantiation —
+  exactly what `run_compiled_body` does.
+- **The try eligibility gate is `tail_safe_depth == try_depth <= 1`**: a
+  return is tail-eligible only in the INNERMOST try's own
+  catch-without-finally or finally clause, with no enclosing trys. The
+  try's frame is already consumed when the clause runs (the catch entered
+  via `throw_machinery`, the finally via `control_transfer` — both remove
+  the frame), so the replacement loses no handler coverage; an enclosing
+  try (catch OR finally) would observe a throw from the callee or run
+  after the call, so `try_depth >= 2` stays a normal call. The pending
+  control a finally was processing needs no explicit discard: the
+  `Replaced(ir)` path's `self.reset()` clears it, and the leaf/`call_inner`
+  paths' `return_completion` pops it via `control_transfer`'s finally-
+  running branch. The compiler tracks `tail_safe_depth` per clause in
+  `compile_try` (try Block → 0; catch → depth iff no finally; finally →
+  depth).
+
+## The v8 reference checkout is gitignored
 The engine compiles every expression and statement to `Step` bytecode
 (`crates/runtime/src/ir.rs`) and runs ordinary calls/constructs, generators,
 async functions, and top-level scripts on the `Vm` dispatch loop. The old

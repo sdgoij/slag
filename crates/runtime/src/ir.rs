@@ -378,6 +378,31 @@ pub enum Step {
         arg_slots: Vec<usize>,
         store_slot: usize,
     },
+    /// Proper tail call (spec 14.2.2): a strict-mode `return f(x)` outside
+    /// any try/with. The callee/args are on the stack exactly as for
+    /// `CallFast`, but the handler runs the return's cleanup (iterator
+    /// close, env unwind) and replaces the current frame with the callee's
+    /// instead of recursing — `run_inner`'s driver loops on the new body.
+    TailCallFast {
+        argc: u8,
+        direct_eval: bool,
+    },
+    /// The vector-argument form of `TailCallFast` (≥3 args or a spread).
+    TailCall {
+        direct_eval: bool,
+    },
+    /// Tail form of `CallFastGlobal` (a plain declared-global callee).
+    TailCallFastGlobal {
+        name: crux::AtomId,
+        argc: u8,
+    },
+    /// Tail form of `CallFastSlot` (a frame-slot callee).
+    TailCallFastSlot {
+        slot: usize,
+        argc: u8,
+    },
+    /// Tail form of `TaggedTemplate` (`return tag\`...\``).
+    TailTaggedTemplate(syntax::ast::TemplateLiteral),
     SuperCall,
     Construct,
     TaggedTemplate(syntax::ast::TemplateLiteral),
@@ -1325,6 +1350,34 @@ pub enum ResumeAbrupt {
 pub enum VmOutcome {
     Completed(Completion),
     Suspended(Suspension),
+    /// A proper tail call replaced the running body: the handler already set
+    /// up the callee's context and frame on this Vm, and `run_inner`'s
+    /// driver continues with the carried body.
+    TailCall(std::rc::Rc<CompiledBody>),
+}
+
+/// The body a [`Vm::run_inner`] driver is currently executing: a proper tail
+/// call replaces it, and the enum owns each replacement's `Rc` so the
+/// per-iteration reborrow stays valid.
+enum CurrentBody<'a> {
+    Borrowed(&'a CompiledBody),
+    Owned(std::rc::Rc<CompiledBody>),
+}
+
+impl<'a> CurrentBody<'a> {
+    fn get(&self) -> &CompiledBody {
+        match self {
+            CurrentBody::Borrowed(body) => body,
+            CurrentBody::Owned(rc) => rc,
+        }
+    }
+}
+
+/// A tail call's outcome: the current body completed (a leaf/native callee)
+/// or the frame was replaced and the driver must continue with the new body.
+enum TailOutcome {
+    Returned(VmOutcome),
+    Replaced(std::rc::Rc<CompiledBody>),
 }
 
 /// A property key for member steps.
@@ -3078,11 +3131,16 @@ impl Vm {
     }
 
     fn run_inner(&mut self, agent: &mut Agent, body: &CompiledBody) -> Result<VmOutcome, JsError> {
+        // A proper tail call replaces the running body instead of recursing:
+        // the handler swaps in the callee's body and the driver loops.
+        let mut current = CurrentBody::Borrowed(body);
         // Record the agent for the duration so crux-side ECMAScript calls
         // (proxy traps reached through property access) can find the runtime.
         crux::function::with_agent(agent as *mut Agent as *mut (), || {
             loop {
+                let body = current.get();
                 match self.run_inner_inner(agent, body) {
+                    Ok(VmOutcome::TailCall(next)) => current = CurrentBody::Owned(next),
                     Ok(outcome) => return Ok(outcome),
                     // A step's engine error (a TypeError from a property access, a
                     // ReferenceError from an unresolved identifier, ...) inside a
@@ -4134,6 +4192,18 @@ impl Vm {
                 Step::CallFast { argc, direct_eval } => {
                     self.do_call_fast(agent, *argc as usize, *direct_eval)?;
                 }
+                Step::TailCallFast { argc, direct_eval } => {
+                    return self.tail_call_fast(agent, *argc as usize, *direct_eval, body);
+                }
+                Step::TailCall { direct_eval } => {
+                    return self.tail_call_vector(agent, *direct_eval, body);
+                }
+                Step::TailCallFastGlobal { name, argc } => {
+                    return self.do_tail_call_global(agent, *name, *argc as usize, body);
+                }
+                Step::TailCallFastSlot { slot, argc } => {
+                    return self.do_tail_call_slot(agent, *slot, *argc as usize, body);
+                }
                 Step::CallFastGlobal {
                     name,
                     argc,
@@ -4284,6 +4354,44 @@ impl Vm {
                     let substitutions = self.args.split_off(base);
                     let value = tagged_template(agent, this, tag, template, substitutions)?;
                     self.stack.push(value);
+                }
+                Step::TailTaggedTemplate(template) => {
+                    let tag = self.pop();
+                    let this = self.pop();
+                    let base = self.args_base_stack.pop().ok_or_else(|| {
+                        JsError::new(
+                            ErrorKind::SyntaxError,
+                            "TailTaggedTemplate without an argument boundary".into(),
+                        )
+                    })?;
+                    let substitutions = self.args.split_off(base);
+                    // The tag invocation is the tail call: build the
+                    // template object + substitution arguments, lay them out
+                    // as a fast-form call, and let the shared dispatcher
+                    // frame-replace (or run a leaf in place) and complete the
+                    // return.
+                    let template_object = crate::expr::get_template_object(agent, template)?;
+                    let mut args = vec![template_object];
+                    args.extend(substitutions);
+                    let argc = args.len();
+                    let keep = self.stack.len();
+                    self.stack.push(this.clone());
+                    self.stack.push(tag.clone());
+                    self.stack.extend(args);
+                    let n = self.stack.len();
+                    return match self.tail_call_shared(
+                        agent,
+                        this,
+                        tag,
+                        argc,
+                        n - argc,
+                        keep,
+                        false,
+                        body,
+                    )? {
+                        TailOutcome::Returned(outcome) => Ok(outcome),
+                        TailOutcome::Replaced(ir) => Ok(VmOutcome::TailCall(ir)),
+                    };
                 }
                 Step::ArrayBegin => {
                     let array = crate::builtins::array::array_create(agent, 0.0)?;
@@ -6530,6 +6638,11 @@ impl Vm {
                 ErrorKind::TypeError,
                 "ordinary function suspended unexpectedly".into(),
             )),
+            // A leaf body contains no calls, so a tail call cannot escape it.
+            Ok(VmOutcome::TailCall(_)) => Err(JsError::new(
+                ErrorKind::TypeError,
+                "tail call escaped a leaf body".into(),
+            )),
             Err(error) => Err(error),
         }
     }
@@ -7142,6 +7255,415 @@ impl Vm {
             2,
             LeafCacheSite::None,
         )
+    }
+
+    /// The `TailCallFast` handler (proper tail calls): the callee/args are on
+    /// the stack as for a normal call, but the current body's return cleanup
+    /// runs and the frame is replaced instead of recursing.
+    fn tail_call_fast(
+        &mut self,
+        agent: &mut Agent,
+        argc: usize,
+        direct_eval: bool,
+        body: &CompiledBody,
+    ) -> Result<VmOutcome, JsError> {
+        let n = self.stack.len();
+        let arg_start = n - argc;
+        let callee = self.stack[arg_start - 1].clone();
+        let this = self.stack[arg_start - 2].clone();
+        match self.tail_call_shared(
+            agent,
+            this,
+            callee,
+            argc,
+            arg_start,
+            arg_start - 2,
+            direct_eval,
+            body,
+        )? {
+            TailOutcome::Returned(outcome) => Ok(outcome),
+            TailOutcome::Replaced(ir) => Ok(VmOutcome::TailCall(ir)),
+        }
+    }
+
+    /// The `TailCall` (vector-form) handler: the arguments came through the
+    /// `ArgsBase`/`ArgsPush` machinery; rebuild the fast-form layout so the
+    /// shared dispatcher reads them in place (the vector form is rare — ≥3
+    /// args or a spread).
+    fn tail_call_vector(
+        &mut self,
+        agent: &mut Agent,
+        direct_eval: bool,
+        body: &CompiledBody,
+    ) -> Result<VmOutcome, JsError> {
+        let callee = self.pop();
+        let this = self.pop();
+        let base = self.args_base_stack.pop().ok_or_else(|| {
+            JsError::new(
+                ErrorKind::SyntaxError,
+                "TailCall without an argument boundary".into(),
+            )
+        })?;
+        let args = self.args.split_off(base);
+        let argc = args.len();
+        let keep = self.stack.len();
+        self.stack.push(this.clone());
+        self.stack.push(callee.clone());
+        self.stack.extend(args);
+        let n = self.stack.len();
+        match self.tail_call_shared(agent, this, callee, argc, n - argc, keep, direct_eval, body)? {
+            TailOutcome::Returned(outcome) => Ok(outcome),
+            TailOutcome::Replaced(ir) => Ok(VmOutcome::TailCall(ir)),
+        }
+    }
+
+    /// The `TailCallFastGlobal` handler: the callee comes from the global
+    /// cell with an `undefined` receiver (the compiler emitted no receiver
+    /// push or callee load).
+    fn do_tail_call_global(
+        &mut self,
+        agent: &mut Agent,
+        name: crux::AtomId,
+        argc: usize,
+        body: &CompiledBody,
+    ) -> Result<VmOutcome, JsError> {
+        let n = self.stack.len();
+        let callee = self.load_global_value(agent, name)?;
+        let keep = n - argc;
+        match self.tail_call_shared(
+            agent,
+            Value::Undefined,
+            callee,
+            argc,
+            n - argc,
+            keep,
+            false,
+            body,
+        )? {
+            TailOutcome::Returned(outcome) => Ok(outcome),
+            TailOutcome::Replaced(ir) => Ok(VmOutcome::TailCall(ir)),
+        }
+    }
+
+    /// The `TailCallFastSlot` handler: the callee comes from a frame slot
+    /// with an `undefined` receiver.
+    fn do_tail_call_slot(
+        &mut self,
+        agent: &mut Agent,
+        slot: usize,
+        argc: usize,
+        body: &CompiledBody,
+    ) -> Result<VmOutcome, JsError> {
+        let n = self.stack.len();
+        let callee = self.frame_get(slot).clone();
+        let keep = n - argc;
+        match self.tail_call_shared(
+            agent,
+            Value::Undefined,
+            callee,
+            argc,
+            n - argc,
+            keep,
+            false,
+            body,
+        )? {
+            TailOutcome::Returned(outcome) => Ok(outcome),
+            TailOutcome::Replaced(ir) => Ok(VmOutcome::TailCall(ir)),
+        }
+    }
+
+    /// The shared tail-call dispatch: `args_base` is the stack index where
+    /// the arguments start, `keep` the stack length to restore on the normal
+    /// path. The callee/args are on the stack as for a normal call.
+    #[allow(clippy::too_many_arguments)]
+    fn tail_call_shared(
+        &mut self,
+        agent: &mut Agent,
+        this: Value,
+        callee: Value,
+        argc: usize,
+        args_base: usize,
+        keep: usize,
+        direct_eval: bool,
+        body: &CompiledBody,
+    ) -> Result<TailOutcome, JsError> {
+        // A direct eval in tail position (`return eval(x)`) is a host
+        // operation that must run with the caller's environment intact: the
+        // eval'd script inherits the caller's lexical/private environment and
+        // function position, so the frame replacement never applies. The
+        // `direct_eval` flag is name-based (`eval` as the callee identifier —
+        // a shadowed `eval` function is still tail-called), so the resolved
+        // callee is checked here before routing.
+        if direct_eval && is_eval_function(agent, &callee)? {
+            let source = self
+                .stack
+                .get(args_base)
+                .cloned()
+                .unwrap_or(Value::Undefined);
+            // spec 19.2.1.1 step 2: a non-string argument is returned as-is.
+            if !matches!(source.kind(), ValueKind::String(_)) {
+                self.stack.truncate(keep);
+                return Ok(TailOutcome::Returned(
+                    self.return_completion(agent, body, source)?,
+                ));
+            }
+            let source = crux::convert::to_string(&source)?;
+            let result = crate::script::perform_eval(agent, &source, self.strict, true)?;
+            self.stack.truncate(keep);
+            return Ok(TailOutcome::Returned(
+                self.return_completion(agent, body, result)?,
+            ));
+        }
+        // A tail call's value is this body's return: close the iterators and
+        // unwind the environment exactly as the return completion would (the
+        // frame is gone once the callee runs).
+        if !self.for_of_stack.is_empty() {
+            self.close_for_of_return(agent)?;
+        }
+        self.env_stack.truncate(1);
+        if let Some(base) = self.env_stack.get(0) {
+            self.lexical_env = base.clone();
+        }
+        // A certified leaf runs in place on this Vm (it never grew the
+        // stack); its result completes this body's return.
+        if self.can_inline_leaf()
+            && let ValueKind::Function(function) = callee.kind()
+            && matches!(function.kind, crux::function::FunctionKind::EcmaScript)
+            && agent.realm_count.get() == 1
+            && let Some(entry) = agent.leaf_lookup(function.id())
+        {
+            let entry = LeafEntry {
+                ir: entry.ir.clone(),
+                strict: entry.strict,
+                environment: entry.environment.clone(),
+                construct_inline: entry.construct_inline,
+            };
+            let below = self.stack.len() - argc - keep;
+            self.run_inline_leaf(agent, argc, this, entry, below, None)?;
+            let value = self.pop();
+            return Ok(TailOutcome::Returned(
+                self.return_completion(agent, body, value)?,
+            ));
+        }
+        // Frame replacement applies only to an ordinary-callable ECMAScript
+        // function in a single realm; everything else (builtin, bound,
+        // async, generator, class constructor, proxy, cross-realm) takes the
+        // normal call path — which does not recurse into `run_inner` for the
+        // tail call itself — and completes the return.
+        let args: Vec<Value> = self.stack[args_base..self.stack.len()].to_vec();
+        if let ValueKind::Function(function) = callee.kind()
+            && matches!(function.kind, crux::function::FunctionKind::EcmaScript)
+            && agent.realm_count.get() == 1
+            && let Some(ir) = self.tail_prepare_ordinary(agent, &function, this.clone(), &args)?
+        {
+            return Ok(TailOutcome::Replaced(ir));
+        }
+        let result = crate::function::call_inner(agent, &callee, this, &args)?;
+        self.stack.truncate(keep);
+        Ok(TailOutcome::Returned(
+            self.return_completion(agent, body, result)?,
+        ))
+    }
+
+    /// Complete the current body with a return of `value` — the `Step::Return`
+    /// behavior, factored for the tail-call paths (the compiler skipped the
+    /// `Return` step).
+    fn return_completion(
+        &mut self,
+        agent: &mut Agent,
+        body: &CompiledBody,
+        value: Value,
+    ) -> Result<VmOutcome, JsError> {
+        match self.control_transfer(
+            agent,
+            body,
+            Ctl::Return {
+                value: value.clone(),
+            },
+        )? {
+            // A finally can never defer a compiled tail call (the compiler
+            // gates on try_depth == 0), so Continue is unreachable; complete
+            // the return anyway.
+            CtlResult::Continue => Ok(VmOutcome::Completed(Completion::Return(value))),
+            CtlResult::Done(outcome) => Ok(outcome),
+        }
+    }
+
+    /// Set up an ordinary-callable ECMAScript callee's context and frame on
+    /// THIS Vm (PrepareForTailCall + PrepareForOrdinaryCall): the current
+    /// context is popped, the callee's is pushed, the Vm is reset to the
+    /// fresh-call state, and the frame/args/this are bound. `None` when the
+    /// callee needs a path the tail dispatch does not handle (class
+    /// constructor, async, generator, an AST-only body) — the caller falls
+    /// back to the normal call.
+    fn tail_prepare_ordinary(
+        &mut self,
+        agent: &mut Agent,
+        function: &std::rc::Rc<crux::function::Function>,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Option<std::rc::Rc<CompiledBody>>, JsError> {
+        let (ir, old_env, realm, strict, is_marked) = {
+            let record = agent.ecma_functions.get(&function.id()).ok_or_else(|| {
+                JsError::new(
+                    ErrorKind::TypeError,
+                    "Function body is not registered".into(),
+                )
+            })?;
+            if record.is_class_constructor || record.is_async || record.is_generator {
+                return Ok(None);
+            }
+            (
+                record.ir.clone(),
+                record.environment.clone(),
+                record.realm.clone(),
+                record.strict,
+                record.class_field_initializer,
+            )
+        };
+        let Some(ir) = ir else {
+            return Ok(None); // an AST-only body keeps the normal path
+        };
+        let saved_depth = agent.field_initializer_depth;
+        agent.field_initializer_depth = if is_marked { saved_depth + 1 } else { 0 };
+        if let Some(scope) = &ir.scope {
+            // Certified: the frame-slot path — no function environment, no
+            // declaration instantiation (the scope analysis certified the
+            // body references none of it). Mirrors `ordinary_call`'s fast
+            // branch + `run_compiled_body`'s setup.
+            let body_env = match scope.new_body_context(&old_env, args)? {
+                Some(context) => context,
+                None => old_env.clone(),
+            };
+            let context_function = (scope.arguments_slot.is_some() && !strict)
+                .then(|| Value::Function(function.clone()));
+            agent.execution_context_stack.pop();
+            agent
+                .execution_context_stack
+                .push(crate::context::ExecutionContext {
+                    function: context_function,
+                    realm,
+                    script_or_module: None,
+                    lexical_environment: body_env.clone(),
+                    variable_environment: body_env.clone(),
+                    private_environment: None,
+                    source: None,
+                    annex_b_hoistable: Default::default(),
+                });
+            let this_value = if scope.this_slot.is_some() {
+                Some(if strict {
+                    this
+                } else {
+                    match this.kind() {
+                        ValueKind::Undefined | ValueKind::Null => {
+                            let global = agent.running_context()?.realm.global_object.clone();
+                            Value::Object(global)
+                        }
+                        ValueKind::Object(_) | ValueKind::Function(_) => this,
+                        _ => crate::context::to_object(agent, &this)?,
+                    }
+                })
+            } else {
+                None
+            };
+            // Reuse this Vm as the callee's fresh Vm (a normal call would
+            // grab a pooled Vm), then bind the frame/args/this exactly like
+            // `run_compiled_body`.
+            self.reset(body_env.clone(), strict);
+            self.body_context = Some(body_env.clone());
+            if scope.frame_size > 0 {
+                self.setup_frame(scope, args);
+            }
+            if scope.arguments_slot.is_some() {
+                self.call_args = args.to_vec();
+            }
+            if let (Some(slot), Some(tv)) = (scope.this_slot, this_value) {
+                *self.frame.get_mut(slot) = tv;
+            }
+            self.ip = 0;
+            return Ok(Some(ir));
+        }
+        // Slow path (uncertified): a function environment + declaration
+        // instantiation, mirroring `ordinary_call`'s slow branch.
+        let (this_mode, params, body, declaring_module, private_environment) = {
+            let record = agent.ecma_functions.get(&function.id()).ok_or_else(|| {
+                JsError::new(
+                    ErrorKind::TypeError,
+                    "Function body is not registered".into(),
+                )
+            })?;
+            (
+                record.this_mode,
+                record.params.clone(),
+                record.body.clone(),
+                record.declaring_module.clone(),
+                record.private_environment.clone(),
+            )
+        };
+        let function_value = function.self_value();
+        let function_env = crate::env::new_function_environment(
+            Some(old_env),
+            function_value.clone(),
+            Value::Undefined,
+            this_mode == crate::function::ThisMode::Lexical,
+        );
+        let caller_script_or_module = agent
+            .running_context()
+            .ok()
+            .and_then(|context| context.script_or_module.clone());
+        let script_or_module = declaring_module
+            .map(crate::context::ScriptOrModule::Module)
+            .or(caller_script_or_module);
+        agent.execution_context_stack.pop();
+        agent
+            .execution_context_stack
+            .push(crate::context::ExecutionContext {
+                function: Some(function_value.clone()),
+                realm,
+                script_or_module,
+                lexical_environment: function_env.clone(),
+                variable_environment: function_env.clone(),
+                private_environment,
+                source: agent
+                    .running_context()
+                    .ok()
+                    .and_then(|context| context.source.clone()),
+                annex_b_hoistable: Default::default(),
+            });
+        if this_mode != crate::function::ThisMode::Lexical {
+            let this = if this_mode == crate::function::ThisMode::Sloppy {
+                match this.kind() {
+                    ValueKind::Undefined | ValueKind::Null => {
+                        let global = agent.running_context()?.realm.global_object.clone();
+                        Value::Object(global)
+                    }
+                    ValueKind::Object(_) | ValueKind::Function(_) => this,
+                    _ => crate::context::to_object(agent, &this)?,
+                }
+            } else {
+                this
+            };
+            function_env.bind_this_value(this)?;
+        }
+        crate::function::function_declaration_instantiation(
+            agent,
+            &function_value,
+            &params,
+            &body,
+            this_mode,
+            strict,
+            args,
+            &function_env,
+        )?;
+        // The body runs against the lexical env declaration instantiation
+        // installed on the running context (a sloppy body's `let` bindings
+        // live in a fresh wrapper over the function env), not the function
+        // env itself — mirror `run_compiled_body`, which resets the pooled
+        // Vm with the context's lexical env after instantiation.
+        let body_env = agent.running_context()?.lexical_environment.clone();
+        self.reset(body_env, strict);
+        self.ip = 0;
+        Ok(Some(ir))
     }
 
     /// The `CallFastGlobal` handler (Cut 35 slice 2): the callee comes from
@@ -9003,6 +9525,26 @@ struct Compiler {
     /// Cut 34: the `compile_expr` nesting depth, so `statement_expr` reaches
     /// only the statement's own assignment, not a nested one in an operand.
     expr_depth: usize,
+    /// The nesting depth of try/catch/finally bodies being compiled: a return
+    /// inside one cannot be a proper tail call (the finally must still run
+    /// after the call returns).
+    try_depth: usize,
+    /// The `try_depth` at which the currently-compiled clause is tail-safe:
+    /// the innermost try's catch (when it has no finally) or its finally.
+    /// `0` outside such a clause. A return is tail-eligible only when
+    /// `tail_safe_depth == try_depth <= 1` (the innermost try's own clause,
+    /// with no enclosing trys — an outer catch could catch a throw from the
+    /// callee, and an outer finally must run after the call).
+    tail_safe_depth: usize,
+    /// Whether the expression currently being compiled is in tail position —
+    /// its value is directly the return statement's argument: a call compiled
+    /// in tail position emits a frame-replacing tail call.
+    tail: bool,
+    /// Whether the body contains a `using` declaration: a tail call would
+    /// skip the body env's disposal on the way out, so such bodies never
+    /// compile tail calls (conservative — the corpus has no `using` + tail
+    /// shape, and correctness wins).
+    has_using: bool,
 }
 
 /// Where a binding lives for emission purposes: a frame slot (fast body),
@@ -9747,7 +10289,25 @@ impl Compiler {
     /// The argument compilation + call step (fast 0-2 args or the vector
     /// form), shared by the guarded and unguarded call paths.
     fn compile_call_args(&mut self, args: &[Argument], direct_eval: bool) -> Result<(), JsError> {
-        match self.compile_arguments(args, true)? {
+        let tail = self.tail;
+        self.tail = false; // arguments are never in tail position
+        let argc = self.compile_arguments(args, true)?;
+        self.tail = tail;
+        // A direct eval in tail position stays a tail call: the flag is
+        // name-based (`eval` as the callee identifier — a shadowed `eval`
+        // function is still tail-called), and `tail_call_shared` routes a
+        // callee that really is %eval% through `perform_eval` with the
+        // caller's environment intact instead of frame-replacing.
+        match argc {
+            Some(argc) if tail => {
+                self.emit(Step::TailCallFast {
+                    argc: argc as u8,
+                    direct_eval,
+                });
+            }
+            None if tail => {
+                self.emit(Step::TailCall { direct_eval });
+            }
             Some(argc) => self.emit(Step::CallFast {
                 argc: argc as u8,
                 direct_eval,
@@ -10320,6 +10880,7 @@ impl Compiler {
                             // after its binding.
                             self.emit(Step::SetFunctionName { name: *name });
                         }
+                        self.has_using = true;
                         self.emit(Step::UsingInit {
                             pattern: decl.pattern.clone(),
                             is_await: *is_await,
@@ -10329,16 +10890,42 @@ impl Compiler {
             }
             StmtKind::Return(expr) => {
                 let has_value = expr.is_some();
-                match expr {
-                    Some(expr) => self.compile_expr(expr)?,
-                    None => self.emit(Step::Push(Value::Undefined)),
+                if let Some(expr) = expr {
+                    // A proper tail call (spec 14.2.2): strict mode, outside
+                    // any try, no `with` in scope (the callee could resolve
+                    // through it), in an ordinary body, with no `using`
+                    // declarations (their disposal would be skipped by the
+                    // frame replacement) — the argument's final call compiles
+                    // to a frame-replacing tail call. A return in the
+                    // innermost try's own catch-without-finally or finally
+                    // clause is also tail-eligible (`tail_safe_depth ==
+                    // try_depth`): the try's frame is already consumed when
+                    // the clause runs, and with `try_depth <= 1` no outer
+                    // catch could observe a throw from the callee and no
+                    // outer finally must run after it. The env unwind and
+                    // `Return` below still emit: they are dead after a
+                    // replaced frame but required by the non-tail branches of
+                    // a forwarded shape (`return a ? 0 : f(b)`).
+                    let eligible = self.strict
+                        && self.try_depth == self.tail_safe_depth
+                        && self.try_depth <= 1
+                        && self.with_depth == 0
+                        && !self.is_async_generator
+                        && !self.has_using;
+                    let saved = self.tail;
+                    self.tail = eligible;
+                    self.compile_expr(expr)?;
+                    self.tail = saved;
+                } else {
+                    self.emit(Step::Push(Value::Undefined));
                 }
                 self.leave_scopes(self.scope_count);
                 if self.is_async_generator && has_value {
-                    // spec ReturnStatement evaluation step 3: only `return
-                    // Expression` in an async generator awaits the value
-                    // before completing (AsyncGeneratorCompleteStep does not
-                    // unwrap); `return;` completes with `undefined` without
+                    // spec ReturnStatement evaluation step 3: only
+                    // `return Expression` in an async generator awaits
+                    // the value before completing
+                    // (AsyncGeneratorCompleteStep does not unwrap);
+                    // `return;` completes with `undefined` without
                     // awaiting.
                     self.emit(Step::Await);
                 }
@@ -11512,7 +12099,15 @@ impl Compiler {
             decls: Self::block_decls(&block.stmts),
         });
         self.scope_count += 1;
+        self.try_depth += 1;
+        // A return in the try Block is never tail-safe: the enclosing
+        // catch/finally must run after the call (and its handler coverage
+        // would be lost by the frame replacement).
+        let saved_safe = self.tail_safe_depth;
+        self.tail_safe_depth = 0;
         self.compile_statements(&block.stmts)?;
+        self.tail_safe_depth = saved_safe;
+        self.try_depth -= 1;
         self.scope_count -= 1;
         self.emit(Step::LeaveBlock);
         self.emit(Step::ListEnd);
@@ -11536,7 +12131,18 @@ impl Compiler {
             // control transfer's `leave_scopes` pops the whole chain (the
             // normal path pops them with the explicit `LeaveBlock`s below).
             self.scope_count += if handler.param.is_some() { 3 } else { 1 };
+            self.try_depth += 1;
+            // A catch is tail-safe only when its try has no finally (the
+            // finally would run after the catch's return).
+            let saved_safe = self.tail_safe_depth;
+            self.tail_safe_depth = if finalizer.is_none() {
+                self.try_depth
+            } else {
+                0
+            };
             self.compile_statements(&handler.body.stmts)?;
+            self.tail_safe_depth = saved_safe;
+            self.try_depth -= 1;
             self.scope_count -= if handler.param.is_some() { 3 } else { 1 };
             if handler.param.is_some() {
                 // CatchBind pushed the block env and the parameter env in
@@ -11566,7 +12172,15 @@ impl Compiler {
                 decls: Self::block_decls(&finalizer.stmts),
             });
             self.scope_count += 1;
+            self.try_depth += 1;
+            // A return in the finally is tail-safe (it overrides the pending
+            // control; the finally is already running) — provided no OUTER
+            // try encloses it (checked by the `try_depth <= 1` gate).
+            let saved_safe = self.tail_safe_depth;
+            self.tail_safe_depth = self.try_depth;
             self.compile_statements(&finalizer.stmts)?;
+            self.tail_safe_depth = saved_safe;
+            self.try_depth -= 1;
             self.scope_count -= 1;
             self.emit(Step::LeaveBlock);
             self.emit(Step::ListEnd);
@@ -11583,9 +12197,27 @@ impl Compiler {
     /// statement's own assignment (`expr_depth == 1`), never a nested
     /// assignment in an operand.
     fn compile_expr(&mut self, expr: &Expr) -> Result<(), JsError> {
+        // Tail position (spec 14.2.2): only a call whose value is directly
+        // the return value may replace the frame. The compound shapes below
+        // forward the flag to their tail subexpression; every other shape's
+        // subexpressions are consumed by operations, so none is in tail
+        // position. Parens are transparent. The flag is restored on the way
+        // out so a sibling subexpression (e.g. a conditional's other branch)
+        // keeps the caller's tail position.
+        let saved = self.tail;
+        match &expr.kind {
+            ExprKind::Call(_)
+            | ExprKind::TaggedTemplate { .. }
+            | ExprKind::Conditional { .. }
+            | ExprKind::Logical { .. }
+            | ExprKind::Sequence(_)
+            | ExprKind::Paren(_) => {}
+            _ => self.tail = false,
+        }
         self.expr_depth += 1;
         let result = self.compile_expr_inner(expr);
         self.expr_depth -= 1;
+        self.tail = saved;
         result
     }
 
@@ -11594,8 +12226,16 @@ impl Compiler {
             ExprKind::Paren(inner) => self.compile_expr(inner),
             ExprKind::Sequence(exprs) => {
                 for (index, expr) in exprs.iter().enumerate() {
-                    self.compile_expr(expr)?;
-                    if index + 1 < exprs.len() {
+                    let is_last = index + 1 == exprs.len();
+                    if !is_last {
+                        let saved = self.tail;
+                        self.tail = false;
+                        self.compile_expr(expr)?;
+                        self.tail = saved;
+                    } else {
+                        self.compile_expr(expr)?;
+                    }
+                    if !is_last {
                         self.emit(Step::Pop);
                     }
                 }
@@ -11771,7 +12411,10 @@ impl Compiler {
                 Ok(())
             }
             ExprKind::Logical { op, left, right } => {
+                let saved = self.tail;
+                self.tail = false;
                 self.compile_expr(left)?;
+                self.tail = saved;
                 let end_label = self.new_label();
                 match op {
                     LogicalOp::And => self.jump_if_false_keep(end_label),
@@ -11788,7 +12431,10 @@ impl Compiler {
                 consequent,
                 alternate,
             } => {
+                let saved = self.tail;
+                self.tail = false;
                 self.compile_expr(test)?;
+                self.tail = saved;
                 let else_label = self.new_label();
                 let end_label = self.new_label();
                 self.jump_if_false(else_label);
@@ -11830,6 +12476,8 @@ impl Compiler {
                 Ok(())
             }
             ExprKind::TaggedTemplate { tag, quasi } => {
+                let tail = self.tail;
+                self.tail = false;
                 // A member tag keeps its base object as the call's this (spec
                 // 13.3.6.2: EvaluateCall with the tag reference); a plain tag
                 // is an undefined-receiver call.
@@ -11852,7 +12500,12 @@ impl Compiler {
                     self.compile_expr(expr)?;
                     self.emit(Step::ArgsPush);
                 }
-                self.emit(Step::TaggedTemplate(quasi.clone()));
+                self.tail = tail;
+                if tail {
+                    self.emit(Step::TailTaggedTemplate(quasi.clone()));
+                } else {
+                    self.emit(Step::TaggedTemplate(quasi.clone()));
+                }
                 Ok(())
             }
             ExprKind::Template(template) => self.compile_template(template),
@@ -13098,6 +13751,10 @@ impl Compiler {
     }
 
     fn compile_call(&mut self, call: &syntax::ast::CallExpr) -> Result<(), JsError> {
+        // A tail-position call: every load below (callee, keys, args) is NOT
+        // the tail call itself; the final call step re-checks the flag.
+        let tail = self.tail;
+        self.tail = false;
         if matches!(call.callee.kind, ExprKind::Super) {
             self.compile_arguments(&call.args, false)?;
             self.emit(Step::SuperCall);
@@ -13170,6 +13827,7 @@ impl Compiler {
                     // The member chain may still have short-circuited
                     // upstream (`a?.b.m(args)`): skip the argument
                     // evaluation and call.
+                    self.tail = tail;
                     self.compile_call_args_guarded(&call.args, false)?;
                 }
             }
@@ -13211,6 +13869,7 @@ impl Compiler {
             if call.optional {
                 self.compile_optional_call_tail(&call.args)?;
             } else {
+                self.tail = tail;
                 self.compile_call_args_guarded(&call.args, false)?;
             }
             return Ok(());
@@ -13231,6 +13890,7 @@ impl Compiler {
             if call.optional {
                 self.compile_optional_call_tail(&call.args)?;
             } else {
+                self.tail = tail;
                 self.compile_call_args_guarded(&call.args, direct_eval)?;
             }
             self.emit(Step::PopVarReference);
@@ -13305,7 +13965,20 @@ impl Compiler {
                         self.compile_expr(expr)?;
                     }
                 }
-                self.emit(step);
+                self.tail = tail;
+                if tail {
+                    match step {
+                        Step::CallFastGlobal { name, argc, .. } => {
+                            self.emit(Step::TailCallFastGlobal { name, argc });
+                        }
+                        Step::CallFastSlot { slot, argc } => {
+                            self.emit(Step::TailCallFastSlot { slot, argc });
+                        }
+                        other => self.emit(other),
+                    }
+                } else {
+                    self.emit(step);
+                }
                 return Ok(());
             }
         }
@@ -13315,6 +13988,7 @@ impl Compiler {
             self.compile_optional_call_tail(&call.args)?;
         } else {
             // An upstream `?.` in the callee (`(a?.b)()`) skips the arguments.
+            self.tail = tail;
             self.compile_call_args_guarded(&call.args, direct_eval)?;
         }
         Ok(())
@@ -13634,6 +14308,11 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
                 | Step::CallFastSlot { .. }
                 | Step::CallFastSlotStore { .. }
                 | Step::CallFastGlobalStore { .. }
+                | Step::TailCall { .. }
+                | Step::TailCallFast { .. }
+                | Step::TailCallFastGlobal { .. }
+                | Step::TailCallFastSlot { .. }
+                | Step::TailTaggedTemplate(_)
                 | Step::Construct
                 | Step::SuperCall
                 | Step::TaggedTemplate(_)

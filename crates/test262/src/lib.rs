@@ -12487,6 +12487,22 @@ var $DONE = function (error) {
                 "stale: +275760-09-12T00:00:01Z relativeTo is in range per the current spec".into(),
             );
         }
+        // Windows-checkout CRLF artifacts: the pinned test262 submodule is
+        // checked out with `core.autocrlf` rewriting LF to CRLF, so these
+        // byte-exact fixtures read `\r\n` where the corpus asserts `\n`.
+        // The skip is conditional on the working tree actually being CRLF —
+        // a clean LF checkout runs them normally.
+        if (relative == "Function/prototype/toString/line-terminator-normalisation-LF.js"
+            || relative == "import/import-bytes/bytes-from-js.js"
+            || relative == "import/import-bytes/bytes-from-json.js"
+            || relative == "import/import-bytes/bytes-from-txt.js")
+            && source.contains("\r\n")
+        {
+            return FixtureResult::Skip(
+                "CRLF checkout artifact: fixture asserts LF bytes; passes on a clean checkout"
+                    .into(),
+            );
+        }
         if fm.features.iter().any(|f| f == "await-dictionary") {
             // Promise.allKeyed/allSettledKeyed (the await-dictionary stage-3
             // proposal) are not part of ECMA-262 ES2026.
@@ -12545,6 +12561,7 @@ var $DONE = function (error) {
                         | "temporalHelpers.js"
                         | "testIntl.js"
                         | "testIntlNumberFormat.js"
+                        | "tcoHelper.js"
                 )
             })
             .collect();

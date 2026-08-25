@@ -54,6 +54,16 @@ pub fn eval_program(
                 "yield/await in a script top level".into(),
             ));
         }
+        // `run_inner`'s driver consumes tail calls internally (scripts cannot
+        // contain return statements at all); an escaped one is an internal
+        // invariant violation.
+        Ok(crate::ir::VmOutcome::TailCall(_)) => {
+            agent.return_vm(vm);
+            return Err(JsError::new(
+                ErrorKind::SyntaxError,
+                "tail call in a script top level".into(),
+            ));
+        }
         Err(error) => {
             agent.return_vm(vm);
             return Err(error);

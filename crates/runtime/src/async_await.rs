@@ -176,6 +176,14 @@ pub fn call_async_function(
                     agent.execution_context_stack.pop();
                     attach_await(agent, &state, value)?;
                 }
+                // `run_inner`'s driver consumes tail calls internally; an
+                // escaped one is an internal invariant violation.
+                VmOutcome::TailCall(_) => {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "tail call escaped the async driver".into(),
+                    ));
+                }
                 VmOutcome::Suspended(_) => {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
@@ -296,6 +304,14 @@ fn resume_async(
     match outcome {
         VmOutcome::Suspended(Suspension::Await(value)) => {
             attach_await(agent, &state, value)?;
+        }
+        // `run_inner`'s driver consumes tail calls internally; an escaped one
+        // is an internal invariant violation.
+        VmOutcome::TailCall(_) => {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "tail call escaped the async driver".into(),
+            ));
         }
         VmOutcome::Suspended(_) => {
             return Err(JsError::new(

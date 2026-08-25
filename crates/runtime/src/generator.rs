@@ -555,6 +555,12 @@ fn finish_resume(
             Err(error)
         }
         Ok(outcome) => match outcome {
+            // `run_inner`'s driver consumes tail calls internally; an escaped
+            // one is an internal invariant violation.
+            VmOutcome::TailCall(_) => Err(JsError::new(
+                ErrorKind::TypeError,
+                "tail call escaped the generator driver".into(),
+            )),
             VmOutcome::Suspended(Suspension::Yield { value, delegate }) => {
                 let context = agent.execution_context_stack.pop().ok_or_else(|| {
                     JsError::new(ErrorKind::TypeError, "no context to pop".into())

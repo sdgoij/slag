@@ -1429,6 +1429,16 @@ fn execute_module_body(
                 )?;
             }
         }
+        // `run_inner`'s driver consumes tail calls internally (modules cannot
+        // contain return statements); an escaped one is an internal invariant
+        // violation.
+        Ok(VmOutcome::TailCall(_)) => {
+            agent.execution_context_stack.pop();
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "tail call escaped the module driver".into(),
+            ));
+        }
         Ok(VmOutcome::Suspended(Suspension::Await(value))) => {
             agent.execution_context_stack.pop();
             crate::async_await::attach_await(agent, &state, value)?;

@@ -122,9 +122,11 @@ worktrees' sweep binaries first (the parent A/B worktree at
   bench-noise reality. Load it when a fix touches the VM path.
 - `git-commit-messages` — commit message format.
 - Keep the skip taxonomy (what `run_fixture` skips) in sync with
-  `tools/skip_tally.js`; as of the atomics closure the only skips are
+  `tools/skip_tally.js`; as of the TCO closure the only skips are
   Temporal, await-dictionary, ShadowRealm, and the unsupported-include
-  fixtures (`tcoHelper`, `temporalHelpers`). The `atomicsHelper` (112) and
+  fixtures (`temporalHelpers` — the `tcoHelper` (34) cluster RUNS: proper
+  tail calls pass all 34 `tco-*` fixtures, including the try/catch/finally
+  returns). The `atomicsHelper` (112) and
   `CanBlockIsTrue` (7) clusters run: the harness installs the `$262.agent`
   host API (`start`/`broadcast`/`getReport`/`sleep`/`monotonicNow`), spawns
   worker threads with their own agents, and resolves cross-thread

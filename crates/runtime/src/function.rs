@@ -1910,6 +1910,15 @@ fn run_compiled_body(
                 "ordinary function suspended unexpectedly".into(),
             ));
         }
+        // `run_inner`'s driver consumes tail calls internally; an escaped one
+        // is an internal invariant violation.
+        Ok(VmOutcome::TailCall(_)) => {
+            agent.return_vm(vm);
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "tail call escaped the driver".into(),
+            ));
+        }
         // The body env's `using` resources dispose on an abrupt error too
         // (spec 14.2.3 step 6, mirroring the walker's eval_statement_list);
         // a throwing disposal folds into the error as a SuppressedError.
@@ -2240,6 +2249,15 @@ fn ordinary_construct(
                         "constructor body suspended unexpectedly".into(),
                     ));
                 }
+                // `run_inner`'s driver consumes tail calls internally; an
+                // escaped one is an internal invariant violation.
+                Ok(VmOutcome::TailCall(_)) => {
+                    agent.return_vm(vm);
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "tail call escaped the driver".into(),
+                    ));
+                }
                 Err(error) => {
                     agent.return_vm(vm);
                     return Err(body_error_after_disposal(agent, &body_env, error));
@@ -2412,6 +2430,15 @@ fn ordinary_construct(
                         return Err(JsError::new(
                             ErrorKind::TypeError,
                             "constructor body suspended unexpectedly".into(),
+                        ));
+                    }
+                    // `run_inner`'s driver consumes tail calls internally; an
+                    // escaped one is an internal invariant violation.
+                    Ok(VmOutcome::TailCall(_)) => {
+                        agent.return_vm(vm);
+                        return Err(JsError::new(
+                            ErrorKind::TypeError,
+                            "tail call escaped the driver".into(),
                         ));
                     }
                     Err(error) => {
