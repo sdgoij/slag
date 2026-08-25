@@ -120,7 +120,7 @@ fn ordinary_to_primitive(
         // value (its toString/valueOf return [[StringData]]), like the
         // boxed Number/BigInt/Boolean wrappers below.
         if let crate::object::ObjectKind::String(text) = &obj.kind {
-            return Ok(Value::String(text.clone()));
+            return Ok(Value::String(*text));
         }
         if let Some(boxed) = &*obj.boxed.borrow() {
             return Ok(match boxed {

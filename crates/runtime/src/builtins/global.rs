@@ -88,9 +88,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
         )?;
         if let Some(function_proto) = &function_proto {
-            function
-                .object
-                .set_prototype_of(Some(function_proto.clone()))?;
+            function.object.set_prototype_of(Some(*function_proto))?;
         }
         realm.global_object.define_property_or_throw(
             &JsString::from_utf8(name),

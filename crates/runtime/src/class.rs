@@ -115,8 +115,8 @@ fn setup_class_scope(
     class: &Class,
     class_binding: Option<crux::string::AtomId>,
 ) -> Result<ClassScope, JsError> {
-    let outer_env = agent.running_context()?.lexical_environment.clone();
-    let class_env = new_declarative_environment(Some(outer_env.clone()));
+    let outer_env = agent.running_context()?.lexical_environment;
+    let class_env = new_declarative_environment(Some(outer_env));
     let binding: Option<JsString> = class_binding.map(crux::lookup);
     if let Some(binding) = &binding {
         class_env.create_immutable_binding(binding, true)?;
@@ -124,8 +124,8 @@ fn setup_class_scope(
 
     // The class PrivateEnvironment (spec steps 4-10): a fresh Private Name
     // per private identifier in the body, whose description is `#name`.
-    let outer_private_env = agent.running_context()?.private_environment.clone();
-    let class_private_env = new_private_environment(outer_private_env.clone());
+    let outer_private_env = agent.running_context()?.private_environment;
+    let class_private_env = new_private_environment(outer_private_env);
     {
         let mut names = class_private_env.names.borrow_mut();
         for element in &class.elements {
@@ -164,9 +164,9 @@ fn evaluate_heritage(
     let superclass = match &class.heritage {
         None => None,
         Some(expr) => {
-            agent.running_context_mut()?.lexical_environment = scope.class_env.clone();
+            agent.running_context_mut()?.lexical_environment = scope.class_env;
             let superclass = eval_expr(agent, expr, true)?;
-            agent.running_context_mut()?.lexical_environment = scope.outer_env.clone();
+            agent.running_context_mut()?.lexical_environment = scope.outer_env;
             Some(superclass)
         }
     };
@@ -222,7 +222,7 @@ fn resolve_heritage(agent: &mut Agent, superclass: Option<Value>) -> Result<Heri
                 // A callable prototype (Function.prototype) is still an
                 // ordinary object for prototype purposes.
                 ValueKind::Function(proto) => Ok(Heritage {
-                    proto_parent: Some(proto.object.clone()),
+                    proto_parent: Some(proto.object),
                     super_constructor: Some(superclass.clone()),
                 }),
                 ValueKind::Null => Ok(Heritage {
@@ -281,7 +281,7 @@ fn build_class(
                 agent,
                 function.params.clone(),
                 crate::function::shared_function_body(agent, function, ctor_source.as_ref()),
-                class_env.clone(),
+                class_env,
                 true,
             )?
         }
@@ -293,7 +293,7 @@ fn build_class(
     // initializers (spec 15.7.11 step 24.c); the default constructor gets the
     // same home so fields on a class without an explicit constructor resolve
     // `super` too.
-    make_method(agent, &ctor, Value::Object(proto.clone()))?;
+    make_method(agent, &ctor, Value::Object(proto))?;
 
     // SetFunctionName(ctor, className): the empty string for anonymous
     // class expressions (the enclosing binding renames it later); a default
@@ -311,7 +311,7 @@ fn build_class(
     ctor_handle.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(Value::Object(proto.clone())),
+            value: Some(Value::Object(proto)),
             writable: Some(false),
             get: None,
             set: None,
@@ -333,7 +333,7 @@ fn build_class(
     if let Some(super_ctor) = &super_constructor {
         let super_object = match super_ctor.kind() {
             ValueKind::Object(object) => object,
-            ValueKind::Function(function) => function.object.clone(),
+            ValueKind::Function(function) => function.object,
             _ => {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
@@ -364,8 +364,8 @@ fn build_class(
     let mut fields = Vec::new();
     let mut instance_private_methods = Vec::new();
     let mut static_elements: Vec<StaticElement> = Vec::new();
-    agent.running_context_mut()?.lexical_environment = class_env.clone();
-    agent.running_context_mut()?.private_environment = Some(class_private_env.clone());
+    agent.running_context_mut()?.lexical_environment = class_env;
+    agent.running_context_mut()?.private_environment = Some(class_private_env);
     let mut computed_key_index = 0;
     for element in &class.elements {
         if matches!(
@@ -382,13 +382,13 @@ fn build_class(
         let home = if is_static {
             ctor.clone()
         } else {
-            Value::Object(proto.clone())
+            Value::Object(proto)
         };
         match element {
             ClassElement::Method { name, function, .. } => {
                 let (private_id, key) =
                     element_key_with(agent, name, strict, precomputed_keys, computed_key_index)?;
-                let closure = instantiate_method(agent, function, class_env.clone(), true)?;
+                let closure = instantiate_method(agent, function, class_env, true)?;
                 set_private_environment(agent, &closure, &class_private_env)?;
                 make_method(agent, &closure, home.clone())?;
                 set_function_name(&closure, &element_name_text(name, key.as_ref()), None)?;
@@ -411,7 +411,7 @@ fn build_class(
                 let (private_id, key) =
                     element_key_with(agent, name, strict, precomputed_keys, computed_key_index)?;
                 let getter =
-                    instantiate_accessor(agent, Vec::new(), body.clone(), class_env.clone(), true)?;
+                    instantiate_accessor(agent, Vec::new(), body.clone(), class_env, true)?;
                 set_private_environment(agent, &getter, &class_private_env)?;
                 make_method(agent, &getter, home.clone())?;
                 set_function_name(&getter, &element_name_text(name, key.as_ref()), Some("get"))?;
@@ -450,7 +450,7 @@ fn build_class(
                         span: body.span,
                     }],
                     body.clone(),
-                    class_env.clone(),
+                    class_env,
                     true,
                 )?;
                 set_private_environment(agent, &setter, &class_private_env)?;
@@ -495,7 +495,7 @@ fn build_class(
                             name: PropertyKey::from_utf8(""),
                             private_name: Some(name_id),
                             init: init.clone(),
-                            environment: class_env.clone(),
+                            environment: class_env,
                         });
                     }
                 } else if is_static {
@@ -510,7 +510,7 @@ fn build_class(
                         name: key.unwrap(),
                         private_name: None,
                         init: init.clone(),
-                        environment: class_env.clone(),
+                        environment: class_env,
                     });
                 }
             }
@@ -526,15 +526,15 @@ fn build_class(
             computed_key_index += 1;
         }
     }
-    agent.running_context_mut()?.lexical_environment = env_record.clone();
-    agent.running_context_mut()?.private_environment = outer_private_env.clone();
+    agent.running_context_mut()?.lexical_environment = env_record;
+    agent.running_context_mut()?.private_environment = outer_private_env;
 
     // [[Fields]], [[PrivateMethods]], and the class private environment (spec
     // steps 38-40).
     if let Some(data) = agent.ecma_functions.get_mut(&ctor_handle.id()) {
         data.fields = fields;
         data.private_methods = instance_private_methods;
-        data.private_environment = Some(class_private_env.clone());
+        data.private_environment = Some(class_private_env);
         // Cut 33: fields/private methods arrive after registration, so the
         // cached construct-inline verdict (computed with the empty vectors)
         // is stale — a constructor with fields/private methods must not
@@ -550,8 +550,8 @@ fn build_class(
     // Static fields and blocks evaluate after the class binding is
     // initialized, in source order (spec steps 41-44), with the class scope
     // and private names visible.
-    agent.running_context_mut()?.lexical_environment = class_env.clone();
-    agent.running_context_mut()?.private_environment = Some(class_private_env.clone());
+    agent.running_context_mut()?.lexical_environment = class_env;
+    agent.running_context_mut()?.private_environment = Some(class_private_env);
     for element in &static_elements {
         match element {
             StaticElement::Field {
@@ -589,8 +589,8 @@ fn build_class(
             }
         }
     }
-    agent.running_context_mut()?.lexical_environment = env_record.clone();
-    agent.running_context_mut()?.private_environment = outer_private_env.clone();
+    agent.running_context_mut()?.lexical_environment = env_record;
+    agent.running_context_mut()?.private_environment = outer_private_env;
 
     Ok(ctor)
 }
@@ -643,7 +643,7 @@ fn default_constructor(
     class_env: &EnvRef,
 ) -> Result<Value, JsError> {
     if derived {
-        crate::function::instantiate_default_derived_constructor(agent, class_env.clone(), true)
+        crate::function::instantiate_default_derived_constructor(agent, *class_env, true)
     } else {
         instantiate_class_constructor(
             agent,
@@ -652,7 +652,7 @@ fn default_constructor(
                 stmts: Vec::new(),
                 span: crux::Span::new(0, 0),
             }),
-            class_env.clone(),
+            *class_env,
             true,
         )
     }
@@ -757,7 +757,7 @@ fn set_private_environment(
     let Some(data) = agent.ecma_functions.get_mut(&function.id()) else {
         return Ok(());
     };
-    data.private_environment = Some(private_env.clone());
+    data.private_environment = Some(*private_env);
     Ok(())
 }
 
@@ -855,7 +855,7 @@ fn evaluate_static_field_initializer(
         is_generator: false,
         statement_position: false,
     };
-    let closure = instantiate_method(agent, &function, class_env.clone(), true)?;
+    let closure = instantiate_method(agent, &function, *class_env, true)?;
     set_private_environment(agent, &closure, class_private_env)?;
     make_method(agent, &closure, receiver.clone())?;
     // The synthetic initializer function carries [[ClassFieldInitializerName]]
@@ -971,7 +971,7 @@ fn home_object(home: &Value) -> Option<Handle<crux::object::JsObject>> {
     if let Some(obj) = home.as_object() {
         Some(obj)
     } else {
-        home.as_function().map(|f| f.object.clone())
+        home.as_function().map(|f| f.object)
     }
 }
 
@@ -994,7 +994,7 @@ fn evaluate_static_block(
         is_generator: false,
         statement_position: false,
     };
-    let closure = instantiate_method(agent, &function, class_env.clone(), true)?;
+    let closure = instantiate_method(agent, &function, *class_env, true)?;
     set_private_environment(agent, &closure, class_private_env)?;
     // MakeMethod(body, homeObject): the home object is the class constructor,
     // so `super.prop` in a static block resolves against the superclass

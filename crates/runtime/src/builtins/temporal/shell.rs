@@ -67,7 +67,7 @@ fn statics(
         )?;
         realm
             .intrinsics
-            .define(intrinsic, Value::Function(func.clone()));
+            .define(intrinsic, Value::Function(func));
         ctor.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -98,7 +98,7 @@ fn proto_methods(
         )?;
         realm
             .intrinsics
-            .define(intrinsic, Value::Function(func.clone()));
+            .define(intrinsic, Value::Function(func));
         proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -129,7 +129,7 @@ fn proto_getters(
         )?;
         realm
             .intrinsics
-            .define(intrinsic, Value::Function(func.clone()));
+            .define(intrinsic, Value::Function(func));
         proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -3322,7 +3322,7 @@ fn plain_time_round(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
         let obj = crux::object::JsObject::ordinary_object_create(None);
         obj.create_data_property_or_throw(
             &JsString::from_utf8("smallestUnit"),
-            Value::String(text.clone()),
+            Value::String(*text),
         )?;
         Value::Object(obj)
     } else {
@@ -3915,7 +3915,7 @@ fn plain_date_time_round(
         let obj = crux::object::JsObject::ordinary_object_create(None);
         obj.create_data_property_or_throw(
             &JsString::from_utf8("smallestUnit"),
-            Value::String(text.clone()),
+            Value::String(*text),
         )?;
         Value::Object(obj)
     } else {
@@ -4494,7 +4494,7 @@ fn zoned_round(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
         let obj = crux::object::JsObject::ordinary_object_create(None);
         obj.create_data_property_or_throw(
             &JsString::from_utf8("smallestUnit"),
-            Value::String(text.clone()),
+            Value::String(*text),
         )?;
         Value::Object(obj)
     } else {
@@ -4729,7 +4729,7 @@ fn zoned_get_time_zone_transition(
         let obj = crux::object::JsObject::ordinary_object_create(None);
         obj.create_data_property_or_throw(
             &JsString::from_utf8("direction"),
-            Value::String(text.clone()),
+            Value::String(*text),
         )?;
         Value::Object(obj)
     } else {

@@ -13,6 +13,7 @@ use crate::error::{ErrorKind, JsError};
 use crate::function::call as value_call;
 use crate::function::construct as value_construct;
 use crate::handle::Handle;
+use crate::heap::{GcAny, Trace};
 use crate::object::{
     JsObject, Property, value_define_property, value_delete, value_get, value_get_method,
     value_get_own_property, value_get_prototype_of, value_has_property, value_is_extensible,
@@ -50,6 +51,17 @@ pub struct ProxySlots {
     pub handler: RefCell<Option<Value>>,
     pub callable: std::cell::Cell<bool>,
     pub constructible: std::cell::Cell<bool>,
+}
+
+impl Trace for ProxySlots {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        if let Some(target) = &*self.target.borrow() {
+            target.trace(visit);
+        }
+        if let Some(handler) = &*self.handler.borrow() {
+            handler.trace(visit);
+        }
+    }
 }
 
 fn revoked_error() -> JsError {
@@ -735,7 +747,7 @@ mod tests {
             )
             .unwrap();
         let proxy = proxy_of(target, Value::Object(handler));
-        let receiver = Value::Object(proxy.clone());
+        let receiver = Value::Object(proxy);
         assert_eq!(
             proxy
                 .get_with_receiver_key(&PropertyKey::from_utf8("x"), receiver.clone())
@@ -757,7 +769,7 @@ mod tests {
             .define_property(&key("x"), &PropertyDescriptor::none(Value::Number(1.0)))
             .unwrap();
         // Trap reports a different value: invariant violation -> TypeError.
-        let proxy = proxy_of(target.clone(), trap_handler("get", Value::Number(2.0)));
+        let proxy = proxy_of(target, trap_handler("get", Value::Number(2.0)));
         assert!(proxy.get(&key("x")).is_err());
         // Trap reports the same value: allowed.
         let proxy = proxy_of(target, trap_handler("get", Value::Number(1.0)));
@@ -806,7 +818,7 @@ mod tests {
         // Omitting "x" violates the invariant.
         let empty = JsObject::array_create(None, 0.0).unwrap();
         let proxy = proxy_of(
-            target.clone(),
+            target,
             trap_handler("ownKeys", Value::Object(empty)),
         );
         assert!(proxy.own_property_keys().is_err());
@@ -892,7 +904,7 @@ mod tests {
             )
             .unwrap();
         let proxy = proxy_create(Value::Function(target), Value::Object(handler)).unwrap();
-        assert!(is_callable(&Value::Object(proxy.clone())));
+        assert!(is_callable(&Value::Object(proxy)));
         let result = value_call(
             &Value::Object(proxy),
             Value::Undefined,
@@ -931,7 +943,7 @@ mod tests {
             )
             .unwrap();
         let proxy = proxy_create(Value::Function(target), Value::Object(handler)).unwrap();
-        assert!(is_constructor(&Value::Object(proxy.clone())));
+        assert!(is_constructor(&Value::Object(proxy)));
         let proxy_value = Value::Object(proxy);
         let result = value_construct(&proxy_value, &[], &proxy_value).unwrap();
         assert!(result.is_object());

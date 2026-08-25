@@ -148,6 +148,40 @@ scan land in the following slices.
 - Closes the cycle leaks — the headline correctness win.
 - Gate: full release sweep 0 regressions; cyclic workload memory bounded.
 
+**Slice 2 — the `Handle` flip (landed).** `Handle<T>` is now `Gc<T>`: a `Copy`
+pointer into the (still-unwired) GC heap, behind the same alias so call sites
+barely changed. Scope measured:
+
+- **14 types need `Trace` impls** (the heap-edge enumeration): `JsObject`,
+  `Function`, `JsString` (rope children), `Symbol`, `BigInt`, `Realm`,
+  `SourceTextModule`, `TypedArraySlots`, `PrivateEnvironment`, `EnvRecord`,
+  `ScriptRecord`, `ArgumentsSlots`, `ModuleNamespaceSlots`, `CruxObject`.
+- **641 allocation sites** (`Handle::new`/`Rc::new`) → `Gc::new`;
+  ~260 `Handle<…>` annotations; `Handle::clone`/`Rc::clone` become copies.
+- **`value.rs` refcount bookkeeping disappears**: `Value` stores the box
+  pointer (16-byte aligned, same payload shape as today) and needs no
+  `Rc::from_raw`/`into_raw` in `Clone`/`Drop` → `Clone` is a plain pointer
+  copy. `Value` stays `Clone` (not `Copy`) with its `PhantomData<Rc<()>>`
+  `!Send` marker; the `Copy` upgrade is the GC-5 perf unlock (see the note
+  in `crates/crux/src/value.rs`).
+- **`Rc::ptr_eq` (17 sites: module.rs/ir.rs/module_source.rs)** → `Gc::ptr_eq`.
+- **No `try_unwrap`/`make_mut`/`downgrade`/`strong_count` anywhere** — the
+  feared semantic reworks don't exist; interior mutability is already
+  `RefCell`-based. `SharedBuffer` and the agent's `FinalizationData` stay
+  `Rc`/`Arc` deliberately.
+- The flipped-but-unwired heap never collects, so the tree stays leaky-but-
+  safe; the collector wiring (slice 3) is what makes `--gc-stress` live.
+
+**Status.** Workspace compiles, `cargo test --workspace` green (~4,323
+pass), clippy `-D warnings` clean, and the full release sweep is
+48,025 pass / 0 fail / 158 skip / 439 hang (baseline 48,006 / 0 / 158 /
+458; the hang→pass delta is load-dependent classification wobble, see the
+`slag-conformance` skill). The leak harness confirms the leaky-but-safe
+state: `cycle` grows unboundedly (≈690 MB @ 200k iters, as under `Rc`), and
+`chain` now grows too (≈2.4 GB @ 200k iters) — the tracing heap reclaims
+nothing until slice 3 wires collection, so the old `Rc`-era "acyclic
+structures free on drop" property is gone until then.
+
 ### GC-2 — root audit and `--gc-stress` hardening
 
 - Audit every agent/runtime structure holding `Value`s (the §3 list), tracing

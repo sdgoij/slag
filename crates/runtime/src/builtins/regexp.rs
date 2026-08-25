@@ -160,7 +160,7 @@ pub fn regexp_initialize(
         },
     );
     object.set(&JsString::from_utf8("lastIndex"), Value::Number(0.0), true)?;
-    Ok(Value::Object(object.clone()))
+    Ok(Value::Object(*object))
 }
 
 /// spec 22.2.4.1 RegExp(patternOrRegexp, flags). `new_target` is `undefined`
@@ -410,7 +410,7 @@ fn regexp_builtin_exec(
     // groups that matched.
     let groups = if state.compiled.has_group_names {
         let groups_obj = JsObject::ordinary_object_create(None);
-        let named = groups_obj.clone();
+        let named = groups_obj;
         for name in &state.compiled.named_group_order {
             let value = match last_named_span(&state.compiled, &result, name) {
                 Some((s, e)) => Value::String(Handle::new(substring(string, s, e))),
@@ -1269,8 +1269,8 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .intrinsics
         .get("%Object.prototype%")
         .and_then(|value| as_object(&value));
-    let regexp_proto = JsObject::ordinary_object_create(object_proto.clone());
-    let regexp_proto_value = Value::Object(regexp_proto.clone());
+    let regexp_proto = JsObject::ordinary_object_create(object_proto);
+    let regexp_proto_value = Value::Object(regexp_proto);
 
     let regexp_ctor = Function::create_builtin(
         Some(JsString::from_utf8("RegExp")),
@@ -1279,7 +1279,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         Some(Box::new(placeholder("RegExp"))),
         None,
     )?;
-    let regexp_ctor_value = Value::Function(regexp_ctor.clone());
+    let regexp_ctor_value = Value::Function(regexp_ctor);
 
     realm.intrinsics.define(REGEXP, regexp_ctor_value.clone());
     realm
@@ -1320,7 +1320,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define(SPECIES, Value::Function(species_func.clone()));
+        .define(SPECIES, Value::Function(species_func));
     regexp_ctor.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone()),
         &PropertyDescriptor {
@@ -1343,7 +1343,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define(ESCAPE, Value::Function(escape_func.clone()));
+        .define(ESCAPE, Value::Function(escape_func));
     regexp_ctor.define_property(
         &JsString::from_utf8("escape"),
         &PropertyDescriptor {
@@ -1371,7 +1371,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm.intrinsics.define(key, Value::Function(func.clone()));
+        realm.intrinsics.define(key, Value::Function(func));
         regexp_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -1406,9 +1406,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(key, Value::Function(getter.clone()));
+        realm.intrinsics.define(key, Value::Function(getter));
         regexp_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -1441,10 +1439,9 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm.intrinsics.define(
-            &format!("%RegExp.legacy.{name}%"),
-            Value::Function(getter.clone()),
-        );
+        realm
+            .intrinsics
+            .define(&format!("%RegExp.legacy.{name}%"), Value::Function(getter));
         let setter = if with_setter {
             let setter = Function::create_builtin(
                 Some(JsString::from_utf8(&format!("set {name}"))),
@@ -1455,7 +1452,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             )?;
             realm.intrinsics.define(
                 &format!("%RegExp.legacy.{name}.set%"),
-                Value::Function(setter.clone()),
+                Value::Function(setter),
             );
             Some(setter)
         } else {
@@ -1471,11 +1468,8 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
                 &PropertyDescriptor {
                     value: None,
                     writable: None,
-                    get: Some(Value::Function(getter.clone())),
-                    set: setter
-                        .clone()
-                        .map(Value::Function)
-                        .or(Some(Value::Undefined)),
+                    get: Some(Value::Function(getter)),
+                    set: setter.map(Value::Function).or(Some(Value::Undefined)),
                     enumerable: Some(false),
                     configurable: Some(true),
                 },
@@ -1509,7 +1503,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm.intrinsics.define(key, Value::Function(func.clone()));
+        realm.intrinsics.define(key, Value::Function(func));
         let symbol_key = PropertyKey::Symbol(
             crux::symbol::well_known(symbol_name.trim_start_matches("@@"))
                 .as_ref()
@@ -1532,8 +1526,8 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     // (RegExp is branded via [[RegExpMatcher]] in Object.prototype.toString).
 
     // %RegExpStringIteratorPrototype% (spec 22.2.6.2).
-    let iterator_proto = JsObject::ordinary_object_create(object_proto.clone());
-    let iterator_proto_value = Value::Object(iterator_proto.clone());
+    let iterator_proto = JsObject::ordinary_object_create(object_proto);
+    let iterator_proto_value = Value::Object(iterator_proto);
     realm
         .intrinsics
         .define(STRING_ITERATOR, iterator_proto_value.clone());
@@ -1546,7 +1540,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define(STRING_ITERATOR_NEXT, Value::Function(next_func.clone()));
+        .define(STRING_ITERATOR_NEXT, Value::Function(next_func));
     iterator_proto.define_property(
         &JsString::from_utf8("next"),
         &PropertyDescriptor {

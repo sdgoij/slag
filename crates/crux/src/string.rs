@@ -6,6 +6,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::handle::Handle;
+use crate::heap::{GcAny, Trace};
 
 /// A JavaScript string: a sequence of UTF-16 code units (spec 6.1.4).
 ///
@@ -55,6 +56,24 @@ const CONCAT_FLAT_THRESHOLD: usize = 16;
 /// shares the materialized flat via the Arc — O(1) after the one copy.)
 const ROPE_MAX_DEPTH: usize = 16384;
 
+impl Trace for JsString {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        // A Flat's buffer is an external Arc (not GC-managed); a Rope's
+        // children are handles (the flat cache is an external Arc too).
+        match self {
+            JsString::Flat(_) => {}
+            JsString::Rope { left, right, .. } => {
+                if let Some(left) = left {
+                    left.trace(visit);
+                }
+                if let Some(right) = right {
+                    right.trace(visit);
+                }
+            }
+        }
+    }
+}
+
 impl JsString {
     pub fn from_utf16(units: &[u16]) -> Self {
         JsString::Flat(units.into())
@@ -70,10 +89,10 @@ impl JsString {
     /// boxes become the node's children (refcount bumps, no copies).
     pub fn concat(left: &Handle<JsString>, right: &Handle<JsString>) -> Handle<JsString> {
         if right.is_empty() {
-            return left.clone();
+            return *left;
         }
         if left.is_empty() {
-            return right.clone();
+            return *right;
         }
         let len = left.len() + right.len();
         if len <= CONCAT_FLAT_THRESHOLD {
@@ -89,12 +108,12 @@ impl JsString {
         let left = if left.depth() >= ROPE_MAX_DEPTH as u32 {
             Handle::new(JsString::Flat(left.flat_arc()))
         } else {
-            left.clone()
+            *left
         };
         let depth = 1 + left.depth().max(right.depth());
         Handle::new(JsString::Rope {
             left: Some(left),
-            right: Some(right.clone()),
+            right: Some(*right),
             len,
             depth,
             flat: OnceLock::new(),
@@ -203,42 +222,6 @@ impl JsString {
     }
 }
 
-impl Drop for JsString {
-    fn drop(&mut self) {
-        // A long append chain is hundreds of thousands of nodes deep; dropping
-        // the children recursively would overflow the stack. Unwind
-        // iteratively: `take` the children out (unique ownership — the box's
-        // own field drop then finds `None`), unwrap any we uniquely own, and
-        // keep going (shared children just decrement).
-        let mut work: Vec<Handle<JsString>> = Vec::new();
-        if let JsString::Rope { left, right, .. } = self {
-            if let Some(left) = left.take() {
-                work.push(left);
-            }
-            if let Some(right) = right.take() {
-                work.push(right);
-            }
-        } else {
-            return;
-        }
-        while let Some(handle) = work.pop() {
-            match Handle::try_unwrap(handle) {
-                Ok(mut js) => {
-                    if let JsString::Rope { left, right, .. } = &mut js {
-                        if let Some(left) = left.take() {
-                            work.push(left);
-                        }
-                        if let Some(right) = right.take() {
-                            work.push(right);
-                        }
-                    }
-                }
-                Err(handle) => drop(handle),
-            }
-        }
-    }
-}
-
 impl Clone for JsString {
     fn clone(&self) -> Self {
         // Flat strings share their buffer (Arc bump, O(1)); rope clones share
@@ -253,8 +236,8 @@ impl Clone for JsString {
                 depth,
                 ..
             } => JsString::Rope {
-                left: left.clone(),
-                right: right.clone(),
+                left: *left,
+                right: *right,
                 len: *len,
                 depth: *depth,
                 flat: OnceLock::new(),
@@ -574,7 +557,7 @@ mod tests {
         assert_eq!(left.to_code_points(), right.to_code_points());
         // Clones share the rope's children (not its flat cache — each box has
         // its own), and materialize the same content.
-        let cloned = left.clone();
+        let cloned = left;
         assert_eq!(cloned.as_slice(), left.as_slice());
         assert_eq!(cloned.as_slice().len(), left.as_slice().len());
     }

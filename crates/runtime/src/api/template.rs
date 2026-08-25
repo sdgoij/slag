@@ -210,7 +210,7 @@ impl FunctionTemplate {
                 instance_template.apply(&realm, &instance)?;
             }
             let info = FunctionCallbackInfo {
-                this: Value::Object(instance.clone()),
+                this: Value::Object(instance),
                 args,
                 new_target: Some(new_target.clone()),
                 isolate: this.isolate,
@@ -380,7 +380,7 @@ impl ObjectTemplate {
                             "get {}",
                             name.to_string_lossy()
                         ))),
-                        function_prototype.clone(),
+                        function_prototype,
                     )?;
                     let set = match setter {
                         Some(setter) => Some(
@@ -391,7 +391,7 @@ impl ObjectTemplate {
                                     "set {}",
                                     name.to_string_lossy()
                                 ))),
-                                function_prototype.clone(),
+                                function_prototype,
                             )?
                             .self_value(),
                         ),

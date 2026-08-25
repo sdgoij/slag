@@ -11,12 +11,12 @@
 
 use std::cell::{Cell, RefCell};
 use std::fmt;
-use std::rc::Weak;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{ErrorKind, JsError};
 use crate::function::call;
 use crate::handle::Handle;
+use crate::heap::{GcAny, Trace};
 use crate::ops::{same_value, same_value_zero};
 use crate::property::{PropertyDescriptor, PropertyKey};
 use crate::string::{JsString, lookup};
@@ -44,6 +44,28 @@ pub struct Property {
     pub kind: PropertyKind,
     pub enumerable: bool,
     pub configurable: bool,
+}
+
+impl Trace for PropertyKind {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        match self {
+            PropertyKind::Data { value, .. } => value.trace(visit),
+            PropertyKind::Accessor { get, set } => {
+                if let Some(get) = get {
+                    get.trace(visit);
+                }
+                if let Some(set) = set {
+                    set.trace(visit);
+                }
+            }
+        }
+    }
+}
+
+impl Trace for Property {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.kind.trace(visit);
+    }
 }
 
 impl Property {
@@ -188,8 +210,9 @@ pub enum ObjectKind {
     External(usize),
     /// A host-defined exotic (JSC `JSClassRef` objects, V8 handler
     /// objects): internal methods dispatch to a [`crate::host::HostOps`]
-    /// implementation with ordinary fallback.
-    Host(Handle<dyn crate::host::HostOps>),
+    /// implementation with ordinary fallback. Deliberately `Rc` (host state
+    /// is not GC-managed; the ffi/jsc tables root it, GC-6).
+    Host(std::rc::Rc<dyn crate::host::HostOps>),
 }
 
 /// The [[ParameterMap]] of an arguments exotic object (spec 10.4.4): an
@@ -236,6 +259,43 @@ pub struct ModuleNamespaceSlots {
     pub deferred: bool,
 }
 
+impl Trace for ArgumentsSlots {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        if let Some(parameter_map) = &self.parameter_map {
+            parameter_map.trace(visit);
+        }
+    }
+}
+
+impl Trace for TypedArraySlots {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        // The viewed buffer is a shared-memory buffer (Rc/Arc, deliberately
+        // not GC-managed); only the buffer language value has an edge.
+        self.buffer_object.trace(visit);
+    }
+}
+
+impl Trace for ModuleNamespaceSlots {
+    fn trace(&self, _visit: &mut dyn FnMut(GcAny)) {
+        // Exports are interned property keys (AtomId), not heap edges.
+    }
+}
+
+impl Trace for ObjectKind {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        match self {
+            ObjectKind::String(s) => s.trace(visit),
+            ObjectKind::Arguments(slots) => slots.trace(visit),
+            ObjectKind::Proxy(slots) => slots.trace(visit),
+            ObjectKind::IntegerIndexed(slots) => slots.trace(visit),
+            ObjectKind::ModuleNamespace(slots) => slots.trace(visit),
+            // Ordinary, Array, IsHTMLDDA, External, and Host (deliberately Rc)
+            // carry no GC heap edges.
+            _ => {}
+        }
+    }
+}
+
 impl ObjectKind {
     pub fn name(&self) -> &'static str {
         match self {
@@ -272,6 +332,30 @@ pub enum PrivateElementKind {
     },
 }
 
+impl Trace for PrivateElementKind {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        match self {
+            PrivateElementKind::Field(value) | PrivateElementKind::Method(value) => {
+                value.trace(visit)
+            }
+            PrivateElementKind::Accessor { get, set } => {
+                if let Some(get) = get {
+                    get.trace(visit);
+                }
+                if let Some(set) = set {
+                    set.trace(visit);
+                }
+            }
+        }
+    }
+}
+
+impl Trace for PrivateElement {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.kind.trace(visit);
+    }
+}
+
 /// An ECMAScript object. Equality is identity: each object carries a unique
 /// `id` (mirroring `Symbol`), so `Handle<JsObject>` equality and the derived
 /// `PartialEq` on `Value` are identity tests.
@@ -304,18 +388,43 @@ pub struct JsObject {
     pub private_elements: RefCell<Vec<PrivateElement>>,
     /// A weak back-reference to the owning handle, so internal methods that
     /// need `this` as a language value (accessor invocation, the arguments
-    /// mapping) can recover the real handle instead of a copy.
-    self_handle: RefCell<Option<Weak<JsObject>>>,
-    /// When this object is a function's object part, a weak back-reference to
+    /// mapping) can recover the real handle instead of a copy. Strong under
+    /// the GC model: a self-cycle, which the collector handles (the handle
+    /// and its box are one entity).
+    self_handle: RefCell<Option<Handle<JsObject>>>,
+    /// When this object is a function's object part, a back-reference to
     /// that function so a prototype link recovers the function value (e.g.
     /// `Object.getPrototypeOf(Int8Array)` is %TypedArray% the function, not
-    /// its object part).
-    pub function_self: RefCell<Option<Weak<crate::function::Function>>>,
+    /// its object part). Strong: the function and its object part live and
+    /// die together (the Rc model's weak ref existed only to break the cycle,
+    /// which the collector handles).
+    pub function_self: RefCell<Option<Handle<crate::function::Function>>>,
     /// The wrapped value of a primitive wrapper object (spec 10.4.2
     /// [[NumberData]]/[[BooleanData]]/[[BigIntData]]), mirrored on the object
     /// so crux's ToPrimitive/ToNumber coerce a boxed primitive without
     /// invoking the agent-dispatched `valueOf`.
     pub boxed: RefCell<Option<BoxedPrimitive>>,
+}
+
+impl Trace for JsObject {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.kind.trace(visit);
+        if let Some(prototype) = &*self.prototype.borrow() {
+            prototype.trace(visit);
+        }
+        for (_, property) in &*self.properties.borrow() {
+            property.trace(visit);
+        }
+        for element in &*self.private_elements.borrow() {
+            element.trace(visit);
+        }
+        // The strong function back-reference keeps the function alive while
+        // its object part is reachable; `self_handle` is a self-cycle
+        // (redundant to mark) and `boxed` holds no heap edges.
+        if let Some(function) = &*self.function_self.borrow() {
+            function.trace(visit);
+        }
+    }
 }
 
 /// The wrapped value of a primitive wrapper object (spec 10.4.2).
@@ -344,11 +453,7 @@ impl JsObject {
     /// language value (so a prototype link like `Object.getPrototypeOf(f)`
     /// keeps `typeof`/`is_constructor` working).
     pub fn function_value(&self) -> Option<Value> {
-        self.function_self
-            .borrow()
-            .as_ref()
-            .and_then(|weak| weak.upgrade())
-            .map(Value::Function)
+        (*self.function_self.borrow()).map(Value::Function)
     }
 
     /// The raw object with ordinary behaviour (no handle back-reference).
@@ -372,15 +477,12 @@ impl JsObject {
     }
 
     fn link_self_handle(object: &Handle<JsObject>) {
-        *object.self_handle.borrow_mut() = Some(Handle::downgrade(object));
+        *object.self_handle.borrow_mut() = Some(*object);
     }
 
     /// The object as a language value, recovering the original handle.
     pub fn self_value(&self) -> Value {
-        self.self_handle
-            .borrow()
-            .as_ref()
-            .and_then(|weak| weak.upgrade())
+        (*self.self_handle.borrow())
             .map(Value::Object)
             .unwrap_or(Value::Undefined)
     }
@@ -388,10 +490,7 @@ impl JsObject {
     /// Recover the owning handle of an embedded object (a `Function`'s object
     /// part); `None` for raw copies without a back-reference.
     pub fn handle(&self) -> Option<Handle<JsObject>> {
-        self.self_handle
-            .borrow()
-            .as_ref()
-            .and_then(|weak| weak.upgrade())
+        *self.self_handle.borrow()
     }
 
     /// The object's unique identity ([[ObjectId]]), used by the runtime to
@@ -424,7 +523,7 @@ impl JsObject {
     /// Create a host exotic object: internal methods dispatch to `ops` with
     /// ordinary fallback (JSC `JSClassRef` objects, V8 handler objects).
     pub fn host_object_create(
-        ops: Handle<dyn crate::host::HostOps>,
+        ops: std::rc::Rc<dyn crate::host::HostOps>,
         prototype: Option<Handle<JsObject>>,
     ) -> Handle<JsObject> {
         let object = Handle::new(Self {
@@ -713,7 +812,7 @@ impl JsObject {
         let obj = Handle::new(Self {
             id: NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
             kind: ObjectKind::Arguments(Handle::new(ArgumentsSlots {
-                parameter_map: Some(map.clone()),
+                parameter_map: Some(map),
             })),
             prototype: RefCell::new(prototype),
             extensible: Cell::new(true),
@@ -898,7 +997,7 @@ impl JsObject {
         match &self.kind {
             ObjectKind::Proxy(slots) => crate::proxy::get_prototype_of(slots),
             ObjectKind::ModuleNamespace(_) => Ok(None),
-            _ => Ok(self.prototype.borrow().clone()),
+            _ => Ok(*self.prototype.borrow()),
         }
     }
 
@@ -915,7 +1014,7 @@ impl JsObject {
         }
         let current = self.get_prototype_of()?;
         let same = match (&current, &proto) {
-            (Some(a), Some(b)) => Handle::ptr_eq(a, b),
+            (Some(a), Some(b)) => Handle::ptr_eq(*a, *b),
             (None, None) => true,
             _ => false,
         };
@@ -932,7 +1031,7 @@ impl JsObject {
             return Ok(false);
         }
         if let Some(proto) = &proto {
-            let mut ancestor = Some(proto.clone());
+            let mut ancestor = Some(*proto);
             while let Some(obj) = ancestor {
                 if obj.id == self.id {
                     return Ok(false);
@@ -1174,7 +1273,7 @@ impl JsObject {
         if !self.extensible.get() {
             return Ok(None);
         }
-        let mut probe = self.prototype.borrow().clone();
+        let mut probe = *self.prototype.borrow();
         while let Some(link) = probe {
             if !matches!(link.kind, ObjectKind::Ordinary | ObjectKind::Array) {
                 return Ok(None);
@@ -1182,7 +1281,7 @@ impl JsObject {
             if link.get_own_property_key(&key)?.is_some() {
                 return Ok(None);
             }
-            probe = link.prototype.borrow().clone();
+            probe = *link.prototype.borrow();
         }
         // Dense append (index == length): push the element and bump the
         // length in place, exactly like `array_define_own_property`'s fast
@@ -3088,14 +3187,14 @@ mod tests {
     #[test]
     fn set_prototype_of_blocks_cycles_and_non_extensible_change() {
         let a = JsObject::ordinary_object_create(None);
-        let b = JsObject::ordinary_object_create(Some(a.clone()));
+        let b = JsObject::ordinary_object_create(Some(a));
         // a -> b -> a is a cycle: rejected.
-        assert!(!a.set_prototype_of(Some(b.clone())).unwrap());
+        assert!(!a.set_prototype_of(Some(b)).unwrap());
         assert!(a.set_prototype_of(None).unwrap());
         // Once non-extensible the prototype is fixed.
         assert!(b.set_prototype_of(None).unwrap());
         assert!(b.prevent_extensions().unwrap());
-        assert!(!b.set_prototype_of(Some(a.clone())).unwrap());
+        assert!(!b.set_prototype_of(Some(a)).unwrap());
         // Setting the same prototype is a no-op success.
         assert!(b.set_prototype_of(None).unwrap());
     }

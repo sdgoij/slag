@@ -875,7 +875,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .get("%Object.prototype%")
         .and_then(|value| as_object(&value));
     let date_proto = JsObject::ordinary_object_create(object_proto);
-    let date_proto_value = Value::Object(date_proto.clone());
+    let date_proto_value = Value::Object(date_proto);
 
     let date_ctor = Function::create_builtin(
         Some(JsString::from_utf8("Date")),
@@ -884,7 +884,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         Some(Box::new(placeholder("Date"))),
         None,
     )?;
-    let date_ctor_value = Value::Function(date_ctor.clone());
+    let date_ctor_value = Value::Function(date_ctor);
 
     realm.intrinsics.define(DATE, date_ctor_value.clone());
     realm
@@ -927,11 +927,11 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm.intrinsics.define(key, Value::Function(func.clone()));
+        realm.intrinsics.define(key, Value::Function(func));
         date_ctor.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
-                value: Some(Value::Function(func.clone())),
+                value: Some(Value::Function(func)),
                 writable: Some(true),
                 get: None,
                 set: None,
@@ -1017,11 +1017,11 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm.intrinsics.define(key, Value::Function(func.clone()));
+        realm.intrinsics.define(key, Value::Function(func));
         date_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
-                value: Some(Value::Function(func.clone())),
+                value: Some(Value::Function(func)),
                 writable: Some(true),
                 get: None,
                 set: None,
@@ -1060,7 +1060,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define(DATE_TO_PRIMITIVE, Value::Function(to_primitive.clone()));
+        .define(DATE_TO_PRIMITIVE, Value::Function(to_primitive));
     date_proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("toPrimitive").as_ref().clone()),
         &PropertyDescriptor {

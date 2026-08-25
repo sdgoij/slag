@@ -231,7 +231,7 @@ fn delete_property_or_throw(value: &Value, name: &JsString) -> Result<(), JsErro
 /// coerced primitives already).
 fn object_of(value: &Value) -> Result<Handle<JsObject>, JsError> {
     match value.kind() {
-        ValueKind::Object(obj) => Ok(obj.clone()),
+        ValueKind::Object(obj) => Ok(obj),
         ValueKind::Function(_) => Err(JsError::new(
             ErrorKind::TypeError,
             "expected an object receiver".into(),
@@ -1693,7 +1693,7 @@ fn to_sorted(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, J
         let value = get(agent, &object, &key(k))?;
         array.create_data_property_or_throw(&key(k), value)?;
     }
-    let copy = Value::Object(array.clone());
+    let copy = Value::Object(array);
     sort_indexed_properties(agent, &copy, length, &comparefn)?;
     Ok(copy)
 }
@@ -2352,7 +2352,7 @@ fn async_iterator_from(
         next,
     };
     let async_iterator = crate::async_await::async_from_sync_iterator(agent, &sync_record)?;
-    let async_value = Value::Object(async_iterator.clone());
+    let async_value = Value::Object(async_iterator);
     let next = get_property(
         agent,
         &async_value,
@@ -2383,8 +2383,8 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .intrinsics
         .get("%Object.prototype%")
         .and_then(|value| as_object(&value));
-    let array_proto = JsObject::array_create(object_proto.clone(), 0.0)?;
-    let array_proto_value = Value::Object(array_proto.clone());
+    let array_proto = JsObject::array_create(object_proto, 0.0)?;
+    let array_proto_value = Value::Object(array_proto);
 
     let array_ctor = Function::create_builtin(
         Some(JsString::from_utf8("Array")),
@@ -2393,7 +2393,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         Some(Box::new(placeholder("Array"))),
         None,
     )?;
-    let array_ctor_value = Value::Function(array_ctor.clone());
+    let array_ctor_value = Value::Function(array_ctor);
 
     realm.intrinsics.define(ARRAY, array_ctor_value.clone());
     realm
@@ -2438,9 +2438,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func.clone()));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         array_ctor.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -2498,9 +2496,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func.clone()));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         array_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -2528,9 +2524,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func.clone()));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         array_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -2544,6 +2538,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         )?;
     }
 
+    // spec 23.1.2.5: get Array [ @@species ]
     // spec 23.1.3.39: @@iterator is %Array.prototype.values%.
     let values_func = realm.intrinsics.get(VALUES).ok_or_else(|| {
         JsError::new(
@@ -2576,7 +2571,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define(SPECIES, Value::Function(species_func.clone()));
+        .define(SPECIES, Value::Function(species_func));
     array_ctor.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone()),
         &PropertyDescriptor {
@@ -2638,8 +2633,8 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
 
     // spec 23.1.5: %ArrayIteratorPrototype%.
-    let iterator_proto = JsObject::ordinary_object_create(object_proto.clone());
-    let iterator_proto_value = Value::Object(iterator_proto.clone());
+    let iterator_proto = JsObject::ordinary_object_create(object_proto);
+    let iterator_proto_value = Value::Object(iterator_proto);
     realm
         .intrinsics
         .define(ARRAY_ITERATOR, iterator_proto_value.clone());
@@ -2652,7 +2647,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define(ARRAY_ITERATOR_NEXT, Value::Function(next_func.clone()));
+        .define(ARRAY_ITERATOR_NEXT, Value::Function(next_func));
     iterator_proto.define_property(
         &JsString::from_utf8("next"),
         &PropertyDescriptor {

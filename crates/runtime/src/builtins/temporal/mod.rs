@@ -88,7 +88,7 @@ pub fn install_constructor(
         .get("%Object.prototype%")
         .and_then(|value| as_object(&value));
     let proto = JsObject::ordinary_object_create(object_proto);
-    let proto_value = Value::Object(proto.clone());
+    let proto_value = Value::Object(proto);
 
     let ctor = Function::create_builtin(
         Some(JsString::from_utf8(name)),
@@ -97,7 +97,7 @@ pub fn install_constructor(
         Some(Box::new(placeholder(name))),
         None,
     )?;
-    let ctor_value = Value::Function(ctor.clone());
+    let ctor_value = Value::Function(ctor);
 
     realm.intrinsics.define(intrinsic, ctor_value.clone());
     realm
@@ -1598,7 +1598,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .get("%Object.prototype%")
         .and_then(|value| as_object(&value));
     let temporal = JsObject::ordinary_object_create(object_proto);
-    let temporal_value = Value::Object(temporal.clone());
+    let temporal_value = Value::Object(temporal);
     realm.intrinsics.define(TEMPORAL, temporal_value.clone());
 
     install_now(&temporal, realm)?;
@@ -1643,7 +1643,7 @@ fn install_now(temporal: &Handle<JsObject>, realm: &Handle<Realm>) -> Result<(),
         .get("%Object.prototype%")
         .and_then(|value| as_object(&value));
     let now = JsObject::ordinary_object_create(object_proto);
-    let now_value = Value::Object(now.clone());
+    let now_value = Value::Object(now);
     realm.intrinsics.define(NOW, now_value.clone());
     for (name, intrinsic, length) in [
         ("timeZoneId", NOW_TZ, 0),
@@ -1662,7 +1662,7 @@ fn install_now(temporal: &Handle<JsObject>, realm: &Handle<Realm>) -> Result<(),
         )?;
         realm
             .intrinsics
-            .define(intrinsic, Value::Function(func.clone()));
+            .define(intrinsic, Value::Function(func));
         now.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {

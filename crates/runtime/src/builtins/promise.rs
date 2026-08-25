@@ -117,8 +117,8 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .get("%Object.prototype%")
         .and_then(|value| crate::context::as_object(&value));
 
-    let promise_proto = JsObject::ordinary_object_create(object_proto.clone());
-    let promise_proto_value = Value::Object(promise_proto.clone());
+    let promise_proto = JsObject::ordinary_object_create(object_proto);
+    let promise_proto_value = Value::Object(promise_proto);
 
     let promise_ctor = Function::create_builtin(
         Some(JsString::from_utf8("Promise")),
@@ -127,7 +127,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         Some(Box::new(placeholder("Promise"))),
         None,
     )?;
-    let promise_ctor_value = Value::Function(promise_ctor.clone());
+    let promise_ctor_value = Value::Function(promise_ctor);
 
     realm.intrinsics.define(PROMISE, promise_ctor_value.clone());
     realm
@@ -229,7 +229,7 @@ fn install_methods(realm: &Handle<Realm>, proto: &Handle<JsObject>) -> Result<()
         )?;
         realm.intrinsics.define(
             &format!("%Promise.prototype.{name}%"),
-            Value::Function(method.clone()),
+            Value::Function(method),
         );
         proto.define_property(
             &JsString::from_utf8(name),
@@ -266,7 +266,7 @@ fn install_statics(realm: &Handle<Realm>, ctor: &Handle<Function>) -> Result<(),
         )?;
         realm.intrinsics.define(
             &format!("%Promise.{name}%"),
-            Value::Function(method.clone()),
+            Value::Function(method),
         );
         ctor.define_property(
             &JsString::from_utf8(name),
@@ -414,7 +414,7 @@ fn promise_constructor(
     }
     let proto = get_prototype_from_constructor(agent, new_target, PROMISE_PROTO)?;
     let promise = JsObject::ordinary_object_create(Some(proto));
-    let promise_value = Value::Object(promise.clone());
+    let promise_value = Value::Object(promise);
     let (resolve, reject) = crate::promise::create_resolving_functions(agent, &promise_value);
     agent.promises.insert(
         promise.id(),
@@ -764,7 +764,7 @@ fn promise_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
             1,
             Box::new(placeholder("all handler")),
             None,
-            fn_proto.clone(),
+            fn_proto
         )?;
         agent.promise_compound.insert(
             closure.id(),
@@ -897,7 +897,7 @@ fn promise_all_settled(agent: &mut Agent, this: &Value, args: &[Value]) -> Resul
                 1,
                 Box::new(placeholder("allSettled handler")),
                 None,
-                fn_proto.clone(),
+                fn_proto
             )?;
             agent.promise_compound.insert(
                 closure.id(),
@@ -1047,7 +1047,7 @@ fn promise_any(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
             1,
             Box::new(placeholder("any handler")),
             None,
-            fn_proto.clone(),
+            fn_proto
         )?;
         agent.promise_compound.insert(
             closure.id(),
@@ -1384,7 +1384,7 @@ mod tests {
             .create_data_property(&JsString::from_utf8("next"), Value::Function(next))
             .unwrap();
         let iterable = crux::object::JsObject::ordinary_object_create(None);
-        let iterator_for_method = iterator.clone();
+        let iterator_for_method = iterator;
         iterable
             .define_property_key(
                 &crux::property::PropertyKey::Symbol(
@@ -1394,7 +1394,7 @@ mod tests {
                     crux::Function::create_builtin(
                         Some(JsString::from_utf8("[Symbol.iterator]")),
                         0,
-                        Box::new(move |_, _| Ok(Value::Object(iterator_for_method.clone()))),
+                        Box::new(move |_, _| Ok(Value::Object(iterator_for_method))),
                         None,
                         None,
                     )
@@ -1409,7 +1409,7 @@ mod tests {
     fn settle_with_iterable(source: &str, values: Vec<Value>) -> Result<Value, JsError> {
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
-        let global = agent.running_context().unwrap().realm.global_object.clone();
+        let global = agent.running_context().unwrap().realm.global_object;
         global
             .create_data_property(&JsString::from_utf8("iter"), iterable(values))
             .unwrap();
@@ -1427,7 +1427,7 @@ mod tests {
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
         let values = build(&mut agent);
-        let global = agent.running_context().unwrap().realm.global_object.clone();
+        let global = agent.running_context().unwrap().realm.global_object;
         global
             .create_data_property(&JsString::from_utf8("iter"), iterable(values))
             .unwrap();

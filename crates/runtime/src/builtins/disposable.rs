@@ -100,8 +100,8 @@ fn install_stack(realm: &Handle<Realm>, name: &str, is_async: bool) -> Result<()
     let dispose_symbol = if is_async { "asyncDispose" } else { "dispose" };
     let tag = name;
 
-    let proto = JsObject::ordinary_object_create(object_proto.clone());
-    let proto_value = Value::Object(proto.clone());
+    let proto = JsObject::ordinary_object_create(object_proto);
+    let proto_value = Value::Object(proto);
     realm.intrinsics.define(proto_key, proto_value.clone());
 
     let ctor = Function::create_builtin(
@@ -111,7 +111,7 @@ fn install_stack(realm: &Handle<Realm>, name: &str, is_async: bool) -> Result<()
         Some(Box::new(placeholder(name.to_string()))),
         None,
     )?;
-    let ctor_value = Value::Function(ctor.clone());
+    let ctor_value = Value::Function(ctor);
     realm.intrinsics.define(ctor_key, ctor_value.clone());
     if let Some(function_proto) = realm
         .intrinsics
@@ -156,7 +156,7 @@ fn install_stack(realm: &Handle<Realm>, name: &str, is_async: bool) -> Result<()
         )?;
         realm.intrinsics.define(
             &format!("%{name}.prototype.{method_name}%"),
-            Value::Function(method.clone()),
+            Value::Function(method),
         );
         proto.define_property(
             &JsString::from_utf8(method_name),
@@ -179,12 +179,12 @@ fn install_stack(realm: &Handle<Realm>, name: &str, is_async: bool) -> Result<()
     )?;
     realm.intrinsics.define(
         &format!("%{name}.prototype.{dispose_name}%"),
-        Value::Function(dispose_method.clone()),
+        Value::Function(dispose_method),
     );
     proto.define_property(
         &JsString::from_utf8(dispose_name),
         &PropertyDescriptor {
-            value: Some(Value::Function(dispose_method.clone())),
+            value: Some(Value::Function(dispose_method)),
             writable: Some(true),
             get: None,
             set: None,
@@ -194,7 +194,7 @@ fn install_stack(realm: &Handle<Realm>, name: &str, is_async: bool) -> Result<()
     )?;
     realm.intrinsics.define(
         &format!("%{name}.prototype.@@{dispose_symbol}%"),
-        Value::Function(dispose_method.clone()),
+        Value::Function(dispose_method),
     );
     proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known(dispose_symbol).as_ref().clone()),
@@ -219,7 +219,7 @@ fn install_stack(realm: &Handle<Realm>, name: &str, is_async: bool) -> Result<()
     )?;
     realm.intrinsics.define(
         &format!("%{name}.prototype.disposed-get%"),
-        Value::Function(get.clone()),
+        Value::Function(get),
     );
     proto.define_property(
         &JsString::from_utf8("disposed"),
@@ -1020,7 +1020,7 @@ pub enum AsyncBodySettlement {
     Generator { object_id: u64 },
     /// Module body: settle the module record with the final completion.
     Module {
-        module: std::rc::Rc<crate::module::SourceTextModule>,
+        module: Handle<crate::module::SourceTextModule>,
         state: std::rc::Rc<std::cell::RefCell<crate::async_await::AsyncFunctionState>>,
     },
 }

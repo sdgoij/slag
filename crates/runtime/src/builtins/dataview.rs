@@ -468,7 +468,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .get("%Object.prototype%")
         .and_then(|value| as_object(&value));
     let dv_proto = JsObject::ordinary_object_create(object_proto);
-    let dv_proto_value = Value::Object(dv_proto.clone());
+    let dv_proto_value = Value::Object(dv_proto);
     let dv_ctor = Function::create_builtin(
         Some(JsString::from_utf8("DataView")),
         1,
@@ -476,7 +476,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         Some(Box::new(placeholder("DataView"))),
         None,
     )?;
-    let dv_ctor_value = Value::Function(dv_ctor.clone());
+    let dv_ctor_value = Value::Function(dv_ctor);
     realm.intrinsics.define(DATA_VIEW, dv_ctor_value.clone());
     realm
         .intrinsics
@@ -517,9 +517,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func.clone()));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         dv_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -565,9 +563,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func.clone()));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         dv_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {

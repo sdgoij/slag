@@ -87,7 +87,7 @@ pub fn call_async_function(
             )
         })?;
     let function_value = function.self_value();
-    let old_env = data.environment.clone();
+    let old_env = data.environment;
     let function_env = crate::env::new_function_environment(
         Some(old_env),
         function_value.clone(),
@@ -96,11 +96,11 @@ pub fn call_async_function(
     );
     let context = ExecutionContext {
         function: Some(function_value.clone()),
-        realm: data.realm.clone(),
+        realm: data.realm,
         script_or_module: None,
-        lexical_environment: function_env.clone(),
-        variable_environment: function_env.clone(),
-        private_environment: data.private_environment.clone(),
+        lexical_environment: function_env,
+        variable_environment: function_env,
+        private_environment: data.private_environment,
         source: agent
             .running_context()
             .ok()
@@ -125,7 +125,7 @@ pub fn call_async_function(
                 let this = if data.this_mode == crate::function::ThisMode::Sloppy {
                     match this.kind() {
                         ValueKind::Undefined | ValueKind::Null => {
-                            let global = agent.running_context()?.realm.global_object.clone();
+                            let global = agent.running_context()?.realm.global_object;
                             Value::Object(global)
                         }
                         ValueKind::Object(_) | ValueKind::Function(_) => this,
@@ -150,7 +150,7 @@ pub fn call_async_function(
             // function_declaration_instantiation installed on the running
             // context), not the outer function env, so body-level let/const
             // bindings are reachable.
-            let body_env = agent.running_context()?.lexical_environment.clone();
+            let body_env = agent.running_context()?.lexical_environment;
             let body = data.ir.clone().ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "async body was not compiled".into())
             })?;
@@ -363,7 +363,7 @@ fn settle_async(
 ) -> Result<Value, JsError> {
     // A module body's completion settles the module record too (status,
     // evaluation error, and async-parent propagation, spec 16.2.2.5).
-    if let Some(module) = state.borrow().module.clone() {
+    if let Some(module) = state.borrow().module {
         crate::module::finish_module_evaluation(agent, &module, state, completion)?;
         return Ok(Value::Undefined);
     }
@@ -838,7 +838,7 @@ mod tests {
         // with `@@asyncIterator` (the Symbol builtin does not exist yet).
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
-        let global = agent.running_context().unwrap().realm.global_object.clone();
+        let global = agent.running_context().unwrap().realm.global_object;
         global
             .create_data_property(&JsString::from_utf8("aiter"), async_iterable())
             .unwrap();
@@ -907,7 +907,7 @@ mod tests {
             .create_data_property(&JsString::from_utf8("next"), Value::Function(next))
             .unwrap();
         let iterable = crux::object::JsObject::ordinary_object_create(None);
-        let iterator_for_method = iterator.clone();
+        let iterator_for_method = iterator;
         iterable
             .define_property_key(
                 &crux::property::PropertyKey::Symbol(
@@ -917,7 +917,7 @@ mod tests {
                     crux::Function::create_builtin(
                         Some(JsString::from_utf8("[Symbol.asyncIterator]")),
                         0,
-                        Box::new(move |_, _| Ok(Value::Object(iterator_for_method.clone()))),
+                        Box::new(move |_, _| Ok(Value::Object(iterator_for_method))),
                         None,
                         None,
                     )
@@ -933,7 +933,7 @@ mod tests {
         // A sync iterable is wrapped in AsyncFromSyncIterator.
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
-        let global = agent.running_context().unwrap().realm.global_object.clone();
+        let global = agent.running_context().unwrap().realm.global_object;
         global
             .create_data_property(
                 &JsString::from_utf8("iter"),
@@ -1006,7 +1006,7 @@ mod tests {
             .create_data_property(&JsString::from_utf8("next"), Value::Function(next))
             .unwrap();
         let iterable = crux::object::JsObject::ordinary_object_create(None);
-        let iterator_for_method = iterator.clone();
+        let iterator_for_method = iterator;
         iterable
             .define_property_key(
                 &crux::property::PropertyKey::Symbol(
@@ -1016,7 +1016,7 @@ mod tests {
                     crux::Function::create_builtin(
                         Some(JsString::from_utf8("[Symbol.iterator]")),
                         0,
-                        Box::new(move |_, _| Ok(Value::Object(iterator_for_method.clone()))),
+                        Box::new(move |_, _| Ok(Value::Object(iterator_for_method))),
                         None,
                         None,
                     )

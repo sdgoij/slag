@@ -42,7 +42,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     // `%Object.prototype.toString%` reports "[object Boolean]" and the `==`
     // coercion yields false.
     *boolean_proto.boxed.borrow_mut() = Some(crux::object::BoxedPrimitive::Boolean(false));
-    let boolean_proto_value = Value::Object(boolean_proto.clone());
+    let boolean_proto_value = Value::Object(boolean_proto);
 
     let boolean_ctor = Function::create_builtin(
         Some(JsString::from_utf8("Boolean")),
@@ -51,7 +51,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         Some(Box::new(placeholder("Boolean"))),
         None,
     )?;
-    let boolean_ctor_value = Value::Function(boolean_ctor.clone());
+    let boolean_ctor_value = Value::Function(boolean_ctor);
 
     realm.intrinsics.define(BOOLEAN, boolean_ctor_value.clone());
     realm
@@ -92,9 +92,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(key, Value::Function(method.clone()));
+        realm.intrinsics.define(key, Value::Function(method));
         boolean_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {

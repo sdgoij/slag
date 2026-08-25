@@ -151,7 +151,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .get("%Object.prototype%")
         .and_then(|value| as_object(&value));
     let bigint_proto = JsObject::ordinary_object_create(object_proto);
-    let bigint_proto_value = Value::Object(bigint_proto.clone());
+    let bigint_proto_value = Value::Object(bigint_proto);
 
     let bigint_ctor = Function::create_builtin(
         Some(JsString::from_utf8("BigInt")),
@@ -160,7 +160,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         Some(Box::new(placeholder("BigInt"))),
         None,
     )?;
-    let bigint_ctor_value = Value::Function(bigint_ctor.clone());
+    let bigint_ctor_value = Value::Function(bigint_ctor);
 
     realm.intrinsics.define(BIGINT, bigint_ctor_value.clone());
     realm
@@ -199,7 +199,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm.intrinsics.define(key, Value::Function(func.clone()));
+        realm.intrinsics.define(key, Value::Function(func));
         bigint_ctor.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -227,7 +227,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm.intrinsics.define(key, Value::Function(func.clone()));
+        realm.intrinsics.define(key, Value::Function(func));
         bigint_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {

@@ -37,7 +37,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
     )?;
     realm
         .intrinsics
-        .define(SUPPORTED_VALUES_OF, Value::Function(func.clone()));
+        .define(SUPPORTED_VALUES_OF, Value::Function(func));
     if let Some(obj) = as_object(intl_value) {
         obj.define_property(
             &JsString::from_utf8("supportedValuesOf"),

@@ -5,6 +5,7 @@ use std::cell::RefCell;
 
 use crux::error::{ErrorKind, JsError};
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::object::JsObject;
 use crux::property::PropertyKey;
 use crux::string::JsString;
@@ -43,7 +44,7 @@ pub fn get_function_realm(agent: &mut Agent, value: &Value) -> Result<Handle<Rea
             crux::function::FunctionKind::EcmaScript => agent
                 .ecma_functions
                 .get(&function.id())
-                .map(|data| data.realm.clone())
+                .map(|data| data.realm)
                 .ok_or_else(|| {
                     JsError::new(
                         ErrorKind::TypeError,
@@ -87,7 +88,7 @@ pub fn get_function_realm(agent: &mut Agent, value: &Value) -> Result<Handle<Rea
 /// objects in this engine, but both carry a `Handle<JsObject>`).
 pub fn as_object(value: &Value) -> Option<Handle<JsObject>> {
     match value.kind() {
-        ValueKind::Object(obj) => Some(obj.clone()),
+        ValueKind::Object(obj) => Some(obj),
         ValueKind::Function(f) => f.object.handle(),
         _ => None,
     }
@@ -243,8 +244,8 @@ pub fn to_big_int(agent: &mut Agent, value: &Value) -> Result<crux::BigInt, JsEr
 pub fn to_object(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
     let realm = agent.current_realm()?;
     match value.kind() {
-        ValueKind::Object(obj) => Ok(Value::Object(obj.clone())),
-        ValueKind::Function(function) => Ok(Value::Function(function.clone())),
+        ValueKind::Object(obj) => Ok(Value::Object(obj)),
+        ValueKind::Function(function) => Ok(Value::Function(function)),
         ValueKind::Null | ValueKind::Undefined => Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot convert undefined or null to object".into(),
@@ -337,6 +338,19 @@ pub struct ExecutionContext {
 pub struct PrivateEnvironment {
     pub outer: Option<Handle<PrivateEnvironment>>,
     pub names: RefCell<Vec<PrivateName>>,
+}
+
+impl Trace for PrivateEnvironment {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        if let Some(outer) = &self.outer {
+            outer.trace(visit);
+        }
+        // PrivateName descriptions are JsStrings by value; a rope description
+        // has heap edges.
+        for name in &*self.names.borrow() {
+            name.description.trace(visit);
+        }
+    }
 }
 
 /// A Private Name (spec 9.2.1 table): a unique id plus its description.
@@ -952,14 +966,14 @@ pub fn get_active_script_or_module(agent: &Agent) -> Option<ScriptOrModule> {
 
 /// spec 9.4.2 ResolveBinding.
 pub fn resolve_binding(agent: &Agent, name: &JsString, strict: bool) -> Result<Reference, JsError> {
-    let env = agent.running_context()?.lexical_environment.clone();
+    let env = agent.running_context()?.lexical_environment;
     get_identifier_reference(Some(env), name, strict)
 }
 
 /// spec 9.4.3 GetThisEnvironment: the innermost environment with a `this`
 /// binding.
 pub fn get_this_environment(agent: &Agent) -> Result<EnvRef, JsError> {
-    let mut env = agent.running_context()?.lexical_environment.clone();
+    let mut env = agent.running_context()?.lexical_environment;
     loop {
         if env.has_this_binding() {
             return Ok(env);
@@ -988,7 +1002,7 @@ pub fn get_new_target(agent: &Agent) -> Result<Value, JsError> {
 
 /// spec 9.4.6 GetGlobalObject.
 pub fn get_global_object(agent: &Agent) -> Result<Handle<crux::object::JsObject>, JsError> {
-    Ok(agent.running_context()?.realm.global_object.clone())
+    Ok(agent.running_context()?.realm.global_object)
 }
 
 /// Resolve a `#name` in the running context's PrivateEnvironment (spec
@@ -1000,7 +1014,6 @@ pub fn resolve_private_name(
     let private_env = agent
         .running_context()?
         .private_environment
-        .clone()
         .ok_or_else(|| {
             JsError::new(
                 ErrorKind::SyntaxError,
@@ -1077,7 +1090,7 @@ fn private_object(obj: &Value) -> Option<Handle<crux::object::JsObject>> {
     if let Some(obj) = obj.as_object() {
         Some(obj)
     } else {
-        obj.as_function().map(|f| f.object.clone())
+        obj.as_function().map(|f| f.object)
     }
 }
 
@@ -1170,7 +1183,7 @@ pub fn get_super_base(agent: &Agent) -> Result<Value, JsError> {
     // constructor (a Function); instance members use the class prototype.
     let home_object = match home.kind() {
         ValueKind::Object(obj) => obj,
-        ValueKind::Function(f) => f.object.clone(),
+        ValueKind::Function(f) => f.object,
         _ => return Ok(Value::Undefined),
     };
     Ok(home_object
@@ -1204,7 +1217,7 @@ mod tests {
             .initialize_binding(&name("b"), Value::Number(2.0))
             .unwrap();
 
-        let a = get_identifier_reference(Some(inner.clone()), &name("a"), true).unwrap();
+        let a = get_identifier_reference(Some(inner), &name("a"), true).unwrap();
         assert!(matches!(a.base, ReferenceBase::Environment(_)));
         assert_eq!(get_value(&mut agent, &a).unwrap(), Value::Number(1.0));
 
@@ -1225,7 +1238,7 @@ mod tests {
         let sloppy = get_identifier_reference(None, &name("x"), false).unwrap();
         put_value(&mut agent, &sloppy, Value::Number(5.0)).unwrap();
         // The sloppy write created a property on the global object.
-        let global = agent.running_context().unwrap().realm.global_object.clone();
+        let global = agent.running_context().unwrap().realm.global_object;
         assert_eq!(global.get(&name("x")).unwrap(), Value::Number(5.0));
 
         let strict = get_identifier_reference(None, &name("y"), true).unwrap();

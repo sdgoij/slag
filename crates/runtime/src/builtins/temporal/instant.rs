@@ -68,7 +68,7 @@ pub fn install(
         )?;
         realm
             .intrinsics
-            .define(intrinsic, Value::Function(func.clone()));
+            .define(intrinsic, Value::Function(func));
         ctor.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -95,7 +95,7 @@ pub fn install(
         )?;
         realm
             .intrinsics
-            .define(intrinsic, Value::Function(func.clone()));
+            .define(intrinsic, Value::Function(func));
         proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -131,7 +131,7 @@ pub fn install(
         )?;
         realm
             .intrinsics
-            .define(intrinsic, Value::Function(func.clone()));
+            .define(intrinsic, Value::Function(func));
         proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -513,7 +513,7 @@ fn round(agent: &mut Agent, this: &Value, round_to: &Value) -> Result<Value, JsE
         let obj = crux::object::JsObject::ordinary_object_create(None);
         obj.create_data_property_or_throw(
             &JsString::from_utf8("smallestUnit"),
-            Value::String(text.clone()),
+            Value::String(text),
         )?;
         Value::Object(obj)
     } else {

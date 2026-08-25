@@ -24,16 +24,16 @@ pub fn same_value(x: &Value, y: &Value) -> bool {
         // heap allocation (spec 7.2.12 step 7); a Function value and its
         // underlying object are the same allocation, so cross-kind compares
         // go through the function's object handle.
-        (ValueKind::Object(a), ValueKind::Object(b)) => Handle::ptr_eq(&a, &b),
-        (ValueKind::Function(a), ValueKind::Function(b)) => Handle::ptr_eq(&a, &b),
+        (ValueKind::Object(a), ValueKind::Object(b)) => Handle::ptr_eq(a, b),
+        (ValueKind::Function(a), ValueKind::Function(b)) => Handle::ptr_eq(a, b),
         (ValueKind::Object(a), ValueKind::Function(b)) => b
             .object
             .handle()
-            .is_some_and(|object| Handle::ptr_eq(&a, &object)),
+            .is_some_and(|object| Handle::ptr_eq(a, object)),
         (ValueKind::Function(a), ValueKind::Object(b)) => a
             .object
             .handle()
-            .is_some_and(|object| Handle::ptr_eq(&object, &b)),
+            .is_some_and(|object| Handle::ptr_eq(object, b)),
         _ => x == y,
     }
 }

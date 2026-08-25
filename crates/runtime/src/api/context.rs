@@ -42,7 +42,7 @@ impl Context {
 
     /// The realm's global object.
     pub fn global(&self) -> Local {
-        Local(Value::Object(self.realm.global_object.clone()))
+        Local(Value::Object(self.realm.global_object))
     }
 
     /// An intrinsic value by `%`-name (e.g. `%Object.prototype%`).

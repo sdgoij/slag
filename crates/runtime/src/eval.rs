@@ -37,8 +37,8 @@ pub fn eval_program(
     fast_script: bool,
 ) -> Result<Value, JsError> {
     let body = crate::ir::compile_statements(&program.body, strict, fast_script)?;
-    let env = agent.running_context()?.lexical_environment.clone();
-    let mut vm = agent.take_vm(env.clone(), strict);
+    let env = agent.running_context()?.lexical_environment;
+    let mut vm = agent.take_vm(env, strict);
     // Cut 16: a slotified script's declared vars live in the frame — the
     // prologue already loaded them from the global object, so no argument
     // copies are needed.
@@ -85,7 +85,7 @@ pub(crate) fn eval_statement_list(
     // The list runs in the current lexical environment, whose `using`
     // resources are disposed when the list completes (spec 14.2.3 step 6:
     // DisposeResources of the block/function/eval environment).
-    let env = agent.running_context()?.lexical_environment.clone();
+    let env = agent.running_context()?.lexical_environment;
     let completion = eval_statement_list_inner(agent, stmts, strict);
     dispose_env_resources(agent, &env, completion)
 }
@@ -336,7 +336,7 @@ fn eval_lexical_binding_list(
     // BindingInitialization against the running LexicalEnvironment: the
     // bindings were created uninitialized by declaration instantiation and
     // are filled with InitializeBinding (spec 14.2.2 step 2.c).
-    let env = agent.running_context()?.lexical_environment.clone();
+    let env = agent.running_context()?.lexical_environment;
     for decl in decls {
         let value = match &decl.init {
             Some(init) => {
@@ -508,10 +508,10 @@ pub(crate) fn eval_statement_position_function(
     stmt: &Stmt,
     strict: bool,
 ) -> Result<(), JsError> {
-    let old_env = agent.running_context()?.lexical_environment.clone();
-    let block_env = new_declarative_environment(Some(old_env.clone()));
+    let old_env = agent.running_context()?.lexical_environment;
+    let block_env = new_declarative_environment(Some(old_env));
     block_declaration_instantiation(agent, std::slice::from_ref(stmt), &block_env, strict)?;
-    agent.running_context_mut()?.lexical_environment = block_env.clone();
+    agent.running_context_mut()?.lexical_environment = block_env;
     eval_function_declaration(agent, f, strict)?;
     agent.running_context_mut()?.lexical_environment = old_env;
     Ok(())
@@ -530,8 +530,8 @@ pub(crate) fn eval_function_declaration(
     };
     let name = crux::lookup(name);
     let running = agent.running_context()?;
-    let variable_env = running.variable_environment.clone();
-    let lexical_env = running.lexical_environment.clone();
+    let variable_env = running.variable_environment;
+    let lexical_env = running.lexical_environment;
 
     // Annex B.3.2.2 / B.3.3.3: a block-level function declaration in sloppy
     // code copies its (block-scoped) binding into the variable environment
@@ -560,7 +560,7 @@ pub(crate) fn eval_function_declaration(
         let func_obj = crate::function::instantiate_function(
             agent,
             f,
-            lexical_env.clone(),
+            lexical_env,
             strict,
             Vec::new(),
             Vec::new(),
@@ -615,10 +615,10 @@ fn eval_block_stmts(
     stmts: &[Stmt],
     strict: bool,
 ) -> Result<Completion, JsError> {
-    let old_env = agent.running_context()?.lexical_environment.clone();
-    let block_env = new_declarative_environment(Some(old_env.clone()));
+    let old_env = agent.running_context()?.lexical_environment;
+    let block_env = new_declarative_environment(Some(old_env));
     block_declaration_instantiation(agent, stmts, &block_env, strict)?;
-    agent.running_context_mut()?.lexical_environment = block_env.clone();
+    agent.running_context_mut()?.lexical_environment = block_env;
     let result = eval_statement_list(agent, stmts, strict);
     agent.running_context_mut()?.lexical_environment = old_env;
     result
@@ -692,7 +692,7 @@ pub(crate) fn block_declaration_instantiation_iter<'a>(
                     // plain FunctionDeclarations only — generator and async
                     // declarations stay block-scoped.
                     if !strict && !already_bound && !f.is_async && !f.is_generator {
-                        let variable_env = agent.running_context()?.variable_environment.clone();
+                        let variable_env = agent.running_context()?.variable_environment;
                         // Only names whose hoist B.3.3.x deemed applicable
                         // (no enclosing lexical conflict) are marked; the
                         // binding exists when the hoist applies.
@@ -739,7 +739,7 @@ pub(crate) fn block_declaration_instantiation_iter<'a>(
                         let func_obj = crate::function::instantiate_function(
                             agent,
                             f,
-                            block_env.clone(),
+                            *block_env,
                             strict,
                             Vec::new(),
                             Vec::new(),
@@ -852,7 +852,7 @@ fn create_per_iteration_environment(
     agent: &mut Agent,
     per_iteration: &[crux::string::JsString],
 ) -> Result<EnvRef, JsError> {
-    let last = agent.running_context()?.lexical_environment.clone();
+    let last = agent.running_context()?.lexical_environment;
     let outer = last.outer().ok_or_else(|| {
         JsError::new(
             ErrorKind::ReferenceError,
@@ -880,7 +880,7 @@ fn eval_for(
     strict: bool,
     labels: &[crux::string::AtomId],
 ) -> Result<Completion, JsError> {
-    let old_env = agent.running_context()?.lexical_environment.clone();
+    let old_env = agent.running_context()?.lexical_environment;
     let mut fresh_env: Option<EnvRef> = None;
     let mut per_iteration: Vec<crux::string::JsString> = Vec::new();
     let head_result = match init {
@@ -894,7 +894,7 @@ fn eval_for(
                 // environment while the lexical declaration's initializers
                 // run (closures capture it), and `const` heads share one
                 // binding while `let`/`using` heads get per-iteration copies.
-                let env = new_declarative_environment(Some(old_env.clone()));
+                let env = new_declarative_environment(Some(old_env));
                 for decl in decls {
                     let mut names = Vec::new();
                     crate::script::bound_names(&decl.pattern, &mut names);
@@ -915,8 +915,8 @@ fn eval_for(
                         crate::script::bound_names(&decl.pattern, &mut per_iteration);
                     }
                 }
-                agent.running_context_mut()?.lexical_environment = env.clone();
-                fresh_env = Some(env.clone());
+                agent.running_context_mut()?.lexical_environment = env;
+                fresh_env = Some(env);
                 let kind = match *kind {
                     VarDeclKind::Using => DisposalKind::Sync,
                     VarDeclKind::AwaitUsing => DisposalKind::Async,
@@ -926,7 +926,7 @@ fn eval_for(
                 if let Err(error) = result {
                     // spec 14.7.4.2 step 9: an abrupt head disposes the loop
                     // environment's resources before propagating.
-                    let env = agent.running_context()?.lexical_environment.clone();
+                    let env = agent.running_context()?.lexical_environment;
                     let disposed = dispose_env_resources(agent, &env, Err(error));
                     agent.running_context_mut()?.lexical_environment = old_env;
                     return disposed;
@@ -1083,7 +1083,7 @@ pub(crate) fn key_enumerable_at_level(
         return Ok(false);
     };
     let key = PropertyKey::from_js_string(key.as_ref());
-    let mut current = Some(obj.clone());
+    let mut current = Some(*obj);
     for _ in 0..level {
         let Some(next) = current else {
             return Ok(false);
@@ -1119,8 +1119,8 @@ fn eval_for_head(
     if tdz_names.is_empty() {
         return eval_expr(agent, right, strict);
     }
-    let old_env = agent.running_context()?.lexical_environment.clone();
-    let tdz_env = new_declarative_environment(Some(old_env.clone()));
+    let old_env = agent.running_context()?.lexical_environment;
+    let tdz_env = new_declarative_environment(Some(old_env));
     for name in &tdz_names {
         tdz_env.create_mutable_binding(name, false)?;
     }
@@ -1241,8 +1241,8 @@ fn for_binding_put(
                 crate::binding::binding_initialization(agent, pattern, value, None, strict)?;
                 Ok((None, None))
             } else {
-                let outer = agent.running_context()?.lexical_environment.clone();
-                let env = new_declarative_environment(Some(outer.clone()));
+                let outer = agent.running_context()?.lexical_environment;
+                let env = new_declarative_environment(Some(outer));
                 let mut names = Vec::new();
                 crate::script::bound_names(pattern, &mut names);
                 for name in &names {
@@ -1258,7 +1258,7 @@ fn for_binding_put(
                 // running environment while BindingInitialization runs, so a
                 // default initializer's closure captures the per-iteration
                 // binding.
-                agent.running_context_mut()?.lexical_environment = env.clone();
+                agent.running_context_mut()?.lexical_environment = env;
                 if matches!(*kind, VarDeclKind::Using | VarDeclKind::AwaitUsing) {
                     // ForIn/OfBodyEvaluation: AddDisposableResource runs before
                     // InitializeReferencedBinding (spec 14.7.5.6 step 5.g).
@@ -1466,8 +1466,8 @@ fn eval_switch(
     // before the selectors run, so selectors and consequents see the case
     // block's lexical declarations.
     let discriminant = eval_expr(agent, discriminant, strict)?;
-    let old_env = agent.running_context()?.lexical_environment.clone();
-    let case_env = new_declarative_environment(Some(old_env.clone()));
+    let old_env = agent.running_context()?.lexical_environment;
+    let case_env = new_declarative_environment(Some(old_env));
     block_declaration_instantiation_iter(
         agent,
         cases.iter().flat_map(|c| c.consequent.iter()),
@@ -1578,13 +1578,13 @@ fn eval_catch(
     thrown: Value,
     strict: bool,
 ) -> Result<Completion, JsError> {
-    let old_env = agent.running_context()?.lexical_environment.clone();
+    let old_env = agent.running_context()?.lexical_environment;
     // spec 18.2.3: the catch parameter binds in its own declarative
     // environment; the body is a fresh block env over it, so a body function
     // named like the parameter gets its own block binding (Annex B).
-    let param_env = new_declarative_environment(Some(old_env.clone()));
+    let param_env = new_declarative_environment(Some(old_env));
     param_env.mark_catch_param_env();
-    agent.running_context_mut()?.lexical_environment = param_env.clone();
+    agent.running_context_mut()?.lexical_environment = param_env;
     if let Some(param) = &handler.param {
         // The catch parameter's bound names are created uninitialized, then
         // BindingInitialization fills them (the parameter may be a
@@ -1598,7 +1598,7 @@ fn eval_catch(
         }
         crate::binding::binding_initialization(agent, param, thrown, Some(&param_env), strict)?;
     }
-    let body_env = new_declarative_environment(Some(param_env.clone()));
+    let body_env = new_declarative_environment(Some(param_env));
     block_declaration_instantiation(agent, &handler.body.stmts, &body_env, strict)?;
     agent.running_context_mut()?.lexical_environment = body_env;
     let result = eval_statement_list(agent, &handler.body.stmts, strict);
@@ -1623,8 +1623,8 @@ fn eval_with(
             "Cannot use 'with' on a non-object value".into(),
         )
     })?;
-    let old_env = agent.running_context()?.lexical_environment.clone();
-    let with_env = new_object_environment(obj, true, Some(old_env.clone()));
+    let old_env = agent.running_context()?.lexical_environment;
+    let with_env = new_object_environment(obj, true, Some(old_env));
     agent.running_context_mut()?.lexical_environment = with_env;
     let result = eval_statement(agent, body, strict);
     agent.running_context_mut()?.lexical_environment = old_env;
@@ -1692,7 +1692,7 @@ mod tests {
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
         agent.run_script("var x; var y = 7; x = 3; x").unwrap();
-        let global = agent.running_context().unwrap().realm.global_object.clone();
+        let global = agent.running_context().unwrap().realm.global_object;
         assert_eq!(
             global.get(&JsString::from_utf8("x")).unwrap(),
             Value::Number(3.0)
@@ -1708,7 +1708,7 @@ mod tests {
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
         agent.run_script("{ var z = 3; }").unwrap();
-        let global = agent.running_context().unwrap().realm.global_object.clone();
+        let global = agent.running_context().unwrap().realm.global_object;
         assert_eq!(
             global.get(&JsString::from_utf8("z")).unwrap(),
             Value::Number(3.0)
@@ -1745,7 +1745,7 @@ mod tests {
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
         agent.run_script("function f() {}").unwrap();
-        let global = agent.running_context().unwrap().realm.global_object.clone();
+        let global = agent.running_context().unwrap().realm.global_object;
         let value = global.get(&JsString::from_utf8("f")).unwrap();
         assert!(matches!(value.kind(), ValueKind::Function(_)));
     }
@@ -1755,7 +1755,7 @@ mod tests {
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
         agent.run_script("class C {}").unwrap();
-        let global = agent.running_context().unwrap().realm.global_object.clone();
+        let global = agent.running_context().unwrap().realm.global_object;
         assert!(!global.has_own_property(&JsString::from_utf8("C")).unwrap());
     }
 
@@ -2017,7 +2017,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let global = agent.running_context().unwrap().realm.global_object.clone();
+        let global = agent.running_context().unwrap().realm.global_object;
         global
             .create_data_property(&JsString::from_utf8("add"), Value::Function(add))
             .unwrap();
@@ -2054,14 +2054,14 @@ mod tests {
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
         let proto = crux::object::JsObject::ordinary_object_create(None);
-        let proto_for_ctor = proto.clone();
+        let proto_for_ctor = proto;
         let ctor = crux::Function::create_builtin(
             Some(JsString::from_utf8("C")),
             0,
             Box::new(|_, _| Ok(Value::Undefined)),
             Some(Box::new(move |_, _| {
                 Ok(Value::Object(
-                    crux::object::JsObject::ordinary_object_create(Some(proto_for_ctor.clone())),
+                    crux::object::JsObject::ordinary_object_create(Some(proto_for_ctor)),
                 ))
             })),
             None,
@@ -2072,7 +2072,7 @@ mod tests {
             &crux::property::PropertyDescriptor::data(Value::Object(proto)),
         )
         .unwrap();
-        let global = agent.running_context().unwrap().realm.global_object.clone();
+        let global = agent.running_context().unwrap().realm.global_object;
         global
             .create_data_property(&JsString::from_utf8("C"), Value::Function(ctor))
             .unwrap();
@@ -2262,7 +2262,7 @@ mod tests {
             .create_data_property(&JsString::from_utf8("next"), Value::Function(next))
             .unwrap();
         let iterable = crux::object::JsObject::ordinary_object_create(None);
-        let iterator_for_method = iterator.clone();
+        let iterator_for_method = iterator;
         iterable
             .define_property_key(
                 &crux::property::PropertyKey::Symbol(
@@ -2272,7 +2272,7 @@ mod tests {
                     crux::Function::create_builtin(
                         Some(JsString::from_utf8("[Symbol.iterator]")),
                         0,
-                        Box::new(move |_, _| Ok(Value::Object(iterator_for_method.clone()))),
+                        Box::new(move |_, _| Ok(Value::Object(iterator_for_method))),
                         None,
                         None,
                     )
@@ -2280,7 +2280,7 @@ mod tests {
                 )),
             )
             .unwrap();
-        let global = agent.running_context().unwrap().realm.global_object.clone();
+        let global = agent.running_context().unwrap().realm.global_object;
         global
             .create_data_property(&JsString::from_utf8("iter"), Value::Object(iterable))
             .unwrap();
@@ -2541,7 +2541,7 @@ mod tests {
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
         agent.run_script("var g = 1;").unwrap();
-        let global = agent.running_context().unwrap().realm.global_object.clone();
+        let global = agent.running_context().unwrap().realm.global_object;
         assert_eq!(
             global.get(&JsString::from_utf8("g")).unwrap(),
             Value::Number(1.0)
@@ -2557,7 +2557,7 @@ mod tests {
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
         agent.run_script("let g2 = 2;").unwrap();
-        let global = agent.running_context().unwrap().realm.global_object.clone();
+        let global = agent.running_context().unwrap().realm.global_object;
         assert!(!global.has_own_property(&JsString::from_utf8("g2")).unwrap());
         assert_eq!(agent.run_script("globalThis.g2").unwrap(), Value::Undefined);
         assert_eq!(agent.run_script("g2").unwrap(), Value::Number(2.0));
@@ -2938,7 +2938,7 @@ mod tests {
 
     /// The compiled body of a function bound on the global object.
     fn compiled_body_of(agent: &mut Agent, name: &str) -> std::rc::Rc<crate::ir::CompiledBody> {
-        let global = agent.running_context().unwrap().realm.global_object.clone();
+        let global = agent.running_context().unwrap().realm.global_object;
         let value = global.get(&JsString::from_utf8(name)).unwrap();
         let ValueKind::Function(function) = value.kind() else {
             panic!("{name} is not a function");

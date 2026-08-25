@@ -7,6 +7,7 @@ use std::rc::Rc;
 use crate::bigint::BigInt;
 use crate::function::Function;
 use crate::handle::Handle;
+use crate::heap::{Gc, GcAny, Trace};
 use crate::object::JsObject;
 use crate::string::JsString;
 use crate::symbol::Symbol;
@@ -43,10 +44,14 @@ const TAG_UNINITIALIZED: u64 = 9;
 /// An ECMAScript language value (spec 6.1).
 ///
 /// NaN-boxed: a double when the top 16 bits are not `0x7FF8`, otherwise a tag
-/// plus payload (see the layout note above). Heap values own one strong `Rc`
-/// ref; `Clone`/`Drop` reconstruct the `Rc` from the payload so refcounts stay
-/// exact. `PartialEq` preserves the derived-enum semantics: `Number` compares
-/// via `f64::eq` (`NaN != NaN`), objects via their id equality.
+/// plus payload (see the layout note above). Heap values store the box base
+/// pointer of a GC handle; the collector owns the memory, so there is no
+/// refcount bookkeeping — `Clone` is a plain pointer copy. (Making `Value`
+/// `Copy` is the GC-5 perf unlock; the flip keeps it `Clone` to avoid
+/// churning every `.clone()` site.)
+/// `PartialEq` preserves the derived-enum semantics: `Number` compares via
+/// `f64::eq` (`NaN != NaN`), objects via their id equality.
+#[derive(Clone)]
 pub struct Value(u64, std::marker::PhantomData<Rc<()>>);
 
 // The box holds raw `Rc` pointers, so it must not cross threads (the refcount
@@ -129,10 +134,10 @@ impl Value {
     /// Leak one strong ref into the box and store its pointer in the payload.
     ///
     /// The payload is only 44 bits, so the pointer is stored shifted right 4:
-    /// the `RcBox` allocation base is 16-byte aligned, which recovers a full
+    /// the `GcBox` allocation base is 16-byte aligned, which recovers a full
     /// 48-bit address space.
-    fn box_heap<T>(tag: u64, h: Handle<T>) -> Value {
-        let ptr = Rc::into_raw(h) as usize as u64;
+    fn box_heap<T: Trace>(tag: u64, h: Handle<T>) -> Value {
+        let ptr = h.box_ptr() as u64;
         debug_assert!(
             ptr & 0xF == 0,
             "heap value is not 16-byte aligned (the payload shift would lose bits)"
@@ -178,19 +183,17 @@ impl Value {
         self.0 & TAG_MASK != TAG_PREFIX
     }
 
-    /// Reconstruct the box's leaked ref, clone it for the caller, and leak
-    /// the box's ref back.
-    unsafe fn take_ref<T>(&self, tag: u64) -> Option<Handle<T>> {
+    /// Reconstruct the handle from the boxed pointer (a plain cast — the
+    /// collector owns the box, so there is no refcount to manage).
+    unsafe fn take_ref<T: Trace>(&self, tag: u64) -> Option<Handle<T>> {
         // A double's bits 47-44 can collide with a heap tag (e.g. 65.0 reads
         // as TAG_BIGINT), so the tag check alone is not enough: only tagged
         // (non-double) bit patterns hold a valid payload pointer.
         if !self.is_double() && self.tag() == tag {
-            // SAFETY: the payload holds a ref leaked by `box_heap`'s
-            // `Rc::into_raw`; `forget` below leaks it back.
-            let rc = unsafe { Rc::from_raw((self.payload() << 4) as usize as *const T) };
-            let out = Rc::clone(&rc);
-            std::mem::forget(rc);
-            Some(out)
+            // SAFETY: the payload was written by `box_heap` and holds a live
+            // box pointer (the rooting discipline keeps every encoded value
+            // reachable from a root while it is observable).
+            Some(unsafe { Gc::from_box_ptr((self.payload() << 4) as usize) })
         } else {
             None
         }
@@ -306,45 +309,47 @@ impl Value {
     }
 }
 
-impl Clone for Value {
-    #[inline]
-    fn clone(&self) -> Value {
-        if self.is_uninitialized() {
-            return Value::uninitialized();
+impl Trace for Value {
+    /// Visit the boxed heap value (if any): decode the tag and forward to the
+    /// typed handle's `Trace`, which re-erasures to a `GcAny` for the mark
+    /// phase. Doubles and primitives have no edges.
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        if self.is_double() {
+            return;
         }
-        match self.kind() {
-            ValueKind::Undefined => Value::Undefined,
-            ValueKind::Null => Value::Null,
-            ValueKind::Boolean(b) => Value::Boolean(b),
-            ValueKind::Number(n) => Value::Number(n),
-            ValueKind::BigInt(h) => Value::BigInt(h),
-            ValueKind::String(h) => Value::String(h),
-            ValueKind::Symbol(h) => Value::Symbol(h),
-            ValueKind::Object(h) => Value::Object(h),
-            ValueKind::Function(h) => Value::Function(h),
+        // SAFETY: the payload holds a live box pointer (see `take_ref`).
+        unsafe {
+            match self.tag() {
+                TAG_BIGINT => {
+                    Gc::<BigInt>::from_box_ptr((self.payload() << 4) as usize).trace(visit)
+                }
+                TAG_STRING => {
+                    Gc::<JsString>::from_box_ptr((self.payload() << 4) as usize).trace(visit)
+                }
+                TAG_SYMBOL => {
+                    Gc::<Symbol>::from_box_ptr((self.payload() << 4) as usize).trace(visit)
+                }
+                TAG_OBJECT => {
+                    Gc::<JsObject>::from_box_ptr((self.payload() << 4) as usize).trace(visit)
+                }
+                TAG_FUNCTION => {
+                    Gc::<Function>::from_box_ptr((self.payload() << 4) as usize).trace(visit)
+                }
+                _ => {}
+            }
         }
     }
 }
 
-impl Drop for Value {
-    #[inline]
-    fn drop(&mut self) {
-        if self.is_double() {
-            return;
-        }
-        unsafe fn release<T>(payload: u64) {
-            // SAFETY: the payload holds a ref leaked by `box_heap`.
-            drop(unsafe { Rc::from_raw((payload << 4) as usize as *const T) });
-        }
-        unsafe {
-            match self.tag() {
-                TAG_BIGINT => release::<BigInt>(self.payload()),
-                TAG_STRING => release::<JsString>(self.payload()),
-                TAG_SYMBOL => release::<Symbol>(self.payload()),
-                TAG_OBJECT => release::<JsObject>(self.payload()),
-                TAG_FUNCTION => release::<Function>(self.payload()),
-                _ => {}
-            }
+impl Trace for ValueKind {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        match self {
+            ValueKind::BigInt(h) => h.trace(visit),
+            ValueKind::String(h) => h.trace(visit),
+            ValueKind::Symbol(h) => h.trace(visit),
+            ValueKind::Object(h) => h.trace(visit),
+            ValueKind::Function(h) => h.trace(visit),
+            _ => {}
         }
     }
 }
@@ -621,16 +626,15 @@ mod tests {
     }
 
     #[test]
-    fn clone_and_drop_maintain_refcounts() {
+    fn values_are_copy_and_clones_share_the_payload() {
         let obj = JsObject::ordinary_object_create(None);
-        let v = Value::Object(obj.clone());
-        assert_eq!(Handle::strong_count(&obj), 2); // obj handle + the box's ref
+        let v = Value::Object(obj);
+        // Value is Copy under the GC model: clones are copies, and the boxed
+        // payload address is unchanged (there is no refcount to observe).
         let c = v.clone();
-        assert_eq!(Handle::strong_count(&obj), 3);
-        drop(c);
-        assert_eq!(Handle::strong_count(&obj), 2);
-        drop(v);
-        assert_eq!(Handle::strong_count(&obj), 1);
+        assert_eq!(v.heap_payload(), c.heap_payload());
+        assert!(v.as_object().is_some());
+        assert!(c.as_object().is_some());
     }
 
     #[test]
@@ -642,8 +646,8 @@ mod tests {
         assert_eq!(Value::Number(-0.0), Value::Number(0.0));
         assert_ne!(Value::Number(f64::NAN), Value::Number(f64::NAN));
         let a = JsObject::ordinary_object_create(None);
-        assert_eq!(Value::Object(a.clone()), Value::Object(a.clone()));
+        assert_eq!(Value::Object(a), Value::Object(a));
         let b = JsObject::ordinary_object_create(None);
-        assert_ne!(Value::Object(a.clone()), Value::Object(b));
+        assert_ne!(Value::Object(a), Value::Object(b));
     }
 }

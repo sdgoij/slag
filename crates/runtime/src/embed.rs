@@ -141,12 +141,12 @@ impl Context {
 
     /// The realm's global object.
     pub fn global(&self) -> Result<JsObject, JsError> {
-        Ok(JsObject(self.agent.current_realm()?.global_object.clone()))
+        Ok(JsObject(self.agent.current_realm()?.global_object))
     }
 
     /// Define an own data property on the global object.
     pub fn set_global(&mut self, name: &str, value: JsValue) -> Result<(), JsError> {
-        let global = self.agent.current_realm()?.global_object.clone();
+        let global = self.agent.current_realm()?.global_object;
         global.create_data_property_or_throw(&JsString::from_utf8(name), value.into_value())?;
         Ok(())
     }
@@ -209,7 +209,7 @@ impl Context {
         let array = crate::builtins::array::array_from_values(&self.agent, &values)?;
         let process = CruxObject::ordinary_object_create(None);
         process.create_data_property_or_throw(&JsString::from_utf8("argv"), array)?;
-        let global = self.agent.current_realm()?.global_object.clone();
+        let global = self.agent.current_realm()?.global_object;
         global.create_data_property_or_throw(
             &JsString::from_utf8("process"),
             Value::Object(process),
@@ -342,7 +342,7 @@ impl Context {
         )?;
         fs.create_data_property_or_throw(&JsString::from_utf8("statSync"), Value::Function(stat))?;
 
-        let global = realm.global_object.clone();
+        let global = realm.global_object;
         global.create_data_property_or_throw(&JsString::from_utf8("fs"), Value::Object(fs))?;
         Ok(())
     }
@@ -375,7 +375,7 @@ impl Context {
                 Value::Function(method),
             )?;
         }
-        let global = realm.global_object.clone();
+        let global = realm.global_object;
         global.create_data_property_or_throw(
             &JsString::from_utf8("console"),
             Value::Object(console),
@@ -387,7 +387,7 @@ impl Context {
     /// the runtime's timeout job queue.
     fn install_timers(&mut self) -> Result<(), JsError> {
         let realm = self.agent.current_realm()?;
-        let global = realm.global_object.clone();
+        let global = realm.global_object;
         let timers = self.timers.clone();
 
         let timers_set = timers.clone();
@@ -891,7 +891,7 @@ impl JsObject {
 
     /// The object as a value.
     pub fn as_value(&self) -> JsValue {
-        JsValue(Value::Object(self.0.clone()))
+        JsValue(Value::Object(self.0))
     }
 }
 

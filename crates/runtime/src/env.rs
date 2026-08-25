@@ -8,6 +8,7 @@ use std::cell::{Cell, RefCell};
 
 use crux::error::{ErrorKind, JsError};
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
@@ -32,11 +33,11 @@ impl EnvRecord {
     /// The record's [[OuterEnv]], or `None` when null.
     pub fn outer(&self) -> Option<EnvRef> {
         match self {
-            EnvRecord::Declarative(e) => e.outer.clone(),
-            EnvRecord::Object(e) => e.outer.clone(),
-            EnvRecord::Function(e) => e.declarative.outer.clone(),
-            EnvRecord::Global(e) => e.declarative.outer.clone(),
-            EnvRecord::Module(e) => e.declarative.outer.clone(),
+            EnvRecord::Declarative(e) => e.outer,
+            EnvRecord::Object(e) => e.outer,
+            EnvRecord::Function(e) => e.declarative.outer,
+            EnvRecord::Global(e) => e.declarative.outer,
+            EnvRecord::Module(e) => e.declarative.outer,
         }
     }
 
@@ -209,7 +210,7 @@ impl EnvRecord {
     pub fn get_this_binding(&self) -> Result<Value, JsError> {
         match self {
             EnvRecord::Function(e) => e.get_this_binding(),
-            EnvRecord::Global(e) => Ok(Value::Object(e.global_this.clone())),
+            EnvRecord::Global(e) => Ok(Value::Object(e.global_this)),
             EnvRecord::Module(_) => Ok(Value::Undefined),
             _ => Err(JsError::new(
                 ErrorKind::ReferenceError,
@@ -350,6 +351,82 @@ pub struct DisposableResource {
     pub value: Value,
     pub method: Value,
     pub hint: DisposalHint,
+}
+
+impl Trace for DisposableResource {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.value.trace(visit);
+        self.method.trace(visit);
+    }
+}
+
+impl Trace for Binding {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        if let Some(value) = &self.value {
+            value.trace(visit);
+        }
+        if let Some((env, _)) = &self.indirect {
+            env.trace(visit);
+        }
+    }
+}
+
+impl Trace for DeclarativeEnv {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        if let Some(outer) = &self.outer {
+            outer.trace(visit);
+        }
+        for (_, binding) in &*self.bindings.borrow() {
+            binding.trace(visit);
+        }
+        for resource in &*self.disposable_resources.borrow() {
+            resource.trace(visit);
+        }
+    }
+}
+
+impl Trace for ObjectEnv {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        if let Some(outer) = &self.outer {
+            outer.trace(visit);
+        }
+        self.binding_object.trace(visit);
+    }
+}
+
+impl Trace for FunctionEnv {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.declarative.trace(visit);
+        self.function_object.trace(visit);
+        self.this_value.borrow().trace(visit);
+        self.new_target.trace(visit);
+    }
+}
+
+impl Trace for GlobalEnv {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.object.trace(visit);
+        self.global_this.trace(visit);
+        self.declarative.trace(visit);
+    }
+}
+
+impl Trace for ModuleEnv {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.declarative.trace(visit);
+    }
+}
+
+impl Trace for EnvRecord {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        match self {
+            EnvRecord::Declarative(e) => e.trace(visit),
+            EnvRecord::Object(e) => e.trace(visit),
+            EnvRecord::Function(e) => e.trace(visit),
+            EnvRecord::Global(e) => e.trace(visit),
+            EnvRecord::Module(e) => e.trace(visit),
+        }
+    }
 }
 
 /// A Declarative Environment Record (spec 9.2.2), also the base of the
@@ -739,7 +816,7 @@ impl ObjectEnv {
 
     fn with_base_object(&self) -> Value {
         if self.is_with {
-            Value::Object(self.binding_object.clone())
+            Value::Object(self.binding_object)
         } else {
             Value::Undefined
         }
@@ -1240,7 +1317,7 @@ mod tests {
     #[test]
     fn with_environment_reports_binding_object() {
         let obj = JsObject::ordinary_object_create(None);
-        let env = new_object_environment(obj.clone(), true, None);
+        let env = new_object_environment(obj, true, None);
         assert_eq!(env.with_base_object(), Value::Object(obj));
         let plain = new_object_environment(JsObject::ordinary_object_create(None), false, None);
         assert_eq!(plain.with_base_object(), Value::Undefined);
@@ -1280,7 +1357,7 @@ mod tests {
     #[test]
     fn global_environment_splits_lexical_and_object_bindings() {
         let global = JsObject::ordinary_object_create(None);
-        let env = new_global_environment(global.clone(), global.clone());
+        let env = new_global_environment(global, global);
         assert!(env.has_this_binding());
         assert!(matches!(
             env.get_this_binding().unwrap().kind(),
@@ -1305,7 +1382,7 @@ mod tests {
     #[test]
     fn global_function_binding_defines_a_property() {
         let global = JsObject::ordinary_object_create(None);
-        let env = new_global_environment(global.clone(), global.clone());
+        let env = new_global_environment(global, global);
         let fun = Value::Function(crux::Function::new(None));
         env.create_global_function_binding(&name("f"), fun.clone(), false)
             .unwrap();
@@ -1323,7 +1400,7 @@ mod tests {
                 &crux::PropertyDescriptor::none(Value::Number(f64::INFINITY)),
             )
             .unwrap();
-        let env = new_global_environment(global.clone(), global.clone());
+        let env = new_global_environment(global, global);
         assert!(
             env.has_restricted_global_property(&name("Infinity"))
                 .unwrap()
@@ -1369,7 +1446,7 @@ mod tests {
     #[test]
     fn global_lexical_binding_stays_off_the_object() {
         let global = JsObject::ordinary_object_create(None);
-        let env = new_global_environment(global.clone(), global.clone());
+        let env = new_global_environment(global, global);
         env.create_mutable_binding(&name("let_y"), false).unwrap();
         env.initialize_binding(&name("let_y"), Value::Number(3.0))
             .unwrap();
@@ -1386,7 +1463,7 @@ mod tests {
         // `var a; var a;` — the second declaration reuses the existing
         // object property instead of failing (spec 9.2.6.10).
         let global = JsObject::ordinary_object_create(None);
-        let env = new_global_environment(global.clone(), global.clone());
+        let env = new_global_environment(global, global);
         env.create_global_var_binding(&name("a"), false).unwrap();
         assert!(global.has_own_property(&name("a")).unwrap());
         env.create_global_var_binding(&name("a"), false).unwrap();

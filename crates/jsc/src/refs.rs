@@ -87,7 +87,7 @@ pub fn ref_to_value(r: JSValueRef) -> Option<Value> {
 
 /// The ref for an object handle (pins it as an object value).
 pub fn object_ref(object: &Handle<JsObject>) -> JSObjectRef {
-    let value = Value::Object(object.clone());
+    let value = Value::Object(*object);
     pin(&value);
     tagged(object.id())
 }

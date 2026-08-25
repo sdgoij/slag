@@ -20,6 +20,7 @@ use crate::agent::Agent;
 use crate::context::ExecutionContext;
 use crate::env::{EnvRecord, EnvRef, new_declarative_environment};
 use crate::realm::Realm;
+use crux::heap::{GcAny, Trace};
 
 /// A Script Record (spec 16.1.4): the realm the script runs in and its
 /// parsed ECMAScript code. [[LoadedModules]] joins with module linking
@@ -30,6 +31,14 @@ pub struct ScriptRecord {
     pub code: Program,
     /// The exact source text, for `Function.prototype.toString`.
     pub source: JsString,
+}
+
+impl Trace for ScriptRecord {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.realm.trace(visit);
+        // `code` is the parsed AST (plain data); the source JsString is owned
+        // by `code`'s spans.
+    }
 }
 
 /// ParseScript (spec 16.1.5): parse `source` as a Script and wrap it in a
@@ -53,10 +62,10 @@ pub fn script_evaluation(
     let global_env = script.realm.global_env();
     let context = crate::context::ExecutionContext {
         function: None,
-        realm: script.realm.clone(),
-        script_or_module: Some(crate::context::ScriptOrModule::Script(script.clone())),
-        lexical_environment: global_env.clone(),
-        variable_environment: global_env.clone(),
+        realm: script.realm,
+        script_or_module: Some(crate::context::ScriptOrModule::Script(*script)),
+        lexical_environment: global_env,
+        variable_environment: global_env,
         private_environment: None,
         source: Some(script.source.clone()),
         annex_b_hoistable: Default::default(),
@@ -589,7 +598,7 @@ pub fn global_declaration_instantiation(
         let func_obj = crate::function::instantiate_function(
             agent,
             f,
-            global_env.clone(),
+            *global_env,
             strict,
             Vec::new(),
             Vec::new(),
@@ -648,7 +657,7 @@ fn collect_private_names(agent: &Agent) -> Vec<crux::AtomId> {
     let Some(private_env) = agent
         .running_context()
         .ok()
-        .and_then(|context| context.private_environment.clone())
+        .and_then(|context| context.private_environment)
     else {
         return Vec::new();
     };
@@ -659,7 +668,7 @@ fn collect_private_names(agent: &Agent) -> Vec<crux::AtomId> {
             let units = name.description.as_slice();
             names.push(crux::intern(units.get(1..).unwrap_or(&[])));
         }
-        current = env.outer.clone();
+        current = env.outer
     }
     names
 }
@@ -770,24 +779,24 @@ pub fn perform_eval(
     let (lexical_env, variable_env, private_env) = if direct {
         // Direct eval: a fresh lexical env over the caller's, sharing the
         // caller's variable environment (spec 19.2.1.1 step 12).
-        let lexical_env = new_declarative_environment(Some(running.lexical_environment.clone()));
+        let lexical_env = new_declarative_environment(Some(running.lexical_environment));
         (
             lexical_env,
-            running.variable_environment.clone(),
-            running.private_environment.clone(),
+            running.variable_environment,
+            running.private_environment,
         )
     } else {
         // Indirect eval: fresh lexical env over the global environment.
         let global_env = eval_realm.global_env();
         (
-            new_declarative_environment(Some(global_env.clone())),
+            new_declarative_environment(Some(global_env)),
             global_env,
             None,
         )
     };
     // Strict eval code cannot touch the caller's variable environment.
     let variable_env = if strict_eval {
-        lexical_env.clone()
+        lexical_env
     } else {
         variable_env
     };
@@ -798,8 +807,8 @@ pub fn perform_eval(
         function: None,
         realm: eval_realm,
         script_or_module,
-        lexical_environment: lexical_env.clone(),
-        variable_environment: variable_env.clone(),
+        lexical_environment: lexical_env,
+        variable_environment: variable_env,
         private_environment: private_env,
         source: Some(eval_source),
         annex_b_hoistable: Default::default(),
@@ -849,9 +858,9 @@ fn eval_declaration_instantiation(
         // variable environment, rejecting vars that would hoist over a
         // lexical binding (spec 19.2.1.4 steps 3-10). A catch parameter's
         // environment is exempt (Annex B.3.5).
-        let mut this_env = Some(lexical_env.clone());
+        let mut this_env = Some(*lexical_env);
         while let Some(env) = this_env {
-            if Handle::ptr_eq(&env, variable_env) {
+            if Handle::ptr_eq(env, *variable_env) {
                 break;
             }
             if !matches!(&*env, EnvRecord::Object(_)) && !env.is_catch_param_env() {
@@ -932,7 +941,7 @@ fn eval_declaration_instantiation(
             continue;
         };
         let name = lookup(func_name);
-        let env = agent.running_context()?.lexical_environment.clone();
+        let env = agent.running_context()?.lexical_environment;
         let func_obj =
             crate::function::instantiate_function(agent, f, env, strict, Vec::new(), Vec::new())?;
         if variable_env_is_global {
@@ -1440,7 +1449,7 @@ mod tests {
         .unwrap();
         assert_eq!(result, Value::Number(5.0));
         // The var landed on the global object, deletable (eval-created).
-        let global = agent.running_context().unwrap().realm.global_object.clone();
+        let global = agent.running_context().unwrap().realm.global_object;
         assert_eq!(
             global.get(&JsString::from_utf8("ev")).unwrap(),
             Value::Number(5.0)
@@ -1464,7 +1473,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, Value::Number(7.0));
-        let global = agent.running_context().unwrap().realm.global_object.clone();
+        let global = agent.running_context().unwrap().realm.global_object;
         assert_eq!(
             global.get(&JsString::from_utf8("gv")).unwrap(),
             Value::Number(7.0)
@@ -1484,7 +1493,7 @@ mod tests {
         .unwrap();
         assert_eq!(result, Value::Number(1.0));
         // Strict eval's vars go to the fresh lexical env, not the global.
-        let global = agent.running_context().unwrap().realm.global_object.clone();
+        let global = agent.running_context().unwrap().realm.global_object;
         assert!(!global.has_own_property(&JsString::from_utf8("s")).unwrap());
     }
 
@@ -1500,7 +1509,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, Value::Number(3.0));
-        let realm = agent.running_context().unwrap().realm.clone();
+        let realm = agent.running_context().unwrap().realm;
         assert!(
             !realm
                 .global_env
@@ -1560,7 +1569,7 @@ mod tests {
             Ok(Value::Undefined)
         });
         agent.run_jobs().unwrap();
-        let global = agent.running_context().unwrap().realm.global_object.clone();
+        let global = agent.running_context().unwrap().realm.global_object;
         assert_eq!(
             global.get(&JsString::from_utf8("from_job")).unwrap(),
             Value::Number(2.0)
@@ -1622,7 +1631,7 @@ mod tests {
             true,
         )
         .unwrap();
-        let global = agent.running_context().unwrap().realm.global_object.clone();
+        let global = agent.running_context().unwrap().realm.global_object;
         assert!(matches!(
             global.get(&JsString::from_utf8("ef")).unwrap().kind(),
             ValueKind::Function(_)
@@ -1643,7 +1652,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, Value::Number(3.0));
-        let global = agent.running_context().unwrap().realm.global_object.clone();
+        let global = agent.running_context().unwrap().realm.global_object;
         assert_eq!(
             global.get(&JsString::from_utf8("iv")).unwrap(),
             Value::Number(3.0)

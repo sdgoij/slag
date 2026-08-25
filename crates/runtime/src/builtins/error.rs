@@ -88,7 +88,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .and_then(|value| as_object(&value));
 
     let error_proto = JsObject::ordinary_object_create(object_proto);
-    let error_proto_value = Value::Object(error_proto.clone());
+    let error_proto_value = Value::Object(error_proto);
 
     let error_ctor = Function::create_builtin(
         Some(JsString::from_utf8("Error")),
@@ -97,7 +97,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         Some(Box::new(placeholder("Error"))),
         None,
     )?;
-    let error_ctor_value = Value::Function(error_ctor.clone());
+    let error_ctor_value = Value::Function(error_ctor);
 
     realm.intrinsics.define(ERROR, error_ctor_value.clone());
     realm
@@ -168,10 +168,10 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define(GET_STACK, Value::Function(stack_getter.clone()));
+        .define(GET_STACK, Value::Function(stack_getter));
     realm
         .intrinsics
-        .define(SET_STACK, Value::Function(stack_setter.clone()));
+        .define(SET_STACK, Value::Function(stack_setter));
     error_proto.define_property(
         &JsString::from_utf8("stack"),
         &PropertyDescriptor {
@@ -194,7 +194,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define(ERROR_TO_STRING, Value::Function(to_string.clone()));
+        .define(ERROR_TO_STRING, Value::Function(to_string));
     error_proto.define_property(
         &JsString::from_utf8("toString"),
         &PropertyDescriptor {
@@ -215,7 +215,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define(ERROR_IS_ERROR, Value::Function(is_error.clone()));
+        .define(ERROR_IS_ERROR, Value::Function(is_error));
     error_ctor.define_property(
         &JsString::from_utf8("isError"),
         &PropertyDescriptor {
@@ -253,13 +253,12 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             Some(Box::new(placeholder(name))),
             None,
         )?;
-        let ctor_value = Value::Function(ctor.clone());
-        ctor.object
-            .set_prototype_of(Some(error_ctor_object.clone()))?;
+        let ctor_value = Value::Function(ctor);
+        ctor.object.set_prototype_of(Some(error_ctor_object))?;
         realm.intrinsics.define(key, ctor_value.clone());
 
-        let proto = JsObject::ordinary_object_create(Some(error_proto.clone()));
-        let proto_value = Value::Object(proto.clone());
+        let proto = JsObject::ordinary_object_create(Some(error_proto));
+        let proto_value = Value::Object(proto);
         realm
             .intrinsics
             .define(&format!("%{name}.prototype%"), proto_value.clone());
@@ -610,7 +609,7 @@ fn stack_setter(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
         .and_then(|value| as_object(&value));
     if error_proto
         .as_ref()
-        .map(|proto| Handle::ptr_eq(proto, &object))
+        .map(|proto| Handle::ptr_eq(*proto, object))
         .unwrap_or(false)
     {
         return Err(JsError::new(

@@ -79,8 +79,8 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .and_then(|value| as_object(&value));
 
     // %WeakRef% (26.1.1) and %WeakRef.prototype% (26.1.3).
-    let weak_ref_proto = JsObject::ordinary_object_create(object_proto.clone());
-    let weak_ref_proto_value = Value::Object(weak_ref_proto.clone());
+    let weak_ref_proto = JsObject::ordinary_object_create(object_proto);
+    let weak_ref_proto_value = Value::Object(weak_ref_proto);
     let weak_ref_ctor = Function::create_builtin(
         Some(JsString::from_utf8("WeakRef")),
         1,
@@ -88,7 +88,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         Some(Box::new(placeholder("WeakRef"))),
         None,
     )?;
-    let weak_ref_ctor_value = Value::Function(weak_ref_ctor.clone());
+    let weak_ref_ctor_value = Value::Function(weak_ref_ctor);
     realm
         .intrinsics
         .define(WEAK_REF, weak_ref_ctor_value.clone());
@@ -126,7 +126,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define(WEAK_REF_DEREF, Value::Function(deref.clone()));
+        .define(WEAK_REF_DEREF, Value::Function(deref));
     weak_ref_proto.define_property(
         &JsString::from_utf8("deref"),
         &PropertyDescriptor {
@@ -153,7 +153,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     // %FinalizationRegistry% (26.2.1) and %FinalizationRegistry.prototype%
     // (26.2.3).
     let fr_proto = JsObject::ordinary_object_create(object_proto);
-    let fr_proto_value = Value::Object(fr_proto.clone());
+    let fr_proto_value = Value::Object(fr_proto);
     let fr_ctor = Function::create_builtin(
         Some(JsString::from_utf8("FinalizationRegistry")),
         1,
@@ -161,7 +161,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         Some(Box::new(placeholder("FinalizationRegistry"))),
         None,
     )?;
-    let fr_ctor_value = Value::Function(fr_ctor.clone());
+    let fr_ctor_value = Value::Function(fr_ctor);
     realm
         .intrinsics
         .define(FINALIZATION_REGISTRY, fr_ctor_value.clone());
@@ -203,7 +203,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         )?;
         realm
             .intrinsics
-            .define(key, Value::Function(method.clone()));
+            .define(key, Value::Function(method));
         fr_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {

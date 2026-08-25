@@ -37,7 +37,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .get("%Object.prototype%")
         .and_then(|value| as_object(&value));
     let proto = JsObject::ordinary_object_create(object_proto);
-    let proto_value = Value::Object(proto.clone());
+    let proto_value = Value::Object(proto);
 
     let ctor = Function::create_builtin(
         Some(JsString::from_utf8("AbstractModuleSource")),
@@ -46,7 +46,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         Some(Box::new(placeholder("AbstractModuleSource"))),
         None,
     )?;
-    let ctor_value = Value::Function(ctor.clone());
+    let ctor_value = Value::Function(ctor);
 
     realm
         .intrinsics
@@ -89,7 +89,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     proto.create_data_property_or_throw(
         &JsString::from_utf8("toString"),
-        Value::Function(to_string.clone()),
+        Value::Function(to_string),
     )?;
     realm
         .intrinsics
@@ -112,7 +112,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         &PropertyDescriptor {
             value: None,
             writable: None,
-            get: Some(Value::Function(to_string_tag.clone())),
+            get: Some(Value::Function(to_string_tag)),
             set: None,
             enumerable: Some(false),
             configurable: Some(true),
@@ -191,7 +191,7 @@ fn module_source_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsE
         .loaded_modules
         .borrow()
         .iter()
-        .find(|(_, m)| std::rc::Rc::ptr_eq(m, &module))
+        .find(|(_, m)| Handle::ptr_eq(**m, module))
         .map(|(specifier, _)| specifier.clone());
     let bytes = specifier
         .and_then(|specifier| agent.host_modules.borrow().get(&specifier).cloned())

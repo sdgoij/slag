@@ -739,12 +739,12 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         0,
         placeholder("Intl.Collator"),
         Some(placeholder("Intl.Collator")),
-        function_proto.clone(),
+        function_proto
     )?;
     proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(Value::Function(ctor.clone())),
+            value: Some(Value::Function(ctor)),
             writable: Some(true),
             get: None,
             set: None,
@@ -757,11 +757,11 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         0,
         placeholder("resolvedOptions"),
         None,
-        function_proto.clone(),
+        function_proto
     )?;
     realm
         .intrinsics
-        .define(COLLATOR_RESOLVED_OPTIONS, Value::Function(resolved.clone()));
+        .define(COLLATOR_RESOLVED_OPTIONS, Value::Function(resolved));
     proto.define_property(
         &JsString::from_utf8("resolvedOptions"),
         &PropertyDescriptor {
@@ -779,11 +779,11 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         0,
         placeholder("compare getter"),
         None,
-        function_proto.clone(),
+        function_proto
     )?;
     realm.intrinsics.define(
         COLLATOR_COMPARE_GETTER,
-        Value::Function(compare_getter.clone()),
+        Value::Function(compare_getter),
     );
     proto.define_property(
         &JsString::from_utf8("compare"),
@@ -810,7 +810,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
             configurable: Some(true),
         },
     )?;
-    let proto_value = Value::Object(proto.clone());
+    let proto_value = Value::Object(proto);
     ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
@@ -827,11 +827,11 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         1,
         placeholder("supportedLocalesOf"),
         None,
-        function_proto.clone(),
+        function_proto
     )?;
     realm.intrinsics.define(
         COLLATOR_SUPPORTED_LOCALES_OF,
-        Value::Function(supported.clone()),
+        Value::Function(supported),
     );
     ctor.define_property(
         &JsString::from_utf8("supportedLocalesOf"),
@@ -847,7 +847,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
     realm.intrinsics.define(COLLATOR_PROTO, proto_value);
     realm
         .intrinsics
-        .define(COLLATOR, Value::Function(ctor.clone()));
+        .define(COLLATOR, Value::Function(ctor));
     if let Some(obj) = as_object(intl_value) {
         obj.define_property(
             &JsString::from_utf8("Collator"),

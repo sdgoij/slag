@@ -1546,9 +1546,9 @@ fn get_substitution(
                         let name = JsString::from_utf16(&units[q + 2..gt_position]);
                         let capture = get_property(
                             agent,
-                            &Value::Object(named.clone()),
+                            &Value::Object(*named),
                             &name,
-                            Value::Object(named.clone()),
+                            Value::Object(*named),
                         )?;
                         if !matches!(capture.kind(), ValueKind::Undefined) {
                             result.extend_from_slice(to_string(&capture)?.as_slice());
@@ -1659,8 +1659,8 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .intrinsics
         .get("%Object.prototype%")
         .and_then(|value| as_object(&value));
-    let string_proto = JsObject::string_create(JsString::from_utf8(""), object_proto.clone())?;
-    let string_proto_value = Value::Object(string_proto.clone());
+    let string_proto = JsObject::string_create(JsString::from_utf8(""), object_proto)?;
+    let string_proto_value = Value::Object(string_proto);
 
     let string_ctor = Function::create_builtin(
         Some(JsString::from_utf8("String")),
@@ -1669,7 +1669,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         Some(Box::new(placeholder("String"))),
         None,
     )?;
-    let string_ctor_value = Value::Function(string_ctor.clone());
+    let string_ctor_value = Value::Function(string_ctor);
 
     realm.intrinsics.define(STRING, string_ctor_value.clone());
     realm
@@ -1717,7 +1717,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             length,
             Box::new(body),
             None,
-            function_proto.clone(),
+            function_proto,
         )?;
         string_ctor.define_property(
             &JsString::from_utf8(name),
@@ -1739,9 +1739,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         None,
         None,
     )?;
-    realm
-        .intrinsics
-        .define(RAW, Value::Function(raw_func.clone()));
+    realm.intrinsics.define(RAW, Value::Function(raw_func));
     string_ctor.define_property(
         &JsString::from_utf8("raw"),
         &PropertyDescriptor {
@@ -1806,7 +1804,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm.intrinsics.define(key, Value::Function(func.clone()));
+        realm.intrinsics.define(key, Value::Function(func));
         string_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -1854,7 +1852,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm.intrinsics.define(key, Value::Function(func.clone()));
+        realm.intrinsics.define(key, Value::Function(func));
         string_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -1878,7 +1876,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define(ITERATOR, Value::Function(iterator_func.clone()));
+        .define(ITERATOR, Value::Function(iterator_func));
     string_proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
         &PropertyDescriptor {
@@ -1892,8 +1890,8 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
 
     // spec 22.1.5: %StringIteratorPrototype%.
-    let iterator_proto = JsObject::ordinary_object_create(object_proto.clone());
-    let iterator_proto_value = Value::Object(iterator_proto.clone());
+    let iterator_proto = JsObject::ordinary_object_create(object_proto);
+    let iterator_proto_value = Value::Object(iterator_proto);
     realm
         .intrinsics
         .define(STRING_ITERATOR, iterator_proto_value.clone());
@@ -1906,7 +1904,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define(STRING_ITERATOR_NEXT, Value::Function(next_func.clone()));
+        .define(STRING_ITERATOR_NEXT, Value::Function(next_func));
     iterator_proto.define_property(
         &JsString::from_utf8("next"),
         &PropertyDescriptor {

@@ -615,7 +615,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             length,
             body,
             None,
-            function_proto.clone(),
+            function_proto
         )?;
         math.define_property(
             &JsString::from_utf8(name),
@@ -640,7 +640,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define(MATH_SUM_PRECISE, Value::Function(sum_precise.clone()));
+        .define(MATH_SUM_PRECISE, Value::Function(sum_precise));
     math.define_property(
         &JsString::from_utf8("sumPrecise"),
         &PropertyDescriptor {

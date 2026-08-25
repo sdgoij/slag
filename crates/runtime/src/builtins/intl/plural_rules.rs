@@ -114,12 +114,12 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         0,
         placeholder("Intl.PluralRules"),
         Some(placeholder("Intl.PluralRules")),
-        function_proto.clone(),
+        function_proto
     )?;
     proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(Value::Function(ctor.clone())),
+            value: Some(Value::Function(ctor)),
             writable: Some(true),
             get: None,
             set: None,
@@ -138,9 +138,9 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
             *length,
             placeholder(name),
             None,
-            function_proto.clone(),
+            function_proto
         )?;
-        realm.intrinsics.define(key, Value::Function(func.clone()));
+        realm.intrinsics.define(key, Value::Function(func));
         proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -167,7 +167,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
             configurable: Some(true),
         },
     )?;
-    let proto_value = Value::Object(proto.clone());
+    let proto_value = Value::Object(proto);
     ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
@@ -184,11 +184,11 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         1,
         placeholder("supportedLocalesOf"),
         None,
-        function_proto.clone(),
+        function_proto
     )?;
     realm
         .intrinsics
-        .define(PR_SUPPORTED_LOCALES_OF, Value::Function(supported.clone()));
+        .define(PR_SUPPORTED_LOCALES_OF, Value::Function(supported));
     ctor.define_property(
         &JsString::from_utf8("supportedLocalesOf"),
         &PropertyDescriptor {
@@ -203,7 +203,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
     realm.intrinsics.define(PLURAL_RULES_PROTO, proto_value);
     realm
         .intrinsics
-        .define(PLURAL_RULES, Value::Function(ctor.clone()));
+        .define(PLURAL_RULES, Value::Function(ctor));
     if let Some(obj) = as_object(intl_value) {
         obj.define_property(
             &JsString::from_utf8("PluralRules"),

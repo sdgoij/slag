@@ -694,7 +694,7 @@ impl Agent {
         }
         let ir = data.ir.clone().expect("leaf_inline implies a compiled ir");
         let environment = if ir.leaf_uses_env {
-            Some(data.environment.clone())
+            Some(data.environment)
         } else {
             None
         };
@@ -726,19 +726,19 @@ impl Agent {
     /// execution context.
     pub fn initialize_host_defined_realm(&mut self) -> Result<Handle<Realm>, JsError> {
         let realm = initialize_host_defined_realm(self)?;
-        self.push_bootstrap_context(realm.clone());
+        self.push_bootstrap_context(realm);
         Ok(realm)
     }
 
     /// Push the initial execution context created in
     /// InitializeHostDefinedRealm: Function and ScriptOrModule are null.
     pub fn push_bootstrap_context(&mut self, realm: Handle<Realm>) {
-        let global_env = realm.global_env.clone();
+        let global_env = realm.global_env;
         self.execution_context_stack.push(ExecutionContext {
             function: None,
             realm,
             script_or_module: None,
-            lexical_environment: global_env.clone(),
+            lexical_environment: global_env,
             variable_environment: global_env,
             private_environment: None,
             source: None,
@@ -748,7 +748,7 @@ impl Agent {
 
     /// The current Realm Record (the Realm component of the running context).
     pub fn current_realm(&self) -> Result<Handle<Realm>, JsError> {
-        Ok(self.running_context()?.realm.clone())
+        Ok(self.running_context()?.realm)
     }
 
     /// HostEnqueueGenericJob (spec 9.5.3): schedule a job without additional

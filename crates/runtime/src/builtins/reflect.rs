@@ -51,7 +51,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .get("%Object.prototype%")
         .and_then(|value| as_object(&value));
     let reflect = JsObject::ordinary_object_create(object_proto);
-    let reflect_value = Value::Object(reflect.clone());
+    let reflect_value = Value::Object(reflect);
     realm.intrinsics.define(REFLECT, reflect_value.clone());
     // spec 28.1.3.2: Reflect[@@toStringTag] = "Reflect", non-writable,
     // non-enumerable, configurable.
@@ -74,10 +74,9 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm.intrinsics.define(
-            &format!("%Reflect.{name}%"),
-            Value::Function(method.clone()),
-        );
+        realm
+            .intrinsics
+            .define(&format!("%Reflect.{name}%"), Value::Function(method));
         reflect.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -124,7 +123,7 @@ pub fn dispatch_call(
 /// The object half of a Reflect target: `TypeError` for primitives.
 fn object_of(value: &Value) -> Result<Handle<JsObject>, JsError> {
     match value.kind() {
-        ValueKind::Object(obj) => Ok(obj.clone()),
+        ValueKind::Object(obj) => Ok(obj),
         ValueKind::Function(f) => f.object.handle().ok_or_else(|| {
             JsError::new(ErrorKind::TypeError, "Reflect target has no object".into())
         }),
@@ -216,7 +215,7 @@ fn reflect_method(agent: &mut Agent, name: &str, args: &[Value]) -> Result<Value
             let obj = object_of(&arg(0))?;
             let key = crate::context::to_property_key(agent, &arg(1))?;
             let receiver = match arg(2) {
-                v if v.is_undefined() => Value::Object(obj.clone()),
+                v if v.is_undefined() => Value::Object(obj),
                 other => other,
             };
             crate::context::get_property_key(agent, &Value::Object(obj), &key, receiver)
@@ -282,7 +281,7 @@ fn reflect_method(agent: &mut Agent, name: &str, args: &[Value]) -> Result<Value
             let key = crate::context::to_property_key(agent, &arg(1))?;
             let value = arg(2);
             let receiver = match arg(3) {
-                v if v.is_undefined() => Value::Object(obj.clone()),
+                v if v.is_undefined() => Value::Object(obj),
                 other => other,
             };
             let status = obj.set_with_receiver_key(&key, value, receiver, false)?;

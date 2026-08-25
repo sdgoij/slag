@@ -46,7 +46,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .get("%Object.prototype%")
         .and_then(|value| as_object(&value));
     let proxy_proto = JsObject::ordinary_object_create(object_proto);
-    let proxy_proto_value = Value::Object(proxy_proto.clone());
+    let proxy_proto_value = Value::Object(proxy_proto);
 
     // %Proxy% (28.2.1): `new Proxy(target, handler)` creates the proxy; the
     // call form throws (spec 28.2.1.1 step 1).
@@ -57,7 +57,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         Some(placeholder_ctor("Proxy")),
         None,
     )?;
-    let proxy_ctor_value = Value::Function(proxy_ctor.clone());
+    let proxy_ctor_value = Value::Function(proxy_ctor);
 
     realm.intrinsics.define(PROXY, proxy_ctor_value.clone());
     realm
@@ -94,7 +94,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define(REVOCABLE, Value::Function(revocable.clone()));
+        .define(REVOCABLE, Value::Function(revocable));
     proxy_ctor.define_property(
         &JsString::from_utf8("revocable"),
         &PropertyDescriptor {
@@ -185,7 +185,7 @@ fn proxy_revocable(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> 
         slots.constructible.set(false);
     }
     let slots = match &proxy.kind {
-        ObjectKind::Proxy(slots) => slots.clone(),
+        ObjectKind::Proxy(slots) => *slots,
         _ => unreachable!("proxy_create returns a proxy object"),
     };
     let revoke = Function::create_builtin(

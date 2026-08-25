@@ -156,12 +156,12 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         2,
         placeholder("Intl.DisplayNames"),
         Some(placeholder("Intl.DisplayNames")),
-        function_proto.clone(),
+        function_proto
     )?;
     proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(Value::Function(ctor.clone())),
+            value: Some(Value::Function(ctor)),
             writable: Some(true),
             get: None,
             set: None,
@@ -179,9 +179,9 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
             *length,
             placeholder(name),
             None,
-            function_proto.clone(),
+            function_proto
         )?;
-        realm.intrinsics.define(key, Value::Function(func.clone()));
+        realm.intrinsics.define(key, Value::Function(func));
         proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -208,7 +208,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
             configurable: Some(true),
         },
     )?;
-    let proto_value = Value::Object(proto.clone());
+    let proto_value = Value::Object(proto);
     ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
@@ -223,7 +223,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
     realm.intrinsics.define(DISPLAY_NAMES_PROTO, proto_value);
     realm
         .intrinsics
-        .define(DISPLAY_NAMES, Value::Function(ctor.clone()));
+        .define(DISPLAY_NAMES, Value::Function(ctor));
     if let Some(obj) = as_object(intl_value) {
         obj.define_property(
             &JsString::from_utf8("DisplayNames"),

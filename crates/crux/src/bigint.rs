@@ -3,11 +3,18 @@
 use num_bigint::BigInt as NumBigInt;
 
 use crate::error::{ErrorKind, JsError};
+use crate::heap::Trace;
 
 /// A BigInt value. Equality follows the mathematical value, per
 /// `BigInt::equal` (spec 6.1.6.2.6).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BigInt(pub NumBigInt);
+
+impl Trace for BigInt {
+    fn trace(&self, _visit: &mut dyn FnMut(crate::heap::GcAny)) {
+        // An arbitrary-precision integer: no heap edges.
+    }
+}
 
 impl From<i32> for BigInt {
     fn from(v: i32) -> Self {

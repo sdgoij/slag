@@ -94,6 +94,14 @@ pub struct PromiseCapability {
     pub reject: Value,
 }
 
+impl crux::heap::Trace for PromiseCapability {
+    fn trace(&self, visit: &mut dyn FnMut(crux::heap::GcAny)) {
+        self.promise.trace(visit);
+        self.resolve.trace(visit);
+        self.reject.trace(visit);
+    }
+}
+
 /// IsPromise (spec 27.2.1.4): the value is an object with a Promise Record.
 pub fn is_promise(agent: &Agent, value: &Value) -> bool {
     let ValueKind::Object(obj) = value.kind() else {
@@ -196,7 +204,7 @@ pub fn create_resolving_functions(agent: &mut Agent, promise: &Value) -> (Value,
                 ))
             }),
             None,
-            function_proto.clone(),
+            function_proto
         )
         .expect("builtin creation cannot fail");
         agent.promise_resolvers.insert(

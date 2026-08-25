@@ -9,6 +9,7 @@ use std::sync::atomic::Ordering;
 use crux::error::{ErrorKind, JsError};
 use crux::function::Function;
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::object::JsObject;
 use crux::property::PropertyKey;
 use crux::string::JsString;
@@ -100,6 +101,41 @@ pub struct SourceTextModule {
     /// [[DeferredNamespace]] (import-defer): the deferred module namespace
     /// object, created on first access.
     pub deferred_namespace: RefCell<Option<Value>>,
+}
+
+impl Trace for SourceTextModule {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.realm.trace(visit);
+        if let Some(environment) = &*self.environment.borrow() {
+            environment.trace(visit);
+        }
+        if let Some(namespace) = &*self.namespace.borrow() {
+            namespace.trace(visit);
+        }
+        if let Some(cycle_root) = &*self.cycle_root.borrow() {
+            cycle_root.trace(visit);
+        }
+        for parent in &*self.async_parents.borrow() {
+            parent.trace(visit);
+        }
+        if let Some(capability) = &*self.top_level_capability.borrow() {
+            capability.trace(visit);
+        }
+        if let Some(error) = &*self.evaluation_error.borrow() {
+            error.trace(visit);
+        }
+        if let Some(meta) = &*self.import_meta.borrow() {
+            meta.trace(visit);
+        }
+        if let Some(source) = &*self.module_source.borrow() {
+            source.trace(visit);
+        }
+        if let Some(namespace) = &*self.deferred_namespace.borrow() {
+            namespace.trace(visit);
+        }
+        // `code` is the parsed AST (plain data); the source JsString is only
+        // reachable through `code`'s spans, which the AST owns by value.
+    }
 }
 
 /// A host-provided module source (HostResolveImportedModule): the raw
@@ -330,8 +366,8 @@ pub(crate) fn module_source_object(
         .get("%AbstractModuleSource.prototype%")
         .and_then(|value| value.as_object());
     let object = JsObject::ordinary_object_create(prototype);
-    let value = Value::Object(object.clone());
-    agent.module_sources.insert(object.id(), module.clone());
+    let value = Value::Object(object);
+    agent.module_sources.insert(object.id(), *module);
     module.module_source.replace(Some(value.clone()));
     Ok(value)
 }
@@ -347,7 +383,7 @@ pub(crate) fn module_source_text(
         .loaded_modules
         .borrow()
         .iter()
-        .find(|(_, m)| std::rc::Rc::ptr_eq(m, module))
+        .find(|(_, m)| Handle::ptr_eq(**m, *module))
         .map(|(specifier, _)| specifier.clone());
     let bytes = specifier
         .and_then(|specifier| agent.host_modules.borrow().get(&specifier).cloned())
@@ -368,7 +404,7 @@ pub fn host_resolve_imported_module(
 ) -> Result<Handle<SourceTextModule>, JsError> {
     let realm = agent.current_realm()?;
     if let Some(module) = realm.loaded_modules.borrow().get(specifier) {
-        return Ok(module.clone());
+        return Ok(*module);
     }
     let source = agent
         .host_modules
@@ -387,7 +423,7 @@ pub fn host_resolve_imported_module(
     realm
         .loaded_modules
         .borrow_mut()
-        .insert(specifier.clone(), module.clone());
+        .insert(specifier.clone(), module);
     Ok(module)
 }
 
@@ -668,8 +704,8 @@ pub fn module_declaration_instantiation(
     // NewModuleEnvironment(module.[[Realm]].[[GlobalEnv]]) (spec
     // 16.2.1.6.1.2.1 step 4): the module env chains to the global env so
     // module bodies resolve realm globals (URIError, assert, …).
-    let env = new_module_environment(Some(module.realm.global_env.clone()));
-    module.environment.replace(Some(env.clone()));
+    let env = new_module_environment(Some(module.realm.global_env));
+    module.environment.replace(Some(env));
 
     // spec 16.2.1.6.1.2.1 step 8: every requested module — including those
     // referenced only by `export *`/`export {} from` — must resolve before
@@ -760,12 +796,18 @@ pub fn module_declaration_instantiation(
         let mut resolve_set = Vec::new();
         match resolve_export(agent, &imported, &import_name, &mut resolve_set)? {
             Some(ResolvedBinding::Local(target, binding)) => {
-                let target_env = target.environment.borrow().clone().ok_or_else(|| {
-                    JsError::new(
-                        ErrorKind::TypeError,
-                        "imported module has no environment".into(),
-                    )
-                })?;
+                let target_env =
+                    target
+                        .environment
+                        .borrow()
+                        .as_ref()
+                        .copied()
+                        .ok_or_else(|| {
+                            JsError::new(
+                                ErrorKind::TypeError,
+                                "imported module has no environment".into(),
+                            )
+                        })?;
                 create_import_binding(&env, &local, target_env, &binding)?;
             }
             Some(ResolvedBinding::Namespace(target)) => {
@@ -1007,7 +1049,7 @@ fn instantiate_module_declarations(
             let func = crate::function::instantiate_function_with_source(
                 agent,
                 function,
-                env.clone(),
+                *env,
                 true,
                 source,
                 Vec::new(),
@@ -1019,7 +1061,7 @@ fn instantiate_module_declarations(
             if let ValueKind::Function(handle) = func.kind()
                 && let Some(record) = agent.ecma_functions.get_mut(&handle.id())
             {
-                record.declaring_module = Some(module.clone());
+                record.declaring_module = Some(*module);
             }
             env.initialize_binding(&name, func)?;
         }
@@ -1198,7 +1240,7 @@ pub fn module_evaluation(
     }
     module.status.replace(ModuleStatus::Evaluating);
     module_namespace(agent, module)?;
-    agent.module_eval_stack.push(module.clone());
+    agent.module_eval_stack.push(*module);
     // Evaluate the module's dependencies depth-first (spec 16.2.1.6.1.3.1
     // steps 11-12). A dependency that is already evaluating is a cycle: its
     // body finishes on the current evaluation stack, so it is skipped here.
@@ -1253,12 +1295,12 @@ pub fn module_evaluation(
                     if let Some(index) = agent
                         .module_eval_stack
                         .iter()
-                        .position(|m| std::rc::Rc::ptr_eq(m, &imported))
+                        .position(|m| Handle::ptr_eq(*m, imported))
                     {
-                        let root = imported.clone();
+                        let root = imported;
                         for member in &agent.module_eval_stack[index..] {
                             if member.cycle_root.borrow().is_none() {
-                                *member.cycle_root.borrow_mut() = Some(root.clone());
+                                *member.cycle_root.borrow_mut() = Some(root);
                             }
                         }
                     }
@@ -1338,14 +1380,11 @@ fn register_async_parent(
 ) -> Result<(), JsError> {
     let _ = agent;
     let target = if module.cycle_root.borrow().is_some() {
-        dep.clone()
+        *dep
     } else {
-        dep.cycle_root
-            .borrow()
-            .clone()
-            .unwrap_or_else(|| dep.clone())
+        (*dep.cycle_root.borrow()).unwrap_or(*dep)
     };
-    target.async_parents.borrow_mut().push(module.clone());
+    target.async_parents.borrow_mut().push(*module);
     *module.pending_async.borrow_mut() += 1;
     Ok(())
 }
@@ -1363,18 +1402,15 @@ fn execute_module_body(
     if module.evaluation_error.borrow().is_some() {
         return Ok(());
     }
-    let env = module
-        .environment
-        .borrow()
-        .clone()
+    let env = (*module.environment.borrow())
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "module is not linked".into()))?;
     let stmts = module_statements(module);
     let context = ExecutionContext {
         function: None,
-        realm: module.realm.clone(),
-        script_or_module: Some(ScriptOrModule::Module(module.clone())),
-        lexical_environment: env.clone(),
-        variable_environment: env.clone(),
+        realm: module.realm,
+        script_or_module: Some(ScriptOrModule::Module(*module)),
+        lexical_environment: env,
+        variable_environment: env,
         private_environment: None,
         source: Some(module.source.clone()),
         annex_b_hoistable: Default::default(),
@@ -1402,7 +1438,7 @@ fn execute_module_body(
         promise,
         resolve,
         reject,
-        module: Some(module.clone()),
+        module: Some(*module),
     }));
     let mut state_ref = state.borrow_mut();
     let body = state_ref.body.clone();
@@ -1423,7 +1459,7 @@ fn execute_module_body(
                     resources,
                     completion,
                     crate::builtins::disposable::AsyncBodySettlement::Module {
-                        module: module.clone(),
+                        module: *module,
                         state: state.clone(),
                     },
                 )?;
@@ -1580,7 +1616,6 @@ fn notify_async_parents_fulfilled(
             // fulfillment does not cascade into its parents' parents before
             // the remaining siblings execute (spec 16.2.2.5 — the DFS visit
             // order is preserved).
-            let parent = parent.clone();
             let realm = agent.current_realm().ok();
             agent.enqueue_promise_job(realm, move |agent| {
                 execute_module_body(agent, &parent)?;
@@ -1645,9 +1680,7 @@ pub(crate) fn deferred_module_object(
         None,
         None,
     )?;
-    agent
-        .deferred_module_thens
-        .insert(then.id(), module.clone());
+    agent.deferred_module_thens.insert(then.id(), *module);
     object.create_data_property_or_throw(&JsString::from_utf8("then"), Value::Function(then))?;
     Ok(Value::Object(object))
 }
@@ -1696,7 +1729,7 @@ fn deferred_module_then(
     // transitive dependencies, then settle with the deferred namespace — the
     // module itself is left unevaluated for lazy access.
     let realm = agent.current_realm()?;
-    let module = module.clone();
+    let module = *module;
     agent.enqueue_generic_job(Some(realm), move |agent| {
         let result = (|| -> Result<(), JsError> {
             let async_deps = gather_async_transitive_dependencies(agent, &module, &mut Vec::new())?;
@@ -1721,7 +1754,7 @@ fn deferred_module_then(
                     remaining.clone(),
                     on_fulfilled.clone(),
                     on_rejected.clone(),
-                    module.clone(),
+                    module,
                     resolve.clone(),
                     reject.clone(),
                 ),
@@ -1893,15 +1926,11 @@ fn create_namespace(
         .map(|name| PropertyKey::from_js_string(&name))
         .collect();
     let namespace = JsObject::module_namespace_object_create(exports, deferred)?;
-    let namespace_value = Value::Object(namespace.clone());
+    let namespace_value = Value::Object(namespace);
     if deferred {
-        agent
-            .deferred_namespaces
-            .insert(namespace.id(), module.clone());
+        agent.deferred_namespaces.insert(namespace.id(), *module);
     } else {
-        agent
-            .module_namespaces
-            .insert(namespace.id(), module.clone());
+        agent.module_namespaces.insert(namespace.id(), *module);
     }
     Ok(namespace_value)
 }
@@ -2053,10 +2082,10 @@ fn module_sync_ready(
     module: &Handle<SourceTextModule>,
     seen: &mut Vec<Handle<SourceTextModule>>,
 ) -> Result<bool, JsError> {
-    if seen.iter().any(|m| Rc::ptr_eq(m, module)) {
+    if seen.iter().any(|m| Handle::ptr_eq(*m, *module)) {
         return Ok(true);
     }
-    seen.push(module.clone());
+    seen.push(*module);
     // ReadyForSyncExecution step 5: a fully-evaluated SCC is ready, even
     // when individual members' statuses are EVALUATED (spec
     // 16.2.1.5.2.1). A member of a cycle whose root is still evaluating is
@@ -2322,7 +2351,7 @@ fn class_has_top_level_await(class: &Class) -> bool {
 /// module whose cycle root is still evaluating is not, even when its own
 /// status is EVALUATED.
 fn is_module_scc_evaluated(module: &Handle<SourceTextModule>) -> bool {
-    if let Some(root) = module.cycle_root.borrow().clone() {
+    if let Some(root) = *module.cycle_root.borrow() {
         return *root.status.borrow() == ModuleStatus::Evaluated;
     }
     *module.status.borrow() == ModuleStatus::Evaluated
@@ -2337,10 +2366,10 @@ fn gather_async_transitive_dependencies(
     seen: &mut Vec<Handle<SourceTextModule>>,
 ) -> Result<Vec<Handle<SourceTextModule>>, JsError> {
     let mut result = Vec::new();
-    if seen.iter().any(|m| Rc::ptr_eq(m, module)) {
+    if seen.iter().any(|m| Handle::ptr_eq(*m, *module)) {
         return Ok(result);
     }
-    seen.push(module.clone());
+    seen.push(*module);
     // spec step 6: an evaluating module — or one whose SCC is already fully
     // evaluated — contributes nothing. A member of a cycle whose root is
     // still evaluating is NOT SCC-evaluated: the walk continues into it so
@@ -2352,7 +2381,7 @@ fn gather_async_transitive_dependencies(
         return Ok(result);
     }
     if module_has_tla(agent, module)? {
-        result.push(module.clone());
+        result.push(*module);
         return Ok(result);
     }
     let requested = module.requested_modules.clone();
@@ -2360,7 +2389,7 @@ fn gather_async_transitive_dependencies(
         let imported = host_resolve_imported_module(agent, specifier, &[])?;
         let additional = gather_async_transitive_dependencies(agent, &imported, seen)?;
         for m in additional {
-            if !result.iter().any(|existing| Rc::ptr_eq(existing, &m)) {
+            if !result.iter().any(|existing| Handle::ptr_eq(*existing, m)) {
                 result.push(m);
             }
         }
@@ -2378,10 +2407,10 @@ fn collect_exported_names(
     stack: &mut Vec<Handle<SourceTextModule>>,
     out: &mut Vec<JsString>,
 ) -> Result<(), JsError> {
-    if stack.iter().any(|m| Rc::ptr_eq(m, module)) {
+    if stack.iter().any(|m| Handle::ptr_eq(*m, *module)) {
         return Ok(());
     }
-    stack.push(module.clone());
+    stack.push(*module);
     for export in &module.local_export_entries {
         if let Ok(name) = export_name_string(export.export_name.as_ref())
             && !out.contains(&name)
@@ -2448,11 +2477,11 @@ fn resolve_export(
 ) -> Result<Option<ResolvedBinding>, JsError> {
     if resolve_set
         .iter()
-        .any(|(m, n)| Rc::ptr_eq(m, module) && n == name)
+        .any(|(m, n)| Handle::ptr_eq(*m, *module) && n == name)
     {
         return Ok(None);
     }
-    resolve_set.push((module.clone(), name.clone()));
+    resolve_set.push((*module, name.clone()));
     for export in &module.local_export_entries {
         if export_name_string(export.export_name.as_ref())
             .ok()
@@ -2460,10 +2489,7 @@ fn resolve_export(
             == Some(name)
         {
             if let Some(local) = export.local_name {
-                return Ok(Some(ResolvedBinding::Local(
-                    module.clone(),
-                    crux::lookup(local),
-                )));
+                return Ok(Some(ResolvedBinding::Local(*module, crux::lookup(local))));
             }
             // `export * as ns from ...`: the binding is a namespace.
             let specifier = export.module_request.as_ref().ok_or_else(|| {
@@ -2523,16 +2549,18 @@ fn resolve_export(
                 // Ambiguous unless both resolve to the same binding.
                 let same = match (previous, &resolution) {
                     (ResolvedBinding::Local(pm, pn), ResolvedBinding::Local(m, n)) => {
-                        Rc::ptr_eq(pm, m) && pn == n
+                        Handle::ptr_eq(*pm, *m) && pn == n
                     }
                     (ResolvedBinding::Namespace(pm), ResolvedBinding::Namespace(m)) => {
-                        Rc::ptr_eq(pm, m)
+                        Handle::ptr_eq(*pm, *m)
                     }
                     (
                         ResolvedBinding::DeferredNamespace(pm),
                         ResolvedBinding::DeferredNamespace(m),
-                    ) => Rc::ptr_eq(pm, m),
-                    (ResolvedBinding::Source(pm), ResolvedBinding::Source(m)) => Rc::ptr_eq(pm, m),
+                    ) => Handle::ptr_eq(*pm, *m),
+                    (ResolvedBinding::Source(pm), ResolvedBinding::Source(m)) => {
+                        Handle::ptr_eq(*pm, *m)
+                    }
                     _ => false,
                 };
                 if !same {
@@ -2555,10 +2583,12 @@ pub fn namespace_get(
     let mut resolve_set = Vec::new();
     match resolve_export(agent, module, name, &mut resolve_set)? {
         Some(ResolvedBinding::Local(target, local)) => {
-            let env =
-                target.environment.borrow().clone().ok_or_else(|| {
-                    JsError::new(ErrorKind::TypeError, "module is not linked".into())
-                })?;
+            let env = target
+                .environment
+                .borrow()
+                .as_ref()
+                .copied()
+                .ok_or_else(|| JsError::new(ErrorKind::TypeError, "module is not linked".into()))?;
             env.get_binding_value(&local, true)
         }
         Some(ResolvedBinding::Namespace(target)) => module_namespace(agent, &target),

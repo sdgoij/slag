@@ -15,7 +15,7 @@ impl Script {
     /// Parse `source` in `context`'s realm. A syntax error is returned
     /// directly (the caller decides how to surface it).
     pub fn compile(context: &Context, source: &str) -> Result<Self, JsError> {
-        crate::script::parse_script(source, context.realm().clone())?;
+        crate::script::parse_script(source, *context.realm())?;
         Ok(Self {
             source: source.to_string(),
         })

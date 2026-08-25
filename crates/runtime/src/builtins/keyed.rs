@@ -196,7 +196,7 @@ fn map_of(agent: &Agent, this: &Value) -> Result<Handle<JsObject>, JsError> {
             "Method called on an incompatible receiver".into(),
         ));
     }
-    Ok(object.clone())
+    Ok(object)
 }
 
 fn set_of(agent: &Agent, this: &Value) -> Result<Handle<JsObject>, JsError> {
@@ -212,7 +212,7 @@ fn set_of(agent: &Agent, this: &Value) -> Result<Handle<JsObject>, JsError> {
             "Method called on an incompatible receiver".into(),
         ));
     }
-    Ok(object.clone())
+    Ok(object)
 }
 
 /// The number of live elements of a Set's [[SetData]].
@@ -256,7 +256,7 @@ fn weak_map_of(agent: &Agent, this: &Value) -> Result<Handle<JsObject>, JsError>
             "Method called on an incompatible receiver".into(),
         ));
     }
-    Ok(object.clone())
+    Ok(object)
 }
 
 fn weak_set_of(agent: &Agent, this: &Value) -> Result<Handle<JsObject>, JsError> {
@@ -272,7 +272,7 @@ fn weak_set_of(agent: &Agent, this: &Value) -> Result<Handle<JsObject>, JsError>
             "Method called on an incompatible receiver".into(),
         ));
     }
-    Ok(object.clone())
+    Ok(object)
 }
 
 /// CanBeHeldWeakly (spec 26.1.1): Object, or a Symbol without a global
@@ -851,11 +851,7 @@ fn set_union(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, J
     let record = get_set_record(agent, &other)?;
     let mut result = agent.set_data.get(&object.id()).unwrap().borrow().clone();
     let keys = get_iterator_from_method(agent, &record.object, &record.keys)?;
-    loop {
-        let next = match crate::expr::iterator_step(agent, &keys)? {
-            Some(value) => value,
-            None => break,
-        };
+    while let Some(next) = crate::expr::iterator_step(agent, &keys)? {
         let value = canonicalize_key(next);
         if find_set_index(&result, &value).is_none() {
             result.push(Some(value));
@@ -887,11 +883,7 @@ fn set_intersection(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
         }
     } else {
         let keys = get_iterator_from_method(agent, &record.object, &record.keys)?;
-        loop {
-            let next = match crate::expr::iterator_step(agent, &keys)? {
-                Some(value) => value,
-                None => break,
-            };
+        while let Some(next) = crate::expr::iterator_step(agent, &keys)? {
             let value = canonicalize_key(next);
             if find_set_index(&data, &value).is_some() && find_set_index(&result, &value).is_none()
             {
@@ -930,11 +922,7 @@ fn set_difference(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
         }
     } else {
         let keys = get_iterator_from_method(agent, &record.object, &record.keys)?;
-        loop {
-            let next = match crate::expr::iterator_step(agent, &keys)? {
-                Some(value) => value,
-                None => break,
-            };
+        while let Some(next) = crate::expr::iterator_step(agent, &keys)? {
             let value = canonicalize_key(next);
             if let Some(index) = find_set_index(&result, &value) {
                 result[index] = None;
@@ -961,11 +949,7 @@ fn set_symmetric_difference(
     // the mutation and drops values re-added by it).
     let mut result = agent.set_data.get(&id).unwrap().borrow().clone();
     let keys = get_iterator_from_method(agent, &record.object, &record.keys)?;
-    loop {
-        let next = match crate::expr::iterator_step(agent, &keys)? {
-            Some(value) => value,
-            None => break,
-        };
+    while let Some(next) = crate::expr::iterator_step(agent, &keys)? {
         let value = canonicalize_key(next);
         if find_set_index(&result, &value).is_none() {
             result.push(Some(value.clone()));
@@ -1020,11 +1004,7 @@ fn set_is_superset_of(agent: &mut Agent, this: &Value, args: &[Value]) -> Result
         return Ok(Value::Boolean(false));
     }
     let keys = get_iterator_from_method(agent, &record.object, &record.keys)?;
-    loop {
-        let next = match crate::expr::iterator_step(agent, &keys)? {
-            Some(value) => value,
-            None => break,
-        };
+    while let Some(next) = crate::expr::iterator_step(agent, &keys)? {
         if find_set_index(&data, &canonicalize_key(next)).is_none() {
             crate::expr::iterator_close(agent, &keys)?;
             return Ok(Value::Boolean(false));
@@ -1058,11 +1038,7 @@ fn set_is_disjoint_from(agent: &mut Agent, this: &Value, args: &[Value]) -> Resu
         return Ok(Value::Boolean(true));
     }
     let keys = get_iterator_from_method(agent, &record.object, &record.keys)?;
-    loop {
-        let next = match crate::expr::iterator_step(agent, &keys)? {
-            Some(value) => value,
-            None => break,
-        };
+    while let Some(next) = crate::expr::iterator_step(agent, &keys)? {
         if set_data_contains(agent, id, &canonicalize_key(next)) {
             crate::expr::iterator_close(agent, &keys)?;
             return Ok(Value::Boolean(false));
@@ -1521,8 +1497,8 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         });
 
     // ---- Map ----
-    let map_proto = JsObject::ordinary_object_create(object_proto.clone());
-    let map_proto_value = Value::Object(map_proto.clone());
+    let map_proto = JsObject::ordinary_object_create(object_proto);
+    let map_proto_value = Value::Object(map_proto);
     let map_ctor = Function::create_builtin(
         Some(JsString::from_utf8("Map")),
         0,
@@ -1530,7 +1506,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         Some(Box::new(placeholder("Map"))),
         None,
     )?;
-    let map_ctor_value = Value::Function(map_ctor.clone());
+    let map_ctor_value = Value::Function(map_ctor);
     realm.intrinsics.define(MAP, map_ctor_value.clone());
     realm.intrinsics.define(MAP_PROTO, map_proto_value.clone());
     map_ctor.define_property(
@@ -1566,7 +1542,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define(MAP_GROUP_BY, Value::Function(group_by.clone()));
+        .define(MAP_GROUP_BY, Value::Function(group_by));
     map_ctor.define_property(
         &JsString::from_utf8("groupBy"),
         &PropertyDescriptor {
@@ -1587,7 +1563,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define(MAP_SPECIES, Value::Function(map_species.clone()));
+        .define(MAP_SPECIES, Value::Function(map_species));
     map_ctor.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone()),
         &PropertyDescriptor {
@@ -1656,11 +1632,9 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func.clone()));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         if name == "entries" {
-            entries_func = Some(Value::Function(func.clone()));
+            entries_func = Some(Value::Function(func));
         }
         map_proto.define_property(
             &JsString::from_utf8(name),
@@ -1684,7 +1658,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define(MAP_SIZE, Value::Function(size_getter.clone()));
+        .define(MAP_SIZE, Value::Function(size_getter));
     map_proto.define_property(
         &JsString::from_utf8("size"),
         &PropertyDescriptor {
@@ -1698,8 +1672,8 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
 
     // %MapIteratorPrototype%.
-    let map_iterator_proto = JsObject::ordinary_object_create(object_proto.clone());
-    let map_iterator_proto_value = Value::Object(map_iterator_proto.clone());
+    let map_iterator_proto = JsObject::ordinary_object_create(object_proto);
+    let map_iterator_proto_value = Value::Object(map_iterator_proto);
     realm
         .intrinsics
         .define(MAP_ITERATOR, map_iterator_proto_value);
@@ -1712,7 +1686,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define(MAP_ITERATOR_NEXT, Value::Function(map_next.clone()));
+        .define(MAP_ITERATOR_NEXT, Value::Function(map_next));
     map_iterator_proto.define_property(
         &JsString::from_utf8("next"),
         &PropertyDescriptor {
@@ -1732,7 +1706,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         0,
         Box::new(|this, _| Ok(this.clone())),
         None,
-        function_proto.clone(),
+        function_proto,
     )?;
     map_iterator_proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
@@ -1758,8 +1732,8 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
 
     // ---- Set ----
-    let set_proto = JsObject::ordinary_object_create(object_proto.clone());
-    let set_proto_value = Value::Object(set_proto.clone());
+    let set_proto = JsObject::ordinary_object_create(object_proto);
+    let set_proto_value = Value::Object(set_proto);
     let set_ctor = Function::create_builtin(
         Some(JsString::from_utf8("Set")),
         0,
@@ -1767,7 +1741,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         Some(Box::new(placeholder("Set"))),
         None,
     )?;
-    let set_ctor_value = Value::Function(set_ctor.clone());
+    let set_ctor_value = Value::Function(set_ctor);
     realm.intrinsics.define(SET, set_ctor_value.clone());
     realm.intrinsics.define(SET_PROTO, set_proto_value.clone());
     set_ctor.define_property(
@@ -1801,7 +1775,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define(SET_SPECIES, Value::Function(set_species.clone()));
+        .define(SET_SPECIES, Value::Function(set_species));
     set_ctor.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone()),
         &PropertyDescriptor {
@@ -1856,11 +1830,9 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func.clone()));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         if name == "values" {
-            values_func_opt = Some(Value::Function(func.clone()));
+            values_func_opt = Some(Value::Function(func));
         }
         set_proto.define_property(
             &JsString::from_utf8(name),
@@ -1915,7 +1887,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define(SET_SIZE, Value::Function(set_size_getter.clone()));
+        .define(SET_SIZE, Value::Function(set_size_getter));
     set_proto.define_property(
         &JsString::from_utf8("size"),
         &PropertyDescriptor {
@@ -1929,8 +1901,8 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
 
     // %SetIteratorPrototype%.
-    let set_iterator_proto = JsObject::ordinary_object_create(object_proto.clone());
-    let set_iterator_proto_value = Value::Object(set_iterator_proto.clone());
+    let set_iterator_proto = JsObject::ordinary_object_create(object_proto);
+    let set_iterator_proto_value = Value::Object(set_iterator_proto);
     realm
         .intrinsics
         .define(SET_ITERATOR, set_iterator_proto_value);
@@ -1943,7 +1915,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define(SET_ITERATOR_NEXT, Value::Function(set_next.clone()));
+        .define(SET_ITERATOR_NEXT, Value::Function(set_next));
     set_iterator_proto.define_property(
         &JsString::from_utf8("next"),
         &PropertyDescriptor {
@@ -1960,7 +1932,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         0,
         Box::new(|this, _| Ok(this.clone())),
         None,
-        function_proto.clone(),
+        function_proto,
     )?;
     set_iterator_proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
@@ -1986,8 +1958,8 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
 
     // ---- WeakMap ----
-    let weak_map_proto = JsObject::ordinary_object_create(object_proto.clone());
-    let weak_map_proto_value = Value::Object(weak_map_proto.clone());
+    let weak_map_proto = JsObject::ordinary_object_create(object_proto);
+    let weak_map_proto_value = Value::Object(weak_map_proto);
     let weak_map_ctor = Function::create_builtin(
         Some(JsString::from_utf8("WeakMap")),
         0,
@@ -1995,7 +1967,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         Some(Box::new(placeholder("WeakMap"))),
         None,
     )?;
-    let weak_map_ctor_value = Value::Function(weak_map_ctor.clone());
+    let weak_map_ctor_value = Value::Function(weak_map_ctor);
     realm
         .intrinsics
         .define(WEAK_MAP, weak_map_ctor_value.clone());
@@ -2040,9 +2012,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func.clone()));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         weak_map_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -2068,8 +2038,8 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
 
     // ---- WeakSet ----
-    let weak_set_proto = JsObject::ordinary_object_create(object_proto.clone());
-    let weak_set_proto_value = Value::Object(weak_set_proto.clone());
+    let weak_set_proto = JsObject::ordinary_object_create(object_proto);
+    let weak_set_proto_value = Value::Object(weak_set_proto);
     let weak_set_ctor = Function::create_builtin(
         Some(JsString::from_utf8("WeakSet")),
         0,
@@ -2077,7 +2047,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         Some(Box::new(placeholder("WeakSet"))),
         None,
     )?;
-    let weak_set_ctor_value = Value::Function(weak_set_ctor.clone());
+    let weak_set_ctor_value = Value::Function(weak_set_ctor);
     realm
         .intrinsics
         .define(WEAK_SET, weak_set_ctor_value.clone());
@@ -2119,9 +2089,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func.clone()));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         weak_set_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {

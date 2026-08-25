@@ -12,11 +12,11 @@
 
 use std::cell::RefCell;
 use std::fmt;
-use std::rc::Weak;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{ErrorKind, JsError};
 use crate::handle::Handle;
+use crate::heap::Trace;
 use crate::object::JsObject;
 use crate::ops::same_value;
 use crate::property::{PropertyDescriptor, PropertyKey};
@@ -177,10 +177,22 @@ pub struct Function {
     /// `JsObject::handle()` recovers it.
     pub object: Handle<JsObject>,
     pub kind: FunctionKind,
-    /// Weak back-reference to the owning handle so `this`-receiver operations
-    /// (accessor invocation, own-property creation on `set`) target the real
-    /// function value instead of a copy.
-    self_handle: RefCell<Option<Weak<Function>>>,
+    /// Strong back-reference to the owning handle so `this`-receiver
+    /// operations (accessor invocation, own-property creation on `set`)
+    /// target the real function value instead of a copy. A self-cycle under
+    /// the GC model (the Rc model's weak ref existed only to break it).
+    self_handle: RefCell<Option<Handle<Function>>>,
+}
+
+impl Trace for Function {
+    fn trace(&self, visit: &mut dyn FnMut(crate::heap::GcAny)) {
+        // The object part is a forward edge (a function keeps its object
+        // alive); `name` may be a rope; `self_handle` is a self-cycle.
+        self.object.trace(visit);
+        if let Some(name) = &self.name {
+            name.trace(visit);
+        }
+    }
 }
 
 impl PartialEq for Function {
@@ -216,21 +228,18 @@ impl Function {
             kind: FunctionKind::EcmaScript,
             self_handle: RefCell::new(None),
         });
-        *function.self_handle.borrow_mut() = Some(Handle::downgrade(&function));
-        *function.object.function_self.borrow_mut() = Some(Handle::downgrade(&function));
+        *function.self_handle.borrow_mut() = Some(function);
+        *function.object.function_self.borrow_mut() = Some(function);
         function
     }
 
     fn link_self_handle(function: &Handle<Function>) {
-        *function.self_handle.borrow_mut() = Some(Handle::downgrade(function));
+        *function.self_handle.borrow_mut() = Some(*function);
     }
 
     /// The function as a language value, recovering the original handle.
     pub fn self_value(&self) -> Value {
-        self.self_handle
-            .borrow()
-            .as_ref()
-            .and_then(|weak| weak.upgrade())
+        (*self.self_handle.borrow())
             .map(Value::Function)
             .unwrap_or(Value::Undefined)
     }
@@ -255,7 +264,7 @@ impl Function {
             self_handle: RefCell::new(None),
         });
         Self::link_self_handle(&function);
-        *function.object.function_self.borrow_mut() = Some(Handle::downgrade(&function));
+        *function.object.function_self.borrow_mut() = Some(function);
         function.define_property(
             &JsString::from_utf8("length"),
             &PropertyDescriptor {
@@ -310,7 +319,7 @@ impl Function {
             self_handle: RefCell::new(None),
         });
         Self::link_self_handle(&function);
-        *function.object.function_self.borrow_mut() = Some(Handle::downgrade(&function));
+        *function.object.function_self.borrow_mut() = Some(function);
         Ok(function)
     }
 
@@ -464,7 +473,7 @@ pub fn construct(callee: &Value, args: &[Value], new_target: &Value) -> Result<V
                 let mut all = bound_args.clone();
                 all.extend_from_slice(args);
                 let target_value = target.clone();
-                let new_target = if same_value(&Value::Function(function.clone()), new_target) {
+                let new_target = if same_value(&Value::Function(function), new_target) {
                     &target_value
                 } else {
                     new_target
@@ -566,10 +575,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(is_callable(&Value::Function(f.clone())));
-        assert!(!is_constructor(&Value::Function(f.clone())));
+        assert!(is_callable(&Value::Function(f)));
+        assert!(!is_constructor(&Value::Function(f)));
         let value = call(
-            &Value::Function(f.clone()),
+            &Value::Function(f),
             Value::Undefined,
             &[Value::Number(2.0), Value::Number(3.0)],
         )
@@ -630,7 +639,7 @@ mod tests {
         )
         .unwrap();
         let result = call(
-            &Value::Function(bound.clone()),
+            &Value::Function(bound),
             Value::Undefined,
             &[Value::Number(1.0)],
         )
@@ -640,7 +649,7 @@ mod tests {
         assert_eq!(this, &Value::Number(7.0));
         assert_eq!(args, &[Value::Boolean(true), Value::Number(1.0)]);
         // Bound functions are callable but inherit constructor-ness.
-        assert!(is_callable(&Value::Function(bound.clone())));
+        assert!(is_callable(&Value::Function(bound)));
         assert!(!is_constructor(&Value::Function(bound)));
     }
 
@@ -684,7 +693,7 @@ mod tests {
     #[test]
     fn throw_type_error_always_throws_and_is_restricted() {
         let thrower = throw_type_error(None).unwrap();
-        assert!(call(&Value::Function(thrower.clone()), Value::Undefined, &[]).is_err());
+        assert!(call(&Value::Function(thrower), Value::Undefined, &[]).is_err());
         assert!(!thrower.object.is_extensible().unwrap());
         for key in ["length", "name"] {
             let prop = thrower

@@ -1189,7 +1189,7 @@ impl ScopeInfo {
         if self.context_names.is_empty() {
             return Ok(None);
         }
-        let env = new_declarative_environment(Some(outer.clone()));
+        let env = new_declarative_environment(Some(*outer));
         for (index, name) in self.context_names.iter().enumerate() {
             let text = crux::lookup(*name);
             if self.context_const[index] {
@@ -1311,7 +1311,7 @@ pub fn pending_env_depth(pending: &PendingControl) -> (EnvRef, usize) {
         | PendingControl::Break { env, depth, .. }
         | PendingControl::Continue { env, depth, .. }
         | PendingControl::Return { env, depth, .. }
-        | PendingControl::Throw { env, depth, .. } => (env.clone(), *depth),
+        | PendingControl::Throw { env, depth, .. } => (*env, *depth),
     }
 }
 
@@ -1938,7 +1938,7 @@ impl Vm {
             leaf_frame_base: None,
             leaf_frame_offset: 0,
             args: Vec::new(),
-            lexical_env: lexical_env.clone(),
+            lexical_env,
             env_stack: EnvStack::with_base(lexical_env),
             body_context: None,
             global: None,
@@ -1990,7 +1990,7 @@ impl Vm {
         self.leaf_frame_base = None;
         self.leaf_frame_offset = 0;
         self.args.clear();
-        self.lexical_env = lexical_env.clone();
+        self.lexical_env = lexical_env;
         self.env_stack.reset(lexical_env);
         self.body_context = None;
         self.global = None;
@@ -2117,10 +2117,10 @@ impl Vm {
         agent: &mut Agent,
     ) -> Result<Handle<crux::object::JsObject>, JsError> {
         if let Some(global) = &self.global {
-            return Ok(global.clone());
+            return Ok(*global);
         }
-        let global = agent.running_context()?.realm.global_object.clone();
-        self.global = Some(global.clone());
+        let global = agent.running_context()?.realm.global_object;
+        self.global = Some(global);
         Ok(global)
     }
 
@@ -2138,7 +2138,7 @@ impl Vm {
         if let Some(global) = &self.global {
             return Ok(global.id() == id && global.generation() == generation);
         }
-        let global = agent.running_context()?.realm.global_object.clone();
+        let global = agent.running_context()?.realm.global_object;
         let matches = global.id() == id && global.generation() == generation;
         self.global = Some(global);
         Ok(matches)
@@ -2176,7 +2176,7 @@ impl Vm {
         let Some(global) = agent
             .running_context()
             .ok()
-            .map(|context| context.realm.global_object.clone())
+            .map(|context| context.realm.global_object)
         else {
             return;
         };
@@ -2347,7 +2347,7 @@ impl Vm {
                     object.kind,
                     crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array
                 ) {
-                    Some(object.clone())
+                    Some(*object)
                 } else {
                     None
                 }
@@ -2445,7 +2445,7 @@ impl Vm {
         // The walk starts at the prototype itself (the first recorded link)
         // and compares every link's generation — a mutation anywhere in the
         // chain bumps one and misses.
-        let mut link = Some(proto.clone());
+        let mut link = Some(*proto);
         for &expected in gens.iter().take(len as usize) {
             let Some(current) = link else { return false };
             if current.generation() != expected {
@@ -2482,7 +2482,7 @@ impl Vm {
         }
         let mut gens = [0u32; 4];
         let mut len = 0usize;
-        let mut link = Some(proto.clone());
+        let mut link = Some(proto);
         while let Some(current) = link {
             if len >= 4 {
                 return false;
@@ -2534,7 +2534,7 @@ impl Vm {
         };
         let receiver = match object.kind() {
             ValueKind::Object(obj) => obj,
-            ValueKind::Function(f) => f.object.clone(),
+            ValueKind::Function(f) => f.object,
             _ => return Ok(false),
         };
         if !matches!(receiver.kind, crux::object::ObjectKind::Ordinary) {
@@ -2922,7 +2922,7 @@ impl Vm {
         // control (a `break`/`continue` inside the finally) unwinds against
         // the same levels.
         while self.env_stack.len() < depth {
-            self.env_stack.push(env.clone());
+            self.env_stack.push(env);
         }
         self.env_stack.truncate(depth);
         self.lexical_env = env;
@@ -3264,9 +3264,9 @@ impl Vm {
             // the whole sync is skipped for it.
             if !body.env_constant
                 && let Ok(context) = agent.running_context_mut()
-                && !std::rc::Rc::ptr_eq(&context.lexical_environment, &self.lexical_env)
+                && !Handle::ptr_eq(context.lexical_environment, self.lexical_env)
             {
-                context.lexical_environment = self.lexical_env.clone();
+                context.lexical_environment = self.lexical_env
             }
             match step {
                 Step::LoadIdent { name } => {
@@ -3373,7 +3373,7 @@ impl Vm {
                     outer_chain,
                     per_iteration_chain,
                 } => {
-                    let env = agent.running_context()?.lexical_environment.clone();
+                    let env = agent.running_context()?.lexical_environment;
                     let value = crate::function::instantiate_function_expression(
                         agent,
                         function,
@@ -3392,7 +3392,7 @@ impl Vm {
                     outer_chain,
                     per_iteration_chain,
                 } => {
-                    let env = agent.running_context()?.lexical_environment.clone();
+                    let env = agent.running_context()?.lexical_environment;
                     let value = crate::function::instantiate_arrow(
                         agent,
                         *is_async,
@@ -3443,7 +3443,7 @@ impl Vm {
                     // at body entry, so it sees only the INHERITED
                     // per-iteration chain (the loops inside this body have
                     // not started).
-                    let env = agent.running_context()?.lexical_environment.clone();
+                    let env = agent.running_context()?.lexical_environment;
                     let value = crate::function::instantiate_function(
                         agent,
                         function,
@@ -4332,7 +4332,7 @@ impl Vm {
                         // Cut 30: clone the callee's env only for a leaf
                         // that reads one (see `do_call_fast`).
                         let environment = if ir.leaf_uses_env {
-                            entry.environment.clone()
+                            entry.environment
                         } else {
                             None
                         };
@@ -4542,15 +4542,15 @@ impl Vm {
                     // activate them, so the heritage and computed names run
                     // with the class name in TDZ and `super`/private names
                     // visible (spec 15.7.14 steps 2-11).
-                    let outer_env = self.lexical_env.clone();
-                    let class_env = new_declarative_environment(Some(outer_env.clone()));
+                    let outer_env = self.lexical_env;
+                    let class_env = new_declarative_environment(Some(outer_env));
                     if let Some(binding) = binding {
                         let name = crux::lookup(*binding);
                         class_env.create_immutable_binding(&name, true)?;
                     }
-                    let outer_private_env = agent.running_context()?.private_environment.clone();
+                    let outer_private_env = agent.running_context()?.private_environment;
                     let class_private_env =
-                        crate::context::new_private_environment(outer_private_env.clone());
+                        crate::context::new_private_environment(outer_private_env);
                     {
                         let mut names = class_private_env.names.borrow_mut();
                         for element in &class.elements {
@@ -4567,10 +4567,10 @@ impl Vm {
                         }
                     }
                     if let Ok(context) = agent.running_context_mut() {
-                        context.lexical_environment = class_env.clone();
-                        context.private_environment = Some(class_private_env.clone());
+                        context.lexical_environment = class_env;
+                        context.private_environment = Some(class_private_env);
                     }
-                    self.lexical_env = class_env.clone();
+                    self.lexical_env = class_env;
                     self.class_stack.push(ClassEvalState {
                         class_env,
                         class_private_env,
@@ -4618,10 +4618,10 @@ impl Vm {
                             "ClassFinish without a pending class".into(),
                         )
                     })?;
-                    self.lexical_env = state.outer_env.clone();
+                    self.lexical_env = state.outer_env;
                     if let Ok(context) = agent.running_context_mut() {
-                        context.lexical_environment = state.outer_env.clone();
-                        context.private_environment = state.outer_private_env.clone();
+                        context.lexical_environment = state.outer_env;
+                        context.private_environment = state.outer_private_env;
                     }
                     let class_value = crate::class::class_definition_evaluation_with_scope(
                         agent,
@@ -4670,10 +4670,10 @@ impl Vm {
                     }
                 }
                 Step::EnterBlock { decls } => {
-                    let old_env = self.lexical_env.clone();
+                    let old_env = self.lexical_env;
                     let env = new_declarative_environment(Some(old_env));
                     block_declaration_instantiation(agent, decls, &env, self.strict)?;
-                    self.lexical_env = env.clone();
+                    self.lexical_env = env;
                     self.env_stack.push(env);
                 }
                 Step::LeaveBlock => {
@@ -4706,7 +4706,7 @@ impl Vm {
                 Step::EnterTry { handler } => {
                     self.try_stack.push(TryFrame {
                         handler: *handler,
-                        saved_env: self.lexical_env.clone(),
+                        saved_env: self.lexical_env,
                         env_depth: self.env_stack.len(),
                     });
                 }
@@ -4755,7 +4755,7 @@ impl Vm {
                         }
                     }
                     let thrown = self.thrown.take().unwrap_or(Value::Undefined);
-                    let old_env = self.lexical_env.clone();
+                    let old_env = self.lexical_env;
                     let env = new_declarative_environment(Some(old_env));
                     // The catch parameter binds in its own environment, so a
                     // default initializer's closure captures the parameter
@@ -4765,7 +4765,7 @@ impl Vm {
                     // stay active after the catch, leaking its bindings.
                     let body_env = match &param {
                         Some(param) => {
-                            let param_env = new_declarative_environment(Some(env.clone()));
+                            let param_env = new_declarative_environment(Some(env));
                             // Annex B.3.5: a direct eval's var-vs-lexical walk
                             // skips the catch parameter's environment.
                             param_env.mark_catch_param_env();
@@ -4780,7 +4780,7 @@ impl Vm {
                             // so a closure captures the parameter (spec
                             // 15.1.7 step 7).
                             if let Ok(context) = agent.running_context_mut() {
-                                context.lexical_environment = param_env.clone();
+                                context.lexical_environment = param_env;
                             }
                             crate::binding::binding_initialization(
                                 agent,
@@ -4789,13 +4789,13 @@ impl Vm {
                                 Some(&param_env),
                                 self.strict,
                             )?;
-                            self.env_stack.push(param_env.clone());
+                            self.env_stack.push(param_env);
                             new_declarative_environment(Some(param_env))
                         }
                         None => env,
                     };
                     block_declaration_instantiation(agent, decls, &body_env, self.strict)?;
-                    self.lexical_env = body_env.clone();
+                    self.lexical_env = body_env;
                     self.env_stack.push(body_env);
                 }
                 Step::FinallyEnd => {
@@ -4839,12 +4839,12 @@ impl Vm {
                     }
                 }
                 Step::EnterIterTdzEnv { names } => {
-                    let old_env = self.lexical_env.clone();
+                    let old_env = self.lexical_env;
                     let env = new_declarative_environment(Some(old_env));
                     for name in names {
                         env.create_mutable_binding(name, false)?;
                     }
-                    self.lexical_env = env.clone();
+                    self.lexical_env = env;
                     self.env_stack.push(env);
                 }
                 Step::LeaveIterTdzEnv => {
@@ -4866,16 +4866,13 @@ impl Vm {
                             "Cannot use 'with' on a non-object value".into(),
                         )
                     })?;
-                    let with_env = crate::env::new_object_environment(
-                        obj,
-                        true,
-                        Some(self.lexical_env.clone()),
-                    );
-                    self.lexical_env = with_env.clone();
+                    let with_env =
+                        crate::env::new_object_environment(obj, true, Some(self.lexical_env));
+                    self.lexical_env = with_env;
                     self.env_stack.push(with_env);
                 }
                 Step::PerIteration { names } => {
-                    let last = self.lexical_env.clone();
+                    let last = self.lexical_env;
                     let outer = last.outer().ok_or_else(|| {
                         JsError::new(
                             ErrorKind::ReferenceError,
@@ -4904,11 +4901,8 @@ impl Vm {
                     // `LeaveBlock` pops it and restores the capture context.
                     // Later iterations re-use `PerIteration` above (the
                     // copies then come from the previous per-iteration env).
-                    let source = self
-                        .body_context
-                        .clone()
-                        .unwrap_or_else(|| self.lexical_env.clone());
-                    let env = new_declarative_environment(Some(self.lexical_env.clone()));
+                    let source = self.body_context.unwrap_or(self.lexical_env);
+                    let env = new_declarative_environment(Some(self.lexical_env));
                     for name in names {
                         let value = source.get_binding_value(name, false)?;
                         env.create_mutable_binding(name, false)?;
@@ -4917,7 +4911,7 @@ impl Vm {
                     if let EnvRecord::Declarative(declarative) = &*env {
                         declarative.mark_context_transparent();
                     }
-                    self.lexical_env = env.clone();
+                    self.lexical_env = env;
                     self.env_stack.push(env);
                 }
                 Step::LoadPerIteration { depth, index } => {
@@ -4953,7 +4947,7 @@ impl Vm {
                     self.stack.push(if *prefix { new } else { old_numeric });
                 }
                 Step::EnterLoopEnv { kind, decls } => {
-                    let old_env = self.lexical_env.clone();
+                    let old_env = self.lexical_env;
                     let env = new_declarative_environment(Some(old_env));
                     // The head initializers (evaluated through the tree-walker)
                     // run with the loop env active: a closure they create
@@ -4961,10 +4955,10 @@ impl Vm {
                     // (spec 14.7.4.2 — the loop env is the running
                     // execution context's environment while the declarations
                     // initialize).
-                    self.lexical_env = env.clone();
-                    self.env_stack.push(env.clone());
+                    self.lexical_env = env;
+                    self.env_stack.push(env);
                     if let Ok(context) = agent.running_context_mut() {
-                        context.lexical_environment = env.clone();
+                        context.lexical_environment = env;
                     }
                     let head = (|| -> Result<(), JsError> {
                         for decl in decls {
@@ -5438,7 +5432,7 @@ impl Vm {
                                 func,
                                 &self.call_args,
                                 &formals,
-                                self.lexical_env.clone(),
+                                self.lexical_env,
                             )?
                         }
                         None => crate::function::create_unmapped_arguments_object(
@@ -6579,7 +6573,7 @@ impl Vm {
             };
             if ir.leaf_needs_env {
                 (
-                    self.body_context.replace(body_env.clone()),
+                    self.body_context.replace(body_env),
                     Some(std::mem::replace(&mut self.lexical_env, body_env)),
                 )
             } else {
@@ -6728,7 +6722,7 @@ impl Vm {
             };
             if ir.leaf_needs_env {
                 (
-                    self.body_context.replace(body_env.clone()),
+                    self.body_context.replace(body_env),
                     Some(std::mem::replace(&mut self.lexical_env, body_env)),
                 )
             } else {
@@ -7422,7 +7416,7 @@ impl Vm {
         }
         self.env_stack.truncate(1);
         if let Some(base) = self.env_stack.get(0) {
-            self.lexical_env = base.clone();
+            self.lexical_env = *base
         }
         // A certified leaf runs in place on this Vm (it never grew the
         // stack); its result completes this body's return.
@@ -7435,7 +7429,7 @@ impl Vm {
             let entry = LeafEntry {
                 ir: entry.ir.clone(),
                 strict: entry.strict,
-                environment: entry.environment.clone(),
+                environment: entry.environment,
                 construct_inline: entry.construct_inline,
             };
             let below = self.stack.len() - argc - keep;
@@ -7499,7 +7493,7 @@ impl Vm {
     fn tail_prepare_ordinary(
         &mut self,
         agent: &mut Agent,
-        function: &std::rc::Rc<crux::function::Function>,
+        function: &Handle<crux::function::Function>,
         this: Value,
         args: &[Value],
     ) -> Result<Option<std::rc::Rc<CompiledBody>>, JsError> {
@@ -7515,8 +7509,8 @@ impl Vm {
             }
             (
                 record.ir.clone(),
-                record.environment.clone(),
-                record.realm.clone(),
+                record.environment,
+                record.realm,
                 record.strict,
                 record.class_field_initializer,
             )
@@ -7533,10 +7527,10 @@ impl Vm {
             // branch + `run_compiled_body`'s setup.
             let body_env = match scope.new_body_context(&old_env, args)? {
                 Some(context) => context,
-                None => old_env.clone(),
+                None => old_env,
             };
-            let context_function = (scope.arguments_slot.is_some() && !strict)
-                .then(|| Value::Function(function.clone()));
+            let context_function =
+                (scope.arguments_slot.is_some() && !strict).then(|| Value::Function(*function));
             agent.execution_context_stack.pop();
             agent
                 .execution_context_stack
@@ -7544,8 +7538,8 @@ impl Vm {
                     function: context_function,
                     realm,
                     script_or_module: None,
-                    lexical_environment: body_env.clone(),
-                    variable_environment: body_env.clone(),
+                    lexical_environment: body_env,
+                    variable_environment: body_env,
                     private_environment: None,
                     source: None,
                     annex_b_hoistable: Default::default(),
@@ -7556,7 +7550,7 @@ impl Vm {
                 } else {
                     match this.kind() {
                         ValueKind::Undefined | ValueKind::Null => {
-                            let global = agent.running_context()?.realm.global_object.clone();
+                            let global = agent.running_context()?.realm.global_object;
                             Value::Object(global)
                         }
                         ValueKind::Object(_) | ValueKind::Function(_) => this,
@@ -7569,8 +7563,8 @@ impl Vm {
             // Reuse this Vm as the callee's fresh Vm (a normal call would
             // grab a pooled Vm), then bind the frame/args/this exactly like
             // `run_compiled_body`.
-            self.reset(body_env.clone(), strict);
-            self.body_context = Some(body_env.clone());
+            self.reset(body_env, strict);
+            self.body_context = Some(body_env);
             if scope.frame_size > 0 {
                 self.setup_frame(scope, args);
             }
@@ -7596,8 +7590,8 @@ impl Vm {
                 record.this_mode,
                 record.params.clone(),
                 record.body.clone(),
-                record.declaring_module.clone(),
-                record.private_environment.clone(),
+                record.declaring_module,
+                record.private_environment,
             )
         };
         let function_value = function.self_value();
@@ -7621,8 +7615,8 @@ impl Vm {
                 function: Some(function_value.clone()),
                 realm,
                 script_or_module,
-                lexical_environment: function_env.clone(),
-                variable_environment: function_env.clone(),
+                lexical_environment: function_env,
+                variable_environment: function_env,
                 private_environment,
                 source: agent
                     .running_context()
@@ -7634,7 +7628,7 @@ impl Vm {
             let this = if this_mode == crate::function::ThisMode::Sloppy {
                 match this.kind() {
                     ValueKind::Undefined | ValueKind::Null => {
-                        let global = agent.running_context()?.realm.global_object.clone();
+                        let global = agent.running_context()?.realm.global_object;
                         Value::Object(global)
                     }
                     ValueKind::Object(_) | ValueKind::Function(_) => this,
@@ -7660,7 +7654,7 @@ impl Vm {
         // live in a fresh wrapper over the function env), not the function
         // env itself — mirror `run_compiled_body`, which resets the pooled
         // Vm with the context's lexical env after instantiation.
-        let body_env = agent.running_context()?.lexical_environment.clone();
+        let body_env = agent.running_context()?.lexical_environment;
         self.reset(body_env, strict);
         self.ip = 0;
         Ok(Some(ir))
@@ -7940,7 +7934,7 @@ impl Vm {
             let entry = LeafEntry {
                 ir: entry.ir.clone(),
                 strict: entry.strict,
-                environment: entry.environment.clone(),
+                environment: entry.environment,
                 construct_inline: entry.construct_inline,
             };
             match leaf_cache {
@@ -8112,8 +8106,8 @@ impl Vm {
                         self.strict,
                     )?;
                 } else {
-                    let outer = self.lexical_env.clone();
-                    let env = new_declarative_environment(Some(outer.clone()));
+                    let outer = self.lexical_env;
+                    let env = new_declarative_environment(Some(outer));
                     let mut names = Vec::new();
                     crate::script::bound_names(pattern, &mut names);
                     for name in &names {
@@ -8143,10 +8137,10 @@ impl Vm {
                     // per-iteration environment (a default like `b = a` sees
                     // the already-bound sibling `a`). Sync the context now so
                     // the mid-step destructure sees the new environment.
-                    self.lexical_env = env.clone();
-                    self.env_stack.push(env.clone());
+                    self.lexical_env = env;
+                    self.env_stack.push(env);
                     if let Ok(context) = agent.running_context_mut() {
-                        context.lexical_environment = env.clone();
+                        context.lexical_environment = env;
                     }
                     crate::binding::binding_initialization(
                         agent,
@@ -8196,7 +8190,7 @@ impl Vm {
     /// of enclosing per-iteration envs, so the walk stays inside the env
     /// chain of declarative per-iteration envs (each fresh per iteration).
     fn per_iteration_env(&self, depth: usize) -> Result<EnvRef, JsError> {
-        let mut env = self.lexical_env.clone();
+        let mut env = self.lexical_env;
         for _ in 0..depth {
             env = env.outer().ok_or_else(|| {
                 JsError::new(
@@ -8213,9 +8207,7 @@ impl Vm {
     /// directly — inside a per-iteration loop the lexical env is the loop's
     /// fresh per-iteration env, which holds only the head names.
     fn body_context_env(&self) -> EnvRef {
-        self.body_context
-            .clone()
-            .unwrap_or_else(|| self.lexical_env.clone())
+        self.body_context.unwrap_or(self.lexical_env)
     }
 
     /// The capture context at static context-chain `depth` (Cut 3
@@ -8261,7 +8253,6 @@ impl Vm {
         body: &CompiledBody,
         ctl: Ctl,
     ) -> Result<CtlResult, JsError> {
-        let ctl = ctl;
         // An abrupt control transfer while a finally is running replaces the
         // pending control the finally was processing (spec 14.15.4 step 8: a
         // `break`/`continue`/`return`/`throw` inside a finally overrides it)
@@ -8325,7 +8316,7 @@ impl Vm {
                         .env_stack
                         .get(depth.saturating_sub(1))
                         .cloned()
-                        .unwrap_or_else(|| self.lexical_env.clone());
+                        .unwrap_or(self.lexical_env);
                     self.pending.push(match &ctl {
                         Ctl::Normal { after } => PendingControl::Normal {
                             after: *after,
@@ -8435,7 +8426,6 @@ impl Vm {
         body: &CompiledBody,
         value: Value,
     ) -> Result<CtlResult, JsError> {
-        let value = value;
         loop {
             let decision = {
                 let mut found: Option<(usize, ThrowAction)> = None;
@@ -8489,7 +8479,7 @@ impl Vm {
                         .handlers
                         .get(handler_index)
                         .is_some_and(|h| h.finally.is_some());
-                    let saved_env = self.try_stack[index].saved_env.clone();
+                    let saved_env = self.try_stack[index].saved_env;
                     let env_depth = self.try_stack[index].env_depth;
                     if !has_finally {
                         // Keep the frame when a finally is pending: the catch's
@@ -8520,7 +8510,7 @@ impl Vm {
                     // Restore to the try-entry environment (the state when
                     // the finally started) so the finally's block envs unwind
                     // with the pending throw.
-                    let env = frame.saved_env.clone();
+                    let env = frame.saved_env;
                     let depth = frame.env_depth;
                     self.pending
                         .push(PendingControl::Throw { value, env, depth });
@@ -8821,9 +8811,9 @@ fn object_method(
     let ValueKind::Object(obj) = object.kind() else {
         return Err(JsError::new(ErrorKind::TypeError, "not an object".into()));
     };
-    let env = agent.running_context()?.lexical_environment.clone();
+    let env = agent.running_context()?.lexical_environment;
     let closure = crate::function::instantiate_method(agent, function, env, strict)?;
-    crate::function::make_method(agent, &closure, Value::Object(obj.clone()))?;
+    crate::function::make_method(agent, &closure, Value::Object(obj))?;
     crate::function::set_function_name(&closure, &crate::expr::property_key_display(&key), None)?;
     obj.create_data_property_key(&key, closure)?;
     Ok(())
@@ -8843,14 +8833,14 @@ fn object_accessor(
     let ValueKind::Object(obj) = object.kind() else {
         return Err(JsError::new(ErrorKind::TypeError, "not an object".into()));
     };
-    let env = agent.running_context()?.lexical_environment.clone();
+    let env = agent.running_context()?.lexical_environment;
     let params = if let Some(param) = param {
         vec![param.clone()]
     } else {
         Vec::new()
     };
     let closure = crate::function::instantiate_accessor(agent, params, body.clone(), env, strict)?;
-    crate::function::make_method(agent, &closure, Value::Object(obj.clone()))?;
+    crate::function::make_method(agent, &closure, Value::Object(obj))?;
     let prefix = if get { Some("get") } else { Some("set") };
     crate::function::set_function_name(&closure, &crate::expr::property_key_display(&key), prefix)?;
     let descriptor = crux::property::PropertyDescriptor {
@@ -8967,9 +8957,9 @@ fn async_from_sync_or_async(
     let wrapped = crate::async_await::async_from_sync_iterator(agent, &sync)?;
     let next = crate::context::get_property(
         agent,
-        &Value::Object(wrapped.clone()),
+        &Value::Object(wrapped),
         &JsString::from_utf8("next"),
-        Value::Object(wrapped.clone()),
+        Value::Object(wrapped),
     )?;
     Ok(crate::expr::IteratorRecord {
         iterator: Value::Object(wrapped),

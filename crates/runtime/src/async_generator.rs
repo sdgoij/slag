@@ -102,7 +102,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .get("%AsyncIterator.prototype%")
         .and_then(|value| crate::context::as_object(&value));
     let proto = JsObject::ordinary_object_create(async_iterator_proto);
-    let proto_value = Value::Object(proto.clone());
+    let proto_value = Value::Object(proto);
     realm.intrinsics.define(ASYNC_GENERATOR_PROTO, proto_value);
     for (name, length) in [(NEXT, 1), (RETURN, 1), (THROW, 1)] {
         let method = Function::create_builtin(
@@ -121,7 +121,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         // another dispatches with its own realm current.
         realm.intrinsics.define(
             &format!("%AsyncGenerator.prototype.{name}%"),
-            Value::Function(method.clone()),
+            Value::Function(method),
         );
         proto.define_property(
             &JsString::from_utf8(name),
@@ -231,18 +231,18 @@ pub fn call_async_generator(
         })?;
     let function_value = function.self_value();
     let function_env = crate::env::new_function_environment(
-        Some(data.environment.clone()),
+        Some(data.environment),
         function_value.clone(),
         Value::Undefined,
         data.this_mode == ThisMode::Lexical,
     );
     let context = ExecutionContext {
         function: Some(function_value.clone()),
-        realm: data.realm.clone(),
+        realm: data.realm,
         script_or_module: None,
-        lexical_environment: function_env.clone(),
-        variable_environment: function_env.clone(),
-        private_environment: data.private_environment.clone(),
+        lexical_environment: function_env,
+        variable_environment: function_env,
+        private_environment: data.private_environment,
         source: agent
             .running_context()
             .ok()
@@ -260,7 +260,7 @@ pub fn call_async_generator(
             let this = if data.this_mode == ThisMode::Sloppy {
                 match this.kind() {
                     ValueKind::Undefined | ValueKind::Null => {
-                        let global = agent.running_context()?.realm.global_object.clone();
+                        let global = agent.running_context()?.realm.global_object;
                         Value::Object(global)
                     }
                     ValueKind::Object(_) | ValueKind::Function(_) => this,
@@ -292,7 +292,7 @@ pub fn call_async_generator(
         .last()
         .cloned()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no context to capture".into()))?;
-    let body_env = instantiated_context.lexical_environment.clone();
+    let body_env = instantiated_context.lexical_environment;
     agent.execution_context_stack.pop();
 
     // OrdinaryCreateFromConstructor (spec 10.2.4): the instance inherits the
@@ -322,7 +322,7 @@ pub fn call_async_generator(
             })?,
     };
     let object = JsObject::ordinary_object_create(Some(proto));
-    let object_value = Value::Object(object.clone());
+    let object_value = Value::Object(object);
     agent.async_generators.insert(
         object.id(),
         Rc::new(RefCell::new(AsyncGeneratorState {
@@ -333,8 +333,8 @@ pub fn call_async_generator(
             vm: None,
             body: None,
             context: Some(instantiated_context),
-            function: Value::Function(function.clone()),
-            realm: data.realm.clone(),
+            function: Value::Function(*function),
+            realm: data.realm,
             body_env: Some(body_env),
         })),
     );
@@ -750,8 +750,7 @@ fn drive(
                 .cloned()
                 .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async generator".into()))?
                 .borrow()
-                .body_env
-                .clone();
+                .body_env;
             let resources = match body_env {
                 Some(env) => env.drain_disposable_resources(),
                 None => Vec::new(),
@@ -808,7 +807,7 @@ fn start_body(agent: &mut Agent, object_id: u64) -> Result<VmOutcome, JsError> {
                 .context
                 .take()
                 .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no saved context".into()))?,
-            state.body_env.clone().ok_or_else(|| {
+            state.body_env.ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "no instantiated environment".into())
             })?,
         )

@@ -113,7 +113,6 @@ pub trait HostOps: std::fmt::Debug {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handle::Handle;
     use crate::object::JsObject;
     use crate::string::JsString;
 
@@ -139,7 +138,7 @@ mod tests {
 
     #[test]
     fn host_get_intercepts_magic_and_falls_back_otherwise() {
-        let object = JsObject::host_object_create(Handle::new(InterceptGet), None);
+        let object = JsObject::host_object_create(std::rc::Rc::new(InterceptGet), None);
         assert_eq!(
             object.get(&JsString::from_utf8("magic")).unwrap(),
             Value::Number(42.0)
@@ -172,7 +171,7 @@ mod tests {
 
     #[test]
     fn callable_host_objects_report_function_and_call() {
-        let object = JsObject::host_object_create(Handle::new(Callable), None);
+        let object = JsObject::host_object_create(std::rc::Rc::new(Callable), None);
         let value = Value::Object(object);
         assert!(crate::value::is_callable(&value));
         assert_eq!(crate::value::type_of(&value), "function");

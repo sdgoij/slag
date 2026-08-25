@@ -145,7 +145,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .get("%Object.prototype%")
         .and_then(|value| as_object(&value));
     let proto = JsObject::ordinary_object_create(object_proto);
-    let proto_value = Value::Object(proto.clone());
+    let proto_value = Value::Object(proto);
     realm.intrinsics.define(ASYNC_ITERATOR_PROTO, proto_value);
 
     // @@asyncIterator returns `this` (spec 27.1.4.2).
@@ -158,7 +158,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         0,
         Box::new(|this, _| Ok(this.clone())),
         None,
-        function_proto.clone(),
+        function_proto,
     )?;
     proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("asyncIterator").as_ref().clone()),
@@ -182,7 +182,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm.intrinsics.define(
         "%AsyncIterator.prototype.@@asyncDispose%",
-        Value::Function(async_dispose.clone()),
+        Value::Function(async_dispose),
     );
     proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("asyncDispose").as_ref().clone()),
@@ -235,7 +235,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         )?;
         realm.intrinsics.define(
             &format!("%AsyncIterator.prototype.{name}%"),
-            Value::Function(method.clone()),
+            Value::Function(method),
         );
         proto.define_property(
             &JsString::from_utf8(name),
@@ -270,7 +270,7 @@ fn install_helper_prototype(realm: &Handle<Realm>) -> Result<(), JsError> {
         .get(ASYNC_ITERATOR_PROTO)
         .and_then(|value| as_object(&value));
     let proto = JsObject::ordinary_object_create(async_iterator_proto);
-    let proto_value = Value::Object(proto.clone());
+    let proto_value = Value::Object(proto);
     realm
         .intrinsics
         .define(ASYNC_ITERATOR_HELPER_PROTO, proto_value);
@@ -284,7 +284,7 @@ fn install_helper_prototype(realm: &Handle<Realm>) -> Result<(), JsError> {
         )?;
         realm.intrinsics.define(
             &format!("%AsyncIteratorHelper.prototype.{name}%"),
-            Value::Function(method.clone()),
+            Value::Function(method),
         );
         proto.define_property(
             &JsString::from_utf8(name),
@@ -1160,9 +1160,9 @@ fn continue_lazy(agent: &mut Agent, object_id: u64, result: Value) -> Result<Val
                         let object = crate::async_await::async_from_sync_iterator(agent, &sync)?;
                         let next = crate::context::get_property(
                             agent,
-                            &Value::Object(object.clone()),
+                            &Value::Object(object),
                             &JsString::from_utf8("next"),
-                            Value::Object(object.clone()),
+                            Value::Object(object),
                         )?;
                         *inner = Some(AsyncIteratorRecord {
                             iterator: Value::Object(object),

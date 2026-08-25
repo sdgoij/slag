@@ -470,7 +470,7 @@ fn internalize_json_property(
     record: Option<&ParseRecord>,
 ) -> Result<Value, JsError> {
     let key = PropertyKey::from_utf8(name);
-    let holder_value = Value::Object(holder.clone());
+    let holder_value = Value::Object(*holder);
     let value = crate::context::get_property_key(agent, &holder_value, &key, holder_value.clone())?;
     let context = JsObject::ordinary_object_create(
         agent
@@ -540,7 +540,7 @@ fn internalize_json_property(
     let result = crate::function::call(
         agent,
         reviver,
-        Value::Object(holder.clone()),
+        Value::Object(*holder),
         &[str(name), value, Value::Object(context)],
     )?;
     Ok(result)
@@ -1033,7 +1033,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     );
     realm
         .intrinsics
-        .define(JSON_NS, Value::Object(json_object.clone()));
+        .define(JSON_NS, Value::Object(json_object));
 
     let methods: [(&str, &str, u64); 4] = [
         ("parse", JSON_PARSE, 2),
@@ -1051,7 +1051,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         )?;
         realm
             .intrinsics
-            .define(intrinsic, Value::Function(func.clone()));
+            .define(intrinsic, Value::Function(func));
         json_object.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {

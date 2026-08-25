@@ -112,18 +112,18 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         .intrinsics
         .get("%Function.prototype%")
         .and_then(|value| as_object(&value));
-    let proto = JsObject::ordinary_object_create(object_proto.clone());
+    let proto = JsObject::ordinary_object_create(object_proto);
     let ctor = Function::create_builtin(
         Some(JsString::from_utf8("Segmenter")),
         0,
         placeholder("Intl.Segmenter"),
         Some(placeholder("Intl.Segmenter")),
-        function_proto.clone(),
+        function_proto
     )?;
     proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(Value::Function(ctor.clone())),
+            value: Some(Value::Function(ctor)),
             writable: Some(true),
             get: None,
             set: None,
@@ -136,11 +136,11 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         1,
         placeholder("segment"),
         None,
-        function_proto.clone(),
+        function_proto
     )?;
     realm
         .intrinsics
-        .define(SEGMENTER_SEGMENT, Value::Function(segment.clone()));
+        .define(SEGMENTER_SEGMENT, Value::Function(segment));
     proto.define_property(
         &JsString::from_utf8("segment"),
         &PropertyDescriptor {
@@ -157,11 +157,11 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         0,
         placeholder("resolvedOptions"),
         None,
-        function_proto.clone(),
+        function_proto
     )?;
     realm.intrinsics.define(
         SEGMENTER_RESOLVED_OPTIONS,
-        Value::Function(resolved.clone()),
+        Value::Function(resolved),
     );
     proto.define_property(
         &JsString::from_utf8("resolvedOptions"),
@@ -188,7 +188,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
             configurable: Some(true),
         },
     )?;
-    let proto_value = Value::Object(proto.clone());
+    let proto_value = Value::Object(proto);
     ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
@@ -205,11 +205,11 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         1,
         placeholder("supportedLocalesOf"),
         None,
-        function_proto.clone(),
+        function_proto
     )?;
     realm.intrinsics.define(
         SEGMENTER_SUPPORTED_LOCALES_OF,
-        Value::Function(supported.clone()),
+        Value::Function(supported),
     );
     ctor.define_property(
         &JsString::from_utf8("supportedLocalesOf"),
@@ -225,7 +225,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
     realm.intrinsics.define(SEGMENTER_PROTO, proto_value);
     realm
         .intrinsics
-        .define(SEGMENTER, Value::Function(ctor.clone()));
+        .define(SEGMENTER, Value::Function(ctor));
     if let Some(obj) = as_object(intl_value) {
         obj.define_property(
             &JsString::from_utf8("Segmenter"),
@@ -248,11 +248,11 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         1,
         placeholder("containing"),
         None,
-        function_proto.clone(),
+        function_proto
     )?;
     realm
         .intrinsics
-        .define(SEGMENTS_CONTAINING, Value::Function(containing.clone()));
+        .define(SEGMENTS_CONTAINING, Value::Function(containing));
     segments_proto.define_property(
         &JsString::from_utf8("containing"),
         &PropertyDescriptor {
@@ -269,11 +269,11 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         0,
         placeholder("[Symbol.iterator]"),
         None,
-        function_proto.clone(),
+        function_proto
     )?;
     realm
         .intrinsics
-        .define(SEGMENTS_ITERATOR, Value::Function(segments_iter.clone()));
+        .define(SEGMENTS_ITERATOR, Value::Function(segments_iter));
     segments_proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
         &PropertyDescriptor {
@@ -301,11 +301,11 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         0,
         placeholder("next"),
         None,
-        function_proto.clone(),
+        function_proto
     )?;
     realm
         .intrinsics
-        .define(SEGMENT_ITERATOR_NEXT, Value::Function(next.clone()));
+        .define(SEGMENT_ITERATOR_NEXT, Value::Function(next));
     segment_iter_proto.define_property(
         &JsString::from_utf8("next"),
         &PropertyDescriptor {

@@ -208,12 +208,12 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         0,
         placeholder("Intl.RelativeTimeFormat"),
         Some(placeholder("Intl.RelativeTimeFormat")),
-        function_proto.clone(),
+        function_proto
     )?;
     proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(Value::Function(ctor.clone())),
+            value: Some(Value::Function(ctor)),
             writable: Some(true),
             get: None,
             set: None,
@@ -232,9 +232,9 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
             *length,
             placeholder(name),
             None,
-            function_proto.clone(),
+            function_proto
         )?;
-        realm.intrinsics.define(key, Value::Function(func.clone()));
+        realm.intrinsics.define(key, Value::Function(func));
         proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -261,7 +261,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
             configurable: Some(true),
         },
     )?;
-    let proto_value = Value::Object(proto.clone());
+    let proto_value = Value::Object(proto);
     ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
@@ -278,11 +278,11 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         1,
         placeholder("supportedLocalesOf"),
         None,
-        function_proto.clone(),
+        function_proto
     )?;
     realm
         .intrinsics
-        .define(RTF_SUPPORTED_LOCALES_OF, Value::Function(supported.clone()));
+        .define(RTF_SUPPORTED_LOCALES_OF, Value::Function(supported));
     ctor.define_property(
         &JsString::from_utf8("supportedLocalesOf"),
         &PropertyDescriptor {
@@ -297,7 +297,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
     realm.intrinsics.define(RTF_PROTO, proto_value);
     realm
         .intrinsics
-        .define(RELATIVE_TIME_FORMAT, Value::Function(ctor.clone()));
+        .define(RELATIVE_TIME_FORMAT, Value::Function(ctor));
     if let Some(obj) = as_object(intl_value) {
         obj.define_property(
             &JsString::from_utf8("RelativeTimeFormat"),
@@ -430,7 +430,7 @@ fn format_to_parts_method(
         .and_then(|value| as_object(&value));
     let mut array = Vec::new();
     for (part_type, part_value, part_unit) in parts {
-        let obj = JsObject::ordinary_object_create(object_proto.clone());
+        let obj = JsObject::ordinary_object_create(object_proto);
         obj.define_property(
             &JsString::from_utf8("type"),
             &PropertyDescriptor {

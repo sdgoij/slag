@@ -149,8 +149,8 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .and_then(|value| as_object(&value));
 
     // %Iterator.prototype%: an ordinary object with proto %Object.prototype%.
-    let iterator_proto = JsObject::ordinary_object_create(object_proto.clone());
-    let iterator_proto_value = Value::Object(iterator_proto.clone());
+    let iterator_proto = JsObject::ordinary_object_create(object_proto);
+    let iterator_proto_value = Value::Object(iterator_proto);
     realm
         .intrinsics
         .define(ITERATOR_PROTO, iterator_proto_value.clone());
@@ -164,7 +164,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         Some(Box::new(placeholder("Iterator".to_string()))),
         None,
     )?;
-    let iterator_ctor_value = Value::Function(iterator_ctor.clone());
+    let iterator_ctor_value = Value::Function(iterator_ctor);
     realm
         .intrinsics
         .define(ITERATOR, iterator_ctor_value.clone());
@@ -235,11 +235,11 @@ fn define_method(
     )?;
     realm
         .intrinsics
-        .define(key, Value::Function(method.clone()));
+        .define(key, Value::Function(method));
     proto.define_property(
         &JsString::from_utf8(name),
         &PropertyDescriptor {
-            value: Some(Value::Function(method.clone())),
+            value: Some(Value::Function(method)),
             writable: Some(true),
             get: None,
             set: None,
@@ -308,7 +308,7 @@ fn install_prototype_methods(
     )?;
     realm.intrinsics.define(
         "%Iterator.prototype.@@dispose%",
-        Value::Function(dispose_method.clone()),
+        Value::Function(dispose_method),
     );
     proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("dispose").as_ref().clone()),
@@ -332,7 +332,7 @@ fn install_prototype_methods(
     )?;
     realm.intrinsics.define(
         "%Iterator.prototype.@@iterator%",
-        Value::Function(iterator_method.clone()),
+        Value::Function(iterator_method),
     );
     proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
@@ -364,11 +364,11 @@ fn install_prototype_methods(
     )?;
     realm.intrinsics.define(
         "%Iterator.prototype.@@toStringTag-get%",
-        Value::Function(tag_get.clone()),
+        Value::Function(tag_get),
     );
     realm.intrinsics.define(
         "%Iterator.prototype.@@toStringTag-set%",
-        Value::Function(tag_set.clone()),
+        Value::Function(tag_set),
     );
     proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
@@ -400,11 +400,11 @@ fn install_prototype_methods(
     )?;
     realm.intrinsics.define(
         "%Iterator.prototype.constructor-get%",
-        Value::Function(get.clone()),
+        Value::Function(get),
     );
     realm.intrinsics.define(
         "%Iterator.prototype.constructor-set%",
-        Value::Function(set.clone()),
+        Value::Function(set),
     );
     proto.define_property(
         &JsString::from_utf8("constructor"),
@@ -431,7 +431,7 @@ fn install_statics(realm: &Handle<Realm>, ctor: &Handle<Function>) -> Result<(),
         )?;
         realm.intrinsics.define(
             &format!("%Iterator.{name}%"),
-            Value::Function(method.clone()),
+            Value::Function(method),
         );
         ctor.define_property(
             &JsString::from_utf8(name),
@@ -456,7 +456,7 @@ fn install_helper_prototype(realm: &Handle<Realm>) -> Result<(), JsError> {
         .get(ITERATOR_PROTO)
         .and_then(|value| as_object(&value));
     let proto = JsObject::ordinary_object_create(iterator_proto);
-    let proto_value = Value::Object(proto.clone());
+    let proto_value = Value::Object(proto);
     realm.intrinsics.define(ITERATOR_HELPER_PROTO, proto_value);
     for (name, length) in [(NEXT, 0), (RETURN, 0)] {
         let method = Function::create_builtin(
@@ -468,7 +468,7 @@ fn install_helper_prototype(realm: &Handle<Realm>) -> Result<(), JsError> {
         )?;
         realm.intrinsics.define(
             &format!("%IteratorHelper.prototype.{name}%"),
-            Value::Function(method.clone()),
+            Value::Function(method),
         );
         proto.define_property(
             &JsString::from_utf8(name),
@@ -491,7 +491,7 @@ fn install_helper_prototype(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm.intrinsics.define(
         "%IteratorHelper.prototype.@@iterator%",
-        Value::Function(iterator_method.clone()),
+        Value::Function(iterator_method),
     );
     proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
@@ -521,7 +521,7 @@ fn install_wrap_prototype(realm: &Handle<Realm>) -> Result<(), JsError> {
         .get(ITERATOR_PROTO)
         .and_then(|value| as_object(&value));
     let proto = JsObject::ordinary_object_create(iterator_proto);
-    let proto_value = Value::Object(proto.clone());
+    let proto_value = Value::Object(proto);
     realm.intrinsics.define(WRAP_PROTO, proto_value);
     for name in [NEXT, RETURN, THROW] {
         let method = Function::create_builtin(
@@ -533,7 +533,7 @@ fn install_wrap_prototype(realm: &Handle<Realm>) -> Result<(), JsError> {
         )?;
         realm.intrinsics.define(
             &format!("%WrapForValidIterator.prototype.{name}%"),
-            Value::Function(method.clone()),
+            Value::Function(method),
         );
         proto.define_property(
             &JsString::from_utf8(name),
@@ -556,7 +556,7 @@ fn install_wrap_prototype(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm.intrinsics.define(
         "%WrapForValidIterator.prototype.@@iterator%",
-        Value::Function(iterator_method.clone()),
+        Value::Function(iterator_method),
     );
     proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),

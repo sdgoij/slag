@@ -10967,7 +10967,7 @@ var $DONE = function (error) {
         }
         let realm = agent.current_realm().map_err(|e| e.message)?;
         let async_failure = if fm.flags.iter().any(|f| f == "async") {
-            read_async_completion(&mut agent, &Value::Object(realm.global_object.clone()))?
+            read_async_completion(&mut agent, &Value::Object(realm.global_object))?
         } else {
             None
         };
@@ -11151,7 +11151,7 @@ var $DONE = function (error) {
             realm
                 .loaded_modules
                 .borrow_mut()
-                .insert(JsString::from_utf8(fixture_specifier), entry.clone());
+                .insert(JsString::from_utf8(fixture_specifier), entry);
         }
         // Negative resolution tests: the error surfaces when the module graph
         // links — a dependency that fails to parse, an import that does not
@@ -11196,7 +11196,7 @@ var $DONE = function (error) {
         let rejection = module_settled(&agent, &promise)?;
         let realm = agent.current_realm().map_err(|e| e.message)?;
         let async_failure = if fm.flags.iter().any(|f| f == "async") {
-            read_async_completion(&mut agent, &Value::Object(realm.global_object.clone()))?
+            read_async_completion(&mut agent, &Value::Object(realm.global_object))?
         } else {
             None
         };
@@ -11493,9 +11493,9 @@ var $DONE = function (error) {
             let realm = agent.current_realm().map_err(|e| e.message)?;
             let passed = runtime::context::get_property(
                 agent,
-                &Value::Object(realm.global_object.clone()),
+                &Value::Object(realm.global_object),
                 &JsString::from_utf8("asyncTestPassed"),
-                Value::Object(realm.global_object.clone()),
+                Value::Object(realm.global_object),
             )
             .map_err(|e| e.message)?;
             if to_boolean(&passed) || std::time::Instant::now() >= deadline {
@@ -11529,7 +11529,7 @@ var $DONE = function (error) {
         .map_err(|e| e.message)?;
         realm
             .intrinsics
-            .define("%evalScript%", Value::Function(eval_script.clone()));
+            .define("%evalScript%", Value::Function(eval_script));
         let dollar_two_six_two = realm
             .global_object
             .get(&JsString::from_utf8("$262"))
@@ -11558,7 +11558,7 @@ var $DONE = function (error) {
                 let record = JsObject::ordinary_object_create(None);
                 record.create_data_property_or_throw(
                     &JsString::from_utf8("global"),
-                    Value::Object(new_realm.global_object.clone()),
+                    Value::Object(new_realm.global_object),
                 )?;
                 let eval_script = Function::create_builtin(
                     Some(JsString::from_utf8("evalScript")),
@@ -11567,7 +11567,7 @@ var $DONE = function (error) {
                         let agent = runtime::context::current_agent_mut()?;
                         let source = args.first().cloned().unwrap_or(Value::Undefined);
                         let text = runtime::context::to_string(agent, &source)?;
-                        agent.push_bootstrap_context(new_realm.clone());
+                        agent.push_bootstrap_context(new_realm);
                         let result = agent.run_script(&text.to_string_lossy());
                         agent.execution_context_stack.pop();
                         result
@@ -11950,7 +11950,7 @@ var $DONE = function (error) {
         index: usize,
     ) -> Result<(), JsError> {
         let realm = agent.current_realm()?;
-        let global = realm.global_object.clone();
+        let global = realm.global_object;
         let d262 = JsObject::ordinary_object_create(None);
         let agent_obj = JsObject::ordinary_object_create(None);
 
@@ -12152,7 +12152,7 @@ var $DONE = function (error) {
     /// the async fixtures' polling loops cooperative.
     fn install_harness_set_timeout(agent: &mut Agent) -> Result<(), String> {
         let realm = agent.current_realm().map_err(|e| e.message)?;
-        let global = realm.global_object.clone();
+        let global = realm.global_object;
         let set_timeout = create_host_builtin(
             agent,
             "setTimeout",
@@ -12187,11 +12187,7 @@ var $DONE = function (error) {
 
     /// Minimal native `assert` helper: the surface the vendored fixtures use.
     fn install_harness_globals(agent: &Agent) -> Result<(), String> {
-        let global = agent
-            .current_realm()
-            .map_err(|e| e.message)?
-            .global_object
-            .clone();
+        let global = agent.current_realm().map_err(|e| e.message)?.global_object;
         // The global `assert` is the callable bare function with the helper
         // methods attached (real test262 assert.js defines `assert` as a
         // function), so fixtures calling `assert(x)` directly work.

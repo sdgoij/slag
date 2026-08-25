@@ -1124,8 +1124,8 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .and_then(|value| as_object(&value));
 
     // ---- ArrayBuffer ----
-    let ab_proto = JsObject::ordinary_object_create(object_proto.clone());
-    let ab_proto_value = Value::Object(ab_proto.clone());
+    let ab_proto = JsObject::ordinary_object_create(object_proto);
+    let ab_proto_value = Value::Object(ab_proto);
     let ab_ctor = Function::create_builtin(
         Some(JsString::from_utf8("ArrayBuffer")),
         1,
@@ -1133,7 +1133,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         Some(Box::new(placeholder("ArrayBuffer"))),
         None,
     )?;
-    let ab_ctor_value = Value::Function(ab_ctor.clone());
+    let ab_ctor_value = Value::Function(ab_ctor);
     realm.intrinsics.define(ARRAY_BUFFER, ab_ctor_value.clone());
     realm
         .intrinsics
@@ -1171,7 +1171,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define(AB_IS_VIEW, Value::Function(is_view_func.clone()));
+        .define(AB_IS_VIEW, Value::Function(is_view_func));
     ab_ctor.define_property(
         &JsString::from_utf8("isView"),
         &PropertyDescriptor {
@@ -1192,7 +1192,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define(AB_SPECIES, Value::Function(ab_species.clone()));
+        .define(AB_SPECIES, Value::Function(ab_species));
     ab_ctor.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone()),
         &PropertyDescriptor {
@@ -1221,9 +1221,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func.clone()));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         ab_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -1254,9 +1252,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func.clone()));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         ab_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -1283,7 +1279,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
 
     // ---- SharedArrayBuffer ----
     let sab_proto = JsObject::ordinary_object_create(object_proto);
-    let sab_proto_value = Value::Object(sab_proto.clone());
+    let sab_proto_value = Value::Object(sab_proto);
     let sab_ctor = Function::create_builtin(
         Some(JsString::from_utf8("SharedArrayBuffer")),
         1,
@@ -1291,7 +1287,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         Some(Box::new(placeholder("SharedArrayBuffer"))),
         None,
     )?;
-    let sab_ctor_value = Value::Function(sab_ctor.clone());
+    let sab_ctor_value = Value::Function(sab_ctor);
     realm
         .intrinsics
         .define(SHARED_ARRAY_BUFFER, sab_ctor_value.clone());
@@ -1330,7 +1326,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define(SAB_SPECIES, Value::Function(sab_species.clone()));
+        .define(SAB_SPECIES, Value::Function(sab_species));
     sab_ctor.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone()),
         &PropertyDescriptor {
@@ -1356,9 +1352,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func.clone()));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         sab_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -1379,9 +1373,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func.clone()));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         sab_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {

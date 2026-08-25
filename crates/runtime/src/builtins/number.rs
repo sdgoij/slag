@@ -382,7 +382,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     // `%Object.prototype.toString%` reports "[object Number]" and ToNumber
     // coercion yields 0.
     *number_proto.boxed.borrow_mut() = Some(crux::object::BoxedPrimitive::Number(0.0));
-    let number_proto_value = Value::Object(number_proto.clone());
+    let number_proto_value = Value::Object(number_proto);
 
     let number_ctor = Function::create_builtin(
         Some(JsString::from_utf8("Number")),
@@ -391,7 +391,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         Some(Box::new(placeholder("Number"))),
         None,
     )?;
-    let number_ctor_value = Value::Function(number_ctor.clone());
+    let number_ctor_value = Value::Function(number_ctor);
 
     realm.intrinsics.define(NUMBER, number_ctor_value.clone());
     realm
@@ -468,7 +468,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             length,
             Box::new(body),
             None,
-            function_proto.clone(),
+            function_proto
         )?;
         number_ctor.define_property(
             &JsString::from_utf8(name),
@@ -516,7 +516,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm.intrinsics.define(key, Value::Function(func.clone()));
+        realm.intrinsics.define(key, Value::Function(func));
         number_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {

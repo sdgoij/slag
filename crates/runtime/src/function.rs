@@ -498,7 +498,7 @@ pub fn shared_function_body(
 ) -> std::rc::Rc<Block> {
     let realm = agent
         .current_realm()
-        .map(|realm| crux::handle::Handle::as_ptr(&realm) as usize)
+        .map(|realm| crux::handle::Handle::as_ptr(realm) as usize)
         .unwrap_or(0);
     let source_key = source.map(source_hash).unwrap_or(0);
     let key = (
@@ -693,13 +693,13 @@ fn register_function(
         ThisMode::Sloppy
     };
     let realm = agent.current_realm()?;
-    let private_environment = agent.running_context()?.private_environment.clone();
+    let private_environment = agent.running_context()?.private_environment;
     let declaring_module =
         agent
             .running_context()
             .ok()
             .and_then(|context| match &context.script_or_module {
-                Some(crate::context::ScriptOrModule::Module(module)) => Some(module.clone()),
+                Some(crate::context::ScriptOrModule::Module(module)) => Some(*module),
                 _ => None,
             });
     let mut data = EcmaFunction {
@@ -914,7 +914,7 @@ pub fn instantiate_function_expression(
     let value = instantiate_function(
         agent,
         f,
-        scope.clone(),
+        scope,
         enclosing_strict,
         outer_chain,
         per_iteration_chain,
@@ -994,7 +994,7 @@ pub fn instantiate_arrow(
         ArrowBody::Block(block) => block,
     };
     let realm = agent.current_realm()?;
-    let private_environment = agent.running_context()?.private_environment.clone();
+    let private_environment = agent.running_context()?.private_environment;
     let strict = body_is_strict(agent, &body, None) || enclosing_strict;
     let class_field_initializer = agent.field_initializer_depth > 0;
     let mut data = EcmaFunction {
@@ -1061,16 +1061,12 @@ pub fn owning_realm(agent: &mut Agent, function: &Handle<Function>) -> Option<Ha
         .realms
         .borrow()
         .iter()
-        .find(|realm| {
-            realm
-                .intrinsics
-                .contains(&Value::Function(function.clone()))
-        })
+        .find(|realm| realm.intrinsics.contains(&Value::Function(*function)))
         .cloned();
     agent
         .function_realms
         .borrow_mut()
-        .insert(function.id(), found.clone());
+        .insert(function.id(), found);
     found
 }
 
@@ -1147,7 +1143,7 @@ pub(crate) fn call_inner(
                         ErrorKind::TypeError,
                         "Class constructor cannot be invoked without 'new'".into(),
                     );
-                    return Err(realm_throwable(agent, error, data.realm.clone())?);
+                    return Err(realm_throwable(agent, error, data.realm)?);
                 }
                 // A function created inside a class field initializer runs
                 // its body with the "Eval Inside Initializer" context (spec
@@ -1161,14 +1157,8 @@ pub(crate) fn call_inner(
                 // The fast path reads the record's `ir`/`environment`/`realm`/
                 // `strict`; clone them while the borrow is live so
                 // `ordinary_call` skips its own lookup for certified bodies.
-                let fast = data.map(|data| {
-                    (
-                        data.ir.clone(),
-                        data.environment.clone(),
-                        data.realm.clone(),
-                        data.strict,
-                    )
-                });
+                let fast =
+                    data.map(|data| (data.ir.clone(), data.environment, data.realm, data.strict));
                 let saved_depth = agent.field_initializer_depth;
                 agent.field_initializer_depth = if marked { saved_depth + 1 } else { 0 };
                 let result = if is_async_gen {
@@ -1432,12 +1422,11 @@ fn construct_inner(
                 let mut all = bound_args.clone();
                 all.extend_from_slice(args);
                 let target_value = target.clone();
-                let new_target =
-                    if crux::ops::same_value(&Value::Function(function.clone()), new_target) {
-                        &target_value
-                    } else {
-                        new_target
-                    };
+                let new_target = if crux::ops::same_value(&Value::Function(function), new_target) {
+                    &target_value
+                } else {
+                    new_target
+                };
                 construct(agent, target, &all, new_target)
             }
             _ => {
@@ -1638,8 +1627,8 @@ fn ordinary_call(
             })?;
             (
                 record.ir.clone(),
-                record.environment.clone(),
-                record.realm.clone(),
+                record.environment,
+                record.realm,
                 record.strict,
             )
         }
@@ -1661,7 +1650,7 @@ fn ordinary_call(
         // returns. Bodies without capture keep the plain closure env.
         let body_env = match scope.new_body_context(&old_env, args)? {
             Some(context) => context,
-            None => old_env.clone(),
+            None => old_env,
         };
         // The context's `function` is read only by a sloppy body's mapped
         // `arguments` creation (`Step::CreateArguments`, for `callee`); every
@@ -1674,7 +1663,7 @@ fn ordinary_call(
         // is derived-only), so the clone is skipped unless the body uses
         // `arguments` in sloppy mode.
         let context_function =
-            (scope.arguments_slot.is_some() && !strict).then(|| Value::Function(function.clone()));
+            (scope.arguments_slot.is_some() && !strict).then(|| Value::Function(*function));
         agent.execution_context_stack.push(ExecutionContext {
             function: context_function,
             realm,
@@ -1683,7 +1672,7 @@ fn ordinary_call(
             // certification rejects the `variable_environment` readers —
             // Annex B function hoisting and direct eval), so both slots can
             // share one clone.
-            lexical_environment: body_env.clone(),
+            lexical_environment: body_env,
             variable_environment: body_env,
             private_environment: None,
             source: None,
@@ -1699,7 +1688,7 @@ fn ordinary_call(
             } else {
                 match this.kind() {
                     ValueKind::Undefined | ValueKind::Null => {
-                        let global = agent.running_context()?.realm.global_object.clone();
+                        let global = agent.running_context()?.realm.global_object;
                         Value::Object(global)
                     }
                     ValueKind::Object(_) | ValueKind::Function(_) => this,
@@ -1746,14 +1735,14 @@ fn ordinary_call(
             )
         })?;
         (
-            record.environment.clone(),
+            record.environment,
             record.this_mode,
-            record.realm.clone(),
-            record.private_environment.clone(),
+            record.realm,
+            record.private_environment,
             record.strict,
             record.params.clone(),
             record.body.clone(),
-            record.declaring_module.clone(),
+            record.declaring_module,
             record.ir.clone(),
         )
     };
@@ -1778,8 +1767,8 @@ fn ordinary_call(
         function: Some(function_value.clone()),
         realm,
         script_or_module,
-        lexical_environment: function_env.clone(),
-        variable_environment: function_env.clone(),
+        lexical_environment: function_env,
+        variable_environment: function_env,
         private_environment,
         source: agent
             .running_context()
@@ -1795,7 +1784,7 @@ fn ordinary_call(
             let this = if this_mode == ThisMode::Sloppy {
                 match this.kind() {
                     ValueKind::Undefined | ValueKind::Null => {
-                        let global = agent.running_context()?.realm.global_object.clone();
+                        let global = agent.running_context()?.realm.global_object;
                         Value::Object(global)
                     }
                     ValueKind::Object(_) | ValueKind::Function(_) => this,
@@ -1871,13 +1860,13 @@ fn run_compiled_body(
     args: &[Value],
     this_value: Option<Value>,
 ) -> Result<Value, JsError> {
-    let body_env = agent.running_context()?.lexical_environment.clone();
-    let mut vm = agent.take_vm(body_env.clone(), strict);
+    let body_env = agent.running_context()?.lexical_environment;
+    let mut vm = agent.take_vm(body_env, strict);
     // Cut 3 continuation (per-iteration loop heads): the certified body's
     // capture context is fixed for the run — the per-iteration loop
     // machinery copies fresh head bindings from it.
     if ir.scope.is_some() {
-        vm.body_context = Some(body_env.clone());
+        vm.body_context = Some(body_env);
     }
     // A certified body with no bindings (frame_size 0) never reads the
     // frame — `Vm::new` already left the inline buffer in place — so the
@@ -1999,9 +1988,8 @@ pub(crate) fn create_mapped_arguments_object(
         .get("%Object.prototype%")
         .and_then(|value| crate::context::as_object(&value));
     let make_getter = {
-        let env = env.clone();
         move |name: &JsString| -> Value {
-            let env = env.clone();
+            let env = env;
             let name = name.clone();
             Value::Function(
                 Function::create_builtin(
@@ -2016,9 +2004,8 @@ pub(crate) fn create_mapped_arguments_object(
         }
     };
     let make_setter = {
-        let env = env.clone();
         move |name: &JsString| -> Value {
-            let env = env.clone();
+            let env = env;
             let name = name.clone();
             Value::Function(
                 Function::create_builtin(
@@ -2181,12 +2168,7 @@ fn ordinary_construct(
                 ir.scope
                     .as_ref()
                     .is_some_and(|scope| scope.context_names.is_empty())
-                    .then_some((
-                        ir,
-                        data.environment.clone(),
-                        data.realm.clone(),
-                        data.strict,
-                    ))
+                    .then_some((ir, data.environment, data.realm, data.strict))
             })
         } else {
             None
@@ -2212,21 +2194,21 @@ fn ordinary_construct(
             function: context_function,
             realm,
             script_or_module: None,
-            lexical_environment: environment.clone(),
-            variable_environment: environment.clone(),
+            lexical_environment: environment,
+            variable_environment: environment,
             private_environment: None,
             source: None,
             annex_b_hoistable: Default::default(),
         });
         let result = (|| -> Result<Value, JsError> {
-            let body_env = agent.running_context()?.lexical_environment.clone();
-            let mut vm = agent.take_vm(body_env.clone(), strict);
+            let body_env = agent.running_context()?.lexical_environment;
+            let mut vm = agent.take_vm(body_env, strict);
             // Closures created inside the body record the function's
             // captured environment — the running context's lexical env here
             // (set above) is that environment, so a depth-0 static
             // context-chain read lands on the right context.
-            vm.body_context = Some(environment.clone());
-            vm.lexical_env = environment.clone();
+            vm.body_context = Some(environment);
+            vm.lexical_env = environment;
             if let Some(scope) = &ir.scope {
                 vm.setup_frame(scope, args);
                 // Cut 3 continuation (unmapped arguments slice): the body's
@@ -2313,7 +2295,7 @@ fn ordinary_construct(
         construct_this_object(agent, new_target)?
     };
     let function_value = function.self_value();
-    let old_env = data.environment.clone();
+    let old_env = data.environment;
     let function_env = new_function_environment(
         Some(old_env),
         function_value.clone(),
@@ -2326,16 +2308,15 @@ fn ordinary_construct(
         .and_then(|context| context.script_or_module.clone());
     let script_or_module = data
         .declaring_module
-        .clone()
         .map(crate::context::ScriptOrModule::Module)
         .or(caller_script_or_module);
     agent.execution_context_stack.push(ExecutionContext {
         function: Some(function_value.clone()),
-        realm: data.realm.clone(),
+        realm: data.realm,
         script_or_module,
-        lexical_environment: function_env.clone(),
-        variable_environment: function_env.clone(),
-        private_environment: data.private_environment.clone(),
+        lexical_environment: function_env,
+        variable_environment: function_env,
+        private_environment: data.private_environment,
         source: agent
             .running_context()
             .ok()
@@ -2387,15 +2368,15 @@ fn ordinary_construct(
                     .as_ref()
                     .is_none_or(|scope| scope.context_names.is_empty()) =>
             {
-                let body_env = agent.running_context()?.lexical_environment.clone();
-                let mut vm = agent.take_vm(body_env.clone(), data.strict);
+                let body_env = agent.running_context()?.lexical_environment;
+                let mut vm = agent.take_vm(body_env, data.strict);
                 // Cut 3 continuation (nested context chains): a certified
                 // body's static context-chain reads resolve against its
                 // captured environment (its own capture context when it has
                 // one, the enclosing body's context otherwise) — the running
                 // env at construct can be an unrelated caller.
                 if ir.scope.is_some() {
-                    vm.body_context = Some(data.environment.clone());
+                    vm.body_context = Some(data.environment);
                     // Closures created inside the certified body record the
                     // running context's lexical environment; the empty
                     // lexical env `function_declaration_instantiation`
@@ -2406,8 +2387,8 @@ fn ordinary_construct(
                     // (closures reading them bail the scan), so the
                     // function's captured environment is the right base for
                     // both the VM walk and the execution context.
-                    vm.lexical_env = data.environment.clone();
-                    agent.running_context_mut()?.lexical_environment = data.environment.clone();
+                    vm.lexical_env = data.environment;
+                    agent.running_context_mut()?.lexical_environment = data.environment;
                 }
                 if let Some(scope) = &ir.scope {
                     vm.setup_frame(scope, args);
@@ -2537,14 +2518,14 @@ pub fn initialize_instance_elements(
                 // inherits this context, so its `new.target` is also
                 // *undefined*.
                 let init_env = crate::env::new_function_environment(
-                    Some(agent.running_context()?.lexical_environment.clone()),
-                    Value::Function(ctor.clone()),
+                    Some(agent.running_context()?.lexical_environment),
+                    Value::Function(ctor),
                     Value::Undefined,
                     false,
                 );
-                init_env.bind_this_value(Value::Object(obj.clone()))?;
-                let saved_lexical = agent.running_context_mut()?.lexical_environment.clone();
-                agent.running_context_mut()?.lexical_environment = init_env.clone();
+                init_env.bind_this_value(Value::Object(obj))?;
+                let saved_lexical = agent.running_context_mut()?.lexical_environment;
+                agent.running_context_mut()?.lexical_environment = init_env;
                 let result = eval_expr(agent, init, true);
                 agent.running_context_mut()?.lexical_environment = saved_lexical;
                 agent.field_initializer_depth -= 1;
@@ -2640,10 +2621,10 @@ pub(crate) fn function_declaration_instantiation(
     // parameter list binds in its own environment, and the body's vars live
     // in a further environment so defaults cannot see them.
     let (param_env, variable_env) = if simple {
-        (function_env.clone(), function_env.clone())
+        (*function_env, *function_env)
     } else {
-        let param_env = new_declarative_environment(Some(function_env.clone()));
-        let variable_env = new_declarative_environment(Some(param_env.clone()));
+        let param_env = new_declarative_environment(Some(*function_env));
+        let variable_env = new_declarative_environment(Some(param_env));
         (param_env, variable_env)
     };
 
@@ -2685,7 +2666,7 @@ pub(crate) fn function_declaration_instantiation(
                         )
                     })?;
                 Value::Object(JsObject::unmapped_arguments_object_create(
-                    arguments_prototype.clone(),
+                    arguments_prototype,
                     args,
                     thrower,
                 )?)
@@ -2695,7 +2676,7 @@ pub(crate) fn function_declaration_instantiation(
                     function_value.clone(),
                     args,
                     &param_names,
-                    function_env.clone(),
+                    *function_env,
                 )?
             }
         } else {
@@ -2746,7 +2727,7 @@ pub(crate) fn function_declaration_instantiation(
             param_env.initialize_binding(&name, value)?;
         }
     } else {
-        agent.running_context_mut()?.lexical_environment = param_env.clone();
+        agent.running_context_mut()?.lexical_environment = param_env;
         crate::binding::iterator_binding_initialization(
             agent,
             params,
@@ -2758,7 +2739,7 @@ pub(crate) fn function_declaration_instantiation(
         // record only after the formals bind, so a direct eval inside a
         // default sees the callee's environment (closures created there
         // resolve eval-introduced vars through it).
-        agent.running_context_mut()?.variable_environment = variable_env.clone();
+        agent.running_context_mut()?.variable_environment = variable_env;
     }
 
     // Var bindings: created and initialized to *undefined* during
@@ -2815,11 +2796,11 @@ pub(crate) fn function_declaration_instantiation(
     // env; sloppy functions get a fresh declarative record so direct eval
     // cannot see the var bindings (spec 16.1.8 steps 37-42).
     let lexical_env = if strict {
-        variable_env.clone()
+        variable_env
     } else {
-        new_declarative_environment(Some(variable_env.clone()))
+        new_declarative_environment(Some(variable_env))
     };
-    agent.running_context_mut()?.lexical_environment = lexical_env.clone();
+    agent.running_context_mut()?.lexical_environment = lexical_env;
 
     // Lexically declared names: instantiated but not initialized (spec
     // 16.1.8 steps 43-48).
@@ -2853,14 +2834,7 @@ pub(crate) fn function_declaration_instantiation(
     }
     for f in funcs {
         let name = crux::lookup(f.name.unwrap());
-        let func_obj = instantiate_function(
-            agent,
-            f,
-            lexical_env.clone(),
-            strict,
-            Vec::new(),
-            Vec::new(),
-        )?;
+        let func_obj = instantiate_function(agent, f, lexical_env, strict, Vec::new(), Vec::new())?;
         variable_env.set_mutable_binding(&name, func_obj, false)?;
     }
 
@@ -2972,7 +2946,7 @@ mod tests {
             .create_data_property(&JsString::from_utf8("next"), Value::Function(next))
             .unwrap();
         let iterable = crux::object::JsObject::ordinary_object_create(None);
-        let iterator_for_method = iterator.clone();
+        let iterator_for_method = iterator;
         iterable
             .define_property_key(
                 &crux::property::PropertyKey::Symbol(
@@ -2982,7 +2956,7 @@ mod tests {
                     crux::Function::create_builtin(
                         Some(JsString::from_utf8("[Symbol.iterator]")),
                         0,
-                        Box::new(move |_, _| Ok(Value::Object(iterator_for_method.clone()))),
+                        Box::new(move |_, _| Ok(Value::Object(iterator_for_method))),
                         None,
                         None,
                     )
@@ -2998,7 +2972,7 @@ mod tests {
     fn run_with_iterable(source: &str, values: Vec<Value>) -> Result<Value, JsError> {
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
-        let global = agent.running_context().unwrap().realm.global_object.clone();
+        let global = agent.running_context().unwrap().realm.global_object;
         global
             .create_data_property(&JsString::from_utf8("iter"), iterable(values))
             .unwrap();

@@ -107,25 +107,25 @@ mod tests {
     fn jobs_drain_in_fifo_order_with_promise_priority() {
         let mut agent = Agent::new();
         let realm = initialize_host_defined_realm(&agent).unwrap();
-        agent.push_bootstrap_context(realm.clone());
+        agent.push_bootstrap_context(realm);
 
         let order: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>> =
             std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        agent.enqueue_generic_job(Some(realm.clone()), {
+        agent.enqueue_generic_job(Some(realm), {
             let order = order.clone();
             move |_| {
                 order.borrow_mut().push("generic-1");
                 Ok(Value::Undefined)
             }
         });
-        agent.enqueue_promise_job(Some(realm.clone()), {
+        agent.enqueue_promise_job(Some(realm), {
             let order = order.clone();
             move |_| {
                 order.borrow_mut().push("promise-1");
                 Ok(Value::Undefined)
             }
         });
-        agent.enqueue_promise_job(Some(realm.clone()), {
+        agent.enqueue_promise_job(Some(realm), {
             let order = order.clone();
             move |_| {
                 order.borrow_mut().push("promise-2");
@@ -153,11 +153,11 @@ mod tests {
     fn jobs_enqueued_while_running_are_drained() {
         let mut agent = Agent::new();
         let realm = initialize_host_defined_realm(&agent).unwrap();
-        agent.push_bootstrap_context(realm.clone());
+        agent.push_bootstrap_context(realm);
 
         let order: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>> =
             std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        agent.enqueue_generic_job(Some(realm.clone()), {
+        agent.enqueue_generic_job(Some(realm), {
             let order = order.clone();
             move |agent| {
                 order.borrow_mut().push("first");

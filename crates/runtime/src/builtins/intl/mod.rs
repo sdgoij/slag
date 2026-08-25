@@ -63,11 +63,11 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         1,
         placeholder("Intl.getCanonicalLocales"),
         None,
-        function_proto.clone(),
+        function_proto
     )?;
     realm.intrinsics.define(
         GET_CANONICAL_LOCALES,
-        Value::Function(get_canonical.clone()),
+        Value::Function(get_canonical),
     );
     intl.define_property(
         &JsString::from_utf8("getCanonicalLocales"),

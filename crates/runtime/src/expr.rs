@@ -44,7 +44,7 @@ pub fn eval_expr(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Value, 
         ExprKind::Array(literal) => eval_array_literal(agent, literal, strict),
         ExprKind::Object(literal) => eval_object_literal(agent, literal, strict),
         ExprKind::Function(f) => {
-            let env = agent.running_context()?.lexical_environment.clone();
+            let env = agent.running_context()?.lexical_environment;
             crate::function::instantiate_function_expression(
                 agent,
                 f,
@@ -59,7 +59,7 @@ pub fn eval_expr(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Value, 
             params,
             body,
         } => {
-            let env = agent.running_context()?.lexical_environment.clone();
+            let env = agent.running_context()?.lexical_environment;
             crate::function::instantiate_arrow(
                 agent,
                 *is_async,
@@ -718,16 +718,16 @@ fn eval_object_literal(
                 // MethodDefinition evaluation (spec 15.4.3): OrdinaryFunction-
                 // Create, MakeMethod, SetFunctionName, DefineMethodProperty.
                 let key = eval_property_name(agent, key, strict)?;
-                let env = agent.running_context()?.lexical_environment.clone();
+                let env = agent.running_context()?.lexical_environment;
                 let closure = crate::function::instantiate_method(agent, function, env, strict)?;
-                crate::function::make_method(agent, &closure, Value::Object(object.clone()))?;
+                crate::function::make_method(agent, &closure, Value::Object(object))?;
                 crate::function::set_function_name(&closure, &property_key_display(&key), None)?;
                 object.create_data_property_key(&key, closure)?;
             }
             ObjectProperty::Get { key, body } => {
                 // PropertyDefinition : get PropertyName ( ) { FunctionBody }
                 let key = eval_property_name(agent, key, strict)?;
-                let env = agent.running_context()?.lexical_environment.clone();
+                let env = agent.running_context()?.lexical_environment;
                 let getter = crate::function::instantiate_accessor(
                     agent,
                     Vec::new(),
@@ -735,7 +735,7 @@ fn eval_object_literal(
                     env,
                     strict,
                 )?;
-                crate::function::make_method(agent, &getter, Value::Object(object.clone()))?;
+                crate::function::make_method(agent, &getter, Value::Object(object))?;
                 crate::function::set_function_name(
                     &getter,
                     &property_key_display(&key),
@@ -761,7 +761,7 @@ fn eval_object_literal(
             } => {
                 // PropertyDefinition : set PropertyName ( BindingElement ) { FunctionBody }
                 let key = eval_property_name(agent, key, strict)?;
-                let env = agent.running_context()?.lexical_environment.clone();
+                let env = agent.running_context()?.lexical_environment;
                 let setter = crate::function::instantiate_accessor(
                     agent,
                     vec![BindingElement {
@@ -774,7 +774,7 @@ fn eval_object_literal(
                     env,
                     strict,
                 )?;
-                crate::function::make_method(agent, &setter, Value::Object(object.clone()))?;
+                crate::function::make_method(agent, &setter, Value::Object(object))?;
                 crate::function::set_function_name(
                     &setter,
                     &property_key_display(&key),
@@ -1380,10 +1380,7 @@ pub fn ordinary_has_instance(
     };
     let mut current = value_obj.get_prototype_of()?;
     while let Some(obj) = current {
-        if same_value(
-            &Value::Object(obj.clone()),
-            &Value::Object(prototype_obj.clone()),
-        ) {
+        if same_value(&Value::Object(obj), &Value::Object(prototype_obj)) {
             return Ok(Value::Boolean(true));
         }
         current = obj.get_prototype_of()?;
@@ -1717,12 +1714,12 @@ fn abstract_loosely_equal(agent: &mut Agent, left: &Value, right: &Value) -> Res
     // string, which StringToBigInt maps to 0n.
     if let (ValueKind::BigInt(a), ValueKind::String(s)) = (left_prim.kind(), right_prim.kind()) {
         return Ok(crux::convert::string_to_bigint(&s).is_some_and(|n| {
-            is_strictly_equal(&Value::BigInt(Handle::new(n)), &Value::BigInt(a.clone()))
+            is_strictly_equal(&Value::BigInt(Handle::new(n)), &Value::BigInt(a))
         }));
     }
     if let (ValueKind::String(s), ValueKind::BigInt(b)) = (left_prim.kind(), right_prim.kind()) {
         return Ok(crux::convert::string_to_bigint(&s).is_some_and(|n| {
-            is_strictly_equal(&Value::BigInt(Handle::new(n)), &Value::BigInt(b.clone()))
+            is_strictly_equal(&Value::BigInt(Handle::new(n)), &Value::BigInt(b))
         }));
     }
     crux::ops::is_loosely_equal(&left_prim, &right_prim)
@@ -1871,7 +1868,7 @@ pub(crate) fn get_template_object(
     let span = template.span;
     let key = (
         generation,
-        crux::handle::Handle::as_ptr(&realm) as usize,
+        crux::handle::Handle::as_ptr(realm) as usize,
         span.start as usize,
         span.end as usize,
     );
@@ -2207,7 +2204,7 @@ fn iterator_chain_has_return(agent: &mut Agent, iterator: &Value) -> Result<bool
         if object.get_own_property_key(&key)?.is_some() {
             return Ok(true);
         }
-        probe = object.prototype.borrow().clone();
+        probe = *object.prototype.borrow()
     }
     let _ = agent;
     Ok(false)

@@ -18,6 +18,7 @@
 //! the conservative native-stack scan land in the following GC-1 slices.
 
 use std::cell::{Cell, RefCell};
+use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 
@@ -43,15 +44,46 @@ struct GcBox<T: ?Sized + Trace> {
 
 /// A heap handle: a `Copy` pointer into the GC heap. `!Send`/`!Sync` by the
 /// raw-pointer marker — a heap is agent-local (workers use separate agents).
-pub struct Gc<T: Trace> {
+/// `T` may be unsized (`dyn HostOps` for host-defined exotics); `Gc::new`
+/// requires a sized `T`.
+///
+/// Equality forwards to the pointee (like `Rc`), so `ValueKind`'s derived
+/// `PartialEq` keeps its old semantics: strings compare by content, objects
+/// by identity (their `PartialEq` is id-based).
+pub struct Gc<T: ?Sized + Trace> {
     ptr: NonNull<GcBox<T>>,
     _not_send_sync: std::marker::PhantomData<*mut ()>,
 }
 
-impl<T: Trace> Copy for Gc<T> {}
-impl<T: Trace> Clone for Gc<T> {
+impl<T: ?Sized + Trace + PartialEq> PartialEq for Gc<T> {
+    fn eq(&self, other: &Gc<T>) -> bool {
+        **self == **other
+    }
+}
+impl<T: ?Sized + Trace + Eq> Eq for Gc<T> {}
+
+impl<T: ?Sized + Trace> Copy for Gc<T> {}
+impl<T: ?Sized + Trace> Clone for Gc<T> {
     fn clone(&self) -> Self {
         *self
+    }
+}
+
+impl<T: ?Sized + Trace> AsRef<T> for Gc<T> {
+    fn as_ref(&self) -> &T {
+        self
+    }
+}
+
+impl<T: Trace> Gc<T> {
+    /// The erased form, usable as a [`Heap::collect`] root.
+    pub fn as_any(self) -> GcAny {
+        GcAny(self.ptr.as_ptr() as *mut GcBox<dyn Trace>)
+    }
+
+    /// Pointer identity, replacing `Rc::ptr_eq` for the migration.
+    pub fn ptr_eq(self, other: Gc<T>) -> bool {
+        self.ptr == other.ptr
     }
 }
 
@@ -70,13 +102,34 @@ impl<T: Trace> Gc<T> {
         }
     }
 
-    /// The erased form, usable as a [`Heap::collect`] root.
-    pub fn as_any(self) -> GcAny {
-        GcAny(self.ptr.as_ptr() as *mut GcBox<dyn Trace>)
+    /// The box base address, for NaN-boxing into `Value`'s 44-bit payload.
+    pub(crate) fn box_ptr(self) -> usize {
+        self.ptr.as_ptr() as usize
+    }
+
+    /// A raw pointer to the boxed value, replacing `Rc::as_ptr` (used as an
+    /// identity key). Valid while the box is live.
+    pub fn as_ptr(self) -> *const T {
+        &*self as *const T
+    }
+
+    /// Reconstruct a handle from a box base address produced by `box_ptr`.
+    ///
+    /// SAFETY: `ptr` must be a live `GcBox<T>` in the current thread's heap
+    /// (the rooting discipline guarantees this for every encoded value).
+    pub(crate) unsafe fn from_box_ptr(ptr: usize) -> Gc<T> {
+        // SAFETY (caller): `ptr` is a live `GcBox<T>`; `new_unchecked` trusts
+        // the non-null invariant the rooting discipline guarantees.
+        unsafe {
+            Gc {
+                ptr: NonNull::new_unchecked(ptr as *mut GcBox<T>),
+                _not_send_sync: std::marker::PhantomData,
+            }
+        }
     }
 }
 
-impl<T: Trace> Deref for Gc<T> {
+impl<T: ?Sized + Trace> Deref for Gc<T> {
     type Target = T;
     fn deref(&self) -> &T {
         // The box is kept alive by the rooting discipline (see the module
@@ -85,7 +138,7 @@ impl<T: Trace> Deref for Gc<T> {
     }
 }
 
-impl<T: Trace> DerefMut for Gc<T> {
+impl<T: ?Sized + Trace> DerefMut for Gc<T> {
     fn deref_mut(&mut self) -> &mut T {
         unsafe { &mut self.ptr.as_mut().data }
     }
@@ -94,6 +147,20 @@ impl<T: Trace> DerefMut for Gc<T> {
 impl<T: Trace> Trace for Gc<T> {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         visit(self.as_any());
+    }
+}
+
+impl<T: ?Sized + Trace> fmt::Debug for Gc<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Debug on handles must not require `T: Debug` (derived Debug impls on
+        // structs containing handles — Realm, EnvRecord, ... — would break).
+        write!(f, "Gc({:p})", self.ptr.as_ptr())
+    }
+}
+
+impl<T: ?Sized + Trace + fmt::Display> fmt::Display for Gc<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&**self, f)
     }
 }
 
@@ -250,6 +317,16 @@ mod tests {
         let gc = Gc::new(Node::default());
         gc.next.borrow_mut().replace(Gc::new(Node::default()));
         assert!(gc.next.borrow().is_some());
+    }
+
+    #[test]
+    fn ptr_eq_compares_box_identity() {
+        let a = Gc::new(Node::default());
+        let b = Gc::new(Node::default());
+        assert!(Gc::ptr_eq(a, a));
+        assert!(!Gc::ptr_eq(a, b));
+        let copied = a;
+        assert!(Gc::ptr_eq(copied, a));
     }
 
     #[test]

@@ -728,9 +728,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             .get("%Object.prototype%")
             .and_then(|value| as_object(&value)),
     );
-    realm
-        .intrinsics
-        .define(ATOMICS, Value::Object(atomics.clone()));
+    realm.intrinsics.define(ATOMICS, Value::Object(atomics));
 
     let methods: [(&str, &str, u64); 14] = [
         ("add", ATOMICS_ADD, 3),
@@ -756,9 +754,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func.clone()));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         atomics.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {

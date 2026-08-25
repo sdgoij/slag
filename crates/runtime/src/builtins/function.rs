@@ -42,7 +42,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .get("%Object.prototype%")
         .and_then(|value| as_object(&value));
     function_proto.object.set_prototype_of(object_proto)?;
-    let function_proto_value = Value::Function(function_proto.clone());
+    let function_proto_value = Value::Function(function_proto);
 
     // %Function% (20.2.1): call and construct both run CreateDynamicFunction.
     let function_ctor = Function::create_builtin(
@@ -52,7 +52,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         Some(Box::new(placeholder("Function"))),
         None,
     )?;
-    let function_ctor_value = Value::Function(function_ctor.clone());
+    let function_ctor_value = Value::Function(function_ctor);
 
     realm
         .intrinsics
@@ -183,11 +183,9 @@ fn install_methods(
             length,
             Box::new(placeholder(name)),
             None,
-            Some(proto.clone()),
+            Some(proto),
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(method.clone()));
+        realm.intrinsics.define(intrinsic, Value::Function(method));
         desc.value = Some(Value::Function(method));
         function_proto.define_property(&JsString::from_utf8(name), &desc)?;
     }
@@ -199,11 +197,11 @@ fn install_methods(
         1,
         Box::new(placeholder("Function.prototype[@@hasInstance]")),
         None,
-        Some(proto.clone()),
+        Some(proto),
     )?;
     realm
         .intrinsics
-        .define(HAS_INSTANCE, Value::Function(has_instance.clone()));
+        .define(HAS_INSTANCE, Value::Function(has_instance));
     function_proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("hasInstance").as_ref().clone()),
         &PropertyDescriptor {
@@ -223,8 +221,8 @@ fn install_methods(
     // them with their own null-valued data properties. The same intrinsic is
     // the get/set of unmapped arguments objects' `callee`, so all six slots
     // are one object (ThrowTypeError/unique-per-realm-*).
-    let thrower = crux::function::throw_type_error(Some(proto.clone()))?;
-    let thrower_value = Value::Function(thrower.clone());
+    let thrower = crux::function::throw_type_error(Some(proto))?;
+    let thrower_value = Value::Function(thrower);
     realm
         .intrinsics
         .define("%ThrowTypeError%", Value::Function(thrower));

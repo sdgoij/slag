@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::handle::Handle;
+use crate::heap::Trace;
 use crate::string::JsString;
 
 static NEXT_SYMBOL_ID: AtomicU64 = AtomicU64::new(1);
@@ -14,6 +15,16 @@ static NEXT_SYMBOL_ID: AtomicU64 = AtomicU64::new(1);
 pub struct Symbol {
     pub id: u64,
     pub description: Option<JsString>,
+}
+
+impl Trace for Symbol {
+    fn trace(&self, visit: &mut dyn FnMut(crate::heap::GcAny)) {
+        // The description is a JsString by value; a Rope description's
+        // children are heap edges.
+        if let Some(description) = &self.description {
+            description.trace(visit);
+        }
+    }
 }
 
 impl Symbol {
@@ -69,7 +80,7 @@ pub fn well_known(name: &str) -> Handle<Symbol> {
                     "Symbol.{name}"
                 )))))
             })
-            .clone()
+            .to_owned()
     })
 }
 

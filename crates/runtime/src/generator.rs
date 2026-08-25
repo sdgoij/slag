@@ -57,7 +57,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .get("%Object.prototype%")
         .and_then(|value| crate::context::as_object(&value));
     let proto = JsObject::ordinary_object_create(object_proto);
-    let proto_value = Value::Object(proto.clone());
+    let proto_value = Value::Object(proto);
     realm.intrinsics.define(GENERATOR_PROTO, proto_value);
     for (name, length) in [(NEXT, 1), (RETURN, 1), (THROW, 1)] {
         let method = Function::create_builtin(
@@ -76,7 +76,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         // another dispatches with its own realm current.
         realm.intrinsics.define(
             &format!("%Generator.prototype.{name}%"),
-            Value::Function(method.clone()),
+            Value::Function(method),
         );
         proto.define_property(
             &JsString::from_utf8(name),
@@ -185,18 +185,18 @@ pub fn call_generator(
         })?;
     let function_value = function.self_value();
     let function_env = crate::env::new_function_environment(
-        Some(data.environment.clone()),
+        Some(data.environment),
         function_value.clone(),
         Value::Undefined,
         data.this_mode == ThisMode::Lexical,
     );
     let context = ExecutionContext {
         function: Some(function_value.clone()),
-        realm: data.realm.clone(),
+        realm: data.realm,
         script_or_module: None,
-        lexical_environment: function_env.clone(),
-        variable_environment: function_env.clone(),
-        private_environment: data.private_environment.clone(),
+        lexical_environment: function_env,
+        variable_environment: function_env,
+        private_environment: data.private_environment,
         source: agent
             .running_context()
             .ok()
@@ -211,7 +211,7 @@ pub fn call_generator(
             let this = if data.this_mode == ThisMode::Sloppy {
                 match this.kind() {
                     ValueKind::Undefined | ValueKind::Null => {
-                        let global = agent.running_context()?.realm.global_object.clone();
+                        let global = agent.running_context()?.realm.global_object;
                         Value::Object(global)
                     }
                     ValueKind::Object(_) | ValueKind::Function(_) => this,
@@ -246,14 +246,14 @@ pub fn call_generator(
         .last()
         .cloned()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no context to capture".into()))?;
-    let body_env = instantiated_context.lexical_environment.clone();
+    let body_env = instantiated_context.lexical_environment;
     agent.execution_context_stack.pop();
 
     let proto_value = crate::context::get_property(
         agent,
-        &Value::Function(function.clone()),
+        &Value::Function(*function),
         &JsString::from_utf8("prototype"),
-        Value::Function(function.clone()),
+        Value::Function(*function),
     )?;
     // GetPrototypeFromConstructor (spec 9.1.14): a non-object
     // `prototype` (e.g. `g.prototype = null`) falls back to the
@@ -277,7 +277,7 @@ pub fn call_generator(
         }
     };
     let object = JsObject::ordinary_object_create(Some(proto));
-    let object_value = Value::Object(object.clone());
+    let object_value = Value::Object(object);
     agent.generators.insert(
         object.id(),
         Rc::new(RefCell::new(GeneratorState {
@@ -285,8 +285,8 @@ pub fn call_generator(
             vm: None,
             body: None,
             context: Some(instantiated_context),
-            function: Value::Function(function.clone()),
-            realm: data.realm.clone(),
+            function: Value::Function(*function),
+            realm: data.realm,
             body_env: Some(body_env),
         })),
     );
@@ -469,7 +469,6 @@ fn start_body(
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no saved context".into()))?;
     let body_env = state
         .body_env
-        .clone()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no instantiated environment".into()))?;
     let function_value = state.function.clone();
     let ValueKind::Function(function_handle) = function_value.kind() else {
@@ -598,7 +597,7 @@ fn finish_resume(
                 // spec 27.4.2.1 step 4.j: the generator body's `using` resources
                 // are disposed when the body completes (implicit or explicit
                 // return), even on an abrupt completion.
-                let env = state.vm.as_ref().map(|vm| vm.lexical_env.clone());
+                let env = state.vm.as_ref().map(|vm| vm.lexical_env);
                 state.vm = None;
                 let completion = match env {
                     Some(env) => crate::eval::dispose_env_resources(agent, &env, Ok(completion))?,

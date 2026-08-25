@@ -72,7 +72,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     // spec 20.1.3: %Object.prototype% is an immutable prototype exotic
     // object (9.4.7): its prototype is null and never changes.
     object_proto.mark_immutable_prototype();
-    let object_proto_value = Value::Object(object_proto.clone());
+    let object_proto_value = Value::Object(object_proto);
 
     let object_ctor = Function::create_builtin(
         Some(JsString::from_utf8("Object")),
@@ -81,7 +81,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         Some(Box::new(placeholder("Object"))),
         None,
     )?;
-    let object_ctor_value = Value::Function(object_ctor.clone());
+    let object_ctor_value = Value::Function(object_ctor);
 
     realm.intrinsics.define(OBJECT, object_ctor_value.clone());
     realm
@@ -148,9 +148,7 @@ fn define_method(
         None,
         None,
     )?;
-    realm
-        .intrinsics
-        .define(key, Value::Function(method.clone()));
+    realm.intrinsics.define(key, Value::Function(method));
     owner.define_property(
         &JsString::from_utf8(name),
         &PropertyDescriptor {
@@ -198,10 +196,10 @@ fn install_prototype_methods(realm: &Handle<Realm>, proto: &JsObject) -> Result<
     )?;
     realm
         .intrinsics
-        .define(PROTO_GET_PROTO, Value::Function(getter.clone()));
+        .define(PROTO_GET_PROTO, Value::Function(getter));
     realm
         .intrinsics
-        .define(PROTO_SET_PROTO, Value::Function(setter.clone()));
+        .define(PROTO_SET_PROTO, Value::Function(setter));
     proto.define_property(
         &JsString::from_utf8("__proto__"),
         &PropertyDescriptor {
@@ -667,7 +665,7 @@ pub fn dispatch_call(
             };
             let mut proto = candidate_obj.get_prototype_of()?;
             while let Some(p) = proto {
-                if Handle::ptr_eq(&p, &this_obj) {
+                if Handle::ptr_eq(p, this_obj) {
                     return Ok(Value::Boolean(true));
                 }
                 proto = p.get_prototype_of()?;
@@ -734,7 +732,7 @@ pub fn dispatch_call(
         return Some((|| {
             let proto_value = arg(args, 0);
             let proto = match proto_value.kind() {
-                ValueKind::Object(obj) => Some(obj.clone()),
+                ValueKind::Object(obj) => Some(obj),
                 ValueKind::Null => None,
                 _ => {
                     return Err(JsError::new(
@@ -1133,7 +1131,7 @@ fn set_prototype_of(
     }
     let proto = match proto_value.kind() {
         ValueKind::Object(obj) => Some(obj),
-        ValueKind::Function(f) => Some(f.object.clone()),
+        ValueKind::Function(f) => Some(f.object),
         ValueKind::Null => None,
         _ => {
             return Err(JsError::new(
@@ -1673,7 +1671,7 @@ mod tests {
             .create_data_property(&JsString::from_utf8("next"), Value::Function(next))
             .unwrap();
         let iterable = JsObject::ordinary_object_create(None);
-        let iterator_for_method = iterator.clone();
+        let iterator_for_method = iterator;
         iterable
             .define_property_key(
                 &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
@@ -1681,7 +1679,7 @@ mod tests {
                     Function::create_builtin(
                         Some(JsString::from_utf8("[Symbol.iterator]")),
                         0,
-                        Box::new(move |_, _| Ok(Value::Object(iterator_for_method.clone()))),
+                        Box::new(move |_, _| Ok(Value::Object(iterator_for_method))),
                         None,
                         None,
                     )
@@ -1689,7 +1687,7 @@ mod tests {
                 )),
             )
             .unwrap();
-        let global = agent.running_context().unwrap().realm.global_object.clone();
+        let global = agent.running_context().unwrap().realm.global_object;
         global
             .create_data_property(&JsString::from_utf8("iter"), Value::Object(iterable))
             .unwrap();

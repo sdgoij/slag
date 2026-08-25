@@ -105,8 +105,8 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .get("%Function%")
         .and_then(|value| as_object(&value));
     for kind in Kind::all() {
-        let proto = JsObject::ordinary_object_create(function_proto.clone());
-        let proto_value = Value::Object(proto.clone());
+        let proto = JsObject::ordinary_object_create(function_proto);
+        let proto_value = Value::Object(proto);
         let ctor = Function::create_builtin(
             Some(JsString::from_utf8(kind.name())),
             1,
@@ -114,7 +114,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             Some(Box::new(placeholder(kind.name()))),
             None,
         )?;
-        let ctor_value = Value::Function(ctor.clone());
+        let ctor_value = Value::Function(ctor);
         realm.intrinsics.define(kind.key(), ctor_value.clone());
         realm
             .intrinsics
@@ -196,7 +196,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             },
         )?;
         if let Some(function_ctor) = &function_ctor {
-            ctor.object.set_prototype_of(Some(function_ctor.clone()))?;
+            ctor.object.set_prototype_of(Some(*function_ctor))?;
         }
     }
     Ok(())

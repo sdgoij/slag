@@ -62,7 +62,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .get("%Object.prototype%")
         .and_then(|value| as_object(&value));
     let symbol_proto = JsObject::ordinary_object_create(object_proto);
-    let symbol_proto_value = Value::Object(symbol_proto.clone());
+    let symbol_proto_value = Value::Object(symbol_proto);
 
     // %Symbol% (20.4.1): non-constructible when called with new (the body
     // throws), but it still has a [[Construct]] internal method so
@@ -80,7 +80,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         })),
         None,
     )?;
-    let symbol_ctor_value = Value::Function(symbol_ctor.clone());
+    let symbol_ctor_value = Value::Function(symbol_ctor);
 
     realm.intrinsics.define(SYMBOL, symbol_ctor_value.clone());
     realm
@@ -131,7 +131,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         )?;
         realm
             .intrinsics
-            .define(key, Value::Function(method.clone()));
+            .define(key, Value::Function(method));
         symbol_ctor.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -159,7 +159,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         )?;
         realm
             .intrinsics
-            .define(key, Value::Function(method.clone()));
+            .define(key, Value::Function(method));
         symbol_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -183,7 +183,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm.intrinsics.define(
         PROTO_DESCRIPTION,
-        Value::Function(description_getter.clone()),
+        Value::Function(description_getter),
     );
     symbol_proto.define_property(
         &JsString::from_utf8("description"),
@@ -207,7 +207,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define(PROTO_TO_PRIMITIVE, Value::Function(to_primitive.clone()));
+        .define(PROTO_TO_PRIMITIVE, Value::Function(to_primitive));
     symbol_proto.define_property_key(
         &PropertyKey::Symbol(well_known("toPrimitive").as_ref().clone()),
         &PropertyDescriptor {

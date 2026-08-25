@@ -170,7 +170,7 @@ fn keyed_binding_initialization(
         BindingPattern::Ident(atom) => {
             let name = crux::lookup(*atom);
             match env {
-                Some(env) => Some(ResolvedTarget::Initialize(env.clone(), name)),
+                Some(env) => Some(ResolvedTarget::Initialize(*env, name)),
                 None => Some(ResolvedTarget::Reference(resolve_binding(
                     agent, &name, strict,
                 )?)),

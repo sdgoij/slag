@@ -60,13 +60,13 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         1,
         placeholder("Intl.Locale"),
         Some(placeholder_ctor("Intl.Locale")),
-        function_proto.clone(),
+        function_proto,
     )?;
     // Intl.Locale.prototype.constructor.
     locale_proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(Value::Function(locale_ctor.clone())),
+            value: Some(Value::Function(locale_ctor)),
             writable: Some(true),
             get: None,
             set: None,
@@ -87,9 +87,9 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
             *length,
             placeholder(name),
             None,
-            function_proto.clone(),
+            function_proto
         )?;
-        realm.intrinsics.define(key, Value::Function(func.clone()));
+        realm.intrinsics.define(key, Value::Function(func));
         locale_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -124,11 +124,11 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
             0,
             placeholder(name),
             None,
-            function_proto.clone(),
+            function_proto
         )?;
         realm
             .intrinsics
-            .define(key, Value::Function(getter.clone()));
+            .define(key, Value::Function(getter));
         locale_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -157,7 +157,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         },
     )?;
 
-    let locale_proto_value = Value::Object(locale_proto.clone());
+    let locale_proto_value = Value::Object(locale_proto);
     // MakeConstructor: %Intl.Locale%.prototype (the class-extends check and
     // GetPrototypeFromConstructor read it).
     locale_ctor.define_property(
@@ -174,7 +174,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
     realm.intrinsics.define(LOCALE_PROTO, locale_proto_value);
     realm
         .intrinsics
-        .define(LOCALE, Value::Function(locale_ctor.clone()));
+        .define(LOCALE, Value::Function(locale_ctor));
 
     // `Intl.Locale` on the %Intl% object (writable, non-enumerable,
     // configurable — a normal function property).

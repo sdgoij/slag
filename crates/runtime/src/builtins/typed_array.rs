@@ -178,7 +178,7 @@ fn is_typed_array(value: &Value) -> bool {
 fn typed_array_slots(value: &Value) -> Option<Handle<TypedArraySlots>> {
     match value.kind() {
         ValueKind::Object(obj) => match &obj.kind {
-            ObjectKind::IntegerIndexed(slots) => Some(slots.clone()),
+            ObjectKind::IntegerIndexed(slots) => Some(*slots),
             _ => None,
         },
         _ => None,
@@ -2145,7 +2145,7 @@ fn string_arg(args: &[Value]) -> Result<Handle<JsString>, JsError> {
     if let Some(value) = args.first()
         && let ValueKind::String(string) = value.kind()
     {
-        return Ok(string.clone());
+        return Ok(string);
     }
     Err(JsError::new(
         ErrorKind::TypeError,
@@ -2534,8 +2534,8 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .intrinsics
         .get("%Object.prototype%")
         .and_then(|value| as_object(&value));
-    let typed_array_proto = JsObject::ordinary_object_create(object_proto.clone());
-    let typed_array_proto_value = Value::Object(typed_array_proto.clone());
+    let typed_array_proto = JsObject::ordinary_object_create(object_proto);
+    let typed_array_proto_value = Value::Object(typed_array_proto);
 
     let typed_array_ctor = Function::create_builtin(
         Some(JsString::from_utf8("TypedArray")),
@@ -2544,7 +2544,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         Some(Box::new(placeholder("TypedArray"))),
         None,
     )?;
-    let typed_array_ctor_value = Value::Function(typed_array_ctor.clone());
+    let typed_array_ctor_value = Value::Function(typed_array_ctor);
     realm
         .intrinsics
         .define(TYPED_ARRAY, typed_array_ctor_value.clone());
@@ -2627,9 +2627,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func.clone()));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         typed_array_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -2695,13 +2693,13 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define(SPECIES, Value::Function(species_func.clone()));
+        .define(SPECIES, Value::Function(species_func));
     typed_array_proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone()),
         &PropertyDescriptor {
             value: None,
             writable: None,
-            get: Some(Value::Function(species_func.clone())),
+            get: Some(Value::Function(species_func)),
             set: Some(Value::Undefined),
             enumerable: Some(false),
             configurable: Some(true),
@@ -2736,9 +2734,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func.clone()));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         typed_array_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -2764,7 +2760,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define(GET_TO_STRING_TAG, Value::Function(tag_func.clone()));
+        .define(GET_TO_STRING_TAG, Value::Function(tag_func));
     typed_array_proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
         &PropertyDescriptor {
@@ -2786,9 +2782,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func.clone()));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         typed_array_ctor.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -2808,8 +2802,8 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         JsError::new(ErrorKind::TypeError, "%TypedArray% is not an object".into())
     })?;
     for kind in KINDS {
-        let kind_proto = JsObject::ordinary_object_create(Some(typed_array_proto.clone()));
-        let kind_proto_value = Value::Object(kind_proto.clone());
+        let kind_proto = JsObject::ordinary_object_create(Some(typed_array_proto));
+        let kind_proto_value = Value::Object(kind_proto);
         let ctor = Function::create_builtin(
             Some(JsString::from_utf8(kind.tag)),
             3,
@@ -2817,10 +2811,9 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             Some(Box::new(placeholder(kind.tag))),
             None,
         )?;
-        let ctor_value = Value::Function(ctor.clone());
+        let ctor_value = Value::Function(ctor);
         // spec 25.2.1: the kind constructors inherit %TypedArray%.
-        ctor.object
-            .set_prototype_of(Some(typed_array_object.clone()))?;
+        ctor.object.set_prototype_of(Some(typed_array_object))?;
         realm.intrinsics.define(kind.ctor, ctor_value.clone());
         realm
             .intrinsics
@@ -2930,9 +2923,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
                     None,
                     None,
                 )?;
-                realm
-                    .intrinsics
-                    .define(intrinsic, Value::Function(func.clone()));
+                realm.intrinsics.define(intrinsic, Value::Function(func));
                 ctor.define_property(
                     &JsString::from_utf8(name),
                     &PropertyDescriptor {
@@ -2972,9 +2963,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func.clone()));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         uint8_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {

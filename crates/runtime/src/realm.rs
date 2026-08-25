@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use crux::error::{ErrorKind, JsError};
 use crux::function::Function;
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::object::JsObject;
 use crux::property::PropertyDescriptor;
 use crux::string::JsString;
@@ -30,9 +31,20 @@ pub struct Realm {
         RefCell<std::collections::HashMap<JsString, Handle<crate::module::SourceTextModule>>>,
 }
 
+impl Trace for Realm {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.intrinsics.trace(visit);
+        self.global_object.trace(visit);
+        self.global_env.trace(visit);
+        for module in self.loaded_modules.borrow().values() {
+            module.trace(visit);
+        }
+    }
+}
+
 impl Realm {
     pub fn global_env(&self) -> EnvRef {
-        self.global_env.clone()
+        self.global_env
     }
 }
 
@@ -47,6 +59,17 @@ pub struct Intrinsics {
     /// literals (`ObjectBegin`) and constructor `this` fallbacks read it per
     /// object creation.
     object_prototype: RefCell<Option<Value>>,
+}
+
+impl Trace for Intrinsics {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        for value in self.entries.borrow().values() {
+            value.trace(visit);
+        }
+        if let Some(prototype) = &*self.object_prototype.borrow() {
+            prototype.trace(visit);
+        }
+    }
 }
 
 impl Intrinsics {
@@ -116,16 +139,16 @@ pub fn initialize_host_defined_realm(agent: &Agent) -> Result<Handle<Realm>, JsE
             .get("%Object.prototype%")
             .and_then(|v| as_object(&v)),
     );
-    let global_env = new_global_environment(global.clone(), global.clone());
+    let global_env = new_global_environment(global, global);
     let realm = Handle::new(Realm {
         agent_signifier: agent.signifier,
         intrinsics,
-        global_object: global.clone(),
+        global_object: global,
         global_env,
         loaded_modules: RefCell::new(std::collections::HashMap::new()),
     });
     set_default_global_bindings(&realm)?;
-    agent.realms.borrow_mut().push(realm.clone());
+    agent.realms.borrow_mut().push(realm);
     agent.realm_count.set(agent.realm_count.get() + 1);
     Ok(realm)
 }
@@ -139,7 +162,7 @@ fn set_default_global_bindings(realm: &Handle<Realm>) -> Result<(), JsError> {
     global.define_property_or_throw(
         &JsString::from_utf8("globalThis"),
         &PropertyDescriptor {
-            value: Some(Value::Object(global.clone())),
+            value: Some(Value::Object(*global)),
             writable: Some(true),
             get: None,
             set: None,
@@ -181,7 +204,7 @@ fn set_default_global_bindings(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     realm
         .intrinsics
-        .define("%eval%", Value::Function(eval_func.clone()));
+        .define("%eval%", Value::Function(eval_func));
     global.define_property_or_throw(
         &JsString::from_utf8("eval"),
         &PropertyDescriptor {
@@ -256,7 +279,7 @@ fn set_default_global_bindings(realm: &Handle<Realm>) -> Result<(), JsError> {
                 .get(name)
                 .and_then(|value| as_object(&value))
             {
-                proto.set_prototype_of(Some(iterator_proto.clone()))?;
+                proto.set_prototype_of(Some(iterator_proto))?;
             }
         }
     }
@@ -279,7 +302,7 @@ fn set_default_global_bindings(realm: &Handle<Realm>) -> Result<(), JsError> {
                 && let Some(object) = function.object.handle()
                 && object.get_prototype_of()?.is_none()
             {
-                object.set_prototype_of(Some(function_proto.clone()))?;
+                object.set_prototype_of(Some(function_proto))?;
             }
         }
     }
@@ -309,7 +332,7 @@ mod tests {
         // globalThis points back at the global object...
         assert_eq!(
             global.get(&JsString::from_utf8("globalThis")).unwrap(),
-            Value::Object(global.clone())
+            Value::Object(*global)
         );
         // ...and the non-configurable value properties exist.
         assert_eq!(
@@ -333,7 +356,7 @@ mod tests {
         // The global environment is reachable and supplies `this`.
         assert_eq!(
             realm.global_env.get_this_binding().unwrap(),
-            Value::Object(global.clone())
+            Value::Object(*global)
         );
         // Binding an identifier through the global env works end to end.
         realm
