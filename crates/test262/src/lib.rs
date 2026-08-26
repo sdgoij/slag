@@ -10909,7 +10909,6 @@ var $DONE = function (error) {
         }
         let skip_harness = fm.flags.iter().any(|f| f == "__debug_skip_harness");
         let mut agent = Agent::new();
-        agent.set_gc_stress(GC_STRESS.with(|stress| stress.get()));
         // `CanBlockIsTrue` fixtures (and the atomicsHelper ones, whose
         // safeBroadcast exercises `Atomics.wait` on the main thread) assume
         // [[CanBlock]] = true: the main agent may suspend.
@@ -10921,6 +10920,7 @@ var $DONE = function (error) {
         agent
             .initialize_host_defined_realm()
             .map_err(|e| e.message)?;
+        agent.set_gc_stress(GC_STRESS.with(|stress| stress.get()));
         install_harness_globals(&agent)?;
         // The preludes need to call user-level functions (assert.throws runs
         // `func`, compareArray reads properties, $262.detachArrayBuffer calls
@@ -11087,7 +11087,6 @@ var $DONE = function (error) {
         }
         let skip_harness = fm.flags.iter().any(|f| f == "__debug_skip_harness");
         let mut agent = Agent::new();
-        agent.set_gc_stress(GC_STRESS.with(|stress| stress.get()));
         if fm.flags.iter().any(|f| f == "CanBlockIsTrue")
             || fm.includes.iter().any(|i| i == "atomicsHelper.js")
         {
@@ -11096,6 +11095,7 @@ var $DONE = function (error) {
         agent
             .initialize_host_defined_realm()
             .map_err(|e| e.message)?;
+        agent.set_gc_stress(GC_STRESS.with(|stress| stress.get()));
         install_harness_globals(&agent)?;
         agent
             .run_script(ASSERT_THROWS_PRELUDE)

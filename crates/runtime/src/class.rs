@@ -25,6 +25,22 @@ use crate::function::{
 };
 use crate::ir::has_computed_public_name;
 
+/// GC-2: marks the `--gc-stress` build-in-progress window (see
+/// `Agent::build_roots`); dropping it restores the flag. Holds a raw agent
+/// pointer so it does not conflict with the `&mut Agent` the build needs.
+struct BuildRootsGuard(*const Agent);
+impl BuildRootsGuard {
+    fn new(agent: &Agent) -> Self {
+        agent.build_roots.set(true);
+        BuildRootsGuard(agent as *const Agent)
+    }
+}
+impl Drop for BuildRootsGuard {
+    fn drop(&mut self) {
+        unsafe { (&*self.0).build_roots.set(false) };
+    }
+}
+
 /// ClassDefinitionEvaluation (spec 15.7.14). `class_binding` is the class
 /// name for declarations (bound in the class scope AND returned for the
 /// caller to initialize the outer binding) or named class expressions.
@@ -361,6 +377,13 @@ fn build_class(
     // the prototype, static methods on the constructor, instance fields
     // collected into [[Fields]], static fields/blocks collected for the
     // post-binding evaluation pass (steps 41-44).
+    // GC-2: the build accumulates handle-bearing values (private-method
+    // closures, field/static-element keys) in the local Vecs below, which
+    // the conservative stack scan cannot see; the `build_roots` flag makes
+    // any `--gc-stress` collection that fires during the element evaluation
+    // abort (retain everything), so the half-built buffers cannot be swept
+    // out from under the final record assignment.
+    let _build_roots = BuildRootsGuard::new(agent);
     let mut fields = Vec::new();
     let mut instance_private_methods = Vec::new();
     let mut static_elements: Vec<StaticElement> = Vec::new();

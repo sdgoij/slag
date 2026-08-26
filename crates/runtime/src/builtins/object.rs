@@ -434,24 +434,39 @@ fn own_keys_of(agent: &mut Agent, value: &Value, want_symbols: bool) -> Result<V
     // A deferred namespace's ownKeys triggers its module's evaluation
     // (import-defer [[OwnPropertyKeys]]).
     crate::module::ensure_deferred_namespace_evaluation(agent, &obj)?;
-    let mut keys = Vec::new();
-    for key in obj.own_property_keys()? {
+    let keys = obj.own_property_keys()?;
+    let count = keys
+        .iter()
+        .filter(|key| {
+            matches!(
+                (key, want_symbols),
+                (PropertyKey::String(_), false) | (PropertyKey::Symbol(_), true)
+            )
+        })
+        .count();
+    // GC-2: define each element on the array as it is boxed — collecting
+    // the `Value`s in a local Vec would leave the earlier boxes in a heap
+    // buffer the conservative stack scan cannot see, and the next
+    // `Handle::new` (per-allocation `--gc-stress`) would sweep them (the
+    // array handle is a stack local, so the scan roots it and its property
+    // vector keeps the defined elements).
+    let array = crate::builtins::array::array_create(agent, count as f64)?;
+    let mut index: u64 = 0;
+    for key in keys {
         let matches = matches!(
             (&key, want_symbols),
             (PropertyKey::String(_), false) | (PropertyKey::Symbol(_), true)
         );
         if matches {
             let value = match key {
-                PropertyKey::String(id) => {
-                    let text = crux::lookup(id);
-                    Value::String(Handle::new(text))
-                }
+                PropertyKey::String(id) => Value::String(Handle::new(crux::lookup(id))),
                 PropertyKey::Symbol(sym) => Value::Symbol(Handle::new(sym)),
             };
-            keys.push(value);
+            array.create_data_property(&JsString::from_utf8(&index.to_string()), value)?;
+            index += 1;
         }
     }
-    array_of(agent, &keys)
+    Ok(Value::Object(array))
 }
 
 /// Object.freeze/Object.seal (spec 20.1.2.7 / 20.1.2.20): a primitive

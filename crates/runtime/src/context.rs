@@ -34,6 +34,23 @@ pub fn current_agent_mut() -> Result<&'static mut Agent, JsError> {
     Ok(unsafe { &mut *(agent as *mut Agent) })
 }
 
+/// The current agent, immutably (GC-2): the `--gc-stress` collector reads
+/// the agent's roots through this instead of `current_agent_mut`, because a
+/// per-allocation collection fires inside code that already holds `&mut
+/// Agent` — a second mutable borrow through the TLS pointer would alias it.
+pub fn current_agent() -> Result<&'static Agent, JsError> {
+    let agent = crux::function::current_agent();
+    if agent.is_null() {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "host global called outside an agent window".into(),
+        ));
+    }
+    // SAFETY: `with_agent` guarantees a live agent for the duration of the
+    // enclosing call; the stress collector only reads its roots.
+    Ok(unsafe { &*(agent as *const Agent) })
+}
+
 /// GetFunctionRealm (spec 10.2.6): the realm the function object was
 /// created in — the creation realm for ECMAScript functions, the owning
 /// realm for builtins, recursing through bound functions and proxy targets

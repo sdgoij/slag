@@ -1878,6 +1878,54 @@ struct ActiveRun {
 thread_local! {
     static ACTIVE_RUNS: std::cell::RefCell<Vec<ActiveRun>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// A body is being compiled: the compiler's `steps` Vec is the only
+    /// reference to the literal `Value`s it embeds, and it is a heap buffer
+    /// the stack scan cannot see — a mid-compile stress collection would
+    /// sweep them. The compiled body becomes a root once the run starts.
+    static COMPILING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// GC-2: a window where a local `Vec<Value>` holds unrooted handles
+    /// across a collection (the tail-call argument copy — the instantiation
+    /// that follows allocates). Collections are suppressed (retain
+    /// everything) for the window's duration.
+    static SUPPRESS_STRESS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether a body is currently being compiled (GC-2): the `--gc-stress`
+/// collector skips allocations inside the compile so the constants a
+/// half-built body holds are not swept.
+pub(crate) fn is_compiling() -> bool {
+    COMPILING.with(|compiling| compiling.get())
+        || SUPPRESS_STRESS.with(|suppress| suppress.get() > 0)
+}
+
+/// RAII: suppress `--gc-stress` collections for the duration of a window
+/// where unrooted handles sit in local heap buffers (the tail-call
+/// argument Vec). Nests with the compile guard via the counter.
+pub(crate) struct StressSuppress;
+impl StressSuppress {
+    pub(crate) fn new() -> Self {
+        SUPPRESS_STRESS.with(|suppress| suppress.set(suppress.get() + 1));
+        StressSuppress
+    }
+}
+impl Drop for StressSuppress {
+    fn drop(&mut self) {
+        SUPPRESS_STRESS.with(|suppress| suppress.set(suppress.get() - 1));
+    }
+}
+
+/// RAII: suppress `--gc-stress` collections for the duration of a compile.
+struct CompilingGuard;
+impl CompilingGuard {
+    fn new() -> Self {
+        COMPILING.with(|compiling| compiling.set(true));
+        CompilingGuard
+    }
+}
+impl Drop for CompilingGuard {
+    fn drop(&mut self) {
+        COMPILING.with(|compiling| compiling.set(false));
+    }
 }
 
 /// Trace every Vm currently running a body and its compiled body (GC-2
@@ -4558,6 +4606,11 @@ impl Vm {
                             "SuperCall without an argument boundary".into(),
                         )
                     })?;
+                    // GC-2: the argument copy below is a local `Vec<Value>`
+                    // the stack scan cannot see, and the super constructor's
+                    // setup allocates — suppress `--gc-stress` for the window
+                    // (see the `Call` step).
+                    let _stress = StressSuppress::new();
                     let args = self.args.split_off(base);
                     let new_target = get_new_target(agent)?;
                     let super_ctor = get_super_constructor(agent)?;
@@ -4582,15 +4635,13 @@ impl Vm {
                             "Construct without an argument boundary".into(),
                         )
                     })?;
-                    let args = self.args.split_off(base);
-                    // Cut 25: inline a certified base-constructor leaf the
-                    // way `do_call_fast` inlines a leaf call — the certified
-                    // construct path's checks (base kind, no fields/private
-                    // methods) gate it, plus the same clean-site/single-realm
-                    // guard. Cut 35 slice 15: the record comes from the
-                    // shared leaf cache (the construct-inline verdict rides
-                    // along), skipping the `ecma_functions` HashMap lookup
-                    // the construct path paid per construct.
+                    // GC-2: the general construct path copies its arguments
+                    // into a local Vec (the leaf path's frame copies them
+                    // before any collection, so it can split freely); the
+                    // copy is unrooted while the construct machinery (env
+                    // records, the capture context, a rest binding's
+                    // `array_from_values`) allocates, so `--gc-stress` is
+                    // suppressed for the window.
                     let result = if self.can_inline_leaf()
                         && let ValueKind::Function(function) = callee.kind()
                         && matches!(function.kind, crux::function::FunctionKind::EcmaScript)
@@ -4601,6 +4652,7 @@ impl Vm {
                         // cached at ir-compile time.
                         && entry.construct_inline
                     {
+                        let args = self.args.split_off(base);
                         let ir = entry.ir.clone();
                         let strict = entry.strict;
                         // Cut 30: clone the callee's env only for a leaf
@@ -4612,6 +4664,8 @@ impl Vm {
                         };
                         self.run_leaf_construct(agent, &ir, environment, strict, &callee, &args)?
                     } else {
+                        let _stress = StressSuppress::new();
+                        let args = self.args.split_off(base);
                         crate::function::construct(agent, &callee, &args, &callee)?
                     };
                     self.stack.push(result);
@@ -4625,6 +4679,10 @@ impl Vm {
                             "TaggedTemplate without an argument boundary".into(),
                         )
                     })?;
+                    // GC-2: the substitution Vec is unrooted while the tag
+                    // invocation allocates — suppress `--gc-stress` for the
+                    // window (see the tail-call dispatch).
+                    let _stress = StressSuppress::new();
                     let substitutions = self.args.split_off(base);
                     let value = tagged_template(agent, this, tag, template, substitutions)?;
                     self.stack.push(value);
@@ -4638,7 +4696,10 @@ impl Vm {
                             "TailTaggedTemplate without an argument boundary".into(),
                         )
                     })?;
-                    let substitutions = self.args.split_off(base);
+                    // GC-2: borrow the substitutions from the traced
+                    // `self.args` (see the `Construct` step) — the template
+                    // object creation below allocates.
+                    let substitutions = &self.args[base..];
                     // The tag invocation is the tail call: build the
                     // template object + substitution arguments, lay them out
                     // as a fast-form call, and let the shared dispatcher
@@ -4646,7 +4707,7 @@ impl Vm {
                     // return.
                     let template_object = crate::expr::get_template_object(agent, template)?;
                     let mut args = vec![template_object];
-                    args.extend(substitutions);
+                    args.extend_from_slice(substitutions);
                     let argc = args.len();
                     let keep = self.stack.len();
                     self.stack.push(this.clone());
@@ -6715,6 +6776,12 @@ impl Vm {
                 "Call without an argument boundary".into(),
             )
         })?;
+        // GC-2: the argument copy below is a local `Vec<Value>` the stack
+        // scan cannot see, and the callee setup that follows (declaration
+        // instantiation, a rest binding's `array_from_values`) allocates —
+        // suppress `--gc-stress` collections for the window so the copy
+        // cannot be swept out from under the callee.
+        let _stress = StressSuppress::new();
         let args = self.args.split_off(base);
         if is_eval_function(agent, &callee)? {
             let source = args.first().cloned().unwrap_or(Value::Undefined);
@@ -7718,6 +7785,12 @@ impl Vm {
         // async, generator, class constructor, proxy, cross-realm) takes the
         // normal call path — which does not recurse into `run_inner` for the
         // tail call itself — and completes the return.
+        // GC-2: the argument copy below is a local `Vec<Value>` the stack
+        // scan cannot see, and the callee setup that follows (declaration
+        // instantiation, the rest binding's `array_from_values`) allocates —
+        // suppress `--gc-stress` collections for the window so the copy
+        // cannot be swept out from under the callee.
+        let _stress = StressSuppress::new();
         let args: Vec<Value> = self.stack[args_base..self.stack.len()].to_vec();
         if let ValueKind::Function(function) = callee.kind()
             && matches!(function.kind, crux::function::FunctionKind::EcmaScript)
@@ -15102,6 +15175,7 @@ fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
 
 /// Compile a function body for resumable execution.
 pub fn compile_body(function: &EcmaFunction) -> Result<CompiledBody, JsError> {
+    let _guard = CompilingGuard::new();
     let scope = analyze_scope(function);
     let mut compiler = Compiler {
         is_async_generator: function.is_generator && function.is_async,
@@ -15211,6 +15285,7 @@ pub fn compile_statements(
     strict: bool,
     fast_script: bool,
 ) -> Result<CompiledBody, JsError> {
+    let _guard = CompilingGuard::new();
     let (slots, script_globals, script_assigned) = if fast_script {
         match analyze_script_scope(stmts) {
             Some((slots, globals, assigned)) => (slots, Some(globals), Some(assigned)),

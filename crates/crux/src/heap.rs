@@ -316,7 +316,7 @@ thread_local! {
 
 /// Record that a traced `RefCell` was borrowed during marking; the sweep
 /// must be aborted.
-pub(crate) fn note_aborted_trace() {
+pub fn note_aborted_trace() {
     ABORT_SWEEP.with(|abort| abort.set(true));
 }
 

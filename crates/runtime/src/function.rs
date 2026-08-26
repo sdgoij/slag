@@ -759,9 +759,13 @@ fn register_function(
         per_iteration_chain: Vec::new(),
     };
     // Every body compiles to the step IR; the VM executes ordinary bodies
-    // the same way it runs the resumable kinds.
-    data.set_compiled(std::rc::Rc::new(crate::ir::compile_body(&data)?));
+    // the same way it runs the resumable kinds. The Function is created
+    // before the compile: `Function::new` fires a `--gc-stress` collection,
+    // and the compiled body's literal `Value`s are only rooted once the
+    // record lands in `ecma_functions` — a collection in that window would
+    // sweep them (GC-2).
     let function = Function::new(name.clone());
+    data.set_compiled(std::rc::Rc::new(crate::ir::compile_body(&data)?));
     agent.ecma_functions.insert(function.id(), data);
     set_function_properties(&function, &params, name.as_ref())?;
     // AddRestrictedFunctionProperties (spec 10.2.1): sloppy ordinary
@@ -1053,8 +1057,11 @@ pub fn instantiate_arrow(
         outer_chain,
         per_iteration_chain,
     };
-    data.set_compiled(std::rc::Rc::new(crate::ir::compile_body(&data)?));
+    // The Function is created before the compile so a `--gc-stress`
+    // collection at `Function::new` cannot sweep the compiled body's literal
+    // `Value`s while they are unrooted (GC-2, see `register_function`).
     let function = Function::new(None);
+    data.set_compiled(std::rc::Rc::new(crate::ir::compile_body(&data)?));
     let params = data.params.clone();
     agent.ecma_functions.insert(function.id(), data);
     set_function_properties(&function, &params, None)?;

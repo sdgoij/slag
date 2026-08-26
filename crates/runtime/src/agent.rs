@@ -195,6 +195,12 @@ pub struct Agent {
     /// [[KeptAlive]]: objects/symbols kept alive until the end of the
     /// current Job (WeakRef, Phase 13).
     pub kept_alive: Vec<Value>,
+    /// GC-2: a build-in-progress flag — native code accumulating
+    /// handle-bearing values in local buffers (the class element build) sets
+    /// it for the window; a `--gc-stress` collection that fires inside then
+    /// aborts (retain everything), so the half-built buffers cannot be swept
+    /// out from under the final record assignment.
+    pub build_roots: std::cell::Cell<bool>,
     /// [[GlobalSymbolRegistry]]: `Symbol.for` entries (Phase 8).
     pub global_symbol_registry: RefCell<Vec<(JsString, Symbol)>>,
     /// [[ModuleAsyncEvaluationCount]]: module linking (Phase 7).
@@ -571,6 +577,7 @@ impl Agent {
                 is_lock_free_for_size(8),
             ],
             kept_alive: Vec::new(),
+            build_roots: std::cell::Cell::new(false),
             global_symbol_registry: RefCell::new(Vec::new()),
             module_async_evaluation_count: 0,
             module_eval_stack: Vec::new(),
@@ -1025,14 +1032,21 @@ impl Agent {
     /// GC-1 slice 3: gather the precise roots and mark-sweep with the
     /// conservative native-stack scan. Must run at a quiescent point (no
     /// job closures in flight, no active RefCell borrows on the traced
-    /// tables).
-    pub fn collect_garbage(&mut self) {
+    /// tables). Takes `&self` so the `--gc-stress` collector can run it from
+    /// inside code that already holds `&mut Agent` without aliasing it.
+    pub fn collect_garbage(&self) {
         self.collect_garbage_with(None);
     }
 
     /// [`Agent::collect_garbage`] with an extra root: the fresh box of the
     /// allocation that triggered a `--gc-stress` collection (GC-2).
-    pub fn collect_garbage_with(&mut self, extra: Option<GcAny>) {
+    pub fn collect_garbage_with(&self, extra: Option<GcAny>) {
+        // GC-2: a native build in progress (the class element build holds
+        // `build_roots`) — abort the sweep (retain everything) so its local
+        // buffers cannot be swept.
+        if self.build_roots.get() {
+            crux::heap::note_aborted_trace();
+        }
         let mut roots: Vec<GcAny> = Vec::new();
         if let Some(extra) = extra {
             roots.push(extra);
@@ -1064,7 +1078,9 @@ impl Agent {
             // the fresh box; outside an agent window (realm bootstrap) it
             // is a no-op.
             crux::heap::enable_stress_collector(Box::new(|fresh| {
-                if let Ok(agent) = crate::context::current_agent_mut() {
+                if let Ok(agent) = crate::context::current_agent()
+                    && !crate::ir::is_compiling()
+                {
                     agent.collect_garbage_with(Some(fresh));
                 }
             }));
