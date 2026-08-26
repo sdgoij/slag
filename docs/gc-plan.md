@@ -397,27 +397,39 @@ thread-local allocation budget (`Gc::new` bumps a counter; loop back-edges —
 the fused `FastLoopHead` and backward `Step::Jump` — do one TLS read +
 compare) calls `Agent::maybe_collect` when the budget is exceeded, so a
 loop's garbage is reclaimed incrementally instead of in one script-boundary
-sweep. Measured on the same machine: construct churn 74→65.7ms (−11%),
-string concat 20.7→22.3ms (+1.6ms — the check + counter overhead; a concat
-rope is all live, so there is nothing to reclaim), and the six machinery
-rows unchanged (the back-edge check is invisible when a loop never
-allocates). A collection that swept nothing disables mid-loop collections
-until the next script boundary (a growing live set would otherwise be
-re-marked every budget crossing), and the budget resets at script/job
-boundaries so it never drifts across scripts. The new collection point
-surfaced one test-helper rooting gap (the `iterable()` helper's `next`
-closure captured a plain `Vec<Value>` — opaque to tracing, now rooted
-through a holder object on the iterator); the engine itself is clean
+sweep. Measured on the same machine: construct churn 74→62.9ms (−15%),
+string concat 20.7→20.0ms (back to baseline — the check + counter
+overhead is recovered by the collection-side cuts below), and the six
+machinery rows unchanged (the back-edge check is invisible when a loop
+never allocates). A collection that swept nothing disables mid-loop
+collections until the next script boundary (a growing live set would
+otherwise be re-marked every budget crossing), and the budget resets at
+script/job boundaries so it never drifts across scripts. The new collection
+point surfaced one test-helper rooting gap (the `iterable()` helper's
+`next` closure captured a plain `Vec<Value>` — opaque to tracing, now
+rooted through a holder object on the iterator); the engine itself is clean
 (WeakRef 29/29, FinalizationRegistry 47/47, and a 134-fixture `language`
 sample pass under `--gc-stress`).
 
+The remaining collection-side costs were then cut: the conservative stack
+scan now pre-filters each word against the live boxes' address range
+(tracked by `register` and refreshed by the sweep — most stack words are
+not box addresses, so two compares replace a HashMap lookup per word), and
+the address maps (`by_addr` and the precise dead set) switched from
+SipHash to FxHash (addresses are word-aligned and not attacker-controlled).
+A `Gc::new` vs `Rc::new` microbenchmark confirmed the registration path is
+already near its floor (~11ns/alloc of TLS + borrow + push), so the box
+itself is not the remaining lever; the mid-loop and boundary sweeps were.
+
 Gate status: the plan's predicted 2–4x on allocation-bound code is **not
 met** — per-iteration/closure rows yes, construct/string rows no (construct
-is now 1.8x vs the Rc model after the safe-point work, concat 2.1x). The
-remaining lever is the plan's original slot-arena design (bump/segment
-allocation + a per-size free list instead of one malloc per box), which
-removes both the per-box malloc and the sweep's allocator round-trips; it is
-deferred as a follow-up.
+is now 1.75x vs the Rc model after the safe-point + collection-side work,
+concat ~1.9x). The remaining lever is the plan's original slot-arena
+design (bump/segment allocation + a per-size free list instead of one
+malloc per box), which removes both the per-box malloc and the sweep's
+allocator round-trips; it is deferred as a follow-up (note the free-list
+half measured net-neutral, so the arena alone is unlikely to close the
+remaining gap).
 
 **Bonus fix (GC-4 machinery, found while measuring):** the FinalizationRegistry
 cleanup job's closure region was wrong. `Job::new` computed it via

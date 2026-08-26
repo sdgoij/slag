@@ -303,7 +303,43 @@ impl<T: Default> Default for GcCell<T> {
 /// The thread-local mark-sweep heap.
 pub struct Heap {
     live: Vec<*mut GcBox<dyn Trace>>,
+    /// Address range of the registered boxes, refreshed by the sweep (GC-5):
+    /// the stack scan pre-filter skips words outside it — most stack words
+    /// are not box addresses, and two compares are far cheaper than a
+    /// HashMap lookup per word.
+    live_min: usize,
+    live_max: usize,
 }
+
+/// A fast non-cryptographic hasher for the box-address maps (GC-5): the
+/// addresses are word-aligned and not attacker-controlled, so SipHash's
+/// collision resistance is wasted cost on every collection's `by_addr`
+/// build and the precise dead set.
+#[derive(Default)]
+struct FxHasher(u64);
+
+impl std::hash::Hasher for FxHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 =
+                (self.0.rotate_left(5) ^ u64::from(byte)).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        }
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type AddrMap = std::collections::HashMap<
+    usize,
+    *mut GcBox<dyn Trace>,
+    std::hash::BuildHasherDefault<FxHasher>,
+>;
+
+type AddrSet = std::collections::HashSet<usize, std::hash::BuildHasherDefault<FxHasher>>;
 
 thread_local! {
     static HEAP: RefCell<Heap> = const { RefCell::new(Heap::new()) };
@@ -452,7 +488,7 @@ fn maybe_stress_collect(fresh: GcAny) {
 pub fn scan_regions(regions: &[(*const u8, usize)], visit: &mut dyn FnMut(GcAny)) {
     HEAP.with(|heap| {
         let heap = heap.borrow();
-        let by_addr: HashMap<usize, *mut GcBox<dyn Trace>> = heap
+        let by_addr: AddrMap = heap
             .live
             .iter()
             .map(|ptr| (*ptr as *const u8 as usize, *ptr))
@@ -495,7 +531,11 @@ impl Default for Heap {
 
 impl Heap {
     pub const fn new() -> Heap {
-        Heap { live: Vec::new() }
+        Heap {
+            live: Vec::new(),
+            live_min: 0,
+            live_max: 0,
+        }
     }
 
     /// Number of live boxes (for the leak-detection harness).
@@ -504,6 +544,13 @@ impl Heap {
     }
 
     fn register(&mut self, boxed: *mut GcBox<dyn Trace>) {
+        let addr = boxed as *const u8 as usize;
+        if addr < self.live_min {
+            self.live_min = addr;
+        }
+        if addr > self.live_max {
+            self.live_max = addr;
+        }
         self.live.push(boxed);
     }
 
@@ -618,12 +665,12 @@ impl Heap {
     ) -> Vec<usize> {
         // Address → fat pointer: the scan recovers a box address from a
         // stack word and needs the `dyn Trace` vtable to mark through it.
-        let by_addr: HashMap<usize, *mut GcBox<dyn Trace>> = self
+        let by_addr: AddrMap = self
             .live
             .iter()
             .map(|ptr| (*ptr as *const u8 as usize, *ptr))
             .collect();
-        let sp = &by_addr as *const HashMap<usize, *mut GcBox<dyn Trace>> as usize;
+        let sp = &by_addr as *const AddrMap as usize;
         let mut work: Vec<GcAny> = roots.to_vec();
         if let Some((_low, high)) = stack_bounds()
             && high > sp
@@ -657,52 +704,51 @@ impl Heap {
         // heap reachability (plus the ephemeron fixpoint), never from stale
         // stack words. The ephemeron edges registered while tracing the
         // roots flow through to the conservative pass below.
-        let precise_marked: Option<std::collections::HashSet<usize>> =
-            if precise && work.len() > precise_roots.len() {
-                let mut marked = std::collections::HashSet::new();
-                let mut pwork: Vec<GcAny> = precise_roots.to_vec();
+        let precise_marked: Option<AddrSet> = if precise && work.len() > precise_roots.len() {
+            let mut marked = AddrSet::default();
+            let mut pwork: Vec<GcAny> = precise_roots.to_vec();
+            while let Some(any) = pwork.pop() {
+                let addr = any.addr();
+                if !marked.insert(addr) {
+                    continue;
+                }
+                // SAFETY: `any` is a registered box (a precise root);
+                // the mark set breaks cycles.
+                unsafe {
+                    (*any.0).data.trace(&mut |child| pwork.push(child));
+                }
+            }
+            loop {
+                let mut promoted = false;
+                let edges = EPHEMERONS.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+                for (key, value) in edges {
+                    let key_marked = marked.contains(&key.addr());
+                    let value_marked = marked.contains(&value.addr());
+                    if key_marked && !value_marked {
+                        pwork.push(value);
+                        promoted = true;
+                    }
+                    EPHEMERONS.with(|slot| slot.borrow_mut().push((key, value)));
+                }
+                if !promoted {
+                    break;
+                }
                 while let Some(any) = pwork.pop() {
                     let addr = any.addr();
                     if !marked.insert(addr) {
                         continue;
                     }
-                    // SAFETY: `any` is a registered box (a precise root);
-                    // the mark set breaks cycles.
+                    // SAFETY: as above; the promoted value is a
+                    // registered box.
                     unsafe {
                         (*any.0).data.trace(&mut |child| pwork.push(child));
                     }
                 }
-                loop {
-                    let mut promoted = false;
-                    let edges = EPHEMERONS.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
-                    for (key, value) in edges {
-                        let key_marked = marked.contains(&key.addr());
-                        let value_marked = marked.contains(&value.addr());
-                        if key_marked && !value_marked {
-                            pwork.push(value);
-                            promoted = true;
-                        }
-                        EPHEMERONS.with(|slot| slot.borrow_mut().push((key, value)));
-                    }
-                    if !promoted {
-                        break;
-                    }
-                    while let Some(any) = pwork.pop() {
-                        let addr = any.addr();
-                        if !marked.insert(addr) {
-                            continue;
-                        }
-                        // SAFETY: as above; the promoted value is a
-                        // registered box.
-                        unsafe {
-                            (*any.0).data.trace(&mut |child| pwork.push(child));
-                        }
-                    }
-                }
-                Some(marked)
-            } else {
-                None
-            };
+            }
+            Some(marked)
+        } else {
+            None
+        };
         // SAFETY: every `GcAny` in `work` is a registered box (a root from a
         // live `Gc<T>`'s `Trace` impl, or an address the scan looked up in
         // the live set); the mark bit breaks cycles.
@@ -831,6 +877,8 @@ impl Heap {
         }
         let mut keep = Vec::with_capacity(self.live.len());
         let mut swept = Vec::new();
+        let mut new_min = usize::MAX;
+        let mut new_max = 0usize;
         for ptr in self.live.drain(..) {
             // SAFETY: every entry was registered by `Gc::new` and is a valid
             // box; unmarked boxes have no live handles (the rooting
@@ -838,6 +886,13 @@ impl Heap {
             unsafe {
                 if (*ptr).mark.get() {
                     (*ptr).mark.set(false);
+                    let addr = ptr as *const u8 as usize;
+                    if addr < new_min {
+                        new_min = addr;
+                    }
+                    if addr > new_max {
+                        new_max = addr;
+                    }
                     keep.push(ptr);
                 } else {
                     swept.push(ptr as *const u8 as usize);
@@ -846,6 +901,8 @@ impl Heap {
             }
         }
         self.live = keep;
+        self.live_min = if new_min == usize::MAX { 0 } else { new_min };
+        self.live_max = new_max;
         swept
     }
 
@@ -855,24 +912,26 @@ impl Heap {
     /// address can only be marked when it is a real box, so coincidental
     /// stack values at worst retain a reachable box (imprecise, never
     /// unsafe).
-    fn scan_stack(
-        &self,
-        sp: usize,
-        high: usize,
-        by_addr: &HashMap<usize, *mut GcBox<dyn Trace>>,
-        work: &mut Vec<GcAny>,
-    ) {
+    fn scan_stack(&self, sp: usize, high: usize, by_addr: &AddrMap, work: &mut Vec<GcAny>) {
+        // GC-5: most stack words are not box addresses — skip the HashMap
+        // lookups for words outside the live boxes' address range (tracked
+        // by register and refreshed by the sweep).
+        let live_low = self.live_min;
+        let live_high = self.live_max;
         let mut addr = sp;
         while addr < high {
             // SAFETY: `[sp, high)` is the current thread's committed stack
             // (platform stack_bounds guarantees readability); reads are
             // unaligned so the exact frame layout does not matter.
             let word = unsafe { std::ptr::read_unaligned::<usize>(addr as *const usize) };
-            if let Some(&ptr) = by_addr.get(&word) {
+            if (live_low..=live_high).contains(&word)
+                && let Some(&ptr) = by_addr.get(&word)
+            {
                 // SAFETY: `ptr` is a registered, live box; the scan only
                 // pushes boxes already in the live set.
                 work.push(GcAny(ptr));
             } else if let Some(box_addr) = crate::value::Value::encoded_box_address(word as u64)
+                && (live_low..=live_high).contains(&box_addr)
                 && let Some(&ptr) = by_addr.get(&box_addr)
             {
                 // SAFETY: `ptr` is a registered, live box decoded from a
