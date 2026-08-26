@@ -186,7 +186,10 @@ impl<T> GcCell<T> {
 
 impl<T: Trace> Trace for GcCell<T> {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
-        self.inner.borrow().trace(visit);
+        // `RefCell<T>`'s own trace skips the cell and aborts the sweep when
+        // it is mutably borrowed mid-collection (per-allocation
+        // `--gc-stress`), instead of panicking.
+        self.inner.trace(visit);
     }
 }
 

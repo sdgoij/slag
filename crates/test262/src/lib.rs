@@ -12686,6 +12686,21 @@ var $DONE = function (error) {
         assert!(result.is_ok());
     }
 
+    #[test]
+    fn debug_dynamic_import_fixture() {
+        set_gc_stress(true);
+        let Some(base) = fixture_root(Area::Builtins) else {
+            return;
+        };
+        let path = base.join("Atomics/waitAsync/undefined-for-timeout.js");
+        let source = std::fs::read_to_string(&path).unwrap();
+        let (fm, body) = parse_fixture(&source).unwrap();
+        let specifier = format!("./{}", path.file_name().unwrap().to_string_lossy());
+        let result = run_one(body, Mode::Sloppy, &fm, path.parent().unwrap(), &specifier);
+        eprintln!("RESULT: {result:?}");
+        assert!(result.is_ok());
+    }
+
     /// Directory pass-rate scanner: `cargo test -p test262 -- --ignored
     /// scan_builtins --nocapture` prints how much of each Phase 8 built-ins
     /// directory already passes, so the next batch of `test262_builtin_fixture!`

@@ -903,12 +903,17 @@ fn split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
         let string_len = string.len();
         let out_length = (lim as usize).min(string_len);
         let head = substring(&string, 0, out_length);
-        let code_units: Vec<Value> = head
-            .as_slice()
-            .iter()
-            .map(|&u| Value::String(Handle::new(JsString::from_utf16(&[u]))))
-            .collect();
-        return crate::builtins::array::array_from_values(agent, &code_units);
+        // GC-2: define each freshly-boxed code unit on the result array as
+        // it is created (a local `Vec<Value>` would be unrooted across the
+        // boxings; see `array_from_list`).
+        let array = crate::builtins::array::array_create(agent, head.len() as f64)?;
+        for (index, &unit) in head.as_slice().iter().enumerate() {
+            array.create_data_property(
+                &crux::string::JsString::from_utf8(&index.to_string()),
+                Value::String(Handle::new(JsString::from_utf16(&[unit]))),
+            )?;
+        }
+        return Ok(Value::Object(array));
     }
     if string.is_empty() {
         return array_from_list(agent, &[string]);
@@ -1449,11 +1454,20 @@ fn iter_result(value: Value, done: bool) -> Result<Value, JsError> {
 
 /// CreateArrayFromList of strings.
 fn array_from_list(agent: &mut Agent, items: &[JsString]) -> Result<Value, JsError> {
-    let values: Vec<Value> = items
-        .iter()
-        .map(|s| Value::String(Handle::new(s.clone())))
-        .collect();
-    crate::builtins::array::array_from_values(agent, &values)
+    // GC-2: define each freshly-boxed string on the result array as it is
+    // created — a local `Vec<Value>` of the boxes would sit in a heap
+    // buffer the stack scan cannot see across the boxings (each
+    // `Handle::new` fires a per-allocation stress collection). The array
+    // handle is a stack local, so the scan roots it and its property
+    // vector keeps the defined elements.
+    let array = crate::builtins::array::array_create(agent, items.len() as f64)?;
+    for (index, item) in items.iter().enumerate() {
+        array.create_data_property(
+            &crux::string::JsString::from_utf8(&index.to_string()),
+            Value::String(Handle::new(item.clone())),
+        )?;
+    }
+    Ok(Value::Object(array))
 }
 
 /// spec 22.1.3.17.1 GetSubstitution: the `$`-directive replacement template

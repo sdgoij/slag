@@ -638,6 +638,11 @@ fn move_stack(
         data.disposed = true;
         std::mem::take(&mut data.resources)
     };
+    // GC-2: the moved resources sit in a local Vec the stack scan cannot
+    // see while the new stack object is built — suppress `--gc-stress` so
+    // the resource methods cannot be swept before they land in the new
+    // stack's traced data.
+    let _stress = crate::ir::StressSuppress::new();
     let proto = agent
         .current_realm()?
         .intrinsics
@@ -666,6 +671,11 @@ fn dispose_resources(agent: &mut Agent, id: u64) -> Result<Option<Value>, JsErro
             .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not a stack".into()))?;
         data.borrow().resources.clone()
     };
+    // GC-2: the collected resources sit in a local Vec the stack scan cannot
+    // see while the next dispose call (user code) allocates — suppress
+    // `--gc-stress` for the loop so the not-yet-disposed entries cannot be
+    // swept.
+    let _stress = crate::ir::StressSuppress::new();
     let mut completion: Option<Value> = None;
     for resource in resources.iter().rev() {
         if resource.method == Value::Undefined {

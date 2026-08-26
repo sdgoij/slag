@@ -1016,6 +1016,12 @@ pub(crate) fn for_in_key_levels(
     agent: &mut Agent,
     rhs: &Value,
 ) -> Result<Vec<(usize, Value)>, JsError> {
+    // GC-2: the keys are freshly-boxed `Value::String` handles collected
+    // into a local Vec the conservative stack scan cannot see, and each
+    // `Handle::new` fires a per-allocation stress collection — suppress the
+    // window so the half-built Vec cannot be swept (the caller roots it once
+    // it lands in the Vm's `for_in_stack`).
+    let _stress = crate::ir::StressSuppress::new();
     for_in_key_levels_inner(agent, rhs)
 }
 
@@ -1156,6 +1162,11 @@ fn eval_for_in(
     let base_object = crate::context::as_object(&rhs);
     let keys = for_in_key_levels(agent, &rhs)?;
     let mut iteration_result = Value::Undefined;
+    // GC-2: the loop holds the keys Vec (a native heap buffer the stack
+    // scan cannot see) across the per-iteration binding and body evaluation,
+    // which allocate — suppress `--gc-stress` for the loop so the not-yet-
+    // consumed keys cannot be swept.
+    let _stress = crate::ir::StressSuppress::new();
     for (level, key) in keys {
         if let Some(base) = &base_object
             && !key_enumerable_at_level(base, level, &key)?

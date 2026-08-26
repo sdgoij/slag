@@ -36,9 +36,10 @@ impl Trace for Realm {
         self.intrinsics.trace(visit);
         self.global_object.trace(visit);
         self.global_env.trace(visit);
-        for module in self.loaded_modules.borrow().values() {
-            module.trace(visit);
-        }
+        // `loaded_modules` is a RefCell: `RefCell<T>`'s trace skips a cell
+        // that is mutably borrowed mid-collection (per-allocation
+        // `--gc-stress`) and aborts the sweep instead of panicking.
+        self.loaded_modules.trace(visit);
     }
 }
 
@@ -63,12 +64,11 @@ pub struct Intrinsics {
 
 impl Trace for Intrinsics {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
-        for value in self.entries.borrow().values() {
-            value.trace(visit);
-        }
-        if let Some(prototype) = &*self.object_prototype.borrow() {
-            prototype.trace(visit);
-        }
+        // The cells are RefCells: `RefCell<T>`'s trace skips a cell that is
+        // mutably borrowed mid-collection (per-allocation `--gc-stress`) and
+        // aborts the sweep instead of panicking.
+        self.entries.trace(visit);
+        self.object_prototype.trace(visit);
     }
 }
 

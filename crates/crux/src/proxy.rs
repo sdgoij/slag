@@ -55,12 +55,11 @@ pub struct ProxySlots {
 
 impl Trace for ProxySlots {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
-        if let Some(target) = &*self.target.borrow() {
-            target.trace(visit);
-        }
-        if let Some(handler) = &*self.handler.borrow() {
-            handler.trace(visit);
-        }
+        // The cells are RefCells: `RefCell<T>`'s trace skips a cell that is
+        // mutably borrowed mid-collection (per-allocation `--gc-stress`) and
+        // aborts the sweep instead of panicking.
+        self.target.trace(visit);
+        self.handler.trace(visit);
     }
 }
 
@@ -817,10 +816,7 @@ mod tests {
             .unwrap();
         // Omitting "x" violates the invariant.
         let empty = JsObject::array_create(None, 0.0).unwrap();
-        let proxy = proxy_of(
-            target,
-            trap_handler("ownKeys", Value::Object(empty)),
-        );
+        let proxy = proxy_of(target, trap_handler("ownKeys", Value::Object(empty)));
         assert!(proxy.own_property_keys().is_err());
         // Including it is fine.
         let arr = JsObject::array_create(None, 1.0).unwrap();

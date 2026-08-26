@@ -703,6 +703,11 @@ fn symbol_match(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
         flags.as_slice().contains(&(b'u' as u16)) || flags.as_slice().contains(&(b'v' as u16));
     let this_obj = as_object(this).unwrap();
     this_obj.set(&JsString::from_utf8("lastIndex"), Value::Number(0.0), true)?;
+    // GC-2: the freshly-boxed match strings accumulate in a local Vec the
+    // stack scan cannot see while the next `regexp_exec`/`Handle::new`
+    // allocates — suppress `--gc-stress` for the loop so the half-built Vec
+    // cannot be swept (the elements land on the traced result array after).
+    let _stress = crate::ir::StressSuppress::new();
     let mut result: Vec<Value> = Vec::new();
     loop {
         match regexp_exec(agent, this, &string)? {
@@ -873,6 +878,10 @@ fn symbol_split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
         to_uint32(to_number(&limit)?)
     };
     let mut array: Vec<Value> = Vec::new();
+    // GC-2: the split segments/captures accumulate in a local Vec the stack
+    // scan cannot see while the next exec/substring boxes — suppress
+    // `--gc-stress` for the loop so the half-built Vec cannot be swept.
+    let _stress = crate::ir::StressSuppress::new();
     let size = string.len();
     if lim == 0 {
         return array_from_values(agent, &[]);
@@ -1072,6 +1081,12 @@ fn symbol_replace(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
         let obj = as_object(this).unwrap();
         obj.set(&JsString::from_utf8("lastIndex"), Value::Number(0.0), true)?;
     }
+    // GC-2: the exec-result arrays accumulate in a local Vec (and the
+    // functional replacer's argument Vec is built per match) in heap
+    // buffers the stack scan cannot see while the next exec/replacer call
+    // allocates — suppress `--gc-stress` for the whole replace so those
+    // buffers cannot be swept.
+    let _stress = crate::ir::StressSuppress::new();
     let mut results: Vec<Value> = Vec::new();
     loop {
         match regexp_exec(agent, this, &string)? {

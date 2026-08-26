@@ -271,10 +271,14 @@ mod tests {
         let function = template.get_function(&context).unwrap();
         Object::set(&context, &context.global(), "echo", &function, true).unwrap();
         let result = context
-            .try_eval("({ x: 'hi' }).x = echo.call({ y: 'obj' }, 'arg')")
+            .try_eval("globalThis.hold = { y: 'obj' }; ({ x: 'hi' }).x = echo.call(globalThis.hold, 'arg')")
             .unwrap_or_else(|error| panic!("eval failed: {error}"));
         assert_eq!(result.as_string().as_deref(), Some("arg"));
-        // `this` inside the callback is the `call` receiver, an object.
+        // `this` inside the callback is the `call` receiver, an object. The
+        // callback stashed the value in a native cell, so the receiver must
+        // stay reachable from a traced root (`globalThis.hold`) until the
+        // read-back — a Value held only in native memory would be swept
+        // (GC model; the pre-GC Rc handle kept it alive implicitly).
         let this = observed_this.borrow().clone().unwrap();
         assert!(this.is_object());
         let this_object = crate::context::as_object(&this).unwrap();

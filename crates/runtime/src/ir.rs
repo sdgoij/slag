@@ -3251,8 +3251,31 @@ impl Vm {
     }
 
     /// The throw machinery entry used by await-rejection resumes: run the
-    /// throw through the handler table.
+    /// throw through the handler table. The abrupt-completion handling
+    /// (closing a suspended destructure's iterators, `throw_machinery`)
+    /// allocates before `run_inner` registers this Vm, so the Vm is rooted
+    /// for the whole call (GC-2: its heap-buffered stacks would otherwise be
+    /// unrooted while those closes fire stress collections).
     pub fn run_abrupt(
+        &mut self,
+        agent: &mut Agent,
+        body: &CompiledBody,
+        resume: Resume,
+    ) -> Result<VmOutcome, JsError> {
+        ACTIVE_RUNS.with(|stack| {
+            stack.borrow_mut().push(ActiveRun {
+                vm: self as *const Vm,
+                body: body as *const CompiledBody,
+            });
+        });
+        let result = self.run_abrupt_inner(agent, body, resume);
+        ACTIVE_RUNS.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+        result
+    }
+
+    fn run_abrupt_inner(
         &mut self,
         agent: &mut Agent,
         body: &CompiledBody,

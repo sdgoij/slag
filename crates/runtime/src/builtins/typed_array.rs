@@ -641,6 +641,10 @@ fn iterate_source(
             ));
         }
         let record = IteratorRecord { iterator, next };
+        // GC-2: the collected element Values sit in a local Vec the stack
+        // scan cannot see while the next iterator step (user code) allocates
+        // — suppress `--gc-stress` so the half-built Vec cannot be swept.
+        let _stress = crate::ir::StressSuppress::new();
         let mut values = Vec::new();
         while let Some(value) = crate::expr::iterator_step(agent, &record)? {
             values.push(value);
@@ -1044,6 +1048,11 @@ fn filter(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
         ));
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    // GC-2: the kept element Values sit in a local Vec the stack scan cannot
+    // see while the callback call allocates — suppress `--gc-stress` so the
+    // half-built Vec cannot be swept (the elements land on the species-created
+    // result after).
+    let _stress = crate::ir::StressSuppress::new();
     let mut kept = Vec::new();
     for k in 0..typed_array_effective_length(&slots) as u64 {
         let k_value = get(agent, this, &key(k))?;
@@ -1640,6 +1649,11 @@ fn sort_indexed_properties(
     length: u64,
     comparefn: &Value,
 ) -> Result<(), JsError> {
+    // GC-2: the collected elements sit in a local Vec the stack scan cannot
+    // see across the collection and the comparator calls (user code that
+    // allocates) — suppress `--gc-stress` for the whole sort so the buffer
+    // cannot be swept out from under the comparisons.
+    let _stress = crate::ir::StressSuppress::new();
     let mut items: Vec<Value> = Vec::with_capacity(length as usize);
     for k in 0..length {
         items.push(get(agent, object, &key(k))?);
@@ -1897,6 +1911,11 @@ fn from(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
             ));
         }
         let record = IteratorRecord { iterator, next };
+        // GC-2: the collected element Values sit in a local Vec the stack
+        // scan cannot see while the next iterator step / mapfn call (user
+        // code) allocates — suppress `--gc-stress` so the half-built Vec
+        // cannot be swept.
+        let _stress = crate::ir::StressSuppress::new();
         let mut values = Vec::new();
         while let Some(value) = crate::expr::iterator_step(agent, &record)? {
             values.push(value);

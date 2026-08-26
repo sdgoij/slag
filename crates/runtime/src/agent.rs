@@ -912,7 +912,15 @@ impl Agent {
         for (_, entry) in self.leaf_cache.iter().flatten() {
             entry.trace(visit);
         }
-        for (_, (_, value)) in self.construct_prototypes.borrow().iter() {
+        // The cells below are RefCells: a per-allocation `--gc-stress`
+        // collection can fire while one is mutably borrowed, so read them
+        // with `try_borrow` and abort the sweep (retain everything) instead
+        // of panicking.
+        let Ok(construct_prototypes) = self.construct_prototypes.try_borrow() else {
+            crux::heap::note_aborted_trace();
+            return;
+        };
+        for (_, (_, value)) in construct_prototypes.iter() {
             value.trace(visit);
         }
         self.vm_pool.trace(visit);
@@ -945,8 +953,14 @@ impl Agent {
         self.disposable_async_drivers.trace(visit);
         self.disposable_async_caps.trace(visit);
         self.async_body_disposal.trace(visit);
-        // `host_modules` is keyed by JsString: keys are heap edges too.
-        for (key, value) in self.host_modules.borrow().iter() {
+        // `host_modules` is keyed by JsString: keys are heap edges too, so
+        // trace the whole cell manually (the generic HashMap trace visits
+        // values only).
+        let Ok(host_modules) = self.host_modules.try_borrow() else {
+            crux::heap::note_aborted_trace();
+            return;
+        };
+        for (key, value) in host_modules.iter() {
             key.trace(visit);
             value.trace(visit);
         }
@@ -993,11 +1007,19 @@ impl Agent {
         self.weak_map_data.trace(visit);
         self.weak_set_data.trace(visit);
         for iter_data in self.map_iter_data.values() {
-            let (value, _, _) = &*iter_data.borrow();
+            let Ok(guard) = iter_data.try_borrow() else {
+                crux::heap::note_aborted_trace();
+                return;
+            };
+            let (value, _, _) = &*guard;
             value.trace(visit);
         }
         for iter_data in self.set_iter_data.values() {
-            let (value, _, _) = &*iter_data.borrow();
+            let Ok(guard) = iter_data.try_borrow() else {
+                crux::heap::note_aborted_trace();
+                return;
+            };
+            let (value, _, _) = &*guard;
             value.trace(visit);
         }
         self.realms.trace(visit);

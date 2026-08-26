@@ -45,6 +45,10 @@ impl Trace for AsyncFunctionState {
         self.resolve.trace(visit);
         self.reject.trace(visit);
         self.module.trace(visit);
+        // The compiled body's steps embed literal `Value`s; while suspended
+        // at an await the body is no longer in the active-run stack, so the
+        // state must root it (GC-2).
+        self.body.trace(visit);
     }
 }
 
@@ -185,6 +189,11 @@ pub fn call_async_function(
             let body = data.ir.clone().ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "async body was not compiled".into())
             })?;
+            // GC-2: the state's `promise`/`resolve`/`reject` Values (and the
+            // compiled body's literals) sit in a local `Rc` until the run
+            // finishes and `attach_await` registers the state — suppress
+            // `--gc-stress` for the first-run window so they cannot be swept.
+            let _stress = crate::ir::StressSuppress::new();
             let state = Rc::new(RefCell::new(AsyncFunctionState {
                 vm: Vm::new(body_env, data.strict),
                 body,

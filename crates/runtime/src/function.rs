@@ -2025,12 +2025,20 @@ pub(crate) fn create_mapped_arguments_object(
     let make_getter = {
         move |name: &JsString| -> Value {
             let env = env;
-            let name = name.clone();
+            // GC-2: the parameter name is interned (immortal) and the
+            // environment handle is rooted by the arguments object's
+            // `ArgumentsSlots::env` — the closure box itself captures no GC
+            // handles that tracing can miss, so a `--gc-stress` collection
+            // cannot sweep them.
+            let name = crux::intern(name.as_slice());
             Value::Function(
                 Function::create_builtin(
                     None,
                     0,
-                    Box::new(move |_, _| env.get_binding_value(&name, false)),
+                    Box::new(move |_, _| {
+                        let name = crux::string::lookup(name);
+                        env.get_binding_value(&name, false)
+                    }),
                     None,
                     None,
                 )
@@ -2041,12 +2049,13 @@ pub(crate) fn create_mapped_arguments_object(
     let make_setter = {
         move |name: &JsString| -> Value {
             let env = env;
-            let name = name.clone();
+            let name = crux::intern(name.as_slice());
             Value::Function(
                 Function::create_builtin(
                     None,
                     0,
                     Box::new(move |_, value| {
+                        let name = crux::string::lookup(name);
                         let value = value.first().cloned().unwrap_or(Value::Undefined);
                         env.set_mutable_binding(&name, value, false)?;
                         Ok(Value::Undefined)
@@ -2066,6 +2075,15 @@ pub(crate) fn create_mapped_arguments_object(
         make_getter,
         make_setter,
     )?);
+    // GC-2: root the parameter environment from the arguments object itself
+    // (the accessor closures capture its handle; `ArgumentsSlots::env` keeps
+    // the box alive for exactly the object's lifetime).
+    if let Some(obj) = crate::context::as_object(&value)
+        && let crux::object::ObjectKind::Arguments(slots) = &obj.kind
+    {
+        let mut slots = *slots;
+        slots.env = Some(env.as_any());
+    }
     if let Some(obj) = crate::context::as_object(&value)
         && let Some(values) = realm.intrinsics.get("%Array.prototype.values%")
     {

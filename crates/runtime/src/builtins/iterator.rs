@@ -2157,6 +2157,11 @@ fn iterator_zip(
     // before the iterables argument is touched.
     let (mode, padding_option) = zip_options(agent, args.get(1).cloned())?;
 
+    // GC-2: the opened column `IteratorRecord`s accumulate in a local Vec
+    // the stack scan cannot see while the next column's GetIterator
+    // allocates — suppress `--gc-stress` for the build (the records become
+    // a traced root once `create_helper` stores the `Zip` mode).
+    let _stress = crate::ir::StressSuppress::new();
     let mut iterators = Vec::new();
     let mut keys = Vec::new();
     if keyed {

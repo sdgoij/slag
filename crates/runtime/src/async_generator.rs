@@ -95,6 +95,10 @@ impl Trace for AsyncGeneratorState {
         self.function.trace(visit);
         self.realm.trace(visit);
         self.body_env.trace(visit);
+        // The compiled body's steps embed literal `Value`s; while suspended
+        // at a yield/await the body is no longer in the active-run stack, so
+        // the state must root it (GC-2).
+        self.body.trace(visit);
     }
 }
 

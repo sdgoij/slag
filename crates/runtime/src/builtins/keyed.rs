@@ -1300,6 +1300,11 @@ where
         ));
     }
     let iterator = crate::expr::get_iterator(agent, items)?;
+    // GC-2: the group keys and element Values accumulate in a local Vec the
+    // stack scan cannot see while the next iterator step / callback call
+    // allocates — suppress `--gc-stress` for the loop so the half-built
+    // groups cannot be swept.
+    let _stress = crate::ir::StressSuppress::new();
     let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
     let mut k = 0u64;
     loop {
@@ -1347,6 +1352,11 @@ where
 
 /// GroupBy (spec 7.3.38) with ~collection~ key coercion: `Map.groupBy`.
 fn map_group_by(agent: &mut Agent, _this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    // GC-2: the collected groups sit in a local Vec the stack scan cannot
+    // see from `group_by`'s loop through the map build (each callback call
+    // and array build allocates) — suppress `--gc-stress` for the whole
+    // operation so the half-built groups cannot be swept.
+    let _stress = crate::ir::StressSuppress::new();
     let items = args.first().cloned().unwrap_or(Value::Undefined);
     let callback = args.get(1).cloned().unwrap_or(Value::Undefined);
     let groups = group_by(agent, &items, &callback, |_agent, key| {

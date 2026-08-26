@@ -395,6 +395,11 @@ fn apply(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
     if matches!(arg_array.kind(), ValueKind::Undefined | ValueKind::Null) {
         return crate::function::call(agent, &func, this_arg, &[]);
     }
+    // GC-2: the collected argument list sits in a local Vec the stack scan
+    // cannot see while the callee (user code) allocates — suppress
+    // `--gc-stress` for the build and the call so the list cannot be swept
+    // out from under the callee's parameter binding.
+    let _stress = crate::ir::StressSuppress::new();
     let arg_list = create_list_from_array_like(agent, &arg_array)?;
     crate::function::call(agent, &func, this_arg, &arg_list)
 }
@@ -560,6 +565,12 @@ fn create_list_from_array_like(agent: &mut Agent, value: &Value) -> Result<Vec<V
             }
         }
     }
+    // GC-2: the collected elements sit in a local Vec the stack scan cannot
+    // see while the next indexed `Get` allocates (a TypedArray element read
+    // boxes a fresh value; `to_string` boxes a key) — suppress `--gc-stress`
+    // for the loop so the half-built list cannot be swept (the caller roots
+    // it once it is passed to the call).
+    let _stress = crate::ir::StressSuppress::new();
     let mut list = Vec::new();
     for index in 0..length {
         let item = get_property_key(

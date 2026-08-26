@@ -217,10 +217,23 @@ pub enum ObjectKind {
 
 /// The [[ParameterMap]] of an arguments exotic object (spec 10.4.4): an
 /// ordinary object holding accessor properties that read/write the mapped
-/// formal parameter bindings.
-#[derive(Debug, Clone)]
+/// formal parameter bindings. `env` roots the environment the accessors
+/// read from — it is not a language value, so it rides along as an opaque
+/// GC edge (GC-2: the accessor closures capture the environment handle
+/// directly; the object keeps the box alive).
+#[derive(Clone)]
 pub struct ArgumentsSlots {
     pub parameter_map: Option<Handle<JsObject>>,
+    pub env: Option<crate::heap::GcAny>,
+}
+
+impl std::fmt::Debug for ArgumentsSlots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArgumentsSlots")
+            .field("parameter_map", &self.parameter_map.is_some())
+            .field("env", &self.env.is_some())
+            .finish()
+    }
 }
 
 /// The TypedArray (Integer-Indexed) exotic slots (spec 10.4.5.1): the viewed
@@ -263,6 +276,9 @@ impl Trace for ArgumentsSlots {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         if let Some(parameter_map) = &self.parameter_map {
             parameter_map.trace(visit);
+        }
+        if let Some(env) = &self.env {
+            visit(*env);
         }
     }
 }
@@ -409,21 +425,17 @@ pub struct JsObject {
 impl Trace for JsObject {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         self.kind.trace(visit);
-        if let Some(prototype) = &*self.prototype.borrow() {
-            prototype.trace(visit);
-        }
-        for (_, property) in &*self.properties.borrow() {
-            property.trace(visit);
-        }
-        for element in &*self.private_elements.borrow() {
-            element.trace(visit);
-        }
+        // The cells are RefCells: `RefCell<T>`'s trace skips a cell that is
+        // mutably borrowed mid-collection (per-allocation `--gc-stress`) and
+        // aborts the sweep instead of panicking. Tracing the whole `properties`
+        // cell also marks symbol keys (a symbol description may be a rope).
+        self.prototype.trace(visit);
+        self.properties.trace(visit);
+        self.private_elements.trace(visit);
         // The strong function back-reference keeps the function alive while
         // its object part is reachable; `self_handle` is a self-cycle
         // (redundant to mark) and `boxed` holds no heap edges.
-        if let Some(function) = &*self.function_self.borrow() {
-            function.trace(visit);
-        }
+        self.function_self.trace(visit);
     }
 }
 
@@ -813,6 +825,7 @@ impl JsObject {
             id: NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
             kind: ObjectKind::Arguments(Handle::new(ArgumentsSlots {
                 parameter_map: Some(map),
+                env: None,
             })),
             prototype: RefCell::new(prototype),
             extensible: Cell::new(true),
@@ -907,6 +920,7 @@ impl JsObject {
             id: NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
             kind: ObjectKind::Arguments(Handle::new(ArgumentsSlots {
                 parameter_map: None,
+                env: None,
             })),
             prototype: RefCell::new(prototype),
             extensible: Cell::new(true),

@@ -118,33 +118,18 @@ pub struct SourceTextModule {
 impl Trace for SourceTextModule {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         self.realm.trace(visit);
-        if let Some(environment) = &*self.environment.borrow() {
-            environment.trace(visit);
-        }
-        if let Some(namespace) = &*self.namespace.borrow() {
-            namespace.trace(visit);
-        }
-        if let Some(cycle_root) = &*self.cycle_root.borrow() {
-            cycle_root.trace(visit);
-        }
-        for parent in &*self.async_parents.borrow() {
-            parent.trace(visit);
-        }
-        if let Some(capability) = &*self.top_level_capability.borrow() {
-            capability.trace(visit);
-        }
-        if let Some(error) = &*self.evaluation_error.borrow() {
-            error.trace(visit);
-        }
-        if let Some(meta) = &*self.import_meta.borrow() {
-            meta.trace(visit);
-        }
-        if let Some(source) = &*self.module_source.borrow() {
-            source.trace(visit);
-        }
-        if let Some(namespace) = &*self.deferred_namespace.borrow() {
-            namespace.trace(visit);
-        }
+        // The cells below are RefCells: `RefCell<T>`'s trace skips a cell
+        // that is mutably borrowed mid-collection (per-allocation
+        // `--gc-stress`) and aborts the sweep instead of panicking.
+        self.environment.trace(visit);
+        self.namespace.trace(visit);
+        self.cycle_root.trace(visit);
+        self.async_parents.trace(visit);
+        self.top_level_capability.trace(visit);
+        self.evaluation_error.trace(visit);
+        self.import_meta.trace(visit);
+        self.module_source.trace(visit);
+        self.deferred_namespace.trace(visit);
         // The module source and the module-record strings (specifiers,
         // import attributes, export names) are JsStrings: a rope's children
         // are heap edges. `code` is the parsed AST (plain data) — its
@@ -750,6 +735,11 @@ pub fn module_declaration_instantiation(
     agent: &mut Agent,
     module: &Handle<SourceTextModule>,
 ) -> Result<(), JsError> {
+    // GC-2: the resolved-imports Vec and the specifier/import-entry clones
+    // are local heap buffers the stack scan cannot see, held across the
+    // resolve/instantiate recursion that allocates — suppress `--gc-stress`
+    // for the link so their handles cannot be swept.
+    let _stress = crate::ir::StressSuppress::new();
     match *module.status.borrow() {
         // A module already on the link stack (cycle) or past linking returns
         // immediately (spec 16.2.1.6.1.2.1 step 6).
@@ -1241,6 +1231,13 @@ pub fn module_evaluation(
     agent: &mut Agent,
     module: &Handle<SourceTextModule>,
 ) -> Result<Value, JsError> {
+    // GC-2: the wave holds module handles and specifier JsStrings in local
+    // heap buffers (the dependency clone, the gathered async-dependency
+    // Vec) the conservative stack scan cannot see, across recursion that
+    // allocates — suppress `--gc-stress` for the window (the bodies run in
+    // traced Vms; the module records stay reachable through
+    // `loaded_modules`).
+    let _stress = crate::ir::StressSuppress::new();
     let promise_ctor = || {
         module
             .realm
@@ -1487,6 +1484,11 @@ fn execute_module_body(
             })?;
         (capability.promise, capability.resolve, capability.reject)
     };
+    // GC-2: the state's `promise`/`resolve`/`reject` Values and the compiled
+    // body's literals sit in a local `Rc` until the run finishes and
+    // `attach_await` registers the state — suppress `--gc-stress` for the
+    // first-run window so they cannot be swept.
+    let _stress = crate::ir::StressSuppress::new();
     let state = Rc::new(RefCell::new(AsyncFunctionState {
         vm: Vm::new(env, strict),
         body: Rc::new(body),
@@ -1787,6 +1789,11 @@ fn deferred_module_then(
     let realm = agent.current_realm()?;
     let module = *module;
     agent.enqueue_generic_job(Some(realm), move |agent| {
+        // GC-2: the async-dependency Vec is a local heap buffer the stack
+        // scan cannot see, held across the promise aggregation below that
+        // allocates — suppress `--gc-stress` for the job window so its
+        // module handles cannot be swept.
+        let _stress = crate::ir::StressSuppress::new();
         let result = (|| -> Result<(), JsError> {
             let async_deps = gather_async_transitive_dependencies(agent, &module, &mut Vec::new())?;
             if async_deps.is_empty() {
@@ -1961,6 +1968,11 @@ fn create_namespace(
     module: &Handle<SourceTextModule>,
     deferred: bool,
 ) -> Result<Value, JsError> {
+    // GC-2: the `names`/`stack` Vecs are local heap buffers the stack scan
+    // cannot see, held across the exported-names and resolve recursion that
+    // allocates — suppress `--gc-stress` so their JsString/module handles
+    // cannot be swept.
+    let _stress = crate::ir::StressSuppress::new();
     // GetExportedNames (spec 16.2.1.7.1.1): local + indirect names, then the
     // names of every star export, with a cycle guard so a self- or mutually
     // star-exporting module (`export * from` itself) terminates. The namespace
@@ -2138,6 +2150,10 @@ fn module_sync_ready(
     module: &Handle<SourceTextModule>,
     seen: &mut Vec<Handle<SourceTextModule>>,
 ) -> Result<bool, JsError> {
+    // GC-2: `seen` is a local heap buffer of module handles the stack scan
+    // cannot see, held across the recursion that allocates — suppress
+    // `--gc-stress` for the walk so its entries cannot be swept.
+    let _stress = crate::ir::StressSuppress::new();
     if seen.iter().any(|m| Handle::ptr_eq(*m, *module)) {
         return Ok(true);
     }
@@ -2421,6 +2437,10 @@ fn gather_async_transitive_dependencies(
     module: &Handle<SourceTextModule>,
     seen: &mut Vec<Handle<SourceTextModule>>,
 ) -> Result<Vec<Handle<SourceTextModule>>, JsError> {
+    // GC-2: `seen`/`result` are local heap buffers of module handles the
+    // stack scan cannot see, held across the recursion that allocates —
+    // suppress `--gc-stress` for the walk so their entries cannot be swept.
+    let _stress = crate::ir::StressSuppress::new();
     let mut result = Vec::new();
     if seen.iter().any(|m| Handle::ptr_eq(*m, *module)) {
         return Ok(result);
@@ -2463,6 +2483,10 @@ fn collect_exported_names(
     stack: &mut Vec<Handle<SourceTextModule>>,
     out: &mut Vec<JsString>,
 ) -> Result<(), JsError> {
+    // GC-2: `stack`/`out` are local heap buffers the stack scan cannot see,
+    // held across the recursion — suppress `--gc-stress` for the walk so
+    // their handles cannot be swept.
+    let _stress = crate::ir::StressSuppress::new();
     if stack.iter().any(|m| Handle::ptr_eq(*m, *module)) {
         return Ok(());
     }
@@ -2531,6 +2555,10 @@ fn resolve_export(
     name: &JsString,
     resolve_set: &mut Vec<(Handle<SourceTextModule>, JsString)>,
 ) -> Result<Option<ResolvedBinding>, JsError> {
+    // GC-2: `resolve_set` is a local heap buffer the stack scan cannot see,
+    // held across the recursion — suppress `--gc-stress` so its module/
+    // JsString handles cannot be swept.
+    let _stress = crate::ir::StressSuppress::new();
     if resolve_set
         .iter()
         .any(|(m, n)| Handle::ptr_eq(*m, *module) && n == name)

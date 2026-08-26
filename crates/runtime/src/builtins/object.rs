@@ -823,6 +823,12 @@ pub fn dispatch_call(
             let obj = as_object(&object).ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "value is not an object".into())
             })?;
+            // GC-2: the freshly-created pair objects accumulate in a local
+            // Vec the stack scan cannot see while the next pair's creation
+            // allocates — suppress `--gc-stress` for the build so the
+            // half-built Vec cannot be swept (the per-key descriptor re-read
+            // makes a count-first pass unsound: getters may hide later keys).
+            let _stress = crate::ir::StressSuppress::new();
             let mut entries = Vec::new();
             for key in obj.own_property_keys()? {
                 // EnumerableOwnProperties (spec 7.3.26): the descriptor's
@@ -856,6 +862,11 @@ pub fn dispatch_call(
                 JsError::new(ErrorKind::TypeError, "value is not an object".into())
             })?;
             let mut values = Vec::new();
+            // GC-2: the values (freshly-boxed for a primitive-string receiver)
+            // accumulate in a local Vec the stack scan cannot see while the
+            // next property read allocates — suppress `--gc-stress` for the
+            // build so the half-built Vec cannot be swept.
+            let _stress = crate::ir::StressSuppress::new();
             for key in obj.own_property_keys()? {
                 // EnumerableOwnProperties re-reads each descriptor, so a
                 // getter for an earlier key can hide a later one.
@@ -879,6 +890,11 @@ pub fn dispatch_call(
     if intrinsics.get(KEYS).as_ref() == Some(callee) {
         return Some((|| {
             let keys = enumerable_string_keys(agent, &arg(args, 0))?;
+            // GC-2: the freshly-boxed key strings accumulate in a local Vec
+            // the stack scan cannot see while the next `Handle::new` fires a
+            // stress collection — suppress the window so the half-built Vec
+            // cannot be swept (the array is built by `array_of` after).
+            let _stress = crate::ir::StressSuppress::new();
             let values: Vec<Value> = keys
                 .into_iter()
                 .map(|key| str(&key.to_string_lossy()))
@@ -1286,6 +1302,11 @@ fn lookup_legacy_accessor(
 /// returned as an ordinary object with a null prototype whose own data
 /// properties are the group arrays.
 fn object_group_by(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
+    // GC-2: the collected groups sit in a local Vec the stack scan cannot
+    // see from `group_by`'s loop through the result-object build (each
+    // callback call and array build allocates) — suppress `--gc-stress` for
+    // the whole operation so the half-built groups cannot be swept.
+    let _stress = crate::ir::StressSuppress::new();
     let items = arg(args, 0).clone();
     let callback = arg(args, 1).clone();
     let groups = crate::builtins::keyed::group_by(agent, &items, &callback, |agent, key| {

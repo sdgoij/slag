@@ -376,12 +376,12 @@ impl Trace for DeclarativeEnv {
         if let Some(outer) = &self.outer {
             outer.trace(visit);
         }
-        for (_, binding) in &*self.bindings.borrow() {
-            binding.trace(visit);
-        }
-        for resource in &*self.disposable_resources.borrow() {
-            resource.trace(visit);
-        }
+        // The cells are RefCells: `RefCell<T>`'s trace skips a cell that is
+        // mutably borrowed mid-collection (per-allocation `--gc-stress`) and
+        // aborts the sweep instead of panicking. Tracing the whole `bindings`
+        // cell also marks the binding-name keys (flat strings, no edges).
+        self.bindings.trace(visit);
+        self.disposable_resources.trace(visit);
     }
 }
 
@@ -398,7 +398,10 @@ impl Trace for FunctionEnv {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         self.declarative.trace(visit);
         self.function_object.trace(visit);
-        self.this_value.borrow().trace(visit);
+        // `this_value` is a RefCell: `RefCell<T>`'s trace skips a cell that
+        // is mutably borrowed mid-collection (per-allocation `--gc-stress`)
+        // and aborts the sweep instead of panicking.
+        self.this_value.trace(visit);
         self.new_target.trace(visit);
     }
 }

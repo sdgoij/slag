@@ -192,6 +192,19 @@ impl Trace for Function {
         if let Some(name) = &self.name {
             name.trace(visit);
         }
+        // A bound function's target, bound `this`, and bound argument list
+        // are Values — heap edges (GC-2; a swept target turned `extends`
+        // heritage reads into "not a constructor" under `--gc-stress`).
+        if let FunctionKind::Bound {
+            target,
+            bound_this,
+            bound_args,
+        } = &self.kind
+        {
+            target.trace(visit);
+            bound_this.trace(visit);
+            bound_args.trace(visit);
+        }
     }
 }
 

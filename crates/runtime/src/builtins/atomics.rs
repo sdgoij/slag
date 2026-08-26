@@ -365,6 +365,12 @@ fn notify(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
         return Ok(Value::Number(0.0));
     }
     let key = (slots.buffer.block_id(), offset);
+    // GC-2: the same-thread resolve functions move from the traced
+    // `agent.wait_async` root into this local Vec, whose heap buffer the
+    // stack scan cannot see while each resolution call allocates —
+    // suppress `--gc-stress` for the drain so the not-yet-resolved
+    // entries cannot be swept.
+    let _stress = crate::ir::StressSuppress::new();
     let mut woken = 0usize;
     let mut same_thread: Vec<(u64, Value)> = Vec::new();
     {
@@ -681,6 +687,11 @@ fn wait_async(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
 /// while unresolved, and the timeout job also removes them, so an entry can
 /// never be resolved twice.
 pub fn service_wait_async(agent: &mut Agent) -> Result<(), JsError> {
+    // GC-2: the collected resolve functions sit in a local Vec the stack
+    // scan cannot see while each resolution call allocates — suppress
+    // `--gc-stress` for the drain so the not-yet-resolved entries cannot be
+    // swept.
+    let _stress = crate::ir::StressSuppress::new();
     let mut resolved: Vec<(u64, Value, usize, usize, &'static str)> = Vec::new();
     {
         let registry = registry()

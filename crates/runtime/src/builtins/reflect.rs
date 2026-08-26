@@ -263,14 +263,24 @@ fn reflect_method(agent: &mut Agent, name: &str, args: &[Value]) -> Result<Value
             // evaluation (import-defer).
             crate::module::ensure_deferred_namespace_evaluation(agent, &obj)?;
             let keys = obj.own_property_keys()?;
-            let values: Vec<Value> = keys
-                .iter()
-                .map(|key| match key {
-                    PropertyKey::String(id) => Value::String(Handle::new(crux::lookup(*id))),
-                    PropertyKey::Symbol(symbol) => Value::Symbol(Handle::new(symbol.clone())),
-                })
-                .collect();
-            crate::builtins::array::array_from_values(agent, &values)
+            // GC-2: define each key on the result array as it is boxed — a
+            // local `Vec<Value>` of freshly-boxed keys would sit in a heap
+            // buffer the stack scan cannot see across the boxings (each
+            // `Handle::new` fires a per-allocation stress collection). The
+            // array handle is a stack local, so the scan roots it and its
+            // property vector keeps the defined elements.
+            let array = crate::builtins::array::array_create(agent, keys.len() as f64)?;
+            for (index, key) in keys.into_iter().enumerate() {
+                let value = match key {
+                    PropertyKey::String(id) => Value::String(Handle::new(crux::lookup(id))),
+                    PropertyKey::Symbol(symbol) => Value::Symbol(Handle::new(symbol)),
+                };
+                array.create_data_property(
+                    &crux::string::JsString::from_utf8(&index.to_string()),
+                    value,
+                )?;
+            }
+            Ok(Value::Object(array))
         }
         "preventExtensions" => {
             let obj = object_of(&arg(0))?;

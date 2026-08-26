@@ -383,11 +383,10 @@ impl Trace for PrivateEnvironment {
         if let Some(outer) = &self.outer {
             outer.trace(visit);
         }
-        // PrivateName descriptions are JsStrings by value; a rope description
-        // has heap edges.
-        for name in &*self.names.borrow() {
-            name.description.trace(visit);
-        }
+        // `names` is a RefCell: `RefCell<T>`'s trace skips a cell that is
+        // mutably borrowed mid-collection (per-allocation `--gc-stress`) and
+        // aborts the sweep instead of panicking.
+        self.names.trace(visit);
     }
 }
 
@@ -396,6 +395,14 @@ impl Trace for PrivateEnvironment {
 pub struct PrivateName {
     pub id: u64,
     pub description: JsString,
+}
+
+impl Trace for PrivateName {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        // A PrivateName description is a JsString by value; a rope description
+        // has heap edges.
+        self.description.trace(visit);
+    }
 }
 
 static NEXT_PRIVATE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);

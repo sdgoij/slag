@@ -430,6 +430,12 @@ pub(crate) fn validate_json(agent: &mut Agent, text: &str) -> Result<(), JsError
 /// JSON.parse (spec 26.6.2): parse the text, then internalize through the
 /// reviver with the ES2026 parse-record context.
 fn json_parse(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    // GC-2: the ParseRecord tree (and its per-element/per-entry record Vecs)
+    // sits in native heap buffers the stack scan cannot see while parsing
+    // and the reviver (user code) allocate — suppress `--gc-stress` for the
+    // whole operation so the records cannot be swept out from under the
+    // internalize recursion.
+    let _stress = crate::ir::StressSuppress::new();
     let _ = this;
     let text_value = args.first().cloned().unwrap_or(Value::Undefined);
     let text = to_string_arg(agent, &text_value)?;
@@ -1031,9 +1037,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             .get("%Object.prototype%")
             .and_then(|value| as_object(&value)),
     );
-    realm
-        .intrinsics
-        .define(JSON_NS, Value::Object(json_object));
+    realm.intrinsics.define(JSON_NS, Value::Object(json_object));
 
     let methods: [(&str, &str, u64); 4] = [
         ("parse", JSON_PARSE, 2),
@@ -1049,9 +1053,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         json_object.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {

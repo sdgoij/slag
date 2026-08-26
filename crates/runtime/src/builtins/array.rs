@@ -149,6 +149,11 @@ pub fn array_create(agent: &Agent, length: f64) -> Result<Handle<JsObject>, JsEr
 /// CreateArrayFromList (spec 7.3.15): a fresh `%Array.prototype%`-linked
 /// array holding the values.
 pub fn array_from_values(agent: &Agent, values: &[Value]) -> Result<Value, JsError> {
+    // GC-2: the caller's `values` slice may live in a native heap buffer the
+    // stack scan cannot see (a freshly-built `Vec<Value>`); the array
+    // creation and element definitions below allocate — suppress
+    // `--gc-stress` for the window so the slice cannot be swept.
+    let _stress = crate::ir::StressSuppress::new();
     let array = array_create(agent, values.len() as f64)?;
     for (index, value) in values.iter().enumerate() {
         array.create_data_property(&key(index as u64), value.clone())?;
@@ -1490,6 +1495,11 @@ fn sort_indexed_properties(
     length: u64,
     comparefn: &Value,
 ) -> Result<(), JsError> {
+    // GC-2: the collected elements sit in a local Vec the stack scan cannot
+    // see across the collection and the comparator calls (user code that
+    // allocates) — suppress `--gc-stress` for the whole sort so the buffer
+    // cannot be swept out from under the comparisons.
+    let _stress = crate::ir::StressSuppress::new();
     let mut items: Vec<Value> = Vec::new();
     for k in 0..length {
         let name = key(k);

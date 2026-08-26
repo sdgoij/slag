@@ -196,6 +196,13 @@ pub fn new_promise_capability(
         None,
         function_proto,
     )?;
+    // GC-2: the executor writes the resolving functions into the native
+    // `captured` cell while the (user-provided) constructor body still runs
+    // — the cell is a heap buffer the conservative stack scan cannot see,
+    // so a per-allocation `--gc-stress` collection fired by the rest of the
+    // body would sweep them. Suppress the construct window; the values
+    // move onto the stack (scan-visible) once `captured` is read back.
+    let _stress = crate::ir::StressSuppress::new();
     let promise = crate::function::construct(
         agent,
         constructor,

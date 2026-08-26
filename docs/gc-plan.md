@@ -253,6 +253,42 @@ holds `Value`s; the remaining un-traced `Rc<RefCell<…>>` auxiliary states
 must be verified against the stress sweep). Gate: `--gc-stress` clean
 across the sweep; leak harness bounded (the harness is already bounded).
 
+**Increment 2 (landed).** The built-ins and language crash clusters are
+closed — the full `all` sweep is `--gc-stress` clean: **0 fail / 0 crash /
+158 skip** across 48,622 fixtures. The remaining ~539 hangs are all
+pre-existing stress-cost artifacts (the RegExp property-escape table
+builds, the decodeURI/encodeURI/parseInt/parseFloat families, and a few
+allocation-heavy intrinsic-graph walks — each passes standalone under a
+long deadline; the live set stays bounded). Root gaps closed:
+
+- **Native buffers across allocating loops**: `Atomics.notify`'s
+  same-thread resolve drain, `Function.prototype.apply`'s argument list
+  (build *and* the callee call), `TypedArray` filter/from element
+  collection, `Object`/`Map.groupBy` (the shared `group_by` loop *and* the
+  result-object/map build — the guard must span both or the gap between
+  them is sweepable), `DisposableStack` move/dispose resource Vecs, and
+  `JSON.parse`'s ParseRecord tree all get `StressSuppress` windows so
+  half-built `Vec<Value>` buffers cannot be swept.
+- **`new_promise_capability`'s captured resolving functions**: the
+  executor writes them into a native `Rc<RefCell>` while the user
+  constructor body still runs — suppress the construct window.
+- **Mapped-arguments accessors hold GC handles**: the MakeArgGetter/
+  MakeArgSetter closures captured the parameter `JsString` and
+  `EnvRef` — both sweepable. The name is now interned (immortal) and the
+  environment is rooted from `ArgumentsSlots::env` (an opaque `GcAny`
+  edge), so the closure captures stay valid exactly as long as the
+  arguments object; no per-call agent table (an earlier design retained
+  every called function's environment and blew up the zip fixtures to
+  minutes under stress).
+- **`Vm::run_abrupt` ran unrooted**: the abrupt-completion handling
+  (closing suspended destructure iterators, `throw_machinery`) allocates
+  *before* `run_inner` registers the Vm in the active-run stack, so a
+  suspended async-generator resume could sweep its own `async_for_of_stack`
+  mid-close (the `async-gen-decl-dstr-array-elem-iter-rtrn-close-null`
+  crash family). The Vm is now registered for the whole `run_abrupt` call.
+
+Gate status: `--gc-stress` clean across the sweep; leak harness bounded.
+
 ### GC-3 — ephemeron-aware WeakMap / WeakSet
 
 - Replace the strong entry storage with key→value ephemeron semantics
