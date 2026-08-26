@@ -421,15 +421,32 @@ A `Gc::new` vs `Rc::new` microbenchmark confirmed the registration path is
 already near its floor (~11ns/alloc of TLS + borrow + push), so the box
 itself is not the remaining lever; the mid-loop and boundary sweeps were.
 
+**The engine hot paths, not the collector, now bound the rows** — measured
+against `node --jitless` (V8's interpreter, same architecture): construct
+churn 63ms vs 2.75ms (~23x), string concat 20ms vs 1.26ms (~16x). A
+construct-churn decomposition (per 100k-iteration bench) pinned the cost:
+`new C()` with an empty body is ~240ns/iter, the first `this.x = x` store
+adds ~110ns (the properties-`Vec` buffer allocation dominates — a second
+store is only +15ns), and loop/add/property-read are ~15ns. Two wins
+landed: the constructor-`prototype` cache (Cut 26) switched from a SipHash
+`HashMap` + RefCell borrow to a direct-mapped array (per construct), and
+object ids moved from a global locked `fetch_add` to a thread-local counter
+(per object; ids key per-agent caches that never cross threads). Both are
+V8-inspired (V8 caches the prototype read in the Map and assigns ids
+without atomics). Remaining structural gap to V8: bump/semi-space
+allocation, in-object properties (the `Vec`-buffer alloc), and register-
+style bytecode — each a follow-up of its own.
+
 Gate status: the plan's predicted 2–4x on allocation-bound code is **not
 met** — per-iteration/closure rows yes, construct/string rows no (construct
-is now 1.75x vs the Rc model after the safe-point + collection-side work,
-concat ~1.9x). The remaining lever is the plan's original slot-arena
-design (bump/segment allocation + a per-size free list instead of one
-malloc per box), which removes both the per-box malloc and the sweep's
-allocator round-trips; it is deferred as a follow-up (note the free-list
-half measured net-neutral, so the arena alone is unlikely to close the
-remaining gap).
+is now ~1.7x vs the Rc model after the safe-point + collection-side + hot-
+path work, concat ~1.9x). The remaining lever is the plan's original
+slot-arena design (bump/segment allocation + a per-size free list instead
+of one malloc per box), which removes both the per-box malloc and the
+sweep's allocator round-trips; it is deferred as a follow-up (note the
+free-list half measured net-neutral, so the arena alone is unlikely to
+close the remaining gap — the measured 16-23x gap to V8's interpreter is
+engine-hot-path, not collector, cost).
 
 **Bonus fix (GC-4 machinery, found while measuring):** the FinalizationRegistry
 cleanup job's closure region was wrong. `Job::new` computed it via

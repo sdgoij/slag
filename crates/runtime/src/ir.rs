@@ -1478,6 +1478,19 @@ const INLINE_FRAME: usize = 8;
 /// The direct-mapped member-access cell count (P3): a power of two so the
 /// cache index is a mask.
 pub(crate) const MEMBER_CELLS: usize = 16;
+
+/// The cached `prototype` read of a constructor (Cut 26): (function id,
+/// generation, value) — a hot construct loop pays a direct-mapped probe
+/// instead of a HashMap + RefCell borrow per construct.
+pub struct ConstructPrototypeCell {
+    pub id: u64,
+    pub generation: u32,
+    pub value: Value,
+}
+
+/// Direct-mapped slots for [`ConstructPrototypeCell`] (a power of two so
+/// the cache index is a mask).
+pub(crate) const CONSTRUCT_PROTO_CELLS: usize = 256;
 /// The read-side array-element value cache entry (Cut 35 slice 13): the
 /// cached value of `array[index]` at the array's generation — a generation
 /// match means no own-property change since the read (slice 11 bumps every

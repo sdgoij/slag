@@ -11,7 +11,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{ErrorKind, JsError};
 use crate::function::call;
@@ -23,7 +22,21 @@ use crate::string::{JsString, lookup};
 use crate::symbol::well_known;
 use crate::value::{Value, ValueKind, is_callable};
 
-static NEXT_OBJECT_ID: AtomicU64 = AtomicU64::new(1);
+thread_local! {
+    /// The next object id — thread-local (per-agent caches never mix
+    /// threads, and values never cross heaps), so allocation avoids a
+    /// locked atomic per object (GC-5: the construct hot path).
+    static NEXT_OBJECT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+}
+
+/// The next object identity key (see [`JsObject::id`]).
+fn next_object_id() -> u64 {
+    NEXT_OBJECT_ID.with(|id| {
+        let next = id.get();
+        id.set(next + 1);
+        next
+    })
+}
 
 /// The data/accessor union of a stored property (spec 6.2.5 table).
 #[derive(Debug, Clone, PartialEq)]
@@ -473,7 +486,7 @@ impl JsObject {
     /// a `Handle` call `link_self_handle` on the way out.
     pub fn basic_object_create(prototype: Option<Handle<JsObject>>) -> Self {
         Self {
-            id: NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
+            id: next_object_id(),
             kind: ObjectKind::Ordinary,
             prototype: RefCell::new(prototype),
             extensible: Cell::new(true),
@@ -550,7 +563,7 @@ impl JsObject {
     /// [[IsHTMLDDA]] internal slot.
     pub fn is_htmldda_object_create(prototype: Option<Handle<JsObject>>) -> Handle<JsObject> {
         let object = Handle::new(Self {
-            id: NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
+            id: next_object_id(),
             kind: ObjectKind::IsHTMLDDA,
             prototype: RefCell::new(prototype),
             extensible: Cell::new(true),
@@ -580,7 +593,7 @@ impl JsObject {
             ));
         }
         let array = Handle::new(Self {
-            id: NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
+            id: next_object_id(),
             kind: ObjectKind::Array,
             prototype: RefCell::new(prototype),
             extensible: Cell::new(true),
@@ -614,7 +627,7 @@ impl JsObject {
     ) -> Result<Handle<JsObject>, JsError> {
         let length = value.len() as f64;
         let string = Handle::new(Self {
-            id: NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
+            id: next_object_id(),
             kind: ObjectKind::String(Handle::new(value)),
             prototype: RefCell::new(prototype),
             extensible: Cell::new(true),
@@ -644,7 +657,7 @@ impl JsObject {
     /// are set up by `crate::proxy::proxy_create`.
     pub fn proxy_object_create(slots: crate::proxy::ProxySlots) -> Handle<JsObject> {
         let proxy = Handle::new(Self {
-            id: NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
+            id: next_object_id(),
             kind: ObjectKind::Proxy(Handle::new(slots)),
             prototype: RefCell::new(None),
             extensible: Cell::new(true),
@@ -668,7 +681,7 @@ impl JsObject {
         prototype: Option<Handle<JsObject>>,
     ) -> Result<Handle<JsObject>, JsError> {
         let object = Handle::new(Self {
-            id: NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
+            id: next_object_id(),
             kind: ObjectKind::IntegerIndexed(Handle::new(slots)),
             prototype: RefCell::new(prototype),
             extensible: Cell::new(true),
@@ -771,7 +784,7 @@ impl JsObject {
         deferred: bool,
     ) -> Result<Handle<JsObject>, JsError> {
         let object = Handle::new(Self {
-            id: NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
+            id: next_object_id(),
             kind: ObjectKind::ModuleNamespace(Handle::new(ModuleNamespaceSlots {
                 exports,
                 deferred,
@@ -822,7 +835,7 @@ impl JsObject {
     ) -> Result<Handle<JsObject>, JsError> {
         let map = JsObject::ordinary_object_create(None);
         let obj = Handle::new(Self {
-            id: NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
+            id: next_object_id(),
             kind: ObjectKind::Arguments(Handle::new(ArgumentsSlots {
                 parameter_map: Some(map),
                 env: None,
@@ -917,7 +930,7 @@ impl JsObject {
         thrower: Value,
     ) -> Result<Handle<JsObject>, JsError> {
         let obj = Handle::new(Self {
-            id: NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
+            id: next_object_id(),
             kind: ObjectKind::Arguments(Handle::new(ArgumentsSlots {
                 parameter_map: None,
                 env: None,

@@ -2147,11 +2147,13 @@ pub(crate) fn construct_this_object(
     // traps).
     let prototype = if let ValueKind::Function(function) = new_target.kind() {
         let generation = function.object.generation();
-        if let Some(&(cached_generation, ref cached)) =
-            agent.construct_prototypes.borrow().get(&function.id())
-            && cached_generation == generation
+        let index = (function.id().wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize)
+            & (crate::ir::CONSTRUCT_PROTO_CELLS - 1);
+        if let Some(cell) = agent.construct_prototypes[index].as_ref()
+            && cell.id == function.id()
+            && cell.generation == generation
         {
-            cached.clone()
+            cell.value.clone()
         } else {
             let value = crate::context::get_property(
                 agent,
@@ -2159,10 +2161,11 @@ pub(crate) fn construct_this_object(
                 &JsString::from_utf8("prototype"),
                 new_target.clone(),
             )?;
-            agent
-                .construct_prototypes
-                .borrow_mut()
-                .insert(function.id(), (generation, value.clone()));
+            agent.construct_prototypes[index] = Some(crate::ir::ConstructPrototypeCell {
+                id: function.id(),
+                generation,
+                value: value.clone(),
+            });
             value
         }
     } else {

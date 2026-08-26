@@ -186,7 +186,8 @@ pub struct Agent {
     /// generation counter (Cut 22's mechanism — a redefine/delete bumps
     /// it), so a hot construct loop pays a HashMap probe instead of the
     /// full property path.
-    pub(crate) construct_prototypes: RefCell<std::collections::HashMap<u64, (u32, Value)>>,
+    pub(crate) construct_prototypes:
+        Box<[Option<crate::ir::ConstructPrototypeCell>; crate::ir::CONSTRUCT_PROTO_CELLS]>,
     /// The free-list of Vms for per-call reuse: `run_compiled_body`, the
     /// construct fast path, and the script/eval paths take one, run, and
     /// return it — a pooled Vm is never handed to a suspended
@@ -587,7 +588,7 @@ impl Agent {
             for_of_fast_cells: std::array::from_fn(|_| None),
             for_of_array_cells: Box::new([None; crate::ir::MEMBER_CELLS]),
             leaf_cache: Box::new(std::array::from_fn(|_| None)),
-            construct_prototypes: RefCell::new(std::collections::HashMap::new()),
+            construct_prototypes: Box::new(std::array::from_fn(|_| None)),
             vm_pool: Vec::new(),
             promise_jobs: VecDeque::new(),
             generic_jobs: VecDeque::new(),
@@ -963,14 +964,9 @@ impl Agent {
         }
         // The cells below are RefCells: a per-allocation `--gc-stress`
         // collection can fire while one is mutably borrowed, so read them
-        // with `try_borrow` and abort the sweep (retain everything) instead
-        // of panicking.
-        let Ok(construct_prototypes) = self.construct_prototypes.try_borrow() else {
-            crux::heap::note_aborted_trace();
-            return;
-        };
-        for (_, (_, value)) in construct_prototypes.iter() {
-            value.trace(visit);
+        // Cut 26: the cached constructor-prototype reads hold Values.
+        for cell in self.construct_prototypes.iter().flatten() {
+            cell.value.trace(visit);
         }
         self.vm_pool.trace(visit);
         self.promise_jobs.trace(visit);
