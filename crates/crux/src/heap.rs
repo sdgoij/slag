@@ -35,6 +35,14 @@ pub trait Trace: 'static {
 #[derive(Clone, Copy)]
 pub struct GcAny(*mut GcBox<dyn Trace>);
 
+impl GcAny {
+    /// The box base address (the identity used by the conservative stack
+    /// scan and the weak-table compaction after a collection).
+    pub fn addr(self) -> usize {
+        self.0 as *const u8 as usize
+    }
+}
+
 /// A cell in the GC heap. `T` is unsized only through `dyn Trace`; for a
 /// typed `Gc<T>` the box is sized. The header holds the mark bit; `data` is
 /// the payload the handle derefs to.
@@ -315,12 +323,26 @@ thread_local! {
     /// would free boxes the mark could not see, so it is aborted (retain
     /// everything) instead.
     static ABORT_SWEEP: Cell<bool> = const { Cell::new(false) };
+    /// GC-3: the ephemeron edges (WeakMap key→value, WeakSet element→itself)
+    /// registered while tracing the weak tables. A value is only reachable
+    /// while its key is reachable from other roots, so the edges are
+    /// deferred: the mark phase promotes a value once its key is marked,
+    /// iterating to a fixpoint. Valid only during one collection.
+    static EPHEMERONS: RefCell<Vec<(GcAny, GcAny)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Record that a traced `RefCell` was borrowed during marking; the sweep
 /// must be aborted.
 pub fn note_aborted_trace() {
     ABORT_SWEEP.with(|abort| abort.set(true));
+}
+
+/// GC-3: register an ephemeron edge — `value` is reachable only while
+/// `key` is reachable from other roots (WeakMap: the value lives while its
+/// key does; WeakSet: the element is its own key). The collector marks the
+/// value once the key is marked, so a weak table never retains its key.
+pub fn note_ephemeron(key: GcAny, value: GcAny) {
+    EPHEMERONS.with(|slot| slot.borrow_mut().push((key, value)));
 }
 
 /// Enable the per-allocation stress collector. `collect` receives the fresh
@@ -421,9 +443,9 @@ impl Heap {
     /// is iterative (an explicit worklist), so a deeply nested object graph
     /// (a long rope, a deep prototype chain) cannot overflow the native
     /// stack.
-    pub fn collect(&mut self, roots: &[GcAny]) {
+    pub fn collect(&mut self, roots: &[GcAny]) -> Vec<usize> {
         let work = roots.to_vec();
-        self.collect_from_work(work);
+        self.collect_from_work(work)
     }
 }
 
@@ -497,7 +519,7 @@ impl Heap {
     /// `roots` are traced, then the sweep frees everything unmarked. The
     /// scan is the safety net for Rust-held handles that no precise root
     /// can see; it may retain garbage, never free a reachable box.
-    pub fn collect_with_stack(&mut self, roots: &[GcAny]) {
+    pub fn collect_with_stack(&mut self, roots: &[GcAny]) -> Vec<usize> {
         // Address → fat pointer: the scan recovers a box address from a
         // stack word and needs the `dyn Trace` vtable to mark through it.
         let by_addr: HashMap<usize, *mut GcBox<dyn Trace>> = self
@@ -512,13 +534,15 @@ impl Heap {
         {
             self.scan_stack(sp, high, &by_addr, &mut work);
         }
-        self.collect_from_work(work);
+        self.collect_from_work(work)
     }
 
     /// The mark phase shared by [`Heap::collect`] and
     /// [`Heap::collect_with_stack`]: drain `work` (the roots plus any boxes
-    /// the conservative stack scan found) iteratively, then sweep.
-    fn collect_from_work(&mut self, mut work: Vec<GcAny>) {
+    /// the conservative stack scan found) iteratively, then sweep. Returns
+    /// the addresses of the swept boxes (the weak tables compact their
+    /// entries against it — GC-3).
+    fn collect_from_work(&mut self, mut work: Vec<GcAny>) -> Vec<usize> {
         // SAFETY: every `GcAny` in `work` is a registered box (a root from a
         // live `Gc<T>`'s `Trace` impl, or an address the scan looked up in
         // the live set); the mark bit breaks cycles.
@@ -532,6 +556,41 @@ impl Heap {
                 (*ptr).data.trace(&mut |child| work.push(child));
             }
         }
+        // GC-3 ephemeron fixpoint: a weak-table value is reachable only
+        // while its key is reachable from other roots. Each pass promotes
+        // the values whose keys are now marked (their trace can register
+        // further edges — e.g. a WeakMap value that is itself a WeakMap key
+        // — so the passes repeat until nothing new is promoted).
+        loop {
+            let mut promoted = false;
+            let edges = EPHEMERONS.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+            for (key, value) in edges {
+                let key_marked = unsafe { (*key.0).mark.get() };
+                let value_marked = unsafe { (*value.0).mark.get() };
+                if key_marked && !value_marked {
+                    unsafe {
+                        (*value.0).mark.set(true);
+                    }
+                    work.push(value);
+                    promoted = true;
+                }
+                EPHEMERONS.with(|slot| slot.borrow_mut().push((key, value)));
+            }
+            if !promoted {
+                break;
+            }
+            while let Some(any) = work.pop() {
+                unsafe {
+                    let ptr = any.0;
+                    if (*ptr).mark.get() {
+                        continue;
+                    }
+                    (*ptr).mark.set(true);
+                    (*ptr).data.trace(&mut |child| work.push(child));
+                }
+            }
+        }
+        EPHEMERONS.with(|slot| slot.borrow_mut().clear());
         // A traced `RefCell` was mutably borrowed mid-mark (per-allocation
         // `--gc-stress`): the mark is incomplete, so retain everything —
         // imprecise but safe. The next collection retries.
@@ -544,9 +603,10 @@ impl Heap {
                     (**ptr).mark.set(false);
                 }
             }
-            return;
+            return Vec::new();
         }
         let mut keep = Vec::with_capacity(self.live.len());
+        let mut swept = Vec::new();
         for ptr in self.live.drain(..) {
             // SAFETY: every entry was registered by `Gc::new` and is a valid
             // box; unmarked boxes have no live handles (the rooting
@@ -556,11 +616,13 @@ impl Heap {
                     (*ptr).mark.set(false);
                     keep.push(ptr);
                 } else {
+                    swept.push(ptr as *const u8 as usize);
                     drop(Box::from_raw(ptr));
                 }
             }
         }
         self.live = keep;
+        swept
     }
 
     /// Scan every word in the current thread's live stack region

@@ -2387,6 +2387,60 @@ mod tests {
     }
 
     #[test]
+    fn weak_map_ephemeron_lifetime() {
+        // GC-3: a WeakMap value lives only while its key is reachable from
+        // other roots, and an entry whose key dies is dropped (its boxes are
+        // swept, not retained by the table).
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.run_script("globalThis.wm = new WeakMap();").unwrap();
+        // A live key keeps its entry (and value) across a collection.
+        agent
+            .run_script("var live = {}; wm.set(live, { tag: 'kept' }); globalThis.live = live;")
+            .unwrap();
+        agent.collect_garbage();
+        let value = agent.run_script("wm.get(live).tag").unwrap();
+        assert!(matches!(value.kind(), ValueKind::String(s) if s.to_string_lossy() == "kept"));
+        // An unreferenced key's entry — key and value both — is swept.
+        let baseline = crux::heap::with_heap(|heap| heap.live_count());
+        agent
+            .run_script("var dead = {}; var payload = {}; wm.set(dead, payload);")
+            .unwrap();
+        let grown = crux::heap::with_heap(|heap| heap.live_count());
+        assert!(grown > baseline, "the dead key and payload should be live");
+        agent.collect_garbage();
+        let after = crux::heap::with_heap(|heap| heap.live_count());
+        assert!(
+            after < grown,
+            "the dead-key entry (key + value) must be swept, not retained"
+        );
+        // The live entry still works after the collection.
+        let has = agent.run_script("wm.has(live)").unwrap();
+        assert!(matches!(has.kind(), ValueKind::Boolean(true)));
+    }
+
+    #[test]
+    fn weak_set_ephemeron_lifetime() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.run_script("globalThis.ws = new WeakSet();").unwrap();
+        agent
+            .run_script("var live = {}; ws.add(live); globalThis.live = live;")
+            .unwrap();
+        agent.collect_garbage();
+        let has = agent.run_script("ws.has(live)").unwrap();
+        assert!(matches!(has.kind(), ValueKind::Boolean(true)));
+        // A dead element is dropped from the set.
+        let baseline = crux::heap::with_heap(|heap| heap.live_count());
+        agent.run_script("var dead = {}; ws.add(dead);").unwrap();
+        let grown = crux::heap::with_heap(|heap| heap.live_count());
+        assert!(grown > baseline);
+        agent.collect_garbage();
+        let after = crux::heap::with_heap(|heap| heap.live_count());
+        assert!(after < grown, "the dead element must be swept");
+    }
+
+    #[test]
     fn map_get_or_insert_and_group_by() {
         assert_eq!(
             text(

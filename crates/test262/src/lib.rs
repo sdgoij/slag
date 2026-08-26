@@ -11559,6 +11559,24 @@ var $DONE = function (error) {
                 true,
             )
             .map_err(|e| e.message)?;
+        // `$262.gc()` (test262 host spec): force a full collection, making
+        // the WeakMap/WeakSet ephemeron and WeakRef/FinalizationRegistry
+        // semantics observable (GC-3/GC-4).
+        let gc = Function::create_builtin(
+            Some(JsString::from_utf8("gc")),
+            0,
+            Box::new(|_, _| {
+                let agent = runtime::context::current_agent_mut()?;
+                agent.collect_garbage();
+                Ok(Value::Undefined)
+            }),
+            None,
+            None,
+        )
+        .map_err(|e| e.message)?;
+        dollar_two_six_two_obj
+            .set(&JsString::from_utf8("gc"), Value::Function(gc), true)
+            .map_err(|e| e.message)?;
         // `$262.createRealm` (test262 host spec): a fresh realm with its own
         // intrinsics and global object, returned as `{ global, evalScript }`.
         // The record's `evalScript` evaluates as a Script in that realm (the

@@ -291,9 +291,30 @@ Gate status: `--gc-stress` clean across the sweep; leak harness bounded.
 
 ### GC-3 — ephemeron-aware WeakMap / WeakSet
 
-- Replace the strong entry storage with key→value ephemeron semantics
-  (mark-sweep fixpoint). Un-skip the collection fixtures.
-- Gate: fixtures pass; `--gc-stress` clean.
+**Landed.** The weak tables now have true ephemeron semantics instead of
+strong entry storage:
+
+- **Collector fixpoint** (`crux/heap.rs`): traces register ephemeron edges
+  (`note_ephemeron(key, value)`); the mark phase promotes a value once its
+  key is marked, iterating to a fixpoint (a value that is itself a weak key
+  can promote further edges). `collect`/`collect_with_stack` now return the
+  swept box addresses.
+- **Runtime wiring** (`runtime/agent.rs`): `trace_roots` registers
+  WeakMap key→value and WeakSet element→element edges instead of tracing
+  the tables strongly; `collect_garbage_with` compacts the weak tables
+  after each collection, dropping entries whose key (or element) box was
+  swept — a dead key's handle can never dangle on the next access.
+- **`$262.gc()`**: the test262 host hook forces a full collection, making
+  the ephemeron semantics observable to fixtures.
+- Tests: `weak_map_ephemeron_lifetime` / `weak_set_ephemeron_lifetime`
+  (live keys keep their values across a collection; an unreferenced key's
+  entry — key and value — is swept; the live entry still works after).
+- Gate: the 226 pinned WeakMap/WeakSet fixtures pass under `--gc-stress`;
+  the full `all` sweep stays 0 fail / 0 crash; the leak harness stays
+  bounded. (The pinned corpus never calls `$262.gc()`, so the visible gate
+  is the API surface + no regression — the ephemeron machinery is verified
+  by the unit tests and `$262.gc`-driven fixtures on a corpus that forces
+  collection.)
 
 ### GC-4 — WeakRef and FinalizationRegistry activation
 

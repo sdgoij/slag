@@ -16,6 +16,7 @@ use crux::heap::{GcAny, Trace};
 use crux::string::JsString;
 use crux::symbol::Symbol;
 use crux::value::Value;
+use crux::value::ValueKind;
 
 use crate::context::ExecutionContext;
 use crate::host::HostHooks;
@@ -37,6 +38,20 @@ pub type MapEntry = Option<(Value, Value)>;
 
 /// One element of a Set/WeakSet `[[*Data]]` List.
 pub type SetEntry = Option<Value>;
+
+/// The GC box address of a heap value, `None` for doubles and the non-heap
+/// tags (GC-3: the weak-table compaction and ephemeron registration identify
+/// entries by their key's box).
+pub fn value_box_addr(value: &Value) -> Option<crux::heap::GcAny> {
+    match value.kind() {
+        ValueKind::Object(object) => Some(object.as_any()),
+        ValueKind::Function(function) => Some(function.as_any()),
+        ValueKind::String(text) => Some(text.as_any()),
+        ValueKind::Symbol(symbol) => Some(symbol.as_any()),
+        ValueKind::BigInt(bigint) => Some(bigint.as_any()),
+        _ => None,
+    }
+}
 
 /// The surrounding agent: the execution context stack, the job queues, and
 /// the Agent Record fields of spec 9.7.
@@ -1004,8 +1019,35 @@ impl Agent {
         self.raw_json_data.trace(visit);
         self.map_data.trace(visit);
         self.set_data.trace(visit);
-        self.weak_map_data.trace(visit);
-        self.weak_set_data.trace(visit);
+        // GC-3: WeakMap/WeakSet entries are ephemerons — the key (and thus
+        // the entry) lives only while it is reachable from other roots, and
+        // the value lives only while its key does. Register the edges for
+        // the collector's fixpoint instead of tracing them strongly; the
+        // post-collection compaction drops entries whose key was swept.
+        for cell in self.weak_map_data.values() {
+            let Ok(data) = cell.try_borrow() else {
+                crux::heap::note_aborted_trace();
+                return;
+            };
+            for entry in data.iter().flatten() {
+                let Some(key) = value_box_addr(&entry.0) else {
+                    continue;
+                };
+                let value = value_box_addr(&entry.1).unwrap_or(key);
+                crux::heap::note_ephemeron(key, value);
+            }
+        }
+        for cell in self.weak_set_data.values() {
+            let Ok(data) = cell.try_borrow() else {
+                crux::heap::note_aborted_trace();
+                return;
+            };
+            for element in data.iter().flatten() {
+                if let Some(element) = value_box_addr(element) {
+                    crux::heap::note_ephemeron(element, element);
+                }
+            }
+        }
         for iter_data in self.map_iter_data.values() {
             let Ok(guard) = iter_data.try_borrow() else {
                 crux::heap::note_aborted_trace();
@@ -1074,9 +1116,43 @@ impl Agent {
             roots.push(extra);
         }
         self.trace_roots(&mut |any| roots.push(any));
-        crux::heap::with_heap_mut(|heap| heap.collect_with_stack(&roots));
+        let swept = crux::heap::with_heap_mut(|heap| heap.collect_with_stack(&roots));
         self.last_collected_live
             .set(crux::heap::with_heap(|heap| heap.live_count()));
+        // GC-3: drop the weak entries whose key was swept (the ephemeron
+        // mark keeps a value only while its key is reachable; a swept key's
+        // handle would dangle on the next access).
+        self.compact_weak_tables(&swept);
+    }
+
+    /// GC-3: remove the WeakMap/WeakSet entries whose key (or element) box
+    /// was freed by the collection just completed.
+    fn compact_weak_tables(&self, swept: &[usize]) {
+        if swept.is_empty() {
+            return;
+        }
+        let swept: std::collections::HashSet<usize> = swept.iter().copied().collect();
+        for cell in self.weak_map_data.values() {
+            let mut data = cell.borrow_mut();
+            data.retain(|entry| match entry {
+                Some((key, _)) => match value_box_addr(key) {
+                    Some(key) => !swept.contains(&key.addr()),
+                    // A non-heap key cannot have been swept.
+                    None => true,
+                },
+                None => false,
+            });
+        }
+        for cell in self.weak_set_data.values() {
+            let mut data = cell.borrow_mut();
+            data.retain(|entry| match entry {
+                Some(element) => match value_box_addr(element) {
+                    Some(element) => !swept.contains(&element.addr()),
+                    None => true,
+                },
+                None => false,
+            });
+        }
     }
 
     /// The safe-point collection trigger: collect when the heap has grown
