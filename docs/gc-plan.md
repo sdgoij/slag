@@ -385,10 +385,35 @@ the batched mark-sweep reclamation (the sweep of a loop's garbage runs at the
 script boundary, inside the timed window; the Rc model freed per iteration and
 reused hot memory). A swept-box free-list (direct-mapped size-class cache)
 was prototyped and measured net-neutral (within the machine's ±10% load
-noise) and reverted.
+noise) and reverted. A per-box intrusive live list (the registry link stored
+in each box, so registration is one store) was also prototyped and measured a
+clear regression: the fat link grows every box (+16B — the string box goes
+32→48B), which costs more in the allocation-bound loops than the Vec push it
+removes (construct churn 72→95ms, string concat 20→28ms on the same
+machine) and was reverted. The registration Vec is not the bottleneck.
+
+**Mid-script safe-point collection was then prototyped and kept.** A
+thread-local allocation budget (`Gc::new` bumps a counter; loop back-edges —
+the fused `FastLoopHead` and backward `Step::Jump` — do one TLS read +
+compare) calls `Agent::maybe_collect` when the budget is exceeded, so a
+loop's garbage is reclaimed incrementally instead of in one script-boundary
+sweep. Measured on the same machine: construct churn 74→65.7ms (−11%),
+string concat 20.7→22.3ms (+1.6ms — the check + counter overhead; a concat
+rope is all live, so there is nothing to reclaim), and the six machinery
+rows unchanged (the back-edge check is invisible when a loop never
+allocates). A collection that swept nothing disables mid-loop collections
+until the next script boundary (a growing live set would otherwise be
+re-marked every budget crossing), and the budget resets at script/job
+boundaries so it never drifts across scripts. The new collection point
+surfaced one test-helper rooting gap (the `iterable()` helper's `next`
+closure captured a plain `Vec<Value>` — opaque to tracing, now rooted
+through a holder object on the iterator); the engine itself is clean
+(WeakRef 29/29, FinalizationRegistry 47/47, and a 134-fixture `language`
+sample pass under `--gc-stress`).
 
 Gate status: the plan's predicted 2–4x on allocation-bound code is **not
-met** — per-iteration/closure rows yes, construct/string rows no. The
+met** — per-iteration/closure rows yes, construct/string rows no (construct
+is now 1.8x vs the Rc model after the safe-point work, concat 2.1x). The
 remaining lever is the plan's original slot-arena design (bump/segment
 allocation + a per-size free list instead of one malloc per box), which
 removes both the per-box malloc and the sweep's allocator round-trips; it is

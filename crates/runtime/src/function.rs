@@ -2965,20 +2965,30 @@ mod tests {
     /// `@@iterator` arrive with the builtins phase, so array-destructuring
     /// tests iterate this until then.
     fn iterable(values: Vec<Value>) -> Value {
-        let values_clone = values.clone();
+        // GC-5: the values live in a numeric-indexed holder object attached
+        // to the iterator — the `next` closure's captures are opaque to the
+        // GC trace, so a plain `Vec<Value>` there would be swept by a
+        // mid-loop collection (the iterator is rooted by the for-of
+        // machinery while the loop runs, and the holder is traced with it).
+        let len = values.len();
+        let holder = crux::object::JsObject::ordinary_object_create(None);
+        for (i, value) in values.into_iter().enumerate() {
+            holder
+                .create_data_property(&JsString::from_utf8(&i.to_string()), value)
+                .unwrap();
+        }
         let index = std::cell::Cell::new(0usize);
+        let holder_for_next = holder;
         let next = crux::Function::create_builtin(
             Some(JsString::from_utf8("next")),
             0,
             Box::new(move |_, _| {
                 let i = index.get();
                 let result = crux::object::JsObject::ordinary_object_create(None);
-                if i < values_clone.len() {
+                if i < len {
                     index.set(i + 1);
-                    result.create_data_property(
-                        &JsString::from_utf8("value"),
-                        values_clone[i].clone(),
-                    )?;
+                    let value = holder_for_next.get(&JsString::from_utf8(&i.to_string()))?;
+                    result.create_data_property(&JsString::from_utf8("value"), value)?;
                     result.create_data_property(
                         &JsString::from_utf8("done"),
                         Value::Boolean(false),
@@ -2997,6 +3007,12 @@ mod tests {
         let iterator = crux::object::JsObject::ordinary_object_create(None);
         iterator
             .create_data_property(&JsString::from_utf8("next"), Value::Function(next))
+            .unwrap();
+        iterator
+            .create_data_property(
+                &JsString::from_utf8("$values"),
+                Value::Object(holder_for_next),
+            )
             .unwrap();
         let iterable = crux::object::JsObject::ordinary_object_create(None);
         let iterator_for_method = iterator;

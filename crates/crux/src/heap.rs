@@ -106,6 +106,7 @@ impl<T: Trace> Gc<T> {
         });
         let raw = Box::into_raw(boxed);
         with_heap_mut(|heap| heap.register(raw as *mut GcBox<dyn Trace>));
+        ALLOC_SINCE_COLLECT.with(|count| count.set(count.get() + 1));
         let gc = Gc {
             ptr: unsafe { NonNull::new_unchecked(raw) },
             _not_send_sync: std::marker::PhantomData,
@@ -306,6 +307,74 @@ pub struct Heap {
 
 thread_local! {
     static HEAP: RefCell<Heap> = const { RefCell::new(Heap::new()) };
+    /// GC-5: allocations since the last safe-point check — the cheap
+    /// mid-script collection trigger. Loop back-edges cannot afford a
+    /// live-count read (TLS + RefCell borrow per iteration), so `Gc::new`
+    /// bumps this and the back-edge check compares it against
+    /// [`ALLOC_BUDGET`] (one TLS read).
+    static ALLOC_SINCE_COLLECT: Cell<u64> = const { Cell::new(0) };
+    /// GC-5: safe-point backoff — set to `u64::MAX` when a safe-point
+    /// collection swept nothing (a growing live set, e.g. a concat rope,
+    /// keeps every node reachable, so re-marking it each budget crossing is
+    /// pure overhead), disabling mid-loop collections until the next script
+    /// boundary; a collection that reclaimed garbage keeps them eager.
+    static BUDGET_BACKOFF: Cell<u64> = const { Cell::new(1) };
+}
+
+/// The allocation budget that paces safe-point collections (GC-5): after
+/// this many allocations since the last check, the runtime runs its real
+/// collection trigger (`Agent::maybe_collect`, which still gates on the
+/// live count). 1024 keeps the heap bounded at a few thousand garbage
+/// boxes in a hot allocation loop while the back-edge check itself stays a
+/// single compare.
+const ALLOC_BUDGET: u64 = 1024;
+
+/// GC-5: the cheap safe-point check for loop back-edges. Returns true when
+/// enough allocations have happened since the last check (the caller then
+/// runs its collection trigger); the counter is reset either way. An empty
+/// sweep multiplies the budget by [`BUDGET_BACKOFF`] (see
+/// [`note_collection`]). `#[inline]` so the back-edge check is a TLS read +
+/// compare (cross-crate calls are not inlined otherwise).
+#[inline]
+pub fn allocation_budget_exceeded() -> bool {
+    // Fast path: below the base budget the backoff cannot matter — one TLS
+    // read and out (the machinery rows never allocate, so this is the hot
+    // shape: counter is 0).
+    if ALLOC_SINCE_COLLECT.with(|count| count.get()) < ALLOC_BUDGET {
+        return false;
+    }
+    let budget = ALLOC_BUDGET.saturating_mul(BUDGET_BACKOFF.with(|backoff| backoff.get()));
+    let exceeded = ALLOC_SINCE_COLLECT.with(|count| count.get()) >= budget;
+    if exceeded {
+        ALLOC_SINCE_COLLECT.with(|count| count.set(0));
+    }
+    exceeded
+}
+
+/// GC-5: reset the safe-point allocation budget (a script/job boundary —
+/// the budget counts allocations since the last trigger or collection, so
+/// it must not leak across scripts). Also re-enables mid-loop collections
+/// that an empty sweep disabled.
+pub fn reset_allocation_budget() {
+    ALLOC_SINCE_COLLECT.with(|count| count.set(0));
+    BUDGET_BACKOFF.with(|backoff| backoff.set(1));
+}
+
+/// GC-5: record a collection that ran (any path — a script/job boundary, a
+/// safe point, or `--gc-stress`): the allocation budget restarts from zero
+/// (so it counts allocations since the last collection, never drifting). A
+/// collection that swept nothing is pure overhead for a growing live set (a
+/// concat rope keeps every node reachable), so mid-loop collections are
+/// disabled until the next script boundary; reclamation keeps them eager.
+pub fn note_collection(swept: usize) {
+    ALLOC_SINCE_COLLECT.with(|count| count.set(0));
+    BUDGET_BACKOFF.with(|backoff| {
+        if swept == 0 {
+            backoff.set(u64::MAX);
+        } else {
+            backoff.set(1);
+        }
+    });
 }
 
 // GC-2 `--gc-stress`: collect after every allocation. The collector runs

@@ -857,6 +857,9 @@ impl Agent {
     }
 
     fn run_jobs_inner(&mut self) -> Result<(), JsError> {
+        // GC-5: the job drain is a fresh execution unit — the safe-point
+        // allocation budget must not leak in from the previous script/job.
+        crux::heap::reset_allocation_budget();
         // GC-4: promote the FinalizationRegistry cleanup jobs enqueued by the
         // collector's compaction hook into the generic queue (the hook runs
         // with `&self` and cannot touch the queues directly).
@@ -912,6 +915,9 @@ impl Agent {
     /// realm, returning the script's completion value.
     pub fn run_script(&mut self, source: &str) -> Result<Value, JsError> {
         crux::function::with_agent(self as *mut Agent as *mut (), || {
+            // GC-5: a fresh script is a fresh execution unit — the safe-point
+            // allocation budget must not leak in from the previous script.
+            crux::heap::reset_allocation_budget();
             let realm = self.current_realm()?;
             let script = crate::script::parse_script(source, realm)?;
             let result = crate::script::script_evaluation(self, &script);
@@ -1189,7 +1195,7 @@ impl Agent {
         // or FinalizationRegistry target alive (the sweep still uses the
         // conservative mark — the scan stays the safety net for Rust-held
         // handles).
-        crux::heap::with_heap_mut(|heap| {
+        let swept = crux::heap::with_heap_mut(|heap| {
             heap.collect_with_stack_compacting(
                 &roots,
                 self.has_weak_structures(),
@@ -1197,9 +1203,11 @@ impl Agent {
                     self.compact_weak_tables(dead, retain);
                 },
             )
+            .len()
         });
         self.last_collected_live
             .set(crux::heap::with_heap(|heap| heap.live_count()));
+        crux::heap::note_collection(swept);
     }
 
     /// GC-4: whether any weak structure exists — the collector then runs a

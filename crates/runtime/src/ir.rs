@@ -5611,7 +5611,15 @@ impl Vm {
                         self.completion_is_empty = empty;
                     }
                 }
-                Step::Jump(target) => self.ip = *target,
+                Step::Jump(target) => {
+                    // GC-5 safe point: a backward jump is a loop back-edge —
+                    // pace the collection trigger on the allocation budget
+                    // (a live-count read is too expensive per iteration).
+                    if *target < self.ip && crux::heap::allocation_budget_exceeded() {
+                        agent.maybe_collect();
+                    }
+                    self.ip = *target
+                }
                 Step::JumpIfFalse(target) => {
                     let value = self.pop();
                     if !crux::convert::to_boolean(&value) {
@@ -5650,6 +5658,12 @@ impl Vm {
                     body_start,
                     after,
                 } => {
+                    // GC-5 safe point: the fused canonical loop head is the
+                    // loop's back-edge (increment + re-test + jump back) —
+                    // pace the collection trigger on the allocation budget.
+                    if crux::heap::allocation_budget_exceeded() {
+                        agent.maybe_collect();
+                    }
                     // The fused canonical loop head: increment, re-test, and
                     // jump back (or out) in one dispatch — the body dispatches
                     // inline in the main loop.
