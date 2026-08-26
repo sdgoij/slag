@@ -362,10 +362,50 @@ cleanup jobs actually fire:
 
 ### GC-5 — the perf payoff
 
-- Re-measure the three allocation-bound rows (construct churn, string
-  concat, per-iteration closures). `Copy` values + arena handles remove Rc
-  clone/alloc traffic from closure captures and constructs.
-- Gate: those rows into the `docs/perf.md` 2–4x band.
+**Measured — partially landed, gate open.** Re-measured the eight `--bench`
+rows against the pre-GC Rc model on the same machine (a temp worktree at the
+last pre-GC commit `b54af4a`), interleaved medians:
+
+| Row | Rc model | GC model | delta |
+|---|---|---|---|
+| arithmetic | ~25ms | ~12.5ms | **~2.0x faster** |
+| property access | ~58ms | ~28ms | **~2.1x faster** |
+| array iteration | ~52ms | ~23ms | **~2.3x faster** |
+| function calls | ~45ms | ~23ms | **~2.0x faster** |
+| closure capture | ~53ms | ~25ms | **~2.1x faster** |
+| per-iteration | ~16.7ms | ~8.8ms | **~1.9x faster** |
+| string concat | ~10.7ms | ~20ms | ~1.9x slower |
+| construct churn | ~36ms | ~74ms | ~2.1x slower |
+
+`Copy` values + arena handles delivered the predicted ~2x on the closure and
+call machinery (per-iteration 1.9x, closure capture 2.1x — those rows are in
+the 2–4x band), but the two allocation-bound rows regressed: `Gc::new`
+(~150ns vs `Rc::new` ~60ns — the live-set registration + stress checks) and
+the batched mark-sweep reclamation (the sweep of a loop's garbage runs at the
+script boundary, inside the timed window; the Rc model freed per iteration and
+reused hot memory). A swept-box free-list (direct-mapped size-class cache)
+was prototyped and measured net-neutral (within the machine's ±10% load
+noise) and reverted.
+
+Gate status: the plan's predicted 2–4x on allocation-bound code is **not
+met** — per-iteration/closure rows yes, construct/string rows no. The
+remaining lever is the plan's original slot-arena design (bump/segment
+allocation + a per-size free list instead of one malloc per box), which
+removes both the per-box malloc and the sweep's allocator round-trips; it is
+deferred as a follow-up.
+
+**Bonus fix (GC-4 machinery, found while measuring):** the FinalizationRegistry
+cleanup job's closure region was wrong. `Job::new` computed it via
+`Layout::for_value` on the boxed `dyn FnOnce`, whose vtable under-reports
+the size for a multi-capture closure (16 bytes reported as 8), and the
+cleanup caller double-boxed its closure (`Job::new(_, Box::new(closure))`
+where `Job::new` boxes again), so the region covered the outer box rather
+than the captures. The conservative region scan then missed the captured
+heldValue and a later collection swept it — `finalization_registry_cleanup_job_runs`
+flaked (~1-in-8). `Job::new` now records the region at construction from the
+concrete closure's size (reliable before the box erases it), and the cleanup
+caller passes the raw closure. The test is deterministic (0/50 failures);
+full sweeps stay 0 fail / 0 crash.
 
 ### GC-6 — threads, workers, and the C-API surface
 

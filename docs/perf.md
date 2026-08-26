@@ -2404,15 +2404,37 @@ arithmetic, 3-run medians); the gate's arithmetic target still needs a
 fast global property access (cell/IC), and function calls need less
 per-call machinery.
 
-## GC milestone (PLAN Phase 18 item 2)
+## GC milestone (PLAN Phase 18 item 2) — landed, perf gate open
 
 The plan's GC milestone (arena heap + mark-sweep; root tracing;
-ephemeron-aware WeakMap/WeakSet; `WeakRef`/`FinalizationRegistry`
-semantics activated; `--gc-stress` mode) is a rewrite of the value/object
-model from `Rc`-based ownership to GC-managed handles, and is deferred as a
-unit. The observable spec surface (`WeakRef`, `FinalizationRegistry`,
-`keptAlive`, `WeakMap`/`WeakSet` keying) is implemented and tested; only the
-collector itself is missing.
+ephemeron-aware WeakMap/WeakSet; `WeakRef`/`FinalizationRegistry` semantics
+activated; `--gc-stress` mode) is a rewrite of the value/object model from
+`Rc`-based ownership to GC-managed handles. It is **landed** (GC-1..4:
+`Handle` → GC heap, collector wiring, per-allocation `--gc-stress` root
+audit, ephemerons, weak-ref semantics) — see `docs/gc-plan.md`.
+
+**GC-5 measured (2026-08-26)** — the eight `--bench` rows vs the pre-GC Rc
+model on the same machine (interleaved medians):
+
+| Row | Rc model | GC model | delta |
+|---|---|---|---|
+| arithmetic | ~25ms | ~12.5ms | ~2.0x faster |
+| property access | ~58ms | ~28ms | ~2.1x faster |
+| array iteration | ~52ms | ~23ms | ~2.3x faster |
+| function calls | ~45ms | ~23ms | ~2.0x faster |
+| closure capture | ~53ms | ~25ms | ~2.1x faster |
+| per-iteration | ~16.7ms | ~8.8ms | ~1.9x faster |
+| string concat | ~10.7ms | ~20ms | ~1.9x slower |
+| construct churn | ~36ms | ~74ms | ~2.1x slower |
+
+The GC delivered the predicted ~2x on the machinery rows (the `Copy`-value
+win removes Rc clone traffic), but the allocation-bound rows (construct
+churn, string concat) regressed ~2x: `Gc::new` is heavier than `Rc::new`
+(the live-set registration + stress checks), and mark-sweep reclaims a
+loop's garbage in one batch at the script boundary (inside the timed
+window) instead of per iteration. The plan's slot-arena allocation (the
+original recommendation) is the remaining lever; see `docs/gc-plan.md`
+GC-5.
 
 ## Accepted no-op CLI flags
 

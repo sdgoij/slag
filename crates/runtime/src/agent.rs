@@ -1279,19 +1279,11 @@ impl Agent {
                     if let Some(held) = value_box_addr(&held_value) {
                         retain(held);
                     }
-                    self.pending_cleanup_jobs
-                        .borrow_mut()
-                        .push(crate::job::Job::new(
-                            Some(realm),
-                            Box::new(move |agent: &mut crate::agent::Agent| {
-                                crate::function::call(
-                                    agent,
-                                    &callback,
-                                    Value::Undefined,
-                                    &[held_value],
-                                )
-                            }),
-                        ));
+                    let cleanup_closure = move |agent: &mut crate::agent::Agent| {
+                        crate::function::call(agent, &callback, Value::Undefined, &[held_value])
+                    };
+                    let job = crate::job::Job::new(Some(realm), cleanup_closure);
+                    self.pending_cleanup_jobs.borrow_mut().push(job);
                 } else {
                     // Live cell: clear a dead unregister token so the
                     // dangling handle is never compared.

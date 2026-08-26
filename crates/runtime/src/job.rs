@@ -25,6 +25,12 @@ pub struct Job {
     /// The realm the job runs in; `None` for jobs that evaluate no code.
     pub realm: Option<Handle<Realm>>,
     pub closure: JobClosure,
+    /// The closure's capture region, captured at construction (GC-2/GC-5):
+    /// `Layout::for_value` on the boxed `dyn FnOnce` under-reports the size
+    /// for a multi-capture closure (the vtable says one `Value`), so a
+    /// region computed from it would miss later captures and let them be
+    /// swept mid-job.
+    region: (*const u8, usize),
 }
 
 impl Job {
@@ -32,9 +38,15 @@ impl Job {
         realm: Option<Handle<Realm>>,
         closure: impl FnOnce(&mut Agent) -> Result<Value, JsError> + 'static,
     ) -> Self {
+        // The concrete closure's size is reliable here (it is not yet
+        // erased); the boxed `dyn`'s vtable size is not (see `region`).
+        let size = std::mem::size_of_val(&closure);
+        let closure: JobClosure = Box::new(closure);
+        let ptr = &*closure as *const dyn FnOnce(&mut Agent) -> Result<Value, JsError> as *const u8;
         Self {
             realm,
-            closure: Box::new(closure),
+            closure,
+            region: (ptr, size),
         }
     }
 
@@ -43,11 +55,7 @@ impl Job {
     /// no precise `Trace` can reach. Valid while the job is queued or
     /// running.
     pub fn closure_region(&self) -> (*const u8, usize) {
-        let closure = &self.closure;
-        let ptr =
-            &**closure as *const dyn FnOnce(&mut Agent) -> Result<Value, JsError> as *const u8;
-        let size = std::alloc::Layout::for_value(&**closure).size();
-        (ptr, size)
+        self.region
     }
 }
 
