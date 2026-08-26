@@ -98,10 +98,14 @@ impl<T: Trace> Gc<T> {
         });
         let raw = Box::into_raw(boxed);
         with_heap_mut(|heap| heap.register(raw as *mut GcBox<dyn Trace>));
-        Gc {
+        let gc = Gc {
             ptr: unsafe { NonNull::new_unchecked(raw) },
             _not_send_sync: std::marker::PhantomData,
-        }
+        };
+        // GC-2 `--gc-stress`: the fresh box is not yet reachable from any
+        // handle the caller holds, so it is passed through as an extra root.
+        maybe_stress_collect(gc.as_any());
+        gc
     }
 
     /// The box base address, for NaN-boxing into `Value`'s 44-bit payload.
@@ -235,7 +239,14 @@ impl<K: Eq + std::hash::Hash + 'static, V: Trace, S: std::hash::BuildHasher + 's
 
 impl<T: Trace> Trace for RefCell<T> {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
-        self.borrow().trace(visit);
+        // A collection can run mid-mutation (per-allocation `--gc-stress`):
+        // a borrowed cell cannot be read without panicking. Skipping it and
+        // aborting the sweep (retain everything) is safe — imprecise, never
+        // a use-after-free; the collector retries at the next safe point.
+        match self.try_borrow() {
+            Ok(guard) => guard.trace(visit),
+            Err(_) => note_aborted_trace(),
+        }
     }
 }
 
@@ -284,6 +295,92 @@ pub struct Heap {
 
 thread_local! {
     static HEAP: RefCell<Heap> = const { RefCell::new(Heap::new()) };
+}
+
+// GC-2 `--gc-stress`: collect after every allocation. The collector runs
+// from `Gc::new` with the just-created box as an extra root (it is not yet
+// reachable from any handle the caller holds). The runtime registers a
+// thread-local collector that finds the current agent and collects from its
+// roots; outside an agent window (bootstrap) the collector is a no-op.
+type StressCollector = Box<dyn Fn(GcAny)>;
+thread_local! {
+    static STRESS: Cell<bool> = const { Cell::new(false) };
+    static STRESS_COLLECTOR: RefCell<Option<StressCollector>> =
+        const { RefCell::new(None) };
+    static COLLECTING: Cell<bool> = const { Cell::new(false) };
+    /// A traced `RefCell` was mutably borrowed during marking: the sweep
+    /// would free boxes the mark could not see, so it is aborted (retain
+    /// everything) instead.
+    static ABORT_SWEEP: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Record that a traced `RefCell` was borrowed during marking; the sweep
+/// must be aborted.
+pub(crate) fn note_aborted_trace() {
+    ABORT_SWEEP.with(|abort| abort.set(true));
+}
+
+/// Enable the per-allocation stress collector. `collect` receives the fresh
+/// box of every allocation so it can be rooted through the collection.
+pub fn enable_stress_collector(collect: StressCollector) {
+    STRESS.with(|stress| stress.set(true));
+    STRESS_COLLECTOR.with(|slot| *slot.borrow_mut() = Some(collect));
+}
+
+/// Disable the per-allocation stress collector.
+pub fn disable_stress_collector() {
+    STRESS.with(|stress| stress.set(false));
+    STRESS_COLLECTOR.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// Run the stress collector after an allocation (GC-2). No-op when stress is
+/// off, when no collector is registered (outside an agent window), or when a
+/// collection is already running (the mark/sweep must not re-enter itself).
+fn maybe_stress_collect(fresh: GcAny) {
+    if !STRESS.with(|stress| stress.get()) || COLLECTING.with(|collecting| collecting.get()) {
+        return;
+    }
+    COLLECTING.with(|collecting| collecting.set(true));
+    STRESS_COLLECTOR.with(|slot| {
+        if let Some(collect) = &*slot.borrow() {
+            collect(fresh);
+        }
+    });
+    COLLECTING.with(|collecting| collecting.set(false));
+}
+
+/// Conservatively scan heap regions (the opaque job-closure boxes) for box
+/// addresses and encoded `Value` payloads, visiting every live box found
+/// (GC-2). A `Box<dyn FnOnce>` job closure holds its captured `Value`s as
+/// raw bytes that no precise `Trace` can reach; scanning the closure's
+/// allocation roots those captures. Imprecise by design: it may retain
+/// garbage, never frees a live box.
+pub fn scan_regions(regions: &[(*const u8, usize)], visit: &mut dyn FnMut(GcAny)) {
+    HEAP.with(|heap| {
+        let heap = heap.borrow();
+        let by_addr: HashMap<usize, *mut GcBox<dyn Trace>> = heap
+            .live
+            .iter()
+            .map(|ptr| (*ptr as *const u8 as usize, *ptr))
+            .collect();
+        for (base, len) in regions {
+            let mut addr = *base as usize;
+            let end = addr + *len;
+            while addr + std::mem::size_of::<usize>() <= end {
+                // SAFETY: the region is the live allocation of a queued or
+                // running job closure; reads are unaligned.
+                let word = unsafe { std::ptr::read_unaligned::<usize>(addr as *const usize) };
+                if let Some(&ptr) = by_addr.get(&word) {
+                    visit(GcAny(ptr));
+                } else if let Some(box_addr) = crate::value::Value::encoded_box_address(word as u64)
+                    && let Some(&ptr) = by_addr.get(&box_addr)
+                {
+                    visit(GcAny(ptr));
+                }
+                addr += std::mem::size_of::<usize>();
+            }
+        }
+    });
 }
 
 /// Run `f` with the current thread's heap.
@@ -431,6 +528,20 @@ impl Heap {
                 (*ptr).mark.set(true);
                 (*ptr).data.trace(&mut |child| work.push(child));
             }
+        }
+        // A traced `RefCell` was mutably borrowed mid-mark (per-allocation
+        // `--gc-stress`): the mark is incomplete, so retain everything —
+        // imprecise but safe. The next collection retries.
+        let aborted = ABORT_SWEEP.with(|abort| abort.replace(false));
+        if aborted {
+            for ptr in &self.live {
+                // SAFETY: entries are registered boxes; resetting the mark
+                // prepares for the next cycle.
+                unsafe {
+                    (**ptr).mark.set(false);
+                }
+            }
+            return;
         }
         let mut keep = Vec::with_capacity(self.live.len());
         for ptr in self.live.drain(..) {

@@ -1864,6 +1864,40 @@ struct FastLoopShape {
     inc: UpdateOp,
 }
 
+// The stack of Vms currently running bodies (GC-2): the active Vm is
+// not in the pool, and its heap-buffered value stacks are invisible to
+// the conservative native-stack scan, so a mid-execution collection
+// must trace them precisely. Each entry also carries the compiled body
+// the Vm is running — its steps embed literal `Value`s (script bodies are
+// per-evaluation `Rc<CompiledBody>` locals, not `EcmaFunction.ir`).
+// Nested calls stack multiple runs.
+struct ActiveRun {
+    vm: *const Vm,
+    body: *const CompiledBody,
+}
+thread_local! {
+    static ACTIVE_RUNS: std::cell::RefCell<Vec<ActiveRun>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Trace every Vm currently running a body and its compiled body (GC-2
+/// root): the active Vms' heap buffers hold live values the stack scan
+/// cannot see, and the compiled steps hold the body's literal `Value`s.
+pub(crate) fn trace_active_vms(visit: &mut dyn FnMut(crux::heap::GcAny)) {
+    ACTIVE_RUNS.with(|stack| {
+        for run in &*stack.borrow() {
+            // SAFETY: an entry is pushed for the duration of a `run_inner`
+            // call and popped before the Vm is returned to the pool (the
+            // owned body is dropped with `current` at the same return), so
+            // both are live and immobile while on the stack.
+            unsafe {
+                (&*run.vm).trace(visit);
+                (&*run.body).trace(visit);
+            }
+        }
+    });
+}
+
 /// The resumable VM state. Saved across suspension by the driver.
 #[derive(Debug)]
 pub struct Vm {
@@ -3341,6 +3375,27 @@ impl Vm {
     }
 
     fn run_inner(&mut self, agent: &mut Agent, body: &CompiledBody) -> Result<VmOutcome, JsError> {
+        // GC-2: root this Vm and its compiled body for the run's duration —
+        // a mid-execution stress collection must trace the active Vm
+        // precisely (its heap-buffered stacks and the body's literal steps).
+        ACTIVE_RUNS.with(|stack| {
+            stack.borrow_mut().push(ActiveRun {
+                vm: self as *const Vm,
+                body: body as *const CompiledBody,
+            });
+        });
+        let result = self.run_inner_impl(agent, body);
+        ACTIVE_RUNS.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+        result
+    }
+
+    fn run_inner_impl(
+        &mut self,
+        agent: &mut Agent,
+        body: &CompiledBody,
+    ) -> Result<VmOutcome, JsError> {
         // A proper tail call replaces the running body instead of recursing:
         // the handler swaps in the callee's body and the driver loops.
         let mut current = CurrentBody::Borrowed(body);
@@ -3350,7 +3405,16 @@ impl Vm {
             loop {
                 let body = current.get();
                 match self.run_inner_inner(agent, body) {
-                    Ok(VmOutcome::TailCall(next)) => current = CurrentBody::Owned(next),
+                    Ok(VmOutcome::TailCall(next)) => {
+                        current = CurrentBody::Owned(next);
+                        // The tracked body must follow the tail call (the
+                        // owned callee body outlives the borrowed one).
+                        ACTIVE_RUNS.with(|stack| {
+                            if let Some(last) = stack.borrow_mut().last_mut() {
+                                last.body = current.get() as *const CompiledBody;
+                            }
+                        });
+                    }
                     Ok(outcome) => return Ok(outcome),
                     // A step's engine error (a TypeError from a property access, a
                     // ReferenceError from an unresolved identifier, ...) inside a

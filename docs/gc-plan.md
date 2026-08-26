@@ -223,10 +223,35 @@ for missed roots.
 
 ### GC-2 — root audit and `--gc-stress` hardening
 
-- Audit every agent/runtime structure holding `Value`s (the §3 list), tracing
-  or invalidating each. `--gc-stress` (collect on every allocation) turns any
-  missed root into a caught failure.
-- Gate: `--gc-stress` clean across the sweep; leak harness bounded.
+**Increment 1 (landed).** The per-allocation stress net is wired and already
+caught three real root gaps:
+
+- **Per-allocation collection**: `Gc::new` triggers a full collection with
+  the fresh box as an extra root (it is not yet reachable from any handle).
+  The runtime registers a thread-local collector that finds the current
+  agent via the `with_agent` TLS window; outside an agent window (realm
+  bootstrap) it is a no-op. `test262-sweep --gc-stress` propagates the flag
+  to every fixture agent.
+- **Active Vms and their compiled bodies are precise roots**: a mid-
+  execution collection must trace the running Vm (its heap-buffered value
+  stacks are invisible to the stack scan) and the body it is executing (a
+  script body is a per-evaluation `Rc<CompiledBody>` whose steps embed
+  literal `Value`s — the gap that corrupted `str += "."` loops). Nested
+  calls and tail calls are tracked through a thread-local run stack.
+- **Fail-safe tracing under in-flight borrows**: a traced `RefCell` that is
+  mutably borrowed mid-collection aborts the sweep (retain everything)
+  instead of panicking — imprecise, never a use-after-free.
+- **Opaque job closures**: queued (and the running) `Box<dyn FnOnce>` job
+  closures hold captured `Value`s no precise `Trace` can reach; their
+  allocations are scanned conservatively (`Layout::for_value`), the same
+  mechanism that fixed the flaky promise UAF.
+
+**Remaining.** The full `--gc-stress` sweep gate (slow; per-allocation
+collection is O(live) per allocation), a rare residual flake in the
+deep-concat stress path, and the rest of the §3 audit (every agent table
+holds `Value`s; the remaining un-traced `Rc<RefCell<…>>` auxiliary states
+must be verified against the stress sweep). Gate: `--gc-stress` clean
+across the sweep; leak harness bounded (the harness is already bounded).
 
 ### GC-3 — ephemeron-aware WeakMap / WeakSet
 

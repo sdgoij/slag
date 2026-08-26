@@ -24,6 +24,13 @@ use crate::realm::{Realm, initialize_host_defined_realm};
 
 static NEXT_AGENT_ID: AtomicU64 = AtomicU64::new(1);
 
+// The closure region of the job currently running (GC-2): its opaque
+// captures must be conservatively scanned alongside the queued jobs'.
+thread_local! {
+    static RUNNING_JOB_REGION: std::cell::RefCell<Option<(*const u8, usize)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// One entry of a Map/WeakMap `[[*Data]]` List: `None` is the ~empty~
 /// (deleted) slot, `Some((key, value))` a live entry.
 pub type MapEntry = Option<(Value, Value)>;
@@ -838,7 +845,13 @@ impl Agent {
     }
 
     fn run_job(&mut self, job: Job) -> Result<Value, JsError> {
-        (job.closure)(self)
+        // GC-2: root the running closure's captures while it executes (see
+        // `trace_roots`).
+        let region = job.closure_region();
+        RUNNING_JOB_REGION.with(|slot| *slot.borrow_mut() = Some(region));
+        let result = (job.closure)(self);
+        RUNNING_JOB_REGION.with(|slot| *slot.borrow_mut() = None);
+        result
     }
 
     pub fn job_queues_empty(&self) -> bool {
@@ -982,6 +995,31 @@ impl Agent {
         }
         self.realms.trace(visit);
         self.function_realms.trace(visit);
+        // GC-2: the Vms currently running bodies (their heap-buffered value
+        // stacks are invisible to the conservative stack scan). Pooled and
+        // suspended Vms are covered by `vm_pool` and the generator/async
+        // tables above.
+        crate::ir::trace_active_vms(visit);
+        // GC-2: the opaque job closures hold captured Values; scan their
+        // boxes conservatively (queued jobs plus the job currently running).
+        let mut regions: Vec<(*const u8, usize)> = Vec::new();
+        for job in &self.promise_jobs {
+            regions.push(job.closure_region());
+        }
+        for job in &self.generic_jobs {
+            regions.push(job.closure_region());
+        }
+        for (_, job) in &self.timeout_jobs {
+            regions.push(job.closure_region());
+        }
+        RUNNING_JOB_REGION.with(|region| {
+            if let Some(region) = &*region.borrow() {
+                regions.push(*region);
+            }
+        });
+        if !regions.is_empty() {
+            crux::heap::scan_regions(&regions, visit);
+        }
     }
 
     /// GC-1 slice 3: gather the precise roots and mark-sweep with the
@@ -989,7 +1027,16 @@ impl Agent {
     /// job closures in flight, no active RefCell borrows on the traced
     /// tables).
     pub fn collect_garbage(&mut self) {
+        self.collect_garbage_with(None);
+    }
+
+    /// [`Agent::collect_garbage`] with an extra root: the fresh box of the
+    /// allocation that triggered a `--gc-stress` collection (GC-2).
+    pub fn collect_garbage_with(&mut self, extra: Option<GcAny>) {
         let mut roots: Vec<GcAny> = Vec::new();
+        if let Some(extra) = extra {
+            roots.push(extra);
+        }
         self.trace_roots(&mut |any| roots.push(any));
         crux::heap::with_heap_mut(|heap| heap.collect_with_stack(&roots));
         self.last_collected_live
@@ -1011,6 +1058,19 @@ impl Agent {
     /// only on heap growth. Settable through `&Agent` (the cell).
     pub fn set_gc_stress(&self, enabled: bool) {
         self.gc_stress.set(enabled);
+        if enabled {
+            // GC-2: collect after *every* allocation. The collector finds
+            // the current agent through the with_agent TLS window and roots
+            // the fresh box; outside an agent window (realm bootstrap) it
+            // is a no-op.
+            crux::heap::enable_stress_collector(Box::new(|fresh| {
+                if let Ok(agent) = crate::context::current_agent_mut() {
+                    agent.collect_garbage_with(Some(fresh));
+                }
+            }));
+        } else {
+            crux::heap::disable_stress_collector();
+        }
     }
 }
 

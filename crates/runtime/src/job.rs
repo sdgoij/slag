@@ -37,6 +37,18 @@ impl Job {
             closure: Box::new(closure),
         }
     }
+
+    /// The memory region of the opaque closure's captures (GC-2): the
+    /// conservative collector scans it to root the captured `Value`s, which
+    /// no precise `Trace` can reach. Valid while the job is queued or
+    /// running.
+    pub fn closure_region(&self) -> (*const u8, usize) {
+        let closure = &self.closure;
+        let ptr =
+            &**closure as *const dyn FnOnce(&mut Agent) -> Result<Value, JsError> as *const u8;
+        let size = std::alloc::Layout::for_value(&**closure).size();
+        (ptr, size)
+    }
 }
 
 impl std::fmt::Debug for Job {

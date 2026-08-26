@@ -112,6 +112,10 @@ fn sanitize(detail: &str) -> String {
 // ---- worker mode ----
 
 fn worker_main() -> ExitCode {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--gc-stress") {
+        test262::harness::set_gc_stress(true);
+    }
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -148,6 +152,7 @@ struct Options {
     filter: Option<String>,
     list: Option<std::path::PathBuf>,
     json: bool,
+    gc_stress: bool,
     areas: Vec<Area>,
 }
 
@@ -164,6 +169,7 @@ options:
   --sample N           at most N fixtures per top-level directory
   --filter GLOB        only fixtures whose relative path matches (* and ?)
   --list FILE          only the fixtures listed in FILE (one relative path per line)
+  --gc-stress          collect after every allocation (GC-2 root-audit net)
   --json               emit a JSON report instead of the text report
   --help, -h";
 
@@ -179,6 +185,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
         filter: None,
         list: None,
         json: false,
+        gc_stress: false,
         areas: vec![Area::Language, Area::Builtins, Area::AnnexB],
     };
     let mut index = 0;
@@ -222,6 +229,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
                 );
             }
             "--json" => options.json = true,
+            "--gc-stress" => options.gc_stress = true,
             "--help" | "-h" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -420,7 +428,7 @@ fn run_batch_inner(
     batch: &[Fixture],
     options: &std::sync::Arc<Options>,
 ) -> Vec<(String, SweepResult)> {
-    let mut child = spawn_worker(batch);
+    let mut child = spawn_worker(batch, options.gc_stress);
     let stdout = child.stdout.take().expect("worker stdout");
     let (line_tx, line_rx) = mpsc::channel();
     let reader = std::thread::spawn(move || {
@@ -488,7 +496,7 @@ fn run_batch_inner(
 
 /// Re-run one fixture on its own with a short deadline; times out => Hang.
 fn run_single(fixture: &Fixture, options: &Options) -> SweepResult {
-    let mut child = spawn_worker(std::slice::from_ref(fixture));
+    let mut child = spawn_worker(std::slice::from_ref(fixture), options.gc_stress);
     let stdout = child.stdout.take().expect("worker stdout");
     let reader = std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
@@ -530,7 +538,7 @@ fn wait_for_child(child: &mut Child, timeout: Duration) -> bool {
 }
 
 /// Spawn a worker child running exactly `batch`, described on its stdin.
-fn spawn_worker(batch: &[Fixture]) -> Child {
+fn spawn_worker(batch: &[Fixture], gc_stress: bool) -> Child {
     let mut input = String::new();
     for fixture in batch {
         input.push_str(area_label(fixture.area));
@@ -544,6 +552,9 @@ fn spawn_worker(batch: &[Fixture]) -> Child {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
+    if gc_stress {
+        command.arg("--gc-stress");
+    }
     let mut child = command.spawn().expect("spawn sweep worker");
     let mut stdin = child.stdin.take().expect("worker stdin");
     stdin

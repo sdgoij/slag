@@ -12,6 +12,7 @@
 /// the vendored `#[test]` fixtures share the same code path; the fixture
 /// tests themselves are `#[test]`-gated below.
 pub mod harness {
+    use std::cell::Cell;
     use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Condvar, Mutex};
@@ -25,6 +26,18 @@ pub mod harness {
     use crux::typed_array::SharedBuffer;
     use crux::value::{Value, ValueKind};
     use runtime::Agent;
+
+    // GC-2 `--gc-stress` (collect after every allocation): set by the sweep
+    // runner, applied to every fixture agent.
+    thread_local! {
+        static GC_STRESS: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Enable the per-allocation `--gc-stress` mode for subsequent fixture
+    /// agents (the `test262-sweep --gc-stress` gate, docs/gc-plan.md GC-2).
+    pub fn set_gc_stress(enabled: bool) {
+        GC_STRESS.with(|stress| stress.set(enabled));
+    }
 
     /// Defines `assert.throws` (the real test262 assert.js checks
     /// `thrown.constructor === expectedErrorConstructor`); run before every
@@ -10896,6 +10909,7 @@ var $DONE = function (error) {
         }
         let skip_harness = fm.flags.iter().any(|f| f == "__debug_skip_harness");
         let mut agent = Agent::new();
+        agent.set_gc_stress(GC_STRESS.with(|stress| stress.get()));
         // `CanBlockIsTrue` fixtures (and the atomicsHelper ones, whose
         // safeBroadcast exercises `Atomics.wait` on the main thread) assume
         // [[CanBlock]] = true: the main agent may suspend.
@@ -11073,6 +11087,7 @@ var $DONE = function (error) {
         }
         let skip_harness = fm.flags.iter().any(|f| f == "__debug_skip_harness");
         let mut agent = Agent::new();
+        agent.set_gc_stress(GC_STRESS.with(|stress| stress.get()));
         if fm.flags.iter().any(|f| f == "CanBlockIsTrue")
             || fm.includes.iter().any(|i| i == "atomicsHelper.js")
         {
@@ -12032,6 +12047,7 @@ var $DONE = function (error) {
         let result =
             (|| -> Result<(), JsError> {
                 let mut agent = Agent::new();
+                agent.set_gc_stress(GC_STRESS.with(|stress| stress.get()));
                 agent.can_block = true;
                 agent.initialize_host_defined_realm()?;
                 install_worker_agent_api(&mut agent, &hub, index)?;
