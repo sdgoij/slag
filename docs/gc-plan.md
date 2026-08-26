@@ -427,14 +427,17 @@ churn 63ms vs 2.75ms (~23x), string concat 20ms vs 1.26ms (~16x). A
 construct-churn decomposition (per 100k-iteration bench) pinned the cost:
 `new C()` with an empty body is ~240ns/iter, the first `this.x = x` store
 adds ~110ns (the properties-`Vec` buffer allocation dominates — a second
-store is only +15ns), and loop/add/property-read are ~15ns. Two wins
-landed: the constructor-`prototype` cache (Cut 26) switched from a SipHash
-`HashMap` + RefCell borrow to a direct-mapped array (per construct), and
-object ids moved from a global locked `fetch_add` to a thread-local counter
-(per object; ids key per-agent caches that never cross threads). Both are
-V8-inspired (V8 caches the prototype read in the Map and assigns ids
-without atomics). Remaining structural gap to V8: bump/semi-space
-allocation, in-object properties (the `Vec`-buffer alloc), and register-
+store is only +15ns), and loop/add/property-read are ~15ns. Wins landed:
+the constructor-`prototype` cache (Cut 26) switched from a SipHash
+`HashMap` + RefCell borrow to a direct-mapped array (per construct); object
+ids moved from a global locked `fetch_add` to a thread-local counter (per
+object; ids key per-agent caches that never cross threads); and the
+properties vector became `SmallProps` — V8's in-object properties — with
+the first two entries stored inline in the object (no per-construct
+buffer allocation for the common small object, spilling to a heap `Vec`
+past that, with the slice interface preserved via `Deref`). Construct
+churn: 74 → ~45ms (normalized vs the arithmetic row, ~5x → ~3.5x).
+Remaining structural gap to V8: bump/semi-space allocation and register-
 style bytecode — each a follow-up of its own.
 
 Gate status: the plan's predicted 2–4x on allocation-bound code is **not

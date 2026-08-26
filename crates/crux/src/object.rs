@@ -11,6 +11,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::fmt;
+use std::mem::MaybeUninit;
 
 use crate::error::{ErrorKind, JsError};
 use crate::function::call;
@@ -78,6 +79,156 @@ impl Trace for PropertyKind {
 impl Trace for Property {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         self.kind.trace(visit);
+    }
+}
+
+/// An inline-capacity property vector (GC-5, V8's in-object properties):
+/// the first `INLINE_PROPS` entries live inside the object, so the common
+/// small object (a constructor's fresh `this` with a couple of fields) never
+/// allocates the property buffer. When the inline capacity is exceeded the
+/// inline entries move into a heap `Vec`, so the live entries are always one
+/// contiguous region and `Deref` exposes the slice interface the property
+/// machinery uses (`len`, `iter`, indexing, `first`, `last`, `position`).
+pub struct SmallProps {
+    inline: [MaybeUninit<(PropertyKey, Property)>; INLINE_PROPS],
+    len: usize,
+    heap: Vec<(PropertyKey, Property)>,
+}
+
+const INLINE_PROPS: usize = 2;
+
+impl Default for SmallProps {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SmallProps {
+    pub fn new() -> Self {
+        Self {
+            inline: [const { MaybeUninit::uninit() }; INLINE_PROPS],
+            len: 0,
+            heap: Vec::new(),
+        }
+    }
+
+    fn slice(&self) -> &[(PropertyKey, Property)] {
+        if self.len <= INLINE_PROPS {
+            // SAFETY: entries `[0, len)` are initialized.
+            unsafe { std::slice::from_raw_parts(self.inline.as_ptr() as *const _, self.len) }
+        } else {
+            &self.heap
+        }
+    }
+
+    fn slice_mut(&mut self) -> &mut [(PropertyKey, Property)] {
+        if self.len <= INLINE_PROPS {
+            // SAFETY: entries `[0, len)` are initialized and not aliased.
+            unsafe { std::slice::from_raw_parts_mut(self.inline.as_mut_ptr() as *mut _, self.len) }
+        } else {
+            &mut self.heap
+        }
+    }
+
+    pub fn push(&mut self, entry: (PropertyKey, Property)) {
+        if self.len < INLINE_PROPS {
+            self.inline[self.len].write(entry);
+            self.len += 1;
+        } else if self.len == INLINE_PROPS {
+            // Spill: move the inline entries to the heap (the inline array
+            // is left empty; the live entries are then contiguous there).
+            let mut heap = Vec::with_capacity(INLINE_PROPS + 1);
+            // SAFETY: all inline entries are initialized at `len == INLINE_PROPS`;
+            // `assume_init_read` moves each out of the array.
+            for i in 0..INLINE_PROPS {
+                heap.push(unsafe { self.inline[i].assume_init_read() });
+            }
+            heap.push(entry);
+            self.heap = heap;
+            self.len += 1;
+        } else {
+            self.heap.push(entry);
+            self.len += 1;
+        }
+    }
+
+    /// Remove and return the entry at `index`, preserving insertion order
+    /// (the shift mirrors `Vec::remove`).
+    pub fn remove(&mut self, index: usize) -> (PropertyKey, Property) {
+        if self.len > INLINE_PROPS {
+            let entry = self.heap.remove(index);
+            self.len -= 1;
+            // Shrink back into the inline array once the count fits — the
+            // slice invariants require the live entries to be in `inline`
+            // exactly when `len <= INLINE_PROPS`.
+            if self.len == INLINE_PROPS {
+                for i in 0..INLINE_PROPS {
+                    // SAFETY: the remaining entries live in the heap; clone
+                    // them into the inline array, then drop the heap.
+                    self.inline[i].write(self.heap[i].clone());
+                }
+                self.heap = Vec::new();
+            }
+            entry
+        } else {
+            // SAFETY: `index < len`, so the slot is initialized.
+            let entry = unsafe { self.inline[index].assume_init_read() };
+            for i in index..self.len - 1 {
+                // SAFETY: slots `i` and `i + 1` are initialized; the read
+                // moves `i + 1` out and the write overwrites `i` (which was
+                // already moved out on the first iteration or shifted).
+                unsafe {
+                    self.inline[i].write(self.inline[i + 1].assume_init_read());
+                }
+            }
+            self.len -= 1;
+            entry
+        }
+    }
+}
+
+impl Clone for SmallProps {
+    fn clone(&self) -> Self {
+        let mut cloned = SmallProps::new();
+        for entry in self.iter() {
+            cloned.push(entry.clone());
+        }
+        cloned
+    }
+}
+
+impl Drop for SmallProps {
+    fn drop(&mut self) {
+        if self.len <= INLINE_PROPS {
+            // SAFETY: entries `[0, len)` are initialized.
+            for i in 0..self.len {
+                unsafe { self.inline[i].assume_init_drop() };
+            }
+        }
+        // The heap `Vec` drops itself.
+    }
+}
+
+impl std::ops::Deref for SmallProps {
+    type Target = [(PropertyKey, Property)];
+    fn deref(&self) -> &Self::Target {
+        self.slice()
+    }
+}
+
+impl std::ops::DerefMut for SmallProps {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.slice_mut()
+    }
+}
+
+impl Trace for SmallProps {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        // The tuple trace marks the property value and a symbol key (a
+        // symbol description may be a rope) — same as `Vec<T>`'s trace.
+        for entry in self.iter() {
+            entry.trace(visit);
+        }
     }
 }
 
@@ -406,7 +557,7 @@ pub struct JsObject {
     generation: Cell<u32>,
     /// Own properties in insertion order (the [[OwnPropertyKeys]] string
     /// order for ordinary objects).
-    pub properties: RefCell<Vec<(PropertyKey, Property)>>,
+    pub properties: RefCell<SmallProps>,
     /// Lazy key→position index over `properties`, built on the first lookup
     /// once the vector is large enough and invalidated by structural changes
     /// (insert/delete). Value updates in place keep it valid. The property
@@ -492,7 +643,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
-            properties: RefCell::new(Vec::new()),
+            properties: RefCell::new(SmallProps::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
@@ -569,7 +720,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
-            properties: RefCell::new(Vec::new()),
+            properties: RefCell::new(SmallProps::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
@@ -599,7 +750,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
-            properties: RefCell::new(Vec::new()),
+            properties: RefCell::new(SmallProps::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
@@ -633,7 +784,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
-            properties: RefCell::new(Vec::new()),
+            properties: RefCell::new(SmallProps::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
@@ -663,7 +814,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
-            properties: RefCell::new(Vec::new()),
+            properties: RefCell::new(SmallProps::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
@@ -687,7 +838,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
-            properties: RefCell::new(Vec::new()),
+            properties: RefCell::new(SmallProps::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
@@ -793,7 +944,7 @@ impl JsObject {
             extensible: Cell::new(false),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
-            properties: RefCell::new(Vec::new()),
+            properties: RefCell::new(SmallProps::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
@@ -844,7 +995,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
-            properties: RefCell::new(Vec::new()),
+            properties: RefCell::new(SmallProps::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
@@ -939,7 +1090,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
-            properties: RefCell::new(Vec::new()),
+            properties: RefCell::new(SmallProps::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
             self_handle: RefCell::new(None),
@@ -3028,6 +3179,70 @@ pub(crate) fn value_get_method(value: &Value, key: &JsString) -> Result<Option<V
 mod tests {
     use super::*;
     use crate::symbol::Symbol;
+
+    #[test]
+    fn small_props_inline_spill_remove_order() {
+        // The inline property vector: pushes stay inline up to the capacity,
+        // spill to the heap past it, and removing back down shrinks into the
+        // inline array — insertion order is preserved throughout (own-key
+        // order).
+        let mut props = SmallProps::new();
+        let data = |n: f64| Property::data(Value::Number(n), true, true, true);
+        let keys = |p: &SmallProps| {
+            p.iter()
+                .map(|(k, _)| k.display_string())
+                .collect::<Vec<_>>()
+        };
+        // Inline path (capacity 2).
+        props.push((PropertyKey::from_utf8("a"), data(1.0)));
+        props.push((PropertyKey::from_utf8("b"), data(2.0)));
+        assert_eq!(keys(&props), ["a", "b"]);
+        // Spill path.
+        props.push((PropertyKey::from_utf8("c"), data(3.0)));
+        props.push((PropertyKey::from_utf8("d"), data(4.0)));
+        assert_eq!(keys(&props), ["a", "b", "c", "d"]);
+        assert_eq!(props.len(), 4);
+        // Indexing through the deref.
+        assert_eq!(props[1].0.display_string(), "b");
+        assert_eq!(props.first().unwrap().0.display_string(), "a");
+        assert_eq!(props.last().unwrap().0.display_string(), "d");
+        // Remove from the spilled region.
+        let removed = props.remove(1);
+        assert_eq!(removed.0.display_string(), "b");
+        assert_eq!(keys(&props), ["a", "c", "d"]);
+        // Remove down into the inline region (len 3 -> 2 shrinks back).
+        let removed = props.remove(1);
+        assert_eq!(removed.0.display_string(), "c");
+        assert_eq!(keys(&props), ["a", "d"]);
+        assert_eq!(props.len(), 2);
+        // Now inline: push again stays inline.
+        props.push((PropertyKey::from_utf8("e"), data(5.0)));
+        assert_eq!(keys(&props), ["a", "d", "e"]);
+        // Remove from the inline region (shift).
+        let removed = props.remove(0);
+        assert_eq!(removed.0.display_string(), "a");
+        assert_eq!(keys(&props), ["d", "e"]);
+        // Clone preserves content and order (both inline and spilled).
+        let cloned = props.clone();
+        assert_eq!(
+            cloned
+                .iter()
+                .map(|(k, _)| k.display_string())
+                .collect::<Vec<_>>(),
+            ["d", "e"]
+        );
+        for _ in 0..4 {
+            props.push((PropertyKey::from_utf8("x"), data(9.0)));
+        }
+        let cloned_spilled = props.clone();
+        assert_eq!(
+            cloned_spilled
+                .iter()
+                .map(|(k, _)| k.display_string())
+                .collect::<Vec<_>>(),
+            ["d", "e", "x", "x", "x", "x"]
+        );
+    }
 
     fn key(text: &str) -> JsString {
         JsString::from_utf8(text)
