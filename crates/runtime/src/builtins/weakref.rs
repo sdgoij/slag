@@ -316,8 +316,9 @@ pub fn dispatch_call(
                     "WeakRef.prototype.deref requires a WeakRef".into(),
                 ));
             };
-            agent
+            let target = agent
                 .weak_ref_targets
+                .borrow()
                 .get(&obj.id())
                 .cloned()
                 .ok_or_else(|| {
@@ -325,7 +326,15 @@ pub fn dispatch_call(
                         ErrorKind::TypeError,
                         "WeakRef.prototype.deref requires a WeakRef".into(),
                     )
-                })
+                })?;
+            // GC-4 KeepDuringJob: the returned target stays alive until the
+            // end of the current job (spec 26.1.1) — a deref result that is
+            // discarded immediately must still keep its target through a
+            // same-job `$262.gc()`.
+            if crate::agent::value_box_addr(&target).is_some() {
+                agent.kept_during_job.borrow_mut().push(target.clone());
+            }
+            Ok(target)
         })());
     }
     if intrinsics.get(FR_REGISTER).as_ref() == Some(callee) {
@@ -351,7 +360,10 @@ pub fn dispatch_construct(
             weakly_holdable(agent, &target)?;
             let proto = instance_proto(agent, new_target, WEAK_REF_PROTO)?;
             let object = JsObject::ordinary_object_create(Some(proto));
-            agent.weak_ref_targets.insert(object.id(), target);
+            agent
+                .weak_ref_targets
+                .borrow_mut()
+                .insert(object.id(), target);
             Ok(Value::Object(object))
         })());
     }
@@ -550,5 +562,80 @@ mod tests {
             run("Object.prototype.toString.call(new WeakRef({}))").unwrap(),
             str("[object WeakRef]")
         );
+    }
+
+    #[test]
+    fn weak_ref_target_dies_after_collection() {
+        // GC-4: a WeakRef holds its target weakly — a target reachable only
+        // through the ref is swept, and deref then returns undefined.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.run_script("globalThis.w = new WeakRef({});").unwrap();
+        agent.collect_garbage();
+        let value = agent.run_script("w.deref()").unwrap();
+        assert!(matches!(value.kind(), ValueKind::Undefined));
+    }
+
+    #[test]
+    fn weak_ref_keep_during_job() {
+        // GC-4 KeepDuringJob (spec 26.1.1): a deref result stays alive until
+        // the end of the current job — a discarded deref keeps its target
+        // through a same-window collection, then the target dies once the
+        // window closes (a later job clears the set).
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script(
+                "(function () { let t = {}; globalThis.w = new WeakRef(t); w.deref(); })();",
+            )
+            .unwrap();
+        agent.collect_garbage();
+        let value = agent.run_script("w.deref() instanceof Object").unwrap();
+        assert!(matches!(value.kind(), ValueKind::Boolean(true)));
+        // Close the job window, then the target is swept.
+        agent.enqueue_generic_job(None, |_| Ok(Value::Undefined));
+        agent.run_jobs().unwrap();
+        agent.collect_garbage();
+        let value = agent.run_script("w.deref() === undefined").unwrap();
+        assert!(matches!(value.kind(), ValueKind::Boolean(true)));
+    }
+
+    #[test]
+    fn finalization_registry_cleanup_job_runs() {
+        // GC-4: a dead target's cell is removed and its held value captured
+        // into a cleanup job; draining the job queue invokes the callback
+        // with the held value.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script(
+                "globalThis.saw = null; \
+                 globalThis.fr = new FinalizationRegistry(function (held) { saw = held; }); \
+                 fr.register({}, 'held');",
+            )
+            .unwrap();
+        agent.collect_garbage();
+        agent.run_jobs().unwrap();
+        let value = agent.run_script("saw").unwrap();
+        assert!(matches!(value.kind(), ValueKind::String(s) if s.to_string_lossy() == "held"));
+    }
+
+    #[test]
+    fn finalization_registry_unregister_prevents_cleanup() {
+        // GC-4: unregister removes the cell, so a dead target enqueues no
+        // cleanup job and the callback never fires.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script(
+                "globalThis.saw = null; \
+                 globalThis.fr = new FinalizationRegistry(function (held) { saw = held; }); \
+                 let token = {}; fr.register({}, 'held', token); fr.unregister(token);",
+            )
+            .unwrap();
+        agent.collect_garbage();
+        agent.run_jobs().unwrap();
+        let value = agent.run_script("saw").unwrap();
+        assert!(matches!(value.kind(), ValueKind::Null));
     }
 }

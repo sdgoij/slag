@@ -445,9 +445,15 @@ impl Heap {
     /// stack.
     pub fn collect(&mut self, roots: &[GcAny]) -> Vec<usize> {
         let work = roots.to_vec();
-        self.collect_from_work(work)
+        self.collect_from_work(work, roots, false, &mut |_, _| {})
     }
 }
+
+/// GC-4: the collector's compaction hook — `dead` lists the addresses of
+/// the boxes that would be swept (still allocated, so their values are
+/// readable), and `retain` marks a box the hook needs to keep alive through
+/// the sweep (a captured FinalizationRegistry heldValue).
+pub type CompactHook<'a> = dyn FnMut(&[usize], &mut dyn FnMut(GcAny)) + 'a;
 
 /// The current thread's committed stack region `[low, high)`, or `None`
 /// when the platform cannot provide it (the collector then relies on the
@@ -520,6 +526,27 @@ impl Heap {
     /// scan is the safety net for Rust-held handles that no precise root
     /// can see; it may retain garbage, never free a reachable box.
     pub fn collect_with_stack(&mut self, roots: &[GcAny]) -> Vec<usize> {
+        self.collect_with_stack_compacting(roots, false, &mut |_, _| {})
+    }
+
+    /// [`Heap::collect_with_stack`] with a GC-4 compaction hook: `compact`
+    /// runs between the mark and the sweep with the addresses of the boxes
+    /// that would be swept (still allocated, so the weak tables can capture
+    /// values into cleanup jobs) and a `retain` closure that marks boxes the
+    /// hook needs to keep alive (a captured heldValue). The retained boxes
+    /// are traced and the ephemeron fixpoint re-runs before the sweep.
+    ///
+    /// `precise` requests a second, scan-free mark (GC-4): the compaction's
+    /// dead set comes from it, so a stale stack word cannot keep a WeakRef
+    /// or FinalizationRegistry target alive. The sweep still uses the
+    /// conservative mark — the scan remains the safety net for Rust-held
+    /// handles, and clearing a weak entry never frees a box.
+    pub fn collect_with_stack_compacting(
+        &mut self,
+        roots: &[GcAny],
+        precise: bool,
+        compact: &mut CompactHook<'_>,
+    ) -> Vec<usize> {
         // Address → fat pointer: the scan recovers a box address from a
         // stack word and needs the `dyn Trace` vtable to mark through it.
         let by_addr: HashMap<usize, *mut GcBox<dyn Trace>> = self
@@ -534,15 +561,79 @@ impl Heap {
         {
             self.scan_stack(sp, high, &by_addr, &mut work);
         }
-        self.collect_from_work(work)
+        self.collect_from_work(work, roots, precise, compact)
     }
 
     /// The mark phase shared by [`Heap::collect`] and
     /// [`Heap::collect_with_stack`]: drain `work` (the roots plus any boxes
-    /// the conservative stack scan found) iteratively, then sweep. Returns
-    /// the addresses of the swept boxes (the weak tables compact their
-    /// entries against it — GC-3).
-    fn collect_from_work(&mut self, mut work: Vec<GcAny>) -> Vec<usize> {
+    /// the conservative stack scan found) iteratively, run the GC-4
+    /// compaction hook, then sweep. Returns the addresses of the swept
+    /// boxes.
+    ///
+    /// GC-4: `precise_roots` are the precise roots only — the stack scan's
+    /// findings in `work` are imprecise, since a stale word in a popped
+    /// frame can retain a box the heap no longer reaches. When `precise` is
+    /// requested and the scan found boxes, a second scan-free mark runs
+    /// first and the compaction's dead set comes from it; the sweep still
+    /// uses the conservative mark.
+    fn collect_from_work(
+        &mut self,
+        mut work: Vec<GcAny>,
+        precise_roots: &[GcAny],
+        precise: bool,
+        compact: &mut CompactHook<'_>,
+    ) -> Vec<usize> {
+        // GC-4: precise dead set for the weak tables. Run before the
+        // conservative mark so the compaction decides liveness from true
+        // heap reachability (plus the ephemeron fixpoint), never from stale
+        // stack words. The ephemeron edges registered while tracing the
+        // roots flow through to the conservative pass below.
+        let precise_marked: Option<std::collections::HashSet<usize>> =
+            if precise && work.len() > precise_roots.len() {
+                let mut marked = std::collections::HashSet::new();
+                let mut pwork: Vec<GcAny> = precise_roots.to_vec();
+                while let Some(any) = pwork.pop() {
+                    let addr = any.addr();
+                    if !marked.insert(addr) {
+                        continue;
+                    }
+                    // SAFETY: `any` is a registered box (a precise root);
+                    // the mark set breaks cycles.
+                    unsafe {
+                        (*any.0).data.trace(&mut |child| pwork.push(child));
+                    }
+                }
+                loop {
+                    let mut promoted = false;
+                    let edges = EPHEMERONS.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+                    for (key, value) in edges {
+                        let key_marked = marked.contains(&key.addr());
+                        let value_marked = marked.contains(&value.addr());
+                        if key_marked && !value_marked {
+                            pwork.push(value);
+                            promoted = true;
+                        }
+                        EPHEMERONS.with(|slot| slot.borrow_mut().push((key, value)));
+                    }
+                    if !promoted {
+                        break;
+                    }
+                    while let Some(any) = pwork.pop() {
+                        let addr = any.addr();
+                        if !marked.insert(addr) {
+                            continue;
+                        }
+                        // SAFETY: as above; the promoted value is a
+                        // registered box.
+                        unsafe {
+                            (*any.0).data.trace(&mut |child| pwork.push(child));
+                        }
+                    }
+                }
+                Some(marked)
+            } else {
+                None
+            };
         // SAFETY: every `GcAny` in `work` is a registered box (a root from a
         // live `Gc<T>`'s `Trace` impl, or an address the scan looked up in
         // the live set); the mark bit breaks cycles.
@@ -568,9 +659,9 @@ impl Heap {
                 let key_marked = unsafe { (*key.0).mark.get() };
                 let value_marked = unsafe { (*value.0).mark.get() };
                 if key_marked && !value_marked {
-                    unsafe {
-                        (*value.0).mark.set(true);
-                    }
+                    // Push unmarked: the drain below marks *and traces* the
+                    // promoted value (a pre-mark would make the drain skip
+                    // it, leaving its children unmarked and sweepable).
                     work.push(value);
                     promoted = true;
                 }
@@ -603,7 +694,71 @@ impl Heap {
                     (**ptr).mark.set(false);
                 }
             }
+            compact(&[], &mut |_| {});
             return Vec::new();
+        }
+        // GC-4: the compaction hook sees the would-be-swept addresses while
+        // the boxes are still allocated. Retained boxes are marked and
+        // re-traced, and the ephemeron fixpoint re-runs (a retained
+        // heldValue may itself be a weak key).
+        let mut dead: Vec<usize> = Vec::new();
+        if let Some(precise_marked) = &precise_marked {
+            for ptr in &self.live {
+                let addr = *ptr as *const u8 as usize;
+                if !precise_marked.contains(&addr) {
+                    dead.push(addr);
+                }
+            }
+        } else {
+            for ptr in &self.live {
+                if !unsafe { (**ptr).mark.get() } {
+                    dead.push(*ptr as *const u8 as usize);
+                }
+            }
+        }
+        dead.sort_unstable();
+        let mut retained: Vec<GcAny> = Vec::new();
+        compact(&dead, &mut |any| retained.push(any));
+        while let Some(any) = retained.pop() {
+            let mut work = vec![any];
+            while let Some(any) = work.pop() {
+                unsafe {
+                    let ptr = any.0;
+                    if (*ptr).mark.get() {
+                        continue;
+                    }
+                    (*ptr).mark.set(true);
+                    (*ptr).data.trace(&mut |child| work.push(child));
+                }
+            }
+            // Re-run the fixpoint for edges reachable from the retained box.
+            loop {
+                let mut promoted = false;
+                let edges = EPHEMERONS.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+                for (key, value) in edges {
+                    if unsafe { (*key.0).mark.get() } && !unsafe { (*value.0).mark.get() } {
+                        // Push unmarked so the drain traces it (see the
+                        // main fixpoint).
+                        work.push(value);
+                        promoted = true;
+                    }
+                    EPHEMERONS.with(|slot| slot.borrow_mut().push((key, value)));
+                }
+                if !promoted {
+                    break;
+                }
+                while let Some(any) = work.pop() {
+                    unsafe {
+                        let ptr = any.0;
+                        if (*ptr).mark.get() {
+                            continue;
+                        }
+                        (*ptr).mark.set(true);
+                        (*ptr).data.trace(&mut |child| work.push(child));
+                    }
+                }
+            }
+            EPHEMERONS.with(|slot| slot.borrow_mut().clear());
         }
         let mut keep = Vec::with_capacity(self.live.len());
         let mut swept = Vec::new();

@@ -470,9 +470,19 @@ pub struct Agent {
     /// itself is not an own data property, spec 20.5.3.4).
     pub error_stack: std::collections::HashMap<u64, crux::string::JsString>,
     /// [[WeakRefTarget]] of WeakRef instances, keyed by object identity
-    /// (spec 26.1.1: without a GC, the target never dies, so `deref` always
-    /// returns it).
-    pub weak_ref_targets: std::collections::HashMap<u64, Value>,
+    /// (spec 26.1.1: the target is held weakly — `deref` returns it while it
+    /// is reachable, `undefined` once a collection clears it; GC-4).
+    pub weak_ref_targets: std::cell::RefCell<std::collections::HashMap<u64, Value>>,
+    /// The KeepDuringJob set (spec 26.1.1): WeakRef targets returned by
+    /// `deref` in the current job stay alive until the job ends (the
+    /// conservative stack scan covers the common case; this covers a deref
+    /// result that is discarded immediately). Cleared at each job boundary.
+    pub kept_during_job: std::cell::RefCell<Vec<Value>>,
+    /// GC-4: FinalizationRegistry cleanup jobs enqueued by the collector's
+    /// compaction hook (it cannot touch the job queues — the collector runs
+    /// with `&self`). Moved into `generic_jobs` by the next job drain; the
+    /// job closures' regions are scanned alongside the queued jobs.
+    pub pending_cleanup_jobs: std::cell::RefCell<Vec<crate::job::Job>>,
     /// [[Cells]] and [[CleanupCallback]] of FinalizationRegistry instances,
     /// keyed by object identity (spec 26.2.1).
     pub finalization_registries: std::collections::HashMap<
@@ -655,7 +665,9 @@ impl Agent {
             string_iter_data: std::collections::HashMap::new(),
             error_data: std::collections::HashSet::new(),
             error_stack: std::collections::HashMap::new(),
-            weak_ref_targets: std::collections::HashMap::new(),
+            weak_ref_targets: std::cell::RefCell::new(std::collections::HashMap::new()),
+            kept_during_job: std::cell::RefCell::new(Vec::new()),
+            pending_cleanup_jobs: std::cell::RefCell::new(Vec::new()),
             finalization_registries: std::collections::HashMap::new(),
             array_iter_data: std::collections::HashMap::new(),
             array_from_async: std::collections::HashMap::new(),
@@ -716,7 +728,16 @@ impl Agent {
 
     /// Return a Vm to the pool after its run finished (the next run reuses
     /// its Vec capacities and inline frame).
-    pub(crate) fn return_vm(&mut self, vm: crate::ir::Vm) {
+    pub(crate) fn return_vm(&mut self, mut vm: crate::ir::Vm) {
+        // GC-4: fully reset the pooled Vm's traceable state — a stale frame
+        // slot, value-stack entry, or scope-env binding would otherwise keep
+        // a WeakRef/FR target alive until the next run resets it (`vm_pool`
+        // traces the pool). Re-pointing the env at the current context's
+        // (itself a traced root) adds no retention.
+        if let Ok(context) = self.running_context() {
+            let env = context.lexical_environment;
+            vm.reset(env, false);
+        }
         self.vm_pool.push(vm);
     }
 
@@ -836,6 +857,11 @@ impl Agent {
     }
 
     fn run_jobs_inner(&mut self) -> Result<(), JsError> {
+        // GC-4: promote the FinalizationRegistry cleanup jobs enqueued by the
+        // collector's compaction hook into the generic queue (the hook runs
+        // with `&self` and cannot touch the queues directly).
+        self.generic_jobs
+            .extend(self.pending_cleanup_jobs.borrow_mut().drain(..));
         loop {
             if let Some(job) = self.promise_jobs.pop_front() {
                 self.run_job(job)?;
@@ -873,6 +899,8 @@ impl Agent {
         RUNNING_JOB_REGION.with(|slot| *slot.borrow_mut() = Some(region));
         let result = (job.closure)(self);
         RUNNING_JOB_REGION.with(|slot| *slot.borrow_mut() = None);
+        // GC-4: the job ended — its KeepDuringJob set is no longer needed.
+        self.kept_during_job.borrow_mut().clear();
         result
     }
 
@@ -1004,8 +1032,35 @@ impl Agent {
             text.trace(visit);
         }
         self.error_stack.trace(visit);
-        self.weak_ref_targets.trace(visit);
-        self.finalization_registries.trace(visit);
+        // GC-4: WeakRef targets are held weakly — the table is deliberately
+        // *not* traced, so a target dies unless reachable elsewhere (deref
+        // then returns `undefined`; the compaction clears the entry). The
+        // KeepDuringJob set (deref results of the current job) is traced.
+        if let Ok(kept) = self.kept_during_job.try_borrow() {
+            kept.trace(visit);
+        } else {
+            crux::heap::note_aborted_trace();
+            return;
+        }
+        // GC-4: FinalizationRegistry — the cleanup callback is a strong
+        // edge; each cell's held value is an ephemeron on its target (it
+        // lives while the target does and is captured into a cleanup job
+        // when the target dies); the unregister token is held weakly. The
+        // compaction drops dead-target cells and clears dead tokens.
+        for data in self.finalization_registries.values() {
+            let Ok(data) = data.try_borrow() else {
+                crux::heap::note_aborted_trace();
+                return;
+            };
+            data.callback.trace(visit);
+            for cell in &data.cells {
+                let Some(target) = value_box_addr(&cell.target) else {
+                    continue;
+                };
+                let held = value_box_addr(&cell.held_value).unwrap_or(target);
+                crux::heap::note_ephemeron(target, held);
+            }
+        }
         for (value, _, _) in self.array_iter_data.values() {
             value.trace(visit);
         }
@@ -1083,6 +1138,16 @@ impl Agent {
         for (_, job) in &self.timeout_jobs {
             regions.push(job.closure_region());
         }
+        // GC-4: the pending FinalizationRegistry cleanup jobs (captured
+        // held values and callbacks) ride alongside the queued jobs.
+        if let Ok(pending) = self.pending_cleanup_jobs.try_borrow() {
+            for job in pending.iter() {
+                regions.push(job.closure_region());
+            }
+        } else {
+            crux::heap::note_aborted_trace();
+            return;
+        }
         RUNNING_JOB_REGION.with(|region| {
             if let Some(region) = &*region.borrow() {
                 regions.push(*region);
@@ -1116,27 +1181,59 @@ impl Agent {
             roots.push(extra);
         }
         self.trace_roots(&mut |any| roots.push(any));
-        let swept = crux::heap::with_heap_mut(|heap| heap.collect_with_stack(&roots));
+        // GC-3/GC-4: the compaction hook runs between the mark and the sweep
+        // (the would-be-swept boxes are still allocated), dropping dead weak
+        // entries and capturing FinalizationRegistry held values into
+        // cleanup jobs. The `precise` flag requests a scan-free mark for the
+        // compaction's dead set: stale stack words must not keep a WeakRef
+        // or FinalizationRegistry target alive (the sweep still uses the
+        // conservative mark — the scan stays the safety net for Rust-held
+        // handles).
+        crux::heap::with_heap_mut(|heap| {
+            heap.collect_with_stack_compacting(
+                &roots,
+                self.has_weak_structures(),
+                &mut |dead, retain| {
+                    self.compact_weak_tables(dead, retain);
+                },
+            )
+        });
         self.last_collected_live
             .set(crux::heap::with_heap(|heap| heap.live_count()));
-        // GC-3: drop the weak entries whose key was swept (the ephemeron
-        // mark keeps a value only while its key is reachable; a swept key's
-        // handle would dangle on the next access).
-        self.compact_weak_tables(&swept);
     }
 
-    /// GC-3: remove the WeakMap/WeakSet entries whose key (or element) box
-    /// was freed by the collection just completed.
-    fn compact_weak_tables(&self, swept: &[usize]) {
-        if swept.is_empty() {
+    /// GC-4: whether any weak structure exists — the collector then runs a
+    /// scan-free mark so the weak tables compact against true heap
+    /// reachability instead of stale stack words. A `RefCell` mid-borrow
+    /// (the tables are read-only here) defaults to `true`: the precise pass
+    /// is harmless when the tables are empty.
+    fn has_weak_structures(&self) -> bool {
+        !self.weak_map_data.is_empty()
+            || !self.weak_set_data.is_empty()
+            || !self.finalization_registries.is_empty()
+            || self
+                .weak_ref_targets
+                .try_borrow()
+                .is_ok_and(|targets| !targets.is_empty())
+    }
+
+    /// GC-3/GC-4: the pre-sweep compaction — drop the WeakMap/WeakSet
+    /// entries and WeakRef targets whose key (or element, or target) box is
+    /// dead, and process the FinalizationRegistry cells: a dead target's
+    /// cell is removed and its held value captured into a cleanup job
+    /// (retained so the sweep does not free it); a live cell's dead
+    /// unregister token is cleared. Runs while the dead boxes are still
+    /// allocated, so the entry values are readable.
+    fn compact_weak_tables(&self, dead: &[usize], retain: &mut dyn FnMut(crux::heap::GcAny)) {
+        if dead.is_empty() {
             return;
         }
-        let swept: std::collections::HashSet<usize> = swept.iter().copied().collect();
+        let dead: std::collections::HashSet<usize> = dead.iter().copied().collect();
         for cell in self.weak_map_data.values() {
             let mut data = cell.borrow_mut();
             data.retain(|entry| match entry {
                 Some((key, _)) => match value_box_addr(key) {
-                    Some(key) => !swept.contains(&key.addr()),
+                    Some(key) => !dead.contains(&key.addr()),
                     // A non-heap key cannot have been swept.
                     None => true,
                 },
@@ -1147,11 +1244,67 @@ impl Agent {
             let mut data = cell.borrow_mut();
             data.retain(|entry| match entry {
                 Some(element) => match value_box_addr(element) {
-                    Some(element) => !swept.contains(&element.addr()),
+                    Some(element) => !dead.contains(&element.addr()),
                     None => true,
                 },
                 None => false,
             });
+        }
+        // GC-4 WeakRef: a dead target clears the entry (deref → undefined).
+        for (_, target) in self.weak_ref_targets.borrow_mut().iter_mut() {
+            if let Some(target_box) = value_box_addr(target)
+                && dead.contains(&target_box.addr())
+            {
+                *target = Value::Undefined;
+            }
+        }
+        // GC-4 FinalizationRegistry: dead-target cells are removed and
+        // their held values captured into a cleanup job (retained so the
+        // sweep keeps them); dead unregister tokens on live cells clear.
+        let Ok(realm) = self.current_realm() else {
+            return;
+        };
+        for data in self.finalization_registries.values() {
+            let mut data = data.borrow_mut();
+            let mut cells = std::mem::take(&mut data.cells);
+            let mut i = 0;
+            while i < cells.len() {
+                let cell = &cells[i];
+                let target_dead = value_box_addr(&cell.target)
+                    .is_some_and(|target| dead.contains(&target.addr()));
+                if target_dead {
+                    let cell = cells.swap_remove(i);
+                    let callback = data.callback.clone();
+                    let held_value = cell.held_value.clone();
+                    if let Some(held) = value_box_addr(&held_value) {
+                        retain(held);
+                    }
+                    self.pending_cleanup_jobs
+                        .borrow_mut()
+                        .push(crate::job::Job::new(
+                            Some(realm),
+                            Box::new(move |agent: &mut crate::agent::Agent| {
+                                crate::function::call(
+                                    agent,
+                                    &callback,
+                                    Value::Undefined,
+                                    &[held_value],
+                                )
+                            }),
+                        ));
+                } else {
+                    // Live cell: clear a dead unregister token so the
+                    // dangling handle is never compared.
+                    if let Some(token) = &mut cells[i].unregister_token
+                        && let Some(token_box) = value_box_addr(token)
+                        && dead.contains(&token_box.addr())
+                    {
+                        cells[i].unregister_token = None;
+                    }
+                    i += 1;
+                }
+            }
+            data.cells = cells;
         }
     }
 

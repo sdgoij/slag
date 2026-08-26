@@ -318,12 +318,47 @@ strong entry storage:
 
 ### GC-4 — WeakRef and FinalizationRegistry activation
 
-- `weak_ref_targets` becomes a true weak table (`deref()` returns
-  `undefined` post-collection; `KeepDuringJob` semantics); registry cells
-  enqueue cleanup jobs via `HostEnqueueFinalizationRegistryCleanupJob` with
-  correct `heldValue` / unregister-token lifetimes.
-- Un-skip those fixtures.
-- Gate: fixtures pass; `--gc-stress` clean.
+**Landed.** WeakRef targets are held weakly and FinalizationRegistry
+cleanup jobs actually fire:
+
+- **Weak table** (`runtime/agent.rs`, `runtime/builtins/weakref.rs`):
+  `weak_ref_targets` is no longer traced — a collection clears a dead
+  target (`deref` returns `undefined`) — and `deref` pushes its result
+  to the `kept_during_job` set (spec 26.1.1 KeepDuringJob), cleared at
+  each job boundary.
+- **Precise weak compaction** (`crux/heap.rs`): the collector runs a
+  second, scan-free mark (from the precise roots) when weak structures
+  exist and the conservative scan found boxes; the compaction's dead set
+  comes from it, so a stale stack word cannot keep a WeakRef or FR
+  target alive. The sweep still uses the conservative mark — the scan
+  stays the safety net for Rust-held handles, and clearing a weak entry
+  never frees a box.
+- **Cleanup jobs**: a dead-target cell is removed pre-sweep (the boxes
+  are still allocated), its held value retained through the sweep, and a
+  cleanup job enqueued into `pending_cleanup_jobs` (the collector runs
+  with `&self` and cannot touch the job queues); the next job drain
+  moves it into `generic_jobs`. Dead unregister tokens on live cells are
+  cleared.
+- **Pooled-Vm hygiene** (`runtime/ir.rs`): `return_vm` fully resets the
+  Vm — a stale frame slot or value-stack entry from the last run would
+  otherwise be traced by `vm_pool` and keep a frame-local weak target
+  alive forever.
+- **Ephemeron fix**: promoted values are pushed unmarked in the fixpoint
+  so the drain marks *and traces* them (a pre-mark made the drain skip
+  the value, leaving its children sweepable — a latent GC-3 bug when a
+  WeakMap value holds heap children).
+- Tests: `weak_ref_target_dies_after_collection`,
+  `weak_ref_keep_during_job`, `finalization_registry_cleanup_job_runs`,
+  `finalization_registry_unregister_prevents_cleanup` (a target dies
+  after a collection; KeepDuringJob survives a same-window collection; a
+  dead target's held value reaches the cleanup callback; unregister
+  blocks cleanup).
+- Gate: the 76 pinned WeakRef/FR fixtures pass under `--gc-stress`; the
+  full `all` sweep stays 0 fail / 0 crash (48,015 pass, 0 fail, 0 crash,
+  449 hang of 48,622); the leak harness stays bounded. (The pinned
+  corpus never calls `$262.gc()`, so the visible gate is the API surface
+  + no regression — the collection semantics are verified by the unit
+  tests, which drive the collector directly.)
 
 ### GC-5 — the perf payoff
 

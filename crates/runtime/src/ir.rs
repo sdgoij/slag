@@ -2277,6 +2277,10 @@ impl Vm {
     /// `frame_size` on the next run, and a `frame_size`-0 body never reads
     /// it (the pool hands a Vm out only after its previous run finished).
     pub fn reset(&mut self, lexical_env: EnvRef, strict: bool) {
+        // GC-4: drop the frame's slot values so the pooled Vm (and a tail
+        // call's fresh run, which reuses this Vm) does not trace stale
+        // frame locals as roots.
+        self.clear_frame();
         self.ip = 0;
         self.stack.clear();
         self.leaf_frame_base = None;
@@ -2320,6 +2324,16 @@ impl Vm {
         self.array_index_stack.clear();
         self.args_base_stack.clear();
         self.call_args.clear();
+    }
+
+    /// GC-4: clear every frame slot so a Vm's stale values are never traced
+    /// as roots (a WeakRef or FinalizationRegistry target that lived in a
+    /// frame slot must die when the script/function that held it returns).
+    pub(crate) fn clear_frame(&mut self) {
+        match &mut self.frame {
+            Frame::Inline(buf) => buf.fill(Value::Undefined),
+            Frame::Heap(vec) => vec.clear(),
+        }
     }
 
     fn pop(&mut self) -> Value {
