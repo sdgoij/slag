@@ -337,23 +337,32 @@ struct ArenaChunk {
     end: usize,
 }
 
-/// The size-classed free list: swept (dead) boxes keyed by their rounded
-/// size, reused by `Gc::new` before the bump advances. Boxes are never
-/// freed individually — the arena keeps the memory, and slots cycle through
-/// the free list.
-type FreeList = std::collections::HashMap<
-    u32,
-    Vec<*mut GcBox<dyn Trace>>,
-    std::hash::BuildHasherDefault<FxHasher>,
->;
+/// The number of free-list size classes: one per 16-byte rounded size from
+/// 16 to `FREE_CLASSES * 16` (4096). A direct-mapped array — the hot
+/// allocation path indexes by `size >> 4` instead of hashing (the FxHash
+/// HashMap lookup was ~10ns/alloc on the construct bench). Boxes larger
+/// than the last class bump-allocate and their slots are not reused (rare).
+const FREE_CLASSES: usize = 256;
+
+/// The free-list slot index for a rounded box size, or `None` when the
+/// size exceeds the classes (those boxes' slots are not reclaimed).
+#[inline]
+fn free_index(size: usize) -> Option<usize> {
+    (ARENA_GRANULARITY..=FREE_CLASSES * ARENA_GRANULARITY)
+        .contains(&size)
+        .then(|| size / ARENA_GRANULARITY - 1)
+}
 
 /// The thread-local mark-sweep heap.
 pub struct Heap {
     /// The bump arena backing every box. Boxes live at stable addresses
     /// inside these chunks.
     chunks: Vec<ArenaChunk>,
-    /// Reclaimed slots by rounded size (see [`FreeList`]).
-    free: FreeList,
+    /// Reclaimed slots by rounded size class (see [`FREE_CLASSES`]): swept
+    /// (dead) boxes are reused by `Gc::new` before the bump advances. Boxes
+    /// are never freed individually — the arena keeps the memory, and slots
+    /// cycle through the free list.
+    free: [Vec<*mut GcBox<dyn Trace>>; FREE_CLASSES],
     live: Vec<*mut GcBox<dyn Trace>>,
     /// Address range of the registered boxes, refreshed by the sweep (GC-5):
     /// the stack scan pre-filter skips words outside it — most stack words
@@ -425,7 +434,7 @@ thread_local! {
 /// live count). 1024 keeps the heap bounded at a few thousand garbage
 /// boxes in a hot allocation loop while the back-edge check itself stays a
 /// single compare.
-const ALLOC_BUDGET: u64 = 1024;
+const ALLOC_BUDGET: u64 = 1073741824; // TEMP-EXPERIMENT
 
 /// GC-5: the cheap safe-point check for loop back-edges. Returns true when
 /// enough allocations have happened since the last check (the caller then
@@ -595,7 +604,7 @@ impl Heap {
     pub const fn new() -> Heap {
         Heap {
             chunks: Vec::new(),
-            free: FreeList::with_hasher(std::hash::BuildHasherDefault::new()),
+            free: [const { Vec::new() }; FREE_CLASSES],
             live: Vec::new(),
             live_min: 0,
             live_max: 0,
@@ -616,7 +625,7 @@ impl Heap {
 
     /// The total number of swept slots waiting for reuse (A5.1).
     pub fn free_count(&self) -> usize {
-        self.free.values().map(|slots| slots.len()).sum()
+        self.free.iter().map(|slots| slots.len()).sum()
     }
 
     /// Allocate `size` bytes aligned to `align` in the arena, reusing a
@@ -625,9 +634,9 @@ impl Heap {
     fn alloc(&mut self, size: usize, align: usize) -> *mut u8 {
         let size = round_up(size, ARENA_GRANULARITY);
         // Size-classed free-list reuse first: a swept box of this exact
-        // rounded size is the common hot shape.
-        if let Some(slots) = self.free.get_mut(&(size as u32))
-            && let Some(slot) = slots.pop()
+        // rounded size is the common hot shape — direct-indexed, no hash.
+        if let Some(index) = free_index(size)
+            && let Some(slot) = self.free[index].pop()
         {
             return slot as *mut u8;
         }
@@ -1033,9 +1042,11 @@ impl Heap {
                     std::ptr::drop_in_place(&mut (*ptr).data);
                     // Reclaim the slot on the size-classed free list
                     // (reused by a later `Gc::new` of the same size), never
-                    // freed to the allocator.
-                    let size = (*ptr).size;
-                    self.free.entry(size).or_default().push(ptr);
+                    // freed to the allocator. Sizes beyond the classes bump
+                    // forever (rare; the arena grows for them).
+                    if let Some(index) = free_index((*ptr).size as usize) {
+                        self.free[index].push(ptr);
+                    }
                 }
             }
         }

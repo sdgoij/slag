@@ -14,55 +14,102 @@ bigger win on property-access rows. They compose: maps shrink the object,
 the nursery makes object allocation cheap, and the constructor's property
 patterns (already collected) pre-build the object's final map.
 
-## 0. Measured baselines (this worktree, release build)
+## Status (2026-08-27 — GC half substantially landed, map half not started)
 
-| Row | current | node --jitless | gap |
+Landed and committed (in order):
+
+- `a1c8bd1` — construct-churn pre-work (property-pattern tracking, store-cache
+  pre-warm, lock-free `prototype` Cell, empty-props shortcut, GC compaction
+  hook skip) — see its commit body.
+- `42438e3` — **A5.1**: chunked bump arena + `GcBox.size` header +
+  size-classed free-list reuse + in-place payload drop on sweep.
+- `2ca8cab` — **A5.1b (first half)**: sorted-`live` binary-search stack scan
+  (replaces the per-collection `by_addr` HashMap rebuild) + store-then-read
+  value-cache fronting in `fast_fresh_store`.
+
+Uncommitted on top of `2ca8cab`:
+
+- **A5.1b (second half) — direct-mapped free list**: the size-classed free
+  list is now `[Vec<*mut GcBox>; 256]` indexed by `size >> 4` (sizes
+  16..=4096) instead of an FxHash HashMap. The per-alloc `get_mut` was the
+  sleeper cost — construct churn ~28ms → ~20ms. Commit this first.
+
+Measured result (release, interleaved medians): construct churn ~53ms →
+**~20ms**, string concat ~6.6ms → **~4.3ms**, other rows flat or better.
+Collections went from ~24ms of the construct-churn run to **~2.5ms**.
+
+The GC half's remaining idea (A5.2-A5.4, generational young GC) is now
+**low ROI** (~≤2.5ms of collections left) and hits an architectural wall
+(the write barrier needs cheap box access from crux mutation sites, which
+`bump_generation` does not have). **The next step is Part B (maps)**, which
+targets the ~19ms of allocation/init + store/read that dominate now. See
+§4 for the concrete pick-up point.
+
+## 0. Measured baselines
+
+Pre-session baseline (this worktree, release build — the rows the plan
+started from):
+
+| Row | before | after (session end) | node --jitless |
 |---|---|---|---|
-| arithmetic | ~12.5ms | 0.6ms | ~21x |
-| property access | ~27ms | 0.3ms | ~90x |
-| string concat | ~6.5ms | 1.4ms | ~4.6x |
-| array iteration | ~22ms | 0.6ms | ~37x |
-| function calls | ~22ms | 1.1ms | ~20x |
-| closure capture | ~26ms | 0.9ms | ~29x |
-| per-iteration | ~8.8ms | 0.2ms | ~44x |
-| construct churn | ~53ms | 3.0ms | ~18x |
+| arithmetic | ~12.5ms | ~14ms | 0.6ms |
+| property access | ~27ms | ~26ms | 0.3ms |
+| string concat | ~6.5ms | **~4.3ms** | 1.4ms |
+| array iteration | ~22ms | ~22ms | 0.6ms |
+| function calls | ~22ms | ~22.5ms | 1.1ms |
+| closure capture | ~26ms | ~26ms | 0.9ms |
+| per-iteration | ~8.8ms | ~8.7ms | 0.2ms |
+| construct churn | ~53ms | **~20ms** | 3.0ms |
 
-Decomposition of the construct churn row (per 100k iterations):
+Post-session decomposition of construct churn (per 100k iterations,
+allocation-budget-disabled floor):
 
-- `Gc::new` (Box::new + TLS registration + stress checks): ~190ns/alloc,
-  ~19ms. `Rc::new` on the pre-GC model was ~60ns.
-- GC collections: 33 collections in isolation at ~400-500µs each (~16ms);
-  the per-collection cost is `by_addr` map rebuild (~130µs at 3k live,
-  ~5-7ms at 350k), realm mark (~150-260µs — the realm holds ~3000 builtin
-  objects), and sweep frees (~150µs). In the full bench the string-concat
-  rope (200k live nodes) inflates the heap to ~350k boxes, so the final
-  collections cost 18-42ms each.
-- Machinery (construct_this_object, leaf-body setup, `o.x` read): the rest.
+- Allocation + `JsObject` init: ~11ms (~110ns/box — `Gc::new` TLS/borrow/
+  free-list-index/write/register ≈ 40-60ns, `basic_object_create` ≈ 40-60ns
+  of RefCell/SmallProps struct init).
+- Store `this.x =` + read `o.x` + accumulate: ~8ms (the value-cache
+  fronting from `2ca8cab` made the read a cache hit; the store's probe walk
+  + `fresh_data_define` borrows are near the floor for the current model).
+- Construct machinery (construct_this_object, leaf-body setup): ~2ms.
+- GC collections: ~2.5ms (was ~24ms — the arena + free list + sorted scan
+  made them nearly free).
 
-Why the current model is capped: every allocation is a malloc plus a
-thread-local map/`Vec` registration; every collection marks and sweeps the
-entire heap (realm included) and rebuilds an address map; every property
-access on a fresh object pays RefCell borrows and cold object-keyed caches
-because each object has a fresh identity.
+Why the current model is capped: `JsObject` is ~230B of RefCells + SmallProps
+(init cost), every property access on a fresh object pays RefCell borrows
+and cold object-keyed caches, and allocation still does 3-4 TLS accesses per
+box. The map model (Part B) attacks all three at once.
 
 ## 1. Goals and success metrics
 
 - **Allocation**: `Gc::new` from ~190ns to ~20ns (bump pointer, no malloc,
-  no registration `Vec` push on the young path).
-- **Young churn**: a loop that allocates short-lived objects (construct
-  churn) pays a scavenge proportional to the *survivor* set, not the whole
-  heap. Isolated construct churn: ~53ms → target ~20-25ms (machine
-  + engine-hot-path floor).
-- **Property access on fresh objects**: `o.x` after `new C(i)` becomes a
-  map check + offset read (no property-vector scan, no RefCell borrow,
-  no cold cache miss). Property-access row: ~27ms → target ~10-15ms.
-- **String concat**: the rope's 200k live nodes stop being re-marked on
-  every collection (they promote to old gen and are only touched by old-gen
-  collections). Row stays ≤ ~7ms.
-- **Correctness parity**: all 789 unit tests, the weak-* fixtures, and the
-  sweep union stay green; `--gc-stress` clean.
+  no registration `Vec` push on the young path). **Landed** the bump + no
+  malloc + direct-indexed free list; the remaining ~110ns/box is TLS/borrow
+  (3-4 accesses) + the ~230B `JsObject` init. The object-init half is a
+  Part B win (a map-shaped object drops most of the RefCells).
+- **Young churn**: construct churn from ~53ms to ~20-25ms. **Met** (~20ms)
+  without a generational collector — the arena + free-list reclamation + a
+  sorted-live scan made the existing mark-sweep collections nearly free for
+  this workload. The generational young GC (A5.2-A5.4) is deferred as low
+  ROI (see the status block).
+- **Property access on fresh objects**: `o.x` after `new C(i)` becomes a map
+  check + offset read. **Not started** — Part B. Store+read is ~8ms of the
+  construct-churn run; property-access row ~26ms vs node 0.3ms.
+- **String concat**: ~6.6ms → **~4.3ms** (the arena + free list cut the
+  rope-node allocation cost; the rope is still re-marked per collection but
+  collections are cheap now).
+- **Correctness parity**: all workspace tests green (3323 test262), the
+  weak-* fixtures, `--gc-stress` clean, leak harness flat (cycle ~3MB growth
+  over 200k evals), at every landed cut.
 
 ## 2. Part A — bump-pointer nursery + generational GC
+
+> **What actually landed (session 1):** A5.1/A5.1b took the *non-moving*
+> route — a chunked bump arena + size-classed free-list reclamation + the
+> existing mark-sweep, which reached the ~20ms construct-churn target without
+> a generational split (collections became nearly free once allocation was
+> cheap and the sweep was a free-list push). A1-A4 below are the *deferred*
+> semi-space/generational design; the free-list route sidestepped the copying
+> collector's pointer-update problem entirely.
 
 ### A0. Design decisions
 
@@ -70,7 +117,9 @@ because each object has a fresh identity.
   arena cannot reclaim the holes dead objects leave without a free list
   (measured net-neutral in GC-5) or copying. Copying is the V8 model and the
   only one that reaches the ~20ns allocation target with O(survivors)
-  collection.
+  collection. **Session-1 amendment:** the free-list route (A5.1) hit the
+  target without copying; the semi-space is only worth revisiting if
+  collections re-grow as a cost.
 - **A-D2 — In-box forwarding pointers, not a side-table.** During a
   scavenge the mark slot becomes a forwarding pointer to the new location
   (V8 does exactly this: `mark` is either unmarked, marked, or a
@@ -164,25 +213,41 @@ the old gen and is re-marked only by rare old-gen collections.
 
 ### A5. Cuts
 
-- **A5.1 — Bump arena, collections still full mark-sweep.** Swap `Box::new`
-  for the arena bump; keep the collector treating the arena as one space
-  (iterate `[bump base, bump end)` — contiguous, no by_addr needed for the
-  young region). Gate: tests green, `--gc-stress` green, measure
-  `Gc::new` (target ≤ ~60ns) and construct churn.
-- **A5.2 — Semi-space + scavenge with in-box forwarding.** Implement A2 with
-  promotion disabled (everything survives to the end of the scavenge; the
-  to-space is the "old" side). Gate: `--gc-stress` green, weak fixtures
-  green, leak harness bounded on cyclic workloads.
-- **A5.3 — Promotion + old-gen.** Split survivors by age; old gen gets the
-  retained mark-sweep. Gate: long-running workloads bounded, rope
-  benchmarks stable.
-- **A5.4 — Write barrier + remembered set.** Land the barrier on all store
-  sites; verify a young-only scavenge no longer traces the old gen. Gate:
-  `--gc-stress` green with a deliberately leak-detecting workload (young
-  object stored into an old object, then all other roots dropped → must be
-  collected).
-- **A5.5 — Tunables + measurement.** Nursery size, promotion threshold,
-  scavenge-vs-malloc cross-over. Gate: the benchmarks in §0.
+- **A5.1 — Bump arena, collections still full mark-sweep. — LANDED**
+  (`42438e3`). Chunked 1 MiB bump arena (address-stable `Box<[u8]>`
+  chunks), `GcBox` gains a `size: u32` header (mark+size is still an 8-byte
+  header, so boxes do not grow), swept boxes are **dropped in place**
+  (`drop_in_place` of the payload) and their slots reclaimed on a
+  size-classed free list. The in-place drop is the critical correctness
+  piece: without it the free list reused slots whose payloads (Vecs,
+  HashMaps, Arc buffers) leaked — the leak harness showed 526MB growth
+  before the fix, flat afterwards. Construct churn ~53ms → ~35ms.
+- **A5.1b (adopted as part of A5.1) — cheap scan + cheap free list.**
+  First half (`2ca8cab`): the conservative stack scan resolves a stack word
+  by binary-searching `live` sorted by box address once per collection,
+  replacing the per-collection `by_addr` HashMap rebuild (exact — a random
+  word can never be mistaken for a box). `fast_fresh_store` also fronts the
+  just-defined property in `member_value_cells` so a constructor's
+  `this.x =` followed by `o.x` hits without a property-vector borrow
+  (isolated store-then-read ~45ms → ~39ms). Second half (uncommitted): the
+  free list became `[Vec<_>; 256]` indexed by `size >> 4` instead of an
+  FxHash HashMap — the per-alloc `get_mut` cost ~8ms total on construct
+  churn. Construct churn ~35ms → ~20ms, concat ~4.8ms → ~4.3ms.
+- **A5.2 — Semi-space + scavenge with in-box forwarding. — DEFERRED (low
+  ROI).** A scavenge with promotion disabled re-copies the realm (~3000
+  builtins) every collection, which is *worse* than mark-sweep for this
+  workload; it only pays off with A5.3. Collections now cost ~2.5ms total
+  on construct churn, so the generational machinery's ceiling is small.
+  If picked up, the blocking design issue is the write barrier (A5.4): the
+  collector works at the erased `GcBox` level, but mutation signals live in
+  the object data (`JsObject::bump_generation` has no box/heap handle), so
+  hooking the barrier cheaply needs a design pass (e.g. a box-header
+  mutation bit written from the store sites that already hold the box, or a
+  per-agent dirty set threaded through crux).
+- **A5.3 — Promotion + old-gen. — DEFERRED with A5.2.**
+- **A5.4 — Write barrier + remembered set. — DEFERRED with A5.2.** The
+  store-site list in A3 stays accurate.
+- **A5.5 — Tunables + measurement. — DEFERRED.**
 
 ## 3. Part B — map-based object model (V8 hidden classes)
 
@@ -263,6 +328,9 @@ constructor's *final* map:
 
 ### B5. Cuts
 
+> **Status: not started.** This is the next session's work. The uncommitted
+> free-list array (see the status block) should be committed first.
+
 - **B5.1 — `Map` type + empty-map creation, storage still Vec.** Land the
   map as a parallel shape; `JsObject.map` exists; reads still go through
   `SmallProps`. Gate: tests green, no behavior change, measure the overhead
@@ -270,11 +338,14 @@ constructor's *final* map:
 - **B5.2 — In-object fields + map-based read path.** Fresh objects use
   `in_fields`; `member_cell_get` re-keyed to `(map, name)`. Gate:
   property-access row improves; `Object.keys`/iteration order tests green.
+  Target: the ~8ms store+read slice of construct churn.
 - **B5.3 — Map-based store + transitions.** Add-property transitions;
   store IC re-keyed. Gate: construct churn's store becomes an in-place
   field write; `defineProperty`/`delete` tests green.
 - **B5.4 — Constructor boilerplate.** Final-map pre-build from
-  `construct_property_patterns`. Gate: construct churn target (§1).
+  `construct_property_patterns` (the compiler already records `this.*`
+  writes per constructor — the data is in `Agent::construct_property_patterns`).
+  Gate: construct churn target (§1).
 - **B5.5 — Dictionary fallback + attribute forks.** Land delete/
   defineProperty/overflow semantics. Gate: full suite + sweep green.
 
@@ -282,43 +353,66 @@ constructor's *final* map:
 
 - Part A and Part B are independent; each cut in either part is
   self-contained and gate-closing.
-- Recommended order: **A5.1 → B5.1 → B5.2 → A5.2 → B5.3 → B5.4 → A5.3 →
-  A5.4 → B5.5 → A5.5**. Rationale: A5.1 and B5.1 are low-risk foundations
-  that each pay off alone; the construct-churn target needs both A5.2 (cheap
-  allocation) and B5.4 (cheap stores), so landing B5.2/3 before A5.2 keeps
-  the two halves independently verifiable.
-- A5.4 (write barrier) is the only cut with a hard cross-part dependency: it
-  must hook `SmallProps`/ConsString/env stores regardless of maps, and the
-  barrier target check uses the nursery range from A5.1.
+- Actual path taken (session 1 of the plan): A5.1 → A5.1b → (free-list
+  array). Part A's practical wins are banked; A5.2-A5.4 are deferred.
+- **Next session pick-up point: Part B.** Recommended order **B5.1 → B5.2 →
+  B5.3 → B5.4 → B5.5**, in that order. B5.1 is low-risk (a parallel shape
+  with no behavior change); the value lands at B5.2 (map-keyed read) and
+  B5.4 (constructor boilerplate via `construct_property_patterns`).
+- B5 scope warning: crux's property machinery (`ordinary_get_own_property`,
+  `define_own_property`, `validate_and_apply`, `property_slot`, iteration,
+  `[[OwnPropertyKeys]]` order, proxies, descriptors — ~2000 lines in
+  `crates/crux/src/object.rs` + the runtime's member-cell caches) all assume
+  `SmallProps` is the one store. A split store (map fields + SmallProps
+  overflow) is a correctness minefield — the safest shape is B5.1 landing
+  the `Map` type with **no storage change**, then B5.2 switching the read
+  path, keeping `SmallProps` authoritative until the fast path is proven.
+- A5.4 (write barrier) is the only cut with a hard cross-part dependency:
+  it must hook `SmallProps`/ConsString/env stores regardless of maps, and
+  the barrier target check uses the nursery range from A5.1. Deferred.
 
 ## 5. Risk register
 
-1. **Write-barrier completeness (A5.4).** A missed old→young edge is a
-   use-after-free, invisible to the conservative stack scan (the scan covers
-   the native stack, not heap edges). Mitigation: enumerate every store site
-   (the list in A3), and land a `--gc-stress`-style nursery-stress mode that
-   scavenges after every allocation so a missing barrier fails fast.
-2. **Copying collector + the conservative scan.** A stack word inside the
+**Lessons learned (session 1, all confirmed by measurement):**
+
+0. **Free-list reuse without a payload drop leaks every swept box's
+   internals.** The arena owns the slot, but `drop_in_place((*ptr).data)`
+   must still run before the slot is reused — the leak harness showed 526MB
+   growth until it was added. Any future free-list/arena reclamation must
+   keep the payload drop.
+1. **HashMap lookups on per-alloc / per-collection hot paths are expensive
+   beyond their micro-cost.** The `by_addr` rebuild (~130µs/collection) and
+   the free-list `get_mut` (~8ms over the construct run) both vanished when
+   replaced with direct indexing / a sorted slice. When a cache is keyed by
+   a bounded integer (box address range, rounded size class), prefer a
+   direct-mapped structure over a hash map.
+2. **Collections became nearly free** (~2.5ms of the construct run) once
+   allocation was cheap and the sweep was a free-list push — re-measure
+   before investing in a generational collector; the ROI moved down sharply.
+
+**Open risks (unchanged / Part B):**
+
+3. **Write-barrier completeness (A5.4).** A missed old→young edge is a
+   use-after-free, invisible to the conservative stack scan. Deferred, but
+   the store-site list in A3 stands. The blocking architectural issue: crux
+   mutation sites (`JsObject::bump_generation`) have no cheap box/heap
+   handle, so the barrier hook needs a design pass.
+4. **Copying collector + the conservative scan.** A stack word inside the
    nursery range that is not actually a pointer gets "rewritten" — safe (it
    was going to retain garbage either way), but the rewrite must be
-   idempotent across a single scavenge (a word pointing at a *forwarded* box
-   must follow the chain, not re-copy).
-3. **Job closures / opaque regions.** The FinalizationRegistry cleanup
+   idempotent across a single scavenge.
+5. **Job closures / opaque regions.** The FinalizationRegistry cleanup
    closure and generic job closures hold captured `Value`s the collector
-   sees only through region scans; the region scan must recognize nursery
-   addresses (the A2 stack-word rewrite applies to the closure regions too).
-4. **Map canonicalization table.** Two objects with identical shapes must
-   share a Map for the ICs to hit; the table keyed by `(proto, descriptors)`
-   needs invalidation when a prototype mutates (the existing generation
-   mechanism covers this).
-5. **Attribute/delete semantics (B5.5).** The current `ValidateAndApplyPropertyDescriptor`
-   machinery is exhaustive; the map fork must reproduce it exactly. Keep the
-   Vec path as the dictionary fallback and run the descriptor test corpus
-   against it.
-6. **Perf regression on non-target rows.** The map pointer and in-object
-   fields grow `JsObject` slightly; the nursery's from/to split doubles young
-   memory. Both are bounded (in_fields capped, nursery sized by measurement)
-   and measured at every cut.
+   sees only through region scans; a moving collector must recognize
+   nursery addresses in those regions.
+6. **Split property storage (Part B).** Two stores (map fields + SmallProps
+   overflow) mean every property operation must route correctly; the
+   descriptor/attribute/order corpus must run against both. Land B5.1 with
+   no behavior change and keep `SmallProps` authoritative until the fast
+   path is proven.
+7. **Perf regression on non-target rows.** The map pointer and in-object
+   fields grow `JsObject` slightly. Measured at every cut; `INLINE_FIELDS`
+   capped (the construct case needs 1).
 
 ## 6. Validation per cut
 
