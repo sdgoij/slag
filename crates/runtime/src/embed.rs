@@ -174,12 +174,8 @@ impl Context {
         args: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let values: Vec<Value> = args.iter().map(JsValue::value).cloned().collect();
-        let result = crate::function::call(
-            &mut self.agent,
-            function.value(),
-            *this.value(),
-            &values,
-        )?;
+        let result =
+            crate::function::call(&mut self.agent, function.value(), *this.value(), &values)?;
         self.agent.run_jobs()?;
         Ok(JsValue(result))
     }
@@ -969,6 +965,73 @@ mod tests {
         context.run_jobs().unwrap();
         let result = context.eval("globalThis.result").unwrap();
         assert_eq!(result.as_number(), Some(0.0));
+    }
+
+    // ---- Part B, B5.3: map-based store + transitions (VM level) ----
+
+    #[test]
+    fn member_reads_stay_consistent_across_shape_mutations() {
+        let mut context = Context::new().unwrap();
+        // The construct-then-read pattern warms the map cache; every mutation
+        // below must leave reads serving the property vector's value.
+        context
+            .eval("function C(x) { this.x = x; } globalThis.o = new C(1);")
+            .unwrap();
+        assert_eq!(
+            context.eval("globalThis.o.x").unwrap().as_number(),
+            Some(1.0)
+        );
+        // An in-place value update through [[Set]] must mirror into the
+        // inline field (the map read serves from there).
+        context.eval("globalThis.o.x = 2;").unwrap();
+        assert_eq!(
+            context.eval("globalThis.o.x").unwrap().as_number(),
+            Some(2.0)
+        );
+        // A defineProperty value update on a mapped key must mirror too.
+        context
+            .eval("Object.defineProperty(globalThis.o, 'x', { value: 3 });")
+            .unwrap();
+        assert_eq!(
+            context.eval("globalThis.o.x").unwrap().as_number(),
+            Some(3.0)
+        );
+        // Deleting the mapped key drops the object to dictionary mode: the
+        // stale inline field must not win over the (now empty) property
+        // vector.
+        context.eval("delete globalThis.o.x;").unwrap();
+        assert_eq!(
+            context.eval("globalThis.o.x").unwrap().type_name(),
+            "undefined"
+        );
+    }
+
+    #[test]
+    fn shared_shape_reads_per_object_fields() {
+        let mut context = Context::new().unwrap();
+        context
+            .eval("function C(v) { this.x = v; } globalThis.a = new C(1); globalThis.b = new C(2);")
+            .unwrap();
+        // Both instances share the transitioned map; each reads its own
+        // inline field through the same (map_id, name) cache entry.
+        assert_eq!(
+            context.eval("globalThis.a.x").unwrap().as_number(),
+            Some(1.0)
+        );
+        assert_eq!(
+            context.eval("globalThis.b.x").unwrap().as_number(),
+            Some(2.0)
+        );
+        // A mutation on one instance must not leak into the other.
+        context.eval("globalThis.a.x = 10;").unwrap();
+        assert_eq!(
+            context.eval("globalThis.a.x").unwrap().as_number(),
+            Some(10.0)
+        );
+        assert_eq!(
+            context.eval("globalThis.b.x").unwrap().as_number(),
+            Some(2.0)
+        );
     }
 
     #[test]

@@ -17,8 +17,8 @@ use crate::error::{ErrorKind, JsError};
 use crate::function::call;
 use crate::handle::Handle;
 use crate::heap::{GcAny, Trace};
-use crate::map::Map;
 use crate::map::canonical_empty_map;
+use crate::map::{Map, MapAttrs};
 use crate::ops::{same_value, same_value_zero};
 use crate::property::{PropertyDescriptor, PropertyKey};
 use crate::string::{JsString, lookup};
@@ -560,7 +560,7 @@ pub struct JsObject {
     ///
     /// Part B: parallel map-based shape. B5.1 — parallel shape only:
     /// `map` is allocated and wired, reads/writes stay through `SmallProps`.
-    pub map: Handle<Map>,
+    pub map: Cell<Option<Handle<Map>>>,
     /// Inline property storage for fresh objects (Part B, B5.2). The map
     /// assigns property offsets into this array; the read path checks the
     /// map first and reads from `in_fields` when a field offset is present.
@@ -619,7 +619,9 @@ impl Trace for JsObject {
         if let Some(proto) = self.prototype.get() {
             proto.trace(visit);
         }
-        self.map.trace(visit);
+        if let Some(m) = self.map.get() {
+            m.trace(visit);
+        }
         for field in &self.in_fields {
             if let Some(v) = field.get() {
                 v.trace(visit);
@@ -671,7 +673,7 @@ impl JsObject {
             id: next_object_id(),
             kind: ObjectKind::Ordinary,
             prototype: Cell::new(prototype),
-            map: canonical_empty_map(prototype),
+            map: Cell::new(Some(canonical_empty_map(prototype))),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
@@ -714,7 +716,7 @@ impl JsObject {
     /// but unset; `None` when the map doesn't describe the key (fall through
     /// to SmallProps/prototype chain).
     pub fn map_get(&self, key: &PropertyKey) -> Option<Value> {
-        let offset = self.map.find(key)?;
+        let offset = self.map.get()?.find(key)?;
         if offset >= INLINE_FIELDS {
             return None;
         }
@@ -725,7 +727,7 @@ impl JsObject {
     /// a descriptor of `key`, then write the value to `in_fields` at the
     /// assigned offset. Returns `false` when the key is not in the map.
     pub fn map_set(&self, key: &PropertyKey, value: Value) -> bool {
-        let offset = match self.map.find(key) {
+        let offset = match self.map.get().and_then(|m| m.find(key)) {
             Some(o) => o,
             None => return false,
         };
@@ -734,6 +736,71 @@ impl JsObject {
         }
         self.in_fields[offset].set(Some(value));
         true
+    }
+
+    /// Part B, B5.3: read the inline field at a map-assigned offset directly
+    /// (the runtime's map cache pins `(map_id, name) → slot`, so the read
+    /// skips the descriptor scan). `None` when the slot is out of range;
+    /// an unset field reads as *undefined* like `map_get`.
+    pub fn map_field(&self, slot: usize) -> Option<Value> {
+        self.in_fields
+            .get(slot)
+            .map(|cell| cell.get().unwrap_or(Value::Undefined))
+    }
+
+    /// Part B, B5.3: transition the object's map for a new property.
+    /// Creates a child map with a descriptor for the key and returns it.
+    /// Returns `None` if the object has no map or the map is full (past the
+    /// maximum descriptor count for the inline field capacity).
+    pub fn map_add_property_cell(&self, key: PropertyKey, attrs: MapAttrs) -> Option<Handle<Map>> {
+        let mut map = self.map.get()?;
+        let child = map.get_or_create_child(key, attrs)?;
+        self.map.set(Some(child));
+        self.bump_generation();
+        self.map.get()
+    }
+
+    /// Part B, B5.3: keep the map-based shape in sync after a define
+    /// (`validate_and_apply`). The map read path serves `in_fields` at the
+    /// descriptor offset, so the field must mirror the stored property's
+    /// value and the map must still describe the same shape: a value update
+    /// on a mapped key rewrites the field; a data→accessor conversion drops
+    /// the object to dictionary mode (the map's data descriptor is stale); a
+    /// fresh w/e/c data property transitions the shape. Only Ordinary
+    /// objects have a map read path in the runtime, so the exotic kinds skip
+    /// the bookkeeping.
+    fn sync_map_after_define(&self, key: &PropertyKey, property: &Property) {
+        if !matches!(self.kind, ObjectKind::Ordinary) {
+            return;
+        }
+        let Some(map) = self.map.get() else {
+            return;
+        };
+        if !property.is_data() {
+            self.map.set(None);
+            return;
+        }
+        let value = property.value().unwrap_or(Value::Undefined);
+        let mapped = map.find(key).is_some();
+        if mapped
+            || (property.writable() == Some(true)
+                && property.enumerable
+                && property.configurable
+                && self
+                    .map_add_property_cell(key.clone(), MapAttrs::new(true, true, true))
+                    .is_some())
+        {
+            let _ = self.map_set(key, value);
+        }
+    }
+
+    /// Part B, B5.3: a deleted own property's inline field is stale; drop
+    /// the object to dictionary mode when the map described the key (the
+    /// map's shape no longer matches the property vector).
+    fn drop_map_if_mapped(&self, key: &PropertyKey) {
+        if self.map.get().is_some_and(|m| m.find(key).is_some()) {
+            self.map.set(None);
+        }
     }
 
     /// OrdinaryObjectCreate (spec 10.1.13).
@@ -778,7 +845,7 @@ impl JsObject {
             id: next_object_id(),
             kind: ObjectKind::IsHTMLDDA,
             prototype: Cell::new(prototype),
-            map: canonical_empty_map(prototype),
+            map: Cell::new(Some(canonical_empty_map(prototype))),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
@@ -810,7 +877,7 @@ impl JsObject {
             id: next_object_id(),
             kind: ObjectKind::Array,
             prototype: Cell::new(prototype),
-            map: canonical_empty_map(prototype),
+            map: Cell::new(Some(canonical_empty_map(prototype))),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
@@ -846,7 +913,7 @@ impl JsObject {
             id: next_object_id(),
             kind: ObjectKind::String(Handle::new(value)),
             prototype: Cell::new(prototype),
-            map: canonical_empty_map(prototype),
+            map: Cell::new(Some(canonical_empty_map(prototype))),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
@@ -878,7 +945,7 @@ impl JsObject {
             id: next_object_id(),
             kind: ObjectKind::Proxy(Handle::new(slots)),
             prototype: Cell::new(None),
-            map: canonical_empty_map(None),
+            map: Cell::new(Some(canonical_empty_map(None))),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
@@ -904,7 +971,7 @@ impl JsObject {
             id: next_object_id(),
             kind: ObjectKind::IntegerIndexed(Handle::new(slots)),
             prototype: Cell::new(prototype),
-            map: canonical_empty_map(prototype),
+            map: Cell::new(Some(canonical_empty_map(prototype))),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
@@ -1012,7 +1079,7 @@ impl JsObject {
                 deferred,
             })),
             prototype: Cell::new(None),
-            map: canonical_empty_map(None),
+            map: Cell::new(Some(canonical_empty_map(None))),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
             extensible: Cell::new(false),
             immutable_prototype: Cell::new(false),
@@ -1065,7 +1132,7 @@ impl JsObject {
                 env: None,
             })),
             prototype: Cell::new(prototype),
-            map: canonical_empty_map(prototype),
+            map: Cell::new(Some(canonical_empty_map(prototype))),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
@@ -1162,7 +1229,7 @@ impl JsObject {
                 env: None,
             })),
             prototype: Cell::new(prototype),
-            map: canonical_empty_map(prototype),
+            map: Cell::new(Some(canonical_empty_map(prototype))),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
@@ -1744,6 +1811,11 @@ impl JsObject {
                 && *writable
             {
                 *slot = value;
+                // Part B, B5.3: mirror the in-place value update into the
+                // inline field when the key is mapped — the map-based read
+                // path serves from there, so a stale field would win over
+                // the property vector.
+                let _ = self.map_set(key, value);
                 // An in-place value update is an own-property change: bump
                 // the generation so the read-side value cache (Cut 35
                 // slice 11) re-validates its cached value.
@@ -1945,6 +2017,17 @@ impl JsObject {
         if !self.extensible.get() {
             return false;
         }
+        // Part B, B5.3: transition the map for the fresh w/e/c data property
+        // and write the value into the field it assigned, so the map-based
+        // read path serves it without a property-vector borrow. A full map
+        // (past the inline capacity) leaves the key in dictionary mode — the
+        // map read falls through to SmallProps.
+        if self
+            .map_add_property_cell(key.clone(), MapAttrs::new(true, true, true))
+            .is_some()
+        {
+            let _ = self.map_set(key, value);
+        }
         let mut props = self.properties.borrow_mut();
         let position = props.len();
         props.push((key.clone(), Property::data(value, true, true, true)));
@@ -2059,6 +2142,7 @@ impl JsObject {
                         if props[index].1.configurable {
                             props.remove(index);
                             *self.property_index.borrow_mut() = None;
+                            self.drop_map_if_mapped(key);
                             self.bump_generation();
                             true
                         } else {
@@ -2089,6 +2173,7 @@ impl JsObject {
                 if props[index].1.configurable {
                     props.remove(index);
                     *self.property_index.borrow_mut() = None;
+                    self.drop_map_if_mapped(key);
                     self.bump_generation();
                     true
                 } else {
@@ -2268,8 +2353,12 @@ fn validate_and_apply(
         };
         let mut props = obj.properties.borrow_mut();
         let position = props.len();
-        props.push((key.clone(), property));
+        props.push((key.clone(), property.clone()));
         drop(props);
+        // Part B, B5.3: a fresh data property defined through the full path
+        // transitions the map when its attributes allow, so the map read
+        // path serves it like a `fresh_data_define`.
+        obj.sync_map_after_define(key, &property);
         // Maintain the lazy index incrementally: an append shifts nothing, so
         // the new key maps to its pushed position (a full rebuild would make
         // sequential fills O(n^2) — the property-escape fixtures build
@@ -2379,7 +2468,13 @@ fn validate_and_apply(
         props.iter().position(|(name, _)| name == key)
     };
     if let Some(position) = position {
-        props[position].1 = next;
+        let applied = next;
+        props[position].1 = applied.clone();
+        drop(props);
+        // Part B, B5.3: a value update on a mapped key must mirror into the
+        // inline field; a data→accessor conversion drops the object to
+        // dictionary mode (see `sync_map_after_define`).
+        obj.sync_map_after_define(key, &applied);
     }
     Ok(true)
 }
@@ -3493,6 +3588,187 @@ mod tests {
         assert!(obj.delete(&key("free")).unwrap());
         assert!(!obj.has_property(&key("free")).unwrap());
         assert!(obj.delete(&key("absent")).unwrap());
+    }
+
+    // ---- Part B, B5.3: map-based shape invariants ----
+
+    #[test]
+    fn fresh_define_transitions_map_and_writes_field() {
+        let obj = JsObject::ordinary_object_create(None);
+        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("x"), Value::Number(1.0)));
+        // The map transitioned and the field holds the value: the map read
+        // path serves it, and the property vector agrees.
+        assert_eq!(
+            obj.map_get(&PropertyKey::from_utf8("x")),
+            Some(Value::Number(1.0))
+        );
+        assert_eq!(obj.get(&key("x")).unwrap(), Value::Number(1.0));
+        // Two fresh properties share one transitioned shape; each key reads
+        // through its own field.
+        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("y"), Value::Number(2.0)));
+        assert_eq!(
+            obj.map_get(&PropertyKey::from_utf8("x")),
+            Some(Value::Number(1.0))
+        );
+        assert_eq!(
+            obj.map_get(&PropertyKey::from_utf8("y")),
+            Some(Value::Number(2.0))
+        );
+    }
+
+    #[test]
+    fn in_place_value_update_mirrors_into_inline_field() {
+        let obj = JsObject::ordinary_object_create(None);
+        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("x"), Value::Number(1.0)));
+        // The second write goes through the in-place own-descriptor path: the
+        // inline field must follow, or the map read serves a stale value.
+        assert!(
+            obj.set_key(&PropertyKey::from_utf8("x"), Value::Number(2.0), false)
+                .unwrap()
+        );
+        assert_eq!(
+            obj.map_get(&PropertyKey::from_utf8("x")),
+            Some(Value::Number(2.0))
+        );
+        assert_eq!(obj.get(&key("x")).unwrap(), Value::Number(2.0));
+    }
+
+    #[test]
+    fn define_value_update_mirrors_into_inline_field() {
+        let obj = JsObject::ordinary_object_create(None);
+        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("x"), Value::Number(1.0)));
+        // A defineProperty value update on a mapped key (the full
+        // ValidateAndApplyPropertyDescriptor path) must mirror into the
+        // field.
+        obj.define_property(
+            &key("x"),
+            &descriptor(Some(Value::Number(3.0)), None, None, None),
+        )
+        .unwrap();
+        assert_eq!(
+            obj.map_get(&PropertyKey::from_utf8("x")),
+            Some(Value::Number(3.0))
+        );
+        assert_eq!(obj.get(&key("x")).unwrap(), Value::Number(3.0));
+    }
+
+    #[test]
+    fn delete_of_mapped_key_drops_to_dictionary() {
+        let obj = JsObject::ordinary_object_create(None);
+        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("x"), Value::Number(1.0)));
+        assert!(obj.delete(&key("x")).unwrap());
+        // The map no longer describes x (the stale inline field must not
+        // win): the map read falls through and the property is gone.
+        assert_eq!(obj.map_get(&PropertyKey::from_utf8("x")), None);
+        assert_eq!(obj.get(&key("x")).unwrap(), Value::Undefined);
+    }
+
+    #[test]
+    fn define_add_transitions_when_attributes_allow() {
+        let obj = JsObject::ordinary_object_create(None);
+        // A full w/e/c data descriptor through the define path transitions
+        // the map like a fresh store.
+        obj.define_property(
+            &key("x"),
+            &descriptor(Some(Value::Number(1.0)), Some(true), Some(true), Some(true)),
+        )
+        .unwrap();
+        assert_eq!(
+            obj.map_get(&PropertyKey::from_utf8("x")),
+            Some(Value::Number(1.0))
+        );
+        // A default-attribute define (all false) stays in dictionary mode.
+        obj.define_property(
+            &key("y"),
+            &descriptor(Some(Value::Number(2.0)), None, None, None),
+        )
+        .unwrap();
+        assert_eq!(obj.map_get(&PropertyKey::from_utf8("y")), None);
+        assert_eq!(obj.get(&key("y")).unwrap(), Value::Number(2.0));
+        // The mapped x survives the dictionary-mode y: the shapes diverged
+        // cleanly.
+        assert_eq!(
+            obj.map_get(&PropertyKey::from_utf8("x")),
+            Some(Value::Number(1.0))
+        );
+        assert_eq!(obj.get(&key("x")).unwrap(), Value::Number(1.0));
+    }
+
+    #[test]
+    fn accessor_conversion_drops_to_dictionary() {
+        let obj = JsObject::ordinary_object_create(None);
+        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("x"), Value::Number(1.0)));
+        let getter = builtin("get", |_, _| Ok(Value::Number(42.0)));
+        obj.define_property(
+            &key("x"),
+            &PropertyDescriptor {
+                get: Some(getter),
+                set: None,
+                value: None,
+                writable: None,
+                enumerable: Some(true),
+                configurable: Some(true),
+            },
+        )
+        .unwrap();
+        // The map's data descriptor is stale after the conversion: the
+        // object dropped to dictionary mode and the accessor serves the read.
+        assert_eq!(obj.map_get(&PropertyKey::from_utf8("x")), None);
+        assert_eq!(obj.get(&key("x")).unwrap(), Value::Number(42.0));
+    }
+
+    #[test]
+    fn map_capacity_falls_back_to_dictionary() {
+        let obj = JsObject::ordinary_object_create(None);
+        for i in 0..INLINE_FIELDS + 1 {
+            let name = format!("k{i}");
+            assert!(obj.fresh_data_define(&PropertyKey::from_utf8(&name), Value::Number(i as f64)));
+        }
+        // The first INLINE_FIELDS keys are mapped and read through fields.
+        for i in 0..INLINE_FIELDS {
+            let name = format!("k{i}");
+            assert_eq!(
+                obj.map_get(&PropertyKey::from_utf8(&name)),
+                Some(Value::Number(i as f64))
+            );
+        }
+        // The (INLINE_FIELDS + 1)th key exceeds the inline capacity: it
+        // stays dictionary-only, served by the property vector.
+        let overflow = format!("k{INLINE_FIELDS}");
+        assert_eq!(obj.map_get(&PropertyKey::from_utf8(&overflow)), None);
+        assert_eq!(
+            obj.get(&JsString::from_utf8(&overflow)).unwrap(),
+            Value::Number(INLINE_FIELDS as f64)
+        );
+    }
+
+    #[test]
+    fn dictionary_object_keeps_working_after_shape_divergence() {
+        let obj = JsObject::ordinary_object_create(None);
+        // x transitions the map; y drops it to dictionary mode via an
+        // accessor define. Everything stays consistent afterwards.
+        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("x"), Value::Number(1.0)));
+        let getter = builtin("get", |_, _| Ok(Value::Number(9.0)));
+        obj.define_property(
+            &key("y"),
+            &PropertyDescriptor {
+                get: Some(getter),
+                set: None,
+                value: None,
+                writable: None,
+                enumerable: Some(true),
+                configurable: Some(true),
+            },
+        )
+        .unwrap();
+        assert_eq!(obj.map_get(&PropertyKey::from_utf8("x")), None);
+        assert_eq!(obj.get(&key("x")).unwrap(), Value::Number(1.0));
+        assert_eq!(obj.get(&key("y")).unwrap(), Value::Number(9.0));
+        // A subsequent fresh define stays dictionary-only (no map to
+        // transition), but the property is served correctly.
+        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("z"), Value::Number(3.0)));
+        assert_eq!(obj.map_get(&PropertyKey::from_utf8("z")), None);
+        assert_eq!(obj.get(&key("z")).unwrap(), Value::Number(3.0));
     }
 
     #[test]

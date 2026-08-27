@@ -1560,12 +1560,13 @@ pub(crate) struct MemberValueCell {
     pub value: Value,
 }
 
-/// Part B, B5.2: map-keyed member cache entry — maps map_id + name to a
-/// field offset for the in_fields fast path.
+/// Part B, B5.2: map-keyed member cache entry — maps (map_id, name) to a
+/// field offset for the in_fields fast path. The map's shape is immutable,
+/// so a map_id + name match pins the descriptor (and its offset) exactly.
 #[derive(Clone, Copy)]
 pub(crate) struct MemberMapCell {
     pub map_id: u64,
-    #[expect(dead_code)]
+    pub name: crux::AtomId,
     pub slot: usize,
 }
 
@@ -2721,17 +2722,27 @@ impl Vm {
     /// `member_cell_get`'s existing path).
     fn member_cell_get_map(agent: &mut Agent, object: &Value, name: crux::AtomId) -> Option<Value> {
         let object = Self::cell_object(object)?;
-        let map_id = object.map.id();
-        // Check the map-based cache first: (map_id, name) → slot
+        let map = object.map.get()?;
+        let map_id = map.id();
+        // The direct-mapped cache probe: (map_id, name) → field offset. The
+        // map's shape is immutable, so a match pins the descriptor; the
+        // offset addresses the object's own `in_fields` (shared map,
+        // per-object storage).
         let index = Self::member_map_cell_index(map_id, name);
         if let Some(cell) = &agent.member_map_cells[index]
             && cell.map_id == map_id
-            && let Some(slot) = object.map_get(&PropertyKey::String(name))
+            && cell.name == name
+            && let Some(value) = object.map_field(cell.slot)
         {
-            return Some(slot);
+            return Some(value);
         }
-        // Cache miss on map key → no map-based field, fall through.
-        None
+        // Cache miss (a cold shape or an evicted entry): resolve through the
+        // descriptor scan and re-cache the offset.
+        let key = PropertyKey::String(name);
+        let slot = map.field_offset(&key)?;
+        let value = object.map_field(slot)?;
+        agent.member_map_cells[index] = Some(MemberMapCell { map_id, name, slot });
+        Some(value)
     }
 
     /// The cached read of `object.name` — an own data property on a plain
@@ -2979,13 +2990,20 @@ impl Vm {
             // No chain: [[Set]] always defines on the receiver.
             receiver.fresh_data_define(&property_key, *value)
         };
-        // Part B, B5.2: also try the map-based store path.
+        // Part B, B5.2: also try the map-based store path — `fresh_data_define`
+        // transitioned the map, so the field write lands in `in_fields`.
         let map_ok = receiver.map_set(&property_key, *value);
-        if map_ok {
-            // Cache the map-based entry for this shape.
-            let map_id = receiver.map.id();
+        if map_ok && let Some(map) = receiver.map.get() {
+            // Cache the (map_id, name) → offset entry for the read path.
+            let map_id = map.id();
             let index = Self::member_map_cell_index(map_id, *atom);
-            agent.member_map_cells[index] = Some(crate::ir::MemberMapCell { map_id, slot: 0 });
+            if let Some(slot) = map.field_offset(&property_key) {
+                agent.member_map_cells[index] = Some(crate::ir::MemberMapCell {
+                    map_id,
+                    name: *atom,
+                    slot,
+                });
+            }
         }
         if ok || map_ok {
             // Cut 35 slice 32: the store-then-read pattern (a constructor

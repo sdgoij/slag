@@ -14,7 +14,7 @@ bigger win on property-access rows. They compose: maps shrink the object,
 the nursery makes object allocation cheap, and the constructor's property
 patterns (already collected) pre-build the object's final map.
 
-## Status (2026-08-27 — GC half substantially landed, map B5.2 landed)
+## Status (2026-08-27 — GC half substantially landed, map B5.3 landed)
 
 Landed and committed (in order):
 
@@ -30,19 +30,21 @@ Landed and committed (in order):
   size-classed free list is now `[Vec<*mut GcBox>; 256]` indexed by `size >>
   4` (sizes 16..=4096) instead of an FxHash HashMap.
 
-Uncommitted on top of B5.2 commit:
+Uncommitted on top of B5.3 work:
 
-- **B5.2**: In-object fields + map-based read path. Added
-  `in_fields: [Cell<Option<Value>>; 4]` to `JsObject`. Added `INLINE_FIELDS`
-  constant, `map_get`/`map_set` for map-based read/write. `Value` gained `Copy`.
-  `map.rs` gained `field_offset`. B5.2 reads/writes not yet wired into the
-  runtime caches (map field exists, `map_get`/`map_set` ready for the next
-  integration step).
-
-- **A5.1b (second half) — direct-mapped free list**: the size-classed free
-  list is now `[Vec<*mut GcBox>; 256]` indexed by `size >> 4` (sizes
-  16..=4096) instead of an FxHash HashMap. The per-alloc `get_mut` was the
-  sleeper cost — construct churn ~28ms → ~20ms. Commit this first.
+- **B5.3**: Map-based store + transitions. Add-property transitions wired
+  from `define_property`: `fresh_data_define` transitions the map and writes
+  the value into the assigned `in_fields` slot; the full
+  `validate_and_apply` path does the same for fresh w/e/c data properties
+  and mirrors value updates on mapped keys into the field. `set_key`'s
+  in-place write mirrors into the field. `delete_key` and data→accessor
+  conversions drop the object to dictionary mode (the map no longer
+  describes it). Child maps inherit the parent's full descriptor set, so
+  field offsets are cumulative and the `INLINE_FIELDS` capacity limit binds.
+  Store IC re-keyed: `MemberMapCell` is now `(map_id, name) → field offset`;
+  the read path probes it and reads `in_fields` directly, re-resolving on a
+  miss. Gate met: `defineProperty`/`delete` tests green, full workspace +
+  clippy clean.
 
 Measured result (release, interleaved medians): construct churn ~53ms →
 **~20ms**, string concat ~6.6ms → **~4.3ms**, other rows flat or better.
@@ -355,9 +357,18 @@ constructor's *final* map:
   `member_map_cells` array added to Agent. Maps transitioned shape
   infrastructure ready; actual map transition wiring from `define_property`
   comes next.
-- **B5.3 — Map-based store + transitions.** Add-property transitions; store
-  IC re-keyed. Gate: construct churn's store becomes an in-place field write;
-  `defineProperty`/`delete` tests green.
+- **B5.3 — LANDED.** Map-based store + transitions. Add-property transitions
+  wired from `define_property`: `fresh_data_define` transitions the map and
+  writes the value into the assigned `in_fields` slot; the full
+  `validate_and_apply` path does the same for fresh w/e/c data properties
+  and mirrors value updates on mapped keys into the field. `set_key`'s
+  in-place write mirrors into the field. `delete_key` and data→accessor
+  conversions drop the object to dictionary mode (the map no longer
+  describes it). Child maps inherit the parent's full descriptor set, so
+  field offsets are cumulative and the `INLINE_FIELDS` capacity limit binds.
+  Store IC re-keyed: `MemberMapCell` is now `(map_id, name) → field offset`;
+  the read path probes it and reads `in_fields` directly, re-resolving on a
+  miss. Gate met: `defineProperty`/`delete` tests green.
 - **B5.2 — In-object fields + map-based read path.** Fresh objects use
   `in_fields`; `member_cell_get` re-keyed to `(map, name)`. Gate:
   property-access row improves; `Object.keys`/iteration order tests green.

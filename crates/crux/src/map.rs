@@ -161,11 +161,48 @@ impl Map {
             return *child;
         }
         // Create a back-pointer handle to *this* allocation (not a new box).
-        let back = unsafe { Handle::<Map>::from_box_ptr(&*self as *const Map as usize) };
+        // GcBox header is mark(1) + padding(3) + size(4) = 8 bytes before data.
+        let header_offset: usize = 8;
+        let back = unsafe {
+            Handle::<Map>::from_box_ptr((&*self as *const Map as usize).wrapping_sub(header_offset))
+        };
         let mut child = Map::new(self.prototype, Some(back));
+        // The child describes the parent's whole shape plus the new key
+        // (`add_descriptor` assigns the next offset, so the parent's
+        // descriptor count is the child's field offset for the new key).
+        child.descriptors = self.descriptors.clone();
         child.add_descriptor(key.clone(), 0, attrs);
         self.transitions.insert(key, child);
         child
+    }
+
+    /// Get or create a child map for a new property key. Returns `None`
+    /// if the map already has `INLINE_FIELDS` descriptors (in-field capacity
+    /// exhausted — the object will drop to dictionary mode).
+    pub fn get_or_create_child(
+        &mut self,
+        key: PropertyKey,
+        attrs: MapAttrs,
+    ) -> Option<Handle<Map>> {
+        if let Some(child) = self.transitions.get(&key) {
+            return Some(*child);
+        }
+        if self.descriptors.len() >= crate::object::INLINE_FIELDS {
+            return None;
+        }
+        // GcBox header is mark(1) + padding(3) + size(4) = 8 bytes before data.
+        let header_offset: usize = 8;
+        let back = unsafe {
+            Handle::<Map>::from_box_ptr((&*self as *const Map as usize).wrapping_sub(header_offset))
+        };
+        let mut child = Map::new(self.prototype, Some(back));
+        // The child describes the parent's whole shape plus the new key
+        // (`add_descriptor` assigns the next offset, so the parent's
+        // descriptor count is the child's field offset for the new key).
+        child.descriptors = self.descriptors.clone();
+        child.add_descriptor(key.clone(), 0, attrs);
+        self.transitions.insert(key, child);
+        Some(child)
     }
 
     /// Get the generation counter (for IC invalidation).
@@ -248,6 +285,52 @@ mod tests {
         );
         assert_eq!(child1.id(), child2.id());
         assert_eq!(map.transitions.len(), 1);
+    }
+
+    #[test]
+    fn child_inherits_parent_descriptors() {
+        let mut map = Map::new_empty(None);
+        let x = PropertyKey::from_utf8("x");
+        let mut child1 = map
+            .get_or_create_child(x.clone(), MapAttrs::new(true, true, true))
+            .unwrap();
+        // Child 1 describes x at offset 0.
+        assert_eq!(child1.field_offset(&x), Some(0));
+        let y = PropertyKey::from_utf8("y");
+        let child2 = child1
+            .get_or_create_child(y.clone(), MapAttrs::new(true, true, true))
+            .unwrap();
+        // Child 2 describes the parent's whole shape plus y — the child
+        // inherits the descriptors, so the new key gets the next offset.
+        assert_eq!(child2.field_offset(&x), Some(0));
+        assert_eq!(child2.field_offset(&y), Some(1));
+        assert_eq!(child2.descriptor_count(), 2);
+        // The transition is cached: a second fork returns the same child.
+        let again = child1
+            .get_or_create_child(y.clone(), MapAttrs::new(true, true, true))
+            .unwrap();
+        assert_eq!(child2.id(), again.id());
+    }
+
+    #[test]
+    fn inline_field_capacity_limits_transitions() {
+        let mut current = Map::new_empty(None);
+        for i in 0..crate::object::INLINE_FIELDS {
+            let key = PropertyKey::from_utf8(&format!("k{i}"));
+            let child = current
+                .get_or_create_child(key, MapAttrs::new(true, true, true))
+                .unwrap();
+            assert_eq!(child.descriptor_count(), i + 1);
+            current = child;
+        }
+        // One more than the inline field capacity: no transition — the
+        // object drops to dictionary mode.
+        let overflow = PropertyKey::from_utf8(&format!("k{}", crate::object::INLINE_FIELDS));
+        assert!(
+            current
+                .get_or_create_child(overflow, MapAttrs::new(true, true, true))
+                .is_none()
+        );
     }
 
     #[test]
