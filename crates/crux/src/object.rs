@@ -710,13 +710,15 @@ impl JsObject {
 
     /// Part B, B5.2: map-based read fast path. Check the object's map for
     /// a descriptor of `key`, then read the value from `in_fields` at the
-    /// assigned offset. Returns `None` when the key is not in the map.
+    /// assigned offset. Returns `Some(Undefined)` when the key is mapped
+    /// but unset; `None` when the map doesn't describe the key (fall through
+    /// to SmallProps/prototype chain).
     pub fn map_get(&self, key: &PropertyKey) -> Option<Value> {
         let offset = self.map.find(key)?;
         if offset >= INLINE_FIELDS {
             return None;
         }
-        self.in_fields[offset].get()
+        Some(self.in_fields[offset].get().unwrap_or(Value::Undefined))
     }
 
     /// Part B, B5.2: map-based write fast path. Check the object's map for

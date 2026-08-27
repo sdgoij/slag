@@ -349,8 +349,12 @@ constructor's *final* map:
   `in_fields: [Cell<Option<Value>>; 4]` to `JsObject`, `INLINE_FIELDS`
   constant, `map_get`/`map_set` for map-based read/write. `Value` gained
   `Copy` (with `clone()` calls updated across workspace). `Map::field_offset`
-  added. The map field exists and `map_get`/`map_set` are ready; the runtime
-  cache wiring (B5.2 read path) is the remaining work.
+  added. Runtime wiring: `member_cell_get_map` checks map-based cache →
+  `in_fields`, `member_cell_get` calls map fast path first,
+  `fast_fresh_store` caches `member_map_cells` entry. `MemberMapCell` and
+  `member_map_cells` array added to Agent. Maps transitioned shape
+  infrastructure ready; actual map transition wiring from `define_property`
+  comes next.
 - **B5.3 — Map-based store + transitions.** Add-property transitions; store
   IC re-keyed. Gate: construct churn's store becomes an in-place field write;
   `defineProperty`/`delete` tests green.

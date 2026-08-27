@@ -150,6 +150,9 @@ pub struct Agent {
     /// against each object's own property vector on access (a divergent
     /// layout misses and re-resolves). Self-validating like `member_cells`.
     pub(crate) member_proto_cells: [Option<(u64, crux::AtomId, usize)>; crate::ir::MEMBER_CELLS],
+    /// Part B, B5.2: map-keyed read-cell cache `(map_id, name) → slot` —
+    /// the fast path for fresh objects whose map describes the property.
+    pub(crate) member_map_cells: [Option<crate::ir::MemberMapCell>; crate::ir::MEMBER_CELLS],
     pub(crate) array_element_cells:
         [Option<(u64, u64, crux::AtomId, usize)>; crate::ir::MEMBER_CELLS],
     /// The write-side chain cache (Cut 22): "the chain from this prototype
@@ -593,6 +596,7 @@ impl Agent {
             array_element_value_cells: Box::new(std::array::from_fn(|_| None)),
             array_length_cells: Box::new(std::array::from_fn(|_| None)),
             member_proto_cells: [None; crate::ir::MEMBER_CELLS],
+            member_map_cells: [const { None }; crate::ir::MEMBER_CELLS],
             array_element_cells: [None; crate::ir::MEMBER_CELLS],
             member_store_cells: [None; crate::ir::MEMBER_CELLS],
             for_of_fast_cells: std::array::from_fn(|_| None),

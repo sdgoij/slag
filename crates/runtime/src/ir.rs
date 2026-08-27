@@ -1560,6 +1560,15 @@ pub(crate) struct MemberValueCell {
     pub value: Value,
 }
 
+/// Part B, B5.2: map-keyed member cache entry — maps map_id + name to a
+/// field offset for the in_fields fast path.
+#[derive(Clone, Copy)]
+pub(crate) struct MemberMapCell {
+    pub map_id: u64,
+    #[expect(dead_code)]
+    pub slot: usize,
+}
+
 impl Trace for MemberValueCell {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         self.value.trace(visit);
@@ -2667,6 +2676,11 @@ impl Vm {
         (object_id as usize ^ name as usize) & (MEMBER_CELLS - 1)
     }
 
+    /// The direct-mapped cache index for (map id, name atom). Part B, B5.2.
+    fn member_map_cell_index(map_id: u64, name: crux::AtomId) -> usize {
+        (map_id as usize ^ name as usize) & (MEMBER_CELLS - 1)
+    }
+
     /// The object part of a value whose own properties the member cells can
     /// serve: plain/array objects and functions (a function's own data
     /// properties — `length`/`name`/`prototype` — live in the ordinary
@@ -2701,6 +2715,25 @@ impl Vm {
         }
     }
 
+    /// Part B, B5.2: map-based read fast path. Check the object's map for
+    /// a descriptor of `name`, then read from `in_fields` at the assigned
+    /// offset. Returns `None` if not in the map (falls through to
+    /// `member_cell_get`'s existing path).
+    fn member_cell_get_map(agent: &mut Agent, object: &Value, name: crux::AtomId) -> Option<Value> {
+        let object = Self::cell_object(object)?;
+        let map_id = object.map.id();
+        // Check the map-based cache first: (map_id, name) → slot
+        let index = Self::member_map_cell_index(map_id, name);
+        if let Some(cell) = &agent.member_map_cells[index]
+            && cell.map_id == map_id
+            && let Some(slot) = object.map_get(&PropertyKey::String(name))
+        {
+            return Some(slot);
+        }
+        // Cache miss on map key → no map-based field, fall through.
+        None
+    }
+
     /// The cached read of `object.name` — an own data property on a plain
     /// object at the direct-mapped slot, re-validated against the stored key
     /// and property kind. `None` falls back to the full Get (which then
@@ -2709,6 +2742,10 @@ impl Vm {
     /// generation matches the cached read (every own-property mutation path
     /// bumps the generation, including `set_key`'s in-place value update).
     fn member_cell_get(agent: &mut Agent, object: &Value, name: crux::AtomId) -> Option<Value> {
+        // Part B, B5.2: map-based fast path first.
+        if let Some(value) = Self::member_cell_get_map(agent, object, name) {
+            return Some(value);
+        }
         let object = Self::cell_object(object)?;
         let index = Self::member_cell_index(object.id(), name);
         if let Some(cell) = agent.member_value_cells[index].as_ref()
@@ -2942,7 +2979,15 @@ impl Vm {
             // No chain: [[Set]] always defines on the receiver.
             receiver.fresh_data_define(&property_key, *value)
         };
-        if ok {
+        // Part B, B5.2: also try the map-based store path.
+        let map_ok = receiver.map_set(&property_key, *value);
+        if map_ok {
+            // Cache the map-based entry for this shape.
+            let map_id = receiver.map.id();
+            let index = Self::member_map_cell_index(map_id, *atom);
+            agent.member_map_cells[index] = Some(crate::ir::MemberMapCell { map_id, slot: 0 });
+        }
+        if ok || map_ok {
             // Cut 35 slice 32: the store-then-read pattern (a constructor
             // writing `this.x` and the caller reading `o.x` right after) —
             // front the just-defined property in the read-side value cache
@@ -3115,12 +3160,8 @@ impl Vm {
             });
             return Ok(length);
         }
-        let length_value = crate::context::get_property(
-            agent,
-            array,
-            &JsString::from_utf8("length"),
-            *array,
-        )?;
+        let length_value =
+            crate::context::get_property(agent, array, &JsString::from_utf8("length"), *array)?;
         Ok(crux::convert::to_length(crate::context::to_number(
             agent,
             &length_value,
@@ -3991,8 +4032,7 @@ impl Vm {
                         return Err(nullish_error("Cannot read properties of null"));
                     }
                     let key = crate::context::to_property_key(agent, &key)?;
-                    let value =
-                        crate::context::get_property_key(agent, &object, &key, object)?;
+                    let value = crate::context::get_property_key(agent, &object, &key, object)?;
                     self.pop(); // the write copy of the raw key
                     let key = match key {
                         PropertyKey::String(id) => Value::String(Handle::new(crux::lookup(id))),
@@ -4247,8 +4287,7 @@ impl Vm {
                             "DestructureObjKey without an object".into(),
                         )
                     })?;
-                    let value =
-                        crate::context::get_property_key(agent, &object, key, object)?;
+                    let value = crate::context::get_property_key(agent, &object, key, object)?;
                     self.stack.push(value);
                 }
                 Step::DestructureObjKeyComputed => {
@@ -4263,8 +4302,7 @@ impl Vm {
                     if let Some(frame) = self.destructure_excluded.last_mut() {
                         frame.push(key.clone());
                     }
-                    let value =
-                        crate::context::get_property_key(agent, &object, &key, object)?;
+                    let value = crate::context::get_property_key(agent, &object, &key, object)?;
                     self.stack.push(value);
                 }
                 Step::DestructureObjKeyStore => {
@@ -4288,8 +4326,7 @@ impl Vm {
                     if let Some(frame) = self.destructure_excluded.last_mut() {
                         frame.push(key.clone());
                     }
-                    let value =
-                        crate::context::get_property_key(agent, &object, &key, object)?;
+                    let value = crate::context::get_property_key(agent, &object, &key, object)?;
                     self.stack.push(value);
                 }
                 Step::DestructureObjRest { excluded } => {
@@ -5616,12 +5653,8 @@ impl Vm {
                     // the flag on a fulfilled resume; the rejection path
                     // discards the record instead.
                     self.async_for_of_stepping = true;
-                    let next_result = crate::function::call(
-                        agent,
-                        &iterator.next,
-                        iterator.iterator,
-                        &[],
-                    )?;
+                    let next_result =
+                        crate::function::call(agent, &iterator.next, iterator.iterator, &[])?;
                     return Ok(VmOutcome::Suspended(Suspension::Await(next_result)));
                 }
                 Step::AsyncForOfTest { done } => {
@@ -6042,18 +6075,14 @@ impl Vm {
                             CtlResult::Done(outcome) => return Ok(outcome),
                         },
                     };
-                    let result = match crate::function::call(
-                        agent,
-                        &next,
-                        iterator.iterator,
-                        &[received],
-                    ) {
-                        Ok(result) => result,
-                        Err(error) => match self.throw_js_error(agent, body, error)? {
-                            CtlResult::Continue => continue,
-                            CtlResult::Done(outcome) => return Ok(outcome),
-                        },
-                    };
+                    let result =
+                        match crate::function::call(agent, &next, iterator.iterator, &[received]) {
+                            Ok(result) => result,
+                            Err(error) => match self.throw_js_error(agent, body, error)? {
+                                CtlResult::Continue => continue,
+                                CtlResult::Done(outcome) => return Ok(outcome),
+                            },
+                        };
                     if !matches!(result.kind(), ValueKind::Object(_)) {
                         // Spec 15.5.5 normal case step a.iii.
                         let error = JsError::new(
@@ -6309,12 +6338,8 @@ impl Vm {
                     let received = state.received;
                     let iterator = state.iterator.clone();
                     let next = crate::expr::iterator_next_method(agent, &iterator)?;
-                    let result = crate::function::call(
-                        agent,
-                        &next,
-                        iterator.iterator,
-                        &[received],
-                    )?;
+                    let result =
+                        crate::function::call(agent, &next, iterator.iterator, &[received])?;
                     // The await resume pushes the fulfilled iterator result.
                     return Ok(VmOutcome::Suspended(Suspension::Await(result)));
                 }
@@ -6761,12 +6786,8 @@ impl Vm {
         match Self::member_cell_get(agent, &object, name) {
             Some(value) => Ok(value),
             None => {
-                let value = crate::context::get_property(
-                    agent,
-                    &object,
-                    &crux::lookup(name),
-                    object,
-                )?;
+                let value =
+                    crate::context::get_property(agent, &object, &crux::lookup(name), object)?;
                 Self::resolve_member_cell(agent, &object, name);
                 Ok(value)
             }
@@ -6806,8 +6827,7 @@ impl Vm {
             PropertyKey::String(atom) => match Self::member_cell_get(agent, &object, *atom) {
                 Some(value) => value,
                 None => {
-                    let value =
-                        crate::context::get_property_key(agent, &object, &key, object)?;
+                    let value = crate::context::get_property_key(agent, &object, &key, object)?;
                     Self::resolve_member_cell(agent, &object, *atom);
                     value
                 }
@@ -7961,13 +7981,7 @@ impl Vm {
         body: &CompiledBody,
         value: Value,
     ) -> Result<VmOutcome, JsError> {
-        match self.control_transfer(
-            agent,
-            body,
-            Ctl::Return {
-                value,
-            },
-        )? {
+        match self.control_transfer(agent, body, Ctl::Return { value })? {
             // A finally can never defer a compiled tail call (the compiler
             // gates on try_depth == 0), so Continue is unreachable; complete
             // the return anyway.
@@ -9371,8 +9385,7 @@ fn tagged_template(
 }
 
 fn iterator_result_done(agent: &mut Agent, result: &Value) -> Result<bool, JsError> {
-    let done =
-        crate::context::get_property(agent, result, &JsString::from_utf8("done"), *result)?;
+    let done = crate::context::get_property(agent, result, &JsString::from_utf8("done"), *result)?;
     Ok(crux::convert::to_boolean(&done))
 }
 
@@ -9396,12 +9409,8 @@ fn get_async_iterator_record(
                 "async iterator must be an object".into(),
             ));
         }
-        let next = crate::context::get_property(
-            agent,
-            &iterator,
-            &JsString::from_utf8("next"),
-            iterator,
-        )?;
+        let next =
+            crate::context::get_property(agent, &iterator, &JsString::from_utf8("next"), iterator)?;
         if !crux::value::is_callable(&next) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -9413,12 +9422,8 @@ fn get_async_iterator_record(
     let sync = crate::expr::get_iterator(agent, value)?;
     let object = crate::async_await::async_from_sync_iterator(agent, &sync)?;
     let iterator = Value::Object(object);
-    let next = crate::context::get_property(
-        agent,
-        &iterator,
-        &JsString::from_utf8("next"),
-        iterator,
-    )?;
+    let next =
+        crate::context::get_property(agent, &iterator, &JsString::from_utf8("next"), iterator)?;
     Ok(crate::expr::IteratorRecord { iterator, next })
 }
 
@@ -9431,12 +9436,8 @@ fn async_from_sync_or_async(
     let async_method = crate::expr::get_method(agent, value, "@@asyncIterator")?;
     if let Some(method) = async_method {
         let iterator = crate::function::call(agent, &method, *value, &[])?;
-        let next = crate::context::get_property(
-            agent,
-            &iterator,
-            &JsString::from_utf8("next"),
-            iterator,
-        )?;
+        let next =
+            crate::context::get_property(agent, &iterator, &JsString::from_utf8("next"), iterator)?;
         if !is_callable(&next) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
