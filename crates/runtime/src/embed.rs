@@ -1237,5 +1237,15 @@ mod tests {
                 .as_boolean(),
             Some(true)
         );
+        // A leaf-inlined construct with a heap-valued argument (the construct
+        // leaf branch reads its args from a stack buffer under
+        // per-allocation collection).
+        assert_eq!(
+            context
+                .eval("function C(x) { this.x = x; } var n = 0; for (var i = 0; i < 1000; i++) { var o = new C({ v: i }); n += o.x.v; } n")
+                .unwrap()
+                .as_number(),
+            Some(499500.0)
+        );
     }
 }

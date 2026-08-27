@@ -4871,7 +4871,21 @@ impl Vm {
                         // cached at ir-compile time.
                         && entry.construct_inline
                     {
-                        let args = self.args.split_off(base);
+                        // The argument slice is read in place from `self.args`
+                        // into a small stack buffer (≤3 args, the common
+                        // shape) instead of `split_off`'s per-construct Vec
+                        // allocation; a longer argument list keeps the Vec
+                        // path. The buffer is a local like the Vec was, so
+                        // the rooting story is unchanged.
+                        let argc = self.args.len() - base;
+                        let mut args_buf = [Value::Undefined; 3];
+                        let args: std::borrow::Cow<'_, [Value]> = if argc <= args_buf.len() {
+                            args_buf[..argc].copy_from_slice(&self.args[base..]);
+                            std::borrow::Cow::Borrowed(&args_buf[..argc])
+                        } else {
+                            std::borrow::Cow::Owned(self.args.split_off(base))
+                        };
+                        self.args.truncate(base);
                         let ir = entry.ir.clone();
                         let strict = entry.strict;
                         // Cut 30: clone the callee's env only for a leaf

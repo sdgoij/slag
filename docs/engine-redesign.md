@@ -53,37 +53,39 @@ Landed and committed (in order):
   handle instead of an owned integer, so `ordinary_to_primitive` returns it
   without a per-read clone + fresh box, and `boxed` became a trace edge
   (plus a `Trace for Cell<T>` impl). Measured: noise-neutral.
+- `67f39a2` — **`PropertyKey::Symbol` by value → `Handle<Symbol>`**: the key
+  never owns a Symbol (with its by-value `JsString` description) any more,
+  so `PropertyKey` drops 64B → 16B and `JsObject` 488B → 392B (~20%
+  smaller; `SmallProps` 240B → 144B). `Gc<T>` gained a pointee-forwarding
+  `Hash` impl, `Map::trace` now visits its descriptor/transition keys (real
+  arena edges — the by-value form had none), and the ~50 call sites that
+  cloned `well_known(...).as_ref().clone()` into keys pass the handle
+  directly. Plus a per-allocation-collection smoke test in the embed suite
+  (runs in ~0.04s, the fast in-suite stand-in for `--gc-stress` sweeps).
+  Measured: construct churn ~22.4ms → ~20.4ms median (-9%).
+- `36e803e` — **object-literal fast path**: `create_data_property_key`
+  routes absent-key defines on ordinary extensible objects through
+  `fresh_data_define`, and `object_init`'s Ident case defines plain data
+  properties directly through the already-interned atom — no
+  JsString/Rust-String materialization, with `__proto__` detected by an
+  atom compare against the cached canonical (`crux::proto_atom`). Measured:
+  object literal churn `{x: i}` ~18.2ms → ~10.9ms median (-40%), spread
+  ~66ms → ~50ms.
 
 Not yet committed:
 
-- **`PropertyKey::Symbol` by value → `Handle<Symbol>`**: the key never owns
-  a Symbol (with its by-value `JsString` description) any more, so
-  `PropertyKey` drops 64B → 16B and `JsObject` 488B → 392B (~20% smaller;
-  `SmallProps` 240B → 144B). `Gc<T>` gained a pointee-forwarding `Hash`
-  impl, `Map::trace` now visits its descriptor/transition keys (they became
-  real arena edges — the by-value form had none), and the ~50 call sites
-  that cloned `well_known(...).as_ref().clone()` into keys now pass the
-  handle directly (`proxy`'s key→Value conversion skips a per-read box
-  alloc too). Plus a per-allocation-collection smoke test in the embed
-  suite (runs in ~0.04s, the fast in-suite stand-in for `--gc-stress`
-  sweeps). Measured: construct churn ~22.4ms → ~20.4ms median (-9%),
-  other rows flat.
-- **Object-literal fast path**: `create_data_property_key` routes
-  absent-key defines on ordinary extensible objects through
-  `fresh_data_define` (skipping the descriptor clone +
-  ValidateAndApplyPropertyDescriptor), and `object_init`'s Ident case
-  defines plain data properties directly through the already-interned
-  atom — no JsString/Rust-String materialization, with `__proto__`
-  detected by an atom compare against the cached canonical
-  (`crux::proto_atom`). Measured: object literal churn `{x: i}`
-  ~18.2ms → ~10.9ms median (-40%), spread `{ ...{a, b} }` ~66ms → ~50ms;
-  other rows flat.
+- **Construct arg slice in place**: the `Construct` step's leaf branch
+  reads its arguments from `self.args` into a small stack buffer (≤3 args)
+  instead of `split_off`'s per-construct `Vec` allocation (longer lists
+  keep the Vec path). Measured: construct churn ~19.9ms → ~17.3ms median
+  (-13%), 1-arg construct ~16.7ms → ~13.9ms.
 
 Session wrap-up: the plan's structural items (A5.1/A5.1b, B1–B4) are all
-landed. Construct churn ~53ms → ~20.5ms, literals ~11ms, collections
+landed. Construct churn ~53ms → ~17.3ms, literals ~11ms, collections
 ~2.5ms of the gate. The remaining gate cost is incremental (alloc
-~4.5ms, store+read ~7.5ms, construct-call machinery ~3.7ms) — further
-work would be tail-grinding rather than new plan sections.
+~4.2ms, store ~4.8ms, read ~3ms, construct machinery ~4ms — the leaf
+call protocol, caches, and dispatch, per the bytecode-vm skill's
+slice-15/25 analysis that the leaf core is real work).
 
 Measured result (release, interleaved medians): construct churn ~53ms →
 **~20ms**, string concat ~6.6ms → **~4.3ms**, other rows flat or better.
