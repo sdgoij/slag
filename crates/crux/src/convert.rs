@@ -122,13 +122,11 @@ fn ordinary_to_primitive(
         if let crate::object::ObjectKind::String(text) = &obj.kind {
             return Ok(Value::String(*text));
         }
-        if let Some(boxed) = &*obj.boxed.borrow() {
+        if let Some(boxed) = obj.boxed.get() {
             return Ok(match boxed {
-                crate::object::BoxedPrimitive::Number(n) => Value::Number(*n),
-                crate::object::BoxedPrimitive::BigInt(b) => {
-                    Value::BigInt(crate::handle::Handle::new(b.clone()))
-                }
-                crate::object::BoxedPrimitive::Boolean(b) => Value::Boolean(*b),
+                crate::object::BoxedPrimitive::Number(n) => Value::Number(n),
+                crate::object::BoxedPrimitive::BigInt(b) => Value::BigInt(b),
+                crate::object::BoxedPrimitive::Boolean(b) => Value::Boolean(b),
             });
         }
     }

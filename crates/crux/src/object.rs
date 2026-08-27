@@ -590,29 +590,34 @@ pub struct JsObject {
     /// need `this` as a language value (accessor invocation, the arguments
     /// mapping) can recover the real handle instead of a copy. Strong under
     /// the GC model: a self-cycle, which the collector handles (the handle
-    /// and its box are one entity).
-    self_handle: RefCell<Option<Handle<JsObject>>>,
+    /// and its box are one entity). A lock-free `Cell`: written once by
+    /// `link_self_handle`, read on every `self_value`/`handle` (the hot
+    /// [[Set]] receiver path), and the handle is `Copy`.
+    self_handle: Cell<Option<Handle<JsObject>>>,
     /// When this object is a function's object part, a back-reference to
     /// that function so a prototype link recovers the function value (e.g.
     /// `Object.getPrototypeOf(Int8Array)` is %TypedArray% the function, not
     /// its object part). Strong: the function and its object part live and
     /// die together (the Rc model's weak ref existed only to break the cycle,
-    /// which the collector handles).
-    pub function_self: RefCell<Option<Handle<crate::function::Function>>>,
+    /// which the collector handles). A lock-free `Cell` (write-once, the
+    /// handle is `Copy`).
+    pub function_self: Cell<Option<Handle<crate::function::Function>>>,
     /// The wrapped value of a primitive wrapper object (spec 10.4.2
     /// [[NumberData]]/[[BooleanData]]/[[BigIntData]]), mirrored on the object
     /// so crux's ToPrimitive/ToNumber coerce a boxed primitive without
-    /// invoking the agent-dispatched `valueOf`.
-    pub boxed: RefCell<Option<BoxedPrimitive>>,
+    /// invoking the agent-dispatched `valueOf`. A lock-free `Cell`: set once
+    /// right after creation, then read-only. The BigInt variant stores a GC
+    /// handle (a `Copy` handle into the heap), so `boxed` is a trace edge.
+    pub boxed: Cell<Option<BoxedPrimitive>>,
 }
 
 impl Trace for JsObject {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         self.kind.trace(visit);
         // `prototype` is a lock-free `Cell` now: the handle is traced
-        // directly (always readable, no mid-mutation abort). The other
-        // cells are RefCells: `RefCell<T>`'s trace skips a cell that is
-        // mutably borrowed mid-collection (per-allocation `--gc-stress`)
+        // directly (always readable, no mid-mutation abort). The mutable
+        // collections stay RefCells: `RefCell<T>`'s trace skips a cell that
+        // is mutably borrowed mid-collection (per-allocation `--gc-stress`)
         // and aborts the sweep instead of panicking. Tracing the whole
         // `properties` cell also marks symbol keys (a symbol description
         // may be a rope).
@@ -631,17 +636,29 @@ impl Trace for JsObject {
         self.private_elements.trace(visit);
         // The strong function back-reference keeps the function alive while
         // its object part is reachable; `self_handle` is a self-cycle
-        // (redundant to mark) and `boxed` holds no heap edges.
+        // (redundant to mark). The wrapper mirror's BigInt is a GC handle, so
+        // `boxed` is a heap edge too.
         self.function_self.trace(visit);
+        self.boxed.trace(visit);
     }
 }
 
 /// The wrapped value of a primitive wrapper object (spec 10.4.2).
-#[derive(Debug, Clone)]
+/// `Copy`: the BigInt variant holds a GC handle, never an owned integer, so
+/// the mirror can live in a lock-free `Cell`.
+#[derive(Debug, Clone, Copy)]
 pub enum BoxedPrimitive {
     Number(f64),
-    BigInt(crate::BigInt),
+    BigInt(Handle<crate::BigInt>),
     Boolean(bool),
+}
+
+impl Trace for BoxedPrimitive {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        if let BoxedPrimitive::BigInt(b) = self {
+            b.trace(visit);
+        }
+    }
 }
 
 impl PartialEq for JsObject {
@@ -662,7 +679,7 @@ impl JsObject {
     /// language value (so a prototype link like `Object.getPrototypeOf(f)`
     /// keeps `typeof`/`is_constructor` working).
     pub fn function_value(&self) -> Option<Value> {
-        (*self.function_self.borrow()).map(Value::Function)
+        self.function_self.get().map(Value::Function)
     }
 
     /// The raw object with ordinary behaviour (no handle back-reference).
@@ -688,9 +705,9 @@ impl JsObject {
             properties: RefCell::new(SmallProps::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
-            self_handle: RefCell::new(None),
-            function_self: RefCell::new(None),
-            boxed: RefCell::new(None),
+            self_handle: Cell::new(None),
+            function_self: Cell::new(None),
+            boxed: Cell::new(None),
         }
     }
 
@@ -736,25 +753,23 @@ impl JsObject {
                 std::ptr::addr_of_mut!((*this).private_elements),
                 RefCell::new(Vec::new()),
             );
-            std::ptr::write(
-                std::ptr::addr_of_mut!((*this).self_handle),
-                RefCell::new(None),
-            );
+            std::ptr::write(std::ptr::addr_of_mut!((*this).self_handle), Cell::new(None));
             std::ptr::write(
                 std::ptr::addr_of_mut!((*this).function_self),
-                RefCell::new(None),
+                Cell::new(None),
             );
-            std::ptr::write(std::ptr::addr_of_mut!((*this).boxed), RefCell::new(None));
+            std::ptr::write(std::ptr::addr_of_mut!((*this).boxed), Cell::new(None));
         }
     }
 
     fn link_self_handle(object: &Handle<JsObject>) {
-        *object.self_handle.borrow_mut() = Some(*object);
+        object.self_handle.set(Some(*object));
     }
 
     /// The object as a language value, recovering the original handle.
     pub fn self_value(&self) -> Value {
-        (*self.self_handle.borrow())
+        self.self_handle
+            .get()
             .map(Value::Object)
             .unwrap_or(Value::Undefined)
     }
@@ -762,7 +777,7 @@ impl JsObject {
     /// Recover the owning handle of an embedded object (a `Function`'s object
     /// part); `None` for raw copies without a back-reference.
     pub fn handle(&self) -> Option<Handle<JsObject>> {
-        *self.self_handle.borrow()
+        self.self_handle.get()
     }
 
     /// The object's unique identity ([[ObjectId]]), used by the runtime to
@@ -933,9 +948,9 @@ impl JsObject {
             properties: RefCell::new(SmallProps::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
-            self_handle: RefCell::new(None),
-            function_self: RefCell::new(None),
-            boxed: RefCell::new(None),
+            self_handle: Cell::new(None),
+            function_self: Cell::new(None),
+            boxed: Cell::new(None),
         });
         Self::link_self_handle(&object);
         object
@@ -965,9 +980,9 @@ impl JsObject {
             properties: RefCell::new(SmallProps::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
-            self_handle: RefCell::new(None),
-            function_self: RefCell::new(None),
-            boxed: RefCell::new(None),
+            self_handle: Cell::new(None),
+            function_self: Cell::new(None),
+            boxed: Cell::new(None),
         });
         Self::link_self_handle(&array);
         let length_desc = PropertyDescriptor {
@@ -1001,9 +1016,9 @@ impl JsObject {
             properties: RefCell::new(SmallProps::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
-            self_handle: RefCell::new(None),
-            function_self: RefCell::new(None),
-            boxed: RefCell::new(None),
+            self_handle: Cell::new(None),
+            function_self: Cell::new(None),
+            boxed: Cell::new(None),
         });
         Self::link_self_handle(&string);
         let length_desc = PropertyDescriptor {
@@ -1033,9 +1048,9 @@ impl JsObject {
             properties: RefCell::new(SmallProps::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
-            self_handle: RefCell::new(None),
-            function_self: RefCell::new(None),
-            boxed: RefCell::new(None),
+            self_handle: Cell::new(None),
+            function_self: Cell::new(None),
+            boxed: Cell::new(None),
         });
         Self::link_self_handle(&proxy);
         proxy
@@ -1059,9 +1074,9 @@ impl JsObject {
             properties: RefCell::new(SmallProps::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
-            self_handle: RefCell::new(None),
-            function_self: RefCell::new(None),
-            boxed: RefCell::new(None),
+            self_handle: Cell::new(None),
+            function_self: Cell::new(None),
+            boxed: Cell::new(None),
         });
         Self::link_self_handle(&object);
         Ok(object)
@@ -1167,9 +1182,9 @@ impl JsObject {
             properties: RefCell::new(SmallProps::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
-            self_handle: RefCell::new(None),
-            function_self: RefCell::new(None),
-            boxed: RefCell::new(None),
+            self_handle: Cell::new(None),
+            function_self: Cell::new(None),
+            boxed: Cell::new(None),
         });
         Self::link_self_handle(&object);
         // spec 26.3.1: `@@toStringTag` is an own data property ("Module", or
@@ -1220,9 +1235,9 @@ impl JsObject {
             properties: RefCell::new(SmallProps::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
-            self_handle: RefCell::new(None),
-            function_self: RefCell::new(None),
-            boxed: RefCell::new(None),
+            self_handle: Cell::new(None),
+            function_self: Cell::new(None),
+            boxed: Cell::new(None),
         });
         Self::link_self_handle(&obj);
         // spec steps 15-16: index properties first, then length. The map is
@@ -1317,9 +1332,9 @@ impl JsObject {
             properties: RefCell::new(SmallProps::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
-            self_handle: RefCell::new(None),
-            function_self: RefCell::new(None),
-            boxed: RefCell::new(None),
+            self_handle: Cell::new(None),
+            function_self: Cell::new(None),
+            boxed: Cell::new(None),
         });
         Self::link_self_handle(&obj);
         obj.define_property(

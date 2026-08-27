@@ -10,7 +10,7 @@
 //! `Value::Function` stays separate from `Value::Object` (Phase 4 decision);
 //! the embedded `JsObject` provides the object side of a function value.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -181,7 +181,9 @@ pub struct Function {
     /// operations (accessor invocation, own-property creation on `set`)
     /// target the real function value instead of a copy. A self-cycle under
     /// the GC model (the Rc model's weak ref existed only to break it).
-    self_handle: RefCell<Option<Handle<Function>>>,
+    /// A lock-free `Cell`: written once by `link_self_handle`, read on every
+    /// `self_value` (the hot receiver path), and the handle is `Copy`.
+    self_handle: Cell<Option<Handle<Function>>>,
 }
 
 impl Trace for Function {
@@ -239,20 +241,21 @@ impl Function {
             name,
             object: JsObject::ordinary_object_create(None),
             kind: FunctionKind::EcmaScript,
-            self_handle: RefCell::new(None),
+            self_handle: Cell::new(None),
         });
-        *function.self_handle.borrow_mut() = Some(function);
-        *function.object.function_self.borrow_mut() = Some(function);
+        function.self_handle.set(Some(function));
+        function.object.function_self.set(Some(function));
         function
     }
 
     fn link_self_handle(function: &Handle<Function>) {
-        *function.self_handle.borrow_mut() = Some(*function);
+        function.self_handle.set(Some(*function));
     }
 
     /// The function as a language value, recovering the original handle.
     pub fn self_value(&self) -> Value {
-        (*self.self_handle.borrow())
+        self.self_handle
+            .get()
             .map(Value::Function)
             .unwrap_or(Value::Undefined)
     }
@@ -274,10 +277,10 @@ impl Function {
                 call: Some(call),
                 construct,
             },
-            self_handle: RefCell::new(None),
+            self_handle: Cell::new(None),
         });
         Self::link_self_handle(&function);
-        *function.object.function_self.borrow_mut() = Some(function);
+        function.object.function_self.set(Some(function));
         function.define_property(
             &JsString::from_utf8("length"),
             &PropertyDescriptor {
@@ -329,10 +332,10 @@ impl Function {
                 bound_this,
                 bound_args,
             },
-            self_handle: RefCell::new(None),
+            self_handle: Cell::new(None),
         });
         Self::link_self_handle(&function);
-        *function.object.function_self.borrow_mut() = Some(function);
+        function.object.function_self.set(Some(function));
         Ok(function)
     }
 

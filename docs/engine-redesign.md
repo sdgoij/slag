@@ -29,23 +29,34 @@ Landed and committed (in order):
 - `6baab46` — **A5.1b (second half)**: direct-mapped free list — the
   size-classed free list is now `[Vec<*mut GcBox>; 256]` indexed by `size >>
   4` (sizes 16..=4096) instead of an FxHash HashMap.
+- `9c06ce0` — **B5.2**: inline field storage (`in_fields`) + map-based read
+  fast path; `Value` became `Copy`; `member_cell_get_map` in the runtime
+  cache layer.
+- `7ae9f74` — **B5.3**: map transitions wired from `define_property`;
+  child maps inherit parent descriptors (cumulative offsets); store IC
+  re-keyed to `(map_id, name) → offset`; delete/accessor/dictionary forks.
+- `cf80952` — **B5.4**: constructor boilerplate + in-place object
+  allocation. `construct_this_object` pre-builds the constructor's final
+  map from `construct_property_patterns`, so the body's `this.x =` stores
+  are in-place field writes (no per-store transition, stable (map_id, name)
+  cache keys); a pre-sized field the body never writes stays unset, which
+  the map read path treats as absent. `Gc::new_in_place` + `init_ordinary`
+  write the 528B `JsObject` directly in the arena slot, skipping the
+  stack-temp build + memcpy that measured ~80ns of the ~134ns per-alloc.
+  Measured: construct churn ~23.6ms → ~21.7ms median.
 
-Uncommitted on top of B5.4 work:
+Uncommitted on top of B5.4:
 
-- **B5.4**: Constructor boilerplate. `construct_this_object` pre-builds the
-  constructor's final map from `construct_property_patterns` and starts
-  every construct on it, so the body's `this.x =` stores are in-place field
-  writes (no per-store transition, stable (map_id, name) cache keys); the
-  cache re-validates against the function object's generation and the
-  prototype's identity. A pre-sized field the body never writes stays
-  unset, which the map read path treats as absent — a conditional store
-  cannot mask an inherited property. Store micro-opts: the own-property
-  check for map-shaped objects reads the field state (written ⟺ in the
-  property vector) instead of scanning the vector; the redundant second
-  `map_set` is gone. Measured: neutral on the construct-churn gate (the
-  per-store transitions were already cached). The 528B `JsObject` alloc
-  dominates the gate — shrinking it (map-authoritative storage / smaller
-  `SmallProps` footprint) is the next lever.
+- **Write-once `Copy` fields → `Cell`**: the handle back-references
+  (`JsObject.self_handle`, `JsObject.function_self`, `Function.self_handle`)
+  and the wrapper mirror `boxed` drop `RefCell` for lock-free `Cell`s,
+  removing the borrow bookkeeping from the hot accessors
+  (`self_value`/`function_value`/`handle` run on every receiver path) and
+  from `ordinary_to_primitive`. The BigInt wrapper mirror now stores a GC
+  handle instead of an owned integer, so `ordinary_to_primitive` returns it
+  without a per-read clone + fresh box, and `boxed` became a trace edge.
+  Measured: noise-neutral on the construct-churn gate (the micro-bench is
+  dominated by the 528B `JsObject` alloc).
 
 Measured result (release, interleaved medians): construct churn ~53ms →
 **~20ms**, string concat ~6.6ms → **~4.3ms**, other rows flat or better.

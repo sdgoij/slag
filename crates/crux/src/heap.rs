@@ -309,6 +309,14 @@ impl<T: Trace> Trace for RefCell<T> {
     }
 }
 
+impl<T: Trace + Copy> Trace for Cell<T> {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        // `Cell` carries no borrow state, so the value is always readable
+        // mid-collection (unlike `RefCell`, no abort path needed).
+        self.get().trace(visit);
+    }
+}
+
 impl<T: Trace> Trace for Rc<T> {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         self.as_ref().trace(visit);

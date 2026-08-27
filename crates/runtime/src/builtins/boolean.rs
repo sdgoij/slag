@@ -41,7 +41,9 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     // spec 20.3.3: %Boolean.prototype% is a Boolean object wrapping false, so
     // `%Object.prototype.toString%` reports "[object Boolean]" and the `==`
     // coercion yields false.
-    *boolean_proto.boxed.borrow_mut() = Some(crux::object::BoxedPrimitive::Boolean(false));
+    boolean_proto
+        .boxed
+        .set(Some(crux::object::BoxedPrimitive::Boolean(false)));
     let boolean_proto_value = Value::Object(boolean_proto);
 
     let boolean_ctor = Function::create_builtin(
@@ -54,9 +56,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let boolean_ctor_value = Value::Function(boolean_ctor);
 
     realm.intrinsics.define(BOOLEAN, boolean_ctor_value);
-    realm
-        .intrinsics
-        .define(BOOLEAN_PROTO, boolean_proto_value);
+    realm.intrinsics.define(BOOLEAN_PROTO, boolean_proto_value);
 
     boolean_ctor.define_property(
         &JsString::from_utf8("prototype"),
@@ -190,8 +190,11 @@ pub fn dispatch_construct(
                 }
             };
             let object = JsObject::ordinary_object_create(Some(proto));
-            *object.boxed.borrow_mut() =
-                Some(crux::object::BoxedPrimitive::Boolean(to_boolean(&value)));
+            object
+                .boxed
+                .set(Some(crux::object::BoxedPrimitive::Boolean(to_boolean(
+                    &value,
+                ))));
             agent.boolean_data.insert(object.id(), to_boolean(&value));
             Ok(Value::Object(object))
         })());

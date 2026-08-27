@@ -283,7 +283,9 @@ pub fn to_object(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
                 .get("%Boolean.prototype%")
                 .and_then(|v| as_object(&v));
             let object = JsObject::ordinary_object_create(proto);
-            *object.boxed.borrow_mut() = Some(crux::object::BoxedPrimitive::Boolean(b));
+            object
+                .boxed
+                .set(Some(crux::object::BoxedPrimitive::Boolean(b)));
             agent.boolean_data.insert(object.id(), b);
             Ok(Value::Object(object))
         }
@@ -304,7 +306,9 @@ pub fn to_object(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
                 .get("%Number.prototype%")
                 .and_then(|v| as_object(&v));
             let object = JsObject::ordinary_object_create(proto);
-            *object.boxed.borrow_mut() = Some(crux::object::BoxedPrimitive::Number(n));
+            object
+                .boxed
+                .set(Some(crux::object::BoxedPrimitive::Number(n)));
             agent.number_data.insert(object.id(), n);
             Ok(Value::Object(object))
         }
@@ -314,8 +318,11 @@ pub fn to_object(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
                 .get("%BigInt.prototype%")
                 .and_then(|v| as_object(&v));
             let object = JsObject::ordinary_object_create(proto);
-            *object.boxed.borrow_mut() =
-                Some(crux::object::BoxedPrimitive::BigInt(b.as_ref().clone()));
+            object
+                .boxed
+                .set(Some(crux::object::BoxedPrimitive::BigInt(Handle::new(
+                    b.as_ref().clone(),
+                ))));
             agent.bigint_data.insert(object.id(), b.as_ref().clone());
             Ok(Value::Object(object))
         }
@@ -725,10 +732,7 @@ fn find_ecma_accessor(
         // trap is present the crux [[Get]]/[[Set]] runs it, so report no
         // agent-dispatched accessor here.
         if let crux::object::ObjectKind::Proxy(slots) = &obj.kind {
-            let (target, handler) = match (
-                *slots.target.borrow(),
-                *slots.handler.borrow(),
-            ) {
+            let (target, handler) = match (*slots.target.borrow(), *slots.handler.borrow()) {
                 (Some(target), Some(handler)) => (target, handler),
                 // A revoked proxy throws via the crux path; report no
                 // accessor so [[Get]]/[[Set]] surfaces the TypeError.

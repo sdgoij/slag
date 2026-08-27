@@ -84,9 +84,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let object_ctor_value = Value::Function(object_ctor);
 
     realm.intrinsics.define(OBJECT, object_ctor_value);
-    realm
-        .intrinsics
-        .define(OBJECT_PROTO, object_proto_value);
+    realm.intrinsics.define(OBJECT_PROTO, object_proto_value);
 
     // 20.1.1.2: Object.prototype is non-writable, non-enumerable,
     // non-configurable (the only such prototype property in the spec).
@@ -349,7 +347,7 @@ fn builtin_tag(agent: &mut Agent, object: &Value) -> Result<String, JsError> {
     if crux::value::is_callable(object) {
         return Ok("Function".to_string());
     }
-    if let Some(boxed) = &*obj.boxed.borrow() {
+    if let Some(boxed) = obj.boxed.get() {
         return Ok(match boxed {
             crux::object::BoxedPrimitive::Boolean(_) => "Boolean",
             crux::object::BoxedPrimitive::Number(_) => "Number",
@@ -713,12 +711,8 @@ pub fn dispatch_call(
     }
     if intrinsics.get(PROTO_TO_LOCALE).as_ref() == Some(callee) {
         return Some((|| {
-            let method = crate::context::get_property(
-                agent,
-                this,
-                &JsString::from_utf8("toString"),
-                *this,
-            )?;
+            let method =
+                crate::context::get_property(agent, this, &JsString::from_utf8("toString"), *this)?;
             crate::function::call(agent, &method, *this, &[])
         })());
     }
@@ -1383,30 +1377,22 @@ fn from_entries(agent: &mut Agent, iterable: &Value) -> Result<Value, JsError> {
         }
         // IfAbruptCloseIterator around the key read, the value read, and
         // the key coercion.
-        let key = match crate::context::get_property(
-            agent,
-            &entry,
-            &JsString::from_utf8("0"),
-            entry,
-        ) {
-            Ok(key) => key,
-            Err(error) => {
-                let _ = crate::expr::iterator_close(agent, &iterator);
-                return Err(error);
-            }
-        };
-        let value = match crate::context::get_property(
-            agent,
-            &entry,
-            &JsString::from_utf8("1"),
-            entry,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                let _ = crate::expr::iterator_close(agent, &iterator);
-                return Err(error);
-            }
-        };
+        let key =
+            match crate::context::get_property(agent, &entry, &JsString::from_utf8("0"), entry) {
+                Ok(key) => key,
+                Err(error) => {
+                    let _ = crate::expr::iterator_close(agent, &iterator);
+                    return Err(error);
+                }
+            };
+        let value =
+            match crate::context::get_property(agent, &entry, &JsString::from_utf8("1"), entry) {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = crate::expr::iterator_close(agent, &iterator);
+                    return Err(error);
+                }
+            };
         let key = match crate::context::to_property_key(agent, &key) {
             Ok(key) => key,
             Err(error) => {

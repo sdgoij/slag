@@ -121,7 +121,9 @@ fn number_construct(
         Some(value) => number_argument(agent, value)?,
         None => 0.0,
     };
-    *object.boxed.borrow_mut() = Some(crux::object::BoxedPrimitive::Number(value));
+    object
+        .boxed
+        .set(Some(crux::object::BoxedPrimitive::Number(value)));
     agent.number_data.insert(object.id(), value);
     Ok(Value::Object(object))
 }
@@ -381,7 +383,9 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     // spec 21.1.3: %Number.prototype% is a Number object wrapping 0, so
     // `%Object.prototype.toString%` reports "[object Number]" and ToNumber
     // coercion yields 0.
-    *number_proto.boxed.borrow_mut() = Some(crux::object::BoxedPrimitive::Number(0.0));
+    number_proto
+        .boxed
+        .set(Some(crux::object::BoxedPrimitive::Number(0.0)));
     let number_proto_value = Value::Object(number_proto);
 
     let number_ctor = Function::create_builtin(
@@ -394,9 +398,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let number_ctor_value = Value::Function(number_ctor);
 
     realm.intrinsics.define(NUMBER, number_ctor_value);
-    realm
-        .intrinsics
-        .define(NUMBER_PROTO, number_proto_value);
+    realm.intrinsics.define(NUMBER_PROTO, number_proto_value);
 
     number_ctor.define_property(
         &JsString::from_utf8("prototype"),
@@ -468,7 +470,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             length,
             Box::new(body),
             None,
-            function_proto
+            function_proto,
         )?;
         number_ctor.define_property(
             &JsString::from_utf8(name),
