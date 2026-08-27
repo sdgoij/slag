@@ -17,6 +17,8 @@ use crate::error::{ErrorKind, JsError};
 use crate::function::call;
 use crate::handle::Handle;
 use crate::heap::{GcAny, Trace};
+use crate::map::Map;
+use crate::map::canonical_empty_map;
 use crate::ops::{same_value, same_value_zero};
 use crate::property::{PropertyDescriptor, PropertyKey};
 use crate::string::{JsString, lookup};
@@ -549,6 +551,11 @@ pub struct JsObject {
     /// was measurable there (the Cut 27 lesson, applied to the hottest
     /// field in the struct).
     pub prototype: Cell<Option<Handle<JsObject>>>,
+    /// Hidden class / shape descriptor for this object.
+    ///
+    /// Part B: parallel map-based shape. B5.1 — parallel shape only:
+    /// `map` is allocated and wired, reads/writes stay through `SmallProps`.
+    pub map: Handle<Map>,
     /// [[Extensible]].
     pub extensible: Cell<bool>,
     /// Whether this object is an immutable prototype exotic object (spec
@@ -603,6 +610,7 @@ impl Trace for JsObject {
         if let Some(proto) = self.prototype.get() {
             proto.trace(visit);
         }
+        self.map.trace(visit);
         self.properties.trace(visit);
         self.private_elements.trace(visit);
         // The strong function back-reference keeps the function alive while
@@ -649,6 +657,7 @@ impl JsObject {
             id: next_object_id(),
             kind: ObjectKind::Ordinary,
             prototype: Cell::new(prototype),
+            map: canonical_empty_map(prototype),
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -726,6 +735,7 @@ impl JsObject {
             id: next_object_id(),
             kind: ObjectKind::IsHTMLDDA,
             prototype: Cell::new(prototype),
+            map: canonical_empty_map(prototype),
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -756,6 +766,7 @@ impl JsObject {
             id: next_object_id(),
             kind: ObjectKind::Array,
             prototype: Cell::new(prototype),
+            map: canonical_empty_map(prototype),
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -790,6 +801,7 @@ impl JsObject {
             id: next_object_id(),
             kind: ObjectKind::String(Handle::new(value)),
             prototype: Cell::new(prototype),
+            map: canonical_empty_map(prototype),
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -820,6 +832,7 @@ impl JsObject {
             id: next_object_id(),
             kind: ObjectKind::Proxy(Handle::new(slots)),
             prototype: Cell::new(None),
+            map: canonical_empty_map(None),
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -844,6 +857,7 @@ impl JsObject {
             id: next_object_id(),
             kind: ObjectKind::IntegerIndexed(Handle::new(slots)),
             prototype: Cell::new(prototype),
+            map: canonical_empty_map(prototype),
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -950,6 +964,7 @@ impl JsObject {
                 deferred,
             })),
             prototype: Cell::new(None),
+            map: canonical_empty_map(None),
             extensible: Cell::new(false),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -1001,6 +1016,7 @@ impl JsObject {
                 env: None,
             })),
             prototype: Cell::new(prototype),
+            map: canonical_empty_map(prototype),
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -1096,6 +1112,7 @@ impl JsObject {
                 env: None,
             })),
             prototype: Cell::new(prototype),
+            map: canonical_empty_map(prototype),
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),

@@ -14,7 +14,7 @@ bigger win on property-access rows. They compose: maps shrink the object,
 the nursery makes object allocation cheap, and the constructor's property
 patterns (already collected) pre-build the object's final map.
 
-## Status (2026-08-27 — GC half substantially landed, map half not started)
+## Status (2026-08-27 — GC half substantially landed, map B5.1 landed)
 
 Landed and committed (in order):
 
@@ -26,8 +26,16 @@ Landed and committed (in order):
 - `2ca8cab` — **A5.1b (first half)**: sorted-`live` binary-search stack scan
   (replaces the per-collection `by_addr` HashMap rebuild) + store-then-read
   value-cache fronting in `fast_fresh_store`.
+- `6baab46` — **A5.1b (second half)**: direct-mapped free list — the
+  size-classed free list is now `[Vec<*mut GcBox>; 256]` indexed by `size >>
+  4` (sizes 16..=4096) instead of an FxHash HashMap.
 
-Uncommitted on top of `2ca8cab`:
+Uncommitted on top of `6baab46`:
+
+- **B5.1**: `Map` type + empty-map creation, storage still Vec. Land the map
+  as a parallel shape — `JsObject.map` exists; reads still go through
+  `SmallProps`. 6 new tests in `crates/crux/src/map.rs`; all 173 crux tests
+  green, full workspace green, clippy clean. No behavior change.
 
 - **A5.1b (second half) — direct-mapped free list**: the size-classed free
   list is now `[Vec<*mut GcBox>; 256]` indexed by `size >> 4` (sizes

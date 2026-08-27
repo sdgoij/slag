@@ -629,7 +629,7 @@ mod tests {
         let leaf = Handle::new(JsString::from_utf8("x"));
         for i in 0..200_000 {
             s = JsString::concat(&s, &leaf);
-            if i < 3 || i >= 199_998 {
+            if !(3..199_998).contains(&i) {
                 eprintln!("iter {}: len={}", i, s.len());
             }
         }
