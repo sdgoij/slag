@@ -2204,7 +2204,7 @@ fn iterator_chain_has_return(agent: &mut Agent, iterator: &Value) -> Result<bool
         if object.get_own_property_key(&key)?.is_some() {
             return Ok(true);
         }
-        probe = *object.prototype.borrow()
+        probe = object.prototype.get()
     }
     let _ = agent;
     Ok(false)

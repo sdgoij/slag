@@ -1491,6 +1491,32 @@ pub struct ConstructPrototypeCell {
 /// Direct-mapped slots for [`ConstructPrototypeCell`] (a power of two so
 /// the cache index is a mask).
 pub(crate) const CONSTRUCT_PROTO_CELLS: usize = 256;
+/// Direct-mapped slots for the constructor property-pattern cache (Cut 35
+/// slice 30): function id → the `this.*` property names its body assigns.
+/// A power of two so the cache index is a mask; a collision evicts (the
+/// pre-warm is an optimization — a miss just means the store path walks
+/// the chain on its own).
+pub(crate) const CONSTRUCT_PATTERN_CELLS: usize = 256;
+
+/// A cached constructor property pattern: the count of property names and
+/// up to four `AtomId`s (the fixed array keeps the cache entry tiny).
+pub(crate) type ConstructPatternCell = (u8, [crux::AtomId; 4]);
+
+/// The direct-mapped cache index for a function's property patterns.
+pub(crate) fn construct_pattern_index(function_id: u64) -> usize {
+    (function_id.wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize) & (CONSTRUCT_PATTERN_CELLS - 1)
+}
+
+/// Record a function body's collected `this.*` property writes (Cut 35
+/// slice 30) for `construct_this_object`'s store-cache pre-warm.
+pub(crate) fn store_construct_patterns(
+    agent: &mut Agent,
+    function_id: u64,
+    this_writes: (usize, [crux::AtomId; 4]),
+) {
+    let index = construct_pattern_index(function_id);
+    agent.construct_property_patterns[index] = Some((this_writes.0 as u8, this_writes.1));
+}
 /// The read-side array-element value cache entry (Cut 35 slice 13): the
 /// cached value of `array[index]` at the array's generation — a generation
 /// match means no own-property change since the read (slice 11 bumps every
@@ -2741,7 +2767,7 @@ impl Vm {
     }
 
     /// The direct-mapped cache index for the write-side chain cache.
-    fn member_store_cell_index(proto_id: u64, atom: crux::AtomId) -> usize {
+    pub(crate) fn member_store_cell_index(proto_id: u64, atom: crux::AtomId) -> usize {
         (proto_id as usize ^ atom as usize) & (MEMBER_CELLS - 1)
     }
 
@@ -2834,6 +2860,47 @@ impl Vm {
         let index = Self::member_store_cell_index(proto.id(), atom);
         agent.member_store_cells[index] = Some((proto.id(), atom, len as u32, gens));
         true
+    }
+
+    /// Resolve the store verdict for a given prototype (no receiver),
+    /// returning the cache entry `(proto_id, atom, len, gens)` so the
+    /// caller can directly set it (used by construct cache pre-warm).
+    pub(crate) fn member_store_cell_resolve_raw(
+        _agent: &mut Agent,
+        proto: crux::handle::Handle<crux::object::JsObject>,
+        atom: crux::AtomId,
+    ) -> Option<(u64, crux::AtomId, u32, [u32; 4])> {
+        let mut gens = [0u32; 4];
+        let mut len = 0usize;
+        let mut link: Option<crux::handle::Handle<crux::object::JsObject>> = Some(proto);
+        while let Some(current) = link {
+            if len >= 4 {
+                return None;
+            }
+            if !matches!(
+                current.kind,
+                crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array
+            ) {
+                return None;
+            }
+            let key = PropertyKey::String(atom);
+            match current.get_own_property_key(&key).ok().flatten() {
+                Some(prop) => match &prop.kind {
+                    crux::object::PropertyKind::Data { writable, .. } if *writable => {
+                        gens[len] = current.generation();
+                        len += 1;
+                        break;
+                    }
+                    _ => return None,
+                },
+                None => {
+                    gens[len] = current.generation();
+                    len += 1;
+                    link = current.get_prototype_of().ok().flatten();
+                }
+            }
+        }
+        Some((proto.id(), atom, len as u32, gens))
     }
 
     /// The fresh-property write fast path (Cut 22): a plain ordinary
@@ -9946,6 +10013,12 @@ struct Compiler {
     /// compile tail calls (conservative — the corpus has no `using` + tail
     /// shape, and correctness wins).
     has_using: bool,
+    /// Cut 35 slice 30: property names written to `this` in a certified
+    /// constructor body (only tracked when the body uses lexical `this` /
+    /// is a constructor — detected by `this_slot.is_some()` in scope).
+    /// Populated during compilation and returned alongside the compiled
+    /// body for store-cache pre-warming in `construct_this_object`.
+    this_writes: (usize, [crux::AtomId; 4]),
 }
 
 /// Where a binding lives for emission purposes: a frame slot (fast body),
@@ -14021,6 +14094,20 @@ impl Compiler {
         }
         match &member.property {
             MemberProperty::Name(name) => {
+                // Cut 35 slice 30: detect `this.name = value` in constructor
+                // bodies to collect property patterns for store-cache pre-warm.
+                if matches!(op, AssignOp::Assign)
+                    && let ExprKind::Ident(ident) = &member.object.kind
+                    && syntax::keywords::from_identifier(*ident)
+                        == Some(syntax::keywords::Keyword::This)
+                    && self.scope.as_ref().is_some_and(|s| s.this_slot.is_some())
+                {
+                    let (count, arr) = &mut self.this_writes;
+                    if *count < 4 {
+                        arr[*count] = *name;
+                        *count += 1;
+                    }
+                }
                 self.compile_expr(&member.object)?;
                 let needs_old = is_compound_assign(op);
                 if needs_old {
@@ -15237,8 +15324,13 @@ fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
     Some(ops.into_boxed_slice())
 }
 
-/// Compile a function body for resumable execution.
-pub fn compile_body(function: &EcmaFunction) -> Result<CompiledBody, JsError> {
+/// Compile a function body and collect its `this.*` property writes.
+/// Returns `(compiled_body, (count, array))` where the tuple holds the
+/// count of property names and up to 4 AtomIds (empty if the body
+/// doesn't use lexical `this` or is not a constructor).
+pub fn compile_body(
+    function: &EcmaFunction,
+) -> Result<(CompiledBody, (usize, [crux::AtomId; 4])), JsError> {
     let _guard = CompilingGuard::new();
     let scope = analyze_scope(function);
     let mut compiler = Compiler {
@@ -15324,18 +15416,21 @@ pub fn compile_body(function: &EcmaFunction) -> Result<CompiledBody, JsError> {
     } else {
         None
     };
-    Ok(CompiledBody {
-        steps: compiler.steps,
-        handlers: compiler.handlers,
-        strict: function.strict,
-        scope: compiler.scope,
-        env_constant,
-        leaf,
-        leaf_needs_env,
-        leaf_uses_env,
-        leaf_ops,
-        script_globals: None,
-    })
+    Ok((
+        CompiledBody {
+            steps: compiler.steps,
+            handlers: compiler.handlers,
+            strict: function.strict,
+            scope: compiler.scope,
+            env_constant,
+            leaf,
+            leaf_needs_env,
+            leaf_uses_env,
+            leaf_ops,
+            script_globals: None,
+        },
+        compiler.this_writes,
+    ))
 }
 
 /// Compile a statement list standalone (modules and top-level await).

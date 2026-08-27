@@ -568,6 +568,16 @@ pub struct Agent {
     /// The live-box count after the last collection, for the growth
     /// threshold that decides when a safe point collects.
     pub last_collected_live: Cell<usize>,
+    /// Hot constructor property patterns (Cut 35 slice 30): function id →
+    /// `(count, array)` of the property names that constructor body assigns
+    /// to `this`. Direct-mapped (a SipHash HashMap lookup per construct
+    /// was measurable); re-validated by the function id. Used by
+    /// `construct_this_object` to pre-warm the member store cache so the
+    /// first `this.x =` hit the cache on the first construct, not the
+    /// second (V8's AllocationSite / boilerplate approach). Boxed per the
+    /// Cut 27 lesson.
+    pub(crate) construct_property_patterns:
+        Box<[Option<crate::ir::ConstructPatternCell>; crate::ir::CONSTRUCT_PATTERN_CELLS]>,
 }
 
 impl Agent {
@@ -589,6 +599,7 @@ impl Agent {
             for_of_array_cells: Box::new([None; crate::ir::MEMBER_CELLS]),
             leaf_cache: Box::new(std::array::from_fn(|_| None)),
             construct_prototypes: Box::new(std::array::from_fn(|_| None)),
+            construct_property_patterns: Box::new(std::array::from_fn(|_| None)),
             vm_pool: Vec::new(),
             promise_jobs: VecDeque::new(),
             generic_jobs: VecDeque::new(),
@@ -1191,15 +1202,19 @@ impl Agent {
         // or FinalizationRegistry target alive (the sweep still uses the
         // conservative mark — the scan stays the safety net for Rust-held
         // handles).
+        let has_weak = self.has_weak_structures();
+        // Cut 35 slice 31: the compaction hook (dead-set HashSet build +
+        // weak-table walks) runs only when a weak structure actually exists
+        // — the benchmark's collections have none, and the SipHash HashSet
+        // of every dead address was measurable per collection.
+        let compact: &mut crux::heap::CompactHook = if has_weak {
+            &mut |dead, retain| self.compact_weak_tables(dead, retain)
+        } else {
+            &mut |_, _| {}
+        };
         let swept = crux::heap::with_heap_mut(|heap| {
-            heap.collect_with_stack_compacting(
-                &roots,
-                self.has_weak_structures(),
-                &mut |dead, retain| {
-                    self.compact_weak_tables(dead, retain);
-                },
-            )
-            .len()
+            heap.collect_with_stack_compacting(&roots, has_weak, compact)
+                .len()
         });
         self.last_collected_live
             .set(crux::heap::with_heap(|heap| heap.live_count()));
@@ -1232,12 +1247,15 @@ impl Agent {
         if dead.is_empty() {
             return;
         }
-        let dead: std::collections::HashSet<usize> = dead.iter().copied().collect();
+        // The collector sorts the dead set before the hook runs, so a
+        // membership test is a binary search — the SipHash HashSet of every
+        // dead address was measurable per collection.
+        let is_dead = |addr: usize| dead.binary_search(&addr).is_ok();
         for cell in self.weak_map_data.values() {
             let mut data = cell.borrow_mut();
             data.retain(|entry| match entry {
                 Some((key, _)) => match value_box_addr(key) {
-                    Some(key) => !dead.contains(&key.addr()),
+                    Some(key) => !is_dead(key.addr()),
                     // A non-heap key cannot have been swept.
                     None => true,
                 },
@@ -1248,7 +1266,7 @@ impl Agent {
             let mut data = cell.borrow_mut();
             data.retain(|entry| match entry {
                 Some(element) => match value_box_addr(element) {
-                    Some(element) => !dead.contains(&element.addr()),
+                    Some(element) => !is_dead(element.addr()),
                     None => true,
                 },
                 None => false,
@@ -1257,7 +1275,7 @@ impl Agent {
         // GC-4 WeakRef: a dead target clears the entry (deref → undefined).
         for (_, target) in self.weak_ref_targets.borrow_mut().iter_mut() {
             if let Some(target_box) = value_box_addr(target)
-                && dead.contains(&target_box.addr())
+                && is_dead(target_box.addr())
             {
                 *target = Value::Undefined;
             }
@@ -1274,8 +1292,8 @@ impl Agent {
             let mut i = 0;
             while i < cells.len() {
                 let cell = &cells[i];
-                let target_dead = value_box_addr(&cell.target)
-                    .is_some_and(|target| dead.contains(&target.addr()));
+                let target_dead =
+                    value_box_addr(&cell.target).is_some_and(|target| is_dead(target.addr()));
                 if target_dead {
                     let cell = cells.swap_remove(i);
                     let callback = data.callback.clone();
@@ -1293,7 +1311,7 @@ impl Agent {
                     // dangling handle is never compared.
                     if let Some(token) = &mut cells[i].unregister_token
                         && let Some(token_box) = value_box_addr(token)
-                        && dead.contains(&token_box.addr())
+                        && is_dead(token_box.addr())
                     {
                         cells[i].unregister_token = None;
                     }

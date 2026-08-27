@@ -765,8 +765,12 @@ fn register_function(
     // record lands in `ecma_functions` — a collection in that window would
     // sweep them (GC-2).
     let function = Function::new(name.clone());
-    data.set_compiled(std::rc::Rc::new(crate::ir::compile_body(&data)?));
+    let (compiled, this_writes) = crate::ir::compile_body(&data)?;
+    data.set_compiled(std::rc::Rc::new(compiled));
     agent.ecma_functions.insert(function.id(), data);
+    // Cut 35 slice 30: store collected `this.*` property writes for
+    // constructor store-cache pre-warming in `construct_this_object`.
+    crate::ir::store_construct_patterns(agent, function.id(), this_writes);
     set_function_properties(&function, &params, name.as_ref())?;
     // AddRestrictedFunctionProperties (spec 10.2.1): sloppy ordinary
     // functions carry own `caller`/`arguments` (value undefined when no
@@ -1061,9 +1065,11 @@ pub fn instantiate_arrow(
     // collection at `Function::new` cannot sweep the compiled body's literal
     // `Value`s while they are unrooted (GC-2, see `register_function`).
     let function = Function::new(None);
-    data.set_compiled(std::rc::Rc::new(crate::ir::compile_body(&data)?));
+    let (compiled, this_writes) = crate::ir::compile_body(&data)?;
+    data.set_compiled(std::rc::Rc::new(compiled));
     let params = data.params.clone();
     agent.ecma_functions.insert(function.id(), data);
+    crate::ir::store_construct_patterns(agent, function.id(), this_writes);
     set_function_properties(&function, &params, None)?;
     set_function_prototype(agent, &function)?;
     Ok(Value::Function(function))
@@ -2192,6 +2198,30 @@ pub(crate) fn construct_this_object(
                 .and_then(|value| crate::context::as_object(&value))
         }
     };
+    // Cut 35 slice 30: for hot constructors, pre-warm the member store cache
+    // so the first `this.x =` hit the cache on construct instead of walking
+    // the prototype chain. The resolve (a chain walk) runs only when the
+    // direct-mapped cache entry is missing or stale — a hit by (proto,
+    // atom) skips it, so the hot loop pays one cache-compare per property
+    // instead of a chain walk per construct.
+    if let Some(proto_obj) = proto
+        && let ValueKind::Function(func) = new_target.kind()
+        && let Some((count, arr)) =
+            agent.construct_property_patterns[crate::ir::construct_pattern_index(func.id())]
+        && count > 0
+    {
+        for &name in &arr[..count as usize] {
+            let index = crate::ir::Vm::member_store_cell_index(proto_obj.id(), name);
+            let stale = agent.member_store_cells[index]
+                .is_none_or(|(pid, pname, _, _)| pid != proto_obj.id() || pname != name);
+            if stale
+                && let Some((proto_id, proto_atom, len, gens)) =
+                    crate::ir::Vm::member_store_cell_resolve_raw(agent, proto_obj, name)
+            {
+                agent.member_store_cells[index] = Some((proto_id, proto_atom, len, gens));
+            }
+        }
+    }
     Ok(Value::Object(JsObject::ordinary_object_create(proto)))
 }
 

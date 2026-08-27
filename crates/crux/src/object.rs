@@ -543,8 +543,12 @@ impl Trace for PrivateElement {
 pub struct JsObject {
     id: u64,
     pub kind: ObjectKind,
-    /// [[Prototype]]; `None` when the prototype is *null*.
-    pub prototype: RefCell<Option<Handle<JsObject>>>,
+    /// [[Prototype]]; `None` when the prototype is *null*. A lock-free
+    /// `Cell` (the handle is `Copy`): `get_prototype_of` runs on every
+    /// member read/store and prototype-chain walk, and the RefCell borrow
+    /// was measurable there (the Cut 27 lesson, applied to the hottest
+    /// field in the struct).
+    pub prototype: Cell<Option<Handle<JsObject>>>,
     /// [[Extensible]].
     pub extensible: Cell<bool>,
     /// Whether this object is an immutable prototype exotic object (spec
@@ -589,11 +593,16 @@ pub struct JsObject {
 impl Trace for JsObject {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         self.kind.trace(visit);
-        // The cells are RefCells: `RefCell<T>`'s trace skips a cell that is
-        // mutably borrowed mid-collection (per-allocation `--gc-stress`) and
-        // aborts the sweep instead of panicking. Tracing the whole `properties`
-        // cell also marks symbol keys (a symbol description may be a rope).
-        self.prototype.trace(visit);
+        // `prototype` is a lock-free `Cell` now: the handle is traced
+        // directly (always readable, no mid-mutation abort). The other
+        // cells are RefCells: `RefCell<T>`'s trace skips a cell that is
+        // mutably borrowed mid-collection (per-allocation `--gc-stress`)
+        // and aborts the sweep instead of panicking. Tracing the whole
+        // `properties` cell also marks symbol keys (a symbol description
+        // may be a rope).
+        if let Some(proto) = self.prototype.get() {
+            proto.trace(visit);
+        }
         self.properties.trace(visit);
         self.private_elements.trace(visit);
         // The strong function back-reference keeps the function alive while
@@ -639,7 +648,7 @@ impl JsObject {
         Self {
             id: next_object_id(),
             kind: ObjectKind::Ordinary,
-            prototype: RefCell::new(prototype),
+            prototype: Cell::new(prototype),
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -716,7 +725,7 @@ impl JsObject {
         let object = Handle::new(Self {
             id: next_object_id(),
             kind: ObjectKind::IsHTMLDDA,
-            prototype: RefCell::new(prototype),
+            prototype: Cell::new(prototype),
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -746,7 +755,7 @@ impl JsObject {
         let array = Handle::new(Self {
             id: next_object_id(),
             kind: ObjectKind::Array,
-            prototype: RefCell::new(prototype),
+            prototype: Cell::new(prototype),
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -780,7 +789,7 @@ impl JsObject {
         let string = Handle::new(Self {
             id: next_object_id(),
             kind: ObjectKind::String(Handle::new(value)),
-            prototype: RefCell::new(prototype),
+            prototype: Cell::new(prototype),
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -810,7 +819,7 @@ impl JsObject {
         let proxy = Handle::new(Self {
             id: next_object_id(),
             kind: ObjectKind::Proxy(Handle::new(slots)),
-            prototype: RefCell::new(None),
+            prototype: Cell::new(None),
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -834,7 +843,7 @@ impl JsObject {
         let object = Handle::new(Self {
             id: next_object_id(),
             kind: ObjectKind::IntegerIndexed(Handle::new(slots)),
-            prototype: RefCell::new(prototype),
+            prototype: Cell::new(prototype),
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -940,7 +949,7 @@ impl JsObject {
                 exports,
                 deferred,
             })),
-            prototype: RefCell::new(None),
+            prototype: Cell::new(None),
             extensible: Cell::new(false),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -991,7 +1000,7 @@ impl JsObject {
                 parameter_map: Some(map),
                 env: None,
             })),
-            prototype: RefCell::new(prototype),
+            prototype: Cell::new(prototype),
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -1086,7 +1095,7 @@ impl JsObject {
                 parameter_map: None,
                 env: None,
             })),
-            prototype: RefCell::new(prototype),
+            prototype: Cell::new(prototype),
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -1175,7 +1184,7 @@ impl JsObject {
         match &self.kind {
             ObjectKind::Proxy(slots) => crate::proxy::get_prototype_of(slots),
             ObjectKind::ModuleNamespace(_) => Ok(None),
-            _ => Ok(*self.prototype.borrow()),
+            _ => Ok(self.prototype.get()),
         }
     }
 
@@ -1224,7 +1233,7 @@ impl JsObject {
                 }
             }
         }
-        *self.prototype.borrow_mut() = proto;
+        self.prototype.set(proto);
         self.bump_generation();
         Ok(true)
     }
@@ -1326,6 +1335,12 @@ impl JsObject {
     fn ordinary_property_lookup(&self, key: &PropertyKey) -> Option<Property> {
         const INDEX_THRESHOLD: usize = 16;
         let props = self.properties.borrow();
+        // A fresh object (a constructor's new `this` before its first store)
+        // has no own properties — return without paying the property_index
+        // RefCell borrow (the construct bench's `this.x =` hot path).
+        if props.is_empty() {
+            return None;
+        }
         let index = self.property_index.borrow();
         if props.len() >= INDEX_THRESHOLD {
             if index.is_none() {
@@ -1451,7 +1466,7 @@ impl JsObject {
         if !self.extensible.get() {
             return Ok(None);
         }
-        let mut probe = *self.prototype.borrow();
+        let mut probe = self.prototype.get();
         while let Some(link) = probe {
             if !matches!(link.kind, ObjectKind::Ordinary | ObjectKind::Array) {
                 return Ok(None);
@@ -1459,7 +1474,7 @@ impl JsObject {
             if link.get_own_property_key(&key)?.is_some() {
                 return Ok(None);
             }
-            probe = *link.prototype.borrow();
+            probe = link.prototype.get();
         }
         // Dense append (index == length): push the element and bump the
         // length in place, exactly like `array_define_own_property`'s fast
@@ -1867,8 +1882,12 @@ impl JsObject {
         props.push((key.clone(), Property::data(value, true, true, true)));
         drop(props);
         // The lazy index's incremental maintenance (an append shifts
-        // nothing, so the new key maps to its pushed position).
-        if let Some(index) = &mut *self.property_index.borrow_mut() {
+        // nothing, so the new key maps to its pushed position). Only pay
+        // the RefCell borrow for the index when it already exists — for
+        // fresh objects the index starts as None and is built lazily.
+        if self.property_index.borrow().is_some()
+            && let Some(index) = &mut *self.property_index.borrow_mut()
+        {
             index.insert(key.clone(), position);
         }
         self.bump_generation();
