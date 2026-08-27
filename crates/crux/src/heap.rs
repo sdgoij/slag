@@ -44,11 +44,16 @@ impl GcAny {
 }
 
 /// A cell in the GC heap. `T` is unsized only through `dyn Trace`; for a
-/// typed `Gc<T>` the box is sized. The header holds the mark bit; `data` is
-/// the payload the handle derefs to.
+/// typed `Gc<T>` the box is sized. The header holds the mark bit and the
+/// box's rounded arena size (A5.1: the arena walk steps by it and the
+/// size-classed free list keys by it); `data` is the payload the handle
+/// derefs to.
 #[repr(C)]
 struct GcBox<T: ?Sized + Trace> {
     mark: Cell<bool>,
+    /// The box's total arena footprint (header + data, rounded to
+    /// [`ARENA_GRANULARITY`]), written once at allocation.
+    size: u32,
     data: T,
 }
 
@@ -98,19 +103,30 @@ impl<T: Trace> Gc<T> {
 }
 
 impl<T: Trace> Gc<T> {
-    /// Allocate a new boxed value on the thread-local heap and register it.
+    /// Allocate a new box in the bump arena and register it. A5.1: replaces
+    /// the per-box `Box::new` malloc with a bump + size-classed free-list
+    /// reuse inside one heap borrow.
     pub fn new(value: T) -> Gc<T> {
-        let boxed = Box::new(GcBox {
-            mark: Cell::new(false),
-            data: value,
+        let size = round_up(size_of::<GcBox<T>>(), ARENA_GRANULARITY);
+        let gc = with_heap_mut(|heap| {
+            let raw = heap.alloc(size, align_of::<GcBox<T>>()) as *mut GcBox<T>;
+            // SAFETY: `raw` is a fresh arena slot (bumped or reused) of at
+            // least `size` bytes; writing the header + payload initializes
+            // the box before any handle can see it.
+            unsafe {
+                raw.write(GcBox {
+                    mark: Cell::new(false),
+                    size: size as u32,
+                    data: value,
+                });
+            }
+            heap.register(raw as *mut GcBox<dyn Trace>);
+            Gc {
+                ptr: unsafe { NonNull::new_unchecked(raw) },
+                _not_send_sync: std::marker::PhantomData,
+            }
         });
-        let raw = Box::into_raw(boxed);
-        with_heap_mut(|heap| heap.register(raw as *mut GcBox<dyn Trace>));
         ALLOC_SINCE_COLLECT.with(|count| count.set(count.get() + 1));
-        let gc = Gc {
-            ptr: unsafe { NonNull::new_unchecked(raw) },
-            _not_send_sync: std::marker::PhantomData,
-        };
         // GC-2 `--gc-stress`: the fresh box is not yet reachable from any
         // handle the caller holds, so it is passed through as an extra root.
         maybe_stress_collect(gc.as_any());
@@ -300,8 +316,44 @@ impl<T: Default> Default for GcCell<T> {
     }
 }
 
+/// The fixed size of an arena chunk (1 MiB). Chunks are appended as the
+/// bump grows; each chunk's buffer is a `Box<[u8]>` whose address never
+/// moves, so box addresses stay stable across chunk growth.
+const ARENA_CHUNK_SIZE: usize = 1 << 20;
+
+/// The granularity every box's arena footprint is rounded up to. A fixed
+/// multiple keeps the bump pointer aligned for any box whose alignment is
+/// ≤ this value and makes the arena walk (step by `size`) exact.
+const ARENA_GRANULARITY: usize = 16;
+
+/// A contiguous arena chunk: an uninitialized buffer plus a bump pointer.
+struct ArenaChunk {
+    /// Owns the chunk's memory (never read — boxes are addressed directly).
+    #[allow(dead_code)]
+    data: Box<[u8]>,
+    /// The next allocation offset within the chunk.
+    bump: usize,
+    /// The last usable address (exclusive).
+    end: usize,
+}
+
+/// The size-classed free list: swept (dead) boxes keyed by their rounded
+/// size, reused by `Gc::new` before the bump advances. Boxes are never
+/// freed individually — the arena keeps the memory, and slots cycle through
+/// the free list.
+type FreeList = std::collections::HashMap<
+    u32,
+    Vec<*mut GcBox<dyn Trace>>,
+    std::hash::BuildHasherDefault<FxHasher>,
+>;
+
 /// The thread-local mark-sweep heap.
 pub struct Heap {
+    /// The bump arena backing every box. Boxes live at stable addresses
+    /// inside these chunks.
+    chunks: Vec<ArenaChunk>,
+    /// Reclaimed slots by rounded size (see [`FreeList`]).
+    free: FreeList,
     live: Vec<*mut GcBox<dyn Trace>>,
     /// Address range of the registered boxes, refreshed by the sweep (GC-5):
     /// the stack scan pre-filter skips words outside it — most stack words
@@ -309,6 +361,16 @@ pub struct Heap {
     /// HashMap lookup per word.
     live_min: usize,
     live_max: usize,
+}
+
+/// Round `n` up to the next multiple of `m` (a power of two).
+const fn round_up(n: usize, m: usize) -> usize {
+    n.div_ceil(m) * m
+}
+
+/// Align `n` up to the next multiple of `m` (a power of two).
+const fn align_up(n: usize, m: usize) -> usize {
+    (n + m - 1) & !(m - 1)
 }
 
 /// A fast non-cryptographic hasher for the box-address maps (GC-5): the
@@ -532,6 +594,8 @@ impl Default for Heap {
 impl Heap {
     pub const fn new() -> Heap {
         Heap {
+            chunks: Vec::new(),
+            free: FreeList::with_hasher(std::hash::BuildHasherDefault::new()),
             live: Vec::new(),
             live_min: 0,
             live_max: 0,
@@ -541,6 +605,69 @@ impl Heap {
     /// Number of live boxes (for the leak-detection harness).
     pub fn live_count(&self) -> usize {
         self.live.len()
+    }
+
+    /// The number of arena chunks (A5.1): under size-classed churn the
+    /// free list reuses swept slots, so the arena must not grow with the
+    /// allocation count.
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// The total number of swept slots waiting for reuse (A5.1).
+    pub fn free_count(&self) -> usize {
+        self.free.values().map(|slots| slots.len()).sum()
+    }
+
+    /// Allocate `size` bytes aligned to `align` in the arena, reusing a
+    /// swept slot of the same rounded size when one is free, else bumping
+    /// into the current chunk (growing the arena by a chunk when full).
+    fn alloc(&mut self, size: usize, align: usize) -> *mut u8 {
+        let size = round_up(size, ARENA_GRANULARITY);
+        // Size-classed free-list reuse first: a swept box of this exact
+        // rounded size is the common hot shape.
+        if let Some(slots) = self.free.get_mut(&(size as u32))
+            && let Some(slot) = slots.pop()
+        {
+            return slot as *mut u8;
+        }
+        let bump = self.chunks.last().map_or(0, |chunk| chunk.bump);
+        let aligned = align_up(bump, align);
+        if let Some(chunk) = self.chunks.last_mut()
+            && aligned + size <= chunk.end
+        {
+            chunk.bump = aligned + size;
+            return aligned as *mut u8;
+        }
+        self.push_chunk();
+        let chunk = self.chunks.last_mut().expect("a chunk was just pushed");
+        let aligned = align_up(chunk.bump, align);
+        chunk.bump = aligned + size;
+        aligned as *mut u8
+    }
+
+    /// Append a fresh arena chunk. The buffer is uninitialized (no zeroing
+    /// cost per chunk); the allocator writes every slot before use.
+    fn push_chunk(&mut self) {
+        let mut buffer: Vec<std::mem::MaybeUninit<u8>> = Vec::with_capacity(ARENA_CHUNK_SIZE);
+        // SAFETY: the capacity is exactly the chunk size and the memory is
+        // never read before a box is written into it.
+        unsafe {
+            buffer.set_len(ARENA_CHUNK_SIZE);
+        }
+        let data = buffer.into_boxed_slice();
+        // SAFETY: `MaybeUninit<u8>` and `u8` have identical layout, so the
+        // boxed slice erases the `MaybeUninit` wrapper without changing the
+        // allocation's deallocation layout.
+        let data: Box<[u8]> = unsafe { Box::from_raw(Box::into_raw(data) as *mut [u8]) };
+        let raw = data.as_ptr() as usize;
+        let base = align_up(raw, ARENA_GRANULARITY);
+        let end = raw + ARENA_CHUNK_SIZE;
+        self.chunks.push(ArenaChunk {
+            data,
+            bump: base,
+            end,
+        });
     }
 
     fn register(&mut self, boxed: *mut GcBox<dyn Trace>) {
@@ -896,7 +1023,17 @@ impl Heap {
                     keep.push(ptr);
                 } else {
                     swept.push(ptr as *const u8 as usize);
-                    drop(Box::from_raw(ptr));
+                    // A5.1: the arena owns the slot memory, but the dead
+                    // box's payload must still be dropped (its Vecs,
+                    // HashMaps, and Arc buffers are heap allocations of
+                    // their own) before the slot is reused — otherwise
+                    // every swept box leaks its internals.
+                    std::ptr::drop_in_place(&mut (*ptr).data);
+                    // Reclaim the slot on the size-classed free list
+                    // (reused by a later `Gc::new` of the same size), never
+                    // freed to the allocator.
+                    let size = (*ptr).size;
+                    self.free.entry(size).or_default().push(ptr);
                 }
             }
         }
@@ -1021,6 +1158,30 @@ mod tests {
         }
         with_heap_mut(|heap| heap.collect(&[]));
         assert_eq!(with_heap(|heap| heap.live_count()), start);
+    }
+
+    #[test]
+    fn arena_reuses_swept_slots_under_churn() {
+        // A5.1: churning same-size boxes with a collection between batches
+        // must reuse the swept slots — the arena chunk count stays bounded
+        // instead of growing with the allocation count.
+        for batch in 0..4 {
+            for _ in 0..256 {
+                let node = Gc::new(Node::default());
+                node.next.borrow_mut().replace(Gc::new(Node::default()));
+            }
+            with_heap_mut(|heap| heap.collect(&[]));
+            assert!(
+                with_heap(|heap| heap.chunk_count()) <= 2,
+                "batch {batch}: arena grew to {} chunks",
+                with_heap(|heap| heap.chunk_count())
+            );
+            assert!(
+                with_heap(|heap| heap.free_count()) >= 128,
+                "batch {batch}: free list has {} slots",
+                with_heap(|heap| heap.free_count())
+            );
+        }
     }
 
     #[test]
