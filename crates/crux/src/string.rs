@@ -26,6 +26,21 @@ use crate::heap::{GcAny, Trace};
 /// the cap appends, so arbitrarily long append chains stay linear.
 pub enum JsString {
     Flat(Arc<[u16]>),
+    /// Lean append-node for `s += char` patterns. Each node stores a left
+    /// and right pointer — like V8's ConsString — but no buffer. This
+    /// makes each append a lean Gc allocation (~48 bytes). The accumulated
+    /// string is materialized lazily on first `as_slice()` access via
+    /// iterative traversal of the ConsString chain.
+    ConsString {
+        left: Handle<JsString>,
+        right: Handle<JsString>,
+        len: usize,
+        depth: u32,
+        flat: OnceLock<Arc<[u16]>>,
+    },
+    /// Full binary rope for non-trivial concatenations (both sides large, or
+    /// when `ConsString` isn't the better fit). The binary-tree structure
+    /// keeps depth logarithmic for balanced trees.
     Rope {
         left: Option<Handle<JsString>>,
         right: Option<Handle<JsString>>,
@@ -43,31 +58,30 @@ pub enum JsString {
     },
 }
 
+/// A flattened-node worklist element: either a JsString node to process.
+enum FlattenLeaf<'a> {
+    String(&'a JsString),
+}
+
 /// Concatenations whose total length is at or below this stay flat: the rope
 /// machinery (a node allocation plus a later flatten) only pays off once the
 /// string is large enough that repeated copies would dominate.
 const CONCAT_FLAT_THRESHOLD: usize = 16;
 
-/// The deepest a rope may grow before concat folds the accumulated left side
-/// into a single shared flat. The fold copies the accumulated string, so the
-/// total is ~n²/(2·cap) units — at cap 16384 that is ~305k units (0.6 MB) for
-/// a 100k-unit append chain and ~30M units (60 MB) for a 1M-unit chain,
-/// versus a cap-sized final tree of ~cap nodes to drop either way. (The fold
-/// shares the materialized flat via the Arc — O(1) after the one copy.)
-const ROPE_MAX_DEPTH: usize = 16384;
-
 impl Trace for JsString {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
-        // A Flat's buffer is an external Arc (not GC-managed); a Rope's
-        // children are handles (the flat cache is an external Arc too).
         match self {
             JsString::Flat(_) => {}
+            JsString::ConsString { left, right, .. } => {
+                left.trace(visit);
+                right.trace(visit);
+            }
             JsString::Rope { left, right, .. } => {
-                if let Some(left) = left {
-                    left.trace(visit);
+                if let Some(l) = left {
+                    l.trace(visit);
                 }
-                if let Some(right) = right {
-                    right.trace(visit);
+                if let Some(r) = right {
+                    r.trace(visit);
                 }
             }
         }
@@ -87,6 +101,11 @@ impl JsString {
     /// node that IS the result box — one allocation per append. Small results
     /// (and empty operands) stay flat or reuse an operand. The operands' own
     /// boxes become the node's children (refcount bumps, no copies).
+    ///
+    /// For `s += 'x'` loops: Flat appends stay Flat up to CONCAT_FLAT_THRESHOLD.
+    /// Beyond that, a lean ConsString node is created — just a left pointer
+    /// and total length, no buffer/Vec/Arc. The accumulated string is
+    /// materialized lazily on first `as_slice()` access.
     pub fn concat(left: &Handle<JsString>, right: &Handle<JsString>) -> Handle<JsString> {
         if right.is_empty() {
             return *left;
@@ -101,19 +120,30 @@ impl JsString {
             units.extend_from_slice(right.as_slice());
             return Handle::new(JsString::Flat(units.into()));
         }
-        // Fold an over-deep left side into one shared flat so the tree stays
-        // shallow (see ROPE_MAX_DEPTH): the materialization copy is amortized
-        // across the cap appends, and the Arc share makes the fold itself
-        // O(1). Appends between folds are a single node allocation.
-        let left = if left.depth() >= ROPE_MAX_DEPTH as u32 {
-            Handle::new(JsString::Flat(left.flat_arc()))
-        } else {
-            *left
-        };
-        let depth = 1 + left.depth().max(right.depth());
-        Handle::new(JsString::Rope {
-            left: Some(left),
-            right: Some(*right),
+        // Both Flat and small (≤ 128) → merge into Flat.
+        // Beyond that, use ConsString or Rope.
+        if let (JsString::Flat(left_units), JsString::Flat(right_units)) = (&**left, &**right) {
+            if len <= 128 {
+                let mut units = Vec::with_capacity(len);
+                units.extend_from_slice(left_units);
+                units.extend_from_slice(right_units);
+                return Handle::new(JsString::Flat(units.into()));
+            }
+            // Both Flat but large → create a balanced Rope.
+            return Handle::new(JsString::Rope {
+                left: Some(*left),
+                right: Some(*right),
+                len,
+                depth: 1,
+                flat: OnceLock::new(),
+            });
+        }
+        // Default: create a lean ConsString append-node (like V8).
+        // Each append = one Gc allocation. No buffer, no Arc, no Vec clone.
+        let depth = 1 + left.depth();
+        Handle::new(JsString::ConsString {
+            left: *left,
+            right: *right,
             len,
             depth,
             flat: OnceLock::new(),
@@ -124,17 +154,7 @@ impl JsString {
     fn depth(&self) -> u32 {
         match self {
             JsString::Flat(_) => 0,
-            JsString::Rope { depth, .. } => *depth,
-        }
-    }
-
-    /// The materialized contiguous form as a shared buffer, materializing the
-    /// rope first if needed. The Arc share lets `concat`'s depth fold reuse
-    /// the buffer instead of copying it a second time.
-    fn flat_arc(&self) -> Arc<[u16]> {
-        match self {
-            JsString::Flat(arc) => arc.clone(),
-            JsString::Rope { flat, .. } => flat.get_or_init(|| self.flatten()).clone(),
+            JsString::ConsString { depth, .. } | JsString::Rope { depth, .. } => *depth,
         }
     }
 
@@ -142,7 +162,7 @@ impl JsString {
     pub fn len(&self) -> usize {
         match self {
             JsString::Flat(units) => units.len(),
-            JsString::Rope { len, .. } => *len,
+            JsString::ConsString { len, .. } | JsString::Rope { len, .. } => *len,
         }
     }
 
@@ -153,7 +173,9 @@ impl JsString {
     pub fn as_slice(&self) -> &[u16] {
         match self {
             JsString::Flat(units) => units,
-            JsString::Rope { flat, .. } => flat.get_or_init(|| self.flatten()).as_ref(),
+            JsString::ConsString { flat, .. } | JsString::Rope { flat, .. } => {
+                flat.get_or_init(|| self.flatten()).as_ref()
+            }
         }
     }
 
@@ -200,35 +222,56 @@ impl JsString {
     /// the call stack.
     fn flatten(&self) -> Arc<[u16]> {
         let mut units = Vec::with_capacity(self.len());
-        // Pop the left side first, so the leaves emit in order. Children are
-        // always `Some` until the node is being dropped; a missing side is
-        // skipped defensively.
-        let mut stack = vec![self];
-        while let Some(string) = stack.pop() {
-            match string {
-                JsString::Flat(flat) => units.extend_from_slice(flat),
-                JsString::Rope { left, right, .. } => {
-                    if let Some(right) = right.as_deref() {
-                        stack.push(right);
+        self.flatten_into(&mut units);
+        Arc::from(units)
+    }
+
+    /// Iterative leaf-order materialization of self into `units`.
+    ///
+    /// For ConsString, the tree is left-leaning: `left + right`. We traverse
+    /// left-first by pushing the right child before left.
+    fn flatten_into(&self, units: &mut Vec<u16>) {
+        let mut stack: Vec<FlattenLeaf> = vec![FlattenLeaf::String(self)];
+        while let Some(item) = stack.pop() {
+            match item {
+                FlattenLeaf::String(string) => match string {
+                    JsString::Flat(flat) => units.extend_from_slice(flat.as_ref()),
+                    JsString::ConsString { left, right, .. } => {
+                        // Push right first (so it's processed after left).
+                        stack.push(FlattenLeaf::String(right));
+                        stack.push(FlattenLeaf::String(left));
                     }
-                    if let Some(left) = left.as_deref() {
-                        stack.push(left);
+                    JsString::Rope { left, right, .. } => {
+                        if let Some(r) = right {
+                            stack.push(FlattenLeaf::String(r));
+                        }
+                        if let Some(l) = left {
+                            stack.push(FlattenLeaf::String(l));
+                        }
                     }
-                }
+                },
             }
         }
-        // Vec → Arc reuses the buffer (exact capacity), no second copy.
-        Arc::from(units)
     }
 }
 
 impl Clone for JsString {
     fn clone(&self) -> Self {
-        // Flat strings share their buffer (Arc bump, O(1)); rope clones share
-        // their children (Rc bumps) and get a fresh flat cache — strings are
-        // immutable, so sharing is never observable.
         match self {
             JsString::Flat(units) => JsString::Flat(units.clone()),
+            JsString::ConsString {
+                left,
+                right,
+                len,
+                depth,
+                ..
+            } => JsString::ConsString {
+                left: *left,
+                right: *right,
+                len: *len,
+                depth: *depth,
+                flat: OnceLock::new(),
+            },
             JsString::Rope {
                 left,
                 right,
@@ -511,15 +554,21 @@ mod tests {
     #[test]
     fn concat_large_builds_a_rope_with_correct_content() {
         // Cross the flat threshold by accumulating a long string.
+        // Single-unit right operands produce `ConsString` (the append-heavy
+        // fast path); two-unit chunks produce `Rope`.
         let mut s = Handle::new(JsString::from_utf8(""));
         let leaf = Handle::new(JsString::from_utf8("x"));
-        for _ in 0..64 {
+        for _ in 0..200 {
             s = JsString::concat(&s, &leaf);
         }
-        assert!(matches!(*s, JsString::Rope { .. }));
-        assert_eq!(s.len(), 64);
+        // 64 single-unit appends → ConsString, not Rope.
+        assert!(matches!(
+            *s,
+            JsString::ConsString { .. } | JsString::Rope { .. }
+        ));
+        assert_eq!(s.len(), 200);
         let units = s.as_slice();
-        assert_eq!(units.len(), 64);
+        assert_eq!(units.len(), 200);
         assert!(units.iter().all(|&u| u == b'x' as u16));
         // The materialized form is cached: a second view is the same buffer.
         let again = s.as_slice();
@@ -578,12 +627,16 @@ mod tests {
         // materialization and the final drop exercise the iterative paths.
         let mut s = Handle::new(JsString::from_utf8(""));
         let leaf = Handle::new(JsString::from_utf8("x"));
-        for _ in 0..200_000 {
+        for i in 0..200_000 {
             s = JsString::concat(&s, &leaf);
+            if i < 3 || i >= 199_998 {
+                eprintln!("iter {}: len={}", i, s.len());
+            }
         }
-        assert_eq!(s.len(), 200_000);
+        let total = s.as_slice().len();
+        eprintln!("total_len={}", total);
+        assert_eq!(total, 200_000);
         let units = s.as_slice();
-        assert_eq!(units.len(), 200_000);
         assert!(units.iter().all(|&u| u == b'x' as u16));
 
         // Right-leaning prepends: the cap only inspects the left side, so the
@@ -592,9 +645,41 @@ mod tests {
         for _ in 0..200_000 {
             p = JsString::concat(&leaf, &p);
         }
-        assert_eq!(p.len(), 200_000);
+        let plen = p.len();
+        let punits = p.as_slice();
+        eprintln!("prepend: len={} as_slice_len={}", plen, punits.len());
+        assert_eq!(plen, 200_000);
         let units = p.as_slice();
         assert_eq!(units.len(), 200_000);
         assert!(units.iter().all(|&u| u == b'x' as u16));
+    }
+
+    #[test]
+    fn cons_string_flattens_correctly() {
+        // Verify that nested ConsString (single-unit right operands) flatten
+        // in left-to-right order, not reversed.
+        let mut s = Handle::new(JsString::from_utf16(&[b'a' as u16]));
+        let x = Handle::new(JsString::from_utf8("x"));
+        for _ in 0..20 {
+            s = JsString::concat(&s, &x);
+        }
+        eprintln!(
+            "after 20 appends: len={} starts_with_a={}",
+            s.len(),
+            s.code_unit(0) == Some(b'a' as u16)
+        );
+        let emoji = Handle::new(JsString::from_utf16(&[0xD83D, 0xDE00]));
+        s = JsString::concat(&s, &emoji);
+        eprintln!(
+            "after emoji: len={} slice_len={}",
+            s.len(),
+            s.as_slice().len()
+        );
+        assert_eq!(s.len(), 23); // 21 units + the surrogate pair
+        assert_eq!(s.code_unit(0), Some(b'a' as u16));
+        assert_eq!(s.code_unit(20), Some(b'x' as u16));
+        assert_eq!(s.code_point_at(21), Some((0x1F600, false, 2)));
+        // Content is correct (Flat after emoji merge).
+        assert_eq!(s.as_slice().len(), 23);
     }
 }
