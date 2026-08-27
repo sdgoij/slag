@@ -203,7 +203,7 @@ fn install_methods(
         .intrinsics
         .define(HAS_INSTANCE, Value::Function(has_instance));
     function_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("hasInstance").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("hasInstance")),
         &PropertyDescriptor {
             value: Some(Value::Function(has_instance)),
             writable: Some(false),
@@ -715,7 +715,7 @@ mod tests {
             ValueKind::Function(f) => f,
             other => panic!("C should be a function, got {other:?}"),
         };
-        let key = PropertyKey::Symbol(crux::symbol::well_known("hasInstance").as_ref().clone());
+        let key = PropertyKey::Symbol(crux::symbol::well_known("hasInstance"));
         let override_with = |result: bool| {
             let method = Function::create_builtin(
                 Some(JsString::from_utf8("[Symbol.hasInstance]")),

@@ -7,11 +7,15 @@ use crate::string::{AtomId, JsString, intern, intern_utf8, lookup};
 use crate::symbol::{Symbol, descriptive_string};
 use crate::value::{Value, is_callable};
 
-/// A property key: an interned String or a Symbol (spec 6.1.7.6).
+/// A property key: an interned String or a Symbol (spec 6.1.7.6). The Symbol
+/// variant holds a GC handle — a key never owns a Symbol by value, so the
+/// key stays 16 bytes (the by-value form with its `JsString` description was
+/// 64, bloating every `SmallProps` entry and the object itself) and the
+/// symbol box is rooted through the key's trace.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PropertyKey {
     String(AtomId),
-    Symbol(Symbol),
+    Symbol(Handle<Symbol>),
 }
 
 impl crate::heap::Trace for PropertyKey {

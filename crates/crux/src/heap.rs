@@ -76,6 +76,13 @@ impl<T: ?Sized + Trace + PartialEq> PartialEq for Gc<T> {
     }
 }
 impl<T: ?Sized + Trace + Eq> Eq for Gc<T> {}
+impl<T: ?Sized + Trace + std::hash::Hash> std::hash::Hash for Gc<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Hash the pointee, not the pointer: a handle to an equal value must
+        // hash like the value (PropertyKey's derived Hash relies on this).
+        (**self).hash(state);
+    }
+}
 
 impl<T: ?Sized + Trace> Copy for Gc<T> {}
 impl<T: ?Sized + Trace> Clone for Gc<T> {

@@ -188,7 +188,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
     )?;
     // %Intl.Segmenter.prototype%[@@toStringTag] = "Intl.Segmenter".
     proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(Value::String(Handle::new(JsString::from_utf8(
                 "Intl.Segmenter",
@@ -284,7 +284,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         .intrinsics
         .define(SEGMENTS_ITERATOR, Value::Function(segments_iter));
     segments_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("iterator")),
         &PropertyDescriptor {
             value: Some(Value::Function(segments_iter)),
             writable: Some(true),
@@ -328,7 +328,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
     )?;
     // %IntlSegmentIteratorPrototype%[@@toStringTag] = "Segmenter String Iterator".
     segment_iter_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(Value::String(Handle::new(JsString::from_utf8(
                 "Segmenter String Iterator",

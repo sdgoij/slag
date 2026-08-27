@@ -171,7 +171,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         )?;
         // @@toStringTag (spec 27.4.3.3/27.5.3.3/27.6.3.3).
         proto.define_property_key(
-            &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+            &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
             &PropertyDescriptor {
                 value: Some(Value::String(Handle::new(JsString::from_utf8(kind.tag())))),
                 writable: Some(false),

@@ -1994,7 +1994,7 @@ pub(crate) fn create_unmapped_arguments_object(
     {
         obj.define_property_key(
             &crux::property::PropertyKey::Symbol(
-                crux::symbol::well_known("iterator").as_ref().clone(),
+                crux::symbol::well_known("iterator")
             ),
             &crux::property::PropertyDescriptor {
                 value: Some(values),
@@ -2095,7 +2095,7 @@ pub(crate) fn create_mapped_arguments_object(
     {
         obj.define_property_key(
             &crux::property::PropertyKey::Symbol(
-                crux::symbol::well_known("iterator").as_ref().clone(),
+                crux::symbol::well_known("iterator")
             ),
             &crux::property::PropertyDescriptor {
                 value: Some(values),
@@ -2828,7 +2828,7 @@ pub(crate) fn function_declaration_instantiation(
         {
             obj.define_property_key(
                 &crux::property::PropertyKey::Symbol(
-                    crux::symbol::well_known("iterator").as_ref().clone(),
+                    crux::symbol::well_known("iterator")
                 ),
                 &crux::property::PropertyDescriptor {
                     value: Some(values),
@@ -3095,7 +3095,7 @@ mod tests {
         iterable
             .define_property_key(
                 &crux::property::PropertyKey::Symbol(
-                    crux::symbol::well_known("iterator").as_ref().clone(),
+                    crux::symbol::well_known("iterator")
                 ),
                 &crux::property::PropertyDescriptor::data(Value::Function(
                     crux::Function::create_builtin(

@@ -317,7 +317,7 @@ fn prototype_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsError
             let tag = crate::context::get_property_key(
                 agent,
                 &object,
-                &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+                &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
                 object,
             )?;
             match tag.kind() {
@@ -458,7 +458,7 @@ fn own_keys_of(agent: &mut Agent, value: &Value, want_symbols: bool) -> Result<V
         if matches {
             let value = match key {
                 PropertyKey::String(id) => Value::String(Handle::new(crux::lookup(id))),
-                PropertyKey::Symbol(sym) => Value::Symbol(Handle::new(sym)),
+                PropertyKey::Symbol(sym) => Value::Symbol(sym),
             };
             array.create_data_property(&JsString::from_utf8(&index.to_string()), value)?;
             index += 1;
@@ -1307,7 +1307,7 @@ fn object_group_by(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> 
         let key = crate::context::to_property_key(agent, &key)?;
         Ok(match key {
             PropertyKey::String(id) => Value::String(Handle::new(crux::string::lookup(id))),
-            PropertyKey::Symbol(symbol) => Value::Symbol(Handle::new(symbol)),
+            PropertyKey::Symbol(symbol) => Value::Symbol(symbol),
         })
     })?;
     // spec 20.1.2.9 steps 2-4: OrdinaryObjectCreate(null), then one
@@ -1317,7 +1317,7 @@ fn object_group_by(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> 
         let array = crate::builtins::array::array_from_values(agent, &elements)?;
         let key = match key.kind() {
             ValueKind::String(text) => PropertyKey::String(crux::intern(text.as_slice())),
-            ValueKind::Symbol(symbol) => PropertyKey::Symbol(symbol.as_ref().clone()),
+            ValueKind::Symbol(symbol) => PropertyKey::Symbol(symbol),
             _ => continue,
         };
         obj.create_data_property_key(&key, array)?;
@@ -1696,7 +1696,7 @@ mod tests {
         let iterator_for_method = iterator;
         iterable
             .define_property_key(
-                &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
+                &PropertyKey::Symbol(crux::symbol::well_known("iterator")),
                 &crux::property::PropertyDescriptor::data(Value::Function(
                     Function::create_builtin(
                         Some(JsString::from_utf8("[Symbol.iterator]")),

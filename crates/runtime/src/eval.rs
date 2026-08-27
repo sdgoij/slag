@@ -2277,7 +2277,7 @@ mod tests {
         iterable
             .define_property_key(
                 &crux::property::PropertyKey::Symbol(
-                    crux::symbol::well_known("iterator").as_ref().clone(),
+                    crux::symbol::well_known("iterator")
                 ),
                 &crux::property::PropertyDescriptor::data(Value::Function(
                     crux::Function::create_builtin(

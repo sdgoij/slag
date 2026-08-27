@@ -44,9 +44,8 @@ pub fn to_primitive(value: &Value, hint: ToPrimitiveHint) -> Result<Value, JsErr
     // valueOf/toString loop, and its abrupt completion wins.
     match value.kind() {
         ValueKind::Object(obj) => {
-            let key = crate::property::PropertyKey::Symbol(
-                crate::symbol::well_known("toPrimitive").as_ref().clone(),
-            );
+            let key =
+                crate::property::PropertyKey::Symbol(crate::symbol::well_known("toPrimitive"));
             let method = obj.get_key(&key)?;
             if !matches!(method.kind(), ValueKind::Undefined | ValueKind::Null) {
                 if !is_callable(&method) {
@@ -60,9 +59,8 @@ pub fn to_primitive(value: &Value, hint: ToPrimitiveHint) -> Result<Value, JsErr
             ordinary_to_primitive(|name| obj.get(name), *value, hint)
         }
         ValueKind::Function(function) => {
-            let key = crate::property::PropertyKey::Symbol(
-                crate::symbol::well_known("toPrimitive").as_ref().clone(),
-            );
+            let key =
+                crate::property::PropertyKey::Symbol(crate::symbol::well_known("toPrimitive"));
             let method = function.get_key(&key)?;
             if !matches!(method.kind(), ValueKind::Undefined | ValueKind::Null) {
                 if !is_callable(&method) {
@@ -704,7 +702,7 @@ pub fn to_uint8_clamp(number: f64) -> u8 {
 pub fn to_property_key(value: &Value) -> Result<PropertyKey, JsError> {
     let key = to_primitive(value, ToPrimitiveHint::String)?;
     if let ValueKind::Symbol(sym) = key.kind() {
-        Ok(PropertyKey::Symbol(sym.as_ref().clone()))
+        Ok(PropertyKey::Symbol(sym))
     } else {
         let text = to_string(&key)?;
         Ok(PropertyKey::String(intern(text.as_slice())))
@@ -1024,7 +1022,7 @@ mod tests {
         let sym = crate::symbol::Symbol::new(Some(JsString::from_utf8("k")));
         assert_eq!(
             to_property_key(&Value::Symbol(Handle::new(sym.clone()))).unwrap(),
-            PropertyKey::Symbol(sym)
+            PropertyKey::Symbol(Handle::new(sym))
         );
     }
 

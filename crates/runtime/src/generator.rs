@@ -120,7 +120,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         function_proto,
     )?;
     proto.define_property_key(
-        &crux::property::PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
+        &crux::property::PropertyKey::Symbol(crux::symbol::well_known("iterator")),
         &PropertyDescriptor {
             value: Some(Value::Function(iterator_method)),
             writable: Some(true),
@@ -133,7 +133,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     // %Generator.prototype%[@@toStringTag] = "Generator" (spec 27.4.3.3).
     proto.define_property_key(
         &crux::property::PropertyKey::Symbol(
-            crux::symbol::well_known("toStringTag").as_ref().clone(),
+            crux::symbol::well_known("toStringTag")
         ),
         &PropertyDescriptor {
             value: Some(Value::String(Handle::new(JsString::from_utf8("Generator")))),

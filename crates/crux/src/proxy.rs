@@ -597,7 +597,7 @@ pub fn construct(slots: &ProxySlots, args: &[Value], new_target: &Value) -> Resu
 fn key_value(key: &PropertyKey) -> Value {
     match key {
         PropertyKey::String(id) => Value::String(Handle::new(crate::string::lookup(*id))),
-        PropertyKey::Symbol(sym) => Value::Symbol(Handle::new(sym.clone())),
+        PropertyKey::Symbol(sym) => Value::Symbol(*sym),
     }
 }
 

@@ -1194,4 +1194,48 @@ mod tests {
     fn eval_in(context: &mut Context, source: &str) -> JsValue {
         context.eval(source).unwrap()
     }
+
+    #[test]
+    fn symbol_property_keys_survive_per_allocation_collection() {
+        // With the stress collector, a collection runs after every
+        // allocation: a symbol-keyed property whose key handle is not traced
+        // (map transition, descriptor, property vector, for-in seen set)
+        // would be swept out from under the live object. Each snippet below
+        // exercises one such storage site.
+        let mut context = Context::new().unwrap();
+        context.set_gc_stress(true);
+        // Map transition keyed by a user symbol, then reads through it.
+        assert_eq!(
+            context
+                .eval("var s = Symbol('k'); var o = {}; for (var i = 0; i < 1000; i++) { o[s] = i; } o[s]")
+                .unwrap()
+                .as_number(),
+            Some(999.0)
+        );
+        // Well-known symbol keys installed at realm bootstrap and looked up.
+        assert_eq!(
+            context
+                .eval("var a = [1, 2]; var it = a[Symbol.iterator](); it.next().value")
+                .unwrap()
+                .as_number(),
+            Some(1.0)
+        );
+        // for-in over an object with symbol keys (the seen-set holds key
+        // handles transiently).
+        assert_eq!(
+            context
+                .eval("var s = Symbol('x'); var o = { a: 1 }; o[s] = 2; var n = 0; for (var k in o) { n++; } n")
+                .unwrap()
+                .as_number(),
+            Some(1.0)
+        );
+        // A symbol wrapper and its unwrapping.
+        assert_eq!(
+            context
+                .eval("var s = Symbol('w'); var o = Object(s); o.valueOf() === s")
+                .unwrap()
+                .as_boolean(),
+            Some(true)
+        );
+    }
 }

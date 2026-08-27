@@ -467,7 +467,7 @@ fn species_constructor(
             "constructor is not an object".into(),
         ));
     }
-    let species_key = PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone());
+    let species_key = PropertyKey::Symbol(crux::symbol::well_known("species"));
     let species = crate::context::get_property_key(agent, &ctor, &species_key, ctor)?;
     match species.kind() {
         ValueKind::Null | ValueKind::Undefined => Ok(default_ctor),
@@ -2691,7 +2691,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     })?;
     realm.intrinsics.define(ITERATOR, values_func);
     typed_array_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("iterator")),
         &PropertyDescriptor {
             value: Some(values_func),
             writable: Some(true),
@@ -2714,7 +2714,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .intrinsics
         .define(SPECIES, Value::Function(species_func));
     typed_array_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("species")),
         &PropertyDescriptor {
             value: None,
             writable: None,
@@ -2727,7 +2727,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     // The same accessor on the %TypedArray% constructor (spec 25.2.3.31);
     // the kind constructors inherit it through [[Prototype]] = %TypedArray%.
     typed_array_ctor.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("species")),
         &PropertyDescriptor {
             value: None,
             writable: None,
@@ -2781,7 +2781,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .intrinsics
         .define(GET_TO_STRING_TAG, Value::Function(tag_func));
     typed_array_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: None,
             writable: None,
@@ -2909,7 +2909,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             species_func.object.set_prototype_of(Some(function_proto))?;
         }
         kind_proto.define_property_key(
-            &PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone()),
+            &PropertyKey::Symbol(crux::symbol::well_known("species")),
             &PropertyDescriptor {
                 value: None,
                 writable: None,

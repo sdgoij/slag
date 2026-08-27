@@ -107,7 +107,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     proto.define_property_key(
         &crux::property::PropertyKey::Symbol(
-            crux::symbol::well_known("toStringTag").as_ref().clone(),
+            crux::symbol::well_known("toStringTag")
         ),
         &PropertyDescriptor {
             value: None,

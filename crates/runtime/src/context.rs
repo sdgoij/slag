@@ -129,7 +129,7 @@ pub fn to_primitive(
     let exotic = get_property_key(
         agent,
         value,
-        &PropertyKey::Symbol(crux::symbol::well_known("toPrimitive").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toPrimitive")),
         *value,
     )?;
     if !matches!(exotic.kind(), ValueKind::Undefined | ValueKind::Null) {
@@ -207,7 +207,7 @@ pub fn to_number(agent: &mut Agent, value: &Value) -> Result<f64, JsError> {
 pub fn to_property_key(agent: &mut Agent, value: &Value) -> Result<PropertyKey, JsError> {
     let key = to_primitive(agent, value, crux::convert::ToPrimitiveHint::String)?;
     match key.kind() {
-        ValueKind::Symbol(sym) => Ok(PropertyKey::Symbol(sym.as_ref().clone())),
+        ValueKind::Symbol(sym) => Ok(PropertyKey::Symbol(sym)),
         _ => {
             let text = to_string(agent, &key)?;
             Ok(PropertyKey::String(crux::intern(text.as_slice())))

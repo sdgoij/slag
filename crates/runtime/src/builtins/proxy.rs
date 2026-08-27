@@ -80,7 +80,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         },
     )?;
     proxy_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor::none(Value::String(Handle::new(JsString::from_utf8("Proxy")))),
     )?;
 

@@ -750,7 +750,7 @@ impl ObjectEnv {
         // spec 9.2.3.1 steps 4-9: `with` bindings are blocked when the
         // binding object's %Symbol.unscopables% property maps the name to a
         // truthy value.
-        let unscopables_key = PropertyKey::Symbol(crux::symbol::unscopables().as_ref().clone());
+        let unscopables_key = PropertyKey::Symbol(crux::symbol::unscopables());
         let unscopables = self.binding_object.get_key(&unscopables_key)?;
         if let ValueKind::Object(unscopables_obj) = unscopables.kind()
             && crux::convert::to_boolean(&unscopables_obj.get(name)?)
@@ -1338,7 +1338,7 @@ mod tests {
         unscopables
             .create_data_property(&name("blocked"), Value::Boolean(true))
             .unwrap();
-        let key = PropertyKey::Symbol(crux::symbol::unscopables().as_ref().clone());
+        let key = PropertyKey::Symbol(crux::symbol::unscopables());
         obj.create_data_property_key(&key, Value::Object(unscopables))
             .unwrap();
 

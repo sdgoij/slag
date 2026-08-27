@@ -181,7 +181,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     proto.define_property_key(
         &crux::property::PropertyKey::Symbol(
-            crux::symbol::well_known("asyncIterator").as_ref().clone(),
+            crux::symbol::well_known("asyncIterator")
         ),
         &PropertyDescriptor {
             value: Some(Value::Function(async_iterator_method)),
@@ -198,7 +198,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     // double-getPrototypeOf chain).
     proto.define_property_key(
         &crux::property::PropertyKey::Symbol(
-            crux::symbol::well_known("toStringTag").as_ref().clone(),
+            crux::symbol::well_known("toStringTag")
         ),
         &PropertyDescriptor {
             value: Some(Value::String(Handle::new(JsString::from_utf8(

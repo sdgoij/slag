@@ -2080,7 +2080,7 @@ pub fn for_of_begin(agent: &mut Agent, value: &Value) -> Result<ForOfState, JsEr
         && matches!(object.kind, crux::object::ObjectKind::Array)
         && object
             .get_own_property_key(&PropertyKey::Symbol(
-                crux::symbol::well_known("iterator").as_ref().clone(),
+                crux::symbol::well_known("iterator")
             ))?
             .is_none()
         && let Some(ap_value) = realm.intrinsics.get("%Array.prototype%")
@@ -2241,7 +2241,7 @@ fn for_of_fast_resolve(
     let Some(realm) = agent.current_realm().ok() else {
         return Ok(None);
     };
-    let iterator_key = PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone());
+    let iterator_key = PropertyKey::Symbol(crux::symbol::well_known("iterator"));
     let stock = realm.intrinsics.get("%Array.prototype[Symbol.iterator]%");
     let Some(ap_iterator) = array_proto.get_own_property_key(&iterator_key)? else {
         return Ok(None);
@@ -2415,8 +2415,6 @@ pub fn get_method(
     // `name`; the registry keys by the short name.
     let key = PropertyKey::Symbol(
         crux::symbol::well_known(symbol_name.trim_start_matches("@@"))
-            .as_ref()
-            .clone(),
     );
     let method = get_property_key(agent, value, &key, *value)?;
     match method.kind() {

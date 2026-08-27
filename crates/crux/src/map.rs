@@ -83,7 +83,13 @@ impl Trace for Map {
         if let Some(proto) = self.prototype {
             proto.trace(visit);
         }
-        for child in self.transitions.values() {
+        // Descriptor and transition keys are `PropertyKey`s; the Symbol
+        // variant holds a GC handle, so the keys are heap edges too.
+        for entry in &self.descriptors {
+            entry.0.trace(visit);
+        }
+        for (key, child) in &self.transitions {
+            key.trace(visit);
             child.trace(visit);
         }
         if let Some(bp) = self.back_pointer {

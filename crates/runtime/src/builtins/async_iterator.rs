@@ -226,7 +226,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         function_proto,
     )?;
     proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("asyncIterator").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("asyncIterator")),
         &PropertyDescriptor {
             value: Some(Value::Function(async_iterator)),
             writable: Some(true),
@@ -250,7 +250,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         Value::Function(async_dispose),
     );
     proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("asyncDispose").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("asyncDispose")),
         &PropertyDescriptor {
             value: Some(Value::Function(async_dispose)),
             writable: Some(true),
@@ -264,7 +264,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     // @@toStringTag = "Async Iterator" with { writable: false, enumerable:
     // false, configurable: true } (spec 27.1.4.3).
     proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(Value::String(Handle::new(JsString::from_utf8(
                 "Async Iterator",
@@ -371,7 +371,7 @@ fn install_helper_prototype(realm: &Handle<Realm>) -> Result<(), JsError> {
         None,
     )?;
     proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("asyncIterator").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("asyncIterator")),
         &PropertyDescriptor {
             value: Some(Value::Function(async_iterator)),
             writable: Some(true),
@@ -382,7 +382,7 @@ fn install_helper_prototype(realm: &Handle<Realm>) -> Result<(), JsError> {
         },
     )?;
     proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor::none(Value::String(Handle::new(JsString::from_utf8(
             "Async Iterator Helper",
         )))),

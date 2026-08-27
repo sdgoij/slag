@@ -1067,7 +1067,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         )?;
     }
     json_object.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(str("JSON")),
             writable: Some(false),

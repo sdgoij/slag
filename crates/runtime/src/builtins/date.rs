@@ -1062,7 +1062,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .intrinsics
         .define(DATE_TO_PRIMITIVE, Value::Function(to_primitive));
     date_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toPrimitive").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toPrimitive")),
         &PropertyDescriptor {
             value: Some(Value::Function(to_primitive)),
             writable: Some(false),

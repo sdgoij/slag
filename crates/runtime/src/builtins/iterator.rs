@@ -356,7 +356,7 @@ fn install_prototype_methods(
         Value::Function(dispose_method),
     );
     proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("dispose").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("dispose")),
         &PropertyDescriptor {
             value: Some(Value::Function(dispose_method)),
             writable: Some(true),
@@ -380,7 +380,7 @@ fn install_prototype_methods(
         Value::Function(iterator_method),
     );
     proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("iterator")),
         &PropertyDescriptor {
             value: Some(Value::Function(iterator_method)),
             writable: Some(true),
@@ -416,7 +416,7 @@ fn install_prototype_methods(
         Value::Function(tag_set),
     );
     proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: None,
             writable: None,
@@ -536,7 +536,7 @@ fn install_helper_prototype(realm: &Handle<Realm>) -> Result<(), JsError> {
         Value::Function(iterator_method),
     );
     proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("iterator")),
         &PropertyDescriptor {
             value: Some(Value::Function(iterator_method)),
             writable: Some(true),
@@ -547,7 +547,7 @@ fn install_helper_prototype(realm: &Handle<Realm>) -> Result<(), JsError> {
         },
     )?;
     proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor::none(Value::String(Handle::new(JsString::from_utf8(
             "Iterator Helper",
         )))),
@@ -601,7 +601,7 @@ fn install_wrap_prototype(realm: &Handle<Realm>) -> Result<(), JsError> {
         Value::Function(iterator_method),
     );
     proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("iterator")),
         &PropertyDescriptor {
             value: Some(Value::Function(iterator_method)),
             writable: Some(true),
@@ -705,7 +705,7 @@ pub fn dispatch_call(
             this,
             args,
             &proto_obj,
-            PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+            PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         ));
     }
     if intrinsics.get(ITERATOR).as_ref() == Some(callee) {

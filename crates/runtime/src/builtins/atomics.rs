@@ -779,7 +779,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         )?;
     }
     atomics.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(str("Atomics")),
             writable: Some(false),

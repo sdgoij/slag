@@ -243,7 +243,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
 
     // spec 21.2.3: BigInt.prototype[@@toStringTag] = "BigInt".
     bigint_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(Value::String(Handle::new(JsString::from_utf8("BigInt")))),
             writable: Some(false),

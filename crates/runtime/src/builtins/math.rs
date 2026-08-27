@@ -655,7 +655,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
 
     // spec 21.3.1: Math[@@toStringTag] = "Math".
     math.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(Value::String(Handle::new(JsString::from_utf8("Math")))),
             writable: Some(false),
@@ -934,7 +934,7 @@ mod tests {
             .unwrap();
             iterable
                 .create_data_property_key(
-                    &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
+                    &PropertyKey::Symbol(crux::symbol::well_known("iterator")),
                     Value::Function(iterator_method),
                 )
                 .unwrap();

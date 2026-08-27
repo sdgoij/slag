@@ -3283,7 +3283,7 @@ mod tests {
             &mut evaluated.agent,
             &evaluated.namespace,
             &crux::property::PropertyKey::Symbol(
-                crux::symbol::well_known("toStringTag").as_ref().clone(),
+                crux::symbol::well_known("toStringTag")
             ),
             evaluated.namespace,
         )

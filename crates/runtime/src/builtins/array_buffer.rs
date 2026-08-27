@@ -311,7 +311,7 @@ fn species_constructor(
             "constructor is not an object".into(),
         ));
     }
-    let species_key = PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone());
+    let species_key = PropertyKey::Symbol(crux::symbol::well_known("species"));
     let species = get_property_key(agent, &ctor, &species_key, ctor)?;
     match species.kind() {
         ValueKind::Null | ValueKind::Undefined => Ok(default_ctor),
@@ -1194,7 +1194,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .intrinsics
         .define(AB_SPECIES, Value::Function(ab_species));
     ab_ctor.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("species")),
         &PropertyDescriptor {
             value: None,
             writable: None,
@@ -1266,7 +1266,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         )?;
     }
     ab_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(str("ArrayBuffer")),
             writable: Some(false),
@@ -1328,7 +1328,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .intrinsics
         .define(SAB_SPECIES, Value::Function(sab_species));
     sab_ctor.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("species")),
         &PropertyDescriptor {
             value: None,
             writable: None,
@@ -1387,7 +1387,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         )?;
     }
     sab_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(str("SharedArrayBuffer")),
             writable: Some(false),

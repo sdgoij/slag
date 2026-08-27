@@ -217,7 +217,7 @@ fn install_stack(realm: &Handle<Realm>, name: &str, is_async: bool) -> Result<()
         Value::Function(dispose_method),
     );
     proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known(dispose_symbol).as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known(dispose_symbol)),
         &PropertyDescriptor {
             value: Some(Value::Function(dispose_method)),
             writable: Some(true),
@@ -255,7 +255,7 @@ fn install_stack(realm: &Handle<Realm>, name: &str, is_async: bool) -> Result<()
 
     // @@toStringTag.
     proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(Value::String(Handle::new(JsString::from_utf8(tag)))),
             writable: Some(false),
@@ -452,7 +452,7 @@ fn get_dispose_method(agent: &mut Agent, value: &Value, is_async: bool) -> Resul
     let method = crate::context::get_property_key(
         agent,
         value,
-        &PropertyKey::Symbol(crux::symbol::well_known(symbol).as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known(symbol)),
         *value,
     )?;
     if is_async && matches!(method.kind(), ValueKind::Undefined | ValueKind::Null) {

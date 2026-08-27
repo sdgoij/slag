@@ -1006,7 +1006,7 @@ fn species_constructor(
             "constructor is not an object".into(),
         ));
     }
-    let species_key = PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone());
+    let species_key = PropertyKey::Symbol(crux::symbol::well_known("species"));
     let species = get_property_key(agent, &ctor, &species_key, ctor)?;
     match species.kind() {
         // The pinned fixtures follow the ES6 text: a null/undefined species
@@ -1345,7 +1345,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .intrinsics
         .define(SPECIES, Value::Function(species_func));
     regexp_ctor.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("species")),
         &PropertyDescriptor {
             value: None,
             writable: None,
@@ -1529,8 +1529,6 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         realm.intrinsics.define(key, Value::Function(func));
         let symbol_key = PropertyKey::Symbol(
             crux::symbol::well_known(symbol_name.trim_start_matches("@@"))
-                .as_ref()
-                .clone(),
         );
         regexp_proto.define_property_key(
             &symbol_key,
@@ -1576,7 +1574,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         },
     )?;
     iterator_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(Value::String(Handle::new(JsString::from_utf8(
                 "RegExp String Iterator",

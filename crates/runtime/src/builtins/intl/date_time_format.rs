@@ -2205,7 +2205,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
     )?;
     // %Intl.DateTimeFormat.prototype%[@@toStringTag] = "Intl.DateTimeFormat".
     proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(Value::String(Handle::new(JsString::from_utf8(
                 "Intl.DateTimeFormat",
@@ -2289,7 +2289,7 @@ fn date_time_format_record(agent: &Agent, this: &Value) -> Result<DateTimeFormat
 
 /// The `[[FallbackSymbol]]` used by the legacy constructor mode (shared
 /// with NumberFormat — it is `%Intl%.[[FallbackSymbol]]`, per-realm).
-fn fallback_symbol(agent: &Agent) -> Result<crux::symbol::Symbol, JsError> {
+fn fallback_symbol(agent: &Agent) -> Result<crux::handle::Handle<crux::symbol::Symbol>, JsError> {
     number_format::fallback_symbol(agent)
 }
 

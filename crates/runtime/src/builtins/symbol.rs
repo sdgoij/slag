@@ -209,7 +209,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .intrinsics
         .define(PROTO_TO_PRIMITIVE, Value::Function(to_primitive));
     symbol_proto.define_property_key(
-        &PropertyKey::Symbol(well_known("toPrimitive").as_ref().clone()),
+        &PropertyKey::Symbol(well_known("toPrimitive")),
         &PropertyDescriptor {
             value: Some(Value::Function(to_primitive)),
             writable: Some(false),
@@ -222,7 +222,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     // Symbol.prototype[@@toStringTag] (20.4.3.6): "Symbol", writable and
     // enumerable false, configurable true.
     symbol_proto.define_property_key(
-        &PropertyKey::Symbol(well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(Value::String(Handle::new(JsString::from_utf8("Symbol")))),
             writable: Some(false),

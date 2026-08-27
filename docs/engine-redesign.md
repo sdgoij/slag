@@ -44,19 +44,30 @@ Landed and committed (in order):
   write the 528B `JsObject` directly in the arena slot, skipping the
   stack-temp build + memcpy that measured ~80ns of the ~134ns per-alloc.
   Measured: construct churn ~23.6ms → ~21.7ms median.
+- `b8f4bc1` — **write-once `Copy` fields → `Cell`**: the handle
+  back-references (`JsObject.self_handle`, `JsObject.function_self`,
+  `Function.self_handle`) and the wrapper mirror `boxed` drop `RefCell` for
+  lock-free `Cell`s, removing the borrow bookkeeping from the hot
+  accessors (`self_value`/`function_value`/`handle`) and from
+  `ordinary_to_primitive`. The BigInt wrapper mirror now stores a GC
+  handle instead of an owned integer, so `ordinary_to_primitive` returns it
+  without a per-read clone + fresh box, and `boxed` became a trace edge
+  (plus a `Trace for Cell<T>` impl). Measured: noise-neutral.
 
 Uncommitted on top of B5.4:
 
-- **Write-once `Copy` fields → `Cell`**: the handle back-references
-  (`JsObject.self_handle`, `JsObject.function_self`, `Function.self_handle`)
-  and the wrapper mirror `boxed` drop `RefCell` for lock-free `Cell`s,
-  removing the borrow bookkeeping from the hot accessors
-  (`self_value`/`function_value`/`handle` run on every receiver path) and
-  from `ordinary_to_primitive`. The BigInt wrapper mirror now stores a GC
-  handle instead of an owned integer, so `ordinary_to_primitive` returns it
-  without a per-read clone + fresh box, and `boxed` became a trace edge.
-  Measured: noise-neutral on the construct-churn gate (the micro-bench is
-  dominated by the 528B `JsObject` alloc).
+- **`PropertyKey::Symbol` by value → `Handle<Symbol>`**: the key never owns
+  a Symbol (with its by-value `JsString` description) any more, so
+  `PropertyKey` drops 64B → 16B and `JsObject` 488B → 392B (~20% smaller;
+  `SmallProps` 240B → 144B). `Gc<T>` gained a pointee-forwarding `Hash`
+  impl, `Map::trace` now visits its descriptor/transition keys (they became
+  real arena edges — the by-value form had none), and the ~50 call sites
+  that cloned `well_known(...).as_ref().clone()` into keys now pass the
+  handle directly (`proxy`'s key→Value conversion skips a per-read box
+  alloc too). Plus a per-allocation-collection smoke test in the embed
+  suite (runs in ~0.04s, the fast in-suite stand-in for `--gc-stress`
+  sweeps). Measured: construct churn ~22.4ms → ~20.4ms median (-9%),
+  other rows flat.
 
 Measured result (release, interleaved medians): construct churn ~53ms →
 **~20ms**, string concat ~6.6ms → **~4.3ms**, other rows flat or better.

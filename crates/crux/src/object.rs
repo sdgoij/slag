@@ -1084,7 +1084,7 @@ impl JsObject {
 
     /// The module namespace's `@@toStringTag` property key (spec 26.3.1).
     fn namespace_to_string_tag_key() -> PropertyKey {
-        PropertyKey::Symbol(well_known("toStringTag").as_ref().clone())
+        PropertyKey::Symbol(well_known("toStringTag"))
     }
 
     /// The module namespace's `@@toStringTag` value: "Module", or
@@ -1196,7 +1196,7 @@ impl JsObject {
             _ => unreachable!(),
         };
         object.properties.borrow_mut().push((
-            PropertyKey::Symbol(well_known("toStringTag").as_ref().clone()),
+            PropertyKey::Symbol(well_known("toStringTag")),
             Property::data(
                 Value::String(Handle::new(Self::namespace_tag_value(slots))),
                 false,
@@ -1285,7 +1285,7 @@ impl JsObject {
         // spec steps 25-26: @@iterator and callee. %Array.prototype.values%
         // joins with Phase 8.
         obj.define_property_key(
-            &PropertyKey::Symbol(well_known("iterator").as_ref().clone()),
+            &PropertyKey::Symbol(well_known("iterator")),
             &PropertyDescriptor {
                 value: Some(Value::Undefined),
                 writable: Some(true),
@@ -1352,7 +1352,7 @@ impl JsObject {
             obj.create_data_property(&JsString::from_utf8(&index.to_string()), *value)?;
         }
         obj.define_property_key(
-            &PropertyKey::Symbol(well_known("iterator").as_ref().clone()),
+            &PropertyKey::Symbol(well_known("iterator")),
             &PropertyDescriptor {
                 value: Some(Value::Undefined),
                 writable: Some(true),
@@ -2294,7 +2294,7 @@ impl JsObject {
             ObjectKind::ModuleNamespace(slots) => {
                 let mut keys = slots.exports.clone();
                 keys.push(PropertyKey::Symbol(
-                    well_known("toStringTag").as_ref().clone(),
+                    well_known("toStringTag")
                 ));
                 Ok(keys)
             }
@@ -3945,7 +3945,7 @@ mod tests {
     fn symbol_keyed_properties_are_supported() {
         let obj = JsObject::ordinary_object_create(None);
         let sym = crate::symbol::unscopables();
-        let key = PropertyKey::Symbol(sym.as_ref().clone());
+        let key = PropertyKey::Symbol(sym);
         obj.create_data_property_key(&key, Value::Number(9.0))
             .unwrap();
         assert!(obj.has_own_property_key(&key).unwrap());
@@ -3956,7 +3956,7 @@ mod tests {
         );
         let other = Symbol::new(Some(JsString::from_utf8("Symbol.unscopables")));
         assert!(
-            !obj.has_own_property_key(&PropertyKey::Symbol(other))
+            !obj.has_own_property_key(&PropertyKey::Symbol(Handle::new(other)))
                 .unwrap()
         );
     }
@@ -4293,7 +4293,7 @@ mod tests {
         assert!(prop.enumerable);
         assert!(!prop.configurable);
         assert_eq!(string.get(&key("01")).unwrap(), Value::Undefined);
-        let sym = PropertyKey::Symbol(Symbol::new(None));
+        let sym = PropertyKey::Symbol(Handle::new(Symbol::new(None)));
         assert_eq!(string.get_key(&sym).unwrap(), Value::Undefined);
     }
 
@@ -4548,10 +4548,10 @@ mod tests {
         assert_eq!(
             ns.own_property_keys().unwrap(),
             vec![PropertyKey::Symbol(
-                well_known("toStringTag").as_ref().clone()
+                well_known("toStringTag")
             )]
         );
-        let tag_key = PropertyKey::Symbol(well_known("toStringTag").as_ref().clone());
+        let tag_key = PropertyKey::Symbol(well_known("toStringTag"));
         let tag = ns.get_own_property_key(&tag_key).unwrap().unwrap();
         assert_eq!(
             tag.value(),
@@ -4595,7 +4595,7 @@ mod tests {
             );
         }
         assert_eq!(
-            array_index_of(&PropertyKey::Symbol(Symbol::new(None))),
+            array_index_of(&PropertyKey::Symbol(Handle::new(Symbol::new(None)))),
             None
         );
     }

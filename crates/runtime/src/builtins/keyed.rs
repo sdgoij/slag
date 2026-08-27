@@ -1575,7 +1575,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .intrinsics
         .define(MAP_SPECIES, Value::Function(map_species));
     map_ctor.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("species")),
         &PropertyDescriptor {
             value: None,
             writable: None,
@@ -1608,7 +1608,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         let is_iterator = name == "[Symbol.iterator]";
         if is_tag {
             map_proto.define_property_key(
-                &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+                &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
                 &PropertyDescriptor {
                     value: Some(str("Map")),
                     writable: Some(false),
@@ -1623,7 +1623,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         // @@iterator is %Map.prototype.entries%: the same function value.
         if is_iterator && let Some(entries) = entries_func {
             map_proto.define_property_key(
-                &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
+                &PropertyKey::Symbol(crux::symbol::well_known("iterator")),
                 &PropertyDescriptor {
                     value: Some(entries),
                     writable: Some(true),
@@ -1719,7 +1719,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         function_proto,
     )?;
     map_iterator_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("iterator")),
         &PropertyDescriptor {
             value: Some(Value::Function(map_self)),
             writable: Some(true),
@@ -1730,7 +1730,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         },
     )?;
     map_iterator_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(str("Map Iterator")),
             writable: Some(false),
@@ -1787,7 +1787,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .intrinsics
         .define(SET_SPECIES, Value::Function(set_species));
     set_ctor.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("species")),
         &PropertyDescriptor {
             value: None,
             writable: None,
@@ -1821,7 +1821,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         // @@iterator is %Set.prototype.values%: the same function value.
         if is_iterator && let Some(values) = values_func_opt {
             set_proto.define_property_key(
-                &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
+                &PropertyKey::Symbol(crux::symbol::well_known("iterator")),
                 &PropertyDescriptor {
                     value: Some(values),
                     writable: Some(true),
@@ -1878,7 +1878,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         },
     )?;
     set_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(str("Set")),
             writable: Some(false),
@@ -1945,7 +1945,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         function_proto,
     )?;
     set_iterator_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("iterator")),
         &PropertyDescriptor {
             value: Some(Value::Function(set_self)),
             writable: Some(true),
@@ -1956,7 +1956,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         },
     )?;
     set_iterator_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(str("Set Iterator")),
             writable: Some(false),
@@ -2036,7 +2036,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         )?;
     }
     weak_map_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(str("WeakMap")),
             writable: Some(false),
@@ -2113,7 +2113,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         )?;
     }
     weak_set_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(str("WeakSet")),
             writable: Some(false),

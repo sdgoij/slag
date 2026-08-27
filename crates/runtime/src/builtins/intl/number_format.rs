@@ -2414,21 +2414,23 @@ fn unwrap_number_format(agent: &mut Agent, nf: &Value) -> Result<Value, JsError>
 /// symbol with the description "IntlLegacyConstructedSymbol", cached in the
 /// realm intrinsics (the FallbackSymbol/per-realm fixture pins that two
 /// realms get distinct symbols).
-pub(crate) fn fallback_symbol(agent: &Agent) -> Result<crux::symbol::Symbol, JsError> {
+pub(crate) fn fallback_symbol(
+    agent: &Agent,
+) -> Result<crux::handle::Handle<crux::symbol::Symbol>, JsError> {
     const INTL_FALLBACK_SYMBOL: &str = "%Intl.FallbackSymbol%";
     let realm = agent.current_realm()?;
     if let Some(value) = realm.intrinsics.get(INTL_FALLBACK_SYMBOL)
         && let ValueKind::Symbol(sym) = value.kind()
     {
-        return Ok(sym.as_ref().clone());
+        return Ok(sym);
     }
-    let symbol =
-        crux::symbol::Symbol::new(Some(JsString::from_utf8("IntlLegacyConstructedSymbol")));
-    realm.intrinsics.define(
-        INTL_FALLBACK_SYMBOL,
-        Value::Symbol(Handle::new(symbol.clone())),
-    );
-    Ok(symbol)
+    let handle = Handle::new(crux::symbol::Symbol::new(Some(JsString::from_utf8(
+        "IntlLegacyConstructedSymbol",
+    ))));
+    realm
+        .intrinsics
+        .define(INTL_FALLBACK_SYMBOL, Value::Symbol(handle));
+    Ok(handle)
 }
 
 /// Install `Intl.NumberFormat` and its prototype (ECMA-402 §16).
@@ -2512,7 +2514,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
     )?;
     // %Intl.NumberFormat.prototype%[@@toStringTag] = "Intl.NumberFormat".
     proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(Value::String(Handle::new(JsString::from_utf8(
                 "Intl.NumberFormat",

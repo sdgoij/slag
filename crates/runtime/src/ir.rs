@@ -4085,7 +4085,7 @@ impl Vm {
                     self.pop(); // the write copy of the raw key
                     let key = match key {
                         PropertyKey::String(id) => Value::String(Handle::new(crux::lookup(id))),
-                        PropertyKey::Symbol(symbol) => Value::Symbol(Handle::new(symbol)),
+                        PropertyKey::Symbol(symbol) => Value::Symbol(symbol),
                     };
                     self.stack.push(key);
                     self.stack.push(value);
@@ -4104,7 +4104,7 @@ impl Vm {
                     self.pop(); // the write copy of the raw key
                     let key = match key {
                         PropertyKey::String(id) => Value::String(Handle::new(crux::lookup(id))),
-                        PropertyKey::Symbol(symbol) => Value::Symbol(Handle::new(symbol)),
+                        PropertyKey::Symbol(symbol) => Value::Symbol(symbol),
                     };
                     self.stack.push(key);
                     self.stack.push(value);
@@ -5031,7 +5031,7 @@ impl Vm {
                     let key = crate::context::to_property_key(agent, &key)?;
                     let key = match key {
                         PropertyKey::String(id) => Value::String(Handle::new(crux::lookup(id))),
-                        PropertyKey::Symbol(symbol) => Value::Symbol(Handle::new(symbol)),
+                        PropertyKey::Symbol(symbol) => Value::Symbol(symbol),
                     };
                     self.stack.push(key);
                 }
@@ -5150,7 +5150,7 @@ impl Vm {
                     let key = crate::context::to_property_key(agent, &value)?;
                     let key = match key {
                         PropertyKey::String(id) => Value::String(Handle::new(crux::lookup(id))),
-                        PropertyKey::Symbol(symbol) => Value::Symbol(Handle::new(symbol)),
+                        PropertyKey::Symbol(symbol) => Value::Symbol(symbol),
                     };
                     self.stack.push(key);
                 }

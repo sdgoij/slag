@@ -1588,7 +1588,7 @@ pub(crate) fn is_regexp(agent: &mut Agent, value: &Value) -> Result<bool, JsErro
     }
     // spec IsRegExp: the @@match property takes precedence over the
     // [[RegExpMatcher]] slot (an explicit false makes the object a non-Regexp).
-    let key = PropertyKey::Symbol(crux::symbol::well_known("match").as_ref().clone());
+    let key = PropertyKey::Symbol(crux::symbol::well_known("match"));
     let matcher = get_property_key(agent, value, &key, *value)?;
     if matches!(matcher.kind(), ValueKind::Undefined) {
         if let ValueKind::Object(obj) = value.kind()
@@ -1892,7 +1892,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .intrinsics
         .define(ITERATOR, Value::Function(iterator_func));
     string_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("iterator")),
         &PropertyDescriptor {
             value: Some(Value::Function(iterator_func)),
             writable: Some(true),
@@ -1931,7 +1931,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         },
     )?;
     iterator_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(Value::String(Handle::new(JsString::from_utf8(
                 "String Iterator",

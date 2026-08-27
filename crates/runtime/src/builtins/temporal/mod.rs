@@ -139,7 +139,7 @@ pub fn install_constructor(
     // `[@@toStringTag]` is a non-writable data property (spec 7.3.2).
     proto.define_property_key(
         &crux::property::PropertyKey::Symbol(
-            crux::symbol::well_known("toStringTag").as_ref().clone(),
+            crux::symbol::well_known("toStringTag")
         ),
         &PropertyDescriptor {
             value: Some(Value::String(Handle::new(JsString::from_utf8(tag)))),
@@ -1619,7 +1619,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     // data property.
     temporal.define_property_key(
         &crux::property::PropertyKey::Symbol(
-            crux::symbol::well_known("toStringTag").as_ref().clone(),
+            crux::symbol::well_known("toStringTag")
         ),
         &PropertyDescriptor {
             value: Some(Value::String(Handle::new(JsString::from_utf8("Temporal")))),
@@ -1696,7 +1696,7 @@ fn install_now(temporal: &Handle<JsObject>, realm: &Handle<Realm>) -> Result<(),
     // Temporal.Now[@@toStringTag] = "Temporal.Now" (spec 2.1.1).
     now.define_property_key(
         &crux::property::PropertyKey::Symbol(
-            crux::symbol::well_known("toStringTag").as_ref().clone(),
+            crux::symbol::well_known("toStringTag")
         ),
         &PropertyDescriptor {
             value: Some(Value::String(Handle::new(JsString::from_utf8(

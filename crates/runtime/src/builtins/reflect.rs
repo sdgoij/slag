@@ -56,7 +56,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     // spec 28.1.3.2: Reflect[@@toStringTag] = "Reflect", non-writable,
     // non-enumerable, configurable.
     reflect.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(Value::String(Handle::new(JsString::from_utf8("Reflect")))),
             writable: Some(false),
@@ -273,7 +273,7 @@ fn reflect_method(agent: &mut Agent, name: &str, args: &[Value]) -> Result<Value
             for (index, key) in keys.into_iter().enumerate() {
                 let value = match key {
                     PropertyKey::String(id) => Value::String(Handle::new(crux::lookup(id))),
-                    PropertyKey::Symbol(symbol) => Value::Symbol(Handle::new(symbol)),
+                    PropertyKey::Symbol(symbol) => Value::Symbol(symbol),
                 };
                 array.create_data_property(
                     &crux::string::JsString::from_utf8(&index.to_string()),

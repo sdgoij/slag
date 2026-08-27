@@ -226,7 +226,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     // (spec 27.2.4.6): an accessor whose getter is named "get [Symbol.species]"
     // and returns `this`.
     promise_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(Value::String(Handle::new(JsString::from_utf8("Promise")))),
             writable: Some(false),
@@ -247,7 +247,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             .and_then(|v| crate::context::as_object(&v)),
     )?;
     promise_ctor.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("species")),
         &PropertyDescriptor {
             value: None,
             writable: None,
@@ -1325,7 +1325,7 @@ fn species_constructor(agent: &mut Agent, promise: &Value) -> Result<Value, JsEr
     }
     // spec 7.3.21 step 4: read @@species from the constructor (the
     // well-known symbol is shared, so the intrinsic table is not consulted).
-    let species_key = PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone());
+    let species_key = PropertyKey::Symbol(crux::symbol::well_known("species"));
     let species =
         crate::context::get_property_key(agent, &constructor, &species_key, constructor)?;
     // spec steps 5-7: undefined/null fall back to the default; anything else
@@ -1441,7 +1441,7 @@ mod tests {
         iterable
             .define_property_key(
                 &crux::property::PropertyKey::Symbol(
-                    crux::symbol::well_known("iterator").as_ref().clone(),
+                    crux::symbol::well_known("iterator")
                 ),
                 &crux::property::PropertyDescriptor::data(Value::Function(
                     crux::Function::create_builtin(

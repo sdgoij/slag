@@ -317,7 +317,7 @@ fn array_species_create(
         ValueKind::Undefined => return array_create(agent, length),
         ValueKind::Object(_) | ValueKind::Function(_) => {
             let species_key =
-                PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone());
+                PropertyKey::Symbol(crux::symbol::well_known("species"));
             crate::context::get_property_key(agent, &c, &species_key, c)?
         }
         _ => {
@@ -558,8 +558,6 @@ fn is_concat_spreadable(agent: &mut Agent, value: &Value) -> Result<bool, JsErro
     }
     let spreadable_key = PropertyKey::Symbol(
         crux::symbol::well_known("isConcatSpreadable")
-            .as_ref()
-            .clone(),
     );
     let spreadable =
         crate::context::get_property_key(agent, value, &spreadable_key, *value)?;
@@ -2573,7 +2571,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     })?;
     realm.intrinsics.define(ITERATOR, values_func);
     array_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("iterator")),
         &PropertyDescriptor {
             value: Some(values_func),
             writable: Some(true),
@@ -2598,7 +2596,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .intrinsics
         .define(SPECIES, Value::Function(species_func));
     array_ctor.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("species")),
         &PropertyDescriptor {
             value: None,
             writable: None,
@@ -2646,7 +2644,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         unscopables.create_data_property(&JsString::from_utf8(name), Value::Boolean(true))?;
     }
     array_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("unscopables").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("unscopables")),
         &PropertyDescriptor {
             value: Some(Value::Object(unscopables)),
             writable: Some(false),
@@ -2685,7 +2683,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         },
     )?;
     iterator_proto.define_property_key(
-        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
+        &PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(Value::String(Handle::new(JsString::from_utf8(
                 "Array Iterator",
