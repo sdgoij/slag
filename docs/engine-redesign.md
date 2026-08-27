@@ -14,7 +14,7 @@ bigger win on property-access rows. They compose: maps shrink the object,
 the nursery makes object allocation cheap, and the constructor's property
 patterns (already collected) pre-build the object's final map.
 
-## Status (2026-08-27 — GC + map model landed, construct churn 53 → ~20ms)
+## Status (2026-08-27 — GC + map model landed, construct churn 53 → ~17ms)
 
 Landed and committed (in order):
 
@@ -71,24 +71,22 @@ Landed and committed (in order):
   atom compare against the cached canonical (`crux::proto_atom`). Measured:
   object literal churn `{x: i}` ~18.2ms → ~10.9ms median (-40%), spread
   ~66ms → ~50ms.
-
-Not yet committed:
-
-- **Construct arg slice in place**: the `Construct` step's leaf branch
-  reads its arguments from `self.args` into a small stack buffer (≤3 args)
-  instead of `split_off`'s per-construct `Vec` allocation (longer lists
-  keep the Vec path). Measured: construct churn ~19.9ms → ~17.3ms median
-  (-13%), 1-arg construct ~16.7ms → ~13.9ms.
+- `611e410` — **construct arg slice in place**: the `Construct` step's leaf
+  branch reads its arguments from `self.args` into a small stack buffer
+  (≤3 args) instead of `split_off`'s per-construct `Vec` allocation
+  (longer lists keep the Vec path). Measured: construct churn ~19.9ms →
+  ~17.3ms median (-13%), 1-arg construct ~16.7ms → ~13.9ms.
 
 Session wrap-up: the plan's structural items (A5.1/A5.1b, B1–B4) are all
-landed. Construct churn ~53ms → ~17.3ms, literals ~11ms, collections
-~2.5ms of the gate. The remaining gate cost is incremental (alloc
+landed. Construct churn ~53ms → ~17ms, literals ~11ms, collections
+~2.5ms of the gate. The remaining gate cost is real work (alloc
 ~4.2ms, store ~4.8ms, read ~3ms, construct machinery ~4ms — the leaf
 call protocol, caches, and dispatch, per the bytecode-vm skill's
-slice-15/25 analysis that the leaf core is real work).
+slice-15/25 analysis that the leaf core is real work; further changes
+would be sub-0.5ms grinds with regression risk).
 
 Measured result (release, interleaved medians): construct churn ~53ms →
-**~20ms**, string concat ~6.6ms → **~4.3ms**, other rows flat or better.
+**~17ms**, string concat ~6.6ms → **~4.3ms**, other rows flat or better.
 Collections went from ~24ms of the construct-churn run to **~2.5ms**.
 
 The GC half's remaining idea (A5.2-A5.4, generational young GC) is now
