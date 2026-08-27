@@ -236,7 +236,7 @@ pub fn from_property_descriptor(
 ) -> Result<Value, JsError> {
     let obj = JsObject::ordinary_object_create(prototype.or_else(current_object_proto));
     if let Some(value) = &desc.value {
-        obj.create_data_property_or_throw(&JsString::from_utf8("value"), value.clone())?;
+        obj.create_data_property_or_throw(&JsString::from_utf8("value"), *value)?;
     }
     if let Some(writable) = desc.writable {
         obj.create_data_property_or_throw(
@@ -245,10 +245,10 @@ pub fn from_property_descriptor(
         )?;
     }
     if let Some(get) = &desc.get {
-        obj.create_data_property_or_throw(&JsString::from_utf8("get"), get.clone())?;
+        obj.create_data_property_or_throw(&JsString::from_utf8("get"), *get)?;
     }
     if let Some(set) = &desc.set {
-        obj.create_data_property_or_throw(&JsString::from_utf8("set"), set.clone())?;
+        obj.create_data_property_or_throw(&JsString::from_utf8("set"), *set)?;
     }
     if let Some(enumerable) = desc.enumerable {
         obj.create_data_property_or_throw(

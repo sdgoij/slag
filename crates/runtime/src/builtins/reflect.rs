@@ -52,7 +52,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .and_then(|value| as_object(&value));
     let reflect = JsObject::ordinary_object_create(object_proto);
     let reflect_value = Value::Object(reflect);
-    realm.intrinsics.define(REFLECT, reflect_value.clone());
+    realm.intrinsics.define(REFLECT, reflect_value);
     // spec 28.1.3.2: Reflect[@@toStringTag] = "Reflect", non-writable,
     // non-enumerable, configurable.
     reflect.define_property_key(
@@ -146,7 +146,7 @@ fn list_from_array_like(agent: &mut Agent, value: &Value) -> Result<Vec<Value>, 
         ));
     }
     let length =
-        crate::context::get_property(agent, value, &JsString::from_utf8("length"), value.clone())?;
+        crate::context::get_property(agent, value, &JsString::from_utf8("length"), *value)?;
     let length = to_length(to_number(&length)?);
     let mut list = Vec::with_capacity(length as usize);
     for index in 0..length {
@@ -154,7 +154,7 @@ fn list_from_array_like(agent: &mut Agent, value: &Value) -> Result<Vec<Value>, 
             agent,
             value,
             &JsString::from_utf8(&index.to_string()),
-            value.clone(),
+            *value,
         )?;
         list.push(element);
     }
@@ -185,7 +185,7 @@ fn reflect_method(agent: &mut Agent, name: &str, args: &[Value]) -> Result<Value
                 ));
             }
             let new_target = match arg(2) {
-                v if v.is_undefined() => target.clone(),
+                v if v.is_undefined() => target,
                 other => {
                     if !is_constructor(&other) {
                         return Err(JsError::new(
@@ -193,7 +193,7 @@ fn reflect_method(agent: &mut Agent, name: &str, args: &[Value]) -> Result<Value
                             "Reflect.construct newTarget must be a constructor".into(),
                         ));
                     }
-                    other.clone()
+                    other
                 }
             };
             let list = list_from_array_like(agent, &arg(1))?;

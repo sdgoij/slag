@@ -172,7 +172,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let async_iterator_method = Function::create_builtin(
         Some(JsString::from_utf8("[Symbol.asyncIterator]")),
         0,
-        Box::new(|this, _| Ok(this.clone())),
+        Box::new(|this, _| Ok(*this)),
         None,
         realm
             .intrinsics
@@ -266,12 +266,12 @@ pub fn call_async_generator(
     let function_value = function.self_value();
     let function_env = crate::env::new_function_environment(
         Some(data.environment),
-        function_value.clone(),
+        function_value,
         Value::Undefined,
         data.this_mode == ThisMode::Lexical,
     );
     let context = ExecutionContext {
-        function: Some(function_value.clone()),
+        function: Some(function_value),
         realm: data.realm,
         script_or_module: None,
         lexical_environment: function_env,
@@ -334,12 +334,11 @@ pub fn call_async_generator(
     // prototype is %AsyncGenerator.prototype%), falling back to the intrinsic
     // when that property is not an object. This keeps the
     // double-getPrototypeOf chain of Symbol.toStringTag.js intact.
-    let function_value = function_value.clone();
     let prototype = crate::context::get_property(
         agent,
         &function_value,
         &JsString::from_utf8("prototype"),
-        function_value.clone(),
+        function_value,
     )?;
     let proto = match crate::context::as_object(&prototype) {
         Some(object) => object,
@@ -495,7 +494,7 @@ fn pop_front(
 /// throwing synchronously.
 fn async_generator_next(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let capability = new_capability(agent)?;
-    let promise = capability.promise.clone();
+    let promise = capability.promise;
     let object_id = match validate(agent, this) {
         Ok(id) => id,
         Err(error) => {
@@ -537,7 +536,7 @@ fn async_generator_return(
     args: &[Value],
 ) -> Result<Value, JsError> {
     let capability = new_capability(agent)?;
-    let promise = capability.promise.clone();
+    let promise = capability.promise;
     let object_id = match validate(agent, this) {
         Ok(id) => id,
         Err(error) => {
@@ -552,7 +551,7 @@ fn async_generator_return(
         agent,
         object_id,
         AsyncGeneratorRequest {
-            completion: Resume::Return(value.clone()),
+            completion: Resume::Return(value),
             capability,
         },
     )?;
@@ -582,7 +581,7 @@ fn async_generator_throw(
     args: &[Value],
 ) -> Result<Value, JsError> {
     let capability = new_capability(agent)?;
-    let promise = capability.promise.clone();
+    let promise = capability.promise;
     let object_id = match validate(agent, this) {
         Ok(id) => id,
         Err(error) => {
@@ -848,7 +847,6 @@ fn start_body(agent: &mut Agent, object_id: u64) -> Result<VmOutcome, JsError> {
     };
     let function_value = context
         .function
-        .clone()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no function in context".into()))?;
     let ValueKind::Function(function_handle) = function_value.kind() else {
         return Err(JsError::new(ErrorKind::TypeError, "not a function".into()));
@@ -1087,7 +1085,7 @@ fn resume_with_return(agent: &mut Agent, object_id: u64, value: Value) -> Result
         .intrinsics
         .get("%Promise%")
         .unwrap_or(Value::Undefined);
-    let promise = match promise_resolve(agent, &promise_ctor, value.clone()) {
+    let promise = match promise_resolve(agent, &promise_ctor, value) {
         Ok(promise) => promise,
         Err(error) => {
             let rejection = crate::promise::error_value(agent, &error);
@@ -1108,7 +1106,7 @@ fn await_return(agent: &mut Agent, object_id: u64, value: Value) -> Result<(), J
         .intrinsics
         .get("%Promise%")
         .unwrap_or(Value::Undefined);
-    let promise = match promise_resolve(agent, &promise_ctor, value.clone()) {
+    let promise = match promise_resolve(agent, &promise_ctor, value) {
         Ok(promise) => promise,
         Err(error) => {
             let request = take_current(agent, object_id)?;
@@ -1205,14 +1203,14 @@ mod tests {
         let value = agent.run_script(source)?;
         agent.run_jobs()?;
         let ValueKind::Object(obj) = value.kind() else {
-            return Ok(value.clone());
+            return Ok(value);
         };
         let Some(data) = agent.promises.get(&obj.id()) else {
-            return Ok(value.clone());
+            return Ok(value);
         };
         match &data.borrow().state {
-            crate::promise::PromiseState::Fulfilled(v) => Ok(v.clone()),
-            crate::promise::PromiseState::Rejected(v) => Ok(v.clone()),
+            crate::promise::PromiseState::Fulfilled(v) => Ok(*v),
+            crate::promise::PromiseState::Rejected(v) => Ok(*v),
             _ => Err(JsError::new(
                 ErrorKind::TypeError,
                 "promise not settled".into(),

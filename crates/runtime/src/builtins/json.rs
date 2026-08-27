@@ -145,7 +145,7 @@ impl<'a> JsonParser<'a> {
                 return Err(self.syntax_error());
             }
             let value = self.parse_value()?;
-            object.create_data_property_or_throw(&key, value.value.clone())?;
+            object.create_data_property_or_throw(&key, value.value)?;
             entries.push((key, value));
             self.skip_ws();
             if self.eat(b'}') {
@@ -192,7 +192,7 @@ impl<'a> JsonParser<'a> {
         for (index, element) in elements.iter().enumerate() {
             array.create_data_property_or_throw(
                 &JsString::from_utf8(&index.to_string()),
-                element.value.clone(),
+                element.value,
             )?;
         }
         Ok(ParseRecord {
@@ -461,7 +461,7 @@ fn json_parse(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
             .get("%Object.prototype%")
             .and_then(|value| as_object(&value)),
     );
-    root.create_data_property_or_throw(&JsString::from_utf8(""), record.value.clone())?;
+    root.create_data_property_or_throw(&JsString::from_utf8(""), record.value)?;
     let result = internalize_json_property(agent, &root, "", &reviver, Some(&record))?;
     Ok(result)
 }
@@ -477,7 +477,7 @@ fn internalize_json_property(
 ) -> Result<Value, JsError> {
     let key = PropertyKey::from_utf8(name);
     let holder_value = Value::Object(*holder);
-    let value = crate::context::get_property_key(agent, &holder_value, &key, holder_value.clone())?;
+    let value = crate::context::get_property_key(agent, &holder_value, &key, holder_value)?;
     let context = JsObject::ordinary_object_create(
         agent
             .current_realm()?
@@ -554,7 +554,7 @@ fn internalize_json_property(
 
 /// LengthOfArrayLike (spec 7.3.22).
 fn length_of_array_like(agent: &mut Agent, value: &Value) -> Result<u64, JsError> {
-    let length = get_property(agent, value, &JsString::from_utf8("length"), value.clone())?;
+    let length = get_property(agent, value, &JsString::from_utf8("length"), *value)?;
     Ok(to_length(to_number(&length)?))
 }
 
@@ -596,7 +596,7 @@ fn json_stringify(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
     let (replacer_function, property_list) = match replacer.kind() {
         ValueKind::Object(_) | ValueKind::Function(_) => {
             if is_callable(&replacer) {
-                (Some(replacer.clone()), None)
+                (Some(replacer), None)
             } else {
                 // spec 26.6.3.1 step 4.b.i: IsArray on a revoked proxy
                 // throws a TypeError.
@@ -688,7 +688,7 @@ fn property_list_from(agent: &mut Agent, replacer: &Value) -> Result<Vec<JsStrin
             agent,
             replacer,
             &JsString::from_utf8(&index.to_string()),
-            replacer.clone(),
+            *replacer,
         )?;
         match item.kind() {
             ValueKind::String(s) => {
@@ -729,19 +729,19 @@ fn serialize_json_property(
     holder: &Value,
 ) -> Result<Option<JsString>, JsError> {
     let key_string = JsString::from_utf8(key);
-    let mut value = get_property(agent, holder, &key_string, holder.clone())?;
+    let mut value = get_property(agent, holder, &key_string, *holder)?;
     if matches!(
         value.kind(),
         ValueKind::Object(_) | ValueKind::Function(_) | ValueKind::BigInt(_)
     ) {
-        let to_json = get_property(agent, &value, &JsString::from_utf8("toJSON"), value.clone())?;
+        let to_json = get_property(agent, &value, &JsString::from_utf8("toJSON"), value)?;
         if is_callable(&to_json) {
             value = crate::function::call(agent, &to_json, value, &[str(key)])?;
         }
     }
     if let Some(replacer_function) = &state.replacer_function {
         value =
-            crate::function::call(agent, replacer_function, holder.clone(), &[str(key), value])?;
+            crate::function::call(agent, replacer_function, *holder, &[str(key), value])?;
     }
     if let ValueKind::Object(obj) = value.kind() {
         if is_raw_json(agent, &value) {
@@ -803,7 +803,7 @@ fn serialize_json_object(
             "Converting circular structure to JSON".into(),
         ));
     }
-    state.stack.push(value.clone());
+    state.stack.push(*value);
     let stepback = state.indent.clone();
     state.indent = format!("{}{}", state.indent, state.gap);
     let keys = match &state.property_list {
@@ -856,7 +856,7 @@ fn serialize_json_array(
             "Converting circular structure to JSON".into(),
         ));
     }
-    state.stack.push(value.clone());
+    state.stack.push(*value);
     let stepback = state.indent.clone();
     state.indent = format!("{}{}", state.indent, state.gap);
     let length = length_of_array_like(agent, value)?;

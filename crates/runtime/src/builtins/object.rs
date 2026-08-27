@@ -83,17 +83,17 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     let object_ctor_value = Value::Function(object_ctor);
 
-    realm.intrinsics.define(OBJECT, object_ctor_value.clone());
+    realm.intrinsics.define(OBJECT, object_ctor_value);
     realm
         .intrinsics
-        .define(OBJECT_PROTO, object_proto_value.clone());
+        .define(OBJECT_PROTO, object_proto_value);
 
     // 20.1.1.2: Object.prototype is non-writable, non-enumerable,
     // non-configurable (the only such prototype property in the spec).
     object_ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(object_proto_value.clone()),
+            value: Some(object_proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -105,7 +105,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     object_proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(object_ctor_value.clone()),
+            value: Some(object_ctor_value),
             writable: Some(true),
             get: None,
             set: None,
@@ -320,7 +320,7 @@ fn prototype_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsError
                 agent,
                 &object,
                 &PropertyKey::Symbol(crux::symbol::well_known("toStringTag").as_ref().clone()),
-                object.clone(),
+                object,
             )?;
             match tag.kind() {
                 ValueKind::String(text) => {
@@ -474,7 +474,7 @@ fn own_keys_of(agent: &mut Agent, value: &Value, want_symbols: bool) -> Result<V
 fn freeze_or_seal(value: &Value, freeze: bool) -> Result<Value, JsError> {
     // spec step 1: Type(O) is not Object → return O unchanged.
     if !matches!(value.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
-        return Ok(value.clone());
+        return Ok(*value);
     }
     if !set_integrity_level(value, freeze)? {
         return Err(JsError::new(
@@ -486,7 +486,7 @@ fn freeze_or_seal(value: &Value, freeze: bool) -> Result<Value, JsError> {
             },
         ));
     }
-    Ok(value.clone())
+    Ok(*value)
 }
 
 /// SetIntegrityLevel (spec 7.3.15): freeze (writable off too) or seal.
@@ -593,7 +593,7 @@ fn object_define_properties(
         if !prop.enumerable {
             continue;
         }
-        let value = crate::context::get_property_key(agent, &props, &key, props.clone())?;
+        let value = crate::context::get_property_key(agent, &props, &key, props)?;
         let mut desc = crux::property::to_property_descriptor(&value)?;
         // ArraySetLength coerces an object [[Value]] through the agent
         // (spec 10.4.2.4 steps 3-4); crux cannot invoke user toString.
@@ -620,7 +620,7 @@ fn object_define_properties(
             ));
         }
     }
-    Ok(object.clone())
+    Ok(*object)
 }
 
 /// Dispatch a %Object% static or %Object.prototype% method call.
@@ -717,9 +717,9 @@ pub fn dispatch_call(
                 agent,
                 this,
                 &JsString::from_utf8("toString"),
-                this.clone(),
+                *this,
             )?;
-            crate::function::call(agent, &method, this.clone(), &[])
+            crate::function::call(agent, &method, *this, &[])
         })());
     }
     if intrinsics.get(PROTO_GET_PROTO).as_ref() == Some(callee) {
@@ -807,7 +807,7 @@ pub fn dispatch_call(
                     ),
                 ));
             }
-            Ok(receiver.clone())
+            Ok(receiver)
         })());
     }
     if intrinsics.get(DEFINE_PROPERTIES).as_ref() == Some(callee) {
@@ -846,7 +846,7 @@ pub fn dispatch_call(
                     continue;
                 }
                 let text = crux::lookup(id);
-                let value = crate::context::get_property(agent, &object, &text, object.clone())?;
+                let value = crate::context::get_property(agent, &object, &text, object)?;
                 let pair = crate::builtins::array::array_create(agent, 2.0)?;
                 pair.create_data_property(&JsString::from_utf8("0"), str(&text.to_string_lossy()))?;
                 pair.create_data_property(&JsString::from_utf8("1"), value)?;
@@ -881,7 +881,7 @@ pub fn dispatch_call(
                     continue;
                 }
                 let text = crux::lookup(id);
-                let value = crate::context::get_property(agent, &object, &text, object.clone())?;
+                let value = crate::context::get_property(agent, &object, &text, object)?;
                 values.push(value);
             }
             array_of(agent, &values)
@@ -1008,7 +1008,7 @@ pub fn dispatch_call(
             // spec 20.1.2.18 step 1: a non-object is returned unchanged.
             let value = arg(args, 0);
             let Some(obj) = as_object(&value) else {
-                return Ok(value.clone());
+                return Ok(value);
             };
             // spec step 4: a failed [[PreventExtensions]] (e.g. a proxy trap
             // returning false) is a TypeError.
@@ -1018,7 +1018,7 @@ pub fn dispatch_call(
                     "Cannot prevent extensions of the object".into(),
                 ));
             }
-            Ok(value.clone())
+            Ok(value)
         })());
     }
     if intrinsics.get(FREEZE).as_ref() == Some(callee) {
@@ -1116,7 +1116,7 @@ fn get_prototype_from_constructor(
         agent,
         constructor,
         &PropertyKey::from_utf8("prototype"),
-        constructor.clone(),
+        *constructor,
     )?;
     match as_object(&proto) {
         Some(object) => Ok(object),
@@ -1173,11 +1173,11 @@ fn set_prototype_of(
     };
     // spec step 3: a non-object O is returned unchanged.
     let Some(obj) = as_object(value) else {
-        return Ok(value.clone());
+        return Ok(*value);
     };
     // Setting the same prototype is a no-op (spec step 5).
     if obj.get_prototype_of()? == proto {
-        return Ok(value.clone());
+        return Ok(*value);
     }
     if !obj.set_prototype_of(proto)? {
         return Err(JsError::new(
@@ -1185,7 +1185,7 @@ fn set_prototype_of(
             "Cannot set prototype of a non-extensible object".into(),
         ));
     }
-    Ok(value.clone())
+    Ok(*value)
 }
 
 /// Object.prototype.__proto__ setter (spec B.2.2.1.3): a silent no-op for
@@ -1246,9 +1246,9 @@ fn define_legacy_accessor(
     // steps 3-4: the descriptor and the property key.
     let key = crate::context::to_property_key(agent, &arg(args, 0))?;
     let desc = if getter {
-        PropertyDescriptor::accessor(Some(accessor.clone()), None)
+        PropertyDescriptor::accessor(Some(accessor), None)
     } else {
-        PropertyDescriptor::accessor(None, Some(accessor.clone()))
+        PropertyDescriptor::accessor(None, Some(accessor))
     };
     // step 5: DefinePropertyOrThrow.
     if !obj.define_property_key(&key, &desc)? {
@@ -1307,8 +1307,8 @@ fn object_group_by(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> 
     // callback call and array build allocates) — suppress `--gc-stress` for
     // the whole operation so the half-built groups cannot be swept.
     let _stress = crate::ir::StressSuppress::new();
-    let items = arg(args, 0).clone();
-    let callback = arg(args, 1).clone();
+    let items = arg(args, 0);
+    let callback = arg(args, 1);
     let groups = crate::builtins::keyed::group_by(agent, &items, &callback, |agent, key| {
         let key = crate::context::to_property_key(agent, &key)?;
         Ok(match key {
@@ -1353,7 +1353,7 @@ fn object_assign(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
             if let Some(prop) = source_obj.get_own_property_key(&key)?
                 && prop.enumerable
             {
-                let value = crate::context::get_property_key(agent, &source, &key, source.clone())?;
+                let value = crate::context::get_property_key(agent, &source, &key, source)?;
                 target_obj.set_key(&key, value, true)?;
             }
         }
@@ -1387,7 +1387,7 @@ fn from_entries(agent: &mut Agent, iterable: &Value) -> Result<Value, JsError> {
             agent,
             &entry,
             &JsString::from_utf8("0"),
-            entry.clone(),
+            entry,
         ) {
             Ok(key) => key,
             Err(error) => {
@@ -1399,7 +1399,7 @@ fn from_entries(agent: &mut Agent, iterable: &Value) -> Result<Value, JsError> {
             agent,
             &entry,
             &JsString::from_utf8("1"),
-            entry.clone(),
+            entry,
         ) {
             Ok(value) => value,
             Err(error) => {

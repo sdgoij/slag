@@ -99,6 +99,11 @@ pub struct SmallProps {
 
 const INLINE_PROPS: usize = 2;
 
+/// Inline field capacity for fresh objects (Part B, B5.2). The map assigns
+/// property offsets into this array; properties past `INLINE_FIELDS` overflow
+/// into the heap `SmallProps` buffer.
+pub(crate) const INLINE_FIELDS: usize = 4;
+
 impl Default for SmallProps {
     fn default() -> Self {
         Self::new()
@@ -274,7 +279,7 @@ impl Property {
     /// The data property's [[Value]], or `None` for accessors.
     pub fn value(&self) -> Option<Value> {
         match &self.kind {
-            PropertyKind::Data { value, .. } => Some(value.clone()),
+            PropertyKind::Data { value, .. } => Some(*value),
             PropertyKind::Accessor { .. } => None,
         }
     }
@@ -289,14 +294,14 @@ impl Property {
 
     pub fn getter(&self) -> Option<Value> {
         match &self.kind {
-            PropertyKind::Accessor { get, .. } => get.clone(),
+            PropertyKind::Accessor { get, .. } => *get,
             PropertyKind::Data { .. } => None,
         }
     }
 
     pub fn setter(&self) -> Option<Value> {
         match &self.kind {
-            PropertyKind::Accessor { set, .. } => set.clone(),
+            PropertyKind::Accessor { set, .. } => *set,
             PropertyKind::Data { .. } => None,
         }
     }
@@ -305,7 +310,7 @@ impl Property {
     pub fn to_descriptor(&self) -> PropertyDescriptor {
         match &self.kind {
             PropertyKind::Data { value, writable } => PropertyDescriptor {
-                value: Some(value.clone()),
+                value: Some(*value),
                 writable: Some(*writable),
                 get: None,
                 set: None,
@@ -315,8 +320,8 @@ impl Property {
             PropertyKind::Accessor { get, set } => PropertyDescriptor {
                 value: None,
                 writable: None,
-                get: Some(get.clone().unwrap_or(Value::Undefined)),
-                set: Some(set.clone().unwrap_or(Value::Undefined)),
+                get: Some((*get).unwrap_or(Value::Undefined)),
+                set: Some((*set).unwrap_or(Value::Undefined)),
                 enumerable: Some(self.enumerable),
                 configurable: Some(self.configurable),
             },
@@ -331,15 +336,15 @@ impl Property {
         if desc.is_data_descriptor() {
             Some(Property {
                 kind: PropertyKind::Data {
-                    value: desc.value.clone()?,
+                    value: desc.value?,
                     writable: desc.writable?,
                 },
                 enumerable,
                 configurable,
             })
         } else if desc.is_accessor_descriptor() {
-            let get = desc.get.clone().filter(|v| !v.is_undefined());
-            let set = desc.set.clone().filter(|v| !v.is_undefined());
+            let get = desc.get.filter(|v| !v.is_undefined());
+            let set = desc.set.filter(|v| !v.is_undefined());
             Some(Property {
                 kind: PropertyKind::Accessor { get, set },
                 enumerable,
@@ -556,6 +561,10 @@ pub struct JsObject {
     /// Part B: parallel map-based shape. B5.1 — parallel shape only:
     /// `map` is allocated and wired, reads/writes stay through `SmallProps`.
     pub map: Handle<Map>,
+    /// Inline property storage for fresh objects (Part B, B5.2). The map
+    /// assigns property offsets into this array; the read path checks the
+    /// map first and reads from `in_fields` when a field offset is present.
+    in_fields: [Cell<Option<Value>>; INLINE_FIELDS],
     /// [[Extensible]].
     pub extensible: Cell<bool>,
     /// Whether this object is an immutable prototype exotic object (spec
@@ -611,6 +620,11 @@ impl Trace for JsObject {
             proto.trace(visit);
         }
         self.map.trace(visit);
+        for field in &self.in_fields {
+            if let Some(v) = field.get() {
+                v.trace(visit);
+            }
+        }
         self.properties.trace(visit);
         self.private_elements.trace(visit);
         // The strong function back-reference keeps the function alive while
@@ -658,6 +672,7 @@ impl JsObject {
             kind: ObjectKind::Ordinary,
             prototype: Cell::new(prototype),
             map: canonical_empty_map(prototype),
+            in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -691,6 +706,32 @@ impl JsObject {
     /// key per-object state (promises, generators) in agent-side tables.
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// Part B, B5.2: map-based read fast path. Check the object's map for
+    /// a descriptor of `key`, then read the value from `in_fields` at the
+    /// assigned offset. Returns `None` when the key is not in the map.
+    pub fn map_get(&self, key: &PropertyKey) -> Option<Value> {
+        let offset = self.map.find(key)?;
+        if offset >= INLINE_FIELDS {
+            return None;
+        }
+        self.in_fields[offset].get()
+    }
+
+    /// Part B, B5.2: map-based write fast path. Check the object's map for
+    /// a descriptor of `key`, then write the value to `in_fields` at the
+    /// assigned offset. Returns `false` when the key is not in the map.
+    pub fn map_set(&self, key: &PropertyKey, value: Value) -> bool {
+        let offset = match self.map.find(key) {
+            Some(o) => o,
+            None => return false,
+        };
+        if offset >= INLINE_FIELDS {
+            return false;
+        }
+        self.in_fields[offset].set(Some(value));
+        true
     }
 
     /// OrdinaryObjectCreate (spec 10.1.13).
@@ -736,6 +777,7 @@ impl JsObject {
             kind: ObjectKind::IsHTMLDDA,
             prototype: Cell::new(prototype),
             map: canonical_empty_map(prototype),
+            in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -767,6 +809,7 @@ impl JsObject {
             kind: ObjectKind::Array,
             prototype: Cell::new(prototype),
             map: canonical_empty_map(prototype),
+            in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -802,6 +845,7 @@ impl JsObject {
             kind: ObjectKind::String(Handle::new(value)),
             prototype: Cell::new(prototype),
             map: canonical_empty_map(prototype),
+            in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -833,6 +877,7 @@ impl JsObject {
             kind: ObjectKind::Proxy(Handle::new(slots)),
             prototype: Cell::new(None),
             map: canonical_empty_map(None),
+            in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -858,6 +903,7 @@ impl JsObject {
             kind: ObjectKind::IntegerIndexed(Handle::new(slots)),
             prototype: Cell::new(prototype),
             map: canonical_empty_map(prototype),
+            in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -965,6 +1011,7 @@ impl JsObject {
             })),
             prototype: Cell::new(None),
             map: canonical_empty_map(None),
+            in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
             extensible: Cell::new(false),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -1017,6 +1064,7 @@ impl JsObject {
             })),
             prototype: Cell::new(prototype),
             map: canonical_empty_map(prototype),
+            in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -1031,7 +1079,7 @@ impl JsObject {
         // spec steps 15-16: index properties first, then length. The map is
         // still empty, so these defines do not touch the mappings.
         for (index, value) in args.iter().enumerate() {
-            obj.create_data_property(&JsString::from_utf8(&index.to_string()), value.clone())?;
+            obj.create_data_property(&JsString::from_utf8(&index.to_string()), *value)?;
         }
         obj.define_property(
             &JsString::from_utf8("length"),
@@ -1113,6 +1161,7 @@ impl JsObject {
             })),
             prototype: Cell::new(prototype),
             map: canonical_empty_map(prototype),
+            in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -1136,7 +1185,7 @@ impl JsObject {
             },
         )?;
         for (index, value) in args.iter().enumerate() {
-            obj.create_data_property(&JsString::from_utf8(&index.to_string()), value.clone())?;
+            obj.create_data_property(&JsString::from_utf8(&index.to_string()), *value)?;
         }
         obj.define_property_key(
             &PropertyKey::Symbol(well_known("iterator").as_ref().clone()),
@@ -1154,7 +1203,7 @@ impl JsObject {
             &PropertyDescriptor {
                 value: None,
                 writable: None,
-                get: Some(thrower.clone()),
+                get: Some(thrower),
                 set: Some(thrower),
                 enumerable: Some(false),
                 configurable: Some(false),
@@ -1739,7 +1788,7 @@ impl JsObject {
                     && let Some(map) = slots.parameter_map.as_ref()
                     && map.has_own_property_key(key)?
                 {
-                    map.set_key(key, value.clone(), false)?;
+                    map.set_key(key, value, false)?;
                 }
             }
             ObjectKind::Host(ops) => {
@@ -2275,22 +2324,17 @@ fn validate_and_apply(
     // descriptor changes kind.
     let mut next = current;
     if next.is_data() && desc.is_accessor_descriptor() {
-        next = Property::accessor(
-            desc.get.clone(),
-            desc.set.clone(),
-            next.enumerable,
-            next.configurable,
-        );
+        next = Property::accessor(desc.get, desc.set, next.enumerable, next.configurable);
     } else if next.is_accessor() && desc.is_data_descriptor() {
         next = Property::data(
-            desc.value.clone().unwrap_or(Value::Undefined),
+            desc.value.unwrap_or(Value::Undefined),
             desc.writable.unwrap_or(false),
             next.enumerable,
             next.configurable,
         );
     }
     if let (Some(value), PropertyKind::Data { value: slot, .. }) = (&desc.value, &mut next.kind) {
-        *slot = value.clone();
+        *slot = *value;
     }
     if let (Some(writable), PropertyKind::Data { writable: slot, .. }) =
         (desc.writable, &mut next.kind)
@@ -2304,10 +2348,10 @@ fn validate_and_apply(
         next.configurable = configurable;
     }
     if let (Some(get), PropertyKind::Accessor { get: slot, .. }) = (&desc.get, &mut next.kind) {
-        *slot = Some(get.clone()).filter(|v| !v.is_undefined());
+        *slot = Some(*get).filter(|v| !v.is_undefined());
     }
     if let (Some(set), PropertyKind::Accessor { set: slot, .. }) = (&desc.set, &mut next.kind) {
-        *slot = Some(set.clone()).filter(|v| !v.is_undefined());
+        *slot = Some(*set).filter(|v| !v.is_undefined());
     }
     let mut props = obj.properties.borrow_mut();
     let position = if props.len() >= 16 {
@@ -2581,6 +2625,7 @@ fn array_define_own_property(
                 }
                 None => false,
             }
+            && let Some(value) = desc.value
         {
             let mut props = array.properties.borrow_mut();
             let position = props.len();
@@ -2588,7 +2633,7 @@ fn array_define_own_property(
                 key.clone(),
                 Property {
                     kind: PropertyKind::Data {
-                        value: desc.value.clone().expect("checked above"),
+                        value,
                         writable: desc.writable.unwrap_or(true),
                     },
                     enumerable: desc.enumerable.unwrap_or(true),
@@ -2737,7 +2782,7 @@ fn arguments_define_own_property(
             map.delete_key(key)?;
         } else {
             if let Some(value) = &desc.value {
-                map.set_key(key, value.clone(), false)?;
+                map.set_key(key, *value, false)?;
             }
             if desc.writable == Some(false) {
                 map.delete_key(key)?;
@@ -3505,7 +3550,7 @@ mod tests {
         let getter = crate::function::Function::create_builtin(
             Some(key("get x")),
             0,
-            Box::new(move |_, _| Ok(getter_storage.borrow().clone())),
+            Box::new(move |_, _| Ok(*getter_storage.borrow())),
             None,
             None,
         )
@@ -3935,7 +3980,7 @@ mod tests {
             &[Value::Number(1.0), Value::Number(2.0)],
             move |_name| {
                 let binding = binding_for_getter.clone();
-                builtin("get a", move |_, _| Ok(binding.borrow().clone()))
+                builtin("get a", move |_, _| Ok(*binding.borrow()))
             },
             move |_name| {
                 let binding = binding_for_setter.clone();

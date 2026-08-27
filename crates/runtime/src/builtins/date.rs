@@ -75,10 +75,10 @@ fn date_to_primitive(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<
             agent,
             this,
             &PropertyKey::from_utf8(name),
-            this.clone(),
+            *this,
         )?;
         if is_callable(&method) {
-            let result = crate::function::call(agent, &method, this.clone(), &[])?;
+            let result = crate::function::call(agent, &method, *this, &[])?;
             if !matches!(result.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
                 return Ok(result);
             }
@@ -293,7 +293,7 @@ fn instance_proto(agent: &mut Agent, new_target: &Value) -> Result<Handle<JsObje
         agent,
         new_target,
         &JsString::from_utf8("prototype"),
-        new_target.clone(),
+        *new_target,
     )?;
     if let Some(obj) = as_object(&proto) {
         return Ok(obj);
@@ -886,15 +886,15 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     let date_ctor_value = Value::Function(date_ctor);
 
-    realm.intrinsics.define(DATE, date_ctor_value.clone());
+    realm.intrinsics.define(DATE, date_ctor_value);
     realm
         .intrinsics
-        .define(DATE_PROTO, date_proto_value.clone());
+        .define(DATE_PROTO, date_proto_value);
 
     date_ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(date_proto_value.clone()),
+            value: Some(date_proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -905,7 +905,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     date_proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(date_ctor_value.clone()),
+            value: Some(date_ctor_value),
             writable: Some(true),
             get: None,
             set: None,
@@ -1403,7 +1403,7 @@ pub fn dispatch_call(
                 agent,
                 &object,
                 &PropertyKey::from_utf8("toISOString"),
-                object.clone(),
+                object,
             )?;
             if !is_callable(&to_iso) {
                 return Err(JsError::new(

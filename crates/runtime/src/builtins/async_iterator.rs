@@ -221,7 +221,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let async_iterator = Function::create_builtin(
         Some(JsString::from_utf8("[Symbol.asyncIterator]")),
         0,
-        Box::new(|this, _| Ok(this.clone())),
+        Box::new(|this, _| Ok(*this)),
         None,
         function_proto,
     )?;
@@ -366,7 +366,7 @@ fn install_helper_prototype(realm: &Handle<Realm>) -> Result<(), JsError> {
     let async_iterator = Function::create_builtin(
         Some(JsString::from_utf8("[Symbol.asyncIterator]")),
         0,
-        Box::new(|this, _| Ok(this.clone())),
+        Box::new(|this, _| Ok(*this)),
         None,
         None,
     )?;
@@ -464,14 +464,14 @@ fn async_dispose(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Val
         .get("%Promise%")
         .unwrap_or(Value::Undefined);
     let capability = new_promise_capability(agent, &promise_ctor)?;
-    let promise = capability.promise.clone();
+    let promise = capability.promise;
     // spec 27.1.4.6 step 3: GetMethod(return) — a throwing `return` getter
     // rejects the promise (IfAbruptRejectPromise), never throws synchronously.
     let return_method = match crate::context::get_property(
         agent,
         this,
         &JsString::from_utf8("return"),
-        this.clone(),
+        *this,
     ) {
         Ok(method) => method,
         Err(error) => {
@@ -500,15 +500,15 @@ fn async_dispose(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Val
             )?;
         }
         Some(return_method) => {
-            let result = crate::function::call(agent, &return_method, this.clone(), &[]);
+            let result = crate::function::call(agent, &return_method, *this, &[]);
             match result {
                 Ok(result) => {
                     let promise = promise_resolve(agent, &promise_ctor, result)?;
                     perform_promise_then(
                         agent,
                         &promise,
-                        Some(capability.resolve.clone()),
-                        Some(capability.reject.clone()),
+                        Some(capability.resolve),
+                        Some(capability.reject),
                         Some(capability),
                     )?;
                 }
@@ -542,7 +542,7 @@ fn get_async_iterator_direct(
         ));
     }
     let next =
-        crate::context::get_property(agent, this, &JsString::from_utf8("next"), this.clone())?;
+        crate::context::get_property(agent, this, &JsString::from_utf8("next"), *this)?;
     if !is_callable(&next) {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -550,7 +550,7 @@ fn get_async_iterator_direct(
         ));
     }
     Ok(AsyncIteratorRecord {
-        iterator: this.clone(),
+        iterator: *this,
         next,
     })
 }
@@ -621,7 +621,7 @@ fn dispatch_await(
                 reject_pending(agent, *object_id, value)?;
                 return Ok(Value::Undefined);
             }
-            continue_filter(agent, *object_id, keep.clone(), value)
+            continue_filter(agent, *object_id, *keep, value)
         }
         AwaitEntry::FlatInner {
             object_id,
@@ -715,7 +715,7 @@ fn continue_filter(
                 JsError::new(ErrorKind::TypeError, "no underlying iterator".into())
             })?
         };
-    let result = crate::function::call(agent, &record.next, record.iterator.clone(), &[])?;
+    let result = crate::function::call(agent, &record.next, record.iterator, &[])?;
     let promise_ctor = agent
         .current_realm()?
         .intrinsics
@@ -749,12 +749,12 @@ fn continue_flat_inner(agent: &mut Agent, object_id: u64, result: Value) -> Resu
         ));
     }
     let done =
-        crate::context::get_property(agent, &result, &JsString::from_utf8("done"), result.clone())?;
+        crate::context::get_property(agent, &result, &JsString::from_utf8("done"), result)?;
     let value = crate::context::get_property(
         agent,
         &result,
         &JsString::from_utf8("value"),
-        result.clone(),
+        result,
     )?;
     let capability = agent
         .async_iterator_pending
@@ -779,7 +779,7 @@ fn continue_flat_inner(agent: &mut Agent, object_id: u64, result: Value) -> Resu
                 JsError::new(ErrorKind::TypeError, "no underlying iterator".into())
             })?
         };
-        let result = crate::function::call(agent, &record.next, record.iterator.clone(), &[])?;
+        let result = crate::function::call(agent, &record.next, record.iterator, &[])?;
         let promise_ctor = agent
             .current_realm()?
             .intrinsics
@@ -831,7 +831,7 @@ fn async_helper_method(
         .get("%Promise%")
         .unwrap_or(Value::Undefined);
     let capability = new_promise_capability(agent, &promise_ctor)?;
-    let result_promise = capability.promise.clone();
+    let result_promise = capability.promise;
     let state = agent
         .async_iterator_helpers
         .get(&obj.id())
@@ -859,19 +859,19 @@ fn async_helper_method(
                     agent,
                     &record.iterator,
                     &JsString::from_utf8("return"),
-                    record.iterator.clone(),
+                    record.iterator,
                 )?;
                 if is_callable(&return_method) {
                     let result =
-                        crate::function::call(agent, &return_method, record.iterator.clone(), &[]);
+                        crate::function::call(agent, &return_method, record.iterator, &[]);
                     match result {
                         Ok(result) => {
                             let promise = promise_resolve(agent, &promise_ctor, result)?;
                             perform_promise_then(
                                 agent,
                                 &promise,
-                                Some(capability.resolve.clone()),
-                                Some(capability.reject.clone()),
+                                Some(capability.resolve),
+                                Some(capability.reject),
                                 Some(capability),
                             )?;
                         }
@@ -933,7 +933,7 @@ fn async_helper_method(
         }
     };
     if let Some(inner) = flat_inner {
-        let result = crate::function::call(agent, &inner.next, inner.iterator.clone(), &[])?;
+        let result = crate::function::call(agent, &inner.next, inner.iterator, &[])?;
         let promise = promise_resolve(agent, &promise_ctor, result)?;
         let on_fulfilled = make_await_closure(
             agent,
@@ -961,7 +961,7 @@ fn async_helper_method(
         .clone()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no underlying iterator".into()))?;
     // chain the underlying next through the driver
-    let result = crate::function::call(agent, &record.next, record.iterator.clone(), &[]);
+    let result = crate::function::call(agent, &record.next, record.iterator, &[]);
     let value = match result {
         Ok(value) => value,
         Err(error) => {
@@ -1003,12 +1003,12 @@ fn continue_lazy(agent: &mut Agent, object_id: u64, result: Value) -> Result<Val
         ));
     }
     let done =
-        crate::context::get_property(agent, &result, &JsString::from_utf8("done"), result.clone())?;
+        crate::context::get_property(agent, &result, &JsString::from_utf8("done"), result)?;
     let value = crate::context::get_property(
         agent,
         &result,
         &JsString::from_utf8("value"),
-        result.clone(),
+        result,
     )?;
     let capability = agent
         .async_iterator_pending
@@ -1043,10 +1043,10 @@ fn continue_lazy(agent: &mut Agent, object_id: u64, result: Value) -> Result<Val
         let state = state.borrow();
         let mode = match &state.mode {
             HelperMode::Map { mapper } => HelperMode::Map {
-                mapper: mapper.clone(),
+                mapper: *mapper,
             },
             HelperMode::Filter { filterer } => HelperMode::Filter {
-                filterer: filterer.clone(),
+                filterer: *filterer,
             },
             HelperMode::Take { remaining } => HelperMode::Take {
                 remaining: *remaining,
@@ -1055,7 +1055,7 @@ fn continue_lazy(agent: &mut Agent, object_id: u64, result: Value) -> Result<Val
                 remaining: *remaining,
             },
             HelperMode::FlatMap { mapper, inner } => HelperMode::FlatMap {
-                mapper: mapper.clone(),
+                mapper: *mapper,
                 inner: inner.clone(),
             },
         };
@@ -1109,7 +1109,7 @@ fn continue_lazy(agent: &mut Agent, object_id: u64, result: Value) -> Result<Val
                 agent,
                 AwaitEntry::FilterKeep {
                     object_id,
-                    value: value.clone(),
+                    value,
                     is_reject: false,
                 },
             )?;
@@ -1117,7 +1117,7 @@ fn continue_lazy(agent: &mut Agent, object_id: u64, result: Value) -> Result<Val
                 agent,
                 AwaitEntry::FilterKeep {
                     object_id,
-                    value: value.clone(),
+                    value,
                     is_reject: true,
                 },
             )?;
@@ -1153,7 +1153,7 @@ fn continue_lazy(agent: &mut Agent, object_id: u64, result: Value) -> Result<Val
             if *remaining > 0.0 {
                 *remaining -= 1.0;
                 let result =
-                    crate::function::call(agent, &record.next, record.iterator.clone(), &[])?;
+                    crate::function::call(agent, &record.next, record.iterator, &[])?;
                 let promise_ctor = agent
                     .current_realm()?
                     .intrinsics
@@ -1194,7 +1194,7 @@ fn continue_lazy(agent: &mut Agent, object_id: u64, result: Value) -> Result<Val
                 match iter_method {
                     Some(method) => {
                         let inner_value =
-                            crate::function::call(agent, &method, mapped.clone(), &[])?;
+                            crate::function::call(agent, &method, mapped, &[])?;
                         if !matches!(inner_value.kind(), ValueKind::Object(_)) {
                             return Err(JsError::new(
                                 ErrorKind::TypeError,
@@ -1205,7 +1205,7 @@ fn continue_lazy(agent: &mut Agent, object_id: u64, result: Value) -> Result<Val
                             agent,
                             &inner_value,
                             &JsString::from_utf8("next"),
-                            inner_value.clone(),
+                            inner_value,
                         )?;
                         if !is_callable(&next) {
                             return Err(JsError::new(
@@ -1257,7 +1257,7 @@ fn step_flat_inner(
     object_id: u64,
     inner: &mut AsyncIteratorRecord,
 ) -> Result<(), JsError> {
-    let result = crate::function::call(agent, &inner.next, inner.iterator.clone(), &[])?;
+    let result = crate::function::call(agent, &inner.next, inner.iterator, &[])?;
     let promise_ctor = agent
         .current_realm()?
         .intrinsics
@@ -1407,7 +1407,7 @@ fn start_eager(agent: &mut Agent, this: &Value, mode: EagerMode) -> Result<Value
         .get("%Promise%")
         .unwrap_or(Value::Undefined);
     let capability = new_promise_capability(agent, &promise_ctor)?;
-    let promise = capability.promise.clone();
+    let promise = capability.promise;
     let driver = JsObject::ordinary_object_create(None);
     agent.async_iterator_eager.insert(
         driver.id(),
@@ -1432,7 +1432,7 @@ fn eager_step(agent: &mut Agent, driver_id: u64) -> Result<Value, JsError> {
         let driver = driver.borrow();
         (driver.record.clone(), driver.capability.clone())
     };
-    let result = crate::function::call(agent, &record.next, record.iterator.clone(), &[]);
+    let result = crate::function::call(agent, &record.next, record.iterator, &[]);
     let value = match result {
         Ok(value) => value,
         Err(error) => {
@@ -1474,12 +1474,12 @@ fn continue_eager(agent: &mut Agent, driver_id: u64, result: Value) -> Result<Va
         ));
     }
     let done =
-        crate::context::get_property(agent, &result, &JsString::from_utf8("done"), result.clone())?;
+        crate::context::get_property(agent, &result, &JsString::from_utf8("done"), result)?;
     let value = crate::context::get_property(
         agent,
         &result,
         &JsString::from_utf8("value"),
-        result.clone(),
+        result,
     )?;
     let (mut mode, capability) = {
         let driver = agent
@@ -1494,17 +1494,17 @@ fn continue_eager(agent: &mut Agent, driver_id: u64, result: Value) -> Result<Va
                 accumulator,
                 started,
             } => EagerMode::Reduce {
-                reducer: reducer.clone(),
-                accumulator: accumulator.clone(),
+                reducer: *reducer,
+                accumulator: *accumulator,
                 started: *started,
             },
             EagerMode::ToArray { values } => EagerMode::ToArray {
                 values: values.clone(),
             },
-            EagerMode::ForEach { f } => EagerMode::ForEach { f: f.clone() },
-            EagerMode::Some { f } => EagerMode::Some { f: f.clone() },
-            EagerMode::Every { f } => EagerMode::Every { f: f.clone() },
-            EagerMode::Find { f } => EagerMode::Find { f: f.clone() },
+            EagerMode::ForEach { f } => EagerMode::ForEach { f: *f },
+            EagerMode::Some { f } => EagerMode::Some { f: *f },
+            EagerMode::Every { f } => EagerMode::Every { f: *f },
+            EagerMode::Find { f } => EagerMode::Find { f: *f },
         };
         (mode, driver.capability.clone())
     };
@@ -1520,7 +1520,7 @@ fn continue_eager(agent: &mut Agent, driver_id: u64, result: Value) -> Result<Va
             started,
         } => {
             if done_flag {
-                let result = accumulator.clone().unwrap_or(Value::Undefined);
+                let result = (*accumulator).unwrap_or(Value::Undefined);
                 finish(agent, result)?;
             } else if !*started {
                 *started = true;
@@ -1529,22 +1529,22 @@ fn continue_eager(agent: &mut Agent, driver_id: u64, result: Value) -> Result<Va
                     agent,
                     driver_id,
                     EagerMode::Reduce {
-                        reducer: reducer.clone(),
-                        accumulator: accumulator.clone(),
+                        reducer: *reducer,
+                        accumulator: *accumulator,
                         started: *started,
                     },
                 )?;
                 eager_step(agent, driver_id)?;
             } else {
-                let acc = accumulator.clone().unwrap_or(Value::Undefined);
+                let acc = (*accumulator).unwrap_or(Value::Undefined);
                 let next = crate::function::call(agent, reducer, Value::Undefined, &[acc, value])?;
                 *accumulator = Some(next);
                 store_eager(
                     agent,
                     driver_id,
                     EagerMode::Reduce {
-                        reducer: reducer.clone(),
-                        accumulator: accumulator.clone(),
+                        reducer: *reducer,
+                        accumulator: *accumulator,
                         started: *started,
                     },
                 )?;
@@ -1723,14 +1723,14 @@ mod tests {
         let value = agent.run_script(source)?;
         agent.run_jobs()?;
         let ValueKind::Object(obj) = value.kind() else {
-            return Ok(value.clone());
+            return Ok(value);
         };
         let Some(data) = agent.promises.get(&obj.id()) else {
-            return Ok(value.clone());
+            return Ok(value);
         };
         match &data.borrow().state {
-            crate::promise::PromiseState::Fulfilled(v) => Ok(v.clone()),
-            crate::promise::PromiseState::Rejected(v) => Ok(v.clone()),
+            crate::promise::PromiseState::Fulfilled(v) => Ok(*v),
+            crate::promise::PromiseState::Rejected(v) => Ok(*v),
             _ => Err(JsError::new(
                 ErrorKind::TypeError,
                 "promise not settled".into(),

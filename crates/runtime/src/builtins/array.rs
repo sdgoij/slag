@@ -156,14 +156,14 @@ pub fn array_from_values(agent: &Agent, values: &[Value]) -> Result<Value, JsErr
     let _stress = crate::ir::StressSuppress::new();
     let array = array_create(agent, values.len() as f64)?;
     for (index, value) in values.iter().enumerate() {
-        array.create_data_property(&key(index as u64), value.clone())?;
+        array.create_data_property(&key(index as u64), *value)?;
     }
     Ok(Value::Object(array))
 }
 
 /// LengthOfArrayLike (spec 7.3.22).
 fn length_of_array_like(agent: &mut Agent, value: &Value) -> Result<u64, JsError> {
-    let length = get_property(agent, value, &JsString::from_utf8("length"), value.clone())?;
+    let length = get_property(agent, value, &JsString::from_utf8("length"), *value)?;
     Ok(to_length(crate::context::to_number(agent, &length)?))
 }
 
@@ -198,7 +198,7 @@ fn has_property(value: &Value, name: &JsString) -> Result<bool, JsError> {
 
 /// Get (spec 7.3.1) with the base as receiver.
 fn get(agent: &mut Agent, value: &Value, name: &JsString) -> Result<Value, JsError> {
-    get_property(agent, value, name, value.clone())
+    get_property(agent, value, name, *value)
 }
 
 /// Set (spec 7.3.3) with `throw = true`.
@@ -259,7 +259,7 @@ fn get_prototype_from_constructor(
         agent,
         constructor,
         &PropertyKey::from_utf8("prototype"),
-        constructor.clone(),
+        *constructor,
     )?;
     match as_object(&proto) {
         Some(object) => Ok(object),
@@ -318,7 +318,7 @@ fn array_species_create(
         ValueKind::Object(_) | ValueKind::Function(_) => {
             let species_key =
                 PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone());
-            crate::context::get_property_key(agent, &c, &species_key, c.clone())?
+            crate::context::get_property_key(agent, &c, &species_key, c)?
         }
         _ => {
             return Err(JsError::new(
@@ -368,7 +368,7 @@ fn array_construct(
     }
     let array = JsObject::array_create(Some(proto), args.len() as f64)?;
     for (index, item) in args.iter().enumerate() {
-        array.create_data_property_or_throw(&key(index as u64), item.clone())?;
+        array.create_data_property_or_throw(&key(index as u64), *item)?;
     }
     Ok(Value::Object(array))
 }
@@ -412,7 +412,7 @@ fn array_of(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
     // spec steps 7-8: CreateDataPropertyOrThrow per item, then Set the
     // length (which invokes an own length setter).
     for (index, item) in args.iter().enumerate() {
-        obj.create_data_property_or_throw(&key(index as u64), item.clone())?;
+        obj.create_data_property_or_throw(&key(index as u64), *item)?;
     }
     obj.set(&JsString::from_utf8("length"), Value::Number(length), true)?;
     Ok(array)
@@ -443,7 +443,7 @@ fn array_from(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
         } else {
             Value::Object(array_create(agent, 0.0)?)
         };
-        let iterator = crate::function::call(agent, &iterator_method, items.clone(), &[])?;
+        let iterator = crate::function::call(agent, &iterator_method, items, &[])?;
         if !matches!(iterator.kind(), ValueKind::Object(_)) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -454,7 +454,7 @@ fn array_from(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
             agent,
             &iterator,
             &JsString::from_utf8("next"),
-            iterator.clone(),
+            iterator,
         )?;
         if !is_callable(&next) {
             return Err(JsError::new(
@@ -482,7 +482,7 @@ fn array_from(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
                 match crate::function::call(
                     agent,
                     &mapfn,
-                    this_arg.clone(),
+                    this_arg,
                     &[next_value, Value::Number(k as f64)],
                 ) {
                     Ok(value) => value,
@@ -516,7 +516,7 @@ fn array_from(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
             crate::function::call(
                 agent,
                 &mapfn,
-                this_arg.clone(),
+                this_arg,
                 &[k_value, Value::Number(k as f64)],
             )?
         } else {
@@ -562,7 +562,7 @@ fn is_concat_spreadable(agent: &mut Agent, value: &Value) -> Result<bool, JsErro
             .clone(),
     );
     let spreadable =
-        crate::context::get_property_key(agent, value, &spreadable_key, value.clone())?;
+        crate::context::get_property_key(agent, value, &spreadable_key, *value)?;
     if !matches!(spreadable.kind(), ValueKind::Undefined) {
         return Ok(to_boolean(&spreadable));
     }
@@ -709,8 +709,8 @@ fn every(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
             let test = crate::function::call(
                 agent,
                 &callbackfn,
-                this_arg.clone(),
-                &[k_value, Value::Number(k as f64), object.clone()],
+                this_arg,
+                &[k_value, Value::Number(k as f64), object],
             )?;
             if !to_boolean(&test) {
                 return Ok(Value::Boolean(false));
@@ -736,7 +736,7 @@ fn fill(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     };
     let final_index = clamped_end(args.get(1..).unwrap_or(&[]), length)?;
     for k in k..final_index {
-        set_property(&object, &key(k), value.clone())?;
+        set_property(&object, &key(k), value)?;
     }
     Ok(object)
 }
@@ -763,8 +763,8 @@ fn filter(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
             let selected = crate::function::call(
                 agent,
                 &callbackfn,
-                this_arg.clone(),
-                &[k_value.clone(), Value::Number(k as f64), object.clone()],
+                this_arg,
+                &[k_value, Value::Number(k as f64), object],
             )?;
             if to_boolean(&selected) {
                 array.create_data_property_or_throw(&key(to_index), k_value)?;
@@ -799,8 +799,8 @@ fn find(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         let test = crate::function::call(
             agent,
             &predicate,
-            this_arg.clone(),
-            &[k_value.clone(), Value::Number(k as f64), object.clone()],
+            this_arg,
+            &[k_value, Value::Number(k as f64), object],
         )?;
         if to_boolean(&test) {
             return Ok(k_value);
@@ -828,8 +828,8 @@ fn find_index(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
         let test = crate::function::call(
             agent,
             &predicate,
-            this_arg.clone(),
-            &[k_value, Value::Number(k as f64), object.clone()],
+            this_arg,
+            &[k_value, Value::Number(k as f64), object],
         )?;
         if to_boolean(&test) {
             return Ok(Value::Number(k as f64));
@@ -863,8 +863,8 @@ fn find_last_common(
         let test = crate::function::call(
             agent,
             &predicate,
-            this_arg.clone(),
-            &[k_value.clone(), Value::Number(k as f64), object.clone()],
+            this_arg,
+            &[k_value, Value::Number(k as f64), object],
         )?;
         if to_boolean(&test) {
             return Ok(if want_index {
@@ -914,8 +914,8 @@ fn flatten_into_array(
             element = crate::function::call(
                 agent,
                 mapfn,
-                this_arg.clone(),
-                &[element, Value::Number(source_index as f64), source.clone()],
+                *this_arg,
+                &[element, Value::Number(source_index as f64), *source],
             )?;
         }
         if depth > 0 && is_array(&element) {
@@ -999,8 +999,8 @@ fn for_each(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
             crate::function::call(
                 agent,
                 &callbackfn,
-                this_arg.clone(),
-                &[k_value, Value::Number(k as f64), object.clone()],
+                this_arg,
+                &[k_value, Value::Number(k as f64), object],
             )?;
         }
     }
@@ -1158,8 +1158,8 @@ fn map(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
             let mapped = crate::function::call(
                 agent,
                 &callbackfn,
-                this_arg.clone(),
-                &[k_value, Value::Number(k as f64), object.clone()],
+                this_arg,
+                &[k_value, Value::Number(k as f64), object],
             )?;
             array.create_data_property_or_throw(&key(k), mapped)?;
         }
@@ -1206,12 +1206,12 @@ fn push(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         // back to the full `[[Set]]`.
         if let Some(array) = object.as_object()
             && matches!(array.kind, crux::object::ObjectKind::Array)
-            && array.array_element_write(length, item.clone())?.is_some()
+            && array.array_element_write(length, *item)?.is_some()
         {
             length += 1;
             continue;
         }
-        set_property(&object, &key(length), item.clone())?;
+        set_property(&object, &key(length), *item)?;
         length += 1;
     }
     set_property(
@@ -1238,7 +1238,7 @@ fn reduce(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
     let mut k = 0u64;
     let mut accumulator: Option<Value> = None;
     if args.len() >= 2 {
-        accumulator = Some(args[1].clone());
+        accumulator = Some(args[1]);
     } else {
         let mut k_present = false;
         while k < length && !k_present {
@@ -1263,7 +1263,7 @@ fn reduce(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
                 agent,
                 &callbackfn,
                 Value::Undefined,
-                &[current, k_value, Value::Number(k as f64), object.clone()],
+                &[current, k_value, Value::Number(k as f64), object],
             )?);
         }
         k += 1;
@@ -1287,7 +1287,7 @@ fn reduce_right(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     let mut k = length as i64 - 1;
     let mut accumulator: Option<Value> = None;
     if args.len() >= 2 {
-        accumulator = Some(args[1].clone());
+        accumulator = Some(args[1]);
     } else {
         let mut k_present = false;
         while k >= 0 && !k_present {
@@ -1312,7 +1312,7 @@ fn reduce_right(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
                 agent,
                 &callbackfn,
                 Value::Undefined,
-                &[current, k_value, Value::Number(k as f64), object.clone()],
+                &[current, k_value, Value::Number(k as f64), object],
             )?);
         }
         k -= 1;
@@ -1446,8 +1446,8 @@ fn some(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
             let test = crate::function::call(
                 agent,
                 &callbackfn,
-                this_arg.clone(),
-                &[k_value, Value::Number(k as f64), object.clone()],
+                this_arg,
+                &[k_value, Value::Number(k as f64), object],
             )?;
             if to_boolean(&test) {
                 return Ok(Value::Boolean(true));
@@ -1474,7 +1474,7 @@ fn sort_compare(
         return Ok(-1.0);
     }
     if !matches!(comparefn.kind(), ValueKind::Undefined) {
-        let v = crate::function::call(agent, comparefn, Value::Undefined, &[x.clone(), y.clone()])?;
+        let v = crate::function::call(agent, comparefn, Value::Undefined, &[*x, *y])?;
         let v = to_number(&v)?;
         return Ok(if v.is_nan() { 0.0 } else { v });
     }
@@ -1526,7 +1526,7 @@ fn sort_indexed_properties(
         return Err(e);
     }
     for (j, item) in items.iter().enumerate() {
-        set_property(object, &key(j as u64), item.clone())?;
+        set_property(object, &key(j as u64), *item)?;
     }
     for k in items.len() as u64..length {
         delete_property_or_throw(object, &key(k))?;
@@ -1630,7 +1630,7 @@ fn splice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
         }
     }
     for (j, item) in args.iter().skip(2).enumerate() {
-        set_property(&object, &key(actual_start + j as u64), item.clone())?;
+        set_property(&object, &key(actual_start + j as u64), *item)?;
     }
     let new_length = length - actual_delete_count + item_count;
     set_property(
@@ -1665,7 +1665,7 @@ fn to_locale_string(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
         // the primitive (primitive_this_value.js); the locales and options
         // arguments pass through.
         let text =
-            crate::function::call(agent, &method, element, &[locales.clone(), options.clone()])?;
+            crate::function::call(agent, &method, element, &[locales, options])?;
         result.push_str(&crate::context::to_string(agent, &text)?.to_string_lossy());
     }
     Ok(Value::String(Handle::new(JsString::from_utf8(&result))))
@@ -1753,7 +1753,7 @@ fn to_spliced(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
         i += 1;
     }
     for item in args.iter().skip(2) {
-        array.create_data_property_or_throw(&key(i), item.clone())?;
+        array.create_data_property_or_throw(&key(i), *item)?;
         i += 1;
     }
     let mut r = actual_start + actual_delete_count;
@@ -1809,7 +1809,7 @@ fn unshift(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsE
             }
         }
         for (j, item) in args.iter().enumerate() {
-            set_property(&object, &key(j as u64), item.clone())?;
+            set_property(&object, &key(j as u64), *item)?;
         }
     }
     let new_length = length + arg_count;
@@ -1853,7 +1853,7 @@ fn with(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     for i in 0..length {
         let name = key(i);
         let new_value = if i == actual_index {
-            value.clone()
+            value
         } else {
             get(agent, &object, &name)?
         };
@@ -1915,11 +1915,11 @@ fn array_iterator_next(agent: &mut Agent, this: &Value, _args: &[Value]) -> Resu
     let name = key(next_index);
     let value = match kind {
         0 => {
-            let element = get_property(agent, &array, &name, array.clone())?;
+            let element = get_property(agent, &array, &name, array)?;
             array_from_values(agent, &[Value::Number(next_index as f64), element])?
         }
         1 => Value::Number(next_index as f64),
-        _ => get_property(agent, &array, &name, array.clone())?,
+        _ => get_property(agent, &array, &name, array)?,
     };
     agent
         .array_iter_data
@@ -2029,7 +2029,7 @@ fn from_async_reject(
 ) -> Result<(), JsError> {
     let (reject, iterator) = {
         let state = state.borrow();
-        (state.capability.reject.clone(), state.iterator.clone())
+        (state.capability.reject, state.iterator.clone())
     };
     if let Some(record) = iterator {
         from_async_iterator_close(agent, &record);
@@ -2049,7 +2049,7 @@ fn from_async_finish(
 ) -> Result<Value, JsError> {
     let (array, resolve) = {
         let state = state.borrow();
-        (state.array.clone(), state.capability.resolve.clone())
+        (state.array, state.capability.resolve)
     };
     if let Err(error) = object_of(&array)?.set(
         &JsString::from_utf8("length"),
@@ -2072,15 +2072,15 @@ fn from_async_define_and_advance(
     value: Value,
 ) -> Result<Value, JsError> {
     let k = state.borrow().k;
-    let array = state.borrow().array.clone();
-    if let Err(error) = object_of(&array)?.create_data_property_or_throw(&key(k), value.clone()) {
+    let array = state.borrow().array;
+    if let Err(error) = object_of(&array)?.create_data_property_or_throw(&key(k), value) {
         from_async_reject(agent, state, error)?;
         return Ok(Value::Undefined);
     }
     state.borrow_mut().k = k + 1;
     let (is_array_like, len, items) = {
         let state = state.borrow();
-        (state.is_array_like, state.len, state.items.clone())
+        (state.is_array_like, state.len, state.items)
     };
     if is_array_like {
         let k = state.borrow().k;
@@ -2106,7 +2106,7 @@ fn from_async_define_and_advance(
         let record = state.iterator.as_ref().ok_or_else(|| {
             JsError::new(ErrorKind::TypeError, "fromAsync iterator missing".into())
         })?;
-        (record.iterator.clone(), record.next.clone())
+        (record.iterator, record.next)
     };
     let step_promise = match crate::function::call(agent, &next, iterator, &[]) {
         Ok(promise) => promise,
@@ -2136,7 +2136,7 @@ fn from_async_resume(
                 agent,
                 &value,
                 &JsString::from_utf8("done"),
-                value.clone(),
+                value,
             )?);
             if done {
                 // spec step 13.d: Set(A, "length", k, true) before returning.
@@ -2144,7 +2144,7 @@ fn from_async_resume(
                 return from_async_finish(agent, &state, k);
             }
             let step_value =
-                get_property(agent, &value, &JsString::from_utf8("value"), value.clone())?;
+                get_property(agent, &value, &JsString::from_utf8("value"), value)?;
             let mapping = !matches!(state.borrow().mapfn.kind(), ValueKind::Undefined);
             if mapping {
                 from_async_map_and_await(agent, &state, step_value)
@@ -2181,10 +2181,10 @@ fn from_async_map_and_await(
     let (mapfn, this_arg, k, array) = {
         let state = state.borrow();
         (
-            state.mapfn.clone(),
-            state.this_arg.clone(),
+            state.mapfn,
+            state.this_arg,
             state.k,
-            state.array.clone(),
+            state.array,
         )
     };
     let mapped = if matches!(mapfn.kind(), ValueKind::Undefined) {
@@ -2219,8 +2219,8 @@ fn from_async(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
         .get("%Promise%")
         .unwrap_or(Value::Undefined);
     let capability = crate::promise::new_promise_capability(agent, &promise_ctor)?;
-    let reject = capability.reject.clone();
-    let promise = capability.promise.clone();
+    let reject = capability.reject;
+    let promise = capability.promise;
     let result = (|| -> Result<(), JsError> {
         let items = args.first().cloned().unwrap_or(Value::Undefined);
         let mapfn = args.get(1).cloned().unwrap_or(Value::Undefined);
@@ -2289,7 +2289,7 @@ fn from_async(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
                 // array-like; the length is set and the loop resolves.
                 let (array, resolve) = {
                     let state = state.borrow();
-                    (state.array.clone(), state.capability.resolve.clone())
+                    (state.array, state.capability.resolve)
                 };
                 if let Err(error) =
                     object_of(&array)?.set(&JsString::from_utf8("length"), Value::Number(0.0), true)
@@ -2300,7 +2300,7 @@ fn from_async(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
                 }
                 return Ok(());
             }
-            let items = state.borrow().items.clone();
+            let items = state.borrow().items;
             let next = get(agent, &items, &key(0))?;
             state.borrow_mut().phase = FromAsyncPhase::Element;
             if let Err(error) = attach_from_async_await(agent, state.clone(), next) {
@@ -2313,7 +2313,7 @@ fn from_async(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
                 let record = state.iterator.as_ref().ok_or_else(|| {
                     JsError::new(ErrorKind::TypeError, "fromAsync iterator missing".into())
                 })?;
-                (record.iterator.clone(), record.next.clone())
+                (record.iterator, record.next)
             };
             let step_promise = crate::function::call(agent, &next, iterator, &[])?;
             attach_from_async_await(agent, state.clone(), step_promise)?;
@@ -2338,12 +2338,12 @@ fn async_iterator_from(
     sync_method: Option<Value>,
 ) -> Result<IteratorRecord, JsError> {
     if let Some(method) = async_method {
-        let iterator = crate::function::call(agent, &method, items.clone(), &[])?;
+        let iterator = crate::function::call(agent, &method, *items, &[])?;
         let next = get_property(
             agent,
             &iterator,
             &JsString::from_utf8("next"),
-            iterator.clone(),
+            iterator,
         )?;
         if !is_callable(&next) {
             return Err(JsError::new(
@@ -2359,12 +2359,12 @@ fn async_iterator_from(
             "Value is not async iterable or iterable".into(),
         ));
     };
-    let sync_iterator = crate::function::call(agent, &sync_method, items.clone(), &[])?;
+    let sync_iterator = crate::function::call(agent, &sync_method, *items, &[])?;
     let next = get_property(
         agent,
         &sync_iterator,
         &JsString::from_utf8("next"),
-        sync_iterator.clone(),
+        sync_iterator,
     )?;
     if !is_callable(&next) {
         return Err(JsError::new(
@@ -2382,7 +2382,7 @@ fn async_iterator_from(
         agent,
         &async_value,
         &JsString::from_utf8("next"),
-        async_value.clone(),
+        async_value,
     )?;
     if !is_callable(&next) {
         return Err(JsError::new(
@@ -2398,7 +2398,7 @@ fn async_iterator_from(
 
 /// The `%Array.prototype[@@species]%` getter (spec 23.1.3.41): returns `this`.
 fn species_getter(_agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
-    Ok(this.clone())
+    Ok(*this)
 }
 
 /// Install the Array intrinsics and the global `Array` binding (spec 23.1)
@@ -2420,15 +2420,15 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     let array_ctor_value = Value::Function(array_ctor);
 
-    realm.intrinsics.define(ARRAY, array_ctor_value.clone());
+    realm.intrinsics.define(ARRAY, array_ctor_value);
     realm
         .intrinsics
-        .define(ARRAY_PROTO, array_proto_value.clone());
+        .define(ARRAY_PROTO, array_proto_value);
 
     array_ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(array_proto_value.clone()),
+            value: Some(array_proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -2439,7 +2439,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     array_proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(array_ctor_value.clone()),
+            value: Some(array_ctor_value),
             writable: Some(true),
             get: None,
             set: None,
@@ -2571,7 +2571,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             "%Array.prototype.values% missing".into(),
         )
     })?;
-    realm.intrinsics.define(ITERATOR, values_func.clone());
+    realm.intrinsics.define(ITERATOR, values_func);
     array_proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
         &PropertyDescriptor {
@@ -2662,7 +2662,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let iterator_proto_value = Value::Object(iterator_proto);
     realm
         .intrinsics
-        .define(ARRAY_ITERATOR, iterator_proto_value.clone());
+        .define(ARRAY_ITERATOR, iterator_proto_value);
     let next_func = Function::create_builtin(
         Some(JsString::from_utf8("next")),
         0,
@@ -3001,14 +3001,14 @@ mod tests {
 
     fn settled(agent: &Agent, value: &Value) -> Result<Value, JsError> {
         let ValueKind::Object(obj) = value.kind() else {
-            return Ok(value.clone());
+            return Ok(*value);
         };
         let Some(data) = agent.promises.get(&obj.id()) else {
-            return Ok(value.clone());
+            return Ok(*value);
         };
         match &data.borrow().state {
-            PromiseState::Fulfilled(v) => Ok(v.clone()),
-            PromiseState::Rejected(v) => Ok(v.clone()),
+            PromiseState::Fulfilled(v) => Ok(*v),
+            PromiseState::Rejected(v) => Ok(*v),
             PromiseState::Pending { .. } => Err(JsError::new(
                 ErrorKind::TypeError,
                 "promise still pending".into(),

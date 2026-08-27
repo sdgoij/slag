@@ -668,7 +668,7 @@ fn to_string_impl(agent: &mut Agent, this: &Value, options: &Value) -> Result<Va
         agent,
         &resolved,
         &JsString::from_utf8("timeZone"),
-        resolved.clone(),
+        resolved,
     )?;
     let time_zone = if matches!(time_zone.kind(), ValueKind::Undefined) {
         None

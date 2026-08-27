@@ -51,7 +51,7 @@ const TAG_UNINITIALIZED: u64 = 9;
 /// churning every `.clone()` site.)
 /// `PartialEq` preserves the derived-enum semantics: `Number` compares via
 /// `f64::eq` (`NaN != NaN`), objects via their id equality.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct Value(u64, std::marker::PhantomData<Rc<()>>);
 
 // The box holds raw `Rc` pointers, so it must not cross threads (the refcount
@@ -646,7 +646,7 @@ mod tests {
         let v = Value::Object(obj);
         // Value is Copy under the GC model: clones are copies, and the boxed
         // payload address is unchanged (there is no refcount to observe).
-        let c = v.clone();
+        let c = v;
         assert_eq!(v.heap_payload(), c.heap_payload());
         assert!(v.as_object().is_some());
         assert!(c.as_object().is_some());

@@ -1720,7 +1720,7 @@ fn leaf_frame(scope: &ScopeInfo, args: &[Value]) -> Frame {
             }
         });
         for (index, arg) in args.iter().take(scope.arity).enumerate() {
-            buf[index] = arg.clone();
+            buf[index] = *arg;
         }
         Frame::Inline(buf)
     } else {
@@ -1734,7 +1734,7 @@ fn leaf_frame(scope: &ScopeInfo, args: &[Value]) -> Frame {
             })
             .collect();
         for (index, arg) in args.iter().take(scope.arity).enumerate() {
-            slots[index] = arg.clone();
+            slots[index] = *arg;
         }
         Frame::Heap(slots)
     }
@@ -2424,7 +2424,7 @@ impl Vm {
         imm: f64,
         target: usize,
     ) -> Result<(), JsError> {
-        let left = self.frame_get(slot).clone();
+        let left = *self.frame_get(slot);
         if left.is_uninitialized() {
             return Err(JsError::new(
                 ErrorKind::ReferenceError,
@@ -2501,7 +2501,7 @@ impl Vm {
         let global = self.global_object(agent)?;
         let global_value = Value::Object(global);
         Ok(crate::context::Reference {
-            base: crate::context::ReferenceBase::Value(global_value.clone()),
+            base: crate::context::ReferenceBase::Value(global_value),
             name: PropertyKey::from_js_string(&crux::lookup(name)),
             strict: self.strict,
             this_value: Some(global_value),
@@ -2550,7 +2550,7 @@ impl Vm {
                 && *key == PropertyKey::String(name)
                 && let crux::object::PropertyKind::Data { value, .. } = &property.kind
             {
-                return Ok(value.clone());
+                return Ok(*value);
             }
         }
         let reference = self.global_reference(agent, name)?;
@@ -2617,7 +2617,7 @@ impl Vm {
                     value: cell,
                 } = &mut property.kind
             {
-                let old = cell.clone();
+                let old = *cell;
                 // A Number counter avoids the `to_numeric` call entirely
                 // (its result for a Number is the value itself, so the
                 // postfix result is `old` unchanged).
@@ -2652,13 +2652,13 @@ impl Vm {
                     };
                     (new, old_numeric)
                 };
-                *cell = new.clone();
+                *cell = new;
                 return Ok(if prefix { new } else { result });
             }
         }
         let old = self.load_global_value(agent, name)?;
         let (old_numeric, new) = update_value(agent, &op, &old)?;
-        self.store_global_value(agent, name, new.clone())?;
+        self.store_global_value(agent, name, new)?;
         Ok(if prefix { new } else { old_numeric })
     }
 
@@ -2716,7 +2716,7 @@ impl Vm {
             && cell.name == name
             && cell.generation == object.generation()
         {
-            return Some(cell.value.clone());
+            return Some(cell.value);
         }
         let slot = match agent.member_cells[index] {
             Some((cached_id, cached_name, slot))
@@ -2753,12 +2753,12 @@ impl Vm {
         }
         match &property.kind {
             crux::object::PropertyKind::Data { value, .. } => {
-                let value = value.clone();
+                let value = *value;
                 agent.member_value_cells[index] = Some(MemberValueCell {
                     id: object.id(),
                     name,
                     generation: object.generation(),
-                    value: value.clone(),
+                    value,
                 });
                 Some(value)
             }
@@ -2937,10 +2937,10 @@ impl Vm {
             {
                 return Ok(false);
             }
-            receiver.fresh_data_define(&property_key, value.clone())
+            receiver.fresh_data_define(&property_key, *value)
         } else {
             // No chain: [[Set]] always defines on the receiver.
-            receiver.fresh_data_define(&property_key, value.clone())
+            receiver.fresh_data_define(&property_key, *value)
         };
         if ok {
             // Cut 35 slice 32: the store-then-read pattern (a constructor
@@ -2953,7 +2953,7 @@ impl Vm {
                 id: receiver.id(),
                 name: *atom,
                 generation: receiver.generation(),
-                value: value.clone(),
+                value: *value,
             });
         }
         Ok(ok)
@@ -2978,7 +2978,7 @@ impl Vm {
                     id: object.id(),
                     name,
                     generation: object.generation(),
-                    value: value.clone(),
+                    value: *value,
                 });
                 // Cut 23: cache the slot for the prototype too — fresh
                 // instances of the same shape hit the proto-keyed fallback
@@ -3019,7 +3019,7 @@ impl Vm {
             && cell.index == index
             && cell.generation == object.generation()
         {
-            return Some(cell.value.clone());
+            return Some(cell.value);
         }
         let (cached_id, cached_index, atom, slot) = agent.array_element_cells[cache_index]?;
         if cached_id != object.id() || cached_index != index {
@@ -3032,12 +3032,12 @@ impl Vm {
         }
         match &property.kind {
             crux::object::PropertyKind::Data { value, .. } => {
-                let value = value.clone();
+                let value = *value;
                 agent.array_element_value_cells[cache_index] = Some(ArrayElementValueCell {
                     id: object.id(),
                     index,
                     generation: object.generation(),
-                    value: value.clone(),
+                    value,
                 });
                 Some(value)
             }
@@ -3072,7 +3072,7 @@ impl Vm {
                     id: object.id(),
                     index,
                     generation: object.generation(),
-                    value: value.clone(),
+                    value: *value,
                 });
             }
         }
@@ -3119,7 +3119,7 @@ impl Vm {
             agent,
             array,
             &JsString::from_utf8("length"),
-            array.clone(),
+            *array,
         )?;
         Ok(crux::convert::to_length(crate::context::to_number(
             agent,
@@ -3201,7 +3201,7 @@ impl Vm {
         }
         let value = match var {
             FastLoopVar::Slot(slot) => {
-                let value = self.frame_get(slot).clone();
+                let value = *self.frame_get(slot);
                 if value.is_uninitialized() {
                     return Err(JsError::new(
                         ErrorKind::ReferenceError,
@@ -3241,7 +3241,7 @@ impl Vm {
     ) -> Result<(), JsError> {
         match var {
             FastLoopVar::Slot(slot) => {
-                let old = self.frame_get(slot).clone();
+                let old = *self.frame_get(slot);
                 if old.is_uninitialized() {
                     return Err(JsError::new(
                         ErrorKind::ReferenceError,
@@ -3284,7 +3284,7 @@ impl Vm {
     /// Number, so the field takes the value's numeric form.
     fn fast_loop_bind(&mut self, agent: &mut Agent, var: FastLoopVar) -> Result<(), JsError> {
         let value = match var {
-            FastLoopVar::Slot(slot) => self.frame_get(slot).clone(),
+            FastLoopVar::Slot(slot) => *self.frame_get(slot),
             FastLoopVar::Global(name) => self.load_global_value(agent, name)?,
             FastLoopVar::Counter => unreachable!("FastLoopBind on the counter field itself"),
         };
@@ -3344,11 +3344,11 @@ impl Vm {
         match resume {
             Resume::Normal(value) => self.stack.push(value),
             Resume::Throw(value) => {
-                self.resume_abrupt = Some(ResumeAbrupt::Throw(value.clone()));
+                self.resume_abrupt = Some(ResumeAbrupt::Throw(value));
                 self.stack.push(value);
             }
             Resume::Return(value) => {
-                self.resume_abrupt = Some(ResumeAbrupt::Return(value.clone()));
+                self.resume_abrupt = Some(ResumeAbrupt::Return(value));
                 self.stack.push(value);
             }
         }
@@ -3705,7 +3705,7 @@ impl Vm {
                     return Ok(VmOutcome::Completed(if self.completion_is_empty {
                         Completion::Empty
                     } else {
-                        Completion::Normal(self.completion.clone())
+                        Completion::Normal(self.completion)
                     }));
                 }
             };
@@ -3731,7 +3731,7 @@ impl Vm {
                     self.stack.push(value);
                 }
                 Step::LoadLocal { slot } => {
-                    let value = self.frame_get(*slot).clone();
+                    let value = *self.frame_get(*slot);
                     if value.is_uninitialized() {
                         return Err(JsError::new(
                             ErrorKind::ReferenceError,
@@ -3758,13 +3758,13 @@ impl Vm {
                             "Cannot access a binding before initialization".into(),
                         ));
                     }
-                    *self.frame_get_mut(*slot) = value.clone();
+                    *self.frame_get_mut(*slot) = value;
                     self.completion = value;
                     self.completion_is_empty = false;
                 }
                 Step::FusedStoreGlobal { name } => {
                     let value = self.pop();
-                    self.store_global_value(agent, *name, value.clone())?;
+                    self.store_global_value(agent, *name, value)?;
                     self.completion = value;
                     self.completion_is_empty = false;
                 }
@@ -3781,7 +3781,7 @@ impl Vm {
                     *self.frame_get_mut(*slot) = value;
                 }
                 Step::UpdateLocal { slot, op, prefix } => {
-                    let old = self.frame_get(*slot).clone();
+                    let old = *self.frame_get(*slot);
                     if old.is_uninitialized() {
                         return Err(JsError::new(
                             ErrorKind::ReferenceError,
@@ -3789,11 +3789,11 @@ impl Vm {
                         ));
                     }
                     let (old_numeric, new) = update_value(agent, op, &old)?;
-                    *self.frame_get_mut(*slot) = new.clone();
+                    *self.frame_get_mut(*slot) = new;
                     self.stack.push(if *prefix { new } else { old_numeric });
                 }
                 Step::Inc { slot } => {
-                    let old = self.frame_get(*slot).clone();
+                    let old = *self.frame_get(*slot);
                     if old.is_uninitialized() {
                         return Err(JsError::new(
                             ErrorKind::ReferenceError,
@@ -3803,7 +3803,7 @@ impl Vm {
                     *self.frame_get_mut(*slot) = update_value(agent, &UpdateOp::Increment, &old)?.1;
                 }
                 Step::Dec { slot } => {
-                    let old = self.frame_get(*slot).clone();
+                    let old = *self.frame_get(*slot);
                     if old.is_uninitialized() {
                         return Err(JsError::new(
                             ErrorKind::ReferenceError,
@@ -3918,20 +3918,20 @@ impl Vm {
                         );
                     }
                 }
-                Step::Push(value) => self.stack.push(value.clone()),
+                Step::Push(value) => self.stack.push(*value),
                 Step::Pop => {
                     self.pop();
                 }
                 Step::Dup => {
                     let top = self.pop();
-                    self.stack.push(top.clone());
+                    self.stack.push(top);
                     self.stack.push(top);
                 }
                 Step::Dup2 => {
                     let b = self.pop();
                     let a = self.pop();
-                    self.stack.push(a.clone());
-                    self.stack.push(b.clone());
+                    self.stack.push(a);
+                    self.stack.push(b);
                     self.stack.push(a);
                     self.stack.push(b);
                 }
@@ -3992,7 +3992,7 @@ impl Vm {
                     }
                     let key = crate::context::to_property_key(agent, &key)?;
                     let value =
-                        crate::context::get_property_key(agent, &object, &key, object.clone())?;
+                        crate::context::get_property_key(agent, &object, &key, object)?;
                     self.pop(); // the write copy of the raw key
                     let key = match key {
                         PropertyKey::String(id) => Value::String(Handle::new(crux::lookup(id))),
@@ -4136,13 +4136,13 @@ impl Vm {
                         AssignOp::Assign
                         | AssignOp::AndAssign
                         | AssignOp::OrAssign
-                        | AssignOp::NullishAssign => value.clone(),
+                        | AssignOp::NullishAssign => value,
                         _ => {
                             let old = crate::context::private_get(agent, &object, name_id)?;
                             crate::expr::apply_compound(agent, *op, &old, &value)?
                         }
                     };
-                    crate::context::private_set(agent, &object, name_id, new.clone())?;
+                    crate::context::private_set(agent, &object, name_id, new)?;
                     self.stack.push(new);
                 }
                 Step::Destructure { pattern } => {
@@ -4150,7 +4150,7 @@ impl Vm {
                     crate::binding::binding_initialization(
                         agent,
                         pattern,
-                        value.clone(),
+                        value,
                         None,
                         self.strict,
                     )?;
@@ -4248,7 +4248,7 @@ impl Vm {
                         )
                     })?;
                     let value =
-                        crate::context::get_property_key(agent, &object, key, object.clone())?;
+                        crate::context::get_property_key(agent, &object, key, object)?;
                     self.stack.push(value);
                 }
                 Step::DestructureObjKeyComputed => {
@@ -4264,7 +4264,7 @@ impl Vm {
                         frame.push(key.clone());
                     }
                     let value =
-                        crate::context::get_property_key(agent, &object, &key, object.clone())?;
+                        crate::context::get_property_key(agent, &object, &key, object)?;
                     self.stack.push(value);
                 }
                 Step::DestructureObjKeyStore => {
@@ -4289,7 +4289,7 @@ impl Vm {
                         frame.push(key.clone());
                     }
                     let value =
-                        crate::context::get_property_key(agent, &object, &key, object.clone())?;
+                        crate::context::get_property_key(agent, &object, &key, object)?;
                     self.stack.push(value);
                 }
                 Step::DestructureObjRest { excluded } => {
@@ -4329,7 +4329,7 @@ impl Vm {
                     crate::binding::binding_initialization(
                         agent,
                         pattern,
-                        value.clone(),
+                        value,
                         Some(&self.lexical_env),
                         self.strict,
                     )?;
@@ -4380,7 +4380,7 @@ impl Vm {
                             "PutVarReference without a resolution".into(),
                         )
                     })?;
-                    crate::context::put_value(agent, &reference, value.clone())?;
+                    crate::context::put_value(agent, &reference, value)?;
                     self.stack.push(value);
                 }
                 Step::PopVarReference => {
@@ -4444,7 +4444,7 @@ impl Vm {
                         )
                     })?;
                     let new = crate::expr::apply_compound(agent, *op, &old, &value)?;
-                    crate::context::put_value(agent, &reference, new.clone())?;
+                    crate::context::put_value(agent, &reference, new)?;
                     self.stack.push(new);
                 }
                 Step::UpdateVarReference { op, prefix } => {
@@ -4456,7 +4456,7 @@ impl Vm {
                             "UpdateVarReference without a resolution".into(),
                         )
                     })?;
-                    crate::context::put_value(agent, &reference, new.clone())?;
+                    crate::context::put_value(agent, &reference, new)?;
                     self.stack.push(if *prefix { new } else { old_numeric });
                 }
                 Step::UsingInit { pattern, is_await } => {
@@ -4471,7 +4471,7 @@ impl Vm {
                     crate::binding::binding_initialization(
                         agent,
                         pattern,
-                        value.clone(),
+                        value,
                         Some(&self.lexical_env),
                         self.strict,
                     )?;
@@ -4501,7 +4501,7 @@ impl Vm {
                     let (old_numeric, new) = update_value(agent, op, &old)?;
                     let reference =
                         crate::context::resolve_binding(agent, &crux::lookup(*name), self.strict)?;
-                    crate::context::put_value(agent, &reference, new.clone())?;
+                    crate::context::put_value(agent, &reference, new)?;
                     self.stack.push(if *prefix { new } else { old_numeric });
                 }
                 Step::UpdateMemberName { name, op, prefix } => {
@@ -4514,7 +4514,7 @@ impl Vm {
                     crate::context::put_value(
                         agent,
                         &member_reference(&object, &PropertyKeyName::Name(*name), self.strict),
-                        new.clone(),
+                        new,
                     )?;
                     self.stack.push(if *prefix { new } else { old_numeric });
                 }
@@ -4530,7 +4530,7 @@ impl Vm {
                     crate::context::put_value(
                         agent,
                         &member_reference(&object, &PropertyKeyName::Key(key), self.strict),
-                        new.clone(),
+                        new,
                     )?;
                     self.stack.push(if *prefix { new } else { old_numeric });
                 }
@@ -4538,7 +4538,7 @@ impl Vm {
                     let old = self.pop();
                     let base = self.pop();
                     let (old_numeric, new) = update_value(agent, op, &old)?;
-                    self.put_super(agent, base, PropertyKeyName::Name(*name), new.clone())?;
+                    self.put_super(agent, base, PropertyKeyName::Name(*name), new)?;
                     self.stack.push(if *prefix { new } else { old_numeric });
                 }
                 Step::UpdateSuperComputed { op, prefix } => {
@@ -4547,7 +4547,7 @@ impl Vm {
                     let base = self.pop();
                     let (old_numeric, new) = update_value(agent, op, &old)?;
                     let key = crate::context::to_property_key(agent, &key)?;
-                    self.put_super(agent, base, PropertyKeyName::Key(key), new.clone())?;
+                    self.put_super(agent, base, PropertyKeyName::Key(key), new)?;
                     self.stack.push(if *prefix { new } else { old_numeric });
                 }
                 Step::UpdatePrivate { atom, op, prefix } => {
@@ -4555,7 +4555,7 @@ impl Vm {
                     let object = self.pop();
                     let (old_numeric, new) = update_value(agent, op, &old)?;
                     let name_id = crate::context::resolve_private_name(agent, *atom)?.id;
-                    crate::context::private_set(agent, &object, name_id, new.clone())?;
+                    crate::context::private_set(agent, &object, name_id, new)?;
                     self.stack.push(if *prefix { new } else { old_numeric });
                 }
                 Step::DeleteIdent { name } => {
@@ -4750,8 +4750,8 @@ impl Vm {
                     let result =
                         crate::function::construct(agent, &super_ctor, &args, &new_target)?;
                     let this_env = get_this_environment(agent)?;
-                    this_env.bind_this_value(result.clone())?;
-                    if let Some(function_value) = agent.running_context()?.function.clone() {
+                    this_env.bind_this_value(result)?;
+                    if let Some(function_value) = agent.running_context()?.function {
                         crate::function::initialize_instance_elements(
                             agent,
                             &result,
@@ -4843,8 +4843,8 @@ impl Vm {
                     args.extend_from_slice(substitutions);
                     let argc = args.len();
                     let keep = self.stack.len();
-                    self.stack.push(this.clone());
-                    self.stack.push(tag.clone());
+                    self.stack.push(this);
+                    self.stack.push(tag);
                     self.stack.extend(args);
                     let n = self.stack.len();
                     return match self.tail_call_shared(
@@ -5099,7 +5099,7 @@ impl Vm {
                         state.class_private_env,
                         state.outer_private_env,
                         state.outer_env,
-                        state.heritage.clone(),
+                        state.heritage,
                         &keys,
                     )?;
                     self.stack.push(class_value);
@@ -5159,7 +5159,7 @@ impl Vm {
                     // environments live outside the stack).
                     self.lexical_env = popped.outer().unwrap_or(popped);
                     if !resources.is_empty() {
-                        let completion = Completion::Normal(self.completion.clone());
+                        let completion = Completion::Normal(self.completion);
                         if let Some(outcome) = self.start_scope_disposal(
                             agent,
                             body,
@@ -5411,7 +5411,7 @@ impl Vm {
                         )
                     })?;
                     let (old_numeric, new) = update_value(agent, op, &old)?;
-                    context_env(&env).set_slot(*index, new.clone());
+                    context_env(&env).set_slot(*index, new);
                     self.stack.push(if *prefix { new } else { old_numeric });
                 }
                 Step::EnterLoopEnv { kind, decls } => {
@@ -5521,7 +5521,7 @@ impl Vm {
                     };
                     let mut pushed = false;
                     while *index < keys.len() {
-                        let (level, key) = keys[*index].clone();
+                        let (level, key) = keys[*index];
                         *index += 1;
                         // A key deleted during enumeration is skipped (spec
                         // EnumerateObjectProperties step 5.a.v).
@@ -5619,7 +5619,7 @@ impl Vm {
                     let next_result = crate::function::call(
                         agent,
                         &iterator.next,
-                        iterator.iterator.clone(),
+                        iterator.iterator,
                         &[],
                     )?;
                     return Ok(VmOutcome::Suspended(Suspension::Await(next_result)));
@@ -5685,7 +5685,7 @@ impl Vm {
                 }
                 Step::ListBegin => {
                     self.list_stack
-                        .push((self.completion.clone(), self.completion_is_empty));
+                        .push((self.completion, self.completion_is_empty));
                     self.completion = Value::Undefined;
                     self.completion_is_empty = true;
                 }
@@ -5699,7 +5699,7 @@ impl Vm {
                 }
                 Step::SaveCompletion => {
                     self.completion_stack
-                        .push((self.completion.clone(), self.completion_is_empty));
+                        .push((self.completion, self.completion_is_empty));
                 }
                 Step::RestoreCompletion => {
                     if let Some((value, empty)) = self.completion_stack.pop() {
@@ -5892,7 +5892,7 @@ impl Vm {
                         ));
                     }
                     let (old_numeric, new) = update_value(agent, op, &old)?;
-                    declarative.set_slot(*index, new.clone());
+                    declarative.set_slot(*index, new);
                     self.stack.push(if *prefix { new } else { old_numeric });
                 }
                 Step::CreateArguments { slot, mapped } => {
@@ -5905,7 +5905,6 @@ impl Vm {
                             let func = agent
                                 .running_context()?
                                 .function
-                                .clone()
                                 .unwrap_or(Value::Undefined);
                             let formals: Vec<JsString> =
                                 formals.iter().map(|id| crux::lookup(*id)).collect();
@@ -6034,7 +6033,7 @@ impl Vm {
                             "YieldStarNext without a delegation".into(),
                         ));
                     };
-                    let received = state.received.clone();
+                    let received = state.received;
                     let iterator = state.iterator.clone();
                     let next = match crate::expr::iterator_next_method(agent, &iterator) {
                         Ok(next) => next,
@@ -6046,7 +6045,7 @@ impl Vm {
                     let result = match crate::function::call(
                         agent,
                         &next,
-                        iterator.iterator.clone(),
+                        iterator.iterator,
                         &[received],
                     ) {
                         Ok(result) => result,
@@ -6119,7 +6118,7 @@ impl Vm {
                                 agent,
                                 &iterator.iterator,
                                 &JsString::from_utf8("throw"),
-                                iterator.iterator.clone(),
+                                iterator.iterator,
                             ) {
                                 Ok(method) => method,
                                 Err(error) => match self.throw_js_error(agent, body, error)? {
@@ -6131,7 +6130,7 @@ impl Vm {
                                 let inner = match crate::function::call(
                                     agent,
                                     &throw_method,
-                                    iterator.iterator.clone(),
+                                    iterator.iterator,
                                     &[value],
                                 ) {
                                     Ok(inner) => inner,
@@ -6213,7 +6212,7 @@ impl Vm {
                                 agent,
                                 &iterator.iterator,
                                 &JsString::from_utf8("return"),
-                                iterator.iterator.clone(),
+                                iterator.iterator,
                             ) {
                                 Ok(method) => method,
                                 Err(error) => match self.throw_js_error(agent, body, error)? {
@@ -6225,7 +6224,7 @@ impl Vm {
                                 let inner = match crate::function::call(
                                     agent,
                                     &return_method,
-                                    iterator.iterator.clone(),
+                                    iterator.iterator,
                                     &[value],
                                 ) {
                                     Ok(inner) => inner,
@@ -6307,13 +6306,13 @@ impl Vm {
                             "AsyncYieldStarNext without a delegation".into(),
                         ));
                     };
-                    let received = state.received.clone();
+                    let received = state.received;
                     let iterator = state.iterator.clone();
                     let next = crate::expr::iterator_next_method(agent, &iterator)?;
                     let result = crate::function::call(
                         agent,
                         &next,
-                        iterator.iterator.clone(),
+                        iterator.iterator,
                         &[received],
                     )?;
                     // The await resume pushes the fulfilled iterator result.
@@ -6412,13 +6411,13 @@ impl Vm {
                                 agent,
                                 &iterator.iterator,
                                 &JsString::from_utf8("throw"),
-                                iterator.iterator.clone(),
+                                iterator.iterator,
                             )?;
                             if is_callable(&throw_method) {
                                 let inner = crate::function::call(
                                     agent,
                                     &throw_method,
-                                    iterator.iterator.clone(),
+                                    iterator.iterator,
                                     &[value],
                                 )?;
                                 self.ip = *inspect;
@@ -6454,13 +6453,13 @@ impl Vm {
                                 agent,
                                 &iterator.iterator,
                                 &JsString::from_utf8("return"),
-                                iterator.iterator.clone(),
+                                iterator.iterator,
                             )?;
                             if is_callable(&return_method) {
                                 let inner = crate::function::call(
                                     agent,
                                     &return_method,
-                                    iterator.iterator.clone(),
+                                    iterator.iterator,
                                     &[value],
                                 )?;
                                 self.ip = *inspect;
@@ -6598,7 +6597,7 @@ impl Vm {
                 // 3.a).
                 Ok(Value::Undefined)
             } else {
-                crate::function::call(agent, &resource.method, resource.value.clone(), &[])
+                crate::function::call(agent, &resource.method, resource.value, &[])
             };
             match method_result {
                 Err(error) => {
@@ -6682,20 +6681,20 @@ impl Vm {
                             .unwrap_or_else(|| crux::lookup(name));
                     crate::function::set_function_name(&value, &display, None)?;
                 }
-                crate::context::put_value(agent, &reference, value.clone())?;
+                crate::context::put_value(agent, &reference, value)?;
                 self.stack.push(value);
             }
             AssignOp::AndAssign | AssignOp::OrAssign | AssignOp::NullishAssign => {
                 let value = self.pop();
                 self.pop(); // old
-                crate::context::put_value(agent, &reference, value.clone())?;
+                crate::context::put_value(agent, &reference, value)?;
                 self.stack.push(value);
             }
             _ => {
                 let value = self.pop();
                 let old = self.pop();
                 let new = crate::expr::apply_compound(agent, op, &old, &value)?;
-                crate::context::put_value(agent, &reference, new.clone())?;
+                crate::context::put_value(agent, &reference, new)?;
                 self.stack.push(new);
             }
         }
@@ -6727,7 +6726,7 @@ impl Vm {
             && let ValueKind::Object(object_ref) = object.kind()
             && matches!(object_ref.kind, crux::object::ObjectKind::Array)
             && object_ref
-                .array_element_write(number as u64, value.clone())?
+                .array_element_write(number as u64, value)?
                 .is_some()
         {
             self.stack.push(value);
@@ -6766,7 +6765,7 @@ impl Vm {
                     agent,
                     &object,
                     &crux::lookup(name),
-                    object.clone(),
+                    object,
                 )?;
                 Self::resolve_member_cell(agent, &object, name);
                 Ok(value)
@@ -6808,12 +6807,12 @@ impl Vm {
                 Some(value) => value,
                 None => {
                     let value =
-                        crate::context::get_property_key(agent, &object, &key, object.clone())?;
+                        crate::context::get_property_key(agent, &object, &key, object)?;
                     Self::resolve_member_cell(agent, &object, *atom);
                     value
                 }
             },
-            _ => crate::context::get_property_key(agent, &object, &key, object.clone())?,
+            _ => crate::context::get_property_key(agent, &object, &key, object)?,
         };
         if let Some(index) = numeric {
             Self::resolve_array_element(agent, &object, index);
@@ -6843,12 +6842,12 @@ impl Vm {
                     return Ok(());
                 }
                 let reference = member_reference(&object, &key, self.strict);
-                crate::context::put_value(agent, &reference, value.clone())?;
+                crate::context::put_value(agent, &reference, value)?;
                 self.stack.push(value);
             }
             AssignOp::AndAssign | AssignOp::OrAssign | AssignOp::NullishAssign => {
                 let reference = member_reference(&object, &key, self.strict);
-                crate::context::put_value(agent, &reference, value.clone())?;
+                crate::context::put_value(agent, &reference, value)?;
                 self.stack.push(value);
             }
             _ => {
@@ -6860,7 +6859,7 @@ impl Vm {
                 };
                 let new = crate::expr::apply_compound(agent, op, &old, &value)?;
                 let reference = member_reference(&object, &key, self.strict);
-                crate::context::put_value(agent, &reference, new.clone())?;
+                crate::context::put_value(agent, &reference, new)?;
                 self.stack.push(new);
             }
         }
@@ -6883,7 +6882,7 @@ impl Vm {
             | AssignOp::OrAssign
             | AssignOp::NullishAssign => {
                 let reference = super_reference(&base, &key, self.strict, &this);
-                crate::context::put_value(agent, &reference, value.clone())?;
+                crate::context::put_value(agent, &reference, value)?;
                 self.stack.push(value);
             }
             _ => {
@@ -6895,7 +6894,7 @@ impl Vm {
                 };
                 let new = crate::expr::apply_compound(agent, op, &old, &value)?;
                 let reference = super_reference(&base, &key, self.strict, &this);
-                crate::context::put_value(agent, &reference, new.clone())?;
+                crate::context::put_value(agent, &reference, new)?;
                 self.stack.push(new);
             }
         }
@@ -7015,7 +7014,7 @@ impl Vm {
         let frame_size = scope.frame_size;
         for slot in 0..frame_size {
             let value = if Some(slot) == scope.this_slot {
-                this_value.clone()
+                this_value
             } else if slot < scope.arity {
                 // Missing arguments stay `undefined` (spec 10.2.11).
                 args.get(slot).cloned().unwrap_or(Value::Undefined)
@@ -7173,7 +7172,7 @@ impl Vm {
         if !aliased {
             for slot in 0..scope.frame_size {
                 let value = if Some(slot) == scope.this_slot {
-                    this_value.clone()
+                    this_value
                 } else if slot < scope.arity {
                     // Missing arguments stay `undefined` (spec 10.2.11).
                     args.get(slot).cloned().unwrap_or(Value::Undefined)
@@ -7249,7 +7248,7 @@ impl Vm {
         for op in ops {
             match op {
                 LeafOp::LoadReg { slot, tdz } => {
-                    let value = self.frame_get(*slot).clone();
+                    let value = *self.frame_get(*slot);
                     if *tdz && value.is_uninitialized() {
                         return Err(JsError::new(
                             ErrorKind::ReferenceError,
@@ -7302,7 +7301,7 @@ impl Vm {
                     // Number wrap.
                     self.acc = Value::Number(self.loop_counter);
                 }
-                LeafOp::LoadConst(value) => self.acc = value.clone(),
+                LeafOp::LoadConst(value) => self.acc = *value,
                 LeafOp::BinReg { op, slot, tdz } => {
                     if *tdz && self.frame_get(*slot).is_uninitialized() {
                         return Err(JsError::new(
@@ -7310,7 +7309,7 @@ impl Vm {
                             "Cannot access a binding before initialization".into(),
                         ));
                     }
-                    let right = self.frame_get(*slot).clone();
+                    let right = *self.frame_get(*slot);
                     self.acc = Self::binary_inline(agent, *op, &self.acc, &right)?;
                 }
                 LeafOp::BinContext { op, index } => {
@@ -7386,7 +7385,7 @@ impl Vm {
                             "Cannot access a binding before initialization".into(),
                         ));
                     }
-                    let left = self.frame_get(*slot).clone();
+                    let left = *self.frame_get(*slot);
                     self.acc = Self::binary_inline(agent, *op, &left, &Value::Number(*imm))?;
                 }
                 LeafOp::BinCtxReg {
@@ -7420,7 +7419,7 @@ impl Vm {
                             "Cannot access a binding before initialization".into(),
                         ));
                     }
-                    let right = self.frame_get(*slot).clone();
+                    let right = *self.frame_get(*slot);
                     self.acc = Self::binary_inline(agent, *op, &left, &right)?;
                 }
                 LeafOp::StoreReg { slot, tdz } => {
@@ -7430,14 +7429,14 @@ impl Vm {
                             "Cannot access a binding before initialization".into(),
                         ));
                     }
-                    *self.frame_get_mut(*slot) = self.acc.clone();
+                    *self.frame_get_mut(*slot) = self.acc;
                 }
                 LeafOp::StoreMemberName { name, value } => {
                     // The object is the accumulator; the value comes from the
                     // operand. Mirrors `Step::AssignMemberName` with a plain
                     // `=`: the nullish check, then `assign_member` (whose
                     // pushed result the frame truncate discards).
-                    let object = self.acc.clone();
+                    let object = self.acc;
                     if is_nullish(&object) {
                         return Err(nullish_error("Cannot set properties of null"));
                     }
@@ -7456,17 +7455,17 @@ impl Vm {
                     // from the operands (neither may be `Acc` — the object
                     // load would have clobbered it). Shares the fast-array
                     // and property-key machinery with the step path.
-                    let object = self.acc.clone();
+                    let object = self.acc;
                     let key = self.leaf_operand_value(key)?;
                     let value = self.leaf_operand_value(value)?;
                     self.assign_computed_plain(agent, object, key, value)?;
                 }
                 LeafOp::GetMemberName { name } => {
-                    let object = self.acc.clone();
+                    let object = self.acc;
                     self.acc = self.get_member_name(agent, object, *name)?;
                 }
                 LeafOp::GetMemberComputed { key } => {
-                    let object = self.acc.clone();
+                    let object = self.acc;
                     let key = self.leaf_operand_value(key)?;
                     self.acc = self.get_member_computed(agent, object, key)?;
                 }
@@ -7488,7 +7487,7 @@ impl Vm {
                     }
                     self.acc = match Self::member_cell_get(agent, object, *name) {
                         Some(value) => value,
-                        None => self.get_member_name(agent, object.clone(), *name)?,
+                        None => self.get_member_name(agent, *object, *name)?,
                     };
                 }
                 LeafOp::GetMemberComputedLocal {
@@ -7496,7 +7495,7 @@ impl Vm {
                     tdz,
                     key,
                 } => {
-                    let object = self.frame_get(*object_slot).clone();
+                    let object = *self.frame_get(*object_slot);
                     if *tdz && object.is_uninitialized() {
                         return Err(JsError::new(
                             ErrorKind::ReferenceError,
@@ -7506,17 +7505,17 @@ impl Vm {
                     let key = self.leaf_operand_value(key)?;
                     self.acc = self.get_member_computed(agent, object, key)?;
                 }
-                LeafOp::PushAcc => self.stack.push(self.acc.clone()),
+                LeafOp::PushAcc => self.stack.push(self.acc),
                 LeafOp::BinAccPop { op } => {
                     let left = self.pop();
                     self.acc = Self::binary_inline(agent, *op, &left, &self.acc)?;
                 }
                 LeafOp::BinLeftReg { op, slot } => {
-                    let left = self.frame_get(*slot).clone();
+                    let left = *self.frame_get(*slot);
                     self.acc = Self::binary_inline(agent, *op, &left, &self.acc)?;
                 }
                 LeafOp::ReturnAcc => {
-                    return Ok(Completion::Return(self.acc.clone()));
+                    return Ok(Completion::Return(self.acc));
                 }
             }
         }
@@ -7574,9 +7573,9 @@ impl Vm {
     /// (including the TDZ and context-transparent-env walks).
     fn leaf_operand_value(&self, operand: &RegOperand) -> Result<Value, JsError> {
         match operand {
-            RegOperand::Acc => Ok(self.acc.clone()),
+            RegOperand::Acc => Ok(self.acc),
             RegOperand::Reg { slot, tdz } => {
-                let value = self.frame_get(*slot).clone();
+                let value = *self.frame_get(*slot);
                 if *tdz && value.is_uninitialized() {
                     return Err(JsError::new(
                         ErrorKind::ReferenceError,
@@ -7610,7 +7609,7 @@ impl Vm {
                         "Cannot access a binding before initialization".into(),
                     )
                 }),
-            RegOperand::Const(value) => Ok(value.clone()),
+            RegOperand::Const(value) => Ok(*value),
             // The lowering rejects spilled keys/values; a reaching spill
             // would be a compiler bug.
             RegOperand::Spilled => Err(JsError::new(
@@ -7689,7 +7688,7 @@ impl Vm {
         args: &[Value],
     ) -> Result<Value, JsError> {
         let this = crate::function::construct_this_object(agent, new_target)?;
-        let completion = self.run_leaf_body(agent, ir, environment, strict, this.clone(), args)?;
+        let completion = self.run_leaf_body(agent, ir, environment, strict, this, args)?;
         // spec 10.2.1 [[Construct]] steps 15-21 (base): an object return
         // wins; anything else falls back to `this`.
         match completion {
@@ -7723,8 +7722,8 @@ impl Vm {
     ) -> Result<(), JsError> {
         let n = self.stack.len();
         let arg_start = n - argc;
-        let callee = self.stack[arg_start - 1].clone();
-        let this = self.stack[arg_start - 2].clone();
+        let callee = self.stack[arg_start - 1];
+        let this = self.stack[arg_start - 2];
         // The shared core: `below` values under the argument region (2 for
         // `CallFast`'s `[this, callee]`) are removed with the arguments when
         // the result replaces the call site.
@@ -7751,8 +7750,8 @@ impl Vm {
     ) -> Result<VmOutcome, JsError> {
         let n = self.stack.len();
         let arg_start = n - argc;
-        let callee = self.stack[arg_start - 1].clone();
-        let this = self.stack[arg_start - 2].clone();
+        let callee = self.stack[arg_start - 1];
+        let this = self.stack[arg_start - 2];
         match self.tail_call_shared(
             agent,
             this,
@@ -7789,8 +7788,8 @@ impl Vm {
         let args = self.args.split_off(base);
         let argc = args.len();
         let keep = self.stack.len();
-        self.stack.push(this.clone());
-        self.stack.push(callee.clone());
+        self.stack.push(this);
+        self.stack.push(callee);
         self.stack.extend(args);
         let n = self.stack.len();
         match self.tail_call_shared(agent, this, callee, argc, n - argc, keep, direct_eval, body)? {
@@ -7837,7 +7836,7 @@ impl Vm {
         body: &CompiledBody,
     ) -> Result<VmOutcome, JsError> {
         let n = self.stack.len();
-        let callee = self.frame_get(slot).clone();
+        let callee = *self.frame_get(slot);
         let keep = n - argc;
         match self.tail_call_shared(
             agent,
@@ -7942,7 +7941,7 @@ impl Vm {
         if let ValueKind::Function(function) = callee.kind()
             && matches!(function.kind, crux::function::FunctionKind::EcmaScript)
             && agent.realm_count.get() == 1
-            && let Some(ir) = self.tail_prepare_ordinary(agent, &function, this.clone(), &args)?
+            && let Some(ir) = self.tail_prepare_ordinary(agent, &function, this, &args)?
         {
             return Ok(TailOutcome::Replaced(ir));
         }
@@ -7966,7 +7965,7 @@ impl Vm {
             agent,
             body,
             Ctl::Return {
-                value: value.clone(),
+                value,
             },
         )? {
             // A finally can never defer a compiled tail call (the compiler
@@ -8091,7 +8090,7 @@ impl Vm {
         let function_value = function.self_value();
         let function_env = crate::env::new_function_environment(
             Some(old_env),
-            function_value.clone(),
+            function_value,
             Value::Undefined,
             this_mode == crate::function::ThisMode::Lexical,
         );
@@ -8106,7 +8105,7 @@ impl Vm {
         agent
             .execution_context_stack
             .push(crate::context::ExecutionContext {
-                function: Some(function_value.clone()),
+                function: Some(function_value),
                 realm,
                 script_or_module,
                 lexical_environment: function_env,
@@ -8212,7 +8211,7 @@ impl Vm {
         // fused step no longer pushed them), then the general core.
         if let Some(base) = caller_arg_base {
             for i in 0..argc {
-                self.stack.push(self.frame_get(base + i).clone());
+                self.stack.push(*self.frame_get(base + i));
             }
         }
         let callee = self.load_global_value(agent, name)?;
@@ -8255,17 +8254,17 @@ impl Vm {
             let entry = cell.entry.clone();
             return self.run_inline_leaf(agent, argc, Value::Undefined, entry, 0, caller_arg_base);
         }
-        let callee = callee.clone();
+        let callee = *callee;
         if let Some(base) = caller_arg_base {
             for i in 0..argc {
-                self.stack.push(self.frame_get(base + i).clone());
+                self.stack.push(*self.frame_get(base + i));
             }
         }
         self.fast_call_core(
             agent,
             argc,
             false,
-            callee.clone(),
+            callee,
             Value::Undefined,
             0,
             LeafCacheSite::Slot {
@@ -8342,7 +8341,7 @@ impl Vm {
             } else {
                 if let Some(base) = caller_arg_base {
                     for i in 0..argc {
-                        self.stack.push(self.frame_get(base + i).clone());
+                        self.stack.push(*self.frame_get(base + i));
                     }
                 }
                 let n = self.stack.len();
@@ -8369,7 +8368,7 @@ impl Vm {
             // then the step body on the copied arguments.
             if let Some(base) = caller_arg_base {
                 for i in 0..argc {
-                    self.stack.push(self.frame_get(base + i).clone());
+                    self.stack.push(*self.frame_get(base + i));
                 }
             }
             let n = self.stack.len();
@@ -8508,7 +8507,7 @@ impl Vm {
         // The innermost state is cloned out so the arm can mutate the stacks
         // while agent-side calls run.
         let fast = match self.for_of_stack.last() {
-            Some(ForOfEntry::Fast { array, index }) => Some((array.clone(), *index)),
+            Some(ForOfEntry::Fast { array, index }) => Some((*array, *index)),
             _ => None,
         };
         if let Some((array, index)) = fast {
@@ -8528,7 +8527,7 @@ impl Vm {
                             agent,
                             &array,
                             &PropertyKey::from_utf8(&index.to_string()),
-                            array.clone(),
+                            array,
                         )?;
                         Self::resolve_array_element(agent, &array, index as u64);
                         value
@@ -8672,7 +8671,7 @@ impl Vm {
         let resources = env.drain_disposable_resources();
         for resource in resources.iter().rev() {
             if !resource.method.is_undefined() {
-                crate::function::call(agent, &resource.method, resource.value.clone(), &[])?;
+                crate::function::call(agent, &resource.method, resource.value, &[])?;
             }
         }
         self.lexical_env = env.outer().unwrap_or(env);
@@ -8828,12 +8827,12 @@ impl Vm {
                             depth,
                         },
                         Ctl::Return { value } => PendingControl::Return {
-                            value: value.clone(),
+                            value: *value,
                             env,
                             depth,
                         },
                         Ctl::Throw { value } => PendingControl::Throw {
-                            value: value.clone(),
+                            value: *value,
                             env,
                             depth,
                         },
@@ -9175,7 +9174,7 @@ fn member_reference(
         PropertyKeyName::Key(key) => key.clone(),
     };
     crate::context::Reference {
-        base: crate::context::ReferenceBase::Value(object.clone()),
+        base: crate::context::ReferenceBase::Value(*object),
         name,
         strict,
         this_value: None,
@@ -9194,10 +9193,10 @@ fn super_reference(
         PropertyKeyName::Key(key) => key.clone(),
     };
     crate::context::Reference {
-        base: crate::context::ReferenceBase::Value(base.clone()),
+        base: crate::context::ReferenceBase::Value(*base),
         name,
         strict,
-        this_value: Some(this.clone()),
+        this_value: Some(*this),
         private_name: None,
     }
 }
@@ -9340,7 +9339,7 @@ fn object_accessor(
     let descriptor = crux::property::PropertyDescriptor {
         value: None,
         writable: None,
-        get: if get { Some(closure.clone()) } else { None },
+        get: if get { Some(closure) } else { None },
         set: if get { None } else { Some(closure) },
         enumerable: Some(true),
         configurable: Some(true),
@@ -9373,12 +9372,12 @@ fn tagged_template(
 
 fn iterator_result_done(agent: &mut Agent, result: &Value) -> Result<bool, JsError> {
     let done =
-        crate::context::get_property(agent, result, &JsString::from_utf8("done"), result.clone())?;
+        crate::context::get_property(agent, result, &JsString::from_utf8("done"), *result)?;
     Ok(crux::convert::to_boolean(&done))
 }
 
 fn iterator_result_value(agent: &mut Agent, result: &Value) -> Result<Value, JsError> {
-    crate::context::get_property(agent, result, &JsString::from_utf8("value"), result.clone())
+    crate::context::get_property(agent, result, &JsString::from_utf8("value"), *result)
 }
 
 /// GetIterator with the ~async~ hint for an async-generator `yield*` (spec
@@ -9390,7 +9389,7 @@ fn get_async_iterator_record(
 ) -> Result<crate::expr::IteratorRecord, JsError> {
     let method = crate::expr::get_method(agent, value, "@@asyncIterator")?;
     if let Some(method) = method {
-        let iterator = crate::function::call(agent, &method, value.clone(), &[])?;
+        let iterator = crate::function::call(agent, &method, *value, &[])?;
         if !matches!(iterator.kind(), ValueKind::Object(_)) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -9401,7 +9400,7 @@ fn get_async_iterator_record(
             agent,
             &iterator,
             &JsString::from_utf8("next"),
-            iterator.clone(),
+            iterator,
         )?;
         if !crux::value::is_callable(&next) {
             return Err(JsError::new(
@@ -9418,7 +9417,7 @@ fn get_async_iterator_record(
         agent,
         &iterator,
         &JsString::from_utf8("next"),
-        iterator.clone(),
+        iterator,
     )?;
     Ok(crate::expr::IteratorRecord { iterator, next })
 }
@@ -9431,12 +9430,12 @@ fn async_from_sync_or_async(
 ) -> Result<crate::expr::IteratorRecord, JsError> {
     let async_method = crate::expr::get_method(agent, value, "@@asyncIterator")?;
     if let Some(method) = async_method {
-        let iterator = crate::function::call(agent, &method, value.clone(), &[])?;
+        let iterator = crate::function::call(agent, &method, *value, &[])?;
         let next = crate::context::get_property(
             agent,
             &iterator,
             &JsString::from_utf8("next"),
-            iterator.clone(),
+            iterator,
         )?;
         if !is_callable(&next) {
             return Err(JsError::new(
@@ -15056,7 +15055,7 @@ fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
     let mut counter_reads = 0;
     for (index, step) in steps.iter().enumerate() {
         match step {
-            Step::Push(value) => stack.push(RegOperand::Const(value.clone())),
+            Step::Push(value) => stack.push(RegOperand::Const(*value)),
             Step::PushAcc => {
                 if counter_reads > 0 {
                     return None;

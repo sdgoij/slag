@@ -626,7 +626,7 @@ fn wait_async(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
     let key = (block_id, offset);
     agent
         .wait_async
-        .insert(resolve_id, (capability.resolve.clone(), block_id, offset));
+        .insert(resolve_id, (capability.resolve, block_id, offset));
     let event = Arc::new(WaiterEvent {
         condvar: Condvar::new(),
         notified: Mutex::new(false),
@@ -709,7 +709,7 @@ pub fn service_wait_async(agent: &mut Agent) -> Result<(), JsError> {
                 .lock()
                 .map_err(|_| JsError::new(ErrorKind::TypeError, "wait registry poisoned".into()))?;
             if let Some(outcome) = *status {
-                resolved.push((*resolve_id, resolve.clone(), *block_id, *offset, outcome));
+                resolved.push((*resolve_id, *resolve, *block_id, *offset, outcome));
             }
         }
     }

@@ -57,7 +57,7 @@ fn object_handle(value: &Value) -> Option<Handle<JsObject>> {
 /// Pin `value` under its object's id so its tagged ref resolves later.
 fn pin(value: &Value) {
     if let Some(object) = object_handle(value) {
-        OBJECTS.with(|objects| objects.borrow_mut().insert(object.id(), value.clone()));
+        OBJECTS.with(|objects| objects.borrow_mut().insert(object.id(), *value));
     }
 }
 

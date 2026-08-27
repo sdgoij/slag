@@ -228,22 +228,22 @@ fn resolve_heritage(agent: &mut Agent, superclass: Option<Value>) -> Result<Heri
                 agent,
                 &superclass,
                 &JsString::from_utf8("prototype"),
-                superclass.clone(),
+                superclass,
             )?;
             match prototype.kind() {
                 ValueKind::Object(proto) => Ok(Heritage {
                     proto_parent: Some(proto),
-                    super_constructor: Some(superclass.clone()),
+                    super_constructor: Some(superclass),
                 }),
                 // A callable prototype (Function.prototype) is still an
                 // ordinary object for prototype purposes.
                 ValueKind::Function(proto) => Ok(Heritage {
                     proto_parent: Some(proto.object),
-                    super_constructor: Some(superclass.clone()),
+                    super_constructor: Some(superclass),
                 }),
                 ValueKind::Null => Ok(Heritage {
                     proto_parent: None,
-                    super_constructor: Some(superclass.clone()),
+                    super_constructor: Some(superclass),
                 }),
                 _ => Err(JsError::new(
                     ErrorKind::TypeError,
@@ -341,7 +341,7 @@ fn build_class(
         && let Some(data) = agent.ecma_functions.get_mut(&ctor_handle.id())
     {
         data.constructor_kind = ConstructorKind::Derived;
-        data.super_constructor = super_constructor.clone();
+        data.super_constructor = super_constructor;
     }
     // Set F.[[Prototype]] to superclass: static members of the superclass
     // (and its own statics, e.g. `Uint8Array.fromBase64`) resolve on the
@@ -364,7 +364,7 @@ fn build_class(
     proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(ctor.clone()),
+            value: Some(ctor),
             writable: Some(true),
             get: None,
             set: None,
@@ -403,7 +403,7 @@ fn build_class(
         }
         let is_static = element_is_static(element);
         let home = if is_static {
-            ctor.clone()
+            ctor
         } else {
             Value::Object(proto)
         };
@@ -413,7 +413,7 @@ fn build_class(
                     element_key_with(agent, name, strict, precomputed_keys, computed_key_index)?;
                 let closure = instantiate_method(agent, function, class_env, true)?;
                 set_private_environment(agent, &closure, &class_private_env)?;
-                make_method(agent, &closure, home.clone())?;
+                make_method(agent, &closure, home)?;
                 set_function_name(&closure, &element_name_text(name, key.as_ref()), None)?;
                 if let Some(name_id) = private_id {
                     // PrivateMethodOrAccessorAdd (spec 10.2.13).
@@ -436,7 +436,7 @@ fn build_class(
                 let getter =
                     instantiate_accessor(agent, Vec::new(), body.clone(), class_env, true)?;
                 set_private_environment(agent, &getter, &class_private_env)?;
-                make_method(agent, &getter, home.clone())?;
+                make_method(agent, &getter, home)?;
                 set_function_name(&getter, &element_name_text(name, key.as_ref()), Some("get"))?;
                 if let Some(name_id) = private_id {
                     let element = crux::object::PrivateElement {
@@ -477,7 +477,7 @@ fn build_class(
                     true,
                 )?;
                 set_private_environment(agent, &setter, &class_private_env)?;
-                make_method(agent, &setter, home.clone())?;
+                make_method(agent, &setter, home)?;
                 set_function_name(&setter, &element_name_text(name, key.as_ref()), Some("set"))?;
                 if let Some(name_id) = private_id {
                     let element = crux::object::PrivateElement {
@@ -567,7 +567,7 @@ fn build_class(
 
     // Initialize the class binding in the class scope (spec step 36).
     if let Some(binding) = &binding {
-        class_env.initialize_binding(binding, ctor.clone())?;
+        class_env.initialize_binding(binding, ctor)?;
     }
 
     // Static fields and blocks evaluate after the class binding is
@@ -880,7 +880,7 @@ fn evaluate_static_field_initializer(
     };
     let closure = instantiate_method(agent, &function, *class_env, true)?;
     set_private_environment(agent, &closure, class_private_env)?;
-    make_method(agent, &closure, receiver.clone())?;
+    make_method(agent, &closure, *receiver)?;
     // The synthetic initializer function carries [[ClassFieldInitializerName]]
     // (spec 15.7.10 step 8), so a direct eval in its body applies the "Eval
     // Inside Initializer" early errors (spec 19.2.1.1).
@@ -889,7 +889,7 @@ fn evaluate_static_field_initializer(
     {
         data.class_field_initializer = true;
     }
-    crate::function::call(agent, &closure, receiver.clone(), &[])
+    crate::function::call(agent, &closure, *receiver, &[])
 }
 
 /// PrivateFieldAdd (spec 10.2.10) on a receiver (object or constructor).
@@ -1022,7 +1022,7 @@ fn evaluate_static_block(
     // MakeMethod(body, homeObject): the home object is the class constructor,
     // so `super.prop` in a static block resolves against the superclass
     // (spec 15.7.13 step 4).
-    make_method(agent, &closure, ctor.clone())?;
-    crate::function::call(agent, &closure, ctor.clone(), &[])?;
+    make_method(agent, &closure, *ctor)?;
+    crate::function::call(agent, &closure, *ctor, &[])?;
     Ok(())
 }

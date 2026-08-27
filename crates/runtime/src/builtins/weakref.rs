@@ -107,14 +107,14 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let weak_ref_ctor_value = Value::Function(weak_ref_ctor);
     realm
         .intrinsics
-        .define(WEAK_REF, weak_ref_ctor_value.clone());
+        .define(WEAK_REF, weak_ref_ctor_value);
     realm
         .intrinsics
-        .define(WEAK_REF_PROTO, weak_ref_proto_value.clone());
+        .define(WEAK_REF_PROTO, weak_ref_proto_value);
     weak_ref_ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(weak_ref_proto_value.clone()),
+            value: Some(weak_ref_proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -125,7 +125,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     weak_ref_proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(weak_ref_ctor_value.clone()),
+            value: Some(weak_ref_ctor_value),
             writable: Some(true),
             get: None,
             set: None,
@@ -180,14 +180,14 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let fr_ctor_value = Value::Function(fr_ctor);
     realm
         .intrinsics
-        .define(FINALIZATION_REGISTRY, fr_ctor_value.clone());
+        .define(FINALIZATION_REGISTRY, fr_ctor_value);
     realm
         .intrinsics
-        .define(FINALIZATION_REGISTRY_PROTO, fr_proto_value.clone());
+        .define(FINALIZATION_REGISTRY_PROTO, fr_proto_value);
     fr_ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(fr_proto_value.clone()),
+            value: Some(fr_proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -198,7 +198,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     fr_proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(fr_ctor_value.clone()),
+            value: Some(fr_ctor_value),
             writable: Some(true),
             get: None,
             set: None,
@@ -276,7 +276,7 @@ fn instance_proto(
         agent,
         new_target,
         &JsString::from_utf8("prototype"),
-        new_target.clone(),
+        *new_target,
     )?;
     match as_object(&proto) {
         Some(object) => Ok(object),
@@ -332,7 +332,7 @@ pub fn dispatch_call(
             // discarded immediately must still keep its target through a
             // same-job `$262.gc()`.
             if crate::agent::value_box_addr(&target).is_some() {
-                agent.kept_during_job.borrow_mut().push(target.clone());
+                agent.kept_during_job.borrow_mut().push(target);
             }
             Ok(target)
         })());

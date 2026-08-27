@@ -162,15 +162,15 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     let bigint_ctor_value = Value::Function(bigint_ctor);
 
-    realm.intrinsics.define(BIGINT, bigint_ctor_value.clone());
+    realm.intrinsics.define(BIGINT, bigint_ctor_value);
     realm
         .intrinsics
-        .define(BIGINT_PROTO, bigint_proto_value.clone());
+        .define(BIGINT_PROTO, bigint_proto_value);
 
     bigint_ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(bigint_proto_value.clone()),
+            value: Some(bigint_proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -181,7 +181,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     bigint_proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(bigint_ctor_value.clone()),
+            value: Some(bigint_ctor_value),
             writable: Some(true),
             get: None,
             set: None,

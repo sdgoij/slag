@@ -441,7 +441,7 @@ pub fn call(callee: &Value, this: Value, args: &[Value]) -> Result<Value, JsErro
             } => {
                 let mut all = bound_args.clone();
                 all.extend_from_slice(args);
-                call(target, bound_this.clone(), &all)
+                call(target, *bound_this, &all)
             }
         },
         ValueKind::Object(obj) => match &obj.kind {
@@ -485,7 +485,7 @@ pub fn construct(callee: &Value, args: &[Value], new_target: &Value) -> Result<V
             } => {
                 let mut all = bound_args.clone();
                 all.extend_from_slice(args);
-                let target_value = target.clone();
+                let target_value = *target;
                 let new_target = if same_value(&Value::Function(function), new_target) {
                     &target_value
                 } else {
@@ -637,7 +637,7 @@ mod tests {
             Some(JsString::from_utf8("f")),
             2,
             Box::new(move |this, args| {
-                recorded.borrow_mut().push((this.clone(), args.to_vec()));
+                recorded.borrow_mut().push((*this, args.to_vec()));
                 Ok(Value::Number(args.len() as f64))
             }),
             None,

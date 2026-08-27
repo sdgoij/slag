@@ -59,10 +59,10 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     let proxy_ctor_value = Value::Function(proxy_ctor);
 
-    realm.intrinsics.define(PROXY, proxy_ctor_value.clone());
+    realm.intrinsics.define(PROXY, proxy_ctor_value);
     realm
         .intrinsics
-        .define(PROXY_PROTO, proxy_proto_value.clone());
+        .define(PROXY_PROTO, proxy_proto_value);
 
     // spec 26.2.1: the Proxy constructor has no `prototype` property; the
     // %Proxy.prototype% intrinsic still exists (with its own constructor
@@ -71,7 +71,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     proxy_proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(proxy_ctor_value.clone()),
+            value: Some(proxy_ctor_value),
             writable: Some(true),
             get: None,
             set: None,
@@ -156,7 +156,7 @@ pub fn dispatch_construct(
     {
         let target = args.first().cloned().unwrap_or(Value::Undefined);
         let handler = args.get(1).cloned().unwrap_or(Value::Undefined);
-        let proxy = match crux::proxy::proxy_create(target.clone(), handler) {
+        let proxy = match crux::proxy::proxy_create(target, handler) {
             Ok(proxy) => proxy,
             Err(error) => return Some(Err(error)),
         };
@@ -178,7 +178,7 @@ pub fn dispatch_construct(
 fn proxy_revocable(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
     let target = args.first().cloned().unwrap_or(Value::Undefined);
     let handler = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let proxy = crux::proxy::proxy_create(target.clone(), handler)?;
+    let proxy = crux::proxy::proxy_create(target, handler)?;
     if !crate::function::is_constructor(agent, &target)
         && let crux::object::ObjectKind::Proxy(slots) = &proxy.kind
     {

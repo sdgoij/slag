@@ -90,7 +90,7 @@ impl Exception {
                 message
             ))))
         };
-        isolate.set_pending_exception(value.clone());
+        isolate.set_pending_exception(value);
         Ok(Local(value))
     }
 

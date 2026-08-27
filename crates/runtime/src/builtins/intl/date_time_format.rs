@@ -540,7 +540,7 @@ fn get_boolean_option(
     options: &Value,
     name: &str,
 ) -> Result<Option<bool>, JsError> {
-    let value = get_property(agent, options, &JsString::from_utf8(name), options.clone())?;
+    let value = get_property(agent, options, &JsString::from_utf8(name), *options)?;
     if value.is_undefined() {
         return Ok(None);
     }
@@ -796,7 +796,7 @@ fn initialize(
         agent,
         &options,
         &JsString::from_utf8("timeZone"),
-        options.clone(),
+        options,
     )?;
     let time_zone = if time_zone_value.is_undefined() {
         "UTC".to_string()
@@ -1016,7 +1016,7 @@ fn get_number_option(
     minimum: f64,
     maximum: f64,
 ) -> Result<Option<f64>, JsError> {
-    let value = get_property(agent, options, &JsString::from_utf8(name), options.clone())?;
+    let value = get_property(agent, options, &JsString::from_utf8(name), *options)?;
     if value.is_undefined() {
         return Ok(None);
     }
@@ -2221,7 +2221,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
     ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(proto_value.clone()),
+            value: Some(proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -2297,7 +2297,7 @@ fn fallback_symbol(agent: &Agent) -> Result<crux::symbol::Symbol, JsError> {
 fn unwrap_date_time_format(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     if let Some(obj) = as_object(this) {
         if agent.intl_date_time_format_data.contains_key(&obj.id()) {
-            return Ok(this.clone());
+            return Ok(*this);
         }
         if let Ok(inner) = crate::context::get_property_key(
             agent,
@@ -2319,7 +2319,7 @@ fn proto_from_ctor(agent: &mut Agent, new_target: &Value) -> Result<Handle<JsObj
         agent,
         new_target,
         &JsString::from_utf8("prototype"),
-        new_target.clone(),
+        *new_target,
     )?;
     if let Some(obj) = as_object(&proto) {
         return Ok(obj);
@@ -2350,7 +2350,7 @@ fn format_getter(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     let dtf = unwrap_date_time_format(agent, this)?;
     let mut record = date_time_format_record(agent, &dtf)?;
     if let Some(bound) = &record.bound_format {
-        return Ok(bound.clone());
+        return Ok(*bound);
     }
     let Some(obj) = as_object(&dtf) else {
         return Err(type_error("Not a DateTimeFormat instance"));
@@ -2370,7 +2370,7 @@ fn format_getter(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     )?;
     agent.intl_dtf_format_functions.insert(func.id(), dtf_id);
     let bound = Value::Function(func);
-    record.bound_format = Some(bound.clone());
+    record.bound_format = Some(bound);
     agent.intl_date_time_format_data.insert(dtf_id, record);
     Ok(bound)
 }
@@ -3023,7 +3023,7 @@ pub fn zoned_to_locale_string(
         agent,
         &options_obj,
         &JsString::from_utf8("timeZone"),
-        options_obj.clone(),
+        options_obj,
     )?;
     if !time_zone.is_undefined() {
         return Err(type_error(
@@ -3223,7 +3223,7 @@ fn construct_inner(
         this_obj.define_property_key(
             &PropertyKey::Symbol(fallback_symbol(agent)?),
             &PropertyDescriptor {
-                value: Some(inner.clone()),
+                value: Some(inner),
                 writable: Some(false),
                 get: None,
                 set: None,
@@ -3231,7 +3231,7 @@ fn construct_inner(
                 configurable: Some(false),
             },
         )?;
-        return Ok(this.clone());
+        return Ok(*this);
     }
     create_instance(agent, proto, record)
 }

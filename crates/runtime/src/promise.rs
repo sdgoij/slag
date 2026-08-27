@@ -209,7 +209,7 @@ pub fn new_promise_capability(
         &[Value::Function(executor)],
         constructor,
     )?;
-    let Some((resolve, reject)) = captured.borrow().clone() else {
+    let Some((resolve, reject)) = *captured.borrow() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Promise executor did not call resolve or reject".into(),
@@ -257,7 +257,7 @@ pub fn create_resolving_functions(agent: &mut Agent, promise: &Value) -> (Value,
         agent.promise_resolvers.insert(
             resolver.id(),
             Rc::new(RefCell::new(ResolverData {
-                promise: promise.clone(),
+                promise: *promise,
                 already_resolved: already_resolved.clone(),
                 is_reject,
             })),
@@ -299,7 +299,7 @@ pub fn resolve_promise(
         agent,
         &resolution,
         &JsString::from_utf8("then"),
-        resolution.clone(),
+        resolution,
     );
     let then = match then {
         Ok(then) => then,
@@ -312,7 +312,7 @@ pub fn resolve_promise(
         return fulfill_promise(agent, promise, resolution);
     }
     // Enqueue a NewPromiseResolveThenableJob (spec 27.2.1.8).
-    enqueue_resolve_thenable_job(agent, promise.clone(), resolution, then)
+    enqueue_resolve_thenable_job(agent, *promise, resolution, then)
 }
 
 /// The Promise Reject Function algorithm: reject `promise` with `reason`.
@@ -339,12 +339,12 @@ pub fn reject_promise(agent: &mut Agent, promise: &Value, reason: Value) -> Resu
         };
         (std::mem::take(reject_reactions), data.is_handled)
     };
-    data.borrow_mut().state = PromiseState::Rejected(reason.clone());
+    data.borrow_mut().state = PromiseState::Rejected(reason);
     if !was_handled {
         crate::host::promise_rejection_tracker(agent, promise, Some(&reason), false)?;
     }
     for reaction in reactions {
-        enqueue_reaction_job(agent, reaction, reason.clone());
+        enqueue_reaction_job(agent, reaction, reason);
     }
     Ok(())
 }
@@ -374,9 +374,9 @@ pub fn fulfill_promise(agent: &mut Agent, promise: &Value, value: Value) -> Resu
         };
         std::mem::take(fulfill_reactions)
     };
-    data.borrow_mut().state = PromiseState::Fulfilled(value.clone());
+    data.borrow_mut().state = PromiseState::Fulfilled(value);
     for reaction in reactions {
-        enqueue_reaction_job(agent, reaction, value.clone());
+        enqueue_reaction_job(agent, reaction, value);
     }
     Ok(())
 }
@@ -391,7 +391,7 @@ pub fn perform_promise_then(
     on_rejected: Option<Value>,
     result_capability: Option<PromiseCapability>,
 ) -> Result<Value, JsError> {
-    let result_promise = result_capability.as_ref().map(|c| c.promise.clone());
+    let result_promise = result_capability.as_ref().map(|c| c.promise);
     let on_fulfilled = on_fulfilled.filter(is_callable);
     let on_rejected = on_rejected.filter(is_callable);
     let fulfill_reaction = PromiseReaction {
@@ -411,7 +411,7 @@ pub fn perform_promise_then(
         ));
     };
     let id = obj.id();
-    let promise_again = promise.clone();
+    let promise_again = *promise;
     // Attach the reactions, or take the settled value; the borrow ends before
     // jobs are enqueued (they need `&mut agent`).
     let outcome = {
@@ -429,8 +429,8 @@ pub fn perform_promise_then(
                 reject_reactions.push(reject_reaction.clone());
                 None
             }
-            PromiseState::Fulfilled(value) => Some((ReactionKind::Fulfill, value.clone())),
-            PromiseState::Rejected(value) => Some((ReactionKind::Reject, value.clone())),
+            PromiseState::Fulfilled(value) => Some((ReactionKind::Fulfill, *value)),
+            PromiseState::Rejected(value) => Some((ReactionKind::Reject, *value)),
         }
     };
     if let Some((kind, value)) = outcome {
@@ -445,7 +445,7 @@ pub fn perform_promise_then(
     if !was_handled {
         agent.promises[&id].borrow_mut().is_handled = true;
         let reason = match &agent.promises[&id].borrow().state {
-            PromiseState::Rejected(value) => Some(value.clone()),
+            PromiseState::Rejected(value) => Some(*value),
             _ => None,
         };
         crate::host::promise_rejection_tracker(agent, &promise_again, reason.as_ref(), true)?;
@@ -461,7 +461,7 @@ pub fn promise_resolve(agent: &mut Agent, constructor: &Value, x: Value) -> Resu
             agent,
             &x,
             &JsString::from_utf8("constructor"),
-            x.clone(),
+            x,
         )?;
         if crux::ops::same_value(&ctor, constructor) {
             return Ok(x);
@@ -476,7 +476,7 @@ pub fn promise_resolve(agent: &mut Agent, constructor: &Value, x: Value) -> Resu
 /// TypeError for an internal error (Phase 8 binds real Error objects).
 pub fn error_value(agent: &mut Agent, error: &JsError) -> Value {
     if let Some(value) = &error.value {
-        return value.clone();
+        return *value;
     }
     // Engine errors reject with a real Error object (spec ch. 17); the
     // message string is the fallback until the built-ins are installed.
@@ -513,12 +513,12 @@ fn enqueue_reaction_job(agent: &mut Agent, reaction: PromiseReaction, argument: 
                 std::slice::from_ref(&argument),
             ),
             None => match reaction.kind {
-                ReactionKind::Fulfill => Ok(argument.clone()),
+                ReactionKind::Fulfill => Ok(argument),
                 ReactionKind::Reject => Err(JsError::new(
                     ErrorKind::TypeError,
                     "Unhandled promise rejection".into(),
                 )
-                .with_value(argument.clone())),
+                .with_value(argument)),
             },
         };
         if let Some(capability) = &reaction.capability {
@@ -552,7 +552,7 @@ fn enqueue_resolve_thenable_job(
     let realm = agent.current_realm().ok();
     let (resolve, reject) = create_resolving_functions(agent, &promise);
     agent.enqueue_promise_job(realm, move |agent| {
-        let result = crate::function::call(agent, &then, thenable, &[resolve, reject.clone()]);
+        let result = crate::function::call(agent, &then, thenable, &[resolve, reject]);
         match result {
             Ok(_) => Ok(Value::Undefined),
             Err(error) => {

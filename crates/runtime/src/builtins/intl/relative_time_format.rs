@@ -265,7 +265,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
     ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(proto_value.clone()),
+            value: Some(proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -338,7 +338,7 @@ fn proto_from_ctor(agent: &mut Agent, new_target: &Value) -> Result<Handle<JsObj
         agent,
         new_target,
         &JsString::from_utf8("prototype"),
-        new_target.clone(),
+        *new_target,
     )?;
     if let Some(obj) = as_object(&proto) {
         return Ok(obj);

@@ -108,15 +108,15 @@ pub fn install_constructor(
     )?;
     let ctor_value = Value::Function(ctor);
 
-    realm.intrinsics.define(intrinsic, ctor_value.clone());
+    realm.intrinsics.define(intrinsic, ctor_value);
     realm
         .intrinsics
-        .define(proto_intrinsic, proto_value.clone());
+        .define(proto_intrinsic, proto_value);
 
     ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(proto_value.clone()),
+            value: Some(proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -127,7 +127,7 @@ pub fn install_constructor(
     proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(ctor_value.clone()),
+            value: Some(ctor_value),
             writable: Some(true),
             get: None,
             set: None,
@@ -154,7 +154,7 @@ pub fn install_constructor(
     parent.define_property(
         &JsString::from_utf8(name),
         &PropertyDescriptor {
-            value: Some(ctor_value.clone()),
+            value: Some(ctor_value),
             writable: Some(true),
             get: None,
             set: None,
@@ -180,7 +180,7 @@ pub fn create_temporal_object(
             agent,
             new_target,
             &JsString::from_utf8("prototype"),
-            new_target.clone(),
+            *new_target,
         )?;
         as_object(&proto)
     };
@@ -359,7 +359,7 @@ pub fn kind_name(kind: RecordKind) -> &'static str {
 pub fn get_options_object(options: &Value) -> Result<Value, JsError> {
     match options.kind() {
         ValueKind::Undefined => Ok(Value::Object(JsObject::ordinary_object_create(None))),
-        ValueKind::Object(_) | ValueKind::Function(_) => Ok(options.clone()),
+        ValueKind::Object(_) | ValueKind::Function(_) => Ok(*options),
         _ => Err(JsError::new(
             ErrorKind::TypeError,
             "options must be an object".into(),
@@ -376,7 +376,7 @@ pub fn get_option(
     default: Option<&str>,
 ) -> Result<Option<String>, JsError> {
     let value =
-        crate::context::get_property(agent, options, &JsString::from_utf8(key), options.clone())?;
+        crate::context::get_property(agent, options, &JsString::from_utf8(key), *options)?;
     if matches!(value.kind(), ValueKind::Undefined) {
         return Ok(default.map(str::to_string));
     }
@@ -434,7 +434,7 @@ pub fn get_rounding_increment(agent: &mut Agent, options: &Value) -> Result<i64,
         agent,
         options,
         &JsString::from_utf8("roundingIncrement"),
-        options.clone(),
+        *options,
     )?;
     if matches!(value.kind(), ValueKind::Undefined) {
         return Ok(1);
@@ -554,7 +554,7 @@ pub fn get_fractional_second_digits(
         agent,
         options,
         &JsString::from_utf8("fractionalSecondDigits"),
-        options.clone(),
+        *options,
     )?;
     if matches!(value.kind(), ValueKind::Undefined) {
         return Ok(FracPrecision::Auto);
@@ -1168,7 +1168,7 @@ fn read_duration_fields(agent: &mut Agent, item: &Value) -> Result<[Option<f64>;
     let mut any = false;
     for (key, idx) in keys {
         let value =
-            crate::context::get_property(agent, item, &JsString::from_utf8(key), item.clone())?;
+            crate::context::get_property(agent, item, &JsString::from_utf8(key), *item)?;
         if !matches!(value.kind(), ValueKind::Undefined) {
             any = true;
             result[idx] = Some(to_integer_if_integral(agent, &value)?);
@@ -1266,7 +1266,7 @@ pub fn get_temporal_relative_to(agent: &mut Agent, options: &Value) -> Result<Re
         agent,
         options,
         &JsString::from_utf8("relativeTo"),
-        options.clone(),
+        *options,
     )?;
     if matches!(value.kind(), ValueKind::Undefined) {
         return Ok(RelativeTo::None);
@@ -1306,7 +1306,7 @@ fn relative_to_object(agent: &mut Agent, item: &Value) -> Result<RelativeTo, JsE
     // own calendar; any other non-String is a TypeError, an unsupported
     // String a RangeError.
     let calendar =
-        crate::context::get_property(agent, item, &JsString::from_utf8("calendar"), item.clone())?;
+        crate::context::get_property(agent, item, &JsString::from_utf8("calendar"), *item)?;
     if !matches!(calendar.kind(), ValueKind::Undefined) {
         if let ValueKind::Object(obj) = calendar.kind()
             && agent.temporal_data.contains_key(&obj.id())
@@ -1358,7 +1358,7 @@ fn relative_to_object(agent: &mut Agent, item: &Value) -> Result<RelativeTo, JsE
         "year",
     ] {
         let value =
-            crate::context::get_property(agent, item, &JsString::from_utf8(key), item.clone())?;
+            crate::context::get_property(agent, item, &JsString::from_utf8(key), *item)?;
         if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
@@ -1608,7 +1608,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         .and_then(|value| as_object(&value));
     let temporal = JsObject::ordinary_object_create(object_proto);
     let temporal_value = Value::Object(temporal);
-    realm.intrinsics.define(TEMPORAL, temporal_value.clone());
+    realm.intrinsics.define(TEMPORAL, temporal_value);
 
     install_now(&temporal, realm)?;
     duration::install(&temporal, realm)?;
@@ -1653,7 +1653,7 @@ fn install_now(temporal: &Handle<JsObject>, realm: &Handle<Realm>) -> Result<(),
         .and_then(|value| as_object(&value));
     let now = JsObject::ordinary_object_create(object_proto);
     let now_value = Value::Object(now);
-    realm.intrinsics.define(NOW, now_value.clone());
+    realm.intrinsics.define(NOW, now_value);
     for (name, intrinsic, length) in [
         ("timeZoneId", NOW_TZ, 0),
         ("instant", NOW_INSTANT, 0),

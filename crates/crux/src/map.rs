@@ -133,6 +133,14 @@ impl Map {
         self.descriptors.iter().position(|(k, _, _)| k == key)
     }
 
+    /// Return the field offset for a property key in this map's descriptors,
+    /// or `None` if the key is not described by this map.
+    pub fn field_offset(&self, key: &PropertyKey) -> Option<usize> {
+        self.descriptors
+            .iter()
+            .find_map(|(k, offset, _)| if k == key { Some(*offset) } else { None })
+    }
+
     /// Add a property descriptor, returning the assigned field offset.
     pub fn add_descriptor(&mut self, key: PropertyKey, _offset: usize, attrs: MapAttrs) -> usize {
         let field = self.descriptors.len();

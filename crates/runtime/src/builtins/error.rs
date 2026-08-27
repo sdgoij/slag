@@ -99,15 +99,15 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     let error_ctor_value = Value::Function(error_ctor);
 
-    realm.intrinsics.define(ERROR, error_ctor_value.clone());
+    realm.intrinsics.define(ERROR, error_ctor_value);
     realm
         .intrinsics
-        .define(ERROR_PROTO, error_proto_value.clone());
+        .define(ERROR_PROTO, error_proto_value);
 
     error_ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(error_proto_value.clone()),
+            value: Some(error_proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -119,7 +119,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     error_proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(error_ctor_value.clone()),
+            value: Some(error_ctor_value),
             writable: Some(true),
             get: None,
             set: None,
@@ -255,17 +255,17 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         )?;
         let ctor_value = Value::Function(ctor);
         ctor.object.set_prototype_of(Some(error_ctor_object))?;
-        realm.intrinsics.define(key, ctor_value.clone());
+        realm.intrinsics.define(key, ctor_value);
 
         let proto = JsObject::ordinary_object_create(Some(error_proto));
         let proto_value = Value::Object(proto);
         realm
             .intrinsics
-            .define(&format!("%{name}.prototype%"), proto_value.clone());
+            .define(&format!("%{name}.prototype%"), proto_value);
         ctor.define_property(
             &JsString::from_utf8("prototype"),
             &PropertyDescriptor {
-                value: Some(proto_value.clone()),
+                value: Some(proto_value),
                 writable: Some(false),
                 get: None,
                 set: None,
@@ -276,7 +276,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         proto.define_property(
             &JsString::from_utf8("constructor"),
             &PropertyDescriptor {
-                value: Some(ctor_value.clone()),
+                value: Some(ctor_value),
                 writable: Some(true),
                 get: None,
                 set: None,
@@ -349,7 +349,7 @@ pub fn dispatch_call(
             return Some(error_construct(
                 agent,
                 args,
-                callee.clone(),
+                *callee,
                 name,
                 *aggregate,
                 *suppressed,
@@ -387,7 +387,7 @@ pub fn dispatch_construct(
             return Some(error_construct(
                 agent,
                 args,
-                new_target.clone(),
+                *new_target,
                 name,
                 *aggregate,
                 *suppressed,
@@ -452,7 +452,7 @@ fn instance_proto(
         agent,
         new_target,
         &JsString::from_utf8("prototype"),
-        new_target.clone(),
+        *new_target,
     )?;
     if let Some(object) = as_object(&proto) {
         return Ok(Some(object));
@@ -507,7 +507,7 @@ fn install_cause(
         agent,
         options,
         &JsString::from_utf8("cause"),
-        options.clone(),
+        *options,
     )?;
     object.define_property(
         &JsString::from_utf8("cause"),
@@ -573,7 +573,7 @@ fn stack_getter(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Valu
             "Error.prototype.stack getter called on a non-object".into(),
         ));
     };
-    if !is_error(agent, this.clone()) {
+    if !is_error(agent, *this) {
         return Ok(Value::Undefined);
     }
     let stack = agent
@@ -640,12 +640,12 @@ fn list_to_array(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
         ));
     }
     if let Some(method) = crate::expr::get_method(agent, value, "@@iterator")? {
-        let iterator = crate::function::call(agent, &method, value.clone(), &[])?;
+        let iterator = crate::function::call(agent, &method, *value, &[])?;
         let next = crate::context::get_property(
             agent,
             &iterator,
             &JsString::from_utf8("next"),
-            iterator.clone(),
+            iterator,
         )?;
         if !crux::value::is_callable(&next) {
             return Err(JsError::new(
@@ -665,7 +665,7 @@ fn list_to_array(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
         return Ok(Value::Object(array));
     }
     let length_value =
-        crate::context::get_property(agent, value, &JsString::from_utf8("length"), value.clone())?;
+        crate::context::get_property(agent, value, &JsString::from_utf8("length"), *value)?;
     let length = to_length(to_number(&length_value)?);
     let array = crate::builtins::array::array_create(agent, length as f64)?;
     for index in 0..length {
@@ -673,7 +673,7 @@ fn list_to_array(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
             agent,
             value,
             &JsString::from_utf8(&index.to_string()),
-            value.clone(),
+            *value,
         )?;
         array.create_data_property(&JsString::from_utf8(&index.to_string()), element)?;
     }
@@ -698,13 +698,13 @@ fn error_prototype_to_string(agent: &mut Agent, this: &Value) -> Result<Value, J
         ));
     }
     let name =
-        crate::context::get_property(agent, this, &JsString::from_utf8("name"), this.clone())?;
+        crate::context::get_property(agent, this, &JsString::from_utf8("name"), *this)?;
     let name = match name.kind() {
         ValueKind::Undefined => "Error".to_string(),
         _ => to_string(&name)?.to_string_lossy(),
     };
     let message =
-        crate::context::get_property(agent, this, &JsString::from_utf8("message"), this.clone())?;
+        crate::context::get_property(agent, this, &JsString::from_utf8("message"), *this)?;
     let message = match message.kind() {
         ValueKind::Undefined => String::new(),
         _ => to_string(&message)?.to_string_lossy(),
@@ -724,7 +724,7 @@ fn error_prototype_to_string(agent: &mut Agent, this: &Value) -> Result<Value, J
 /// back to the message string when the Error built-ins are not installed yet.
 pub fn to_throwable(agent: &mut Agent, error: &JsError) -> Result<Value, JsError> {
     if let Some(value) = &error.value {
-        return Ok(value.clone());
+        return Ok(*value);
     }
     let realm = agent.current_realm()?;
     let ctor = realm

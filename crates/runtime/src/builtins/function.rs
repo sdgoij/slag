@@ -56,16 +56,16 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
 
     realm
         .intrinsics
-        .define(FUNCTION_PROTO, function_proto_value.clone());
+        .define(FUNCTION_PROTO, function_proto_value);
     realm
         .intrinsics
-        .define(FUNCTION, function_ctor_value.clone());
+        .define(FUNCTION, function_ctor_value);
 
     // 20.2.2 Function.prototype: non-writable and non-configurable.
     function_ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(function_proto_value.clone()),
+            value: Some(function_proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -77,7 +77,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     function_proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(function_ctor_value.clone()),
+            value: Some(function_ctor_value),
             writable: Some(true),
             get: None,
             set: None,
@@ -232,8 +232,8 @@ fn install_methods(
             &PropertyDescriptor {
                 value: None,
                 writable: None,
-                get: Some(thrower_value.clone()),
-                set: Some(thrower_value.clone()),
+                get: Some(thrower_value),
+                set: Some(thrower_value),
                 enumerable: Some(false),
                 configurable: Some(true),
             },
@@ -328,9 +328,9 @@ fn create_dynamic_function(
     body_arg: Option<&Value>,
 ) -> Result<Value, JsError> {
     let new_target = if matches!(new_target.kind(), ValueKind::Undefined) {
-        ctor.clone()
+        *ctor
     } else {
-        new_target.clone()
+        *new_target
     };
     let mut param_strings = Vec::new();
     for arg in param_args {
@@ -364,7 +364,7 @@ fn get_prototype_from_constructor(
         agent,
         constructor,
         &PropertyKey::from_utf8("prototype"),
-        constructor.clone(),
+        *constructor,
     )?;
     match as_object(&proto) {
         Some(handle) => Ok(handle),
@@ -383,7 +383,7 @@ fn get_prototype_from_constructor(
 
 /// Function.prototype.apply (spec 20.2.3.2).
 fn apply(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let func = this.clone();
+    let func = *this;
     if !is_callable(&func) {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -406,7 +406,7 @@ fn apply(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
 
 /// Function.prototype.call (spec 20.2.3.4).
 fn call_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let func = this.clone();
+    let func = *this;
     if !is_callable(&func) {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -420,7 +420,7 @@ fn call_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
 
 /// Function.prototype.bind (spec 20.2.3.3).
 fn bind(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let target = this.clone();
+    let target = *this;
     if !is_callable(&target) {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -435,7 +435,7 @@ fn bind(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         .get(FUNCTION_PROTO)
         .and_then(|value| as_object(&value));
     let bound =
-        Function::bound_function_create(target.clone(), this_arg, bound_args.clone(), proto)?;
+        Function::bound_function_create(target, this_arg, bound_args.clone(), proto)?;
 
     // SetFunctionLength (spec steps 4-7): always an own `length`, computed
     // from the target's when it is a Number.
@@ -450,7 +450,7 @@ fn bind(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
             agent,
             &target,
             &PropertyKey::from_utf8("length"),
-            target.clone(),
+            target,
         )?;
         if let ValueKind::Number(number) = target_length.kind() {
             let int = to_integer_or_infinity(number);
@@ -480,7 +480,7 @@ fn bind(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         agent,
         &target,
         &PropertyKey::from_utf8("name"),
-        target.clone(),
+        target,
     )?;
     let target_name = match target_name.kind() {
         ValueKind::String(text) => text.as_ref().clone(),
@@ -506,7 +506,7 @@ fn function_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsError>
     {
         return Ok(Value::String(Handle::new(source.clone())));
     }
-    let name = get_property_key(agent, this, &PropertyKey::from_utf8("name"), this.clone())?;
+    let name = get_property_key(agent, this, &PropertyKey::from_utf8("name"), *this)?;
     let name = match name.kind() {
         ValueKind::String(text) => text.to_string_lossy(),
         _ => String::new(),
@@ -528,7 +528,7 @@ fn create_list_from_array_like(agent: &mut Agent, value: &Value) -> Result<Vec<V
         agent,
         value,
         &PropertyKey::from_utf8("length"),
-        value.clone(),
+        *value,
     )?;
     let length = to_length(to_number(&length)?);
     // Fast path: a dense Array's elements are own data properties in the
@@ -552,7 +552,7 @@ fn create_list_from_array_like(agent: &mut Agent, value: &Value) -> Result<Vec<V
                 }
                 match &prop.kind {
                     crux::object::PropertyKind::Data { value: item, .. } => {
-                        values[index as usize] = Some(item.clone());
+                        values[index as usize] = Some(*item);
                     }
                     crux::object::PropertyKind::Accessor { .. } => {
                         dense = false;
@@ -577,7 +577,7 @@ fn create_list_from_array_like(agent: &mut Agent, value: &Value) -> Result<Vec<V
             agent,
             value,
             &PropertyKey::from_utf8(&index.to_string()),
-            value.clone(),
+            *value,
         )?;
         list.push(item);
     }

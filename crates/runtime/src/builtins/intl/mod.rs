@@ -95,7 +95,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
 
     let intl_value = Value::Object(intl);
-    realm.intrinsics.define(INTL, intl_value.clone());
+    realm.intrinsics.define(INTL, intl_value);
 
     // Intl.Locale (the constructor + prototype), Intl.NumberFormat (plan
     // Cut 2), and Intl.PluralRules/Intl.RelativeTimeFormat (plan Cut 3).
@@ -266,14 +266,14 @@ pub fn canonicalize_locale_list(
         Ok(())
     };
     if single {
-        process(agent, locales.clone())?;
+        process(agent, *locales)?;
     } else {
         let object = to_object(agent, locales)?;
         let length_value = get_property(
             agent,
             &object,
             &JsString::from_utf8("length"),
-            object.clone(),
+            object,
         )?;
         let length = crux::convert::to_length(crux::convert::to_number(&length_value)?) as usize;
         let object_ref = as_object(&object)
@@ -290,7 +290,7 @@ pub fn canonicalize_locale_list(
             )? {
                 continue;
             }
-            let element = get_property(agent, &object, &key, object.clone())?;
+            let element = get_property(agent, &object, &key, object)?;
             process(agent, element)?;
         }
     }

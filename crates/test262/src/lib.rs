@@ -11267,7 +11267,7 @@ var $DONE = function (error) {
         };
         match &data.borrow().state {
             runtime::promise::PromiseState::Fulfilled(_) => Ok(None),
-            runtime::promise::PromiseState::Rejected(value) => Ok(Some(value.clone())),
+            runtime::promise::PromiseState::Rejected(value) => Ok(Some(*value)),
             runtime::promise::PromiseState::Pending { .. } => {
                 Err("module evaluation did not settle".into())
             }
@@ -11293,14 +11293,14 @@ var $DONE = function (error) {
             agent,
             value,
             &JsString::from_utf8("constructor"),
-            value.clone(),
+            *value,
         )
         .ok()?;
         let name = runtime::context::get_property(
             agent,
             &ctor,
             &JsString::from_utf8("name"),
-            ctor.clone(),
+            ctor,
         )
         .ok()?;
         match name.kind() {
@@ -11323,7 +11323,7 @@ var $DONE = function (error) {
                 agent,
                 value,
                 &JsString::from_utf8("message"),
-                value.clone(),
+                *value,
             )
             .ok()
             .filter(|message| matches!(message.kind(), ValueKind::String(_)));
@@ -11349,7 +11349,7 @@ var $DONE = function (error) {
             agent,
             global,
             &JsString::from_utf8("asyncTestPassed"),
-            global.clone(),
+            *global,
         )
         .map_err(|e| e.message)?;
         if !to_boolean(&passed) {
@@ -11359,7 +11359,7 @@ var $DONE = function (error) {
             agent,
             global,
             &JsString::from_utf8("asyncTestError"),
-            global.clone(),
+            *global,
         )
         .map_err(|e| e.message)?;
         if matches!(error.kind(), ValueKind::Undefined | ValueKind::Null) {

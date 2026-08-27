@@ -20,7 +20,7 @@ use crate::tables::retain_value;
 /// `isolate` must point at a live isolate.
 pub unsafe fn throw(isolate: *mut Isolate, error: &JsError, out: Option<&mut u64>) {
     let value = convert(isolate, error);
-    unsafe { &*isolate }.set_pending_exception(value.clone());
+    unsafe { &*isolate }.set_pending_exception(value);
     if let Some(slot) = out {
         *slot = retain_value(value);
     }

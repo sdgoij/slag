@@ -100,7 +100,7 @@ fn regexp_alloc(agent: &mut Agent, new_target: &Value) -> Result<Handle<JsObject
         agent,
         new_target,
         &JsString::from_utf8("prototype"),
-        new_target.clone(),
+        *new_target,
     )?;
     let proto = match as_object(&proto) {
         Some(object) => object,
@@ -190,7 +190,7 @@ fn regexp_construct(
             agent,
             &pattern_or_regexp,
             &JsString::from_utf8("constructor"),
-            pattern_or_regexp.clone(),
+            pattern_or_regexp,
         )?;
         let active = realm.intrinsics.get(REGEXP).unwrap_or(Value::Undefined);
         if crux::ops::same_value(&active, &pattern_ctor) {
@@ -198,7 +198,7 @@ fn regexp_construct(
         }
     }
     let effective_new_target = if is_construct {
-        new_target.clone()
+        *new_target
     } else {
         realm
             .intrinsics
@@ -221,14 +221,14 @@ fn regexp_construct(
             agent,
             &pattern_or_regexp,
             &JsString::from_utf8("source"),
-            pattern_or_regexp.clone(),
+            pattern_or_regexp,
         )?;
         let flags_value = if matches!(flags.kind(), ValueKind::Undefined) {
             get_property(
                 agent,
                 &pattern_or_regexp,
                 &JsString::from_utf8("flags"),
-                pattern_or_regexp.clone(),
+                pattern_or_regexp,
             )?
         } else {
             flags
@@ -243,7 +243,7 @@ fn regexp_construct(
         &object,
         &pattern_source,
         &effective_flags,
-        effective_new_target.clone(),
+        effective_new_target,
     )
 }
 
@@ -338,9 +338,9 @@ pub fn compile(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
         &obj,
         &pattern_source,
         &effective_flags,
-        current_state.constructor.clone(),
+        current_state.constructor,
     )?;
-    Ok(this.clone())
+    Ok(*this)
 }
 
 /// spec 22.2.2.2 RegExpBuiltinExec: the lastIndex protocol and the match
@@ -367,7 +367,7 @@ fn regexp_builtin_exec(
         agent,
         regexp,
         &JsString::from_utf8("lastIndex"),
-        regexp.clone(),
+        *regexp,
     )?;
     let mut last_index = to_length(to_number(&last_index_value)?) as usize;
     let global = state.flags.g;
@@ -430,7 +430,7 @@ fn regexp_builtin_exec(
     } else {
         Value::Undefined
     };
-    array.create_data_property(&JsString::from_utf8("groups"), groups.clone())?;
+    array.create_data_property(&JsString::from_utf8("groups"), groups)?;
     // Group 0 and each capture.
     for (i, capture) in result.iter().enumerate() {
         let value = match capture {
@@ -464,7 +464,7 @@ fn regexp_builtin_exec(
         } else {
             Value::Undefined
         };
-        indices_obj.create_data_property(&JsString::from_utf8("groups"), groups_indices.clone())?;
+        indices_obj.create_data_property(&JsString::from_utf8("groups"), groups_indices)?;
         array.create_data_property(&JsString::from_utf8("indices"), Value::Object(indices_obj))?;
     }
     Ok(Some(Value::Object(array)))
@@ -550,8 +550,8 @@ fn test(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
 /// come back in the canonical (sorted) order.
 fn to_string_method(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     regexp_state(agent, this)?; // thisRegExpValue brand check
-    let source = get_property(agent, this, &JsString::from_utf8("source"), this.clone())?;
-    let flags = get_property(agent, this, &JsString::from_utf8("flags"), this.clone())?;
+    let source = get_property(agent, this, &JsString::from_utf8("source"), *this)?;
+    let flags = get_property(agent, this, &JsString::from_utf8("flags"), *this)?;
     let source_text = crate::context::to_string(agent, &source)?;
     let flags_text = crate::context::to_string(agent, &flags)?;
     let mut units = Vec::with_capacity(source_text.len() + flags_text.len() + 2);
@@ -641,7 +641,7 @@ fn get_flags(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
         ('v', "unicodeSets"),
         ('y', "sticky"),
     ] {
-        let value = match get_property(agent, this, &JsString::from_utf8(name), this.clone()) {
+        let value = match get_property(agent, this, &JsString::from_utf8(name), *this) {
             Ok(value) => value,
             // The built-in flag accessors reject receivers without
             // [[RegExpMatcher]]; %RegExp.prototype% and similar objects
@@ -690,7 +690,7 @@ fn symbol_match(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     // spec 22.2.7.4 steps 3-5: the flags come from Get(rx, "flags") (whose
     // accessor composes global/unicode/etc.); a non-global result returns
     // RegExpExec directly.
-    let flags_value = get_property(agent, this, &JsString::from_utf8("flags"), this.clone())?;
+    let flags_value = get_property(agent, this, &JsString::from_utf8("flags"), *this)?;
     let flags = crate::context::to_string(agent, &flags_value)?;
     let global = flags.as_slice().contains(&(b'g' as u16));
     if !global {
@@ -714,7 +714,7 @@ fn symbol_match(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
             None => break,
             Some(array) => {
                 let matched_value =
-                    get_property(agent, &array, &JsString::from_utf8("0"), array.clone())?;
+                    get_property(agent, &array, &JsString::from_utf8("0"), array)?;
                 let matched = crate::context::to_string(agent, &matched_value)?;
                 result.push(Value::String(Handle::new(matched.clone())));
                 if matched.is_empty() {
@@ -722,7 +722,7 @@ fn symbol_match(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
                         agent,
                         this,
                         &JsString::from_utf8("lastIndex"),
-                        this.clone(),
+                        *this,
                     )?)?) as usize;
                     let next_index = simple_advance(&string, this_index, full_unicode);
                     this_obj.set(
@@ -764,7 +764,7 @@ fn symbol_match_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
         .get(REGEXP)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "%RegExp% is not defined".into()))?;
     let ctor = species_constructor(agent, this, default_ctor)?;
-    let flags_value = get_property(agent, this, &JsString::from_utf8("flags"), this.clone())?;
+    let flags_value = get_property(agent, this, &JsString::from_utf8("flags"), *this)?;
     let flags = crate::context::to_string(agent, &flags_value)?;
     let global = flags.as_slice().contains(&(b'g' as u16));
     let full_unicode =
@@ -772,7 +772,7 @@ fn symbol_match_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
     let matcher = crate::function::construct(
         agent,
         &ctor,
-        &[this.clone(), Value::String(Handle::new(flags))],
+        &[*this, Value::String(Handle::new(flags))],
         &ctor,
     )?;
     // The pinned fixtures keep the 2018 MatchAllIterator step: the initial
@@ -780,7 +780,7 @@ fn symbol_match_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
     // propagates from matchAll itself) and cached onto the matcher, so later
     // writes to the original regexp's lastIndex do not move the iterator
     // (`this-lastindex-cached.js`).
-    let last_index = get_property(agent, this, &JsString::from_utf8("lastIndex"), this.clone())?;
+    let last_index = get_property(agent, this, &JsString::from_utf8("lastIndex"), *this)?;
     let last_index = to_length(to_number(&last_index)?);
     as_object(&matcher)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "matcher is not an object".into()))?
@@ -813,20 +813,20 @@ fn symbol_search(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Valu
         crate::context::to_string(agent, &args.first().cloned().unwrap_or(Value::Undefined))?;
     // spec 22.2.7.4: preserve and restore lastIndex around the exec; the
     // restore is skipped when the exec itself throws (match-err fixtures).
-    let previous = get_property(agent, this, &JsString::from_utf8("lastIndex"), this.clone())?;
+    let previous = get_property(agent, this, &JsString::from_utf8("lastIndex"), *this)?;
     let this_obj = as_object(this).unwrap();
     if !crux::ops::same_value(&previous, &Value::Number(0.0)) {
         this_obj.set(&JsString::from_utf8("lastIndex"), Value::Number(0.0), true)?;
     }
     let result = regexp_exec(agent, this, &string)?;
-    let current = get_property(agent, this, &JsString::from_utf8("lastIndex"), this.clone())?;
+    let current = get_property(agent, this, &JsString::from_utf8("lastIndex"), *this)?;
     if !crux::ops::same_value(&current, &previous) {
         this_obj.set(&JsString::from_utf8("lastIndex"), previous, true)?;
     }
     match result {
         None => Ok(Value::Number(-1.0)),
         Some(array) => {
-            let index = get_property(agent, &array, &JsString::from_utf8("index"), array.clone())?;
+            let index = get_property(agent, &array, &JsString::from_utf8("index"), array)?;
             Ok(Value::Number(to_integer_or_infinity(to_number(&index)?)))
         }
     }
@@ -854,7 +854,7 @@ fn symbol_split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
         .get(REGEXP)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "%RegExp% is not defined".into()))?;
     let ctor = species_constructor(agent, this, default_ctor)?;
-    let flags_value = get_property(agent, this, &JsString::from_utf8("flags"), this.clone())?;
+    let flags_value = get_property(agent, this, &JsString::from_utf8("flags"), *this)?;
     let flags = crate::context::to_string(agent, &flags_value)?;
     let unicode_matching =
         flags.as_slice().contains(&(b'u' as u16)) || flags.as_slice().contains(&(b'v' as u16));
@@ -866,7 +866,7 @@ fn symbol_split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
         agent,
         &ctor,
         &[
-            this.clone(),
+            *this,
             Value::String(Handle::new(JsString::from_utf16(&new_flags))),
         ],
         &ctor,
@@ -918,7 +918,7 @@ fn symbol_split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
                     agent,
                     &splitter,
                     &JsString::from_utf8("lastIndex"),
-                    splitter.clone(),
+                    splitter,
                 )?;
                 let match_end = (to_length(to_number(&match_end_value)?) as usize).min(size);
                 if match_end == last_match_end {
@@ -942,7 +942,7 @@ fn symbol_split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
                             agent,
                             &match_result,
                             &JsString::from_utf8(&i.to_string()),
-                            match_result.clone(),
+                            match_result,
                         )?;
                         array.push(capture);
                         if array.len() == lim as usize {
@@ -962,12 +962,12 @@ fn symbol_split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
 /// RegExpExec (spec 22.2.6.2.1): call the `exec` method when present, else
 /// RegExpBuiltinExec.
 fn regexp_exec(agent: &mut Agent, rx: &Value, string: &JsString) -> Result<Option<Value>, JsError> {
-    let exec = get_property(agent, rx, &JsString::from_utf8("exec"), rx.clone())?;
+    let exec = get_property(agent, rx, &JsString::from_utf8("exec"), *rx)?;
     if is_callable(&exec) {
         let result = crate::function::call(
             agent,
             &exec,
-            rx.clone(),
+            *rx,
             &[Value::String(Handle::new(string.clone()))],
         )?;
         return match result.kind() {
@@ -994,7 +994,7 @@ fn species_constructor(
         agent,
         exemplar,
         &JsString::from_utf8("constructor"),
-        exemplar.clone(),
+        *exemplar,
     )?;
     if matches!(ctor.kind(), ValueKind::Undefined) {
         return Ok(default_ctor);
@@ -1007,7 +1007,7 @@ fn species_constructor(
         ));
     }
     let species_key = PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone());
-    let species = get_property_key(agent, &ctor, &species_key, ctor.clone())?;
+    let species = get_property_key(agent, &ctor, &species_key, ctor)?;
     match species.kind() {
         // The pinned fixtures follow the ES6 text: a null/undefined species
         // falls back to the default constructor (an inherited `constructor`
@@ -1071,7 +1071,7 @@ fn symbol_replace(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
     };
     // spec 22.2.7.3 steps 6-11: the flags come from Get(rx, "flags"); a
     // global rx is reset to lastIndex 0 before the exec loop.
-    let flags_value = get_property(agent, this, &JsString::from_utf8("flags"), this.clone())?;
+    let flags_value = get_property(agent, this, &JsString::from_utf8("flags"), *this)?;
     let flags = crate::context::to_string(agent, &flags_value)?;
     let global = flags.as_slice().contains(&(b'g' as u16));
     let full_unicode =
@@ -1092,19 +1092,19 @@ fn symbol_replace(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
         match regexp_exec(agent, this, &string)? {
             None => break,
             Some(array) => {
-                results.push(array.clone());
+                results.push(array);
                 if !global {
                     break;
                 }
                 let match_value =
-                    get_property(agent, &array, &JsString::from_utf8("0"), array.clone())?;
+                    get_property(agent, &array, &JsString::from_utf8("0"), array)?;
                 let match_string = crate::context::to_string(agent, &match_value)?;
                 if match_string.is_empty() {
                     let this_index = to_length(to_number(&get_property(
                         agent,
                         this,
                         &JsString::from_utf8("lastIndex"),
-                        this.clone(),
+                        *this,
                     )?)?) as usize;
                     let next_index = simple_advance(&string, this_index, full_unicode);
                     let obj = as_object(this).unwrap();
@@ -1121,14 +1121,14 @@ fn symbol_replace(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
     let mut next_source_position = 0usize;
     for result in results {
         let matched_value =
-            get_property(agent, &result, &JsString::from_utf8("0"), result.clone())?;
+            get_property(agent, &result, &JsString::from_utf8("0"), result)?;
         let matched = crate::context::to_string(agent, &matched_value)?;
         let match_length = matched.len();
         let position_value = to_number(&get_property(
             agent,
             &result,
             &JsString::from_utf8("index"),
-            result.clone(),
+            result,
         )?)?;
         let position = to_integer_or_infinity(position_value);
         let position = if position.is_finite() {
@@ -1146,7 +1146,7 @@ fn symbol_replace(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
                 agent,
                 &result,
                 &JsString::from_utf8(&i.to_string()),
-                result.clone(),
+                result,
             )?;
             captures.push(capture);
         }
@@ -1154,7 +1154,7 @@ fn symbol_replace(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
             agent,
             &result,
             &JsString::from_utf8("groups"),
-            result.clone(),
+            result,
         )?;
         let replacement_string = if functional {
             let mut replacer_args = vec![Value::String(Handle::new(matched.clone()))];
@@ -1162,7 +1162,7 @@ fn symbol_replace(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
             replacer_args.push(Value::Number(position as f64));
             replacer_args.push(Value::String(Handle::new(string.clone())));
             if !matches!(named_captures.kind(), ValueKind::Undefined) {
-                replacer_args.push(named_captures.clone());
+                replacer_args.push(named_captures);
             }
             let called =
                 crate::function::call(agent, &replace_value, Value::Undefined, &replacer_args)?;
@@ -1198,7 +1198,7 @@ fn symbol_replace(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
 }
 
 fn array_length(agent: &mut Agent, value: &Value) -> Result<usize, JsError> {
-    let length = get_property(agent, value, &JsString::from_utf8("length"), value.clone())?;
+    let length = get_property(agent, value, &JsString::from_utf8("length"), *value)?;
     Ok(to_length(to_number(&length)?) as usize)
 }
 
@@ -1234,14 +1234,14 @@ fn string_iterator_next(
         Some(array) => {
             if global {
                 let matched_value =
-                    get_property(agent, &array, &JsString::from_utf8("0"), array.clone())?;
+                    get_property(agent, &array, &JsString::from_utf8("0"), array)?;
                 let matched = crate::context::to_string(agent, &matched_value)?;
                 if matched.is_empty() {
                     let this_index = to_length(to_number(&get_property(
                         agent,
                         &regexp,
                         &JsString::from_utf8("lastIndex"),
-                        regexp.clone(),
+                        regexp,
                     )?)?) as usize;
                     let next_index = simple_advance(&string, this_index, full_unicode);
                     if let Some(rx_obj) = as_object(&regexp) {
@@ -1304,15 +1304,15 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     let regexp_ctor_value = Value::Function(regexp_ctor);
 
-    realm.intrinsics.define(REGEXP, regexp_ctor_value.clone());
+    realm.intrinsics.define(REGEXP, regexp_ctor_value);
     realm
         .intrinsics
-        .define(REGEXP_PROTO, regexp_proto_value.clone());
+        .define(REGEXP_PROTO, regexp_proto_value);
 
     regexp_ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(regexp_proto_value.clone()),
+            value: Some(regexp_proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -1323,7 +1323,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     regexp_proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(regexp_ctor_value.clone()),
+            value: Some(regexp_ctor_value),
             writable: Some(true),
             get: None,
             set: None,
@@ -1553,7 +1553,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let iterator_proto_value = Value::Object(iterator_proto);
     realm
         .intrinsics
-        .define(STRING_ITERATOR, iterator_proto_value.clone());
+        .define(STRING_ITERATOR, iterator_proto_value);
     let next_func = Function::create_builtin(
         Some(JsString::from_utf8("next")),
         0,
@@ -1691,7 +1691,7 @@ pub fn dispatch_call(
         return Some(escape(agent, this, args));
     }
     if intrinsics.get(SPECIES).as_ref() == Some(callee) {
-        return Some(Ok(this.clone()));
+        return Some(Ok(*this));
     }
     if intrinsics.get(STRING_ITERATOR_NEXT).as_ref() == Some(callee) {
         return Some(string_iterator_next(agent, this, args));

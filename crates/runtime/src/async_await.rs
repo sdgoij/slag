@@ -125,12 +125,12 @@ pub fn call_async_function(
     let old_env = data.environment;
     let function_env = crate::env::new_function_environment(
         Some(old_env),
-        function_value.clone(),
+        function_value,
         Value::Undefined,
         data.this_mode == crate::function::ThisMode::Lexical,
     );
     let context = ExecutionContext {
-        function: Some(function_value.clone()),
+        function: Some(function_value),
         realm: data.realm,
         script_or_module: None,
         lexical_environment: function_env,
@@ -198,9 +198,9 @@ pub fn call_async_function(
                 vm: Vm::new(body_env, data.strict),
                 body,
                 context,
-                promise: capability.promise.clone(),
-                resolve: capability.resolve.clone(),
-                reject: capability.reject.clone(),
+                promise: capability.promise,
+                resolve: capability.resolve,
+                reject: capability.reject,
                 module: None,
             }));
             let mut state_ref = state.borrow_mut();
@@ -231,7 +231,7 @@ pub fn call_async_function(
                     ));
                 }
             }
-            Ok(capability.promise.clone())
+            Ok(capability.promise)
         };
         match run() {
             Ok(value) => Ok(value),
@@ -334,7 +334,7 @@ fn resume_async(
         Err(error) => {
             let (reject, promise) = {
                 let state = state.borrow();
-                (state.reject.clone(), state.promise.clone())
+                (state.reject, state.promise)
             };
             let rejection = crate::promise::error_value(agent, &error);
             crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
@@ -385,7 +385,7 @@ fn settle_async_completion(
     }
     let (resolve, reject) = {
         let state = state.borrow();
-        (state.resolve.clone(), state.reject.clone())
+        (state.resolve, state.reject)
     };
     crate::builtins::disposable::dispose_async_body_resources(
         agent,
@@ -409,7 +409,7 @@ fn settle_async(
     }
     let (resolve, reject) = {
         let state = state.borrow();
-        (state.resolve.clone(), state.reject.clone())
+        (state.resolve, state.reject)
     };
     match completion {
         // Only a `return` completion carries a value; a normal completion
@@ -531,23 +531,23 @@ fn run_async_from_sync(
         .get("%Promise%")
         .unwrap_or(Value::Undefined);
     let capability = new_promise_capability(agent, &promise_ctor)?;
-    let promise = capability.promise.clone();
+    let promise = capability.promise;
     let sync = entry.sync.clone();
     let method = entry.method;
     let result = match method {
         AsyncFromSyncMethod::Next => {
             let next = crate::expr::iterator_next_method(agent, &sync)?;
-            crate::function::call(agent, &next, sync.iterator.clone(), args)
+            crate::function::call(agent, &next, sync.iterator, args)
         }
         AsyncFromSyncMethod::Return => {
             let return_method = crate::context::get_property(
                 agent,
                 &sync.iterator,
                 &JsString::from_utf8("return"),
-                sync.iterator.clone(),
+                sync.iterator,
             )?;
             if is_callable(&return_method) {
-                crate::function::call(agent, &return_method, sync.iterator.clone(), args)
+                crate::function::call(agent, &return_method, sync.iterator, args)
             } else {
                 // spec 27.1.5.2.2 steps 8-9: no return method resolves with
                 // `{ value: (the argument), done: true }` directly.
@@ -571,10 +571,10 @@ fn run_async_from_sync(
                 agent,
                 &sync.iterator,
                 &JsString::from_utf8("throw"),
-                sync.iterator.clone(),
+                sync.iterator,
             )?;
             if is_callable(&throw_method) {
-                crate::function::call(agent, &throw_method, sync.iterator.clone(), args)
+                crate::function::call(agent, &throw_method, sync.iterator, args)
             } else {
                 // spec 27.1.5.2.3 steps 8-9: no throw method closes the
                 // iterator (for finally blocks) and rejects with a TypeError.
@@ -622,7 +622,7 @@ fn run_async_from_sync(
         agent,
         &result,
         &JsString::from_utf8("done"),
-        result.clone(),
+        result,
     ) {
         Ok(done) => crux::convert::to_boolean(&done),
         Err(error) => {
@@ -635,7 +635,7 @@ fn run_async_from_sync(
         agent,
         &result,
         &JsString::from_utf8("value"),
-        result.clone(),
+        result,
     ) {
         Ok(value) => value,
         Err(error) => {
@@ -650,7 +650,7 @@ fn run_async_from_sync(
     // `return` (or a non-object `return` result) is swallowed (spec
     // 27.1.5.4 steps 5-6).
     let close_on_rejection = method != AsyncFromSyncMethod::Return;
-    let value_wrapper = match promise_resolve(agent, &promise_ctor, value.clone()) {
+    let value_wrapper = match promise_resolve(agent, &promise_ctor, value) {
         Ok(promise) => promise,
         Err(error) => {
             if !done && close_on_rejection {
@@ -763,14 +763,14 @@ mod tests {
         let value = agent.run_script(source)?;
         agent.run_jobs()?;
         let ValueKind::Object(obj) = value.kind() else {
-            return Ok(value.clone());
+            return Ok(value);
         };
         let Some(data) = agent.promises.get(&obj.id()) else {
-            return Ok(value.clone());
+            return Ok(value);
         };
         match &data.borrow().state {
-            PromiseState::Fulfilled(v) => Ok(v.clone()),
-            PromiseState::Rejected(v) => Ok(v.clone()),
+            PromiseState::Fulfilled(v) => Ok(*v),
+            PromiseState::Rejected(v) => Ok(*v),
             PromiseState::Pending { .. } => Err(JsError::new(
                 ErrorKind::TypeError,
                 "promise still pending".into(),
@@ -1028,7 +1028,7 @@ mod tests {
                     result
                         .create_data_property(
                             &JsString::from_utf8("value"),
-                            values_clone[i].clone(),
+                            values_clone[i],
                         )
                         .unwrap();
                     result

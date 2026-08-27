@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn job_callback_records_wrap_callables() {
         let fun = Value::Function(crux::Function::new(None));
-        let record = host_make_job_callback(fun.clone());
+        let record = host_make_job_callback(fun);
         assert_eq!(record.callback, fun);
         assert!(record.host_defined.is_none());
     }

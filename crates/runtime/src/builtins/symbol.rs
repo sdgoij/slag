@@ -82,16 +82,16 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     let symbol_ctor_value = Value::Function(symbol_ctor);
 
-    realm.intrinsics.define(SYMBOL, symbol_ctor_value.clone());
+    realm.intrinsics.define(SYMBOL, symbol_ctor_value);
     realm
         .intrinsics
-        .define(SYMBOL_PROTO, symbol_proto_value.clone());
+        .define(SYMBOL_PROTO, symbol_proto_value);
 
     // 20.4.2.11: Symbol.prototype is non-writable and non-configurable.
     symbol_ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(symbol_proto_value.clone()),
+            value: Some(symbol_proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -102,7 +102,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     symbol_proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(symbol_ctor_value.clone()),
+            value: Some(symbol_ctor_value),
             writable: Some(true),
             get: None,
             set: None,

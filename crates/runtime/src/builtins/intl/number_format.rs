@@ -1635,7 +1635,7 @@ pub(crate) fn get_option(
     values: &[&str],
     fallback: Option<&str>,
 ) -> Result<Option<String>, JsError> {
-    let value = get_property(agent, options, &JsString::from_utf8(name), options.clone())?;
+    let value = get_property(agent, options, &JsString::from_utf8(name), *options)?;
     if value.is_undefined() {
         return Ok(fallback.map(|s| s.to_string()));
     }
@@ -1669,7 +1669,7 @@ fn get_boolean_or_string_number_format_option(
     string_values: &[&str],
     fallback: &str,
 ) -> Result<Value, JsError> {
-    let value = get_property(agent, options, &JsString::from_utf8(name), options.clone())?;
+    let value = get_property(agent, options, &JsString::from_utf8(name), *options)?;
     if value.is_undefined() {
         return Ok(Value::String(Handle::new(JsString::from_utf8(fallback))));
     }
@@ -1697,7 +1697,7 @@ pub(crate) fn get_number_option(
     maximum: f64,
     fallback: f64,
 ) -> Result<f64, JsError> {
-    let value = get_property(agent, options, &JsString::from_utf8(name), options.clone())?;
+    let value = get_property(agent, options, &JsString::from_utf8(name), *options)?;
     if value.is_undefined() {
         return Ok(fallback);
     }
@@ -2033,25 +2033,25 @@ pub(crate) fn set_number_format_digit_options(
         agent,
         options,
         &JsString::from_utf8("minimumFractionDigits"),
-        options.clone(),
+        *options,
     )?;
     let mxfd = get_property(
         agent,
         options,
         &JsString::from_utf8("maximumFractionDigits"),
-        options.clone(),
+        *options,
     )?;
     let mnsd = get_property(
         agent,
         options,
         &JsString::from_utf8("minimumSignificantDigits"),
-        options.clone(),
+        *options,
     )?;
     let mxsd = get_property(
         agent,
         options,
         &JsString::from_utf8("maximumSignificantDigits"),
-        options.clone(),
+        *options,
     )?;
     record.minimum_integer_digits = mnid as u32;
     let rounding_increment =
@@ -2399,7 +2399,7 @@ fn unwrap_number_format(agent: &mut Agent, nf: &Value) -> Result<Value, JsError>
         && ordinary_has_instance_number_format(agent, nf)
     {
         let key = PropertyKey::Symbol(fallback_symbol(agent)?);
-        let value = crate::context::get_property_key(agent, nf, &key, nf.clone())?;
+        let value = crate::context::get_property_key(agent, nf, &key, *nf)?;
         if value.is_undefined() {
             return Err(type_error(
                 "Intl.NumberFormat method called on an incompatible receiver",
@@ -2407,7 +2407,7 @@ fn unwrap_number_format(agent: &mut Agent, nf: &Value) -> Result<Value, JsError>
         }
         return Ok(value);
     }
-    Ok(nf.clone())
+    Ok(*nf)
 }
 
 /// The %Intl%.[[FallbackSymbol]] of the current realm: a per-realm private
@@ -2528,7 +2528,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
     ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(proto_value.clone()),
+            value: Some(proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -2624,7 +2624,7 @@ fn construct_inner(
         agent,
         new_target,
         &JsString::from_utf8("prototype"),
-        new_target.clone(),
+        *new_target,
     )?;
     let proto = if let Some(obj) = as_object(&proto) {
         obj
@@ -2647,7 +2647,7 @@ fn construct_inner(
             this_obj.define_property_key(
                 &PropertyKey::Symbol(fallback_symbol(agent)?),
                 &PropertyDescriptor {
-                    value: Some(inner.clone()),
+                    value: Some(inner),
                     writable: Some(false),
                     get: None,
                     set: None,
@@ -2655,7 +2655,7 @@ fn construct_inner(
                     configurable: Some(false),
                 },
             )?;
-            return Ok(this.clone());
+            return Ok(*this);
         }
     }
     create_instance(agent, Some(&proto), record)
@@ -2732,7 +2732,7 @@ fn format_getter(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     let nf = unwrap_number_format(agent, this)?;
     let mut record = number_format_record(agent, &nf)?;
     if let Some(bound) = &record.bound_format {
-        return Ok(bound.clone());
+        return Ok(*bound);
     }
     let Some(obj) = as_object(&nf) else {
         return Err(type_error(
@@ -2754,7 +2754,7 @@ fn format_getter(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     )?;
     agent.intl_format_functions.insert(func.id(), nf_id);
     let bound = Value::Function(func);
-    record.bound_format = Some(bound.clone());
+    record.bound_format = Some(bound);
     agent.intl_number_format_data.insert(nf_id, record);
     Ok(bound)
 }

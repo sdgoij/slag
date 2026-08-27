@@ -80,7 +80,7 @@ pub fn get_function_realm(agent: &mut Agent, value: &Value) -> Result<Handle<Rea
         },
         ValueKind::Object(obj) => match &obj.kind {
             crux::object::ObjectKind::Proxy(slots) => {
-                let Some(target) = slots.target.borrow().clone() else {
+                let Some(target) = *slots.target.borrow() else {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
                         "GetFunctionRealm: revoked proxy".into(),
@@ -121,7 +121,7 @@ pub fn to_primitive(
     hint: crux::convert::ToPrimitiveHint,
 ) -> Result<Value, JsError> {
     if !matches!(value.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
-        return Ok(value.clone());
+        return Ok(*value);
     }
     // spec 7.1.1 step 1.a: the @@toPrimitive method runs first, and its
     // abrupt completion or object result decides. GetMethod semantics: only
@@ -130,7 +130,7 @@ pub fn to_primitive(
         agent,
         value,
         &PropertyKey::Symbol(crux::symbol::well_known("toPrimitive").as_ref().clone()),
-        value.clone(),
+        *value,
     )?;
     if !matches!(exotic.kind(), ValueKind::Undefined | ValueKind::Null) {
         if !crux::value::is_callable(&exotic) {
@@ -147,7 +147,7 @@ pub fn to_primitive(
         let result = crate::function::call(
             agent,
             &exotic,
-            value.clone(),
+            *value,
             &[Value::String(Handle::new(JsString::from_utf8(hint_text)))],
         )?;
         if matches!(result.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
@@ -167,9 +167,9 @@ pub fn to_primitive(
         }
     };
     for name in [first, second] {
-        let method = get_property_key(agent, value, &PropertyKey::from_utf8(name), value.clone())?;
+        let method = get_property_key(agent, value, &PropertyKey::from_utf8(name), *value)?;
         if crux::value::is_callable(&method) {
-            let result = crate::function::call(agent, &method, value.clone(), &[])?;
+            let result = crate::function::call(agent, &method, *value, &[])?;
             if !matches!(result.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
                 return Ok(result);
             }
@@ -726,8 +726,8 @@ fn find_ecma_accessor(
         // agent-dispatched accessor here.
         if let crux::object::ObjectKind::Proxy(slots) = &obj.kind {
             let (target, handler) = match (
-                slots.target.borrow().clone(),
-                slots.handler.borrow().clone(),
+                *slots.target.borrow(),
+                *slots.handler.borrow(),
             ) {
                 (Some(target), Some(handler)) => (target, handler),
                 // A revoked proxy throws via the crux path; report no
@@ -857,7 +857,7 @@ pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Resu
                 // not trigger evaluation.
                 let mut probe =
                     if matches!(base.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
-                        Some(base.clone())
+                        Some(*base)
                     } else {
                         to_object(agent, base).ok()
                     };
@@ -891,7 +891,7 @@ pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Resu
             // ephemeral wrapper.
             let receiver = get_this_value(reference);
             let base = if matches!(base.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
-                base.clone()
+                *base
             } else {
                 to_object(agent, base)?
             };
@@ -904,20 +904,20 @@ pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Resu
                         && let Some(setter) =
                             find_ecma_accessor(agent, &obj, key, AccessorKind::Set)?
                     {
-                        crate::function::call(agent, &setter, receiver.clone(), &[value])?;
+                        crate::function::call(agent, &setter, receiver, &[value])?;
                         return Ok(());
                     }
-                    obj.set_with_receiver_key(key, value, receiver.clone(), reference.strict)
+                    obj.set_with_receiver_key(key, value, receiver, reference.strict)
                 }
                 ValueKind::Function(f) => {
                     if let Some(setter) =
                         find_ecma_accessor(agent, &f.object, key, AccessorKind::Set)?
                     {
-                        crate::function::call(agent, &setter, receiver.clone(), &[value])?;
+                        crate::function::call(agent, &setter, receiver, &[value])?;
                         return Ok(());
                     }
                     f.object
-                        .set_with_receiver_key(key, value, receiver.clone(), reference.strict)
+                        .set_with_receiver_key(key, value, receiver, reference.strict)
                 }
                 _ => {
                     return Err(JsError::new(
@@ -1003,10 +1003,10 @@ pub fn initialize_referenced_binding(reference: &Reference, value: Value) -> Res
 /// step 4.b.ii).
 pub fn get_this_value(reference: &Reference) -> Value {
     if let Some(this) = &reference.this_value {
-        return this.clone();
+        return *this;
     }
     match &reference.base {
-        ReferenceBase::Value(base) => base.clone(),
+        ReferenceBase::Value(base) => *base,
         ReferenceBase::Environment(env) => env.with_base_object(),
         ReferenceBase::Unresolvable => Value::Undefined,
     }
@@ -1103,7 +1103,7 @@ pub fn private_get(agent: &mut Agent, obj: &Value, name_id: u64) -> Result<Value
         | crux::object::PrivateElementKind::Method(value) => Ok(value),
         crux::object::PrivateElementKind::Accessor {
             get: Some(getter), ..
-        } => crate::function::call(agent, &getter, obj.clone(), &[]),
+        } => crate::function::call(agent, &getter, *obj, &[]),
         // spec 10.2.9 step 6.b: a private accessor with no getter throws on
         // read (e.g. a setter-only accessor, possibly shadowing a getter in
         // an outer class).
@@ -1141,7 +1141,7 @@ pub fn private_set(
         crux::object::PrivateElementKind::Accessor {
             set: Some(setter), ..
         } => {
-            crate::function::call(agent, &setter, obj.clone(), &[value])?;
+            crate::function::call(agent, &setter, *obj, &[value])?;
             Ok(())
         }
         crux::object::PrivateElementKind::Accessor { .. } => {
@@ -1240,7 +1240,7 @@ pub fn get_super_base(agent: &Agent) -> Result<Value, JsError> {
     let Some(home) = agent
         .ecma_functions
         .get(&function.id())
-        .and_then(|data| data.home_object.clone())
+        .and_then(|data| data.home_object)
     else {
         return Ok(Value::Undefined);
     };

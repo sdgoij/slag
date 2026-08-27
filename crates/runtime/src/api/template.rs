@@ -36,7 +36,7 @@ pub struct FunctionCallbackInfo<'a> {
 impl FunctionCallbackInfo<'_> {
     /// The `this` value of the call.
     pub fn this(&self) -> Local {
-        Local(self.this.clone())
+        Local(self.this)
     }
 
     /// The number of arguments.
@@ -102,7 +102,7 @@ impl ReturnValue<'_> {
 
     /// The currently set value, if any.
     pub fn get(&self) -> Option<Local> {
-        self.0.borrow().clone().map(Local)
+        (*self.0.borrow()).map(Local)
     }
 }
 
@@ -178,7 +178,7 @@ impl FunctionTemplate {
         let callback = this.callback.borrow().clone();
         let call: NativeFn = Box::new(move |this_value, args| {
             let info = FunctionCallbackInfo {
-                this: this_value.clone(),
+                this: *this_value,
                 args,
                 new_target: None,
                 isolate: this.isolate,
@@ -212,7 +212,7 @@ impl FunctionTemplate {
             let info = FunctionCallbackInfo {
                 this: Value::Object(instance),
                 args,
-                new_target: Some(new_target.clone()),
+                new_target: Some(*new_target),
                 isolate: this.isolate,
                 return_value: RefCell::new(None),
             };
@@ -359,7 +359,7 @@ impl ObjectTemplate {
                     target.define_property_or_throw(
                         name,
                         &PropertyDescriptor {
-                            value: Some(value.clone()),
+                            value: Some(*value),
                             writable: Some(true),
                             enumerable: Some(true),
                             configurable: Some(true),
@@ -476,7 +476,7 @@ fn host_function(
 ) -> Result<Handle<Function>, JsError> {
     let call: NativeFn = Box::new(move |this, args| {
         let info = FunctionCallbackInfo {
-            this: this.clone(),
+            this: *this,
             args,
             new_target: None,
             isolate,

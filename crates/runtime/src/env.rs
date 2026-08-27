@@ -239,7 +239,7 @@ impl EnvRecord {
     /// Record; an error elsewhere (only function bodies may use new.target).
     pub fn get_new_target(&self) -> Result<Value, JsError> {
         match self {
-            EnvRecord::Function(e) => Ok(e.new_target.clone()),
+            EnvRecord::Function(e) => Ok(e.new_target),
             _ => Err(JsError::new(
                 ErrorKind::ReferenceError,
                 "new.target is only valid inside functions".into(),
@@ -523,7 +523,7 @@ impl DeclarativeEnv {
         self.bindings
             .borrow()
             .get(index)
-            .and_then(|(_, b)| b.value.clone())
+            .and_then(|(_, b)| b.value)
     }
 
     /// Whether the binding at `index` is mutable: the static context-chain
@@ -669,7 +669,7 @@ impl DeclarativeEnv {
             return target.get_binding_value(target_name, true);
         }
         match &binding.1.value {
-            Some(v) => Ok(v.clone()),
+            Some(v) => Ok(*v),
             None => Err(JsError::new(
                 ErrorKind::ReferenceError,
                 format!(
@@ -877,7 +877,7 @@ impl FunctionEnv {
                 "Cannot access 'this' before initialization".into(),
             ));
         }
-        Ok(self.this_value.borrow().clone())
+        Ok(*self.this_value.borrow())
     }
 
     fn has_super_binding(&self, agent: &Agent) -> bool {
@@ -1064,7 +1064,7 @@ impl GlobalEnv {
         let existing = self.object.get_own_property(name)?;
         let desc = match existing {
             None => PropertyDescriptor {
-                value: Some(value.clone()),
+                value: Some(value),
                 writable: Some(true),
                 get: None,
                 set: None,
@@ -1072,7 +1072,7 @@ impl GlobalEnv {
                 configurable: Some(deletable),
             },
             Some(prop) if prop.configurable => PropertyDescriptor {
-                value: Some(value.clone()),
+                value: Some(value),
                 writable: Some(true),
                 get: None,
                 set: None,
@@ -1080,7 +1080,7 @@ impl GlobalEnv {
                 configurable: Some(deletable),
             },
             Some(_) => PropertyDescriptor {
-                value: Some(value.clone()),
+                value: Some(value),
                 writable: None,
                 get: None,
                 set: None,
@@ -1387,7 +1387,7 @@ mod tests {
         let global = JsObject::ordinary_object_create(None);
         let env = new_global_environment(global, global);
         let fun = Value::Function(crux::Function::new(None));
-        env.create_global_function_binding(&name("f"), fun.clone(), false)
+        env.create_global_function_binding(&name("f"), fun, false)
             .unwrap();
         assert!(global.has_own_property(&name("f")).unwrap());
         assert_eq!(env.get_binding_value(&name("f"), true).unwrap(), fun);

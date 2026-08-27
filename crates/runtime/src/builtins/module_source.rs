@@ -50,15 +50,15 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
 
     realm
         .intrinsics
-        .define(ABSTRACT_MODULE_SOURCE, ctor_value.clone());
+        .define(ABSTRACT_MODULE_SOURCE, ctor_value);
     realm
         .intrinsics
-        .define(ABSTRACT_MODULE_SOURCE_PROTO, proto_value.clone());
+        .define(ABSTRACT_MODULE_SOURCE_PROTO, proto_value);
 
     ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(proto_value.clone()),
+            value: Some(proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -69,7 +69,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(ctor_value.clone()),
+            value: Some(ctor_value),
             writable: Some(true),
             get: None,
             set: None,

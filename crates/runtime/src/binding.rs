@@ -178,7 +178,7 @@ fn keyed_binding_initialization(
         }
         _ => None,
     };
-    let value = get_property_key(agent, value, key, value.clone())?;
+    let value = get_property_key(agent, value, key, *value)?;
     let name = binding_ident_name(&element.pattern);
     let value = apply_element_default(agent, value, element.init.as_ref(), name.as_ref(), strict)?;
     match resolved {
@@ -569,7 +569,7 @@ fn object_assignment(
                 } else {
                     Some(crate::expr::eval_assignment_target(agent, inner, strict)?)
                 };
-                let prop_value = get_property_key(agent, &value, &key, value.clone())?;
+                let prop_value = get_property_key(agent, &value, &key, value)?;
                 let name = match &inner.kind {
                     ExprKind::Ident(id) => Some(crux::lookup(*id)),
                     _ => None,

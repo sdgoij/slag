@@ -115,7 +115,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let iterator_method = Function::create_builtin(
         Some(JsString::from_utf8("[Symbol.iterator]")),
         0,
-        Box::new(|this, _| Ok(this.clone())),
+        Box::new(|this, _| Ok(*this)),
         None,
         function_proto,
     )?;
@@ -201,12 +201,12 @@ pub fn call_generator(
     let function_value = function.self_value();
     let function_env = crate::env::new_function_environment(
         Some(data.environment),
-        function_value.clone(),
+        function_value,
         Value::Undefined,
         data.this_mode == ThisMode::Lexical,
     );
     let context = ExecutionContext {
-        function: Some(function_value.clone()),
+        function: Some(function_value),
         realm: data.realm,
         script_or_module: None,
         lexical_environment: function_env,
@@ -485,7 +485,7 @@ fn start_body(
     let body_env = state
         .body_env
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no instantiated environment".into()))?;
-    let function_value = state.function.clone();
+    let function_value = state.function;
     let ValueKind::Function(function_handle) = function_value.kind() else {
         return Err(JsError::new(ErrorKind::TypeError, "not a function".into()));
     };

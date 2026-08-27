@@ -32,7 +32,7 @@ impl External {
 
     /// The External as a language value.
     pub fn as_value(&self) -> Local {
-        Local(self.0.clone())
+        Local(self.0)
     }
 }
 

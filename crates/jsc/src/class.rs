@@ -152,7 +152,7 @@ impl HostOps for ClassOps {
         let ctx = self.callbacks_ctx()?;
         let object_ref = refs::object_id_ref(object.id());
         let name_ref = string_ref(&jsstring_of_key(key));
-        let value_ref = refs::value_to_ref(value.clone());
+        let value_ref = refs::value_to_ref(*value);
         let mut exception: JSValueRef = std::ptr::null_mut();
         let result = unsafe {
             callback(
@@ -215,7 +215,7 @@ impl HostOps for ClassOps {
         let ctx = self.callbacks_ctx()?;
         let arg_refs: Vec<JSValueRef> = args
             .iter()
-            .map(|arg| refs::value_to_ref(arg.clone()))
+            .map(|arg| refs::value_to_ref(*arg))
             .collect();
         let this_ref = refs::value_object_ref(this);
         let object_ref = refs::object_id_ref(object.id());
@@ -254,7 +254,7 @@ impl HostOps for ClassOps {
         set_private(instance.id(), 0);
         let arg_refs: Vec<JSValueRef> = args
             .iter()
-            .map(|arg| refs::value_to_ref(arg.clone()))
+            .map(|arg| refs::value_to_ref(*arg))
             .collect();
         let mut exception: JSValueRef = std::ptr::null_mut();
         let result = unsafe {
@@ -598,7 +598,7 @@ pub(crate) fn make_function_with_callback(
     let call: crux::function::NativeFn = Box::new(move |this, args| {
         let arg_refs: Vec<JSValueRef> = args
             .iter()
-            .map(|arg| refs::value_to_ref(arg.clone()))
+            .map(|arg| refs::value_to_ref(*arg))
             .collect();
         let this_ref = refs::value_object_ref(this);
         let mut exception: JSValueRef = std::ptr::null_mut();

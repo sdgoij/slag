@@ -92,7 +92,7 @@ impl JscContext {
                 error.message
             ))))
         });
-        unsafe { &*isolate }.set_pending_exception(value.clone());
+        unsafe { &*isolate }.set_pending_exception(value);
         if let Some(slot) = out {
             *slot = refs::value_to_ref(value);
         }

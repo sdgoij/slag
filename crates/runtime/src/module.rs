@@ -398,7 +398,7 @@ pub(crate) fn module_source_object(
     agent: &mut Agent,
     module: &Handle<SourceTextModule>,
 ) -> Result<Value, JsError> {
-    if let Some(source) = module.module_source.borrow().clone() {
+    if let Some(source) = *module.module_source.borrow() {
         return Ok(source);
     }
     let realm = agent.current_realm()?;
@@ -409,7 +409,7 @@ pub(crate) fn module_source_object(
     let object = JsObject::ordinary_object_create(prototype);
     let value = Value::Object(object);
     agent.module_sources.insert(object.id(), *module);
-    module.module_source.replace(Some(value.clone()));
+    module.module_source.replace(Some(value));
     Ok(value)
 }
 
@@ -1251,12 +1251,12 @@ pub fn module_evaluation(
             // spec Evaluate steps 2-3: an errored module — or a fulfilled
             // member of an errored cycle, redirected through its cycle root —
             // rejects a fresh capability with the recorded error.
-            let recorded = module.evaluation_error.borrow().clone().or_else(|| {
+            let recorded = (*module.evaluation_error.borrow()).or_else(|| {
                 module
                     .cycle_root
                     .borrow()
                     .as_ref()
-                    .and_then(|root| root.evaluation_error.borrow().clone())
+                    .and_then(|root| *root.evaluation_error.borrow())
             });
             if let Some(error) = recorded {
                 let capability = crate::promise::new_promise_capability(agent, &promise_ctor())?;
@@ -1267,7 +1267,7 @@ pub fn module_evaluation(
                 .top_level_capability
                 .borrow()
                 .as_ref()
-                .map(|c| c.promise.clone())
+                .map(|c| c.promise)
                 .unwrap_or(Value::Undefined));
         }
         ModuleStatus::Evaluating => {
@@ -1281,7 +1281,7 @@ pub fn module_evaluation(
                 .top_level_capability
                 .borrow()
                 .as_ref()
-                .map(|c| c.promise.clone())
+                .map(|c| c.promise)
                 .unwrap_or(Value::Undefined));
         }
         _ => {}
@@ -1315,7 +1315,7 @@ pub fn module_evaluation(
                     let dep_status = *dep.status.borrow();
                     match dep_status {
                         ModuleStatus::Evaluated => {
-                            if let Some(error) = dep.evaluation_error.borrow().clone() {
+                            if let Some(error) = *dep.evaluation_error.borrow() {
                                 return Err(JsError::new(
                                     ErrorKind::TypeError,
                                     "dependency module errored".into(),
@@ -1363,7 +1363,7 @@ pub fn module_evaluation(
                     // module's evaluation with the recorded error (spec
                     // 16.2.2.5 InnerModuleEvaluation step 6 — the abrupt
                     // completion propagates).
-                    if let Some(error) = imported.evaluation_error.borrow().clone() {
+                    if let Some(error) = *imported.evaluation_error.borrow() {
                         return Err(JsError::new(
                             ErrorKind::TypeError,
                             "dependency module errored".into(),
@@ -1381,7 +1381,7 @@ pub fn module_evaluation(
                     // A synchronously-errored dependency aborts this module's
                     // evaluation with the dependency's error (spec 16.2.2.5
                     // InnerModuleEvaluation step 6).
-                    if let Some(error) = imported.evaluation_error.borrow().clone() {
+                    if let Some(error) = *imported.evaluation_error.borrow() {
                         return Err(JsError::new(
                             ErrorKind::TypeError,
                             "dependency module errored".into(),
@@ -1570,7 +1570,7 @@ pub(crate) fn finish_module_evaluation(
 ) -> Result<(), JsError> {
     let (resolve, reject) = {
         let state = state.borrow();
-        (state.resolve.clone(), state.reject.clone())
+        (state.resolve, state.reject)
     };
     // An errored cycle's rejection may already have settled this module (a
     // deferred body is a no-op after the propagation); the later completion
@@ -1593,7 +1593,7 @@ pub(crate) fn finish_module_evaluation(
             notify_async_parents_fulfilled(agent, module)?;
         }
         Completion::Throw(value) => {
-            module.evaluation_error.replace(Some(value.clone()));
+            module.evaluation_error.replace(Some(value));
             crate::function::call(
                 agent,
                 &reject,
@@ -1606,7 +1606,7 @@ pub(crate) fn finish_module_evaluation(
             let error = Value::String(Handle::new(JsString::from_utf8(
                 "Illegal control flow in a module body",
             )));
-            module.evaluation_error.replace(Some(error.clone()));
+            module.evaluation_error.replace(Some(error));
             crate::function::call(
                 agent,
                 &reject,
@@ -1633,12 +1633,12 @@ fn propagate_module_error(
             continue;
         }
         parent.status.replace(ModuleStatus::Evaluated);
-        parent.evaluation_error.replace(Some(error.clone()));
+        parent.evaluation_error.replace(Some(error));
         let reject = parent
             .top_level_capability
             .borrow()
             .as_ref()
-            .map(|c| c.reject.clone());
+            .map(|c| c.reject);
         if let Some(reject) = reject {
             crate::function::call(
                 agent,
@@ -1647,7 +1647,7 @@ fn propagate_module_error(
                 std::slice::from_ref(&error),
             )?;
         }
-        propagate_module_error(agent, &parent, error.clone())?;
+        propagate_module_error(agent, &parent, error)?;
     }
     Ok(())
 }
@@ -1689,11 +1689,11 @@ pub fn module_namespace(
     agent: &mut Agent,
     module: &Handle<SourceTextModule>,
 ) -> Result<Value, JsError> {
-    if let Some(namespace) = module.namespace.borrow().clone() {
+    if let Some(namespace) = *module.namespace.borrow() {
         return Ok(namespace);
     }
     let value = create_namespace(agent, module, false)?;
-    module.namespace.replace(Some(value.clone()));
+    module.namespace.replace(Some(value));
     Ok(value)
 }
 
@@ -1704,11 +1704,11 @@ pub fn deferred_namespace(
     agent: &mut Agent,
     module: &Handle<SourceTextModule>,
 ) -> Result<Value, JsError> {
-    if let Some(namespace) = module.deferred_namespace.borrow().clone() {
+    if let Some(namespace) = *module.deferred_namespace.borrow() {
         return Ok(namespace);
     }
     let value = create_namespace(agent, module, true)?;
-    module.deferred_namespace.replace(Some(value.clone()));
+    module.deferred_namespace.replace(Some(value));
     Ok(value)
 }
 
@@ -1780,8 +1780,8 @@ fn deferred_module_then(
         .get("%Promise%")
         .unwrap_or(Value::Undefined);
     let capability = crate::promise::new_promise_capability(agent, &promise_ctor)?;
-    let resolve = capability.resolve.clone();
-    let reject = capability.reject.clone();
+    let resolve = capability.resolve;
+    let reject = capability.reject;
     // The load completes asynchronously (the host's FinishLoadingImportedModule
     // with phase ~defer~): gather and evaluate the module's asynchronous
     // transitive dependencies, then settle with the deferred namespace — the
@@ -1815,11 +1815,11 @@ fn deferred_module_then(
                 wait_id,
                 DeferredWait(
                     remaining.clone(),
-                    on_fulfilled.clone(),
-                    on_rejected.clone(),
+                    on_fulfilled,
+                    on_rejected,
                     module,
-                    resolve.clone(),
-                    reject.clone(),
+                    resolve,
+                    reject,
                 ),
             );
             let fulfill = make_deferred_waiter(agent, wait_id, false)?;
@@ -1833,8 +1833,8 @@ fn deferred_module_then(
                 crate::promise::perform_promise_then(
                     agent,
                     &evaluation,
-                    Some(fulfill.clone()),
-                    Some(on_rejected_wait.clone()),
+                    Some(fulfill),
+                    Some(on_rejected_wait),
                     None,
                 )?;
             }
@@ -1869,7 +1869,7 @@ fn settle_deferred_then(
             std::slice::from_ref(&namespace),
         )
     } else {
-        Ok(namespace.clone())
+        Ok(namespace)
     };
     match result {
         Ok(value) => crate::function::call(agent, resolve, Value::Undefined, &[value]).map(|_| ()),
@@ -2092,12 +2092,12 @@ pub fn ensure_deferred_namespace_evaluation(
     // EvaluateSync (import-defer): a module whose evaluation already rejected
     // throws the recorded error on every export access — an errored module is
     // evaluated for the purposes of this check.
-    let recorded = module.evaluation_error.borrow().clone().or_else(|| {
+    let recorded = (*module.evaluation_error.borrow()).or_else(|| {
         module
             .cycle_root
             .borrow()
             .as_ref()
-            .and_then(|root| root.evaluation_error.borrow().clone())
+            .and_then(|root| *root.evaluation_error.borrow())
     });
     if let Some(error) = recorded {
         return Err(
@@ -2125,12 +2125,12 @@ pub fn ensure_deferred_namespace_evaluation(
             // EvaluateSync: the DFS evaluation completes synchronously for a
             // sync module; a rejecting evaluation throws its result.
             module_evaluation(agent, &module)?;
-            let recorded = module.evaluation_error.borrow().clone().or_else(|| {
+            let recorded = (*module.evaluation_error.borrow()).or_else(|| {
                 module
                     .cycle_root
                     .borrow()
                     .as_ref()
-                    .and_then(|root| root.evaluation_error.borrow().clone())
+                    .and_then(|root| *root.evaluation_error.borrow())
             });
             if let Some(error) = recorded {
                 return Err(
@@ -2697,8 +2697,8 @@ pub fn dynamic_import(
         .get("%Promise%")
         .unwrap_or(Value::Undefined);
     let capability = crate::promise::new_promise_capability(agent, &promise_ctor)?;
-    let resolve = capability.resolve.clone();
-    let reject = capability.reject.clone();
+    let resolve = capability.resolve;
+    let reject = capability.reject;
     // ToString(specifier) abrupts reject the capability (spec 13.3.10.1
     // steps 6-7) — the import expression must not throw synchronously.
     let specifier_text = match crux::convert::to_string(specifier) {
@@ -2797,10 +2797,10 @@ pub fn dynamic_import(
                     agent,
                     &evaluation,
                     &JsString::from_utf8("then"),
-                    evaluation.clone(),
+                    evaluation,
                 )?;
                 let then_resolve = make_namespace_resolver(agent, &resolve, &namespace)?;
-                crate::function::call(agent, &method, evaluation, &[then_resolve, reject.clone()])?;
+                crate::function::call(agent, &method, evaluation, &[then_resolve, reject])?;
             } else {
                 crate::function::call(agent, &resolve, Value::Undefined, &[namespace])?;
             }
@@ -2842,7 +2842,7 @@ fn make_namespace_resolver(
     )?;
     agent
         .import_namespace_resolvers
-        .insert(closure.id(), (resolve.clone(), namespace.clone()));
+        .insert(closure.id(), (*resolve, *namespace));
     Ok(Value::Function(closure))
 }
 
@@ -2872,7 +2872,7 @@ pub fn import_meta(agent: &mut Agent) -> Result<Value, JsError> {
     // for every access within a module and distinct across modules.
     let context = agent.running_context()?;
     if let Some(crate::context::ScriptOrModule::Module(module)) = &context.script_or_module {
-        if let Some(meta) = module.import_meta.borrow().clone() {
+        if let Some(meta) = *module.import_meta.borrow() {
             return Ok(meta);
         }
         let proto = agent
@@ -2881,7 +2881,7 @@ pub fn import_meta(agent: &mut Agent) -> Result<Value, JsError> {
             .get("%Object.prototype%")
             .and_then(|value| crate::context::as_object(&value));
         let meta = Value::Object(JsObject::ordinary_object_create(proto));
-        module.import_meta.replace(Some(meta.clone()));
+        module.import_meta.replace(Some(meta));
         return Ok(meta);
     }
     let proto = agent
@@ -2910,7 +2910,7 @@ fn import_attributes(
         agent,
         options,
         &JsString::from_utf8("with"),
-        options.clone(),
+        *options,
     )?;
     if matches!(with.kind(), ValueKind::Undefined) {
         return Ok(Vec::new());
@@ -2992,20 +2992,20 @@ mod tests {
             &mut evaluated.agent,
             &evaluated.namespace,
             &JsString::from_utf8(name),
-            evaluated.namespace.clone(),
+            evaluated.namespace,
         )
     }
 
     /// The settled value of a promise (or the value itself if not a promise).
     fn settled(agent: &Agent, value: &Value) -> Result<Value, JsError> {
         let ValueKind::Object(obj) = value.kind() else {
-            return Ok(value.clone());
+            return Ok(*value);
         };
         let Some(data) = agent.promises.get(&obj.id()) else {
-            return Ok(value.clone());
+            return Ok(*value);
         };
         match &data.borrow().state {
-            PromiseState::Fulfilled(v) | PromiseState::Rejected(v) => Ok(v.clone()),
+            PromiseState::Fulfilled(v) | PromiseState::Rejected(v) => Ok(*v),
             PromiseState::Pending { .. } => Err(JsError::new(
                 ErrorKind::TypeError,
                 "promise still pending".into(),
@@ -3144,7 +3144,7 @@ mod tests {
                 &mut evaluated.agent,
                 &m1,
                 &JsString::from_utf8("a"),
-                m1.clone(),
+                m1,
             )
             .unwrap(),
             Value::Number(5.0)
@@ -3236,7 +3236,7 @@ mod tests {
                 &mut agent,
                 &namespace,
                 &JsString::from_utf8("a"),
-                namespace.clone(),
+                namespace,
             )
             .unwrap(),
             Value::Number(1.0)
@@ -3246,7 +3246,7 @@ mod tests {
                 &mut agent,
                 &namespace,
                 &JsString::from_utf8("len"),
-                namespace.clone(),
+                namespace,
             )
             .unwrap(),
             Value::Number(2.0)
@@ -3285,7 +3285,7 @@ mod tests {
             &crux::property::PropertyKey::Symbol(
                 crux::symbol::well_known("toStringTag").as_ref().clone(),
             ),
-            evaluated.namespace.clone(),
+            evaluated.namespace,
         )
         .unwrap();
         assert_eq!(tag, js_str("Module"));
@@ -3308,7 +3308,7 @@ mod tests {
             &mut evaluated.agent,
             &greet,
             &JsString::from_utf8("toString"),
-            greet.clone(),
+            greet,
         )
         .unwrap();
         let rendered = crate::function::call(&mut evaluated.agent, &to_string, greet, &[]).unwrap();
@@ -3347,7 +3347,7 @@ mod tests {
             &mut agent,
             &main_error,
             &JsString::from_utf8("message"),
-            main_error.clone(),
+            main_error,
         )
         .unwrap();
         assert_eq!(message, js_str("async error in B"));

@@ -67,7 +67,7 @@ impl Promise {
             };
             let value = match &data.borrow().state {
                 crate::promise::PromiseState::Fulfilled(value)
-                | crate::promise::PromiseState::Rejected(value) => value.clone(),
+                | crate::promise::PromiseState::Rejected(value) => *value,
                 crate::promise::PromiseState::Pending { .. } => Value::Undefined,
             };
             Ok(Local(value))

@@ -14,7 +14,7 @@ bigger win on property-access rows. They compose: maps shrink the object,
 the nursery makes object allocation cheap, and the constructor's property
 patterns (already collected) pre-build the object's final map.
 
-## Status (2026-08-27 — GC half substantially landed, map B5.1 landed)
+## Status (2026-08-27 — GC half substantially landed, map B5.2 landed)
 
 Landed and committed (in order):
 
@@ -30,12 +30,14 @@ Landed and committed (in order):
   size-classed free list is now `[Vec<*mut GcBox>; 256]` indexed by `size >>
   4` (sizes 16..=4096) instead of an FxHash HashMap.
 
-Uncommitted on top of `6baab46`:
+Uncommitted on top of B5.2 commit:
 
-- **B5.1**: `Map` type + empty-map creation, storage still Vec. Land the map
-  as a parallel shape — `JsObject.map` exists; reads still go through
-  `SmallProps`. 6 new tests in `crates/crux/src/map.rs`; all 173 crux tests
-  green, full workspace green, clippy clean. No behavior change.
+- **B5.2**: In-object fields + map-based read path. Added
+  `in_fields: [Cell<Option<Value>>; 4]` to `JsObject`. Added `INLINE_FIELDS`
+  constant, `map_get`/`map_set` for map-based read/write. `Value` gained `Copy`.
+  `map.rs` gained `field_offset`. B5.2 reads/writes not yet wired into the
+  runtime caches (map field exists, `map_get`/`map_set` ready for the next
+  integration step).
 
 - **A5.1b (second half) — direct-mapped free list**: the size-classed free
   list is now `[Vec<*mut GcBox>; 256]` indexed by `size >> 4` (sizes
@@ -257,7 +259,12 @@ the old gen and is re-marked only by rare old-gen collections.
   store-site list in A3 stays accurate.
 - **A5.5 — Tunables + measurement. — DEFERRED.**
 
-## 3. Part B — map-based object model (V8 hidden classes)
+### B5.2 — LANDED
+
+`Map` type + empty-map creation. Land the map as a parallel shape —
+`JsObject.map` exists; reads still go through `SmallProps`. 6 new tests
+in `crates/crux/src/map.rs`; all 173 crux tests green, full workspace
+green, clippy clean. No behavior change.
 
 ### B0. Design decisions
 
@@ -335,14 +342,18 @@ constructor's *final* map:
   method dispatch.
 
 ### B5. Cuts
+### B5. Cuts
 
-> **Status: not started.** This is the next session's work. The uncommitted
-> free-list array (see the status block) should be committed first.
-
-- **B5.1 — `Map` type + empty-map creation, storage still Vec.** Land the
-  map as a parallel shape; `JsObject.map` exists; reads still go through
-  `SmallProps`. Gate: tests green, no behavior change, measure the overhead
-  of the map pointer.
+- **B5.1** — LANDED. Map type + empty-map creation, storage still Vec.
+- **B5.2 — LANDED.** In-object fields + map-based read path. Added
+  `in_fields: [Cell<Option<Value>>; 4]` to `JsObject`, `INLINE_FIELDS`
+  constant, `map_get`/`map_set` for map-based read/write. `Value` gained
+  `Copy` (with `clone()` calls updated across workspace). `Map::field_offset`
+  added. The map field exists and `map_get`/`map_set` are ready; the runtime
+  cache wiring (B5.2 read path) is the remaining work.
+- **B5.3 — Map-based store + transitions.** Add-property transitions; store
+  IC re-keyed. Gate: construct churn's store becomes an in-place field write;
+  `defineProperty`/`delete` tests green.
 - **B5.2 — In-object fields + map-based read path.** Fresh objects use
   `in_fields`; `member_cell_get` re-keyed to `(map, name)`. Gate:
   property-access row improves; `Object.keys`/iteration order tests green.

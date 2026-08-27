@@ -667,7 +667,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
 
     let math_value = Value::Object(math);
-    realm.intrinsics.define("%Math%", math_value.clone());
+    realm.intrinsics.define("%Math%", math_value);
     realm.global_object.define_property_or_throw(
         &JsString::from_utf8("Math"),
         &PropertyDescriptor {
@@ -927,7 +927,7 @@ mod tests {
             let iterator_method = Function::create_builtin(
                 Some(JsString::from_utf8("[Symbol.iterator]")),
                 0,
-                Box::new(|this, _| Ok(this.clone())),
+                Box::new(|this, _| Ok(*this)),
                 None,
                 None,
             )

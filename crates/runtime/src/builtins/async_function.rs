@@ -115,10 +115,10 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
         )?;
         let ctor_value = Value::Function(ctor);
-        realm.intrinsics.define(kind.key(), ctor_value.clone());
+        realm.intrinsics.define(kind.key(), ctor_value);
         realm
             .intrinsics
-            .define(kind.proto_key(), proto_value.clone());
+            .define(kind.proto_key(), proto_value);
 
         // The prototype's own `prototype` property is the generator (or async
         // generator) prototype intrinsic (spec 27.4.3.2/27.6.3.2); async
@@ -130,7 +130,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             proto.define_property(
                 &JsString::from_utf8("prototype"),
                 &PropertyDescriptor {
-                    value: Some(instance_proto.clone()),
+                    value: Some(instance_proto),
                     writable: Some(false),
                     get: None,
                     set: None,
@@ -146,7 +146,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
                 instance_obj.define_property(
                     &JsString::from_utf8("constructor"),
                     &PropertyDescriptor {
-                        value: Some(proto_value.clone()),
+                        value: Some(proto_value),
                         writable: Some(false),
                         get: None,
                         set: None,
@@ -161,7 +161,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         proto.define_property(
             &JsString::from_utf8("constructor"),
             &PropertyDescriptor {
-                value: Some(ctor_value.clone()),
+                value: Some(ctor_value),
                 writable: Some(false),
                 get: None,
                 set: None,
@@ -269,9 +269,9 @@ fn create_dynamic_function(
     kind: Kind,
 ) -> Result<Value, JsError> {
     let new_target = if matches!(new_target.kind(), ValueKind::Undefined) {
-        ctor.clone()
+        *ctor
     } else {
-        new_target.clone()
+        *new_target
     };
     let (param_args, body_arg) = split_dynamic_args(args);
     let mut param_strings = Vec::new();
@@ -310,7 +310,7 @@ fn get_prototype_from_constructor(
         agent,
         constructor,
         &PropertyKey::from_utf8("prototype"),
-        constructor.clone(),
+        *constructor,
     )?;
     match crate::context::as_object(&proto) {
         Some(handle) => Ok(handle),

@@ -2256,7 +2256,7 @@ pub fn to_plain_date_with_options(
         let mut day = None;
         for key in ["day", "month", "monthCode", "year"] {
             let value =
-                crate::context::get_property(agent, item, &JsString::from_utf8(key), item.clone())?;
+                crate::context::get_property(agent, item, &JsString::from_utf8(key), *item)?;
             if matches!(value.kind(), ValueKind::Undefined) {
                 continue;
             }
@@ -2581,7 +2581,7 @@ fn read_zoned_fields(agent: &mut Agent, bag: &Value) -> Result<ZonedFields, JsEr
         "year",
     ] {
         let value =
-            crate::context::get_property(agent, bag, &JsString::from_utf8(key), bag.clone())?;
+            crate::context::get_property(agent, bag, &JsString::from_utf8(key), *bag)?;
         if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
@@ -2671,7 +2671,7 @@ fn read_zoned_with_fields(
         "year",
     ] {
         let value =
-            crate::context::get_property(agent, bag, &JsString::from_utf8(key), bag.clone())?;
+            crate::context::get_property(agent, bag, &JsString::from_utf8(key), *bag)?;
         if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
@@ -3444,7 +3444,7 @@ fn read_partial_time_fields(agent: &mut Agent, bag: &Value) -> Result<[Option<i6
         "second",
     ] {
         let value =
-            crate::context::get_property(agent, bag, &JsString::from_utf8(key), bag.clone())?;
+            crate::context::get_property(agent, bag, &JsString::from_utf8(key), *bag)?;
         if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
@@ -3508,7 +3508,7 @@ fn read_date_time_fields(
         "year",
     ] {
         let value =
-            crate::context::get_property(agent, bag, &JsString::from_utf8(key), bag.clone())?;
+            crate::context::get_property(agent, bag, &JsString::from_utf8(key), *bag)?;
         if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
@@ -5006,7 +5006,7 @@ fn to_temporal_calendar_identifier(
 /// bag: reads the `calendar` property; `undefined` means iso8601.
 fn read_bag_calendar(agent: &mut Agent, item: &Value) -> Result<Option<String>, JsError> {
     let calendar =
-        crate::context::get_property(agent, item, &JsString::from_utf8("calendar"), item.clone())?;
+        crate::context::get_property(agent, item, &JsString::from_utf8("calendar"), *item)?;
     if matches!(calendar.kind(), ValueKind::Undefined) {
         return Ok(None);
     }
@@ -5130,7 +5130,7 @@ pub(super) fn read_era_fields(
     let mut era_year: Option<i64> = None;
     for key in ["era", "eraYear"] {
         let value =
-            crate::context::get_property(agent, bag, &JsString::from_utf8(key), bag.clone())?;
+            crate::context::get_property(agent, bag, &JsString::from_utf8(key), *bag)?;
         if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
@@ -5234,7 +5234,7 @@ fn read_partial_era_fields(
     let mut era_year = None;
     for key in ["era", "eraYear"] {
         let value =
-            crate::context::get_property(agent, bag, &JsString::from_utf8(key), bag.clone())?;
+            crate::context::get_property(agent, bag, &JsString::from_utf8(key), *bag)?;
         if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
@@ -5299,7 +5299,7 @@ fn prepare_partial_date_fields(
     let mut day = None;
     for key in ["day", "month", "monthCode", "year"] {
         let value =
-            crate::context::get_property(agent, bag, &JsString::from_utf8(key), bag.clone())?;
+            crate::context::get_property(agent, bag, &JsString::from_utf8(key), *bag)?;
         if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
@@ -5341,7 +5341,7 @@ fn reject_temporal_like_object(agent: &mut Agent, item: &Value) -> Result<(), Js
             agent,
             item,
             &JsString::from_utf8("calendar"),
-            item.clone(),
+            *item,
         )?;
         if !matches!(calendar.kind(), ValueKind::Undefined) {
             return Err(JsError::new(
@@ -5353,7 +5353,7 @@ fn reject_temporal_like_object(agent: &mut Agent, item: &Value) -> Result<(), Js
             agent,
             item,
             &JsString::from_utf8("timeZone"),
-            item.clone(),
+            *item,
         )?;
         if !matches!(time_zone.kind(), ValueKind::Undefined) {
             return Err(JsError::new(
@@ -5720,7 +5720,7 @@ fn plain_date_to_zoned_date_time(
             agent,
             &item,
             &JsString::from_utf8("timeZone"),
-            item.clone(),
+            item,
         )?;
         if matches!(time_zone_like.kind(), ValueKind::Undefined) {
             let tz = super::instant::to_temporal_time_zone_identifier(agent, &item)?;
@@ -5731,7 +5731,7 @@ fn plain_date_to_zoned_date_time(
                 agent,
                 &item,
                 &JsString::from_utf8("plainTime"),
-                item.clone(),
+                item,
             )?;
             let time = if matches!(plain_time.kind(), ValueKind::Undefined) {
                 None
@@ -6181,7 +6181,7 @@ fn read_year_month_fields(
     let mut year = None;
     for key in ["month", "monthCode", "year"] {
         let value =
-            crate::context::get_property(agent, bag, &JsString::from_utf8(key), bag.clone())?;
+            crate::context::get_property(agent, bag, &JsString::from_utf8(key), *bag)?;
         if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
@@ -6217,7 +6217,7 @@ fn read_month_day_fields(
     let mut year = None;
     for key in ["day", "month", "monthCode", "year"] {
         let value =
-            crate::context::get_property(agent, bag, &JsString::from_utf8(key), bag.clone())?;
+            crate::context::get_property(agent, bag, &JsString::from_utf8(key), *bag)?;
         if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
@@ -6794,7 +6794,7 @@ fn plain_year_month_to_plain_date(
         ));
     }
     let value =
-        crate::context::get_property(agent, &item, &JsString::from_utf8("day"), item.clone())?;
+        crate::context::get_property(agent, &item, &JsString::from_utf8("day"), item)?;
     let day = match value.kind() {
         ValueKind::Undefined => {
             return Err(JsError::new(ErrorKind::TypeError, "day is required".into()));
@@ -6945,7 +6945,7 @@ fn plain_month_day_to_plain_date(
     }
     let calendar = super::temporal_calendar_id(agent, this);
     let value =
-        crate::context::get_property(agent, &item, &JsString::from_utf8("year"), item.clone())?;
+        crate::context::get_property(agent, &item, &JsString::from_utf8("year"), item)?;
     let year = match value.kind() {
         ValueKind::Undefined => None,
         _ => Some(super::to_integer_with_truncation(agent, &value)?),

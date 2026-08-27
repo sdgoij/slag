@@ -153,7 +153,7 @@ fn max_byte_length_option(agent: &mut Agent, options: &Value) -> Result<Option<u
         agent,
         options,
         &JsString::from_utf8("maxByteLength"),
-        options.clone(),
+        *options,
     )?;
     if matches!(value.kind(), ValueKind::Undefined) {
         return Ok(None);
@@ -299,7 +299,7 @@ fn species_constructor(
         agent,
         exemplar,
         &JsString::from_utf8("constructor"),
-        exemplar.clone(),
+        *exemplar,
     )?;
     if matches!(ctor.kind(), ValueKind::Undefined) {
         return Ok(default_ctor);
@@ -312,7 +312,7 @@ fn species_constructor(
         ));
     }
     let species_key = PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone());
-    let species = get_property_key(agent, &ctor, &species_key, ctor.clone())?;
+    let species = get_property_key(agent, &ctor, &species_key, ctor)?;
     match species.kind() {
         ValueKind::Null | ValueKind::Undefined => Ok(default_ctor),
         _ if is_constructor(&species) => Ok(species),
@@ -1091,7 +1091,7 @@ fn get_prototype_from_constructor(
         agent,
         constructor,
         &PropertyKey::from_utf8("prototype"),
-        constructor.clone(),
+        *constructor,
     )?;
     match as_object(&proto) {
         Some(object) => Ok(object),
@@ -1114,7 +1114,7 @@ fn get_prototype_from_constructor(
 /// The species getter body: `return this` (spec 25.1.4.3, 25.3.3.2).
 fn species_getter(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     let _ = agent;
-    Ok(this.clone())
+    Ok(*this)
 }
 
 pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
@@ -1134,14 +1134,14 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         None,
     )?;
     let ab_ctor_value = Value::Function(ab_ctor);
-    realm.intrinsics.define(ARRAY_BUFFER, ab_ctor_value.clone());
+    realm.intrinsics.define(ARRAY_BUFFER, ab_ctor_value);
     realm
         .intrinsics
-        .define(ARRAY_BUFFER_PROTO, ab_proto_value.clone());
+        .define(ARRAY_BUFFER_PROTO, ab_proto_value);
     ab_ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(ab_proto_value.clone()),
+            value: Some(ab_proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -1152,7 +1152,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     ab_proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(ab_ctor_value.clone()),
+            value: Some(ab_ctor_value),
             writable: Some(true),
             get: None,
             set: None,
@@ -1290,14 +1290,14 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let sab_ctor_value = Value::Function(sab_ctor);
     realm
         .intrinsics
-        .define(SHARED_ARRAY_BUFFER, sab_ctor_value.clone());
+        .define(SHARED_ARRAY_BUFFER, sab_ctor_value);
     realm
         .intrinsics
-        .define(SHARED_ARRAY_BUFFER_PROTO, sab_proto_value.clone());
+        .define(SHARED_ARRAY_BUFFER_PROTO, sab_proto_value);
     sab_ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(sab_proto_value.clone()),
+            value: Some(sab_proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -1308,7 +1308,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     sab_proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(sab_ctor_value.clone()),
+            value: Some(sab_ctor_value),
             writable: Some(true),
             get: None,
             set: None,

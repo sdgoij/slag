@@ -84,17 +84,17 @@ impl Intrinsics {
     /// resolution (see the struct field).
     pub fn object_prototype(&self) -> Option<Value> {
         if let Some(value) = self.object_prototype.borrow().as_ref() {
-            return Some(value.clone());
+            return Some(*value);
         }
         let value = self.get("%Object.prototype%")?;
-        *self.object_prototype.borrow_mut() = Some(value.clone());
+        *self.object_prototype.borrow_mut() = Some(value);
         Some(value)
     }
 
     pub fn define(&self, name: &str, value: Value) {
         self.entries
             .borrow_mut()
-            .insert(JsString::from_utf8(name), value.clone());
+            .insert(JsString::from_utf8(name), value);
         // Register an agent-dependent builtin's native handler so a warm
         // call dispatches in O(1) (see `builtins::array::handler_for`);
         // functions without a registered handler (prototypes, plain

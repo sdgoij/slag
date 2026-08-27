@@ -280,7 +280,7 @@ fn is_array_buffer(agent: &Agent, value: &Value) -> bool {
 
 /// Get (spec 7.3.1) with the base as receiver.
 fn get(agent: &mut Agent, value: &Value, name: &JsString) -> Result<Value, JsError> {
-    get_property(agent, value, name, value.clone())
+    get_property(agent, value, name, *value)
 }
 
 /// Set (spec 7.3.3) with `throw = true`.
@@ -300,7 +300,7 @@ fn set_property(value: &Value, name: &JsString, v: Value) -> Result<(), JsError>
 
 /// LengthOfArrayLike (spec 7.3.22).
 fn length_of_array_like(agent: &mut Agent, value: &Value) -> Result<u64, JsError> {
-    let length = get_property(agent, value, &JsString::from_utf8("length"), value.clone())?;
+    let length = get_property(agent, value, &JsString::from_utf8("length"), *value)?;
     Ok(crux::convert::to_length(crate::context::to_number(
         agent, &length,
     )?))
@@ -317,7 +317,7 @@ fn get_prototype_from_constructor(
         agent,
         constructor,
         &PropertyKey::from_utf8("prototype"),
-        constructor.clone(),
+        *constructor,
     )?;
     match as_object(&proto) {
         Some(object) => Ok(object),
@@ -468,7 +468,7 @@ fn species_constructor(
         ));
     }
     let species_key = PropertyKey::Symbol(crux::symbol::well_known("species").as_ref().clone());
-    let species = crate::context::get_property_key(agent, &ctor, &species_key, ctor.clone())?;
+    let species = crate::context::get_property_key(agent, &ctor, &species_key, ctor)?;
     match species.kind() {
         ValueKind::Null | ValueKind::Undefined => Ok(default_ctor),
         _ if is_constructor(&species) => Ok(species),
@@ -613,7 +613,7 @@ fn typed_array_construct(
     // Multiple arguments: the argument list is the element list (spec step 7).
     let dst = allocate_typed_array_buffer(agent, prototype, element_type, args.len())?;
     for (k, value) in args.iter().enumerate() {
-        set_property(&dst, &key(k as u64), value.clone())?;
+        set_property(&dst, &key(k as u64), *value)?;
     }
     Ok(dst)
 }
@@ -627,12 +627,12 @@ fn iterate_source(
     items: &Value,
 ) -> Result<Value, JsError> {
     if let Some(method) = get_method(agent, items, "@@iterator")? {
-        let iterator = crate::function::call(agent, &method, items.clone(), &[])?;
+        let iterator = crate::function::call(agent, &method, *items, &[])?;
         let next = get_property(
             agent,
             &iterator,
             &JsString::from_utf8("next"),
-            iterator.clone(),
+            iterator,
         )?;
         if !is_callable(&next) {
             return Err(JsError::new(
@@ -802,7 +802,7 @@ fn typed_array_buffer_path(
     };
     let array_length = byte_length / element_size;
     let slots = TypedArraySlots {
-        buffer_object: buffer.clone(),
+        buffer_object: *buffer,
         buffer: shared,
         element_type,
         byte_length,
@@ -828,7 +828,7 @@ fn get_length(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value,
 fn get_buffer(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     let slots = typed_array_slots_required(this)?;
     let _ = agent;
-    Ok(slots.buffer_object.clone())
+    Ok(slots.buffer_object)
 }
 
 fn get_byte_length(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
@@ -959,7 +959,7 @@ fn copy_within(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
             to = (to as i64 + direction) as u64;
         }
     }
-    Ok(this.clone())
+    Ok(*this)
 }
 
 /// spec 25.2.3.7 TypedArray.prototype.entries.
@@ -967,7 +967,7 @@ fn entries(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, Js
     validate_typed_array(agent, this)?;
     crate::builtins::array::create_array_iterator(
         agent,
-        this.clone(),
+        *this,
         crate::builtins::array::ArrayIterationKind::KeyValue,
     )
 }
@@ -988,8 +988,8 @@ fn every(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
         let test = crate::function::call(
             agent,
             &callbackfn,
-            this_arg.clone(),
-            &[k_value, Value::Number(k as f64), this.clone()],
+            this_arg,
+            &[k_value, Value::Number(k as f64), *this],
         )?;
         if !to_boolean(&test) {
             return Ok(Value::Boolean(false));
@@ -1032,9 +1032,9 @@ fn fill(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         ));
     }
     for k in k..final_index {
-        set_property(this, &key(k), value.clone())?;
+        set_property(this, &key(k), value)?;
     }
-    Ok(this.clone())
+    Ok(*this)
 }
 
 /// spec 25.2.3.10 TypedArray.prototype.filter.
@@ -1059,8 +1059,8 @@ fn filter(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
         let selected = crate::function::call(
             agent,
             &callbackfn,
-            this_arg.clone(),
-            &[k_value.clone(), Value::Number(k as f64), this.clone()],
+            this_arg,
+            &[k_value, Value::Number(k as f64), *this],
         )?;
         if to_boolean(&selected) {
             kept.push(k_value);
@@ -1094,8 +1094,8 @@ fn find_common(
         let test = crate::function::call(
             agent,
             &predicate,
-            this_arg.clone(),
-            &[k_value.clone(), Value::Number(k as f64), this.clone()],
+            this_arg,
+            &[k_value, Value::Number(k as f64), *this],
         )?;
         if to_boolean(&test) {
             return Ok(if want_index {
@@ -1144,8 +1144,8 @@ fn find_last_common(
         let test = crate::function::call(
             agent,
             &predicate,
-            this_arg.clone(),
-            &[k_value.clone(), Value::Number(k as f64), this.clone()],
+            this_arg,
+            &[k_value, Value::Number(k as f64), *this],
         )?;
         if to_boolean(&test) {
             return Ok(if want_index {
@@ -1189,8 +1189,8 @@ fn for_each(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
         crate::function::call(
             agent,
             &callbackfn,
-            this_arg.clone(),
-            &[k_value, Value::Number(k as f64), this.clone()],
+            this_arg,
+            &[k_value, Value::Number(k as f64), *this],
         )?;
     }
     Ok(Value::Undefined)
@@ -1283,7 +1283,7 @@ fn keys(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsErr
     validate_typed_array(agent, this)?;
     crate::builtins::array::create_array_iterator(
         agent,
-        this.clone(),
+        *this,
         crate::builtins::array::ArrayIterationKind::Key,
     )
 }
@@ -1343,8 +1343,8 @@ fn map(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
         let mapped = crate::function::call(
             agent,
             &callbackfn,
-            this_arg.clone(),
-            &[k_value, Value::Number(k as f64), this.clone()],
+            this_arg,
+            &[k_value, Value::Number(k as f64), *this],
         )?;
         set_property(&result, &key(k), mapped)?;
     }
@@ -1365,7 +1365,7 @@ fn reduce(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
     let mut k = 0u64;
     let mut accumulator: Value;
     if args.len() >= 2 {
-        accumulator = args[1].clone();
+        accumulator = args[1];
     } else {
         if length == 0 {
             return Err(JsError::new(
@@ -1382,7 +1382,7 @@ fn reduce(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
             agent,
             &callbackfn,
             Value::Undefined,
-            &[accumulator, k_value, Value::Number(k as f64), this.clone()],
+            &[accumulator, k_value, Value::Number(k as f64), *this],
         )?;
         k += 1;
     }
@@ -1403,7 +1403,7 @@ fn reduce_right(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     let mut k = length as i64 - 1;
     let mut accumulator: Value;
     if args.len() >= 2 {
-        accumulator = args[1].clone();
+        accumulator = args[1];
     } else {
         if length == 0 {
             return Err(JsError::new(
@@ -1420,7 +1420,7 @@ fn reduce_right(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
             agent,
             &callbackfn,
             Value::Undefined,
-            &[accumulator, k_value, Value::Number(k as f64), this.clone()],
+            &[accumulator, k_value, Value::Number(k as f64), *this],
         )?;
         k -= 1;
     }
@@ -1440,7 +1440,7 @@ fn reverse(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, Js
         set_property(this, &key(upper), lower_value)?;
         lower += 1;
     }
-    Ok(this.clone())
+    Ok(*this)
 }
 
 /// spec 25.2.3.25 TypedArray.prototype.set.
@@ -1589,8 +1589,8 @@ fn some(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         let test = crate::function::call(
             agent,
             &callbackfn,
-            this_arg.clone(),
-            &[k_value, Value::Number(k as f64), this.clone()],
+            this_arg,
+            &[k_value, Value::Number(k as f64), *this],
         )?;
         if to_boolean(&test) {
             return Ok(Value::Boolean(true));
@@ -1619,7 +1619,7 @@ fn typed_sort_compare(
         return Ok(-1.0);
     }
     if !matches!(comparefn.kind(), ValueKind::Undefined) {
-        let v = crate::function::call(agent, comparefn, Value::Undefined, &[x.clone(), y.clone()])?;
+        let v = crate::function::call(agent, comparefn, Value::Undefined, &[*x, *y])?;
         let v = crate::context::to_number(agent, &v)?;
         return Ok(if v.is_nan() { 0.0 } else { v });
     }
@@ -1695,7 +1695,7 @@ fn sort(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         typed_array_effective_length(&slots) as u64,
         &comparefn,
     )?;
-    Ok(this.clone())
+    Ok(*this)
 }
 
 /// spec 25.2.3.29 TypedArray.prototype.subarray.
@@ -1706,7 +1706,7 @@ fn subarray(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
     let end = clamped_end(agent, args, length)?;
     let count = end.saturating_sub(begin);
     let new_byte_offset = slots.byte_offset + begin as usize * slots.element_type.size();
-    let buffer = slots.buffer_object.clone();
+    let buffer = slots.buffer_object;
     if slots.auto_length && args.get(1).is_none_or(|v| v.is_undefined()) {
         // An auto-length view with no explicit end yields an auto-length
         // result: species create with « buffer, byteOffset » (spec 25.2.3.30
@@ -1746,7 +1746,7 @@ fn to_locale_string(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
         let boxed = crate::context::to_object(agent, &element)?;
         let method = get(agent, &boxed, &JsString::from_utf8("toLocaleString"))?;
         let text =
-            crate::function::call(agent, &method, boxed, &[locales.clone(), options.clone()])?;
+            crate::function::call(agent, &method, boxed, &[locales, options])?;
         result.push_str(&crate::context::to_string(agent, &text)?.to_string_lossy());
     }
     Ok(Value::String(Handle::new(JsString::from_utf8(&result))))
@@ -1793,7 +1793,7 @@ fn values(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsE
     validate_typed_array(agent, this)?;
     crate::builtins::array::create_array_iterator(
         agent,
-        this.clone(),
+        *this,
         crate::builtins::array::ArrayIterationKind::Value,
     )
 }
@@ -1847,7 +1847,7 @@ fn with(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     let result = typed_array_create_same_type(agent, &slots, length as usize)?;
     for k in 0..length {
         let new_value = if k == actual_index {
-            value.clone()
+            value
         } else {
             get(agent, this, &key(k))?
         };
@@ -1872,7 +1872,7 @@ fn of(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError>
     let length = args.len();
     let target = typed_array_create(agent, this, length)?;
     for (k, item) in args.iter().enumerate() {
-        set_property(&target, &key(k as u64), item.clone())?;
+        set_property(&target, &key(k as u64), *item)?;
     }
     Ok(target)
 }
@@ -1897,12 +1897,12 @@ fn from(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     }
     let using_iterator = get_method(agent, &items, "@@iterator")?;
     if let Some(method) = using_iterator {
-        let iterator = crate::function::call(agent, &method, items.clone(), &[])?;
+        let iterator = crate::function::call(agent, &method, items, &[])?;
         let next = get_property(
             agent,
             &iterator,
             &JsString::from_utf8("next"),
-            iterator.clone(),
+            iterator,
         )?;
         if !is_callable(&next) {
             return Err(JsError::new(
@@ -1926,7 +1926,7 @@ fn from(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
                 crate::function::call(
                     agent,
                     &mapfn,
-                    this_arg.clone(),
+                    this_arg,
                     &[value, Value::Number(k as f64)],
                 )?
             } else {
@@ -1945,7 +1945,7 @@ fn from(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
             crate::function::call(
                 agent,
                 &mapfn,
-                this_arg.clone(),
+                this_arg,
                 &[value, Value::Number(k as f64)],
             )?
         } else {
@@ -1958,7 +1958,7 @@ fn from(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
 
 /// The `%TypedArray.prototype[@@species]%` getter (spec 25.2.3.38): `this`.
 fn species_getter(_agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
-    Ok(this.clone())
+    Ok(*this)
 }
 
 /// The base64 alphabets of `toBase64`/`setFromBase64` (spec 25.2.3.44-45).
@@ -2566,15 +2566,15 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let typed_array_ctor_value = Value::Function(typed_array_ctor);
     realm
         .intrinsics
-        .define(TYPED_ARRAY, typed_array_ctor_value.clone());
+        .define(TYPED_ARRAY, typed_array_ctor_value);
     realm
         .intrinsics
-        .define(TYPED_ARRAY_PROTO, typed_array_proto_value.clone());
+        .define(TYPED_ARRAY_PROTO, typed_array_proto_value);
     // spec 25.2.2: %TypedArray% is exposed as the `TypedArray` global.
     realm.global_object.define_property_or_throw(
         &JsString::from_utf8("TypedArray"),
         &PropertyDescriptor {
-            value: Some(typed_array_ctor_value.clone()),
+            value: Some(typed_array_ctor_value),
             writable: Some(true),
             get: None,
             set: None,
@@ -2585,7 +2585,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     typed_array_ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(typed_array_proto_value.clone()),
+            value: Some(typed_array_proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -2596,7 +2596,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     typed_array_proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(typed_array_ctor_value.clone()),
+            value: Some(typed_array_ctor_value),
             writable: Some(true),
             get: None,
             set: None,
@@ -2689,7 +2689,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             "%TypedArray.prototype.values% missing".into(),
         )
     })?;
-    realm.intrinsics.define(ITERATOR, values_func.clone());
+    realm.intrinsics.define(ITERATOR, values_func);
     typed_array_proto.define_property_key(
         &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
         &PropertyDescriptor {
@@ -2706,7 +2706,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let species_func = Function::create_builtin(
         Some(JsString::from_utf8("get [Symbol.species]")),
         0,
-        Box::new(|this, _| Ok(this.clone())),
+        Box::new(|this, _| Ok(*this)),
         None,
         None,
     )?;
@@ -2833,10 +2833,10 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         let ctor_value = Value::Function(ctor);
         // spec 25.2.1: the kind constructors inherit %TypedArray%.
         ctor.object.set_prototype_of(Some(typed_array_object))?;
-        realm.intrinsics.define(kind.ctor, ctor_value.clone());
+        realm.intrinsics.define(kind.ctor, ctor_value);
         realm
             .intrinsics
-            .define(kind.proto, kind_proto_value.clone());
+            .define(kind.proto, kind_proto_value);
         // spec 25.2.1 table: BYTES_PER_ELEMENT is a non-writable,
         // non-enumerable, non-configurable data property of the constructor.
         ctor.define_property(
@@ -2853,7 +2853,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         ctor.define_property(
             &JsString::from_utf8("prototype"),
             &PropertyDescriptor {
-                value: Some(kind_proto_value.clone()),
+                value: Some(kind_proto_value),
                 writable: Some(false),
                 get: None,
                 set: None,
@@ -2877,7 +2877,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         kind_proto.define_property(
             &JsString::from_utf8("constructor"),
             &PropertyDescriptor {
-                value: Some(ctor_value.clone()),
+                value: Some(ctor_value),
                 writable: Some(true),
                 get: None,
                 set: None,
@@ -2889,7 +2889,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         let species_func = Function::create_builtin(
             Some(JsString::from_utf8("get [Symbol.species]")),
             0,
-            Box::new(|this, _| Ok(this.clone())),
+            Box::new(|this, _| Ok(*this)),
             None,
             None,
         )?;

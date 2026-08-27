@@ -663,7 +663,7 @@ fn get_boolean_option(
     options: &Value,
     name: &str,
 ) -> Result<Option<bool>, JsError> {
-    let value = get_property(agent, options, &JsString::from_utf8(name), options.clone())?;
+    let value = get_property(agent, options, &JsString::from_utf8(name), *options)?;
     if value.is_undefined() {
         return Ok(None);
     }
@@ -821,7 +821,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
     ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(proto_value.clone()),
+            value: Some(proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -893,7 +893,7 @@ fn compare_getter(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     let collator = unwrap_collator(agent, this)?;
     let mut record = collator_record(agent, &collator)?;
     if let Some(bound) = &record.bound_compare {
-        return Ok(bound.clone());
+        return Ok(*bound);
     }
     let Some(obj) = as_object(&collator) else {
         return Err(type_error("Not a Collator instance"));
@@ -915,7 +915,7 @@ fn compare_getter(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
         .intl_collator_compare_functions
         .insert(func.id(), collator_id);
     let bound = Value::Function(func);
-    record.bound_compare = Some(bound.clone());
+    record.bound_compare = Some(bound);
     agent.intl_collator_data.insert(collator_id, record);
     Ok(bound)
 }
@@ -1086,7 +1086,7 @@ fn proto_from_ctor(agent: &mut Agent, new_target: &Value) -> Result<Handle<JsObj
         agent,
         new_target,
         &JsString::from_utf8("prototype"),
-        new_target.clone(),
+        *new_target,
     )?;
     if let Some(obj) = as_object(&proto) {
         return Ok(obj);
@@ -1114,7 +1114,7 @@ fn unwrap_collator(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
         return Err(type_error("Not a Collator instance"));
     };
     if agent.intl_collator_data.contains_key(&obj.id()) {
-        return Ok(value.clone());
+        return Ok(*value);
     }
     Err(type_error("Not a Collator instance"))
 }

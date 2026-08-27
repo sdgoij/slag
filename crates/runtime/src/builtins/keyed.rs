@@ -135,7 +135,7 @@ fn get_prototype_from_constructor(
         agent,
         constructor,
         &PropertyKey::from_utf8("prototype"),
-        constructor.clone(),
+        *constructor,
     )?;
     match as_object(&proto) {
         Some(object) => Ok(object),
@@ -314,7 +314,7 @@ fn map_set(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsE
     } else {
         data.push(Some((key, value)));
     }
-    Ok(this.clone())
+    Ok(*this)
 }
 
 /// Map.prototype.delete (spec 24.1.3.3): mark the entry ~empty~.
@@ -338,7 +338,7 @@ fn map_get(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsE
     Ok(match find_index(&data, &key) {
         Some(index) => data[index]
             .as_ref()
-            .map(|entry| entry.1.clone())
+            .map(|entry| entry.1)
             .unwrap_or(Value::Undefined),
         None => Value::Undefined,
     })
@@ -379,11 +379,11 @@ fn map_get_or_insert(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<
     if let Some(index) = find_index(&data, &key) {
         let value = data[index]
             .as_ref()
-            .map(|entry| entry.1.clone())
+            .map(|entry| entry.1)
             .unwrap_or(Value::Undefined);
         return Ok(value);
     }
-    data.push(Some((key, value.clone())));
+    data.push(Some((key, value)));
     Ok(value)
 }
 
@@ -408,7 +408,7 @@ fn map_get_or_insert_computed(
         if let Some(index) = find_index(&data, &key) {
             let value = data[index]
                 .as_ref()
-                .map(|entry| entry.1.clone())
+                .map(|entry| entry.1)
                 .unwrap_or(Value::Undefined);
             return Ok(value);
         }
@@ -422,10 +422,10 @@ fn map_get_or_insert_computed(
     let mut data = agent.map_data.get(&object.id()).unwrap().borrow_mut();
     if let Some(index) = find_index(&data, &key) {
         if let Some(entry) = &mut data[index] {
-            entry.1 = value.clone();
+            entry.1 = value;
         }
     } else {
-        data.push(Some((key, value.clone())));
+        data.push(Some((key, value)));
     }
     Ok(value)
 }
@@ -456,8 +456,8 @@ fn map_for_each(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
             crate::function::call(
                 agent,
                 &callback,
-                this_arg.clone(),
-                &[value, key, this.clone()],
+                this_arg,
+                &[value, key, *this],
             )?;
         }
     }
@@ -486,7 +486,7 @@ fn create_map_iterator(
     let iterator = JsObject::ordinary_object_create(Some(proto));
     agent.map_iter_data.insert(
         iterator.id(),
-        RefCell::new((Some(map.clone()), 0usize, kind.code())),
+        RefCell::new((Some(*map), 0usize, kind.code())),
     );
     Ok(Value::Object(iterator))
 }
@@ -510,7 +510,7 @@ fn map_iterator_next(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result
     }
     let (map, mut index, kind_code) = {
         let state = agent.map_iter_data.get(&id).unwrap().borrow();
-        state.clone()
+        *state
     };
     let Some(map_value) = map else {
         return iter_result(agent, Value::Undefined, true);
@@ -529,7 +529,7 @@ fn map_iterator_next(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result
         .clone();
     let len = data.len();
     while index < len {
-        let entry = data[index].clone();
+        let entry = data[index];
         index += 1;
         if let Some((key, value)) = entry {
             let result = match kind {
@@ -570,7 +570,7 @@ fn map_values(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value,
 
 /// The `get Map.prototype[Symbol.species]` accessor (spec 24.1.2.2): `this`.
 fn species_getter(_agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
-    Ok(this.clone())
+    Ok(*this)
 }
 
 /// Set.prototype.add (spec 24.2.3.1): append when the value is new.
@@ -581,7 +581,7 @@ fn set_add(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsE
     if find_set_index(&data, &value).is_none() {
         data.push(Some(value));
     }
-    Ok(this.clone())
+    Ok(*this)
 }
 
 /// Set.prototype.delete (spec 24.2.3.4).
@@ -648,8 +648,8 @@ fn set_for_each(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
             crate::function::call(
                 agent,
                 &callback,
-                this_arg.clone(),
-                &[value.clone(), value, this.clone()],
+                this_arg,
+                &[value, value, *this],
             )?;
         }
     }
@@ -681,7 +681,7 @@ fn create_set_iterator(
     };
     agent.set_iter_data.insert(
         iterator.id(),
-        RefCell::new((Some(set.clone()), 0usize, kind_code)),
+        RefCell::new((Some(*set), 0usize, kind_code)),
     );
     Ok(Value::Object(iterator))
 }
@@ -703,7 +703,7 @@ fn set_iterator_next(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result
     }
     let (set, mut index, kind_code) = {
         let state = agent.set_iter_data.get(&id).unwrap().borrow();
-        state.clone()
+        *state
     };
     let Some(set_value) = set else {
         return iter_result(agent, Value::Undefined, true);
@@ -719,11 +719,11 @@ fn set_iterator_next(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result
         .clone();
     let len = data.len();
     while index < len {
-        let entry = data[index].clone();
+        let entry = data[index];
         index += 1;
         if let Some(value) = entry {
             let result = match kind_code {
-                0 => crate::builtins::array::array_from_values(agent, &[value.clone(), value])?,
+                0 => crate::builtins::array::array_from_values(agent, &[value, value])?,
                 _ => value,
             };
             let mut state = agent.set_iter_data.get(&id).unwrap().borrow_mut();
@@ -794,7 +794,7 @@ fn get_set_record(agent: &mut Agent, other: &Value) -> Result<SetRecord, JsError
         ));
     }
     Ok(SetRecord {
-        object: other.clone(),
+        object: *other,
         size: int_size as usize,
         has,
         keys,
@@ -802,7 +802,7 @@ fn get_set_record(agent: &mut Agent, other: &Value) -> Result<SetRecord, JsError
 }
 
 fn get(agent: &mut Agent, value: &Value, name: &JsString) -> Result<Value, JsError> {
-    get_property(agent, value, name, value.clone())
+    get_property(agent, value, name, *value)
 }
 
 /// GetIteratorFromMethod (spec 7.4.3): call `method` on `obj` and extract
@@ -812,7 +812,7 @@ fn get_iterator_from_method(
     obj: &Value,
     method: &Value,
 ) -> Result<IteratorRecord, JsError> {
-    let iterator = crate::function::call(agent, method, obj.clone(), &[])?;
+    let iterator = crate::function::call(agent, method, *obj, &[])?;
     if !matches!(iterator.kind(), ValueKind::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -874,11 +874,11 @@ fn set_intersection(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
             let in_other = to_boolean(&crate::function::call(
                 agent,
                 &record.has,
-                record.object.clone(),
+                record.object,
                 std::slice::from_ref(value),
             )?);
             if in_other && find_set_index(&result, value).is_none() {
-                result.push(Some(value.clone()));
+                result.push(Some(*value));
             }
         }
     } else {
@@ -906,13 +906,13 @@ fn set_difference(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
     if this_size <= record.size {
         let mut index = 0usize;
         while index < result.len() {
-            let entry = result[index].clone();
+            let entry = result[index];
             index += 1;
             if let Some(value) = entry {
                 let in_other = to_boolean(&crate::function::call(
                     agent,
                     &record.has,
-                    record.object.clone(),
+                    record.object,
                     &[value],
                 )?);
                 if in_other {
@@ -952,7 +952,7 @@ fn set_symmetric_difference(
     while let Some(next) = crate::expr::iterator_step(agent, &keys)? {
         let value = canonicalize_key(next);
         if find_set_index(&result, &value).is_none() {
-            result.push(Some(value.clone()));
+            result.push(Some(value));
         }
         if set_data_contains(agent, id, &value)
             && let Some(index) = find_set_index(&result, &value)
@@ -981,7 +981,7 @@ fn set_is_subset_of(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
         let in_other = to_boolean(&crate::function::call(
             agent,
             &record.has,
-            record.object.clone(),
+            record.object,
             std::slice::from_ref(&value),
         )?);
         if !in_other {
@@ -1027,7 +1027,7 @@ fn set_is_disjoint_from(agent: &mut Agent, this: &Value, args: &[Value]) -> Resu
             let in_other = to_boolean(&crate::function::call(
                 agent,
                 &record.has,
-                record.object.clone(),
+                record.object,
                 std::slice::from_ref(&value),
             )?);
             if in_other {
@@ -1066,7 +1066,7 @@ fn weak_map_set(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     } else {
         data.push(Some((key, value)));
     }
-    Ok(this.clone())
+    Ok(*this)
 }
 
 /// WeakMap.prototype.get (spec 26.3.3.4): undefined for non-weak keys.
@@ -1080,7 +1080,7 @@ fn weak_map_get(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     Ok(match find_index(&data, &key) {
         Some(index) => data[index]
             .as_ref()
-            .map(|entry| entry.1.clone())
+            .map(|entry| entry.1)
             .unwrap_or(Value::Undefined),
         None => Value::Undefined,
     })
@@ -1132,11 +1132,11 @@ fn weak_map_get_or_insert(
     if let Some(index) = find_index(&data, &key) {
         let value = data[index]
             .as_ref()
-            .map(|entry| entry.1.clone())
+            .map(|entry| entry.1)
             .unwrap_or(Value::Undefined);
         return Ok(value);
     }
-    data.push(Some((key, value.clone())));
+    data.push(Some((key, value)));
     Ok(value)
 }
 
@@ -1166,7 +1166,7 @@ fn weak_map_get_or_insert_computed(
         if let Some(index) = find_index(&data, &key) {
             let value = data[index]
                 .as_ref()
-                .map(|entry| entry.1.clone())
+                .map(|entry| entry.1)
                 .unwrap_or(Value::Undefined);
             return Ok(value);
         }
@@ -1180,10 +1180,10 @@ fn weak_map_get_or_insert_computed(
     let mut data = agent.weak_map_data.get(&object.id()).unwrap().borrow_mut();
     if let Some(index) = find_index(&data, &key) {
         if let Some(entry) = &mut data[index] {
-            entry.1 = value.clone();
+            entry.1 = value;
         }
     } else {
-        data.push(Some((key, value.clone())));
+        data.push(Some((key, value)));
     }
     Ok(value)
 }
@@ -1202,7 +1202,7 @@ fn weak_set_add(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     if find_set_index(&data, &value).is_none() {
         data.push(Some(value));
     }
-    Ok(this.clone())
+    Ok(*this)
 }
 
 /// WeakSet.prototype.has (spec 26.4.3.3).
@@ -1244,7 +1244,7 @@ fn add_entries_from_iterable(
     loop {
         let next = match crate::expr::iterator_step(agent, &iterator)? {
             Some(value) => value,
-            None => return Ok(target.clone()),
+            None => return Ok(*target),
         };
         if !matches!(next.kind(), ValueKind::Object(_)) {
             let error = JsError::new(
@@ -1270,7 +1270,7 @@ fn add_entries_from_iterable(
                 return Err(error);
             }
         };
-        if let Err(error) = crate::function::call(agent, adder, target.clone(), &[key, value]) {
+        if let Err(error) = crate::function::call(agent, adder, *target, &[key, value]) {
             let _ = crate::expr::iterator_close(agent, &iterator);
             return Err(error);
         }
@@ -1323,7 +1323,7 @@ where
             agent,
             callback,
             Value::Undefined,
-            &[next.clone(), Value::Number(k as f64)],
+            &[next, Value::Number(k as f64)],
         ) {
             Ok(key) => key,
             Err(error) => {
@@ -1422,7 +1422,7 @@ fn set_construct(agent: &mut Agent, args: &[Value], new_target: &Value) -> Resul
             Some(value) => value,
             None => return Ok(set_value),
         };
-        if let Err(error) = crate::function::call(agent, &adder, set_value.clone(), &[next]) {
+        if let Err(error) = crate::function::call(agent, &adder, set_value, &[next]) {
             let _ = crate::expr::iterator_close(agent, &iterator);
             return Err(error);
         }
@@ -1484,7 +1484,7 @@ fn weak_set_construct(
             Some(value) => value,
             None => return Ok(set_value),
         };
-        if let Err(error) = crate::function::call(agent, &adder, set_value.clone(), &[next]) {
+        if let Err(error) = crate::function::call(agent, &adder, set_value, &[next]) {
             let _ = crate::expr::iterator_close(agent, &iterator);
             return Err(error);
         }
@@ -1517,12 +1517,12 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         None,
     )?;
     let map_ctor_value = Value::Function(map_ctor);
-    realm.intrinsics.define(MAP, map_ctor_value.clone());
-    realm.intrinsics.define(MAP_PROTO, map_proto_value.clone());
+    realm.intrinsics.define(MAP, map_ctor_value);
+    realm.intrinsics.define(MAP_PROTO, map_proto_value);
     map_ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(map_proto_value.clone()),
+            value: Some(map_proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -1533,7 +1533,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     map_proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(map_ctor_value.clone()),
+            value: Some(map_ctor_value),
             writable: Some(true),
             get: None,
             set: None,
@@ -1621,7 +1621,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             continue;
         }
         // @@iterator is %Map.prototype.entries%: the same function value.
-        if is_iterator && let Some(entries) = entries_func.clone() {
+        if is_iterator && let Some(entries) = entries_func {
             map_proto.define_property_key(
                 &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
                 &PropertyDescriptor {
@@ -1714,7 +1714,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let map_self = Function::create_builtin(
         Some(JsString::from_utf8("[Symbol.iterator]")),
         0,
-        Box::new(|this, _| Ok(this.clone())),
+        Box::new(|this, _| Ok(*this)),
         None,
         function_proto,
     )?;
@@ -1752,12 +1752,12 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         None,
     )?;
     let set_ctor_value = Value::Function(set_ctor);
-    realm.intrinsics.define(SET, set_ctor_value.clone());
-    realm.intrinsics.define(SET_PROTO, set_proto_value.clone());
+    realm.intrinsics.define(SET, set_ctor_value);
+    realm.intrinsics.define(SET_PROTO, set_proto_value);
     set_ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(set_proto_value.clone()),
+            value: Some(set_proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -1768,7 +1768,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     set_proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(set_ctor_value.clone()),
+            value: Some(set_ctor_value),
             writable: Some(true),
             get: None,
             set: None,
@@ -1819,7 +1819,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     for (name, intrinsic, length) in set_methods {
         let is_iterator = name == "[Symbol.iterator]";
         // @@iterator is %Set.prototype.values%: the same function value.
-        if is_iterator && let Some(values) = values_func_opt.clone() {
+        if is_iterator && let Some(values) = values_func_opt {
             set_proto.define_property_key(
                 &PropertyKey::Symbol(crux::symbol::well_known("iterator").as_ref().clone()),
                 &PropertyDescriptor {
@@ -1865,7 +1865,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     })?;
     realm
         .intrinsics
-        .define("%Set.prototype.keys%", values_func.clone());
+        .define("%Set.prototype.keys%", values_func);
     set_proto.define_property(
         &JsString::from_utf8("keys"),
         &PropertyDescriptor {
@@ -1940,7 +1940,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let set_self = Function::create_builtin(
         Some(JsString::from_utf8("[Symbol.iterator]")),
         0,
-        Box::new(|this, _| Ok(this.clone())),
+        Box::new(|this, _| Ok(*this)),
         None,
         function_proto,
     )?;
@@ -1980,14 +1980,14 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let weak_map_ctor_value = Value::Function(weak_map_ctor);
     realm
         .intrinsics
-        .define(WEAK_MAP, weak_map_ctor_value.clone());
+        .define(WEAK_MAP, weak_map_ctor_value);
     realm
         .intrinsics
-        .define(WEAK_MAP_PROTO, weak_map_proto_value.clone());
+        .define(WEAK_MAP_PROTO, weak_map_proto_value);
     weak_map_ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(weak_map_proto_value.clone()),
+            value: Some(weak_map_proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -1998,7 +1998,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     weak_map_proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(weak_map_ctor_value.clone()),
+            value: Some(weak_map_ctor_value),
             writable: Some(true),
             get: None,
             set: None,
@@ -2060,14 +2060,14 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let weak_set_ctor_value = Value::Function(weak_set_ctor);
     realm
         .intrinsics
-        .define(WEAK_SET, weak_set_ctor_value.clone());
+        .define(WEAK_SET, weak_set_ctor_value);
     realm
         .intrinsics
-        .define(WEAK_SET_PROTO, weak_set_proto_value.clone());
+        .define(WEAK_SET_PROTO, weak_set_proto_value);
     weak_set_ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(weak_set_proto_value.clone()),
+            value: Some(weak_set_proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -2078,7 +2078,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     weak_set_proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(weak_set_ctor_value.clone()),
+            value: Some(weak_set_ctor_value),
             writable: Some(true),
             get: None,
             set: None,

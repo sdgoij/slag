@@ -78,12 +78,12 @@ impl Completion {
     /// The completion's `[[Value]]`, with `~empty~` read as *undefined*.
     pub fn value(&self) -> Value {
         match self {
-            Completion::Normal(value) => value.clone(),
+            Completion::Normal(value) => *value,
             Completion::Empty => Value::Undefined,
             Completion::Break { value, .. } | Completion::Continue { value, .. } => {
-                value.clone().unwrap_or(Value::Undefined)
+                (*value).unwrap_or(Value::Undefined)
             }
-            Completion::Return(value) | Completion::Throw(value) => value.clone(),
+            Completion::Return(value) | Completion::Throw(value) => *value,
         }
     }
 }

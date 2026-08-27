@@ -129,7 +129,7 @@ impl Isolate {
 
     /// The pending exception value, if set.
     pub fn pending_exception(&self) -> Option<Value> {
-        self.pending_exception.borrow().clone()
+        *self.pending_exception.borrow()
     }
 
     pub fn set_pending_exception(&self, value: Value) {
@@ -279,7 +279,7 @@ mod tests {
         // stay reachable from a traced root (`globalThis.hold`) until the
         // read-back — a Value held only in native memory would be swept
         // (GC model; the pre-GC Rc handle kept it alive implicitly).
-        let this = observed_this.borrow().clone().unwrap();
+        let this = (*observed_this.borrow()).unwrap();
         assert!(this.is_object());
         let this_object = crate::context::as_object(&this).unwrap();
         let y = this_object

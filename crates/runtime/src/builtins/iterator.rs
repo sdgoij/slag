@@ -200,7 +200,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let iterator_proto_value = Value::Object(iterator_proto);
     realm
         .intrinsics
-        .define(ITERATOR_PROTO, iterator_proto_value.clone());
+        .define(ITERATOR_PROTO, iterator_proto_value);
 
     // %Iterator%: a function object with proto %Function.prototype%; both
     // call and construct throw.
@@ -214,7 +214,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let iterator_ctor_value = Value::Function(iterator_ctor);
     realm
         .intrinsics
-        .define(ITERATOR, iterator_ctor_value.clone());
+        .define(ITERATOR, iterator_ctor_value);
     if let Some(function_proto) = realm
         .intrinsics
         .get("%Function.prototype%")
@@ -227,7 +227,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     iterator_ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(iterator_proto_value.clone()),
+            value: Some(iterator_proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -371,7 +371,7 @@ fn install_prototype_methods(
     let iterator_method = Function::create_builtin(
         Some(JsString::from_utf8("[Symbol.iterator]")),
         0,
-        Box::new(|this, _| Ok(this.clone())),
+        Box::new(|this, _| Ok(*this)),
         None,
         None,
     )?;
@@ -527,7 +527,7 @@ fn install_helper_prototype(realm: &Handle<Realm>) -> Result<(), JsError> {
     let iterator_method = Function::create_builtin(
         Some(JsString::from_utf8("[Symbol.iterator]")),
         0,
-        Box::new(|this, _| Ok(this.clone())),
+        Box::new(|this, _| Ok(*this)),
         None,
         None,
     )?;
@@ -592,7 +592,7 @@ fn install_wrap_prototype(realm: &Handle<Realm>) -> Result<(), JsError> {
     let iterator_method = Function::create_builtin(
         Some(JsString::from_utf8("[Symbol.iterator]")),
         0,
-        Box::new(|this, _| Ok(this.clone())),
+        Box::new(|this, _| Ok(*this)),
         None,
         None,
     )?;
@@ -757,7 +757,7 @@ pub fn dispatch_construct(
                 agent,
                 new_target,
                 &JsString::from_utf8("prototype"),
-                new_target.clone(),
+                *new_target,
             ) {
                 Ok(value) => as_object(&value),
                 Err(e) => return Err(e),
@@ -804,7 +804,7 @@ fn setter_that_ignores_prototype_properties(
         object.create_data_property_or_throw_key(&key, value)?;
         return Ok(Value::Undefined);
     }
-    let _ = get_property_key(agent, this, &key, this.clone())?;
+    let _ = get_property_key(agent, this, &key, *this)?;
     object.set_key(&key, value, true)?;
     Ok(Value::Undefined)
 }
@@ -833,9 +833,9 @@ fn get_iterator_direct(agent: &mut Agent, this: &Value) -> Result<IteratorRecord
     };
     // The next method is stored as-is; a non-callable one surfaces as a
     // TypeError from the first step (spec: the helpers defer the check).
-    let next = get_property(agent, this, &JsString::from_utf8("next"), this.clone())?;
+    let next = get_property(agent, this, &JsString::from_utf8("next"), *this)?;
     Ok(IteratorRecord {
-        iterator: this.clone(),
+        iterator: *this,
         next,
     })
 }
@@ -851,10 +851,10 @@ fn step_value(agent: &mut Agent, record: &IteratorRecord) -> Result<Option<Value
 /// validation error wins.
 fn close_this_on_error(agent: &mut Agent, this: &Value, error: JsError) -> Result<Value, JsError> {
     let return_key = JsString::from_utf8("return");
-    if let Ok(return_method) = get_property(agent, this, &return_key, this.clone())
+    if let Ok(return_method) = get_property(agent, this, &return_key, *this)
         && is_callable(&return_method)
     {
-        let _ = crate::function::call(agent, &return_method, this.clone(), &[]);
+        let _ = crate::function::call(agent, &return_method, *this, &[]);
     }
     Err(error)
 }
@@ -913,7 +913,7 @@ fn call_predicate(
         agent,
         f,
         Value::Undefined,
-        &[value.clone(), Value::Number(counter)],
+        &[*value, Value::Number(counter)],
     )?;
     Ok(to_boolean(&result))
 }
@@ -1032,7 +1032,7 @@ fn reduce_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Valu
         0.0
     };
     iterate_eager(agent, &record, start_counter, |agent, value, counter| {
-        let acc = accumulator.clone().unwrap_or(Value::Undefined);
+        let acc = accumulator.unwrap_or(Value::Undefined);
         accumulator = Some(crate::function::call(
             agent,
             &reducer,
@@ -1150,10 +1150,10 @@ fn join_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
 /// (spec 27.1.3.12) — the receiver need not have a `next`.
 fn dispose_method(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     let return_key = JsString::from_utf8("return");
-    if let Ok(return_method) = get_property(agent, this, &return_key, this.clone())
+    if let Ok(return_method) = get_property(agent, this, &return_key, *this)
         && is_callable(&return_method)
     {
-        crate::function::call(agent, &return_method, this.clone(), &[])?;
+        crate::function::call(agent, &return_method, *this, &[])?;
     }
     Ok(Value::Undefined)
 }
@@ -1772,7 +1772,7 @@ fn step_helper(agent: &mut Agent, state: &mut HelperState) -> Result<Value, JsEr
                 // GetIteratorDirect (spec 7.4.1): call the open method and
                 // require an object iterator with a callable next.
                 let iterator =
-                    crate::function::call(agent, &item.open_method, item.iterable.clone(), &[])?;
+                    crate::function::call(agent, &item.open_method, item.iterable, &[])?;
                 if !matches!(
                     iterator.kind(),
                     ValueKind::Object(_) | ValueKind::Function(_)
@@ -1786,7 +1786,7 @@ fn step_helper(agent: &mut Agent, state: &mut HelperState) -> Result<Value, JsEr
                     agent,
                     &iterator,
                     &JsString::from_utf8("next"),
-                    iterator.clone(),
+                    iterator,
                 )?;
                 if !is_callable(&next) {
                     return Err(JsError::new(
@@ -1951,7 +1951,7 @@ fn zip_keyed_object(
 ) -> Result<Value, JsError> {
     let object = JsObject::ordinary_object_create(None);
     for (key, value) in keys.iter().zip(values.iter()) {
-        object.create_data_property_key(key, value.clone())?;
+        object.create_data_property_key(key, *value)?;
     }
     Ok(Value::Object(object))
 }
@@ -1980,16 +1980,16 @@ fn get_iterator_flattenable(
         // A flat iterable: the wrapper stores the value's own `next`; a
         // non-callable one surfaces as a TypeError from the first next()
         // (spec 7.4.3 step 3: the check is deferred).
-        let next = get_property(agent, value, &JsString::from_utf8("next"), value.clone())?;
+        let next = get_property(agent, value, &JsString::from_utf8("next"), *value)?;
         return Ok((
             IteratorRecord {
-                iterator: value.clone(),
+                iterator: *value,
                 next,
             },
             true,
         ));
     };
-    let iterator = crate::function::call(agent, &method, value.clone(), &[])?;
+    let iterator = crate::function::call(agent, &method, *value, &[])?;
     if !matches!(iterator.kind(), ValueKind::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -2000,7 +2000,7 @@ fn get_iterator_flattenable(
         agent,
         &iterator,
         &JsString::from_utf8("next"),
-        iterator.clone(),
+        iterator,
     )?;
     if !is_callable(&next) {
         return Err(JsError::new(
@@ -2051,7 +2051,7 @@ fn wrap_method(
     let record = state.borrow().record.clone();
     match name {
         NEXT => {
-            let result = crate::function::call(agent, &record.next, record.iterator.clone(), args)?;
+            let result = crate::function::call(agent, &record.next, record.iterator, args)?;
             if !matches!(result.kind(), ValueKind::Object(_)) {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
@@ -2065,10 +2065,10 @@ fn wrap_method(
                 agent,
                 &record.iterator,
                 &JsString::from_utf8("return"),
-                record.iterator.clone(),
+                record.iterator,
             )?;
             if is_callable(&return_method) {
-                crate::function::call(agent, &return_method, record.iterator.clone(), args)
+                crate::function::call(agent, &return_method, record.iterator, args)
             } else {
                 // spec 27.1.4.2.2 step 6: no return method — a fresh result
                 // object with an undefined value (not the argument).
@@ -2080,10 +2080,10 @@ fn wrap_method(
                 agent,
                 &record.iterator,
                 &JsString::from_utf8("throw"),
-                record.iterator.clone(),
+                record.iterator,
             )?;
             if is_callable(&throw_method) {
-                crate::function::call(agent, &throw_method, record.iterator.clone(), args)
+                crate::function::call(agent, &throw_method, record.iterator, args)
             } else {
                 let reason = args.first().cloned().unwrap_or(Value::Undefined);
                 Err(
@@ -2115,7 +2115,7 @@ fn iterator_concat(agent: &mut Agent, _this: &Value, args: &[Value]) -> Result<V
             )
         })?;
         items.push(ConcatItem {
-            iterable: value.clone(),
+            iterable: *value,
             open_method: method,
         });
     }
@@ -2187,7 +2187,7 @@ fn iterator_zip(
             if !desc.enumerable {
                 continue;
             }
-            let value = match get_property_key(agent, &iterables, &key, iterables.clone()) {
+            let value = match get_property_key(agent, &iterables, &key, iterables) {
                 Ok(value) => value,
                 Err(e) => {
                     close_collected_throw(agent, &mut iterators);
@@ -2291,7 +2291,7 @@ fn zip_options(
         agent,
         &options,
         &JsString::from_utf8("mode"),
-        options.clone(),
+        options,
     )?;
     let mode = match mode_value.kind() {
         ValueKind::Undefined => ZipMode::Shortest,
@@ -2310,7 +2310,7 @@ fn zip_options(
             agent,
             &options,
             &JsString::from_utf8("padding"),
-            options.clone(),
+            options,
         )?;
         if !matches!(
             padding.kind(),
@@ -2402,7 +2402,7 @@ fn build_keyed_padding(
     }
     let mut padding = Vec::with_capacity(keys.len());
     for key in keys {
-        let value = match get_property_key(agent, &padding_value, key, padding_value.clone()) {
+        let value = match get_property_key(agent, &padding_value, key, padding_value) {
             Ok(value) => value,
             Err(e) => {
                 close_collected_throw(agent, iterators);

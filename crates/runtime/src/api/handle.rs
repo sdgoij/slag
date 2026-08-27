@@ -151,7 +151,7 @@ impl Global {
     }
 
     pub fn get(&self) -> Local {
-        Local(self.0.clone())
+        Local(self.0)
     }
 
     pub fn reset(&mut self, local: Local) {

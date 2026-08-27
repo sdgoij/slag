@@ -194,7 +194,7 @@ fn instance_proto(
         agent,
         new_target,
         &JsString::from_utf8("prototype"),
-        new_target.clone(),
+        *new_target,
     )?;
     match as_object(&proto) {
         Some(object) => Ok(Some(object)),
@@ -255,7 +255,7 @@ fn raw(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
     let template = args.first().cloned().unwrap_or(Value::Undefined);
     let substitutions = &args[1..];
     let cooked = to_object(agent, &template)?;
-    let raw_value = get_property(agent, &cooked, &JsString::from_utf8("raw"), cooked.clone())?;
+    let raw_value = get_property(agent, &cooked, &JsString::from_utf8("raw"), cooked)?;
     let literals = to_object(agent, &raw_value)?;
     let literal_count = length_of_array_like(agent, &literals)?;
     if literal_count == 0 {
@@ -268,7 +268,7 @@ fn raw(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
             agent,
             &literals,
             &JsString::from_utf8(&next_index.to_string()),
-            literals.clone(),
+            literals,
         )?;
         result.extend_from_slice(crate::context::to_string(agent, &literal_value)?.as_slice());
         if next_index + 1 == literal_count {
@@ -283,7 +283,7 @@ fn raw(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
 
 /// LengthOfArrayLike (spec 7.3.22).
 fn length_of_array_like(agent: &mut Agent, value: &Value) -> Result<u64, JsError> {
-    let length = get_property(agent, value, &JsString::from_utf8("length"), value.clone())?;
+    let length = get_property(agent, value, &JsString::from_utf8("length"), *value)?;
     Ok(to_length(crate::context::to_number(agent, &length)?))
 }
 
@@ -530,7 +530,7 @@ fn match_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, J
                 agent,
                 &regexp,
                 &JsString::from_utf8("flags"),
-                regexp.clone(),
+                regexp,
             )?;
             require_object_coercible(&flags)?;
             let flag_text = crate::context::to_string(agent, &flags)?;
@@ -700,7 +700,7 @@ fn replace(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsE
             agent,
             &replacer,
             search_value,
-            &[this.clone(), replace_value],
+            &[*this, replace_value],
         );
     }
     let string = crate::context::to_string(agent, this)?;
@@ -761,7 +761,7 @@ fn replace_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
                 agent,
                 &search_value,
                 &JsString::from_utf8("flags"),
-                search_value.clone(),
+                search_value,
             )?;
             require_object_coercible(&flags)?;
             let flag_text = crate::context::to_string(agent, &flags)?;
@@ -777,7 +777,7 @@ fn replace_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
                 agent,
                 &replacer,
                 search_value,
-                &[this.clone(), replace_value],
+                &[*this, replace_value],
             );
         }
     }
@@ -883,7 +883,7 @@ fn split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
         ValueKind::Object(_) | ValueKind::Function(_)
     ) && let Some(splitter) = crate::expr::get_method(agent, &separator, "@@split")?
     {
-        return crate::function::call(agent, &splitter, separator, &[this.clone(), limit]);
+        return crate::function::call(agent, &splitter, separator, &[*this, limit]);
     }
     let string = crate::context::to_string(agent, this)?;
     let lim = if matches!(limit.kind(), ValueKind::Undefined) {
@@ -1589,7 +1589,7 @@ pub(crate) fn is_regexp(agent: &mut Agent, value: &Value) -> Result<bool, JsErro
     // spec IsRegExp: the @@match property takes precedence over the
     // [[RegExpMatcher]] slot (an explicit false makes the object a non-Regexp).
     let key = PropertyKey::Symbol(crux::symbol::well_known("match").as_ref().clone());
-    let matcher = get_property_key(agent, value, &key, value.clone())?;
+    let matcher = get_property_key(agent, value, &key, *value)?;
     if matches!(matcher.kind(), ValueKind::Undefined) {
         if let ValueKind::Object(obj) = value.kind()
             && agent.regexp_data.contains_key(&obj.id())
@@ -1646,10 +1646,10 @@ fn regexp_create(
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "%RegExp% is not defined".into()))?;
     let args: Vec<Value> = match flags {
         Some(flags) => vec![
-            pattern.clone(),
+            *pattern,
             Value::String(Handle::new(JsString::from_utf8(flags))),
         ],
-        None => vec![pattern.clone()],
+        None => vec![*pattern],
     };
     crate::function::construct(agent, &ctor, &args, &ctor)
 }
@@ -1685,15 +1685,15 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     let string_ctor_value = Value::Function(string_ctor);
 
-    realm.intrinsics.define(STRING, string_ctor_value.clone());
+    realm.intrinsics.define(STRING, string_ctor_value);
     realm
         .intrinsics
-        .define(STRING_PROTO, string_proto_value.clone());
+        .define(STRING_PROTO, string_proto_value);
 
     string_ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(string_proto_value.clone()),
+            value: Some(string_proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -1704,7 +1704,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     string_proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(string_ctor_value.clone()),
+            value: Some(string_ctor_value),
             writable: Some(true),
             get: None,
             set: None,
@@ -1908,7 +1908,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let iterator_proto_value = Value::Object(iterator_proto);
     realm
         .intrinsics
-        .define(STRING_ITERATOR, iterator_proto_value.clone());
+        .define(STRING_ITERATOR, iterator_proto_value);
     let next_func = Function::create_builtin(
         Some(JsString::from_utf8("next")),
         0,

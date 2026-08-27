@@ -177,7 +177,7 @@ impl Context {
         let result = crate::function::call(
             &mut self.agent,
             function.value(),
-            this.value().clone(),
+            *this.value(),
             &values,
         )?;
         self.agent.run_jobs()?;

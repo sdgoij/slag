@@ -104,13 +104,13 @@ fn eval_statement_list_inner(
         completion = eval_statement(agent, stmt, strict)?;
         match &mut completion {
             Completion::Normal(value) => {
-                list_value = value.clone();
+                list_value = *value;
                 list_is_empty = false;
             }
             Completion::Break { value, .. } | Completion::Continue { value, .. }
                 if index > 0 && value.is_none() && !list_is_empty =>
             {
-                *value = Some(list_value.clone());
+                *value = Some(list_value);
             }
             _ => {}
         }
@@ -431,7 +431,7 @@ pub(crate) fn create_disposable_resource(
         ));
     }
     Ok(crate::env::DisposableResource {
-        value: value.clone(),
+        value: *value,
         method,
         hint: if kind == DisposalKind::Async {
             crate::env::DisposalHint::Async
@@ -461,7 +461,7 @@ pub(crate) fn dispose_env_resources(
         if resource.method.is_undefined() {
             continue;
         }
-        match crate::function::call(agent, &resource.method, resource.value.clone(), &[]) {
+        match crate::function::call(agent, &resource.method, resource.value, &[]) {
             Ok(_) => {}
             Err(disposal_error) => {
                 let disposal_value = crate::promise::error_value(agent, &disposal_error);
@@ -795,7 +795,7 @@ fn eval_while(
                     value: Some(value.unwrap_or(iteration_result)),
                 });
             }
-            other => return Ok(other.update_empty(iteration_result.clone())),
+            other => return Ok(other.update_empty(iteration_result)),
         }
     }
 }
@@ -834,7 +834,7 @@ fn eval_do_while(
                     value: Some(value.unwrap_or(iteration_result)),
                 });
             }
-            other => return Ok(other.update_empty(iteration_result.clone())),
+            other => return Ok(other.update_empty(iteration_result)),
         }
         let test_value = eval_expr(agent, test, strict)?;
         if !to_boolean(&test_value) {
@@ -952,7 +952,7 @@ fn eval_for(
         if let Some(test) = test {
             let test_value = eval_expr(agent, test, strict)?;
             if !to_boolean(&test_value) {
-                break Ok(Completion::Normal(iteration_result.clone()));
+                break Ok(Completion::Normal(iteration_result));
             }
         }
         match eval_statement(agent, body, strict)? {
@@ -970,7 +970,7 @@ fn eval_for(
                 value,
             } => {
                 break Ok(Completion::Normal(
-                    value.unwrap_or(iteration_result.clone()),
+                    value.unwrap_or(iteration_result),
                 ));
             }
             Completion::Break {
@@ -979,10 +979,10 @@ fn eval_for(
             } if labels.contains(&l) => {
                 break Ok(Completion::Break {
                     target: Some(l),
-                    value: Some(value.unwrap_or(iteration_result.clone())),
+                    value: Some(value.unwrap_or(iteration_result)),
                 });
             }
-            other => break Ok(other.update_empty(iteration_result.clone())),
+            other => break Ok(other.update_empty(iteration_result)),
         }
         // spec 14.7.4.2 step 5: a fresh environment is created *before* the
         // increment runs, so closures capture the unmutated per-iteration
@@ -1209,7 +1209,7 @@ fn eval_for_in(
                     value: Some(value.unwrap_or(iteration_result)),
                 });
             }
-            other => return Ok(other.update_empty(iteration_result.clone())),
+            other => return Ok(other.update_empty(iteration_result)),
         }
     }
     Ok(Completion::Normal(iteration_result))
@@ -1374,7 +1374,7 @@ fn eval_for_of(
             }
             other => {
                 iterator_close(agent, &iterator)?;
-                return Ok(other.update_empty(iteration_result.clone()));
+                return Ok(other.update_empty(iteration_result));
             }
         }
     }
@@ -1525,7 +1525,7 @@ fn eval_switch(
                     // (LabelledEvaluation of BreakableStatement).
                     return Ok(Completion::Normal(value.unwrap_or(result_value)));
                 }
-                other => return Ok(other.update_empty(result_value.clone())),
+                other => return Ok(other.update_empty(result_value)),
             }
         }
         Ok(Completion::Normal(result_value))

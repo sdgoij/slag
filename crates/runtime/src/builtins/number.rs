@@ -76,7 +76,7 @@ fn instance_proto(
         agent,
         new_target,
         &JsString::from_utf8("prototype"),
-        new_target.clone(),
+        *new_target,
     )?;
     let proto = match as_object(&proto) {
         Some(object) => Some(object),
@@ -393,15 +393,15 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     let number_ctor_value = Value::Function(number_ctor);
 
-    realm.intrinsics.define(NUMBER, number_ctor_value.clone());
+    realm.intrinsics.define(NUMBER, number_ctor_value);
     realm
         .intrinsics
-        .define(NUMBER_PROTO, number_proto_value.clone());
+        .define(NUMBER_PROTO, number_proto_value);
 
     number_ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(number_proto_value.clone()),
+            value: Some(number_proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -412,7 +412,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     number_proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(number_ctor_value.clone()),
+            value: Some(number_ctor_value),
             writable: Some(true),
             get: None,
             set: None,

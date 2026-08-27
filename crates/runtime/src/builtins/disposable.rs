@@ -122,7 +122,7 @@ fn install_stack(realm: &Handle<Realm>, name: &str, is_async: bool) -> Result<()
 
     let proto = JsObject::ordinary_object_create(object_proto);
     let proto_value = Value::Object(proto);
-    realm.intrinsics.define(proto_key, proto_value.clone());
+    realm.intrinsics.define(proto_key, proto_value);
 
     let ctor = Function::create_builtin(
         Some(JsString::from_utf8(name)),
@@ -132,7 +132,7 @@ fn install_stack(realm: &Handle<Realm>, name: &str, is_async: bool) -> Result<()
         None,
     )?;
     let ctor_value = Value::Function(ctor);
-    realm.intrinsics.define(ctor_key, ctor_value.clone());
+    realm.intrinsics.define(ctor_key, ctor_value);
     if let Some(function_proto) = realm
         .intrinsics
         .get("%Function.prototype%")
@@ -143,7 +143,7 @@ fn install_stack(realm: &Handle<Realm>, name: &str, is_async: bool) -> Result<()
     ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(proto_value.clone()),
+            value: Some(proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -154,7 +154,7 @@ fn install_stack(realm: &Handle<Realm>, name: &str, is_async: bool) -> Result<()
     proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(ctor_value.clone()),
+            value: Some(ctor_value),
             writable: Some(true),
             get: None,
             set: None,
@@ -386,7 +386,7 @@ fn stack_construct(
         agent,
         new_target,
         &PropertyKey::from_utf8("prototype"),
-        new_target.clone(),
+        *new_target,
     )?;
     let proto = match as_object(&proto) {
         Some(handle) => handle,
@@ -453,7 +453,7 @@ fn get_dispose_method(agent: &mut Agent, value: &Value, is_async: bool) -> Resul
         agent,
         value,
         &PropertyKey::Symbol(crux::symbol::well_known(symbol).as_ref().clone()),
-        value.clone(),
+        *value,
     )?;
     if is_async && matches!(method.kind(), ValueKind::Undefined | ValueKind::Null) {
         // async-dispose falls back to the sync @@dispose method (an async
@@ -490,7 +490,7 @@ fn adopt(
     add_resource(
         agent,
         id,
-        value.clone(),
+        value,
         on_dispose,
         is_async,
         DisposalCall::Argument,
@@ -542,7 +542,7 @@ fn use_value(
             add_resource(
                 agent,
                 id,
-                value.clone(),
+                value,
                 Value::Undefined,
                 true,
                 DisposalCall::Receiver,
@@ -562,7 +562,7 @@ fn use_value(
     add_resource(
         agent,
         id,
-        value.clone(),
+        value,
         method,
         is_async,
         DisposalCall::Receiver,
@@ -707,7 +707,7 @@ fn dispose_resources(agent: &mut Agent, id: u64) -> Result<Option<Value>, JsErro
 /// 27.4.1.3 and the adopt/defer closures).
 fn resource_receiver(resource: &DisposableResource) -> Value {
     match resource.call {
-        DisposalCall::Receiver => resource.value.clone(),
+        DisposalCall::Receiver => resource.value,
         DisposalCall::Argument | DisposalCall::Plain => Value::Undefined,
     }
 }
@@ -715,7 +715,7 @@ fn resource_receiver(resource: &DisposableResource) -> Value {
 /// The argument list of a resource's dispose method per its call kind.
 fn resource_arguments(resource: &DisposableResource) -> Vec<Value> {
     match resource.call {
-        DisposalCall::Argument => vec![resource.value.clone()],
+        DisposalCall::Argument => vec![resource.value],
         DisposalCall::Receiver | DisposalCall::Plain => vec![],
     }
 }
@@ -749,7 +749,7 @@ fn dispose_async_method(agent: &mut Agent, this: &Value) -> Result<Value, JsErro
         .get("%Promise%")
         .unwrap_or(Value::Undefined);
     let capability = crate::promise::new_promise_capability(agent, &promise_ctor)?;
-    let result_promise = capability.promise.clone();
+    let result_promise = capability.promise;
     // RequireInternalSlot: a non-object or non-stack receiver rejects the
     // returned promise (spec 27.4.3.3 steps 1-2), it does not throw
     // synchronously.
@@ -822,7 +822,7 @@ fn drive_async_disposal(agent: &mut Agent, driver_id: u64) -> Result<Value, JsEr
         (
             resources,
             driver.index,
-            driver.completion.clone(),
+            driver.completion,
             driver.needs_await,
             driver.has_awaited,
             driver.final_await,
@@ -1029,7 +1029,7 @@ pub fn make_suppressed_error(
                 agent,
                 &ctor,
                 &JsString::from_utf8("prototype"),
-                ctor.clone(),
+                ctor,
             )
             .ok()
         })
@@ -1150,7 +1150,7 @@ fn drive_async_body_disposal(agent: &mut Agent, driver_id: u64) -> Result<Value,
         // 3.a) — `await using _ = null` implies an await.
         Ok(Value::Undefined)
     } else {
-        crate::function::call(agent, &resource.method, resource.value.clone(), &[])
+        crate::function::call(agent, &resource.method, resource.value, &[])
     };
     if resource.hint == crate::env::DisposalHint::Sync {
         let result = method_result.map_err(|error| crate::promise::error_value(agent, &error));
@@ -1304,14 +1304,14 @@ mod tests {
         let value = agent.run_script(source)?;
         agent.run_jobs()?;
         let ValueKind::Object(obj) = value.kind() else {
-            return Ok(value.clone());
+            return Ok(value);
         };
         let Some(data) = agent.promises.get(&obj.id()) else {
-            return Ok(value.clone());
+            return Ok(value);
         };
         match &data.borrow().state {
-            PromiseState::Fulfilled(v) => Ok(v.clone()),
-            PromiseState::Rejected(v) => Ok(v.clone()),
+            PromiseState::Fulfilled(v) => Ok(*v),
+            PromiseState::Rejected(v) => Ok(*v),
             PromiseState::Pending { .. } => Err(JsError::new(
                 ErrorKind::TypeError,
                 "promise still pending".into(),

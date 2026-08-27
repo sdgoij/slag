@@ -72,8 +72,8 @@ fn revoked_error() -> JsError {
 
 /// ValidateNonRevokedProxy (spec 10.5.13): both slots must still be set.
 fn resolved(slots: &ProxySlots) -> Result<(Value, Value), JsError> {
-    let target = slots.target.borrow().clone().ok_or_else(revoked_error)?;
-    let handler = slots.handler.borrow().clone().ok_or_else(revoked_error)?;
+    let target = (*slots.target.borrow()).ok_or_else(revoked_error)?;
+    let handler = (*slots.handler.borrow()).ok_or_else(revoked_error)?;
     Ok((target, handler))
 }
 
@@ -159,7 +159,7 @@ pub fn set_prototype_of(
         Some(proto) => Value::Object(proto),
         None => Value::Null,
     };
-    let result = value_call(&trap, handler, &[target.clone(), proto.clone()])?;
+    let result = value_call(&trap, handler, &[target, proto])?;
     if !crate::convert::to_boolean(&result) {
         return Ok(false);
     }
@@ -224,7 +224,7 @@ pub fn get_own_property(
     let Some(trap) = value_get_method(&handler, &trap_key("getOwnPropertyDescriptor"))? else {
         return value_get_own_property(&target, key);
     };
-    let trap_result = value_call(&trap, handler, &[target.clone(), key_value(key)])?;
+    let trap_result = value_call(&trap, handler, &[target, key_value(key)])?;
     if !trap_result.is_object() && !trap_result.is_undefined() {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -304,7 +304,7 @@ pub fn define_own_property(
         return value_define_property(&target, key, desc);
     };
     let desc_obj = from_property_descriptor(desc, None)?;
-    let result = value_call(&trap, handler, &[target.clone(), key_value(key), desc_obj])?;
+    let result = value_call(&trap, handler, &[target, key_value(key), desc_obj])?;
     if !crate::convert::to_boolean(&result) {
         return Ok(false);
     }
@@ -366,7 +366,7 @@ pub fn has_property(slots: &ProxySlots, key: &PropertyKey) -> Result<bool, JsErr
     let Some(trap) = value_get_method(&handler, &trap_key("has"))? else {
         return value_has_property(&target, key);
     };
-    let result = value_call(&trap, handler, &[target.clone(), key_value(key)])?;
+    let result = value_call(&trap, handler, &[target, key_value(key)])?;
     let trap_result = crate::convert::to_boolean(&result);
     if !trap_result && let Some(target_desc) = value_get_own_property(&target, key)? {
         if !target_desc.configurable {
@@ -391,7 +391,7 @@ pub fn get(slots: &ProxySlots, key: &PropertyKey, receiver: Value) -> Result<Val
     let Some(trap) = value_get_method(&handler, &trap_key("get"))? else {
         return value_get(&target, key, receiver);
     };
-    let trap_result = value_call(&trap, handler, &[target.clone(), key_value(key), receiver])?;
+    let trap_result = value_call(&trap, handler, &[target, key_value(key), receiver])?;
     if let Some(target_desc) = value_get_own_property(&target, key)?
         && !target_desc.configurable
     {
@@ -431,7 +431,7 @@ pub fn set(
     let result = value_call(
         &trap,
         handler,
-        &[target.clone(), key_value(key), value.clone(), receiver],
+        &[target, key_value(key), value, receiver],
     )?;
     if !crate::convert::to_boolean(&result) {
         return Ok(false);
@@ -464,7 +464,7 @@ pub fn delete(slots: &ProxySlots, key: &PropertyKey) -> Result<bool, JsError> {
     let Some(trap) = value_get_method(&handler, &trap_key("deleteProperty"))? else {
         return value_delete(&target, key);
     };
-    let result = value_call(&trap, handler, &[target.clone(), key_value(key)])?;
+    let result = value_call(&trap, handler, &[target, key_value(key)])?;
     if !crate::convert::to_boolean(&result) {
         return Ok(false);
     }
@@ -583,7 +583,7 @@ pub fn construct(slots: &ProxySlots, args: &[Value], new_target: &Value) -> Resu
         return value_construct(&target, args, new_target);
     };
     let arg_array = create_array_from_list(args)?;
-    let new_obj = value_call(&trap, handler, &[target, arg_array, new_target.clone()])?;
+    let new_obj = value_call(&trap, handler, &[target, arg_array, *new_target])?;
     if !new_obj.is_object() {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -611,7 +611,7 @@ fn create_list_from_array_like(value: &Value) -> Result<Vec<PropertyKey>, JsErro
         let element = value_get(
             value,
             &PropertyKey::from_utf8(&index.to_string()),
-            value.clone(),
+            *value,
         )?;
         let key = if element.is_string() || element.is_symbol() {
             crate::convert::to_property_key(&element)?
@@ -633,7 +633,7 @@ fn length_of_array_like(value: &Value) -> Result<u64, JsError> {
             "Value is not an object".into(),
         ));
     }
-    let length = value_get(value, &PropertyKey::from_utf8("length"), value.clone())?;
+    let length = value_get(value, &PropertyKey::from_utf8("length"), *value)?;
     let length = crate::convert::to_length(crate::convert::to_number(&length)?);
     Ok(length)
 }
@@ -649,7 +649,7 @@ fn create_array_from_list(list: &[Value]) -> Result<Value, JsError> {
     }
     let array = JsObject::array_create(None, list.len() as f64)?;
     for (index, element) in list.iter().enumerate() {
-        array.create_data_property(&JsString::from_utf8(&index.to_string()), element.clone())?;
+        array.create_data_property(&JsString::from_utf8(&index.to_string()), *element)?;
     }
     Ok(Value::Object(array))
 }
@@ -681,7 +681,7 @@ mod tests {
     fn trap_handler(trap: &str, result: Value) -> Value {
         let handler = plain_object();
         handler
-            .create_data_property(&key(trap), builtin(trap, move |_, _| Ok(result.clone())))
+            .create_data_property(&key(trap), builtin(trap, move |_, _| Ok(result)))
             .unwrap();
         Value::Object(handler)
     }
@@ -736,10 +736,10 @@ mod tests {
                 builtin("get", move |this, args| {
                     assert_eq!(args.len(), 3);
                     recorder.borrow_mut().push((
-                        this.clone(),
-                        args[0].clone(),
-                        args[1].clone(),
-                        args[2].clone(),
+                        *this,
+                        args[0],
+                        args[1],
+                        args[2],
                     ));
                     Ok(Value::Number(99.0))
                 }),
@@ -749,7 +749,7 @@ mod tests {
         let receiver = Value::Object(proxy);
         assert_eq!(
             proxy
-                .get_with_receiver_key(&PropertyKey::from_utf8("x"), receiver.clone())
+                .get_with_receiver_key(&PropertyKey::from_utf8("x"), receiver)
                 .unwrap(),
             Value::Number(99.0)
         );

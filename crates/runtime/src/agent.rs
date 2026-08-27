@@ -1296,8 +1296,8 @@ impl Agent {
                     value_box_addr(&cell.target).is_some_and(|target| is_dead(target.addr()));
                 if target_dead {
                     let cell = cells.swap_remove(i);
-                    let callback = data.callback.clone();
-                    let held_value = cell.held_value.clone();
+                    let callback = data.callback;
+                    let held_value = cell.held_value;
                     if let Some(held) = value_box_addr(&held_value) {
                         retain(held);
                     }

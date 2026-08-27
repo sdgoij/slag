@@ -53,15 +53,15 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     let boolean_ctor_value = Value::Function(boolean_ctor);
 
-    realm.intrinsics.define(BOOLEAN, boolean_ctor_value.clone());
+    realm.intrinsics.define(BOOLEAN, boolean_ctor_value);
     realm
         .intrinsics
-        .define(BOOLEAN_PROTO, boolean_proto_value.clone());
+        .define(BOOLEAN_PROTO, boolean_proto_value);
 
     boolean_ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(boolean_proto_value.clone()),
+            value: Some(boolean_proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -72,7 +72,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     boolean_proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(boolean_ctor_value.clone()),
+            value: Some(boolean_ctor_value),
             writable: Some(true),
             get: None,
             set: None,
@@ -170,7 +170,7 @@ pub fn dispatch_construct(
                 agent,
                 new_target,
                 &JsString::from_utf8("prototype"),
-                new_target.clone(),
+                *new_target,
             )?;
             let proto = match as_object(&proto) {
                 Some(object) => object,

@@ -299,8 +299,8 @@ fn eval_call_chain(
         let args = eval_arguments(agent, &call.args, strict)?;
         let result = crate::function::construct(agent, &super_ctor, &args, &new_target)?;
         let this_env = crate::context::get_this_environment(agent)?;
-        this_env.bind_this_value(result.clone())?;
-        if let Some(function_value) = agent.running_context()?.function.clone() {
+        this_env.bind_this_value(result)?;
+        if let Some(function_value) = agent.running_context()?.function {
             crate::function::initialize_instance_elements(agent, &result, &function_value)?;
         }
         return Ok(Some(ChainResult::Value(result)));
@@ -423,7 +423,7 @@ fn get_reference_value(agent: &mut Agent, reference: &Reference) -> Result<Value
     let ReferenceBase::Value(base) = &reference.base else {
         return get_value(agent, reference);
     };
-    get_property_key(agent, base, &reference.name, receiver.clone())
+    get_property_key(agent, base, &reference.name, *receiver)
 }
 
 /// PutValue of a Reference, honoring a super reference's [[ThisValue]]
@@ -1051,7 +1051,7 @@ fn eval_update(
         }
         _ => unreachable!(),
     };
-    put_reference_value(agent, &reference, new.clone())?;
+    put_reference_value(agent, &reference, new)?;
     // spec 13.4.4: a postfix update returns the old ToNumeric value (the
     // object is coerced, not returned as-is).
     if prefix { Ok(new) } else { Ok(old_numeric) }
@@ -1096,7 +1096,7 @@ fn eval_assignment(
         && matches!(&target.kind, ExprKind::Array(_) | ExprKind::Object(_))
     {
         let value = eval_expr(agent, value_expr, strict)?;
-        crate::binding::destructuring_assignment(agent, target, value.clone(), strict)?;
+        crate::binding::destructuring_assignment(agent, target, value, strict)?;
         return Ok(value);
     }
     if matches!(op, AssignOp::Assign) {
@@ -1105,7 +1105,7 @@ fn eval_assignment(
         // nullish-base TypeError surfaces in PutValue.
         let reference = eval_assignment_target(agent, target, strict)?;
         let value = named_eval_rhs(agent, target, value_expr, strict)?;
-        reference.put(agent, value.clone())?;
+        reference.put(agent, value)?;
         return Ok(value);
     }
     // Compound and logical assignments: GetValue(lref) runs before the RHS,
@@ -1117,7 +1117,7 @@ fn eval_assignment(
             let old = get_reference_value(agent, &reference)?;
             if to_boolean(&old) {
                 let new = named_eval_rhs(agent, target, value_expr, strict)?;
-                put_reference_value(agent, &reference, new.clone())?;
+                put_reference_value(agent, &reference, new)?;
                 Ok(new)
             } else {
                 Ok(old)
@@ -1129,7 +1129,7 @@ fn eval_assignment(
                 Ok(old)
             } else {
                 let new = named_eval_rhs(agent, target, value_expr, strict)?;
-                put_reference_value(agent, &reference, new.clone())?;
+                put_reference_value(agent, &reference, new)?;
                 Ok(new)
             }
         }
@@ -1137,7 +1137,7 @@ fn eval_assignment(
             let old = get_reference_value(agent, &reference)?;
             if is_nullish(&old) {
                 let new = named_eval_rhs(agent, target, value_expr, strict)?;
-                put_reference_value(agent, &reference, new.clone())?;
+                put_reference_value(agent, &reference, new)?;
                 Ok(new)
             } else {
                 Ok(old)
@@ -1147,7 +1147,7 @@ fn eval_assignment(
             let old = get_reference_value(agent, &reference)?;
             let right = eval_expr(agent, value_expr, strict)?;
             let new = apply_compound(agent, *op, &old, &right)?;
-            put_reference_value(agent, &reference, new.clone())?;
+            put_reference_value(agent, &reference, new)?;
             Ok(new)
         }
     }
@@ -1327,7 +1327,7 @@ pub(crate) fn apply_binary(
                 let result = crate::function::call(
                     agent,
                     &handler,
-                    right.clone(),
+                    *right,
                     std::slice::from_ref(left),
                 )?;
                 return Ok(Value::Boolean(to_boolean(&result)));
@@ -1367,7 +1367,7 @@ pub fn ordinary_has_instance(
         agent,
         constructor,
         &JsString::from_utf8("prototype"),
-        constructor.clone(),
+        *constructor,
     )?;
     // Constructors hold their prototype as either an object value or (for
     // %Function%, whose `prototype` is the callable %Function.prototype%) a
@@ -1702,12 +1702,12 @@ fn abstract_loosely_equal(agent: &mut Agent, left: &Value, right: &Value) -> Res
     let left_prim = if left_obj {
         crate::context::to_primitive(agent, left, ToPrimitiveHint::Default)?
     } else {
-        left.clone()
+        *left
     };
     let right_prim = if right_obj {
         crate::context::to_primitive(agent, right, ToPrimitiveHint::Default)?
     } else {
-        right.clone()
+        *right
     };
     // spec 7.2.15 steps 6-7: a BigInt and a String compare by StringToBigInt.
     // The crux `is_loosely_equal` uses a variant that rejects the empty
@@ -1877,7 +1877,7 @@ pub(crate) fn get_template_object(
             .borrow()
             .iter()
             .find(|(cached_key, _)| *cached_key == key)
-            .map(|(_, value)| value.clone())
+            .map(|(_, value)| *value)
     });
     if let Some(value) = cached {
         return Ok(value);
@@ -1955,7 +1955,7 @@ pub(crate) fn get_template_object(
     obj.prevent_extensions()?;
     let value = Value::Object(obj);
     TEMPLATE_OBJECT_CACHE.with(|cache| {
-        cache.borrow_mut().push((key, value.clone()));
+        cache.borrow_mut().push((key, value));
     });
     Ok(value)
 }
@@ -2008,7 +2008,7 @@ pub fn get_iterator(agent: &mut Agent, value: &Value) -> Result<IteratorRecord, 
             "Value is not iterable".into(),
         ));
     };
-    let iterator = crate::function::call(agent, &method, value.clone(), &[])?;
+    let iterator = crate::function::call(agent, &method, *value, &[])?;
     if !matches!(iterator.kind(), ValueKind::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -2023,7 +2023,7 @@ pub fn get_iterator(agent: &mut Agent, value: &Value) -> Result<IteratorRecord, 
         agent,
         &iterator,
         &JsString::from_utf8("next"),
-        iterator.clone(),
+        iterator,
     )?;
     Ok(IteratorRecord { iterator, next })
 }
@@ -2067,7 +2067,7 @@ pub fn for_of_begin(agent: &mut Agent, value: &Value) -> Result<ForOfState, JsEr
             && proto.id() == cached_proto
             && for_of_fast_probe(agent, &proto)
         {
-            return Ok(ForOfState::FastArray(value.clone()));
+            return Ok(ForOfState::FastArray(*value));
         }
     }
     // Cut 24: the fast-path verdict without the `get_method` chain walk —
@@ -2095,7 +2095,7 @@ pub fn for_of_begin(agent: &mut Agent, value: &Value) -> Result<ForOfState, JsEr
         let index = object.id() as usize & (crate::ir::MEMBER_CELLS - 1);
         agent.for_of_array_cells[index] =
             Some((object.id(), object.generation(), array_proto.id()));
-        return Ok(ForOfState::FastArray(value.clone()));
+        return Ok(ForOfState::FastArray(*value));
     }
     let method = get_method(agent, value, "@@iterator")?;
     let Some(method) = method else {
@@ -2138,11 +2138,11 @@ pub fn for_of_begin(agent: &mut Agent, value: &Value) -> Result<ForOfState, JsEr
                     None => false,
                 };
             if next_is_stock && !iterator_chain_has_return(agent, &iterator_proto_value)? {
-                return Ok(ForOfState::FastArray(value.clone()));
+                return Ok(ForOfState::FastArray(*value));
             }
         }
     }
-    let iterator = crate::function::call(agent, &method, value.clone(), &[])?;
+    let iterator = crate::function::call(agent, &method, *value, &[])?;
     if !matches!(iterator.kind(), ValueKind::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -2153,7 +2153,7 @@ pub fn for_of_begin(agent: &mut Agent, value: &Value) -> Result<ForOfState, JsEr
         agent,
         &iterator,
         &JsString::from_utf8("next"),
-        iterator.clone(),
+        iterator,
     )?;
     // The stock values-iterator state: over a plain Array (a proxy whose
     // @@iterator resolves to the intrinsic would also create an entry — its
@@ -2288,13 +2288,13 @@ pub fn iterator_next_method(
     iterator: &IteratorRecord,
 ) -> Result<Value, JsError> {
     if is_callable(&iterator.next) {
-        return Ok(iterator.next.clone());
+        return Ok(iterator.next);
     }
     let next = get_property(
         agent,
         &iterator.iterator,
         &JsString::from_utf8("next"),
-        iterator.iterator.clone(),
+        iterator.iterator,
     )?;
     if !is_callable(&next) {
         return Err(JsError::new(
@@ -2312,14 +2312,14 @@ pub fn iterator_step(
     iterator: &IteratorRecord,
 ) -> Result<Option<Value>, JsError> {
     let next = iterator_next_method(agent, iterator)?;
-    let result = crate::function::call(agent, &next, iterator.iterator.clone(), &[])?;
+    let result = crate::function::call(agent, &next, iterator.iterator, &[])?;
     if !matches!(result.kind(), ValueKind::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Iterator result is not an object".into(),
         ));
     }
-    let done = get_property(agent, &result, &JsString::from_utf8("done"), result.clone())?;
+    let done = get_property(agent, &result, &JsString::from_utf8("done"), result)?;
     if to_boolean(&done) {
         return Ok(None);
     }
@@ -2327,7 +2327,7 @@ pub fn iterator_step(
         agent,
         &result,
         &JsString::from_utf8("value"),
-        result.clone(),
+        result,
     )?;
     Ok(Some(value))
 }
@@ -2347,7 +2347,7 @@ pub fn iterator_close_throw(agent: &mut Agent, iterator: &IteratorRecord) -> Res
         agent,
         &iterator.iterator,
         &JsString::from_utf8("return"),
-        iterator.iterator.clone(),
+        iterator.iterator,
     ) {
         Ok(method) => method,
         Err(_) => return Ok(()),
@@ -2355,7 +2355,7 @@ pub fn iterator_close_throw(agent: &mut Agent, iterator: &IteratorRecord) -> Res
     if matches!(return_method.kind(), ValueKind::Undefined | ValueKind::Null) {
         return Ok(());
     }
-    let _ = crate::function::call(agent, &return_method, iterator.iterator.clone(), &[]);
+    let _ = crate::function::call(agent, &return_method, iterator.iterator, &[]);
     Ok(())
 }
 
@@ -2368,12 +2368,12 @@ pub(crate) fn iterator_close_inner(
         agent,
         &iterator.iterator,
         &JsString::from_utf8("return"),
-        iterator.iterator.clone(),
+        iterator.iterator,
     )?;
     if matches!(return_method.kind(), ValueKind::Undefined | ValueKind::Null) {
         return Ok(());
     }
-    let result = crate::function::call(agent, &return_method, iterator.iterator.clone(), &[])?;
+    let result = crate::function::call(agent, &return_method, iterator.iterator, &[])?;
     if !completion_is_throw && !matches!(result.kind(), ValueKind::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -2418,7 +2418,7 @@ pub fn get_method(
             .as_ref()
             .clone(),
     );
-    let method = get_property_key(agent, value, &key, value.clone())?;
+    let method = get_property_key(agent, value, &key, *value)?;
     match method.kind() {
         ValueKind::Undefined | ValueKind::Null => Ok(None),
         _ if is_callable(&method) => Ok(Some(method)),

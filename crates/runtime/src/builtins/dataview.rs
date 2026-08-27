@@ -107,7 +107,7 @@ fn get_prototype_from_constructor(
         agent,
         constructor,
         &PropertyKey::from_utf8("prototype"),
-        constructor.clone(),
+        *constructor,
     )?;
     match as_object(&proto) {
         Some(object) => Ok(object),
@@ -233,7 +233,7 @@ fn data_view_construct(
 fn get_buffer(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     let object = require_data_view(agent, this)?;
     Ok(state(agent, object.id())
-        .map(|state| state.buffer_object.clone())
+        .map(|state| state.buffer_object)
         .unwrap_or(Value::Undefined))
 }
 
@@ -243,7 +243,7 @@ fn get_byte_length(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<V
     let (buffer_object, byte_length, byte_offset) = {
         let state = state(agent, object.id()).expect("registered data view");
         (
-            state.buffer_object.clone(),
+            state.buffer_object,
             state.byte_length,
             state.byte_offset,
         )
@@ -282,7 +282,7 @@ fn get_byte_offset(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<V
     let (buffer_object, byte_length, byte_offset) = {
         let state = state(agent, object.id()).expect("registered data view");
         (
-            state.buffer_object.clone(),
+            state.buffer_object,
             state.byte_length,
             state.byte_offset,
         )
@@ -327,7 +327,7 @@ fn view_state(agent: &Agent, this: &Value) -> Result<(u64, usize, Option<usize>)
     let (buffer_object, byte_length, byte_offset) = {
         let state = state(agent, object.id()).expect("registered data view");
         (
-            state.buffer_object.clone(),
+            state.buffer_object,
             state.byte_length,
             state.byte_offset,
         )
@@ -484,14 +484,14 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         None,
     )?;
     let dv_ctor_value = Value::Function(dv_ctor);
-    realm.intrinsics.define(DATA_VIEW, dv_ctor_value.clone());
+    realm.intrinsics.define(DATA_VIEW, dv_ctor_value);
     realm
         .intrinsics
-        .define(DATA_VIEW_PROTO, dv_proto_value.clone());
+        .define(DATA_VIEW_PROTO, dv_proto_value);
     dv_ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(dv_proto_value.clone()),
+            value: Some(dv_proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -502,7 +502,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     dv_proto.define_property(
         &JsString::from_utf8("constructor"),
         &PropertyDescriptor {
-            value: Some(dv_ctor_value.clone()),
+            value: Some(dv_ctor_value),
             writable: Some(true),
             get: None,
             set: None,

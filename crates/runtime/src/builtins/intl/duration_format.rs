@@ -239,7 +239,7 @@ fn get_options_object(_agent: &mut Agent, options: &Value) -> Result<Value, JsEr
     if options.is_undefined() {
         Ok(Value::Object(JsObject::ordinary_object_create(None)))
     } else if as_object(options).is_some() {
-        Ok(options.clone())
+        Ok(*options)
     } else {
         Err(type_error("Options must be an object"))
     }
@@ -317,7 +317,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
     ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(proto_value.clone()),
+            value: Some(proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -390,7 +390,7 @@ fn proto_from_ctor(agent: &mut Agent, new_target: &Value) -> Result<Handle<JsObj
         agent,
         new_target,
         &JsString::from_utf8("prototype"),
-        new_target.clone(),
+        *new_target,
     )?;
     if let Some(obj) = as_object(&proto) {
         return Ok(obj);
@@ -437,7 +437,7 @@ fn to_duration_record(agent: &mut Agent, input: &Value) -> Result<[f64; 10], JsE
     let mut fields = [0f64; 10];
     let mut any = false;
     for (key, index) in FIELD_ORDER {
-        let value = get_property(agent, input, &JsString::from_utf8(key), input.clone())?;
+        let value = get_property(agent, input, &JsString::from_utf8(key), *input)?;
         if !value.is_undefined() {
             any = true;
             fields[index] = to_integer_if_integral(agent, &value)?;
@@ -902,7 +902,7 @@ fn number_format_parts(
         define("signDisplay", str_value("never"))?;
     }
     for (name, value) in opts {
-        define(name, value.clone())?;
+        define(name, *value)?;
     }
     let nf_record = crate::builtins::intl::number_format::initialize(
         agent,

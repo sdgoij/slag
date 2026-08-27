@@ -163,7 +163,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
     locale_ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
-            value: Some(locale_proto_value.clone()),
+            value: Some(locale_proto_value),
             writable: Some(false),
             get: None,
             set: None,
@@ -355,7 +355,7 @@ fn construct(agent: &mut Agent, new_target: &Value, args: &[Value]) -> Result<Va
         agent,
         new_target,
         &JsString::from_utf8("prototype"),
-        new_target.clone(),
+        *new_target,
     )?;
     let proto = if let Some(obj) = as_object(&proto) {
         obj
@@ -384,7 +384,7 @@ fn get_options_object(agent: &mut Agent, options: &Value) -> Result<Value, JsErr
     match options.kind() {
         ValueKind::Undefined => Ok(Value::Object(JsObject::ordinary_object_create(None))),
         ValueKind::Null => Err(type_error("Options argument cannot be null")),
-        ValueKind::Object(_) | ValueKind::Function(_) => Ok(options.clone()),
+        ValueKind::Object(_) | ValueKind::Function(_) => Ok(*options),
         _ => to_object(agent, options),
     }
 }
@@ -392,7 +392,7 @@ fn get_options_object(agent: &mut Agent, options: &Value) -> Result<Value, JsErr
 /// GetOption (spec 7.3.18, simplified to "string-or-boolean"): `None` when
 /// the property is absent or undefined. Reading the property runs a getter.
 fn get_option(agent: &mut Agent, options: &Value, name: &str) -> Result<Option<Value>, JsError> {
-    let value = get_property(agent, options, &JsString::from_utf8(name), options.clone())?;
+    let value = get_property(agent, options, &JsString::from_utf8(name), *options)?;
     if value.is_undefined() {
         Ok(None)
     } else {

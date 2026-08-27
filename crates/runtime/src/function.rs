@@ -958,7 +958,7 @@ pub fn instantiate_function_expression(
     // spec 15.2.5 step 6: the self-binding is a non-strict immutable binding,
     // so a sloppy-mode assignment to the function's own name is ignored.
     scope.create_immutable_binding(&name, false)?;
-    scope.initialize_binding(&name, value.clone())?;
+    scope.initialize_binding(&name, value)?;
     Ok(value)
 }
 
@@ -1221,7 +1221,7 @@ pub(crate) fn call_inner(
             } => {
                 let mut all = bound_args.clone();
                 all.extend_from_slice(args);
-                call(agent, target, bound_this.clone(), &all)
+                call(agent, target, *bound_this, &all)
             }
             _ => {
                 // Agent-dependent built-ins (the Function constructor and the
@@ -1462,7 +1462,7 @@ fn construct_inner(
             } => {
                 let mut all = bound_args.clone();
                 all.extend_from_slice(args);
-                let target_value = target.clone();
+                let target_value = *target;
                 let new_target = if crux::ops::same_value(&Value::Function(function), new_target) {
                     &target_value
                 } else {
@@ -1789,7 +1789,7 @@ fn ordinary_call(
     };
     let function_env = new_function_environment(
         Some(old_env),
-        function_value.clone(),
+        function_value,
         Value::Undefined,
         this_mode == ThisMode::Lexical,
     );
@@ -1805,7 +1805,7 @@ fn ordinary_call(
         .map(crate::context::ScriptOrModule::Module)
         .or(caller_script_or_module);
     agent.execution_context_stack.push(ExecutionContext {
-        function: Some(function_value.clone()),
+        function: Some(function_value),
         realm,
         script_or_module,
         lexical_environment: function_env,
@@ -2159,18 +2159,18 @@ pub(crate) fn construct_this_object(
             && cell.id == function.id()
             && cell.generation == generation
         {
-            cell.value.clone()
+            cell.value
         } else {
             let value = crate::context::get_property(
                 agent,
                 new_target,
                 &JsString::from_utf8("prototype"),
-                new_target.clone(),
+                *new_target,
             )?;
             agent.construct_prototypes[index] = Some(crate::ir::ConstructPrototypeCell {
                 id: function.id(),
                 generation,
-                value: value.clone(),
+                value,
             });
             value
         }
@@ -2179,7 +2179,7 @@ pub(crate) fn construct_this_object(
             agent,
             new_target,
             &JsString::from_utf8("prototype"),
-            new_target.clone(),
+            *new_target,
         )?
     };
     let proto = match crate::context::as_object(&prototype) {
@@ -2275,7 +2275,7 @@ fn ordinary_construct(
             .as_ref()
             .is_some_and(|scope| scope.arguments_slot.is_some())
             && !strict)
-            .then(|| function_value.clone());
+            .then_some(function_value);
         agent.execution_context_stack.push(ExecutionContext {
             function: context_function,
             realm,
@@ -2305,7 +2305,7 @@ fn ordinary_construct(
                 // Cut 3 continuation (this slots): the constructed `this`
                 // lands in the body's `this` slot.
                 if let Some(slot) = scope.this_slot {
-                    *vm.frame.get_mut(slot) = this.clone();
+                    *vm.frame.get_mut(slot) = this;
                 }
             }
             let completion = match vm.start(agent, &ir) {
@@ -2384,8 +2384,8 @@ fn ordinary_construct(
     let old_env = data.environment;
     let function_env = new_function_environment(
         Some(old_env),
-        function_value.clone(),
-        new_target.clone(),
+        function_value,
+        *new_target,
         false,
     );
     let caller_script_or_module = agent
@@ -2397,7 +2397,7 @@ fn ordinary_construct(
         .map(crate::context::ScriptOrModule::Module)
         .or(caller_script_or_module);
     agent.execution_context_stack.push(ExecutionContext {
-        function: Some(function_value.clone()),
+        function: Some(function_value),
         realm: data.realm,
         script_or_module,
         lexical_environment: function_env,
@@ -2414,14 +2414,14 @@ fn ordinary_construct(
             // spec 15.7.14 step 23 (derived branch): Construct the superclass
             // with the original arguments and the current newTarget — the
             // arguments are passed directly, without the iterator protocol.
-            let Some(super_ctor) = data.super_constructor.clone() else {
+            let Some(super_ctor) = data.super_constructor else {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
                     "A class extending null cannot be constructed".into(),
                 ));
             };
             let this = crate::function::construct(agent, &super_ctor, args, new_target)?;
-            function_env.bind_this_value(this.clone())?;
+            function_env.bind_this_value(this)?;
             initialize_instance_elements(agent, &this, &function_value)?;
             return Ok(this);
         }
@@ -2429,7 +2429,7 @@ fn ordinary_construct(
             // `this` stays uninitialized: accessing it before `super()` is a
             // ReferenceError (the FunctionEnv's uninitialized status).
         } else {
-            function_env.bind_this_value(this.clone())?;
+            function_env.bind_this_value(this)?;
             // spec 10.2.1 steps 8-9: instance fields initialize before the
             // constructor body runs.
             initialize_instance_elements(agent, &this, &function_value)?;
@@ -2487,7 +2487,7 @@ fn ordinary_construct(
                     // Cut 3 continuation (this slots): the constructed
                     // `this` lands in the body's `this` slot.
                     if let Some(slot) = scope.this_slot {
-                        *vm.frame.get_mut(slot) = this.clone();
+                        *vm.frame.get_mut(slot) = this;
                     }
                 }
                 let completion = match vm.start(agent, ir) {
@@ -2759,7 +2759,7 @@ pub(crate) fn function_declaration_instantiation(
             } else {
                 create_mapped_arguments_object(
                     agent,
-                    function_value.clone(),
+                    *function_value,
                     args,
                     &param_names,
                     *function_env,

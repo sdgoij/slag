@@ -55,9 +55,9 @@ pub fn to_primitive(value: &Value, hint: ToPrimitiveHint) -> Result<Value, JsErr
                         "Symbol.toPrimitive is not a function".into(),
                     ));
                 }
-                return call_exotic_to_primitive(&method, value.clone(), hint);
+                return call_exotic_to_primitive(&method, *value, hint);
             }
-            ordinary_to_primitive(|name| obj.get(name), value.clone(), hint)
+            ordinary_to_primitive(|name| obj.get(name), *value, hint)
         }
         ValueKind::Function(function) => {
             let key = crate::property::PropertyKey::Symbol(
@@ -71,11 +71,11 @@ pub fn to_primitive(value: &Value, hint: ToPrimitiveHint) -> Result<Value, JsErr
                         "Symbol.toPrimitive is not a function".into(),
                     ));
                 }
-                return call_exotic_to_primitive(&method, value.clone(), hint);
+                return call_exotic_to_primitive(&method, *value, hint);
             }
-            ordinary_to_primitive(|name| function.get(name), value.clone(), hint)
+            ordinary_to_primitive(|name| function.get(name), *value, hint)
         }
-        _ => Ok(value.clone()),
+        _ => Ok(*value),
     }
 }
 
@@ -142,7 +142,7 @@ fn ordinary_to_primitive(
         if is_callable(&method) {
             // spec step 2.b.ii: a non-object result is the primitive; an
             // object result falls through to the next method name.
-            let result = crate::function::call(&method, receiver.clone(), &[])?;
+            let result = crate::function::call(&method, receiver, &[])?;
             if !matches!(result.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
                 return Ok(result);
             }
