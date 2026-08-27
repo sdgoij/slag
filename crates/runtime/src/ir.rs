@@ -2931,16 +2931,32 @@ impl Vm {
             // An existing property: the in-place update path handles it.
             return Ok(false);
         }
-        let Some(proto) = receiver.get_prototype_of()? else {
+        let ok = if let Some(proto) = receiver.get_prototype_of()? {
+            if !Self::member_store_cell_probe(agent, &proto, *atom)
+                && !Self::member_store_cell_resolve(agent, &receiver, &property_key, *atom)
+            {
+                return Ok(false);
+            }
+            receiver.fresh_data_define(&property_key, value.clone())
+        } else {
             // No chain: [[Set]] always defines on the receiver.
-            return Ok(receiver.fresh_data_define(&property_key, value.clone()));
+            receiver.fresh_data_define(&property_key, value.clone())
         };
-        if !Self::member_store_cell_probe(agent, &proto, *atom)
-            && !Self::member_store_cell_resolve(agent, &receiver, &property_key, *atom)
-        {
-            return Ok(false);
+        if ok {
+            // Cut 35 slice 32: the store-then-read pattern (a constructor
+            // writing `this.x` and the caller reading `o.x` right after) —
+            // front the just-defined property in the read-side value cache
+            // so the next `member_cell_get` returns it with no
+            // property-vector borrow or proto-keyed fallback.
+            let index = Self::member_cell_index(receiver.id(), *atom);
+            agent.member_value_cells[index] = Some(MemberValueCell {
+                id: receiver.id(),
+                name: *atom,
+                generation: receiver.generation(),
+                value: value.clone(),
+            });
         }
-        Ok(receiver.fresh_data_define(&property_key, value.clone()))
+        Ok(ok)
     }
 
     /// Resolve and cache the slot of `object`'s own data property for

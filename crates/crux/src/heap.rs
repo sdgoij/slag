@@ -790,19 +790,21 @@ impl Heap {
         precise: bool,
         compact: &mut CompactHook<'_>,
     ) -> Vec<usize> {
-        // Address → fat pointer: the scan recovers a box address from a
-        // stack word and needs the `dyn Trace` vtable to mark through it.
-        let by_addr: AddrMap = self
-            .live
-            .iter()
-            .map(|ptr| (*ptr as *const u8 as usize, *ptr))
-            .collect();
-        let sp = &by_addr as *const AddrMap as usize;
+        // Sort the live list by box address once, so the conservative scan
+        // resolves a stack word to its fat pointer by binary search — exact
+        // (a random word can never be mistaken for a box) and far cheaper
+        // than rebuilding an address HashMap every collection (A5.1b).
+        self.live
+            .sort_unstable_by_key(|ptr| *ptr as *const u8 as usize);
+        // The scan starts at a local's address (this frame) and runs to the
+        // stack top, covering every caller frame that may hold a handle.
+        let stack_bottom_marker = 0usize;
+        let sp = &stack_bottom_marker as *const usize as usize;
         let mut work: Vec<GcAny> = roots.to_vec();
         if let Some((_low, high)) = stack_bounds()
             && high > sp
         {
-            self.scan_stack(sp, high, &by_addr, &mut work);
+            self.scan_stack(sp, high, &self.live, &mut work);
         }
         self.collect_from_work(work, roots, precise, compact)
     }
@@ -1045,16 +1047,27 @@ impl Heap {
 
     /// Scan every word in the current thread's live stack region
     /// `[sp, high)` and push boxes whose address appears there onto `work`.
-    /// `by_addr` maps every registered box address to its fat pointer; an
-    /// address can only be marked when it is a real box, so coincidental
-    /// stack values at worst retain a reachable box (imprecise, never
-    /// unsafe).
-    fn scan_stack(&self, sp: usize, high: usize, by_addr: &AddrMap, work: &mut Vec<GcAny>) {
-        // GC-5: most stack words are not box addresses — skip the HashMap
-        // lookups for words outside the live boxes' address range (tracked
-        // by register and refreshed by the sweep).
+    /// `live_sorted` is the `live` list sorted by box address (A5.1b); a
+    /// membership test is a binary search, so a coincidental stack word can
+    /// only be marked when it is a real box (imprecise, never unsafe).
+    fn scan_stack(
+        &self,
+        sp: usize,
+        high: usize,
+        live_sorted: &[*mut GcBox<dyn Trace>],
+        work: &mut Vec<GcAny>,
+    ) {
+        // GC-5: most stack words are not box addresses — skip the search
+        // for words outside the live boxes' address range (tracked by
+        // register and refreshed by the sweep).
         let live_low = self.live_min;
         let live_high = self.live_max;
+        let find = |addr: usize| {
+            live_sorted
+                .binary_search_by_key(&addr, |ptr| *ptr as *const u8 as usize)
+                .ok()
+                .map(|index| live_sorted[index])
+        };
         let mut addr = sp;
         while addr < high {
             // SAFETY: `[sp, high)` is the current thread's committed stack
@@ -1062,14 +1075,14 @@ impl Heap {
             // unaligned so the exact frame layout does not matter.
             let word = unsafe { std::ptr::read_unaligned::<usize>(addr as *const usize) };
             if (live_low..=live_high).contains(&word)
-                && let Some(&ptr) = by_addr.get(&word)
+                && let Some(ptr) = find(word)
             {
                 // SAFETY: `ptr` is a registered, live box; the scan only
                 // pushes boxes already in the live set.
                 work.push(GcAny(ptr));
             } else if let Some(box_addr) = crate::value::Value::encoded_box_address(word as u64)
                 && (live_low..=live_high).contains(&box_addr)
-                && let Some(&ptr) = by_addr.get(&box_addr)
+                && let Some(ptr) = find(box_addr)
             {
                 // SAFETY: `ptr` is a registered, live box decoded from a
                 // tagged Value; the scan only pushes boxes already live.
