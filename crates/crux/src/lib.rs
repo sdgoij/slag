@@ -30,6 +30,6 @@ pub use map::{Map, MapAttrs, canonical_empty_map};
 pub use object::{JsObject, Property};
 pub use property::{PropertyDescriptor, PropertyKey};
 pub use span::{SourceLocation, Span};
-pub use string::{AtomId, JsString, intern, intern_utf8, lookup};
+pub use string::{AtomId, JsString, intern, intern_utf8, lookup, proto_atom};
 pub use symbol::{Symbol, descriptive_string};
 pub use value::{Value, type_of};

@@ -2057,6 +2057,20 @@ impl JsObject {
         key: &PropertyKey,
         value: Value,
     ) -> Result<bool, JsError> {
+        // Fast path (object literals, spread, Object.assign, destructuring
+        // defaults): an ordinary, extensible object with the key absent
+        // appends a fresh w/e/c data property via `fresh_data_define`,
+        // skipping the descriptor clone + ValidateAndApplyPropertyDescriptor
+        // machinery. Exotic kinds keep the kind dispatch (proxy targets,
+        // array length sync); a present key (a duplicate literal key) falls
+        // back to the in-place update path; a non-extensible receiver falls
+        // through to the spec path, which reports the rejection.
+        if matches!(self.kind, ObjectKind::Ordinary)
+            && !self.has_own_property_key(key)?
+            && self.fresh_data_define(key, value)
+        {
+            return Ok(true);
+        }
         self.define_property_key(key, &PropertyDescriptor::data(value))
     }
 
@@ -2293,9 +2307,7 @@ impl JsObject {
             ObjectKind::IntegerIndexed(slots) => Ok(typed_array_own_property_keys(slots, self)),
             ObjectKind::ModuleNamespace(slots) => {
                 let mut keys = slots.exports.clone();
-                keys.push(PropertyKey::Symbol(
-                    well_known("toStringTag")
-                ));
+                keys.push(PropertyKey::Symbol(well_known("toStringTag")));
                 Ok(keys)
             }
             ObjectKind::Array => Ok(array_own_property_keys(self)),
@@ -4547,9 +4559,7 @@ mod tests {
         // "Module" and cannot be changed.
         assert_eq!(
             ns.own_property_keys().unwrap(),
-            vec![PropertyKey::Symbol(
-                well_known("toStringTag")
-            )]
+            vec![PropertyKey::Symbol(well_known("toStringTag"))]
         );
         let tag_key = PropertyKey::Symbol(well_known("toStringTag"));
         let tag = ns.get_own_property_key(&tag_key).unwrap().unwrap();

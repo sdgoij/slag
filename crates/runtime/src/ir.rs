@@ -9303,7 +9303,19 @@ fn object_init(
         return Err(JsError::new(ErrorKind::TypeError, "not an object".into()));
     };
     let name = match key {
-        PropertyName::Ident(id) => crux::lookup(*id),
+        PropertyName::Ident(id) => {
+            // Fast path: a plain data property (not the `__proto__`
+            // prototype setter, no anonymous-function name) defines directly
+            // through the already-interned atom — the slow path materializes
+            // a JsString, a Rust String (for the `__proto__` check), and a
+            // re-intern of the same text per property.
+            if !shorthand && !set_name && *id != crux::proto_atom() {
+                return obj
+                    .create_data_property_key(&PropertyKey::String(*id), value)
+                    .map(|_| ());
+            }
+            crux::lookup(*id)
+        }
         PropertyName::Str(text) => text.clone(),
         PropertyName::Number(n) => crux::convert::to_string(&Value::Number(*n))?,
         PropertyName::Computed(_) => {

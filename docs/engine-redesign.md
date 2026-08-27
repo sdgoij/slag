@@ -14,7 +14,7 @@ bigger win on property-access rows. They compose: maps shrink the object,
 the nursery makes object allocation cheap, and the constructor's property
 patterns (already collected) pre-build the object's final map.
 
-## Status (2026-08-27 — GC half substantially landed, map B5.4 landed)
+## Status (2026-08-27 — GC + map model landed, construct churn 53 → ~20ms)
 
 Landed and committed (in order):
 
@@ -54,7 +54,7 @@ Landed and committed (in order):
   without a per-read clone + fresh box, and `boxed` became a trace edge
   (plus a `Trace for Cell<T>` impl). Measured: noise-neutral.
 
-Uncommitted on top of B5.4:
+Not yet committed:
 
 - **`PropertyKey::Symbol` by value → `Handle<Symbol>`**: the key never owns
   a Symbol (with its by-value `JsString` description) any more, so
@@ -68,6 +68,22 @@ Uncommitted on top of B5.4:
   suite (runs in ~0.04s, the fast in-suite stand-in for `--gc-stress`
   sweeps). Measured: construct churn ~22.4ms → ~20.4ms median (-9%),
   other rows flat.
+- **Object-literal fast path**: `create_data_property_key` routes
+  absent-key defines on ordinary extensible objects through
+  `fresh_data_define` (skipping the descriptor clone +
+  ValidateAndApplyPropertyDescriptor), and `object_init`'s Ident case
+  defines plain data properties directly through the already-interned
+  atom — no JsString/Rust-String materialization, with `__proto__`
+  detected by an atom compare against the cached canonical
+  (`crux::proto_atom`). Measured: object literal churn `{x: i}`
+  ~18.2ms → ~10.9ms median (-40%), spread `{ ...{a, b} }` ~66ms → ~50ms;
+  other rows flat.
+
+Session wrap-up: the plan's structural items (A5.1/A5.1b, B1–B4) are all
+landed. Construct churn ~53ms → ~20.5ms, literals ~11ms, collections
+~2.5ms of the gate. The remaining gate cost is incremental (alloc
+~4.5ms, store+read ~7.5ms, construct-call machinery ~3.7ms) — further
+work would be tail-grinding rather than new plan sections.
 
 Measured result (release, interleaved medians): construct churn ~53ms →
 **~20ms**, string concat ~6.6ms → **~4.3ms**, other rows flat or better.

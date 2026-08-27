@@ -424,6 +424,15 @@ pub fn intern_utf8(text: &str) -> AtomId {
     intern(&units)
 }
 
+/// The canonical atom for `"__proto__"` (the object-literal prototype
+/// setter). Cached: the interner is a global (not thread-local), so the id
+/// is process-stable, and the object-literal hot path compares against it
+/// without paying `intern_utf8`'s per-call UTF-16 allocation.
+pub fn proto_atom() -> AtomId {
+    static PROTO: OnceLock<AtomId> = OnceLock::new();
+    *PROTO.get_or_init(|| intern_utf8("__proto__"))
+}
+
 /// Returns the interned text for `id`.
 pub fn lookup(id: AtomId) -> JsString {
     LOOKUP_MEMO.with(|memo| {
