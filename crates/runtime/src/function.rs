@@ -2221,6 +2221,54 @@ pub(crate) fn construct_this_object(
                 agent.member_store_cells[index] = Some((proto_id, proto_atom, len, gens));
             }
         }
+        // Part B, B5.4: constructor boilerplate — pre-build the final map
+        // from the recorded `this.*` pattern and start every construct on it,
+        // so the body's stores are in-place field writes (no per-store map
+        // transition, stable (map_id, name) cache keys). The cache is
+        // re-validated against the function object's generation (a
+        // `prototype` redefine/delete bumps it) and the prototype's
+        // identity; a miss rebuilds from the shared empty map. A field the
+        // body never writes stays unset, which the map read path treats as
+        // absent (it falls through to the property vector / prototype
+        // chain), so a conditional store cannot mask an inherited property.
+        let index = crate::ir::construct_pattern_index(func.id());
+        let generation = func.object.generation();
+        let map = match agent.construct_maps[index].as_ref() {
+            Some(cell)
+                if cell.id == func.id()
+                    && cell.proto_id == proto_obj.id()
+                    && cell.generation == generation =>
+            {
+                cell.map
+            }
+            _ => {
+                let mut map = crux::canonical_empty_map(Some(proto_obj));
+                let mut complete = true;
+                for &name in &arr[..count as usize] {
+                    if let Some(child) = map.get_or_create_child(
+                        crux::PropertyKey::String(name),
+                        crux::MapAttrs::new(true, true, true),
+                    ) {
+                        map = child;
+                    } else {
+                        complete = false;
+                        break;
+                    }
+                }
+                if complete {
+                    agent.construct_maps[index] = Some(crate::ir::ConstructMapCell {
+                        id: func.id(),
+                        proto_id: proto_obj.id(),
+                        generation,
+                        map,
+                    });
+                }
+                map
+            }
+        };
+        return Ok(Value::Object(
+            crux::object::JsObject::ordinary_object_create_with_map(Some(proto_obj), map),
+        ));
     }
     Ok(Value::Object(JsObject::ordinary_object_create(proto)))
 }
@@ -2382,12 +2430,7 @@ fn ordinary_construct(
     };
     let function_value = function.self_value();
     let old_env = data.environment;
-    let function_env = new_function_environment(
-        Some(old_env),
-        function_value,
-        *new_target,
-        false,
-    );
+    let function_env = new_function_environment(Some(old_env), function_value, *new_target, false);
     let caller_script_or_module = agent
         .running_context()
         .ok()

@@ -1488,6 +1488,24 @@ pub struct ConstructPrototypeCell {
     pub value: Value,
 }
 
+/// Part B, B5.4: the cached constructor boilerplate map — (function id,
+/// prototype id, function-object generation) → the final shape the body's
+/// `this.*` stores transition to. Re-validated against the function object's
+/// generation (a `prototype` redefine/delete bumps it) and the prototype's
+/// identity, so a stale entry misses and rebuilds.
+pub struct ConstructMapCell {
+    pub id: u64,
+    pub proto_id: u64,
+    pub generation: u32,
+    pub map: crux::Handle<crux::Map>,
+}
+
+impl Trace for ConstructMapCell {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.map.trace(visit);
+    }
+}
+
 /// Direct-mapped slots for [`ConstructPrototypeCell`] (a power of two so
 /// the cache index is a mask).
 pub(crate) const CONSTRUCT_PROTO_CELLS: usize = 256;
@@ -2975,8 +2993,20 @@ impl Vm {
             return Ok(false);
         }
         let property_key = PropertyKey::String(*atom);
-        if receiver.get_own_property_key(&property_key)?.is_some() {
-            // An existing property: the in-place update path handles it.
+        // An existing property: the in-place update path handles it. For a
+        // map-shaped object (the map describes the key) the field state is
+        // the authoritative own-property signal — the field is written iff
+        // the property vector holds the key (every mapped write mirrors
+        // both, and a delete drops the object to dictionary mode), so the
+        // property-vector scan is skipped.
+        let existing = if let Some(map) = receiver.map.get()
+            && let Some(offset) = map.field_offset(&property_key)
+        {
+            receiver.map_field(offset).is_some()
+        } else {
+            receiver.get_own_property_key(&property_key)?.is_some()
+        };
+        if existing {
             return Ok(false);
         }
         let ok = if let Some(proto) = receiver.get_prototype_of()? {
@@ -2990,22 +3020,23 @@ impl Vm {
             // No chain: [[Set]] always defines on the receiver.
             receiver.fresh_data_define(&property_key, *value)
         };
-        // Part B, B5.2: also try the map-based store path — `fresh_data_define`
-        // transitioned the map, so the field write lands in `in_fields`.
-        let map_ok = receiver.map_set(&property_key, *value);
-        if map_ok && let Some(map) = receiver.map.get() {
-            // Cache the (map_id, name) → offset entry for the read path.
+        // Part B, B5.2/B5.4: `fresh_data_define` wrote the value into the
+        // field the map assigned (a fresh transition or a boilerplate
+        // pre-sized field) — cache the (map_id, name) → offset entry for the
+        // read path. A dictionary-mode define (map full) has no field.
+        if ok
+            && let Some(map) = receiver.map.get()
+            && let Some(slot) = map.field_offset(&property_key)
+        {
             let map_id = map.id();
             let index = Self::member_map_cell_index(map_id, *atom);
-            if let Some(slot) = map.field_offset(&property_key) {
-                agent.member_map_cells[index] = Some(crate::ir::MemberMapCell {
-                    map_id,
-                    name: *atom,
-                    slot,
-                });
-            }
+            agent.member_map_cells[index] = Some(crate::ir::MemberMapCell {
+                map_id,
+                name: *atom,
+                slot,
+            });
         }
-        if ok || map_ok {
+        if ok {
             // Cut 35 slice 32: the store-then-read pattern (a constructor
             // writing `this.x` and the caller reading `o.x` right after) —
             // front the just-defined property in the read-side value cache

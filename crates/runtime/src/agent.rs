@@ -581,6 +581,12 @@ pub struct Agent {
     /// Cut 27 lesson.
     pub(crate) construct_property_patterns:
         Box<[Option<crate::ir::ConstructPatternCell>; crate::ir::CONSTRUCT_PATTERN_CELLS]>,
+    /// Part B, B5.4: cached constructor boilerplate maps — (function id,
+    /// prototype id, generation) → the final shape its body's `this.*`
+    /// stores transition to, so every construct after the first starts the
+    /// object on the final map (see [`crate::ir::ConstructMapCell`]).
+    pub(crate) construct_maps:
+        Box<[Option<crate::ir::ConstructMapCell>; crate::ir::CONSTRUCT_PROTO_CELLS]>,
 }
 
 impl Agent {
@@ -604,6 +610,7 @@ impl Agent {
             leaf_cache: Box::new(std::array::from_fn(|_| None)),
             construct_prototypes: Box::new(std::array::from_fn(|_| None)),
             construct_property_patterns: Box::new(std::array::from_fn(|_| None)),
+            construct_maps: Box::new(std::array::from_fn(|_| None)),
             vm_pool: Vec::new(),
             promise_jobs: VecDeque::new(),
             generic_jobs: VecDeque::new(),
@@ -982,6 +989,10 @@ impl Agent {
         // Cut 26: the cached constructor-prototype reads hold Values.
         for cell in self.construct_prototypes.iter().flatten() {
             cell.value.trace(visit);
+        }
+        // B5.4: the cached constructor boilerplate maps keep the shapes alive.
+        for cell in self.construct_maps.iter().flatten() {
+            cell.trace(visit);
         }
         self.vm_pool.trace(visit);
         self.promise_jobs.trace(visit);

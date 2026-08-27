@@ -14,7 +14,7 @@ bigger win on property-access rows. They compose: maps shrink the object,
 the nursery makes object allocation cheap, and the constructor's property
 patterns (already collected) pre-build the object's final map.
 
-## Status (2026-08-27 — GC half substantially landed, map B5.3 landed)
+## Status (2026-08-27 — GC half substantially landed, map B5.4 landed)
 
 Landed and committed (in order):
 
@@ -30,21 +30,22 @@ Landed and committed (in order):
   size-classed free list is now `[Vec<*mut GcBox>; 256]` indexed by `size >>
   4` (sizes 16..=4096) instead of an FxHash HashMap.
 
-Uncommitted on top of B5.3 work:
+Uncommitted on top of B5.4 work:
 
-- **B5.3**: Map-based store + transitions. Add-property transitions wired
-  from `define_property`: `fresh_data_define` transitions the map and writes
-  the value into the assigned `in_fields` slot; the full
-  `validate_and_apply` path does the same for fresh w/e/c data properties
-  and mirrors value updates on mapped keys into the field. `set_key`'s
-  in-place write mirrors into the field. `delete_key` and data→accessor
-  conversions drop the object to dictionary mode (the map no longer
-  describes it). Child maps inherit the parent's full descriptor set, so
-  field offsets are cumulative and the `INLINE_FIELDS` capacity limit binds.
-  Store IC re-keyed: `MemberMapCell` is now `(map_id, name) → field offset`;
-  the read path probes it and reads `in_fields` directly, re-resolving on a
-  miss. Gate met: `defineProperty`/`delete` tests green, full workspace +
-  clippy clean.
+- **B5.4**: Constructor boilerplate. `construct_this_object` pre-builds the
+  constructor's final map from `construct_property_patterns` and starts
+  every construct on it, so the body's `this.x =` stores are in-place field
+  writes (no per-store transition, stable (map_id, name) cache keys); the
+  cache re-validates against the function object's generation and the
+  prototype's identity. A pre-sized field the body never writes stays
+  unset, which the map read path treats as absent — a conditional store
+  cannot mask an inherited property. Store micro-opts: the own-property
+  check for map-shaped objects reads the field state (written ⟺ in the
+  property vector) instead of scanning the vector; the redundant second
+  `map_set` is gone. Measured: neutral on the construct-churn gate (the
+  per-store transitions were already cached). The 528B `JsObject` alloc
+  dominates the gate — shrinking it (map-authoritative storage / smaller
+  `SmallProps` footprint) is the next lever.
 
 Measured result (release, interleaved medians): construct churn ~53ms →
 **~20ms**, string concat ~6.6ms → **~4.3ms**, other rows flat or better.
@@ -369,17 +370,28 @@ constructor's *final* map:
   Store IC re-keyed: `MemberMapCell` is now `(map_id, name) → field offset`;
   the read path probes it and reads `in_fields` directly, re-resolving on a
   miss. Gate met: `defineProperty`/`delete` tests green.
-- **B5.2 — In-object fields + map-based read path.** Fresh objects use
-  `in_fields`; `member_cell_get` re-keyed to `(map, name)`. Gate:
-  property-access row improves; `Object.keys`/iteration order tests green.
-  Target: the ~8ms store+read slice of construct churn.
-- **B5.3 — Map-based store + transitions.** Add-property transitions;
-  store IC re-keyed. Gate: construct churn's store becomes an in-place
-  field write; `defineProperty`/`delete` tests green.
-- **B5.4 — Constructor boilerplate.** Final-map pre-build from
-  `construct_property_patterns` (the compiler already records `this.*`
-  writes per constructor — the data is in `Agent::construct_property_patterns`).
-  Gate: construct churn target (§1).
+- **B5.4 — LANDED.** Constructor boilerplate. `construct_this_object`
+  pre-builds the final map from `construct_property_patterns` and starts
+  every construct on it, so the body's `this.x =` stores are in-place field
+  writes (no per-store transition, stable (map_id, name) cache keys). The
+  cache is re-validated against the function object's generation and the
+  prototype's identity. Soundness: a pre-sized field the body never writes
+  stays unset, which the map read path treats as absent (falls through to
+  the property vector / prototype chain) — a conditional store cannot mask
+  an inherited property. Store micro-opts: the own-property check for
+  map-shaped objects reads the field state (written ⟺ in the property
+  vector) instead of scanning the vector; the redundant second `map_set`
+  after `fresh_data_define` is gone.
+
+  **In-place allocation**: `Gc::new_in_place` initializes the `JsObject`
+  directly in the arena slot (a single `init_ordinary` that mirrors the
+  stack literal), skipping the 528B stack-temp build + memcpy — measured
+  ~80ns of the ~134ns per-allocation cost. `ordinary_object_create` and
+  `ordinary_object_create_with_map` use it (every ordinary object: literals,
+  construct churn). Measured: construct churn ~23.6ms → **~21.7ms** (median,
+  interleaved vs the B5.3 commit); the boilerplate store-side savings were
+  within noise (the per-store transitions were already cached), the alloc
+  change is the real gate win.
 - **B5.5 — Dictionary fallback + attribute forks.** Land delete/
   defineProperty/overflow semantics. Gate: full suite + sweep green.
 

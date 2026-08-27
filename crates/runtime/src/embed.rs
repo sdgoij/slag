@@ -1034,6 +1034,89 @@ mod tests {
         );
     }
 
+    // ---- Part B, B5.4: constructor boilerplate ----
+
+    #[test]
+    fn constructor_boilerplate_pre_sizes_the_final_shape() {
+        let mut context = Context::new().unwrap();
+        context
+            .eval("function C(x) { this.x = x; this.y = x * 2; } globalThis.a = new C(1); globalThis.b = new C(2);")
+            .unwrap();
+        // The second construct starts on the cached final shape; both read
+        // through their own pre-sized fields.
+        assert_eq!(
+            context.eval("globalThis.a.x").unwrap().as_number(),
+            Some(1.0)
+        );
+        assert_eq!(
+            context.eval("globalThis.a.y").unwrap().as_number(),
+            Some(2.0)
+        );
+        assert_eq!(
+            context.eval("globalThis.b.x").unwrap().as_number(),
+            Some(2.0)
+        );
+        assert_eq!(
+            context.eval("globalThis.b.y").unwrap().as_number(),
+            Some(4.0)
+        );
+    }
+
+    #[test]
+    fn boilerplate_skipped_field_falls_through_to_the_prototype() {
+        let mut context = Context::new().unwrap();
+        context
+            .eval("function C(x) { this.x = x; if (x > 1) { this.y = 2; } } C.prototype.y = 99; globalThis.o = new C(0);")
+            .unwrap();
+        // The pre-sized `y` field was never written by this construct: the
+        // read must fall through to the prototype, not serve the unset field
+        // as an own undefined.
+        assert_eq!(
+            context.eval("globalThis.o.x").unwrap().as_number(),
+            Some(0.0)
+        );
+        assert_eq!(
+            context.eval("globalThis.o.y").unwrap().as_number(),
+            Some(99.0)
+        );
+        // A construct that does write y gets its own value.
+        context.eval("globalThis.p = new C(5);").unwrap();
+        assert_eq!(
+            context.eval("globalThis.p.y").unwrap().as_number(),
+            Some(2.0)
+        );
+    }
+
+    #[test]
+    fn boilerplate_rebuilds_after_prototype_redefine() {
+        let mut context = Context::new().unwrap();
+        context
+            .eval("function C(x) { this.x = x; } globalThis.o1 = new C(1); C.prototype = { tag: 'new' }; globalThis.o2 = new C(2);")
+            .unwrap();
+        // The prototype redefine bumped the function's generation: the cache
+        // rebuilt with the new prototype.
+        assert_eq!(
+            context.eval("globalThis.o1.x").unwrap().as_number(),
+            Some(1.0)
+        );
+        assert_eq!(
+            context.eval("globalThis.o2.x").unwrap().as_number(),
+            Some(2.0)
+        );
+        assert_eq!(
+            context
+                .eval("globalThis.o2.tag")
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("new")
+        );
+        assert_eq!(
+            context.eval("globalThis.o1.tag").unwrap().type_name(),
+            "undefined"
+        );
+    }
+
     #[test]
     #[cfg(feature = "fs")]
     fn fs_reads_files_and_directories() {

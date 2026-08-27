@@ -133,6 +133,37 @@ impl<T: Trace> Gc<T> {
         gc
     }
 
+    /// Allocate a box and initialize its payload in place. `init` writes the
+    /// value directly into the arena slot, so a large payload (the 528B
+    /// `JsObject`) skips the stack-temp build + memcpy that `Gc::new` pays —
+    /// the hot allocation paths (object literals, construct churn) measured
+    /// ~80ns of that copy per allocation. `init` MUST write every field of
+    /// `*T` before returning (the slot starts uninitialized); it must not
+    /// allocate through the heap (the heap is mutably borrowed here).
+    pub fn new_in_place(init: impl FnOnce(*mut T)) -> Gc<T> {
+        let size = round_up(size_of::<GcBox<T>>(), ARENA_GRANULARITY);
+        let gc = with_heap_mut(|heap| {
+            let raw = heap.alloc(size, align_of::<GcBox<T>>()) as *mut GcBox<T>;
+            // SAFETY: `raw` is a fresh arena slot (bumped or reused) of at
+            // least `size` bytes; the header is written here and `init`
+            // initializes the payload before any handle can see it.
+            unsafe {
+                let boxed = &mut *raw;
+                boxed.mark = Cell::new(false);
+                boxed.size = size as u32;
+                init(std::ptr::addr_of_mut!(boxed.data));
+            }
+            heap.register(raw as *mut GcBox<dyn Trace>);
+            Gc {
+                ptr: unsafe { NonNull::new_unchecked(raw) },
+                _not_send_sync: std::marker::PhantomData,
+            }
+        });
+        ALLOC_SINCE_COLLECT.with(|count| count.set(count.get() + 1));
+        maybe_stress_collect(gc.as_any());
+        gc
+    }
+
     /// The box base address, for NaN-boxing into `Value`'s 44-bit payload.
     pub(crate) fn box_ptr(self) -> usize {
         self.ptr.as_ptr() as usize

@@ -669,11 +669,18 @@ impl JsObject {
     /// Used to embed an object inside `Function`; constructors that hand out
     /// a `Handle` call `link_self_handle` on the way out.
     pub fn basic_object_create(prototype: Option<Handle<JsObject>>) -> Self {
+        Self::basic_object_create_with_map(prototype, canonical_empty_map(prototype))
+    }
+
+    /// The raw ordinary object on a specific map (Part B, B5.4): the
+    /// constructor boilerplate path pre-sizes the final shape, so the object
+    /// skips the canonical-empty-map lookup.
+    fn basic_object_create_with_map(prototype: Option<Handle<JsObject>>, map: Handle<Map>) -> Self {
         Self {
             id: next_object_id(),
             kind: ObjectKind::Ordinary,
             prototype: Cell::new(prototype),
-            map: Cell::new(Some(canonical_empty_map(prototype))),
+            map: Cell::new(Some(map)),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
@@ -684,6 +691,60 @@ impl JsObject {
             self_handle: RefCell::new(None),
             function_self: RefCell::new(None),
             boxed: RefCell::new(None),
+        }
+    }
+
+    /// Initialize a fresh ordinary object's fields directly in an
+    /// uninitialized slot (the in-place arena path, `Gc::new_in_place`).
+    /// Every field is written with `ptr::write` — a plain assignment would
+    /// drop the slot's stale value first. Must mirror
+    /// `basic_object_create_with_map`'s field set exactly.
+    unsafe fn init_ordinary(
+        this: *mut Self,
+        prototype: Option<Handle<JsObject>>,
+        map: Handle<Map>,
+    ) {
+        // SAFETY: the caller guarantees `this` points at an uninitialized
+        // slot sized for `Self`.
+        unsafe {
+            std::ptr::write(std::ptr::addr_of_mut!((*this).id), next_object_id());
+            std::ptr::write(std::ptr::addr_of_mut!((*this).kind), ObjectKind::Ordinary);
+            std::ptr::write(
+                std::ptr::addr_of_mut!((*this).prototype),
+                Cell::new(prototype),
+            );
+            std::ptr::write(std::ptr::addr_of_mut!((*this).map), Cell::new(Some(map)));
+            std::ptr::write(
+                std::ptr::addr_of_mut!((*this).in_fields),
+                [const { Cell::new(None) }; INLINE_FIELDS],
+            );
+            std::ptr::write(std::ptr::addr_of_mut!((*this).extensible), Cell::new(true));
+            std::ptr::write(
+                std::ptr::addr_of_mut!((*this).immutable_prototype),
+                Cell::new(false),
+            );
+            std::ptr::write(std::ptr::addr_of_mut!((*this).generation), Cell::new(0));
+            std::ptr::write(
+                std::ptr::addr_of_mut!((*this).properties),
+                RefCell::new(SmallProps::new()),
+            );
+            std::ptr::write(
+                std::ptr::addr_of_mut!((*this).property_index),
+                RefCell::new(None),
+            );
+            std::ptr::write(
+                std::ptr::addr_of_mut!((*this).private_elements),
+                RefCell::new(Vec::new()),
+            );
+            std::ptr::write(
+                std::ptr::addr_of_mut!((*this).self_handle),
+                RefCell::new(None),
+            );
+            std::ptr::write(
+                std::ptr::addr_of_mut!((*this).function_self),
+                RefCell::new(None),
+            );
+            std::ptr::write(std::ptr::addr_of_mut!((*this).boxed), RefCell::new(None));
         }
     }
 
@@ -712,15 +773,13 @@ impl JsObject {
 
     /// Part B, B5.2: map-based read fast path. Check the object's map for
     /// a descriptor of `key`, then read the value from `in_fields` at the
-    /// assigned offset. Returns `Some(Undefined)` when the key is mapped
-    /// but unset; `None` when the map doesn't describe the key (fall through
-    /// to SmallProps/prototype chain).
+    /// assigned offset. Returns `None` when the key is not described by the
+    /// map or the field was never written (a boilerplate pre-sized field the
+    /// body skipped is not an own property yet) — the caller falls through
+    /// to SmallProps/prototype chain.
     pub fn map_get(&self, key: &PropertyKey) -> Option<Value> {
         let offset = self.map.get()?.find(key)?;
-        if offset >= INLINE_FIELDS {
-            return None;
-        }
-        Some(self.in_fields[offset].get().unwrap_or(Value::Undefined))
+        self.map_field(offset)
     }
 
     /// Part B, B5.2: map-based write fast path. Check the object's map for
@@ -740,12 +799,11 @@ impl JsObject {
 
     /// Part B, B5.3: read the inline field at a map-assigned offset directly
     /// (the runtime's map cache pins `(map_id, name) → slot`, so the read
-    /// skips the descriptor scan). `None` when the slot is out of range;
-    /// an unset field reads as *undefined* like `map_get`.
+    /// skips the descriptor scan). `None` when the slot is out of range or
+    /// the field is unset — an unset field is not an own property, so the
+    /// caller falls through to the property vector / prototype chain.
     pub fn map_field(&self, slot: usize) -> Option<Value> {
-        self.in_fields
-            .get(slot)
-            .map(|cell| cell.get().unwrap_or(Value::Undefined))
+        self.in_fields.get(slot)?.get()
     }
 
     /// Part B, B5.3: transition the object's map for a new property.
@@ -803,9 +861,31 @@ impl JsObject {
         }
     }
 
-    /// OrdinaryObjectCreate (spec 10.1.13).
+    /// OrdinaryObjectCreate (spec 10.1.13). The object is initialized in
+    /// place in the arena, skipping the stack-temp build + memcpy that
+    /// `Handle::new(Self {...})` pays (the ~528B `JsObject` copy measured
+    /// ~80ns per allocation on the hot paths).
     pub fn ordinary_object_create(prototype: Option<Handle<JsObject>>) -> Handle<JsObject> {
-        let object = Handle::new(Self::basic_object_create(prototype));
+        let map = canonical_empty_map(prototype);
+        let object = Handle::new_in_place(|ptr: *mut Self| {
+            // SAFETY: `init_ordinary` writes every field of the fresh slot.
+            unsafe { Self::init_ordinary(ptr, prototype, map) }
+        });
+        Self::link_self_handle(&object);
+        object
+    }
+
+    /// OrdinaryObjectCreate on a pre-built map (Part B, B5.4): the
+    /// constructor boilerplate path starts the object on the constructor's
+    /// final shape, so its `this.x =` stores are in-place field writes.
+    pub fn ordinary_object_create_with_map(
+        prototype: Option<Handle<JsObject>>,
+        map: Handle<Map>,
+    ) -> Handle<JsObject> {
+        let object = Handle::new_in_place(|ptr: *mut Self| {
+            // SAFETY: `init_ordinary` writes every field of the fresh slot.
+            unsafe { Self::init_ordinary(ptr, prototype, map) }
+        });
         Self::link_self_handle(&object);
         object
     }
@@ -2017,14 +2097,18 @@ impl JsObject {
         if !self.extensible.get() {
             return false;
         }
-        // Part B, B5.3: transition the map for the fresh w/e/c data property
-        // and write the value into the field it assigned, so the map-based
-        // read path serves it without a property-vector borrow. A full map
+        // Part B, B5.3/B5.4: transition the map for the fresh w/e/c data
+        // property and write the value into the field it assigned, so the
+        // map-based read path serves it without a property-vector borrow. A
+        // key the object's map ALREADY describes (a constructor-boilerplate
+        // pre-sized object) writes the field in place — the shape is fixed,
+        // so there is no transition (the `||` short-circuits it). A full map
         // (past the inline capacity) leaves the key in dictionary mode — the
         // map read falls through to SmallProps.
-        if self
-            .map_add_property_cell(key.clone(), MapAttrs::new(true, true, true))
-            .is_some()
+        if self.map.get().is_some_and(|m| m.find(key).is_some())
+            || self
+                .map_add_property_cell(key.clone(), MapAttrs::new(true, true, true))
+                .is_some()
         {
             let _ = self.map_set(key, value);
         }
@@ -3740,6 +3824,48 @@ mod tests {
             obj.get(&JsString::from_utf8(&overflow)).unwrap(),
             Value::Number(INLINE_FIELDS as f64)
         );
+    }
+
+    #[test]
+    fn unset_field_reads_as_absent() {
+        // A boilerplate pre-sized object: the map describes the field but
+        // the body never wrote it — the map read must report absent (so the
+        // caller falls through to the property vector / prototype chain),
+        // not undefined.
+        let mut map = Map::new_empty(None);
+        let child = map
+            .get_or_create_child(PropertyKey::from_utf8("x"), MapAttrs::new(true, true, true))
+            .unwrap();
+        let obj = JsObject::ordinary_object_create_with_map(None, child);
+        assert_eq!(obj.map_get(&PropertyKey::from_utf8("x")), None);
+        // Once the body writes the field it reads through the map.
+        assert!(obj.map_set(&PropertyKey::from_utf8("x"), Value::Number(1.0)));
+        assert_eq!(
+            obj.map_get(&PropertyKey::from_utf8("x")),
+            Some(Value::Number(1.0))
+        );
+    }
+
+    #[test]
+    fn fresh_define_in_place_on_pre_sized_field() {
+        // A boilerplate object's store writes the pre-sized field in place
+        // (no transition) and still pushes the own property.
+        let mut map = Map::new_empty(None);
+        let child = map
+            .get_or_create_child(PropertyKey::from_utf8("x"), MapAttrs::new(true, true, true))
+            .unwrap();
+        let obj = JsObject::ordinary_object_create_with_map(None, child);
+        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("x"), Value::Number(7.0)));
+        assert_eq!(
+            obj.map_get(&PropertyKey::from_utf8("x")),
+            Some(Value::Number(7.0))
+        );
+        assert_eq!(obj.get(&key("x")).unwrap(), Value::Number(7.0));
+        // The shape is unchanged (no transition): the map still describes
+        // exactly one key at offset 0.
+        let map = obj.map.get().unwrap();
+        assert_eq!(map.field_offset(&PropertyKey::from_utf8("x")), Some(0));
+        assert_eq!(map.descriptor_count(), 1);
     }
 
     #[test]
