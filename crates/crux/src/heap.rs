@@ -57,6 +57,12 @@ struct GcBox<T: ?Sized + Trace> {
     data: T,
 }
 
+/// The offset of a boxed value's data within its `GcBox` (the box header —
+/// `mark` + `size` — precedes the value): the compiled member-cell probe
+/// adds this to the NaN-boxing payload's box base to reach the `JsObject`.
+/// The header fields are fixed, so the offset is a stable ABI constant.
+pub const GCBOX_DATA_OFFSET: usize = std::mem::offset_of!(GcBox<crate::Value>, data);
+
 /// A heap handle: a `Copy` pointer into the GC heap. `!Send`/`!Sync` by the
 /// raw-pointer marker — a heap is agent-local (workers use separate agents).
 /// `T` may be unsized (`dyn HostOps` for host-defined exotics); `Gc::new`

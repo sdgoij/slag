@@ -31,6 +31,7 @@ pub enum Helper {
     SetMemberName,
     SetMemberComputed,
     CallSlow,
+    LeafCallProbe,
     GetGlobal,
     SetGlobal,
     SetGlobalSlot,
@@ -66,6 +67,7 @@ impl Helper {
             Helper::SetMemberName => "set_member_name",
             Helper::SetMemberComputed => "set_member_computed",
             Helper::CallSlow => "call_slow",
+            Helper::LeafCallProbe => "leaf_call_probe",
             Helper::GetGlobal => "get_global",
             Helper::SetGlobal => "set_global",
             Helper::SetGlobalSlot => "set_global_slot",
@@ -87,6 +89,29 @@ impl Helper {
             Helper::PutVarReferenceOp => "put_var_reference_op",
             Helper::PopVarReference => "pop_var_reference",
         }
+    }
+
+    /// Whether calling this helper can re-enter the interpreter (a getter,
+    /// setter, `valueOf`/`toString`, or nested call), which is the only way
+    /// the Vm stacks and realm count the leaf-call probe's eligibility
+    /// checks can change mid-run. The compiled code bumps the ctx's
+    /// leaf-eligibility epoch after such helpers so a cached leaf verdict is
+    /// not reused across the disturbance. The excluded helpers are pure
+    /// slot/descriptor reads and writes or immediate throws (the probe
+    /// itself is excluded — it only validates and fills).
+    pub fn disturbs_leaf_eligibility(self) -> bool {
+        !matches!(
+            self,
+            Helper::TdzError
+                | Helper::LeafCallProbe
+                | Helper::ToBooleanSlow
+                | Helper::LoadContext
+                | Helper::StoreContext
+                | Helper::InitContext
+                | Helper::LoadPerIter
+                | Helper::StorePerIter
+                | Helper::PopVarReference
+        )
     }
 }
 
@@ -128,6 +153,13 @@ pub struct JitHelpers {
     /// result value.
     pub call_slow: Option<
         extern "C" fn(vm: *mut c_void, callee: u64, this: u64, argc: u64, args: *mut u64) -> u64,
+    >,
+    /// The compiled leaf-call probe (Cut 37): validates the callee is an
+    /// inlineable leaf and returns its JIT entry (0 = fall back to
+    /// `call_slow`). `site` is the call site's step index (Cut 39 — the
+    /// probe records the cache identity so repeat visits skip it).
+    pub leaf_call_probe: Option<
+        extern "C" fn(vm: *mut c_void, callee: u64, args: *mut u64, argc: u64, site: u64) -> u64,
     >,
     /// Read a declared top-level `var` off the global object (`name` is an
     /// `AtomId`); returns the value.
@@ -223,6 +255,7 @@ impl JitHelpers {
             set_member_name: None,
             set_member_computed: None,
             call_slow: None,
+            leaf_call_probe: None,
             get_global: None,
             set_global: None,
             set_global_slot: None,
@@ -259,6 +292,7 @@ impl JitHelpers {
             Helper::SetMemberName => self.set_member_name.map(|f| f as usize as u64),
             Helper::SetMemberComputed => self.set_member_computed.map(|f| f as usize as u64),
             Helper::CallSlow => self.call_slow.map(|f| f as usize as u64),
+            Helper::LeafCallProbe => self.leaf_call_probe.map(|f| f as usize as u64),
             Helper::GetGlobal => self.get_global.map(|f| f as usize as u64),
             Helper::SetGlobal => self.set_global.map(|f| f as usize as u64),
             Helper::SetGlobalSlot => self.set_global_slot.map(|f| f as usize as u64),
@@ -524,6 +558,19 @@ pub(crate) extern "C" fn test_call_slow(
             .unwrap_or(0.0);
     }
     Value::Number(sum).bits()
+}
+
+/// The probe test double: always rejects (the unit tests exercise the
+/// `call_slow` fallback path).
+#[cfg(test)]
+pub(crate) extern "C" fn test_leaf_call_probe(
+    _vm: *mut c_void,
+    _callee: u64,
+    _args: *mut u64,
+    _argc: u64,
+    _site: u64,
+) -> u64 {
+    0
 }
 
 #[cfg(test)]

@@ -37,10 +37,10 @@ use cranelift_control::ControlPlane;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use crux::Value;
 use runtime::ir::{
-    CompiledBody, FastLoopVar, GLOBAL_CELLS, LeafOp, RegOperand, ScopeInfo, Step,
-    is_compound_assign,
+    CompiledBody, FastLoopVar, GLOBAL_CELLS, LeafOp, MEMBER_CELLS, MemberValueCell, RegOperand,
+    ScopeInfo, Step, is_compound_assign,
 };
-use runtime::jit::{GlobalValueCell, JitCallContext};
+use runtime::jit::{GlobalValueCell, JitCallContext, LeafCallSiteCache, LeafInlineInfo};
 use syntax::ast::{BinaryOp, UpdateOp};
 use target_lexicon::PointerWidth;
 
@@ -225,6 +225,13 @@ fn helper_sig(params: &[Type], conv: CallConv) -> Signature {
     sig
 }
 
+/// The byte offset of a `LeafInlineInfo` field inside `JitCallContext`'s
+/// `leaf_call_cache` record (Cranelift has no `offset_of!`, so the compiled
+/// code loads the fields at these fixed offsets).
+fn leaf_inline_offset(field: usize) -> usize {
+    std::mem::offset_of!(LeafCallSiteCache, leaf_inline) + field
+}
+
 /// Lower `body` into `func`. `func`/`fctx` are consumed by the builder and
 /// finalized in place.
 fn lower<'a>(
@@ -393,6 +400,9 @@ struct Lowerer<'a> {
     sig_set_comp: SigRef,
     sig_call: SigRef,
     sig_assign: SigRef,
+    /// The JIT entry signature `(frame, stack, vm) -> value` — the in-frame
+    /// leaf-call path calls the callee's compiled entry with it.
+    sig_entry: SigRef,
     // NaN-boxing bit patterns (see `crux::value`).
     undef_bits: i64,
     null_bits: i64,
@@ -427,6 +437,7 @@ impl<'a> Lowerer<'a> {
         let sig_set_comp = builder.import_signature(helper_sig(&[types::I64; 4], conv));
         let sig_call = builder.import_signature(helper_sig(&[types::I64; 5], conv));
         let sig_assign = builder.import_signature(helper_sig(&[types::I64; 6], conv));
+        let sig_entry = builder.import_signature(helper_sig(&[types::I64; 3], conv));
         Lowerer {
             builder,
             helpers,
@@ -449,6 +460,7 @@ impl<'a> Lowerer<'a> {
             sig_set_comp,
             sig_call,
             sig_assign,
+            sig_entry,
             undef_bits: Value::Undefined.bits() as i64,
             null_bits: Value::Null.bits() as i64,
             false_bits: Value::Boolean(false).bits() as i64,
@@ -659,7 +671,282 @@ impl<'a> Lowerer<'a> {
         self.builder.ins().return_(&[undef]);
         self.builder.seal_block(err);
         self.builder.switch_to_block(cont);
+        // Cut 39: a helper that can re-enter the interpreter may disturb the
+        // Vm stacks / realm count the leaf-call probe's eligibility checks,
+        // so bump the leaf-eligibility epoch — any cached leaf verdict from
+        // before the helper is invalidated (the next call site re-probes).
+        if helper.disturbs_leaf_eligibility() {
+            let epoch = self.builder.ins().load(
+                types::I32,
+                MemFlagsData::new(),
+                vm,
+                Offset32::new(std::mem::offset_of!(JitCallContext, leaf_epoch) as i32),
+            );
+            let bumped = self.builder.ins().iadd_imm_u(epoch, 1);
+            self.builder.ins().store(
+                MemFlagsData::new(),
+                bumped,
+                vm,
+                Offset32::new(std::mem::offset_of!(JitCallContext, leaf_epoch) as i32),
+            );
+        }
         Ok(result)
+    }
+
+    /// Emit a call step with the leaf-inline probe (Cut 37) and its
+    /// per-call-site cache (Cut 39): the probe validates the callee (a
+    /// this-less, env-free leaf whose compiled body fits in the working
+    /// buffer) and fills its frame above the arguments; on a hit the machine
+    /// code calls the leaf's compiled entry directly in-frame — no
+    /// `call_slow`, no interpreter call machinery, no Vm-stack round trip —
+    /// and on a miss falls back to `call_slow` unchanged. A cached verdict
+    /// (this site, this callee, unchanged leaf-eligibility epoch) skips the
+    /// probe helper entirely on repeat visits. `pre_call_sp` is the stack
+    /// pointer the result replaces (the call's argument region base).
+    fn emit_call(
+        &mut self,
+        index: usize,
+        callee: ClifValue,
+        this: ClifValue,
+        args_ptr: ClifValue,
+        argc: usize,
+        pre_call_sp: ClifValue,
+    ) -> Result<(), Unsupported> {
+        let argc_imm = self.builder.ins().iconst(types::I64, argc as i64);
+        let ctx = self.vm();
+        let cache = self.builder.ins().iadd_imm_s(
+            ctx,
+            std::mem::offset_of!(JitCallContext, leaf_call_cache) as i64,
+        );
+        // The cache-reuse gate: the record matches this call site, the
+        // leaf-eligibility epoch is unchanged since the probe wrote it (no
+        // JS-running helper ran), and the live callee's NaN-box identity
+        // (`bits >> 44` + `bits & PAYLOAD_MASK`, together all 64 bits)
+        // matches the probed callee.
+        let site = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cache,
+            Offset32::new(std::mem::offset_of!(LeafCallSiteCache, site) as i32),
+        );
+        let site_ok = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, site, index as i64);
+        let epoch = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, leaf_epoch) as i32),
+        );
+        let cached_epoch = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cache,
+            Offset32::new(std::mem::offset_of!(LeafCallSiteCache, epoch) as i32),
+        );
+        let epoch_ok = self.builder.ins().icmp(IntCC::Equal, epoch, cached_epoch);
+        let callee_hi = self.builder.ins().ushr_imm_u(callee, 44);
+        let cached_hi = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cache,
+            Offset32::new(std::mem::offset_of!(LeafCallSiteCache, callee_hi) as i32),
+        );
+        let cached_hi = self.builder.ins().uextend(types::I64, cached_hi);
+        let hi_ok = self.builder.ins().icmp(IntCC::Equal, callee_hi, cached_hi);
+        let payload = self
+            .builder
+            .ins()
+            .band_imm_u(callee, crux::PAYLOAD_MASK as i64);
+        let cached_payload = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            cache,
+            Offset32::new(std::mem::offset_of!(LeafCallSiteCache, callee_payload) as i32),
+        );
+        let payload_ok = self
+            .builder
+            .ins()
+            .icmp(IntCC::Equal, payload, cached_payload);
+        let site_hit = self.builder.ins().band(site_ok, epoch_ok);
+        let callee_hit = self.builder.ins().band(hi_ok, payload_ok);
+        let hit = self.builder.ins().band(site_hit, callee_hit);
+        let cached_entry = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            cache,
+            Offset32::new(leaf_inline_offset(std::mem::offset_of!(LeafInlineInfo, entry)) as i32),
+        );
+        let hit_block = self.builder.create_block();
+        let probe_block = self.builder.create_block();
+        let slow = self.builder.create_block();
+        let merge = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(hit, hit_block, &[], probe_block, &[]);
+        // A cache hit: a cached zero entry is a stable rejection (go straight
+        // to `call_slow`); a nonzero entry reuses the verdict in-frame.
+        self.builder.switch_to_block(hit_block);
+        let entry_zero = self.builder.ins().icmp_imm_u(IntCC::Equal, cached_entry, 0);
+        let fast = self.builder.create_block();
+        self.builder.ins().brif(entry_zero, slow, &[], fast, &[]);
+        // The aliased in-frame call: the leaf's frame IS the argument region
+        // (`frame_size == arity` with all args present), so there is no frame
+        // fill for the machine code to reproduce — a built frame's per-slot
+        // TDZ markers come from the probe's fill, which a non-aliased hit
+        // falls back to.
+        self.builder.switch_to_block(fast);
+        let frame_size = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cache,
+            Offset32::new(
+                leaf_inline_offset(std::mem::offset_of!(LeafInlineInfo, frame_size)) as i32,
+            ),
+        );
+        let arity = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cache,
+            Offset32::new(leaf_inline_offset(std::mem::offset_of!(LeafInlineInfo, arity)) as i32),
+        );
+        let stack_usage = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            cache,
+            Offset32::new(
+                leaf_inline_offset(std::mem::offset_of!(LeafInlineInfo, stack_usage)) as i32,
+            ),
+        );
+        let fs_eq_ar = self.builder.ins().icmp(IntCC::Equal, frame_size, arity);
+        let argc_ge_fs =
+            self.builder
+                .ins()
+                .icmp_imm_u(IntCC::UnsignedLessThanOrEqual, frame_size, argc as i64);
+        let aliased = self.builder.ins().band(fs_eq_ar, argc_ge_fs);
+        let room = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(aliased, room, &[], probe_block, &[]);
+        // The inline frame + working area must fit above the argument
+        // region's top in the caller's working buffer (the probe checked it
+        // once; the stack pointer at a merged-CFG call site can differ across
+        // visits, so re-check before trusting the cached verdict).
+        self.builder.switch_to_block(room);
+        let buf_end = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, buf_end) as i32),
+        );
+        let args_top = self.builder.ins().iadd_imm_s(args_ptr, (argc as i64) * 8);
+        let stack_bytes = self.builder.ins().imul_imm_s(stack_usage, 8);
+        let top_needed = self.builder.ins().iadd(args_top, stack_bytes);
+        let fits = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThanOrEqual, top_needed, buf_end);
+        let inline = self.builder.create_block();
+        self.builder.ins().brif(fits, inline, &[], probe_block, &[]);
+        self.builder.switch_to_block(inline);
+        let frame_size_64 = self.builder.ins().uextend(types::I64, frame_size);
+        let frame_bytes = self.builder.ins().imul_imm_s(frame_size_64, 8);
+        let stack_ptr = self.builder.ins().iadd(args_ptr, frame_bytes);
+        self.emit_leaf_call_tail(cached_entry, args_ptr, stack_ptr, pre_call_sp, merge);
+        // The probe path: the full validation + lookups + frame fill (Cut
+        // 37); the probe records the cache identity so repeat visits skip it.
+        self.builder.switch_to_block(probe_block);
+        let site_imm = self.builder.ins().iconst(types::I64, index as i64);
+        let probe = self.call_slow(
+            self.sig_call,
+            Helper::LeafCallProbe,
+            &[callee, args_ptr, argc_imm, site_imm],
+        )?;
+        let hit = self.builder.ins().icmp_imm_u(IntCC::NotEqual, probe, 0);
+        let inline2 = self.builder.create_block();
+        self.builder.ins().brif(hit, inline2, &[], slow, &[]);
+        self.builder.switch_to_block(inline2);
+        let ctx = self.vm();
+        let info = self.builder.ins().iadd_imm_s(
+            ctx,
+            (std::mem::offset_of!(JitCallContext, leaf_call_cache)
+                + std::mem::offset_of!(LeafCallSiteCache, leaf_inline)) as i64,
+        );
+        let frame_size = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            info,
+            Offset32::new(std::mem::offset_of!(LeafInlineInfo, frame_size) as i32),
+        );
+        let arity = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            info,
+            Offset32::new(std::mem::offset_of!(LeafInlineInfo, arity) as i32),
+        );
+        let sp = self.builder.use_var(self.sp_var);
+        let fs_eq_ar = self.builder.ins().icmp(IntCC::Equal, frame_size, arity);
+        let argc_ge_fs =
+            self.builder
+                .ins()
+                .icmp_imm_u(IntCC::UnsignedLessThanOrEqual, frame_size, argc as i64);
+        let aliased = self.builder.ins().band(fs_eq_ar, argc_ge_fs);
+        let frame_ptr = self.builder.ins().select(aliased, args_ptr, sp);
+        let frame_size_64 = self.builder.ins().uextend(types::I64, frame_size);
+        let frame_bytes = self.builder.ins().imul_imm_s(frame_size_64, 8);
+        let stack_ptr = self.builder.ins().iadd(frame_ptr, frame_bytes);
+        self.emit_leaf_call_tail(probe, frame_ptr, stack_ptr, pre_call_sp, merge);
+        // The slow path: the interpreter's call machinery (unchanged).
+        self.builder.switch_to_block(slow);
+        let res = self.call_slow(
+            self.sig_call,
+            Helper::CallSlow,
+            &[callee, this, argc_imm, args_ptr],
+        )?;
+        self.builder.def_var(self.sp_var, pre_call_sp);
+        self.push(res);
+        self.builder.ins().jump(merge, &[]);
+        self.builder.seal_block(merge);
+        self.builder.switch_to_block(merge);
+        self.fall_through(index);
+        Ok(())
+    }
+
+    /// The in-frame leaf tail shared by the cache-hit and probe paths: call
+    /// `entry` with `(frame_ptr, stack_ptr, ctx)`, check the pending byte (a
+    /// throwing leaf slow path bails the whole body), then land the result
+    /// on the value stack and jump to `merge`.
+    fn emit_leaf_call_tail(
+        &mut self,
+        entry: ClifValue,
+        frame_ptr: ClifValue,
+        stack_ptr: ClifValue,
+        pre_call_sp: ClifValue,
+        merge: Block,
+    ) {
+        let ctx = self.vm();
+        let inst =
+            self.builder
+                .ins()
+                .call_indirect(self.sig_entry, entry, &[frame_ptr, stack_ptr, ctx]);
+        let result = self.builder.func.dfg.inst_results(inst)[0];
+        let pending =
+            self.builder
+                .ins()
+                .load(types::I8, MemFlagsData::new(), ctx, Offset32::new(0));
+        let ok = self.builder.ins().icmp_imm_u(IntCC::Equal, pending, 0);
+        let cont = self.builder.create_block();
+        let err = self.builder.create_block();
+        self.builder.ins().brif(ok, cont, &[], err, &[]);
+        self.builder.switch_to_block(err);
+        let undef = self.builder.ins().iconst(types::I64, self.undef_bits);
+        self.builder.ins().return_(&[undef]);
+        self.builder.seal_block(err);
+        self.builder.switch_to_block(cont);
+        self.builder.def_var(self.sp_var, pre_call_sp);
+        self.push(result);
+        self.builder.ins().jump(merge, &[]);
     }
 
     fn const_value(&mut self, value: &Value) -> Result<ClifValue, Unsupported> {
@@ -1030,11 +1317,127 @@ impl<'a> Lowerer<'a> {
                 self.fall_through(index);
             }
             Step::GetMemberName { name } => {
+                // Cut 38: inline the member-value fast cell. The compiled
+                // code checks the receiver is a plain Object value, extracts
+                // the box address, reads its LIVE id/generation, and probes
+                // the direct-mapped value cell (recorded by the
+                // interpreter's own-property reads, including the map
+                // path) — a hit serves the cached value with no
+                // `get_member_name` helper call. Function receivers,
+                // primitives (boxing), proxies, accessors, and
+                // prototype-chain reads all miss to the helper.
                 let object = self.pop();
-                let name = self.builder.ins().iconst(types::I64, *name as i64);
-                let res =
-                    self.call_slow(self.sig_get_name, Helper::GetMemberName, &[object, name])?;
-                self.push(res);
+                let name_imm = self.builder.ins().iconst(types::I64, *name as i64);
+                let ctx = self.vm();
+                let cells = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    ctx,
+                    Offset32::new(std::mem::offset_of!(JitCallContext, member_value_cells) as i32),
+                );
+                let value_var = self.builder.declare_var(types::I64);
+                let slow = self.builder.create_block();
+                let merge = self.builder.create_block();
+                let is_heap = self.builder.ins().band_imm_u(object, crux::TAG_MASK as i64);
+                let is_obj =
+                    self.builder
+                        .ins()
+                        .icmp_imm_u(IntCC::Equal, is_heap, crux::TAG_PREFIX as i64);
+                let tag = self.builder.ins().ushr_imm_u(object, 44);
+                let tag = self.builder.ins().band_imm_u(tag, 0xF);
+                let tag_obj =
+                    self.builder
+                        .ins()
+                        .icmp_imm_u(IntCC::Equal, tag, crux::TAG_OBJECT as i64);
+                let is_plain_obj = self.builder.ins().band(is_obj, tag_obj);
+                let probe = self.builder.create_block();
+                self.builder.ins().brif(is_plain_obj, probe, &[], slow, &[]);
+                // The probe: the cell's id/name/generation must match the
+                // receiver's LIVE id and generation (a mutation anywhere
+                // bumps the generation, so a match means the own data
+                // property is unchanged since the cell was recorded).
+                self.builder.switch_to_block(probe);
+                let ptr = self
+                    .builder
+                    .ins()
+                    .band_imm_u(object, crux::PAYLOAD_MASK as i64);
+                let ptr = self.builder.ins().ishl_imm_u(ptr, 4);
+                // The payload stores the `GcBox` base; the `JsObject` sits
+                // after the box header (`mark` + `size`).
+                let ptr = self
+                    .builder
+                    .ins()
+                    .iadd_imm_s(ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+                let live_id = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    ptr,
+                    Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
+                );
+                let live_gen = self.builder.ins().load(
+                    types::I32,
+                    MemFlagsData::new(),
+                    ptr,
+                    Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+                );
+                let cell_slot = self.builder.ins().bxor(live_id, name_imm);
+                let cell_slot = self
+                    .builder
+                    .ins()
+                    .band_imm_u(cell_slot, (MEMBER_CELLS - 1) as i64);
+                let index_bytes = self
+                    .builder
+                    .ins()
+                    .imul_imm_s(cell_slot, std::mem::size_of::<MemberValueCell>() as i64);
+                let cell = self.builder.ins().iadd(cells, index_bytes);
+                let cell_id = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    cell,
+                    Offset32::new(std::mem::offset_of!(MemberValueCell, id) as i32),
+                );
+                let cell_name = self.builder.ins().load(
+                    types::I32,
+                    MemFlagsData::new(),
+                    cell,
+                    Offset32::new(std::mem::offset_of!(MemberValueCell, name) as i32),
+                );
+                let cell_gen = self.builder.ins().load(
+                    types::I32,
+                    MemFlagsData::new(),
+                    cell,
+                    Offset32::new(std::mem::offset_of!(MemberValueCell, generation) as i32),
+                );
+                let cell_value = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    cell,
+                    Offset32::new(std::mem::offset_of!(MemberValueCell, value) as i32),
+                );
+                let id_ok = self.builder.ins().icmp(IntCC::Equal, cell_id, live_id);
+                let name_ok = self
+                    .builder
+                    .ins()
+                    .icmp_imm_u(IntCC::Equal, cell_name, *name as i64);
+                let gen_ok = self.builder.ins().icmp(IntCC::Equal, cell_gen, live_gen);
+                let id_name_ok = self.builder.ins().band(id_ok, name_ok);
+                let ok = self.builder.ins().band(id_name_ok, gen_ok);
+                self.builder.def_var(value_var, cell_value);
+                self.builder.ins().brif(ok, merge, &[], slow, &[]);
+                // The slow path: the full Get (which also re-resolves and
+                // repopulates the cell for the next read).
+                self.builder.switch_to_block(slow);
+                let res = self.call_slow(
+                    self.sig_get_name,
+                    Helper::GetMemberName,
+                    &[object, name_imm],
+                )?;
+                self.builder.def_var(value_var, res);
+                self.builder.ins().jump(merge, &[]);
+                self.builder.seal_block(merge);
+                self.builder.switch_to_block(merge);
+                let value = self.builder.use_var(value_var);
+                self.push(value);
                 self.fall_through(index);
             }
             Step::GetMemberComputed => {
@@ -1097,11 +1500,12 @@ impl<'a> Lowerer<'a> {
                 if *direct_eval {
                     return Err(Unsupported::Step("CallFast direct eval"));
                 }
-                // `[..., this, callee, a1..aN]` on the JIT stack; pass the
-                // argument region by pointer (the helper copies it out
-                // before running the interpreter's call machinery). The
-                // callee/`this` sit BELOW the args, so they are loaded by
-                // address, not popped.
+                // `[..., this, callee, a1..aN]` on the JIT stack; the probe
+                // reads the callee by address, and the in-frame leaf path
+                // (when the callee is an inlineable leaf) replaces the whole
+                // region with the result. The slow path passes the argument
+                // region by pointer (the helper copies it out before running
+                // the interpreter's call machinery).
                 let sp = self.builder.use_var(self.sp_var);
                 let args_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64) * 8));
                 let callee_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64 + 1) * 8));
@@ -1118,36 +1522,18 @@ impl<'a> Lowerer<'a> {
                     this_ptr,
                     Offset32::new(0),
                 );
-                // The result replaces the whole `[this, callee, args]`
-                // region: drop sp to the `this` slot, then push on top.
-                self.builder.def_var(self.sp_var, this_ptr);
-                let argc_imm = self.builder.ins().iconst(types::I64, *argc as i64);
-                let res = self.call_slow(
-                    self.sig_call,
-                    Helper::CallSlow,
-                    &[callee, this, argc_imm, args_ptr],
-                )?;
-                self.push(res);
-                self.fall_through(index);
+                self.emit_call(index, callee, this, args_ptr, *argc as usize, this_ptr)?;
             }
             Step::CallFastSlot { slot, argc } => {
                 // `[..., a1..aN]` — the fused slot call (`do_call_fast_slot`
                 // reads the callee from the frame and passes `undefined` as
                 // `this`; the fuse guards rule out an argument that writes
-                // the slot).
+                // the slot). A leaf callee at the slot runs in-frame.
                 let sp = self.builder.use_var(self.sp_var);
                 let args_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64) * 8));
                 let callee = self.load_slot(*slot);
                 let this = self.builder.ins().iconst(types::I64, self.undef_bits);
-                self.builder.def_var(self.sp_var, args_ptr);
-                let argc_imm = self.builder.ins().iconst(types::I64, *argc as i64);
-                let res = self.call_slow(
-                    self.sig_call,
-                    Helper::CallSlow,
-                    &[callee, this, argc_imm, args_ptr],
-                )?;
-                self.push(res);
-                self.fall_through(index);
+                self.emit_call(index, callee, this, args_ptr, *argc as usize, args_ptr)?;
             }
             Step::LoadGlobal { name } => {
                 // Cut 36: inline the direct-mapped global-value fast cell.

@@ -327,6 +327,7 @@ fn runtime_helpers() -> JitHelpers {
         set_member_name: Some(rt.set_member_name),
         set_member_computed: Some(rt.set_member_computed),
         call_slow: Some(rt.call_slow),
+        leaf_call_probe: Some(rt.leaf_call_probe),
         get_global: Some(rt.get_global),
         set_global: Some(rt.set_global),
         set_global_slot: Some(rt.set_global_slot),
@@ -439,6 +440,7 @@ mod tests {
             set_member_name: Some(helpers::test_set_member_name),
             set_member_computed: Some(helpers::test_set_member_computed),
             call_slow: Some(helpers::test_call_slow),
+            leaf_call_probe: Some(helpers::test_leaf_call_probe),
             get_global: Some(helpers::test_get_global),
             set_global: Some(helpers::test_set_global),
             set_global_slot: Some(helpers::test_set_global_slot),
@@ -487,7 +489,11 @@ mod tests {
             // helper (the test doubles), so the bare ctx stays safe.
             global_object: std::ptr::null_mut(),
             global_value_cells: std::ptr::null_mut(),
+            member_value_cells: std::ptr::null_mut(),
             clean_chain: false,
+            buf_end: std::ptr::null_mut(),
+            leaf_epoch: 0,
+            leaf_call_cache: runtime::jit::LeafCallSiteCache::empty(),
         };
         // Safety: the buffers outlive the call; `vm` is never dereferenced by
         // the scaffold's test helpers.
@@ -984,6 +990,25 @@ mod tests {
     }
 
     #[test]
+    fn installed_jit_member_probe_misses_on_mid_run_mutation() {
+        // The compiled `GetMemberName` probe validates the value cell
+        // against the receiver's LIVE generation: the `o.f = 2` store at
+        // `i == 50` bumps it, so the remaining reads must miss to the
+        // helper (a stale cell would keep serving 1). Expected:
+        // 50 * 1 + 50 * 2 = 150.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(o, n) { var s = 0; for (var i = 0; i < n; i++) { if (i === 50) { o.f = 2; } s += o.f; } return s; }\n\
+                     f({ f: 1 }, 100);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(150.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_with_gc_stress_keeps_the_buffer_rooted() {
         // The private frame/working buffer must be traced for the JIT run's
         // duration: `s` (a string only the buffer references) would be swept
@@ -1193,6 +1218,59 @@ mod tests {
         });
         assert_eq!(value.as_number(), Some(2.0));
         assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_inline_leaf_call_this_using_callee_falls_back() {
+        // A this-using leaf (a `this` slot) cannot run in-frame — the probe
+        // rejects it and the call falls back to `call_slow`, whose
+        // interpreter leaf-inline binds `this`. Result:
+        // sum(41 + i, i in 0..100) = 4100 + 4950 = 9050.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(o, n) { var s = 0; for (var i = 0; i < n; i++) { s += o.f(i); } return s; }\n\
+                     f({ f: function (x) { return this.v + x; }, v: 41 }, 100);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(9050.0));
+        assert!(compiled >= 2, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_inline_leaf_call_captured_callee_falls_back() {
+        // An env-using leaf (captures `y`) cannot run in-frame — the probe
+        // rejects it and the interpreter's leaf-inline resolves the capture
+        // through the closure's environment. Result: sum(i + 10) = 5950.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var y = 10; function f(g, n) { var s = 0; for (var i = 0; i < n; i++) { s += g(i); } return s; }\n\
+                     f(function (x) { return x + y; }, 100);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(5950.0));
+        assert!(compiled >= 2, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_inline_leaf_call_with_var_slot_builds_the_frame() {
+        // A leaf with a `var` slot (frame_size > arity, so the arguments
+        // cannot alias the frame): the probe builds the frame above the
+        // arguments, the var initializes to undefined, and the body's
+        // arithmetic uses it. Result: 2 * sum(i + 1, i in 0..100) = 10100.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(g, n) { var s = 0; for (var i = 0; i < n; i++) { s += g(i); } return s; }\n\
+                     f(function (x) { var t = x + 1; return t * 2; }, 100);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(10100.0));
+        assert!(compiled >= 2, "{compiled} bodies");
     }
 
     #[test]
@@ -1598,6 +1676,53 @@ mod tests {
                 .expect("runs")
         });
         assert_eq!(value.as_number(), Some(5.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_leaf_cache_reprobes_on_callee_change() {
+        // Cut 39: the per-call-site leaf cache re-probes when the callee at
+        // a site changes — the cached record's identity check is the
+        // callee's full NaN-box bits, so a cached `g` verdict must not serve
+        // `h`'s calls. `f` swaps its local `c` between the two leaf params
+        // at the loop midpoint (a slot store, no helper in between); without
+        // the identity gate `g`'s body would run for every `h` call and the
+        // loop would land 100 instead of 101.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function g(x) { return x + 1; }\n\
+                     function h(x) { return x + 2; }\n\
+                     function f(a, b, n) { var c = a; var s = 0; for (var i = 0; i < n; i++) { if (i === 50) { c = b; } s = c(i); } return s; }\n\
+                     f(g, h, 100);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(101.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_leaf_cache_revalidates_after_a_disturbing_helper() {
+        // Cut 39: a slow-path helper that re-enters the interpreter (here
+        // the accessor setter behind `o.x = s`) bumps the leaf-eligibility
+        // epoch, so a cached leaf verdict is re-probed — never blindly
+        // reused — after the disturbance. The loop alternates the leaf call
+        // and the member store, so every iteration exercises the bump +
+        // re-probe cycle; the results stay exact.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var count = 0;\n\
+                     var o = {};\n\
+                     Object.defineProperty(o, 'x', { set: function (v) { count += 1; } });\n\
+                     function g(x) { return x + 1; }\n\
+                     function f(n) { var s = 0; for (var i = 0; i < n; i++) { s = g(i); o.x = s; } return s; }\n\
+                     var r = f(100); r === 100 && count === 100;",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_boolean(), Some(true));
         assert!(compiled >= 1, "{compiled} bodies");
     }
 }

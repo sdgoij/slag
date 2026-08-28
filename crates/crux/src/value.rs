@@ -28,7 +28,10 @@ use crate::symbol::Symbol;
 pub const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
 pub const TAG_PREFIX: u64 = 0x7FF8_0000_0000_0000;
 const CANON_NAN: u64 = 0x7FF9_0000_0000_0000;
-const PAYLOAD_MASK: u64 = (1 << 44) - 1;
+/// The low 44 bits of a heap value's NaN-boxing payload (the box address >> 4
+/// after the tag). Public for the JIT crate's inline object-pointer
+/// extraction — the NaN-boxing layout is frozen.
+pub const PAYLOAD_MASK: u64 = (1 << 44) - 1;
 
 const TAG_UNDEFINED: u64 = 0;
 const TAG_NULL: u64 = 1;
@@ -37,7 +40,9 @@ const TAG_TRUE: u64 = 3;
 const TAG_BIGINT: u64 = 4;
 const TAG_STRING: u64 = 5;
 const TAG_SYMBOL: u64 = 6;
-const TAG_OBJECT: u64 = 7;
+/// The Object tag (public for the JIT crate's inline member-cell probe — the
+/// NaN-boxing layout is frozen).
+pub const TAG_OBJECT: u64 = 7;
 const TAG_FUNCTION: u64 = 8;
 /// The frame-slot TDZ marker (tag 9 in the reserved range): a `let`-like
 /// binding before its `InitLocal`. It lives only in VM frames; every frame

@@ -28,6 +28,7 @@
 use std::os::raw::c_void;
 
 use crux::Value;
+use crux::value::ValueKind;
 use syntax::ast::{AssignOp, BinaryOp, UpdateOp};
 
 use crate::agent::Agent;
@@ -75,6 +76,78 @@ pub struct JitHook {
     pub helpers: *const JitSlowPaths,
 }
 
+/// The per-call leaf-inline descriptor the compiled `CallFast`/`CallFastSlot`
+/// probe writes (Cut 37): the machine code reads the leaf's entry and frame
+/// layout from here after the probe accepts, then calls the entry directly
+/// in the caller's working buffer. `#[repr(C)]` so the compiled code reads
+/// the fields at fixed offsets (`offset_of!`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LeafInlineInfo {
+    /// The leaf's JIT entry (0 = the probe rejected the call site).
+    pub entry: u64,
+    /// The leaf's maximum value-stack depth above its frame, in slots.
+    pub stack_usage: u64,
+    /// The leaf's frame size (params + vars + TDZ slots; a this-less leaf
+    /// by the probe's gate, so no `this` slot).
+    pub frame_size: u32,
+    /// The leaf's parameter count.
+    pub arity: u32,
+}
+
+impl LeafInlineInfo {
+    /// An empty descriptor: entry 0 makes the compiled code fall back to
+    /// `call_slow`.
+    pub const fn empty() -> Self {
+        Self {
+            entry: 0,
+            stack_usage: 0,
+            frame_size: 0,
+            arity: 0,
+        }
+    }
+}
+
+/// The per-call-site leaf-call cache (Cut 39): the compiled `CallFast`/
+/// `CallFastSlot` sites reuse the probe helper's verdict instead of calling
+/// it every visit. The machine code trusts a record only when ALL of: the
+/// step index matches `site`, the ctx's LIVE `leaf_epoch` still equals
+/// `epoch` (no slow-path helper that can re-enter the interpreter has run
+/// since the probe), and the callee's NaN-box upper bits + payload match
+/// `callee_hi`/`callee_payload` — together those cover all 64 value bits, so
+/// the identity check is exact (a polymorphic call site re-probes). The
+/// probe fills `leaf_inline`; a zero `entry` caches a rejection (the site
+/// falls back to `call_slow`). `#[repr(C)]` with all-scalar fields: the
+/// compiled code reads the fields at fixed offsets (`offset_of!`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LeafCallSiteCache {
+    /// The call-site step index this record belongs to (`u32::MAX` = none).
+    pub site: u32,
+    /// The leaf-eligibility epoch at probe time (see `JitCallContext::leaf_epoch`).
+    pub epoch: u32,
+    /// The callee's `bits >> 44` (the NaN-box prefix + tag) at probe time.
+    pub callee_hi: u32,
+    /// The callee's `bits & PAYLOAD_MASK` (the box address >> 4) at probe time.
+    pub callee_payload: u64,
+    /// The probe's verdict (see `LeafInlineInfo`).
+    pub leaf_inline: LeafInlineInfo,
+}
+
+impl LeafCallSiteCache {
+    /// An empty record: no site matches (`site` is `u32::MAX`), so the first
+    /// visit probes.
+    pub const fn empty() -> Self {
+        Self {
+            site: u32::MAX,
+            epoch: 0,
+            callee_hi: 0,
+            callee_payload: 0,
+            leaf_inline: LeafInlineInfo::empty(),
+        }
+    }
+}
+
 /// The per-call context the Vm passes to a compiled body as its `ctx`
 /// argument. `pending` is offset 0 — the compiled code's error-check ABI.
 #[repr(C)]
@@ -96,6 +169,10 @@ pub struct JitCallContext {
     /// The `Agent::global_value_cells` array base (the JIT indexes it by
     /// `name & (GLOBAL_CELLS - 1)` and reads the `#[repr(C)]` cells).
     pub global_value_cells: *mut c_void,
+    /// The `Agent::member_value_cells` array base (the compiled
+    /// `GetMemberName` probe indexes it by `(object_id ^ name) &
+    /// (MEMBER_CELLS - 1)` and reads the `#[repr(C)]` cells).
+    pub member_value_cells: *mut c_void,
     /// Whether the body's env chain is EXACTLY the global env (no
     /// intermediate envs): the compiled `LoadIdent` probe is sound only then
     /// — a named function expression's self-binding scope, a block/catch
@@ -104,6 +181,20 @@ pub struct JitCallContext {
     /// Computed once per call — a certified body adds no envs mid-run (no
     /// `with`/`eval` in its own statements).
     pub clean_chain: bool,
+    /// One-past-the-end of the JIT's working buffer (in bytes): the
+    /// compiled leaf-call probe checks the inline leaf's frame + working
+    /// area fits above the current stack top before accepting.
+    pub buf_end: *mut c_void,
+    /// Cut 39: the leaf-eligibility epoch — the compiled code bumps it after
+    /// every slow-path helper that can re-enter the interpreter (a getter,
+    /// setter, `valueOf`/`toString`, or nested call), and the compiled
+    /// leaf-call cache is trusted only while `leaf_call_cache.epoch ==
+    /// leaf_epoch`. A certified body's own statements never touch the Vm
+    /// stacks or realm count the probe's eligibility checks, so a helper is
+    /// the only way those can change mid-run.
+    pub leaf_epoch: u32,
+    /// Cut 39: the per-call-site leaf-call cache (see `LeafCallSiteCache`).
+    pub leaf_call_cache: LeafCallSiteCache,
 }
 
 /// A direct-mapped global-value cell the compiled `LoadGlobal`/`StoreGlobal`
@@ -188,6 +279,19 @@ pub struct JitSlowPaths {
     /// slots). Runs the interpreter's call machinery on the Vm's own stack.
     pub call_slow:
         extern "C" fn(ctx: *mut c_void, callee: u64, this: u64, argc: u64, args: *mut u64) -> u64,
+    /// Cut 37: the compiled leaf-call probe — validates the callee (a
+    /// certified, environment-free, this-less leaf whose body has compiled
+    /// machine code) and that the inline frame + working area fit above the
+    /// current stack top in the JIT buffer, fills the leaf's frame (the
+    /// params/vars/TDZ slots above the argument region; the aliased case is
+    /// the arguments themselves), and returns the leaf's JIT entry (0 = the
+    /// call site falls back to `call_slow`). `args` points at the argument
+    /// region's first slot; `argc` is the argument count; `site` is the call
+    /// site's step index (Cut 39 — the probe records it, plus the live
+    /// leaf-eligibility epoch and the callee identity, so the compiled code
+    /// can skip the probe on repeat visits).
+    pub leaf_call_probe:
+        extern "C" fn(ctx: *mut c_void, callee: u64, args: *mut u64, argc: u64, site: u64) -> u64,
     /// Read a declared top-level `var` off the global object (`name` is an
     /// `AtomId`); returns the value.
     pub get_global: extern "C" fn(ctx: *mut c_void, name: u64) -> u64,
@@ -287,6 +391,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     set_member_name,
     set_member_computed,
     call_slow,
+    leaf_call_probe,
     get_global,
     set_global,
     set_global_slot,
@@ -565,6 +670,116 @@ extern "C" fn call_slow(
             slow_error(ctx, error)
         }
     }
+}
+
+extern "C" fn leaf_call_probe(
+    ctx: *mut c_void,
+    callee: u64,
+    args: *mut u64,
+    argc: u64,
+    site: u64,
+) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    // Record the cache identity up front, before any rejection: the compiled
+    // code reuses this record only when its step index, the live leaf epoch,
+    // and the callee's full NaN-box identity all match — so a cached zero
+    // entry skips the probe for a stable rejection, and a stale record is
+    // simply re-probed.
+    ctx.leaf_call_cache = LeafCallSiteCache {
+        site: site as u32,
+        epoch: ctx.leaf_epoch,
+        callee_hi: (callee >> 44) as u32,
+        callee_payload: callee & crux::PAYLOAD_MASK,
+        leaf_inline: LeafInlineInfo::empty(),
+    };
+    let callee = Value::from_bits(callee);
+    // The eligibility mirrors `fast_call_core`'s leaf gate (the compiled
+    // call site is inside a certified body, whose own stacks are the ones
+    // `can_inline_leaf` checks), plus the inline-specific restrictions: the
+    // leaf must not read its environment (the body_context/lexical_env swap
+    // `run_jit_leaf` performs around the run cannot be split across the
+    // helper/machine-code boundary) and must have no `this` slot (the
+    // machine code cannot bind `this` into the frame).
+    if !vm.can_inline_leaf() || agent.realm_count.get() != 1 {
+        return 0;
+    }
+    let ValueKind::Function(function) = callee.kind() else {
+        return 0;
+    };
+    if !matches!(function.kind, crux::function::FunctionKind::EcmaScript) {
+        return 0;
+    }
+    let Some(entry) = agent.leaf_lookup(function.id()) else {
+        return 0;
+    };
+    let ir = entry.ir.clone();
+    if ir.leaf_uses_env {
+        return 0;
+    }
+    let Some(scope) = ir.scope.as_ref() else {
+        return 0;
+    };
+    if scope.this_slot.is_some() {
+        return 0;
+    }
+    // The leaf must have compiled machine code (compiling on first use); a
+    // body without compiled code falls back to `call_slow`, whose
+    // interpreter leaf-inline path handles it. The in-flight flag keeps the
+    // cache from evicting a frame running right now.
+    let Some(hook) = agent.jit_hook else {
+        return 0;
+    };
+    let info_ptr = crate::jit::lookup_info(hook, &ir, agent.jit_depth > 0);
+    if info_ptr.is_null() {
+        return 0;
+    }
+    let compiled = unsafe { &*info_ptr };
+    // The inline frame + working area must fit above the argument region's
+    // top in the caller's working buffer: the aliased case (the frame IS
+    // the arguments) needs only the working area; the built frame adds its
+    // frame_size slots on top of the args.
+    let argc = argc as usize;
+    let aliased = scope.frame_size == scope.arity && argc >= scope.frame_size;
+    let args_top = (args as usize) + argc * 8;
+    let needed = (if aliased { 0 } else { scope.frame_size }) + compiled.stack_usage;
+    if args_top + needed * 8 > ctx.buf_end as usize {
+        return 0;
+    }
+    // Fill the leaf's frame above the arguments (the aliased case is the
+    // arguments themselves — no fill; missing arguments stay `undefined`,
+    // var slots `undefined`, lexical slots the uninitialized marker). The
+    // buffer is only written by the machine code, which is suspended for
+    // the duration of this synchronous helper.
+    if !aliased {
+        let frame = args_top as *mut u64;
+        for slot in 0..scope.frame_size {
+            let value = if slot < scope.arity {
+                if slot < argc {
+                    // SAFETY: the JIT passes a pointer into its own (live)
+                    // stack buffer with `argc` slots.
+                    unsafe { *args.add(slot) }
+                } else {
+                    Value::Undefined.bits()
+                }
+            } else if scope.tdz_store.get(slot).copied().unwrap_or(false) {
+                Value::uninitialized().bits()
+            } else {
+                Value::Undefined.bits()
+            };
+            // SAFETY: the room check above guarantees `frame_size` slots
+            // fit past the argument region's top.
+            unsafe { *frame.add(slot) = value };
+        }
+    }
+    ctx.leaf_call_cache.leaf_inline = LeafInlineInfo {
+        entry: compiled.entry as u64,
+        stack_usage: compiled.stack_usage as u64,
+        frame_size: scope.frame_size as u32,
+        arity: scope.arity as u32,
+    };
+    compiled.entry as u64
 }
 
 extern "C" fn get_global(ctx: *mut c_void, name: u64) -> u64 {
@@ -1210,7 +1425,11 @@ pub(crate) fn run_jit_body(
         vm: vm as *mut Vm,
         global_object: global.as_ptr() as *mut c_void,
         global_value_cells: agent.global_value_cells.as_ptr() as *mut c_void,
+        member_value_cells: agent.member_value_cells.as_ptr() as *mut c_void,
         clean_chain,
+        buf_end: (work_ptr as usize + work_len * std::mem::size_of::<Value>()) as *mut c_void,
+        leaf_epoch: 0,
+        leaf_call_cache: LeafCallSiteCache::empty(),
     };
     // Register the vm (its trace covers `vm.frame`, `vm.stack`, and any
     // nested leaf jit roots) plus the working area for the call's duration:

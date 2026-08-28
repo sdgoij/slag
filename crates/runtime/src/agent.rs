@@ -139,9 +139,11 @@ pub struct Agent {
     /// The fronting read-side value cache (Cut 35 slice 11): (id, name,
     /// generation, value) — a hit returns the value with no property-vector
     /// borrow or re-validation. Boxed so the Agent's hot-field cache
-    /// footprint stays small (the Cut 27 lesson).
-    pub(crate) member_value_cells:
-        Box<[Option<crate::ir::MemberValueCell>; crate::ir::MEMBER_CELLS]>,
+    /// footprint stays small (the Cut 27 lesson). A plain `#[repr(C)]`
+    /// array (no `Option`) so the compiled `GetMemberName` probe reads the
+    /// cells at fixed offsets; `MemberValueCell::empty()`'s impossible id
+    /// never validates.
+    pub(crate) member_value_cells: Box<[crate::ir::MemberValueCell; crate::ir::MEMBER_CELLS]>,
     /// The fronting array-element value cache (Cut 35 slice 13): (id, index,
     /// generation, value) — a hit returns the element with no
     /// property-vector borrow. Boxed per the Cut 27 lesson.
@@ -630,7 +632,9 @@ impl Agent {
             global_leaf_cells: Box::new(std::array::from_fn(|_| None)),
             slot_leaf_cells: Box::new(std::array::from_fn(|_| None)),
             member_cells: [None; crate::ir::MEMBER_CELLS],
-            member_value_cells: Box::new(std::array::from_fn(|_| None)),
+            member_value_cells: Box::new(std::array::from_fn(|_| {
+                crate::ir::MemberValueCell::empty()
+            })),
             array_element_value_cells: Box::new(std::array::from_fn(|_| None)),
             array_length_cells: Box::new(std::array::from_fn(|_| None)),
             member_proto_cells: [None; crate::ir::MEMBER_CELLS],

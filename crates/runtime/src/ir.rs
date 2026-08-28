@@ -1484,8 +1484,9 @@ type ForInState = (Handle<crux::object::JsObject>, Vec<(usize, Value)>, usize);
 /// slots); larger layouts fall back to the heap.
 const INLINE_FRAME: usize = 8;
 /// The direct-mapped member-access cell count (P3): a power of two so the
-/// cache index is a mask.
-pub(crate) const MEMBER_CELLS: usize = 16;
+/// cache index is a mask. `pub` so the jit crate's inline member-cell probe
+/// indexes the same table.
+pub const MEMBER_CELLS: usize = 16;
 
 /// The cached `prototype` read of a constructor (Cut 26): (function id,
 /// generation, value) — a hot construct loop pays a direct-mapped probe
@@ -1577,13 +1578,30 @@ pub(crate) type MemberStoreCell = (u64, crux::AtomId, u32, [u32; 4]);
 /// `object.name` at the object's generation — a generation match means no
 /// own-property change since the read (every mutation path bumps,
 /// including `set_key`'s in-place value update), so the value is current
-/// without re-borrowing the property vector.
+/// without re-borrowing the property vector. `#[repr(C)]` with all-scalar
+/// fields so the compiled `GetMemberName` probe reads them at fixed
+/// offsets (`offset_of!`).
+#[repr(C)]
 #[derive(Clone)]
-pub(crate) struct MemberValueCell {
+pub struct MemberValueCell {
     pub id: u64,
     pub name: crux::AtomId,
     pub generation: u32,
     pub value: Value,
+}
+
+impl MemberValueCell {
+    /// An empty cell: `id` is an impossible object id, so the compiled
+    /// probe's validation never matches it and the read falls to the full
+    /// Get.
+    pub(crate) const fn empty() -> Self {
+        Self {
+            id: u64::MAX,
+            name: 0,
+            generation: 0,
+            value: Value::Undefined,
+        }
+    }
 }
 
 /// Part B, B5.2: map-keyed member cache entry — maps (map_id, name) to a
@@ -2869,6 +2887,17 @@ impl Vm {
             && cell.name == name
             && let Some(value) = object.map_field(cell.slot)
         {
+            // Warm the JIT's member-value probe too: a map-served read is an
+            // own data property like the slot path's, so the compiled
+            // `GetMemberName` probe (id + name + generation validation)
+            // serves the next read as a native load.
+            agent.member_value_cells[Self::member_cell_index(object.id(), name)] =
+                MemberValueCell {
+                    id: object.id(),
+                    name,
+                    generation: object.generation(),
+                    value,
+                };
             return Some(value);
         }
         // Cache miss (a cold shape or an evicted entry): resolve through the
@@ -2877,6 +2906,12 @@ impl Vm {
         let slot = map.field_offset(&key)?;
         let value = object.map_field(slot)?;
         agent.member_map_cells[index] = Some(MemberMapCell { map_id, name, slot });
+        agent.member_value_cells[Self::member_cell_index(object.id(), name)] = MemberValueCell {
+            id: object.id(),
+            name,
+            generation: object.generation(),
+            value,
+        };
         Some(value)
     }
 
@@ -2894,11 +2929,8 @@ impl Vm {
         }
         let object = Self::cell_object(object)?;
         let index = Self::member_cell_index(object.id(), name);
-        if let Some(cell) = agent.member_value_cells[index].as_ref()
-            && cell.id == object.id()
-            && cell.name == name
-            && cell.generation == object.generation()
-        {
+        let cell = &agent.member_value_cells[index];
+        if cell.id == object.id() && cell.name == name && cell.generation == object.generation() {
             return Some(cell.value);
         }
         let slot = match agent.member_cells[index] {
@@ -2937,12 +2969,12 @@ impl Vm {
         match &property.kind {
             crux::object::PropertyKind::Data { value, .. } => {
                 let value = *value;
-                agent.member_value_cells[index] = Some(MemberValueCell {
+                agent.member_value_cells[index] = MemberValueCell {
                     id: object.id(),
                     name,
                     generation: object.generation(),
                     value,
-                });
+                };
                 Some(value)
             }
             _ => None,
@@ -3160,12 +3192,12 @@ impl Vm {
             // so the next `member_cell_get` returns it with no
             // property-vector borrow or proto-keyed fallback.
             let index = Self::member_cell_index(receiver.id(), *atom);
-            agent.member_value_cells[index] = Some(MemberValueCell {
+            agent.member_value_cells[index] = MemberValueCell {
                 id: receiver.id(),
                 name: *atom,
                 generation: receiver.generation(),
                 value: *value,
-            });
+            };
         }
         Ok(ok)
     }
@@ -3185,12 +3217,12 @@ impl Vm {
             {
                 let index = Self::member_cell_index(object.id(), name);
                 agent.member_cells[index] = Some((object.id(), name, slot));
-                agent.member_value_cells[index] = Some(MemberValueCell {
+                agent.member_value_cells[index] = MemberValueCell {
                     id: object.id(),
                     name,
                     generation: object.generation(),
                     value: *value,
-                });
+                };
                 // Cut 23: cache the slot for the prototype too — fresh
                 // instances of the same shape hit the proto-keyed fallback
                 // in `member_cell_get` (validated per access).
@@ -7164,7 +7196,7 @@ impl Vm {
     /// destructure flags are false at any call step by construction (they
     /// are only set around the iterator steps that run on nested Vms).
     #[inline]
-    fn can_inline_leaf(&self) -> bool {
+    pub(crate) fn can_inline_leaf(&self) -> bool {
         self.try_stack.is_empty()
             && self.pending.is_empty()
             && self.for_of_stack.is_empty()
@@ -8832,7 +8864,12 @@ impl Vm {
             vm: self as *mut Vm,
             global_object: global.as_ptr() as *mut std::os::raw::c_void,
             global_value_cells: agent.global_value_cells.as_ptr() as *mut std::os::raw::c_void,
+            member_value_cells: agent.member_value_cells.as_ptr() as *mut std::os::raw::c_void,
             clean_chain,
+            buf_end: (buf.as_ptr() as usize + std::mem::size_of_val(buf))
+                as *mut std::os::raw::c_void,
+            leaf_epoch: 0,
+            leaf_call_cache: crate::jit::LeafCallSiteCache::empty(),
         };
         let frame_ptr = buf.as_mut_ptr() as *mut std::os::raw::c_void;
         // SAFETY: `buf` has `frame_size + stack_usage + slack` slots.
