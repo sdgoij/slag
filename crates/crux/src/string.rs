@@ -356,8 +356,8 @@ pub type AtomId = u32;
 
 #[derive(Default)]
 struct Interner {
-    map: HashMap<Box<[u16]>, AtomId>,
-    atoms: Vec<Box<[u16]>>,
+    map: HashMap<Arc<[u16]>, AtomId>,
+    atoms: Vec<Arc<[u16]>>,
 }
 
 impl Interner {
@@ -366,9 +366,9 @@ impl Interner {
             return id;
         }
         let id = self.atoms.len() as AtomId;
-        let key: Box<[u16]> = units.into();
-        self.map.insert(key.clone(), id);
-        self.atoms.push(key);
+        let key: Arc<[u16]> = units.into();
+        self.atoms.push(key.clone());
+        self.map.insert(key, id);
         id
     }
 
@@ -399,7 +399,7 @@ const MEMO_CAP: usize = 64;
 thread_local! {
     static LOOKUP_MEMO: std::cell::RefCell<Vec<(AtomId, JsString)>> =
         const { std::cell::RefCell::new(Vec::new()) };
-    static INTERN_MEMO: std::cell::RefCell<Vec<(Box<[u16]>, AtomId)>> =
+    static INTERN_MEMO: std::cell::RefCell<Vec<(Arc<[u16]>, AtomId)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
