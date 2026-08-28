@@ -162,12 +162,13 @@ impl Compiled {
 /// Each entry holds the body's `Rc` strongly, so the key can never be reused
 /// by a different body while its compiled code is cached, and entries are
 /// never evicted while live — a running JIT frame holds raw pointers into
-/// the executable allocation. (A future eviction policy must track
-/// in-flight frames.)
+/// the executable allocation. A body that fails to compile is remembered as
+/// a miss so the (expensive) compile attempt happens once, not on every
+/// call. (A future eviction policy must track in-flight frames.)
 pub struct JitCache {
     engine: JitEngine,
     helpers: JitHelpers,
-    entries: HashMap<usize, (Rc<CompiledBody>, Rc<Compiled>)>,
+    entries: HashMap<usize, (Rc<CompiledBody>, Option<Rc<Compiled>>)>,
 }
 
 impl JitCache {
@@ -186,20 +187,24 @@ impl JitCache {
     pub fn lookup(&mut self, body: &Rc<CompiledBody>) -> *const JitCompiledInfo {
         let key = Rc::as_ptr(body) as usize;
         if !self.entries.contains_key(&key) {
-            let Some(compiled) = self.engine.compile(body, &self.helpers) else {
-                return std::ptr::null();
-            };
-            self.entries.insert(key, (body.clone(), Rc::new(compiled)));
+            let compiled = self.engine.compile(body, &self.helpers).map(Rc::new);
+            self.entries.insert(key, (body.clone(), compiled));
         }
         // The entry is never evicted (and HashMap nodes are individually
         // heap-allocated), so the reference outlives this call.
         let (_, compiled) = &self.entries[&key];
-        &compiled.info
+        match compiled {
+            Some(compiled) => &compiled.info,
+            None => std::ptr::null(),
+        }
     }
 
     /// The number of distinct bodies compiled so far (test introspection).
     pub fn compiled_count(&self) -> usize {
-        self.entries.len()
+        self.entries
+            .values()
+            .filter(|(_, compiled)| compiled.is_some())
+            .count()
     }
 }
 
@@ -397,6 +402,33 @@ mod tests {
     }
 
     #[test]
+    fn register_body_push_acc_spills_the_accumulator() {
+        // `acc = 1; push acc; acc = 2; acc = pop + acc; return acc` — the
+        // Cut 35 slice 10 spill shape (`LeafOp::PushAcc` pushes the
+        // ACCUMULATOR, not the loop counter; the counter push is
+        // `Step::PushAcc`, which a register body reads via `LoadCounter`).
+        // Expected 3; pushing the counter (seeded 0) would return 2.
+        let engine = JitEngine::new().expect("native isa");
+        let body = make_body(
+            vec![Step::RunRegBody {
+                ops: vec![
+                    runtime::ir::LeafOp::LoadConst(Value::Number(1.0)),
+                    runtime::ir::LeafOp::PushAcc,
+                    runtime::ir::LeafOp::LoadConst(Value::Number(2.0)),
+                    runtime::ir::LeafOp::BinAccPop {
+                        op: syntax::ast::BinaryOp::Add,
+                    },
+                    runtime::ir::LeafOp::ReturnAcc,
+                ]
+                .into(),
+            }],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(3.0).bits());
+    }
+
+    #[test]
     fn compile_and_run_register_loop_body() {
         // The register-lowered body: `n = n + 1` (LoadReg + BinImmLocal +
         // StoreReg) inside the counter loop, i.e. a `RunRegBody` body.
@@ -581,6 +613,10 @@ mod tests {
             0,
         ));
         assert!(cache.lookup(&body).is_null());
+        // A failed compile is remembered, so the (expensive) attempt does
+        // not repeat on every call.
+        assert!(cache.lookup(&body).is_null());
+        assert_eq!(cache.compiled_count(), 0);
     }
 
     #[test]

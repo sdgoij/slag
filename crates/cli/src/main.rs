@@ -7,8 +7,10 @@
 //!   quits).
 //!
 //! Flags: `--version`/`-V`, `--help`/`-h`, `--dump-ast`, `--dump-tokens`,
-//! `--bench` (run the micro-benchmark suite), `--print-bytecode` (print the
-//! compiled step stream), and the accepted-no-op knobs `--stack-size N`,
+//! `--bench` (run the micro-benchmark suite), `--jit-bench` (run the
+//! JIT-vs-interpreter comparison suite), `--print-bytecode` (print the
+//! compiled step stream), `--jit` (install the Cranelift JIT hook on every
+//! context), and the accepted-no-op knobs `--stack-size N`,
 //! `--max-old-space N`, `--harmony-*`.
 
 use std::io::{self, BufRead, Write};
@@ -27,8 +29,10 @@ struct Options {
     dump_ast: bool,
     dump_tokens: bool,
     bench: bool,
+    jit_bench: bool,
     print_bytecode: bool,
     gc_stress: bool,
+    jit: bool,
     stack_size: Option<u64>,
     max_old_space: Option<u64>,
 }
@@ -57,7 +61,9 @@ fn parse(args: &[String]) -> Command {
             "--dump-ast" => options.dump_ast = true,
             "--dump-tokens" => options.dump_tokens = true,
             "--bench" => options.bench = true,
+            "--jit-bench" => options.jit_bench = true,
             "--print-bytecode" => options.print_bytecode = true,
+            "--jit" => options.jit = true,
             "--stack-size" => {
                 index += 1;
                 options.stack_size = args.get(index).and_then(|value| value.parse().ok());
@@ -108,6 +114,8 @@ fn run(command: Command) -> Result<(), u8> {
             eprintln!("  --help, -h");
             eprintln!("  --dump-ast, --dump-tokens");
             eprintln!("  --bench");
+            eprintln!("  --jit-bench               JIT vs interpreter comparison");
+            eprintln!("  --jit                     install the Cranelift JIT hook");
             eprintln!("  --print-bytecode");
             eprintln!("  --stack-size N            (no-op)");
             eprintln!("  --max-old-space N         (no-op)");
@@ -121,9 +129,15 @@ fn run(command: Command) -> Result<(), u8> {
             options,
         } => run_file(&file, &args, &options),
         Command::Repl(options) => {
+            if options.jit_bench {
+                return run_jit_benchmarks();
+            }
             if options.bench {
                 let mut context = Context::new().map_err(report)?;
                 context.set_gc_stress(options.gc_stress);
+                if options.jit {
+                    jit::install(context.agent_mut()).map_err(report)?;
+                }
                 return run_benchmarks(&mut context);
             }
             repl(&options)
@@ -158,6 +172,9 @@ fn run_file_inner(file: &str, args: &[String], options: &Options, source: &str) 
     }
     let mut context = Context::new().map_err(report)?;
     context.set_gc_stress(options.gc_stress);
+    if options.jit {
+        jit::install(context.agent_mut()).map_err(report)?;
+    }
     context.install_fs().map_err(report)?;
     if !args.is_empty() {
         let mut argv = vec![
@@ -245,6 +262,9 @@ fn dump_bytecode(source: &str) -> Result<(), u8> {
 fn repl(options: &Options) -> Result<(), u8> {
     let mut context = Context::new().map_err(report)?;
     context.set_gc_stress(options.gc_stress);
+    if options.jit {
+        jit::install(context.agent_mut()).map_err(report)?;
+    }
     println!("slag {VERSION} REPL (type .exit or Ctrl-D to quit)");
     let stdin = io::stdin();
     let mut buffer = String::new();
@@ -416,6 +436,66 @@ fn run_benchmarks(context: &mut Context) -> Result<(), u8> {
     Ok(())
 }
 
+/// Run the JIT-vs-interpreter comparison suite: each snippet is a certified
+/// leaf callee whose body is inside the JIT's supported subset (the
+/// counter-loop / arithmetic / member shapes the JIT lowers), so the JIT
+/// column actually executes machine code. Each snippet runs in two fresh
+/// contexts — one with the JIT hook installed, one without — each warmed by
+/// one eval and timed on a second. The printed ratio is jit/interpreter
+/// (below 1 means the JIT is faster; ~1 means the body did not JIT). Note
+/// that re-evaluating the source re-parses the function into a fresh body,
+/// so the JIT column's timed run includes one Cranelift compile (~1ms for
+/// these tiny bodies) — the loop timings are therefore pessimistic. The
+/// completion values are compared as a differential check that the machine
+/// code agrees with the interpreter.
+fn run_jit_benchmarks() -> Result<(), u8> {
+    let benchmarks: &[(&str, &str)] = &[
+        (
+            "arithmetic",
+            "function bench() { var n = 0; for (var i = 0; i < 1_000_000; i++) { n += i * 2; } return n; } bench();",
+        ),
+        (
+            "property read",
+            "function bench(o) { var n = 0; for (var i = 0; i < 1_000_000; i++) { n += o.a + o.b; } return n; } bench({ a: 1, b: 2 });",
+        ),
+        (
+            "string concat",
+            "function bench(x) { var s = x; for (var i = 0; i < 100_000; i++) { s += x; } return s.length; } bench('x');",
+        ),
+    ];
+    println!("slag {VERSION} JIT vs interpreter micro-benchmarks");
+    println!("(ratio < 1 means the JIT is faster; ~1 means the body did not JIT)");
+    for (name, source) in benchmarks {
+        let (interp, interp_result) = bench_once(source, false)?;
+        let (jit, jit_result) = bench_once(source, true)?;
+        let ratio = jit.as_secs_f64() / interp.as_secs_f64();
+        let agrees = interp_result == jit_result;
+        if agrees {
+            println!("{name:18} interp {interp:12?}  jit {jit:12?}  ratio {ratio:5.2}  result-ok");
+        } else {
+            println!(
+                "{name:18} interp {interp:12?}  jit {jit:12?}  ratio {ratio:5.2}  MISMATCH interp={interp_result:?} jit={jit_result:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Time one evaluation of `source` in a fresh context (warm-up eval, then a
+/// timed eval), installing the JIT hook when `jit` is set. Returns the
+/// elapsed time and the completion value's number (the suite's snippets all
+/// complete with a Number).
+fn bench_once(source: &str, jit: bool) -> Result<(std::time::Duration, Option<f64>), u8> {
+    let mut context = Context::new().map_err(report)?;
+    if jit {
+        jit::install(context.agent_mut()).map_err(report)?;
+    }
+    context.eval(source).map_err(report)?;
+    let start = Instant::now();
+    let value = context.eval(source).map_err(report)?;
+    Ok((start.elapsed(), value.as_number()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,6 +550,20 @@ mod tests {
                 options,
             }
         );
+    }
+
+    #[test]
+    fn jit_flags_are_recognized() {
+        let options = Options {
+            jit: true,
+            ..Options::default()
+        };
+        assert_eq!(parse(&["--jit".into()]), Command::Repl(options.clone()));
+        let options = Options {
+            jit_bench: true,
+            ..Options::default()
+        };
+        assert_eq!(parse(&["--jit-bench".into()]), Command::Repl(options));
     }
 
     #[test]

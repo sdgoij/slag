@@ -1412,7 +1412,10 @@ impl<'a> Lowerer<'a> {
                 self.builder.def_var(self.acc_var, res);
             }
             LeafOp::PushAcc => {
-                let bits = self.counter_bits();
+                // The register executor pushes the accumulator (Cut 35 slice
+                // 10 spill) — NOT the loop counter (that is `Step::PushAcc`,
+                // which lowers to `LoadCounter` instead).
+                let bits = self.builder.use_var(self.acc_var);
                 self.push(bits);
             }
             LeafOp::ReturnAcc => {
