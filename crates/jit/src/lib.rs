@@ -1416,4 +1416,80 @@ mod tests {
         assert_eq!(value.as_number(), Some(41.0));
         assert!(compiled >= 1, "{compiled} bodies");
     }
+
+    #[test]
+    fn installed_jit_runs_a_fused_global_call_store() {
+        // `s = g(i)` inside a loop: the compiler fuses the arg loads, the
+        // global-callee call, and the store into one `CallFastGlobalStore`
+        // step, whose handler passes the caller-frame argument base. The
+        // enclosing body bails (the fused step is unsupported), so the
+        // interpreter runs it and the fused call site hands the certified
+        // callee's run to the JIT with the args materialized from the
+        // frame.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function g(x) { return x + 1; }\n\
+                     function f(n) { var s = 0; for (var i = 0; i < 100; i++) { s = g(i); } return s; }\n\
+                     f(100);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(100.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_fused_slot_call_store() {
+        // The param-callee twin: `s = g(i)` fuses into `CallFastSlotStore`
+        // (the callee comes from the frame slot); the anonymous callee's
+        // body is a certified leaf, JIT-run from the fused call site's
+        // caller-frame argument base.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(g, n) { var s = 0; for (var i = 0; i < n; i++) { s = g(i); } return s; }\n\
+                     f(function (x) { return x + 1; }, 100);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(100.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_tail_call_to_a_leaf() {
+        // `return g(x)` in tail position routes through `tail_call_shared`,
+        // whose leaf path hands the certified callee's run to the JIT. The
+        // driver is called 1000 times, so the TCO fires a thousand JIT
+        // runs; the driver body bails (its tail-call step is unsupported)
+        // and runs on the interpreter.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function g(x) { return x + 1; }\n\
+                     function f(x) { return g(x); }\n\
+                     var s = 0; for (var i = 0; i < 1000; i++) { s = f(i); } s",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(1000.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_construct_leaf() {
+        // `new C(5)`: C's body is a construct-inline certified leaf, so the
+        // certified construct path (`run_leaf_construct`) materializes the
+        // construct args and hands the run to the JIT; the base-constructor
+        // result rule (an object/function return wins, else `this`) lands
+        // the constructed object.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script("function C(x) { this.v = x; } new C(5).v")
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(5.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
 }
