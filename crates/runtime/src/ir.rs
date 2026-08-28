@@ -7833,6 +7833,23 @@ impl Vm {
         args: &[Value],
     ) -> Result<Value, JsError> {
         let this = crate::function::construct_this_object(agent, new_target)?;
+        // The JIT path: the machine code reads its arguments off the value
+        // stack (its frame is a private buffer), so the construct args are
+        // materialized first — the same layout the leaf-inline run uses —
+        // and the base-constructor result rule applies to the returned
+        // value (an object/function return wins, else `this`).
+        if agent.jit_hook.is_some() {
+            let pre_call = self.stack.len();
+            self.stack.extend_from_slice(args);
+            if self.run_jit_leaf(agent, args.len(), this, ir, strict, 0, environment)? {
+                let value = self.pop();
+                return match value.kind() {
+                    ValueKind::Object(_) | ValueKind::Function(_) => Ok(value),
+                    _ => Ok(this),
+                };
+            }
+            self.stack.truncate(pre_call);
+        }
         let completion = self.run_leaf_body(agent, ir, environment, strict, this, args)?;
         // spec 10.2.1 [[Construct]] steps 15-21 (base): an object return
         // wins; anything else falls back to `this`.
@@ -8065,6 +8082,25 @@ impl Vm {
                 construct_inline: entry.construct_inline,
             };
             let below = self.stack.len() - argc - keep;
+            // The JIT path first: `run_jit_leaf` pushes the result exactly
+            // like the interpreter's leaf-inline run (the truncate + push
+            // tail), so the same pop-and-complete-return follows.
+            if agent.jit_hook.is_some()
+                && self.run_jit_leaf(
+                    agent,
+                    argc,
+                    this,
+                    &entry.ir,
+                    entry.strict,
+                    below,
+                    entry.environment,
+                )?
+            {
+                let value = self.pop();
+                return Ok(TailOutcome::Returned(
+                    self.return_completion(agent, body, value)?,
+                ));
+            }
             self.run_inline_leaf(agent, argc, this, entry, below, None)?;
             let value = self.pop();
             return Ok(TailOutcome::Returned(
@@ -8336,6 +8372,24 @@ impl Vm {
                 && self.can_inline_leaf()
                 && agent.realm_count.get() == 1
             {
+                if agent.jit_hook.is_some() {
+                    if self.try_jit_leaf(
+                        agent,
+                        argc,
+                        Value::Undefined,
+                        &entry.ir,
+                        entry.strict,
+                        0,
+                        entry.environment,
+                        caller_arg_base,
+                    )? {
+                        return Ok(());
+                    }
+                    // The fused args (if any) were materialized by the JIT
+                    // attempt; the interpreter fallback reads them from the
+                    // stack (no caller-frame base).
+                    return self.run_inline_leaf(agent, argc, Value::Undefined, entry, 0, None);
+                }
                 return self.run_inline_leaf(
                     agent,
                     argc,
@@ -8391,6 +8445,24 @@ impl Vm {
             && agent.realm_count.get() == 1
         {
             let entry = cell.entry.clone();
+            if agent.jit_hook.is_some() {
+                if self.try_jit_leaf(
+                    agent,
+                    argc,
+                    Value::Undefined,
+                    &entry.ir,
+                    entry.strict,
+                    0,
+                    entry.environment,
+                    caller_arg_base,
+                )? {
+                    return Ok(());
+                }
+                // The fused args (if any) were materialized by the JIT
+                // attempt; the interpreter fallback reads them from the
+                // stack.
+                return self.run_inline_leaf(agent, argc, Value::Undefined, entry, 0, None);
+            }
             return self.run_inline_leaf(agent, argc, Value::Undefined, entry, 0, caller_arg_base);
         }
         let callee = *callee;
@@ -8526,6 +8598,40 @@ impl Vm {
         self.stack.truncate(pre_call - below);
         self.stack.push(result);
         Ok(())
+    }
+
+    /// Try the JIT leaf path at this call site, shared by every leaf entry
+    /// point. `caller_arg_base` marks a fused call-store site whose
+    /// arguments live in the caller's frame slots (Cut 35 slice 23) —
+    /// materialize them first so `run_jit_leaf` reads them from the stack; a
+    /// `None` base means the arguments are already on the stack (a normal
+    /// call site, TCO, or a construct site the caller materialized). Returns
+    /// `Ok(true)` when the compiled body ran (its result replaced the call
+    /// site), `Ok(false)` when the hook is absent or the body has no
+    /// compiled code — the caller falls back to the interpreter, and any
+    /// materialized arguments remain on the stack for the stack-argument
+    /// fallback.
+    #[allow(clippy::too_many_arguments)]
+    fn try_jit_leaf(
+        &mut self,
+        agent: &mut Agent,
+        argc: usize,
+        this: Value,
+        ir: &std::rc::Rc<CompiledBody>,
+        strict: bool,
+        below: usize,
+        environment: Option<EnvRef>,
+        caller_arg_base: Option<usize>,
+    ) -> Result<bool, JsError> {
+        if agent.jit_hook.is_none() {
+            return Ok(false);
+        }
+        if let Some(base) = caller_arg_base {
+            for i in 0..argc {
+                self.stack.push(*self.frame_get(base + i));
+            }
+        }
+        self.run_jit_leaf(agent, argc, this, ir, strict, below, environment)
     }
 
     /// The JIT leaf path (see `crate::jit`): run `ir`'s compiled machine
@@ -8753,17 +8859,16 @@ impl Vm {
             // The JIT path (when installed) runs the certified body's
             // machine code; a body without compiled code falls through to
             // the interpreter's leaf-inline run.
-            if agent.jit_hook.is_some()
-                && self.run_jit_leaf(
-                    agent,
-                    argc,
-                    this,
-                    &entry.ir,
-                    entry.strict,
-                    below,
-                    entry.environment,
-                )?
-            {
+            if self.try_jit_leaf(
+                agent,
+                argc,
+                this,
+                &entry.ir,
+                entry.strict,
+                below,
+                entry.environment,
+                None,
+            )? {
                 return Ok(());
             }
             return self.run_inline_leaf(agent, argc, this, entry, below, None);
