@@ -318,6 +318,7 @@ fn runtime_helpers() -> JitHelpers {
     let rt = &runtime::jit::JIT_SLOW_PATHS;
     JitHelpers {
         binary_slow: Some(rt.binary_slow),
+        concat_strings: Some(rt.concat_strings),
         relational_slow: Some(rt.relational_slow),
         update_value_slow: Some(rt.update_value_slow),
         to_boolean_slow: Some(rt.to_boolean_slow),
@@ -432,6 +433,7 @@ mod tests {
     fn helpers_all() -> JitHelpers {
         JitHelpers {
             binary_slow: Some(helpers::test_binary_slow),
+            concat_strings: Some(helpers::test_concat_strings),
             relational_slow: Some(helpers::test_relational_slow),
             update_value_slow: Some(helpers::test_update_value_slow),
             to_boolean_slow: Some(helpers::test_to_boolean_slow),
@@ -1802,6 +1804,56 @@ mod tests {
                      Object.defineProperty(o, 'x', { get: function () { count += 1; return 1; } });\n\
                      function f(o, n) { var s = 0; for (var i = 0; i < n; i++) { s += o.x; } return s; }\n\
                      var r = f(o, 100); r === 100 && count === 100;",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_boolean(), Some(true));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_string_concat_in_a_fast_loop() {
+        // Cut 41: `s += x` with two strings in a certified loop lowers to
+        // `BinLeftReg` whose compiled Add now checks both string tags and
+        // calls the rope-concat helper directly — no `binary_slow`.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(x, n) { var s = x; for (var i = 0; i < n; i++) { s += x; } return s.length; }\n\
+                     f('ab', 10);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(22.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_string_concat_with_a_number_operand() {
+        // Cut 41: only one string operand — the compiled tag check misses
+        // and the general Add coerces the number (the fallback stays
+        // exact).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(x, n) { var s = x; for (var i = 0; i < n; i++) { s += 1; } return s; }\n\
+                     f('x', 3) === 'x111';",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_boolean(), Some(true));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_step_path_string_concat() {
+        // Cut 41: the step path's `Binary(Add)` (a non-loop body) shares
+        // the string-string fast path.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(x) { var s = x + x + x; return s; }\n\
+                     f('ab') === 'ababab';",
                 )
                 .expect("runs")
         });

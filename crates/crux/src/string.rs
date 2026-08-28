@@ -129,24 +129,39 @@ impl JsString {
                 units.extend_from_slice(right_units);
                 return Handle::new(JsString::Flat(units.into()));
             }
-            // Both Flat but large → create a balanced Rope.
-            return Handle::new(JsString::Rope {
-                left: Some(*left),
-                right: Some(*right),
-                len,
-                depth: 1,
-                flat: OnceLock::new(),
+            // Both Flat but large → create a balanced Rope (in place — the
+            // node's construction writes straight into the arena slot,
+            // skipping the stack-temp copy `Gc::new` pays for a large enum).
+            return Handle::new_in_place(|ptr: *mut JsString| {
+                // SAFETY: `new_in_place` hands back the fresh slot; this
+                // closure writes every field before returning.
+                unsafe {
+                    ptr.write(JsString::Rope {
+                        left: Some(*left),
+                        right: Some(*right),
+                        len,
+                        depth: 1,
+                        flat: OnceLock::new(),
+                    });
+                }
             });
         }
         // Default: create a lean ConsString append-node (like V8).
-        // Each append = one Gc allocation. No buffer, no Arc, no Vec clone.
+        // Each append = one Gc allocation, written in place. No buffer, no
+        // Arc, no Vec clone.
         let depth = 1 + left.depth();
-        Handle::new(JsString::ConsString {
-            left: *left,
-            right: *right,
-            len,
-            depth,
-            flat: OnceLock::new(),
+        Handle::new_in_place(|ptr: *mut JsString| {
+            // SAFETY: `new_in_place` hands back the fresh slot; this
+            // closure writes every field before returning.
+            unsafe {
+                ptr.write(JsString::ConsString {
+                    left: *left,
+                    right: *right,
+                    len,
+                    depth,
+                    flat: OnceLock::new(),
+                });
+            }
         })
     }
 

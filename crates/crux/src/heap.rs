@@ -683,8 +683,10 @@ impl Heap {
     /// Allocate `size` bytes aligned to `align` in the arena, reusing a
     /// swept slot of the same rounded size when one is free, else bumping
     /// into the current chunk (growing the arena by a chunk when full).
+    /// `size` must already be rounded to [`ARENA_GRANULARITY`] (the `Gc`
+    /// constructors round it once).
     fn alloc(&mut self, size: usize, align: usize) -> *mut u8 {
-        let size = round_up(size, ARENA_GRANULARITY);
+        debug_assert_eq!(size % ARENA_GRANULARITY, 0, "callers round the size");
         // Size-classed free-list reuse first: a swept box of this exact
         // rounded size is the common hot shape — direct-indexed, no hash.
         if let Some(index) = free_index(size)

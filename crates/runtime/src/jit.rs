@@ -256,6 +256,13 @@ pub struct JitSlowPaths {
     /// Full binary-operator semantics (`apply_binary`); `op` is a
     /// `BinaryOp` discriminant.
     pub binary_slow: extern "C" fn(ctx: *mut c_void, op: u64, a: u64, b: u64) -> u64,
+    /// Cut 41: the string-string `Add` fast path — the compiled `Add`
+    /// checked both operands' string tags, so the rope concat runs directly
+    /// (skipping `apply_binary`'s dispatch and number checks). Returns the
+    /// concatenated value, or 0 when either operand is not a string (a
+    /// string value's bits are never 0 — the sentinel is unreachable from
+    /// the compiled path's tag check).
+    pub concat_strings: extern "C" fn(ctx: *mut c_void, a: u64, b: u64) -> u64,
     /// JS relational semantics for a loop test on a non-Number; returns 1
     /// when the test holds.
     pub relational_slow: extern "C" fn(ctx: *mut c_void, op: u64, a: u64, b: u64) -> u64,
@@ -391,6 +398,7 @@ pub struct JitSlowPaths {
 /// The runtime's slow-path table, installed into every `JitHook`.
 pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     binary_slow,
+    concat_strings,
     relational_slow,
     update_value_slow,
     to_boolean_slow,
@@ -515,6 +523,19 @@ extern "C" fn binary_slow(ctx: *mut c_void, op: u64, a: u64, b: u64) -> u64 {
     match crate::expr::apply_binary(agent, op, &Value::from_bits(a), &Value::from_bits(b)) {
         Ok(value) => value.bits(),
         Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn concat_strings(_ctx: *mut c_void, a: u64, b: u64) -> u64 {
+    // The compiled `Add` fast path checked both operands' string tags, so
+    // both are strings and the rope concat cannot throw. The 0 sentinel is
+    // defense in depth for a non-string operand (unreachable from the
+    // compiled path — a string value's bits are never 0).
+    let a = Value::from_bits(a);
+    let b = Value::from_bits(b);
+    match (a.as_string(), b.as_string()) {
+        (Some(a), Some(b)) => Value::String(crux::string::JsString::concat(&a, &b)).bits(),
+        _ => 0,
     }
 }
 
@@ -1507,6 +1528,7 @@ mod tests {
         // helper, so a null here would silently drop bodies to the
         // interpreter).
         assert_ne!(JIT_SLOW_PATHS.binary_slow as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.concat_strings as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.relational_slow as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.update_value_slow as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.to_boolean_slow as usize, 0);

@@ -22,6 +22,7 @@ use crux::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Helper {
     BinarySlow,
+    ConcatStrings,
     RelationalSlow,
     UpdateValueSlow,
     ToBooleanSlow,
@@ -59,6 +60,7 @@ impl Helper {
     pub fn name(self) -> &'static str {
         match self {
             Helper::BinarySlow => "binary_slow",
+            Helper::ConcatStrings => "concat_strings",
             Helper::RelationalSlow => "relational_slow",
             Helper::UpdateValueSlow => "update_value_slow",
             Helper::ToBooleanSlow => "to_boolean_slow",
@@ -99,14 +101,21 @@ impl Helper {
     /// checks can change mid-run. The compiled code bumps the ctx's
     /// leaf-eligibility epoch after such helpers so a cached leaf verdict is
     /// not reused across the disturbance. The excluded helpers are pure
-    /// slot/descriptor reads and writes or immediate throws (the probe
-    /// itself is excluded — it only validates and fills).
+    /// Whether calling this helper can re-enter the interpreter (a getter,
+    /// setter, `valueOf`/`toString`, or nested call), which is the only way
+    /// the Vm stacks and realm count the leaf-call probe's eligibility
+    /// checks can change mid-run. The compiled code bumps the ctx's
+    /// leaf-eligibility epoch after such helpers so a cached leaf verdict is
+    /// not reused across the disturbance. The excluded helpers are pure
+    /// slot/descriptor reads and writes, the string concat, or immediate
+    /// throws (the probe itself is excluded — it only validates and fills).
     pub fn disturbs_leaf_eligibility(self) -> bool {
         !matches!(
             self,
             Helper::TdzError
                 | Helper::LeafCallProbe
                 | Helper::ToBooleanSlow
+                | Helper::ConcatStrings
                 | Helper::LoadContext
                 | Helper::StoreContext
                 | Helper::InitContext
@@ -128,6 +137,11 @@ pub struct JitHelpers {
     /// Full binary-operator semantics (`apply_binary`): `op` is a
     /// `BinaryOp` discriminant. Returns the result value.
     pub binary_slow: Option<extern "C" fn(vm: *mut c_void, op: u64, a: u64, b: u64) -> u64>,
+    /// Cut 41: the string-string `Add` fast path — the compiled `Add`
+    /// checked both operands' string tags, so the rope concat runs directly.
+    /// Returns the concatenated value (0 when either operand is not a
+    /// string).
+    pub concat_strings: Option<extern "C" fn(vm: *mut c_void, a: u64, b: u64) -> u64>,
     /// JS relational semantics for a loop test on a non-Number: `op` is a
     /// `BinaryOp` discriminant; returns 1 when the test holds, else 0.
     pub relational_slow: Option<extern "C" fn(vm: *mut c_void, op: u64, a: u64, b: u64) -> u64>,
@@ -255,6 +269,7 @@ impl JitHelpers {
     pub fn none() -> Self {
         Self {
             binary_slow: None,
+            concat_strings: None,
             relational_slow: None,
             update_value_slow: None,
             to_boolean_slow: None,
@@ -293,6 +308,7 @@ impl JitHelpers {
     pub fn get(&self, helper: Helper) -> Option<u64> {
         match helper {
             Helper::BinarySlow => self.binary_slow.map(|f| f as usize as u64),
+            Helper::ConcatStrings => self.concat_strings.map(|f| f as usize as u64),
             Helper::RelationalSlow => self.relational_slow.map(|f| f as usize as u64),
             Helper::UpdateValueSlow => self.update_value_slow.map(|f| f as usize as u64),
             Helper::ToBooleanSlow => self.to_boolean_slow.map(|f| f as usize as u64),
@@ -337,6 +353,12 @@ impl JitHelpers {
 /// Returns `42` — proves `binary_slow` was called with the right ABI.
 pub extern "C" fn test_binary_slow(_vm: *mut c_void, _op: u64, _a: u64, _b: u64) -> u64 {
     Value::Number(42.0).bits()
+}
+
+/// Returns the left operand unchanged — proves `concat_strings` was called
+/// with the right ABI.
+pub extern "C" fn test_concat_strings(_vm: *mut c_void, a: u64, _b: u64) -> u64 {
+    a
 }
 
 pub extern "C" fn test_relational_slow(_vm: *mut c_void, _op: u64, _a: u64, _b: u64) -> u64 {

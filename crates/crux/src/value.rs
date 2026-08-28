@@ -38,7 +38,9 @@ const TAG_NULL: u64 = 1;
 const TAG_FALSE: u64 = 2;
 const TAG_TRUE: u64 = 3;
 const TAG_BIGINT: u64 = 4;
-const TAG_STRING: u64 = 5;
+/// The String tag (public for the JIT crate's inline string-string `Add`
+/// fast path — the NaN-boxing layout is frozen).
+pub const TAG_STRING: u64 = 5;
 const TAG_SYMBOL: u64 = 6;
 /// The Object tag (public for the JIT crate's inline member-cell probe — the
 /// NaN-boxing layout is frozen).

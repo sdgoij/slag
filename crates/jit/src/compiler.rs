@@ -1109,6 +1109,25 @@ impl<'a> Lowerer<'a> {
             .icmp_imm_u(IntCC::NotEqual, masked, crux::TAG_PREFIX as i64)
     }
 
+    /// `bits & TAG_MASK == TAG_PREFIX` and `(bits >> 44) & 0xF == TAG_STRING`
+    /// — the string check (I8). The heap-prefix test runs first: a double
+    /// can carry the tag bits by coincidence (same discipline as the member
+    /// probe's object check).
+    fn is_string(&mut self, bits: ClifValue) -> ClifValue {
+        let is_heap = self.builder.ins().band_imm_u(bits, crux::TAG_MASK as i64);
+        let is_heap = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, is_heap, crux::TAG_PREFIX as i64);
+        let tag = self.builder.ins().ushr_imm_u(bits, 44);
+        let tag = self.builder.ins().band_imm_u(tag, 0xF);
+        let is_str = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, tag, crux::TAG_STRING as i64);
+        self.builder.ins().band(is_heap, is_str)
+    }
+
     /// I8 bool → I64 0/1 (cranelift 0.134's `bint` is `uextend`).
     fn bint(&mut self, cond: ClifValue) -> ClifValue {
         self.builder.ins().uextend(types::I64, cond)
@@ -2478,7 +2497,27 @@ impl<'a> Lowerer<'a> {
         let merge = self.builder.create_block();
         let slow = self.builder.create_block();
         self.builder.ins().brif(both, merge, &[], slow, &[]);
+        // The slow branch: for `Add`, the string-string rope concat runs
+        // through a direct helper (Cut 41 — the compiled code checks both
+        // operands' string tags, so `apply_binary`'s dispatch and number
+        // checks are skipped); everything else goes to `binary_slow`.
         self.builder.switch_to_block(slow);
+        if op == BinaryOp::Add {
+            let lhs_str = self.is_string(lhs);
+            let rhs_str = self.is_string(rhs);
+            let both_str = self.builder.ins().band(lhs_str, rhs_str);
+            let concat = self.builder.create_block();
+            let str_slow = self.builder.create_block();
+            self.builder
+                .ins()
+                .brif(both_str, concat, &[], str_slow, &[]);
+            self.builder.switch_to_block(concat);
+            let concat_res =
+                self.call_slow(self.sig_get_name, Helper::ConcatStrings, &[lhs, rhs])?;
+            self.builder.def_var(res_var, concat_res);
+            self.builder.ins().jump(merge, &[]);
+            self.builder.switch_to_block(str_slow);
+        }
         let op_imm = self.builder.ins().iconst(types::I64, op as i64);
         let slow_res = self.call_slow(self.sig_binary, Helper::BinarySlow, &[op_imm, lhs, rhs])?;
         self.builder.def_var(res_var, slow_res);
