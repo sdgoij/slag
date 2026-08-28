@@ -196,6 +196,10 @@ pub struct Agent {
     /// return it — a pooled Vm is never handed to a suspended
     /// generator/async state (those own their Vm).
     pub(crate) vm_pool: Vec<crate::ir::Vm>,
+    /// The installed JIT hook (the `jit` crate's `install`), consulted by
+    /// the leaf-call path before interpreting a certified body. The Drop
+    /// impl frees the installed cache.
+    pub jit_hook: Option<crate::jit::JitHook>,
     pub(crate) promise_jobs: VecDeque<Job>,
     pub(crate) generic_jobs: VecDeque<Job>,
     pub(crate) timeout_jobs: VecDeque<(Instant, Job)>,
@@ -589,6 +593,18 @@ pub struct Agent {
         Box<[Option<crate::ir::ConstructMapCell>; crate::ir::CONSTRUCT_PROTO_CELLS]>,
 }
 
+impl Drop for Agent {
+    fn drop(&mut self) {
+        // The JIT cache is a heap allocation owned by the installed hook
+        // (`jit::install` `Box::into_raw`'d it); free it here.
+        if let Some(hook) = self.jit_hook {
+            // SAFETY: the agent is the cache's sole owner and is being
+            // dropped, so this runs exactly once with a live pointer.
+            unsafe { (hook.drop_cache)(hook.cache) };
+        }
+    }
+}
+
 impl Agent {
     pub fn new() -> Self {
         crate::function::ensure_ecma_hook();
@@ -612,6 +628,7 @@ impl Agent {
             construct_property_patterns: Box::new(std::array::from_fn(|_| None)),
             construct_maps: Box::new(std::array::from_fn(|_| None)),
             vm_pool: Vec::new(),
+            jit_hook: None,
             promise_jobs: VecDeque::new(),
             generic_jobs: VecDeque::new(),
             timeout_jobs: VecDeque::new(),

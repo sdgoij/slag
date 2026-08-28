@@ -88,8 +88,58 @@ impl JitEngine {
         // pointer to a fn pointer is a plain integer cast on every supported
         // target (no trampolines).
         let entry: JitEntry = unsafe { std::mem::transmute(code.as_ptr()) };
-        Some(Compiled { code, entry })
+        let info = crate::JitCompiledInfo {
+            entry: entry as usize,
+            stack_usage: max_stack_usage(body),
+        };
+        Some(Compiled { code, info })
     }
+}
+
+/// The body's maximum value-stack depth above the entry stack pointer, in
+/// slots — the JIT's working-area size the Vm integration must pre-allocate.
+/// A conservative straight-line bound: the compiler emits balanced push/pop
+/// pairs (the interpreter's own stack discipline keeps every loop body
+/// balanced, so the first-pass depth at a loop head is the depth each
+/// iteration sees), and a `RunRegBody` truncates its transient use back to
+/// the entry depth. Unsupported steps bail out of `compile` before this is
+/// consulted, so the un-modeled variants need no entry here.
+fn max_stack_usage(body: &CompiledBody) -> usize {
+    let mut depth = 0usize;
+    let mut max = 0usize;
+    for step in &body.steps {
+        match step {
+            Step::Push(_) | Step::Dup | Step::PushAcc => depth += 1,
+            Step::Pop => depth = depth.saturating_sub(1),
+            // Two operands in, one result out.
+            Step::Binary(_) | Step::BinaryImm { .. } => depth = depth.saturating_sub(1),
+            // The test pops; the keep variants leave the value.
+            Step::JumpIfFalse(_) | Step::JumpIfTrue(_) => depth = depth.saturating_sub(1),
+            // A store consumes the value; `UpdateLocal` pushes its result.
+            Step::StoreLocal { .. } | Step::FusedStoreLocal { .. } | Step::InitLocal { .. } => {
+                depth = depth.saturating_sub(1)
+            }
+            Step::UpdateLocal { .. } => depth += 1,
+            // Member read: pop, push the result back. Member writes pop two
+            // (three computed) and push the stored value back.
+            Step::GetMemberName { .. } => {}
+            Step::GetMemberComputed => depth = depth.saturating_sub(1),
+            Step::AssignMemberName { .. } => depth = depth.saturating_sub(1),
+            Step::AssignMemberComputed { .. } => depth = depth.saturating_sub(2),
+            // The register body's transient pushes (each `PushAcc`) are
+            // unwound by the entry-depth truncate.
+            Step::RunRegBody { ops } => {
+                let transient = ops
+                    .iter()
+                    .filter(|op| matches!(op, LeafOp::PushAcc))
+                    .count();
+                max = max.max(depth + transient);
+            }
+            _ => {}
+        }
+        max = max.max(depth);
+    }
+    max
 }
 
 /// The C ABI for the host platform: the JIT entry and the slow-path helpers

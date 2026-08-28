@@ -6798,7 +6798,7 @@ impl Vm {
     /// property-key conversion and `assign_member`. Pushes the assigned
     /// value (the step path's result; the register frame truncate discards
     /// it).
-    fn assign_computed_plain(
+    pub(crate) fn assign_computed_plain(
         &mut self,
         agent: &mut Agent,
         object: Value,
@@ -6837,7 +6837,7 @@ impl Vm {
     /// this Vm — the leaf callers handle the nested state exactly like the
     /// step path). Returns the value; the step path pushes it, the register
     /// op stores it in the accumulator.
-    fn get_member_name(
+    pub(crate) fn get_member_name(
         &self,
         agent: &mut Agent,
         object: Value,
@@ -6861,7 +6861,7 @@ impl Vm {
     /// the register `GetMemberComputed` op): nullish check, the fast array
     /// element read (a canonical Number index on a plain Array), then the
     /// property-key conversion + member-cell/property machinery.
-    fn get_member_computed(
+    pub(crate) fn get_member_computed(
         &self,
         agent: &mut Agent,
         object: Value,
@@ -6903,7 +6903,7 @@ impl Vm {
         Ok(value)
     }
 
-    fn assign_member(
+    pub(crate) fn assign_member(
         &mut self,
         agent: &mut Agent,
         object: Value,
@@ -8466,6 +8466,110 @@ impl Vm {
         Ok(())
     }
 
+    /// The JIT leaf path (see `crate::jit`): run `ir`'s compiled machine
+    /// code against a private frame/working-area buffer, mirroring
+    /// `run_inline_leaf`'s stack discipline — the call site's arguments are
+    /// the top `argc` stack values and the result replaces them. Returns
+    /// `Ok(true)` when the compiled body ran, `Ok(false)` when the body has
+    /// no compiled code (the caller falls back to the interpreter), and
+    /// `Err` on a thrown error.
+    ///
+    /// The frame and the JIT's working area live in a local buffer, not on
+    /// `self.stack`: the slow-path helpers receive `&mut Vm` and may push
+    /// arbitrary values (a member helper can invoke a setter, which runs JS
+    /// on this stack and reallocates the `Vec` under the JIT's raw
+    /// pointers). The helpers never see the leaf's frame, so the private
+    /// buffer is unobservable.
+    fn run_jit_leaf(
+        &mut self,
+        agent: &mut Agent,
+        argc: usize,
+        this_value: Value,
+        ir: &std::rc::Rc<CompiledBody>,
+        strict: bool,
+        below: usize,
+    ) -> Result<bool, JsError> {
+        let Some(hook) = agent.jit_hook else {
+            return Ok(false);
+        };
+        let scope = ir.scope.as_ref().expect("a leaf is certified");
+        // Fetch (compiling on first use) the body's machine code; the cache
+        // keys on the `Rc` identity and holds the body alive, so the pointer
+        // is exact. `body` points at the caller's `Rc` (the hook's
+        // contract); a null return = not JIT-compilable, run the
+        // interpreter.
+        // SAFETY: `hook.cache` is the installed cache and `ir` is alive for
+        // the call.
+        let info = unsafe {
+            (hook.lookup)(
+                hook.cache,
+                ir as *const std::rc::Rc<CompiledBody> as *const std::os::raw::c_void,
+            )
+        };
+        if info.is_null() {
+            return Ok(false);
+        }
+        // SAFETY: the cache returns a pointer into its own (never-evicted)
+        // entry.
+        let info = unsafe { &*(info as *const crate::jit::JitCompiledInfo) };
+        // SAFETY: `info.entry` is a code pointer the cache owns; a fn
+        // pointer is pointer-sized, so the integer cast is exact.
+        let entry: crate::jit::JitEntry = unsafe { std::mem::transmute(info.entry) };
+        // The common leaf has no `this` slot — skip `bind_this_value` (its
+        // first check would return `undefined` anyway), mirroring
+        // `run_inline_leaf`.
+        let this_value = if scope.this_slot.is_none() {
+            Value::Undefined
+        } else {
+            self.bind_this_value(agent, scope, strict, this_value)?
+        };
+        let pre_call = self.stack.len() - argc;
+        // The frame (this slot, params, `var`s as undefined, `let`/`const`
+        // in the TDZ — `run_leaf_body`'s layout) plus the JIT's working area
+        // and the helper slack, in a private buffer.
+        let buf_len = scope.frame_size + info.stack_usage + crate::jit::JIT_STACK_SLACK;
+        let mut buf = vec![Value::Undefined; buf_len];
+        for (slot, cell) in buf.iter_mut().enumerate().take(scope.frame_size) {
+            *cell = if Some(slot) == scope.this_slot {
+                this_value
+            } else if slot < scope.arity {
+                // Missing arguments stay `undefined` (spec 10.2.11).
+                self.stack
+                    .get(pre_call + slot)
+                    .copied()
+                    .unwrap_or(Value::Undefined)
+            } else if scope.tdz_store.get(slot).copied().unwrap_or(false) {
+                Value::uninitialized()
+            } else {
+                Value::Undefined
+            };
+        }
+        let mut ctx = crate::jit::JitCallContext {
+            pending: false,
+            error: None,
+            agent: agent as *mut Agent,
+            vm: self as *mut Vm,
+        };
+        let result = unsafe {
+            (entry)(
+                buf.as_mut_ptr() as *mut std::os::raw::c_void,
+                buf.as_mut_ptr().add(scope.frame_size) as *mut std::os::raw::c_void,
+                (&mut ctx as *mut crate::jit::JitCallContext) as *mut std::os::raw::c_void,
+            )
+        };
+        // Unwind the argument region (the frame/working area were local),
+        // then surface a pending error or land the result —
+        // `run_inline_leaf`'s tail. The compiled body stops executing after
+        // a throwing slow path, so the pending error, when set, is the
+        // call's only error.
+        self.stack.truncate(pre_call - below);
+        if ctx.pending {
+            return Err(ctx.error.take().expect("a pending JIT error is present"));
+        }
+        self.stack.push(Value::from_bits(result));
+        Ok(true)
+    }
+
     /// The shared fast-call core: `callee`/`this` as values, the arguments
     /// as the top `argc` stack values, `below` values under them to truncate
     /// with the arguments on completion. Covers the leaf-inline path (Cut
@@ -8535,6 +8639,14 @@ impl Vm {
                     });
                 }
                 LeafCacheSite::None => {}
+            }
+            // The JIT path (when installed) runs the certified body's
+            // machine code; a body without compiled code falls through to
+            // the interpreter's leaf-inline run.
+            if agent.jit_hook.is_some()
+                && self.run_jit_leaf(agent, argc, this, &entry.ir, entry.strict, below)?
+            {
+                return Ok(());
             }
             return self.run_inline_leaf(agent, argc, this, entry, below, None);
         }
@@ -9216,7 +9328,11 @@ fn error_message_value(error: &JsError) -> Value {
 /// The `++`/`--` result pair: (numeric old, new) — the postfix update
 /// returns the ToNumeric-converted old value (spec 13.4.4 step 5), the
 /// prefix the new value.
-fn update_value(_agent: &mut Agent, op: &UpdateOp, old: &Value) -> Result<(Value, Value), JsError> {
+pub(crate) fn update_value(
+    _agent: &mut Agent,
+    op: &UpdateOp,
+    old: &Value,
+) -> Result<(Value, Value), JsError> {
     let old_numeric = crux::convert::to_numeric(old)?;
     let new = match old_numeric.kind() {
         ValueKind::Number(n) => {

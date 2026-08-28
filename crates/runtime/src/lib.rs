@@ -25,6 +25,7 @@ pub mod function;
 pub mod generator;
 pub mod host;
 pub mod ir;
+pub mod jit;
 pub mod job;
 pub mod module;
 pub mod promise;
