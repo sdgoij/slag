@@ -30,6 +30,7 @@ pub enum Helper {
     GetMemberComputed,
     SetMemberName,
     SetMemberComputed,
+    CallSlow,
 }
 
 impl Helper {
@@ -44,6 +45,7 @@ impl Helper {
             Helper::GetMemberComputed => "get_member_computed",
             Helper::SetMemberName => "set_member_name",
             Helper::SetMemberComputed => "set_member_computed",
+            Helper::CallSlow => "call_slow",
         }
     }
 }
@@ -81,6 +83,12 @@ pub struct JitHelpers {
     /// `Set(o, key, v)` with a computed key; returns the stored value.
     pub set_member_computed:
         Option<extern "C" fn(vm: *mut c_void, object: u64, key: u64, value: u64) -> u64>,
+    /// The general `CallFast` (a body may contain calls): `args` points at
+    /// the JIT buffer's argument region (`argc` slots); returns the call's
+    /// result value.
+    pub call_slow: Option<
+        extern "C" fn(vm: *mut c_void, callee: u64, this: u64, argc: u64, args: *mut u64) -> u64,
+    >,
 }
 
 impl JitHelpers {
@@ -96,6 +104,7 @@ impl JitHelpers {
             get_member_computed: None,
             set_member_name: None,
             set_member_computed: None,
+            call_slow: None,
         }
     }
 
@@ -111,6 +120,7 @@ impl JitHelpers {
             Helper::GetMemberComputed => self.get_member_computed.map(|f| f as usize as u64),
             Helper::SetMemberName => self.set_member_name.map(|f| f as usize as u64),
             Helper::SetMemberComputed => self.set_member_computed.map(|f| f as usize as u64),
+            Helper::CallSlow => self.call_slow.map(|f| f as usize as u64),
         }
     }
 }
@@ -168,6 +178,27 @@ pub extern "C" fn test_set_member_computed(
     value
 }
 
+/// Sums its numeric arguments — proves the `args` pointer/`argc` ABI the
+/// `CallFast` lowering passes. The callers (compiled test code and the test
+/// harness) guarantee `args` points at `argc` valid slots.
+#[cfg(test)]
+pub(crate) extern "C" fn test_call_slow(
+    _vm: *mut c_void,
+    _callee: u64,
+    _this: u64,
+    argc: u64,
+    args: *mut u64,
+) -> u64 {
+    let mut sum = 0.0;
+    for i in 0..argc {
+        // SAFETY: the test harness passes a buffer with `argc` slots.
+        sum += Value::from_bits(unsafe { *args.add(i as usize) })
+            .as_number()
+            .unwrap_or(0.0);
+    }
+    Value::Number(sum).bits()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +216,7 @@ mod tests {
             Helper::GetMemberComputed,
             Helper::SetMemberName,
             Helper::SetMemberComputed,
+            Helper::CallSlow,
         ] {
             assert!(none.get(h).is_none(), "{} should be None", h.name());
         }
@@ -194,6 +226,7 @@ mod tests {
     fn helper_names_are_stable() {
         assert_eq!(Helper::BinarySlow.name(), "binary_slow");
         assert_eq!(Helper::TdzError.name(), "tdz_error");
+        assert_eq!(Helper::CallSlow.name(), "call_slow");
     }
 
     #[test]

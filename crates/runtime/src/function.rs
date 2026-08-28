@@ -1931,6 +1931,22 @@ fn run_compiled_body(
     {
         *vm.frame.get_mut(slot) = this_value;
     }
+    // The JIT path (when installed): the general path runs certified bodies
+    // that may contain calls (leaf bodies never do — `steps_are_leaf`
+    // excludes every call step). A body with compiled machine code runs it
+    // here instead of `vm.start`'s interpreter dispatch; a body without
+    // compiled code (or no hook) falls through. A JIT-compilable body has
+    // no `using` resources (those steps bail), so the disposal tail below
+    // is a no-op for it.
+    if ir.scope.is_some()
+        && let Some(value) = crate::jit::run_jit_body(agent, &mut vm, ir)?
+    {
+        let result =
+            crate::eval::dispose_env_resources(agent, &body_env, Ok(Completion::Return(value)));
+        agent.return_vm(vm);
+        let completion = result?;
+        return body_completion_to_value(completion);
+    }
     let completion = match vm.start(agent, ir) {
         Ok(VmOutcome::Completed(completion)) => completion,
         Ok(VmOutcome::Suspended(_)) => {
@@ -1993,9 +2009,7 @@ pub(crate) fn create_unmapped_arguments_object(
         && let Some(values) = realm.intrinsics.get("%Array.prototype.values%")
     {
         obj.define_property_key(
-            &crux::property::PropertyKey::Symbol(
-                crux::symbol::well_known("iterator")
-            ),
+            &crux::property::PropertyKey::Symbol(crux::symbol::well_known("iterator")),
             &crux::property::PropertyDescriptor {
                 value: Some(values),
                 writable: Some(true),
@@ -2094,9 +2108,7 @@ pub(crate) fn create_mapped_arguments_object(
         && let Some(values) = realm.intrinsics.get("%Array.prototype.values%")
     {
         obj.define_property_key(
-            &crux::property::PropertyKey::Symbol(
-                crux::symbol::well_known("iterator")
-            ),
+            &crux::property::PropertyKey::Symbol(crux::symbol::well_known("iterator")),
             &crux::property::PropertyDescriptor {
                 value: Some(values),
                 writable: Some(true),
@@ -2827,9 +2839,7 @@ pub(crate) fn function_declaration_instantiation(
                 .get("%Array.prototype.values%")
         {
             obj.define_property_key(
-                &crux::property::PropertyKey::Symbol(
-                    crux::symbol::well_known("iterator")
-                ),
+                &crux::property::PropertyKey::Symbol(crux::symbol::well_known("iterator")),
                 &crux::property::PropertyDescriptor {
                     value: Some(values),
                     writable: Some(true),
@@ -3094,9 +3104,7 @@ mod tests {
         let iterator_for_method = iterator;
         iterable
             .define_property_key(
-                &crux::property::PropertyKey::Symbol(
-                    crux::symbol::well_known("iterator")
-                ),
+                &crux::property::PropertyKey::Symbol(crux::symbol::well_known("iterator")),
                 &crux::property::PropertyDescriptor::data(Value::Function(
                     crux::Function::create_builtin(
                         Some(JsString::from_utf8("[Symbol.iterator]")),

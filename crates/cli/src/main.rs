@@ -462,6 +462,11 @@ fn run_jit_benchmarks() -> Result<(), u8> {
             "string concat",
             "function bench(x) { var s = x; for (var i = 0; i < 100_000; i++) { s += x; } return s.length; } bench('x');",
         ),
+        (
+            "function calls",
+            "function bench(o, n) { var s = 0; for (var i = 0; i < n; i++) { s += o.f(i); } return s; }\n\
+             bench({ f: function (x) { return x + 1; } }, 100_000);",
+        ),
     ];
     println!("slag {VERSION} JIT vs interpreter micro-benchmarks");
     println!("(ratio < 1 means the JIT is faster; ~1 means the body did not JIT)");

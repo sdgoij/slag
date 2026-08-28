@@ -31,7 +31,7 @@ use crux::Value;
 use syntax::ast::{BinaryOp, UpdateOp};
 
 use crate::agent::Agent;
-use crate::ir::Vm;
+use crate::ir::{CompiledBody, Vm};
 use crux::error::{ErrorKind, JsError};
 
 /// The compiled entry ABI (mirrors `jit::JitEntry`; all arguments are
@@ -108,6 +108,11 @@ pub struct JitSlowPaths {
     /// `Set(o, key, v)` with a computed key; returns the stored value.
     pub set_member_computed:
         extern "C" fn(ctx: *mut c_void, object: u64, key: u64, value: u64) -> u64,
+    /// The general `CallFast` (a body may contain calls — leaf bodies never
+    /// do): `args` points at the JIT buffer's argument region (`argc`
+    /// slots). Runs the interpreter's call machinery on the Vm's own stack.
+    pub call_slow:
+        extern "C" fn(ctx: *mut c_void, callee: u64, this: u64, argc: u64, args: *mut u64) -> u64,
 }
 
 /// The runtime's slow-path table, installed into every `JitHook`.
@@ -121,12 +126,18 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     get_member_computed,
     set_member_name,
     set_member_computed,
+    call_slow,
 };
 
 /// The slack (in slots) reserved above a compiled body's working area on the
 /// value stack: the member helpers push their stored value once per call, and
 /// the JIT's own usage is bounded by `JitCompiledInfo::stack_usage`.
 pub const JIT_STACK_SLACK: usize = 16;
+
+/// The JIT's per-call frame/working buffer fits a stack array up to this
+/// many slots (512 bytes); larger bodies spill to a per-call heap Vec. Most
+/// certified bodies are far smaller, so the hot path avoids the allocation.
+pub(crate) const INLINE_JIT_BUF: usize = 64;
 
 /// The `BinaryOp` variants in declaration order (a fieldless enum's
 /// discriminant is its index — guaranteed by the language).
@@ -290,6 +301,157 @@ extern "C" fn set_member_computed(ctx: *mut c_void, object: u64, key: u64, value
     }
 }
 
+extern "C" fn call_slow(
+    ctx: *mut c_void,
+    callee: u64,
+    this: u64,
+    argc: u64,
+    args: *mut u64,
+) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let argc = argc as usize;
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let entry_len = vm.stack.len();
+    vm.stack.push(Value::from_bits(this));
+    vm.stack.push(Value::from_bits(callee));
+    // The arguments are pushed straight from the JIT buffer (no copy): the
+    // buffer is only written by the machine code, which is suspended for
+    // the duration of this synchronous helper, so it is stable even while
+    // `vm.stack` reallocates.
+    for i in 0..argc {
+        // SAFETY: the JIT passes a pointer into its own (live) stack buffer
+        // with `argc` slots.
+        vm.stack.push(Value::from_bits(unsafe { *args.add(i) }));
+    }
+    match vm.do_call_fast(agent, argc, false) {
+        Ok(()) => {
+            // `do_call_fast` replaced `[this, callee, args]` with the result.
+            let result = match vm.stack.pop() {
+                Some(value) => value,
+                None => {
+                    vm.stack.truncate(entry_len);
+                    return slow_error(
+                        ctx,
+                        JsError::new(
+                            ErrorKind::TypeError,
+                            "the JIT call produced no result".into(),
+                        ),
+                    );
+                }
+            };
+            debug_assert_eq!(vm.stack.len(), entry_len);
+            result.bits()
+        }
+        Err(error) => {
+            vm.stack.truncate(entry_len);
+            slow_error(ctx, error)
+        }
+    }
+}
+
+/// The body's compiled-info pointer: the per-body fast cell when set (the
+/// first successful lookup stores it — the cache never evicts a body it
+/// holds alive, so it stays valid), else a consult of the installed hook
+/// (compiling on first use). `1` marks a known non-compilable body, so the
+/// hook is not reconsulted. Returns null when the body has no compiled
+/// code.
+pub(crate) fn lookup_info(
+    hook: crate::jit::JitHook,
+    ir: &std::rc::Rc<CompiledBody>,
+) -> *const JitCompiledInfo {
+    let known = ir.jit_info.get();
+    if known > 1 {
+        known as *const JitCompiledInfo
+    } else if known == 0 {
+        // SAFETY: `hook.cache` is the installed cache and `ir` is alive for
+        // the call.
+        let ptr = unsafe {
+            (hook.lookup)(
+                hook.cache,
+                ir as *const std::rc::Rc<CompiledBody> as *const std::os::raw::c_void,
+            )
+        };
+        if ptr.is_null() {
+            ir.jit_info.set(1);
+        } else {
+            ir.jit_info.set(ptr as usize);
+        }
+        ptr as *const JitCompiledInfo
+    } else {
+        std::ptr::null()
+    }
+}
+
+/// The general-path JIT run (the leaf path is `Vm::run_jit_leaf`): run
+/// `ir`'s compiled machine code for a body running on its own Vm — one
+/// that may contain calls, since leaf bodies never do (`steps_are_leaf`
+/// excludes every call step). The frame is `vm.frame` (the caller set it
+/// up: params, `var`s, TDZ slots, this slot); the working area is a
+/// private buffer, rooted for the call's duration. Returns `Ok(None)` when
+/// no hook is installed or the body has no compiled code — the caller
+/// falls back to the interpreter.
+pub(crate) fn run_jit_body(
+    agent: &mut Agent,
+    vm: &mut Vm,
+    ir: &std::rc::Rc<CompiledBody>,
+) -> Result<Option<Value>, JsError> {
+    let Some(hook) = agent.jit_hook else {
+        return Ok(None);
+    };
+    let info_ptr = lookup_info(hook, ir);
+    if info_ptr.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: the cache never evicts a body it holds alive; the pointer is
+    // into the cache's own entry.
+    let info = unsafe { &*info_ptr };
+    // SAFETY: `info.entry` is a code pointer the cache owns; a fn pointer
+    // is pointer-sized, so the integer cast is exact.
+    let entry: JitEntry = unsafe { std::mem::transmute(info.entry) };
+    // The frame lives in `vm.frame` (the caller filled it with `setup_frame`
+    // plus the this slot); the working area is a private buffer — helpers
+    // receive `&mut Vm` and may reallocate `vm.stack`, so the JIT's raw
+    // pointers must never alias it. A small body fits a stack array (no
+    // per-call heap allocation); larger bodies spill to a Vec.
+    let (frame_ptr, _frame_len): (*mut Value, usize) = match &mut vm.frame {
+        crate::ir::Frame::Inline(buf) => (buf.as_mut_ptr(), buf.len()),
+        crate::ir::Frame::Heap(vec) => (vec.as_mut_ptr(), vec.len()),
+    };
+    let work_len = info.stack_usage + JIT_STACK_SLACK;
+    let (mut inline_work, mut heap_work) =
+        ([Value::Undefined; INLINE_JIT_BUF], Vec::<Value>::new());
+    let work: &mut [Value] = if work_len <= INLINE_JIT_BUF {
+        &mut inline_work[..work_len]
+    } else {
+        heap_work.resize(work_len, Value::Undefined);
+        &mut heap_work[..]
+    };
+    let work_ptr = work.as_mut_ptr() as *mut c_void;
+    let mut ctx = JitCallContext {
+        pending: false,
+        error: None,
+        agent: agent as *mut Agent,
+        vm: vm as *mut Vm,
+    };
+    // Register the vm (its trace covers `vm.frame`, `vm.stack`, and any
+    // nested leaf jit roots) plus the working area for the call's duration:
+    // a helper can allocate and trigger a collection, and a heap value only
+    // those buffers reference must survive until the JIT stores or returns
+    // it.
+    let result = crate::ir::with_jit_run(vm, ir, work, || unsafe {
+        (entry)(
+            frame_ptr as *mut c_void,
+            work_ptr,
+            (&mut ctx as *mut JitCallContext) as *mut c_void,
+        )
+    });
+    if ctx.pending {
+        return Err(ctx.error.take().expect("a pending JIT error is present"));
+    }
+    Ok(Some(Value::from_bits(result)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,6 +470,7 @@ mod tests {
         assert_ne!(JIT_SLOW_PATHS.get_member_computed as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.set_member_name as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.set_member_computed as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.call_slow as usize, 0);
     }
 
     #[test]

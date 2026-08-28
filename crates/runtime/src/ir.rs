@@ -1292,6 +1292,13 @@ pub struct CompiledBody {
     /// scripts). Keys are `String` (not `JsString`) so the set stays free of
     /// interior-mutability lints.
     pub script_globals: Option<HashSet<String>>,
+    /// The JIT's compiled-info pointer for this body: `0` = not yet looked
+    /// up, `1` = known non-compilable, otherwise a `*const
+    /// crate::jit::JitCompiledInfo` owned by the installed jit cache. The
+    /// cache never evicts a body it holds alive, so the pointer stays valid
+    /// for the body's lifetime; the JIT's call paths set it on the first
+    /// lookup so a hot call skips the cache consultation entirely.
+    pub jit_info: std::cell::Cell<usize>,
 }
 
 impl Trace for CompiledBody {
@@ -1941,6 +1948,11 @@ struct FastLoopShape {
 struct ActiveRun {
     vm: *const Vm,
     body: *const CompiledBody,
+    /// A JIT body's private frame/working buffer (heap values only it
+    /// references), as `(ptr as usize, len)` — `None` for an interpreter
+    /// run. A helper-triggered collection during the JIT body must trace it
+    /// like the Vm's own stacks.
+    jit_buffer: Option<(usize, usize)>,
 }
 thread_local! {
     static ACTIVE_RUNS: std::cell::RefCell<Vec<ActiveRun>> =
@@ -1997,20 +2009,51 @@ impl Drop for CompilingGuard {
 
 /// Trace every Vm currently running a body and its compiled body (GC-2
 /// root): the active Vms' heap buffers hold live values the stack scan
-/// cannot see, and the compiled steps hold the body's literal `Value`s.
+/// cannot see, and the compiled steps hold the body's literal `Value`s. A
+/// JIT run's private working area is traced alongside (see [`with_jit_run`]).
 pub(crate) fn trace_active_vms(visit: &mut dyn FnMut(crux::heap::GcAny)) {
     ACTIVE_RUNS.with(|stack| {
         for run in &*stack.borrow() {
             // SAFETY: an entry is pushed for the duration of a `run_inner`
-            // call and popped before the Vm is returned to the pool (the
-            // owned body is dropped with `current` at the same return), so
-            // both are live and immobile while on the stack.
+            // or JIT call and popped before the Vm is returned to the pool
+            // (the owned body is dropped with `current` at the same
+            // return), so both are live and immobile while on the stack.
             unsafe {
                 (&*run.vm).trace(visit);
                 (&*run.body).trace(visit);
+                if let Some((ptr, len)) = run.jit_buffer {
+                    for value in std::slice::from_raw_parts(ptr as *const Value, len) {
+                        value.trace(visit);
+                    }
+                }
             }
         }
     });
+}
+
+/// Root a JIT body running on `vm` (covering the vm's own state — its
+/// frame, stack, and any nested leaf jit roots — plus the private working
+/// area) for the duration of `f`: a helper the compiled code calls can
+/// allocate and trigger a collection, and a heap value only those buffers
+/// reference must survive until the JIT stores or returns it.
+pub(crate) fn with_jit_run<T>(
+    vm: &Vm,
+    body: &CompiledBody,
+    work: &[Value],
+    f: impl FnOnce() -> T,
+) -> T {
+    ACTIVE_RUNS.with(|stack| {
+        stack.borrow_mut().push(ActiveRun {
+            vm: vm as *const Vm,
+            body: body as *const CompiledBody,
+            jit_buffer: Some((work.as_ptr() as usize, work.len())),
+        });
+    });
+    let result = f();
+    ACTIVE_RUNS.with(|stack| {
+        stack.borrow_mut().pop();
+    });
+    result
 }
 
 /// The resumable VM state. Saved across suspension by the driver.
@@ -2018,6 +2061,12 @@ pub(crate) fn trace_active_vms(visit: &mut dyn FnMut(crux::heap::GcAny)) {
 pub struct Vm {
     pub ip: usize,
     pub stack: Vec<Value>,
+    /// The JIT runs' private buffers as `(ptr as usize, len)`, pushed for
+    /// the duration of each leaf-path JIT call on this Vm and traced with
+    /// it (the leaf path runs on the caller's Vm, which the active-run
+    /// tracer already covers — no thread-local registration needed). Empty
+    /// outside a JIT call.
+    pub(crate) jit_roots: Vec<(usize, usize)>,
     /// The fast-path frame (Cut 3): named-binding slots for the active body,
     /// sized by `ScopeInfo::frame_size`. Empty on the environment path.
     pub(crate) frame: Frame,
@@ -2197,6 +2246,15 @@ impl Trace for Vm {
         }
         self.var_ref_stack.trace(visit);
         self.call_args.trace(visit);
+        // The leaf-path JIT runs' private buffers (pushed by `run_jit_leaf`
+        // for the call's duration; empty otherwise).
+        // SAFETY: each entry is a buffer `run_jit_leaf` holds alive for its
+        // call, and the call outlives any collection it triggers.
+        for (ptr, len) in &self.jit_roots {
+            for value in unsafe { std::slice::from_raw_parts(*ptr as *const Value, *len) } {
+                value.trace(visit);
+            }
+        }
     }
 }
 
@@ -2293,6 +2351,7 @@ impl Vm {
         Self {
             ip: 0,
             stack: Vec::new(),
+            jit_roots: Vec::new(),
             frame: Frame::Inline(std::array::from_fn(|_| Value::Undefined)),
             leaf_frame_base: None,
             leaf_frame_offset: 0,
@@ -2350,6 +2409,7 @@ impl Vm {
         self.clear_frame();
         self.ip = 0;
         self.stack.clear();
+        self.jit_roots.clear();
         self.leaf_frame_base = None;
         self.leaf_frame_offset = 0;
         self.args.clear();
@@ -3466,6 +3526,7 @@ impl Vm {
             stack.borrow_mut().push(ActiveRun {
                 vm: self as *const Vm,
                 body: body as *const CompiledBody,
+                jit_buffer: None,
             });
         });
         let result = self.run_abrupt_inner(agent, body, resume);
@@ -3653,6 +3714,7 @@ impl Vm {
             stack.borrow_mut().push(ActiveRun {
                 vm: self as *const Vm,
                 body: body as *const CompiledBody,
+                jit_buffer: None,
             });
         });
         let result = self.run_inner_impl(agent, body);
@@ -7795,9 +7857,9 @@ impl Vm {
     /// The fast-call path (`CallFast`): the 0-2 arguments are already on the
     /// value stack above `[this, callee]`. The arguments slice is read in
     /// place — no argument-vector build, no per-call `Vec` allocation — and
-    /// the frame is popped after the call. Stack: `[..., this, callee,
-    /// arg1..argN]`.
-    fn do_call_fast(
+    /// the result replaces the call site — the frame is popped after the
+    /// call. Stack: `[..., this, callee, arg1..argN]`.
+    pub(crate) fn do_call_fast(
         &mut self,
         agent: &mut Agent,
         argc: usize,
@@ -8493,25 +8555,17 @@ impl Vm {
             return Ok(false);
         };
         let scope = ir.scope.as_ref().expect("a leaf is certified");
-        // Fetch (compiling on first use) the body's machine code; the cache
-        // keys on the `Rc` identity and holds the body alive, so the pointer
-        // is exact. `body` points at the caller's `Rc` (the hook's
-        // contract); a null return = not JIT-compilable, run the
-        // interpreter.
-        // SAFETY: `hook.cache` is the installed cache and `ir` is alive for
-        // the call.
-        let info = unsafe {
-            (hook.lookup)(
-                hook.cache,
-                ir as *const std::rc::Rc<CompiledBody> as *const std::os::raw::c_void,
-            )
-        };
-        if info.is_null() {
+        // The per-body fast pointer (set on the first successful lookup —
+        // the cache never evicts a body it holds alive, so it stays valid):
+        // a hot call skips the hook entirely. Null = not JIT-compilable,
+        // run the interpreter.
+        let info_ptr = crate::jit::lookup_info(hook, ir);
+        if info_ptr.is_null() {
             return Ok(false);
         }
-        // SAFETY: the cache returns a pointer into its own (never-evicted)
-        // entry.
-        let info = unsafe { &*(info as *const crate::jit::JitCompiledInfo) };
+        // SAFETY: the cache never evicts a body it holds alive; the pointer
+        // is into the cache's own entry.
+        let info = unsafe { &*info_ptr };
         // SAFETY: `info.entry` is a code pointer the cache owns; a fn
         // pointer is pointer-sized, so the integer cast is exact.
         let entry: crate::jit::JitEntry = unsafe { std::mem::transmute(info.entry) };
@@ -8526,9 +8580,21 @@ impl Vm {
         let pre_call = self.stack.len() - argc;
         // The frame (this slot, params, `var`s as undefined, `let`/`const`
         // in the TDZ — `run_leaf_body`'s layout) plus the JIT's working area
-        // and the helper slack, in a private buffer.
+        // and the helper slack, in a private buffer — helpers receive
+        // `&mut Vm` and may reallocate `self.stack`, so the JIT's raw
+        // pointers must never alias it. A small body fits a stack array (no
+        // per-call heap allocation); larger bodies spill to a Vec.
         let buf_len = scope.frame_size + info.stack_usage + crate::jit::JIT_STACK_SLACK;
-        let mut buf = vec![Value::Undefined; buf_len];
+        let (mut inline_buf, mut heap_buf) = (
+            [Value::Undefined; crate::jit::INLINE_JIT_BUF],
+            Vec::<Value>::new(),
+        );
+        let buf: &mut [Value] = if buf_len <= crate::jit::INLINE_JIT_BUF {
+            &mut inline_buf[..buf_len]
+        } else {
+            heap_buf.resize(buf_len, Value::Undefined);
+            &mut heap_buf[..]
+        };
         for (slot, cell) in buf.iter_mut().enumerate().take(scope.frame_size) {
             *cell = if Some(slot) == scope.this_slot {
                 this_value
@@ -8550,13 +8616,24 @@ impl Vm {
             agent: agent as *mut Agent,
             vm: self as *mut Vm,
         };
+        let frame_ptr = buf.as_mut_ptr() as *mut std::os::raw::c_void;
+        // SAFETY: `buf` has `frame_size + stack_usage + slack` slots.
+        let stack_ptr =
+            unsafe { buf.as_mut_ptr().add(scope.frame_size) } as *mut std::os::raw::c_void;
+        // Root the buffer for the call's duration via the Vm's jit-root list
+        // (this Vm is already registered with the active-run tracer, so no
+        // thread-local registration is needed): a helper it invokes can
+        // allocate and trigger a collection, and a heap value only the
+        // buffer references must survive until the JIT stores or returns it.
+        self.jit_roots.push((buf.as_ptr() as usize, buf.len()));
         let result = unsafe {
             (entry)(
-                buf.as_mut_ptr() as *mut std::os::raw::c_void,
-                buf.as_mut_ptr().add(scope.frame_size) as *mut std::os::raw::c_void,
+                frame_ptr,
+                stack_ptr,
                 (&mut ctx as *mut crate::jit::JitCallContext) as *mut std::os::raw::c_void,
             )
         };
+        self.jit_roots.pop();
         // Unwind the argument region (the frame/working area were local),
         // then surface a pending error or land the result —
         // `run_inline_leaf`'s tail. The compiled body stops executing after
@@ -15635,6 +15712,7 @@ pub fn compile_body(
             leaf_uses_env,
             leaf_ops,
             script_globals: None,
+            jit_info: std::cell::Cell::new(0),
         },
         compiler.this_writes,
     ))
@@ -15707,6 +15785,7 @@ pub fn compile_statements(
         leaf_uses_env: false,
         leaf_ops: None,
         script_globals: compiler.script_globals,
+        jit_info: std::cell::Cell::new(0),
     })
 }
 

@@ -135,6 +135,16 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
                     .count();
                 max = max.max(depth + transient);
             }
+            // The call pops `this` + callee + `argc` args and pushes the
+            // result.
+            Step::CallFast { argc, .. } => {
+                depth = depth.saturating_sub(*argc as usize + 2).saturating_add(1);
+            }
+            // The fused slot call pops `argc` args (the callee is the
+            // frame slot) and pushes the result.
+            Step::CallFastSlot { argc, .. } => {
+                depth = depth.saturating_sub(*argc as usize).saturating_add(1);
+            }
             _ => {}
         }
         max = max.max(depth);
@@ -334,6 +344,7 @@ struct Lowerer<'a> {
     sig_get_comp: SigRef,
     sig_set_name: SigRef,
     sig_set_comp: SigRef,
+    sig_call: SigRef,
     // NaN-boxing bit patterns (see `crux::value`).
     undef_bits: i64,
     null_bits: i64,
@@ -366,6 +377,7 @@ impl<'a> Lowerer<'a> {
         let sig_get_comp = builder.import_signature(helper_sig(&[types::I64; 3], conv));
         let sig_set_name = builder.import_signature(helper_sig(&[types::I64; 4], conv));
         let sig_set_comp = builder.import_signature(helper_sig(&[types::I64; 4], conv));
+        let sig_call = builder.import_signature(helper_sig(&[types::I64; 5], conv));
         Lowerer {
             builder,
             helpers,
@@ -386,6 +398,7 @@ impl<'a> Lowerer<'a> {
             sig_get_comp,
             sig_set_name,
             sig_set_comp,
+            sig_call,
             undef_bits: Value::Undefined.bits() as i64,
             null_bits: Value::Null.bits() as i64,
             false_bits: Value::Boolean(false).bits() as i64,
@@ -576,7 +589,27 @@ impl<'a> Lowerer<'a> {
         all_args.push(self.vm());
         all_args.extend_from_slice(args);
         let inst = self.builder.ins().call_indirect(sig, callee, &all_args);
-        Ok(self.builder.func.dfg.inst_results(inst)[0])
+        let result = self.builder.func.dfg.inst_results(inst)[0];
+        // The error ABI: a helper that hit an interpreter error sets the
+        // context's `pending` byte (offset 0). Bail the whole body out
+        // immediately (returning `undefined` — the runtime surfaces the
+        // pending error) so no further side effect runs with the placeholder
+        // value.
+        let vm = self.vm();
+        let pending = self
+            .builder
+            .ins()
+            .load(types::I8, MemFlagsData::new(), vm, Offset32::new(0));
+        let ok = self.builder.ins().icmp_imm_u(IntCC::Equal, pending, 0);
+        let cont = self.builder.create_block();
+        let err = self.builder.create_block();
+        self.builder.ins().brif(ok, cont, &[], err, &[]);
+        self.builder.switch_to_block(err);
+        let undef = self.builder.ins().iconst(types::I64, self.undef_bits);
+        self.builder.ins().return_(&[undef]);
+        self.builder.seal_block(err);
+        self.builder.switch_to_block(cont);
+        Ok(result)
     }
 
     fn const_value(&mut self, value: &Value) -> Result<ClifValue, Unsupported> {
@@ -861,6 +894,62 @@ impl<'a> Lowerer<'a> {
                     self.sig_set_comp,
                     Helper::SetMemberComputed,
                     &[object, key, value],
+                )?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::CallFast { argc, direct_eval } => {
+                if *direct_eval {
+                    return Err(Unsupported::Step("CallFast direct eval"));
+                }
+                // `[..., this, callee, a1..aN]` on the JIT stack; pass the
+                // argument region by pointer (the helper copies it out
+                // before running the interpreter's call machinery). The
+                // callee/`this` sit BELOW the args, so they are loaded by
+                // address, not popped.
+                let sp = self.builder.use_var(self.sp_var);
+                let args_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64) * 8));
+                let callee_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64 + 1) * 8));
+                let this_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64 + 2) * 8));
+                let callee = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    callee_ptr,
+                    Offset32::new(0),
+                );
+                let this = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    this_ptr,
+                    Offset32::new(0),
+                );
+                // The result replaces the whole `[this, callee, args]`
+                // region: drop sp to the `this` slot, then push on top.
+                self.builder.def_var(self.sp_var, this_ptr);
+                let argc_imm = self.builder.ins().iconst(types::I64, *argc as i64);
+                let res = self.call_slow(
+                    self.sig_call,
+                    Helper::CallSlow,
+                    &[callee, this, argc_imm, args_ptr],
+                )?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::CallFastSlot { slot, argc } => {
+                // `[..., a1..aN]` — the fused slot call (`do_call_fast_slot`
+                // reads the callee from the frame and passes `undefined` as
+                // `this`; the fuse guards rule out an argument that writes
+                // the slot).
+                let sp = self.builder.use_var(self.sp_var);
+                let args_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64) * 8));
+                let callee = self.load_slot(*slot);
+                let this = self.builder.ins().iconst(types::I64, self.undef_bits);
+                self.builder.def_var(self.sp_var, args_ptr);
+                let argc_imm = self.builder.ins().iconst(types::I64, *argc as i64);
+                let res = self.call_slow(
+                    self.sig_call,
+                    Helper::CallSlow,
+                    &[callee, this, argc_imm, args_ptr],
                 )?;
                 self.push(res);
                 self.fall_through(index);

@@ -222,6 +222,7 @@ fn runtime_helpers() -> JitHelpers {
         get_member_computed: Some(rt.get_member_computed),
         set_member_name: Some(rt.set_member_name),
         set_member_computed: Some(rt.set_member_computed),
+        call_slow: Some(rt.call_slow),
     }
 }
 
@@ -294,6 +295,7 @@ mod tests {
             leaf_uses_env: false,
             leaf_ops: None,
             script_globals: None,
+            jit_info: std::cell::Cell::new(0),
         }
     }
 
@@ -308,6 +310,7 @@ mod tests {
             get_member_computed: Some(helpers::test_get_member_computed),
             set_member_name: Some(helpers::test_set_member_name),
             set_member_computed: Some(helpers::test_set_member_computed),
+            call_slow: Some(helpers::test_call_slow),
         }
     }
 
@@ -318,17 +321,31 @@ mod tests {
 
     /// Run a compiled body against a fresh frame + stack and return the
     /// completion value. Canary slots around both buffers catch out-of-bounds
-    /// writes from the compiled code.
+    /// writes from the compiled code. A real per-call context is passed (the
+    /// compiled code's pending-check reads its `pending` byte at offset 0);
+    /// the test doubles never touch the agent/vm pointers.
     fn run(compiled: &Compiled, frame_len: usize) -> u64 {
         const CANARY: u64 = 0xDEAD_BEEF_CAFE_F00D;
         let mut frame = vec![0u64; frame_len + 1];
         frame[frame_len] = CANARY;
         let mut stack = vec![0u64; 65];
         stack[64] = CANARY;
+        let mut ctx = runtime::jit::JitCallContext {
+            pending: false,
+            error: None,
+            agent: std::ptr::null_mut(),
+            vm: std::ptr::null_mut(),
+        };
         // Safety: the buffers outlive the call; `vm` is never dereferenced by
         // the scaffold's test helpers.
-        let result =
-            unsafe { compiled.call(frame.as_mut_ptr(), stack.as_mut_ptr(), std::ptr::null_mut()) };
+        let result = unsafe {
+            compiled.call(
+                frame.as_mut_ptr(),
+                stack.as_mut_ptr(),
+                (&mut ctx as *mut runtime::jit::JitCallContext) as *mut std::os::raw::c_void,
+            )
+        };
+        assert!(!ctx.pending, "a test-double helper set the error flag");
         assert_eq!(frame[frame_len], CANARY, "frame overrun");
         assert_eq!(stack[64], CANARY, "stack overrun");
         result
@@ -606,10 +623,7 @@ mod tests {
     fn cache_returns_null_for_an_unsupported_body() {
         let mut cache = JitCache::new(helpers_all()).expect("isa");
         let body = std::rc::Rc::new(make_body(
-            vec![Step::CallFast {
-                argc: 0,
-                direct_eval: false,
-            }],
+            vec![Step::Push(Value::Undefined), Step::Throw],
             0,
         ));
         assert!(cache.lookup(&body).is_null());
@@ -620,15 +634,48 @@ mod tests {
     }
 
     #[test]
-    fn installed_jit_runs_a_certified_leaf_body() {
-        // End to end through the Vm: the script body bails (its `CallFast`
-        // step is unsupported), so the interpreter runs it and the
-        // leaf-inline path hands the certified callee's run to the JIT. The
-        // counter loop and the member access both route through the real
-        // runtime slow-path table; a miscompile would surface as a wrong
-        // result. The cache lives on the test's stack, so `drop_cache` is a
-        // no-op and the hook is cleared before drop (the agent's Drop would
-        // otherwise free a non-heap pointer).
+    fn call_fast_lowers_and_passes_args_by_pointer() {
+        // `[this, callee, 1, 2, 3] -> CallFast(argc=3)`: the test double
+        // sums the numeric arguments, proving the `args` pointer/`argc` ABI.
+        let engine = JitEngine::new().expect("native isa");
+        let body = make_body(
+            vec![
+                Step::Push(Value::Undefined),
+                Step::Push(Value::Undefined),
+                Step::Push(Value::Number(1.0)),
+                Step::Push(Value::Number(2.0)),
+                Step::Push(Value::Number(3.0)),
+                Step::CallFast {
+                    argc: 3,
+                    direct_eval: false,
+                },
+                Step::Return,
+            ],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(6.0).bits());
+    }
+
+    #[test]
+    fn call_fast_direct_eval_bails() {
+        let engine = JitEngine::new().expect("native isa");
+        let body = make_body(
+            vec![Step::CallFast {
+                argc: 0,
+                direct_eval: true,
+            }],
+            0,
+        );
+        assert!(engine.compile(&body, &helpers_all()).is_none());
+    }
+
+    /// Run `f` with a fresh agent that has the JIT hook installed; returns
+    /// the completion value and the number of distinct bodies the cache
+    /// compiled. The cache lives on the test's stack, so `drop_cache` is a
+    /// no-op and the hook is cleared before the agent drops (the agent's
+    /// Drop would otherwise free a non-heap pointer).
+    fn with_jit_agent(f: impl FnOnce(&mut runtime::Agent) -> Value) -> (Value, usize) {
         extern "C" fn noop_drop(_cache: *mut c_void) {}
         let mut agent = runtime::Agent::new();
         agent.initialize_host_defined_realm().expect("realm");
@@ -639,28 +686,134 @@ mod tests {
             drop_cache: noop_drop,
             helpers: &runtime::jit::JIT_SLOW_PATHS,
         });
-        let value = agent
-            .run_script(
-                "function f(n) { var s = 0; for (var i = 0; i < n; i++) { s += i; } return s; }\n\
-                 f(100);",
-            )
-            .expect("runs");
-        assert_eq!(value.as_number(), Some(4950.0));
-        assert!(
-            cache.compiled_count() >= 1,
-            "the callee body was JIT-compiled ({} bodies)",
-            cache.compiled_count()
-        );
-
-        let value = agent
-            .run_script("function g(o) { var v = o.x; o.x = 42; return v; } g({ x: 41 });")
-            .expect("runs");
-        assert_eq!(value.as_number(), Some(41.0));
-        assert!(
-            cache.compiled_count() >= 2,
-            "g's body was JIT-compiled ({} bodies)",
-            cache.compiled_count()
-        );
+        let value = f(&mut agent);
+        let compiled = cache.compiled_count();
         agent.jit_hook = None;
+        (value, compiled)
+    }
+
+    #[test]
+    fn installed_jit_runs_a_member_callee() {
+        // `return o.f(1) + 1` — a member callee (plain `CallFast`), no loop.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(o) { return o.f(1) + 1; } f({ f: function (x) { return x + 1; } });",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(3.0));
+        assert!(compiled >= 2, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_slot_callee() {
+        // `return g(x) + 1` — a param callee (fused `CallFastSlot`), no loop.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(g, x) { return g(x) + 1; } f(function (x) { return x + 1; }, 41);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(43.0));
+        assert!(compiled >= 2, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_loop_with_slot_calls() {
+        // `f(g, n) { var s = 0; for (...) { s += g(i); } }` — a slot call
+        // inside a general loop (a call disqualifies the fast-loop shape).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(g, n) { var s = 0; for (var i = 0; i < n; i++) { s += g(i); } return s; }\n\
+                     f(function (x) { return x + 1; }, 100);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(5050.0));
+        assert!(compiled >= 2, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_loop_with_member_calls() {
+        // The general path: `f`'s body contains a plain `CallFast` (a loop
+        // calling `o.f(i)`), so it is certified but not a leaf — it runs
+        // through `ordinary_call` → `run_compiled_body`, whose JIT hook runs
+        // the compiled body. The callee is a certified leaf, so the nested
+        // call takes the leaf-path JIT. Result: sum 1..100 = 5050.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(o, n) { var s = 0; for (var i = 0; i < n; i++) { s += o.f(i); } return s; }\n\
+                     f({ f: function (x) { return x + 1; } }, 100);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(5050.0));
+        assert!(compiled >= 2, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_with_gc_stress_keeps_the_buffer_rooted() {
+        // The private frame/working buffer must be traced for the JIT run's
+        // duration: `s` (a string only the buffer references) would be swept
+        // by a helper-triggered per-allocation stress collection. The loop
+        // concats 1000 times, so collections run mid-body.
+        let (value, _) = with_jit_agent(|agent| {
+            agent.set_gc_stress(true);
+            agent
+                .run_script(
+                    "function f(x) { var s = x; for (var i = 0; i < 1000; i++) { s += x; } return s.length; } f('x');",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(1001.0));
+    }
+
+    #[test]
+    fn installed_jit_with_gc_stress_roots_the_general_frame() {
+        // The general-path frame lives in `vm.frame`, not the private
+        // working area — a computed string stored to a frame slot must be
+        // traced across the loop's per-allocation stress collections, with
+        // calls (the general path) interleaved.
+        let (value, _) = with_jit_agent(|agent| {
+            agent.set_gc_stress(true);
+            agent
+                .run_script(
+                    "function f(o, n) { var s = o.name; for (var i = 0; i < n; i++) { s += o.f(i); } return s.length; }\n\
+                     f({ name: '', f: function (x) { return x + 1; } }, 1000);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(2893.0));
+    }
+
+    #[test]
+    fn installed_jit_runs_a_certified_leaf_body() {
+        // The leaf path: the script body bails (its `CallFastGlobal` step is
+        // unsupported), so the interpreter runs it and the leaf-inline path
+        // hands the certified callee's run to the JIT. The counter loop and
+        // the member access both route through the real runtime slow-path
+        // table; a miscompile would surface as a wrong result.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(n) { var s = 0; for (var i = 0; i < n; i++) { s += i; } return s; }\n\
+                     f(100);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(4950.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script("function g(o) { var v = o.x; o.x = 42; return v; } g({ x: 41 });")
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(41.0));
+        assert!(compiled >= 1, "{compiled} bodies");
     }
 }
