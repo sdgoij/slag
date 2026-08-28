@@ -58,9 +58,15 @@ pub struct JitHook {
     /// The installed cache (owned by the installer; freed by `drop_cache`).
     pub cache: *mut c_void,
     /// Look up (and compile on first use) a body. `body` points at the
-    /// caller's `Rc<CompiledBody>`. Returns a `JitCompiledInfo` pointer, or
-    /// null when the body is not JIT-compilable.
-    pub lookup: unsafe extern "C" fn(cache: *mut c_void, body: *const c_void) -> *const c_void,
+    /// caller's `Rc<CompiledBody>`; `in_flight` is true while another
+    /// compiled body is executing, so the cache must not evict (a running
+    /// frame's entry pointer stays live). Returns a `JitCompiledInfo`
+    /// pointer, or null when the body is not JIT-compilable.
+    pub lookup: unsafe extern "C" fn(
+        cache: *mut c_void,
+        body: *const c_void,
+        in_flight: bool,
+    ) -> *const c_void,
     /// Free the cache (called by the Agent's drop).
     pub drop_cache: unsafe extern "C" fn(cache: *mut c_void),
     /// The slow-path helper table.
@@ -230,6 +236,13 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
 /// value stack: the member helpers push their stored value once per call, and
 /// the JIT's own usage is bounded by `JitCompiledInfo::stack_usage`.
 pub const JIT_STACK_SLACK: usize = 16;
+
+/// The maximum number of JIT frames nested on the native stack. Each runs
+/// with its own private frame/working buffer (a stack array up to
+/// `INLINE_JIT_BUF` slots in `Vm::run_jit_leaf`), so unbounded JIT nesting
+/// would consume native stack faster than the interpreter; deeper recursion
+/// falls back to the interpreter.
+pub const MAX_JIT_DEPTH: usize = 128;
 
 /// The JIT's per-call frame/working buffer fits a stack array up to this
 /// many slots (512 bytes); larger bodies spill to a per-call heap Vec. Most
@@ -960,14 +973,16 @@ extern "C" fn pop_var_reference(ctx: *mut c_void) -> u64 {
 }
 
 /// The body's compiled-info pointer: the per-body fast cell when set (the
-/// first successful lookup stores it — the cache never evicts a body it
-/// holds alive, so it stays valid), else a consult of the installed hook
+/// first successful lookup stores it; an eviction clears it, so a set
+/// pointer is always valid), else a consult of the installed hook
 /// (compiling on first use). `1` marks a known non-compilable body, so the
-/// hook is not reconsulted. Returns null when the body has no compiled
-/// code.
+/// hook is not reconsulted. `in_flight` is forwarded to the cache — its
+/// eviction policy must not free an entry a running frame holds. Returns
+/// null when the body has no compiled code.
 pub(crate) fn lookup_info(
     hook: crate::jit::JitHook,
     ir: &std::rc::Rc<CompiledBody>,
+    in_flight: bool,
 ) -> *const JitCompiledInfo {
     let known = ir.jit_info.get();
     if known > 1 {
@@ -979,6 +994,7 @@ pub(crate) fn lookup_info(
             (hook.lookup)(
                 hook.cache,
                 ir as *const std::rc::Rc<CompiledBody> as *const std::os::raw::c_void,
+                in_flight,
             )
         };
         if ptr.is_null() {
@@ -1008,12 +1024,19 @@ pub(crate) fn run_jit_body(
     let Some(hook) = agent.jit_hook else {
         return Ok(None);
     };
-    let info_ptr = lookup_info(hook, ir);
+    // The recursion guard (see `Vm::run_jit_leaf`): beyond the cap, fall
+    // back to the interpreter so the JIT's private working buffers cannot
+    // exhaust the native stack.
+    if agent.jit_depth >= MAX_JIT_DEPTH {
+        return Ok(None);
+    }
+    let info_ptr = lookup_info(hook, ir, agent.jit_depth > 0);
     if info_ptr.is_null() {
         return Ok(None);
     }
-    // SAFETY: the cache never evicts a body it holds alive; the pointer is
-    // into the cache's own entry.
+    // SAFETY: the cache clears the per-body fast pointer on eviction, so a
+    // pointer the caller just obtained (with no frame in flight to evict)
+    // is into the cache's own live entry.
     let info = unsafe { &*info_ptr };
     // SAFETY: `info.entry` is a code pointer the cache owns; a fn pointer
     // is pointer-sized, so the integer cast is exact.
@@ -1048,6 +1071,7 @@ pub(crate) fn run_jit_body(
     // a helper can allocate and trigger a collection, and a heap value only
     // those buffers reference must survive until the JIT stores or returns
     // it.
+    agent.jit_depth += 1;
     let result = crate::ir::with_jit_run(vm, ir, work, || unsafe {
         (entry)(
             frame_ptr as *mut c_void,
@@ -1055,6 +1079,7 @@ pub(crate) fn run_jit_body(
             (&mut ctx as *mut JitCallContext) as *mut c_void,
         )
     });
+    agent.jit_depth -= 1;
     if ctx.pending {
         return Err(ctx.error.take().expect("a pending JIT error is present"));
     }

@@ -200,6 +200,11 @@ pub struct Agent {
     /// the leaf-call path before interpreting a certified body. The Drop
     /// impl frees the installed cache.
     pub jit_hook: Option<crate::jit::JitHook>,
+    /// The number of compiled JIT bodies currently executing on the native
+    /// stack. The recursion guard for the JIT's private per-call frame
+    /// buffers (`runtime::jit::MAX_JIT_DEPTH`), and the cache's in-flight
+    /// signal: eviction is disabled while any frame runs.
+    pub jit_depth: usize,
     pub(crate) promise_jobs: VecDeque<Job>,
     pub(crate) generic_jobs: VecDeque<Job>,
     pub(crate) timeout_jobs: VecDeque<(Instant, Job)>,
@@ -629,6 +634,7 @@ impl Agent {
             construct_maps: Box::new(std::array::from_fn(|_| None)),
             vm_pool: Vec::new(),
             jit_hook: None,
+            jit_depth: 0,
             promise_jobs: VecDeque::new(),
             generic_jobs: VecDeque::new(),
             timeout_jobs: VecDeque::new(),

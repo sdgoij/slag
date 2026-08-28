@@ -110,8 +110,13 @@
 //! may reallocate its value stack, so the runtime integration passes the JIT
 //! a frame/working area in a private buffer the helpers never see (their
 //! own pushes grow the interpreter's stack, never the JIT's raw pointers);
-//! and the scaffold allocates executable memory as RWX (W^X — a follow-up
-//! should allocate RW, copy, then protect RX).
+//! the executable pages are W^X (allocated RW, copied, then protected RX);
+//! the compiled-body cache is bounded (least-recently-used entries are
+//! evicted once it overflows, and eviction is suppressed while a compiled
+//! frame is executing, so a running body's entry pointer stays valid); and
+//! deep JIT nesting is guarded — beyond `runtime::jit::MAX_JIT_DEPTH` the
+//! runtime falls back to the interpreter so the private buffers cannot
+//! exhaust the native stack.
 
 pub mod code_buffer;
 pub mod compiler;
@@ -182,42 +187,117 @@ impl Compiled {
 /// The compiled-body cache the Vm consults before interpreting a certified
 /// leaf: keyed on the `Rc<CompiledBody>` identity, compiled on first use.
 /// Each entry holds the body's `Rc` strongly, so the key can never be reused
-/// by a different body while its compiled code is cached, and entries are
-/// never evicted while live — a running JIT frame holds raw pointers into
-/// the executable allocation. A body that fails to compile is remembered as
-/// a miss so the (expensive) compile attempt happens once, not on every
-/// call. (A future eviction policy must track in-flight frames.)
+/// by a different body while its compiled code is cached. The cache is
+/// bounded: once it holds `MAX_CACHE_ENTRIES`, inserting a new body evicts
+/// the least-recently-used entries (down to `EVICT_TO_ENTRIES`), freeing
+/// their executable code and clearing the per-body fast pointer so the next
+/// call recompiles. Eviction only runs when no compiled frame is executing
+/// (the runtime passes `in_flight` to [`JitCache::lookup`]): a running
+/// body's entry pointer stays valid for the call, and the recursion guard
+/// (`runtime::jit::MAX_JIT_DEPTH`) bounds how far the cache can overgrow in
+/// that window. A body that fails to compile is remembered as a miss so the
+/// (expensive) compile attempt happens once, not on every call.
 pub struct JitCache {
     engine: JitEngine,
     helpers: JitHelpers,
-    entries: HashMap<usize, (Rc<CompiledBody>, Option<Rc<Compiled>>)>,
+    entries: HashMap<usize, Entry>,
+    /// A monotonic last-use clock (bumped per lookup); the eviction policy
+    /// evicts the smallest `last_used` entries.
+    clock: u64,
+    /// The entry count beyond which an insert (with no frame in flight)
+    /// evicts the least-recently-used entries.
+    cap: usize,
+    /// The entry count an eviction leaves behind (a floor below the cap, so
+    /// a burst of new bodies does not thrash the cache one entry at a time).
+    evict_to: usize,
 }
+
+/// One cached body: the strong `Rc` (pins the body so its identity cannot
+/// be reused while cached), the compiled code (or a remembered miss), and
+/// the last-use clock for eviction.
+struct Entry {
+    body: Rc<CompiledBody>,
+    compiled: Option<Rc<Compiled>>,
+    last_used: u64,
+}
+
+/// The cache's capacity: beyond this many entries the least-recently-used
+/// bodies are evicted.
+pub const MAX_CACHE_ENTRIES: usize = 256;
+
+/// Eviction removes entries down to this floor (half the capacity), so a
+/// burst of new bodies does not thrash the cache entry by entry.
+pub const EVICT_TO_ENTRIES: usize = 128;
 
 impl JitCache {
     /// A cache whose compile step uses `helpers` as the slow-path table.
     pub fn new(helpers: JitHelpers) -> Result<Self, String> {
+        Self::with_capacity(helpers, MAX_CACHE_ENTRIES, EVICT_TO_ENTRIES)
+    }
+
+    /// A cache with a custom capacity/eviction floor (test introspection).
+    fn with_capacity(helpers: JitHelpers, cap: usize, evict_to: usize) -> Result<Self, String> {
         Ok(Self {
             engine: JitEngine::new()?,
             helpers,
             entries: HashMap::new(),
+            clock: 0,
+            cap,
+            evict_to,
         })
     }
 
     /// Look up `body`'s compiled code, compiling on first use. Returns a
     /// pointer to the metadata, valid for as long as the entry lives (the
-    /// cache never evicts); null when the body is not JIT-compilable.
-    pub fn lookup(&mut self, body: &Rc<CompiledBody>) -> *const JitCompiledInfo {
+    /// cache evicts only when `in_flight` is false, and clears the body's
+    /// fast pointer when it does); null when the body is not
+    /// JIT-compilable. `in_flight` is true while another compiled body is
+    /// executing: its entry pointer must survive, so no eviction runs.
+    pub fn lookup(&mut self, body: &Rc<CompiledBody>, in_flight: bool) -> *const JitCompiledInfo {
         let key = Rc::as_ptr(body) as usize;
-        if !self.entries.contains_key(&key) {
+        self.clock = self.clock.wrapping_add(1);
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.last_used = self.clock;
+        } else {
+            self.evict_if_needed(in_flight);
             let compiled = self.engine.compile(body, &self.helpers).map(Rc::new);
-            self.entries.insert(key, (body.clone(), compiled));
+            self.entries.insert(
+                key,
+                Entry {
+                    body: body.clone(),
+                    compiled,
+                    last_used: self.clock,
+                },
+            );
         }
-        // The entry is never evicted (and HashMap nodes are individually
-        // heap-allocated), so the reference outlives this call.
-        let (_, compiled) = &self.entries[&key];
-        match compiled {
+        let entry = &self.entries[&key];
+        match &entry.compiled {
             Some(compiled) => &compiled.info,
             None => std::ptr::null(),
+        }
+    }
+
+    /// Evict the least-recently-used entries down to the floor, unless a
+    /// compiled frame is executing (its entry pointer is live on the native
+    /// stack) or the cache is under capacity.
+    fn evict_if_needed(&mut self, in_flight: bool) {
+        if in_flight || self.entries.len() < self.cap {
+            return;
+        }
+        let mut keys: Vec<(usize, u64)> = self
+            .entries
+            .iter()
+            .map(|(key, entry)| (*key, entry.last_used))
+            .collect();
+        keys.sort_unstable_by_key(|(_, used)| *used);
+        let remove = self.entries.len() - self.evict_to;
+        for (key, _) in keys.into_iter().take(remove) {
+            if let Some(entry) = self.entries.remove(&key) {
+                // Clear the per-body fast pointer: the compiled info it
+                // points at is freed with the entry, so the next call must
+                // reconsult the cache (and recompile).
+                entry.body.jit_info.set(0);
+            }
         }
     }
 
@@ -225,7 +305,7 @@ impl JitCache {
     pub fn compiled_count(&self) -> usize {
         self.entries
             .values()
-            .filter(|(_, compiled)| compiled.is_some())
+            .filter(|entry| entry.compiled.is_some())
             .count()
     }
 }
@@ -282,12 +362,16 @@ pub fn install(agent: &mut runtime::Agent) -> Result<(), String> {
     Ok(())
 }
 
-unsafe extern "C" fn jit_cache_lookup(cache: *mut c_void, body: *const c_void) -> *const c_void {
+unsafe extern "C" fn jit_cache_lookup(
+    cache: *mut c_void,
+    body: *const c_void,
+    in_flight: bool,
+) -> *const c_void {
     // SAFETY: the runtime passes the pointer `install` returned and a live
     // `Rc<CompiledBody>` (the caller holds it for the call).
     let cache = unsafe { &mut *(cache as *mut JitCache) };
     let body = unsafe { &*(body as *const Rc<CompiledBody>) };
-    cache.lookup(body) as *const c_void
+    cache.lookup(body, in_flight) as *const c_void
 }
 
 unsafe extern "C" fn jit_cache_drop(cache: *mut c_void) {
@@ -669,11 +753,12 @@ mod tests {
             vec![Step::Push(Value::Number(1.0)), Step::Return],
             0,
         ));
-        let p1 = cache.lookup(&body);
+        let p1 = cache.lookup(&body, false);
         assert!(!p1.is_null(), "a supported body compiles");
-        let p2 = cache.lookup(&body);
+        let p2 = cache.lookup(&body, false);
         assert_eq!(p1, p2, "a cached body returns the same pointer");
-        // SAFETY: the cache never evicts, so the pointer stays valid.
+        // SAFETY: the single entry is under the capacity, so nothing evicts
+        // it and the pointer stays valid.
         let info = unsafe { &*p1 };
         assert_eq!(info.stack_usage, 1, "one push above the entry stack");
         assert_ne!(info.entry, 0);
@@ -686,11 +771,85 @@ mod tests {
             vec![Step::Push(Value::Undefined), Step::Throw],
             0,
         ));
-        assert!(cache.lookup(&body).is_null());
+        assert!(cache.lookup(&body, false).is_null());
         // A failed compile is remembered, so the (expensive) attempt does
         // not repeat on every call.
-        assert!(cache.lookup(&body).is_null());
+        assert!(cache.lookup(&body, false).is_null());
         assert_eq!(cache.compiled_count(), 0);
+    }
+
+    #[test]
+    fn cache_evicts_least_recently_used_bodies() {
+        // cap 2, floor 1: A, B, then A again (hot), then C — B is the LRU
+        // and must go; A stays; C lands. The evicted body's per-body fast
+        // pointer is cleared, so a later call recompiles it.
+        let mut cache = JitCache::with_capacity(helpers_all(), 2, 1).expect("isa");
+        let body = |n: f64| {
+            std::rc::Rc::new(make_body(
+                vec![Step::Push(Value::Number(n)), Step::Return],
+                0,
+            ))
+        };
+        let a = body(1.0);
+        let b = body(2.0);
+        let c = body(3.0);
+        assert!(!cache.lookup(&a, false).is_null());
+        assert!(!cache.lookup(&b, false).is_null());
+        assert!(!cache.lookup(&a, false).is_null()); // A is now most-recent
+        assert!(!cache.lookup(&c, false).is_null());
+        assert_eq!(cache.compiled_count(), 2, "B was evicted");
+        // B's fast pointer was cleared by the eviction...
+        assert_eq!(b.jit_info.get(), 0);
+        // ...and a later call recompiles it fresh (evicting the LRU, A).
+        assert!(!cache.lookup(&b, false).is_null());
+        assert_eq!(cache.compiled_count(), 2, "recompiled B evicted the LRU");
+        assert_eq!(a.jit_info.get(), 0, "A's fast pointer was cleared");
+    }
+
+    #[test]
+    fn cache_skips_eviction_while_a_frame_is_in_flight() {
+        // While a compiled body is executing, `lookup` must not evict: the
+        // running body's entry pointer stays live on the native stack.
+        // cap 2, floor 1; the in-flight insert overflows, and the eviction
+        // happens only once the frame leaves.
+        let mut cache = JitCache::with_capacity(helpers_all(), 2, 1).expect("isa");
+        let body = |n: f64| {
+            std::rc::Rc::new(make_body(
+                vec![Step::Push(Value::Number(n)), Step::Return],
+                0,
+            ))
+        };
+        let a = body(1.0);
+        let b = body(2.0);
+        let c = body(3.0);
+        let d = body(4.0);
+        assert!(!cache.lookup(&a, false).is_null());
+        assert!(!cache.lookup(&b, false).is_null());
+        // A frame is in flight: inserting C must not evict A or B.
+        assert!(!cache.lookup(&c, true).is_null());
+        assert_eq!(cache.compiled_count(), 3, "no eviction while in flight");
+        // Once the frame leaves, the next insert evicts down to the floor.
+        assert!(!cache.lookup(&d, false).is_null());
+        assert_eq!(
+            cache.compiled_count(),
+            2,
+            "eviction resumes after the frame"
+        );
+        assert_eq!(b.jit_info.get(), 0, "B was the LRU and got evicted");
+    }
+
+    #[test]
+    fn installed_jit_recursion_guard_falls_back_to_interpreter() {
+        // At the depth cap the JIT path bails to the interpreter: the body
+        // still runs (correct result) but nothing new compiles.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent.jit_depth = runtime::jit::MAX_JIT_DEPTH;
+            agent
+                .run_script("function f(x) { return x + 1; } f(41);")
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(42.0));
+        assert_eq!(compiled, 0, "the depth cap skips the JIT entirely");
     }
 
     #[test]

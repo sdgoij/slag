@@ -1295,9 +1295,10 @@ pub struct CompiledBody {
     /// The JIT's compiled-info pointer for this body: `0` = not yet looked
     /// up, `1` = known non-compilable, otherwise a `*const
     /// crate::jit::JitCompiledInfo` owned by the installed jit cache. The
-    /// cache never evicts a body it holds alive, so the pointer stays valid
-    /// for the body's lifetime; the JIT's call paths set it on the first
-    /// lookup so a hot call skips the cache consultation entirely.
+    /// cache clears it when the entry is evicted (before the compiled code
+    /// is freed), so a set pointer is always valid; the JIT's call paths
+    /// set it on the first lookup so a hot call skips the cache
+    /// consultation entirely.
     pub jit_info: std::cell::Cell<usize>,
 }
 
@@ -8662,17 +8663,28 @@ impl Vm {
         let Some(hook) = agent.jit_hook else {
             return Ok(false);
         };
+        // The recursion guard: a nested JIT frame runs with its own private
+        // frame/working buffer on the native stack, so unbounded JIT nesting
+        // could exhaust it — beyond the cap, fall back to the interpreter
+        // (which is what `Ok(false)` routes to).
+        if agent.jit_depth >= crate::jit::MAX_JIT_DEPTH {
+            return Ok(false);
+        }
         let scope = ir.scope.as_ref().expect("a leaf is certified");
         // The per-body fast pointer (set on the first successful lookup —
-        // the cache never evicts a body it holds alive, so it stays valid):
-        // a hot call skips the hook entirely. Null = not JIT-compilable,
-        // run the interpreter.
-        let info_ptr = crate::jit::lookup_info(hook, ir);
+        // the cache clears it when the entry is evicted, so a set pointer
+        // is always valid): a hot call skips the hook entirely. Null = not
+        // JIT-compilable, run the interpreter. The in-flight flag is the
+        // enclosing JIT depth: a nested lookup (a helper re-entering the
+        // interpreter mid-run) must not let the cache evict a running
+        // frame's code.
+        let info_ptr = crate::jit::lookup_info(hook, ir, agent.jit_depth > 0);
         if info_ptr.is_null() {
             return Ok(false);
         }
-        // SAFETY: the cache never evicts a body it holds alive; the pointer
-        // is into the cache's own entry.
+        // SAFETY: the cache clears the per-body fast pointer on eviction, so
+        // a pointer the caller just obtained (with no frame in flight to
+        // evict) is into the cache's own live entry.
         let info = unsafe { &*info_ptr };
         // SAFETY: `info.entry` is a code pointer the cache owns; a fn
         // pointer is pointer-sized, so the integer cast is exact.
@@ -8759,6 +8771,7 @@ impl Vm {
         // allocate and trigger a collection, and a heap value only the
         // buffer references must survive until the JIT stores or returns it.
         self.jit_roots.push((buf.as_ptr() as usize, buf.len()));
+        agent.jit_depth += 1;
         let result = unsafe {
             (entry)(
                 frame_ptr,
@@ -8766,6 +8779,7 @@ impl Vm {
                 (&mut ctx as *mut crate::jit::JitCallContext) as *mut std::os::raw::c_void,
             )
         };
+        agent.jit_depth -= 1;
         self.jit_roots.pop();
         // Unwind the argument region (the frame/working area were local),
         // then surface a pending error or land the result —
