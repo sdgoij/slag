@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 crux = { path = "../crux" }
+jit = { path = "../jit" }
 parser = { path = "../parser" }
 runtime = { path = "../runtime", features = ["workers"] }
 syntax = { path = "../syntax" }

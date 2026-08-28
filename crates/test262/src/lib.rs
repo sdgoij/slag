@@ -31,12 +31,20 @@ pub mod harness {
     // runner, applied to every fixture agent.
     thread_local! {
         static GC_STRESS: Cell<bool> = const { Cell::new(false) };
+        static JIT: Cell<bool> = const { Cell::new(false) };
     }
 
     /// Enable the per-allocation `--gc-stress` mode for subsequent fixture
     /// agents (the `test262-sweep --gc-stress` gate, docs/gc-plan.md GC-2).
     pub fn set_gc_stress(enabled: bool) {
         GC_STRESS.with(|stress| stress.set(enabled));
+    }
+
+    /// Enable the Cranelift JIT for subsequent fixture agents (the
+    /// `test262-sweep --jit` gate: every certified body runs its compiled
+    /// machine code instead of the interpreter).
+    pub fn set_jit(enabled: bool) {
+        JIT.with(|jit| jit.set(enabled));
     }
 
     /// Defines `assert.throws` (the real test262 assert.js checks
@@ -10921,6 +10929,9 @@ var $DONE = function (error) {
             .initialize_host_defined_realm()
             .map_err(|e| e.message)?;
         agent.set_gc_stress(GC_STRESS.with(|stress| stress.get()));
+        if JIT.with(|jit| jit.get()) {
+            jit::install(&mut agent)?;
+        }
         install_harness_globals(&agent)?;
         // The preludes need to call user-level functions (assert.throws runs
         // `func`, compareArray reads properties, $262.detachArrayBuffer calls
@@ -11096,6 +11107,9 @@ var $DONE = function (error) {
             .initialize_host_defined_realm()
             .map_err(|e| e.message)?;
         agent.set_gc_stress(GC_STRESS.with(|stress| stress.get()));
+        if JIT.with(|jit| jit.get()) {
+            jit::install(&mut agent)?;
+        }
         install_harness_globals(&agent)?;
         agent
             .run_script(ASSERT_THROWS_PRELUDE)
@@ -12066,6 +12080,10 @@ var $DONE = function (error) {
             (|| -> Result<(), JsError> {
                 let mut agent = Agent::new();
                 agent.set_gc_stress(GC_STRESS.with(|stress| stress.get()));
+                if JIT.with(|jit| jit.get()) {
+                    jit::install(&mut agent)
+                        .map_err(|message| JsError::new(ErrorKind::TypeError, message))?;
+                }
                 agent.can_block = true;
                 agent.initialize_host_defined_realm()?;
                 install_worker_agent_api(&mut agent, &hub, index)?;
