@@ -4093,7 +4093,7 @@ impl Vm {
                         agent,
                         *is_async,
                         params.clone(),
-                        body.clone(),
+                        body,
                         env,
                         *strict,
                         outer_chain.clone(),

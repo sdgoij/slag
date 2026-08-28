@@ -254,6 +254,23 @@ pub struct Agent {
         crate::function::EcmaFunction,
         std::hash::BuildHasherDefault<IdentityHasher>,
     >,
+    /// Cut 43: per-site compiled bodies, keyed by the shared body `Rc<Block>`
+    /// pointer (the canonical site identity `shared_function_body` returns).
+    /// Closures from the same declaration site share one `Rc<CompiledBody>`:
+    /// the IR is a pure function of the site (params/body/strict/outer_chain
+    /// are compile-time constants), so instantiating the same site repeatedly
+    /// — a function declaration inside a loop, say — would otherwise
+    /// recompile the IR (and, via the per-body `jit_info` fast pointer, the
+    /// JIT machine code) on every closure. The cache is traced so the
+    /// compiled bodies' literal `Value`s stay rooted between instantiations;
+    /// the paired `(usize, [AtomId; 4])` is the site's collected `this.*`
+    /// property-write pattern (`compile_body`'s second return), re-applied to
+    /// each fresh constructor record. Entries are held for the agent's life
+    /// (like `shared_function_body`'s cache), so a long-running process with
+    /// many dynamically-created sites grows it unboundedly — consistent with
+    /// the existing body-AST cache.
+    pub(crate) compiled_bodies:
+        std::collections::HashMap<usize, crate::function::CompiledBodyCacheEntry>,
     /// The Promise Records keyed by promise-object identity (spec 27.2.1).
     pub promises: std::collections::HashMap<u64, RefCell<crate::promise::PromiseData>>,
     /// The resolving functions created by CreateResolvingFunctions, keyed by
@@ -668,6 +685,7 @@ impl Agent {
             module_async_evaluation_count: 0,
             module_eval_stack: Vec::new(),
             ecma_functions: std::collections::HashMap::default(),
+            compiled_bodies: std::collections::HashMap::new(),
             promises: std::collections::HashMap::new(),
             promise_resolvers: std::collections::HashMap::new(),
             promise_compound: std::collections::HashMap::new(),
@@ -1044,6 +1062,9 @@ impl Agent {
         self.kept_alive.trace(visit);
         self.global_symbol_registry.trace(visit);
         self.module_eval_stack.trace(visit);
+        for entry in self.compiled_bodies.values() {
+            entry.compiled.trace(visit);
+        }
         self.ecma_functions.trace(visit);
         self.promises.trace(visit);
         self.promise_resolvers.trace(visit);

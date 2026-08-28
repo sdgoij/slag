@@ -113,6 +113,16 @@ impl Trace for ClassField {
     }
 }
 
+/// Cut 43: one declaration site's shared compiled body plus its collected
+/// `this.*` property-write pattern (`compile_body`'s second return), which is
+/// re-applied to each fresh constructor record from the site (see
+/// `Agent::compiled_bodies`).
+#[derive(Clone)]
+pub(crate) struct CompiledBodyCacheEntry {
+    pub compiled: std::rc::Rc<crate::ir::CompiledBody>,
+    pub this_writes: (usize, [crux::AtomId; 4]),
+}
+
 /// The spec 10.2.1 internal slots of an ordinary ECMAScript function,
 /// registered per function object.
 #[derive(Debug, Clone)]
@@ -566,6 +576,62 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+/// The shared body `Rc<Block>` for an arrow site (Cut 43): the ArrowBody
+/// node identity is stable — the compiled `Step::CreateArrow` or the walked
+/// AST holds it — so every closure from the site shares one Block, mirroring
+/// `shared_function_body`. The expression form is wrapped in a synthetic
+/// `return` block once; the key carries the node's span and source hash so
+/// raw node addresses reused after a parse is dropped cannot collide.
+pub fn shared_arrow_body(agent: &Agent, body: &syntax::ast::ArrowBody) -> std::rc::Rc<Block> {
+    let realm = agent
+        .current_realm()
+        .map(|realm| crux::handle::Handle::as_ptr(realm) as usize)
+        .unwrap_or(0);
+    let (node, span) = match body {
+        ArrowBody::Expr(expr) => (expr.as_ref() as *const Expr as usize, expr.span),
+        ArrowBody::Block(block) => (block as *const Block as usize, block.span),
+    };
+    let source_key = capture_source(agent, span)
+        .map(|source| source_hash(&source))
+        .unwrap_or(0);
+    let key = (
+        node,
+        realm,
+        span.start as usize,
+        span.end as usize,
+        source_key,
+    );
+    ARROW_BODY_CACHE.with(|cache| {
+        if let Some(block) = cache.borrow().get(&key) {
+            return block.clone();
+        }
+        let block: std::rc::Rc<Block> = match body {
+            ArrowBody::Expr(expr) => {
+                let span = expr.span;
+                std::rc::Rc::new(Block {
+                    stmts: vec![Stmt {
+                        span,
+                        kind: StmtKind::Return(Some((**expr).clone())),
+                    }],
+                    span,
+                })
+            }
+            ArrowBody::Block(block) => std::rc::Rc::new(block.clone()),
+        };
+        cache.borrow_mut().insert(key, block.clone());
+        block
+    })
+}
+
+type ArrowBodyKey = (usize, usize, usize, usize, usize);
+
+type ArrowBodyCache = std::collections::HashMap<ArrowBodyKey, std::rc::Rc<Block>>;
+
+thread_local! {
+    static ARROW_BODY_CACHE: std::cell::RefCell<ArrowBodyCache> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 /// Instantiate a method definition (object literal `m() {}` and class
 /// methods): an ordinary function with no `prototype` own property and no
 /// name until SetFunctionName; [[HomeObject]] is attached by `make_method`.
@@ -698,6 +764,30 @@ pub fn make_method(agent: &mut Agent, function: &Value, home_object: Value) -> R
     Ok(())
 }
 
+/// Cut 43: the shared compiled body for a declaration site (`body_key` is
+/// the shared body `Rc<Block>` pointer), compiling on first use. The
+/// compiled body is a pure function of the site — the record's
+/// params/body/strict/outer_chain/per-iteration chain are compile-time
+/// constants — so every closure from the site shares one `Rc<CompiledBody>`:
+/// the per-body JIT fast pointer stays warm instead of recompiling the IR
+/// and machine code per closure.
+fn shared_compiled_body(
+    agent: &mut Agent,
+    data: &EcmaFunction,
+    body_key: usize,
+) -> Result<CompiledBodyCacheEntry, JsError> {
+    if let Some(entry) = agent.compiled_bodies.get(&body_key) {
+        return Ok(entry.clone());
+    }
+    let (compiled, this_writes) = crate::ir::compile_body(data)?;
+    let entry = CompiledBodyCacheEntry {
+        compiled: std::rc::Rc::new(compiled),
+        this_writes,
+    };
+    agent.compiled_bodies.insert(body_key, entry.clone());
+    Ok(entry)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn register_function(
     agent: &mut Agent,
@@ -730,6 +820,12 @@ fn register_function(
                 Some(crate::context::ScriptOrModule::Module(module)) => Some(*module),
                 _ => None,
             });
+    // Cut 43: closures from the same declaration site share one compiled
+    // body (the `body` Rc is the canonical site identity — see
+    // `shared_function_body`), so the IR compile — and the per-body JIT
+    // fast pointer it feeds — runs once per site instead of once per
+    // closure. The pointer is captured before `body` moves into the record.
+    let body_key = std::rc::Rc::as_ptr(&body) as usize;
     let mut data = EcmaFunction {
         name: name.clone(),
         params: params.clone(),
@@ -765,8 +861,12 @@ fn register_function(
     // record lands in `ecma_functions` — a collection in that window would
     // sweep them (GC-2).
     let function = Function::new(name.clone());
-    let (compiled, this_writes) = crate::ir::compile_body(&data)?;
-    data.set_compiled(std::rc::Rc::new(compiled));
+    // The paired `this_writes` pattern is re-applied to each fresh
+    // constructor record below (Cut 43: the compiled body is shared per
+    // site, so the pattern is computed once and copied).
+    let entry = shared_compiled_body(agent, &data, body_key)?;
+    let this_writes = entry.this_writes;
+    data.set_compiled(entry.compiled);
     agent.ecma_functions.insert(function.id(), data);
     // Cut 35 slice 30: store collected `this.*` property writes for
     // constructor store-cache pre-warming in `construct_this_object`.
@@ -1010,33 +1110,26 @@ pub fn instantiate_arrow(
     agent: &mut Agent,
     is_async: bool,
     params: Vec<BindingElement>,
-    body: ArrowBody,
+    body: &syntax::ast::ArrowBody,
     environment: EnvRef,
     enclosing_strict: bool,
     outer_chain: Vec<Vec<crux::AtomId>>,
     per_iteration_chain: Vec<(Vec<crux::AtomId>, usize)>,
 ) -> Result<Value, JsError> {
-    let body = match body {
-        ArrowBody::Expr(expr) => {
-            let span = expr.span;
-            Block {
-                stmts: vec![Stmt {
-                    span,
-                    kind: StmtKind::Return(Some(*expr)),
-                }],
-                span,
-            }
-        }
-        ArrowBody::Block(block) => block,
-    };
+    // Cut 43: the site's shared Block — every closure from the same arrow
+    // node shares it (and, via `shared_compiled_body` below, one compiled
+    // body), so a loop-created arrow does not recompile per iteration. The
+    // pointer is captured before the Rc moves into the record.
+    let block = shared_arrow_body(agent, body);
+    let body_key = std::rc::Rc::as_ptr(&block) as usize;
     let realm = agent.current_realm()?;
     let private_environment = agent.running_context()?.private_environment;
-    let strict = body_is_strict(agent, &body, None) || enclosing_strict;
+    let strict = body_is_strict(agent, &block, None) || enclosing_strict;
     let class_field_initializer = agent.field_initializer_depth > 0;
     let mut data = EcmaFunction {
         name: None,
         params,
-        body: std::rc::Rc::new(body),
+        body: block,
         environment,
         this_mode: ThisMode::Lexical,
         strict,
@@ -1065,8 +1158,9 @@ pub fn instantiate_arrow(
     // collection at `Function::new` cannot sweep the compiled body's literal
     // `Value`s while they are unrooted (GC-2, see `register_function`).
     let function = Function::new(None);
-    let (compiled, this_writes) = crate::ir::compile_body(&data)?;
-    data.set_compiled(std::rc::Rc::new(compiled));
+    let entry = shared_compiled_body(agent, &data, body_key)?;
+    let this_writes = entry.this_writes;
+    data.set_compiled(entry.compiled);
     let params = data.params.clone();
     agent.ecma_functions.insert(function.id(), data);
     crate::ir::store_construct_patterns(agent, function.id(), this_writes);
