@@ -9704,7 +9704,7 @@ pub(crate) fn update_value(
     Ok((old_numeric, new))
 }
 
-fn member_reference(
+pub(crate) fn member_reference(
     object: &Value,
     key: &PropertyKeyName,
     strict: bool,

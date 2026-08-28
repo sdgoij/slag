@@ -41,6 +41,7 @@ pub enum Helper {
     UpdateIdent,
     AssignMemberName,
     AssignMemberComputed,
+    SetMemberSlot,
     LoadContext,
     StoreContext,
     InitContext,
@@ -77,6 +78,7 @@ impl Helper {
             Helper::UpdateIdent => "update_ident",
             Helper::AssignMemberName => "assign_member_name",
             Helper::AssignMemberComputed => "assign_member_computed",
+            Helper::SetMemberSlot => "set_member_slot",
             Helper::LoadContext => "load_context",
             Helper::StoreContext => "store_context",
             Helper::InitContext => "init_context",
@@ -171,6 +173,13 @@ pub struct JitHelpers {
     /// the cell against the live global). Returns the stored value.
     pub set_global_slot:
         Option<extern "C" fn(vm: *mut c_void, name: u64, slot: u64, value: u64) -> u64>,
+    /// The compiled `AssignMemberName` fast path's in-place property write
+    /// (Cut 40): the compiled code validated the member value cell and
+    /// computed the compound's new value, so the vector entry is written
+    /// directly (with the inline-field mirror); falls back to the full Set
+    /// machinery on any doubt. Returns the stored value.
+    pub set_member_slot:
+        Option<extern "C" fn(vm: *mut c_void, object: u64, name: u64, value: u64) -> u64>,
     /// The identifier read a certified body uses for an outer/global binding
     /// (`resolve_binding` + `get_value`); `name` is an `AtomId`.
     pub load_ident: Option<extern "C" fn(vm: *mut c_void, name: u64) -> u64>,
@@ -265,6 +274,7 @@ impl JitHelpers {
             update_ident: None,
             assign_member_name: None,
             assign_member_computed: None,
+            set_member_slot: None,
             load_context: None,
             store_context: None,
             init_context: None,
@@ -302,6 +312,7 @@ impl JitHelpers {
             Helper::UpdateIdent => self.update_ident.map(|f| f as usize as u64),
             Helper::AssignMemberName => self.assign_member_name.map(|f| f as usize as u64),
             Helper::AssignMemberComputed => self.assign_member_computed.map(|f| f as usize as u64),
+            Helper::SetMemberSlot => self.set_member_slot.map(|f| f as usize as u64),
             Helper::LoadContext => self.load_context.map(|f| f as usize as u64),
             Helper::StoreContext => self.store_context.map(|f| f as usize as u64),
             Helper::InitContext => self.init_context.map(|f| f as usize as u64),
@@ -447,6 +458,17 @@ pub extern "C" fn test_assign_member_computed(
         let old_num = Value::from_bits(old).as_number().unwrap_or(0.0);
         Value::Number(old_num + value_num).bits()
     }
+}
+
+/// Returns the stored value unchanged — proves `set_member_slot` was called
+/// with the right ABI.
+pub extern "C" fn test_set_member_slot(
+    _vm: *mut c_void,
+    _object: u64,
+    _name: u64,
+    value: u64,
+) -> u64 {
+    value
 }
 
 /// Returns `42` — proves `load_context` was called with the right ABI.

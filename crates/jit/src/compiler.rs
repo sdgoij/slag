@@ -41,7 +41,7 @@ use runtime::ir::{
     ScopeInfo, Step, is_compound_assign,
 };
 use runtime::jit::{GlobalValueCell, JitCallContext, LeafCallSiteCache, LeafInlineInfo};
-use syntax::ast::{BinaryOp, UpdateOp};
+use syntax::ast::{AssignOp, BinaryOp, UpdateOp};
 use target_lexicon::PointerWidth;
 
 use crate::helpers::{Helper, JitHelpers};
@@ -598,6 +598,134 @@ impl<'a> Lowerer<'a> {
             .store(MemFlagsData::new(), value, sp, Offset32::new(0));
         let next = self.builder.ins().iadd_imm_s(sp, 8);
         self.builder.def_var(self.sp_var, next);
+    }
+
+    /// The Cut 38 member-value cell probe, shared by the step path's
+    /// `GetMemberName` and the register body's `GetMemberName`/
+    /// `GetMemberNameLocal` (the fast-loop shape): check `object` is a
+    /// plain Object value, extract the box address, read its LIVE
+    /// id/generation, and probe the direct-mapped value cell (recorded by
+    /// the interpreter's own-property reads, including the map path) — a
+    /// hit serves the cached value with no `get_member_name` helper call.
+    /// Function receivers, primitives (boxing), proxies, accessors, and
+    /// prototype-chain reads miss to the helper, which re-resolves and
+    /// repopulates the cell for the next read. The probe's merge block is
+    /// sealed and current on return.
+    fn emit_member_cell_read(
+        &mut self,
+        object: ClifValue,
+        name: crux::AtomId,
+    ) -> Result<ClifValue, Unsupported> {
+        let name_imm = self.builder.ins().iconst(types::I64, name as i64);
+        let ctx = self.vm();
+        let cells = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, member_value_cells) as i32),
+        );
+        let value_var = self.builder.declare_var(types::I64);
+        let probe = self.builder.create_block();
+        let slow = self.builder.create_block();
+        let merge = self.builder.create_block();
+        let is_heap = self.builder.ins().band_imm_u(object, crux::TAG_MASK as i64);
+        let is_obj = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, is_heap, crux::TAG_PREFIX as i64);
+        let tag = self.builder.ins().ushr_imm_u(object, 44);
+        let tag = self.builder.ins().band_imm_u(tag, 0xF);
+        let tag_obj = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, tag, crux::TAG_OBJECT as i64);
+        let is_plain_obj = self.builder.ins().band(is_obj, tag_obj);
+        self.builder.ins().brif(is_plain_obj, probe, &[], slow, &[]);
+        // The probe: the cell's id/name/generation must match the
+        // receiver's LIVE id and generation (a mutation anywhere bumps the
+        // generation, so a match means the own data property is unchanged
+        // since the cell was recorded).
+        self.builder.switch_to_block(probe);
+        let ptr = self
+            .builder
+            .ins()
+            .band_imm_u(object, crux::PAYLOAD_MASK as i64);
+        let ptr = self.builder.ins().ishl_imm_u(ptr, 4);
+        // The payload stores the `GcBox` base; the `JsObject` sits after
+        // the box header (`mark` + `size`).
+        let ptr = self
+            .builder
+            .ins()
+            .iadd_imm_s(ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let live_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
+        );
+        let live_gen = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+        );
+        let cell_slot = self.builder.ins().bxor(live_id, name_imm);
+        let cell_slot = self
+            .builder
+            .ins()
+            .band_imm_u(cell_slot, (MEMBER_CELLS - 1) as i64);
+        let index_bytes = self
+            .builder
+            .ins()
+            .imul_imm_s(cell_slot, std::mem::size_of::<MemberValueCell>() as i64);
+        let cell = self.builder.ins().iadd(cells, index_bytes);
+        let cell_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(MemberValueCell, id) as i32),
+        );
+        let cell_name = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(MemberValueCell, name) as i32),
+        );
+        let cell_gen = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(MemberValueCell, generation) as i32),
+        );
+        let cell_value = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(MemberValueCell, value) as i32),
+        );
+        let id_ok = self.builder.ins().icmp(IntCC::Equal, cell_id, live_id);
+        let name_ok = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, cell_name, name as i64);
+        let gen_ok = self.builder.ins().icmp(IntCC::Equal, cell_gen, live_gen);
+        let id_name_ok = self.builder.ins().band(id_ok, name_ok);
+        let ok = self.builder.ins().band(id_name_ok, gen_ok);
+        self.builder.def_var(value_var, cell_value);
+        self.builder.ins().brif(ok, merge, &[], slow, &[]);
+        // The slow path: the full Get (which also re-resolves and
+        // repopulates the cell for the next read).
+        self.builder.switch_to_block(slow);
+        let res = self.call_slow(
+            self.sig_get_name,
+            Helper::GetMemberName,
+            &[object, name_imm],
+        )?;
+        self.builder.def_var(value_var, res);
+        self.builder.ins().jump(merge, &[]);
+        self.builder.seal_block(merge);
+        self.builder.switch_to_block(merge);
+        Ok(self.builder.use_var(value_var))
     }
 
     fn load_slot(&mut self, slot: usize) -> ClifValue {
@@ -1317,27 +1445,60 @@ impl<'a> Lowerer<'a> {
                 self.fall_through(index);
             }
             Step::GetMemberName { name } => {
-                // Cut 38: inline the member-value fast cell. The compiled
-                // code checks the receiver is a plain Object value, extracts
-                // the box address, reads its LIVE id/generation, and probes
-                // the direct-mapped value cell (recorded by the
-                // interpreter's own-property reads, including the map
-                // path) — a hit serves the cached value with no
-                // `get_member_name` helper call. Function receivers,
-                // primitives (boxing), proxies, accessors, and
-                // prototype-chain reads all miss to the helper.
+                // Cut 38: inline the member-value fast cell (see
+                // `emit_member_cell_read`). Function receivers, primitives
+                // (boxing), proxies, accessors, and prototype-chain reads
+                // miss to the helper.
                 let object = self.pop();
+                let value = self.emit_member_cell_read(object, *name)?;
+                self.push(value);
+                self.fall_through(index);
+            }
+            Step::GetMemberComputed => {
+                let key = self.pop();
+                let object = self.pop();
+                let res =
+                    self.call_slow(self.sig_get_comp, Helper::GetMemberComputed, &[object, key])?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::AssignMemberName { name, op } => {
+                // `[object, old?, value]` — the compound forms carry the
+                // cached GetValue (the `Dup` + `GetMemberName` the compiler
+                // emitted) between the object and the value.
+                let value = self.pop();
+                let old = if is_compound_assign(op) {
+                    Some(self.pop())
+                } else {
+                    None
+                };
+                let object = self.pop();
+                let op_imm = self.builder.ins().iconst(types::I64, *op as i64);
                 let name_imm = self.builder.ins().iconst(types::I64, *name as i64);
+                let old_imm = match old {
+                    Some(bits) => bits,
+                    None => self.builder.ins().iconst(types::I64, self.undef_bits),
+                };
+                // Cut 40: inline the write for a plain-object receiver whose
+                // member value cell validates (the property is an own
+                // writable data property since the cell was warmed): the
+                // compound's new value is computed here when both operands
+                // are numbers with an inline op (the f64 op is exact), then
+                // `set_member_slot` writes the property vector in place —
+                // no `assign_member_name` helper, no [[Set]] chain walk.
+                // Non-number compounds, non-inline ops, cold cells, and
+                // non-object receivers fall back to the full helper (which
+                // applies the op).
                 let ctx = self.vm();
-                let cells = self.builder.ins().load(
-                    types::I64,
-                    MemFlagsData::new(),
-                    ctx,
-                    Offset32::new(std::mem::offset_of!(JitCallContext, member_value_cells) as i32),
-                );
-                let value_var = self.builder.declare_var(types::I64);
-                let slow = self.builder.create_block();
-                let merge = self.builder.create_block();
+                let compound = is_compound_assign(op);
+                let inline_compound = compound
+                    && matches!(
+                        op,
+                        AssignOp::AddAssign
+                            | AssignOp::SubAssign
+                            | AssignOp::MulAssign
+                            | AssignOp::DivAssign
+                    );
                 let is_heap = self.builder.ins().band_imm_u(object, crux::TAG_MASK as i64);
                 let is_obj =
                     self.builder
@@ -1349,14 +1510,63 @@ impl<'a> Lowerer<'a> {
                     self.builder
                         .ins()
                         .icmp_imm_u(IntCC::Equal, tag, crux::TAG_OBJECT as i64);
-                let is_plain_obj = self.builder.ins().band(is_obj, tag_obj);
-                let probe = self.builder.create_block();
-                self.builder.ins().brif(is_plain_obj, probe, &[], slow, &[]);
-                // The probe: the cell's id/name/generation must match the
-                // receiver's LIVE id and generation (a mutation anywhere
-                // bumps the generation, so a match means the own data
-                // property is unchanged since the cell was recorded).
-                self.builder.switch_to_block(probe);
+                let obj_ok = self.builder.ins().band(is_obj, tag_obj);
+                let gate = if inline_compound {
+                    let old_bits = old.expect("compound assigns carry the cached old value");
+                    let old_num = self.is_double(old_bits);
+                    let value_num = self.is_double(value);
+                    let nums = self.builder.ins().band(old_num, value_num);
+                    self.builder.ins().band(obj_ok, nums)
+                } else if compound {
+                    // A compound op the machine code cannot inline
+                    // (rem/exp/bitwise/shifts, or non-number operands): the
+                    // helper applies it.
+                    self.builder.ins().iconst(types::I8, 0)
+                } else {
+                    obj_ok
+                };
+                let new_var = self.builder.declare_var(types::I64);
+                let fast_prep = self.builder.create_block();
+                let slow = self.builder.create_block();
+                let merge = self.builder.create_block();
+                self.builder.ins().brif(gate, fast_prep, &[], slow, &[]);
+                // The inline new-value computation, then the member-cell
+                // probe (mirrors `GetMemberName`): the live id/generation
+                // must match the cell the interpreter warmed on an own
+                // data-property read.
+                self.builder.switch_to_block(fast_prep);
+                let new = if inline_compound {
+                    let old_bits = old.expect("compound assigns carry the cached old value");
+                    let old_f =
+                        self.builder
+                            .ins()
+                            .bitcast(types::F64, MemFlagsData::new(), old_bits);
+                    let value_f =
+                        self.builder
+                            .ins()
+                            .bitcast(types::F64, MemFlagsData::new(), value);
+                    let res = match op {
+                        AssignOp::AddAssign => self.builder.ins().fadd(old_f, value_f),
+                        AssignOp::SubAssign => self.builder.ins().fsub(old_f, value_f),
+                        AssignOp::MulAssign => self.builder.ins().fmul(old_f, value_f),
+                        AssignOp::DivAssign => self.builder.ins().fdiv(old_f, value_f),
+                        _ => unreachable!("the gate restricted the compound op"),
+                    };
+                    let res_bits = self
+                        .builder
+                        .ins()
+                        .bitcast(types::I64, MemFlagsData::new(), res);
+                    self.canon(res_bits)
+                } else {
+                    value
+                };
+                self.builder.def_var(new_var, new);
+                let cells = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    ctx,
+                    Offset32::new(std::mem::offset_of!(JitCallContext, member_value_cells) as i32),
+                );
                 let ptr = self
                     .builder
                     .ins()
@@ -1408,12 +1618,6 @@ impl<'a> Lowerer<'a> {
                     cell,
                     Offset32::new(std::mem::offset_of!(MemberValueCell, generation) as i32),
                 );
-                let cell_value = self.builder.ins().load(
-                    types::I64,
-                    MemFlagsData::new(),
-                    cell,
-                    Offset32::new(std::mem::offset_of!(MemberValueCell, value) as i32),
-                );
                 let id_ok = self.builder.ins().icmp(IntCC::Equal, cell_id, live_id);
                 let name_ok = self
                     .builder
@@ -1422,55 +1626,33 @@ impl<'a> Lowerer<'a> {
                 let gen_ok = self.builder.ins().icmp(IntCC::Equal, cell_gen, live_gen);
                 let id_name_ok = self.builder.ins().band(id_ok, name_ok);
                 let ok = self.builder.ins().band(id_name_ok, gen_ok);
-                self.builder.def_var(value_var, cell_value);
-                self.builder.ins().brif(ok, merge, &[], slow, &[]);
-                // The slow path: the full Get (which also re-resolves and
-                // repopulates the cell for the next read).
-                self.builder.switch_to_block(slow);
-                let res = self.call_slow(
-                    self.sig_get_name,
-                    Helper::GetMemberName,
-                    &[object, name_imm],
+                let fast = self.builder.create_block();
+                self.builder.ins().brif(ok, fast, &[], slow, &[]);
+                // The fast path: the helper writes the property vector in
+                // place and refreshes the cell (the write does not bump the
+                // generation, so the next read probe stays warm). The result
+                // is the stored value.
+                self.builder.switch_to_block(fast);
+                let new = self.builder.use_var(new_var);
+                let stored = self.call_slow(
+                    self.sig_set_name,
+                    Helper::SetMemberSlot,
+                    &[object, name_imm, new],
                 )?;
-                self.builder.def_var(value_var, res);
+                self.push(stored);
                 self.builder.ins().jump(merge, &[]);
-                self.builder.seal_block(merge);
-                self.builder.switch_to_block(merge);
-                let value = self.builder.use_var(value_var);
-                self.push(value);
-                self.fall_through(index);
-            }
-            Step::GetMemberComputed => {
-                let key = self.pop();
-                let object = self.pop();
-                let res =
-                    self.call_slow(self.sig_get_comp, Helper::GetMemberComputed, &[object, key])?;
-                self.push(res);
-                self.fall_through(index);
-            }
-            Step::AssignMemberName { name, op } => {
-                // `[object, old?, value]` — the compound forms carry the
-                // cached GetValue (the `Dup` + `GetMemberName` the compiler
-                // emitted) between the object and the value.
-                let value = self.pop();
-                let old = if is_compound_assign(op) {
-                    Some(self.pop())
-                } else {
-                    None
-                };
-                let object = self.pop();
-                let op_imm = self.builder.ins().iconst(types::I64, *op as i64);
-                let name_imm = self.builder.ins().iconst(types::I64, *name as i64);
-                let old_imm = match old {
-                    Some(bits) => bits,
-                    None => self.builder.ins().iconst(types::I64, self.undef_bits),
-                };
+                // The slow path: the full helper (applies the op with the
+                // general machinery).
+                self.builder.switch_to_block(slow);
                 let res = self.call_slow(
                     self.sig_assign,
                     Helper::AssignMemberName,
                     &[op_imm, object, name_imm, old_imm, value],
                 )?;
                 self.push(res);
+                self.builder.ins().jump(merge, &[]);
+                self.builder.seal_block(merge);
+                self.builder.switch_to_block(merge);
                 self.fall_through(index);
             }
             Step::AssignMemberComputed { op } => {
@@ -2454,10 +2636,8 @@ impl<'a> Lowerer<'a> {
             }
             LeafOp::GetMemberName { name } => {
                 let object = self.builder.use_var(self.acc_var);
-                let name = self.builder.ins().iconst(types::I64, *name as i64);
-                let res =
-                    self.call_slow(self.sig_get_name, Helper::GetMemberName, &[object, name])?;
-                self.builder.def_var(self.acc_var, res);
+                let value = self.emit_member_cell_read(object, *name)?;
+                self.builder.def_var(self.acc_var, value);
             }
             LeafOp::GetMemberComputed { key } => {
                 let object = self.builder.use_var(self.acc_var);
@@ -2475,10 +2655,8 @@ impl<'a> Lowerer<'a> {
                 if *tdz {
                     self.emit_tdz_check(object)?;
                 }
-                let name = self.builder.ins().iconst(types::I64, *name as i64);
-                let res =
-                    self.call_slow(self.sig_get_name, Helper::GetMemberName, &[object, name])?;
-                self.builder.def_var(self.acc_var, res);
+                let value = self.emit_member_cell_read(object, *name)?;
+                self.builder.def_var(self.acc_var, value);
             }
             LeafOp::GetMemberComputedLocal {
                 object_slot,

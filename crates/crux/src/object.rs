@@ -1927,6 +1927,62 @@ impl JsObject {
         self.set_with_receiver_key(key, value, self.self_value(), throw)
     }
 
+    /// The in-place data-property write behind the JIT's member-store fast
+    /// path (Cut 40): find `key` in the property vector and, when it is a
+    /// writable data property on a plain object/array (not array `length`),
+    /// write `value` (vector + inline-field mirror) and return true — no
+    /// receiver, no descriptor machinery, no generation bump. The caller
+    /// validated the own data property through its own cache; the
+    /// generation stays put because the compiled code refreshes its value
+    /// cell on the fast path (mirrors the interpreter's global-store cell
+    /// scheme — see `set_global_slot`). A false return means the caller
+    /// falls back to the full [[Set]].
+    pub fn write_data_property(&self, key: &PropertyKey, value: Value) -> bool {
+        if !matches!(self.kind, ObjectKind::Ordinary | ObjectKind::Array)
+            || (matches!(self.kind, ObjectKind::Array) && key == &PropertyKey::from_utf8("length"))
+        {
+            return false;
+        }
+        let mut props = self.properties.borrow_mut();
+        let position = if props.len() >= 16 {
+            let index = self.property_index.borrow();
+            match index.as_ref() {
+                Some(map) => map.get(key).copied(),
+                None => {
+                    drop(index);
+                    let mut slot = self.property_index.borrow_mut();
+                    if slot.is_none() {
+                        *slot = Some(
+                            props
+                                .iter()
+                                .enumerate()
+                                .map(|(position, (name, _))| (name.clone(), position))
+                                .collect(),
+                        );
+                    }
+                    slot.as_ref().unwrap().get(key).copied()
+                }
+            }
+        } else {
+            props.iter().position(|(name, _)| name == key)
+        };
+        if let Some(position) = position
+            && let PropertyKind::Data {
+                value: cell,
+                writable,
+            } = &mut props[position].1.kind
+            && *writable
+        {
+            *cell = value;
+            // Mirror the in-place value update into the inline field when
+            // the key is mapped (Part B, B5.3) — the map read path serves
+            // from there, so a stale field would win over the vector.
+            let _ = self.map_set(key, value);
+            return true;
+        }
+        false
+    }
+
     /// [[Set]] (P, V, Receiver): the arguments-exotic mapping (spec 10.4.4.6)
     /// followed by OrdinarySet.
     pub fn set_with_receiver_key(

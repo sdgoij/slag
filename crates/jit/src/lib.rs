@@ -337,6 +337,7 @@ fn runtime_helpers() -> JitHelpers {
         update_ident: Some(rt.update_ident),
         assign_member_name: Some(rt.assign_member_name),
         assign_member_computed: Some(rt.assign_member_computed),
+        set_member_slot: Some(rt.set_member_slot),
         load_context: Some(rt.load_context),
         store_context: Some(rt.store_context),
         init_context: Some(rt.init_context),
@@ -450,6 +451,7 @@ mod tests {
             update_ident: Some(helpers::test_update_ident),
             assign_member_name: Some(helpers::test_assign_member_name),
             assign_member_computed: Some(helpers::test_assign_member_computed),
+            set_member_slot: Some(helpers::test_set_member_slot),
             load_context: Some(helpers::test_load_context),
             store_context: Some(helpers::test_store_context),
             init_context: Some(helpers::test_init_context),
@@ -1719,6 +1721,87 @@ mod tests {
                      function g(x) { return x + 1; }\n\
                      function f(n) { var s = 0; for (var i = 0; i < n; i++) { s = g(i); o.x = s; } return s; }\n\
                      var r = f(100); r === 100 && count === 100;",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_boolean(), Some(true));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_compound_assign_fast_path_stays_warm() {
+        // Cut 40: `o.x += 1` on a plain object with a warm value cell
+        // computes the new value inline and writes the property vector in
+        // place (no generation bump), and the cell refresh keeps the
+        // following `s += o.x` read on the native probe — a stale cell
+        // would land 5050 - 100 = 4950 instead of 5050.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(o, n) { var s = 0; for (var i = 0; i < n; i++) { o.x += 1; s += o.x; } return s; }\n\
+                     f({ x: 0 }, 100);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(5050.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_member_store_respects_non_writable() {
+        // Cut 40: the fast path's writable gate — `o.x = 5` on a
+        // non-writable data property must silently fail (sloppy), so the
+        // read keeps seeing 1. The write helper's authoritative check is
+        // what blocks it (the value cell never checks writability); a
+        // direct vector write would land 50 instead of 10.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var o = {};\n\
+                     Object.defineProperty(o, 'x', { value: 1, writable: false });\n\
+                     function f(o, n) { var s = 0; for (var i = 0; i < n; i++) { o.x = 5; s += o.x; } return s; }\n\
+                     f(o, 10);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(10.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_member_compound_runs_the_setter() {
+        // Cut 40: an accessor property never warms the value cell, so
+        // `o.x += 1` stays on the full helper — the setter must run every
+        // iteration (the fast path must not bypass it).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var count = 0;\n\
+                     var o = {};\n\
+                     Object.defineProperty(o, 'x', { get: function () { return 1; }, set: function (v) { count += 1; } });\n\
+                     function f(o, n) { var s = 0; for (var i = 0; i < n; i++) { o.x += 1; s += o.x; } return s; }\n\
+                     var r = f(o, 10); r === 10 && count === 10;",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_boolean(), Some(true));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_fast_loop_member_read_runs_the_getter() {
+        // Cut 40: the register body's fused member read (`s += o.x` in a
+        // certified loop lowers to `GetMemberNameLocal`) shares the
+        // member-cell probe — an accessor never warms the cell, so the
+        // getter must run every iteration, not just the first.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var count = 0;\n\
+                     var o = {};\n\
+                     Object.defineProperty(o, 'x', { get: function () { count += 1; return 1; } });\n\
+                     function f(o, n) { var s = 0; for (var i = 0; i < n; i++) { s += o.x; } return s; }\n\
+                     var r = f(o, 100); r === 100 && count === 100;",
                 )
                 .expect("runs")
         });

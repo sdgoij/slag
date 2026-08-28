@@ -34,7 +34,7 @@ use syntax::ast::{AssignOp, BinaryOp, UpdateOp};
 use crate::agent::Agent;
 use crate::context::ReferenceBase;
 use crate::env::EnvRecord;
-use crate::ir::{CompiledBody, Vm};
+use crate::ir::{CompiledBody, MEMBER_CELLS, MemberValueCell, Vm, member_reference};
 use crux::error::{ErrorKind, JsError};
 
 /// The compiled entry ABI (mirrors `jit::JitEntry`; all arguments are
@@ -304,6 +304,15 @@ pub struct JitSlowPaths {
     /// back to `set_global` semantics on a shape mismatch. Returns the
     /// stored value.
     pub set_global_slot: extern "C" fn(ctx: *mut c_void, name: u64, slot: u64, value: u64) -> u64,
+    /// Cut 40: the compiled `AssignMemberName` fast path's in-place
+    /// property write: the compiled code validated the member value cell
+    /// (object id + name + generation) and computed the compound's new
+    /// value, so `write_data_property` writes the vector entry directly
+    /// (mirroring the inline field) and refreshes the cell — no generation
+    /// bump, no [[Set]] chain walk. Falls back to the full Set machinery on
+    /// any doubt (a non-writable property, a shape change, an exotic
+    /// receiver). Returns the stored value.
+    pub set_member_slot: extern "C" fn(ctx: *mut c_void, object: u64, name: u64, value: u64) -> u64,
     /// The identifier read a certified body uses for an outer/global binding
     /// (`resolve_binding` + `get_value`); `name` is an `AtomId`.
     pub load_ident: extern "C" fn(ctx: *mut c_void, name: u64) -> u64,
@@ -401,6 +410,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     update_ident,
     assign_member_name,
     assign_member_computed,
+    set_member_slot,
     load_context,
     store_context,
     init_context,
@@ -978,6 +988,42 @@ extern "C" fn assign_member_name(
     }
 }
 
+extern "C" fn set_member_slot(ctx: *mut c_void, object: u64, name: u64, value: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let object = Value::from_bits(object);
+    let value = Value::from_bits(value);
+    let name = name as crux::AtomId;
+    let key = crux::property::PropertyKey::String(name);
+    // The compiled `AssignMemberName` fast path validated the member value
+    // cell (object id + name + generation), so the property is an own data
+    // property; the writable check inside `write_data_property` is the
+    // authoritative one (a read-warmed cell never checked it). The in-place
+    // write does not bump the generation — the cell is refreshed here so
+    // the compiled read probe stays warm. Any doubt (a non-writable
+    // property, a shape change, an exotic receiver) falls back to the full
+    // [[Set]] — which mirrors the cell on the paths that bump the
+    // generation, keeping the fast path warm next time.
+    if let Some(obj) = object.as_object()
+        && obj.write_data_property(&key, value)
+    {
+        agent.member_value_cells[(obj.id() as usize ^ name as usize) & (MEMBER_CELLS - 1)] =
+            MemberValueCell {
+                id: obj.id(),
+                name,
+                generation: obj.generation(),
+                value,
+            };
+        return value.bits();
+    }
+    let reference = member_reference(&object, &crate::ir::PropertyKeyName::Name(name), vm.strict);
+    match crate::context::put_value(agent, &reference, value) {
+        Ok(()) => value.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
 extern "C" fn assign_member_computed(
     ctx: *mut c_void,
     op: u64,
@@ -1478,6 +1524,7 @@ mod tests {
         assert_ne!(JIT_SLOW_PATHS.update_ident as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.assign_member_name as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.assign_member_computed as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.set_member_slot as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.load_context as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.store_context as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.init_context as usize, 0);
