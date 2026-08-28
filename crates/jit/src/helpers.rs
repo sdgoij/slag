@@ -39,6 +39,17 @@ pub enum Helper {
     UpdateIdent,
     AssignMemberName,
     AssignMemberComputed,
+    LoadContext,
+    StoreContext,
+    InitContext,
+    UpdateContext,
+    LoadPerIter,
+    StorePerIter,
+    UpdatePerIter,
+    GetVarReference,
+    UpdateVarReference,
+    PutVarReferenceOp,
+    PopVarReference,
 }
 
 impl Helper {
@@ -62,6 +73,17 @@ impl Helper {
             Helper::UpdateIdent => "update_ident",
             Helper::AssignMemberName => "assign_member_name",
             Helper::AssignMemberComputed => "assign_member_computed",
+            Helper::LoadContext => "load_context",
+            Helper::StoreContext => "store_context",
+            Helper::InitContext => "init_context",
+            Helper::UpdateContext => "update_context",
+            Helper::LoadPerIter => "load_per_iter",
+            Helper::StorePerIter => "store_per_iter",
+            Helper::UpdatePerIter => "update_per_iter",
+            Helper::GetVarReference => "get_var_reference",
+            Helper::UpdateVarReference => "update_var_reference",
+            Helper::PutVarReferenceOp => "put_var_reference_op",
+            Helper::PopVarReference => "pop_var_reference",
         }
     }
 }
@@ -139,6 +161,45 @@ pub struct JitHelpers {
     pub assign_member_computed: Option<
         extern "C" fn(vm: *mut c_void, op: u64, object: u64, key: u64, old: u64, value: u64) -> u64,
     >,
+    /// The capture-context read (`LoadContextSlot`): `depth` is the static
+    /// context-chain depth, `index` the binding's context slot. Returns the
+    /// value.
+    pub load_context: Option<extern "C" fn(vm: *mut c_void, depth: u64, index: u64) -> u64>,
+    /// The capture-context write (`StoreContextSlot`): the TDZ and const
+    /// checks, then the slot write. Returns the stored value.
+    pub store_context:
+        Option<extern "C" fn(vm: *mut c_void, depth: u64, index: u64, value: u64) -> u64>,
+    /// The first-write context store (`InitContextSlot`, no checks).
+    pub init_context: Option<extern "C" fn(vm: *mut c_void, index: u64, value: u64) -> u64>,
+    /// The capture-context `++`/`--` (`UpdateContextSlot`); returns the old
+    /// (postfix) or new (prefix) value.
+    pub update_context:
+        Option<extern "C" fn(vm: *mut c_void, depth: u64, index: u64, op: u64, prefix: u64) -> u64>,
+    /// The per-iteration read (`LoadPerIteration`): `depth` walks out
+    /// through the enclosing per-iteration envs (0 = this loop's env),
+    /// `index` the head's slot. Returns the value.
+    pub load_per_iter: Option<extern "C" fn(vm: *mut c_void, depth: u64, index: u64) -> u64>,
+    /// The per-iteration write (`StorePerIteration`): no TDZ/const checks.
+    pub store_per_iter:
+        Option<extern "C" fn(vm: *mut c_void, depth: u64, index: u64, value: u64) -> u64>,
+    /// The per-iteration `++`/`--` (`UpdatePerIteration`); returns the old
+    /// (postfix) or new (prefix) value.
+    pub update_per_iter:
+        Option<extern "C" fn(vm: *mut c_void, depth: u64, index: u64, op: u64, prefix: u64) -> u64>,
+    /// `GetValue` of the reference stack's top (`GetVarReference`); the
+    /// reference stays for the write path.
+    pub get_var_reference: Option<extern "C" fn(vm: *mut c_void) -> u64>,
+    /// The identifier `++`/`--` through the reference machinery
+    /// (`UpdateVarReference`); returns the old (postfix) or new (prefix)
+    /// value.
+    pub update_var_reference:
+        Option<extern "C" fn(vm: *mut c_void, op: u64, prefix: u64, old: u64) -> u64>,
+    /// The compound assign through the reference machinery
+    /// (`PutVarReferenceOp`); returns the new value.
+    pub put_var_reference_op:
+        Option<extern "C" fn(vm: *mut c_void, op: u64, old: u64, value: u64) -> u64>,
+    /// Drop the reference stack's top (`PopVarReference`).
+    pub pop_var_reference: Option<extern "C" fn(vm: *mut c_void) -> u64>,
 }
 
 impl JitHelpers {
@@ -163,6 +224,17 @@ impl JitHelpers {
             update_ident: None,
             assign_member_name: None,
             assign_member_computed: None,
+            load_context: None,
+            store_context: None,
+            init_context: None,
+            update_context: None,
+            load_per_iter: None,
+            store_per_iter: None,
+            update_per_iter: None,
+            get_var_reference: None,
+            update_var_reference: None,
+            put_var_reference_op: None,
+            pop_var_reference: None,
         }
     }
 
@@ -187,6 +259,17 @@ impl JitHelpers {
             Helper::UpdateIdent => self.update_ident.map(|f| f as usize as u64),
             Helper::AssignMemberName => self.assign_member_name.map(|f| f as usize as u64),
             Helper::AssignMemberComputed => self.assign_member_computed.map(|f| f as usize as u64),
+            Helper::LoadContext => self.load_context.map(|f| f as usize as u64),
+            Helper::StoreContext => self.store_context.map(|f| f as usize as u64),
+            Helper::InitContext => self.init_context.map(|f| f as usize as u64),
+            Helper::UpdateContext => self.update_context.map(|f| f as usize as u64),
+            Helper::LoadPerIter => self.load_per_iter.map(|f| f as usize as u64),
+            Helper::StorePerIter => self.store_per_iter.map(|f| f as usize as u64),
+            Helper::UpdatePerIter => self.update_per_iter.map(|f| f as usize as u64),
+            Helper::GetVarReference => self.get_var_reference.map(|f| f as usize as u64),
+            Helper::UpdateVarReference => self.update_var_reference.map(|f| f as usize as u64),
+            Helper::PutVarReferenceOp => self.put_var_reference_op.map(|f| f as usize as u64),
+            Helper::PopVarReference => self.pop_var_reference.map(|f| f as usize as u64),
         }
     }
 }
@@ -312,6 +395,96 @@ pub extern "C" fn test_assign_member_computed(
         let old_num = Value::from_bits(old).as_number().unwrap_or(0.0);
         Value::Number(old_num + value_num).bits()
     }
+}
+
+/// Returns `42` — proves `load_context` was called with the right ABI.
+pub extern "C" fn test_load_context(_vm: *mut c_void, _depth: u64, _index: u64) -> u64 {
+    Value::Number(42.0).bits()
+}
+
+/// Returns the stored value — proves `store_context` was called.
+pub extern "C" fn test_store_context(
+    _vm: *mut c_void,
+    _depth: u64,
+    _index: u64,
+    value: u64,
+) -> u64 {
+    value
+}
+
+/// Returns the stored value — proves `init_context` was called.
+pub extern "C" fn test_init_context(_vm: *mut c_void, _index: u64, value: u64) -> u64 {
+    value
+}
+
+/// `old + 1` — proves the `update_context` arguments arrive in order.
+pub extern "C" fn test_update_context(
+    _vm: *mut c_void,
+    _depth: u64,
+    _index: u64,
+    _op: u64,
+    _prefix: u64,
+) -> u64 {
+    Value::Number(43.0).bits()
+}
+
+/// Returns `44` — proves `load_per_iter` was called with the right ABI.
+pub extern "C" fn test_load_per_iter(_vm: *mut c_void, _depth: u64, _index: u64) -> u64 {
+    Value::Number(44.0).bits()
+}
+
+/// Returns the stored value — proves `store_per_iter` was called.
+pub extern "C" fn test_store_per_iter(
+    _vm: *mut c_void,
+    _depth: u64,
+    _index: u64,
+    value: u64,
+) -> u64 {
+    value
+}
+
+/// Returns `45` — proves `update_per_iter` was called.
+pub extern "C" fn test_update_per_iter(
+    _vm: *mut c_void,
+    _depth: u64,
+    _index: u64,
+    _op: u64,
+    _prefix: u64,
+) -> u64 {
+    Value::Number(45.0).bits()
+}
+
+/// Returns `46` — proves `get_var_reference` was called.
+pub extern "C" fn test_get_var_reference(_vm: *mut c_void) -> u64 {
+    Value::Number(46.0).bits()
+}
+
+/// `old + 1` — proves the `update_var_reference` arguments arrive in order.
+pub extern "C" fn test_update_var_reference(
+    _vm: *mut c_void,
+    _op: u64,
+    _prefix: u64,
+    old: u64,
+) -> u64 {
+    let old = Value::from_bits(old).as_number().unwrap_or(0.0);
+    Value::Number(old + 1.0).bits()
+}
+
+/// `old + value` — proves the `put_var_reference_op` arguments arrive.
+pub extern "C" fn test_put_var_reference_op(
+    _vm: *mut c_void,
+    _op: u64,
+    old: u64,
+    value: u64,
+) -> u64 {
+    let old = Value::from_bits(old).as_number().unwrap_or(0.0);
+    let value = Value::from_bits(value).as_number().unwrap_or(0.0);
+    Value::Number(old + value).bits()
+}
+
+/// Returns `0` — proves `pop_var_reference` was called.
+pub extern "C" fn test_pop_var_reference(_vm: *mut c_void) -> u64 {
+    0
 }
 
 /// Sums its numeric arguments — proves the `args` pointer/`argc` ABI the

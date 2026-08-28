@@ -126,6 +126,15 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
             // handler does; a JIT no-op would accumulate one slot per
             // statement inside a loop).
             Step::SetCompletion => depth = depth.saturating_sub(1),
+            // Capture-context steps: a read pushes; a write pops; the fused
+            // update pushes its result. Per-iteration steps mirror them.
+            Step::LoadContextSlot { .. }
+            | Step::UpdateContextSlot { .. }
+            | Step::LoadPerIteration { .. }
+            | Step::UpdatePerIteration { .. } => depth += 1,
+            Step::StoreContextSlot { .. }
+            | Step::InitContextSlot { .. }
+            | Step::StorePerIteration { .. } => depth = depth.saturating_sub(1),
             // Member read: pop, push the result back. Member writes pop the
             // object + value (and the cached old value for a compound op) and
             // push the stored value back.
@@ -169,6 +178,13 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
             Step::ResolveVarIdent { .. } => {}
             Step::PutVarReference => {}
             Step::UpdateIdent { .. } => {}
+            // The reference machinery: `GetVarReference` pushes the value;
+            // the update pops the old and pushes the result (net 0); the
+            // compound pops both and pushes the result (net -1).
+            Step::GetVarReference => depth += 1,
+            Step::UpdateVarReference { .. } => {}
+            Step::PutVarReferenceOp { .. } => depth = depth.saturating_sub(1),
+            Step::PopVarReference => {}
             _ => {}
         }
         max = max.max(depth);
@@ -308,8 +324,13 @@ fn step_name(step: &Step) -> &'static str {
         Step::Break { .. } | Step::Continue { .. } => "Break/Continue",
         Step::Yield { .. } | Step::Await => "Yield/Await",
         Step::ImportCall { .. } | Step::ImportMeta => "Import",
-        Step::ResolveVarIdent { .. } | Step::GetVarReference => "Reference machinery",
+        Step::ResolveVarIdent { .. } | Step::GetVarReferenceThis => "Reference machinery",
         Step::GetSuperName { .. } | Step::GetSuperBase => "Super",
+        Step::LoadContextSlot { .. } | Step::StoreContextSlot { .. } => "Context slot",
+        Step::InitContextSlot { .. } | Step::UpdateContextSlot { .. } => "Context slot",
+        Step::LoadPerIteration { .. }
+        | Step::StorePerIteration { .. }
+        | Step::UpdatePerIteration { .. } => "Per-iteration",
         _ => "unsupported step",
     }
 }
@@ -768,6 +789,133 @@ impl<'a> Lowerer<'a> {
             }
             Step::UpdateLocal { slot, op, prefix } => {
                 self.emit_update(*slot, *op, *prefix, true, index)?
+            }
+            Step::LoadContextSlot { depth, index: slot } => {
+                // `context_chain_env(depth)` slot `slot` through the slow
+                // path (the env machinery is shared with the interpreter).
+                let depth_imm = self.builder.ins().iconst(types::I64, *depth as i64);
+                let slot_imm = self.builder.ins().iconst(types::I64, *slot as i64);
+                let res = self.call_slow(
+                    self.sig_get_name,
+                    Helper::LoadContext,
+                    &[depth_imm, slot_imm],
+                )?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::StoreContextSlot { depth, index: slot } => {
+                let value = self.pop();
+                let depth_imm = self.builder.ins().iconst(types::I64, *depth as i64);
+                let slot_imm = self.builder.ins().iconst(types::I64, *slot as i64);
+                let _res = self.call_slow(
+                    self.sig_set_name,
+                    Helper::StoreContext,
+                    &[depth_imm, slot_imm, value],
+                )?;
+                self.fall_through(index);
+            }
+            Step::InitContextSlot { index: slot } => {
+                let value = self.pop();
+                let slot_imm = self.builder.ins().iconst(types::I64, *slot as i64);
+                let _res =
+                    self.call_slow(self.sig_get_name, Helper::InitContext, &[slot_imm, value])?;
+                self.fall_through(index);
+            }
+            Step::UpdateContextSlot {
+                depth,
+                index: slot,
+                op,
+                prefix,
+            } => {
+                let depth_imm = self.builder.ins().iconst(types::I64, *depth as i64);
+                let slot_imm = self.builder.ins().iconst(types::I64, *slot as i64);
+                let op_imm = self.builder.ins().iconst(types::I64, *op as i64);
+                let prefix_imm = self.builder.ins().iconst(types::I64, *prefix as i64);
+                let res = self.call_slow(
+                    self.sig_call,
+                    Helper::UpdateContext,
+                    &[depth_imm, slot_imm, op_imm, prefix_imm],
+                )?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::LoadPerIteration { depth, index: slot } => {
+                // `per_iteration_env(depth)` slot `slot` through the slow
+                // path (a captured for-head binding's fresh per-iteration
+                // env).
+                let depth_imm = self.builder.ins().iconst(types::I64, *depth as i64);
+                let slot_imm = self.builder.ins().iconst(types::I64, *slot as i64);
+                let res = self.call_slow(
+                    self.sig_get_name,
+                    Helper::LoadPerIter,
+                    &[depth_imm, slot_imm],
+                )?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::StorePerIteration { depth, index: slot } => {
+                let value = self.pop();
+                let depth_imm = self.builder.ins().iconst(types::I64, *depth as i64);
+                let slot_imm = self.builder.ins().iconst(types::I64, *slot as i64);
+                let _res = self.call_slow(
+                    self.sig_set_name,
+                    Helper::StorePerIter,
+                    &[depth_imm, slot_imm, value],
+                )?;
+                self.fall_through(index);
+            }
+            Step::UpdatePerIteration {
+                depth,
+                index: slot,
+                op,
+                prefix,
+            } => {
+                let depth_imm = self.builder.ins().iconst(types::I64, *depth as i64);
+                let slot_imm = self.builder.ins().iconst(types::I64, *slot as i64);
+                let op_imm = self.builder.ins().iconst(types::I64, *op as i64);
+                let prefix_imm = self.builder.ins().iconst(types::I64, *prefix as i64);
+                let res = self.call_slow(
+                    self.sig_call,
+                    Helper::UpdatePerIter,
+                    &[depth_imm, slot_imm, op_imm, prefix_imm],
+                )?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::GetVarReference => {
+                // The reference stack's top read (no pop — the write path
+                // consumes it); the value goes on the JIT stack.
+                let res = self.call_slow(self.sig_tdz, Helper::GetVarReference, &[])?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::UpdateVarReference { op, prefix } => {
+                let old = self.pop();
+                let op_imm = self.builder.ins().iconst(types::I64, *op as i64);
+                let prefix_imm = self.builder.ins().iconst(types::I64, *prefix as i64);
+                let res = self.call_slow(
+                    self.sig_set_name,
+                    Helper::UpdateVarReference,
+                    &[op_imm, prefix_imm, old],
+                )?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::PutVarReferenceOp { op } => {
+                let value = self.pop();
+                let old = self.pop();
+                let op_imm = self.builder.ins().iconst(types::I64, *op as i64);
+                let res = self.call_slow(
+                    self.sig_set_name,
+                    Helper::PutVarReferenceOp,
+                    &[op_imm, old, value],
+                )?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::PopVarReference => {
+                let _res = self.call_slow(self.sig_tdz, Helper::PopVarReference, &[])?;
+                self.fall_through(index);
             }
             Step::Jump(target) => {
                 let block = self.ensure_block(*target);
@@ -1467,8 +1615,22 @@ impl<'a> Lowerer<'a> {
                 }
                 self.builder.def_var(self.acc_var, bits);
             }
-            LeafOp::LoadContext { .. } | LeafOp::LoadPerIter { .. } => {
-                return Err(Unsupported::Leaf("context/per-iteration read"));
+            LeafOp::LoadContext { index } => {
+                // Depth-0 capture-context read through the slow path.
+                let zero = self.builder.ins().iconst(types::I64, 0);
+                let index_imm = self.builder.ins().iconst(types::I64, *index as i64);
+                let res =
+                    self.call_slow(self.sig_get_name, Helper::LoadContext, &[zero, index_imm])?;
+                self.builder.def_var(self.acc_var, res);
+            }
+            LeafOp::LoadPerIter { index } => {
+                // Depth-0 per-iteration read through the slow path (the
+                // leaf's `lexical_env` is its captured per-iteration env).
+                let zero = self.builder.ins().iconst(types::I64, 0);
+                let index_imm = self.builder.ins().iconst(types::I64, *index as i64);
+                let res =
+                    self.call_slow(self.sig_get_name, Helper::LoadPerIter, &[zero, index_imm])?;
+                self.builder.def_var(self.acc_var, res);
             }
             LeafOp::LoadCounter => {
                 let bits = self.counter_bits();
@@ -1487,8 +1649,45 @@ impl<'a> Lowerer<'a> {
                 let res = self.emit_binary(*op, left, right)?;
                 self.builder.def_var(self.acc_var, res);
             }
-            LeafOp::BinContext { .. } | LeafOp::BinPerIter { .. } | LeafOp::BinCtxReg { .. } => {
-                return Err(Unsupported::Leaf("context binary"));
+            LeafOp::BinContext { op, index } => {
+                // `acc = acc op context[index]` (the fused `LoadContext` +
+                // binary — the register executor's evaluation order).
+                let zero = self.builder.ins().iconst(types::I64, 0);
+                let index_imm = self.builder.ins().iconst(types::I64, *index as i64);
+                let right =
+                    self.call_slow(self.sig_get_name, Helper::LoadContext, &[zero, index_imm])?;
+                let left = self.builder.use_var(self.acc_var);
+                let res = self.emit_binary(*op, left, right)?;
+                self.builder.def_var(self.acc_var, res);
+            }
+            LeafOp::BinPerIter { op, index } => {
+                // `acc = acc op per-iteration[index]` (depth 0).
+                let zero = self.builder.ins().iconst(types::I64, 0);
+                let index_imm = self.builder.ins().iconst(types::I64, *index as i64);
+                let right =
+                    self.call_slow(self.sig_get_name, Helper::LoadPerIter, &[zero, index_imm])?;
+                let left = self.builder.use_var(self.acc_var);
+                let res = self.emit_binary(*op, left, right)?;
+                self.builder.def_var(self.acc_var, res);
+            }
+            LeafOp::BinCtxReg {
+                op,
+                index,
+                slot,
+                tdz,
+            } => {
+                // `acc = context[index] op frame[slot]` (captured left,
+                // frame-slot right — the step path's evaluation order).
+                let zero = self.builder.ins().iconst(types::I64, 0);
+                let index_imm = self.builder.ins().iconst(types::I64, *index as i64);
+                let left =
+                    self.call_slow(self.sig_get_name, Helper::LoadContext, &[zero, index_imm])?;
+                let right = self.load_slot(*slot);
+                if *tdz {
+                    self.emit_tdz_check(right)?;
+                }
+                let res = self.emit_binary(*op, left, right)?;
+                self.builder.def_var(self.acc_var, res);
             }
             LeafOp::BinImm { op, imm } => {
                 let left = self.builder.use_var(self.acc_var);
@@ -1621,10 +1820,20 @@ impl<'a> Lowerer<'a> {
             }
             RegOperand::Const(value) => self.const_value(value),
             RegOperand::Counter => Ok(self.counter_bits()),
-            RegOperand::Acc
-            | RegOperand::Spilled
-            | RegOperand::Ctx { .. }
-            | RegOperand::PerIter { .. } => Err(Unsupported::Leaf("member operand shape")),
+            RegOperand::Ctx { index } => {
+                // A captured binding as a member key/value: the depth-0
+                // context read through the slow path.
+                let zero = self.builder.ins().iconst(types::I64, 0);
+                let index_imm = self.builder.ins().iconst(types::I64, *index as i64);
+                self.call_slow(self.sig_get_name, Helper::LoadContext, &[zero, index_imm])
+            }
+            RegOperand::PerIter { index } => {
+                // A captured for-head binding as a member key/value.
+                let zero = self.builder.ins().iconst(types::I64, 0);
+                let index_imm = self.builder.ins().iconst(types::I64, *index as i64);
+                self.call_slow(self.sig_get_name, Helper::LoadPerIter, &[zero, index_imm])
+            }
+            RegOperand::Acc | RegOperand::Spilled => Err(Unsupported::Leaf("member operand shape")),
         }
     }
 }

@@ -8542,6 +8542,7 @@ impl Vm {
     /// on this stack and reallocates the `Vec` under the JIT's raw
     /// pointers). The helpers never see the leaf's frame, so the private
     /// buffer is unobservable.
+    #[allow(clippy::too_many_arguments)]
     fn run_jit_leaf(
         &mut self,
         agent: &mut Agent,
@@ -8550,6 +8551,7 @@ impl Vm {
         ir: &std::rc::Rc<CompiledBody>,
         strict: bool,
         below: usize,
+        environment: Option<EnvRef>,
     ) -> Result<bool, JsError> {
         let Some(hook) = agent.jit_hook else {
             return Ok(false);
@@ -8578,6 +8580,31 @@ impl Vm {
             self.bind_this_value(agent, scope, strict, this_value)?
         };
         let pre_call = self.stack.len() - argc;
+        // Cut 28/30 mirror: a leaf that reads captured bindings resolves
+        // them against its own per-call capture context (`body_context`)
+        // built from the closure's environment — clone it and swap both
+        // env fields like `run_leaf_body`, restoring them after the run. A
+        // leaf with neither context nor per-iteration reads never touches an
+        // env, so both swaps are skipped.
+        let (caller_body_context, caller_lexical_env) = if let Some(environment) = environment {
+            let body_env = match scope
+                .new_body_context(&environment, &self.stack[pre_call..pre_call + argc])?
+            {
+                Some(context) => context,
+                None => environment,
+            };
+            if ir.leaf_needs_env {
+                (
+                    self.body_context.replace(body_env),
+                    Some(std::mem::replace(&mut self.lexical_env, body_env)),
+                )
+            } else {
+                (self.body_context.replace(body_env), None)
+            }
+        } else {
+            debug_assert!(!ir.leaf_uses_env);
+            (None, None)
+        };
         // The frame (this slot, params, `var`s as undefined, `let`/`const`
         // in the TDZ — `run_leaf_body`'s layout) plus the JIT's working area
         // and the helper slack, in a private buffer — helpers receive
@@ -8640,6 +8667,12 @@ impl Vm {
         // a throwing slow path, so the pending error, when set, is the
         // call's only error.
         self.stack.truncate(pre_call - below);
+        if let Some(saved_env) = caller_body_context {
+            self.body_context = Some(saved_env);
+        }
+        if let Some(saved_env) = caller_lexical_env {
+            self.lexical_env = saved_env;
+        }
         if ctx.pending {
             return Err(ctx.error.take().expect("a pending JIT error is present"));
         }
@@ -8721,7 +8754,15 @@ impl Vm {
             // machine code; a body without compiled code falls through to
             // the interpreter's leaf-inline run.
             if agent.jit_hook.is_some()
-                && self.run_jit_leaf(agent, argc, this, &entry.ir, entry.strict, below)?
+                && self.run_jit_leaf(
+                    agent,
+                    argc,
+                    this,
+                    &entry.ir,
+                    entry.strict,
+                    below,
+                    entry.environment,
+                )?
             {
                 return Ok(());
             }
@@ -8948,7 +8989,7 @@ impl Vm {
     /// env (0 = the loop's own): the compiler emits `depth` as the number
     /// of enclosing per-iteration envs, so the walk stays inside the env
     /// chain of declarative per-iteration envs (each fresh per iteration).
-    fn per_iteration_env(&self, depth: usize) -> Result<EnvRef, JsError> {
+    pub(crate) fn per_iteration_env(&self, depth: usize) -> Result<EnvRef, JsError> {
         let mut env = self.lexical_env;
         for _ in 0..depth {
             env = env.outer().ok_or_else(|| {
@@ -8975,7 +9016,7 @@ impl Vm {
     /// bodies' contexts. Per-iteration environments are skipped — they hold
     /// only the loop-head names, so a capture-free closure created inside a
     /// loop still reaches its enclosing body's context.
-    fn context_chain_env(&self, depth: usize) -> Result<EnvRef, JsError> {
+    pub(crate) fn context_chain_env(&self, depth: usize) -> Result<EnvRef, JsError> {
         let mut env = self.body_context_env();
         loop {
             if !is_context_transparent(&env) {
@@ -15006,7 +15047,7 @@ impl Compiler {
 /// The certified body's capture context (Cut 3 continuation): its lexical
 /// environment is the per-call declarative environment holding the captured
 /// bindings.
-fn context_env(env: &EnvRef) -> &DeclarativeEnv {
+pub(crate) fn context_env(env: &EnvRef) -> &DeclarativeEnv {
     match &**env {
         EnvRecord::Declarative(declarative) => declarative,
         _ => unreachable!("a context slot without a capture-context env"),

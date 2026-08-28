@@ -60,6 +60,18 @@
 //!   read/write/update (`LoadIdent`, `ResolveVarIdent`/`PutVarReference`,
 //!   `UpdateIdent`) plus the script-level fast-script steps `LoadGlobal`/
 //!   `StoreGlobal`/`FusedStoreGlobal`.
+//! - Captured bindings (through the env machinery): `LoadContextSlot`/
+//!   `StoreContextSlot`/`InitContextSlot`/`UpdateContextSlot` (the
+//!   capture-context reads/writes a closure body uses), the per-iteration
+//!   forms `LoadPerIteration`/`StorePerIteration`/`UpdatePerIteration`
+//!   (captured for-head bindings), and the register forms `LeafOp::LoadContext`/
+//!   `BinContext`/`BinCtxReg`/`LoadPerIter`/`BinPerIter`. The JIT leaf
+//!   path builds the leaf's own `body_context` from the closure's
+//!   environment exactly like the interpreter's `run_leaf_body`.
+//! - The reference machinery (an identifier read/write/update through the
+//!   env-chain when the binding falls off the fast paths): `GetVarReference`/
+//!   `UpdateVarReference`/`PutVarReferenceOp`/`PopVarReference` (beside the
+//!   already-lowered `ResolveVarIdent`/`PutVarReference`/`LoadIdent`).
 //! - `Return`, and the completion steps: `ResetCompletion`/
 //!   `NormalizeCompletion`/`ListBegin`/`ListEnd` are no-ops (the scaffold
 //!   assumes function-body semantics, where the completion is discarded
@@ -69,8 +81,8 @@
 //!   loop.
 //!
 //! Everything else (closures, `with`/`try`/`switch`/`using`, generator
-//! suspension, global-reference steps, per-iteration envs) bails to the
-//! interpreter.
+//! suspension, iterator machinery, global-reference steps, mapped
+//! `arguments`) bails to the interpreter.
 //!
 //! # Slow paths
 //!
@@ -241,6 +253,17 @@ fn runtime_helpers() -> JitHelpers {
         update_ident: Some(rt.update_ident),
         assign_member_name: Some(rt.assign_member_name),
         assign_member_computed: Some(rt.assign_member_computed),
+        load_context: Some(rt.load_context),
+        store_context: Some(rt.store_context),
+        init_context: Some(rt.init_context),
+        update_context: Some(rt.update_context),
+        load_per_iter: Some(rt.load_per_iter),
+        store_per_iter: Some(rt.store_per_iter),
+        update_per_iter: Some(rt.update_per_iter),
+        get_var_reference: Some(rt.get_var_reference),
+        update_var_reference: Some(rt.update_var_reference),
+        put_var_reference_op: Some(rt.put_var_reference_op),
+        pop_var_reference: Some(rt.pop_var_reference),
     }
 }
 
@@ -337,6 +360,17 @@ mod tests {
             update_ident: Some(helpers::test_update_ident),
             assign_member_name: Some(helpers::test_assign_member_name),
             assign_member_computed: Some(helpers::test_assign_member_computed),
+            load_context: Some(helpers::test_load_context),
+            store_context: Some(helpers::test_store_context),
+            init_context: Some(helpers::test_init_context),
+            update_context: Some(helpers::test_update_context),
+            load_per_iter: Some(helpers::test_load_per_iter),
+            store_per_iter: Some(helpers::test_store_per_iter),
+            update_per_iter: Some(helpers::test_update_per_iter),
+            get_var_reference: Some(helpers::test_get_var_reference),
+            update_var_reference: Some(helpers::test_update_var_reference),
+            put_var_reference_op: Some(helpers::test_put_var_reference_op),
+            pop_var_reference: Some(helpers::test_pop_var_reference),
         }
     }
 
@@ -950,6 +984,166 @@ mod tests {
     }
 
     #[test]
+    fn context_steps_lower() {
+        // The test doubles: `load_context` returns 42, `update_context` 43;
+        // the stores echo the stored value.
+        let engine = JitEngine::new().expect("native isa");
+        // LoadContextSlot pushes the read value: [LoadContextSlot] -> 42.
+        let body = make_body(
+            vec![Step::LoadContextSlot { depth: 0, index: 0 }, Step::Return],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(42.0).bits());
+
+        // StoreContextSlot pops the value and discards it.
+        let body = make_body(
+            vec![
+                Step::Push(Value::Number(7.0)),
+                Step::StoreContextSlot { depth: 0, index: 1 },
+                Step::Push(Value::Number(3.0)),
+                Step::Return,
+            ],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(3.0).bits());
+
+        // InitContextSlot pops the value and discards it.
+        let body = make_body(
+            vec![
+                Step::Push(Value::Number(7.0)),
+                Step::InitContextSlot { index: 2 },
+                Step::Push(Value::Number(4.0)),
+                Step::Return,
+            ],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(4.0).bits());
+
+        // UpdateContextSlot pushes the updated value (the double's 43).
+        let body = make_body(
+            vec![
+                Step::UpdateContextSlot {
+                    depth: 0,
+                    index: 0,
+                    op: syntax::ast::UpdateOp::Increment,
+                    prefix: false,
+                },
+                Step::Return,
+            ],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(43.0).bits());
+    }
+
+    #[test]
+    fn per_iteration_steps_lower() {
+        // The test doubles: `load_per_iter` returns 44, `update_per_iter` 45;
+        // the store echoes the stored value.
+        let engine = JitEngine::new().expect("native isa");
+        // LoadPerIteration pushes the read value: -> 44.
+        let body = make_body(
+            vec![Step::LoadPerIteration { depth: 0, index: 0 }, Step::Return],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(44.0).bits());
+
+        // StorePerIteration pops the value and discards it.
+        let body = make_body(
+            vec![
+                Step::Push(Value::Number(7.0)),
+                Step::StorePerIteration { depth: 0, index: 1 },
+                Step::Push(Value::Number(3.0)),
+                Step::Return,
+            ],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(3.0).bits());
+
+        // UpdatePerIteration pushes the updated value (the double's 45).
+        let body = make_body(
+            vec![
+                Step::UpdatePerIteration {
+                    depth: 0,
+                    index: 0,
+                    op: syntax::ast::UpdateOp::Increment,
+                    prefix: false,
+                },
+                Step::Return,
+            ],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(45.0).bits());
+    }
+
+    #[test]
+    fn reference_machinery_lowers() {
+        // The test doubles: `get_var_reference` returns 46, the update
+        // returns `old + 1`, the compound `old + value`.
+        let engine = JitEngine::new().expect("native isa");
+        // GetVarReference pushes the read value: -> 46.
+        let body = make_body(
+            vec![
+                Step::ResolveVarIdent { name: 1 },
+                Step::GetVarReference,
+                Step::Return,
+            ],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(46.0).bits());
+
+        // UpdateVarReference pops the old value and pushes the updated one.
+        let body = make_body(
+            vec![
+                Step::Push(Value::Number(5.0)),
+                Step::UpdateVarReference {
+                    op: syntax::ast::UpdateOp::Increment,
+                    prefix: false,
+                },
+                Step::Return,
+            ],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(6.0).bits());
+
+        // PutVarReferenceOp pops value + old, pushes `old op value`.
+        let body = make_body(
+            vec![
+                Step::Push(Value::Number(5.0)),
+                Step::Push(Value::Number(3.0)),
+                Step::PutVarReferenceOp {
+                    op: syntax::ast::AssignOp::AddAssign,
+                },
+                Step::Return,
+            ],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(8.0).bits());
+
+        // PopVarReference has no value-stack effect.
+        let body = make_body(
+            vec![
+                Step::ResolveVarIdent { name: 1 },
+                Step::PopVarReference,
+                Step::Push(Value::Number(7.0)),
+                Step::Return,
+            ],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(7.0).bits());
+    }
+
+    #[test]
     fn installed_jit_runs_a_compound_member_assign() {
         // `o.x += 1` through the real runtime machinery.
         let (value, compiled) = with_jit_agent(|agent| {
@@ -973,6 +1167,67 @@ mod tests {
                 .expect("runs")
         });
         assert_eq!(value.as_number(), Some(5000050000.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_captured_var_body() {
+        // A closure reads/writes a captured binding through the capture
+        // context (`LoadContextSlot`/`StoreContextSlot`/`UpdateContextSlot`):
+        // the JIT leaf path must build the leaf's own `body_context` from
+        // the closure's environment, exactly like `run_leaf_body`, or the
+        // helpers would resolve the caller's env.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function make() { var x = 41; return function f() { return x + 1; }; }\n\
+                     var f = make(); f();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(42.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+
+        // A captured write (`x = x + 41` reads then stores) and the fused
+        // update (`++x` reads, updates, stores, returns the new value).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function make() { var x = 1; return function f() { x = x + 41; return ++x; }; }\n\
+                     var f = make(); f();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(43.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_per_iteration_body() {
+        // A closure capturing a certified `for (let i...)` head reads the
+        // fresh per-iteration binding (`LoadPerIteration`/`LeafOp::LoadPerIter`
+        // through the per-iteration env machinery).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function make() { var fns = []; for (let i = 0; i < 3; i++) { fns.push(function () { return i * 10; }); } return fns[2]; }\n\
+                     make()();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(20.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+
+        // The fused update (`++i` → `UpdatePerIteration`).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function make() { var fns = []; for (let i = 0; i < 3; i++) { fns.push(function () { return ++i; }); } return fns[2]; }\n\
+                     make()();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(3.0));
         assert!(compiled >= 1, "{compiled} bodies");
     }
 

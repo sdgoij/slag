@@ -151,6 +151,46 @@ pub struct JitSlowPaths {
         old: u64,
         value: u64,
     ) -> u64,
+    /// The capture-context read (`LoadContextSlot`): `depth` is the static
+    /// context-chain depth, `index` the binding's context slot. Returns the
+    /// value (a TDZ marker throws the ReferenceError).
+    pub load_context: extern "C" fn(ctx: *mut c_void, depth: u64, index: u64) -> u64,
+    /// The capture-context write (`StoreContextSlot`): the TDZ and const
+    /// checks, then the slot write. Returns the stored value.
+    pub store_context: extern "C" fn(ctx: *mut c_void, depth: u64, index: u64, value: u64) -> u64,
+    /// The first-write context store (`InitContextSlot`, depth 0, no checks).
+    /// Returns the stored value.
+    pub init_context: extern "C" fn(ctx: *mut c_void, index: u64, value: u64) -> u64,
+    /// The capture-context `++`/`--` (`UpdateContextSlot`): read, update,
+    /// store, return the old (postfix) or new (prefix) value.
+    pub update_context:
+        extern "C" fn(ctx: *mut c_void, depth: u64, index: u64, op: u64, prefix: u64) -> u64,
+    /// The per-iteration read (`LoadPerIteration`): `depth` walks out
+    /// through the enclosing per-iteration envs (0 = this loop's env),
+    /// `index` the head's slot. Returns the value.
+    pub load_per_iter: extern "C" fn(ctx: *mut c_void, depth: u64, index: u64) -> u64,
+    /// The per-iteration write (`StorePerIteration`): the bindings are
+    /// always initialized and mutable, so no checks. Returns the stored
+    /// value.
+    pub store_per_iter: extern "C" fn(ctx: *mut c_void, depth: u64, index: u64, value: u64) -> u64,
+    /// The per-iteration `++`/`--` (`UpdatePerIteration`); returns the old
+    /// (postfix) or new (prefix) value.
+    pub update_per_iter:
+        extern "C" fn(ctx: *mut c_void, depth: u64, index: u64, op: u64, prefix: u64) -> u64,
+    /// `GetValue` of the reference stack's top (`GetVarReference`); the
+    /// reference stays for the write path. Returns the value.
+    pub get_var_reference: extern "C" fn(ctx: *mut c_void) -> u64,
+    /// The identifier `++`/`--` through the reference machinery
+    /// (`UpdateVarReference`): pops the reference, puts the updated value,
+    /// returns the old (postfix) or new (prefix) value.
+    pub update_var_reference:
+        extern "C" fn(ctx: *mut c_void, op: u64, prefix: u64, old: u64) -> u64,
+    /// The compound assign through the reference machinery
+    /// (`PutVarReferenceOp`): pops the reference, puts `old op value`.
+    /// Returns the new value.
+    pub put_var_reference_op: extern "C" fn(ctx: *mut c_void, op: u64, old: u64, value: u64) -> u64,
+    /// Drop the reference stack's top (`PopVarReference`).
+    pub pop_var_reference: extern "C" fn(ctx: *mut c_void) -> u64,
 }
 
 /// The runtime's slow-path table, installed into every `JitHook`.
@@ -173,6 +213,17 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     update_ident,
     assign_member_name,
     assign_member_computed,
+    load_context,
+    store_context,
+    init_context,
+    update_context,
+    load_per_iter,
+    store_per_iter,
+    update_per_iter,
+    get_var_reference,
+    update_var_reference,
+    put_var_reference_op,
+    pop_var_reference,
 };
 
 /// The slack (in slots) reserved above a compiled body's working area on the
@@ -629,6 +680,285 @@ extern "C" fn assign_member_computed(
     }
 }
 
+extern "C" fn load_context(ctx: *mut c_void, depth: u64, index: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let vm = unsafe { &mut *ctx.vm };
+    match vm.context_chain_env(depth as usize) {
+        Ok(env) => match crate::ir::context_env(&env).slot_value(index as usize) {
+            Some(value) => value.bits(),
+            None => slow_error(
+                ctx,
+                JsError::new(
+                    ErrorKind::ReferenceError,
+                    "Cannot access a binding before initialization".into(),
+                ),
+            ),
+        },
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn store_context(ctx: *mut c_void, depth: u64, index: u64, value: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let vm = unsafe { &mut *ctx.vm };
+    let value = Value::from_bits(value);
+    let env = match vm.context_chain_env(depth as usize) {
+        Ok(env) => env,
+        Err(error) => return slow_error(ctx, error),
+    };
+    let declarative = crate::ir::context_env(&env);
+    if declarative.slot_value(index as usize).is_none() {
+        return slow_error(
+            ctx,
+            JsError::new(
+                ErrorKind::ReferenceError,
+                "Cannot access a binding before initialization".into(),
+            ),
+        );
+    }
+    if !declarative.slot_mutable(index as usize) {
+        return slow_error(
+            ctx,
+            JsError::new(
+                ErrorKind::TypeError,
+                "Assignment to constant variable".into(),
+            ),
+        );
+    }
+    declarative.set_slot(index as usize, value);
+    value.bits()
+}
+
+extern "C" fn init_context(ctx: *mut c_void, index: u64, value: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let vm = unsafe { &mut *ctx.vm };
+    let value = Value::from_bits(value);
+    match vm.context_chain_env(0) {
+        Ok(env) => {
+            crate::ir::context_env(&env).set_slot(index as usize, value);
+            value.bits()
+        }
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn update_context(
+    ctx: *mut c_void,
+    depth: u64,
+    index: u64,
+    op: u64,
+    prefix: u64,
+) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let env = match vm.context_chain_env(depth as usize) {
+        Ok(env) => env,
+        Err(error) => return slow_error(ctx, error),
+    };
+    let declarative = crate::ir::context_env(&env);
+    let old = match declarative.slot_value(index as usize) {
+        Some(value) => value,
+        None => {
+            return slow_error(
+                ctx,
+                JsError::new(
+                    ErrorKind::ReferenceError,
+                    "Cannot access a binding before initialization".into(),
+                ),
+            );
+        }
+    };
+    if !declarative.slot_mutable(index as usize) {
+        return slow_error(
+            ctx,
+            JsError::new(
+                ErrorKind::TypeError,
+                "Assignment to constant variable".into(),
+            ),
+        );
+    }
+    let op = UPDATE_OPS
+        .get(op as usize)
+        .copied()
+        .unwrap_or(UpdateOp::Increment);
+    match crate::ir::update_value(agent, &op, &old) {
+        Ok((old_numeric, new)) => {
+            declarative.set_slot(index as usize, new);
+            (if prefix != 0 { new } else { old_numeric }).bits()
+        }
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn load_per_iter(ctx: *mut c_void, depth: u64, index: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let vm = unsafe { &mut *ctx.vm };
+    match vm.per_iteration_env(depth as usize) {
+        Ok(env) => match crate::ir::context_env(&env).slot_value(index as usize) {
+            Some(value) => value.bits(),
+            None => slow_error(
+                ctx,
+                JsError::new(
+                    ErrorKind::ReferenceError,
+                    "Cannot access a binding before initialization".into(),
+                ),
+            ),
+        },
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn store_per_iter(ctx: *mut c_void, depth: u64, index: u64, value: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let vm = unsafe { &mut *ctx.vm };
+    let value = Value::from_bits(value);
+    match vm.per_iteration_env(depth as usize) {
+        Ok(env) => {
+            crate::ir::context_env(&env).set_slot(index as usize, value);
+            value.bits()
+        }
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn update_per_iter(
+    ctx: *mut c_void,
+    depth: u64,
+    index: u64,
+    op: u64,
+    prefix: u64,
+) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let env = match vm.per_iteration_env(depth as usize) {
+        Ok(env) => env,
+        Err(error) => return slow_error(ctx, error),
+    };
+    let declarative = crate::ir::context_env(&env);
+    let old = match declarative.slot_value(index as usize) {
+        Some(value) => value,
+        None => {
+            return slow_error(
+                ctx,
+                JsError::new(
+                    ErrorKind::ReferenceError,
+                    "Cannot access a binding before initialization".into(),
+                ),
+            );
+        }
+    };
+    let op = UPDATE_OPS
+        .get(op as usize)
+        .copied()
+        .unwrap_or(UpdateOp::Increment);
+    match crate::ir::update_value(agent, &op, &old) {
+        Ok((old_numeric, new)) => {
+            declarative.set_slot(index as usize, new);
+            (if prefix != 0 { new } else { old_numeric }).bits()
+        }
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn get_var_reference(ctx: *mut c_void) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    match vm.var_ref_stack.last() {
+        Some(reference) => match crate::context::get_value(agent, reference) {
+            Ok(value) => value.bits(),
+            Err(error) => slow_error(ctx, error),
+        },
+        None => slow_error(
+            ctx,
+            JsError::new(
+                ErrorKind::SyntaxError,
+                "GetVarReference without a resolution".into(),
+            ),
+        ),
+    }
+}
+
+extern "C" fn update_var_reference(ctx: *mut c_void, op: u64, prefix: u64, old: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let old = Value::from_bits(old);
+    let op = UPDATE_OPS
+        .get(op as usize)
+        .copied()
+        .unwrap_or(UpdateOp::Increment);
+    let (old_numeric, new) = match crate::ir::update_value(agent, &op, &old) {
+        Ok(result) => result,
+        Err(error) => return slow_error(ctx, error),
+    };
+    let reference = match vm.var_ref_stack.pop() {
+        Some(reference) => reference,
+        None => {
+            return slow_error(
+                ctx,
+                JsError::new(
+                    ErrorKind::SyntaxError,
+                    "UpdateVarReference without a resolution".into(),
+                ),
+            );
+        }
+    };
+    match crate::context::put_value(agent, &reference, new) {
+        Ok(()) => (if prefix != 0 { new } else { old_numeric }).bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn put_var_reference_op(ctx: *mut c_void, op: u64, old: u64, value: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let old = Value::from_bits(old);
+    let value = Value::from_bits(value);
+    let op = ASSIGN_OPS
+        .get(op as usize)
+        .copied()
+        .unwrap_or(AssignOp::Assign);
+    let reference = match vm.var_ref_stack.pop() {
+        Some(reference) => reference,
+        None => {
+            return slow_error(
+                ctx,
+                JsError::new(
+                    ErrorKind::SyntaxError,
+                    "PutVarReferenceOp without a resolution".into(),
+                ),
+            );
+        }
+    };
+    let new = match crate::expr::apply_compound(agent, op, &old, &value) {
+        Ok(new) => new,
+        Err(error) => return slow_error(ctx, error),
+    };
+    match crate::context::put_value(agent, &reference, new) {
+        Ok(()) => new.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn pop_var_reference(ctx: *mut c_void) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let vm = unsafe { &mut *ctx.vm };
+    match vm.var_ref_stack.pop() {
+        Some(_) => 0,
+        None => slow_error(
+            ctx,
+            JsError::new(
+                ErrorKind::SyntaxError,
+                "PopVarReference without a resolution".into(),
+            ),
+        ),
+    }
+}
+
 /// The body's compiled-info pointer: the per-body fast cell when set (the
 /// first successful lookup stores it — the cache never evicts a body it
 /// holds alive, so it stays valid), else a consult of the installed hook
@@ -758,6 +1088,17 @@ mod tests {
         assert_ne!(JIT_SLOW_PATHS.update_ident as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.assign_member_name as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.assign_member_computed as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.load_context as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.store_context as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.init_context as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.update_context as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.load_per_iter as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.store_per_iter as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.update_per_iter as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.get_var_reference as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.update_var_reference as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.put_var_reference_op as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.pop_var_reference as usize, 0);
     }
 
     #[test]
