@@ -53,14 +53,19 @@
 //! - Member access (through the slow-path helpers): `GetMemberName`/
 //!   `GetMemberComputed`, `AssignMemberName`/`AssignMemberComputed` (plain
 //!   `=` only), and the `LeafOp` member forms.
+//! - Calls: `CallFast` and the fused `CallFastSlot` (through `call_slow`).
+//! - Global/outer bindings (through the slow-path helpers): the identifier
+//!   read/write/update (`LoadIdent`, `ResolveVarIdent`/`PutVarReference`,
+//!   `UpdateIdent`) plus the script-level fast-script steps `LoadGlobal`/
+//!   `StoreGlobal`/`FusedStoreGlobal`.
 //! - `Return` and the no-op completion steps (`ResetCompletion`,
 //!   `NormalizeCompletion`, `SetCompletion`, `ListBegin`, `ListEnd` — the
 //!   scaffold assumes function-body semantics, where the completion is
 //!   discarded except through `Return`).
 //!
-//! Everything else (calls, closures, `with`/`try`/`switch`/`using`,
-//! generator suspension, global-object fast paths, reference machinery,
-//! per-iteration envs) bails to the interpreter.
+//! Everything else (closures, `with`/`try`/`switch`/`using`, generator
+//! suspension, compound-member/global-reference steps, per-iteration envs)
+//! bails to the interpreter.
 //!
 //! # Slow paths
 //!
@@ -223,6 +228,12 @@ fn runtime_helpers() -> JitHelpers {
         set_member_name: Some(rt.set_member_name),
         set_member_computed: Some(rt.set_member_computed),
         call_slow: Some(rt.call_slow),
+        get_global: Some(rt.get_global),
+        set_global: Some(rt.set_global),
+        load_ident: Some(rt.load_ident),
+        resolve_var_ident: Some(rt.resolve_var_ident),
+        put_var_reference: Some(rt.put_var_reference),
+        update_ident: Some(rt.update_ident),
     }
 }
 
@@ -311,6 +322,12 @@ mod tests {
             set_member_name: Some(helpers::test_set_member_name),
             set_member_computed: Some(helpers::test_set_member_computed),
             call_slow: Some(helpers::test_call_slow),
+            get_global: Some(helpers::test_get_global),
+            set_global: Some(helpers::test_set_global),
+            load_ident: Some(helpers::test_load_ident),
+            resolve_var_ident: Some(helpers::test_resolve_var_ident),
+            put_var_reference: Some(helpers::test_put_var_reference),
+            update_ident: Some(helpers::test_update_ident),
         }
     }
 
@@ -788,6 +805,84 @@ mod tests {
                 .expect("runs")
         });
         assert_eq!(value.as_number(), Some(2893.0));
+    }
+
+    #[test]
+    fn global_load_store_lower() {
+        // The test doubles: `get_global` returns 42; `set_global` returns
+        // the stored value (discarded by `StoreGlobal`).
+        let engine = JitEngine::new().expect("native isa");
+        let body = make_body(vec![Step::LoadGlobal { name: 1 }, Step::Return], 0);
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(42.0).bits());
+
+        let body = make_body(
+            vec![
+                Step::Push(Value::Number(3.0)),
+                Step::StoreGlobal { name: 2 },
+                Step::Push(Value::Number(5.0)),
+                Step::Return,
+            ],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(5.0).bits());
+    }
+
+    #[test]
+    fn ident_load_store_update_lower() {
+        // The test doubles: `load_ident` returns 42, `put_var_reference`
+        // returns the value, `update_ident` returns old + 1.
+        let engine = JitEngine::new().expect("native isa");
+        let body = make_body(vec![Step::LoadIdent { name: 1 }, Step::Return], 0);
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(42.0).bits());
+
+        // `ResolveVarIdent` (no stack effect) + value + `PutVarReference`
+        // (pops the value, re-pushes it as the assignment's result).
+        let body = make_body(
+            vec![
+                Step::ResolveVarIdent { name: 1 },
+                Step::Push(Value::Number(7.0)),
+                Step::PutVarReference,
+                Step::Return,
+            ],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(7.0).bits());
+
+        // `UpdateIdent`: pop the old value, push the result.
+        let body = make_body(
+            vec![
+                Step::Push(Value::Number(5.0)),
+                Step::UpdateIdent {
+                    name: 1,
+                    op: syntax::ast::UpdateOp::Increment,
+                    prefix: true,
+                },
+                Step::Return,
+            ],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(6.0).bits());
+    }
+
+    #[test]
+    fn installed_jit_runs_a_body_with_globals() {
+        // `f` reads and writes a declared top-level `var` through the
+        // direct-mapped global cells (`LoadGlobal`/`StoreGlobal` route to
+        // the interpreter's cell fast path). Result: 100 * 10 = 1000.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var g = 10; function f() { var s = 0; for (var i = 0; i < 100; i++) { s += g; } g = s; return s; } f();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(1000.0));
+        assert!(compiled >= 1, "{compiled} bodies");
     }
 
     #[test]

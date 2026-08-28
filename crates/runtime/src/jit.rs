@@ -113,6 +113,22 @@ pub struct JitSlowPaths {
     /// slots). Runs the interpreter's call machinery on the Vm's own stack.
     pub call_slow:
         extern "C" fn(ctx: *mut c_void, callee: u64, this: u64, argc: u64, args: *mut u64) -> u64,
+    /// Read a declared top-level `var` off the global object (`name` is an
+    /// `AtomId`); returns the value.
+    pub get_global: extern "C" fn(ctx: *mut c_void, name: u64) -> u64,
+    /// Write a declared top-level `var`; returns the stored value.
+    pub set_global: extern "C" fn(ctx: *mut c_void, name: u64, value: u64) -> u64,
+    /// The identifier read a certified body uses for an outer/global binding
+    /// (`resolve_binding` + `get_value`); `name` is an `AtomId`.
+    pub load_ident: extern "C" fn(ctx: *mut c_void, name: u64) -> u64,
+    /// Resolve an identifier reference and push it onto the Vm's reference
+    /// stack (the write path's `put_var_reference` pops it).
+    pub resolve_var_ident: extern "C" fn(ctx: *mut c_void, name: u64) -> u64,
+    /// `PutValue` on the reference stack's top, popped with the stored value.
+    pub put_var_reference: extern "C" fn(ctx: *mut c_void, value: u64) -> u64,
+    /// The identifier `++`/`--` (resolve, update, store, return the result).
+    pub update_ident:
+        extern "C" fn(ctx: *mut c_void, name: u64, op: u64, prefix: u64, old: u64) -> u64,
 }
 
 /// The runtime's slow-path table, installed into every `JitHook`.
@@ -127,6 +143,12 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     set_member_name,
     set_member_computed,
     call_slow,
+    get_global,
+    set_global,
+    load_ident,
+    resolve_var_ident,
+    put_var_reference,
+    update_ident,
 };
 
 /// The slack (in slots) reserved above a compiled body's working area on the
@@ -350,6 +372,109 @@ extern "C" fn call_slow(
     }
 }
 
+extern "C" fn get_global(ctx: *mut c_void, name: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    match vm.load_global_value(agent, name as crux::AtomId) {
+        Ok(value) => value.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn set_global(ctx: *mut c_void, name: u64, value: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let value = Value::from_bits(value);
+    match vm.store_global_value(agent, name as crux::AtomId, value) {
+        Ok(()) => value.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn load_ident(ctx: *mut c_void, name: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let reference = match crate::context::resolve_binding(
+        agent,
+        &crux::lookup(name as crux::AtomId),
+        vm.strict,
+    ) {
+        Ok(reference) => reference,
+        Err(error) => return slow_error(ctx, error),
+    };
+    match crate::context::get_value(agent, &reference) {
+        Ok(value) => value.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn resolve_var_ident(ctx: *mut c_void, name: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    match crate::context::resolve_binding(agent, &crux::lookup(name as crux::AtomId), vm.strict) {
+        Ok(reference) => {
+            vm.var_ref_stack.push(reference);
+            0
+        }
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn put_var_reference(ctx: *mut c_void, value: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let value = Value::from_bits(value);
+    let reference = match vm.var_ref_stack.pop() {
+        Some(reference) => reference,
+        None => {
+            return slow_error(
+                ctx,
+                JsError::new(
+                    ErrorKind::SyntaxError,
+                    "PutVarReference without a resolution".into(),
+                ),
+            );
+        }
+    };
+    match crate::context::put_value(agent, &reference, value) {
+        Ok(()) => value.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn update_ident(ctx: *mut c_void, name: u64, op: u64, prefix: u64, old: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let old = Value::from_bits(old);
+    let op = UPDATE_OPS
+        .get(op as usize)
+        .copied()
+        .unwrap_or(UpdateOp::Increment);
+    let prefix = prefix != 0;
+    let (old_numeric, new) = match crate::ir::update_value(agent, &op, &old) {
+        Ok(result) => result,
+        Err(error) => return slow_error(ctx, error),
+    };
+    let reference = match crate::context::resolve_binding(
+        agent,
+        &crux::lookup(name as crux::AtomId),
+        vm.strict,
+    ) {
+        Ok(reference) => reference,
+        Err(error) => return slow_error(ctx, error),
+    };
+    match crate::context::put_value(agent, &reference, new) {
+        Ok(()) => (if prefix { new } else { old_numeric }).bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
 /// The body's compiled-info pointer: the per-body fast cell when set (the
 /// first successful lookup stores it — the cache never evicts a body it
 /// holds alive, so it stays valid), else a consult of the installed hook
@@ -471,6 +596,12 @@ mod tests {
         assert_ne!(JIT_SLOW_PATHS.set_member_name as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.set_member_computed as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.call_slow as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.get_global as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.set_global as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.load_ident as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.resolve_var_ident as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.put_var_reference as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.update_ident as usize, 0);
     }
 
     #[test]

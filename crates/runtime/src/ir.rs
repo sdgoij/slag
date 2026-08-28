@@ -2188,7 +2188,7 @@ pub struct Vm {
     list_stack: Vec<(Value, bool)>,
     /// Pre-resolved `var` declaration references awaiting their initializer's
     /// value (spec 14.3.2 step 2).
-    var_ref_stack: Vec<crate::context::Reference>,
+    pub(crate) var_ref_stack: Vec<crate::context::Reference>,
     /// The next element index of each in-progress array literal (nested
     /// literals push in order); the length is set once at `ArrayEnd`.
     array_index_stack: Vec<usize>,
@@ -2624,7 +2624,7 @@ impl Vm {
     /// Read a declared top-level `var` directly off the global object: the
     /// cached slot when still valid (a direct-mapped probe + key match),
     /// else the reference path (which re-resolves the cache).
-    fn load_global_value(
+    pub(crate) fn load_global_value(
         &mut self,
         agent: &mut Agent,
         name: crux::AtomId,
@@ -2651,7 +2651,7 @@ impl Vm {
     /// when still valid and writable, else the reference path (which
     /// enforces the strict-mode non-writable error and re-resolves the
     /// cache).
-    fn store_global_value(
+    pub(crate) fn store_global_value(
         &mut self,
         agent: &mut Agent,
         name: crux::AtomId,

@@ -145,6 +145,17 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
             Step::CallFastSlot { argc, .. } => {
                 depth = depth.saturating_sub(*argc as usize).saturating_add(1);
             }
+            // A global read pushes the value; a global write consumes it.
+            Step::LoadGlobal { .. } => depth += 1,
+            Step::StoreGlobal { .. } | Step::FusedStoreGlobal { .. } => {
+                depth = depth.saturating_sub(1)
+            }
+            // The identifier read pushes; a reference write pops and
+            // re-pushes (net 0); the identifier update pops and re-pushes.
+            Step::LoadIdent { .. } => depth += 1,
+            Step::ResolveVarIdent { .. } => {}
+            Step::PutVarReference => {}
+            Step::UpdateIdent { .. } => {}
             _ => {}
         }
         max = max.max(depth);
@@ -950,6 +961,53 @@ impl<'a> Lowerer<'a> {
                     self.sig_call,
                     Helper::CallSlow,
                     &[callee, this, argc_imm, args_ptr],
+                )?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::LoadGlobal { name } => {
+                let name_imm = self.builder.ins().iconst(types::I64, *name as i64);
+                let res = self.call_slow(self.sig_bool, Helper::GetGlobal, &[name_imm])?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::StoreGlobal { name } | Step::FusedStoreGlobal { name } => {
+                let value = self.pop();
+                let name_imm = self.builder.ins().iconst(types::I64, *name as i64);
+                let _stored =
+                    self.call_slow(self.sig_update, Helper::SetGlobal, &[name_imm, value])?;
+                self.fall_through(index);
+            }
+            Step::LoadIdent { name } => {
+                let name_imm = self.builder.ins().iconst(types::I64, *name as i64);
+                let res = self.call_slow(self.sig_bool, Helper::LoadIdent, &[name_imm])?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::ResolveVarIdent { name } => {
+                // The reference goes on the Vm's reference stack (the write
+                // path's `put_var_reference` pops it); no JIT stack effect.
+                let name_imm = self.builder.ins().iconst(types::I64, *name as i64);
+                let _res = self.call_slow(self.sig_bool, Helper::ResolveVarIdent, &[name_imm])?;
+                self.fall_through(index);
+            }
+            Step::PutVarReference => {
+                // The assignment's value is re-pushed after the store (the
+                // interpreter's handler pushes it back).
+                let value = self.pop();
+                let stored = self.call_slow(self.sig_bool, Helper::PutVarReference, &[value])?;
+                self.push(stored);
+                self.fall_through(index);
+            }
+            Step::UpdateIdent { name, op, prefix } => {
+                let old = self.pop();
+                let name_imm = self.builder.ins().iconst(types::I64, *name as i64);
+                let op_imm = self.builder.ins().iconst(types::I64, *op as i64);
+                let prefix_imm = self.builder.ins().iconst(types::I64, *prefix as i64);
+                let res = self.call_slow(
+                    self.sig_call,
+                    Helper::UpdateIdent,
+                    &[name_imm, op_imm, prefix_imm, old],
                 )?;
                 self.push(res);
                 self.fall_through(index);
