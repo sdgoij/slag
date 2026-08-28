@@ -117,6 +117,14 @@ pub struct Agent {
     /// vector), so sharing them across Vms — and across realms — is exact
     /// and warms a nested call to its caller's shapes.
     pub(crate) global_cells: [Option<(crux::AtomId, usize)>; crate::ir::GLOBAL_CELLS],
+    /// The JIT's direct-mapped global-VALUE cells (Cut 36): `name` + the
+    /// capturing `(global_id, generation)` validate the cached value against
+    /// the global object's LIVE identity and generation (the generation
+    /// bumps on any own-property change), so the compiled `LoadGlobal` fast
+    /// path reads the value in place and only calls `get_global` on a miss.
+    /// `load_global_value` repopulates the cell on every successful read.
+    /// Boxed per the Cut 27 lesson.
+    pub(crate) global_value_cells: Box<[crate::jit::GlobalValueCell; crate::ir::GLOBAL_CELLS]>,
     /// The global call-site leaf cache (Cut 35 slice 12): name → the
     /// resolved leaf entry for a stable global callee, valid while the
     /// global object's identity and generation are unchanged. Boxed so the
@@ -616,6 +624,9 @@ impl Agent {
         Self {
             execution_context_stack: Vec::new(),
             global_cells: [None; crate::ir::GLOBAL_CELLS],
+            global_value_cells: Box::new(std::array::from_fn(|_| {
+                crate::jit::GlobalValueCell::empty()
+            })),
             global_leaf_cells: Box::new(std::array::from_fn(|_| None)),
             slot_leaf_cells: Box::new(std::array::from_fn(|_| None)),
             member_cells: [None; crate::ir::MEMBER_CELLS],
@@ -999,6 +1010,9 @@ impl Agent {
             cell.trace(visit);
         }
         for cell in self.global_leaf_cells.iter() {
+            cell.trace(visit);
+        }
+        for cell in self.global_value_cells.iter() {
             cell.trace(visit);
         }
         for cell in self.slot_leaf_cells.iter() {

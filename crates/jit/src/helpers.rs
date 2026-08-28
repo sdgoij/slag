@@ -33,6 +33,7 @@ pub enum Helper {
     CallSlow,
     GetGlobal,
     SetGlobal,
+    SetGlobalSlot,
     LoadIdent,
     ResolveVarIdent,
     PutVarReference,
@@ -67,6 +68,7 @@ impl Helper {
             Helper::CallSlow => "call_slow",
             Helper::GetGlobal => "get_global",
             Helper::SetGlobal => "set_global",
+            Helper::SetGlobalSlot => "set_global_slot",
             Helper::LoadIdent => "load_ident",
             Helper::ResolveVarIdent => "resolve_var_ident",
             Helper::PutVarReference => "put_var_reference",
@@ -132,6 +134,11 @@ pub struct JitHelpers {
     pub get_global: Option<extern "C" fn(vm: *mut c_void, name: u64) -> u64>,
     /// Write a declared top-level `var`; returns the stored value.
     pub set_global: Option<extern "C" fn(vm: *mut c_void, name: u64, value: u64) -> u64>,
+    /// The compiled `StoreGlobal` fast path's property-vector write: `slot`
+    /// is the binding's property-vector slot (the compiled code validated
+    /// the cell against the live global). Returns the stored value.
+    pub set_global_slot:
+        Option<extern "C" fn(vm: *mut c_void, name: u64, slot: u64, value: u64) -> u64>,
     /// The identifier read a certified body uses for an outer/global binding
     /// (`resolve_binding` + `get_value`); `name` is an `AtomId`.
     pub load_ident: Option<extern "C" fn(vm: *mut c_void, name: u64) -> u64>,
@@ -218,6 +225,7 @@ impl JitHelpers {
             call_slow: None,
             get_global: None,
             set_global: None,
+            set_global_slot: None,
             load_ident: None,
             resolve_var_ident: None,
             put_var_reference: None,
@@ -253,6 +261,7 @@ impl JitHelpers {
             Helper::CallSlow => self.call_slow.map(|f| f as usize as u64),
             Helper::GetGlobal => self.get_global.map(|f| f as usize as u64),
             Helper::SetGlobal => self.set_global.map(|f| f as usize as u64),
+            Helper::SetGlobalSlot => self.set_global_slot.map(|f| f as usize as u64),
             Helper::LoadIdent => self.load_ident.map(|f| f as usize as u64),
             Helper::ResolveVarIdent => self.resolve_var_ident.map(|f| f as usize as u64),
             Helper::PutVarReference => self.put_var_reference.map(|f| f as usize as u64),
@@ -333,6 +342,15 @@ pub extern "C" fn test_get_global(_vm: *mut c_void, _name: u64) -> u64 {
 }
 
 pub extern "C" fn test_set_global(_vm: *mut c_void, _name: u64, value: u64) -> u64 {
+    value
+}
+
+pub extern "C" fn test_set_global_slot(
+    _vm: *mut c_void,
+    _name: u64,
+    _slot: u64,
+    value: u64,
+) -> u64 {
     value
 }
 

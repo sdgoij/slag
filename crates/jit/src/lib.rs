@@ -56,10 +56,12 @@
 //!   cached-old `Dup`+`Get` sequence the compiler emits for `+=` & co.),
 //!   plus the `LeafOp` member forms.
 //! - Calls: `CallFast` and the fused `CallFastSlot` (through `call_slow`).
-//! - Global/outer bindings (through the slow-path helpers): the identifier
-//!   read/write/update (`LoadIdent`, `ResolveVarIdent`/`PutVarReference`,
-//!   `UpdateIdent`) plus the script-level fast-script steps `LoadGlobal`/
-//!   `StoreGlobal`/`FusedStoreGlobal`.
+//! - Global/outer bindings: the identifier read/write/update (`LoadIdent`,
+//!   `ResolveVarIdent`/`PutVarReference`, `UpdateIdent`) and the
+//!   script-level fast-script steps `LoadGlobal`/`StoreGlobal`/
+//!   `FusedStoreGlobal` — the global steps inline the direct-mapped
+//!   `GlobalValueCell` (validated against the live global's id/generation),
+//!   falling back to the helpers on a miss.
 //! - Captured bindings (through the env machinery): `LoadContextSlot`/
 //!   `StoreContextSlot`/`InitContextSlot`/`UpdateContextSlot` (the
 //!   capture-context reads/writes a closure body uses), the per-iteration
@@ -327,6 +329,7 @@ fn runtime_helpers() -> JitHelpers {
         call_slow: Some(rt.call_slow),
         get_global: Some(rt.get_global),
         set_global: Some(rt.set_global),
+        set_global_slot: Some(rt.set_global_slot),
         load_ident: Some(rt.load_ident),
         resolve_var_ident: Some(rt.resolve_var_ident),
         put_var_reference: Some(rt.put_var_reference),
@@ -438,6 +441,7 @@ mod tests {
             call_slow: Some(helpers::test_call_slow),
             get_global: Some(helpers::test_get_global),
             set_global: Some(helpers::test_set_global),
+            set_global_slot: Some(helpers::test_set_global_slot),
             load_ident: Some(helpers::test_load_ident),
             resolve_var_ident: Some(helpers::test_resolve_var_ident),
             put_var_reference: Some(helpers::test_put_var_reference),
@@ -479,6 +483,11 @@ mod tests {
             error: None,
             agent: std::ptr::null_mut(),
             vm: std::ptr::null_mut(),
+            // A null global routes the inline `LoadGlobal` fast path to the
+            // helper (the test doubles), so the bare ctx stays safe.
+            global_object: std::ptr::null_mut(),
+            global_value_cells: std::ptr::null_mut(),
+            clean_chain: false,
         };
         // Safety: the buffers outlive the call; `vm` is never dereferenced by
         // the scaffold's test helpers.
@@ -1084,6 +1093,105 @@ mod tests {
                 .expect("runs")
         });
         assert_eq!(value.as_number(), Some(1000.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_global_read_inline_misses_on_mid_run_mutation() {
+        // The inline `LoadGlobal` fast path validates the value cell against
+        // the global object's LIVE generation: the store at `i == 50` bumps
+        // it, so the remaining reads must miss to `get_global` (a stale ctx
+        // snapshot would keep serving the pre-store value). Expected:
+        // 50 * 1 + 50 * 2 = 150.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var g = 1; function f(n) { var s = 0; for (var i = 0; i < n; i++) { if (i === 50) { g = 2; } s += g; } return s; } f(100);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(150.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_global_store_warm_reads_follow_the_store() {
+        // A global written and read in the SAME compiled body: the first
+        // iteration's `g = i` misses (the cell is empty) and falls to the
+        // cached `store_global_value`, which mirrors the JIT cell; the rest
+        // take the compiled `StoreGlobal` fast path (cell write + validated
+        // slot write). A cached store that did NOT mirror the cell would
+        // leave the cell at `0` and every `s += g` fast read would add 0.
+        // Expected: 0 + 1 + ... + 99 = 4950.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var g = 0; function f(n) { var s = 0; for (var i = 0; i < n; i++) { g = i; s += g; } return s; } f(100);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(4950.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_global_store_then_read_same_body() {
+        // The store-then-read shape in one compiled body: every iteration's
+        // `g = i` store (fast path after the first) must be visible to the
+        // next iteration's `s += g` fast read AND to the final `return g` —
+        // a store that did not update the cell would leave them reading the
+        // pre-store value. Expected: g = 9 after the loop.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var g = 0; function f(n) { var s = 0; for (var i = 0; i < n; i++) { g = i; s += g; } return g; } f(10);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(9.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_ident_read_with_scope_shadow_is_respected() {
+        // A certified closure created inside a `with` reads a name the with
+        // object shadows: its env chain contains a `with` scope, so the
+        // compiled `LoadIdent` probe must be gated off (the cell for `x`
+        // holds the global property's 1, not the with object's 2). The
+        // per-call `clean_chain` flag makes the probe miss to `load_ident`,
+        // which resolves through the with env.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var x = 1; with ({ x: 2 }) { var f = function () { return x; }; } f();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(2.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_ident_read_let_shadow_invalidates_the_cell() {
+        // A global LEXICAL binding shadows an existing CONFIGURABLE data
+        // property (a plain `var` is non-configurable, so this needs
+        // `defineProperty`): the first script's calls warm the `x` cell (the
+        // first `f()` misses and `load_ident` records the property; the
+        // second reads it). The second script's `let x` then shadows the
+        // property in the global env's DECLARATIVE record — which does not
+        // touch the global object, so instantiating it must bump the
+        // generation to invalidate the cell. Without the bump, the compiled
+        // probe would keep serving the property's 1.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "Object.defineProperty(globalThis, 'x', { value: 1, writable: true, configurable: true }); \
+                     function f() { return x; } f(); f();",
+                )
+                .expect("first script");
+            agent.run_script("let x = 2; f();").expect("second script")
+        });
+        assert_eq!(value.as_number(), Some(2.0));
         assert!(compiled >= 1, "{compiled} bodies");
     }
 

@@ -1605,8 +1605,9 @@ impl Trace for MemberValueCell {
 /// The direct-mapped global-var cell count: a power of two so the cache
 /// index is a mask. Bigger than the member cells because a script's
 /// top-level names (`n`, `i`, `s`, ...) all probe this table; a collision
-/// evicts and the reference path re-resolves.
-pub(crate) const GLOBAL_CELLS: usize = 256;
+/// evicts and the reference path re-resolves. `pub` so the jit crate's
+/// inline global fast path can index the same table.
+pub const GLOBAL_CELLS: usize = 256;
 
 /// The direct-mapped leaf-inline cache (Cut 34): the per-function data
 /// `do_call_fast` needs to run a leaf inline — the compiled ir, strictness,
@@ -2546,7 +2547,7 @@ impl Vm {
     /// The running context's realm global object, cached on first access
     /// (see the `Vm::global` field): the top-level fast path's reference
     /// target and the global-cell validation base.
-    fn global_object(
+    pub(crate) fn global_object(
         &mut self,
         agent: &mut Agent,
     ) -> Result<Handle<crux::object::JsObject>, JsError> {
@@ -2622,9 +2623,50 @@ impl Vm {
         }
     }
 
+    /// Record the JIT's global-value cell for `name` under the version read
+    /// NOW (call after the value is read, so a getter that mutated the
+    /// global during the read records a version that will not match it).
+    /// `slot` is the binding's property-vector slot when known — the
+    /// compiled `StoreGlobal` fast path needs it (a load-only cell with
+    /// `None` still validates for reads).
+    fn record_global_cell(
+        agent: &mut Agent,
+        name: crux::AtomId,
+        value: Value,
+        global: &Handle<crux::object::JsObject>,
+        slot: Option<usize>,
+    ) {
+        agent.global_value_cells[Self::global_cell_index(name)] = crate::jit::GlobalValueCell {
+            name,
+            global_id: global.id(),
+            generation: global.generation(),
+            slot: slot.map(|s| s as u32).unwrap_or(u32::MAX),
+            value,
+        };
+    }
+
+    /// Best-effort warm of the JIT's global-value cell after an identifier
+    /// resolve landed on the global object record (the compiled `LoadIdent`
+    /// probe's miss path). Records only when the name is an own data
+    /// property of the global object — the probe's fast path is exactly the
+    /// declared-var read shape; an accessor or absent name stays on the
+    /// resolve path. The read already succeeded, so errors are swallowed
+    /// (the cell is an optimization).
+    pub(crate) fn warm_global_cell(&mut self, agent: &mut Agent, name: crux::AtomId, value: Value) {
+        let Ok(global) = self.global_object(agent) else {
+            return;
+        };
+        Self::resolve_global_cell(agent, name);
+        let slot = agent.global_cells[Self::global_cell_index(name)].map(|(_, slot)| slot);
+        Self::record_global_cell(agent, name, value, &global, slot);
+    }
+
     /// Read a declared top-level `var` directly off the global object: the
     /// cached slot when still valid (a direct-mapped probe + key match),
-    /// else the reference path (which re-resolves the cache).
+    /// else the reference path (which re-resolves the cache). Every
+    /// successful read also records the JIT's global-value cell (Cut 36),
+    /// so the compiled `LoadGlobal` fast path warms from the first
+    /// interpreter or slow-path read.
     pub(crate) fn load_global_value(
         &mut self,
         agent: &mut Agent,
@@ -2639,12 +2681,20 @@ impl Vm {
                 && *key == PropertyKey::String(name)
                 && let crux::object::PropertyKind::Data { value, .. } = &property.kind
             {
-                return Ok(*value);
+                let value = *value;
+                Self::record_global_cell(agent, name, value, &global, Some(slot));
+                return Ok(value);
             }
         }
         let reference = self.global_reference(agent, name)?;
         let value = crate::context::get_value(agent, &reference)?;
         Self::resolve_global_cell(agent, name);
+        // The version read AFTER the value: a getter that mutated the global
+        // during `get_value` bumps the generation, so the recorded cell is
+        // either current or never matched by the JIT's live check.
+        let global = self.global_object(agent)?;
+        let slot = agent.global_cells[Self::global_cell_index(name)].map(|(_, slot)| slot);
+        Self::record_global_cell(agent, name, value, &global, slot);
         Ok(value)
     }
 
@@ -2671,6 +2721,11 @@ impl Vm {
                 } = &mut property.kind
             {
                 *cell = value;
+                // Mirror the JIT's global-value cell (Cut 36): a plain
+                // cached write does not bump the generation, so without the
+                // mirror the cell would keep serving the pre-store value to
+                // the compiled `LoadGlobal` fast path.
+                Self::record_global_cell(agent, name, value, &global, Some(slot));
                 return Ok(());
             }
         }
@@ -2742,6 +2797,7 @@ impl Vm {
                     (new, old_numeric)
                 };
                 *cell = new;
+                Self::record_global_cell(agent, name, new, &global, Some(slot));
                 return Ok(if prefix { new } else { result });
             }
         }
@@ -8755,11 +8811,28 @@ impl Vm {
                 Value::Undefined
             };
         }
+        // The live global for the compiled `LoadGlobal` fast path: resolved
+        // and cached on this Vm (the machine code re-reads its id/generation
+        // in place, so a mid-run mutation invalidates the value cells).
+        let global = self.global_object(agent)?;
+        // The compiled `LoadIdent` probe's env-chain gate (see
+        // `crate::jit::run_jit_body`): the probe is sound only when the
+        // body's env chain is exactly the global env — any intermediate env
+        // could shadow a name the global fast cell records. Leaf bodies
+        // never contain `LoadIdent` (`steps_are_leaf` excludes the
+        // reference machinery), so this is computed for uniformity only.
+        let clean_chain = {
+            let current = agent.running_context()?.lexical_environment;
+            matches!(&*current, EnvRecord::Global(_)) && current.outer().is_none()
+        };
         let mut ctx = crate::jit::JitCallContext {
             pending: false,
             error: None,
             agent: agent as *mut Agent,
             vm: self as *mut Vm,
+            global_object: global.as_ptr() as *mut std::os::raw::c_void,
+            global_value_cells: agent.global_value_cells.as_ptr() as *mut std::os::raw::c_void,
+            clean_chain,
         };
         let frame_ptr = buf.as_mut_ptr() as *mut std::os::raw::c_void;
         // SAFETY: `buf` has `frame_size + stack_usage + slack` slots.

@@ -548,7 +548,10 @@ impl Trace for PrivateElement {
 /// `PartialEq` on `Value` are identity tests.
 #[derive(Clone)]
 pub struct JsObject {
-    id: u64,
+    /// The unique identity (mirrors `Symbol`); `pub` so the JIT's inline
+    /// global fast path can read it in place (via `offset_of!`) to validate
+    /// its global-value cells.
+    pub id: u64,
     pub kind: ObjectKind,
     /// [[Prototype]]; `None` when the prototype is *null*. A lock-free
     /// `Cell` (the handle is `Copy`): `get_prototype_of` runs on every
@@ -573,8 +576,10 @@ pub struct JsObject {
     /// A generation counter bumped by any own-property or prototype change
     /// (Cut 22): the write-side chain cache re-validates a cached "the chain
     /// holds no accessor/non-writable for this key" verdict against the
-    /// chain links' generations, so a mutation invalidates it exactly.
-    generation: Cell<u32>,
+    /// chain links' generations, so a mutation invalidates it exactly. `pub`
+    /// so the JIT's inline global fast path can read it in place (via
+    /// `offset_of!`) to validate its global-value cells.
+    pub generation: Cell<u32>,
     /// Own properties in insertion order (the [[OwnPropertyKeys]] string
     /// order for ordinary objects).
     pub properties: RefCell<SmallProps>,

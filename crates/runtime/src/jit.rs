@@ -31,6 +31,8 @@ use crux::Value;
 use syntax::ast::{AssignOp, BinaryOp, UpdateOp};
 
 use crate::agent::Agent;
+use crate::context::ReferenceBase;
+use crate::env::EnvRecord;
 use crate::ir::{CompiledBody, Vm};
 use crux::error::{ErrorKind, JsError};
 
@@ -86,6 +88,73 @@ pub struct JitCallContext {
     pub agent: *mut Agent,
     /// The running Vm (member helpers need its member machinery).
     pub vm: *mut Vm,
+    /// The current realm's global object (`Vm::global` resolved once per
+    /// call): the compiled `LoadGlobal`/`StoreGlobal` fast paths read its
+    /// live `id`/`generation` in place to validate the global-value cells —
+    /// a stale ctx snapshot would miss a mutation a helper made mid-run.
+    pub global_object: *mut c_void,
+    /// The `Agent::global_value_cells` array base (the JIT indexes it by
+    /// `name & (GLOBAL_CELLS - 1)` and reads the `#[repr(C)]` cells).
+    pub global_value_cells: *mut c_void,
+    /// Whether the body's env chain is EXACTLY the global env (no
+    /// intermediate envs): the compiled `LoadIdent` probe is sound only then
+    /// — a named function expression's self-binding scope, a block/catch
+    /// scope, a `with` object, or a module env could hold a binding of the
+    /// read name that shadows the global property the cell records.
+    /// Computed once per call — a certified body adds no envs mid-run (no
+    /// `with`/`eval` in its own statements).
+    pub clean_chain: bool,
+}
+
+/// A direct-mapped global-value cell the compiled `LoadGlobal`/`StoreGlobal`
+/// fast paths read and write in place: `name` plus the capturing
+/// `(global_id, generation)` validate the cached `value` against the global
+/// object's LIVE identity and generation (the generation bumps on any
+/// own-property change, so a match means no mutation since the cell was
+/// recorded — including one a slow-path helper performed mid-run), and
+/// `slot` locates the binding's property-vector entry for the store side.
+/// `#[repr(C)]` with all-scalar fields: the compiled code loads the fields
+/// at fixed offsets (`offset_of!`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GlobalValueCell {
+    /// The global binding's atom (the cell's own slot identity check).
+    pub name: crux::AtomId,
+    /// The global object's identity at capture time.
+    pub global_id: u64,
+    /// The global object's generation at capture time.
+    pub generation: u32,
+    /// The binding's property-vector slot at capture time — the compiled
+    /// `StoreGlobal` fast path passes it to `set_global_slot` (the property
+    /// write cannot be inlined: the vector's enum layout is runtime
+    /// internal). `u32::MAX` when the slot was never resolved, which
+    /// disables the store fast path (a load-only cell still validates).
+    pub slot: u32,
+    /// The cached value's bits.
+    pub value: crux::Value,
+}
+
+impl GlobalValueCell {
+    /// An empty cell: `global_id` is an impossible object id, so the JIT's
+    /// validation never matches it and the read falls to the slow path.
+    pub fn empty() -> Self {
+        Self {
+            name: 0,
+            global_id: u64::MAX,
+            generation: 0,
+            slot: u32::MAX,
+            value: crux::Value::from_bits(0),
+        }
+    }
+}
+
+impl crux::heap::Trace for GlobalValueCell {
+    fn trace(&self, visit: &mut dyn FnMut(crux::heap::GcAny)) {
+        // Defense in depth: a validated cell's value is also reachable from
+        // the global object, so this only keeps a stale cell's handle alive
+        // (harmless over-retention) and never under-roots.
+        self.value.trace(visit);
+    }
 }
 
 /// The runtime's slow-path helper table (field order mirrors
@@ -124,6 +193,13 @@ pub struct JitSlowPaths {
     pub get_global: extern "C" fn(ctx: *mut c_void, name: u64) -> u64,
     /// Write a declared top-level `var`; returns the stored value.
     pub set_global: extern "C" fn(ctx: *mut c_void, name: u64, value: u64) -> u64,
+    /// The compiled `StoreGlobal` fast path's property-vector write: `slot`
+    /// is the binding's property-vector slot (the compiled code validated
+    /// the cell's `name`/`global_id`/`generation` against the live global,
+    /// so the vector entry is a writable data property of `name`). Falls
+    /// back to `set_global` semantics on a shape mismatch. Returns the
+    /// stored value.
+    pub set_global_slot: extern "C" fn(ctx: *mut c_void, name: u64, slot: u64, value: u64) -> u64,
     /// The identifier read a certified body uses for an outer/global binding
     /// (`resolve_binding` + `get_value`); `name` is an `AtomId`.
     pub load_ident: extern "C" fn(ctx: *mut c_void, name: u64) -> u64,
@@ -213,6 +289,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     call_slow,
     get_global,
     set_global,
+    set_global_slot,
     load_ident,
     resolve_var_ident,
     put_var_reference,
@@ -511,22 +588,70 @@ extern "C" fn set_global(ctx: *mut c_void, name: u64, value: u64) -> u64 {
     }
 }
 
+extern "C" fn set_global_slot(ctx: *mut c_void, name: u64, slot: u64, value: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let value = Value::from_bits(value);
+    // The compiled `StoreGlobal` fast path validated the cell (same global
+    // identity, live generation, resolved slot), so the property at `slot`
+    // is a writable data property of `name`. Defense in depth: any shape
+    // mismatch falls back to the full machinery (which also mirrors the
+    // cell, keeping the load fast path warm).
+    let global = unsafe { &*ctx.global_object.cast::<crux::object::JsObject>() };
+    let hit = {
+        let mut props = global.properties.borrow_mut();
+        if let Some((key, property)) = props.get_mut(slot as usize)
+            && *key == crux::property::PropertyKey::String(name as crux::AtomId)
+            && let crux::object::PropertyKind::Data {
+                writable: true,
+                value: cell,
+            } = &mut property.kind
+        {
+            *cell = value;
+            true
+        } else {
+            false
+        }
+    };
+    if hit {
+        return value.bits();
+    }
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    match vm.store_global_value(agent, name as crux::AtomId, value) {
+        Ok(()) => value.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
 extern "C" fn load_ident(ctx: *mut c_void, name: u64) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
     let agent = unsafe { &mut *ctx.agent };
     let vm = unsafe { &mut *ctx.vm };
-    let reference = match crate::context::resolve_binding(
-        agent,
-        &crux::lookup(name as crux::AtomId),
-        vm.strict,
-    ) {
+    let name_atom = name as crux::AtomId;
+    let name_string = crux::lookup(name_atom);
+    let reference = match crate::context::resolve_binding(agent, &name_string, vm.strict) {
         Ok(reference) => reference,
         Err(error) => return slow_error(ctx, error),
     };
-    match crate::context::get_value(agent, &reference) {
-        Ok(value) => value.bits(),
-        Err(error) => slow_error(ctx, error),
+    let value = match crate::context::get_value(agent, &reference) {
+        Ok(value) => value,
+        Err(error) => return slow_error(ctx, error),
+    };
+    // Warm the JIT's global fast cell when the resolved binding is a global
+    // OBJECT-record (var/function/undeclared) data property — the compiled
+    // `LoadIdent` probe then serves the next read as a native load. A
+    // DECLARATIVE-record binding (a top-level `let`/`const`/`class`) or any
+    // other env never warms: the probe validates only the cell's name and
+    // the global object's version, which a declarative shadow does not
+    // disturb. Best-effort — a name whose shape does not fit (an accessor,
+    // an absent property) stays missing and the resolve path keeps running.
+    if let ReferenceBase::Environment(env) = &reference.base
+        && let EnvRecord::Global(_) = &**env
+        && !env.has_lexical_declaration(&name_string)
+    {
+        vm.warm_global_cell(agent, name_atom, value);
     }
+    value.bits()
 }
 
 extern "C" fn resolve_var_ident(ctx: *mut c_void, name: u64) -> u64 {
@@ -1060,11 +1185,32 @@ pub(crate) fn run_jit_body(
         &mut heap_work[..]
     };
     let work_ptr = work.as_mut_ptr() as *mut c_void;
+    // The live global for the compiled `LoadGlobal` fast path (resolved and
+    // cached on this Vm; the machine code re-reads its id/generation in
+    // place, so a mid-run mutation invalidates the value cells).
+    let global = vm.global_object(agent)?;
+    // The compiled `LoadIdent` probe is sound only when the body's env chain
+    // is EXACTLY the global env ([[Environment]] == the global object's
+    // record, no intermediate envs): any other env — a named function
+    // expression's self-binding scope, a block/catch scope, a `with` object,
+    // a module env — could hold a binding of the read name that shadows the
+    // global property the cell records. Certified top-level declarations
+    // have [[Environment]] == the global env; nested bodies fall back to
+    // the `load_ident` resolve. A certified body adds no envs mid-run (no
+    // `with`/`eval` in its own statements), so one walk at entry covers the
+    // whole run.
+    let clean_chain = {
+        let current = agent.running_context()?.lexical_environment;
+        matches!(&*current, EnvRecord::Global(_)) && current.outer().is_none()
+    };
     let mut ctx = JitCallContext {
         pending: false,
         error: None,
         agent: agent as *mut Agent,
         vm: vm as *mut Vm,
+        global_object: global.as_ptr() as *mut c_void,
+        global_value_cells: agent.global_value_cells.as_ptr() as *mut c_void,
+        clean_chain,
     };
     // Register the vm (its trace covers `vm.frame`, `vm.stack`, and any
     // nested leaf jit roots) plus the working area for the call's duration:
