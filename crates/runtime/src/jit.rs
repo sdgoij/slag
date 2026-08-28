@@ -28,7 +28,7 @@
 use std::os::raw::c_void;
 
 use crux::Value;
-use syntax::ast::{BinaryOp, UpdateOp};
+use syntax::ast::{AssignOp, BinaryOp, UpdateOp};
 
 use crate::agent::Agent;
 use crate::ir::{CompiledBody, Vm};
@@ -129,6 +129,28 @@ pub struct JitSlowPaths {
     /// The identifier `++`/`--` (resolve, update, store, return the result).
     pub update_ident:
         extern "C" fn(ctx: *mut c_void, name: u64, op: u64, prefix: u64, old: u64) -> u64,
+    /// The general named member assign (`o.x = v` and `o.x += v`): `op` is
+    /// an `AssignOp` discriminant, `old` the cached GetValue for a compound
+    /// op (ignored for `=`). Returns the stored value (the assignment's
+    /// result).
+    pub assign_member_name: extern "C" fn(
+        ctx: *mut c_void,
+        op: u64,
+        object: u64,
+        name: u64,
+        old: u64,
+        value: u64,
+    ) -> u64,
+    /// The general computed member assign (`o[k] = v` and `o[k] += v`);
+    /// `old` as above. Returns the stored value.
+    pub assign_member_computed: extern "C" fn(
+        ctx: *mut c_void,
+        op: u64,
+        object: u64,
+        key: u64,
+        old: u64,
+        value: u64,
+    ) -> u64,
 }
 
 /// The runtime's slow-path table, installed into every `JitHook`.
@@ -149,6 +171,8 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     resolve_var_ident,
     put_var_reference,
     update_ident,
+    assign_member_name,
+    assign_member_computed,
 };
 
 /// The slack (in slots) reserved above a compiled body's working area on the
@@ -189,6 +213,27 @@ const BINARY_OPS: [BinaryOp; 22] = [
 ];
 
 const UPDATE_OPS: [UpdateOp; 2] = [UpdateOp::Increment, UpdateOp::Decrement];
+
+/// The `AssignOp` variants in declaration order (a fieldless enum's
+/// discriminant is its index).
+const ASSIGN_OPS: [AssignOp; 16] = [
+    AssignOp::Assign,
+    AssignOp::AddAssign,
+    AssignOp::SubAssign,
+    AssignOp::MulAssign,
+    AssignOp::DivAssign,
+    AssignOp::RemAssign,
+    AssignOp::ExpAssign,
+    AssignOp::LeftShiftAssign,
+    AssignOp::RightShiftAssign,
+    AssignOp::UnsignedRightShiftAssign,
+    AssignOp::BitAndAssign,
+    AssignOp::BitXorAssign,
+    AssignOp::BitOrAssign,
+    AssignOp::AndAssign,
+    AssignOp::OrAssign,
+    AssignOp::NullishAssign,
+];
 
 unsafe fn ctx_of(ctx: *mut c_void) -> &'static mut JitCallContext {
     // SAFETY: the Vm passes `&mut JitCallContext` on its stack for the
@@ -305,7 +350,13 @@ extern "C" fn set_member_name(ctx: *mut c_void, object: u64, name: u64, value: u
         value,
         syntax::ast::AssignOp::Assign,
     ) {
-        Ok(()) => value.bits(),
+        // `assign_member` pushed the result (the assignment's value); pop it
+        // back so the interpreter's value stack stays balanced across the
+        // JIT body's helpers.
+        Ok(()) => match vm.stack.pop() {
+            Some(result) => result.bits(),
+            None => value.bits(),
+        },
         Err(error) => slow_error(ctx, error),
     }
 }
@@ -318,7 +369,10 @@ extern "C" fn set_member_computed(ctx: *mut c_void, object: u64, key: u64, value
     let agent = unsafe { &mut *ctx.agent };
     let vm = unsafe { &mut *ctx.vm };
     match vm.assign_computed_plain(agent, object, key, value) {
-        Ok(()) => value.bits(),
+        Ok(()) => match vm.stack.pop() {
+            Some(result) => result.bits(),
+            None => value.bits(),
+        },
         Err(error) => slow_error(ctx, error),
     }
 }
@@ -475,6 +529,106 @@ extern "C" fn update_ident(ctx: *mut c_void, name: u64, op: u64, prefix: u64, ol
     }
 }
 
+extern "C" fn assign_member_name(
+    ctx: *mut c_void,
+    op: u64,
+    object: u64,
+    name: u64,
+    old: u64,
+    value: u64,
+) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let object = Value::from_bits(object);
+    let value = Value::from_bits(value);
+    let op = ASSIGN_OPS
+        .get(op as usize)
+        .copied()
+        .unwrap_or(AssignOp::Assign);
+    if crate::ir::is_nullish(&object) {
+        return slow_error(
+            ctx,
+            crate::ir::nullish_error("Cannot set properties of null"),
+        );
+    }
+    let old = if crate::ir::is_compound_assign(&op) {
+        Some(Value::from_bits(old))
+    } else {
+        None
+    };
+    match vm.assign_member(
+        agent,
+        object,
+        crate::ir::PropertyKeyName::Name(name as crux::AtomId),
+        old,
+        value,
+        op,
+    ) {
+        Ok(()) => match vm.stack.pop() {
+            // `assign_member` pushed the result (the assignment's value).
+            Some(result) => result.bits(),
+            None => value.bits(),
+        },
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn assign_member_computed(
+    ctx: *mut c_void,
+    op: u64,
+    object: u64,
+    key: u64,
+    old: u64,
+    value: u64,
+) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let object = Value::from_bits(object);
+    let key = Value::from_bits(key);
+    let value = Value::from_bits(value);
+    let op = ASSIGN_OPS
+        .get(op as usize)
+        .copied()
+        .unwrap_or(AssignOp::Assign);
+    if crate::ir::is_compound_assign(&op) {
+        if crate::ir::is_nullish(&object) {
+            return slow_error(
+                ctx,
+                crate::ir::nullish_error("Cannot set properties of null"),
+            );
+        }
+        let key = match crate::context::to_property_key(agent, &key) {
+            Ok(key) => key,
+            Err(error) => return slow_error(ctx, error),
+        };
+        let old = Value::from_bits(old);
+        match vm.assign_member(
+            agent,
+            object,
+            crate::ir::PropertyKeyName::Key(key),
+            Some(old),
+            value,
+            op,
+        ) {
+            Ok(()) => match vm.stack.pop() {
+                Some(result) => result.bits(),
+                None => value.bits(),
+            },
+            Err(error) => slow_error(ctx, error),
+        }
+    } else {
+        match vm.assign_computed_plain(agent, object, key, value) {
+            Ok(()) => match vm.stack.pop() {
+                Some(result) => result.bits(),
+                None => value.bits(),
+            },
+            Err(error) => slow_error(ctx, error),
+        }
+    }
+}
+
 /// The body's compiled-info pointer: the per-body fast cell when set (the
 /// first successful lookup stores it — the cache never evicts a body it
 /// holds alive, so it stays valid), else a consult of the installed hook
@@ -602,6 +756,8 @@ mod tests {
         assert_ne!(JIT_SLOW_PATHS.resolve_var_ident as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.put_var_reference as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.update_ident as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.assign_member_name as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.assign_member_computed as usize, 0);
     }
 
     #[test]
@@ -616,6 +772,16 @@ mod tests {
         assert_eq!(
             UPDATE_OPS[UpdateOp::Decrement as usize],
             UpdateOp::Decrement
+        );
+        assert_eq!(ASSIGN_OPS.len(), 16);
+        assert_eq!(ASSIGN_OPS[AssignOp::Assign as usize], AssignOp::Assign);
+        assert_eq!(
+            ASSIGN_OPS[AssignOp::AddAssign as usize],
+            AssignOp::AddAssign
+        );
+        assert_eq!(
+            ASSIGN_OPS[AssignOp::NullishAssign as usize],
+            AssignOp::NullishAssign
         );
     }
 }

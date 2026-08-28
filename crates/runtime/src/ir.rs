@@ -9331,7 +9331,7 @@ enum ThrowAction {
 // Free helpers
 // ---------------------------------------------------------------------------
 
-fn is_nullish(value: &Value) -> bool {
+pub(crate) fn is_nullish(value: &Value) -> bool {
     matches!(value.kind(), ValueKind::Undefined | ValueKind::Null)
 }
 
@@ -9382,7 +9382,7 @@ fn pattern_element_contains_suspension(element: &BindingElement) -> bool {
     binding_pattern_contains_suspension_any(&element.pattern, element.init.as_ref())
 }
 
-fn nullish_error(what: &str) -> JsError {
+pub(crate) fn nullish_error(what: &str) -> JsError {
     JsError::new(ErrorKind::TypeError, what.into())
 }
 
@@ -15022,7 +15022,7 @@ fn is_context_transparent(env: &EnvRef) -> bool {
     matches!(&**env, EnvRecord::Declarative(e) if e.context_transparent.get())
 }
 
-fn is_compound_assign(op: &AssignOp) -> bool {
+pub fn is_compound_assign(op: &AssignOp) -> bool {
     matches!(
         op,
         AssignOp::AddAssign

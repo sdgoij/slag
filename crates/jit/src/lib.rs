@@ -51,21 +51,26 @@
 //!   `RunRegBody` (the `LeafOp` register executor), `PushAcc`/`PopAcc`/
 //!   `IncAcc`/`DecAcc`.
 //! - Member access (through the slow-path helpers): `GetMemberName`/
-//!   `GetMemberComputed`, `AssignMemberName`/`AssignMemberComputed` (plain
-//!   `=` only), and the `LeafOp` member forms.
+//!   `GetMemberComputed`, and the member writes `AssignMemberName`/
+//!   `AssignMemberComputed` (plain `=` and the compound ops — the
+//!   cached-old `Dup`+`Get` sequence the compiler emits for `+=` & co.),
+//!   plus the `LeafOp` member forms.
 //! - Calls: `CallFast` and the fused `CallFastSlot` (through `call_slow`).
 //! - Global/outer bindings (through the slow-path helpers): the identifier
 //!   read/write/update (`LoadIdent`, `ResolveVarIdent`/`PutVarReference`,
 //!   `UpdateIdent`) plus the script-level fast-script steps `LoadGlobal`/
 //!   `StoreGlobal`/`FusedStoreGlobal`.
-//! - `Return` and the no-op completion steps (`ResetCompletion`,
-//!   `NormalizeCompletion`, `SetCompletion`, `ListBegin`, `ListEnd` — the
-//!   scaffold assumes function-body semantics, where the completion is
-//!   discarded except through `Return`).
+//! - `Return`, and the completion steps: `ResetCompletion`/
+//!   `NormalizeCompletion`/`ListBegin`/`ListEnd` are no-ops (the scaffold
+//!   assumes function-body semantics, where the completion is discarded
+//!   except through `Return`), and `SetCompletion` discards the statement's
+//!   value exactly like the interpreter's pop — a no-op there would leave a
+//!   slot on the JIT stack and drift it one entry per statement inside a
+//!   loop.
 //!
 //! Everything else (closures, `with`/`try`/`switch`/`using`, generator
-//! suspension, compound-member/global-reference steps, per-iteration envs)
-//! bails to the interpreter.
+//! suspension, global-reference steps, per-iteration envs) bails to the
+//! interpreter.
 //!
 //! # Slow paths
 //!
@@ -234,6 +239,8 @@ fn runtime_helpers() -> JitHelpers {
         resolve_var_ident: Some(rt.resolve_var_ident),
         put_var_reference: Some(rt.put_var_reference),
         update_ident: Some(rt.update_ident),
+        assign_member_name: Some(rt.assign_member_name),
+        assign_member_computed: Some(rt.assign_member_computed),
     }
 }
 
@@ -328,6 +335,8 @@ mod tests {
             resolve_var_ident: Some(helpers::test_resolve_var_ident),
             put_var_reference: Some(helpers::test_put_var_reference),
             update_ident: Some(helpers::test_update_ident),
+            assign_member_name: Some(helpers::test_assign_member_name),
+            assign_member_computed: Some(helpers::test_assign_member_computed),
         }
     }
 
@@ -882,6 +891,88 @@ mod tests {
                 .expect("runs")
         });
         assert_eq!(value.as_number(), Some(1000.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn compound_member_assign_lowers() {
+        // The test doubles: `old + value` for a compound op, else `value`.
+        let engine = JitEngine::new().expect("native isa");
+        // Named compound: [object, old=5, value=3] -> 8.
+        let body = make_body(
+            vec![
+                Step::Push(Value::Undefined),
+                Step::Push(Value::Number(5.0)),
+                Step::Push(Value::Number(3.0)),
+                Step::AssignMemberName {
+                    name: 1,
+                    op: syntax::ast::AssignOp::AddAssign,
+                },
+                Step::Return,
+            ],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(8.0).bits());
+
+        // Named plain: [object, value=7] -> 7 (no old popped).
+        let body = make_body(
+            vec![
+                Step::Push(Value::Undefined),
+                Step::Push(Value::Number(7.0)),
+                Step::AssignMemberName {
+                    name: 1,
+                    op: syntax::ast::AssignOp::Assign,
+                },
+                Step::Return,
+            ],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(7.0).bits());
+
+        // Computed compound: [object, key, old=5, value=2] -> 7.
+        let body = make_body(
+            vec![
+                Step::Push(Value::Undefined),
+                Step::Push(Value::Undefined),
+                Step::Push(Value::Number(5.0)),
+                Step::Push(Value::Number(2.0)),
+                Step::AssignMemberComputed {
+                    op: syntax::ast::AssignOp::AddAssign,
+                },
+                Step::Return,
+            ],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(7.0).bits());
+    }
+
+    #[test]
+    fn installed_jit_runs_a_compound_member_assign() {
+        // `o.x += 1` through the real runtime machinery.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script("function f(o) { o.x += 1; return o.x; } f({ x: 41 });")
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(42.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+
+        // The loop form: the interpreter's `SetCompletion` pops the
+        // statement's value, and the JIT must discard it too — a leftover
+        // slot per iteration drifts the working area past the buffer (the
+        // bench crash, reproduced here at the failing iteration count).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(o, n) { var s = 0; for (var i = 0; i < n; i++) { o.x += 1; s += o.x; } return s; }\n\
+                     f({ x: 0 }, 100000);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(5000050000.0));
         assert!(compiled >= 1, "{compiled} bodies");
     }
 

@@ -36,8 +36,10 @@ use cranelift_codegen::settings::{self, Configurable};
 use cranelift_control::ControlPlane;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use crux::Value;
-use runtime::ir::{CompiledBody, FastLoopVar, LeafOp, RegOperand, ScopeInfo, Step};
-use syntax::ast::{AssignOp, BinaryOp, UpdateOp};
+use runtime::ir::{
+    CompiledBody, FastLoopVar, LeafOp, RegOperand, ScopeInfo, Step, is_compound_assign,
+};
+use syntax::ast::{BinaryOp, UpdateOp};
 use target_lexicon::PointerWidth;
 
 use crate::helpers::{Helper, JitHelpers};
@@ -120,12 +122,23 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
                 depth = depth.saturating_sub(1)
             }
             Step::UpdateLocal { .. } => depth += 1,
-            // Member read: pop, push the result back. Member writes pop two
-            // (three computed) and push the stored value back.
+            // `SetCompletion` pops the statement's value (the interpreter's
+            // handler does; a JIT no-op would accumulate one slot per
+            // statement inside a loop).
+            Step::SetCompletion => depth = depth.saturating_sub(1),
+            // Member read: pop, push the result back. Member writes pop the
+            // object + value (and the cached old value for a compound op) and
+            // push the stored value back.
             Step::GetMemberName { .. } => {}
             Step::GetMemberComputed => depth = depth.saturating_sub(1),
-            Step::AssignMemberName { .. } => depth = depth.saturating_sub(1),
-            Step::AssignMemberComputed { .. } => depth = depth.saturating_sub(2),
+            Step::AssignMemberName { op, .. } => {
+                let popped = if is_compound_assign(op) { 3 } else { 2 };
+                depth = depth.saturating_sub(popped).saturating_add(1);
+            }
+            Step::AssignMemberComputed { op } => {
+                let popped = if is_compound_assign(op) { 4 } else { 3 };
+                depth = depth.saturating_sub(popped).saturating_add(1);
+            }
             // The register body's transient pushes (each `PushAcc`) are
             // unwound by the entry-depth truncate.
             Step::RunRegBody { ops } => {
@@ -356,6 +369,7 @@ struct Lowerer<'a> {
     sig_set_name: SigRef,
     sig_set_comp: SigRef,
     sig_call: SigRef,
+    sig_assign: SigRef,
     // NaN-boxing bit patterns (see `crux::value`).
     undef_bits: i64,
     null_bits: i64,
@@ -389,6 +403,7 @@ impl<'a> Lowerer<'a> {
         let sig_set_name = builder.import_signature(helper_sig(&[types::I64; 4], conv));
         let sig_set_comp = builder.import_signature(helper_sig(&[types::I64; 4], conv));
         let sig_call = builder.import_signature(helper_sig(&[types::I64; 5], conv));
+        let sig_assign = builder.import_signature(helper_sig(&[types::I64; 6], conv));
         Lowerer {
             builder,
             helpers,
@@ -410,6 +425,7 @@ impl<'a> Lowerer<'a> {
             sig_set_name,
             sig_set_comp,
             sig_call,
+            sig_assign,
             undef_bits: Value::Undefined.bits() as i64,
             null_bits: Value::Null.bits() as i64,
             false_bits: Value::Boolean(false).bits() as i64,
@@ -880,31 +896,49 @@ impl<'a> Lowerer<'a> {
                 self.fall_through(index);
             }
             Step::AssignMemberName { name, op } => {
-                if !matches!(op, AssignOp::Assign) {
-                    return Err(Unsupported::Step("AssignMemberName compound"));
-                }
+                // `[object, old?, value]` — the compound forms carry the
+                // cached GetValue (the `Dup` + `GetMemberName` the compiler
+                // emitted) between the object and the value.
                 let value = self.pop();
+                let old = if is_compound_assign(op) {
+                    Some(self.pop())
+                } else {
+                    None
+                };
                 let object = self.pop();
-                let name = self.builder.ins().iconst(types::I64, *name as i64);
+                let op_imm = self.builder.ins().iconst(types::I64, *op as i64);
+                let name_imm = self.builder.ins().iconst(types::I64, *name as i64);
+                let old_imm = match old {
+                    Some(bits) => bits,
+                    None => self.builder.ins().iconst(types::I64, self.undef_bits),
+                };
                 let res = self.call_slow(
-                    self.sig_set_name,
-                    Helper::SetMemberName,
-                    &[object, name, value],
+                    self.sig_assign,
+                    Helper::AssignMemberName,
+                    &[op_imm, object, name_imm, old_imm, value],
                 )?;
                 self.push(res);
                 self.fall_through(index);
             }
             Step::AssignMemberComputed { op } => {
-                if !matches!(op, AssignOp::Assign) {
-                    return Err(Unsupported::Step("AssignMemberComputed compound"));
-                }
+                // `[object, key, old?, value]`.
                 let value = self.pop();
+                let old = if is_compound_assign(op) {
+                    Some(self.pop())
+                } else {
+                    None
+                };
                 let key = self.pop();
                 let object = self.pop();
+                let op_imm = self.builder.ins().iconst(types::I64, *op as i64);
+                let old_imm = match old {
+                    Some(bits) => bits,
+                    None => self.builder.ins().iconst(types::I64, self.undef_bits),
+                };
                 let res = self.call_slow(
-                    self.sig_set_comp,
-                    Helper::SetMemberComputed,
-                    &[object, key, value],
+                    self.sig_assign,
+                    Helper::AssignMemberComputed,
+                    &[op_imm, object, key, old_imm, value],
                 )?;
                 self.push(res);
                 self.fall_through(index);
@@ -1016,15 +1050,16 @@ impl<'a> Lowerer<'a> {
                 let value = self.pop();
                 self.builder.ins().return_(&[value]);
             }
-            // Completion bookkeeping: the scaffold assumes function-body
-            // semantics, where the completion value is only observable
-            // through `Return` (a statement-list completion is eval/script
-            // territory, not yet JIT-compiled).
-            Step::ResetCompletion
-            | Step::NormalizeCompletion
-            | Step::SetCompletion
-            | Step::ListBegin
-            | Step::ListEnd => {
+            // Completion bookkeeping: `ResetCompletion`/`NormalizeCompletion`
+            // (and the list scopes) only touch the completion register, but
+            // `SetCompletion` POPS the statement's value — a no-op would
+            // leave the slot and drift the JIT stack one entry per
+            // expression statement (catastrophic in a loop).
+            Step::SetCompletion => {
+                self.pop();
+                self.fall_through(index);
+            }
+            Step::ResetCompletion | Step::NormalizeCompletion | Step::ListBegin | Step::ListEnd => {
                 self.fall_through(index);
             }
             _ => return Err(Unsupported::Step(step_name(step))),

@@ -37,6 +37,8 @@ pub enum Helper {
     ResolveVarIdent,
     PutVarReference,
     UpdateIdent,
+    AssignMemberName,
+    AssignMemberComputed,
 }
 
 impl Helper {
@@ -58,6 +60,8 @@ impl Helper {
             Helper::ResolveVarIdent => "resolve_var_ident",
             Helper::PutVarReference => "put_var_reference",
             Helper::UpdateIdent => "update_ident",
+            Helper::AssignMemberName => "assign_member_name",
+            Helper::AssignMemberComputed => "assign_member_computed",
         }
     }
 }
@@ -117,6 +121,24 @@ pub struct JitHelpers {
     /// The identifier `++`/`--` (resolve, update, store, return the result).
     pub update_ident:
         Option<extern "C" fn(vm: *mut c_void, name: u64, op: u64, prefix: u64, old: u64) -> u64>,
+    /// The general named member assign (`o.x = v` and `o.x += v`): `op` is
+    /// an `AssignOp` discriminant, `old` the cached GetValue for a compound
+    /// op (ignored for `=`). Returns the stored value.
+    pub assign_member_name: Option<
+        extern "C" fn(
+            vm: *mut c_void,
+            op: u64,
+            object: u64,
+            name: u64,
+            old: u64,
+            value: u64,
+        ) -> u64,
+    >,
+    /// The general computed member assign (`o[k] = v` and `o[k] += v`);
+    /// `old` as above. Returns the stored value.
+    pub assign_member_computed: Option<
+        extern "C" fn(vm: *mut c_void, op: u64, object: u64, key: u64, old: u64, value: u64) -> u64,
+    >,
 }
 
 impl JitHelpers {
@@ -139,6 +161,8 @@ impl JitHelpers {
             resolve_var_ident: None,
             put_var_reference: None,
             update_ident: None,
+            assign_member_name: None,
+            assign_member_computed: None,
         }
     }
 
@@ -161,6 +185,8 @@ impl JitHelpers {
             Helper::ResolveVarIdent => self.resolve_var_ident.map(|f| f as usize as u64),
             Helper::PutVarReference => self.put_var_reference.map(|f| f as usize as u64),
             Helper::UpdateIdent => self.update_ident.map(|f| f as usize as u64),
+            Helper::AssignMemberName => self.assign_member_name.map(|f| f as usize as u64),
+            Helper::AssignMemberComputed => self.assign_member_computed.map(|f| f as usize as u64),
         }
     }
 }
@@ -252,6 +278,42 @@ pub extern "C" fn test_update_ident(
     Value::Number(old + 1.0).bits()
 }
 
+/// `old + value` for a compound op (any op but `=`), else `value` — proves
+/// the assign arguments arrive in order.
+pub extern "C" fn test_assign_member_name(
+    _vm: *mut c_void,
+    op: u64,
+    _object: u64,
+    _name: u64,
+    old: u64,
+    value: u64,
+) -> u64 {
+    let value_num = Value::from_bits(value).as_number().unwrap_or(0.0);
+    if op == 0 {
+        Value::Number(value_num).bits()
+    } else {
+        let old_num = Value::from_bits(old).as_number().unwrap_or(0.0);
+        Value::Number(old_num + value_num).bits()
+    }
+}
+
+pub extern "C" fn test_assign_member_computed(
+    _vm: *mut c_void,
+    op: u64,
+    _object: u64,
+    _key: u64,
+    old: u64,
+    value: u64,
+) -> u64 {
+    let value_num = Value::from_bits(value).as_number().unwrap_or(0.0);
+    if op == 0 {
+        Value::Number(value_num).bits()
+    } else {
+        let old_num = Value::from_bits(old).as_number().unwrap_or(0.0);
+        Value::Number(old_num + value_num).bits()
+    }
+}
+
 /// Sums its numeric arguments — proves the `args` pointer/`argc` ABI the
 /// `CallFast` lowering passes. The callers (compiled test code and the test
 /// harness) guarantee `args` points at `argc` valid slots.
@@ -297,6 +359,8 @@ mod tests {
             Helper::ResolveVarIdent,
             Helper::PutVarReference,
             Helper::UpdateIdent,
+            Helper::AssignMemberName,
+            Helper::AssignMemberComputed,
         ] {
             assert!(none.get(h).is_none(), "{} should be None", h.name());
         }
@@ -313,6 +377,11 @@ mod tests {
         assert_eq!(Helper::ResolveVarIdent.name(), "resolve_var_ident");
         assert_eq!(Helper::PutVarReference.name(), "put_var_reference");
         assert_eq!(Helper::UpdateIdent.name(), "update_ident");
+        assert_eq!(Helper::AssignMemberName.name(), "assign_member_name");
+        assert_eq!(
+            Helper::AssignMemberComputed.name(),
+            "assign_member_computed"
+        );
     }
 
     #[test]
