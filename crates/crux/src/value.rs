@@ -21,8 +21,12 @@ use crate::symbol::Symbol;
 /// whose top 16 bits are exactly `0x7FF8` collides with the tag region and is
 /// canonicalized to `0x7FF9_0000_0000_0000` on box; JS cannot observe a NaN
 /// payload, so this is unobservable.
-const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
-const TAG_PREFIX: u64 = 0x7FF8_0000_0000_0000;
+/// The tag-region mask and prefix: a value is a double iff its top 16 bits
+/// are not `TAG_PREFIX` (`bits & TAG_MASK != TAG_PREFIX`). Public for the JIT
+/// crate's inline tag checks — the NaN-boxing layout is frozen, so these are
+/// a stable ABI constant.
+pub const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
+pub const TAG_PREFIX: u64 = 0x7FF8_0000_0000_0000;
 const CANON_NAN: u64 = 0x7FF9_0000_0000_0000;
 const PAYLOAD_MASK: u64 = (1 << 44) - 1;
 
@@ -195,7 +199,31 @@ impl Value {
     /// Whether the bits hold a double (anything outside the tag region).
     #[inline]
     fn is_double(&self) -> bool {
-        self.0 & TAG_MASK != TAG_PREFIX
+        Self::bits_are_double(self.0)
+    }
+
+    /// The raw NaN-boxed bits (the whole `u64`), for JIT codegen and any
+    /// other consumer that needs the boxed representation.
+    #[inline]
+    pub fn bits(&self) -> u64 {
+        self.0
+    }
+
+    /// Reconstruct a value from raw NaN-boxed bits (the inverse of
+    /// [`Value::bits`]). No canonicalization: a tag-region pattern is
+    /// preserved as-is, so the result may be a tag value or a NaN whose bits
+    /// collide with the tag region. Use [`Value::Number`] when constructing a
+    /// Number from an `f64`.
+    #[inline]
+    pub fn from_bits(bits: u64) -> Value {
+        Value(bits, std::marker::PhantomData)
+    }
+
+    /// Whether the raw bits hold a double (anything outside the tag region).
+    /// The JIT's inline tag check.
+    #[inline]
+    pub fn bits_are_double(bits: u64) -> bool {
+        bits & TAG_MASK != TAG_PREFIX
     }
 
     /// Reconstruct the handle from the boxed pointer (a plain cast — the
@@ -650,6 +678,33 @@ mod tests {
         assert_eq!(v.heap_payload(), c.heap_payload());
         assert!(v.as_object().is_some());
         assert!(c.as_object().is_some());
+    }
+
+    #[test]
+    fn bits_round_trip_and_raw_tag_checks() {
+        // `bits`/`from_bits` are exact inverses for every value.
+        for v in [
+            Value::Undefined,
+            Value::Null,
+            Value::Boolean(false),
+            Value::Boolean(true),
+            Value::Number(0.0),
+            Value::Number(-0.0),
+            Value::Number(f64::NAN),
+            Value::Number(3.5),
+            Value::uninitialized(),
+        ] {
+            assert_eq!(Value::from_bits(v.bits()).bits(), v.bits());
+        }
+        // The JIT's inline double check mirrors `is_number`.
+        assert!(Value::bits_are_double(Value::Number(1.0).bits()));
+        assert!(!Value::bits_are_double(Value::Undefined.bits()));
+        assert!(!Value::bits_are_double(Value::Boolean(true).bits()));
+        assert!(!Value::bits_are_double(Value::uninitialized().bits()));
+        // `Value::Number` canonicalizes a tag-colliding quiet NaN, so the
+        // constructed bits never read as a tag.
+        assert!(Value::bits_are_double(Value::Number(f64::NAN).bits()));
+        assert_eq!(Value::Number(f64::NAN).bits(), 0x7FF9_0000_0000_0000);
     }
 
     #[test]

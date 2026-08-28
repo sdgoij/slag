@@ -32,4 +32,4 @@ pub use property::{PropertyDescriptor, PropertyKey};
 pub use span::{SourceLocation, Span};
 pub use string::{AtomId, JsString, intern, intern_utf8, lookup, proto_atom};
 pub use symbol::{Symbol, descriptive_string};
-pub use value::{Value, type_of};
+pub use value::{TAG_MASK, TAG_PREFIX, Value, type_of};

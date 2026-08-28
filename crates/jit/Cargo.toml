@@ -1,0 +1,17 @@
+[package]
+name = "jit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cranelift-codegen = "=0.134.3"
+cranelift-control = "=0.134.3"
+cranelift-frontend = "=0.134.3"
+cranelift-native = "=0.134.3"
+region = "4"
+target-lexicon = "0.13"
+
+crux = { path = "../crux" }
+runtime = { path = "../runtime" }
+syntax = { path = "../syntax" }
