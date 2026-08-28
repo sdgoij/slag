@@ -34,10 +34,19 @@ JavaScriptCore C-API bindings.
   Proxy/Reflect, TypedArrays, SharedArrayBuffer/Atomics with worker
   threads, full Intl (ECMA-402 Cuts 1–8), and Temporal (the intl402×
   Temporal integration, Cut 9, is in flight).
+- **Experimental Cranelift JIT** — `--jit` compiles the interpreter's
+  certified `Step` bytecode to native machine code via
+  [Cranelift](https://cranelift.dev): inline number/string fast paths,
+  direct-mapped global/member value cells, and register-resident fast
+  loops. `--jit-bench` times JIT vs interpreter, and the conformance
+  sweep runs the full corpus through the JIT (`--jit`). Design, status,
+  and remaining work: `docs/jit-report.md`.
 - **Portable** — no third-party runtime dependencies beyond the Rust
-  standard library (see `PLAN.md` §4.10). The Unicode property tables are
-  generated at compile time from the pinned corpus fixtures, so they can
-  never drift from what the tests assert.
+  standard library (see `PLAN.md` §4.10), with one opt-in exception: the
+  experimental JIT (`crates/jit`) pulls in Cranelift and `region` and is
+  installed only when the `--jit` flag is given. The Unicode property
+  tables are generated at compile time from the pinned corpus fixtures,
+  so they can never drift from what the tests assert.
 - **Embeddable** — `runtime::Context` with `JsValue`/`JsObject` handle
   types and `HostCallbacks` for host integration, plus a drop-in
   JavaScriptCore C API (`crates/jsc`).
@@ -59,9 +68,11 @@ target/release/slag                       # REPL
 
 The CLI exposes `process.argv` and a minimal `fs` (`readFileSync`/
 `readdirSync`/`statSync`) to scripts, and accepts `--dump-ast`,
-`--dump-tokens`, and `--bench`; the `--print-bytecode`, `--stack-size`,
-`--max-old-space`, and `--harmony-*` knobs are accepted for compatibility
-(no-ops for now).
+`--dump-tokens`, `--print-bytecode` (dump the compiled `Step` stream),
+and `--bench`; `--jit` runs certified bodies through the experimental
+Cranelift JIT and `--jit-bench` times JIT vs interpreter. The
+`--stack-size`, `--max-old-space`, and `--harmony-*` knobs are accepted
+for compatibility (no-ops for now).
 
 ## Embedding
 
@@ -127,6 +138,7 @@ reclassifies them as passes. The full methodology and triage live in
 | `parser` | Recursive-descent parser, cover grammar, early errors |
 | `regexp` | RegExp pattern parser + backtracking matcher |
 | `runtime` | Realms, environments, evaluation, modules, all built-ins (incl. Intl + Temporal), `Context` |
+| `jit` | Experimental Cranelift JIT backend for the interpreter's certified `Step` bytecode (opt-in via `--jit`) |
 | `ffi` | Shared C-ABI plumbing for the drop-in surfaces (handle tables, value/string marshaling) |
 | `jsc` | Drop-in JavaScriptCore C API (`JSContextRef` family) backed by Slag |
 | `cli` | The `slag` binary (script runner + REPL) |
@@ -139,6 +151,7 @@ reclassifies them as passes. The full methodology and triage live in
 - `docs/readiness.md` — honest readiness and market-entry assessment
 - `docs/gc-plan.md` — the GC milestone plan (arena heap + mark-sweep, cut-by-cut)
 - `docs/intl-plan.md` — the ECMA-402 (Intl) implementation plan and cut status
+- `docs/jit-report.md` — the experimental Cranelift JIT: design, fast paths, hardening, validation, and remaining work
 - `docs/memory-model.md` — ECMAScript ch. 28 shared-memory model
 - `docs/perf.md` — performance milestones and deferred work
 
