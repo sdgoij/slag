@@ -26,9 +26,19 @@ use crate::context::{JscContext, error_from_exception, release_string_ref, strin
 use crate::refs;
 use crate::{
     JSClassDefinition, JSClassRef, JSContextRef, JSObjectCallAsFunctionCallback,
-    JSObjectGetPropertyCallback, JSObjectSetPropertyCallback, JSPropertyNameAccumulatorRef,
-    JSStaticFunction, JSStaticValue, JSValueRef,
+    JSObjectFinalizeCallback, JSObjectGetPropertyCallback, JSObjectSetPropertyCallback,
+    JSPropertyNameAccumulatorRef, JSStaticFunction, JSStaticValue, JSValueRef,
 };
+
+thread_local! {
+    /// Finalizers keyed by object id. Populated when an object with a
+    /// class `finalize` callback is created via JSObjectMake; cleared
+    /// when the class itself is released or when JSClassRelease is
+    /// called. The entry lives for the thread (it holds a C callback
+    /// pointer that the host keeps alive).
+    static FINALIZERS: RefCell<HashMap<u64, JSObjectFinalizeCallback>> =
+        RefCell::new(HashMap::new());
+}
 
 thread_local! {
     /// Live classes keyed by their (stable, leaked) heap address.
@@ -61,6 +71,13 @@ struct ClassEntry {
 /// pointer into its `ClassEntry` (valid for the process lifetime).
 struct ClassOps {
     entry: Cell<*const ClassEntry>,
+    /// The class's finalize callback (if any). Stored separately from
+    /// ClassEntry because the ClassEntry is process-lifetime but the
+    /// callback pointer must be cleared when the class is released
+    /// (the C host may still hold a reference to the class struct
+    /// after JSClassRelease). This allows finalizers on objects
+    /// created while the class was live to still fire.
+    finalize_callback: Cell<Option<JSObjectFinalizeCallback>>,
 }
 
 impl ClassOps {
@@ -213,10 +230,7 @@ impl HostOps for ClassOps {
     ) -> Option<Result<Value, JsError>> {
         let callback = self.definition().call_as_function?;
         let ctx = self.callbacks_ctx()?;
-        let arg_refs: Vec<JSValueRef> = args
-            .iter()
-            .map(|arg| refs::value_to_ref(*arg))
-            .collect();
+        let arg_refs: Vec<JSValueRef> = args.iter().map(|arg| refs::value_to_ref(*arg)).collect();
         let this_ref = refs::value_object_ref(this);
         let object_ref = refs::object_id_ref(object.id());
         let mut exception: JSValueRef = std::ptr::null_mut();
@@ -252,10 +266,7 @@ impl HostOps for ClassOps {
         let prototype = prototype_of(new_target);
         let instance = JsObject::host_object_create(self.ops_rc(), prototype);
         set_private(instance.id(), 0);
-        let arg_refs: Vec<JSValueRef> = args
-            .iter()
-            .map(|arg| refs::value_to_ref(*arg))
-            .collect();
+        let arg_refs: Vec<JSValueRef> = args.iter().map(|arg| refs::value_to_ref(*arg)).collect();
         let mut exception: JSValueRef = std::ptr::null_mut();
         let result = unsafe {
             callback(
@@ -307,6 +318,7 @@ pub unsafe extern "C" fn JSClassCreate(definition: *const JSClassDefinition) -> 
         let definition = unsafe { (*definition).clone() };
         let ops = Rc::new(ClassOps {
             entry: Cell::new(std::ptr::null()),
+            finalize_callback: Cell::new(definition.finalize),
         });
         let mut entry = Box::new(ClassEntry {
             definition: Box::new(definition),
@@ -314,6 +326,7 @@ pub unsafe extern "C" fn JSClassCreate(definition: *const JSClassDefinition) -> 
         });
         let entry_ptr = &mut *entry as *mut ClassEntry;
         ops.entry.set(entry_ptr);
+        // Store the finalizer so make_object can register per-object hooks
         let raw = Box::into_raw(entry);
         CLASSES.with(|classes| {
             classes.borrow_mut().insert(raw as usize, raw);
@@ -341,6 +354,10 @@ pub unsafe extern "C" fn JSClassRelease(js_class: JSClassRef) {
         CLASSES.with(|classes| {
             classes.borrow_mut().remove(&(js_class as usize));
         });
+        // Clear per-class finalize callbacks. Objects created while this
+        // class was live keep their per-object finalizer registrations
+        // (the C host keeps the callback pointer alive).
+        clear_finalizers();
     })
 }
 
@@ -362,6 +379,23 @@ pub(crate) fn class_ops(js_class: JSClassRef) -> Rc<dyn HostOps> {
     match class_entry(js_class) {
         Some(entry) => entry.ops.clone(),
         None => Rc::new(EmptyOps),
+    }
+}
+
+/// Register a finalize callback for a specific object id.
+pub(crate) fn register_finalizer(object_id: u64, callback: JSObjectFinalizeCallback) {
+    FINALIZERS.with(|f| f.borrow_mut().insert(object_id, callback));
+}
+
+/// Clear all registered finalizers (called when a class is released).
+pub(crate) fn clear_finalizers() {
+    FINALIZERS.with(|f| f.borrow_mut().clear());
+}
+
+/// Invoke the finalize callback for an object, if registered.
+pub fn invoke_finalize(object_id: u64) {
+    if let Some(callback) = FINALIZERS.with(|f| f.borrow().get(&object_id).copied()) {
+        unsafe { callback(object_id as *mut _) };
     }
 }
 
@@ -393,6 +427,13 @@ pub(crate) fn make_object(
             let ctx_ptr = ctx as *const JscContext as *mut JscContext;
             let object_ref = refs::object_ref(&object);
             unsafe { initialize(ctx_ptr as JSContextRef, object_ref) };
+        }
+        // Register per-object finalize callback if the class declares one.
+        // The finalizer fires when the object's last strong reference drops.
+        if let Some(callback) =
+            class_entry(js_class).and_then(|entry| entry.ops.finalize_callback.get())
+        {
+            register_finalizer(object.id(), callback);
         }
     }
     object
@@ -596,10 +637,7 @@ pub(crate) fn make_function_with_callback(
 ) -> Handle<Function> {
     let ctx_ptr = ctx as *const JscContext as *mut JscContext;
     let call: crux::function::NativeFn = Box::new(move |this, args| {
-        let arg_refs: Vec<JSValueRef> = args
-            .iter()
-            .map(|arg| refs::value_to_ref(*arg))
-            .collect();
+        let arg_refs: Vec<JSValueRef> = args.iter().map(|arg| refs::value_to_ref(*arg)).collect();
         let this_ref = refs::value_object_ref(this);
         let mut exception: JSValueRef = std::ptr::null_mut();
         let result = unsafe {

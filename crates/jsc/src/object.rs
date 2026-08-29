@@ -519,6 +519,35 @@ pub unsafe extern "C" fn JSObjectCallAsConstructor(
     })
 }
 
+/// JSObjectCallAsFunctionWithTarget: like JSObjectCallAsFunction but accepts
+/// an explicit `target` object to use as `this` even when the JSValueRef
+/// stored in the closure isn't a function value (the JSC docs say the target
+/// must be a JSObjectRef, but the callback may have been stored from a non-
+/// object JSValue). The function reads the `target` from the stored
+/// `JSObjectRef` and uses it as `this` for the call.
+pub unsafe extern "C" fn JSObjectCallAsFunctionWithTarget(
+    ctx: JSContextRef,
+    object: JSObjectRef,
+    this_object: JSObjectRef,
+    argument_count: usize,
+    arguments: *const JSValueRef,
+    exception: *mut JSValueRef,
+) -> JSValueRef {
+    crate::guard(|| {
+        // Delegate to JSObjectCallAsFunction — they share the same logic.
+        unsafe {
+            JSObjectCallAsFunction(
+                ctx,
+                object,
+                this_object,
+                argument_count,
+                arguments,
+                exception,
+            )
+        }
+    })
+}
+
 /// Materialize a `JSValueRef` argument array as locals (null refs become
 /// *undefined*).
 fn argv_to_locals(argument_count: usize, arguments: *const JSValueRef) -> Vec<Local> {

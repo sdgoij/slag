@@ -45,14 +45,14 @@ pub use context::{
     JSGlobalContextRelease, JSGlobalContextRetain,
 };
 pub use object::{
-    JSObjectCallAsConstructor, JSObjectCallAsFunction, JSObjectCopyPropertyNames,
-    JSObjectDeleteProperty, JSObjectGetPrivate, JSObjectGetProperty, JSObjectGetPropertyAtIndex,
-    JSObjectGetPrototype, JSObjectHasProperty, JSObjectIsConstructor, JSObjectIsFunction,
-    JSObjectMake, JSObjectMakeArray, JSObjectMakeDate, JSObjectMakeError, JSObjectMakeFunction,
-    JSObjectMakeFunctionWithCallback, JSObjectMakeRegExp, JSObjectSetPrivate, JSObjectSetProperty,
-    JSObjectSetPropertyAtIndex, JSObjectSetPrototype, JSPropertyNameAccumulatorAddName,
-    JSPropertyNameArrayGetCount, JSPropertyNameArrayGetNameAtIndex, JSPropertyNameArrayRelease,
-    JSPropertyNameArrayRetain,
+    JSObjectCallAsConstructor, JSObjectCallAsFunction, JSObjectCallAsFunctionWithTarget,
+    JSObjectCopyPropertyNames, JSObjectDeleteProperty, JSObjectGetPrivate, JSObjectGetProperty,
+    JSObjectGetPropertyAtIndex, JSObjectGetPrototype, JSObjectHasProperty, JSObjectIsConstructor,
+    JSObjectIsFunction, JSObjectMake, JSObjectMakeArray, JSObjectMakeDate, JSObjectMakeError,
+    JSObjectMakeFunction, JSObjectMakeFunctionWithCallback, JSObjectMakeRegExp, JSObjectSetPrivate,
+    JSObjectSetProperty, JSObjectSetPropertyAtIndex, JSObjectSetPrototype,
+    JSPropertyNameAccumulatorAddName, JSPropertyNameArrayGetCount,
+    JSPropertyNameArrayGetNameAtIndex, JSPropertyNameArrayRelease, JSPropertyNameArrayRetain,
 };
 pub use string::{
     JSStringCreateWithCharacters, JSStringCreateWithUTF8CString, JSStringGetCharactersPtr,
@@ -60,13 +60,18 @@ pub use string::{
     JSStringIsEqualToUTF8CString, JSStringRelease, JSStringRetain,
 };
 pub use value::{
-    JSValueCreateJSONString, JSValueGetType, JSValueIsArray, JSValueIsBoolean, JSValueIsDate,
-    JSValueIsEqual, JSValueIsInstanceOfConstructor, JSValueIsNull, JSValueIsNumber,
+    JSValueCreateJSONString, JSValueGetByteLength, JSValueGetByteOffset, JSValueGetLength,
+    JSValueGetType, JSValueGetUint8, JSValueIsArray, JSValueIsArrayBuffer, JSValueIsBigInt64Array,
+    JSValueIsBigUint64Array, JSValueIsBoolean, JSValueIsDataView, JSValueIsDate, JSValueIsEqual,
+    JSValueIsFloat32Array, JSValueIsFloat64Array, JSValueIsInstanceOfConstructor,
+    JSValueIsInt8Array, JSValueIsInt16Array, JSValueIsInt32Array, JSValueIsNull, JSValueIsNumber,
     JSValueIsObject, JSValueIsObjectOfClass, JSValueIsStrictEqual, JSValueIsString,
-    JSValueIsSymbol, JSValueIsUndefined, JSValueMakeBoolean, JSValueMakeFromJSONString,
-    JSValueMakeNull, JSValueMakeNumber, JSValueMakeString, JSValueMakeSymbol, JSValueMakeUndefined,
-    JSValueProtect, JSValueToBoolean, JSValueToNumber, JSValueToObject, JSValueToStringCopy,
-    JSValueUnprotect,
+    JSValueIsSymbol, JSValueIsTypedArray, JSValueIsUint8Array, JSValueIsUint8ClampedArray,
+    JSValueIsUint16Array, JSValueIsUint32Array, JSValueIsUndefined, JSValueMakeBoolean,
+    JSValueMakeFromJSONString, JSValueMakeNull, JSValueMakeNumber, JSValueMakeString,
+    JSValueMakeSymbol, JSValueMakeUndefined, JSValueProtect, JSValueSetInt8, JSValueSetLength,
+    JSValueToBoolean, JSValueToNumber, JSValueToObject, JSValueToStringCopy,
+    JSValueToStringWithContext, JSValueUnprotect,
 };
 
 /// Opaque handle types; never dereferenced (refs are encoded ids).
@@ -171,6 +176,7 @@ pub struct JSStaticFunction {
 
 pub type JSObjectInitializeCallback = unsafe extern "C" fn(JSContextRef, JSObjectRef);
 pub type JSObjectFinalizeCallback = unsafe extern "C" fn(JSObjectRef);
+pub use class::invoke_finalize;
 pub type JSObjectHasPropertyCallback =
     unsafe extern "C" fn(JSContextRef, JSObjectRef, JSStringRef) -> bool;
 pub type JSObjectGetPropertyCallback =

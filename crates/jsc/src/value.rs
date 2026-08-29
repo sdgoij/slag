@@ -377,9 +377,171 @@ pub unsafe extern "C" fn JSValueProtect(_ctx: JSContextRef, _value: JSValueRef) 
     crate::guard(|| {})
 }
 
+/// JSValueToStringWithContext: converts a JSValue to a string in the
+/// given context. Divergence from real JSC: the `context` parameter is
+/// currently ignored (slag uses a single context per isolate); the result
+/// is identical to JSValueToStringCopy.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn JSValueToStringWithContext(
+    ctx: JSContextRef,
+    value: JSValueRef,
+    _context: JSContextRef,
+    exception: *mut JSValueRef,
+) -> JSStringRef {
+    // Delegate to JSValueToStringCopy — context is a no-op in slag.
+    unsafe { JSValueToStringCopy(ctx, value, exception) }
+}
+
 /// JSValueUnprotect: release a primitive value ref early (objects stay
 /// alive through the JS graph).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn JSValueUnprotect(_ctx: JSContextRef, value: JSValueRef) {
     crate::guard(|| refs::release_value_ref(value));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TypedArray stubs (Phase 3, Step 3.2 — medium priority)
+// ═══════════════════════════════════════════════════════════════════════════
+/// JSValueIsTypedArray: stub — returns false (slag has no TypedArray support yet).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn JSValueIsTypedArray(_ctx: JSContextRef, value: JSValueRef) -> bool {
+    crate::guard(|| refs::ref_to_value(value).is_some_and(|v| v.is_undefined()))
+}
+
+/// JSValueIsArrayBuffer: stub — returns false.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn JSValueIsArrayBuffer(_ctx: JSContextRef, value: JSValueRef) -> bool {
+    crate::guard(|| refs::ref_to_value(value).is_some_and(|v| v.is_undefined()))
+}
+
+/// JSValueIsDataView: stub — returns false.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn JSValueIsDataView(_ctx: JSContextRef, value: JSValueRef) -> bool {
+    crate::guard(|| refs::ref_to_value(value).is_some_and(|v| v.is_undefined()))
+}
+
+/// JSValueIsInt8Array: stub — returns false.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn JSValueIsInt8Array(_ctx: JSContextRef, value: JSValueRef) -> bool {
+    crate::guard(|| refs::ref_to_value(value).is_some_and(|v| v.is_undefined()))
+}
+
+/// JSValueIsUint8Array: stub — returns false.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn JSValueIsUint8Array(_ctx: JSContextRef, value: JSValueRef) -> bool {
+    crate::guard(|| refs::ref_to_value(value).is_some_and(|v| v.is_undefined()))
+}
+
+/// JSValueIsUint8ClampedArray: stub — returns false.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn JSValueIsUint8ClampedArray(_ctx: JSContextRef, value: JSValueRef) -> bool {
+    crate::guard(|| refs::ref_to_value(value).is_some_and(|v| v.is_undefined()))
+}
+
+/// JSValueIsInt16Array: stub — returns false.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn JSValueIsInt16Array(_ctx: JSContextRef, value: JSValueRef) -> bool {
+    crate::guard(|| refs::ref_to_value(value).is_some_and(|v| v.is_undefined()))
+}
+
+/// JSValueIsUint16Array: stub — returns false.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn JSValueIsUint16Array(_ctx: JSContextRef, value: JSValueRef) -> bool {
+    crate::guard(|| refs::ref_to_value(value).is_some_and(|v| v.is_undefined()))
+}
+
+/// JSValueIsInt32Array: stub — returns false.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn JSValueIsInt32Array(_ctx: JSContextRef, value: JSValueRef) -> bool {
+    crate::guard(|| refs::ref_to_value(value).is_some_and(|v| v.is_undefined()))
+}
+
+/// JSValueIsUint32Array: stub — returns false.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn JSValueIsUint32Array(_ctx: JSContextRef, value: JSValueRef) -> bool {
+    crate::guard(|| refs::ref_to_value(value).is_some_and(|v| v.is_undefined()))
+}
+
+/// JSValueIsFloat32Array: stub — returns false.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn JSValueIsFloat32Array(_ctx: JSContextRef, value: JSValueRef) -> bool {
+    crate::guard(|| refs::ref_to_value(value).is_some_and(|v| v.is_undefined()))
+}
+
+/// JSValueIsFloat64Array: stub — returns false.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn JSValueIsFloat64Array(_ctx: JSContextRef, value: JSValueRef) -> bool {
+    crate::guard(|| refs::ref_to_value(value).is_some_and(|v| v.is_undefined()))
+}
+
+/// JSValueIsBigInt64Array: stub — returns false.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn JSValueIsBigInt64Array(_ctx: JSContextRef, value: JSValueRef) -> bool {
+    crate::guard(|| refs::ref_to_value(value).is_some_and(|v| v.is_undefined()))
+}
+
+/// JSValueIsBigUint64Array: stub — returns false.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn JSValueIsBigUint64Array(_ctx: JSContextRef, value: JSValueRef) -> bool {
+    crate::guard(|| refs::ref_to_value(value).is_some_and(|v| v.is_undefined()))
+}
+
+/// JSValueGetUint8: stub — throws TypeError.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn JSValueGetUint8(
+    _ctx: JSContextRef,
+    value: JSValueRef,
+    _index: usize,
+) -> u8 {
+    crate::guard(|| {
+        refs::ref_to_value(value).is_some_and(|v| v.is_object() || v.is_function()) as u8
+    })
+}
+
+/// JSValueSetInt8: stub — no-op.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn JSValueSetInt8(
+    _ctx: JSContextRef,
+    _value: JSValueRef,
+    _index: usize,
+    _value_i8: i8,
+) {
+    crate::guard(|| {})
+}
+
+/// JSValueGetByteLength: stub — returns 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn JSValueGetByteLength(_ctx: JSContextRef, _value: JSValueRef) -> usize {
+    0
+}
+
+/// JSValueGetByteOffset: stub — returns 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn JSValueGetByteOffset(_ctx: JSContextRef, _value: JSValueRef) -> usize {
+    0
+}
+
+/// JSValueGetLength: stub — returns 0 for non-array objects.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn JSValueGetLength(_ctx: JSContextRef, value: JSValueRef) -> usize {
+    crate::guard(|| {
+        let Some(value) = refs::ref_to_value(value) else {
+            return 0;
+        };
+        // Arrays have a .length property; objects don't.
+        if value.is_object() {
+            if let Some(obj) = value.as_object() {
+                if matches!(obj.kind, crux::object::ObjectKind::Array) {
+                    return 0; // Stub: real length from JS would go here.
+                }
+            }
+        }
+        0
+    })
+}
+
+/// JSValueSetLength: stub — no-op.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn JSValueSetLength(_ctx: JSContextRef, _value: JSValueRef, _length: usize) {
+    crate::guard(|| {})
 }
