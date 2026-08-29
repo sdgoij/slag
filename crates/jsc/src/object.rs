@@ -27,7 +27,14 @@ thread_local! {
 
 /// The object half of a ref, if it is an object value.
 fn object_of(ctx: &JscContext, value: JSValueRef) -> Option<Handle<JsObject>> {
-    let _ = ctx;
+    // JSContextGetGlobalObject returns the context pointer itself as the
+    // global-object ref (JSGlobalContextRef IS the global object, matching
+    // real JSC). Decode that convention to the realm's actual global object;
+    // the normal value round-trip would misread the pointer bits as an
+    // encoded JS value.
+    if value as usize == ctx as *const JscContext as usize {
+        return runtime::context::as_object(ctx.api.global().value());
+    }
     refs::ref_to_value(value).and_then(|value| runtime::context::as_object(&value))
 }
 
