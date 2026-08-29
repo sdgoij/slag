@@ -71,12 +71,8 @@ fn date_to_primitive(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<
         }
     };
     for name in [first, second] {
-        let method = crate::context::get_property_key(
-            agent,
-            this,
-            &PropertyKey::from_utf8(name),
-            *this,
-        )?;
+        let method =
+            crate::context::get_property_key(agent, this, &PropertyKey::from_utf8(name), *this)?;
         if is_callable(&method) {
             let result = crate::function::call(agent, &method, *this, &[])?;
             if !matches!(result.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
@@ -705,7 +701,9 @@ fn format_time_string(t: f64) -> String {
 }
 
 /// spec 21.4.4.36 Date.prototype.toISOString.
-fn to_iso_string(t: f64) -> Result<String, JsError> {
+/// Date.prototype.toISOString (spec 21.4.4.36) — the UTC `YYYY-MM-DDTHH:mm:ss.sssZ`
+/// form. Exposed for the embedding API (`Context::to_iso_string`).
+pub(crate) fn to_iso_string(t: f64) -> Result<String, JsError> {
     if t.is_nan() {
         return Err(JsError::new(
             ErrorKind::RangeError,
@@ -887,9 +885,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let date_ctor_value = Value::Function(date_ctor);
 
     realm.intrinsics.define(DATE, date_ctor_value);
-    realm
-        .intrinsics
-        .define(DATE_PROTO, date_proto_value);
+    realm.intrinsics.define(DATE_PROTO, date_proto_value);
 
     date_ctor.define_property(
         &JsString::from_utf8("prototype"),

@@ -25,7 +25,7 @@ use crux::error::{ErrorKind, JsError};
 use crux::function::Function;
 use crux::handle::Handle;
 use crux::object::{JsObject as CruxObject, ObjectKind, typed_array_effective_length};
-use crux::property::PropertyDescriptor;
+use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
 use crux::typed_array::SharedBuffer;
 use crux::value::{Value, ValueKind};
@@ -303,6 +303,198 @@ impl Context {
             bytes.len(),
         )?;
         Ok(JsValue(value))
+    }
+
+    // ── coercions & type checks (Phase 1: embedding API) ────────────────────
+    // The coercion half of what `bun_jsc`'s `JSC__JSValue__*` externs do:
+    // ToNumber/ToString/ToObject need an agent (objects run valueOf/toString),
+    // so they live on `Context`; the pure ToBoolean and BigInt check live on
+    // `JsValue`.
+
+    /// ToNumber coercion (spec 7.1.3): objects run @@toPrimitive/valueOf
+    /// through the agent.
+    pub fn to_number(&mut self, value: &JsValue) -> Result<f64, JsError> {
+        let agent = self.agent_mut();
+        let prim =
+            crate::context::to_primitive(agent, &value.0, crux::convert::ToPrimitiveHint::Number)?;
+        crux::convert::to_number(&prim)
+    }
+
+    /// ToString coercion (spec 7.1.12): objects run toString/valueOf through
+    /// the agent.
+    pub fn to_string(&mut self, value: &JsValue) -> Result<String, JsError> {
+        let agent = self.agent_mut();
+        Ok(crate::context::to_string(agent, &value.0)?.to_string_lossy())
+    }
+
+    /// ToObject (spec 7.1.13): box a primitive into its wrapper object.
+    pub fn to_object(&mut self, value: &JsValue) -> Result<JsObject, JsError> {
+        let agent = self.agent_mut();
+        match crate::context::to_object(agent, &value.0)?.kind() {
+            ValueKind::Object(obj) => Ok(JsObject(obj)),
+            ValueKind::Function(f) => Ok(JsObject(f.object)),
+            _ => unreachable!("ToObject always returns an object or function"),
+        }
+    }
+
+    /// Whether `value` is a Date instance (has a [[DateValue]] slot).
+    pub fn is_date(&self, value: &JsValue) -> bool {
+        match value.0.kind() {
+            ValueKind::Object(obj) => self.agent.date_data.contains_key(&obj.id()),
+            _ => false,
+        }
+    }
+
+    /// OrdinaryHasInstance (spec 7.3.19): `value instanceof constructor`.
+    pub fn is_instance_of(
+        &mut self,
+        value: &JsValue,
+        constructor: &JsValue,
+    ) -> Result<bool, JsError> {
+        let agent = self.agent_mut();
+        let result = crate::expr::ordinary_has_instance(agent, &constructor.0, &value.0)?;
+        Ok(matches!(result.kind(), ValueKind::Boolean(true)))
+    }
+
+    /// JSON.stringify (spec 25.5.2.2): serialize `value` to JSON text.
+    /// Returns `None` when JSON.stringify yields `undefined` (undefined,
+    /// functions, symbols, or objects that can't stringify to JSON).
+    pub fn json_stringify(&mut self, value: &JsValue) -> Result<Option<String>, JsError> {
+        let agent = self.agent_mut();
+        let stringify = agent
+            .current_realm()?
+            .intrinsics
+            .get("%JSON.stringify%")
+            .ok_or_else(|| JsError::new(ErrorKind::TypeError, "%JSON.stringify% missing".into()))?;
+        let result = crate::function::call(agent, &stringify, Value::Undefined, &[value.0])?;
+        if matches!(result.kind(), ValueKind::Undefined) {
+            return Ok(None);
+        }
+        Ok(Some(
+            crate::context::to_string(agent, &result)?.to_string_lossy(),
+        ))
+    }
+
+    /// IsIterable (spec 7.2.14): whether `value` has a callable @@iterator.
+    pub fn is_iterable(&mut self, value: &JsValue) -> Result<bool, JsError> {
+        let ValueKind::Object(obj) = value.0.kind() else {
+            return Ok(false);
+        };
+        let key = crux::property::PropertyKey::Symbol(crux::symbol::well_known("iterator"));
+        let method = obj.get_key(&key)?;
+        Ok(!matches!(
+            method.kind(),
+            ValueKind::Undefined | ValueKind::Null
+        ))
+    }
+
+    /// Symbol.for (spec 20.4.2.10): look up or create the global-registry
+    /// symbol for `key`.
+    pub fn symbol_for(&mut self, key: &str) -> Result<JsValue, JsError> {
+        let mut registry = self.agent.global_symbol_registry.borrow_mut();
+        let key = JsString::from_utf8(key);
+        if let Some((_, symbol)) = registry.iter().find(|(k, _)| *k == key) {
+            return Ok(JsValue(Value::Symbol(Handle::new(symbol.clone()))));
+        }
+        let symbol = crux::symbol::Symbol::new(Some(key.clone()));
+        registry.push((key, symbol.clone()));
+        Ok(JsValue(Value::Symbol(Handle::new(symbol))))
+    }
+
+    /// Array.prototype.push: append `value` to `array`, returning the new
+    /// length. Errors when `array` is not array-like.
+    pub fn array_push(&mut self, array: &JsValue, value: JsValue) -> Result<u64, JsError> {
+        let agent = self.agent_mut();
+        let result = crate::builtins::array::push(agent, &array.0, std::slice::from_ref(&value.0))?;
+        match result.kind() {
+            ValueKind::Number(n) => Ok(n as u64),
+            _ => Ok(0),
+        }
+    }
+
+    /// Parse a decimal string into a BigInt value.
+    pub fn bigint_from_latin1(&mut self, digits: &str) -> Result<JsValue, JsError> {
+        let big = crux::bigint::BigInt::parse_str(digits, 10).ok_or_else(|| {
+            JsError::new(
+                ErrorKind::SyntaxError,
+                format!("bigint_from_latin1: invalid BigInt literal {digits:?}"),
+            )
+        })?;
+        Ok(JsValue(Value::BigInt(Handle::new(big))))
+    }
+
+    /// Add two BigInt values (spec 13.9.3).
+    pub fn bigint_sum(&mut self, a: &JsValue, b: &JsValue) -> Result<JsValue, JsError> {
+        let ValueKind::BigInt(x) = a.0.kind() else {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "bigint_sum: expected a BigInt".into(),
+            ));
+        };
+        let ValueKind::BigInt(y) = b.0.kind() else {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "bigint_sum: expected a BigInt".into(),
+            ));
+        };
+        Ok(JsValue(Value::BigInt(Handle::new(crux::bigint::add(
+            &x, &y,
+        )))))
+    }
+
+    /// Compare two BigInt values: -1 (a < b), 0 (a == b), 1 (a > b).
+    pub fn bigint_compare(&mut self, a: &JsValue, b: &JsValue) -> Result<i8, JsError> {
+        let ValueKind::BigInt(x) = a.0.kind() else {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "bigint_compare: expected a BigInt".into(),
+            ));
+        };
+        let ValueKind::BigInt(y) = b.0.kind() else {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "bigint_compare: expected a BigInt".into(),
+            ));
+        };
+        Ok(if crux::bigint::less_than(&x, &y) {
+            -1
+        } else if crux::bigint::equal(&x, &y) {
+            0
+        } else {
+            1
+        })
+    }
+
+    /// Create a Date instance from a ms-since-epoch time value (the
+    /// `dateInstanceFromNumber` extern).
+    pub fn date_from_number(&mut self, ms: f64) -> Result<JsValue, JsError> {
+        let agent = self.agent_mut();
+        let proto = agent
+            .current_realm()?
+            .intrinsics
+            .get("%Date.prototype%")
+            .and_then(|value| value.as_object())
+            .ok_or_else(|| JsError::new(ErrorKind::TypeError, "%Date.prototype% missing".into()))?;
+        let object = CruxObject::ordinary_object_create(Some(proto));
+        agent.date_data.insert(object.id(), ms);
+        Ok(JsValue(Value::Object(object)))
+    }
+
+    /// The [[DateValue]] (ms since epoch) of a Date instance, if any.
+    pub fn unix_timestamp(&self, value: &JsValue) -> Option<f64> {
+        match value.0.kind() {
+            ValueKind::Object(obj) => self.agent.date_data.get(&obj.id()).copied(),
+            _ => None,
+        }
+    }
+
+    /// Date.prototype.toISOString of a Date instance (RangeError for invalid
+    /// dates).
+    pub fn to_iso_string(&mut self, value: &JsValue) -> Result<String, JsError> {
+        let ms = self
+            .unix_timestamp(value)
+            .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not a Date".into()))?;
+        crate::builtins::date::to_iso_string(ms)
     }
 
     /// Install a `process` global with an `argv` array, Node-style:
@@ -860,6 +1052,22 @@ impl JsValue {
         crux::value::type_of(&self.0)
     }
 
+    /// ToBoolean coercion (spec 7.1.2) — pure, no agent needed.
+    pub fn to_boolean(&self) -> bool {
+        crux::convert::to_boolean(&self.0)
+    }
+
+    /// Whether the value is a BigInt (spec 7.2.6 `typeof` "bigint").
+    pub fn is_big_int(&self) -> bool {
+        matches!(self.0.kind(), ValueKind::BigInt(_))
+    }
+
+    /// SameValue (spec 7.2.11): `Object.is` semantics — NaN equals NaN,
+    /// +0 and -0 differ.
+    pub fn is_same_value(&self, other: &JsValue) -> bool {
+        crux::ops::same_value(&self.0, &other.0)
+    }
+
     pub fn is_undefined(&self) -> bool {
         self.0.is_undefined()
     }
@@ -993,6 +1201,28 @@ impl JsObject {
     /// The object's unique identity.
     pub fn id(&self) -> u64 {
         self.0.id()
+    }
+
+    /// The object's own enumerable string property keys — `Object.keys`
+    /// semantics (spec 20.1.3.4): array indices ascending, then strings in
+    /// insertion order (spec 10.1.12.1); symbols and non-enumerable
+    /// properties excluded.
+    pub fn property_keys(&self) -> Result<Vec<String>, JsError> {
+        let mut keys = Vec::new();
+        for key in self.0.own_property_keys()? {
+            let PropertyKey::String(id) = key else {
+                continue; // symbols: Object.keys excludes them
+            };
+            let name = crux::string::lookup(id);
+            if self
+                .0
+                .get_own_property(&name)?
+                .is_some_and(|p| p.enumerable)
+            {
+                keys.push(name.to_string_lossy());
+            }
+        }
+        Ok(keys)
     }
 
     /// The object as a value.
@@ -1328,6 +1558,149 @@ mod tests {
         let num = JsValue::number(1.0);
         assert_eq!(context.as_bytes(&num), None);
         assert!(context.set_bytes(&num, b"x").is_err());
+    }
+
+    #[test]
+    fn coercions_and_type_checks() {
+        let mut context = Context::new().unwrap();
+
+        // ToBoolean (pure, no agent window needed).
+        assert!(JsValue::number(1.0).to_boolean());
+        assert!(!JsValue::number(0.0).to_boolean());
+        assert!(!JsValue::undefined().to_boolean());
+        assert!(JsValue::string("x").to_boolean());
+
+        // ToNumber / ToString on primitives and objects (agent-aware).
+        let s = JsValue::string("42");
+        assert_eq!(context.to_number(&s).unwrap(), 42.0);
+        let obj = eval_in(&mut context, "({ valueOf: () => 7 })");
+        assert_eq!(context.to_number(&obj).unwrap(), 7.0);
+        let obj2 = eval_in(&mut context, "({ toString: () => 'hi' })");
+        assert_eq!(context.to_string(&obj2).unwrap(), "hi");
+
+        // ToObject boxes primitives.
+        let boxed = context.to_object(&JsValue::string("s")).unwrap();
+        assert_eq!(boxed.get("length").unwrap().as_number(), Some(1.0));
+
+        // Type checks.
+        assert!(eval_in(&mut context, "10n").is_big_int());
+        assert!(!eval_in(&mut context, "10").is_big_int());
+        let date = eval_in(&mut context, "new Date(0)");
+        assert!(context.is_date(&date));
+        let plain = eval_in(&mut context, "({})");
+        assert!(!context.is_date(&plain));
+
+        // instanceof.
+        let arr = eval_in(&mut context, "[]");
+        let array_ctor = eval_in(&mut context, "Array");
+        assert!(context.is_instance_of(&arr, &array_ctor).unwrap());
+        assert!(
+            !context
+                .is_instance_of(&JsValue::number(1.0), &array_ctor)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn json_iterable_symbol_bigint_date_helpers() {
+        let mut context = Context::new().unwrap();
+
+        // SameValue (Object.is semantics).
+        let nan = JsValue::number(f64::NAN);
+        assert!(nan.is_same_value(&nan));
+        assert!(!JsValue::number(0.0).is_same_value(&JsValue::number(-0.0)));
+        assert!(JsValue::number(1.0).is_same_value(&JsValue::number(1.0)));
+
+        // JSON.stringify (None for undefined/function/symbol).
+        let obj = eval_in(&mut context, "({ a: 1, b: [true, null] })");
+        assert_eq!(
+            context.json_stringify(&obj).unwrap().as_deref(),
+            Some("{\"a\":1,\"b\":[true,null]}")
+        );
+        assert_eq!(context.json_stringify(&JsValue::undefined()).unwrap(), None);
+
+        // IsIterable.
+        let iter_arr = eval_in(&mut context, "[1,2,3]");
+        assert!(context.is_iterable(&iter_arr).unwrap());
+        let iter_set = eval_in(&mut context, "new Set()");
+        assert!(context.is_iterable(&iter_set).unwrap());
+        let iter_obj = eval_in(&mut context, "({})");
+        assert!(!context.is_iterable(&iter_obj).unwrap());
+        assert!(!context.is_iterable(&JsValue::number(1.0)).unwrap());
+
+        // Symbol.for — same registry entry on repeat.
+        let s1 = context.symbol_for("bun.poc").unwrap();
+        let s2 = context.symbol_for("bun.poc").unwrap();
+        assert!(s1.is_same_value(&s2));
+        context.set_global("s", s1).unwrap();
+        assert!(eval_in(&mut context, "Symbol.for('bun.poc') === s").to_boolean());
+
+        // Array.push.
+        let arr = eval_in(&mut context, "[]");
+        assert_eq!(context.array_push(&arr, JsValue::number(1.0)).unwrap(), 1);
+        assert_eq!(context.array_push(&arr, JsValue::number(2.0)).unwrap(), 2);
+        context.set_global("arr", arr).unwrap();
+        assert_eq!(
+            eval_in(&mut context, "arr.join(',')").as_string(),
+            Some("1,2".into())
+        );
+
+        // BigInt helpers.
+        let a = context.bigint_from_latin1("9007199254740993").unwrap();
+        let b = context.bigint_from_latin1("1").unwrap();
+        let sum = context.bigint_sum(&a, &b).unwrap();
+        context.set_global("sum", sum).unwrap();
+        assert_eq!(
+            eval_in(&mut context, "String(sum)").as_string(),
+            Some("9007199254740994".into())
+        );
+        assert_eq!(context.bigint_compare(&a, &b).unwrap(), 1);
+        assert_eq!(context.bigint_compare(&a, &a).unwrap(), 0);
+
+        // Date helpers.
+        let date = context.date_from_number(1_700_000_000_000.0).unwrap();
+        assert_eq!(context.unix_timestamp(&date), Some(1_700_000_000_000.0));
+        assert_eq!(
+            context.to_iso_string(&date).unwrap(),
+            "2023-11-14T22:13:20.000Z"
+        );
+        let js_date = eval_in(&mut context, "new Date(0)");
+        assert_eq!(context.unix_timestamp(&js_date), Some(0.0));
+        assert_eq!(
+            context.to_iso_string(&js_date).unwrap(),
+            "1970-01-01T00:00:00.000Z"
+        );
+    }
+
+    #[test]
+    fn property_keys_enumeration() {
+        let mut context = Context::new().unwrap();
+
+        // Insertion order for string keys.
+        let obj = eval_in(&mut context, "({ b: 1, a: 2, c: 3 })")
+            .as_object()
+            .unwrap();
+        assert_eq!(obj.property_keys().unwrap(), vec!["b", "a", "c"]);
+
+        // Array indices ascending, then extra strings.
+        let arr = eval_in(&mut context, "['x', 'y']").as_object().unwrap();
+        arr.set("extra", JsValue::number(1.0)).unwrap();
+        assert_eq!(arr.property_keys().unwrap(), vec!["0", "1", "extra"]);
+
+        // Non-enumerable properties excluded (Object.keys semantics).
+        let with_hidden = eval_in(
+            &mut context,
+            "Object.defineProperty({ a: 1 }, 'hidden', { value: 2, enumerable: false })",
+        )
+        .as_object()
+        .unwrap();
+        assert_eq!(with_hidden.property_keys().unwrap(), vec!["a"]);
+
+        // Symbol keys excluded.
+        let with_sym = eval_in(&mut context, "({ a: 1, [Symbol.for('x')]: 2 })")
+            .as_object()
+            .unwrap();
+        assert_eq!(with_sym.property_keys().unwrap(), vec!["a"]);
     }
 
     #[test]

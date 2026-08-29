@@ -316,8 +316,7 @@ fn array_species_create(
     let species = match c.kind() {
         ValueKind::Undefined => return array_create(agent, length),
         ValueKind::Object(_) | ValueKind::Function(_) => {
-            let species_key =
-                PropertyKey::Symbol(crux::symbol::well_known("species"));
+            let species_key = PropertyKey::Symbol(crux::symbol::well_known("species"));
             crate::context::get_property_key(agent, &c, &species_key, c)?
         }
         _ => {
@@ -450,12 +449,7 @@ fn array_from(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
                 "Iterator is not an object".into(),
             ));
         }
-        let next = get_property(
-            agent,
-            &iterator,
-            &JsString::from_utf8("next"),
-            iterator,
-        )?;
+        let next = get_property(agent, &iterator, &JsString::from_utf8("next"), iterator)?;
         if !is_callable(&next) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -513,12 +507,7 @@ fn array_from(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
     for k in 0..length {
         let k_value = get(agent, &array_like, &key(k))?;
         let mapped_value = if mapping {
-            crate::function::call(
-                agent,
-                &mapfn,
-                this_arg,
-                &[k_value, Value::Number(k as f64)],
-            )?
+            crate::function::call(agent, &mapfn, this_arg, &[k_value, Value::Number(k as f64)])?
         } else {
             k_value
         };
@@ -556,11 +545,8 @@ fn is_concat_spreadable(agent: &mut Agent, value: &Value) -> Result<bool, JsErro
     if !matches!(value.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Ok(false);
     }
-    let spreadable_key = PropertyKey::Symbol(
-        crux::symbol::well_known("isConcatSpreadable")
-    );
-    let spreadable =
-        crate::context::get_property_key(agent, value, &spreadable_key, *value)?;
+    let spreadable_key = PropertyKey::Symbol(crux::symbol::well_known("isConcatSpreadable"));
+    let spreadable = crate::context::get_property_key(agent, value, &spreadable_key, *value)?;
     if !matches!(spreadable.kind(), ValueKind::Undefined) {
         return Ok(to_boolean(&spreadable));
     }
@@ -1186,7 +1172,9 @@ fn pop(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsErro
 }
 
 /// spec 23.1.3.22 Array.prototype.push.
-fn push(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+/// Array.prototype.push (spec 23.1.3.22): append each argument, returning
+/// the new length. Exposed for the embedding API (`Context::array_push`).
+pub(crate) fn push(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
     let object = crate::context::to_object(agent, this)?;
     let mut length = length_of_array_like(agent, &object)?;
@@ -1662,8 +1650,7 @@ fn to_locale_string(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
         // receiver (not the box), so a primitives' overridden toString sees
         // the primitive (primitive_this_value.js); the locales and options
         // arguments pass through.
-        let text =
-            crate::function::call(agent, &method, element, &[locales, options])?;
+        let text = crate::function::call(agent, &method, element, &[locales, options])?;
         result.push_str(&crate::context::to_string(agent, &text)?.to_string_lossy());
     }
     Ok(Value::String(Handle::new(JsString::from_utf8(&result))))
@@ -2141,8 +2128,7 @@ fn from_async_resume(
                 let k = state.borrow().k;
                 return from_async_finish(agent, &state, k);
             }
-            let step_value =
-                get_property(agent, &value, &JsString::from_utf8("value"), value)?;
+            let step_value = get_property(agent, &value, &JsString::from_utf8("value"), value)?;
             let mapping = !matches!(state.borrow().mapfn.kind(), ValueKind::Undefined);
             if mapping {
                 from_async_map_and_await(agent, &state, step_value)
@@ -2178,12 +2164,7 @@ fn from_async_map_and_await(
 ) -> Result<Value, JsError> {
     let (mapfn, this_arg, k, array) = {
         let state = state.borrow();
-        (
-            state.mapfn,
-            state.this_arg,
-            state.k,
-            state.array,
-        )
+        (state.mapfn, state.this_arg, state.k, state.array)
     };
     let mapped = if matches!(mapfn.kind(), ValueKind::Undefined) {
         value
@@ -2337,12 +2318,7 @@ fn async_iterator_from(
 ) -> Result<IteratorRecord, JsError> {
     if let Some(method) = async_method {
         let iterator = crate::function::call(agent, &method, *items, &[])?;
-        let next = get_property(
-            agent,
-            &iterator,
-            &JsString::from_utf8("next"),
-            iterator,
-        )?;
+        let next = get_property(agent, &iterator, &JsString::from_utf8("next"), iterator)?;
         if !is_callable(&next) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -2419,9 +2395,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let array_ctor_value = Value::Function(array_ctor);
 
     realm.intrinsics.define(ARRAY, array_ctor_value);
-    realm
-        .intrinsics
-        .define(ARRAY_PROTO, array_proto_value);
+    realm.intrinsics.define(ARRAY_PROTO, array_proto_value);
 
     array_ctor.define_property(
         &JsString::from_utf8("prototype"),
