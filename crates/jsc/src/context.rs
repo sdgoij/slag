@@ -19,6 +19,29 @@ use crate::{
 pub struct JscContext {
     pub isolate: Box<Isolate>,
     pub api: api::Context,
+    /// Opaque user data passed to the context via the `data` parameter of
+    /// `JSGlobalContextCreate`. Used by `JSCallbackData` callbacks.
+    #[allow(dead_code)]
+    pub data: *mut std::ffi::c_void,
+}
+
+impl JscContext {
+    /// Create a new context and store it in the LIVE map. Returns the raw
+    /// pointer (for use as JSGlobalContextRef).
+    pub fn create_leaked() -> Result<*mut JscContext, JsError> {
+        let mut isolate = Isolate::new();
+        let api = api::Context::new(&mut isolate)?;
+        let mut ctx = Box::new(JscContext {
+            isolate,
+            api,
+            data: std::ptr::null_mut(),
+        });
+        let ctx_ptr = &mut *ctx as *mut JscContext;
+        LIVE.with(|live| {
+            live.borrow_mut().insert(ctx_ptr as usize, ctx);
+        });
+        Ok(ctx_ptr)
+    }
 }
 
 thread_local! {
@@ -35,7 +58,11 @@ impl JscContext {
     pub fn create() -> Result<*mut JscContext, JsError> {
         let mut isolate = Isolate::new();
         let api = api::Context::new(&mut isolate)?;
-        let mut ctx = Box::new(JscContext { isolate, api });
+        let mut ctx = Box::new(JscContext {
+            isolate,
+            api,
+            data: std::ptr::null_mut(),
+        });
         let ptr: *mut JscContext = &mut *ctx;
         LIVE.with(|live| live.borrow_mut().insert(ptr as usize, ctx));
         Ok(ptr)
@@ -195,7 +222,7 @@ pub unsafe extern "C" fn JSGlobalContextCreate(
 ) -> JSGlobalContextRef {
     // v1: the global object class is accepted but its static members are not
     // applied to the realm's global object.
-    crate::guard(|| match JscContext::create() {
+    crate::guard(|| match JscContext::create_leaked() {
         Ok(ctx) => ctx as JSGlobalContextRef,
         Err(_) => std::ptr::null_mut(),
     })
@@ -236,15 +263,13 @@ pub unsafe extern "C" fn JSGlobalContextRelease(ctx: JSGlobalContextRef) {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn JSContextGetGlobalObject(ctx: JSContextRef) -> JSObjectRef {
-    crate::guard(|| {
-        let Some(ctx) = JscContext::get(ctx as *mut JscContext) else {
-            return std::ptr::null_mut();
-        };
-        match ctx.api.global().into_value().as_object() {
-            Some(object) => refs::value_to_ref(Value::Object(object)),
-            None => std::ptr::null_mut(),
-        }
-    })
+    // In real JSC, JSGlobalContextRef IS the global object.
+    // Return the context pointer as the global object.
+    if !ctx.is_null() && JscContext::get(ctx as *mut JscContext).is_some() {
+        ctx as JSObjectRef
+    } else {
+        std::ptr::null_mut()
+    }
 }
 
 #[unsafe(no_mangle)]
