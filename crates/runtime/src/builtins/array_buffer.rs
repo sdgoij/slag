@@ -921,6 +921,33 @@ pub fn shared_array_buffer_from_block(
     Ok(Value::Object(object))
 }
 
+/// Wrap an existing byte block as an ArrayBuffer object in this agent
+/// (host-facing: lets an embedder hand bytes to JS; spec 25.1.2.2 with a
+/// supplied [[ArrayBufferData]]).
+pub fn array_buffer_from_block(
+    agent: &mut Agent,
+    shared: SharedBuffer,
+    byte_length: usize,
+) -> Result<Value, JsError> {
+    let prototype = agent
+        .current_realm()?
+        .intrinsics
+        .get(ARRAY_BUFFER_PROTO)
+        .and_then(|value| as_object(&value))
+        .ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                "%ArrayBuffer.prototype% missing".into(),
+            )
+        })?;
+    let object = JsObject::ordinary_object_create(Some(prototype));
+    agent.buffer_data.insert(
+        object.id(),
+        std::cell::RefCell::new(BufferState::fixed(shared, byte_length)),
+    );
+    Ok(Value::Object(object))
+}
+
 /// SharedArrayBuffer.prototype.byteLength (spec 25.3.5.1).
 fn sab_get_byte_length(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     let object = require_buffer_object(agent, this)?;
@@ -1135,9 +1162,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     let ab_ctor_value = Value::Function(ab_ctor);
     realm.intrinsics.define(ARRAY_BUFFER, ab_ctor_value);
-    realm
-        .intrinsics
-        .define(ARRAY_BUFFER_PROTO, ab_proto_value);
+    realm.intrinsics.define(ARRAY_BUFFER_PROTO, ab_proto_value);
     ab_ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {
@@ -1288,9 +1313,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         None,
     )?;
     let sab_ctor_value = Value::Function(sab_ctor);
-    realm
-        .intrinsics
-        .define(SHARED_ARRAY_BUFFER, sab_ctor_value);
+    realm.intrinsics.define(SHARED_ARRAY_BUFFER, sab_ctor_value);
     realm
         .intrinsics
         .define(SHARED_ARRAY_BUFFER_PROTO, sab_proto_value);

@@ -24,9 +24,10 @@ use std::rc::Rc;
 use crux::error::{ErrorKind, JsError};
 use crux::function::Function;
 use crux::handle::Handle;
-use crux::object::JsObject as CruxObject;
+use crux::object::{JsObject as CruxObject, ObjectKind, typed_array_effective_length};
 use crux::property::PropertyDescriptor;
 use crux::string::JsString;
+use crux::typed_array::SharedBuffer;
 use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
@@ -200,6 +201,108 @@ impl Context {
     /// Drain the job queues (promise, timeout, then generic jobs).
     pub fn run_jobs(&mut self) -> Result<(), JsError> {
         self.agent.run_jobs()
+    }
+
+    // ── buffer / typed-array access (Phase 0.1: embedding API) ──────────────
+    // Host-facing byte access so an embedder can exchange raw bytes with JS:
+    // read bytes out of a TypedArray/ArrayBuffer, write bytes back in, and
+    // create an ArrayBuffer from bytes. This is what JSBuffer (Node `Buffer`)
+    // and `fs`/`fetch` byte paths will be built on.
+
+    /// Copy the bytes of an ArrayBuffer or TypedArray value.
+    ///
+    /// - TypedArray: the view's bytes (`byteOffset .. byteOffset+byteLength`).
+    /// - ArrayBuffer (or SharedArrayBuffer): all its bytes.
+    /// - Anything else, or a detached buffer: `None`.
+    pub fn as_bytes(&self, value: &JsValue) -> Option<Vec<u8>> {
+        match value.0.kind() {
+            ValueKind::Object(obj) => match &obj.kind {
+                ObjectKind::IntegerIndexed(slots) => {
+                    if slots.buffer.is_detached() {
+                        return None;
+                    }
+                    let len = typed_array_effective_length(slots) * slots.element_type.size();
+                    slots.buffer.read(slots.byte_offset, len).ok()
+                }
+                _ => {
+                    // ArrayBuffer/SharedArrayBuffer: the storage is agent-side.
+                    let state = self.agent.buffer_data.get(&obj.id())?.borrow();
+                    if state.detached {
+                        return None;
+                    }
+                    state.shared.read(0, state.byte_length).ok()
+                }
+            },
+            _ => None,
+        }
+    }
+
+    /// Write `bytes` into an ArrayBuffer or TypedArray value.
+    ///
+    /// Errors when the value is neither, is detached, or the bytes don't fit
+    /// the view/buffer.
+    pub fn set_bytes(&self, value: &JsValue, bytes: &[u8]) -> Result<(), JsError> {
+        match value.0.kind() {
+            ValueKind::Object(obj) => match &obj.kind {
+                ObjectKind::IntegerIndexed(slots) => {
+                    let len = typed_array_effective_length(slots) * slots.element_type.size();
+                    if bytes.len() > len {
+                        return Err(JsError::new(
+                            ErrorKind::TypeError,
+                            format!(
+                                "set_bytes: {} bytes do not fit a {}-byte TypedArray",
+                                bytes.len(),
+                                len
+                            ),
+                        ));
+                    }
+                    slots.buffer.write(slots.byte_offset, bytes)
+                }
+                _ => {
+                    let cell = self.agent.buffer_data.get(&obj.id()).ok_or_else(|| {
+                        JsError::new(
+                            ErrorKind::TypeError,
+                            "set_bytes: not an ArrayBuffer or TypedArray".into(),
+                        )
+                    })?;
+                    let state = cell.borrow_mut();
+                    if state.detached {
+                        return Err(JsError::new(
+                            ErrorKind::TypeError,
+                            "set_bytes: detached ArrayBuffer".into(),
+                        ));
+                    }
+                    if bytes.len() > state.byte_length {
+                        return Err(JsError::new(
+                            ErrorKind::TypeError,
+                            format!(
+                                "set_bytes: {} bytes do not fit a {}-byte ArrayBuffer",
+                                bytes.len(),
+                                state.byte_length
+                            ),
+                        ));
+                    }
+                    state.shared.write(0, bytes)
+                }
+            },
+            _ => Err(JsError::new(
+                ErrorKind::TypeError,
+                "set_bytes: expected an ArrayBuffer or TypedArray".into(),
+            )),
+        }
+    }
+
+    /// Create an ArrayBuffer from bytes (spec 25.1.2.2 with a supplied
+    /// [[ArrayBufferData]]).
+    pub fn array_buffer_from_bytes(&mut self, bytes: &[u8]) -> Result<JsValue, JsError> {
+        let shared = SharedBuffer::new(bytes.len());
+        shared.write(0, bytes)?;
+        let value = crate::builtins::array_buffer::array_buffer_from_block(
+            self.agent_mut(),
+            shared,
+            bytes.len(),
+        )?;
+        Ok(JsValue(value))
     }
 
     /// Install a `process` global with an `argv` array, Node-style:
@@ -1193,6 +1296,38 @@ mod tests {
 
     fn eval_in(context: &mut Context, source: &str) -> JsValue {
         context.eval(source).unwrap()
+    }
+
+    #[test]
+    fn buffer_bytes_round_trip() {
+        let mut context = Context::new().unwrap();
+
+        // Host creates an ArrayBuffer from bytes; as_bytes reads it back.
+        let ab = context.array_buffer_from_bytes(b"hello").unwrap();
+        assert_eq!(context.as_bytes(&ab).as_deref(), Some(&b"hello"[..]));
+
+        // Host writes into it; JS sees the change through a Uint8Array view.
+        context.set_bytes(&ab, b"world").unwrap();
+        context.set_global("buf", ab).unwrap();
+        assert_eq!(
+            eval_in(&mut context, "new Uint8Array(buf).join(',')").as_string(),
+            Some("119,111,114,108,100".into()) // "world"
+        );
+
+        // JS-side view: as_bytes reads the view's bytes, set_bytes writes them
+        // back into the shared storage.
+        let view = eval_in(&mut context, "new Uint8Array(buf)");
+        assert_eq!(context.as_bytes(&view).as_deref(), Some(&b"world"[..]));
+        context.set_bytes(&view, b"abcde").unwrap();
+        assert_eq!(
+            eval_in(&mut context, "new Uint8Array(buf).join(',')").as_string(),
+            Some("97,98,99,100,101".into()) // "abcde"
+        );
+
+        // Non-buffer values return None / error.
+        let num = JsValue::number(1.0);
+        assert_eq!(context.as_bytes(&num), None);
+        assert!(context.set_bytes(&num, b"x").is_err());
     }
 
     #[test]
