@@ -400,6 +400,8 @@ fn runtime_helpers() -> JitHelpers {
         finally_end: Some(rt.finally_end),
         catch_bind: Some(rt.catch_bind),
         dispatch_error: Some(rt.dispatch_error),
+        switch_disc: Some(rt.switch_disc),
+        switch_test: Some(rt.switch_test),
     }
 }
 
@@ -557,6 +559,8 @@ mod tests {
             finally_end: Some(helpers::test_finally_end),
             catch_bind: Some(helpers::test_catch_bind),
             dispatch_error: Some(helpers::test_dispatch_error),
+            switch_disc: Some(helpers::test_switch_disc),
+            switch_test: Some(helpers::test_switch_test),
         }
     }
 
@@ -1932,6 +1936,79 @@ mod tests {
                 .expect("runs")
         });
         assert_eq!(value.as_number(), Some(10.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_switch_body() {
+        // Cut 56: a switch body compiles — the discriminant stores via
+        // `switch_disc`, each `SwitchTest` strictly-equals a case test and
+        // jumps to the matched case block, and `break` routes through the
+        // control dispatch. Includes fall-through, a default in the middle,
+        // and a nested switch.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(x) { var out = ''; switch (x) { \
+                       case 1: out += 'a'; \
+                       case 2: out += 'b'; break; \
+                       default: out += 'd'; } return out; }\n\
+                     function g(x) { switch (x) { case 1: return 'one'; default: return 'd'; } }\n\
+                     function h(x, y) { switch (x) { case 1: switch (y) { case 10: return 'a'; } } return 'z'; }\n\
+                     f(1);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("ab".to_string())
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_switch_loop_and_try() {
+        // Cut 56: a switch in a certified loop with break/continue, and a
+        // throw from a switch case caught by an enclosing try (the case
+        // bodies' errors route through the Cut 55 handler dispatch).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f() { var out = ''; for (var i = 0; i < 4; i++) { \
+                       switch (i) { case 0: out += 'z'; continue; case 2: break; \
+                         default: out += i; } out += '.'; } return out; }\n\
+                     function g(x) { try { switch (x) { case 1: throw 'boom'; case 2: return 'two'; } } \
+                       catch (e) { return 'caught:' + e; } }\n\
+                     f() + '|' + g(1) + '|' + g(2);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("z1..3.|caught:boom|two".to_string())
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_hot_switch_loop() {
+        // Cut 56: a switch in a certified loop with a break in every case —
+        // the matches jump in machine code. Sum over 0..999 of the case
+        // values 1/10/100/1000.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(n) { var s = 0; for (var i = 0; i < n; i++) { \
+                       switch (i % 4) { case 0: s += 1; break; case 1: s += 10; break; \
+                         case 2: s += 100; break; default: s += 1000; } } return s; }\n\
+                     f(1000);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_number(),
+            Some(250.0 * (1.0 + 10.0 + 100.0 + 1000.0))
+        );
         assert!(compiled >= 1, "{compiled} bodies");
     }
 

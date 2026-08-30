@@ -228,6 +228,8 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
             // transfers (`Exit`/`Break`/`Continue`/`FinallyEnd`) and the
             // try/block machinery leave the stack as-is.
             Step::Return | Step::Throw => depth = depth.saturating_sub(1),
+            // Switch steps (Cut 56): `SwitchDisc` and `SwitchTest` pop.
+            Step::SwitchDisc | Step::SwitchTest { .. } => depth = depth.saturating_sub(1),
             _ => {}
         }
         max = max.max(depth);
@@ -433,6 +435,7 @@ fn step_targets(step: &Step) -> Vec<usize> {
         } => vec![*body_start, *after],
         Step::JumpIfChainShort(t) => vec![*t],
         Step::Exit { after } => vec![*after],
+        Step::SwitchTest { case } => vec![*case],
         Step::ForInNext { back, .. } | Step::ForOfNext { back, .. } => vec![*back],
         Step::ForOfNextBindLocal { back, .. } => vec![*back],
         // Cut 46: a self-tail-call jumps to the body's re-entry block, not
@@ -2874,6 +2877,23 @@ impl<'a> Lowerer<'a> {
                 // return), so the finally's save/restore round trip is a
                 // no-op — same treatment as `ResetCompletion`.
                 self.fall_through(index);
+            }
+            Step::SwitchDisc => {
+                let disc = self.pop();
+                let _res = self.call_slow(self.sig_bool, Helper::SwitchDisc, &[disc])?;
+                self.fall_through(index);
+            }
+            Step::SwitchTest { case } => {
+                // Strictly-equal the case test against the stored
+                // discriminant; a match jumps to the case block (a static
+                // target), otherwise the next test (or the default jump)
+                // runs.
+                let test = self.pop();
+                let case_imm = self.builder.ins().iconst(types::I64, *case as i64);
+                let matched =
+                    self.call_slow(self.sig_update, Helper::SwitchTest, &[case_imm, test])?;
+                let target = self.ensure_block(*case);
+                self.cond_jump(matched, true, target, index + 1);
             }
             // Closure creation (Cut 44): the helper reads the step's payload
             // (the function AST, strictness, and the enclosing-chain layouts)

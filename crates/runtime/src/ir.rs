@@ -17847,10 +17847,42 @@ impl FastScopeScan {
                 });
                 try_ok && catch_ok && finalizer_ok
             }
-            StmtKind::UsingDecl { .. }
-            | StmtKind::ClassDecl(_)
-            | StmtKind::Switch { .. }
-            | StmtKind::With { .. } => false,
+            StmtKind::Switch {
+                discriminant,
+                cases,
+                ..
+            } => {
+                // The discriminant and case tests evaluate BEFORE the switch
+                // block's bindings initialize (the tests run first in the
+                // compiled step stream), so they scan at the outer depth — a
+                // test referencing a case-body lexical bails (it would read a
+                // TDZ slot). The case consequents share ONE block scope (the
+                // compiled `EnterBlock` holds all their declarations), so they
+                // scan together at depth + 1 under a single block-names frame.
+                if !self.expr(discriminant, depth) {
+                    return false;
+                }
+                let tests_ok = cases
+                    .iter()
+                    .all(|case| case.test.as_ref().is_none_or(|t| self.expr(t, depth)));
+                self.block_names_stack.push(HashSet::new());
+                let body_ok = cases.iter().all(|case| {
+                    // An Annex B block function declaration DIRECTLY in a
+                    // case consequent needs the block-scope copy machinery
+                    // the compiler activates only for `StmtKind::Block` (the
+                    // case bodies compile as bare statement lists) — bail to
+                    // the env path. A function nested in a block inside the
+                    // consequent is fine (the inner Block arm activates it).
+                    !case
+                        .consequent
+                        .iter()
+                        .any(|stmt| matches!(stmt.kind, StmtKind::FunctionDecl(_)))
+                        && self.stmts(&case.consequent, depth + 1)
+                });
+                self.block_names_stack.pop();
+                tests_ok && body_ok
+            }
+            StmtKind::UsingDecl { .. } | StmtKind::ClassDecl(_) | StmtKind::With { .. } => false,
         }
     }
 

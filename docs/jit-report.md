@@ -69,8 +69,9 @@ run paths:
 | 26 | *(worktree)* | **Object-literal lowering** (Cut 53): all nine object-literal steps lower — `ObjectBegin` creates the plain object with the realm's `Object.prototype`; `ObjectInitName`/`ObjectInitComputed` define data properties (the `__proto__` setter special case and name inference preserved); `ObjectKeyToPropertyKey` converts a computed key before the value evaluates; `ObjectMethodName`/`ObjectMethodComputed`/`ObjectAccessorName`/`ObjectAccessorComputed` define methods/accessors through step-index helpers (the Cut 44 pattern — the function/param/body payload is read back from the running body, so method instantiation runs the shared `instantiate_method`/`instantiate_accessor` machinery); `ObjectSpread` copies a source's own enumerable properties. A body with an object literal compiles instead of bailing: a `{a: n, b: n+1}` loop runs 76ms vs 87ms interpreter for 200K; computed/spread/method shapes are machinery-bound (ToPropertyKey, copy-data-properties, function instantiation). |
 | 27 | *(worktree)* | **String-literal lowering** (Cut 54): a plain string/bigint literal (`Push(Value::String(...))` — `compile_literal` emits a heap `Push`, only templates use `PushStr`) lowers via `push_const`; template quasis (`PushStr`) via `push_str`; the template flatten concat (`ConcatStr`/`ConcatStrConst`) via the `concat_strings`-adjacent helpers; and a register body's heap constant (`LeafOp::LoadConst`/`BinConst`, member `RegOperand::Const`) via `load_const` — a step/op/field-indexed helper reading the value back from the running body. Bodies with string literals — previously bailing wholesale — compile: a string-literal assignment loop runs 7ms vs 15ms interpreter for 2M. The step-index helpers read the RUNNING body's payload, so the steps are excluded from leaf-inlining (an inlined leaf's helpers would see the CALLER's `JitCallContext::body` — the fix that caught a 35-fixture crash in the dynamic-import cluster). |
 | 28 | *(worktree)* | **try/catch/finally + control-transfer dispatch** (Cut 55): the biggest remaining bail item. Certification (`FastScopeScan`) now accepts `try` — the try block/finalizer scan as blocks, the catch parameter as a flat frame slot (a simple uncaptured Ident; captured/destructuring params keep the body on the env path), the catch body one depth deeper so a try-block reference to the parameter bails. The steps lower: `EnterBlock`/`LeaveBlock` push/pop real block envs, `EnterTry` pushes the `TryFrame`, `Exit`/`Return`/`Break`/`Continue`/`Throw`/`FinallyEnd` run the interpreter's `control_transfer`/`throw_machinery` through new dispatch helpers that return a step target (the machine code branches over the body's static transfer-target set) or a completion sentinel, and `CatchBind` mirrors the interpreter handler plus writes the flat param slot. A helper's pending engine error in a try body routes through `dispatch_error` (the interpreter's Err arm) instead of terminating. Try/catch envs are marked context-transparent in certified bodies (like per-iteration envs) so closures created inside them still reach their capture context. Bodies with plain blocks, breaks, continues, and throws also compile now. |
+| 29 | *(worktree)* | **switch** (Cut 56): certification accepts `switch` — the discriminant and case tests scan at the outer depth (they run before the shared case-block's bindings initialize), the case consequents as one shared block scope. `SwitchDisc` stores the popped discriminant via a helper; `SwitchTest` strictly-equals each case test against it and the machine code jumps to the matched case block (a static target) on a match, falling through to the next test otherwise — no dispatch table, the `break` out of a switch rides the Cut 55 control dispatch. A switch case body with a DIRECT Annex B block function declaration stays on the env path (the compiler's block-scope copy machinery is only activated for `StmtKind::Block`, and the case bodies compile as bare statement lists — 2 annexB fixtures caught this). A hot switch loop compiles; nested switches and switch-in-try shapes work. |
 
-### Slow-path helper table (`JitSlowPaths`, 74 helpers)
+### Slow-path helper table (`JitSlowPaths`, 76 helpers)
 
 The JIT inlines the number/string fast paths (tag checks are ~2 instructions
 on NaN-boxed values); everything else calls a helper whose address is baked
@@ -101,8 +102,10 @@ set: `enter_block`/`leave_block` (block envs), `enter_try`/`exit_try`
 `break_control`/`continue_control`/`throw_control`/`finally_end` (the
 abrupt transfers, returning a step target or a completion sentinel),
 `catch_bind` (the catch parameter binding), and `dispatch_error` (the
-pending-engine-error handler dispatch). A body needing a `None` helper
-bails to the interpreter.
+pending-engine-error handler dispatch); the Cut 56 switch pair
+`switch_disc`/`switch_test` (the stored discriminant and the strict-
+equality case test). A body needing a `None` helper bails to the
+interpreter.
 
 ## 3. Fast-path machinery
 
@@ -166,10 +169,11 @@ pass / 445 hang — *pre-existing* (baseline 447) slow RegExp property-escape
 fixtures, unrelated to the JIT. Clusters: `expressions/call` 92/92,
 `arrow-function` 343/343.
 
-**Tests**: `cargo test --workspace` green (4463; jit crate 94 incl. the
+**Tests**: `cargo test --workspace` green (4466; jit crate 97 incl. the
 `installed_jit_*` e2e tests for member/slot callees, loop-with-calls, mid-run
 cell mutation, GC-stress rooting, global store-then-read, scope-shadow
-correctness, and the Cut 55 try/catch/finally/block shapes);
+correctness, the Cut 55 try/catch/finally/block shapes, and the Cut 56
+switch/fall-through/nested/hot-loop shapes);
 `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 **The headline fix**: `tco-call-args.js` (a `getF()` closure per TCO step)
@@ -202,8 +206,9 @@ containing any of these fall back entirely:
 - **Iterator machinery**: all `ForIn*`, `ForOf*`, `AsyncForOf*`.
 - **Suspension**: `Yield`/`Await`/`YieldStar*`/`AsyncYieldStar*`
   (generators/async).
-- **Control machinery**: `SwitchDisc`/`SwitchTest`, class steps (`ClassBegin`/
-  `ClassHeritage`/`ClassFinish`…), `RegExpLiteral`.
+- **Control machinery**: class steps (`ClassBegin`/
+  `ClassHeritage`/`ClassFinish`…), `RegExpLiteral`. `SwitchDisc`/`SwitchTest`
+  are now **compiled** (Cut 56) — see the implemented table.
 - **Destructuring/spread**: `ObjectSpread`, `ArraySpread`, all `Destructure*`.
 - **Sloppy mapped arguments**: `CreateArguments { mapped: Some }`.
 - **Super machinery**: `SuperCall`, `GetSuperBase`, `GetSuperName`/
@@ -247,7 +252,7 @@ containing any of these fall back entirely:
    touches these. Cutting it needs a fast path in `register_function`/
    object creation (share the params Vec per site, skip the intermediate
    descriptors, pool the prototype object) — the report frontier.
-7. **Extend the bail list**: `switch`, `with`, `using`,
+7. **Extend the bail list**: `with`, `using`,
    iterators, generators/async, destructuring/spread, class machinery, mapped
    `arguments` — each is a slice of lowering + helper work. Proper tail calls
    are **done** (Cut 45); the NAMED (Cut 46), global-name (Cut 47), and
@@ -260,11 +265,15 @@ containing any of these fall back entirely:
    literals** (Cut 54 — `Push(Value::String)`/`PushStr`/the template
    concat steps and register-body heap constants lower; the step-index
    forms are excluded from leaf-inlining because an inlined leaf's helpers
-   would see the caller's `JitCallContext::body`), and **try/catch/finally**
+   would see the caller's `JitCallContext::body`), **try/catch/finally**
    (Cut 55 — certification now accepts `try`, the try/block/catch/finally
    steps and the `Return`/`Break`/`Continue`/`Throw` transfers lower through
    the control-dispatch helpers, and engine errors in a try body route
-   through the handler table) no longer bail, so a
+   through the handler table), and **switch** (Cut 56 — the discriminant
+   stores via `switch_disc`, each `SwitchTest` strictly-equals a case test
+   and the machine code jumps to the matched case block; a case body with a
+   direct Annex B block function declaration stays on the env path) no
+   longer bail, so a
    spread self-tail-call compiles and jumps end to end (~430ms for 200K,
    down from the ~2s interpreter bail; the array-creation machinery is the
    remaining floor). A vector call to a certified LEAF still runs the general

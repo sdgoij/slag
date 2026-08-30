@@ -588,6 +588,12 @@ pub struct JitSlowPaths {
     /// catch/finally step, or `DISPATCH_PROPAGATE` when the throw escapes
     /// the body (the pending error is re-set with the value attached).
     pub dispatch_error: extern "C" fn(ctx: *mut c_void, ip: u64) -> u64,
+    /// `Step::SwitchDisc` (Cut 56): store the popped discriminant.
+    pub switch_disc: extern "C" fn(ctx: *mut c_void, value: u64) -> u64,
+    /// `Step::SwitchTest` (Cut 56): strictly-equal the case test against the
+    /// stored discriminant; returns 1 on a match (the machine code jumps to
+    /// the case block), 0 otherwise.
+    pub switch_test: extern "C" fn(ctx: *mut c_void, case: u64, test: u64) -> u64,
 }
 
 /// The runtime's slow-path table, installed into every `JitHook`.
@@ -667,6 +673,8 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     finally_end,
     catch_bind,
     dispatch_error,
+    switch_disc,
+    switch_test,
 };
 
 /// The slack (in slots) reserved above a compiled body's working area on the
@@ -2573,6 +2581,36 @@ extern "C" fn dispatch_error(ctx: *mut c_void, ip: u64) -> u64 {
     vm.ip = ip as usize;
     let result = vm.throw_machinery(agent, body, value);
     dispatch_result(ctx, vm, result)
+}
+
+// ----- Cut 56: switch -----
+
+extern "C" fn switch_disc(ctx: *mut c_void, value: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let vm = unsafe { &mut *ctx.vm };
+    vm.switch_disc = Some(Value::from_bits(value));
+    Value::Undefined.bits()
+}
+
+extern "C" fn switch_test(ctx: *mut c_void, case: u64, test: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let vm = unsafe { &mut *ctx.vm };
+    let test = Value::from_bits(test);
+    let Some(disc) = vm.switch_disc else {
+        return slow_error(
+            ctx,
+            JsError::new(
+                ErrorKind::SyntaxError,
+                "SwitchTest without a discriminant".into(),
+            ),
+        );
+    };
+    if crux::ops::is_strictly_equal(&disc, &test) {
+        vm.ip = case as usize;
+        1
+    } else {
+        0
+    }
 }
 
 extern "C" fn init_context(ctx: *mut c_void, index: u64, value: u64) -> u64 {

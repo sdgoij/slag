@@ -96,6 +96,8 @@ pub enum Helper {
     FinallyEnd,
     CatchBind,
     DispatchError,
+    SwitchDisc,
+    SwitchTest,
 }
 
 impl Helper {
@@ -176,6 +178,8 @@ impl Helper {
             Helper::FinallyEnd => "finally_end",
             Helper::CatchBind => "catch_bind",
             Helper::DispatchError => "dispatch_error",
+            Helper::SwitchDisc => "switch_disc",
+            Helper::SwitchTest => "switch_test",
         }
     }
 
@@ -462,6 +466,10 @@ pub struct JitHelpers {
     pub finally_end: Option<extern "C" fn(vm: *mut c_void, ip: u64) -> u64>,
     pub catch_bind: Option<extern "C" fn(vm: *mut c_void, step: u64) -> u64>,
     pub dispatch_error: Option<extern "C" fn(vm: *mut c_void, ip: u64) -> u64>,
+    /// Switch steps (Cut 56): `SwitchDisc` stores the discriminant;
+    /// `SwitchTest` strictly-equals a case test against it (1 = match).
+    pub switch_disc: Option<extern "C" fn(vm: *mut c_void, value: u64) -> u64>,
+    pub switch_test: Option<extern "C" fn(vm: *mut c_void, case: u64, test: u64) -> u64>,
 }
 
 impl JitHelpers {
@@ -543,6 +551,8 @@ impl JitHelpers {
             finally_end: None,
             catch_bind: None,
             dispatch_error: None,
+            switch_disc: None,
+            switch_test: None,
         }
     }
 
@@ -628,6 +638,8 @@ impl JitHelpers {
             Helper::FinallyEnd => self.finally_end.map(|f| f as usize as u64),
             Helper::CatchBind => self.catch_bind.map(|f| f as usize as u64),
             Helper::DispatchError => self.dispatch_error.map(|f| f as usize as u64),
+            Helper::SwitchDisc => self.switch_disc.map(|f| f as usize as u64),
+            Helper::SwitchTest => self.switch_test.map(|f| f as usize as u64),
         }
     }
 }
@@ -1101,6 +1113,14 @@ pub extern "C" fn test_catch_bind(_vm: *mut c_void, _step: u64) -> u64 {
 
 pub extern "C" fn test_dispatch_error(_vm: *mut c_void, _ip: u64) -> u64 {
     Value::Number(89.0).bits()
+}
+
+pub extern "C" fn test_switch_disc(_vm: *mut c_void, _value: u64) -> u64 {
+    Value::Number(90.0).bits()
+}
+
+pub extern "C" fn test_switch_test(_vm: *mut c_void, _case: u64, test: u64) -> u64 {
+    test
 }
 
 /// Sums its numeric arguments — proves the `args` pointer/`argc` ABI the
