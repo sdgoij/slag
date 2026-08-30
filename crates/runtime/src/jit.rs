@@ -446,6 +446,23 @@ pub struct JitSlowPaths {
         args: *mut u64,
         direct_eval: u64,
     ) -> u64,
+    /// `Step::ArgsBase` (Cut 49, the vector call form): record the current
+    /// argument-vector length as the argument boundary.
+    pub args_base: extern "C" fn(ctx: *mut c_void) -> u64,
+    /// `Step::ArgsPush`: append one value to the argument vector.
+    pub args_push: extern "C" fn(ctx: *mut c_void, value: u64) -> u64,
+    /// `Step::ArgsSpread`: append an iterable's elements to the argument
+    /// vector (the iterator protocol).
+    pub args_spread: extern "C" fn(ctx: *mut c_void, iterable: u64) -> u64,
+    /// `Step::Call` (the vector form): the callee/receiver on the JIT
+    /// buffer, the arguments in the Vm's vector — run the full call and
+    /// return its result.
+    pub call_vector:
+        extern "C" fn(ctx: *mut c_void, this: u64, callee: u64, direct_eval: u64) -> u64,
+    /// `Step::TailCall` (the vector form): like `tail_call`, reading the
+    /// arguments from the Vm's vector instead of the JIT buffer.
+    pub tail_call_vector:
+        extern "C" fn(ctx: *mut c_void, this: u64, callee: u64, direct_eval: u64) -> u64,
 }
 
 /// The runtime's slow-path table, installed into every `JitHook`.
@@ -489,6 +506,11 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     new_target,
     regexp_literal,
     tail_call,
+    args_base,
+    args_push,
+    args_spread,
+    call_vector,
+    tail_call_vector,
 };
 
 /// The slack (in slots) reserved above a compiled body's working area on the
@@ -1417,6 +1439,154 @@ extern "C" fn tail_call(
         Ok(Some(ir)) => {
             // The frame is replaced and the Vm is reset for `ir`; the
             // runtime loops on it (TCO semantics: bounded native stack).
+            ctx.tail = true;
+            vm.tail_replaced = Some(ir);
+            0
+        }
+        Ok(None) => match crate::function::call_inner(agent, &callee, this, &args) {
+            Ok(value) => value.bits(),
+            Err(error) => slow_error(ctx, error),
+        },
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+// ----- Cut 49: the vector call form (≥3 args or a spread) -----
+//
+// The compiler emits `ArgsBase`/`ArgsPush`/`ArgsSpread` to build the
+// argument vector in `Vm::args` (the same channel the interpreter's
+// `Step::Call`/`Step::TailCall` vector handlers read), then the vector
+// `Call`/`TailCall` steps. The JIT lowers the vector-build steps to these
+// helpers and bridges the work-buffer operands onto `vm.stack` for the
+// existing vector handlers (mirroring `call_slow`).
+
+extern "C" fn args_base(ctx: *mut c_void) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let vm = unsafe { &mut *ctx.vm };
+    vm.args_base_stack.push(vm.args.len());
+    0
+}
+
+extern "C" fn args_push(ctx: *mut c_void, value: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let vm = unsafe { &mut *ctx.vm };
+    vm.args.push(Value::from_bits(value));
+    0
+}
+
+extern "C" fn args_spread(ctx: *mut c_void, iterable: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let iterable = Value::from_bits(iterable);
+    let iterator = match crate::expr::get_iterator(agent, &iterable) {
+        Ok(iterator) => iterator,
+        Err(error) => return slow_error(ctx, error),
+    };
+    loop {
+        match crate::expr::iterator_step(agent, &iterator) {
+            Ok(Some(value)) => vm.args.push(value),
+            Ok(None) => break,
+            Err(error) => return slow_error(ctx, error),
+        }
+    }
+    0
+}
+
+extern "C" fn call_vector(ctx: *mut c_void, this: u64, callee: u64, direct_eval: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let entry_len = vm.stack.len();
+    vm.stack.push(Value::from_bits(this));
+    vm.stack.push(Value::from_bits(callee));
+    // The arguments are already in `vm.args` (the vector-build steps); the
+    // vector `do_call` pops the boundary, runs the full call (eval check,
+    // callable check, `call_inner`), and pushes the result.
+    match vm.do_call(agent, direct_eval != 0) {
+        Ok(()) => {
+            let result = match vm.stack.pop() {
+                Some(value) => value,
+                None => {
+                    vm.stack.truncate(entry_len);
+                    return slow_error(
+                        ctx,
+                        JsError::new(
+                            ErrorKind::TypeError,
+                            "the JIT vector call produced no result".into(),
+                        ),
+                    );
+                }
+            };
+            debug_assert_eq!(vm.stack.len(), entry_len);
+            result.bits()
+        }
+        Err(error) => {
+            vm.stack.truncate(entry_len);
+            slow_error(ctx, error)
+        }
+    }
+}
+
+extern "C" fn tail_call_vector(ctx: *mut c_void, this: u64, callee: u64, direct_eval: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let base = match vm.args_base_stack.pop() {
+        Some(base) => base,
+        None => {
+            return slow_error(
+                ctx,
+                JsError::new(
+                    ErrorKind::SyntaxError,
+                    "TailCall without an argument boundary".into(),
+                ),
+            );
+        }
+    };
+    let args = vm.args.split_off(base);
+    let this = Value::from_bits(this);
+    let callee = Value::from_bits(callee);
+    // GC-2: the argument copy is a local `Vec<Value>` the stack scan cannot
+    // see, and the callee setup that follows allocates — suppress
+    // `--gc-stress` collections for the window (mirror `tail_call_shared`).
+    let _stress = crate::ir::StressSuppress::new();
+    // Direct eval in tail position, mirroring `tail_call`'s eval arm: the
+    // eval'd script runs with the caller's environment, so the frame
+    // replacement never applies.
+    if direct_eval != 0
+        && match crate::ir::is_eval_function(agent, &callee) {
+            Ok(eval) => eval,
+            Err(error) => return slow_error(ctx, error),
+        }
+    {
+        let source = args.first().cloned().unwrap_or(Value::Undefined);
+        if !matches!(source.kind(), ValueKind::String(_)) {
+            return source.bits();
+        }
+        let source = match crux::convert::to_string(&source) {
+            Ok(source) => source,
+            Err(error) => return slow_error(ctx, error),
+        };
+        return match crate::script::perform_eval(agent, &source, vm.strict, true) {
+            Ok(result) => result.bits(),
+            Err(error) => slow_error(ctx, error),
+        };
+    }
+    // Frame replacement for an ordinary-callable ECMAScript callee in a
+    // single realm; everything else takes the normal call path whose result
+    // completes this body's return (mirrors `tail_call`).
+    let replaced = (|| -> Result<Option<std::rc::Rc<crate::ir::CompiledBody>>, JsError> {
+        if let ValueKind::Function(function) = callee.kind()
+            && matches!(function.kind, crux::function::FunctionKind::EcmaScript)
+            && agent.realm_count.get() == 1
+        {
+            return vm.tail_prepare_ordinary(agent, &function, this, &args);
+        }
+        Ok(None)
+    })();
+    match replaced {
+        Ok(Some(ir)) => {
             ctx.tail = true;
             vm.tail_replaced = Some(ir);
             0

@@ -164,6 +164,13 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
             Step::CallFast { argc, .. } => {
                 depth = depth.saturating_sub(*argc as usize + 2).saturating_add(1);
             }
+            // The vector form (Cut 49): `ArgsPush`/`ArgsSpread` consume the
+            // value (it goes into the Vm's argument vector, not the work
+            // stack); the vector `Call` pops `this` + callee and pushes the
+            // result; the vector `TailCall` pops both and terminates.
+            Step::ArgsPush | Step::ArgsSpread => depth = depth.saturating_sub(1),
+            Step::Call { .. } => depth = depth.saturating_sub(1),
+            Step::TailCall { .. } => depth = depth.saturating_sub(2),
             // The fused slot call pops `argc` args (the callee is the
             // frame slot) and pushes the result.
             Step::CallFastSlot { argc, .. } => {
@@ -318,6 +325,7 @@ fn step_name(step: &Step) -> &'static str {
     match step {
         Step::Call { .. } | Step::CallFast { .. } => "Call",
         Step::CallFastGlobal { .. } | Step::CallFastSlot { .. } => "CallFastGlobal/Slot",
+        Step::ArgsBase | Step::ArgsPush | Step::ArgsSpread => "ArgsVector",
         Step::TailCall { .. }
         | Step::TailCallFast { .. }
         | Step::TailCallFastGlobal { .. }
@@ -1982,12 +1990,66 @@ impl<'a> Lowerer<'a> {
                 let this = self.builder.ins().iconst(types::I64, self.undef_bits);
                 self.emit_call(index, callee, this, args_ptr, *argc as usize, args_ptr)?;
             }
+            // Cut 49: the vector call form (≥3 args or a spread). The
+            // arguments build in `Vm::args` through the helpers (the same
+            // channel the interpreter's vector `Call`/`TailCall` handlers
+            // read), so the work stack holds only `[this, callee]` at the
+            // call step. `ArgsPush`/`ArgsSpread` consume their value.
+            Step::ArgsBase => {
+                self.call_slow(self.sig_tdz, Helper::ArgsBase, &[])?;
+                self.fall_through(index);
+            }
+            Step::ArgsPush => {
+                let value = self.pop();
+                self.call_slow(self.sig_bool, Helper::ArgsPush, &[value])?;
+                self.fall_through(index);
+            }
+            Step::ArgsSpread => {
+                let iterable = self.pop();
+                self.call_slow(self.sig_bool, Helper::ArgsSpread, &[iterable])?;
+                self.fall_through(index);
+            }
+            Step::Call { direct_eval } => {
+                // The vector `Call`: `[this, callee]` on the work stack, the
+                // arguments in `Vm::args`. The helper bridges both onto
+                // `vm.stack` and runs the interpreter's vector `do_call`.
+                let callee = self.pop();
+                let this = self.pop();
+                let direct_eval_imm = self
+                    .builder
+                    .ins()
+                    .iconst(types::I64, i64::from(*direct_eval));
+                let result = self.call_slow(
+                    self.sig_set_name,
+                    Helper::CallVector,
+                    &[this, callee, direct_eval_imm],
+                )?;
+                self.push(result);
+                self.fall_through(index);
+            }
             // Proper tail calls (Cut 45): the machine code hands the
             // callee/args to the `tail_call` helper and returns its result —
             // an ordinary certified callee replaces the current frame on the
             // Vm (the runtime loops on the new body), anything else is a
             // normal call whose result completes this body's return. The
             // JIT body always terminates here, so no `fall_through`.
+            Step::TailCall { direct_eval } => {
+                // Cut 49: the vector form — `[this, callee]` on the work
+                // stack, the arguments in `Vm::args`. The helper mirrors
+                // `tail_call` reading them from the vector.
+                let callee = self.pop();
+                let this = self.pop();
+                let direct_eval_imm = self
+                    .builder
+                    .ins()
+                    .iconst(types::I64, i64::from(*direct_eval));
+                let result = self.call_slow(
+                    self.sig_set_name,
+                    Helper::TailCallVector,
+                    &[this, callee, direct_eval_imm],
+                )?;
+                self.builder.ins().return_(&[result]);
+            }
             Step::TailCallFast { argc, direct_eval } => {
                 // `[..., this, callee, a1..aN]`.
                 let sp = self.builder.use_var(self.sp_var);

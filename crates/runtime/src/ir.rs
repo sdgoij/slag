@@ -2254,7 +2254,7 @@ pub struct Vm {
     array_index_stack: Vec<usize>,
     /// The argument-vector boundary of each in-progress call (nested calls
     /// push in order); the call step pops it and takes the appended slice.
-    args_base_stack: Vec<usize>,
+    pub(crate) args_base_stack: Vec<usize>,
     /// The call's arguments for the active body (Cut 3 continuation,
     /// unmapped arguments slice): set by the certified call when the body
     /// has an `arguments` slot, read by `Step::CreateArguments`. Distinct
@@ -7208,7 +7208,12 @@ impl Vm {
         crate::context::put_value(agent, &reference, value)
     }
 
-    fn do_call(&mut self, agent: &mut Agent, direct_eval: bool) -> Result<(), JsError> {
+    /// The `Step::Call` (vector-form) handler: the callee and receiver are on
+    /// the stack, the arguments in the Vm's vector (`ArgsBase`/`ArgsPush`/
+    /// `ArgsSpread` built them). `pub(crate)` for the JIT's `call_vector`
+    /// slow-path helper (which bridges the JIT buffer operands onto the
+    /// stack, exactly like `call_slow` does for `do_call_fast`).
+    pub(crate) fn do_call(&mut self, agent: &mut Agent, direct_eval: bool) -> Result<(), JsError> {
         let callee = self.pop();
         let this = self.pop();
         let base = self.args_base_stack.pop().ok_or_else(|| {

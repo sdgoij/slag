@@ -364,6 +364,11 @@ fn runtime_helpers() -> JitHelpers {
         new_target: Some(rt.new_target),
         regexp_literal: Some(rt.regexp_literal),
         tail_call: Some(rt.tail_call),
+        args_base: Some(rt.args_base),
+        args_push: Some(rt.args_push),
+        args_spread: Some(rt.args_spread),
+        call_vector: Some(rt.call_vector),
+        tail_call_vector: Some(rt.tail_call_vector),
     }
 }
 
@@ -485,6 +490,11 @@ mod tests {
             new_target: Some(helpers::test_new_target),
             regexp_literal: Some(helpers::test_regexp_literal),
             tail_call: Some(helpers::test_tail_call),
+            args_base: Some(helpers::test_args_base),
+            args_push: Some(helpers::test_args_push),
+            args_spread: Some(helpers::test_args_spread),
+            call_vector: Some(helpers::test_call_vector),
+            tail_call_vector: Some(helpers::test_tail_call_vector),
         }
     }
 
@@ -867,6 +877,50 @@ mod tests {
         assert_eq!(frame[1], 0xDEAD_BEEF_CAFE_F00D, "frame overrun");
         assert_eq!(stack[64], 0xDEAD_BEEF_CAFE_F00D, "stack overrun");
         assert_eq!(result, Value::Number(0.0).bits());
+    }
+
+    #[test]
+    fn vector_call_lowers_and_runs_the_helper() {
+        // Cut 49: the vector call form (`ArgsBase`/`ArgsPush` build the
+        // argument vector; `Call` runs it) lowers to the helpers — the test
+        // doubles return 53 from `call_vector`.
+        let engine = JitEngine::new().expect("native isa");
+        let body = make_body(
+            vec![
+                Step::Push(Value::Undefined),
+                Step::Push(Value::Number(9.0)),
+                Step::ArgsBase,
+                Step::Push(Value::Number(1.0)),
+                Step::ArgsPush,
+                Step::Push(Value::Number(2.0)),
+                Step::ArgsPush,
+                Step::Call { direct_eval: false },
+                Step::Return,
+            ],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(53.0).bits());
+    }
+
+    #[test]
+    fn vector_tail_call_lowers_and_returns_the_helper_result() {
+        // Cut 49: the vector `TailCall` terminates the body with the helper's
+        // result (54 from the test double).
+        let engine = JitEngine::new().expect("native isa");
+        let body = make_body(
+            vec![
+                Step::Push(Value::Undefined),
+                Step::Push(Value::Number(9.0)),
+                Step::ArgsBase,
+                Step::Push(Value::Number(1.0)),
+                Step::ArgsPush,
+                Step::TailCall { direct_eval: false },
+            ],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(54.0).bits());
     }
 
     #[test]
@@ -1269,6 +1323,50 @@ mod tests {
         });
         assert_eq!(value.as_number(), Some(2.0));
         assert!(compiled >= 2, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_three_arg_call() {
+        // Cut 49: a ≥3-argument call compiles through the vector form
+        // (`ArgsBase`/`ArgsPush`/`Call`) — the certified script's call to
+        // `f(1, 2, 3)` no longer bails the body to the interpreter.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script("function f(a, b, c) { return a + b + c; } f(1, 2, 3);")
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(6.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_spread_call() {
+        // Cut 49: `ArgsSpread` iterates the array into the argument vector.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script("function f(a, b, c) { return a + b + c; } f(...[1, 2, 3]);")
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(6.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_vector_tail_call_chain() {
+        // Cut 49: a ≥3-argument tail call compiles through the vector
+        // `TailCall` — the 100K-deep chain runs with bounded stack.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "\"use strict\";\n\
+                     function g(n, a, b, c) { if (n === 0) { return a + b + c; } \
+                       return g(n - 1, a + 1, b, c); }\n\
+                     g(100000, 0, 1, 2);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(100003.0));
+        assert!(compiled >= 1, "{compiled} bodies");
     }
 
     #[test]

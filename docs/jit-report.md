@@ -61,8 +61,9 @@ run paths:
 | 18 | *(worktree)* | **Proper tail calls** — `TailCallFast`/`TailCallFastGlobal`/`TailCallFastSlot` (strict-mode TCO; the sloppy form stays a normal call per spec) lower to a `tail_call` helper that mirrors `tail_call_shared`: an ordinary certified callee replaces the current frame on the Vm (`JitCallContext::tail` + `Vm::tail_replaced`), anything else is a normal call whose result completes the body's return. `run_compiled_body` loops on the replaced body with the same Vm, so a 100K-deep TCO chain never grows the native stack. |
 | 19 | *(worktree)* | **Self-tail-call as a jump** — `TailCallSelf` (Cut 46): a tail call whose callee is the enclosing named function expression's own immutable self-binding compiles to an in-place frame rebind + jump back to the body's re-entry block, so the whole self-recursive tail chain runs in ONE machine-code invocation (no `tail_call` helper, no `run_compiled_body` round-trip). The compiler emits it only for certified capture-free, arguments-free bodies with the self-name resolving to the `Env` walk; the interpreter's `tail_call_self` rebinds the frame and re-enters the dispatch loop for the same shape. Measured ~3.3× faster than the round-trip path on a 1M-iteration chain (37ms vs ~120ms). |
 | 20 | *(worktree)* | **Global-name self-tail-call check** — `TailCallSelfCheck` (Cut 47): a tail call to the enclosing function's own NAME in a body that is not a named expression (`function f(n) { return f(n - 1); }`) — the name resolves through the global/outer env and could have been reassigned, so the machine code compares the resolved callee against the running closure (`Vm::current_function` captured into `JitCallContext::current_function`, exact bits) and jumps to the re-entry block on a match, else runs the `tail_call` helper. The interpreter routes it through the shared `tail_call_shared` machinery. The 1M global-name chain drops from ~120ms to ~38ms, matching the static form. |
+| 21 | *(worktree)* | **Vector call form** (Cut 49): `ArgsBase`/`ArgsPush`/`ArgsSpread` and the vector `Call`/`TailCall` steps — a ≥3-argument or spread call (which previously bailed the whole body to the interpreter) — lower to helpers that build the argument vector in `Vm::args` and run the interpreter's vector handlers (`do_call`/`tail_call`), bridging the work-buffer operands like `call_slow`. A 3-arg loop compiles for the first time; a ≥3-arg TCO chain runs with bounded stack. |
 
-### Slow-path helper table (`JitSlowPaths`, 38 helpers)
+### Slow-path helper table (`JitSlowPaths`, 43 helpers)
 
 The JIT inlines the number/string fast paths (tag checks are ~2 instructions
 on NaN-boxed values); everything else calls a helper whose address is baked
@@ -77,8 +78,10 @@ into the machine code at compile time. The table: `binary_slow`,
 `update_ident`, `load_context`/`store_context`/`init_context`/`update_context`,
 `load_per_iter`/`store_per_iter`/`update_per_iter`,
 `create_function`/`create_arrow`/`create_function_decl`/`new_target`/
-`regexp_literal` (the step-index helpers), `tail_call` (proper tail calls). A
-body needing a `None` helper bails to the interpreter.
+`regexp_literal` (the step-index helpers), `tail_call` (proper tail calls),
+`args_base`/`args_push`/`args_spread`/`call_vector`/`tail_call_vector` (the
+vector call form, Cut 49). A body needing a `None` helper bails to the
+interpreter.
 
 ## 3. Fast-path machinery
 
@@ -220,14 +223,15 @@ containing any of these fall back entirely:
    descriptors, pool the prototype object) — the report frontier.
 7. **Extend the bail list**: `try/catch/finally`, `switch`, `with`, `using`,
    iterators, generators/async, destructuring/spread, class machinery, mapped
-   `arguments`, the vector call form (`ArgsBase`/`ArgsPush`/`ArgsSpread`) —
-   each is a slice of lowering + helper work. Proper tail calls are **done**
-   (Cut 45); a NAMED function expression's direct self-tail-call now
-   jumps in machine code (Cut 46) and a top-level/global-name self-recursion
-   (`function f(n) { return f(n-1); }`) jumps after an in-machine-code
-   identity check against the running closure (Cut 47) — only a computed
-   callee (`getF()(n-1)`) still pays the per-iteration `tail_call` helper
-   round-trip.
+   `arguments` — each is a slice of lowering + helper work. Proper tail calls
+   are **done** (Cut 45); the NAMED (Cut 46) and global-name (Cut 47)
+   self-tail-call forms jump in machine code; the **vector call form**
+   (≥3 args or a spread — `ArgsBase`/`ArgsPush`/`ArgsSpread` + the vector
+   `Call`/`TailCall`) is **done** (Cut 49), though a vector call to a
+   certified LEAF still runs the general `call_inner` (no leaf-inline — a
+   future slice could rebuild the fast-form layout in machine code). Only a
+   computed callee (`getF()(n-1)`) still pays the per-iteration `tail_call`
+   helper round-trip.
 8. **String concat**: the `concat_strings` helper is called per concat; very
    small strings could concat inline in registers.
 9. **Leaf-cache invalidation breadth**: any "disturbing" helper (a `valueOf`,

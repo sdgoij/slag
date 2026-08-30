@@ -60,6 +60,11 @@ pub enum Helper {
     NewTarget,
     RegExpLiteral,
     TailCall,
+    ArgsBase,
+    ArgsPush,
+    ArgsSpread,
+    CallVector,
+    TailCallVector,
 }
 
 impl Helper {
@@ -104,6 +109,11 @@ impl Helper {
             Helper::NewTarget => "new_target",
             Helper::RegExpLiteral => "regexp_literal",
             Helper::TailCall => "tail_call",
+            Helper::ArgsBase => "args_base",
+            Helper::ArgsPush => "args_push",
+            Helper::ArgsSpread => "args_spread",
+            Helper::CallVector => "call_vector",
+            Helper::TailCallVector => "tail_call_vector",
         }
     }
 
@@ -310,6 +320,16 @@ pub struct JitHelpers {
             direct_eval: u64,
         ) -> u64,
     >,
+    /// The vector call form (Cut 49): `Step::ArgsBase` records the argument
+    /// boundary; `ArgsPush`/`ArgsSpread` append to the Vm's argument vector;
+    /// the vector `Call`/`TailCall` steps run with those arguments.
+    pub args_base: Option<extern "C" fn(vm: *mut c_void) -> u64>,
+    pub args_push: Option<extern "C" fn(vm: *mut c_void, value: u64) -> u64>,
+    pub args_spread: Option<extern "C" fn(vm: *mut c_void, iterable: u64) -> u64>,
+    pub call_vector:
+        Option<extern "C" fn(vm: *mut c_void, this: u64, callee: u64, direct_eval: u64) -> u64>,
+    pub tail_call_vector:
+        Option<extern "C" fn(vm: *mut c_void, this: u64, callee: u64, direct_eval: u64) -> u64>,
 }
 
 impl JitHelpers {
@@ -355,6 +375,11 @@ impl JitHelpers {
             new_target: None,
             regexp_literal: None,
             tail_call: None,
+            args_base: None,
+            args_push: None,
+            args_spread: None,
+            call_vector: None,
+            tail_call_vector: None,
         }
     }
 
@@ -400,6 +425,11 @@ impl JitHelpers {
             Helper::NewTarget => self.new_target.map(|f| f as usize as u64),
             Helper::RegExpLiteral => self.regexp_literal.map(|f| f as usize as u64),
             Helper::TailCall => self.tail_call.map(|f| f as usize as u64),
+            Helper::ArgsBase => self.args_base.map(|f| f as usize as u64),
+            Helper::ArgsPush => self.args_push.map(|f| f as usize as u64),
+            Helper::ArgsSpread => self.args_spread.map(|f| f as usize as u64),
+            Helper::CallVector => self.call_vector.map(|f| f as usize as u64),
+            Helper::TailCallVector => self.tail_call_vector.map(|f| f as usize as u64),
         }
     }
 }
@@ -679,6 +709,36 @@ pub extern "C" fn test_tail_call(
     _direct_eval: u64,
 ) -> u64 {
     Value::Number(52.0).bits()
+}
+
+pub extern "C" fn test_args_base(_vm: *mut c_void) -> u64 {
+    0
+}
+
+pub extern "C" fn test_args_push(_vm: *mut c_void, _value: u64) -> u64 {
+    0
+}
+
+pub extern "C" fn test_args_spread(_vm: *mut c_void, _iterable: u64) -> u64 {
+    0
+}
+
+pub extern "C" fn test_call_vector(
+    _vm: *mut c_void,
+    _this: u64,
+    _callee: u64,
+    _direct_eval: u64,
+) -> u64 {
+    Value::Number(53.0).bits()
+}
+
+pub extern "C" fn test_tail_call_vector(
+    _vm: *mut c_void,
+    _this: u64,
+    _callee: u64,
+    _direct_eval: u64,
+) -> u64 {
+    Value::Number(54.0).bits()
 }
 
 /// Sums its numeric arguments — proves the `args` pointer/`argc` ABI the
