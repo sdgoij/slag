@@ -214,6 +214,11 @@ pub struct JitCallContext {
     /// reassigned to a different closure). `0` when no function is running
     /// (a body that can contain the check always runs with one).
     pub current_function: u64,
+    /// Cut 55: a control-transfer dispatch that completed the body (a
+    /// `return` reaching the end of the finally chain) carries the body's
+    /// result value here — the dispatch helpers signal `DISPATCH_DONE` and
+    /// the compiled code returns this field's bits instead of a step target.
+    pub dispatch_value: u64,
 }
 
 /// A direct-mapped global-value cell the compiled `LoadGlobal`/`StoreGlobal`
@@ -544,6 +549,45 @@ pub struct JitSlowPaths {
     /// 1 = `StoreMemberName.value`, 2 = `GetMemberComputed(.Local).key`,
     /// 3/4 = `StoreMemberComputed.key/value`).
     pub load_const: extern "C" fn(ctx: *mut c_void, step: u64, op: u64, field: u64) -> u64,
+    /// `Step::EnterBlock` (Cut 55): push a declarative block environment and
+    /// instantiate its declarations; `decls` are read back from the running
+    /// body at `step`.
+    pub enter_block: extern "C" fn(ctx: *mut c_void, step: u64) -> u64,
+    /// `Step::LeaveBlock` (Cut 55): pop the block environment.
+    pub leave_block: extern "C" fn(ctx: *mut c_void) -> u64,
+    /// `Step::EnterTry` (Cut 55): push a `TryFrame` for `handler`.
+    pub enter_try: extern "C" fn(ctx: *mut c_void, handler: u64) -> u64,
+    /// `Step::Exit` (Cut 55): run `control_transfer` with `Ctl::Normal`;
+    /// returns the target step index to jump to.
+    pub exit_try: extern "C" fn(ctx: *mut c_void, ip: u64, after: u64) -> u64,
+    /// `Step::Return` in a try body (Cut 55): run `control_transfer` with
+    /// `Ctl::Return`; a finally interception returns its step, a completed
+    /// body signals `DISPATCH_DONE` with the value in `dispatch_value`.
+    pub return_control: extern "C" fn(ctx: *mut c_void, ip: u64, value: u64) -> u64,
+    /// `Step::Break` (Cut 55): `control_transfer` with `Ctl::Break`; returns
+    /// the target step.
+    pub break_control: extern "C" fn(ctx: *mut c_void, ip: u64, target: u64) -> u64,
+    /// `Step::Continue` (Cut 55): `control_transfer` with `Ctl::Continue`;
+    /// returns the target step.
+    pub continue_control: extern "C" fn(ctx: *mut c_void, ip: u64, target: u64) -> u64,
+    /// `Step::Throw` (Cut 55): run `throw_machinery`; a catch/finally
+    /// interception returns its step, an escaping throw sets the pending
+    /// error (with the thrown value attached) and signals `DISPATCH_PROPAGATE`.
+    pub throw_control: extern "C" fn(ctx: *mut c_void, ip: u64, value: u64) -> u64,
+    /// `Step::FinallyEnd` (Cut 55): pop the pending control and re-apply it
+    /// (routing through any further finally/catch); returns the target step,
+    /// `DISPATCH_DONE` (a completed return), or `DISPATCH_PROPAGATE` (an
+    /// escaping throw).
+    pub finally_end: extern "C" fn(ctx: *mut c_void, ip: u64) -> u64,
+    /// `Step::CatchBind` (Cut 55): bind the catch parameter and instantiate
+    /// the catch body's declarations; the parameter is read back from the
+    /// running body at `step`.
+    pub catch_bind: extern "C" fn(ctx: *mut c_void, step: u64) -> u64,
+    /// The pending-error dispatch (Cut 55): route the context's pending
+    /// `JsError` through `throw_machinery` as a thrown value; returns the
+    /// catch/finally step, or `DISPATCH_PROPAGATE` when the throw escapes
+    /// the body (the pending error is re-set with the value attached).
+    pub dispatch_error: extern "C" fn(ctx: *mut c_void, ip: u64) -> u64,
 }
 
 /// The runtime's slow-path table, installed into every `JitHook`.
@@ -612,6 +656,17 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     concat_str_const,
     push_const,
     load_const,
+    enter_block,
+    leave_block,
+    enter_try,
+    exit_try,
+    return_control,
+    break_control,
+    continue_control,
+    throw_control,
+    finally_end,
+    catch_bind,
+    dispatch_error,
 };
 
 /// The slack (in slots) reserved above a compiled body's working area on the
@@ -1345,6 +1400,7 @@ fn step_at(ctx: &JitCallContext, step: u64) -> Option<&crate::ir::Step> {
 extern "C" fn create_function(ctx: *mut c_void, step: u64) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
     let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
     let Some(crate::ir::Step::CreateFunction {
         function,
         strict,
@@ -1356,13 +1412,11 @@ extern "C" fn create_function(ctx: *mut c_void, step: u64) -> u64 {
         // internal invariant violation.
         unreachable!("create_function on a non-CreateFunction step");
     };
-    let env = agent.running_context().ok().map(|c| c.lexical_environment);
-    let Some(env) = env else {
-        return slow_error(
-            ctx,
-            JsError::new(ErrorKind::TypeError, "no running context".into()),
-        );
-    };
+    // The Vm's lexical env is the authoritative running environment during
+    // a JIT run: the interpreter's per-step context-env sync (skipped by
+    // the JIT) keeps the agent context current, so reading the context
+    // here would capture a STALE env after a block/catch pushed one.
+    let env = vm.lexical_env;
     match crate::function::instantiate_function_expression(
         agent,
         function,
@@ -1379,6 +1433,7 @@ extern "C" fn create_function(ctx: *mut c_void, step: u64) -> u64 {
 extern "C" fn create_arrow(ctx: *mut c_void, step: u64) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
     let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
     let Some(crate::ir::Step::CreateArrow {
         is_async,
         params,
@@ -1390,13 +1445,7 @@ extern "C" fn create_arrow(ctx: *mut c_void, step: u64) -> u64 {
     else {
         unreachable!("create_arrow on a non-CreateArrow step");
     };
-    let env = agent.running_context().ok().map(|c| c.lexical_environment);
-    let Some(env) = env else {
-        return slow_error(
-            ctx,
-            JsError::new(ErrorKind::TypeError, "no running context".into()),
-        );
-    };
+    let env = vm.lexical_env;
     match crate::function::instantiate_arrow(
         agent,
         *is_async,
@@ -1427,13 +1476,7 @@ extern "C" fn create_function_decl(ctx: *mut c_void, step: u64) -> u64 {
     else {
         unreachable!("create_function_decl on a non-FunctionDeclInit step");
     };
-    let env = agent.running_context().ok().map(|c| c.lexical_environment);
-    let Some(env) = env else {
-        return slow_error(
-            ctx,
-            JsError::new(ErrorKind::TypeError, "no running context".into()),
-        );
-    };
+    let env = vm.lexical_env;
     let value = match crate::function::instantiate_function(
         agent,
         function,
@@ -2196,6 +2239,342 @@ fn reg_const(operand: &crate::ir::RegOperand) -> Value {
     }
 }
 
+// ----- Cut 55: try/catch/finally and the control-transfer dispatch -----
+
+/// The control-dispatch helpers' return encoding: a value below
+/// `DISPATCH_PROPAGATE` is the step index the machine code jumps to; the
+/// sentinels signal a body-completing outcome (`DISPATCH_DONE` carries the
+/// result in `dispatch_value`, `DISPATCH_PROPAGATE` re-raises the pending
+/// error — the compiled code returns and the runtime surfaces it).
+const DISPATCH_PROPAGATE: u64 = u64::MAX;
+const DISPATCH_DONE: u64 = u64::MAX - 1;
+
+/// A thrown value escaping the body becomes the same `JsError` the
+/// interpreter's `body_completion_to_value` produces — the attached value
+/// round-trips through the caller's `to_throwable`, so an enclosing catch
+/// observes the original thrown value.
+fn throw_value_error(value: Value) -> JsError {
+    JsError::new(ErrorKind::TypeError, format!("Uncaught {value:?}")).with_value(value)
+}
+
+/// Interpret a `control_transfer`/`throw_machinery` result for the compiled
+/// dispatch: `Continue` returns the step the machinery set `vm.ip` to; a
+/// completing return/throw maps to `DISPATCH_DONE`/`DISPATCH_PROPAGATE`;
+/// an internal error reports through the context.
+fn dispatch_result(
+    ctx: &mut JitCallContext,
+    vm: &mut Vm,
+    result: Result<crate::ir::CtlResult, JsError>,
+) -> u64 {
+    match result {
+        Ok(crate::ir::CtlResult::Continue) => vm.ip as u64,
+        Ok(crate::ir::CtlResult::Done(crate::ir::VmOutcome::Completed(
+            crate::flow::Completion::Return(value),
+        ))) => {
+            ctx.dispatch_value = value.bits();
+            DISPATCH_DONE
+        }
+        Ok(crate::ir::CtlResult::Done(crate::ir::VmOutcome::Completed(
+            crate::flow::Completion::Throw(value),
+        ))) => {
+            ctx.pending = true;
+            ctx.error = Some(throw_value_error(value));
+            DISPATCH_PROPAGATE
+        }
+        Ok(crate::ir::CtlResult::Done(_)) => {
+            unreachable!("control transfer cannot suspend")
+        }
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn enter_block(ctx: *mut c_void, step: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let body = unsafe { &*ctx.body };
+    let Some(crate::ir::Step::EnterBlock { decls }) = step_at(ctx, step) else {
+        unreachable!("enter_block on a non-EnterBlock step");
+    };
+    let env = crate::env::new_declarative_environment(Some(vm.lexical_env));
+    if let Err(error) = crate::eval::block_declaration_instantiation(agent, decls, &env, vm.strict)
+    {
+        return slow_error(ctx, error);
+    }
+    // A certified body's closures resolve captures through the static
+    // context chain (see the interpreter's `EnterBlock` arm): the block env
+    // is scaffolding to them, so it is marked context-transparent.
+    if body.scope.is_some()
+        && let crate::env::EnvRecord::Declarative(declarative) = &*env
+    {
+        declarative.mark_context_transparent();
+    }
+    vm.lexical_env = env;
+    vm.env_stack.push(env);
+    Value::Undefined.bits()
+}
+
+extern "C" fn leave_block(ctx: *mut c_void) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let vm = unsafe { &mut *ctx.vm };
+    let Some(popped) = vm.env_stack.pop() else {
+        return slow_error(
+            ctx,
+            JsError::new(ErrorKind::SyntaxError, "Environment stack underflow".into()),
+        );
+    };
+    // A certified body contains no `using` declarations (those steps bail),
+    // so the popped env's disposable resources are always empty.
+    debug_assert!(
+        popped.drain_disposable_resources().is_empty(),
+        "a certified JIT body cannot contain using declarations"
+    );
+    vm.lexical_env = popped.outer().unwrap_or(popped);
+    Value::Undefined.bits()
+}
+
+extern "C" fn enter_try(ctx: *mut c_void, handler: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let vm = unsafe { &mut *ctx.vm };
+    vm.try_stack.push(crate::ir::TryFrame {
+        handler: handler as usize,
+        saved_env: vm.lexical_env,
+        env_depth: vm.env_stack.len(),
+    });
+    Value::Undefined.bits()
+}
+
+extern "C" fn exit_try(ctx: *mut c_void, ip: u64, after: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let body = unsafe { &*ctx.body };
+    vm.ip = ip as usize;
+    let result = vm.control_transfer(
+        agent,
+        body,
+        crate::ir::Ctl::Normal {
+            after: after as usize,
+        },
+    );
+    dispatch_result(ctx, vm, result)
+}
+
+extern "C" fn return_control(ctx: *mut c_void, ip: u64, value: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let body = unsafe { &*ctx.body };
+    vm.ip = ip as usize;
+    let result = vm.control_transfer(
+        agent,
+        body,
+        crate::ir::Ctl::Return {
+            value: Value::from_bits(value),
+        },
+    );
+    dispatch_result(ctx, vm, result)
+}
+
+extern "C" fn break_control(ctx: *mut c_void, ip: u64, target: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let body = unsafe { &*ctx.body };
+    vm.ip = ip as usize;
+    let result = vm.control_transfer(
+        agent,
+        body,
+        crate::ir::Ctl::Break {
+            target: target as usize,
+        },
+    );
+    dispatch_result(ctx, vm, result)
+}
+
+extern "C" fn continue_control(ctx: *mut c_void, ip: u64, target: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let body = unsafe { &*ctx.body };
+    vm.ip = ip as usize;
+    let result = vm.control_transfer(
+        agent,
+        body,
+        crate::ir::Ctl::Continue {
+            target: target as usize,
+        },
+    );
+    dispatch_result(ctx, vm, result)
+}
+
+extern "C" fn throw_control(ctx: *mut c_void, ip: u64, value: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let body = unsafe { &*ctx.body };
+    vm.ip = ip as usize;
+    let result = vm.throw_machinery(agent, body, Value::from_bits(value));
+    dispatch_result(ctx, vm, result)
+}
+
+extern "C" fn finally_end(ctx: *mut c_void, ip: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let body = unsafe { &*ctx.body };
+    vm.ip = ip as usize;
+    // Mirrors the interpreter's `FinallyEnd` handler: pop the pending
+    // control, restore to its recorded environment, then re-apply it
+    // (a pending throw routes through `throw_machinery` so a covering catch
+    // in the same body still runs).
+    let Some(pending) = vm.pending.pop() else {
+        return slow_error(
+            ctx,
+            JsError::new(
+                ErrorKind::SyntaxError,
+                "FinallyEnd without a pending control".into(),
+            ),
+        );
+    };
+    match pending {
+        crate::ir::PendingControl::Normal { after, env, depth } => {
+            vm.restore_env(env, depth);
+            let result = vm.control_transfer(agent, body, crate::ir::Ctl::Normal { after });
+            dispatch_result(ctx, vm, result)
+        }
+        crate::ir::PendingControl::Break { target, env, depth } => {
+            vm.restore_env(env, depth);
+            let result = vm.control_transfer(agent, body, crate::ir::Ctl::Break { target });
+            dispatch_result(ctx, vm, result)
+        }
+        crate::ir::PendingControl::Continue { target, env, depth } => {
+            vm.restore_env(env, depth);
+            let result = vm.control_transfer(agent, body, crate::ir::Ctl::Continue { target });
+            dispatch_result(ctx, vm, result)
+        }
+        crate::ir::PendingControl::Return { value, env, depth } => {
+            vm.restore_env(env, depth);
+            let result = vm.control_transfer(agent, body, crate::ir::Ctl::Return { value });
+            dispatch_result(ctx, vm, result)
+        }
+        crate::ir::PendingControl::Throw { value, env, depth } => {
+            vm.restore_env(env, depth);
+            let result = vm.throw_machinery(agent, body, value);
+            dispatch_result(ctx, vm, result)
+        }
+    }
+}
+
+extern "C" fn catch_bind(ctx: *mut c_void, step: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let body = unsafe { &*ctx.body };
+    let Some(crate::ir::Step::CatchBind { param, decls }) = step_at(ctx, step) else {
+        unreachable!("catch_bind on a non-CatchBind step");
+    };
+    // A caught throw discarded the try block's envs: restore to the try
+    // entry state (a certified body's envs hold no `using` resources, so
+    // there is nothing to dispose) before binding the parameter.
+    if let Some((saved_env, depth)) = vm.pending_catch_disposal.take() {
+        vm.restore_env(saved_env, depth);
+    }
+    let thrown = vm.thrown.take().unwrap_or(Value::Undefined);
+    let old_env = vm.lexical_env;
+    let env = crate::env::new_declarative_environment(Some(old_env));
+    // A certified body's closures resolve captures through the static
+    // context chain (see the interpreter's `CatchBind` arm): its catch envs
+    // are scaffolding to them, so all three are marked context-transparent.
+    if body.scope.is_some()
+        && let crate::env::EnvRecord::Declarative(declarative) = &*env
+    {
+        declarative.mark_context_transparent();
+    }
+    let body_env = match param {
+        Some(param) => {
+            let param_env = crate::env::new_declarative_environment(Some(env));
+            // Annex B.3.5: a direct eval's var-vs-lexical walk skips the
+            // catch parameter's environment.
+            param_env.mark_catch_param_env();
+            if body.scope.is_some()
+                && let crate::env::EnvRecord::Declarative(declarative) = &*param_env
+            {
+                declarative.mark_context_transparent();
+            }
+            vm.env_stack.push(env);
+            let mut names = Vec::new();
+            crate::script::bound_names(param, &mut names);
+            for name in &names {
+                if let Err(error) = param_env.create_mutable_binding(name, false) {
+                    return slow_error(ctx, error);
+                }
+            }
+            // The parameter environment is the running environment while
+            // the default initializers run, so a closure captures the
+            // parameter (spec 15.1.7 step 7).
+            if let Ok(context) = agent.running_context_mut() {
+                context.lexical_environment = param_env;
+            }
+            if let Err(error) = crate::binding::binding_initialization(
+                agent,
+                param,
+                thrown,
+                Some(&param_env),
+                vm.strict,
+            ) {
+                return slow_error(ctx, error);
+            }
+            vm.env_stack.push(param_env);
+            crate::env::new_declarative_environment(Some(param_env))
+        }
+        None => env,
+    };
+    if body.scope.is_some()
+        && let crate::env::EnvRecord::Declarative(declarative) = &*body_env
+    {
+        declarative.mark_context_transparent();
+    }
+    if let Err(error) =
+        crate::eval::block_declaration_instantiation(agent, decls, &body_env, vm.strict)
+    {
+        return slow_error(ctx, error);
+    }
+    vm.lexical_env = body_env;
+    vm.env_stack.push(body_env);
+    // A certified body's catch parameter is a flat frame slot (the scope
+    // scan allocates it): write the thrown value so the slot reads in the
+    // catch body see it.
+    if let Some(scope) = &body.scope
+        && let Some(param) = param
+        && let syntax::ast::BindingPattern::Ident(name) = param
+        && let Some(slot) = scope.slots.get(name)
+    {
+        *vm.frame_get_mut(*slot) = thrown;
+    }
+    Value::Undefined.bits()
+}
+
+extern "C" fn dispatch_error(ctx: *mut c_void, ip: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let body = unsafe { &*ctx.body };
+    // Consume the pending error (a covered error dispatches to the catch /
+    // finally; an uncovered one re-sets the pending error and signals the
+    // propagate sentinel so the machine code returns and the runtime
+    // surfaces it). Mirrors `run_inner_impl`'s Err arm for a covered error.
+    let error = ctx.error.take().expect("a pending JIT error is present");
+    ctx.pending = false;
+    let value = match crate::builtins::error::to_throwable(agent, &error) {
+        Ok(value) => value,
+        Err(_) => crate::ir::error_message_value(&error),
+    };
+    vm.ip = ip as usize;
+    let result = vm.throw_machinery(agent, body, value);
+    dispatch_result(ctx, vm, result)
+}
+
 extern "C" fn init_context(ctx: *mut c_void, index: u64, value: u64) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
     let vm = unsafe { &mut *ctx.vm };
@@ -2561,6 +2940,7 @@ pub(crate) fn run_jit_body(
         body: std::rc::Rc::as_ptr(ir),
         tail: false,
         current_function: vm.current_function.map(|value| value.bits()).unwrap_or(0),
+        dispatch_value: 0,
     };
     // Register the vm (its trace covers `vm.frame`, `vm.stack`, and any
     // nested leaf jit roots) plus the working area for the call's duration:

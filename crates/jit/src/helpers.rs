@@ -85,6 +85,17 @@ pub enum Helper {
     ConcatStrConst,
     PushConst,
     LoadConst,
+    EnterBlock,
+    LeaveBlock,
+    EnterTry,
+    ExitTry,
+    ReturnControl,
+    BreakControl,
+    ContinueControl,
+    ThrowControl,
+    FinallyEnd,
+    CatchBind,
+    DispatchError,
 }
 
 impl Helper {
@@ -154,6 +165,17 @@ impl Helper {
             Helper::ConcatStrConst => "concat_str_const",
             Helper::PushConst => "push_const",
             Helper::LoadConst => "load_const",
+            Helper::EnterBlock => "enter_block",
+            Helper::LeaveBlock => "leave_block",
+            Helper::EnterTry => "enter_try",
+            Helper::ExitTry => "exit_try",
+            Helper::ReturnControl => "return_control",
+            Helper::BreakControl => "break_control",
+            Helper::ContinueControl => "continue_control",
+            Helper::ThrowControl => "throw_control",
+            Helper::FinallyEnd => "finally_end",
+            Helper::CatchBind => "catch_bind",
+            Helper::DispatchError => "dispatch_error",
         }
     }
 
@@ -422,6 +444,24 @@ pub struct JitHelpers {
     /// `RegOperand::Const`): read the value from the running body's register
     /// op at `(step, op)`, `field` selecting the const-bearing field.
     pub load_const: Option<extern "C" fn(vm: *mut c_void, step: u64, op: u64, field: u64) -> u64>,
+    /// try/catch/finally and control-transfer steps (Cut 55): `EnterBlock`
+    /// pushes a block env; `LeaveBlock` pops it; `EnterTry` pushes a
+    /// `TryFrame`; `Exit`/`ReturnControl`/`BreakControl`/`ContinueControl`/
+    /// `ThrowControl`/`FinallyEnd` run the control-transfer machinery and
+    /// return the target step (or a completion sentinel); `CatchBind` binds
+    /// the catch parameter; `DispatchError` routes a pending engine error
+    /// through the handler table.
+    pub enter_block: Option<extern "C" fn(vm: *mut c_void, step: u64) -> u64>,
+    pub leave_block: Option<extern "C" fn(vm: *mut c_void) -> u64>,
+    pub enter_try: Option<extern "C" fn(vm: *mut c_void, handler: u64) -> u64>,
+    pub exit_try: Option<extern "C" fn(vm: *mut c_void, ip: u64, after: u64) -> u64>,
+    pub return_control: Option<extern "C" fn(vm: *mut c_void, ip: u64, value: u64) -> u64>,
+    pub break_control: Option<extern "C" fn(vm: *mut c_void, ip: u64, target: u64) -> u64>,
+    pub continue_control: Option<extern "C" fn(vm: *mut c_void, ip: u64, target: u64) -> u64>,
+    pub throw_control: Option<extern "C" fn(vm: *mut c_void, ip: u64, value: u64) -> u64>,
+    pub finally_end: Option<extern "C" fn(vm: *mut c_void, ip: u64) -> u64>,
+    pub catch_bind: Option<extern "C" fn(vm: *mut c_void, step: u64) -> u64>,
+    pub dispatch_error: Option<extern "C" fn(vm: *mut c_void, ip: u64) -> u64>,
 }
 
 impl JitHelpers {
@@ -492,6 +532,17 @@ impl JitHelpers {
             concat_str_const: None,
             push_const: None,
             load_const: None,
+            enter_block: None,
+            leave_block: None,
+            enter_try: None,
+            exit_try: None,
+            return_control: None,
+            break_control: None,
+            continue_control: None,
+            throw_control: None,
+            finally_end: None,
+            catch_bind: None,
+            dispatch_error: None,
         }
     }
 
@@ -566,6 +617,17 @@ impl JitHelpers {
             Helper::ConcatStrConst => self.concat_str_const.map(|f| f as usize as u64),
             Helper::PushConst => self.push_const.map(|f| f as usize as u64),
             Helper::LoadConst => self.load_const.map(|f| f as usize as u64),
+            Helper::EnterBlock => self.enter_block.map(|f| f as usize as u64),
+            Helper::LeaveBlock => self.leave_block.map(|f| f as usize as u64),
+            Helper::EnterTry => self.enter_try.map(|f| f as usize as u64),
+            Helper::ExitTry => self.exit_try.map(|f| f as usize as u64),
+            Helper::ReturnControl => self.return_control.map(|f| f as usize as u64),
+            Helper::BreakControl => self.break_control.map(|f| f as usize as u64),
+            Helper::ContinueControl => self.continue_control.map(|f| f as usize as u64),
+            Helper::ThrowControl => self.throw_control.map(|f| f as usize as u64),
+            Helper::FinallyEnd => self.finally_end.map(|f| f as usize as u64),
+            Helper::CatchBind => self.catch_bind.map(|f| f as usize as u64),
+            Helper::DispatchError => self.dispatch_error.map(|f| f as usize as u64),
         }
     }
 }
@@ -992,6 +1054,53 @@ pub extern "C" fn test_push_const(_vm: *mut c_void, _step: u64) -> u64 {
 /// `load_const` double: returns 82 (the register body's heap constant).
 pub extern "C" fn test_load_const(_vm: *mut c_void, _step: u64, _op: u64, _field: u64) -> u64 {
     Value::Number(82.0).bits()
+}
+
+/// Cut 55 control-dispatch doubles: each returns a fixed marker value (the
+/// scaffolds that exercise them never reach a real dispatch — they prove the
+/// call ABI).
+pub extern "C" fn test_enter_block(_vm: *mut c_void, _step: u64) -> u64 {
+    Value::Number(83.0).bits()
+}
+
+pub extern "C" fn test_leave_block(_vm: *mut c_void) -> u64 {
+    Value::Number(84.0).bits()
+}
+
+pub extern "C" fn test_enter_try(_vm: *mut c_void, _handler: u64) -> u64 {
+    Value::Number(85.0).bits()
+}
+
+pub extern "C" fn test_exit_try(_vm: *mut c_void, _ip: u64, _after: u64) -> u64 {
+    Value::Number(86.0).bits()
+}
+
+pub extern "C" fn test_return_control(_vm: *mut c_void, _ip: u64, value: u64) -> u64 {
+    value
+}
+
+pub extern "C" fn test_break_control(_vm: *mut c_void, _ip: u64, target: u64) -> u64 {
+    target
+}
+
+pub extern "C" fn test_continue_control(_vm: *mut c_void, _ip: u64, target: u64) -> u64 {
+    target
+}
+
+pub extern "C" fn test_throw_control(_vm: *mut c_void, _ip: u64, value: u64) -> u64 {
+    value
+}
+
+pub extern "C" fn test_finally_end(_vm: *mut c_void, _ip: u64) -> u64 {
+    Value::Number(87.0).bits()
+}
+
+pub extern "C" fn test_catch_bind(_vm: *mut c_void, _step: u64) -> u64 {
+    Value::Number(88.0).bits()
+}
+
+pub extern "C" fn test_dispatch_error(_vm: *mut c_void, _ip: u64) -> u64 {
+    Value::Number(89.0).bits()
 }
 
 /// Sums its numeric arguments — proves the `args` pointer/`argc` ABI the

@@ -1904,7 +1904,7 @@ impl EnvStack {
     }
 
     #[inline]
-    fn push(&mut self, env: EnvRef) {
+    pub(crate) fn push(&mut self, env: EnvRef) {
         if self.len < ENV_INLINE {
             self.inline[self.len] = Some(env);
         } else {
@@ -1914,7 +1914,7 @@ impl EnvStack {
     }
 
     #[inline]
-    fn pop(&mut self) -> Option<EnvRef> {
+    pub(crate) fn pop(&mut self) -> Option<EnvRef> {
         if self.len == 0 {
             return None;
         }
@@ -1927,7 +1927,7 @@ impl EnvStack {
     }
 
     #[inline]
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.len
     }
 
@@ -3617,7 +3617,7 @@ impl Vm {
         })
     }
 
-    fn restore_env(&mut self, env: EnvRef, depth: usize) {
+    pub(crate) fn restore_env(&mut self, env: EnvRef, depth: usize) {
         // A control transfer's leave_scopes may have pre-popped envs a
         // finally's frame restore must re-establish: the finally body runs
         // with the try-entry environment stack intact so its own abrupt
@@ -5486,6 +5486,19 @@ impl Vm {
                     let old_env = self.lexical_env;
                     let env = new_declarative_environment(Some(old_env));
                     block_declaration_instantiation(agent, decls, &env, self.strict)?;
+                    // A certified body's closures resolve captured bindings
+                    // through the static context chain, not these envs (the
+                    // flat slot/context layout is authoritative), so the
+                    // block env is scaffolding to them — mark it
+                    // context-transparent like a per-iteration env so a
+                    // closure created inside the block (a `try` block, whose
+                    // `EnterBlock` is always emitted) still reaches its
+                    // capture context. The env path keeps it visible.
+                    if body.scope.is_some()
+                        && let EnvRecord::Declarative(declarative) = &*env
+                    {
+                        declarative.mark_context_transparent();
+                    }
                     self.lexical_env = env;
                     self.env_stack.push(env);
                 }
@@ -5576,12 +5589,28 @@ impl Vm {
                     // the stack so the body's LeaveBlock(s) unwind back to
                     // `old_env` — otherwise the parameter environment would
                     // stay active after the catch, leaking its bindings.
+                    // A certified body's closures resolve captures through the
+                    // static context chain, so its catch envs are scaffolding
+                    // to them — mark them context-transparent (like a
+                    // per-iteration env) so a closure created inside the catch
+                    // still reaches its capture context. The env path keeps
+                    // them visible.
+                    if body.scope.is_some()
+                        && let EnvRecord::Declarative(declarative) = &*env
+                    {
+                        declarative.mark_context_transparent();
+                    }
                     let body_env = match &param {
                         Some(param) => {
                             let param_env = new_declarative_environment(Some(env));
                             // Annex B.3.5: a direct eval's var-vs-lexical walk
                             // skips the catch parameter's environment.
                             param_env.mark_catch_param_env();
+                            if body.scope.is_some()
+                                && let EnvRecord::Declarative(declarative) = &*param_env
+                            {
+                                declarative.mark_context_transparent();
+                            }
                             self.env_stack.push(env);
                             let mut names = Vec::new();
                             crate::script::bound_names(param, &mut names);
@@ -5607,9 +5636,26 @@ impl Vm {
                         }
                         None => env,
                     };
+                    if body.scope.is_some()
+                        && let EnvRecord::Declarative(declarative) = &*body_env
+                    {
+                        declarative.mark_context_transparent();
+                    }
                     block_declaration_instantiation(agent, decls, &body_env, self.strict)?;
                     self.lexical_env = body_env;
                     self.env_stack.push(body_env);
+                    // A certified body's catch parameter lives in a flat frame
+                    // slot (the scope scan allocates it; a captured or
+                    // destructuring parameter keeps the body on the env path):
+                    // write the thrown value so the slot reads in the catch
+                    // body see it.
+                    if let Some(scope) = &body.scope
+                        && let Some(param) = param
+                        && let BindingPattern::Ident(name) = param
+                        && let Some(slot) = scope.slots.get(name)
+                    {
+                        *self.frame_get_mut(*slot) = thrown;
+                    }
                 }
                 Step::FinallyEnd => {
                     let pending = self.pending.pop().ok_or_else(|| {
@@ -9052,6 +9098,7 @@ impl Vm {
             body: std::rc::Rc::as_ptr(ir),
             tail: false,
             current_function: 0,
+            dispatch_value: 0,
         };
         let frame_ptr = buf.as_mut_ptr() as *mut std::os::raw::c_void;
         // SAFETY: `buf` has `frame_size + stack_usage + slack` slots.
@@ -9465,7 +9512,7 @@ impl Vm {
 
     /// The control-transfer machinery: route through pending finallys, then
     /// apply the control.
-    fn control_transfer(
+    pub(crate) fn control_transfer(
         &mut self,
         agent: &mut Agent,
         body: &CompiledBody,
@@ -9611,7 +9658,11 @@ impl Vm {
 
     /// The innermost try frame the control leaves, with its finally target
     /// (or `None` when the frame has no finally).
-    fn find_finally_frame(&self, body: &CompiledBody, ctl: &Ctl) -> Option<(usize, Option<usize>)> {
+    pub(crate) fn find_finally_frame(
+        &self,
+        body: &CompiledBody,
+        ctl: &Ctl,
+    ) -> Option<(usize, Option<usize>)> {
         for (i, frame) in self.try_stack.iter().enumerate().rev() {
             let handler = body.handlers.get(frame.handler)?;
             let covered_end = handler.catch.map(|c| c.end).unwrap_or(handler.try_end);
@@ -9638,7 +9689,7 @@ impl Vm {
     }
 
     /// The throw machinery: dispatch to a catch or route through finallys.
-    fn throw_machinery(
+    pub(crate) fn throw_machinery(
         &mut self,
         agent: &mut Agent,
         body: &CompiledBody,
@@ -9857,7 +9908,7 @@ pub(crate) fn string_units_of(value: &Value) -> Vec<u16> {
     }
 }
 
-fn error_message_value(error: &JsError) -> Value {
+pub(crate) fn error_message_value(error: &JsError) -> Value {
     Value::String(Handle::new(JsString::from_utf8(&error.message)))
 }
 
@@ -17735,9 +17786,69 @@ impl FastScopeScan {
                     result
                 }
             }
+            StmtKind::Try {
+                block,
+                handler,
+                finalizer,
+            } => {
+                // The try block is a block scope at depth + 1.
+                self.block_names_stack.push(HashSet::new());
+                let try_ok = self.stmts(&block.stmts, depth + 1);
+                self.block_names_stack.pop();
+                // The catch binds its parameter in a scope of its own (the
+                // parameter env sits between the block env and the body env).
+                // A simple Ident parameter gets a flat slot, written by
+                // `CatchBind` at catch entry — its per-entry freshness is
+                // unobservable without closures, so a captured parameter
+                // (whose closure must see the fresh binding) and a
+                // destructuring parameter (the pattern bindings need the env
+                // machinery) keep the body on the env path. The catch body is
+                // scanned one depth deeper than the try block so a try-block
+                // reference to the parameter bails (it is not in scope there).
+                let catch_ok = match handler {
+                    None => true,
+                    Some(handler) => {
+                        if let Some(param) = &handler.param {
+                            let BindingPattern::Ident(name) = param else {
+                                return false;
+                            };
+                            if self.captured.contains(name)
+                                || self.slots.contains_key(name)
+                                || self.context_slots.contains_key(name)
+                            {
+                                return false;
+                            }
+                            let slot = self.next_slot;
+                            self.tdz.push(false);
+                            self.next_slot += 1;
+                            self.slots.insert(*name, slot);
+                            self.declared_depth.insert(*name, depth + 2);
+                        }
+                        self.block_names_stack.push(HashSet::new());
+                        if let Some(param) = &handler.param
+                            && let BindingPattern::Ident(name) = param
+                            && let Some(top) = self.block_names_stack.last_mut()
+                        {
+                            // The parameter shadows a same-name block function
+                            // declaration in the catch body (it is a lexical
+                            // binding in the enclosing scope).
+                            top.insert(*name);
+                        }
+                        let body_ok = self.stmts(&handler.body.stmts, depth + 2);
+                        self.block_names_stack.pop();
+                        body_ok
+                    }
+                };
+                let finalizer_ok = finalizer.as_ref().is_none_or(|f| {
+                    self.block_names_stack.push(HashSet::new());
+                    let ok = self.stmts(&f.stmts, depth + 1);
+                    self.block_names_stack.pop();
+                    ok
+                });
+                try_ok && catch_ok && finalizer_ok
+            }
             StmtKind::UsingDecl { .. }
             | StmtKind::ClassDecl(_)
-            | StmtKind::Try { .. }
             | StmtKind::Switch { .. }
             | StmtKind::With { .. } => false,
         }

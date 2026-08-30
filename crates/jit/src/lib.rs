@@ -389,6 +389,17 @@ fn runtime_helpers() -> JitHelpers {
         concat_str_const: Some(rt.concat_str_const),
         push_const: Some(rt.push_const),
         load_const: Some(rt.load_const),
+        enter_block: Some(rt.enter_block),
+        leave_block: Some(rt.leave_block),
+        enter_try: Some(rt.enter_try),
+        exit_try: Some(rt.exit_try),
+        return_control: Some(rt.return_control),
+        break_control: Some(rt.break_control),
+        continue_control: Some(rt.continue_control),
+        throw_control: Some(rt.throw_control),
+        finally_end: Some(rt.finally_end),
+        catch_bind: Some(rt.catch_bind),
+        dispatch_error: Some(rt.dispatch_error),
     }
 }
 
@@ -535,6 +546,17 @@ mod tests {
             concat_str_const: Some(helpers::test_concat_str_const),
             push_const: Some(helpers::test_push_const),
             load_const: Some(helpers::test_load_const),
+            enter_block: Some(helpers::test_enter_block),
+            leave_block: Some(helpers::test_leave_block),
+            enter_try: Some(helpers::test_enter_try),
+            exit_try: Some(helpers::test_exit_try),
+            return_control: Some(helpers::test_return_control),
+            break_control: Some(helpers::test_break_control),
+            continue_control: Some(helpers::test_continue_control),
+            throw_control: Some(helpers::test_throw_control),
+            finally_end: Some(helpers::test_finally_end),
+            catch_bind: Some(helpers::test_catch_bind),
+            dispatch_error: Some(helpers::test_dispatch_error),
         }
     }
 
@@ -571,6 +593,7 @@ mod tests {
             body: std::ptr::null(),
             tail: false,
             current_function: 0,
+            dispatch_value: 0,
         };
         // Safety: the buffers outlive the call; `vm` is never dereferenced by
         // the scaffold's test helpers.
@@ -813,7 +836,11 @@ mod tests {
     fn unsupported_step_bails() {
         let engine = JitEngine::new().expect("native isa");
         let body = make_body(
-            vec![Step::Push(Value::Number(1.0)), Step::Throw, Step::Return],
+            vec![
+                Step::Push(Value::Number(1.0)),
+                Step::EnterWith,
+                Step::Return,
+            ],
             0,
         );
         assert!(engine.compile(&body, &helpers_all()).is_none());
@@ -905,6 +932,7 @@ mod tests {
             body: std::ptr::null(),
             tail: false,
             current_function: 0,
+            dispatch_value: 0,
         };
         let result = unsafe {
             compiled.call(
@@ -1112,6 +1140,7 @@ mod tests {
             body: std::ptr::null(),
             tail: false,
             current_function: Value::Number(5.0).bits(),
+            dispatch_value: 0,
         };
         let result = unsafe {
             compiled.call(
@@ -1187,6 +1216,7 @@ mod tests {
             body: std::ptr::null(),
             tail: false,
             current_function: 0,
+            dispatch_value: 0,
         };
         let result = unsafe {
             compiled.call(
@@ -1264,7 +1294,7 @@ mod tests {
     fn cache_returns_null_for_an_unsupported_body() {
         let mut cache = JitCache::new(helpers_all()).expect("isa");
         let body = std::rc::Rc::new(make_body(
-            vec![Step::Push(Value::Undefined), Step::Throw],
+            vec![Step::Push(Value::Undefined), Step::EnterWith],
             0,
         ));
         assert!(cache.lookup(&body, false).is_null());
@@ -1802,6 +1832,107 @@ mod tests {
                 .expect("runs")
         });
         assert_eq!(value.as_number(), Some(2893.0));
+    }
+
+    #[test]
+    fn installed_jit_runs_a_try_catch_body() {
+        // Cut 55: a try/catch body compiles — a thrown value dispatches to
+        // the catch block in machine code (via `throw_machinery`), the catch
+        // parameter binds into its flat slot, and an engine error (a null
+        // member read) routes through the same pending-error dispatch.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f() { try { throw 42; } catch (e) { return e * 2; } }\n\
+                     function g() { try { var x = null; return x.y.z; } catch (e) { return e.name; } }\n\
+                     f();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(84.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_try_finally_body() {
+        // Cut 55: a return through a finally runs the finally, and a return
+        // in the finally overrides the pending return; a break/continue
+        // through a finally routes via `control_transfer` too.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var log = [];\n\
+                     function f() { try { log.push('t'); return 1; } finally { log.push('f'); } }\n\
+                     function g() { try { return 1; } finally { return 2; } }\n\
+                     function h() { var out = ''; for (var i = 0; i < 3; i++) { \
+                       try { if (i === 1) continue; out += i; } finally { out += 'f'; } } return out; }\n\
+                     f();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(1.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_hot_try_catch_loop() {
+        // Cut 55: a certified loop whose body contains a try/catch — every
+        // even iteration throws and dispatches to the catch in machine code.
+        // Sum 0..999 = 499500.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(n) { var s = 0; for (var i = 0; i < n; i++) { \
+                       try { if (i % 2 === 0) throw i; s += i; } catch (e) { s += e; } } return s; }\n\
+                     f(1000);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(499500.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_nested_try_catch_and_escaping_throw() {
+        // Cut 55: nested trys (an inner finally then an outer catch) and a
+        // throw that escapes the JIT body into the caller's catch — the
+        // escaping value round-trips through the pending error's attached
+        // value.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var log = [];\n\
+                     function f() { try { try { throw 'inner'; } finally { log.push('f'); } } \
+                       catch (e) { return e + '!'; } }\n\
+                     function g() { try { throw 'escaped'; } finally { log.push('g'); } }\n\
+                     var caught = null;\n\
+                     try { g(); } catch (e) { caught = e; }\n\
+                     f() + '|' + caught + '|' + log.join(',');",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("inner!|escaped|g,f".to_string())
+        );
+        assert!(compiled >= 2, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_block_env_body() {
+        // Cut 55: `EnterBlock`/`LeaveBlock` compile to env push/pop helpers
+        // — a nested `let` block now JITs (the block env keeps the env
+        // stack balanced for the leaf-probe eligibility checks).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f() { { let x = 5; var y = x * 2; } return y; }\n\
+                     f();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(10.0));
+        assert!(compiled >= 1, "{compiled} bodies");
     }
 
     #[test]

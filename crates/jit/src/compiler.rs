@@ -75,7 +75,8 @@ impl JitEngine {
         let mut func =
             Function::with_name_signature(UserFuncName::testcase("jit_body"), jit_sig(conv));
         let mut fctx = FunctionBuilderContext::new();
-        lower(body, helpers, &mut func, &mut fctx, &*self.isa, conv).ok()?;
+        let result = lower(body, helpers, &mut func, &mut fctx, &*self.isa, conv);
+        result.ok()?;
         if std::env::var("JIT_DUMP_CLIF").is_ok() {
             eprintln!("{} \n", func.display());
         }
@@ -223,6 +224,10 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
             Step::UpdateVarReference { .. } => {}
             Step::PutVarReferenceOp { .. } => depth = depth.saturating_sub(1),
             Step::PopVarReference => {}
+            // Control steps (Cut 55): `Return`/`Throw` pop their value; the
+            // transfers (`Exit`/`Break`/`Continue`/`FinallyEnd`) and the
+            // try/block machinery leave the stack as-is.
+            Step::Return | Step::Throw => depth = depth.saturating_sub(1),
             _ => {}
         }
         max = max.max(depth);
@@ -480,6 +485,28 @@ struct Lowerer<'a> {
     /// read their step's payload back out of the running body instead of
     /// marshalling it across the FFI boundary.
     sig_step: SigRef,
+    /// Cut 55: whether the body contains try machinery (`EnterTry`). A
+    /// try body's `Return` routes through `return_control`, its helpers'
+    /// pending errors dispatch through `dispatch_error`, and
+    /// `SaveCompletion`/`RestoreCompletion` are no-ops (the pending control
+    /// carries the values; the completion register is unobservable).
+    has_try: bool,
+    /// Cut 55: the static set of step indexes a control-transfer dispatch
+    /// can jump to — every `Exit`'s `after`, every `Break`/`Continue`
+    /// target, and every handler's catch/finally start. The dispatch
+    /// helpers return one of these (or a completion sentinel), and the
+    /// machine code branches over this set.
+    dispatch_targets: Vec<usize>,
+    /// Cut 55: the step being lowered — the pending-error dispatch passes
+    /// `current_step + 1` as the interpreter ip (the loop-top increment).
+    current_step: usize,
+    /// Cut 55: when a register body (`RunRegBody`) is being lowered, the
+    /// working-stack pointer at its entry — a helper error inside the run
+    /// must truncate the transient stack use back to it BEFORE dispatching
+    /// (the interpreter truncates before propagating; a catch block reads
+    /// the sp at the `RunRegBody` step).
+    error_sp: Option<ClifValue>,
+    // NaN-boxing bit patterns (see `crux::value`).
     /// The `(vm, callee, this, argc, args, direct_eval) -> value` signature
     /// of the tail-call helper (Cut 45).
     sig_tail: SigRef,
@@ -524,6 +551,32 @@ impl<'a> Lowerer<'a> {
         let sig_step = builder.import_signature(helper_sig(&[types::I64; 2], conv));
         let sig_tail = builder.import_signature(helper_sig(&[types::I64; 6], conv));
         let sig_entry = builder.import_signature(helper_sig(&[types::I64; 3], conv));
+        // Cut 55: the body's try machinery and its static dispatch targets
+        // (see `dispatch_targets`).
+        let has_try = body
+            .steps
+            .iter()
+            .any(|step| matches!(step, Step::EnterTry { .. }));
+        let mut dispatch_targets = std::collections::BTreeSet::new();
+        for step in &body.steps {
+            match step {
+                Step::Exit { after }
+                | Step::Break { target: after }
+                | Step::Continue { target: after } => {
+                    dispatch_targets.insert(*after);
+                }
+                _ => {}
+            }
+        }
+        for handler in &body.handlers {
+            if let Some(catch) = handler.catch {
+                dispatch_targets.insert(catch.start);
+            }
+            if let Some(finally) = handler.finally {
+                dispatch_targets.insert(finally);
+            }
+        }
+        let dispatch_targets: Vec<usize> = dispatch_targets.into_iter().collect();
         Lowerer {
             builder,
             helpers,
@@ -551,6 +604,10 @@ impl<'a> Lowerer<'a> {
             sig_step,
             sig_tail,
             sig_entry,
+            has_try,
+            dispatch_targets,
+            current_step: 0,
+            error_sp: None,
             undef_bits: Value::Undefined.bits() as i64,
             null_bits: Value::Null.bits() as i64,
             false_bits: Value::Boolean(false).bits() as i64,
@@ -632,6 +689,15 @@ impl<'a> Lowerer<'a> {
                     self.back_targets.insert(target);
                 }
             }
+        }
+        // Cut 55: the control-transfer dispatch can jump to ANY dispatch
+        // target at runtime — including a forward one (a step's own
+        // pending-error dispatch targets its own catch start, and the
+        // catch/finally blocks are reached only through the dispatches).
+        // Their blocks must stay unsealed until `seal_all_blocks`, or a
+        // later dispatch branch hits the sealed-block assertion.
+        for target in &self.dispatch_targets {
+            self.back_targets.insert(*target);
         }
         // Cut 46: a body with a self-tail-call needs a re-entry block the
         // back edge can jump to — cranelift forbids jumping to the
@@ -1019,22 +1085,15 @@ impl<'a> Lowerer<'a> {
         helper: Helper,
         args: &[ClifValue],
     ) -> Result<ClifValue, Unsupported> {
-        let f = self
-            .helpers
-            .get(helper)
-            .ok_or(Unsupported::Helper(helper.name()))?;
-        let callee = self.builder.ins().iconst(types::I64, f as i64);
-        // The vm pointer is the implicit first argument of every helper.
-        let mut all_args = Vec::with_capacity(args.len() + 1);
-        all_args.push(self.vm());
-        all_args.extend_from_slice(args);
-        let inst = self.builder.ins().call_indirect(sig, callee, &all_args);
-        let result = self.builder.func.dfg.inst_results(inst)[0];
+        let result = self.emit_raw_call(sig, helper, args)?;
         // The error ABI: a helper that hit an interpreter error sets the
-        // context's `pending` byte (offset 0). Bail the whole body out
-        // immediately (returning `undefined` — the runtime surfaces the
-        // pending error) so no further side effect runs with the placeholder
-        // value.
+        // context's `pending` byte (offset 0). Without try machinery, bail
+        // the whole body out immediately (returning `undefined` — the
+        // runtime surfaces the pending error) so no further side effect runs
+        // with the placeholder value. With try machinery, the error routes
+        // through the handler table like the interpreter's Err arm: a
+        // covering catch/finally dispatches to its block, an uncovered one
+        // re-sets the pending error and returns.
         let vm = self.vm();
         let pending = self
             .builder
@@ -1045,8 +1104,24 @@ impl<'a> Lowerer<'a> {
         let err = self.builder.create_block();
         self.builder.ins().brif(ok, cont, &[], err, &[]);
         self.builder.switch_to_block(err);
-        let undef = self.builder.ins().iconst(types::I64, self.undef_bits);
-        self.builder.ins().return_(&[undef]);
+        if self.has_try {
+            // A register body's transient stack use is unwound to its entry
+            // depth before the error propagates (the interpreter truncates
+            // before returning); the catch block reads the sp at the step.
+            if let Some(sp) = self.error_sp {
+                self.builder.def_var(self.sp_var, sp);
+            }
+            let ip = self
+                .builder
+                .ins()
+                .iconst(types::I64, (self.current_step + 1) as i64);
+            let res = self.emit_raw_call(self.sig_bool, Helper::DispatchError, &[ip])?;
+            self.bump_leaf_epoch();
+            self.emit_dispatch(res);
+        } else {
+            let undef = self.builder.ins().iconst(types::I64, self.undef_bits);
+            self.builder.ins().return_(&[undef]);
+        }
         self.builder.seal_block(err);
         self.builder.switch_to_block(cont);
         // Cut 39: a helper that can re-enter the interpreter may disturb the
@@ -1054,21 +1129,147 @@ impl<'a> Lowerer<'a> {
         // so bump the leaf-eligibility epoch — any cached leaf verdict from
         // before the helper is invalidated (the next call site re-probes).
         if helper.disturbs_leaf_eligibility() {
-            let epoch = self.builder.ins().load(
-                types::I32,
-                MemFlagsData::new(),
-                vm,
-                Offset32::new(std::mem::offset_of!(JitCallContext, leaf_epoch) as i32),
-            );
-            let bumped = self.builder.ins().iadd_imm_u(epoch, 1);
-            self.builder.ins().store(
-                MemFlagsData::new(),
-                bumped,
-                vm,
-                Offset32::new(std::mem::offset_of!(JitCallContext, leaf_epoch) as i32),
-            );
+            self.bump_leaf_epoch();
         }
         Ok(result)
+    }
+
+    /// The raw helper call: no pending check, no epoch bump. Used by
+    /// `call_slow` (which adds the error ABI) and the control-dispatch
+    /// helpers (which manage their own pending/error state and return a
+    /// dispatch code instead of a value).
+    fn emit_raw_call(
+        &mut self,
+        sig: SigRef,
+        helper: Helper,
+        args: &[ClifValue],
+    ) -> Result<ClifValue, Unsupported> {
+        let f = self
+            .helpers
+            .get(helper)
+            .ok_or(Unsupported::Helper(helper.name()))?;
+        let callee = self.builder.ins().iconst(types::I64, f as i64);
+        // The vm pointer is the implicit first argument of every helper.
+        let mut all_args = Vec::with_capacity(args.len() + 1);
+        all_args.push(self.vm());
+        all_args.extend_from_slice(args);
+        let inst = self.builder.ins().call_indirect(sig, callee, &all_args);
+        Ok(self.builder.func.dfg.inst_results(inst)[0])
+    }
+
+    /// Bump the ctx's leaf-eligibility epoch: the caller's Vm stacks / env
+    /// chain / realm count may have changed in a way the leaf-call probe's
+    /// cached verdicts assume stable, so any cached verdict must be re-probed.
+    fn bump_leaf_epoch(&mut self) {
+        let vm = self.vm();
+        let epoch = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            vm,
+            Offset32::new(std::mem::offset_of!(JitCallContext, leaf_epoch) as i32),
+        );
+        let bumped = self.builder.ins().iadd_imm_u(epoch, 1);
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            bumped,
+            vm,
+            Offset32::new(std::mem::offset_of!(JitCallContext, leaf_epoch) as i32),
+        );
+    }
+
+    /// Emit a control-dispatch helper call: the raw call, an epoch bump (the
+    /// dispatch mutates the try/pending/env stacks the leaf-call probe
+    /// reads), then the dispatch on the returned code.
+    fn emit_dispatch_call(
+        &mut self,
+        sig: SigRef,
+        helper: Helper,
+        args: &[ClifValue],
+    ) -> Result<(), Unsupported> {
+        let res = self.emit_raw_call(sig, helper, args)?;
+        self.bump_leaf_epoch();
+        self.emit_dispatch(res);
+        Ok(())
+    }
+
+    /// Interpret a control-dispatch result (Cut 55): `u64::MAX` signals an
+    /// escaping throw (the pending error is set — return `undefined` and let
+    /// the runtime surface it); `u64::MAX - 1` signals a completed return
+    /// (return the value from `ctx.dispatch_value`); any other value is a
+    /// step index to jump to — a compare chain over the body's static
+    /// transfer targets.
+    fn emit_dispatch(&mut self, res: ClifValue) {
+        let ctx = self.vm();
+        let propagate = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, res, u64::MAX as i64);
+        let done = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, res, (u64::MAX - 1) as i64);
+        let cont = self.builder.create_block();
+        let done_cont = self.builder.create_block();
+        let propagate_block = self.builder.create_block();
+        let done_block = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(propagate, propagate_block, &[], cont, &[]);
+        self.builder.switch_to_block(propagate_block);
+        let undef = self.builder.ins().iconst(types::I64, self.undef_bits);
+        self.builder.ins().return_(&[undef]);
+        self.builder.seal_block(propagate_block);
+        self.builder.switch_to_block(cont);
+        self.builder
+            .ins()
+            .brif(done, done_block, &[], done_cont, &[]);
+        self.builder.switch_to_block(done_block);
+        let value = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, dispatch_value) as i32),
+        );
+        self.builder.ins().return_(&[value]);
+        self.builder.seal_block(done_block);
+        self.builder.switch_to_block(done_cont);
+        self.emit_jump_to_step(res);
+    }
+
+    /// Jump to the block for a runtime step index: a compare chain over the
+    /// body's static dispatch targets (the control helpers only ever return
+    /// an `Exit`'s `after`, a `Break`/`Continue` target, or a handler's
+    /// catch/finally start). A target outside the set is an invariant
+    /// violation — the machine code returns `undefined` defensively.
+    fn emit_jump_to_step(&mut self, target: ClifValue) {
+        if self.dispatch_targets.is_empty() {
+            let undef = self.builder.ins().iconst(types::I64, self.undef_bits);
+            self.builder.ins().return_(&[undef]);
+            return;
+        }
+        let default = self.builder.create_block();
+        let mut chain = self.builder.create_block();
+        self.builder.ins().jump(chain, &[]);
+        let targets: Vec<usize> = self.dispatch_targets.clone();
+        for (i, t) in targets.iter().enumerate() {
+            self.builder.switch_to_block(chain);
+            let eq = self
+                .builder
+                .ins()
+                .icmp_imm_u(IntCC::Equal, target, *t as i64);
+            let block = self.ensure_block(*t);
+            if i + 1 == self.dispatch_targets.len() {
+                self.builder.ins().brif(eq, block, &[], default, &[]);
+            } else {
+                let next = self.builder.create_block();
+                self.builder.ins().brif(eq, block, &[], next, &[]);
+                chain = next;
+            }
+        }
+        self.builder.switch_to_block(default);
+        let undef = self.builder.ins().iconst(types::I64, self.undef_bits);
+        self.builder.ins().return_(&[undef]);
+        self.builder.seal_block(default);
     }
 
     /// Emit a call step with the leaf-inline probe (Cut 37) and its
@@ -1473,6 +1674,10 @@ impl<'a> Lowerer<'a> {
     // ----- steps -----
 
     fn emit_step(&mut self, index: usize, step: &Step) -> Result<(), Unsupported> {
+        // Cut 55: the pending-error dispatch and the control helpers pass the
+        // interpreter's ip for this step (the loop-top increment means a
+        // step's error/transfer is attributed to `index + 1`).
+        self.current_step = index;
         match step {
             Step::Push(value) => {
                 let bits = match self.const_value(value) {
@@ -1744,9 +1949,14 @@ impl<'a> Lowerer<'a> {
                 let undef = self.builder.ins().iconst(types::I64, self.undef_bits);
                 self.builder.def_var(self.acc_var, undef);
                 let returns = matches!(ops.last(), Some(LeafOp::ReturnAcc));
+                // Cut 55: a helper error inside the run must truncate the
+                // transient stack use to the entry depth before the pending
+                // dispatch (the interpreter truncates before propagating).
+                self.error_sp = Some(entry_sp);
                 for (op_index, op) in ops.iter().enumerate() {
                     self.emit_leaf_op(index, op_index, op)?;
                 }
+                self.error_sp = None;
                 if returns {
                     // `ReturnAcc` already terminated the block.
                     return Ok(());
@@ -2599,7 +2809,71 @@ impl<'a> Lowerer<'a> {
             }
             Step::Return => {
                 let value = self.pop();
-                self.builder.ins().return_(&[value]);
+                if self.has_try {
+                    // A return inside a try must run any finally first
+                    // (and a finally's pending-return overrides an outer
+                    // control): route through `return_control` instead of
+                    // returning directly.
+                    let ip = self.builder.ins().iconst(types::I64, (index + 1) as i64);
+                    self.emit_dispatch_call(self.sig_update, Helper::ReturnControl, &[ip, value])?;
+                } else {
+                    self.builder.ins().return_(&[value]);
+                }
+            }
+            Step::Throw => {
+                let value = self.pop();
+                let ip = self.builder.ins().iconst(types::I64, (index + 1) as i64);
+                self.emit_dispatch_call(self.sig_update, Helper::ThrowControl, &[ip, value])?;
+            }
+            Step::Break { target } => {
+                let ip = self.builder.ins().iconst(types::I64, (index + 1) as i64);
+                let target_imm = self.builder.ins().iconst(types::I64, *target as i64);
+                self.emit_dispatch_call(self.sig_update, Helper::BreakControl, &[ip, target_imm])?;
+            }
+            Step::Continue { target } => {
+                let ip = self.builder.ins().iconst(types::I64, (index + 1) as i64);
+                let target_imm = self.builder.ins().iconst(types::I64, *target as i64);
+                self.emit_dispatch_call(
+                    self.sig_update,
+                    Helper::ContinueControl,
+                    &[ip, target_imm],
+                )?;
+            }
+            Step::EnterTry { handler } => {
+                let handler_imm = self.builder.ins().iconst(types::I64, *handler as i64);
+                let _res = self.call_slow(self.sig_bool, Helper::EnterTry, &[handler_imm])?;
+                self.fall_through(index);
+            }
+            Step::Exit { after } => {
+                let ip = self.builder.ins().iconst(types::I64, (index + 1) as i64);
+                let after_imm = self.builder.ins().iconst(types::I64, *after as i64);
+                self.emit_dispatch_call(self.sig_update, Helper::ExitTry, &[ip, after_imm])?;
+            }
+            Step::FinallyEnd => {
+                let ip = self.builder.ins().iconst(types::I64, (index + 1) as i64);
+                self.emit_dispatch_call(self.sig_bool, Helper::FinallyEnd, &[ip])?;
+            }
+            Step::CatchBind { .. } => {
+                let step_imm = self.builder.ins().iconst(types::I64, index as i64);
+                let _res = self.call_slow(self.sig_bool, Helper::CatchBind, &[step_imm])?;
+                self.fall_through(index);
+            }
+            Step::EnterBlock { .. } => {
+                let step_imm = self.builder.ins().iconst(types::I64, index as i64);
+                let _res = self.call_slow(self.sig_bool, Helper::EnterBlock, &[step_imm])?;
+                self.fall_through(index);
+            }
+            Step::LeaveBlock => {
+                let _res = self.call_slow(self.sig_tdz, Helper::LeaveBlock, &[])?;
+                self.fall_through(index);
+            }
+            Step::SaveCompletion | Step::RestoreCompletion => {
+                // The completion register is unobservable in the certified
+                // model (the pending control carries the finally's deferred
+                // return/throw; the body result comes from the machine-code
+                // return), so the finally's save/restore round trip is a
+                // no-op — same treatment as `ResetCompletion`.
+                self.fall_through(index);
             }
             // Closure creation (Cut 44): the helper reads the step's payload
             // (the function AST, strictness, and the enclosing-chain layouts)
