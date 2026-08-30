@@ -195,6 +195,13 @@ pub struct JitCallContext {
     pub leaf_epoch: u32,
     /// Cut 39: the per-call-site leaf-call cache (see `LeafCallSiteCache`).
     pub leaf_call_cache: LeafCallSiteCache,
+    /// The compiled body whose machine code is running: the step-index
+    /// helpers (`create_function`/`create_arrow`/`create_function_decl`/
+    /// `regexp_literal`) read their step's payload (the AST and the
+    /// enclosing-chain layouts) back out of `steps[step]` instead of
+    /// marshalling it across the FFI boundary. The runtime holds the `Rc`
+    /// for the duration of the call, so the pointer is live.
+    pub body: *const crate::ir::CompiledBody,
 }
 
 /// A direct-mapped global-value cell the compiled `LoadGlobal`/`StoreGlobal`
@@ -393,6 +400,26 @@ pub struct JitSlowPaths {
     pub put_var_reference_op: extern "C" fn(ctx: *mut c_void, op: u64, old: u64, value: u64) -> u64,
     /// Drop the reference stack's top (`PopVarReference`).
     pub pop_var_reference: extern "C" fn(ctx: *mut c_void) -> u64,
+    /// Create a function expression's closure (`Step::CreateFunction`):
+    /// `step` is the step index into `JitCallContext::body`, whose payload
+    /// (the function AST, strictness, enclosing chains) is read back out.
+    /// Returns the created function value.
+    pub create_function: extern "C" fn(ctx: *mut c_void, step: u64) -> u64,
+    /// Create an arrow function's closure (`Step::CreateArrow`). Returns the
+    /// created function value.
+    pub create_arrow: extern "C" fn(ctx: *mut c_void, step: u64) -> u64,
+    /// Instantiate a hoisted top-level function declaration
+    /// (`Step::FunctionDeclInit`) and store it into its frame or
+    /// capture-context slot. Returns the created function value (the step
+    /// completes with no value).
+    pub create_function_decl: extern "C" fn(ctx: *mut c_void, step: u64) -> u64,
+    /// `new.target` (`Step::NewTarget`): the active constructor, or
+    /// *undefined* at the script level.
+    pub new_target: extern "C" fn(ctx: *mut c_void) -> u64,
+    /// A `RegExp` literal (`Step::RegExpLiteral`): construct a fresh RegExp
+    /// object; `step` is the step index into `JitCallContext::body` (the
+    /// pattern/flags `JsString`s live in the step).
+    pub regexp_literal: extern "C" fn(ctx: *mut c_void, step: u64) -> u64,
 }
 
 /// The runtime's slow-path table, installed into every `JitHook`.
@@ -430,6 +457,11 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     update_var_reference,
     put_var_reference_op,
     pop_var_reference,
+    create_function,
+    create_arrow,
+    create_function_decl,
+    new_target,
+    regexp_literal,
 };
 
 /// The slack (in slots) reserved above a compiled body's working area on the
@@ -1149,6 +1181,157 @@ extern "C" fn store_context(ctx: *mut c_void, depth: u64, index: u64, value: u64
     value.bits()
 }
 
+/// Read a step out of the running compiled body by index: the closure/
+/// RegExp helpers receive the step index as an immediate (the payload — the
+/// function AST, enclosing chains, pattern/flags strings — is not marshalled
+/// across the FFI boundary; it is read back from the body's step stream).
+fn step_at(ctx: &JitCallContext, step: u64) -> Option<&crate::ir::Step> {
+    // SAFETY: `ctx.body` points at the `Rc<CompiledBody>` the runtime holds
+    // for the duration of the compiled call (see `JitCallContext::body`).
+    let body = unsafe { &*ctx.body };
+    body.steps.get(step as usize)
+}
+
+extern "C" fn create_function(ctx: *mut c_void, step: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let Some(crate::ir::Step::CreateFunction {
+        function,
+        strict,
+        outer_chain,
+        per_iteration_chain,
+    }) = step_at(ctx, step)
+    else {
+        // The compiled code passes its own step index; a mismatch is an
+        // internal invariant violation.
+        unreachable!("create_function on a non-CreateFunction step");
+    };
+    let env = agent.running_context().ok().map(|c| c.lexical_environment);
+    let Some(env) = env else {
+        return slow_error(
+            ctx,
+            JsError::new(ErrorKind::TypeError, "no running context".into()),
+        );
+    };
+    match crate::function::instantiate_function_expression(
+        agent,
+        function,
+        env,
+        *strict,
+        outer_chain.clone(),
+        per_iteration_chain.clone(),
+    ) {
+        Ok(value) => value.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn create_arrow(ctx: *mut c_void, step: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let Some(crate::ir::Step::CreateArrow {
+        is_async,
+        params,
+        body,
+        strict,
+        outer_chain,
+        per_iteration_chain,
+    }) = step_at(ctx, step)
+    else {
+        unreachable!("create_arrow on a non-CreateArrow step");
+    };
+    let env = agent.running_context().ok().map(|c| c.lexical_environment);
+    let Some(env) = env else {
+        return slow_error(
+            ctx,
+            JsError::new(ErrorKind::TypeError, "no running context".into()),
+        );
+    };
+    match crate::function::instantiate_arrow(
+        agent,
+        *is_async,
+        params.clone(),
+        body,
+        env,
+        *strict,
+        outer_chain.clone(),
+        per_iteration_chain.clone(),
+    ) {
+        Ok(value) => value.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn create_function_decl(ctx: *mut c_void, step: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let Some(crate::ir::Step::FunctionDeclInit {
+        function,
+        frame_slot,
+        context_slot,
+        outer_chain,
+        per_iteration_chain,
+        ..
+    }) = step_at(ctx, step)
+    else {
+        unreachable!("create_function_decl on a non-FunctionDeclInit step");
+    };
+    let env = agent.running_context().ok().map(|c| c.lexical_environment);
+    let Some(env) = env else {
+        return slow_error(
+            ctx,
+            JsError::new(ErrorKind::TypeError, "no running context".into()),
+        );
+    };
+    let value = match crate::function::instantiate_function(
+        agent,
+        function,
+        env,
+        vm.strict,
+        outer_chain.clone(),
+        per_iteration_chain.clone(),
+    ) {
+        Ok(value) => value,
+        Err(error) => return slow_error(ctx, error),
+    };
+    // The declaration's binding is either a frame slot or a capture-context
+    // slot — mirrors the interpreter's `Step::FunctionDeclInit` arm.
+    if let Some(slot) = frame_slot {
+        *vm.frame_get_mut(*slot) = value;
+    } else if let Some(index) = context_slot {
+        let env = match vm.context_chain_env(0) {
+            Ok(env) => env,
+            Err(error) => return slow_error(ctx, error),
+        };
+        crate::ir::context_env(&env).set_slot(*index, value);
+    } else {
+        unreachable!("FunctionDeclInit without a binding slot (the scan allocated one)");
+    }
+    value.bits()
+}
+
+extern "C" fn new_target(ctx: *mut c_void) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    match crate::context::get_new_target(agent) {
+        Ok(value) => value.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn regexp_literal(ctx: *mut c_void, step: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let Some(crate::ir::Step::RegExpLiteral { pattern, flags }) = step_at(ctx, step) else {
+        unreachable!("regexp_literal on a non-RegExpLiteral step");
+    };
+    match crate::expr::eval_regexp_literal(agent, pattern, flags) {
+        Ok(value) => value.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
 extern "C" fn init_context(ctx: *mut c_void, index: u64, value: u64) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
     let vm = unsafe { &mut *ctx.vm };
@@ -1497,6 +1680,7 @@ pub(crate) fn run_jit_body(
         buf_end: (work_ptr as usize + work_len * std::mem::size_of::<Value>()) as *mut c_void,
         leaf_epoch: 0,
         leaf_call_cache: LeafCallSiteCache::empty(),
+        body: std::rc::Rc::as_ptr(ir),
     };
     // Register the vm (its trace covers `vm.frame`, `vm.stack`, and any
     // nested leaf jit roots) plus the working area for the call's duration:
@@ -1558,6 +1742,11 @@ mod tests {
         assert_ne!(JIT_SLOW_PATHS.update_var_reference as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.put_var_reference_op as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.pop_var_reference as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.create_function as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.create_arrow as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.create_function_decl as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.new_target as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.regexp_literal as usize, 0);
     }
 
     #[test]

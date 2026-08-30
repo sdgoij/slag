@@ -32,7 +32,7 @@ fn object_of(ctx: &JscContext, value: JSValueRef) -> Option<Handle<JsObject>> {
     // real JSC). Decode that convention to the realm's actual global object;
     // the normal value round-trip would misread the pointer bits as an
     // encoded JS value.
-    if value as usize == ctx as *const JscContext as usize {
+    if std::ptr::eq(value.cast::<()>(), (ctx as *const JscContext).cast::<()>()) {
         return runtime::context::as_object(ctx.api.global().value());
     }
     refs::ref_to_value(value).and_then(|value| runtime::context::as_object(&value))

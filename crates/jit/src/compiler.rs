@@ -400,6 +400,10 @@ struct Lowerer<'a> {
     sig_set_comp: SigRef,
     sig_call: SigRef,
     sig_assign: SigRef,
+    /// The `(vm, step_index) -> value` signature: the closure/RegExp helpers
+    /// read their step's payload back out of the running body instead of
+    /// marshalling it across the FFI boundary.
+    sig_step: SigRef,
     /// The JIT entry signature `(frame, stack, vm) -> value` — the in-frame
     /// leaf-call path calls the callee's compiled entry with it.
     sig_entry: SigRef,
@@ -437,6 +441,7 @@ impl<'a> Lowerer<'a> {
         let sig_set_comp = builder.import_signature(helper_sig(&[types::I64; 4], conv));
         let sig_call = builder.import_signature(helper_sig(&[types::I64; 5], conv));
         let sig_assign = builder.import_signature(helper_sig(&[types::I64; 6], conv));
+        let sig_step = builder.import_signature(helper_sig(&[types::I64; 2], conv));
         let sig_entry = builder.import_signature(helper_sig(&[types::I64; 3], conv));
         Lowerer {
             builder,
@@ -460,6 +465,7 @@ impl<'a> Lowerer<'a> {
             sig_set_comp,
             sig_call,
             sig_assign,
+            sig_step,
             sig_entry,
             undef_bits: Value::Undefined.bits() as i64,
             null_bits: Value::Null.bits() as i64,
@@ -2100,6 +2106,46 @@ impl<'a> Lowerer<'a> {
             Step::Return => {
                 let value = self.pop();
                 self.builder.ins().return_(&[value]);
+            }
+            // Closure creation (Cut 44): the helper reads the step's payload
+            // (the function AST, strictness, and the enclosing-chain layouts)
+            // back out of the running body by index and instantiates the
+            // closure against the CURRENT lexical environment — exactly the
+            // interpreter's `Step::CreateFunction`/`CreateArrow` arms. The
+            // created closure's own body compiles separately (the per-site
+            // shared compiled body), so a loop creating closures now runs
+            // entirely in machine code.
+            Step::CreateFunction { .. } => {
+                let step_imm = self.builder.ins().iconst(types::I64, index as i64);
+                let res = self.call_slow(self.sig_step, Helper::CreateFunction, &[step_imm])?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::CreateArrow { .. } => {
+                let step_imm = self.builder.ins().iconst(types::I64, index as i64);
+                let res = self.call_slow(self.sig_step, Helper::CreateArrow, &[step_imm])?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            // The hoisted declaration stores into its frame or context slot
+            // inside the helper (mirrors the interpreter arm); the step
+            // completes with no value.
+            Step::FunctionDeclInit { .. } => {
+                let step_imm = self.builder.ins().iconst(types::I64, index as i64);
+                let _res =
+                    self.call_slow(self.sig_step, Helper::CreateFunctionDecl, &[step_imm])?;
+                self.fall_through(index);
+            }
+            Step::NewTarget => {
+                let res = self.call_slow(self.sig_tdz, Helper::NewTarget, &[])?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::RegExpLiteral { .. } => {
+                let step_imm = self.builder.ins().iconst(types::I64, index as i64);
+                let res = self.call_slow(self.sig_step, Helper::RegExpLiteral, &[step_imm])?;
+                self.push(res);
+                self.fall_through(index);
             }
             // Completion bookkeeping: `ResetCompletion`/`NormalizeCompletion`
             // (and the list scopes) only touch the completion register, but

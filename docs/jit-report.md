@@ -57,8 +57,9 @@ run paths:
 | 14 | `e8f7bb8` | **Member stores + fast-loop member reads**: `set_member_slot` in-place property-vector writes, register-path `GetMemberName` probe. |
 | 15 | `25e9071` | **Fast string concat** (`concat_strings` helper — string-string `Add` with both tags checked inline) + in-place rope-node construction. |
 | 16 | `c2dbcde` | **Fix: share one compiled body per function site** — closes the per-closure recompile trap (function declarations *and* arrows in loops). |
+| 17 | *(worktree)* | **Closure creation + trivial context steps** — `CreateFunction`/`CreateArrow`/`FunctionDeclInit`, `NewTarget`, `RegExpLiteral` lower to step-index helpers that read the step's payload back out of the running body (`JitCallContext::body`) and run the interpreter's instantiation/evaluation machinery against the live lexical environment. A loop creating closures now runs entirely in machine code; the created closure's own body compiles separately. |
 
-### Slow-path helper table (`JitSlowPaths`, 33 helpers)
+### Slow-path helper table (`JitSlowPaths`, 38 helpers)
 
 The JIT inlines the number/string fast paths (tag checks are ~2 instructions
 on NaN-boxed values); everything else calls a helper whose address is baked
@@ -71,8 +72,10 @@ into the machine code at compile time. The table: `binary_slow`,
 `resolve_var_ident`/`put_var_reference`/`put_var_reference_op`/
 `get_var_reference`/`update_var_reference`/`pop_var_reference`,
 `update_ident`, `load_context`/`store_context`/`init_context`/`update_context`,
-`load_per_iter`/`store_per_iter`/`update_per_iter`. A body needing a `None`
-helper bails to the interpreter.
+`load_per_iter`/`store_per_iter`/`update_per_iter`,
+`create_function`/`create_arrow`/`create_function_decl`/`new_target`/
+`regexp_literal` (the step-index helpers). A body needing a `None` helper
+bails to the interpreter.
 
 ## 3. Fast-path machinery
 
@@ -155,9 +158,9 @@ first via `shared_arrow_body`).
 From the crate docs and the compiler's `Unsupported` surface — bodies
 containing any of these fall back entirely:
 
-- **Closure creation**: `CreateFunction`, `CreateArrow`,
-  `FunctionDecl`/`FunctionDeclInit` (the *created* closure's body compiles
-  fine — only the creation step bails).
+- **Closure creation** (`CreateFunction`, `CreateArrow`, `FunctionDeclInit`),
+  `NewTarget`, and `RegExpLiteral` are now **compiled** (Cut 44) — see the
+  implemented table.
 - **Env machinery**: `EnterBlock`/`LeaveBlock`, `EnterWith`, `EnterTry`/
   `Exit`/`CatchBind`/`FinallyEnd`, `PerIteration`/`EnterLoopEnv`/
   `EnterPerIteration` (creation), `UsingInit`/`DeclInit`.
@@ -195,11 +198,15 @@ containing any of these fall back entirely:
    leaf probe already caches verdicts, but a statically-known leaf callee at a
    stable slot could skip the probe and `call_slow` round-trip entirely.
 5. **Closure-creation lowering** (`Step::Closure`/`CreateFunction`/
-   `CreateArrow`) — hot loops that allocate closures still pay the interpreter
-   for the creation step itself.
+   `CreateArrow`) — **done** (Cut 44): the creation step now compiles via
+   step-index helpers; the remaining cost is the instantiation machinery
+   itself (env + object allocation), which a future inline fast path for
+   capture-free closures could cut.
 6. **Extend the bail list**: `try/catch/finally`, `switch`, `with`, `using`,
    iterators, generators/async, destructuring/spread, class machinery, mapped
-   `arguments` — each is a slice of lowering + helper work.
+   `arguments`, tail calls (`TailCall`/`TailCallFast` — a TCO-recursive body
+   still bails at the recursion) — each is a slice of lowering + helper
+   work.
 7. **String concat**: the `concat_strings` helper is called per concat; very
    small strings could concat inline in registers.
 8. **Leaf-cache invalidation breadth**: any "disturbing" helper (a `valueOf`,

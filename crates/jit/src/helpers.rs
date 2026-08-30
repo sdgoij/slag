@@ -54,6 +54,11 @@ pub enum Helper {
     UpdateVarReference,
     PutVarReferenceOp,
     PopVarReference,
+    CreateFunction,
+    CreateArrow,
+    CreateFunctionDecl,
+    NewTarget,
+    RegExpLiteral,
 }
 
 impl Helper {
@@ -92,6 +97,11 @@ impl Helper {
             Helper::UpdateVarReference => "update_var_reference",
             Helper::PutVarReferenceOp => "put_var_reference_op",
             Helper::PopVarReference => "pop_var_reference",
+            Helper::CreateFunction => "create_function",
+            Helper::CreateArrow => "create_arrow",
+            Helper::CreateFunctionDecl => "create_function_decl",
+            Helper::NewTarget => "new_target",
+            Helper::RegExpLiteral => "regexp_literal",
         }
     }
 
@@ -262,6 +272,27 @@ pub struct JitHelpers {
         Option<extern "C" fn(vm: *mut c_void, op: u64, old: u64, value: u64) -> u64>,
     /// Drop the reference stack's top (`PopVarReference`).
     pub pop_var_reference: Option<extern "C" fn(vm: *mut c_void) -> u64>,
+    /// Create a function expression's closure (`Step::CreateFunction`):
+    /// `step` is the step index into the running body (the payload — the
+    /// function AST and the enclosing-chain layouts — is read back out of
+    /// the body's step stream, not marshalled across the boundary). Returns
+    /// the created function value.
+    pub create_function: Option<extern "C" fn(vm: *mut c_void, step: u64) -> u64>,
+    /// Create an arrow function's closure (`Step::CreateArrow`). Returns the
+    /// created function value.
+    pub create_arrow: Option<extern "C" fn(vm: *mut c_void, step: u64) -> u64>,
+    /// Instantiate a hoisted top-level function declaration
+    /// (`Step::FunctionDeclInit`) and store it into its frame or
+    /// capture-context slot. Returns the created function value (the step
+    /// completes with no value).
+    pub create_function_decl: Option<extern "C" fn(vm: *mut c_void, step: u64) -> u64>,
+    /// `new.target` (`Step::NewTarget`): the active constructor, or
+    /// *undefined* at the script level.
+    pub new_target: Option<extern "C" fn(vm: *mut c_void) -> u64>,
+    /// A `RegExp` literal (`Step::RegExpLiteral`): construct a fresh RegExp
+    /// object; `step` is the step index into the running body (the
+    /// pattern/flags strings live in the step).
+    pub regexp_literal: Option<extern "C" fn(vm: *mut c_void, step: u64) -> u64>,
 }
 
 impl JitHelpers {
@@ -301,6 +332,11 @@ impl JitHelpers {
             update_var_reference: None,
             put_var_reference_op: None,
             pop_var_reference: None,
+            create_function: None,
+            create_arrow: None,
+            create_function_decl: None,
+            new_target: None,
+            regexp_literal: None,
         }
     }
 
@@ -340,6 +376,11 @@ impl JitHelpers {
             Helper::UpdateVarReference => self.update_var_reference.map(|f| f as usize as u64),
             Helper::PutVarReferenceOp => self.put_var_reference_op.map(|f| f as usize as u64),
             Helper::PopVarReference => self.pop_var_reference.map(|f| f as usize as u64),
+            Helper::CreateFunction => self.create_function.map(|f| f as usize as u64),
+            Helper::CreateArrow => self.create_arrow.map(|f| f as usize as u64),
+            Helper::CreateFunctionDecl => self.create_function_decl.map(|f| f as usize as u64),
+            Helper::NewTarget => self.new_target.map(|f| f as usize as u64),
+            Helper::RegExpLiteral => self.regexp_literal.map(|f| f as usize as u64),
         }
     }
 }
@@ -581,6 +622,32 @@ pub extern "C" fn test_put_var_reference_op(
 /// Returns `0` — proves `pop_var_reference` was called.
 pub extern "C" fn test_pop_var_reference(_vm: *mut c_void) -> u64 {
     0
+}
+
+/// Returns `47` — proves `create_function` was called with the step index.
+pub extern "C" fn test_create_function(_vm: *mut c_void, _step: u64) -> u64 {
+    Value::Number(47.0).bits()
+}
+
+/// Returns `48` — proves `create_arrow` was called with the step index.
+pub extern "C" fn test_create_arrow(_vm: *mut c_void, _step: u64) -> u64 {
+    Value::Number(48.0).bits()
+}
+
+/// Returns `49` — proves `create_function_decl` was called with the step
+/// index.
+pub extern "C" fn test_create_function_decl(_vm: *mut c_void, _step: u64) -> u64 {
+    Value::Number(49.0).bits()
+}
+
+/// Returns `50` — proves `new_target` was called.
+pub extern "C" fn test_new_target(_vm: *mut c_void) -> u64 {
+    Value::Number(50.0).bits()
+}
+
+/// Returns `51` — proves `regexp_literal` was called with the step index.
+pub extern "C" fn test_regexp_literal(_vm: *mut c_void, _step: u64) -> u64 {
+    Value::Number(51.0).bits()
 }
 
 /// Sums its numeric arguments — proves the `args` pointer/`argc` ABI the

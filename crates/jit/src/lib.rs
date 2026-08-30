@@ -81,10 +81,18 @@
 //!   value exactly like the interpreter's pop — a no-op there would leave a
 //!   slot on the JIT stack and drift it one entry per statement inside a
 //!   loop.
+//! - Closure creation (`CreateFunction`/`CreateArrow`, the hoisted
+//!   `FunctionDeclInit`), `NewTarget`, and `RegExpLiteral`: step-index
+//!   helpers read the step's payload back out of the running body and run
+//!   the interpreter's instantiation/evaluation machinery against the live
+//!   lexical environment. The created closure's own body compiles
+//!   separately (the runtime shares one compiled body per declaration
+//!   site), so a loop that creates closures now runs entirely in machine
+//!   code.
 //!
-//! Everything else (closures, `with`/`try`/`switch`/`using`, generator
-//! suspension, iterator machinery, global-reference steps, mapped
-//! `arguments`) bails to the interpreter.
+//! Everything else (`with`/`try`/`switch`/`using`, generator suspension,
+//! iterator machinery, destructuring/spread, class machinery, global-
+//! reference steps, mapped `arguments`) bails to the interpreter.
 //!
 //! # Slow paths
 //!
@@ -350,6 +358,11 @@ fn runtime_helpers() -> JitHelpers {
         update_var_reference: Some(rt.update_var_reference),
         put_var_reference_op: Some(rt.put_var_reference_op),
         pop_var_reference: Some(rt.pop_var_reference),
+        create_function: Some(rt.create_function),
+        create_arrow: Some(rt.create_arrow),
+        create_function_decl: Some(rt.create_function_decl),
+        new_target: Some(rt.new_target),
+        regexp_literal: Some(rt.regexp_literal),
     }
 }
 
@@ -465,6 +478,11 @@ mod tests {
             update_var_reference: Some(helpers::test_update_var_reference),
             put_var_reference_op: Some(helpers::test_put_var_reference_op),
             pop_var_reference: Some(helpers::test_pop_var_reference),
+            create_function: Some(helpers::test_create_function),
+            create_arrow: Some(helpers::test_create_arrow),
+            create_function_decl: Some(helpers::test_create_function_decl),
+            new_target: Some(helpers::test_new_target),
+            regexp_literal: Some(helpers::test_regexp_literal),
         }
     }
 
@@ -498,6 +516,7 @@ mod tests {
             buf_end: std::ptr::null_mut(),
             leaf_epoch: 0,
             leaf_call_cache: runtime::jit::LeafCallSiteCache::empty(),
+            body: std::ptr::null(),
         };
         // Safety: the buffers outlive the call; `vm` is never dereferenced by
         // the scaffold's test helpers.
@@ -747,6 +766,18 @@ mod tests {
     }
 
     #[test]
+    fn closure_creation_and_new_target_lower() {
+        // Cut 44: closure creation, `new.target`, and RegExp literals are no
+        // longer bails — each lowers to a step-index helper call. `NewTarget`
+        // needs no payload (the step-index helpers are exercised by the
+        // installed e2e tests against the real runtime table).
+        let engine = JitEngine::new().expect("native isa");
+        let body = make_body(vec![Step::NewTarget, Step::Return], 0);
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_ne!(compiled.info.entry, 0);
+    }
+
+    #[test]
     fn compile_reports_the_stack_usage() {
         // `Push, Push, Binary, Return`: the depth peaks at 2 (two operands
         // live before the `Binary` consumes one).
@@ -991,6 +1022,29 @@ mod tests {
         });
         assert_eq!(value.as_number(), Some(5050.0));
         assert!(compiled >= 2, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_loop_creating_closures() {
+        // Cut 44: closure creation inside a loop no longer bails the body —
+        // `CreateArrow`/`CreateFunction` lower to step-index helpers, so the
+        // whole loop runs in machine code. Each iteration adds `g() = i`
+        // plus `h(1) = 1 + i`, so `s = sum(2i + 1) = 2*4950 + 100 = 10000`.
+        // `f`, the arrow body, and `h`'s body all compile (3 distinct).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(n) { var s = 0; for (var i = 0; i < n; i++) { \
+                       var g = () => i; \
+                       var h = function (x) { return x + i; }; \
+                       s += g() + h(1); \
+                     } return s; }\n\
+                     f(100);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(10000.0));
+        assert!(compiled >= 3, "{compiled} bodies");
     }
 
     #[test]

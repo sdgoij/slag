@@ -529,12 +529,11 @@ pub unsafe extern "C" fn JSValueGetLength(_ctx: JSContextRef, value: JSValueRef)
             return 0;
         };
         // Arrays have a .length property; objects don't.
-        if value.is_object() {
-            if let Some(obj) = value.as_object() {
-                if matches!(obj.kind, crux::object::ObjectKind::Array) {
-                    return 0; // Stub: real length from JS would go here.
-                }
-            }
+        if value.is_object()
+            && let Some(obj) = value.as_object()
+            && matches!(obj.kind, crux::object::ObjectKind::Array)
+        {
+            return 0; // Stub: real length from JS would go here.
         }
         0
     })

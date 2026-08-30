@@ -2512,7 +2512,7 @@ impl Vm {
     }
 
     #[inline]
-    fn frame_get_mut(&mut self, slot: usize) -> &mut Value {
+    pub(crate) fn frame_get_mut(&mut self, slot: usize) -> &mut Value {
         let slot = slot + self.leaf_frame_offset;
         match self.leaf_frame_base {
             Some(base) => &mut self.stack[base + slot],
@@ -8870,6 +8870,7 @@ impl Vm {
                 as *mut std::os::raw::c_void,
             leaf_epoch: 0,
             leaf_call_cache: crate::jit::LeafCallSiteCache::empty(),
+            body: std::rc::Rc::as_ptr(ir),
         };
         let frame_ptr = buf.as_mut_ptr() as *mut std::os::raw::c_void;
         // SAFETY: `buf` has `frame_size + stack_usage + slack` slots.
