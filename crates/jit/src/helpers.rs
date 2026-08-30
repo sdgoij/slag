@@ -59,6 +59,7 @@ pub enum Helper {
     CreateFunctionDecl,
     NewTarget,
     RegExpLiteral,
+    TailCall,
 }
 
 impl Helper {
@@ -102,6 +103,7 @@ impl Helper {
             Helper::CreateFunctionDecl => "create_function_decl",
             Helper::NewTarget => "new_target",
             Helper::RegExpLiteral => "regexp_literal",
+            Helper::TailCall => "tail_call",
         }
     }
 
@@ -293,6 +295,21 @@ pub struct JitHelpers {
     /// object; `step` is the step index into the running body (the
     /// pattern/flags strings live in the step).
     pub regexp_literal: Option<extern "C" fn(vm: *mut c_void, step: u64) -> u64>,
+    /// A proper tail call (`Step::TailCallFast` and the fused global/slot
+    /// forms): an ordinary certified callee replaces the current frame on
+    /// the Vm; anything else is a normal call whose result completes the
+    /// calling body's return. `args` points at `argc` slots in the JIT
+    /// buffer; `direct_eval` is the step's direct-eval flag.
+    pub tail_call: Option<
+        extern "C" fn(
+            vm: *mut c_void,
+            callee: u64,
+            this: u64,
+            argc: u64,
+            args: *mut u64,
+            direct_eval: u64,
+        ) -> u64,
+    >,
 }
 
 impl JitHelpers {
@@ -337,6 +354,7 @@ impl JitHelpers {
             create_function_decl: None,
             new_target: None,
             regexp_literal: None,
+            tail_call: None,
         }
     }
 
@@ -381,6 +399,7 @@ impl JitHelpers {
             Helper::CreateFunctionDecl => self.create_function_decl.map(|f| f as usize as u64),
             Helper::NewTarget => self.new_target.map(|f| f as usize as u64),
             Helper::RegExpLiteral => self.regexp_literal.map(|f| f as usize as u64),
+            Helper::TailCall => self.tail_call.map(|f| f as usize as u64),
         }
     }
 }
@@ -648,6 +667,18 @@ pub extern "C" fn test_new_target(_vm: *mut c_void) -> u64 {
 /// Returns `51` — proves `regexp_literal` was called with the step index.
 pub extern "C" fn test_regexp_literal(_vm: *mut c_void, _step: u64) -> u64 {
     Value::Number(51.0).bits()
+}
+
+/// Returns `52` — proves `tail_call` was called with the right ABI.
+pub extern "C" fn test_tail_call(
+    _vm: *mut c_void,
+    _callee: u64,
+    _this: u64,
+    _argc: u64,
+    _args: *mut u64,
+    _direct_eval: u64,
+) -> u64 {
+    Value::Number(52.0).bits()
 }
 
 /// Sums its numeric arguments — proves the `args` pointer/`argc` ABI the

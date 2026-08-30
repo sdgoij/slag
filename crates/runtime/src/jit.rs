@@ -202,6 +202,11 @@ pub struct JitCallContext {
     /// marshalling it across the FFI boundary. The runtime holds the `Rc`
     /// for the duration of the call, so the pointer is live.
     pub body: *const crate::ir::CompiledBody,
+    /// Cut 45: a compiled body's `tail_call` helper replaced the frame (the
+    /// Vm's `tail_replaced` field carries the next body). The machine code
+    /// returns the placeholder value; `run_jit_body` signals the caller to
+    /// loop on the new body instead of completing.
+    pub tail: bool,
 }
 
 /// A direct-mapped global-value cell the compiled `LoadGlobal`/`StoreGlobal`
@@ -420,6 +425,20 @@ pub struct JitSlowPaths {
     /// object; `step` is the step index into `JitCallContext::body` (the
     /// pattern/flags `JsString`s live in the step).
     pub regexp_literal: extern "C" fn(ctx: *mut c_void, step: u64) -> u64,
+    /// Cut 45: a proper tail call (`Step::TailCallFast` and the fused
+    /// global/slot forms) — mirrors the interpreter's `tail_call_shared`:
+    /// an ordinary certified callee replaces the current frame on the Vm
+    /// (`ctx.tail` + `Vm::tail_replaced`); anything else is a normal call
+    /// whose result completes the calling body's return. `args` points at
+    /// `argc` slots in the JIT buffer.
+    pub tail_call: extern "C" fn(
+        ctx: *mut c_void,
+        callee: u64,
+        this: u64,
+        argc: u64,
+        args: *mut u64,
+        direct_eval: u64,
+    ) -> u64,
 }
 
 /// The runtime's slow-path table, installed into every `JitHook`.
@@ -462,6 +481,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     create_function_decl,
     new_target,
     regexp_literal,
+    tail_call,
 };
 
 /// The slack (in slots) reserved above a compiled body's working area on the
@@ -1291,6 +1311,7 @@ extern "C" fn create_function_decl(ctx: *mut c_void, step: u64) -> u64 {
         vm.strict,
         outer_chain.clone(),
         per_iteration_chain.clone(),
+        false,
     ) {
         Ok(value) => value,
         Err(error) => return slow_error(ctx, error),
@@ -1328,6 +1349,75 @@ extern "C" fn regexp_literal(ctx: *mut c_void, step: u64) -> u64 {
     };
     match crate::expr::eval_regexp_literal(agent, pattern, flags) {
         Ok(value) => value.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn tail_call(
+    ctx: *mut c_void,
+    callee: u64,
+    this: u64,
+    argc: u64,
+    args: *mut u64,
+    direct_eval: u64,
+) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let callee = Value::from_bits(callee);
+    let this = Value::from_bits(this);
+    // The arguments live in the JIT's private buffer (helpers receive
+    // `&mut Vm` and may reallocate `vm.stack`, so the machine code never
+    // aliases it); copy them out like `tail_call_shared` does from the
+    // interpreter stack.
+    let args: Vec<Value> =
+        unsafe { std::slice::from_raw_parts(args as *const Value, argc as usize) }.to_vec();
+    // Direct eval in tail position (`return eval(x)`), mirroring
+    // `tail_call_shared`'s eval arm: the eval'd script runs with the
+    // caller's environment, so the frame replacement never applies.
+    if direct_eval != 0
+        && match crate::ir::is_eval_function(agent, &callee) {
+            Ok(eval) => eval,
+            Err(error) => return slow_error(ctx, error),
+        }
+    {
+        let source = args.first().cloned().unwrap_or(Value::Undefined);
+        if !matches!(source.kind(), ValueKind::String(_)) {
+            return source.bits();
+        }
+        let source = match crux::convert::to_string(&source) {
+            Ok(source) => source,
+            Err(error) => return slow_error(ctx, error),
+        };
+        return match crate::script::perform_eval(agent, &source, vm.strict, true) {
+            Ok(result) => result.bits(),
+            Err(error) => slow_error(ctx, error),
+        };
+    }
+    // Frame replacement for an ordinary-callable ECMAScript callee in a
+    // single realm; everything else takes the normal call path whose result
+    // completes this body's return (mirrors `tail_call_shared`).
+    let replaced = (|| -> Result<Option<std::rc::Rc<crate::ir::CompiledBody>>, JsError> {
+        if let ValueKind::Function(function) = callee.kind()
+            && matches!(function.kind, crux::function::FunctionKind::EcmaScript)
+            && agent.realm_count.get() == 1
+        {
+            return vm.tail_prepare_ordinary(agent, &function, this, &args);
+        }
+        Ok(None)
+    })();
+    match replaced {
+        Ok(Some(ir)) => {
+            // The frame is replaced and the Vm is reset for `ir`; the
+            // runtime loops on it (TCO semantics: bounded native stack).
+            ctx.tail = true;
+            vm.tail_replaced = Some(ir);
+            0
+        }
+        Ok(None) => match crate::function::call_inner(agent, &callee, this, &args) {
+            Ok(value) => value.bits(),
+            Err(error) => slow_error(ctx, error),
+        },
         Err(error) => slow_error(ctx, error),
     }
 }
@@ -1599,30 +1689,44 @@ pub(crate) fn lookup_info(
 }
 
 /// The general-path JIT run (the leaf path is `Vm::run_jit_leaf`): run
-/// `ir`'s compiled machine code for a body running on its own Vm — one
+/// The outcome of a general-path JIT run (Cut 45): the caller
+/// (`run_compiled_body`) either completes with the value, loops on the tail-
+/// replaced body, or falls back to the interpreter.
+pub(crate) enum JitRunOutcome {
+    /// The body completed with this value.
+    Value(Value),
+    /// The machine code performed a tail-call frame replacement: the Vm's
+    /// `tail_replaced` field holds the next body (its frame is already set
+    /// up); the caller loops on it with the same Vm.
+    TailReplaced,
+    /// No hook installed or no compiled code — the interpreter runs the body.
+    Interp,
+}
+
+/// Run `ir`'s compiled machine code for a body running on its own Vm — one
 /// that may contain calls, since leaf bodies never do (`steps_are_leaf`
 /// excludes every call step). The frame is `vm.frame` (the caller set it
 /// up: params, `var`s, TDZ slots, this slot); the working area is a
-/// private buffer, rooted for the call's duration. Returns `Ok(None)` when
+/// private buffer, rooted for the call's duration. Returns `Interp` when
 /// no hook is installed or the body has no compiled code — the caller
 /// falls back to the interpreter.
 pub(crate) fn run_jit_body(
     agent: &mut Agent,
     vm: &mut Vm,
     ir: &std::rc::Rc<CompiledBody>,
-) -> Result<Option<Value>, JsError> {
+) -> Result<JitRunOutcome, JsError> {
     let Some(hook) = agent.jit_hook else {
-        return Ok(None);
+        return Ok(JitRunOutcome::Interp);
     };
     // The recursion guard (see `Vm::run_jit_leaf`): beyond the cap, fall
     // back to the interpreter so the JIT's private working buffers cannot
     // exhaust the native stack.
     if agent.jit_depth >= MAX_JIT_DEPTH {
-        return Ok(None);
+        return Ok(JitRunOutcome::Interp);
     }
     let info_ptr = lookup_info(hook, ir, agent.jit_depth > 0);
     if info_ptr.is_null() {
-        return Ok(None);
+        return Ok(JitRunOutcome::Interp);
     }
     // SAFETY: the cache clears the per-body fast pointer on eviction, so a
     // pointer the caller just obtained (with no frame in flight to evict)
@@ -1681,6 +1785,7 @@ pub(crate) fn run_jit_body(
         leaf_epoch: 0,
         leaf_call_cache: LeafCallSiteCache::empty(),
         body: std::rc::Rc::as_ptr(ir),
+        tail: false,
     };
     // Register the vm (its trace covers `vm.frame`, `vm.stack`, and any
     // nested leaf jit roots) plus the working area for the call's duration:
@@ -1699,7 +1804,10 @@ pub(crate) fn run_jit_body(
     if ctx.pending {
         return Err(ctx.error.take().expect("a pending JIT error is present"));
     }
-    Ok(Some(Value::from_bits(result)))
+    if ctx.tail {
+        return Ok(JitRunOutcome::TailReplaced);
+    }
+    Ok(JitRunOutcome::Value(Value::from_bits(result)))
 }
 
 #[cfg(test)]
@@ -1747,6 +1855,7 @@ mod tests {
         assert_ne!(JIT_SLOW_PATHS.create_function_decl as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.new_target as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.regexp_literal as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.tail_call as usize, 0);
     }
 
     #[test]

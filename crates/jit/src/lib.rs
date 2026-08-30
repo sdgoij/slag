@@ -363,6 +363,7 @@ fn runtime_helpers() -> JitHelpers {
         create_function_decl: Some(rt.create_function_decl),
         new_target: Some(rt.new_target),
         regexp_literal: Some(rt.regexp_literal),
+        tail_call: Some(rt.tail_call),
     }
 }
 
@@ -483,6 +484,7 @@ mod tests {
             create_function_decl: Some(helpers::test_create_function_decl),
             new_target: Some(helpers::test_new_target),
             regexp_literal: Some(helpers::test_regexp_literal),
+            tail_call: Some(helpers::test_tail_call),
         }
     }
 
@@ -517,6 +519,7 @@ mod tests {
             leaf_epoch: 0,
             leaf_call_cache: runtime::jit::LeafCallSiteCache::empty(),
             body: std::ptr::null(),
+            tail: false,
         };
         // Safety: the buffers outlive the call; `vm` is never dereferenced by
         // the scaffold's test helpers.
@@ -775,6 +778,93 @@ mod tests {
         let body = make_body(vec![Step::NewTarget, Step::Return], 0);
         let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
         assert_ne!(compiled.info.entry, 0);
+    }
+
+    #[test]
+    fn tail_call_lowers_and_returns_the_helper_result() {
+        // Cut 45: a `TailCallFast` terminates the body with the helper's
+        // result (52 from the test double) — no fall-through, no stack leak.
+        let engine = JitEngine::new().expect("native isa");
+        let body = make_body(
+            vec![
+                Step::Push(Value::Undefined),
+                Step::Push(Value::Number(9.0)),
+                Step::Push(Value::Number(1.0)),
+                Step::TailCallFast {
+                    argc: 1,
+                    direct_eval: false,
+                },
+            ],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(52.0).bits());
+    }
+
+    #[test]
+    fn tail_call_self_loops_in_machine_code() {
+        // Cut 46: a `TailCallSelf` rebinds the frame with the new argument
+        // and jumps back to the body's entry — the whole self-recursive
+        // chain runs in ONE machine-code invocation. The body decrements
+        // slot 0 (a parameter, arity 1) and tail-self-calls until it is 0,
+        // then returns it: starting from 5, the loop runs five times with
+        // the back edge and returns 0.
+        let engine = JitEngine::new().expect("native isa");
+        let mut body = make_body(
+            vec![
+                Step::JumpIfGtImm {
+                    slot: 0,
+                    imm: 0.0,
+                    target: 6,
+                },
+                Step::LoadLocal { slot: 0 },
+                Step::Push(Value::Number(1.0)),
+                Step::Binary(syntax::ast::BinaryOp::Sub),
+                Step::TailCallSelf { argc: 1 },
+                // Unreachable fall-through of the self-call (step 5).
+                Step::Push(Value::Undefined),
+                Step::LoadLocal { slot: 0 },
+                Step::Return,
+            ],
+            1,
+        );
+        body.scope = Some(ScopeInfo {
+            arity: 1,
+            ..scope(1)
+        });
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        // The frame is 2 slots (1 + canary); slot 0 starts at 5.
+        let mut frame = vec![0u64; 2];
+        frame[0] = Value::Number(5.0).bits();
+        frame[1] = 0xDEAD_BEEF_CAFE_F00D;
+        let mut stack = vec![0u64; 65];
+        stack[64] = 0xDEAD_BEEF_CAFE_F00D;
+        let mut ctx = runtime::jit::JitCallContext {
+            pending: false,
+            error: None,
+            agent: std::ptr::null_mut(),
+            vm: std::ptr::null_mut(),
+            global_object: std::ptr::null_mut(),
+            global_value_cells: std::ptr::null_mut(),
+            member_value_cells: std::ptr::null_mut(),
+            clean_chain: false,
+            buf_end: std::ptr::null_mut(),
+            leaf_epoch: 0,
+            leaf_call_cache: runtime::jit::LeafCallSiteCache::empty(),
+            body: std::ptr::null(),
+            tail: false,
+        };
+        let result = unsafe {
+            compiled.call(
+                frame.as_mut_ptr(),
+                stack.as_mut_ptr(),
+                (&mut ctx as *mut runtime::jit::JitCallContext) as *mut std::os::raw::c_void,
+            )
+        };
+        assert!(!ctx.pending, "a test-double helper set the error flag");
+        assert_eq!(frame[1], 0xDEAD_BEEF_CAFE_F00D, "frame overrun");
+        assert_eq!(stack[64], 0xDEAD_BEEF_CAFE_F00D, "stack overrun");
+        assert_eq!(result, Value::Number(0.0).bits());
     }
 
     #[test]
@@ -1045,6 +1135,62 @@ mod tests {
         });
         assert_eq!(value.as_number(), Some(10000.0));
         assert!(compiled >= 3, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_tail_call_chain() {
+        // Cut 45: a TCO-recursive body compiles; the tail call's frame
+        // replacement escapes to the runtime, which loops on the same Vm —
+        // the 100K-deep chain runs without growing the native stack.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "\"use strict\";\n\
+                     function f(n) { if (n === 0) { return 0; } return f(n - 1); }\n\
+                     f(100000);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(0.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_self_tail_call_chain() {
+        // Cut 46: a named function expression's DIRECT self-tail-call
+        // (`return f(n - 1)` inside `function f(n)`) compiles to an
+        // in-place frame rebind + jump back to the body's re-entry — the
+        // whole 100K-deep chain runs in one machine-code invocation, no
+        // runtime round-trip.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "\"use strict\";\n\
+                     (function f(n) { if (n === 0) { return 0; } return f(n - 1); }(100000));",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(0.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_tail_call_through_a_closure() {
+        // The tco-call-args shape: `getF()(n - 1)` — closure creation plus a
+        // computed-callee tail call, both compiled now (`f` and `getF`'s
+        // body). `count` lands once at the base case.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "\"use strict\";\n\
+                     var count = 0; (function f(n) { if (n === 0) { count += 1; return; } \
+                       function getF() { return f; } \
+                       return getF()(n - 1); }(100000)); count;",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(1.0));
+        assert!(compiled >= 2, "{compiled} bodies");
     }
 
     #[test]
@@ -1703,11 +1849,11 @@ mod tests {
 
     #[test]
     fn installed_jit_runs_a_tail_call_to_a_leaf() {
-        // `return g(x)` in tail position routes through `tail_call_shared`,
-        // whose leaf path hands the certified callee's run to the JIT. The
-        // driver is called 1000 times, so the TCO fires a thousand JIT
-        // runs; the driver body bails (its tail-call step is unsupported)
-        // and runs on the interpreter.
+        // `return g(x)` in tail position: in sloppy mode the compiler emits a
+        // normal call (TCO is strict-only), so f's body compiles with the
+        // fused slot call and g (a certified leaf) runs in-frame via the
+        // leaf probe. The driver is called 1000 times, so the leaf path
+        // fires a thousand JIT runs.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(

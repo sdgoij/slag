@@ -58,6 +58,8 @@ run paths:
 | 15 | `25e9071` | **Fast string concat** (`concat_strings` helper — string-string `Add` with both tags checked inline) + in-place rope-node construction. |
 | 16 | `c2dbcde` | **Fix: share one compiled body per function site** — closes the per-closure recompile trap (function declarations *and* arrows in loops). |
 | 17 | *(worktree)* | **Closure creation + trivial context steps** — `CreateFunction`/`CreateArrow`/`FunctionDeclInit`, `NewTarget`, `RegExpLiteral` lower to step-index helpers that read the step's payload back out of the running body (`JitCallContext::body`) and run the interpreter's instantiation/evaluation machinery against the live lexical environment. A loop creating closures now runs entirely in machine code; the created closure's own body compiles separately. |
+| 18 | *(worktree)* | **Proper tail calls** — `TailCallFast`/`TailCallFastGlobal`/`TailCallFastSlot` (strict-mode TCO; the sloppy form stays a normal call per spec) lower to a `tail_call` helper that mirrors `tail_call_shared`: an ordinary certified callee replaces the current frame on the Vm (`JitCallContext::tail` + `Vm::tail_replaced`), anything else is a normal call whose result completes the body's return. `run_compiled_body` loops on the replaced body with the same Vm, so a 100K-deep TCO chain never grows the native stack. |
+| 19 | *(worktree)* | **Self-tail-call as a jump** — `TailCallSelf` (Cut 46): a tail call whose callee is the enclosing named function expression's own immutable self-binding compiles to an in-place frame rebind + jump back to the body's re-entry block, so the whole self-recursive tail chain runs in ONE machine-code invocation (no `tail_call` helper, no `run_compiled_body` round-trip). The compiler emits it only for certified capture-free, arguments-free bodies with the self-name resolving to the `Env` walk; the interpreter's `tail_call_self` rebinds the frame and re-enters the dispatch loop for the same shape. Measured ~3.3× faster than the round-trip path on a 1M-iteration chain (37ms vs ~120ms). |
 
 ### Slow-path helper table (`JitSlowPaths`, 38 helpers)
 
@@ -74,8 +76,8 @@ into the machine code at compile time. The table: `binary_slow`,
 `update_ident`, `load_context`/`store_context`/`init_context`/`update_context`,
 `load_per_iter`/`store_per_iter`/`update_per_iter`,
 `create_function`/`create_arrow`/`create_function_decl`/`new_target`/
-`regexp_literal` (the step-index helpers). A body needing a `None` helper
-bails to the interpreter.
+`regexp_literal` (the step-index helpers), `tail_call` (proper tail calls). A
+body needing a `None` helper bails to the interpreter.
 
 ## 3. Fast-path machinery
 
@@ -160,7 +162,10 @@ containing any of these fall back entirely:
 
 - **Closure creation** (`CreateFunction`, `CreateArrow`, `FunctionDeclInit`),
   `NewTarget`, and `RegExpLiteral` are now **compiled** (Cut 44) — see the
-  implemented table.
+  implemented table. Same for **proper tail calls** (`TailCallFast` and the
+  fused global/slot forms, Cut 45); the vector form `TailCall` is unreachable
+  from the JIT (`ArgsBase`/`ArgsPush` still bail), and sloppy-mode `return
+  f(n-1)` compiles as a normal call (TCO is strict-only by spec).
 - **Env machinery**: `EnterBlock`/`LeaveBlock`, `EnterWith`, `EnterTry`/
   `Exit`/`CatchBind`/`FinallyEnd`, `PerIteration`/`EnterLoopEnv`/
   `EnterPerIteration` (creation), `UsingInit`/`DeclInit`.
@@ -204,9 +209,12 @@ containing any of these fall back entirely:
    capture-free closures could cut.
 6. **Extend the bail list**: `try/catch/finally`, `switch`, `with`, `using`,
    iterators, generators/async, destructuring/spread, class machinery, mapped
-   `arguments`, tail calls (`TailCall`/`TailCallFast` — a TCO-recursive body
-   still bails at the recursion) — each is a slice of lowering + helper
-   work.
+   `arguments`, the vector call form (`ArgsBase`/`ArgsPush`/`ArgsSpread`) —
+   each is a slice of lowering + helper work. Proper tail calls are **done**
+   (Cut 45), and a NAMED function expression's direct self-tail-call now
+   jumps in machine code (Cut 46) — the remaining TCO chains (a global-name
+   recursion like `function f(n) { return f(n-1); }`, a computed callee)
+   still pay the per-iteration `tail_call` helper round-trip.
 7. **String concat**: the `concat_strings` helper is called per concat; very
    small strings could concat inline in registers.
 8. **Leaf-cache invalidation breadth**: any "disturbing" helper (a `valueOf`,

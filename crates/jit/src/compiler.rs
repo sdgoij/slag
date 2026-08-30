@@ -318,7 +318,11 @@ fn step_name(step: &Step) -> &'static str {
     match step {
         Step::Call { .. } | Step::CallFast { .. } => "Call",
         Step::CallFastGlobal { .. } | Step::CallFastSlot { .. } => "CallFastGlobal/Slot",
-        Step::TailCall { .. } | Step::TailCallFast { .. } => "TailCall",
+        Step::TailCall { .. }
+        | Step::TailCallFast { .. }
+        | Step::TailCallFastGlobal { .. }
+        | Step::TailCallFastSlot { .. }
+        | Step::TailCallSelf { .. } => "TailCall",
         Step::Throw => "Throw",
         Step::LoadIdent { .. } => "LoadIdent",
         Step::Unary(_) => "Unary",
@@ -371,6 +375,9 @@ fn step_targets(step: &Step) -> Vec<usize> {
         Step::Exit { after } => vec![*after],
         Step::ForInNext { back, .. } | Step::ForOfNext { back, .. } => vec![*back],
         Step::ForOfNextBindLocal { back, .. } => vec![*back],
+        // Cut 46: a self-tail-call jumps to the body's re-entry block, not
+        // to a step block (see `Lowerer::reentry_block`).
+        Step::TailCallSelf { .. } => Vec::new(),
         _ => Vec::new(),
     }
 }
@@ -386,6 +393,17 @@ struct Lowerer<'a> {
     back_targets: HashSet<usize>,
     frame_var: Variable,
     sp_var: Variable,
+    /// Cut 46: the working-stack base the body started with — the `sp_var`
+    /// value at entry, saved so a self-tail-call back edge can reset the
+    /// working stack to the fresh-run base before re-entering the body.
+    entry_sp_var: Variable,
+    /// Cut 46: the re-entry block a `TailCallSelf` back edge jumps to — it
+    /// re-seeds the per-run variables (working-stack base, loop counter,
+    /// accumulator) and enters step 0. `Some` only when the body contains a
+    /// `TailCallSelf` (cranelift forbids jumping to the function's entry
+    /// block, so a body with a self-tail-call routes its entry through this
+    /// block instead).
+    reentry_block: Option<Block>,
     vm_var: Variable,
     counter_var: Variable,
     acc_var: Variable,
@@ -404,6 +422,9 @@ struct Lowerer<'a> {
     /// read their step's payload back out of the running body instead of
     /// marshalling it across the FFI boundary.
     sig_step: SigRef,
+    /// The `(vm, callee, this, argc, args, direct_eval) -> value` signature
+    /// of the tail-call helper (Cut 45).
+    sig_tail: SigRef,
     /// The JIT entry signature `(frame, stack, vm) -> value` — the in-frame
     /// leaf-call path calls the callee's compiled entry with it.
     sig_entry: SigRef,
@@ -427,6 +448,7 @@ impl<'a> Lowerer<'a> {
         let mut builder = FunctionBuilder::new(func, fctx);
         let frame_var = builder.declare_var(types::I64);
         let sp_var = builder.declare_var(types::I64);
+        let entry_sp_var = builder.declare_var(types::I64);
         let vm_var = builder.declare_var(types::I64);
         let counter_var = builder.declare_var(types::F64);
         let acc_var = builder.declare_var(types::I64);
@@ -442,6 +464,7 @@ impl<'a> Lowerer<'a> {
         let sig_call = builder.import_signature(helper_sig(&[types::I64; 5], conv));
         let sig_assign = builder.import_signature(helper_sig(&[types::I64; 6], conv));
         let sig_step = builder.import_signature(helper_sig(&[types::I64; 2], conv));
+        let sig_tail = builder.import_signature(helper_sig(&[types::I64; 6], conv));
         let sig_entry = builder.import_signature(helper_sig(&[types::I64; 3], conv));
         Lowerer {
             builder,
@@ -449,8 +472,10 @@ impl<'a> Lowerer<'a> {
             scope: body.scope.as_ref(),
             blocks: Vec::new(),
             back_targets: HashSet::new(),
+            reentry_block: None,
             frame_var,
             sp_var,
+            entry_sp_var,
             vm_var,
             counter_var,
             acc_var,
@@ -466,6 +491,7 @@ impl<'a> Lowerer<'a> {
             sig_call,
             sig_assign,
             sig_step,
+            sig_tail,
             sig_entry,
             undef_bits: Value::Undefined.bits() as i64,
             null_bits: Value::Null.bits() as i64,
@@ -478,13 +504,20 @@ impl<'a> Lowerer<'a> {
 
     // ----- blocks and the step walk -----
 
+    /// Get or create the block for a step index. Step blocks carry no
+    /// parameters — the function's own entry block (the first created block,
+    /// or a dedicated forwarder when the body has a self-tail-call) binds the
+    /// frame/stack/vm parameters, and every other block's variables flow in
+    /// through the SSA machinery.
     fn ensure_block(&mut self, index: usize) -> Block {
         if let Some(block) = self.blocks[index] {
             return block;
         }
         let block = self.builder.create_block();
         if index == 0 {
-            // The entry block's parameters ARE the function parameters.
+            // The step-0 block is the function entry on the common path (its
+            // parameters ARE the function's). A self-tail-call body creates
+            // its own entry block before step 0 instead (see `emit_all`).
             self.builder.append_block_params_for_function_params(block);
         }
         self.blocks[index] = Some(block);
@@ -501,6 +534,7 @@ impl<'a> Lowerer<'a> {
             let params = self.builder.block_params(block).to_vec();
             self.builder.def_var(self.frame_var, params[0]);
             self.builder.def_var(self.sp_var, params[1]);
+            self.builder.def_var(self.entry_sp_var, params[1]);
             self.builder.def_var(self.vm_var, params[2]);
         }
         if !self.back_targets.contains(&index) {
@@ -541,14 +575,60 @@ impl<'a> Lowerer<'a> {
                 }
             }
         }
-        // Entry block: bind the parameters; seed the scratch variables so a
-        // malformed body can never read an undefined variable (the compiler
-        // only emits counter/acc uses inside counter loops / register bodies).
-        self.visit(0);
-        let zero = self.builder.ins().f64const(0.0);
-        self.builder.def_var(self.counter_var, zero);
-        let undef = self.builder.ins().iconst(types::I64, self.undef_bits);
-        self.builder.def_var(self.acc_var, undef);
+        // Cut 46: a body with a self-tail-call needs a re-entry block the
+        // back edge can jump to — cranelift forbids jumping to the
+        // function's ENTRY block, so the entry binds the parameters and
+        // falls into a re-entry block that seeds the per-run variables
+        // (the working-stack base, the loop counter, the accumulator) and
+        // enters step 0. A fresh body run through either path starts from
+        // exactly the entry state.
+        let has_self_tail_call = body
+            .steps
+            .iter()
+            .any(|step| matches!(step, Step::TailCallSelf { .. }));
+        if has_self_tail_call {
+            // The function's ENTRY block is the first block to receive an
+            // instruction; it binds the parameters and falls into the
+            // re-entry block. (Cranelift forbids jumping to the entry block,
+            // so the self-tail-call back edge targets the re-entry block
+            // instead.)
+            let entry = self.builder.create_block();
+            self.builder.append_block_params_for_function_params(entry);
+            self.builder.switch_to_block(entry);
+            let params = self.builder.block_params(entry).to_vec();
+            self.builder.def_var(self.frame_var, params[0]);
+            self.builder.def_var(self.entry_sp_var, params[1]);
+            self.builder.def_var(self.vm_var, params[2]);
+            let reentry = self.builder.create_block();
+            self.reentry_block = Some(reentry);
+            self.builder.ins().jump(reentry, &[]);
+            self.builder.seal_block(entry);
+            self.builder.switch_to_block(reentry);
+            let fresh_sp = self.builder.use_var(self.entry_sp_var);
+            self.builder.def_var(self.sp_var, fresh_sp);
+            let zero = self.builder.ins().f64const(0.0);
+            self.builder.def_var(self.counter_var, zero);
+            let undef = self.builder.ins().iconst(types::I64, self.undef_bits);
+            self.builder.def_var(self.acc_var, undef);
+            // Step 0's block is a plain block here (the entry above carries
+            // the parameters); it must not be sealed until `seal_all_blocks`
+            // because the re-entry block receives the self-tail-call back
+            // edge later.
+            let step0 = self.builder.create_block();
+            self.blocks[0] = Some(step0);
+            self.builder.ins().jump(step0, &[]);
+            self.builder.switch_to_block(step0);
+        } else {
+            // The common path: bind the parameters and seed the scratch
+            // variables directly in the entry block, so a malformed body can
+            // never read an undefined variable (the compiler only emits
+            // counter/acc uses inside counter loops / register bodies).
+            self.visit(0);
+            let zero = self.builder.ins().f64const(0.0);
+            self.builder.def_var(self.counter_var, zero);
+            let undef = self.builder.ins().iconst(types::I64, self.undef_bits);
+            self.builder.def_var(self.acc_var, undef);
+        }
         for (index, step) in body.steps.iter().enumerate() {
             if index > 0 {
                 self.visit(index);
@@ -727,6 +807,107 @@ impl<'a> Lowerer<'a> {
             Helper::GetMemberName,
             &[object, name_imm],
         )?;
+        self.builder.def_var(value_var, res);
+        self.builder.ins().jump(merge, &[]);
+        self.builder.seal_block(merge);
+        self.builder.switch_to_block(merge);
+        Ok(self.builder.use_var(value_var))
+    }
+
+    /// Cut 36: the direct-mapped global-value fast-cell read (the inline
+    /// `LoadGlobal` kernel): validate the cell's name and captured version
+    /// against the global object's LIVE identity/generation (re-read from
+    /// the per-call context), so a helper that mutated the global mid-run
+    /// bumps the generation and the fast path misses to `get_global` —
+    /// which re-resolves and repopulates the cell. A null global (a bare
+    /// test context) also falls through. The merge block is sealed and
+    /// current on return. Used by `LoadGlobal` and the `TailCallFastGlobal`
+    /// callee read.
+    fn emit_global_read(&mut self, name: crux::AtomId) -> Result<ClifValue, Unsupported> {
+        let ctx = self.vm();
+        let global = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, global_object) as i32),
+        );
+        let cells = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, global_value_cells) as i32),
+        );
+        let name_imm = self.builder.ins().iconst(types::I64, name as i64);
+        let value_var = self.builder.declare_var(types::I64);
+        let slow = self.builder.create_block();
+        let merge = self.builder.create_block();
+        let has_global = self.builder.ins().icmp_imm_u(IntCC::NotEqual, global, 0);
+        let has_global_64 = self.bint(has_global);
+        let probe = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(has_global_64, probe, &[], slow, &[]);
+        // The fast path: the cell's name and captured version must match the
+        // live global (a stale cell, another realm's global, or a mid-run
+        // mutation all miss).
+        self.builder.switch_to_block(probe);
+        let live_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            global,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
+        );
+        let live_gen = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            global,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+        );
+        let cell = self.builder.ins().iadd_imm_s(
+            cells,
+            ((name as usize & (GLOBAL_CELLS - 1)) * std::mem::size_of::<GlobalValueCell>()) as i64,
+        );
+        let cell_name = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(GlobalValueCell, name) as i32),
+        );
+        let cell_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(GlobalValueCell, global_id) as i32),
+        );
+        let cell_gen = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(GlobalValueCell, generation) as i32),
+        );
+        let cell_value = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(GlobalValueCell, value) as i32),
+        );
+        let name_ok = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, cell_name, name as i64);
+        let id_ok = self.builder.ins().icmp(IntCC::Equal, cell_id, live_id);
+        let gen_ok = self.builder.ins().icmp(IntCC::Equal, cell_gen, live_gen);
+        let name_ok_64 = self.bint(name_ok);
+        let id_ok_64 = self.bint(id_ok);
+        let gen_ok_64 = self.bint(gen_ok);
+        let name_id_ok = self.builder.ins().band(name_ok_64, id_ok_64);
+        let ok = self.builder.ins().band(name_id_ok, gen_ok_64);
+        self.builder.def_var(value_var, cell_value);
+        self.builder.ins().brif(ok, merge, &[], slow, &[]);
+        // The slow path: re-resolve through the runtime (which also
+        // repopulates the cell for the next read).
+        self.builder.switch_to_block(slow);
+        let res = self.call_slow(self.sig_bool, Helper::GetGlobal, &[name_imm])?;
         self.builder.def_var(value_var, res);
         self.builder.ins().jump(merge, &[]);
         self.builder.seal_block(merge);
@@ -1081,6 +1262,33 @@ impl<'a> Lowerer<'a> {
         self.builder.def_var(self.sp_var, pre_call_sp);
         self.push(result);
         self.builder.ins().jump(merge, &[]);
+    }
+
+    /// Cut 45: the shared tail-call tail — call the `tail_call` helper with
+    /// the callee/this/arg-region and return its result as this body's
+    /// completion value. The helper either replaced the current frame on the
+    /// Vm (the runtime loops on the new body) or ran the callee as a normal
+    /// call; either way the JIT body terminates here.
+    fn emit_tail_call(
+        &mut self,
+        callee: ClifValue,
+        this: ClifValue,
+        argc: usize,
+        args_ptr: ClifValue,
+        direct_eval: bool,
+    ) -> Result<(), Unsupported> {
+        let argc_imm = self.builder.ins().iconst(types::I64, argc as i64);
+        let direct_eval_imm = self
+            .builder
+            .ins()
+            .iconst(types::I64, i64::from(direct_eval));
+        let result = self.call_slow(
+            self.sig_tail,
+            Helper::TailCall,
+            &[callee, this, argc_imm, args_ptr, direct_eval_imm],
+        )?;
+        self.builder.ins().return_(&[result]);
+        Ok(())
     }
 
     fn const_value(&mut self, value: &Value) -> Result<ClifValue, Unsupported> {
@@ -1742,105 +1950,97 @@ impl<'a> Lowerer<'a> {
                 let this = self.builder.ins().iconst(types::I64, self.undef_bits);
                 self.emit_call(index, callee, this, args_ptr, *argc as usize, args_ptr)?;
             }
+            // Proper tail calls (Cut 45): the machine code hands the
+            // callee/args to the `tail_call` helper and returns its result —
+            // an ordinary certified callee replaces the current frame on the
+            // Vm (the runtime loops on the new body), anything else is a
+            // normal call whose result completes this body's return. The
+            // JIT body always terminates here, so no `fall_through`.
+            Step::TailCallFast { argc, direct_eval } => {
+                // `[..., this, callee, a1..aN]`.
+                let sp = self.builder.use_var(self.sp_var);
+                let args_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64) * 8));
+                let callee_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64 + 1) * 8));
+                let this_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64 + 2) * 8));
+                let callee = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    callee_ptr,
+                    Offset32::new(0),
+                );
+                let this = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    this_ptr,
+                    Offset32::new(0),
+                );
+                self.emit_tail_call(callee, this, *argc as usize, args_ptr, *direct_eval)?;
+            }
+            Step::TailCallFastSlot { slot, argc } => {
+                // `[..., a1..aN]`; the callee comes from the frame slot with
+                // an `undefined` receiver.
+                let sp = self.builder.use_var(self.sp_var);
+                let args_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64) * 8));
+                let callee = self.load_slot(*slot);
+                let this = self.builder.ins().iconst(types::I64, self.undef_bits);
+                self.emit_tail_call(callee, this, *argc as usize, args_ptr, false)?;
+            }
+            Step::TailCallFastGlobal { name, argc } => {
+                // `[..., a1..aN]`; the callee comes from the global fast cell
+                // (the `LoadGlobal` inline read) with an `undefined` receiver.
+                let sp = self.builder.use_var(self.sp_var);
+                let args_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64) * 8));
+                let callee = self.emit_global_read(*name)?;
+                let this = self.builder.ins().iconst(types::I64, self.undef_bits);
+                self.emit_tail_call(callee, this, *argc as usize, args_ptr, false)?;
+            }
+            Step::TailCallSelf { argc } => {
+                // Cut 46: the callee is the named-function-expression
+                // self-binding — statically the running body itself. The
+                // arguments sit alone at `[sp - argc*8, sp)` (the compiler
+                // skipped the this/callee pushes). Rebind the frame in place
+                // exactly like the runtime's fresh-run setup (params from the
+                // arguments, missing params and the var/lexical/`this` slots
+                // back to their entry state), reset the working stack to the
+                // entry base, and jump back to the body's entry — the whole
+                // self-recursive tail chain runs in ONE machine-code
+                // invocation, no runtime round-trip. The Vm state the machine
+                // code and its helpers leave between steps is exactly the
+                // entry state for a certified capture-free body (every helper
+                // restores the shared stacks; the body has no env/iterator
+                // machinery), so the re-entry needs only the frame rebind and
+                // the working-stack reset.
+                let scope = self
+                    .scope
+                    .ok_or(Unsupported::Step("TailCallSelf without a certified scope"))?;
+                let argc = *argc as usize;
+                let sp = self.builder.use_var(self.sp_var);
+                for slot in 0..scope.frame_size {
+                    let value = if slot < scope.arity && slot < argc {
+                        let ptr = self
+                            .builder
+                            .ins()
+                            .iadd_imm_s(sp, -(((argc - slot) as i64) * 8));
+                        self.builder.ins().load(
+                            types::I64,
+                            MemFlagsData::new(),
+                            ptr,
+                            Offset32::new(0),
+                        )
+                    } else if scope.tdz_store.get(slot).copied().unwrap_or(false) {
+                        self.builder.ins().iconst(types::I64, self.uninit_bits)
+                    } else {
+                        self.builder.ins().iconst(types::I64, self.undef_bits)
+                    };
+                    self.store_slot(slot, value);
+                }
+                let entry = self
+                    .reentry_block
+                    .expect("a TailCallSelf body always has a re-entry block");
+                self.builder.ins().jump(entry, &[]);
+            }
             Step::LoadGlobal { name } => {
-                // Cut 36: inline the direct-mapped global-value fast cell.
-                // The compiled code loads the cell and compares its name and
-                // captured version against the global object's LIVE identity
-                // and generation (via the per-call context's pointer), so a
-                // helper that mutated the global mid-run bumps the
-                // generation and the fast path misses to `get_global` —
-                // which re-resolves and repopulates the cell. A null global
-                // (a bare test context) also falls through to the helper.
-                let ctx = self.vm();
-                let global = self.builder.ins().load(
-                    types::I64,
-                    MemFlagsData::new(),
-                    ctx,
-                    Offset32::new(std::mem::offset_of!(JitCallContext, global_object) as i32),
-                );
-                let cells = self.builder.ins().load(
-                    types::I64,
-                    MemFlagsData::new(),
-                    ctx,
-                    Offset32::new(std::mem::offset_of!(JitCallContext, global_value_cells) as i32),
-                );
-                let name_imm = self.builder.ins().iconst(types::I64, *name as i64);
-                let value_var = self.builder.declare_var(types::I64);
-                let slow = self.builder.create_block();
-                let merge = self.builder.create_block();
-                let has_global = self.builder.ins().icmp_imm_u(IntCC::NotEqual, global, 0);
-                let has_global_64 = self.bint(has_global);
-                let probe = self.builder.create_block();
-                self.builder
-                    .ins()
-                    .brif(has_global_64, probe, &[], slow, &[]);
-                // The fast path: the cell's name and captured version must
-                // match the live global (a stale cell, another realm's
-                // global, or a mid-run mutation all miss).
-                self.builder.switch_to_block(probe);
-                let live_id = self.builder.ins().load(
-                    types::I64,
-                    MemFlagsData::new(),
-                    global,
-                    Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
-                );
-                let live_gen = self.builder.ins().load(
-                    types::I32,
-                    MemFlagsData::new(),
-                    global,
-                    Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
-                );
-                let cell = self.builder.ins().iadd_imm_s(
-                    cells,
-                    ((*name as usize & (GLOBAL_CELLS - 1)) * std::mem::size_of::<GlobalValueCell>())
-                        as i64,
-                );
-                let cell_name = self.builder.ins().load(
-                    types::I32,
-                    MemFlagsData::new(),
-                    cell,
-                    Offset32::new(std::mem::offset_of!(GlobalValueCell, name) as i32),
-                );
-                let cell_id = self.builder.ins().load(
-                    types::I64,
-                    MemFlagsData::new(),
-                    cell,
-                    Offset32::new(std::mem::offset_of!(GlobalValueCell, global_id) as i32),
-                );
-                let cell_gen = self.builder.ins().load(
-                    types::I32,
-                    MemFlagsData::new(),
-                    cell,
-                    Offset32::new(std::mem::offset_of!(GlobalValueCell, generation) as i32),
-                );
-                let cell_value = self.builder.ins().load(
-                    types::I64,
-                    MemFlagsData::new(),
-                    cell,
-                    Offset32::new(std::mem::offset_of!(GlobalValueCell, value) as i32),
-                );
-                let name_ok = self
-                    .builder
-                    .ins()
-                    .icmp_imm_u(IntCC::Equal, cell_name, *name as i64);
-                let id_ok = self.builder.ins().icmp(IntCC::Equal, cell_id, live_id);
-                let gen_ok = self.builder.ins().icmp(IntCC::Equal, cell_gen, live_gen);
-                let name_ok_64 = self.bint(name_ok);
-                let id_ok_64 = self.bint(id_ok);
-                let gen_ok_64 = self.bint(gen_ok);
-                let name_id_ok = self.builder.ins().band(name_ok_64, id_ok_64);
-                let ok = self.builder.ins().band(name_id_ok, gen_ok_64);
-                self.builder.def_var(value_var, cell_value);
-                self.builder.ins().brif(ok, merge, &[], slow, &[]);
-                // The slow path: re-resolve through the runtime (which also
-                // repopulates the cell for the next read).
-                self.builder.switch_to_block(slow);
-                let res = self.call_slow(self.sig_bool, Helper::GetGlobal, &[name_imm])?;
-                self.builder.def_var(value_var, res);
-                self.builder.ins().jump(merge, &[]);
-                self.builder.seal_block(merge);
-                self.builder.switch_to_block(merge);
-                let value = self.builder.use_var(value_var);
+                let value = self.emit_global_read(*name)?;
                 self.push(value);
                 self.fall_through(index);
             }

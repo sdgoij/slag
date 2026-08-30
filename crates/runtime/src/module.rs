@@ -1100,6 +1100,7 @@ fn instantiate_module_declarations(
                 source,
                 Vec::new(),
                 Vec::new(),
+                false,
             )?;
             // The function's `import.meta` resolves lexically to this module
             // (spec 13.3.7.1); instantiation runs in the harness context, so
@@ -2906,12 +2907,8 @@ fn import_attributes(
             "import options must be an object".into(),
         ));
     };
-    let with = crate::context::get_property(
-        agent,
-        options,
-        &JsString::from_utf8("with"),
-        *options,
-    )?;
+    let with =
+        crate::context::get_property(agent, options, &JsString::from_utf8("with"), *options)?;
     if matches!(with.kind(), ValueKind::Undefined) {
         return Ok(Vec::new());
     }
@@ -3140,13 +3137,8 @@ mod tests {
         .unwrap();
         let m1 = namespace_read(&mut evaluated, "m1").unwrap();
         assert_eq!(
-            crate::context::get_property(
-                &mut evaluated.agent,
-                &m1,
-                &JsString::from_utf8("a"),
-                m1,
-            )
-            .unwrap(),
+            crate::context::get_property(&mut evaluated.agent, &m1, &JsString::from_utf8("a"), m1,)
+                .unwrap(),
             Value::Number(5.0)
         );
     }
@@ -3282,9 +3274,7 @@ mod tests {
         let tag = crate::context::get_property_key(
             &mut evaluated.agent,
             &evaluated.namespace,
-            &crux::property::PropertyKey::Symbol(
-                crux::symbol::well_known("toStringTag")
-            ),
+            &crux::property::PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
             evaluated.namespace,
         )
         .unwrap();

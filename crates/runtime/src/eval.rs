@@ -564,6 +564,7 @@ pub(crate) fn eval_function_declaration(
             strict,
             Vec::new(),
             Vec::new(),
+            false,
         )?;
         variable_env.set_mutable_binding(&name, func_obj, false)?;
         return Ok(());
@@ -743,6 +744,7 @@ pub(crate) fn block_declaration_instantiation_iter<'a>(
                             strict,
                             Vec::new(),
                             Vec::new(),
+                            false,
                         )?;
                         block_env.initialize_binding(&name, func_obj)?;
                     }
@@ -969,9 +971,7 @@ fn eval_for(
                 target: None,
                 value,
             } => {
-                break Ok(Completion::Normal(
-                    value.unwrap_or(iteration_result),
-                ));
+                break Ok(Completion::Normal(value.unwrap_or(iteration_result)));
             }
             Completion::Break {
                 target: Some(l),
@@ -2276,9 +2276,7 @@ mod tests {
         let iterator_for_method = iterator;
         iterable
             .define_property_key(
-                &crux::property::PropertyKey::Symbol(
-                    crux::symbol::well_known("iterator")
-                ),
+                &crux::property::PropertyKey::Symbol(crux::symbol::well_known("iterator")),
                 &crux::property::PropertyDescriptor::data(Value::Function(
                     crux::Function::create_builtin(
                         Some(JsString::from_utf8("[Symbol.iterator]")),

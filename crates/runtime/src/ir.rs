@@ -402,6 +402,18 @@ pub enum Step {
         slot: usize,
         argc: u8,
     },
+    /// Cut 46: a proper tail call whose callee is the enclosing named
+    /// function expression's own self-binding — statically the running body
+    /// itself (the self-binding is immutable, and the compiler emits this
+    /// only for a certified capture-free, arguments-free body whose own
+    /// name resolves to the `Env` walk). The arguments sit alone on the
+    /// stack (`[a1..aN]` — no `this`/callee pushes); the handler rebinds the
+    /// frame in place and re-enters the body's entry instead of looking up
+    /// the callee, swapping contexts, and re-running the call machinery —
+    /// the whole self-recursive tail chain runs with no runtime round-trip.
+    TailCallSelf {
+        argc: u8,
+    },
     /// Tail form of `TaggedTemplate` (`return tag\`...\``).
     TailTaggedTemplate(syntax::ast::TemplateLiteral),
     SuperCall,
@@ -2176,6 +2188,13 @@ pub struct Vm {
     /// disposes them (folding into the thrown value, spec 9.4.3) before
     /// binding the parameter. `(saved_env, env_depth)` of the try frame.
     pub pending_catch_disposal: Option<(EnvRef, usize)>,
+    /// Cut 45: the next body of a JIT tail-call chain — a compiled body's
+    /// `tail_call` helper replaced the frame (via `tail_prepare_ordinary`)
+    /// and stashed the callee's body here; `run_compiled_body` loops on it
+    /// with the same Vm, so a deep TCO chain never grows the native stack.
+    /// The Rc is also in `ecma_functions` (the callee is registered), so its
+    /// literal `Value`s are already rooted and this field needs no tracing.
+    pub(crate) tail_replaced: Option<std::rc::Rc<crate::ir::CompiledBody>>,
     pub strict: bool,
     /// Whether the statement-completion register holds an empty completion
     /// (spec 6.2.2.3): no value-producing statement has run since the last
@@ -2414,6 +2433,7 @@ impl Vm {
             array_index_stack: Vec::new(),
             args_base_stack: Vec::new(),
             call_args: Vec::new(),
+            tail_replaced: None,
         }
     }
 
@@ -4147,6 +4167,7 @@ impl Vm {
                         self.strict,
                         outer_chain.clone(),
                         per_iteration_chain.clone(),
+                        false,
                     )?;
                     if let Some(slot) = frame_slot {
                         *self.frame_get_mut(*slot) = value;
@@ -4895,6 +4916,14 @@ impl Vm {
                 }
                 Step::TailCallFastSlot { slot, argc } => {
                     return self.do_tail_call_slot(agent, *slot, *argc as usize, body);
+                }
+                Step::TailCallSelf { argc } => {
+                    // Cut 46: the callee is statically the running body
+                    // itself — rebind the frame with the new arguments and
+                    // re-enter the body's entry on this Vm (no callee
+                    // lookup, no context swap, no frame realloc).
+                    self.tail_call_self(agent, *argc as usize, body)?;
+                    continue;
                 }
                 Step::CallFastGlobal {
                     name,
@@ -8247,7 +8276,7 @@ impl Vm {
     /// callee needs a path the tail dispatch does not handle (class
     /// constructor, async, generator, an AST-only body) — the caller falls
     /// back to the normal call.
-    fn tail_prepare_ordinary(
+    pub(crate) fn tail_prepare_ordinary(
         &mut self,
         agent: &mut Agent,
         function: &Handle<crux::function::Function>,
@@ -8415,6 +8444,42 @@ impl Vm {
         self.reset(body_env, strict);
         self.ip = 0;
         Ok(Some(ir))
+    }
+
+    /// Cut 46: the `TailCallSelf` handler — a tail call whose callee is the
+    /// named-function-expression self-binding, statically the running body
+    /// itself. The new arguments sit on the stack (`[a1..aN]` — the compiler
+    /// emitted no receiver/callee pushes); rebind the frame in place and
+    /// reset the per-run state exactly like `tail_prepare_ordinary`'s
+    /// certified branch, minus the callee lookup and the execution-context
+    /// swap (a capture-free self-call's context is identical to the running
+    /// one). The caller's dispatch loop re-enters the body's entry with
+    /// `ip == 0` — the whole self-recursive chain runs on this Vm with no
+    /// runtime round-trip.
+    fn tail_call_self(
+        &mut self,
+        agent: &mut Agent,
+        argc: usize,
+        body: &CompiledBody,
+    ) -> Result<(), JsError> {
+        let scope = body
+            .scope
+            .as_ref()
+            .expect("the compiler emits TailCallSelf only for certified bodies");
+        let n = self.stack.len();
+        let args: Vec<Value> = self.stack[n - argc..].to_vec();
+        let env = agent.running_context()?.lexical_environment;
+        // GC-2: the argument copy is a local `Vec<Value>` the stack scan
+        // cannot see, and `setup_frame` may allocate the heap frame — mirror
+        // `tail_call_shared`'s suppression window.
+        let _stress = StressSuppress::new();
+        self.reset(env, body.strict);
+        self.body_context = Some(env);
+        if scope.frame_size > 0 {
+            self.setup_frame(scope, &args);
+        }
+        self.ip = 0;
+        Ok(())
     }
 
     /// The `CallFastGlobal` handler (Cut 35 slice 2): the callee comes from
@@ -8871,6 +8936,7 @@ impl Vm {
             leaf_epoch: 0,
             leaf_call_cache: crate::jit::LeafCallSiteCache::empty(),
             body: std::rc::Rc::as_ptr(ir),
+            tail: false,
         };
         let frame_ptr = buf.as_mut_ptr() as *mut std::os::raw::c_void;
         // SAFETY: `buf` has `frame_size + stack_usage + slack` slots.
@@ -9742,7 +9808,7 @@ fn super_reference(
     }
 }
 
-fn is_eval_function(agent: &Agent, value: &Value) -> Result<bool, JsError> {
+pub(crate) fn is_eval_function(agent: &Agent, value: &Value) -> Result<bool, JsError> {
     // `%eval%` is a builtin function; a non-function value or a compiled
     // EcmaScript callee can never be it, so the intrinsics lookup (a HashMap
     // hit per call) is skipped for the hot path. Only agent-dependent
@@ -10568,6 +10634,16 @@ struct Compiler {
     /// compile tail calls (conservative — the corpus has no `using` + tail
     /// shape, and correctness wins).
     has_using: bool,
+    /// Cut 46: the enclosing function's own name, when it has one. A tail
+    /// call whose callee identifier matches it — in a NAMED FUNCTION
+    /// EXPRESSION body — is the immutable self-binding (the running body
+    /// itself), compiled as an in-place frame rebind + jump.
+    function_name: Option<crux::AtomId>,
+    /// Cut 46: whether the body belongs to a named function EXPRESSION (its
+    /// name is bound by the immutable self-binding scope) rather than a
+    /// function declaration or anonymous expression. See
+    /// [`crate::function::EcmaFunction::named_expression`].
+    named_expression: bool,
     /// Cut 35 slice 30: property names written to `this` in a certified
     /// constructor body (only tracked when the body uses lexical `this` /
     /// is a constructor — detected by `this_slot.is_some()` in scope).
@@ -14939,6 +15015,43 @@ impl Compiler {
             self.emit(Step::PopVarReference);
             return Ok(());
         }
+        // Cut 46: a tail call whose callee is the enclosing named function
+        // expression's own name, resolving only through the (immutable)
+        // self-binding scope — statically the running body itself. The call
+        // compiles to `TailCallSelf`: the arguments only, no receiver/callee
+        // push, and the handler rebinds the frame in place and re-enters the
+        // body (no callee lookup, no context swap, no runtime round-trip).
+        // Gated on the certified capture-free, arguments-free frame path —
+        // those shapes re-create no per-call env, so the in-place rebind is
+        // exactly what the frame replacement would do. The `Env` binding
+        // check excludes any shadowing param/local/captured/global binding;
+        // `binding` returns `Env` for the self-binding because the scan
+        // never sees the named expression's own scope.
+        if tail
+            && let ExprKind::Ident(name) = &callee.kind
+            && self.named_expression
+            && self.function_name == Some(*name)
+            && self
+                .scope
+                .as_ref()
+                .is_some_and(|s| s.context_names.is_empty())
+            && self
+                .scope
+                .as_ref()
+                .is_some_and(|s| s.arguments_slot.is_none())
+            && matches!(self.binding(*name), BindingLoc::Env)
+            && !call.optional
+            && self.chain_depth == 0
+        {
+            let saved = self.tail;
+            self.tail = false; // the arguments are never in tail position
+            let argc = self.compile_arguments(&call.args, true)?;
+            self.tail = saved;
+            if let Some(argc) = argc {
+                self.emit(Step::TailCallSelf { argc: argc as u8 });
+                return Ok(());
+            }
+        }
         // Cut 35 slice 2/4: a plain named callee with an undefined receiver
         // fuses the receiver push and the callee load into the call step (2
         // fewer dispatches per call in a hot loop). Requires no `?.` on the
@@ -15355,6 +15468,7 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
                 | Step::TailCallFast { .. }
                 | Step::TailCallFastGlobal { .. }
                 | Step::TailCallFastSlot { .. }
+                | Step::TailCallSelf { .. }
                 | Step::TailTaggedTemplate(_)
                 | Step::Construct
                 | Step::SuperCall
@@ -15894,6 +16008,11 @@ pub fn compile_body(
         strict: function.strict,
         outer_chain: function.outer_chain.clone(),
         per_iteration_chain: function.per_iteration_chain.clone(),
+        function_name: function
+            .name
+            .as_ref()
+            .map(|name| crux::intern(name.as_slice())),
+        named_expression: function.named_expression,
         ..Compiler::default()
     };
     // Cut 3 continuation: the body's `arguments` slot is filled at entry —

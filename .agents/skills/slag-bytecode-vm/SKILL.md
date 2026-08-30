@@ -616,6 +616,20 @@ clones get fresh flat caches (no sharing). The 48-byte enum also trips
 clippy's `large_enum_variant` on AST nodes embedding it (`ExportDecl`,
 `StaticElement`) — targeted allows with comments.
 
+## The JIT back edge cannot target the function's entry block
+
+Cranelift verifies a jump to the function's ENTRY block with "invalid
+reference to entry block blockN" — a self-tail-call back edge to the body's
+entry (Cut 46) must jump to a dedicated RE-ENTRY block instead: the entry
+binds the params and falls into the re-entry block, which re-seeds the
+per-run variables (working-stack base, loop counter, accumulator) and jumps
+to step 0; the back edge targets the re-entry block. The entry block is the
+first block to RECEIVE AN INSTRUCTION (not the first `create_block`), so the
+entry's jump must be emitted before the re-entry block's contents, or the
+re-entry block silently becomes the entry and the verifier fires. Step-0's
+block is a plain block in this shape (the entry carries the params), so it
+must not be sealed eagerly — `seal_all_blocks` closes it with the loop.
+
 ## Bench reality (Cut 2)
 
 `cargo run -p cli --release -- --bench` bounces ±15% on this machine (the

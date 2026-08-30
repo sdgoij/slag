@@ -203,6 +203,13 @@ pub struct EcmaFunction {
     /// heads compile to static `LoadPerIteration` reads (resolved against
     /// the closure's own `lexical_env` at run time) instead of env walks.
     pub per_iteration_chain: Vec<(Vec<crux::AtomId>, usize)>,
+    /// Cut 46: the function is a NAMED function expression (its own name is
+    /// bound by the immutable self-binding scope wrapping the body) rather
+    /// than a function declaration or anonymous expression. The compiler
+    /// uses this to recognize a tail call to the function's own name as a
+    /// self-tail-call — statically the running body itself — which compiles
+    /// to an in-place frame rebind + jump instead of a runtime round-trip.
+    pub named_expression: bool,
 }
 
 impl Trace for EcmaFunction {
@@ -476,6 +483,7 @@ pub fn instantiate_function(
     enclosing_strict: bool,
     outer_chain: Vec<Vec<crux::AtomId>>,
     per_iteration_chain: Vec<(Vec<crux::AtomId>, usize)>,
+    named_expression: bool,
 ) -> Result<Value, JsError> {
     instantiate_function_with_source(
         agent,
@@ -485,9 +493,11 @@ pub fn instantiate_function(
         None,
         outer_chain,
         per_iteration_chain,
+        named_expression,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn instantiate_function_with_source(
     agent: &mut Agent,
     f: &syntax::ast::Function,
@@ -496,6 +506,7 @@ pub fn instantiate_function_with_source(
     source: Option<JsString>,
     outer_chain: Vec<Vec<crux::AtomId>>,
     per_iteration_chain: Vec<(Vec<crux::AtomId>, usize)>,
+    named_expression: bool,
 ) -> Result<Value, JsError> {
     let source = source.or_else(|| capture_source(agent, f.span));
     let body = shared_function_body(agent, f, source.as_ref());
@@ -510,6 +521,7 @@ pub fn instantiate_function_with_source(
         source,
         None,
         outer_chain,
+        named_expression,
     )?;
     if !per_iteration_chain.is_empty()
         && let Some(function) = value.as_function()
@@ -654,6 +666,7 @@ pub fn instantiate_method(
         source,
         None,
         Vec::new(),
+        false,
     )
 }
 
@@ -678,6 +691,7 @@ pub fn instantiate_accessor(
         None,
         None,
         Vec::new(),
+        false,
     )
 }
 
@@ -738,6 +752,7 @@ fn instantiate_class_constructor_with(
         None,
         None,
         Vec::new(),
+        false,
     )?;
     if default_derived
         && let Some(function) = function.as_function()
@@ -800,6 +815,7 @@ fn register_function(
     source: Option<JsString>,
     strict: Option<bool>,
     outer_chain: Vec<Vec<crux::AtomId>>,
+    named_expression: bool,
 ) -> Result<Value, JsError> {
     // `strict` overrides the body-directive check (CreateDynamicFunction
     // computes it against its assembled source, which the running context
@@ -853,6 +869,7 @@ fn register_function(
         construct_inline: false,
         outer_chain,
         per_iteration_chain: Vec::new(),
+        named_expression,
     };
     // Every body compiles to the step IR; the VM executes ordinary bodies
     // the same way it runs the resumable kinds. The Function is created
@@ -1037,6 +1054,7 @@ pub fn instantiate_function_expression(
             enclosing_strict,
             outer_chain,
             per_iteration_chain,
+            false,
         );
     };
     let name = crux::lookup(name);
@@ -1054,6 +1072,7 @@ pub fn instantiate_function_expression(
         enclosing_strict,
         outer_chain,
         per_iteration_chain,
+        true,
     )?;
     // spec 15.2.5 step 6: the self-binding is a non-strict immutable binding,
     // so a sloppy-mode assignment to the function's own name is ignored.
@@ -1094,6 +1113,7 @@ pub fn instantiate_dynamic_function(
         source,
         Some(strict),
         Vec::new(),
+        false,
     )?;
     // GetPrototypeFromConstructor wins over the default %Function.prototype%.
     let ValueKind::Function(function) = value.kind() else {
@@ -1153,6 +1173,7 @@ pub fn instantiate_arrow(
         construct_inline: false,
         outer_chain,
         per_iteration_chain,
+        named_expression: false,
     };
     // The Function is created before the compile so a `--gc-stress`
     // collection at `Function::new` cannot sweep the compiled body's literal
@@ -1997,6 +2018,9 @@ fn run_compiled_body(
 ) -> Result<Value, JsError> {
     let body_env = agent.running_context()?.lexical_environment;
     let mut vm = agent.take_vm(body_env, strict);
+    // Cut 45: the running body — reassigned when a compiled body's tail call
+    // replaces the frame (the loop below re-enters with the new body).
+    let mut ir = ir.clone();
     // Cut 3 continuation (per-iteration loop heads): the certified body's
     // capture context is fixed for the run — the per-iteration loop
     // machinery copies fresh head bindings from it.
@@ -2031,17 +2055,36 @@ fn run_compiled_body(
     // here instead of `vm.start`'s interpreter dispatch; a body without
     // compiled code (or no hook) falls through. A JIT-compilable body has
     // no `using` resources (those steps bail), so the disposal tail below
-    // is a no-op for it.
-    if ir.scope.is_some()
-        && let Some(value) = crate::jit::run_jit_body(agent, &mut vm, ir)?
-    {
-        let result =
-            crate::eval::dispose_env_resources(agent, &body_env, Ok(Completion::Return(value)));
-        agent.return_vm(vm);
-        let completion = result?;
-        return body_completion_to_value(completion);
+    // is a no-op for it. A compiled body whose machine code performed a
+    // tail-call frame replacement loops on the next body with the SAME Vm
+    // (its frame is already set up), so a deep TCO chain never grows the
+    // native stack.
+    if ir.scope.is_some() {
+        loop {
+            match crate::jit::run_jit_body(agent, &mut vm, &ir)? {
+                crate::jit::JitRunOutcome::Value(value) => {
+                    let result = crate::eval::dispose_env_resources(
+                        agent,
+                        &body_env,
+                        Ok(Completion::Return(value)),
+                    );
+                    agent.return_vm(vm);
+                    let completion = result?;
+                    return body_completion_to_value(completion);
+                }
+                crate::jit::JitRunOutcome::TailReplaced => {
+                    // `tail_prepare_ordinary` swapped the execution context
+                    // and reset/bound the Vm for the next body.
+                    ir = vm
+                        .tail_replaced
+                        .take()
+                        .expect("a tail replacement carries the next body");
+                }
+                crate::jit::JitRunOutcome::Interp => break,
+            }
+        }
     }
-    let completion = match vm.start(agent, ir) {
+    let completion = match vm.start(agent, &ir) {
         Ok(VmOutcome::Completed(completion)) => completion,
         Ok(VmOutcome::Suspended(_)) => {
             agent.return_vm(vm);
@@ -3067,7 +3110,8 @@ pub(crate) fn function_declaration_instantiation(
     }
     for f in funcs {
         let name = crux::lookup(f.name.unwrap());
-        let func_obj = instantiate_function(agent, f, lexical_env, strict, Vec::new(), Vec::new())?;
+        let func_obj =
+            instantiate_function(agent, f, lexical_env, strict, Vec::new(), Vec::new(), false)?;
         variable_env.set_mutable_binding(&name, func_obj, false)?;
     }
 
