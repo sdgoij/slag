@@ -116,9 +116,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         )?;
         let ctor_value = Value::Function(ctor);
         realm.intrinsics.define(kind.key(), ctor_value);
-        realm
-            .intrinsics
-            .define(kind.proto_key(), proto_value);
+        realm.intrinsics.define(kind.proto_key(), proto_value);
 
         // The prototype's own `prototype` property is the generator (or async
         // generator) prototype intrinsic (spec 27.4.3.2/27.6.3.2); async

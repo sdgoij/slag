@@ -517,7 +517,8 @@ fn start_body(
         )
     })?;
     agent.execution_context_stack.push(context);
-    let vm = Vm::new(body_env, data.strict);
+    let mut vm = Vm::new(body_env, data.strict);
+    vm.current_function = Some(Value::Function(function_handle));
     state.body = Some(body.clone());
     state.vm = Some(vm);
     let outcome = {

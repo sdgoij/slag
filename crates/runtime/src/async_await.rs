@@ -233,6 +233,10 @@ pub fn call_async_function(
             }
             let mut state_ref = state.borrow_mut();
             let body = state_ref.body.clone();
+            // Cut 61: the certified super machinery resolves the home object
+            // and this slot through `current_function` — set it for the whole
+            // run (a certified async method can use `super`).
+            state_ref.vm.current_function = Some(function_value);
             let outcome = if body.scope.is_some() {
                 // A certified body: fill the frame (params from the call's
                 // args, the this slot) and the capture context, then run the
@@ -671,32 +675,24 @@ fn run_async_from_sync(
         return Ok(promise);
     }
     // AsyncFromSyncIteratorContinuation (spec 27.1.5.4) steps 2-5.
-    let done = match crate::context::get_property(
-        agent,
-        &result,
-        &JsString::from_utf8("done"),
-        result,
-    ) {
-        Ok(done) => crux::convert::to_boolean(&done),
-        Err(error) => {
-            let rejection = crate::promise::error_value(agent, &error);
-            crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
-            return Ok(promise);
-        }
-    };
-    let value = match crate::context::get_property(
-        agent,
-        &result,
-        &JsString::from_utf8("value"),
-        result,
-    ) {
-        Ok(value) => value,
-        Err(error) => {
-            let rejection = crate::promise::error_value(agent, &error);
-            crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
-            return Ok(promise);
-        }
-    };
+    let done =
+        match crate::context::get_property(agent, &result, &JsString::from_utf8("done"), result) {
+            Ok(done) => crux::convert::to_boolean(&done),
+            Err(error) => {
+                let rejection = crate::promise::error_value(agent, &error);
+                crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
+                return Ok(promise);
+            }
+        };
+    let value =
+        match crate::context::get_property(agent, &result, &JsString::from_utf8("value"), result) {
+            Ok(value) => value,
+            Err(error) => {
+                let rejection = crate::promise::error_value(agent, &error);
+                crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
+                return Ok(promise);
+            }
+        };
     // Steps 6-7: a throwing PromiseResolve (e.g. a broken promise) closes
     // the sync iterator when the result was not done. AsyncIteratorClose
     // with the throw completion: the original error wins, so a throwing
@@ -1010,9 +1006,7 @@ mod tests {
         let iterator_for_method = iterator;
         iterable
             .define_property_key(
-                &crux::property::PropertyKey::Symbol(
-                    crux::symbol::well_known("asyncIterator")
-                ),
+                &crux::property::PropertyKey::Symbol(crux::symbol::well_known("asyncIterator")),
                 &crux::property::PropertyDescriptor::data(Value::Function(
                     crux::Function::create_builtin(
                         Some(JsString::from_utf8("[Symbol.asyncIterator]")),

@@ -74,8 +74,9 @@ run paths:
 | 31 | *(worktree)* | **Generator/async suspension** (Cut 58): a certified generator or async-function body compiles, with `Step::Yield`/`Step::Await` lowering to `yield_suspend`/`await_suspend` — helpers that record the suspension payload (value + delegate flag for `yield`, the awaited value for `await`), the machine code's working-stack pointer (`suspend_sp` — the depth `run_jit_body` saves into the new traced `Vm::jit_work`), and the continuation step (`vm.ip`), then signal `DISPATCH_SUSPEND` (`u64::MAX - 2`). A body with any suspension gets an entry dispatch on `ctx.resume_kind`: 0 (normal resume) compares `ctx.resume_ip` against the static `suspension_targets` and jumps to the continuation with the resume value pushed on the restored region; 1/2 (throw/return resume) route `ctx.resume_value` through `throw_control`/`return_control`. `resume_ip == 0` is the fresh-run sentinel. The drivers (`run_jit_body_loop`/`run_jit_resume_loop`) loop on `TailReplaced`, convert a completed value to the `Completed(Return)` outcome, and fall back to `vm.start`/`vm.run`/`vm.run_abrupt` (the abrupt-of-a-plain-`yield`/`await` decision mirrors `resume_body`). Resumable bodies are never leaves (a no-`await` async body must still route through `call_async_function` to return a Promise; a no-`yield` generator body through `call_generator`); the generator/async drivers install the capture context (`new_body_context`) into `vm.body_context` + `vm.lexical_env` + the saved ExecutionContext's `lexical_environment` so closures created mid-body capture it, and `setup_certified_frame` fills the frame from the saved call args/this. `yield*` and async generators (`AsyncYieldStar*`) stay bailed: certification rejects `delegate: true` and the combined async+generator kind. |
 | 32 | *(worktree)* | **Destructuring** (Cut 59): certification accepts destructuring declaration patterns (the scan walks the pattern's bound names into the frame/context slot layout, scanning defaults and computed keys as expressions) and destructuring-assignment targets whose elements are identifiers or nested patterns (member targets stay on the env path — they need the reference machinery). The compiler emits the primitive `Destructure*` steps for EVERY certified pattern — `DestructureBegin`/`DestructureNext`/`DestructureUndef`/`DestructureRest`/`DestructureClose` drive an array pattern's iterator through helpers mirroring the interpreter handlers (the element lands on the working stack; `DestructureUndef` is a static conditional jump to the fixup-patched default label, the Cut 56/57 branch pattern); `DestructureObjCoercible`/`DestructureObjKey`/`DestructureObjKeyComputed`/`DestructureObjKeyStore`/`DestructureObjKeyGet`/`DestructureObjRest`/`DestructureObjEnd` drive an object pattern's key reads, computed-key store/get pair, and rest copy (the static exclusion set read from the step payload). The certified binds are flat: a declaration element writes its slot/context via `InitLocal`/`InitContextSlot`, an assignment element via `StoreLocal`/`StoreContextSlot`/`StoreGlobal` (an undeclared assign target falls back to `AssignIdent` — it bails the body at JIT time, correct but slower). A for-loop head's destructuring (`for (var [...x] = iter; ;)`) compiles the same steps (the var/lexical head paths were the two sweep regressions this cut's certification exposed); a lexical pattern head whose name a body closure captures stays on the env path (per-iteration freshness covers only ident heads). Error handling mirrors `run_inner`'s Err arm: a step error in a destructure body closes the active not-done iterators (`destructure_close_all` on the non-try error path; `dispatch_error` closes before the handler-table routing) unless `destructure_stepping` (a `next()` error leaves the iterator open — the interpreter's exact behavior), and an abrupt `yield`/`await` resume inside a pattern closes them like `run_abrupt_inner`. The wholesale `Destructure`/`DeclInit` pattern binds (env machinery) and `SetFunctionName` (anonymous-function defaults) stay bailed. |
 | 33 | *(worktree)* | **Arguments objects** (Cut 60): `Step::CreateArguments` — the last bail item's `mapped: Some` form — lowers via a step-index helper reading the `slot`/`mapped` payload: the sloppy MAPPED object (`create_mapped_arguments_object` — aliasing the simple params through the capture context `vm.lexical_env`, which the mapped-arguments certification slice already moved every param into; `arguments.callee` from the running context's `function`) and the strict UNMAPPED object (`create_unmapped_arguments_object` — reads only the call's argument slice). Both were previously bailed for non-leaf bodies (only the leaf path handled the unmapped form). `Step::TypeofTop` (a `typeof` VALUE operand — `typeof arguments.callee` and any member/computed `typeof`) lowers too: a pure helper returning the `typeof` string, whitelisted as leaf-eligibility-neutral; `TypeofIdent` (the unresolvable-reference form) stays env-path. BOTH `CreateArguments` forms stay leaf-excluded: the helper writes the body's `arguments` slot through `vm.frame`, but a JIT leaf runs on a PRIVATE frame buffer (`run_jit_leaf` builds its own) — a helper-written frame slot would target the caller's frame, and the strict unmapped form's `vm.call_args` is only filled by `setup_certified_frame` on the non-leaf path. That exclusion is the fix for the `--jit`-only failure clusters (Object/defineProperty, Object/create, arguments-object, Array.prototype.*, Date — strict `(function() { return arguments; })()` IIFEs returned `undefined` on the machine-code path). |
+| 34 | *(worktree)* | **Super property access** (Cut 61): certification now accepts `super` in non-arrow method/accessor bodies (`allow_super = allow_this && !is_class_constructor` — a body observing `super` also gets the `this` slot, the receiver); class constructors (`super()` + the this-before-super() TDZ) and arrows capturing `super` (lexical) stay env-path. The 12 super steps lower to helpers mirroring the interpreter handlers, branching the this binding / super base between the certified frame slot + home-object prototype and the env-path Function env: `GetSuperBase`/`ThisValue` (the base/receiver pair — `GetSuperBase` runs the this-binding check first, spec 13.3.7.1), `GetSuperName`/`GetSuperComputed`/`GetSuperComputedKeep` (reads through the base with the current this as receiver; the Keep converts the key once, writes it at the passed sp, and returns the value — `[base, key, base, key]` → `[base, key', value]`, the base surviving from the `GetSuperBase` capture), `AssignSuperName`/`AssignSuperComputed` (plain + compound writes), `UpdateSuperName`/`UpdateSuperComputed` (the `++`/`--` forms — interpreted but NOT emitted by the compiler: updates route through `ResolveSuperRef*` + `GetVarReference` + `UpdateVarReference`), `DeleteSuper` (the always-ReferenceError, spec 13.5.1.2 step 4.b — thrown before the key evaluates), and `ResolveSuperRefName`/`ResolveSuperRefComputed` (the logical-assign/update reference resolution — the reference records the base + this receiver). The base/receiver resolve through `current_function` (`certified_this` reads the `this_slot`, `certified_super_base` the home object's prototype — a static method's base is the superclass constructor); the async driver sets it for the whole run. ALL 12 steps are leaf-excluded — `GetSuperComputed` was MISSING from `steps_are_leaf`, and an inlined leaf would see the caller's this/home object (the sweep gap this cut closed). `SuperCall`/`GetVarReferenceThis`/bare `super(...)` stay bailed. |
 
-### Slow-path helper table (`JitSlowPaths`, 101 helpers)
+### Slow-path helper table (`JitSlowPaths`, 113 helpers)
 
 The JIT inlines the number/string fast paths (tag checks are ~2 instructions
 on NaN-boxed values); everything else calls a helper whose address is baked
@@ -134,7 +135,17 @@ mirroring `run_inner`'s uncovered-error close and skipping when
 `arguments` object — sloppy mapped, aliasing the formals through the
 capture context, or strict unmapped — stored into the frame slot, a
 step-index helper) and `typeof_top` (a `typeof` value operand's string;
-pure). A body needing a `None` helper bails to the
+pure); and the Cut 61 super set: `get_super_base`/`this_value` (the
+base/receiver — `get_super_base` runs the this-binding check first, spec
+13.3.7.1), `get_super_name`/`get_super_computed`/`get_super_computed_keep`
+(reads through the base with the current this as receiver — the Keep writes
+the converted key at the passed sp and returns the read value),
+`assign_super_name`/`assign_super_computed` (plain + compound writes),
+`update_super_name`/`update_super_computed` (the `++`/`--` forms —
+interpreted but not emitted by the compiler), `delete_super` (always the
+ReferenceError, spec 13.5.1.2 step 4.b), and `resolve_super_ref_name`/
+`resolve_super_ref_computed` (the logical-assign/update reference resolution
+recording the base + this receiver). A body needing a `None` helper bails to the
 interpreter.
 
 ## 3. Fast-path machinery
@@ -274,8 +285,12 @@ containing any of these fall back entirely:
 - **Sloppy mapped arguments**: `CreateArguments { mapped: Some }` is now
   **compiled** (Cut 60) — see the implemented table; `TypeofIdent` (the
   unresolvable-reference `typeof` form) stays on the env path.
-- **Super machinery**: `SuperCall`, `GetSuperBase`, `GetSuperName`/
-  `GetSuperComputed`/`AssignSuper*`, `DeleteSuper`, `UpdateSuper*`.
+- **Super machinery**: `SuperCall` (bare `super(...)` constructor calls) and
+  `GetVarReferenceThis` only — the property-access steps (`GetSuperBase`/
+  `ThisValue`, `GetSuperName`/`GetSuperComputed`/`GetSuperComputedKeep`,
+  `AssignSuper*`, `UpdateSuper*`, `DeleteSuper`, `ResolveSuperRef*`) are now
+  **compiled** (Cut 61) — see the implemented table. Class constructors and
+  arrows capturing `super` never certify.
 - **Misc**: `ThisValue`/`NewTarget` (leaf exclusion), direct eval in a
   `CallFast` site, heap-value constants (only non-heap constants inline).
 
@@ -355,8 +370,11 @@ containing any of these fall back entirely:
    `Step::CreateArguments` lower for both the sloppy mapped and strict
    unmapped forms; the mapped object aliases the capture-context params and
    reads `arguments.callee` from the running context, plus `TypeofTop` for
-   `typeof` value operands) no
-   longer bail, so a
+   `typeof` value operands), and **super property access** (Cut 61 — the
+   12 super steps lower through the base/receiver helpers; the this binding
+   and super base read the certified frame slot + home-object prototype via
+   `current_function`, while class constructors and arrows capturing
+   `super` stay on the interpreter) no longer bail, so a
    spread self-tail-call compiles and jumps end to end (~430ms for 200K,
    down from the ~2s interpreter bail; the array-creation machinery is the
    remaining floor). A vector call to a certified LEAF still runs the general

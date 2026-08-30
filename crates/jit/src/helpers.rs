@@ -123,6 +123,18 @@ pub enum Helper {
     DestructureCloseAll,
     CreateArguments,
     TypeofTop,
+    GetSuperBase,
+    ThisValue,
+    GetSuperName,
+    GetSuperComputed,
+    GetSuperComputedKeep,
+    AssignSuperName,
+    AssignSuperComputed,
+    UpdateSuperName,
+    UpdateSuperComputed,
+    DeleteSuper,
+    ResolveSuperRefName,
+    ResolveSuperRefComputed,
 }
 
 impl Helper {
@@ -230,6 +242,18 @@ impl Helper {
             Helper::DestructureCloseAll => "destructure_close_all",
             Helper::CreateArguments => "create_arguments",
             Helper::TypeofTop => "typeof_top",
+            Helper::GetSuperBase => "get_super_base",
+            Helper::ThisValue => "this_value",
+            Helper::GetSuperName => "get_super_name",
+            Helper::GetSuperComputed => "get_super_computed",
+            Helper::GetSuperComputedKeep => "get_super_computed_keep",
+            Helper::AssignSuperName => "assign_super_name",
+            Helper::AssignSuperComputed => "assign_super_computed",
+            Helper::UpdateSuperName => "update_super_name",
+            Helper::UpdateSuperComputed => "update_super_computed",
+            Helper::DeleteSuper => "delete_super",
+            Helper::ResolveSuperRefName => "resolve_super_ref_name",
+            Helper::ResolveSuperRefComputed => "resolve_super_ref_computed",
         }
     }
 
@@ -570,6 +594,34 @@ pub struct JitHelpers {
     /// `Step::TypeofTop` (Cut 60): the `typeof` string of a value operand;
     /// never errors.
     pub typeof_top: Option<extern "C" fn(vm: *mut c_void, value: u64) -> u64>,
+    /// Super property steps (Cut 61): `GetSuperBase`/`ThisValue` (the base
+    /// and receiver), `GetSuperName`/`GetSuperComputed`/`GetSuperComputedKeep`
+    /// (reads), `AssignSuperName`/`AssignSuperComputed`/`UpdateSuperName`/
+    /// `UpdateSuperComputed` (writes/updates), `DeleteSuper` (always the
+    /// ReferenceError), and `ResolveSuperRefName`/`ResolveSuperRefComputed`
+    /// (the reference for the update/logical-assign paths).
+    pub get_super_base: Option<extern "C" fn(vm: *mut c_void) -> u64>,
+    pub this_value: Option<extern "C" fn(vm: *mut c_void) -> u64>,
+    pub get_super_name: Option<extern "C" fn(vm: *mut c_void, base: u64, name: u64) -> u64>,
+    pub get_super_computed: Option<extern "C" fn(vm: *mut c_void, base: u64, key: u64) -> u64>,
+    pub get_super_computed_keep:
+        Option<extern "C" fn(vm: *mut c_void, stack: u64, base: u64, key: u64) -> u64>,
+    pub assign_super_name: Option<
+        extern "C" fn(vm: *mut c_void, op: u64, base: u64, name: u64, old: u64, value: u64) -> u64,
+    >,
+    pub assign_super_computed: Option<
+        extern "C" fn(vm: *mut c_void, op: u64, base: u64, key: u64, old: u64, value: u64) -> u64,
+    >,
+    pub update_super_name: Option<
+        extern "C" fn(vm: *mut c_void, op: u64, prefix: u64, base: u64, name: u64, old: u64) -> u64,
+    >,
+    pub update_super_computed: Option<
+        extern "C" fn(vm: *mut c_void, op: u64, prefix: u64, base: u64, key: u64, old: u64) -> u64,
+    >,
+    pub delete_super: Option<extern "C" fn(vm: *mut c_void) -> u64>,
+    pub resolve_super_ref_name: Option<extern "C" fn(vm: *mut c_void, name: u64) -> u64>,
+    pub resolve_super_ref_computed:
+        Option<extern "C" fn(vm: *mut c_void, base: u64, key: u64) -> u64>,
 }
 
 impl JitHelpers {
@@ -678,6 +730,18 @@ impl JitHelpers {
             destructure_close_all: None,
             create_arguments: None,
             typeof_top: None,
+            get_super_base: None,
+            this_value: None,
+            get_super_name: None,
+            get_super_computed: None,
+            get_super_computed_keep: None,
+            assign_super_name: None,
+            assign_super_computed: None,
+            update_super_name: None,
+            update_super_computed: None,
+            delete_super: None,
+            resolve_super_ref_name: None,
+            resolve_super_ref_computed: None,
         }
     }
 
@@ -796,6 +860,20 @@ impl JitHelpers {
             Helper::DestructureCloseAll => self.destructure_close_all.map(|f| f as usize as u64),
             Helper::CreateArguments => self.create_arguments.map(|f| f as usize as u64),
             Helper::TypeofTop => self.typeof_top.map(|f| f as usize as u64),
+            Helper::GetSuperBase => self.get_super_base.map(|f| f as usize as u64),
+            Helper::ThisValue => self.this_value.map(|f| f as usize as u64),
+            Helper::GetSuperName => self.get_super_name.map(|f| f as usize as u64),
+            Helper::GetSuperComputed => self.get_super_computed.map(|f| f as usize as u64),
+            Helper::GetSuperComputedKeep => self.get_super_computed_keep.map(|f| f as usize as u64),
+            Helper::AssignSuperName => self.assign_super_name.map(|f| f as usize as u64),
+            Helper::AssignSuperComputed => self.assign_super_computed.map(|f| f as usize as u64),
+            Helper::UpdateSuperName => self.update_super_name.map(|f| f as usize as u64),
+            Helper::UpdateSuperComputed => self.update_super_computed.map(|f| f as usize as u64),
+            Helper::DeleteSuper => self.delete_super.map(|f| f as usize as u64),
+            Helper::ResolveSuperRefName => self.resolve_super_ref_name.map(|f| f as usize as u64),
+            Helper::ResolveSuperRefComputed => {
+                self.resolve_super_ref_computed.map(|f| f as usize as u64)
+            }
         }
     }
 }
@@ -1393,6 +1471,91 @@ pub extern "C" fn test_create_arguments(_vm: *mut c_void, _step: u64) -> u64 {
 
 pub extern "C" fn test_typeof_top(_vm: *mut c_void, _value: u64) -> u64 {
     Value::String(crux::Handle::new(crux::JsString::from_utf8("function"))).bits()
+}
+
+/// Cut 61 super doubles: reads return marker values, writes/updates return
+/// the assigned/updated value, `DeleteSuper` returns 0 (the scaffolds never
+/// hit the error path), and the reference resolutions complete with
+/// `undefined`.
+pub extern "C" fn test_get_super_base(_vm: *mut c_void) -> u64 {
+    Value::Number(50.0).bits()
+}
+
+pub extern "C" fn test_this_value(_vm: *mut c_void) -> u64 {
+    Value::Number(51.0).bits()
+}
+
+pub extern "C" fn test_get_super_name(_vm: *mut c_void, _base: u64, _name: u64) -> u64 {
+    Value::Number(52.0).bits()
+}
+
+pub extern "C" fn test_get_super_computed(_vm: *mut c_void, _base: u64, _key: u64) -> u64 {
+    Value::Number(53.0).bits()
+}
+
+pub extern "C" fn test_get_super_computed_keep(
+    _vm: *mut c_void,
+    _stack: u64,
+    _base: u64,
+    _key: u64,
+) -> u64 {
+    Value::Number(54.0).bits()
+}
+
+pub extern "C" fn test_assign_super_name(
+    _vm: *mut c_void,
+    _op: u64,
+    _base: u64,
+    _name: u64,
+    _old: u64,
+    value: u64,
+) -> u64 {
+    value
+}
+
+pub extern "C" fn test_assign_super_computed(
+    _vm: *mut c_void,
+    _op: u64,
+    _base: u64,
+    _key: u64,
+    _old: u64,
+    value: u64,
+) -> u64 {
+    value
+}
+
+pub extern "C" fn test_update_super_name(
+    _vm: *mut c_void,
+    _op: u64,
+    _prefix: u64,
+    _base: u64,
+    _name: u64,
+    old: u64,
+) -> u64 {
+    old
+}
+
+pub extern "C" fn test_update_super_computed(
+    _vm: *mut c_void,
+    _op: u64,
+    _prefix: u64,
+    _base: u64,
+    _key: u64,
+    old: u64,
+) -> u64 {
+    old
+}
+
+pub extern "C" fn test_delete_super(_vm: *mut c_void) -> u64 {
+    0
+}
+
+pub extern "C" fn test_resolve_super_ref_name(_vm: *mut c_void, _name: u64) -> u64 {
+    Value::Undefined.bits()
+}
+
+pub extern "C" fn test_resolve_super_ref_computed(_vm: *mut c_void, _base: u64, _key: u64) -> u64 {
+    Value::Undefined.bits()
 }
 
 /// Sums its numeric arguments — proves the `args` pointer/`argc` ABI the

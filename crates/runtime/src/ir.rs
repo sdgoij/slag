@@ -4360,7 +4360,7 @@ impl Vm {
                     let key = self.pop();
                     let base = self.pop();
                     let key = crate::context::to_property_key(agent, &key)?;
-                    let this = resolve_this_binding(agent)?;
+                    let this = self.vm_this_binding(agent)?;
                     let value = crate::context::get_property_key(agent, &base, &key, this)?;
                     self.pop(); // the write copy of the raw key
                     let key = match key {
@@ -4372,7 +4372,7 @@ impl Vm {
                 }
                 Step::GetSuperName { name } => {
                     let base = self.pop();
-                    let this = resolve_this_binding(agent)?;
+                    let this = self.vm_this_binding(agent)?;
                     let value =
                         crate::context::get_property(agent, &base, &crux::lookup(*name), this)?;
                     self.stack.push(value);
@@ -4381,7 +4381,7 @@ impl Vm {
                     let key = self.pop();
                     let base = self.pop();
                     let key = crate::context::to_property_key(agent, &key)?;
-                    let this = resolve_this_binding(agent)?;
+                    let this = self.vm_this_binding(agent)?;
                     let value = crate::context::get_property_key(agent, &base, &key, this)?;
                     self.stack.push(value);
                 }
@@ -4392,7 +4392,7 @@ impl Vm {
                     self.stack.push(value);
                 }
                 Step::ThisValue => {
-                    let this = resolve_this_binding(agent)?;
+                    let this = self.vm_this_binding(agent)?;
                     self.stack.push(this);
                 }
                 Step::GetSuperBase => {
@@ -4400,8 +4400,8 @@ impl Vm {
                     // (spec 13.3.7.1): an uninitialized `this` in a derived
                     // constructor throws before the base is read or the key
                     // evaluates.
-                    resolve_this_binding(agent)?;
-                    let base = get_super_base(agent)?;
+                    self.vm_this_binding(agent)?;
+                    let base = self.vm_super_base(agent)?;
                     self.stack.push(base);
                 }
                 Step::AssignIdent { name, op, set_name } => {
@@ -4739,8 +4739,8 @@ impl Vm {
                     })?;
                 }
                 Step::ResolveSuperRefName { name } => {
-                    let this = resolve_this_binding(agent)?;
-                    let base = get_super_base(agent)?;
+                    let this = self.vm_this_binding(agent)?;
+                    let base = self.vm_super_base(agent)?;
                     self.var_ref_stack.push(crate::context::Reference {
                         base: crate::context::ReferenceBase::Value(base),
                         name: PropertyKey::from_js_string(&crux::lookup(*name)),
@@ -4753,7 +4753,7 @@ impl Vm {
                     let key = self.pop();
                     let base = self.pop();
                     let key = crate::context::to_property_key(agent, &key)?;
-                    let this = resolve_this_binding(agent)?;
+                    let this = self.vm_this_binding(agent)?;
                     self.var_ref_stack.push(crate::context::Reference {
                         base: crate::context::ReferenceBase::Value(base),
                         name: key,
@@ -7297,7 +7297,26 @@ impl Vm {
         value: Value,
         op: AssignOp,
     ) -> Result<(), JsError> {
-        let this = resolve_this_binding(agent)?;
+        let result = self.assign_super_value(agent, base, key, old, value, op)?;
+        self.stack.push(result);
+        Ok(())
+    }
+
+    /// The shared super-assignment core (Cut 61): `super_reference` put with
+    /// the current run's this binding — the certified frame slot for a
+    /// certified body, the Function env's binding otherwise. Returns the
+    /// assigned value (the interpreter handler pushes it; the JIT helper
+    /// returns its bits).
+    pub(crate) fn assign_super_value(
+        &mut self,
+        agent: &mut Agent,
+        base: Value,
+        key: PropertyKeyName,
+        old: Option<Value>,
+        value: Value,
+        op: AssignOp,
+    ) -> Result<Value, JsError> {
+        let this = self.vm_this_binding(agent)?;
         match op {
             AssignOp::Assign
             | AssignOp::AndAssign
@@ -7305,7 +7324,7 @@ impl Vm {
             | AssignOp::NullishAssign => {
                 let reference = super_reference(&base, &key, self.strict, &this);
                 crate::context::put_value(agent, &reference, value)?;
-                self.stack.push(value);
+                Ok(value)
             }
             _ => {
                 let Some(old) = old else {
@@ -7317,10 +7336,9 @@ impl Vm {
                 let new = crate::expr::apply_compound(agent, op, &old, &value)?;
                 let reference = super_reference(&base, &key, self.strict, &this);
                 crate::context::put_value(agent, &reference, new)?;
-                self.stack.push(new);
+                Ok(new)
             }
         }
-        Ok(())
     }
 
     fn put_super(
@@ -7330,9 +7348,115 @@ impl Vm {
         key: PropertyKeyName,
         value: Value,
     ) -> Result<(), JsError> {
-        let this = resolve_this_binding(agent)?;
+        self.put_super_value(agent, base, key, value)
+    }
+
+    /// The shared super-put core (Cut 61): like `assign_super_value` for a
+    /// plain write (no assigned-value return — the `UpdateSuper*` handlers
+    /// push the prefix/postfix result themselves).
+    pub(crate) fn put_super_value(
+        &mut self,
+        agent: &mut Agent,
+        base: Value,
+        key: PropertyKeyName,
+        value: Value,
+    ) -> Result<(), JsError> {
+        let this = self.vm_this_binding(agent)?;
         let reference = super_reference(&base, &key, self.strict, &this);
         crate::context::put_value(agent, &reference, value)
+    }
+
+    /// The this binding for the current run (Cut 61): the certified frame
+    /// slot for a certified body (`body_context` set — the certified layout
+    /// creates no Function env), the Function env's binding otherwise. The
+    /// super steps share it.
+    pub(crate) fn vm_this_binding(&self, agent: &Agent) -> Result<Value, JsError> {
+        if self.body_context.is_some() {
+            self.certified_this(agent)
+        } else {
+            resolve_this_binding(agent)
+        }
+    }
+
+    /// The super base for the current run (Cut 61): the home object's
+    /// prototype for a certified body, the env walk otherwise.
+    pub(crate) fn vm_super_base(&self, agent: &Agent) -> Result<Value, JsError> {
+        if self.body_context.is_some() {
+            self.certified_super_base(agent)
+        } else {
+            get_super_base(agent)
+        }
+    }
+
+    /// The certified run's this value (Cut 61): the running function's scope
+    /// this slot — the certified call filled it with the OrdinaryCallBindThis
+    /// result. A certified `super` body always has the slot (the scan
+    /// allocates it when `super` or `this` is observed); a method body's this
+    /// is always initialized (derived constructors never certify).
+    pub(crate) fn certified_this(&self, agent: &Agent) -> Result<Value, JsError> {
+        let Some(function_id) = self.current_function.map(|value| match value.kind() {
+            ValueKind::Function(f) => f.id(),
+            _ => 0,
+        }) else {
+            return Err(JsError::new(
+                ErrorKind::ReferenceError,
+                "No this binding".into(),
+            ));
+        };
+        let Some(scope) = agent
+            .ecma_functions
+            .get(&function_id)
+            .and_then(|data| data.ir.as_ref())
+            .and_then(|ir| ir.scope.as_ref())
+        else {
+            return Err(JsError::new(
+                ErrorKind::ReferenceError,
+                "No this binding".into(),
+            ));
+        };
+        let Some(slot) = scope.this_slot else {
+            return Err(JsError::new(
+                ErrorKind::ReferenceError,
+                "No this binding".into(),
+            ));
+        };
+        Ok(*self.frame_get(slot))
+    }
+
+    /// The certified super base (Cut 61): the running function's home
+    /// object's [[Prototype]] — the frame-slot model's equivalent of
+    /// `context::get_super_base` (the certified layout's env chain has no
+    /// Function env). The `has_super_binding` check becomes "the function
+    /// has a home object".
+    pub(crate) fn certified_super_base(&self, agent: &Agent) -> Result<Value, JsError> {
+        let Some(function_id) = self.current_function.map(|value| match value.kind() {
+            ValueKind::Function(f) => f.id(),
+            _ => 0,
+        }) else {
+            return Err(JsError::new(
+                ErrorKind::ReferenceError,
+                "super is only valid inside methods".into(),
+            ));
+        };
+        let Some(home) = agent
+            .ecma_functions
+            .get(&function_id)
+            .and_then(|data| data.home_object)
+        else {
+            return Err(JsError::new(
+                ErrorKind::ReferenceError,
+                "super is only valid inside methods".into(),
+            ));
+        };
+        let home_object = match home.kind() {
+            ValueKind::Object(obj) => obj,
+            ValueKind::Function(f) => f.object,
+            _ => return Ok(Value::Undefined),
+        };
+        Ok(home_object
+            .get_prototype_of()?
+            .map(|proto| proto.function_value().unwrap_or(Value::Object(proto)))
+            .unwrap_or(Value::Undefined))
     }
 
     /// The `Step::Call` (vector-form) handler: the callee and receiver are on
@@ -15922,6 +16046,7 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
                 | Step::ResolveSuperRefComputed
                 | Step::GetSuperBase
                 | Step::GetSuperName { .. }
+                | Step::GetSuperComputed
                 | Step::GetSuperComputedKeep
                 | Step::AssignSuperName { .. }
                 | Step::AssignSuperComputed { .. }
@@ -16730,10 +16855,17 @@ fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
     // anyway).
     let allow_arguments = function.this_mode != crate::function::ThisMode::Lexical;
     let allow_this = function.this_mode != crate::function::ThisMode::Lexical;
+    // Cut 61: super property access certifies in non-arrow method/accessor
+    // bodies (the home object's prototype is the base; the certified this
+    // slot is the receiver). Class CONSTRUCTORS stay on the env path — a
+    // derived constructor's `super()` and the this-before-super() TDZ need
+    // the Function env the certified layout never creates.
+    let allow_super = allow_this && !function.is_class_constructor;
     let arguments_id = crux::intern_utf8("arguments");
     let mut scan = FastScopeScan {
         allow_arguments,
         allow_this,
+        allow_super,
         ..FastScopeScan::default()
     };
     if allow_arguments && function.strict {
@@ -16862,8 +16994,9 @@ fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
     };
     // The body's `this` value is a frame slot the certified call fills with
     // the OrdinaryCallBindThis result; `this` is not a name, so it has no
-    // `slots`-map entry.
-    let this_slot = if scan.observes_this {
+    // `slots`-map entry. A `super` body (Cut 61) gets the slot too — the
+    // super receiver is the this binding.
+    let this_slot = if scan.observes_this || scan.observes_super {
         let slot = scan.next_slot;
         scan.tdz.push(false);
         scan.next_slot += 1;
@@ -17640,6 +17773,15 @@ struct FastScopeScan {
     /// The body references `this`: it gets a `this` slot the certified call
     /// fills with the OrdinaryCallBindThis result.
     observes_this: bool,
+    /// Whether the body is a non-arrow method/accessor whose `super` reads
+    /// resolve through the home object (Cut 61): class and object-literal
+    /// methods and accessors — class CONSTRUCTORS (and arrows, whose `super`
+    /// is lexical) stay on the env path (a derived constructor's `super()`
+    /// and the this-before-super() TDZ need the Function env).
+    allow_super: bool,
+    /// The body references `super` (property access or `super.m()` calls):
+    /// it gets a `this` slot too — the super receiver is the this binding.
+    observes_super: bool,
     /// Whether the body is strict (Cut 6 first slice): a strict body's
     /// block function declarations are block-scoped only — no Annex B var
     /// hoist.
@@ -18419,8 +18561,19 @@ impl FastScopeScan {
                 self.observes_this = true;
                 true
             }
-            ExprKind::Super
-            | ExprKind::Class(_)
+            ExprKind::Super => {
+                // Cut 61: a method/accessor body's `super` — the base is the
+                // home object's prototype, the receiver the certified this
+                // slot. A closure (arrow) containing `super` bails the
+                // enclosing body via `closure_expr_allows` (its `super` is
+                // lexical); a class constructor's `super()` stays env-path.
+                if !self.allow_super {
+                    return false;
+                }
+                self.observes_super = true;
+                true
+            }
+            ExprKind::Class(_)
             | ExprKind::PrivateIn { .. }
             | ExprKind::TaggedTemplate { .. }
             | ExprKind::MetaProperty { .. }

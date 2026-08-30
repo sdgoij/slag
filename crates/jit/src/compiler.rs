@@ -151,6 +151,29 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
                 let popped = if is_compound_assign(op) { 4 } else { 3 };
                 depth = depth.saturating_sub(popped).saturating_add(1);
             }
+            // Super property access (Cut 61): `GetSuperBase`/`ThisValue`
+            // push the base/this; the reads pop the base(+key) and push the
+            // value back (net 0 / -1); the Keep pops the duplicated pair +
+            // write-copy key, advances past the converted key, and pushes the
+            // value (net -1); the assigns mirror the member forms; the
+            // updates pop old(+key)+base and push the result; the computed
+            // reference resolve consumes base+key into the reference stack;
+            // the name form and `DeleteSuper` leave the work stack as-is.
+            Step::GetSuperBase | Step::ThisValue => depth += 1,
+            Step::GetSuperName { .. } => {}
+            Step::GetSuperComputed | Step::GetSuperComputedKeep => depth = depth.saturating_sub(1),
+            Step::AssignSuperName { op, .. } => {
+                let popped = if is_compound_assign(op) { 3 } else { 2 };
+                depth = depth.saturating_sub(popped).saturating_add(1);
+            }
+            Step::AssignSuperComputed { op } => {
+                let popped = if is_compound_assign(op) { 4 } else { 3 };
+                depth = depth.saturating_sub(popped).saturating_add(1);
+            }
+            Step::UpdateSuperName { .. } => depth = depth.saturating_sub(1),
+            Step::UpdateSuperComputed { .. } => depth = depth.saturating_sub(2),
+            Step::DeleteSuper | Step::ResolveSuperRefName { .. } => {}
+            Step::ResolveSuperRefComputed => depth = depth.saturating_sub(2),
             // The register body's transient pushes (each `PushAcc`) are
             // unwound by the entry-depth truncate.
             Step::RunRegBody { ops } => {
@@ -452,7 +475,18 @@ fn step_name(step: &Step) -> &'static str {
         Step::TypeofTop => "TypeofTop",
         Step::ImportCall { .. } | Step::ImportMeta => "Import",
         Step::ResolveVarIdent { .. } | Step::GetVarReferenceThis => "Reference machinery",
-        Step::GetSuperName { .. } | Step::GetSuperBase => "Super",
+        Step::GetSuperName { .. }
+        | Step::GetSuperComputed
+        | Step::GetSuperComputedKeep
+        | Step::GetSuperBase
+        | Step::ThisValue
+        | Step::AssignSuperName { .. }
+        | Step::AssignSuperComputed { .. }
+        | Step::UpdateSuperName { .. }
+        | Step::UpdateSuperComputed { .. }
+        | Step::DeleteSuper
+        | Step::ResolveSuperRefName { .. }
+        | Step::ResolveSuperRefComputed => "Super",
         Step::LoadContextSlot { .. } | Step::StoreContextSlot { .. } => "Context slot",
         Step::InitContextSlot { .. } | Step::UpdateContextSlot { .. } => "Context slot",
         Step::LoadPerIteration { .. }
@@ -3209,6 +3243,149 @@ impl<'a> Lowerer<'a> {
                 let value = self.pop();
                 let res = self.emit_raw_call(self.sig_bool, Helper::TypeofTop, &[value])?;
                 self.push(res);
+                self.fall_through(index);
+            }
+            // Super property access (Cut 61): the helpers mirror the
+            // interpreter handlers, branching the this binding / base between
+            // the certified frame slot + home-object prototype and the
+            // env-path Function env. The base rides the working stack; the
+            // computed Keep leaves the CONVERTED key for the write (the
+            // helper writes it at the passed sp; the machine code advances sp
+            // past it, then pushes the read value).
+            Step::GetSuperBase => {
+                let res = self.call_slow(self.sig_tdz, Helper::GetSuperBase, &[])?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::ThisValue => {
+                let res = self.call_slow(self.sig_tdz, Helper::ThisValue, &[])?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::GetSuperName { name } => {
+                let base = self.pop();
+                let name_imm = self.builder.ins().iconst(types::I64, *name as i64);
+                let res =
+                    self.call_slow(self.sig_get_name, Helper::GetSuperName, &[base, name_imm])?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::GetSuperComputed => {
+                let key = self.pop();
+                let base = self.pop();
+                let res =
+                    self.call_slow(self.sig_get_name, Helper::GetSuperComputed, &[base, key])?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::GetSuperComputedKeep => {
+                // `[base, key, base, key]` → `[base, key', value]`: pop the
+                // top key + base + the write-copy key; the helper converts
+                // the key once (the base stays the GetSuperBase capture) and
+                // writes the converted key at the current sp; the machine
+                // advances sp past it and pushes the read value.
+                let key = self.pop();
+                let base = self.pop();
+                let _write_copy = self.pop();
+                let sp = self.builder.use_var(self.sp_var);
+                let res = self.call_slow(
+                    self.sig_set_name,
+                    Helper::GetSuperComputedKeep,
+                    &[sp, base, key],
+                )?;
+                let sp2 = self.builder.ins().iadd_imm_s(sp, 8);
+                self.builder.def_var(self.sp_var, sp2);
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::AssignSuperName { name, op } => {
+                // `[base, old?, value]` → `[result]`.
+                let value = self.pop();
+                let old = if is_compound_assign(op) {
+                    self.pop()
+                } else {
+                    self.builder.ins().iconst(types::I64, self.undef_bits)
+                };
+                let base = self.pop();
+                let op_imm = self.builder.ins().iconst(types::I64, *op as u8 as i64);
+                let name_imm = self.builder.ins().iconst(types::I64, *name as i64);
+                let res = self.call_slow(
+                    self.sig_assign,
+                    Helper::AssignSuperName,
+                    &[op_imm, base, name_imm, old, value],
+                )?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::AssignSuperComputed { op } => {
+                // `[base, key, old?, value]` → `[result]`.
+                let value = self.pop();
+                let old = if is_compound_assign(op) {
+                    self.pop()
+                } else {
+                    self.builder.ins().iconst(types::I64, self.undef_bits)
+                };
+                let key = self.pop();
+                let base = self.pop();
+                let op_imm = self.builder.ins().iconst(types::I64, *op as u8 as i64);
+                let res = self.call_slow(
+                    self.sig_assign,
+                    Helper::AssignSuperComputed,
+                    &[op_imm, base, key, old, value],
+                )?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::UpdateSuperName { name, op, prefix } => {
+                // `[base, old]` → `[result]`.
+                let old = self.pop();
+                let base = self.pop();
+                let op_imm = self.builder.ins().iconst(types::I64, *op as u8 as i64);
+                let prefix_imm = self.builder.ins().iconst(types::I64, i64::from(*prefix));
+                let name_imm = self.builder.ins().iconst(types::I64, *name as i64);
+                let res = self.call_slow(
+                    self.sig_assign,
+                    Helper::UpdateSuperName,
+                    &[op_imm, prefix_imm, base, name_imm, old],
+                )?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::UpdateSuperComputed { op, prefix } => {
+                // `[base, key, old]` → `[result]`.
+                let old = self.pop();
+                let key = self.pop();
+                let base = self.pop();
+                let op_imm = self.builder.ins().iconst(types::I64, *op as u8 as i64);
+                let prefix_imm = self.builder.ins().iconst(types::I64, i64::from(*prefix));
+                let res = self.call_slow(
+                    self.sig_assign,
+                    Helper::UpdateSuperComputed,
+                    &[op_imm, prefix_imm, base, key, old],
+                )?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::DeleteSuper => {
+                // `delete super.x` always errors — the pending path surfaces
+                // the ReferenceError.
+                let _res = self.call_slow(self.sig_tdz, Helper::DeleteSuper, &[])?;
+                self.fall_through(index);
+            }
+            Step::ResolveSuperRefName { name } => {
+                let name_imm = self.builder.ins().iconst(types::I64, *name as i64);
+                let _res =
+                    self.call_slow(self.sig_bool, Helper::ResolveSuperRefName, &[name_imm])?;
+                self.fall_through(index);
+            }
+            Step::ResolveSuperRefComputed => {
+                let key = self.pop();
+                let base = self.pop();
+                let _res = self.call_slow(
+                    self.sig_get_name,
+                    Helper::ResolveSuperRefComputed,
+                    &[base, key],
+                )?;
                 self.fall_through(index);
             }
             Step::CatchBind { .. } => {

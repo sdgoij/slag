@@ -34,7 +34,9 @@ use syntax::ast::{AssignOp, BinaryOp, UpdateOp};
 use crate::agent::Agent;
 use crate::context::ReferenceBase;
 use crate::env::EnvRecord;
-use crate::ir::{CompiledBody, MEMBER_CELLS, MemberValueCell, Vm, member_reference};
+use crate::ir::{
+    CompiledBody, MEMBER_CELLS, MemberValueCell, PropertyKeyName, Vm, member_reference,
+};
 use crux::error::{ErrorKind, JsError};
 
 /// The compiled entry ABI (mirrors `jit::JitEntry`; all arguments are
@@ -711,6 +713,48 @@ pub struct JitSlowPaths {
     /// `Step::TypeofTop` (Cut 60): compute the `typeof` string of the value
     /// (pops it) and return it. Never errors.
     pub typeof_top: extern "C" fn(ctx: *mut c_void, value: u64) -> u64,
+    /// `Step::GetSuperBase` (Cut 61): the this-binding check + the base (the
+    /// home object's [[Prototype]] for a certified body, the env walk
+    /// otherwise).
+    pub get_super_base: extern "C" fn(ctx: *mut c_void) -> u64,
+    /// `Step::ThisValue` (Cut 61): the current run's this binding — the
+    /// certified frame slot or the Function env's binding.
+    pub this_value: extern "C" fn(ctx: *mut c_void) -> u64,
+    /// `Step::GetSuperName` (Cut 61): `base.name` with the this receiver.
+    pub get_super_name: extern "C" fn(ctx: *mut c_void, base: u64, name: u64) -> u64,
+    /// `Step::GetSuperComputed` (Cut 61): `base[key]` with the this receiver.
+    pub get_super_computed: extern "C" fn(ctx: *mut c_void, base: u64, key: u64) -> u64,
+    /// `Step::GetSuperComputedKeep` (Cut 61): like `get_super_computed`, with
+    /// the converted key written at `stack[0]` for the write (the machine
+    /// code advances sp past it, then pushes the returned value).
+    pub get_super_computed_keep:
+        extern "C" fn(ctx: *mut c_void, stack: u64, base: u64, key: u64) -> u64,
+    /// `Step::AssignSuperName` (Cut 61): `super.x = v` / `super.x op= v`.
+    pub assign_super_name:
+        extern "C" fn(ctx: *mut c_void, op: u64, base: u64, name: u64, old: u64, value: u64) -> u64,
+    /// `Step::AssignSuperComputed` (Cut 61): `super[k] = v` / `super[k] op= v`.
+    pub assign_super_computed:
+        extern "C" fn(ctx: *mut c_void, op: u64, base: u64, key: u64, old: u64, value: u64) -> u64,
+    /// `Step::UpdateSuperName` (Cut 61): `super.x++`/`--` (prefix/postfix).
+    pub update_super_name: extern "C" fn(
+        ctx: *mut c_void,
+        op: u64,
+        prefix: u64,
+        base: u64,
+        name: u64,
+        old: u64,
+    ) -> u64,
+    /// `Step::UpdateSuperComputed` (Cut 61): `super[k]++`/`--`.
+    pub update_super_computed:
+        extern "C" fn(ctx: *mut c_void, op: u64, prefix: u64, base: u64, key: u64, old: u64) -> u64,
+    /// `Step::DeleteSuper` (Cut 61): `delete super.x` — always the
+    /// ReferenceError (spec 13.5.1.2 step 4.b).
+    pub delete_super: extern "C" fn(ctx: *mut c_void) -> u64,
+    /// `Step::ResolveSuperRefName` (Cut 61): build the super reference on the
+    /// var_ref_stack (update/logical-assign paths).
+    pub resolve_super_ref_name: extern "C" fn(ctx: *mut c_void, name: u64) -> u64,
+    /// `Step::ResolveSuperRefComputed` (Cut 61): the computed-key form.
+    pub resolve_super_ref_computed: extern "C" fn(ctx: *mut c_void, base: u64, key: u64) -> u64,
 }
 
 /// The runtime's slow-path table, installed into every `JitHook`.
@@ -817,6 +861,18 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     destructure_close_all,
     create_arguments,
     typeof_top,
+    get_super_base,
+    this_value,
+    get_super_name,
+    get_super_computed,
+    get_super_computed_keep,
+    assign_super_name,
+    assign_super_computed,
+    update_super_name,
+    update_super_computed,
+    delete_super,
+    resolve_super_ref_name,
+    resolve_super_ref_computed,
 };
 
 /// The slack (in slots) reserved above a compiled body's working area on the
@@ -3321,6 +3377,314 @@ extern "C" fn typeof_top(ctx: *mut c_void, value: u64) -> u64 {
         crux::value::type_of(&value),
     )))
     .bits()
+}
+
+// ----- Cut 61: super property access -----
+
+/// `Step::GetSuperBase` (Cut 61): the this-binding check, then the base —
+/// the home object's [[Prototype]] for a certified body (the frame-slot
+/// model creates no Function env), the env walk otherwise. Pushes the base.
+extern "C" fn get_super_base(ctx: *mut c_void) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    match vm
+        .vm_this_binding(agent)
+        .and_then(|_| vm.vm_super_base(agent))
+    {
+        Ok(base) => base.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+/// `Step::ThisValue` (Cut 61): the current run's this binding — the
+/// certified frame slot for a certified body, the Function env otherwise.
+/// (`super.m()` calls push it as the receiver.)
+extern "C" fn this_value(ctx: *mut c_void) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    match vm.vm_this_binding(agent) {
+        Ok(this) => this.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+/// `Step::GetSuperName` (Cut 61): `base.name` with the this receiver
+/// (spec 13.3.7.1). Returns the value bits.
+extern "C" fn get_super_name(ctx: *mut c_void, base: u64, name: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let base = Value::from_bits(base);
+    match vm.vm_this_binding(agent) {
+        Ok(this) => {
+            match crate::context::get_property(agent, &base, &crux::lookup(name as u32), this) {
+                Ok(value) => value.bits(),
+                Err(error) => slow_error(ctx, error),
+            }
+        }
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+/// `Step::GetSuperComputed` (Cut 61): convert the key, then `base[key]`
+/// with the this receiver. Returns the value bits.
+extern "C" fn get_super_computed(ctx: *mut c_void, base: u64, key: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let base = Value::from_bits(base);
+    let key = Value::from_bits(key);
+    match crate::context::to_property_key(agent, &key) {
+        Ok(key) => match vm.vm_this_binding(agent) {
+            Ok(this) => match crate::context::get_property_key(agent, &base, &key, this) {
+                Ok(value) => value.bits(),
+                Err(error) => slow_error(ctx, error),
+            },
+            Err(error) => slow_error(ctx, error),
+        },
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+/// `Step::GetSuperComputedKeep` (Cut 61): like `get_super_computed`, but the
+/// CONVERTED key is written at `stack[0]` (the machine code advances its sp
+/// past it, then pushes the returned value — the write copy). The base was
+/// captured by GetSuperBase, so a key whose toString mutates the prototype
+/// still sees the original base (spec 13.3.7.1, mirroring
+/// `GetMemberComputedKeep`).
+extern "C" fn get_super_computed_keep(ctx: *mut c_void, stack: u64, base: u64, key: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let base = Value::from_bits(base);
+    let key = Value::from_bits(key);
+    let result = (|| -> Result<Value, JsError> {
+        let key = crate::context::to_property_key(agent, &key)?;
+        let this = vm.vm_this_binding(agent)?;
+        let value = crate::context::get_property_key(agent, &base, &key, this)?;
+        // The converted key's value form for the write (mirroring the
+        // interpreter's pop + push of the converted key).
+        let key_value = match key {
+            crux::property::PropertyKey::String(id) => {
+                Value::String(crux::Handle::new(crux::lookup(id)))
+            }
+            crux::property::PropertyKey::Symbol(symbol) => Value::Symbol(symbol),
+        };
+        // SAFETY: the machine code passed its live working-stack pointer
+        // with the write-copy slot vacated.
+        unsafe { *(stack as *mut u64) = key_value.bits() };
+        Ok(value)
+    })();
+    match result {
+        Ok(value) => value.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+/// `Step::AssignSuperName` (Cut 61): `super.x = v` / `super.x op= v` — the
+/// base, the cached old value (compound ops), and the value are popped by
+/// the machine code. Returns the assigned value (the assignment expression's
+/// result).
+extern "C" fn assign_super_name(
+    ctx: *mut c_void,
+    op: u64,
+    base: u64,
+    name: u64,
+    old: u64,
+    value: u64,
+) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let base = Value::from_bits(base);
+    let value = Value::from_bits(value);
+    let op = ASSIGN_OPS
+        .get(op as usize)
+        .copied()
+        .unwrap_or(AssignOp::Assign);
+    let old = if crate::ir::is_compound_assign(&op) {
+        Some(Value::from_bits(old))
+    } else {
+        None
+    };
+    match vm.assign_super_value(
+        agent,
+        base,
+        PropertyKeyName::Name(name as u32),
+        old,
+        value,
+        op,
+    ) {
+        Ok(result) => result.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+/// `Step::AssignSuperComputed` (Cut 61): like `assign_super_name` with a
+/// converted key (the machine code pops value, old, key, base).
+extern "C" fn assign_super_computed(
+    ctx: *mut c_void,
+    op: u64,
+    base: u64,
+    key: u64,
+    old: u64,
+    value: u64,
+) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let base = Value::from_bits(base);
+    let value = Value::from_bits(value);
+    let key = Value::from_bits(key);
+    let op = ASSIGN_OPS
+        .get(op as usize)
+        .copied()
+        .unwrap_or(AssignOp::Assign);
+    let old = if crate::ir::is_compound_assign(&op) {
+        Some(Value::from_bits(old))
+    } else {
+        None
+    };
+    match crate::context::to_property_key(agent, &key) {
+        Ok(key) => {
+            match vm.assign_super_value(agent, base, PropertyKeyName::Key(key), old, value, op) {
+                Ok(result) => result.bits(),
+                Err(error) => slow_error(ctx, error),
+            }
+        }
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+/// `Step::UpdateSuperName` (Cut 61): `super.x++`/`--` — pop the old value
+/// and the base, compute the update, put it through the super reference, and
+/// push the prefix/postfix result.
+extern "C" fn update_super_name(
+    ctx: *mut c_void,
+    op: u64,
+    prefix: u64,
+    base: u64,
+    name: u64,
+    old: u64,
+) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let base = Value::from_bits(base);
+    let old = Value::from_bits(old);
+    let op = UPDATE_OPS
+        .get(op as usize)
+        .copied()
+        .unwrap_or(UpdateOp::Increment);
+    match crate::ir::update_value(agent, &op, &old) {
+        Ok((old_numeric, new)) => {
+            match vm.put_super_value(agent, base, PropertyKeyName::Name(name as u32), new) {
+                Ok(()) => (if prefix != 0 { new } else { old_numeric }).bits(),
+                Err(error) => slow_error(ctx, error),
+            }
+        }
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+/// `Step::UpdateSuperComputed` (Cut 61): like `update_super_name` with a
+/// converted key (the machine code pops old, key, base).
+extern "C" fn update_super_computed(
+    ctx: *mut c_void,
+    op: u64,
+    prefix: u64,
+    base: u64,
+    key: u64,
+    old: u64,
+) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let base = Value::from_bits(base);
+    let key = Value::from_bits(key);
+    let old = Value::from_bits(old);
+    let op = UPDATE_OPS
+        .get(op as usize)
+        .copied()
+        .unwrap_or(UpdateOp::Increment);
+    match crate::context::to_property_key(agent, &key) {
+        Ok(key) => match crate::ir::update_value(agent, &op, &old) {
+            Ok((old_numeric, new)) => {
+                match vm.put_super_value(agent, base, PropertyKeyName::Key(key), new) {
+                    Ok(()) => (if prefix != 0 { new } else { old_numeric }).bits(),
+                    Err(error) => slow_error(ctx, error),
+                }
+            }
+            Err(error) => slow_error(ctx, error),
+        },
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+/// `Step::DeleteSuper` (Cut 61): `delete super.x` — a ReferenceError before
+/// the key is even evaluated (spec 13.5.1.2 step 4.b).
+extern "C" fn delete_super(ctx: *mut c_void) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    slow_error(
+        ctx,
+        JsError::new(
+            ErrorKind::ReferenceError,
+            "Unsupported reference to 'super'".into(),
+        ),
+    )
+}
+
+/// `Step::ResolveSuperRefName` (Cut 61): build the super property reference
+/// — the this binding, the base, the name — on the var_ref_stack (the
+/// update/logical-assign paths share the reference helpers).
+extern "C" fn resolve_super_ref_name(ctx: *mut c_void, name: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    match vm
+        .vm_this_binding(agent)
+        .and_then(|this| vm.vm_super_base(agent).map(|base| (this, base)))
+    {
+        Ok((this, base)) => {
+            vm.var_ref_stack.push(crate::context::Reference {
+                base: crate::context::ReferenceBase::Value(base),
+                name: crux::property::PropertyKey::from_js_string(&crux::lookup(name as u32)),
+                strict: vm.strict,
+                this_value: Some(this),
+                private_name: None,
+            });
+            Value::Undefined.bits()
+        }
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+/// `Step::ResolveSuperRefComputed` (Cut 61): like `resolve_super_ref_name`
+/// with a converted key (the machine code pops base + key).
+extern "C" fn resolve_super_ref_computed(ctx: *mut c_void, base: u64, key: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let base = Value::from_bits(base);
+    let key = Value::from_bits(key);
+    match crate::context::to_property_key(agent, &key) {
+        Ok(key) => match vm.vm_this_binding(agent) {
+            Ok(this) => {
+                vm.var_ref_stack.push(crate::context::Reference {
+                    base: crate::context::ReferenceBase::Value(base),
+                    name: key,
+                    strict: vm.strict,
+                    this_value: Some(this),
+                    private_name: None,
+                });
+                Value::Undefined.bits()
+            }
+            Err(error) => slow_error(ctx, error),
+        },
+        Err(error) => slow_error(ctx, error),
+    }
 }
 
 /// Instantiate a fresh per-iteration env whose bindings copy `names` from

@@ -1,6 +1,6 @@
 ---
 name: slag-jit
-description: "Load when working on Slag's Cranelift JIT (crates/jit/src, crates/runtime/src/jit.rs, the JIT-visible parts of crates/runtime/src/ir.rs) — helper ABI registration, emit_step lowering, block sealing, dispatch sentinels, the leaf-call probe, the certified iterator machinery (for-of/for-in/AsyncForOf*), suspension (generator Yield / async Await, resume entry dispatch, jit_work save/restore), or destructuring (the Destructure* steps, flat slot/context binds, error-close gating). Documents the non-obvious traps: the four-file helper-table mirror, the pending-error ABI, the dispatch-target compare chain, the element-via-working-stack-pointer convention, the fixup-patched ForOfBegin boundary span, the iterator-close requirements for compiled for-of bodies, the sealed-block/back-edge rules, the for_of_advance shared-core contract, the resumable-body rules, and the destructure rules (never the wholesale env binds, the for-head pattern trap, the DestructureUndef fall-through sp, the destructure_stepping close gate)."
+description: "Load when working on Slag's Cranelift JIT (crates/jit/src, crates/runtime/src/jit.rs, the JIT-visible parts of crates/runtime/src/ir.rs) — helper ABI registration, emit_step lowering, block sealing, dispatch sentinels, the leaf-call probe, the certified iterator machinery (for-of/for-in/AsyncForOf*), suspension (generator Yield / async Await, resume entry dispatch, jit_work save/restore), super property access, or destructuring (the Destructure* steps, flat slot/context binds, error-close gating). Traps: the four-file helper-table mirror, the pending-error ABI, the dispatch-target compare chain, the element-via-working-stack-pointer convention, the fixup-patched ForOfBegin boundary span, the iterator-close requirements for compiled for-of bodies, the sealed-block/back-edge rules, the for_of_advance shared-core contract, the resumable-body rules, and the destructure rules (never the wholesale env binds, the for-head pattern trap, the DestructureUndef fall-through sp, the destructure_stepping close gate)."
 ---
 
 # Slag JIT traps
@@ -232,7 +232,51 @@ only the JIT arm was missing. Traps:
   `disturbs_leaf_eligibility` and call it with `emit_raw_call` (it never
   sets the pending byte).
 
-## 12. Validation
+## 12. Super property access (Cut 61)
+
+`super.x`/`super[k]` (reads), `super.x = v`/`super.x += v` (writes),
+`super.x++`/`super.x--` (updates), `super.x &&= v`/`super.x ??= v` (logical
+assign), `super.m()` (calls), and `delete super.x` (the always-ReferenceError,
+spec 13.5.1.2 step 4.b — thrown before the key evaluates) certify in non-arrow
+method/accessor bodies (`allow_super = allow_this && !is_class_constructor`);
+class constructors (`super()` + the this-before-super() TDZ) and arrows
+capturing `super` (lexical) never certify. Traps:
+
+- **The base/receiver come from `current_function`** — `certified_this` reads
+  the running function's `this_slot`, `certified_super_base` its home
+  object's prototype (a STATIC method's home is the class constructor, so
+  the base is the superclass constructor). The drivers install it — and the
+  async driver sets it for the whole run (Cut 61) — but a leaf never sees
+  it, so ALL 12 super steps are leaf-excluded. `GetSuperComputed` was
+  MISSING from `steps_are_leaf` (the sweep gap): an inlined leaf would read
+  the CALLER's this/home object.
+- **`GetSuperComputedKeep` writes the converted key at the passed sp** (the
+  element-via-working-stack-pointer convention): the stack shape is
+  `[base, key, base, key]` → `[base, key', value]` — the base survives from
+  the `GetSuperBase` capture (spec 13.3.7.1: a key whose toString mutates
+  the prototype must still see the original base), and the machine code
+  advances sp past the converted key and pushes the value.
+- **The compiler never emits `UpdateSuperName`/`UpdateSuperComputed`** —
+  `super.x++` routes through `ResolveSuperRef*` + `GetVarReference` +
+  `UpdateVarReference` (the pre-existing reference machinery; the resolved
+  reference records `this_value`), and `super.x &&= v` through `PutVarReference`.
+  The two `UpdateSuper*` steps are interpreted but dead in certified bodies
+  (like `SuperCall`/`GetVarReferenceThis` — still bailed).
+- **`max_stack_usage` accounting**: `GetSuperBase`/`ThisValue` +1; the reads
+  net 0 (name) / −1 (computed, incl. the Keep); the assigns pop 2/3 (name)
+  or 3/4 (computed, compound) and push 1; the updates −1/−2;
+  `ResolveSuperRefComputed` −2 (consumes base+key into the reference
+  stack); the name forms and `DeleteSuper` net 0.
+- **`super.x` READS THROUGH THE BASE, not the receiver's own properties** —
+  `GetValue(super.x)` is `base.[[Get]](name, this)`: the receiver only
+  matters when the base's prototype chain finds an ACCESSOR. A data
+  property on the instance (`this.x = 10` in a constructor) is invisible
+  to `super.x` (returns `undefined` → `NaN` arithmetic). A test/example
+  that wants a super READ or UPDATE to observe a value must put it on the
+  prototype (an accessor on the base, or the base class's prototype
+  property) — the interpreter tests model this (`proto = { x: 42 }`).
+
+## 13. Validation
 
 `cargo clippy --workspace --all-targets -- -D warnings` clean, then
 `cargo test --workspace` green — then REBUILD the sweep

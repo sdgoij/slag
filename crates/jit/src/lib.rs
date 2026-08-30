@@ -427,6 +427,18 @@ fn runtime_helpers() -> JitHelpers {
         destructure_close_all: Some(rt.destructure_close_all),
         create_arguments: Some(rt.create_arguments),
         typeof_top: Some(rt.typeof_top),
+        get_super_base: Some(rt.get_super_base),
+        this_value: Some(rt.this_value),
+        get_super_name: Some(rt.get_super_name),
+        get_super_computed: Some(rt.get_super_computed),
+        get_super_computed_keep: Some(rt.get_super_computed_keep),
+        assign_super_name: Some(rt.assign_super_name),
+        assign_super_computed: Some(rt.assign_super_computed),
+        update_super_name: Some(rt.update_super_name),
+        update_super_computed: Some(rt.update_super_computed),
+        delete_super: Some(rt.delete_super),
+        resolve_super_ref_name: Some(rt.resolve_super_ref_name),
+        resolve_super_ref_computed: Some(rt.resolve_super_ref_computed),
     }
 }
 
@@ -611,6 +623,18 @@ mod tests {
             destructure_close_all: Some(helpers::test_destructure_close_all),
             create_arguments: Some(helpers::test_create_arguments),
             typeof_top: Some(helpers::test_typeof_top),
+            get_super_base: Some(helpers::test_get_super_base),
+            this_value: Some(helpers::test_this_value),
+            get_super_name: Some(helpers::test_get_super_name),
+            get_super_computed: Some(helpers::test_get_super_computed),
+            get_super_computed_keep: Some(helpers::test_get_super_computed_keep),
+            assign_super_name: Some(helpers::test_assign_super_name),
+            assign_super_computed: Some(helpers::test_assign_super_computed),
+            update_super_name: Some(helpers::test_update_super_name),
+            update_super_computed: Some(helpers::test_update_super_computed),
+            delete_super: Some(helpers::test_delete_super),
+            resolve_super_ref_name: Some(helpers::test_resolve_super_ref_name),
+            resolve_super_ref_computed: Some(helpers::test_resolve_super_ref_computed),
         }
     }
 
@@ -3714,6 +3738,190 @@ mod tests {
                 .expect("runs")
         });
         assert_eq!(value.as_boolean(), Some(true));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_super_method_call_keeps_this() {
+        // Cut 61: `super.m()` lowers to `ThisValue` + `GetSuperBase` +
+        // `GetSuperName` + `CallFast` — the receiver must be the current
+        // this (the base method reads `this.v`), not the base object the
+        // `GetSuperBase` capture left on the stack. The derived
+        // constructor itself is env-path (bailed); the method bodies
+        // compile.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "class A { m() { return this.v; } }\n\
+                     class B extends A { constructor() { super(); this.v = 42; } m() { return super.m(); } }\n\
+                     new B().m();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(42.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_super_computed_read_and_call() {
+        // Cut 61: the computed shapes — `super[k]` (read: `GetSuperBase` +
+        // key + `GetSuperComputed`) and `super[j]()` (call: `ThisValue` +
+        // `GetSuperBase` + key + `GetSuperComputed` + `CallFast`). The two
+        // stack shapes differ by the extra this-value push; a height mixup
+        // would land the wrong receiver. The read key hits the prototype
+        // accessor; the call key the prototype method.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "class A { constructor() { this._x = 40; } get x() { return this._x; } m() { return 41; } }\n\
+                     class B extends A { m(k, j) { var a = super[k]; var b = super[j](); return a + b; } }\n\
+                     new B().m('x', 'm');",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(81.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_super_assign_and_compound() {
+        // Cut 61: `super.x = v` (`GetSuperBase` + `AssignSuperName`) and
+        // `super.x += v` (the compound: base + `Dup` + `GetSuperName` old +
+        // `AssignSuperName { op }`) — both write through the super
+        // reference with the current this as the receiver. The accessor
+        // lives on the BASE (the read/write must go through the prototype
+        // chain, not the instance's own property).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "class A { constructor() { this._x = 10; } get x() { return this._x; } set x(v) { this._x = v; } }\n\
+                     class B extends A { m() { super.x = 5; super.x += 3; return this._x; } }\n\
+                     new B().m();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(8.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_super_update_prefix_postfix() {
+        // Cut 61: `super.x++`/`--` route through the pre-resolved
+        // reference (`ResolveSuperRefName`/`ResolveSuperRefComputed` +
+        // `GetVarReference` + `UpdateVarReference`). Sequence: postfix ++
+        // (10→11), prefix ++ (11→12), postfix ++ computed (12→13), prefix
+        // -- computed (13→12).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "class A { constructor() { this._x = 10; } get x() { return this._x; } set x(v) { this._x = v; } }\n\
+                     class B extends A { m(k) { var a = super.x++; var b = ++super.x; var c = super[k]++; var d = --super[k]; return a * 1000 + b * 100 + c * 10 + d; } }\n\
+                     new B().m('x');",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(11332.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_super_logical_assign() {
+        // Cut 61: `super.x &&= v` / `super.x ??= v` — the `ResolveSuperRef*`
+        // + `GetVarReference` + `PutVarReference` chain with both the write
+        // path (old truthy/nullish) and the short-circuit path (old keeps
+        // the expression result). `super[k] &&= 3` exercises the computed
+        // resolve.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "class A { constructor() { this._x = 10; this._y = null; } get x() { return this._x; } set x(v) { this._x = v; } get y() { return this._y; } set y(v) { this._y = v; } }\n\
+                     class B extends A { m(k) { super.x &&= 5; super.y ??= 7; super[k] &&= 3; var sx = super.x; var sy = super.y; super.x ??= 99; var sh = super.x; return sx * 1000 + sy * 100 + sh; } }\n\
+                     new B().m('x');",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(3703.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_super_in_async_method() {
+        // Cut 61: a certified async method body using `super` — the async
+        // driver must set `current_function` for the whole run, or the
+        // `vm_this_binding`/`vm_super_base` reads fail (no home object /
+        // this slot on the certified path).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "class A { m() { return 41; } }\n\
+                     var B = class extends A { async m() { return super.m() + 1; } };\n\
+                     var result = 'pending';\n\
+                     new B().m().then(v => { result = v; });",
+                )
+                .expect("runs");
+            agent.run_jobs().expect("jobs");
+            agent.run_script("result").expect("reads")
+        });
+        assert_eq!(value.as_number(), Some(42.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_delete_super_is_reference_error() {
+        // Cut 61: `delete super.x` / `delete super[k]` is a ReferenceError
+        // before the key is evaluated (spec 13.5.1.2 step 4.b) — both the
+        // name and computed forms surface it through the pending-error path.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "class A {} class B extends A { m() { var hits = 0; try { delete super.x; } catch (e1) { hits += (e1 instanceof ReferenceError ? 1 : 0); } try { delete super['x']; } catch (e2) { hits += (e2 instanceof ReferenceError ? 1 : 0); } return hits; } }\n\
+                     new B().m();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(2.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_super_static_and_inherited_base() {
+        // Cut 61: the base is the home object's prototype — for a static
+        // method that is the superclass CONSTRUCTOR (B.[[Prototype]] = A),
+        // and for an inherited method the receiver's class differs from the
+        // method's home object (C inherits `n` from B, whose home is
+        // B.prototype).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "class A { static s() { return 41; } static v = 7; }\n\
+                     class B extends A { static m() { return super.s() + super.v; } }\n\
+                     class D { n() { return 10; } } class E extends D { n() { return super.n() * 2; } } class F extends E {}\n\
+                     B.m() + new F().n();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(68.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_super_read_and_call_stack_shapes() {
+        // Cut 61: `super.getX` (read: `[base] -> [value]`) and `super.getX()`
+        // (call: `[this, base] -> [this, value]` + `CallFast`) compile to
+        // different working-stack heights; a mixed-up shape lands the wrong
+        // this or base. One body exercises both plus a member read of a
+        // script-global (`proto.getX` via the env-path reference
+        // machinery).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var proto = { getX: function () { return 41; } };\n\
+                     var o = { __proto__: proto, m() { var f = super.getX; return (f === proto.getX && super.getX() === 41) ? 42 : 0; } };\n\
+                     o.m();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(42.0));
         assert!(compiled >= 1, "{compiled} bodies");
     }
 }
