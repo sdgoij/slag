@@ -411,6 +411,8 @@ fn runtime_helpers() -> JitHelpers {
         for_of_close_all: Some(rt.for_of_close_all),
         enter_per_iteration: Some(rt.enter_per_iteration),
         per_iteration: Some(rt.per_iteration),
+        yield_suspend: Some(rt.yield_suspend),
+        await_suspend: Some(rt.await_suspend),
     }
 }
 
@@ -579,6 +581,8 @@ mod tests {
             for_of_close_all: Some(helpers::test_for_of_close_all),
             enter_per_iteration: Some(helpers::test_enter_per_iteration),
             per_iteration: Some(helpers::test_per_iteration),
+            yield_suspend: Some(helpers::test_yield_suspend),
+            await_suspend: Some(helpers::test_await_suspend),
         }
     }
 
@@ -616,6 +620,12 @@ mod tests {
             tail: false,
             current_function: 0,
             dispatch_value: 0,
+            suspension: None,
+            suspend_sp: 0,
+            resume_kind: 0,
+            resume_ip: 0,
+            resume_sp: 0,
+            resume_value: 0,
         };
         // Safety: the buffers outlive the call; `vm` is never dereferenced by
         // the scaffold's test helpers.
@@ -955,6 +965,12 @@ mod tests {
             tail: false,
             current_function: 0,
             dispatch_value: 0,
+            suspension: None,
+            suspend_sp: 0,
+            resume_kind: 0,
+            resume_ip: 0,
+            resume_sp: 0,
+            resume_value: 0,
         };
         let result = unsafe {
             compiled.call(
@@ -1163,6 +1179,12 @@ mod tests {
             tail: false,
             current_function: Value::Number(5.0).bits(),
             dispatch_value: 0,
+            suspension: None,
+            suspend_sp: 0,
+            resume_kind: 0,
+            resume_ip: 0,
+            resume_sp: 0,
+            resume_value: 0,
         };
         let result = unsafe {
             compiled.call(
@@ -1239,6 +1261,12 @@ mod tests {
             tail: false,
             current_function: 0,
             dispatch_value: 0,
+            suspension: None,
+            suspend_sp: 0,
+            resume_kind: 0,
+            resume_ip: 0,
+            resume_sp: 0,
+            resume_value: 0,
         };
         let result = unsafe {
             compiled.call(
@@ -2322,6 +2350,194 @@ mod tests {
             value.as_string().map(|s| s.to_string()),
             Some("a,b".to_string())
         );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_an_async_function_with_awaits() {
+        // Cut 58: a certified async function compiles — each `await`
+        // suspends the machine code (`DISPATCH_SUSPEND`), the driver
+        // attaches the promise reactions, and the resume re-enters the
+        // compiled body at the continuation with the awaited value pushed.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var result = 'pending';\n\
+                     async function f(x) { var a = await x; var b = await (a + 1); return b * 2; }\n\
+                     f(10).then(function (v) { result = v; });",
+                )
+                .expect("runs");
+            agent.run_jobs().expect("jobs");
+            agent.run_script("result").expect("reads")
+        });
+        assert_eq!(value.as_number(), Some(22.0));
+        // The async body itself compiled (the `await` steps lowered): the
+        // body plus the `.then` callback are two distinct compiled bodies.
+        assert!(compiled >= 2, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_async_function_rejection_routes_through_the_catch() {
+        // Cut 58: a rejected `await` resumes with `Resume::Throw`, which the
+        // machine code's entry routes through `throw_control` — the
+        // machinery finds the body's catch (a static dispatch target) and
+        // the resumed segment runs the catch in machine code.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var result = 'pending';\n\
+                     async function f() { var log = ''; try { await Promise.reject('boom'); } \
+                       catch (e) { log += 'c' + e; } return log + 'done'; }\n\
+                     f().then(function (v) { result = v; });",
+                )
+                .expect("runs");
+            agent.run_jobs().expect("jobs");
+            agent.run_script("result").expect("reads")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("cboomdone".to_string())
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_async_function_with_a_finally_and_escaped_rejection() {
+        // Cut 58: an `await` inside a try with a finally — the rejected
+        // resume routes through the machinery (finally runs, then the throw
+        // escapes the body and rejects the promise).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var result = 'pending';\n\
+                     async function f() { var log = ''; try { await Promise.reject('x'); } \
+                       finally { log += 'f'; } return log; }\n\
+                     f().then(function (v) { result = 'ok:' + v; }, function (e) { result = 'rej:' + e; });",
+                )
+                .expect("runs");
+            agent.run_jobs().expect("jobs");
+            agent.run_script("result").expect("reads")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("rej:x".to_string())
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_generator_with_plain_yields() {
+        // Cut 58: a certified generator body compiles — each `yield`
+        // suspends, `next()` resumes at the continuation, and the final
+        // `return` completes the iteration.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function* g() { yield 1; yield 2; return 3; }\n\
+                     var out = ''; var it = g(); var r;\n\
+                     while (!(r = it.next()).done) { out += r.value + ','; }\n\
+                     out += r.value;",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("1,2,3".to_string())
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_generator_with_a_yield_in_a_fast_loop() {
+        // Cut 58: a `yield` inside a certified fast loop — the loop takes
+        // the SLOT-counter path (a suspension body never uses the machine-
+        // local counter field), so the counter persists in the frame slot
+        // across each suspension and the resumed segment continues the loop.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function* g() { for (var i = 0; i < 4; i++) { yield i; } }\n\
+                     var out = ''; var it = g(); var r;\n\
+                     while (!(r = it.next()).done) { out += r.value + ','; }\n\
+                     out += '|' + r.value;",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("0,1,2,3,|undefined".to_string())
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_generator_throw_routes_through_the_machinery() {
+        // Cut 58: `it.throw(v)` at a plain `yield` resumes with
+        // `Resume::Throw` — the machine code's entry routes it through
+        // `throw_control`, and a body catch catches it; a second `throw`
+        // with no catch escapes and completes the generator.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function* g() { var log = ''; try { yield 1; } catch (e) { log += 'c' + e; } \
+                       return log + 'r'; }\n\
+                     var it = g(); var r1 = it.next(); var r2 = it.throw('boom');\n\
+                     r1.value + '|' + r1.done + '|' + r2.value + '|' + r2.done;",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("1|false|cboomr|true".to_string())
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_async_generator_falls_back_to_the_interpreter() {
+        // Cut 58: an async GENERATOR stays on the env path (certification
+        // rejects the combined kind) — it must still run correctly.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var result = 'pending';\n\
+                     async function* g() { yield 1; yield 2; }\n\
+                     (async function () { var out = ''; for await (var v of g()) { out += v; } \
+                       return out; })().then(function (v) { result = v; });",
+                )
+                .expect("runs");
+            agent.run_jobs().expect("jobs");
+            agent.run_script("result").expect("reads")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("12".to_string())
+        );
+        // The async generator body is not certified, so it never compiles;
+        // the `.then` callback (a plain body) does — proving the hook fired.
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_async_method_returns_nested_async_function() {
+        // Cut 58: a strict async METHOD returns an async function capturing
+        // the method's param — the inner body resolves it through the
+        // closure's [[Environment]] (a strict body's instantiated env would
+        // be the Function env — the crash that took down the async-method
+        // fixture cluster). The JIT path and the interpreter share the
+        // `call_async_function` setup, so this guards both.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var C = class { async method(x) { return async function () { return x; }; } };\n\
+                     var c = new C(); var asyncFn = c.method.bind(c); var result = 'pending';\n\
+                     asyncFn(7).then(retFn => retFn()).then(v => { result = v; });",
+                )
+                .expect("runs");
+            agent.run_jobs().expect("jobs");
+            agent.run_script("result").expect("reads")
+        });
+        assert_eq!(value.as_number(), Some(7.0));
         assert!(compiled >= 1, "{compiled} bodies");
     }
 

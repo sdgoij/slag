@@ -243,6 +243,9 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
                 depth = depth.saturating_sub(1)
             }
             Step::ForOfClose | Step::EnterPerIteration { .. } | Step::PerIteration { .. } => {}
+            // Suspension (Cut 58): `Yield`/`Await` pop the value into the
+            // suspension payload (the saved region is what's below).
+            Step::Yield { .. } | Step::Await => depth = depth.saturating_sub(1),
             _ => {}
         }
         max = max.max(depth);
@@ -420,7 +423,13 @@ fn step_name(step: &Step) -> &'static str {
         Step::EnterPerIteration { .. } | Step::PerIteration { .. } => "Per-iteration env",
         Step::SwitchDisc | Step::SwitchTest { .. } => "Switch",
         Step::Break { .. } | Step::Continue { .. } => "Break/Continue",
-        Step::Yield { .. } | Step::Await => "Yield/Await",
+        Step::YieldStarBegin
+        | Step::YieldStarNext { .. }
+        | Step::YieldStarResume { .. }
+        | Step::AsyncYieldStarBegin
+        | Step::AsyncYieldStarNext { .. }
+        | Step::AsyncYieldStarInspect { .. }
+        | Step::AsyncYieldStarResume { .. } => "YieldStar/AsyncYieldStar",
         Step::ImportCall { .. } | Step::ImportMeta => "Import",
         Step::ResolveVarIdent { .. } | Step::GetVarReferenceThis => "Reference machinery",
         Step::GetSuperName { .. } | Step::GetSuperBase => "Super",
@@ -524,6 +533,16 @@ struct Lowerer<'a> {
     /// iterators before the body returns (the callee Vm's stacks are
     /// discarded on the error surface).
     has_for_of: bool,
+    /// Cut 58: whether the body contains a suspension step (`Yield`/
+    /// `Await`). A suspension body gets an entry-forwarder block that
+    /// dispatches the resume: a normal resume jumps to the continuation
+    /// block, a throw/return resume routes through the control machinery.
+    has_suspension: bool,
+    /// Cut 58: the step indices a normal resume can enter at — the step
+    /// after each `Yield`/`Await` (the interpreter's `vm.ip` at the
+    /// suspension). The entry's resume chain compares `ctx.resume_ip`
+    /// against these.
+    suspension_targets: Vec<usize>,
     /// Cut 55: the static set of step indexes a control-transfer dispatch
     /// can jump to — every `Exit`'s `after`, every `Break`/`Continue`
     /// target, and every handler's catch/finally start. The dispatch
@@ -596,6 +615,18 @@ impl<'a> Lowerer<'a> {
                 Step::ForOfBegin { .. } | Step::ForOfNext { .. } | Step::ForOfNextBindLocal { .. }
             )
         });
+        let has_suspension = body
+            .steps
+            .iter()
+            .any(|step| matches!(step, Step::Yield { .. } | Step::Await));
+        let mut suspension_targets = Vec::new();
+        for (index, step) in body.steps.iter().enumerate() {
+            if matches!(step, Step::Yield { .. } | Step::Await) {
+                // The continuation is the next step (possibly the
+                // past-the-end block when the suspension is last).
+                suspension_targets.push(index + 1);
+            }
+        }
         let mut dispatch_targets = std::collections::BTreeSet::new();
         for step in &body.steps {
             match step {
@@ -645,6 +676,8 @@ impl<'a> Lowerer<'a> {
             sig_entry,
             has_try,
             has_for_of,
+            has_suspension,
+            suspension_targets,
             dispatch_targets,
             current_step: 0,
             error_sp: None,
@@ -755,12 +788,13 @@ impl<'a> Lowerer<'a> {
                     | Step::TailCallSelfCheckVector
             )
         });
-        if has_self_tail_call {
+        if has_self_tail_call || self.has_suspension {
             // The function's ENTRY block is the first block to receive an
             // instruction; it binds the parameters and falls into the
-            // re-entry block. (Cranelift forbids jumping to the entry block,
-            // so the self-tail-call back edge targets the re-entry block
-            // instead.)
+            // re-entry block (a self-tail-call back edge) or the resume
+            // dispatch (a suspension). (Cranelift forbids jumping to the
+            // entry block, so the self-tail-call back edge targets the
+            // re-entry block instead.)
             let entry = self.builder.create_block();
             self.builder.append_block_params_for_function_params(entry);
             self.builder.switch_to_block(entry);
@@ -768,24 +802,111 @@ impl<'a> Lowerer<'a> {
             self.builder.def_var(self.frame_var, params[0]);
             self.builder.def_var(self.entry_sp_var, params[1]);
             self.builder.def_var(self.vm_var, params[2]);
-            let reentry = self.builder.create_block();
-            self.reentry_block = Some(reentry);
-            self.builder.ins().jump(reentry, &[]);
-            self.builder.seal_block(entry);
-            self.builder.switch_to_block(reentry);
-            let fresh_sp = self.builder.use_var(self.entry_sp_var);
-            self.builder.def_var(self.sp_var, fresh_sp);
-            let zero = self.builder.ins().f64const(0.0);
-            self.builder.def_var(self.counter_var, zero);
-            let undef = self.builder.ins().iconst(types::I64, self.undef_bits);
-            self.builder.def_var(self.acc_var, undef);
-            // Step 0's block is a plain block here (the entry above carries
-            // the parameters); it must not be sealed until `seal_all_blocks`
-            // because the re-entry block receives the self-tail-call back
-            // edge later.
             let step0 = self.builder.create_block();
             self.blocks[0] = Some(step0);
-            self.builder.ins().jump(step0, &[]);
+            if self.has_suspension {
+                // The resume dispatch (Cut 58): the ctx's `resume_kind`
+                // picks the path — 0 (normal) jumps to the continuation
+                // block (`resume_ip`, compared against the body's static
+                // suspension targets; 0 = a fresh run); 1/2 (throw/return)
+                // route through the control machinery with the resume value
+                // (the `dispatch_targets` compare chain) — mirroring
+                // `vm.run`/`vm.run_abrupt` for a resumed generator/async
+                // body.
+                let vm = self.vm();
+                let kind = self.builder.ins().load(
+                    types::I8,
+                    MemFlagsData::new(),
+                    vm,
+                    Offset32::new(std::mem::offset_of!(JitCallContext, resume_kind) as i32),
+                );
+                let kind64 = self.builder.ins().uextend(types::I64, kind);
+                let normal_block = self.builder.create_block();
+                let mach_block = self.builder.create_block();
+                let is_normal = self.builder.ins().icmp_imm_u(IntCC::Equal, kind64, 0);
+                self.builder
+                    .ins()
+                    .brif(is_normal, normal_block, &[], mach_block, &[]);
+                // The machinery paths: restore the sp, then run the
+                // throw/return transfer with the resume value.
+                let throw_block = self.builder.create_block();
+                let return_block = self.builder.create_block();
+                self.builder.switch_to_block(mach_block);
+                let is_throw = self.builder.ins().icmp_imm_u(IntCC::Equal, kind64, 1);
+                self.builder
+                    .ins()
+                    .brif(is_throw, throw_block, &[], return_block, &[]);
+                self.builder.switch_to_block(throw_block);
+                self.emit_resume_abrupt(Helper::ThrowControl)?;
+                self.builder.switch_to_block(return_block);
+                self.emit_resume_abrupt(Helper::ReturnControl)?;
+                // The normal path: a fresh run (resume_ip 0) seeds the
+                // per-run variables from the stack parameter and enters step
+                // 0; a resume uses the restored working region and jumps to
+                // the continuation block.
+                let fresh_block = self.builder.create_block();
+                let resume_block = self.builder.create_block();
+                self.builder.switch_to_block(normal_block);
+                let resume_ip = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    vm,
+                    Offset32::new(std::mem::offset_of!(JitCallContext, resume_ip) as i32),
+                );
+                let is_fresh = self.builder.ins().icmp_imm_u(IntCC::Equal, resume_ip, 0);
+                self.builder
+                    .ins()
+                    .brif(is_fresh, fresh_block, &[], resume_block, &[]);
+                self.builder.switch_to_block(fresh_block);
+                let fresh_sp = self.builder.use_var(self.entry_sp_var);
+                self.builder.def_var(self.sp_var, fresh_sp);
+                let zero = self.builder.ins().f64const(0.0);
+                self.builder.def_var(self.counter_var, zero);
+                let undef = self.builder.ins().iconst(types::I64, self.undef_bits);
+                self.builder.def_var(self.acc_var, undef);
+                self.builder.ins().jump(step0, &[]);
+                self.builder.seal_block(fresh_block);
+                // The resume chain: sp = ctx.resume_sp; compare resume_ip
+                // against each static suspension target and jump to its
+                // block (a target outside the set returns undefined
+                // defensively — the driver only resumes at a continuation).
+                self.builder.switch_to_block(resume_block);
+                let resume_sp = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    vm,
+                    Offset32::new(std::mem::offset_of!(JitCallContext, resume_sp) as i32),
+                );
+                self.builder.def_var(self.sp_var, resume_sp);
+                let zero = self.builder.ins().f64const(0.0);
+                self.builder.def_var(self.counter_var, zero);
+                let undef = self.builder.ins().iconst(types::I64, self.undef_bits);
+                self.builder.def_var(self.acc_var, undef);
+                self.emit_resume_chain(resume_ip);
+                self.builder.seal_block(resume_block);
+                self.builder.seal_block(normal_block);
+                self.builder.seal_block(mach_block);
+                self.builder.seal_block(throw_block);
+                self.builder.seal_block(return_block);
+                self.builder.seal_block(entry);
+            } else if has_self_tail_call {
+                let reentry = self.builder.create_block();
+                self.reentry_block = Some(reentry);
+                self.builder.ins().jump(reentry, &[]);
+                self.builder.seal_block(entry);
+                self.builder.switch_to_block(reentry);
+                let fresh_sp = self.builder.use_var(self.entry_sp_var);
+                self.builder.def_var(self.sp_var, fresh_sp);
+                let zero = self.builder.ins().f64const(0.0);
+                self.builder.def_var(self.counter_var, zero);
+                let undef = self.builder.ins().iconst(types::I64, self.undef_bits);
+                self.builder.def_var(self.acc_var, undef);
+                self.builder.ins().jump(step0, &[]);
+            }
+            // Step 0's block is a plain block here (the entry above carries
+            // the parameters); it must not be sealed until `seal_all_blocks`
+            // because the fresh/re-entry path and (for a self-tail-call) the
+            // back edge reach it later.
             self.builder.switch_to_block(step0);
         } else {
             // The common path: bind the parameters and seed the scratch
@@ -2905,6 +3026,31 @@ impl<'a> Lowerer<'a> {
                 let ip = self.builder.ins().iconst(types::I64, (index + 1) as i64);
                 self.emit_dispatch_call(self.sig_bool, Helper::FinallyEnd, &[ip])?;
             }
+            // Suspension (Cut 58): `Yield`/`Await` pop the value, record
+            // the suspension (value + working-sp + continuation step) via
+            // the helper, and return `DISPATCH_SUSPEND` — the machine code
+            // ends the segment; the driver saves the Vm (with the working
+            // region) and `run_jit_resume` re-enters at the continuation.
+            Step::Yield { delegate } => {
+                let value = self.pop();
+                let sp = self.builder.use_var(self.sp_var);
+                let ip = self.builder.ins().iconst(types::I64, (index + 1) as i64);
+                let delegate_imm = self.builder.ins().iconst(types::I64, i64::from(*delegate));
+                let res = self.emit_raw_call(
+                    self.sig_call,
+                    Helper::YieldSuspend,
+                    &[sp, value, delegate_imm, ip],
+                )?;
+                self.builder.ins().return_(&[res]);
+            }
+            Step::Await => {
+                let value = self.pop();
+                let sp = self.builder.use_var(self.sp_var);
+                let ip = self.builder.ins().iconst(types::I64, (index + 1) as i64);
+                let res =
+                    self.emit_raw_call(self.sig_rel, Helper::AwaitSuspend, &[sp, value, ip])?;
+                self.builder.ins().return_(&[res]);
+            }
             Step::CatchBind { .. } => {
                 let step_imm = self.builder.ins().iconst(types::I64, index as i64);
                 let _res = self.call_slow(self.sig_bool, Helper::CatchBind, &[step_imm])?;
@@ -3285,6 +3431,74 @@ impl<'a> Lowerer<'a> {
         self.builder.ins().jump(back_block, &[]);
         self.builder.seal_block(elem_block);
         Ok(())
+    }
+
+    /// Cut 58: the entry's abrupt-resume path — restore the working sp,
+    /// then route the resume value through the throw/return control
+    /// machinery (mirroring `vm.run_abrupt` for a resumed plain
+    /// `yield`/`await`). The machinery returns a step index or a completion
+    /// sentinel; the dispatch branches over the body's static transfer
+    /// targets.
+    fn emit_resume_abrupt(&mut self, helper: Helper) -> Result<(), Unsupported> {
+        let vm = self.vm();
+        let sp = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            vm,
+            Offset32::new(std::mem::offset_of!(JitCallContext, resume_sp) as i32),
+        );
+        self.builder.def_var(self.sp_var, sp);
+        let ip = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            vm,
+            Offset32::new(std::mem::offset_of!(JitCallContext, resume_ip) as i32),
+        );
+        let value = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            vm,
+            Offset32::new(std::mem::offset_of!(JitCallContext, resume_value) as i32),
+        );
+        let res = self.emit_raw_call(self.sig_update, helper, &[ip, value])?;
+        self.bump_leaf_epoch();
+        self.emit_dispatch(res);
+        Ok(())
+    }
+
+    /// Cut 58: the entry's normal-resume compare chain — jump to the block
+    /// for the suspension continuation `resume_ip` matches (a target outside
+    /// the body's static suspension set returns `undefined` defensively —
+    /// the driver only resumes at a continuation).
+    fn emit_resume_chain(&mut self, resume_ip: ClifValue) {
+        let targets: Vec<usize> = self.suspension_targets.clone();
+        if targets.is_empty() {
+            let undef = self.builder.ins().iconst(types::I64, self.undef_bits);
+            self.builder.ins().return_(&[undef]);
+            return;
+        }
+        let default = self.builder.create_block();
+        let mut chain = self.builder.create_block();
+        self.builder.ins().jump(chain, &[]);
+        for (i, t) in targets.iter().enumerate() {
+            self.builder.switch_to_block(chain);
+            let eq = self
+                .builder
+                .ins()
+                .icmp_imm_u(IntCC::Equal, resume_ip, *t as i64);
+            let block = self.ensure_block(*t);
+            if i + 1 == targets.len() {
+                self.builder.ins().brif(eq, block, &[], default, &[]);
+            } else {
+                let next = self.builder.create_block();
+                self.builder.ins().brif(eq, block, &[], next, &[]);
+                chain = next;
+            }
+        }
+        self.builder.switch_to_block(default);
+        let undef = self.builder.ins().iconst(types::I64, self.undef_bits);
+        self.builder.ins().return_(&[undef]);
+        self.builder.seal_block(default);
     }
 
     /// The JS relational test `value <op> imm` as a 0/1 I64: the number fast

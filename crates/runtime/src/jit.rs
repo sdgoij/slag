@@ -219,6 +219,28 @@ pub struct JitCallContext {
     /// result value here — the dispatch helpers signal `DISPATCH_DONE` and
     /// the compiled code returns this field's bits instead of a step target.
     pub dispatch_value: u64,
+    /// Cut 58: the suspension payload a compiled body's `Yield`/`Await`
+    /// helper records — valid when the machine code returns
+    /// `DISPATCH_SUSPEND` (`run_jit_body` converts it to a `Suspended`
+    /// outcome and saves the working region). The machine code never reads
+    /// it.
+    pub suspension: Option<crate::ir::Suspension>,
+    /// Cut 58: the machine code's working-stack pointer at the suspension
+    /// (the depth of the region `run_jit_body` saves into `Vm::jit_work`).
+    pub suspend_sp: u64,
+    /// Cut 58: the resume mode for a re-entered compiled body — 0 = normal
+    /// (the entry jumps to the continuation block with the resume value
+    /// pushed at the top of the restored region), 1 = throw, 2 = return
+    /// (the entry routes through the control machinery with `resume_value`).
+    pub resume_kind: u8,
+    /// Cut 58: the step index to resume at (0 = a fresh run — the entry
+    /// uses the stack parameter's working base).
+    pub resume_ip: usize,
+    /// Cut 58: the working-stack pointer the entry should use on a resume
+    /// (the restored region base plus the pushed-resume-value offset).
+    pub resume_sp: u64,
+    /// Cut 58: the resume value for the machinery kinds (throw/return).
+    pub resume_value: u64,
 }
 
 /// A direct-mapped global-value cell the compiled `LoadGlobal`/`StoreGlobal`
@@ -631,6 +653,14 @@ pub struct JitSlowPaths {
     /// `LeaveBlock` restores the loop env); `step` indexes the running
     /// body's `names` payload.
     pub per_iteration: extern "C" fn(ctx: *mut c_void, step: u64) -> u64,
+    /// `Step::Yield` (Cut 58): record the suspension — the value, delegate
+    /// flag, working-stack pointer, and continuation step — then signal
+    /// `DISPATCH_SUSPEND`.
+    pub yield_suspend:
+        extern "C" fn(ctx: *mut c_void, sp: u64, value: u64, delegate: u64, ip: u64) -> u64,
+    /// `Step::Await` (Cut 58): like `yield_suspend`, with an `Await`
+    /// suspension.
+    pub await_suspend: extern "C" fn(ctx: *mut c_void, sp: u64, value: u64, ip: u64) -> u64,
 }
 
 /// The runtime's slow-path table, installed into every `JitHook`.
@@ -721,6 +751,8 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     for_of_close_all,
     enter_per_iteration,
     per_iteration,
+    yield_suspend,
+    await_suspend,
 };
 
 /// The slack (in slots) reserved above a compiled body's working area on the
@@ -2302,6 +2334,10 @@ fn reg_const(operand: &crate::ir::RegOperand) -> Value {
 /// error — the compiled code returns and the runtime surfaces it).
 const DISPATCH_PROPAGATE: u64 = u64::MAX;
 const DISPATCH_DONE: u64 = u64::MAX - 1;
+/// Cut 58: a compiled body's `Yield`/`Await` reached — the suspension
+/// payload is in the ctx and the working region depth in `suspend_sp`;
+/// `run_jit_body` returns the outcome and the driver resumes later.
+const DISPATCH_SUSPEND: u64 = u64::MAX - 2;
 
 /// A thrown value escaping the body becomes the same `JsError` the
 /// interpreter's `body_completion_to_value` produces — the attached value
@@ -2812,6 +2848,36 @@ extern "C" fn for_of_close_all(ctx: *mut c_void) -> u64 {
     Value::Undefined.bits()
 }
 
+// ----- Cut 58: suspension -----
+
+/// `Step::Yield` (Cut 58): record the suspension (the value plus the
+/// delegate flag), the machine code's working-stack pointer (the depth of
+/// the region the resume must restore), and the continuation step, then
+/// signal `DISPATCH_SUSPEND`. The helper never errors — the yield just
+/// suspends.
+extern "C" fn yield_suspend(ctx: *mut c_void, sp: u64, value: u64, delegate: u64, ip: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let vm = unsafe { &mut *ctx.vm };
+    ctx.suspension = Some(crate::ir::Suspension::Yield {
+        value: Value::from_bits(value),
+        delegate: delegate != 0,
+    });
+    ctx.suspend_sp = sp;
+    vm.ip = ip as usize;
+    DISPATCH_SUSPEND
+}
+
+/// `Step::Await` (Cut 58): like `yield_suspend`, with an `Await`
+/// suspension (no delegate flag).
+extern "C" fn await_suspend(ctx: *mut c_void, sp: u64, value: u64, ip: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let vm = unsafe { &mut *ctx.vm };
+    ctx.suspension = Some(crate::ir::Suspension::Await(Value::from_bits(value)));
+    ctx.suspend_sp = sp;
+    vm.ip = ip as usize;
+    DISPATCH_SUSPEND
+}
+
 /// Instantiate a fresh per-iteration env whose bindings copy `names` from
 /// `source`, hanging off `outer` (both env-creation steps share the copy;
 /// the caller decides the outer and whether the env joins the stack). The
@@ -3162,6 +3228,11 @@ pub(crate) enum JitRunOutcome {
     /// `tail_replaced` field holds the next body (its frame is already set
     /// up); the caller loops on it with the same Vm.
     TailReplaced,
+    /// Cut 58: the compiled body suspended (a `yield`/`await`): the
+    /// suspension payload plus the working region saved in `Vm::jit_work`
+    /// (and `vm.ip` set to the continuation) — the driver saves the Vm and
+    /// resumes later via `run_jit_resume`.
+    Suspended(crate::ir::Suspension),
     /// No hook installed or no compiled code — the interpreter runs the body.
     Interp,
 }
@@ -3251,6 +3322,12 @@ pub(crate) fn run_jit_body(
         tail: false,
         current_function: vm.current_function.map(|value| value.bits()).unwrap_or(0),
         dispatch_value: 0,
+        suspension: None,
+        suspend_sp: 0,
+        resume_kind: 0,
+        resume_ip: 0,
+        resume_sp: 0,
+        resume_value: 0,
     };
     // Register the vm (its trace covers `vm.frame`, `vm.stack`, and any
     // nested leaf jit roots) plus the working area for the call's duration:
@@ -3271,6 +3348,220 @@ pub(crate) fn run_jit_body(
     }
     if ctx.tail {
         return Ok(JitRunOutcome::TailReplaced);
+    }
+    if result == DISPATCH_SUSPEND {
+        // The machine code suspended: save the working region (the buffer
+        // is a per-run local) into `vm.jit_work` — the driver holds the Vm
+        // across the suspension and `run_jit_resume` restores the region.
+        // `vm.ip` was set by the helper to the continuation step.
+        let suspension = ctx
+            .suspension
+            .take()
+            .expect("a DISPATCH_SUSPEND result carries a payload");
+        let depth = (ctx.suspend_sp as usize - work_ptr as usize) / std::mem::size_of::<Value>();
+        vm.jit_work.clear();
+        vm.jit_work.extend_from_slice(&work[..depth]);
+        return Ok(JitRunOutcome::Suspended(suspension));
+    }
+    Ok(JitRunOutcome::Value(Value::from_bits(result)))
+}
+
+/// Drive a certified resumable body (async function / generator) through
+/// its compiled machine code from the START (Cut 58): loop on tail-call
+/// frame replacements, convert the outcomes to the interpreter shape the
+/// async/generator drivers match on, and fall back to `vm.start` when the
+/// body has no compiled code.
+pub(crate) fn run_jit_body_loop(
+    agent: &mut Agent,
+    vm: &mut Vm,
+    ir: &mut std::rc::Rc<CompiledBody>,
+) -> Result<crate::ir::VmOutcome, JsError> {
+    loop {
+        match run_jit_body(agent, vm, ir)? {
+            JitRunOutcome::Value(value) => {
+                return Ok(crate::ir::VmOutcome::Completed(
+                    crate::flow::Completion::Return(value),
+                ));
+            }
+            JitRunOutcome::TailReplaced => {
+                *ir = vm
+                    .tail_replaced
+                    .take()
+                    .expect("a tail replacement carries the next body");
+            }
+            JitRunOutcome::Suspended(suspension) => {
+                return Ok(crate::ir::VmOutcome::Suspended(suspension));
+            }
+            JitRunOutcome::Interp => return vm.start(agent, ir),
+        }
+    }
+}
+
+/// Drive a certified resumable body's RESUME (Cut 58): restore the working
+/// region, deliver the resume, and fall back to the interpreter's
+/// `vm.run`/`vm.run_abrupt` (the abrupt-of-a-plain-`yield`/`await` decision)
+/// when the body has no compiled code. A tail replacement hands the rest of
+/// the run to `run_jit_body_loop` (the replacement body starts fresh).
+pub(crate) fn run_jit_resume_loop(
+    agent: &mut Agent,
+    vm: &mut Vm,
+    ir: &mut std::rc::Rc<CompiledBody>,
+    resume: crate::ir::Resume,
+) -> Result<crate::ir::VmOutcome, JsError> {
+    let suspended_at_delegate = vm
+        .ip
+        .checked_sub(1)
+        .and_then(|ip| ir.steps.get(ip))
+        .is_some_and(|step| matches!(step, crate::ir::Step::Yield { delegate: true }));
+    match run_jit_resume(agent, vm, ir, resume.clone())? {
+        JitRunOutcome::Value(value) => Ok(crate::ir::VmOutcome::Completed(
+            crate::flow::Completion::Return(value),
+        )),
+        JitRunOutcome::TailReplaced => {
+            *ir = vm
+                .tail_replaced
+                .take()
+                .expect("a tail replacement carries the next body");
+            // The replacement body runs from its own start (the tail
+            // call consumed the resume and `tail_prepare_ordinary`
+            // reset the Vm).
+            run_jit_body_loop(agent, vm, ir)
+        }
+        JitRunOutcome::Suspended(suspension) => Ok(crate::ir::VmOutcome::Suspended(suspension)),
+        JitRunOutcome::Interp => match &resume {
+            crate::ir::Resume::Throw(_) | crate::ir::Resume::Return(_)
+                if !suspended_at_delegate =>
+            {
+                vm.run_abrupt(agent, ir, resume)
+            }
+            _ => vm.run(agent, ir, resume),
+        },
+    }
+}
+
+/// Resume a suspended compiled body (Cut 58): restore the working region
+/// saved at the suspension, deliver the resume (a normal value pushed on
+/// top; a throw/return routed through the control machinery by the machine
+/// code's entry dispatch — or delivered to a `yield*` delegation's resume
+/// step), and re-enter the machine code at the continuation step. Returns
+/// `Interp` when the body has no compiled code — the caller falls back to
+/// the interpreter's `vm.run`/`vm.run_abrupt`.
+pub(crate) fn run_jit_resume(
+    agent: &mut Agent,
+    vm: &mut Vm,
+    ir: &std::rc::Rc<CompiledBody>,
+    resume: crate::ir::Resume,
+) -> Result<JitRunOutcome, JsError> {
+    let Some(hook) = agent.jit_hook else {
+        return Ok(JitRunOutcome::Interp);
+    };
+    if agent.jit_depth >= MAX_JIT_DEPTH {
+        return Ok(JitRunOutcome::Interp);
+    }
+    let info_ptr = lookup_info(hook, ir, agent.jit_depth > 0);
+    if info_ptr.is_null() {
+        return Ok(JitRunOutcome::Interp);
+    }
+    let info = unsafe { &*info_ptr };
+    let entry: JitEntry = unsafe { std::mem::transmute(info.entry) };
+    // The frame lives in `vm.frame` (persisted); the working region was
+    // saved into `vm.jit_work` at the suspension. Restore it into a fresh
+    // buffer (one extra slot for the resume value), and the machine code's
+    // entry block re-enters at `vm.ip`.
+    let saved = vm.jit_work.len();
+    let work_len = saved + 1 + info.stack_usage + JIT_STACK_SLACK;
+    let (mut inline_work, mut heap_work) =
+        ([Value::Undefined; INLINE_JIT_BUF], Vec::<Value>::new());
+    let work: &mut [Value] = if work_len <= INLINE_JIT_BUF {
+        &mut inline_work[..work_len]
+    } else {
+        heap_work.resize(work_len, Value::Undefined);
+        &mut heap_work[..]
+    };
+    work[..saved].copy_from_slice(&vm.jit_work);
+    let (frame_ptr, _frame_len): (*mut Value, usize) = match &mut vm.frame {
+        crate::ir::Frame::Inline(buf) => (buf.as_mut_ptr(), buf.len()),
+        crate::ir::Frame::Heap(vec) => (vec.as_mut_ptr(), vec.len()),
+    };
+    // An abrupt resume of a `yield*` delegation is delivered to the resume
+    // step (spec 15.5.5): the value pushes and `resume_abrupt` carries the
+    // kind (mirroring `vm.run`). A plain `yield`/`await` routes the abrupt
+    // through the control machinery (mirroring `vm.run_abrupt`).
+    let suspended_at_delegate = vm
+        .ip
+        .checked_sub(1)
+        .and_then(|ip| ir.steps.get(ip))
+        .is_some_and(|step| matches!(step, crate::ir::Step::Yield { delegate: true }));
+    let (kind, resume_value, push) = match resume {
+        crate::ir::Resume::Normal(value) => (0u8, value, true),
+        crate::ir::Resume::Throw(value) if suspended_at_delegate => {
+            vm.resume_abrupt = Some(crate::ir::ResumeAbrupt::Throw(value));
+            (0, value, true)
+        }
+        crate::ir::Resume::Return(value) if suspended_at_delegate => {
+            vm.resume_abrupt = Some(crate::ir::ResumeAbrupt::Return(value));
+            (0, value, true)
+        }
+        crate::ir::Resume::Throw(value) => (1, value, false),
+        crate::ir::Resume::Return(value) => (2, value, false),
+    };
+    let sp_offset = if push { saved + 1 } else { saved };
+    if push {
+        work[saved] = resume_value;
+    }
+    let work_ptr = work.as_mut_ptr() as *mut c_void;
+    let global = vm.global_object(agent)?;
+    let clean_chain = {
+        let current = agent.running_context()?.lexical_environment;
+        matches!(&*current, EnvRecord::Global(_)) && current.outer().is_none()
+    };
+    let mut ctx = JitCallContext {
+        pending: false,
+        error: None,
+        agent: agent as *mut Agent,
+        vm: vm as *mut Vm,
+        global_object: global.as_ptr() as *mut c_void,
+        global_value_cells: agent.global_value_cells.as_ptr() as *mut c_void,
+        member_value_cells: agent.member_value_cells.as_ptr() as *mut c_void,
+        clean_chain,
+        buf_end: (work_ptr as usize + work_len * std::mem::size_of::<Value>()) as *mut c_void,
+        leaf_epoch: 0,
+        leaf_call_cache: LeafCallSiteCache::empty(),
+        body: std::rc::Rc::as_ptr(ir),
+        tail: false,
+        current_function: vm.current_function.map(|value| value.bits()).unwrap_or(0),
+        dispatch_value: 0,
+        suspension: None,
+        suspend_sp: 0,
+        resume_kind: kind,
+        resume_ip: vm.ip,
+        resume_sp: (work_ptr as usize + sp_offset * std::mem::size_of::<Value>()) as u64,
+        resume_value: resume_value.bits(),
+    };
+    agent.jit_depth += 1;
+    let result = crate::ir::with_jit_run(vm, ir, work, || unsafe {
+        (entry)(
+            frame_ptr as *mut c_void,
+            work_ptr,
+            (&mut ctx as *mut JitCallContext) as *mut c_void,
+        )
+    });
+    agent.jit_depth -= 1;
+    if ctx.pending {
+        return Err(ctx.error.take().expect("a pending JIT error is present"));
+    }
+    if ctx.tail {
+        return Ok(JitRunOutcome::TailReplaced);
+    }
+    if result == DISPATCH_SUSPEND {
+        let suspension = ctx
+            .suspension
+            .take()
+            .expect("a DISPATCH_SUSPEND result carries a payload");
+        let depth = (ctx.suspend_sp as usize - work_ptr as usize) / std::mem::size_of::<Value>();
+        vm.jit_work.clear();
+        vm.jit_work.extend_from_slice(&work[..depth]);
+        return Ok(JitRunOutcome::Suspended(suspension));
     }
     Ok(JitRunOutcome::Value(Value::from_bits(result)))
 }

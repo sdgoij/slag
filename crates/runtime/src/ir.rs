@@ -2207,6 +2207,11 @@ pub struct Vm {
     /// rest copy skips them too.
     pub destructure_excluded: Vec<Vec<crux::property::PropertyKey>>,
     pub yield_star_stack: Vec<YieldStarState>,
+    /// Cut 58: the working region of a suspended compiled body — the machine
+    /// code's private buffer contents at the suspension point, saved so the
+    /// resume can restore them (the buffer itself is a per-run local).
+    /// Empty outside a suspended JIT run.
+    pub jit_work: Vec<Value>,
     /// Pending class definitions whose heritage/computed names suspend.
     pub class_stack: Vec<ClassEvalState>,
     pub switch_disc: Option<Value>,
@@ -2312,6 +2317,7 @@ impl Trace for Vm {
         self.destructure_assign_keys.trace(visit);
         self.yield_star_stack.trace(visit);
         self.class_stack.trace(visit);
+        self.jit_work.trace(visit);
         self.switch_disc.trace(visit);
         self.pending_disposal.trace(visit);
         if let Some((env, _)) = &self.pending_catch_disposal {
@@ -2460,6 +2466,7 @@ impl Vm {
             destructure_assign_keys: Vec::new(),
             destructure_excluded: Vec::new(),
             yield_star_stack: Vec::new(),
+            jit_work: Vec::new(),
             class_stack: Vec::new(),
             switch_disc: None,
             chain_short: false,
@@ -2519,6 +2526,7 @@ impl Vm {
         self.destructure_assign_keys.clear();
         self.destructure_excluded.clear();
         self.yield_star_stack.clear();
+        self.jit_work.clear();
         self.class_stack.clear();
         self.switch_disc = None;
         self.chain_short = false;
@@ -2560,6 +2568,26 @@ impl Vm {
     /// scope analysis certified.
     pub fn setup_frame(&mut self, scope: &ScopeInfo, args: &[Value]) {
         self.frame = leaf_frame(scope, args);
+    }
+
+    /// Cut 58: fill a certified resumable body's frame — params from `args`,
+    /// the `this` slot, and the arguments-object inputs — the async/generator
+    /// drivers share `run_compiled_body`'s certified setup.
+    pub(crate) fn setup_certified_frame(
+        &mut self,
+        scope: &ScopeInfo,
+        args: &[Value],
+        this_value: Option<Value>,
+    ) {
+        if scope.frame_size > 0 {
+            self.setup_frame(scope, args);
+        }
+        if scope.arguments_slot.is_some() {
+            self.call_args = args.to_vec();
+        }
+        if let (Some(slot), Some(this_value)) = (scope.this_slot, this_value) {
+            *self.frame.get_mut(slot) = this_value;
+        }
     }
 
     /// Cut 34: the active frame slot — the leaf's flat stack segment when a
@@ -9106,6 +9134,12 @@ impl Vm {
             tail: false,
             current_function: 0,
             dispatch_value: 0,
+            suspension: None,
+            suspend_sp: 0,
+            resume_kind: 0,
+            resume_ip: 0,
+            resume_sp: 0,
+            resume_value: 0,
         };
         let frame_ptr = buf.as_mut_ptr() as *mut std::os::raw::c_void;
         // SAFETY: `buf` has `frame_size + stack_usage + slack` slots.
@@ -16358,7 +16392,14 @@ pub fn compile_body(
     // so the per-step context sync must run (closures created in the loop
     // body capture the per-iteration env, not the capture context).
     let env_constant = compiler.scope.is_some() && !compiler.env_changing;
-    let leaf = compiler.scope.is_some() && steps_are_leaf(&compiler.steps);
+    // Cut 58: a resumable body is never a leaf — an async function with no
+    // `await` (or a generator with no `yield`) still routes through its
+    // driver, which wraps/defers the result; the leaf path would run it
+    // synchronously and return the raw value.
+    let leaf = compiler.scope.is_some()
+        && !function.is_async
+        && !function.is_generator
+        && steps_are_leaf(&compiler.steps);
     let leaf_needs_env = compiler.steps.iter().any(|step| {
         matches!(
             step,
@@ -16544,7 +16585,11 @@ pub fn debug_print_body(body: &CompiledBody) {
 /// Lay out the frame for a fast-path body, or return `None` when the body
 /// needs the environment path.
 fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
-    if function.is_async || function.is_generator {
+    // An async GENERATOR's body mixes `yield` and `await` with the
+    // async-generator delegation machinery (`AsyncYieldStar*`), which the
+    // JIT does not lower yet — those bodies stay on the env path. Plain
+    // generators (`yield`) and async functions (`await`) certify.
+    if function.is_async && function.is_generator {
         return None;
     }
     // A non-arrow body's own `arguments` reads are arguments-object reads:
@@ -17075,7 +17120,12 @@ fn collect_expr_captures(
             .all(|e| collect_expr_captures(e, bindings, captured)),
         // The body's own dynamic constructs (this/arguments/eval/with/...)
         // and its own plain references are the main scan's business, not a
-        // capture.
+        // capture. A suspension point's ARGUMENT is a closure-creation site
+        // (a `yield function () { return i; }` — Cut 58): walk it.
+        ExprKind::Yield { argument, .. } => argument
+            .as_ref()
+            .is_none_or(|arg| collect_expr_captures(arg, bindings, captured)),
+        ExprKind::Await(argument) => collect_expr_captures(argument, bindings, captured),
         ExprKind::Ident(_)
         | ExprKind::Literal(_)
         | ExprKind::This
@@ -17083,8 +17133,6 @@ fn collect_expr_captures(
         | ExprKind::Class(_)
         | ExprKind::PrivateIn { .. }
         | ExprKind::TaggedTemplate { .. }
-        | ExprKind::Yield { .. }
-        | ExprKind::Await(_)
         | ExprKind::MetaProperty { .. }
         | ExprKind::ImportCall { .. } => true,
     }
@@ -18105,10 +18153,19 @@ impl FastScopeScan {
             | ExprKind::Class(_)
             | ExprKind::PrivateIn { .. }
             | ExprKind::TaggedTemplate { .. }
-            | ExprKind::Yield { .. }
-            | ExprKind::Await(_)
             | ExprKind::MetaProperty { .. }
             | ExprKind::ImportCall { .. } => false,
+            // A generator/async body's suspension points (Cut 58): the
+            // argument scans like any other expression. A `yield*`
+            // delegation (`delegate: true`) stays on the env path — its
+            // `YieldStar*` machinery steps are not JIT-lowered.
+            ExprKind::Yield {
+                delegate: false,
+                argument,
+                ..
+            } => argument.as_ref().is_none_or(|arg| self.expr(arg, depth)),
+            ExprKind::Yield { delegate: true, .. } => false,
+            ExprKind::Await(argument) => self.expr(argument, depth),
             ExprKind::Function(function) => {
                 // Cut 3 continuation (closure capture): a closure created by
                 // a certified body — its references to body bindings are

@@ -107,6 +107,8 @@ pub enum Helper {
     ForOfCloseAll,
     EnterPerIteration,
     PerIteration,
+    YieldSuspend,
+    AwaitSuspend,
 }
 
 impl Helper {
@@ -198,6 +200,8 @@ impl Helper {
             Helper::ForOfCloseAll => "for_of_close_all",
             Helper::EnterPerIteration => "enter_per_iteration",
             Helper::PerIteration => "per_iteration",
+            Helper::YieldSuspend => "yield_suspend",
+            Helper::AwaitSuspend => "await_suspend",
         }
     }
 
@@ -504,6 +508,12 @@ pub struct JitHelpers {
     pub for_of_close_all: Option<extern "C" fn(vm: *mut c_void) -> u64>,
     pub enter_per_iteration: Option<extern "C" fn(vm: *mut c_void, step: u64) -> u64>,
     pub per_iteration: Option<extern "C" fn(vm: *mut c_void, step: u64) -> u64>,
+    /// Suspension steps (Cut 58): `YieldSuspend`/`AwaitSuspend` record the
+    /// suspension (value + working-sp + continuation step) and return the
+    /// `DISPATCH_SUSPEND` sentinel so the machine code ends the segment.
+    pub yield_suspend:
+        Option<extern "C" fn(vm: *mut c_void, sp: u64, value: u64, delegate: u64, ip: u64) -> u64>,
+    pub await_suspend: Option<extern "C" fn(vm: *mut c_void, sp: u64, value: u64, ip: u64) -> u64>,
 }
 
 impl JitHelpers {
@@ -596,6 +606,8 @@ impl JitHelpers {
             for_of_close_all: None,
             enter_per_iteration: None,
             per_iteration: None,
+            yield_suspend: None,
+            await_suspend: None,
         }
     }
 
@@ -692,6 +704,8 @@ impl JitHelpers {
             Helper::ForOfCloseAll => self.for_of_close_all.map(|f| f as usize as u64),
             Helper::EnterPerIteration => self.enter_per_iteration.map(|f| f as usize as u64),
             Helper::PerIteration => self.per_iteration.map(|f| f as usize as u64),
+            Helper::YieldSuspend => self.yield_suspend.map(|f| f as usize as u64),
+            Helper::AwaitSuspend => self.await_suspend.map(|f| f as usize as u64),
         }
     }
 }
@@ -1212,6 +1226,23 @@ pub extern "C" fn test_enter_per_iteration(_vm: *mut c_void, _step: u64) -> u64 
 
 pub extern "C" fn test_per_iteration(_vm: *mut c_void, _step: u64) -> u64 {
     Value::Number(95.0).bits()
+}
+
+/// Cut 58 suspension doubles: return the `DISPATCH_SUSPEND` sentinel
+/// (`u64::MAX - 2`) so a scaffold body with a `yield`/`await` ends the
+/// segment — the scaffolds never inspect the ctx suspension payload.
+pub extern "C" fn test_yield_suspend(
+    _vm: *mut c_void,
+    _sp: u64,
+    _value: u64,
+    _delegate: u64,
+    _ip: u64,
+) -> u64 {
+    u64::MAX - 2
+}
+
+pub extern "C" fn test_await_suspend(_vm: *mut c_void, _sp: u64, _value: u64, _ip: u64) -> u64 {
+    u64::MAX - 2
 }
 
 /// Sums its numeric arguments — proves the `args` pointer/`argc` ABI the

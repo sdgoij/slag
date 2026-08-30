@@ -50,6 +50,12 @@ pub struct GeneratorState {
     /// step 1), and the VM runs against this environment on the first
     /// `next()`.
     pub body_env: Option<EnvRef>,
+    /// Cut 58: the generator call's arguments — a certified body's frame
+    /// slots (params, this slot) are filled from them at the first `next()`
+    /// (the env path binds them at call time).
+    pub args: Vec<Value>,
+    /// Cut 58: the OrdinaryCallBindThis result (see `call_generator`).
+    pub this_value: Value,
 }
 
 impl Trace for GeneratorState {
@@ -59,6 +65,8 @@ impl Trace for GeneratorState {
         self.function.trace(visit);
         self.realm.trace(visit);
         self.body_env.trace(visit);
+        self.args.trace(visit);
+        self.this_value.trace(visit);
         // The compiled body's steps embed literal `Value`s; while suspended
         // at a yield the body is no longer in the active-run stack, so the
         // state must root it (GC-2).
@@ -132,9 +140,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     // %Generator.prototype%[@@toStringTag] = "Generator" (spec 27.4.3.3).
     proto.define_property_key(
-        &crux::property::PropertyKey::Symbol(
-            crux::symbol::well_known("toStringTag")
-        ),
+        &crux::property::PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(Value::String(Handle::new(JsString::from_utf8("Generator")))),
             writable: Some(false),
@@ -219,22 +225,29 @@ pub fn call_generator(
         annex_b_hoistable: Default::default(),
     };
     agent.execution_context_stack.push(context);
-    let instantiate = (|| -> Result<(), JsError> {
-        if data.this_mode != ThisMode::Lexical {
-            // OrdinaryCallBindThis (spec 10.2.1): sloppy functions coerce
-            // undefined/null to the global object and box primitives.
-            let this = if data.this_mode == ThisMode::Sloppy {
-                match this.kind() {
-                    ValueKind::Undefined | ValueKind::Null => {
-                        let global = agent.running_context()?.realm.global_object;
-                        Value::Object(global)
-                    }
-                    ValueKind::Object(_) | ValueKind::Function(_) => this,
-                    _ => crate::context::to_object(agent, &this)?,
+    // Cut 58: capture the OrdinaryCallBindThis result — a certified body's
+    // frame fills its `this` slot from it at the first `next()`.
+    let bound_this = if data.this_mode != ThisMode::Lexical {
+        // OrdinaryCallBindThis (spec 10.2.1): sloppy functions coerce
+        // undefined/null to the global object and box primitives.
+        let this = if data.this_mode == ThisMode::Sloppy {
+            match this.kind() {
+                ValueKind::Undefined | ValueKind::Null => {
+                    let global = agent.running_context()?.realm.global_object;
+                    Value::Object(global)
                 }
-            } else {
-                this
-            };
+                ValueKind::Object(_) | ValueKind::Function(_) => this,
+                _ => crate::context::to_object(agent, &this)?,
+            }
+        } else {
+            this
+        };
+        Some(this)
+    } else {
+        None
+    };
+    let instantiate = (|| -> Result<(), JsError> {
+        if let Some(this) = bound_this {
             function_env.bind_this_value(this)?;
         }
         crate::function::function_declaration_instantiation(
@@ -303,6 +316,8 @@ pub fn call_generator(
             function: Value::Function(*function),
             realm: data.realm,
             body_env: Some(body_env),
+            args: args.to_vec(),
+            this_value: bound_this.unwrap_or(Value::Undefined),
         })),
     );
     Ok(object_value)
@@ -505,7 +520,37 @@ fn start_body(
     let vm = Vm::new(body_env, data.strict);
     state.body = Some(body.clone());
     state.vm = Some(vm);
-    let outcome = state.vm.as_mut().expect("vm set").start(agent, &body);
+    let outcome = {
+        let vm = state.vm.as_mut().expect("vm set");
+        if let Some(scope) = body.scope.as_ref() {
+            // A certified body: the capture context (holding the body's
+            // captured bindings — the per-iteration machinery copies fresh
+            // head bindings from it) replaces the instantiated env as the
+            // Vm's env AND the saved context's lexical environment, so
+            // closures created in the body capture it (mirroring
+            // `ordinary_call`). The fallback when the body captures nothing
+            // is the closure's [[Environment]] — a nested closure's
+            // `LoadContextSlot` at outer-chain depth 0 resolves through it
+            // (the instantiated `state.body_env` would be a Function env
+            // for a strict generator — the Cut 58 crash).
+            let capture = match scope.new_body_context(&data.environment, &state.args)? {
+                Some(capture) => capture,
+                None => data.environment,
+            };
+            vm.body_context = Some(capture);
+            vm.lexical_env = capture;
+            if let Some(context) = state.context.as_mut() {
+                context.lexical_environment = capture;
+            }
+            // Fill the frame (params from the generator call's args, the
+            // this slot), then run the compiled machine code (looping on
+            // tail replacements).
+            vm.setup_certified_frame(scope, &state.args, Some(state.this_value));
+            crate::jit::run_jit_body_loop(agent, vm, state.body.as_mut().expect("body set"))
+        } else {
+            vm.start(agent, &body)
+        }
+    };
     finish_resume(agent, state, outcome)
 }
 
@@ -540,11 +585,24 @@ fn resume_body(
             .vm
             .as_mut()
             .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no suspended VM".into()))?;
-        match completion {
-            Resume::Throw(_) | Resume::Return(_) if !suspended_at_delegate => {
-                vm.run_abrupt(agent, &body, completion)
+        if body.scope.is_some() {
+            // A certified body: re-enter the compiled machine code at the
+            // continuation (looping on tail replacements); the resume's
+            // abrupt-of-a-plain-yield routing falls back to the interpreter
+            // when the body has no compiled code.
+            crate::jit::run_jit_resume_loop(
+                agent,
+                vm,
+                state.body.as_mut().expect("body set"),
+                completion,
+            )
+        } else {
+            match completion {
+                Resume::Throw(_) | Resume::Return(_) if !suspended_at_delegate => {
+                    vm.run_abrupt(agent, &body, completion)
+                }
+                _ => vm.run(agent, &body, completion),
             }
-            _ => vm.run(agent, &body, completion),
         }
     };
     finish_resume(agent, state, outcome)
@@ -867,7 +925,7 @@ mod tests {
     #[test]
     fn generator_closure_per_iteration() {
         let value = run(
-            "function* g() { for (let i = 0; i < 3; i++) { yield function () { return i; }; } } \
+            "function* g() { for (let i = 0; i < 3; i++) { yield function __probe_gen_closure () { return i; }; } } \
              var it = g(); var f0 = it.next().value; var f1 = it.next().value; var f2 = it.next().value; \
              f0() + ',' + f1() + ',' + f2()",
         )

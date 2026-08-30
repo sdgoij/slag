@@ -2091,24 +2091,8 @@ fn run_compiled_body(
     // A certified body with no bindings (frame_size 0) never reads the
     // frame — `Vm::new` already left the inline buffer in place — so the
     // slot-by-slot setup is skipped entirely.
-    if let Some(scope) = &ir.scope
-        && scope.frame_size > 0
-    {
-        vm.setup_frame(scope, args);
-    }
-    // Cut 3 continuation (unmapped arguments slice): the body's
-    // `Step::CreateArguments` needs the call's full argument list.
-    if let Some(scope) = &ir.scope
-        && scope.arguments_slot.is_some()
-    {
-        vm.call_args = args.to_vec();
-    }
-    // Cut 3 continuation (this slots): the call filled the body's `this`
-    // slot with the OrdinaryCallBindThis result.
-    if let Some(scope) = &ir.scope
-        && let (Some(slot), Some(this_value)) = (scope.this_slot, this_value)
-    {
-        *vm.frame.get_mut(slot) = this_value;
+    if let Some(scope) = &ir.scope {
+        vm.setup_certified_frame(scope, args, this_value);
     }
     // The JIT path (when installed): the general path runs certified bodies
     // that may contain calls (leaf bodies never do — `steps_are_leaf`
@@ -2140,6 +2124,15 @@ fn run_compiled_body(
                         .tail_replaced
                         .take()
                         .expect("a tail replacement carries the next body");
+                }
+                crate::jit::JitRunOutcome::Suspended(_) => {
+                    // A suspension only happens in a generator/async body,
+                    // which runs through its own driver — never here.
+                    agent.return_vm(vm);
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "ordinary function suspended unexpectedly".into(),
+                    ));
                 }
                 crate::jit::JitRunOutcome::Interp => break,
             }

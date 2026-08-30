@@ -154,7 +154,9 @@ pub fn call_async_function(
         // initial run, or a settle/attach hook — rejects the promise: an
         // async function never throws synchronously (spec 27.7.4.1).
         let run = || -> Result<Value, JsError> {
-            if data.this_mode != crate::function::ThisMode::Lexical {
+            // Cut 58: capture the OrdinaryCallBindThis result — a certified
+            // body's frame fills its `this` slot from it.
+            let bound_this = if data.this_mode != crate::function::ThisMode::Lexical {
                 // OrdinaryCallBindThis (spec 10.2.1): sloppy functions coerce
                 // undefined/null to the global object and box primitives.
                 let this = if data.this_mode == crate::function::ThisMode::Sloppy {
@@ -170,7 +172,10 @@ pub fn call_async_function(
                     this
                 };
                 function_env.bind_this_value(this)?;
-            }
+                Some(this)
+            } else {
+                None
+            };
             crate::function::function_declaration_instantiation(
                 agent,
                 &function_value,
@@ -189,13 +194,31 @@ pub fn call_async_function(
             let body = data.ir.clone().ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "async body was not compiled".into())
             })?;
+            // Cut 58: a certified body runs against the closure's
+            // [[Environment]] (mirroring `ordinary_call`): the capture
+            // context when the body captures bindings, else the closure
+            // environment itself — a nested closure's `LoadContextSlot` at
+            // outer-chain depth 0 resolves through it. The env path keeps
+            // the instantiated body env (`function_declaration_instantiation`
+            // installed it on the running context).
+            let run_env = if let Some(scope) = &body.scope {
+                match scope.new_body_context(&old_env, args)? {
+                    Some(capture) => capture,
+                    None => old_env,
+                }
+            } else {
+                body_env
+            };
+            if body.scope.is_some() {
+                agent.running_context_mut()?.lexical_environment = run_env;
+            }
             // GC-2: the state's `promise`/`resolve`/`reject` Values (and the
             // compiled body's literals) sit in a local `Rc` until the run
             // finishes and `attach_await` registers the state — suppress
             // `--gc-stress` for the first-run window so they cannot be swept.
             let _stress = crate::ir::StressSuppress::new();
             let state = Rc::new(RefCell::new(AsyncFunctionState {
-                vm: Vm::new(body_env, data.strict),
+                vm: Vm::new(run_env, data.strict),
                 body,
                 context,
                 promise: capability.promise,
@@ -203,9 +226,28 @@ pub fn call_async_function(
                 reject: capability.reject,
                 module: None,
             }));
+            if state.borrow().body.scope.is_some() {
+                // The saved context is re-pushed on resume — its lexical
+                // environment must be the capture context too.
+                state.borrow_mut().context.lexical_environment = run_env;
+            }
             let mut state_ref = state.borrow_mut();
             let body = state_ref.body.clone();
-            let outcome = state_ref.vm.start(agent, &body)?;
+            let outcome = if body.scope.is_some() {
+                // A certified body: fill the frame (params from the call's
+                // args, the this slot) and the capture context, then run the
+                // compiled machine code (looping on tail replacements).
+                state_ref.vm.body_context = Some(run_env);
+                if let Some(scope) = &body.scope {
+                    state_ref.vm.setup_certified_frame(scope, args, bound_this);
+                }
+                let mut body_rc = state_ref.body.clone();
+                let result = crate::jit::run_jit_body_loop(agent, &mut state_ref.vm, &mut body_rc);
+                state_ref.body = body_rc;
+                result?
+            } else {
+                state_ref.vm.start(agent, &body)?
+            };
             drop(state_ref);
             match outcome {
                 VmOutcome::Completed(completion) => {
@@ -324,7 +366,18 @@ fn resume_async(
     let body = state.borrow().body.clone();
     let outcome = {
         let mut state = state.borrow_mut();
-        state.vm.run_abrupt(agent, &body, resume)
+        if state.body.scope.is_some() {
+            // A certified body: re-enter the compiled machine code at the
+            // continuation (the abrupt-rejection routing falls back to the
+            // interpreter when the body has no compiled code).
+            let mut body_rc = state.body.clone();
+            let result =
+                crate::jit::run_jit_resume_loop(agent, &mut state.vm, &mut body_rc, resume);
+            state.body = body_rc;
+            result
+        } else {
+            state.vm.run_abrupt(agent, &body, resume)
+        }
     };
     agent.execution_context_stack.pop();
     let outcome = match outcome {
@@ -1026,10 +1079,7 @@ mod tests {
                 if i < values_clone.len() {
                     index.set(i + 1);
                     result
-                        .create_data_property(
-                            &JsString::from_utf8("value"),
-                            values_clone[i],
-                        )
+                        .create_data_property(&JsString::from_utf8("value"), values_clone[i])
                         .unwrap();
                     result
                         .create_data_property(&JsString::from_utf8("done"), Value::Boolean(false))
@@ -1056,9 +1106,7 @@ mod tests {
         let iterator_for_method = iterator;
         iterable
             .define_property_key(
-                &crux::property::PropertyKey::Symbol(
-                    crux::symbol::well_known("iterator")
-                ),
+                &crux::property::PropertyKey::Symbol(crux::symbol::well_known("iterator")),
                 &crux::property::PropertyDescriptor::data(Value::Function(
                     crux::Function::create_builtin(
                         Some(JsString::from_utf8("[Symbol.iterator]")),
