@@ -230,6 +230,19 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
             Step::Return | Step::Throw => depth = depth.saturating_sub(1),
             // Switch steps (Cut 56): `SwitchDisc` and `SwitchTest` pop.
             Step::SwitchDisc | Step::SwitchTest { .. } => depth = depth.saturating_sub(1),
+            // for-in/for-of machinery (Cut 57): `ForInBegin`/`ForOfBegin`
+            // pop the RHS; the fetch steps push the element (the `done`
+            // path pushes nothing — the worst case bounds the working
+            // area); `ForOfNextBindLocal` lands it in a frame slot; the
+            // bind steps pop it; the env-creation steps and `ForOfClose`
+            // leave the value stack as-is.
+            Step::ForInBegin | Step::ForOfBegin { .. } => depth = depth.saturating_sub(1),
+            Step::ForInNext { .. } | Step::ForOfNext { .. } => depth += 1,
+            Step::ForOfNextBindLocal { .. } => {}
+            Step::ForOfBindLocal { .. } | Step::ForOfBindGlobal { .. } => {
+                depth = depth.saturating_sub(1)
+            }
+            Step::ForOfClose | Step::EnterPerIteration { .. } | Step::PerIteration { .. } => {}
             _ => {}
         }
         max = max.max(depth);
@@ -394,7 +407,17 @@ fn step_name(step: &Step) -> &'static str {
         | Step::ObjectAccessorComputed { .. }
         | Step::ObjectSpread => "ObjectLiteral",
         Step::PushStr(_) | Step::ConcatStr | Step::ConcatStrConst(_) => "StringLiteral",
-        Step::ForOfNext { .. } | Step::ForInNext { .. } | Step::ForOfBegin { .. } => "ForOf/ForIn",
+        Step::ForOfBind { .. }
+        | Step::ForInBind { .. }
+        | Step::ForOfRestore
+        | Step::ForInRestore => "ForOf/ForIn env heads",
+        Step::AsyncForOfBegin { .. }
+        | Step::AsyncForOfNext
+        | Step::AsyncForOfTest { .. }
+        | Step::AsyncForOfBind { .. }
+        | Step::AsyncForOfRestore
+        | Step::AsyncForOfClose => "AsyncForOf",
+        Step::EnterPerIteration { .. } | Step::PerIteration { .. } => "Per-iteration env",
         Step::SwitchDisc | Step::SwitchTest { .. } => "Switch",
         Step::Break { .. } | Step::Continue { .. } => "Break/Continue",
         Step::Yield { .. } | Step::Await => "Yield/Await",
@@ -494,6 +517,13 @@ struct Lowerer<'a> {
     /// `SaveCompletion`/`RestoreCompletion` are no-ops (the pending control
     /// carries the values; the completion register is unobservable).
     has_try: bool,
+    /// Cut 57: whether the body contains for-of machinery (`ForOfBegin`/the
+    /// fetch steps). A for-of body's `Return` must close the active iterator
+    /// (route through `return_control` — the interpreter's `control_transfer`
+    /// closes on the escape), and a helper's engine error must close the
+    /// iterators before the body returns (the callee Vm's stacks are
+    /// discarded on the error surface).
+    has_for_of: bool,
     /// Cut 55: the static set of step indexes a control-transfer dispatch
     /// can jump to — every `Exit`'s `after`, every `Break`/`Continue`
     /// target, and every handler's catch/finally start. The dispatch
@@ -560,6 +590,12 @@ impl<'a> Lowerer<'a> {
             .steps
             .iter()
             .any(|step| matches!(step, Step::EnterTry { .. }));
+        let has_for_of = body.steps.iter().any(|step| {
+            matches!(
+                step,
+                Step::ForOfBegin { .. } | Step::ForOfNext { .. } | Step::ForOfNextBindLocal { .. }
+            )
+        });
         let mut dispatch_targets = std::collections::BTreeSet::new();
         for step in &body.steps {
             match step {
@@ -608,6 +644,7 @@ impl<'a> Lowerer<'a> {
             sig_tail,
             sig_entry,
             has_try,
+            has_for_of,
             dispatch_targets,
             current_step: 0,
             error_sp: None,
@@ -1121,6 +1158,16 @@ impl<'a> Lowerer<'a> {
             let res = self.emit_raw_call(self.sig_bool, Helper::DispatchError, &[ip])?;
             self.bump_leaf_epoch();
             self.emit_dispatch(res);
+        } else if self.has_for_of {
+            // A helper error inside a for-of body escapes with the iterator
+            // open on this Vm (the callee's stacks are discarded when the
+            // error surfaces) — close the active iterators first, mirroring
+            // `run_inner`'s uncovered-error close. The raw call skips the
+            // pending check (the pending error is already set; the close
+            // swallows its own errors per spec 7.4.11).
+            self.emit_raw_call(self.sig_tdz, Helper::ForOfCloseAll, &[])?;
+            let undef = self.builder.ins().iconst(types::I64, self.undef_bits);
+            self.builder.ins().return_(&[undef]);
         } else {
             let undef = self.builder.ins().iconst(types::I64, self.undef_bits);
             self.builder.ins().return_(&[undef]);
@@ -2812,11 +2859,13 @@ impl<'a> Lowerer<'a> {
             }
             Step::Return => {
                 let value = self.pop();
-                if self.has_try {
+                if self.has_try || self.has_for_of {
                     // A return inside a try must run any finally first
                     // (and a finally's pending-return overrides an outer
-                    // control): route through `return_control` instead of
-                    // returning directly.
+                    // control); a return in a for-of body must close the
+                    // active iterator before the body completes (spec
+                    // 14.7.5.6 step 7). Both route through
+                    // `return_control`, which runs `control_transfer`.
                     let ip = self.builder.ins().iconst(types::I64, (index + 1) as i64);
                     self.emit_dispatch_call(self.sig_update, Helper::ReturnControl, &[ip, value])?;
                 } else {
@@ -2894,6 +2943,77 @@ impl<'a> Lowerer<'a> {
                     self.call_slow(self.sig_update, Helper::SwitchTest, &[case_imm, test])?;
                 let target = self.ensure_block(*case);
                 self.cond_jump(matched, true, target, index + 1);
+            }
+            // for-in/for-of machinery (Cut 57): the begin steps open the
+            // enumeration/iteration (the RHS was pushed by the head
+            // expression); the fetch steps advance it — the helper writes
+            // the element to the working stack (or the fused slot) and
+            // returns 1, or returns 0 on exhaustion, and the machine code
+            // jumps to `back`/`done` with static conditional branches (the
+            // Cut 56 switch pattern); the binds land the element; the close
+            // pops the boundary + iterator. `EnterPerIteration`/
+            // `PerIteration` create the certified loop's per-iteration envs
+            // (step-index helpers, the Cut 44 pattern).
+            Step::ForInBegin => {
+                let value = self.pop();
+                let _res = self.call_slow(self.sig_bool, Helper::ForInBegin, &[value])?;
+                self.fall_through(index);
+            }
+            Step::ForInNext { done, back } => {
+                self.emit_for_fetch(*back, *done, Helper::ForInNext)?;
+            }
+            Step::ForOfBegin { .. } => {
+                let value = self.pop();
+                let step_imm = self.builder.ins().iconst(types::I64, index as i64);
+                let _res =
+                    self.call_slow(self.sig_get_name, Helper::ForOfBegin, &[step_imm, value])?;
+                self.fall_through(index);
+            }
+            Step::ForOfNext { done, back } => {
+                self.emit_for_fetch(*back, *done, Helper::ForOfNext)?;
+            }
+            Step::ForOfNextBindLocal { slot, done, back } => {
+                let slot_imm = self.builder.ins().iconst(types::I64, *slot as i64);
+                let code =
+                    self.call_slow(self.sig_bool, Helper::ForOfNextBindLocal, &[slot_imm])?;
+                let back_block = self.ensure_block(*back);
+                let done_block = self.ensure_block(*done);
+                let is_elem = self.builder.ins().icmp_imm_u(IntCC::Equal, code, 1);
+                self.builder
+                    .ins()
+                    .brif(is_elem, back_block, &[], done_block, &[]);
+            }
+            Step::ForOfBindLocal { slot } => {
+                // The element writes the frame slot directly (the write IS
+                // the initialization — no TDZ check), mirroring the
+                // interpreter handler.
+                let value = self.pop();
+                self.store_slot(*slot, value);
+                self.fall_through(index);
+            }
+            Step::ForOfBindGlobal { name } => {
+                // `store_global_value` — the `set_global` helper's exact
+                // semantics (a declared global write through the cell
+                // machinery).
+                let value = self.pop();
+                let name_imm = self.builder.ins().iconst(types::I64, *name as i64);
+                let _res =
+                    self.call_slow(self.sig_get_name, Helper::SetGlobal, &[name_imm, value])?;
+                self.fall_through(index);
+            }
+            Step::ForOfClose => {
+                let _res = self.call_slow(self.sig_tdz, Helper::ForOfClose, &[])?;
+                self.fall_through(index);
+            }
+            Step::EnterPerIteration { .. } => {
+                let step_imm = self.builder.ins().iconst(types::I64, index as i64);
+                let _res = self.call_slow(self.sig_step, Helper::EnterPerIteration, &[step_imm])?;
+                self.fall_through(index);
+            }
+            Step::PerIteration { .. } => {
+                let step_imm = self.builder.ins().iconst(types::I64, index as i64);
+                let _res = self.call_slow(self.sig_step, Helper::PerIteration, &[step_imm])?;
+                self.fall_through(index);
             }
             // Closure creation (Cut 44): the helper reads the step's payload
             // (the function AST, strictness, and the enclosing-chain layouts)
@@ -3132,6 +3252,38 @@ impl<'a> Lowerer<'a> {
         let test = self.emit_rel_test(op, bits, imm)?;
         let block = self.ensure_block(target);
         self.cond_jump(test, false, block, next);
+        Ok(())
+    }
+
+    /// The for-in/for-of protocol fetch (Cut 57): call the advance helper
+    /// with the current working-stack pointer — on an element (code 1) it
+    /// wrote the value at `sp[0]`, so advance the stack and jump to `back`
+    /// (the head bind / body start); on exhaustion (code 0) jump to `done`.
+    /// `done` is always a forward label (the certified loop places it after
+    /// the loop), so its block is sealed at its own visit; `back` may be a
+    /// back edge (the loop-bottom fetch's do-while target), already in
+    /// `back_targets` via `step_targets`.
+    fn emit_for_fetch(
+        &mut self,
+        back: usize,
+        done: usize,
+        helper: Helper,
+    ) -> Result<(), Unsupported> {
+        let sp = self.builder.use_var(self.sp_var);
+        let code = self.call_slow(self.sig_bool, helper, &[sp])?;
+        let back_block = self.ensure_block(back);
+        let done_block = self.ensure_block(done);
+        let elem_block = self.builder.create_block();
+        let is_elem = self.builder.ins().icmp_imm_u(IntCC::Equal, code, 1);
+        self.builder
+            .ins()
+            .brif(is_elem, elem_block, &[], done_block, &[]);
+        self.builder.switch_to_block(elem_block);
+        let sp = self.builder.use_var(self.sp_var);
+        let next = self.builder.ins().iadd_imm_s(sp, 8);
+        self.builder.def_var(self.sp_var, next);
+        self.builder.ins().jump(back_block, &[]);
+        self.builder.seal_block(elem_block);
         Ok(())
     }
 

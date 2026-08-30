@@ -402,6 +402,15 @@ fn runtime_helpers() -> JitHelpers {
         dispatch_error: Some(rt.dispatch_error),
         switch_disc: Some(rt.switch_disc),
         switch_test: Some(rt.switch_test),
+        for_in_begin: Some(rt.for_in_begin),
+        for_in_next: Some(rt.for_in_next),
+        for_of_begin: Some(rt.for_of_begin),
+        for_of_next: Some(rt.for_of_next),
+        for_of_next_bind_local: Some(rt.for_of_next_bind_local),
+        for_of_close: Some(rt.for_of_close),
+        for_of_close_all: Some(rt.for_of_close_all),
+        enter_per_iteration: Some(rt.enter_per_iteration),
+        per_iteration: Some(rt.per_iteration),
     }
 }
 
@@ -561,6 +570,15 @@ mod tests {
             dispatch_error: Some(helpers::test_dispatch_error),
             switch_disc: Some(helpers::test_switch_disc),
             switch_test: Some(helpers::test_switch_test),
+            for_in_begin: Some(helpers::test_for_in_begin),
+            for_in_next: Some(helpers::test_for_in_next),
+            for_of_begin: Some(helpers::test_for_of_begin),
+            for_of_next: Some(helpers::test_for_of_next),
+            for_of_next_bind_local: Some(helpers::test_for_of_next_bind_local),
+            for_of_close: Some(helpers::test_for_of_close),
+            for_of_close_all: Some(helpers::test_for_of_close_all),
+            enter_per_iteration: Some(helpers::test_enter_per_iteration),
+            per_iteration: Some(helpers::test_per_iteration),
         }
     }
 
@@ -2008,6 +2026,301 @@ mod tests {
         assert_eq!(
             value.as_number(),
             Some(250.0 * (1.0 + 10.0 + 100.0 + 1000.0))
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_for_of_array_sum() {
+        // Cut 57: the certified for-of over a plain array takes the fast
+        // path (`ForOfBegin` → `ForOfNextBindLocal` fused fetch — the
+        // element writes the frame slot directly, no stack round trip). The
+        // do-while back edge and the array-literal RHS compile.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f() { var s = 0; for (var x of [1, 2, 3, 4, 5]) { s += x * 10; } return s; }\n\
+                     f();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(150.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_hot_for_of_array_loop() {
+        // Cut 57: a hot for-of over an array literal inside a loop — the
+        // per-element fetch + fused bind run in machine code. Sum of
+        // 1..100, 100 times.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(n) { var s = 0; for (var i = 0; i < n; i++) { \
+                       for (var x of [1, 2, 3, 4]) { s += x; } } return s; }\n\
+                     f(100);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(100.0 * 10.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_for_of_generic_iterator() {
+        // Cut 57: a for-of over a custom `[Symbol.iterator]` takes the
+        // generic path — `ForOfBegin` builds the `IteratorRecord` and each
+        // `ForOfNext` calls `next()` through the shared `for_of_advance`
+        // core (the `for_of_stepping` window around the call).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var iter = {}; iter[Symbol.iterator] = function () { var i = 0; \
+                       return { next: function () { return i < 3 ? { value: i++ * 10, done: false } \
+                         : { value: undefined, done: true }; } }; };\n\
+                     function f() { var s = 0; for (var x of iter) { s += x; } return s; }\n\
+                     f();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(30.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_for_of_string() {
+        // Cut 57: a for-of over a string is generic (the String iterator)
+        // and yields code points.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f() { var out = ''; for (var c of 'ab') { out += c + '.'; } return out; }\n\
+                     f();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("a.b.".to_string())
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_for_of_holes_break_and_continue() {
+        // Cut 57: an array hole yields `undefined` (the stock iterator's
+        // element Get), and break/continue route through the control
+        // dispatch (the for-of boundary keeps the loop's own break from
+        // closing early; the loop-bottom fetch's back edge re-runs).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f() { var out = ''; var a = [1, , 3, 4]; \
+                       for (var x of a) { if (x === undefined) { out += 'h'; continue; } \
+                         if (x === 4) break; out += x; } return out; }\n\
+                     f();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("1h3".to_string())
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_for_of_break_and_return_close_the_iterator() {
+        // Cut 57: a break to the loop's end runs the compiled `ForOfClose`;
+        // a return inside the body routes through `return_control` whose
+        // `control_transfer` closes on the escape — both call the iterator's
+        // `return` method (spec 14.7.5.6 step 7). The return VALUE
+        // expression evaluates before the close, so the log is checked
+        // after both calls.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var log = [];\n\
+                     var iter = {}; iter[Symbol.iterator] = function () { var i = 0; \
+                       return { next: function () { return i < 10 ? { value: i++, done: false } \
+                         : { value: undefined, done: true }; }, \
+                         return: function () { log.push('c' + i); return {}; } }; };\n\
+                     function f() { var s = 0; for (var x of iter) { s += x; if (x === 2) break; } \
+                       return s; }\n\
+                     function g() { var s = 0; for (var x of iter) { s += x; if (x === 1) \
+                       return s; } return -1; }\n\
+                     f() + ';' + g() + '|' + log.join(',');",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("3;1|c3,c2".to_string())
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_for_of_throwing_next_does_not_close() {
+        // Cut 57: a `next()` error escapes with the iterator open (spec
+        // 14.7.6.2 uses `?` on the next call — only a normal completion or
+        // an abrupt body/head completion closes). The `for_of_stepping`
+        // flag stays set on the error path, so the engine-error close (the
+        // interpreter's Err arm / the JIT's `throw_machinery` escape) skips
+        // the iterator's `return`.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var log = [];\n\
+                     var iter = {}; iter[Symbol.iterator] = function () { var i = 0; \
+                       return { next: function () { if (i++ === 0) return { value: 1, done: false }; \
+                         throw 'boom'; }, \
+                         return: function () { log.push('closed'); return {}; } }; };\n\
+                     function g() { var s = 0; for (var x of iter) { s += x; } return s; }\n\
+                     var r = ''; try { g(); } catch (e) { r = e; }\n\
+                     r + '|' + log.join(',');",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("boom|".to_string())
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_for_of_body_error_closes_the_iterator() {
+        // Cut 57: an engine error inside the for-of BODY (not the next
+        // call) is an abrupt body completion — the iterator must close
+        // before the error escapes (spec 14.7.5.6 step 7). The JIT's
+        // non-try error path closes the active iterators before surfacing.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var log = [];\n\
+                     var boom = {}; Object.defineProperty(boom, 'x', { get: function () { throw 'get'; } });\n\
+                     var iter = {}; iter[Symbol.iterator] = function () { var i = 0; \
+                       return { next: function () { return i < 3 ? { value: i++, done: false } \
+                         : { value: undefined, done: true }; }, \
+                         return: function () { log.push('closed'); return {}; } }; };\n\
+                     function f() { var s = 0; try { for (var x of iter) { s += boom.x; } } \
+                       catch (e) { s += ':e'; } return s + '|' + log.join(','); }\n\
+                     f();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("0:e|closed".to_string())
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_captured_for_of_head_uses_per_iteration_envs() {
+        // Cut 57: a captured lexical for-of head (`for (let x of ...)` with
+        // a body closure) emits `EnterPerIteration`/`PerIteration` — the
+        // first env pushed at loop entry, a fresh copy per later iteration —
+        // and each closure observes its own iteration's binding.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function make() { var fns = []; for (let x of [10, 20, 30]) { \
+                       fns.push(function () { return x; }); } return fns.map(function (f) { return f(); }).join(','); }\n\
+                     make();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("10,20,30".to_string())
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_for_in_key_loop() {
+        // Cut 57: a certified for-in over an object literal — `ForInBegin`
+        // enumerates the keys, each `ForInNext` skips deleted keys and
+        // lands the key on the working stack, the `ForOfBindLocal` bind
+        // writes it to the head slot.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f() { var out = ''; for (var k in { a: 1, b: 2, c: 3 }) { out += k; } \
+                       return out; }\n\
+                     f();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("abc".to_string())
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_for_in_prototype_chain_and_nullish_rhs() {
+        // Cut 57: for-in walks the prototype chain (the object literal's
+        // proto chain via the realm's Object.prototype — an inherited key
+        // appears only when enumerable) and a nullish RHS is a skipped loop,
+        // not an error.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f() { var out = ''; var proto = { p: 1 }; var o = Object.create(proto); \
+                       o.a = 1; for (var k in o) { out += k; } return out + '|'; }\n\
+                     function g() { var out = 'x'; for (var k in null) { out += k; } return out; }\n\
+                     f() + g();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("ap|x".to_string())
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_for_of_in_a_try_body() {
+        // Cut 57: a for-of inside a try body — the loop's fetches sit
+        // between the try entry and the handler's catch, so a body error
+        // routes through the Cut 55 handler dispatch with the for-of state
+        // intact (a throwing `return` still closes first).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(n) { var s = 0; try { for (var x of [1, 2, 3, 4]) { \
+                       if (x === 3) throw x; s += x; } } catch (e) { s += e * 100; } return s; }\n\
+                     f();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(1.0 + 2.0 + 300.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_captured_for_in_head_uses_per_iteration_envs() {
+        // Cut 57: a captured lexical for-in head emits the same
+        // `EnterPerIteration`/`PerIteration` machinery with `ForInNext` —
+        // each closure observes its own iteration's key.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function make() { var fns = []; for (let k in { a: 1, b: 2 }) { \
+                       fns.push(function () { return k; }); } \
+                       return fns.map(function (f) { return f(); }).join(','); }\n\
+                     make();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("a,b".to_string())
         );
         assert!(compiled >= 1, "{compiled} bodies");
     }

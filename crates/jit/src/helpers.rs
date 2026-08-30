@@ -98,6 +98,15 @@ pub enum Helper {
     DispatchError,
     SwitchDisc,
     SwitchTest,
+    ForInBegin,
+    ForInNext,
+    ForOfBegin,
+    ForOfNext,
+    ForOfNextBindLocal,
+    ForOfClose,
+    ForOfCloseAll,
+    EnterPerIteration,
+    PerIteration,
 }
 
 impl Helper {
@@ -180,6 +189,15 @@ impl Helper {
             Helper::DispatchError => "dispatch_error",
             Helper::SwitchDisc => "switch_disc",
             Helper::SwitchTest => "switch_test",
+            Helper::ForInBegin => "for_in_begin",
+            Helper::ForInNext => "for_in_next",
+            Helper::ForOfBegin => "for_of_begin",
+            Helper::ForOfNext => "for_of_next",
+            Helper::ForOfNextBindLocal => "for_of_next_bind_local",
+            Helper::ForOfClose => "for_of_close",
+            Helper::ForOfCloseAll => "for_of_close_all",
+            Helper::EnterPerIteration => "enter_per_iteration",
+            Helper::PerIteration => "per_iteration",
         }
     }
 
@@ -470,6 +488,22 @@ pub struct JitHelpers {
     /// `SwitchTest` strictly-equals a case test against it (1 = match).
     pub switch_disc: Option<extern "C" fn(vm: *mut c_void, value: u64) -> u64>,
     pub switch_test: Option<extern "C" fn(vm: *mut c_void, case: u64, test: u64) -> u64>,
+    /// for-in/for-of iterator steps (Cut 57): `ForInBegin`/`ForOfBegin` open
+    /// the enumeration/iteration, `ForInNext`/`ForOfNext` advance it (the
+    /// element lands at the passed working-stack pointer; the return is 1 =
+    /// element, 0 = done), `ForOfNextBindLocal` lands the element in a frame
+    /// slot directly, `ForOfClose` closes a generic iterator, and
+    /// `EnterPerIteration`/`PerIteration` create the certified loop's
+    /// per-iteration envs (step-index helpers).
+    pub for_in_begin: Option<extern "C" fn(vm: *mut c_void, value: u64) -> u64>,
+    pub for_in_next: Option<extern "C" fn(vm: *mut c_void, stack: u64) -> u64>,
+    pub for_of_begin: Option<extern "C" fn(vm: *mut c_void, step: u64, value: u64) -> u64>,
+    pub for_of_next: Option<extern "C" fn(vm: *mut c_void, stack: u64) -> u64>,
+    pub for_of_next_bind_local: Option<extern "C" fn(vm: *mut c_void, slot: u64) -> u64>,
+    pub for_of_close: Option<extern "C" fn(vm: *mut c_void) -> u64>,
+    pub for_of_close_all: Option<extern "C" fn(vm: *mut c_void) -> u64>,
+    pub enter_per_iteration: Option<extern "C" fn(vm: *mut c_void, step: u64) -> u64>,
+    pub per_iteration: Option<extern "C" fn(vm: *mut c_void, step: u64) -> u64>,
 }
 
 impl JitHelpers {
@@ -553,6 +587,15 @@ impl JitHelpers {
             dispatch_error: None,
             switch_disc: None,
             switch_test: None,
+            for_in_begin: None,
+            for_in_next: None,
+            for_of_begin: None,
+            for_of_next: None,
+            for_of_next_bind_local: None,
+            for_of_close: None,
+            for_of_close_all: None,
+            enter_per_iteration: None,
+            per_iteration: None,
         }
     }
 
@@ -640,6 +683,15 @@ impl JitHelpers {
             Helper::DispatchError => self.dispatch_error.map(|f| f as usize as u64),
             Helper::SwitchDisc => self.switch_disc.map(|f| f as usize as u64),
             Helper::SwitchTest => self.switch_test.map(|f| f as usize as u64),
+            Helper::ForInBegin => self.for_in_begin.map(|f| f as usize as u64),
+            Helper::ForInNext => self.for_in_next.map(|f| f as usize as u64),
+            Helper::ForOfBegin => self.for_of_begin.map(|f| f as usize as u64),
+            Helper::ForOfNext => self.for_of_next.map(|f| f as usize as u64),
+            Helper::ForOfNextBindLocal => self.for_of_next_bind_local.map(|f| f as usize as u64),
+            Helper::ForOfClose => self.for_of_close.map(|f| f as usize as u64),
+            Helper::ForOfCloseAll => self.for_of_close_all.map(|f| f as usize as u64),
+            Helper::EnterPerIteration => self.enter_per_iteration.map(|f| f as usize as u64),
+            Helper::PerIteration => self.per_iteration.map(|f| f as usize as u64),
         }
     }
 }
@@ -1121,6 +1173,45 @@ pub extern "C" fn test_switch_disc(_vm: *mut c_void, _value: u64) -> u64 {
 
 pub extern "C" fn test_switch_test(_vm: *mut c_void, _case: u64, test: u64) -> u64 {
     test
+}
+
+/// Cut 57 iterator-machinery doubles: the fetch helpers return 1 (element
+/// fetched — the scaffolds never dereference the stack pointer), the env
+/// creators return a marker value.
+pub extern "C" fn test_for_in_begin(_vm: *mut c_void, _value: u64) -> u64 {
+    Value::Number(91.0).bits()
+}
+
+pub extern "C" fn test_for_in_next(_vm: *mut c_void, _stack: u64) -> u64 {
+    1
+}
+
+pub extern "C" fn test_for_of_begin(_vm: *mut c_void, _step: u64, _value: u64) -> u64 {
+    Value::Number(92.0).bits()
+}
+
+pub extern "C" fn test_for_of_next(_vm: *mut c_void, _stack: u64) -> u64 {
+    1
+}
+
+pub extern "C" fn test_for_of_next_bind_local(_vm: *mut c_void, _slot: u64) -> u64 {
+    1
+}
+
+pub extern "C" fn test_for_of_close(_vm: *mut c_void) -> u64 {
+    Value::Number(93.0).bits()
+}
+
+pub extern "C" fn test_for_of_close_all(_vm: *mut c_void) -> u64 {
+    Value::Number(96.0).bits()
+}
+
+pub extern "C" fn test_enter_per_iteration(_vm: *mut c_void, _step: u64) -> u64 {
+    Value::Number(94.0).bits()
+}
+
+pub extern "C" fn test_per_iteration(_vm: *mut c_void, _step: u64) -> u64 {
+    Value::Number(95.0).bits()
 }
 
 /// Sums its numeric arguments — proves the `args` pointer/`argc` ABI the

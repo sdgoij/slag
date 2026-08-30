@@ -1516,7 +1516,7 @@ pub enum CtlResult {
 
 /// A for-in enumeration in progress: the base object, the
 /// (prototype-level, key) pairs, and the next index.
-type ForInState = (Handle<crux::object::JsObject>, Vec<(usize, Value)>, usize);
+pub(crate) type ForInState = (Handle<crux::object::JsObject>, Vec<(usize, Value)>, usize);
 
 /// Frame slots for small layouts live in a fixed inline array so a fast
 /// call allocates nothing (the bench's simple-param functions are ≤ 8
@@ -1850,9 +1850,16 @@ pub enum ForOfEntry {
 /// Where the for-of protocol step's element lands (Cut 21): the value
 /// stack (the general shape, followed by a separate bind step) or a frame
 /// slot directly (the fused bind).
-enum ForOfNextTarget {
+pub(crate) enum ForOfNextTarget {
     Stack,
     Slot(usize),
+}
+
+/// The outcome of advancing an active for-of entry: the next element, or
+/// exhaustion (the entry and its boundary were popped).
+pub(crate) enum ForOfAdvance {
+    Element(Value),
+    Done,
 }
 
 /// The scope-environment stack: a small inline buffer for the common
@@ -3781,7 +3788,7 @@ impl Vm {
     /// original error wins, a throwing `return` (or `return` lookup) is
     /// swallowed (spec 7.4.11 steps 6-7, mirroring the tree-walker's
     /// eval_for_of error paths).
-    fn close_for_of_throw(&mut self, agent: &mut Agent) {
+    pub(crate) fn close_for_of_throw(&mut self, agent: &mut Agent) {
         while let Some(entry) = self.for_of_stack.pop() {
             if let ForOfEntry::Generic(iterator) = entry {
                 let _ = crate::expr::iterator_close_throw(agent, &iterator);
@@ -9262,20 +9269,40 @@ impl Vm {
     }
 
     /// The for-of iteration step (spec 14.7.6.2, `%ArrayIteratorPrototype%.next`
-    /// for the fast path): advances the innermost for-of entry and lands the
+    /// for the fast path): advance the innermost for-of entry and land the
     /// element on the value stack (the general shape) or in a frame slot
-    /// directly (the fused bind, Cut 21). The dense fast path re-reads the
-    /// length and the element every step so a body that mutates the array is
-    /// observed exactly as the stock iterator would. On a successful fetch,
-    /// `back` is where the loop continues (the do-while body start, Cut 35
-    /// slice 18 — no per-element back-jump); on exhaustion, `done`.
-    fn for_of_next(
+    /// directly (the fused bind, Cut 21). On a successful fetch, `back` is
+    /// where the loop continues (the do-while body start, Cut 35 slice 18 —
+    /// no per-element back-jump); on exhaustion, `done`.
+    pub(crate) fn for_of_next(
         &mut self,
         agent: &mut Agent,
         done: usize,
         back: usize,
         target: ForOfNextTarget,
     ) -> Result<(), JsError> {
+        match self.for_of_advance(agent)? {
+            ForOfAdvance::Element(value) => {
+                match target {
+                    ForOfNextTarget::Stack => self.stack.push(value),
+                    ForOfNextTarget::Slot(slot) => *self.frame_get_mut(slot) = value,
+                }
+                self.ip = back;
+            }
+            ForOfAdvance::Done => self.ip = done,
+        }
+        Ok(())
+    }
+
+    /// Advance the innermost for-of entry (spec 14.7.6.2,
+    /// `%ArrayIteratorPrototype%.next` for the fast path). The dense fast
+    /// path re-reads the length and the element every step so a body that
+    /// mutates the array is observed exactly as the stock iterator would. A
+    /// generic `next()` error propagates with `for_of_stepping` left set so
+    /// the close machinery skips the iterator (spec 14.7.6.2 uses `?` on the
+    /// next call — only a normal completion or an abrupt body/head
+    /// completion closes).
+    pub(crate) fn for_of_advance(&mut self, agent: &mut Agent) -> Result<ForOfAdvance, JsError> {
         // The innermost state is cloned out so the arm can mutate the stacks
         // while agent-side calls run.
         let fast = match self.for_of_stack.last() {
@@ -9287,67 +9314,56 @@ impl Vm {
             if index as u64 >= length {
                 self.for_of_stack.pop();
                 self.for_of_boundaries.pop();
-                self.ip = done;
-            } else {
-                // The element read goes through the numeric direct-mapped
-                // cache (no per-element number→string→intern round-trip); a
-                // hole or structural change falls back to the full Get.
-                let value = match Self::array_element_get(agent, &array, index as u64) {
-                    Some(value) => value,
-                    None => {
-                        let value = crate::context::get_property_key(
-                            agent,
-                            &array,
-                            &PropertyKey::from_utf8(&index.to_string()),
-                            array,
-                        )?;
-                        Self::resolve_array_element(agent, &array, index as u64);
-                        value
-                    }
-                };
-                if let Some(ForOfEntry::Fast { index: slot, .. }) = self.for_of_stack.last_mut() {
-                    *slot = index + 1;
-                }
-                match target {
-                    ForOfNextTarget::Stack => self.stack.push(value),
-                    ForOfNextTarget::Slot(slot) => *self.frame_get_mut(slot) = value,
-                }
-                self.ip = back;
+                return Ok(ForOfAdvance::Done);
             }
-        } else {
-            let Some(iterator) = self.for_of_stack.last() else {
-                return Err(JsError::new(
-                    ErrorKind::SyntaxError,
-                    "ForOfNext without a for-of".into(),
-                ));
-            };
-            let ForOfEntry::Generic(iterator) = iterator else {
-                unreachable!("fast entries are handled above")
-            };
-            let iterator = iterator.clone();
-            // A `next()` error propagates without closing the iterator
-            // (spec 14.7.6.2 uses `?`): the flag stays set on the error path
-            // so `run_inner` skips the close.
-            self.for_of_stepping = true;
-            match iterator_step(agent, &iterator) {
-                Ok(Some(value)) => {
-                    self.for_of_stepping = false;
-                    match target {
-                        ForOfNextTarget::Stack => self.stack.push(value),
-                        ForOfNextTarget::Slot(slot) => *self.frame_get_mut(slot) = value,
-                    }
-                    self.ip = back;
+            // The element read goes through the numeric direct-mapped cache
+            // (no per-element number→string→intern round-trip); a hole or
+            // structural change falls back to the full Get.
+            let value = match Self::array_element_get(agent, &array, index as u64) {
+                Some(value) => value,
+                None => {
+                    let value = crate::context::get_property_key(
+                        agent,
+                        &array,
+                        &PropertyKey::from_utf8(&index.to_string()),
+                        array,
+                    )?;
+                    Self::resolve_array_element(agent, &array, index as u64);
+                    value
                 }
-                Ok(None) => {
-                    self.for_of_stepping = false;
-                    self.for_of_stack.pop();
-                    self.for_of_boundaries.pop();
-                    self.ip = done;
-                }
-                Err(error) => return Err(error),
+            };
+            if let Some(ForOfEntry::Fast { index: slot, .. }) = self.for_of_stack.last_mut() {
+                *slot = index + 1;
             }
+            return Ok(ForOfAdvance::Element(value));
         }
-        Ok(())
+        let Some(iterator) = self.for_of_stack.last() else {
+            return Err(JsError::new(
+                ErrorKind::SyntaxError,
+                "ForOfNext without a for-of".into(),
+            ));
+        };
+        let ForOfEntry::Generic(iterator) = iterator else {
+            unreachable!("fast entries are handled above")
+        };
+        let iterator = iterator.clone();
+        // A `next()` error propagates without closing the iterator (spec
+        // 14.7.6.2 uses `?`): the flag stays set on the error path so the
+        // close machinery skips it.
+        self.for_of_stepping = true;
+        match iterator_step(agent, &iterator) {
+            Ok(Some(value)) => {
+                self.for_of_stepping = false;
+                Ok(ForOfAdvance::Element(value))
+            }
+            Ok(None) => {
+                self.for_of_stepping = false;
+                self.for_of_stack.pop();
+                self.for_of_boundaries.pop();
+                Ok(ForOfAdvance::Done)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn for_binding_put(
@@ -9802,7 +9818,14 @@ impl Vm {
                         let (env, depth) = pending_env_depth(&pending);
                         self.restore_env(env, depth);
                     }
-                    self.close_for_of_throw(agent);
+                    // A generic `next()` error escapes with the iterator open
+                    // (spec 14.7.6.2 uses `?` on the next call — the
+                    // interpreter's run_inner Err arm skips the close the
+                    // same way; the JIT's pending-error dispatch routes such
+                    // errors through here).
+                    if !self.for_of_stepping {
+                        self.close_for_of_throw(agent);
+                    }
                     return Ok(CtlResult::Done(VmOutcome::Completed(Completion::Throw(
                         value,
                     ))));

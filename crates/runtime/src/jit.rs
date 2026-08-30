@@ -594,6 +594,43 @@ pub struct JitSlowPaths {
     /// stored discriminant; returns 1 on a match (the machine code jumps to
     /// the case block), 0 otherwise.
     pub switch_test: extern "C" fn(ctx: *mut c_void, case: u64, test: u64) -> u64,
+    /// `Step::ForInBegin` (Cut 57): push a for-in enumeration state for the
+    /// RHS (a nullish RHS pushes an empty-key state so the loop is skipped).
+    pub for_in_begin: extern "C" fn(ctx: *mut c_void, value: u64) -> u64,
+    /// `Step::ForInNext` (Cut 57): advance the innermost for-in enumeration;
+    /// on a live key, write it at `stack[0]` and return 1; on exhaustion,
+    /// pop the state and return 0.
+    pub for_in_next: extern "C" fn(ctx: *mut c_void, stack: u64) -> u64,
+    /// `Step::ForOfBegin` (Cut 57): get the RHS's iterator (the fast-array
+    /// verdict for a plain Array with the stock `@@iterator`) and push the
+    /// entry plus its `(top, end)` boundary; `step` indexes the running
+    /// body's `ForOfBegin` payload (the fixup-patched boundary span).
+    pub for_of_begin: extern "C" fn(ctx: *mut c_void, step: u64, value: u64) -> u64,
+    /// `Step::ForOfNext` (Cut 57): advance the innermost for-of entry; on an
+    /// element, write it at `stack[0]` and return 1; on exhaustion, pop the
+    /// entry and boundary and return 0. A generic `next()` error propagates
+    /// without closing (the `for_of_stepping` flag stays set).
+    pub for_of_next: extern "C" fn(ctx: *mut c_void, stack: u64) -> u64,
+    /// `Step::ForOfNextBindLocal` (Cut 57): like `for_of_next`, landing the
+    /// element directly in frame slot `slot` (the fused bind).
+    pub for_of_next_bind_local: extern "C" fn(ctx: *mut c_void, slot: u64) -> u64,
+    /// `Step::ForOfClose` (Cut 57): pop the innermost boundary and close a
+    /// generic iterator (the fast entry has nothing to close).
+    pub for_of_close: extern "C" fn(ctx: *mut c_void) -> u64,
+    /// Cut 57: a compiled body's engine-error escape with a live for-of
+    /// entry — close all active for-of iterators with a throw completion
+    /// (mirroring `run_inner`'s uncovered-error close) so the pending error
+    /// surfaces with the iterators closed.
+    pub for_of_close_all: extern "C" fn(ctx: *mut c_void) -> u64,
+    /// `Step::EnterPerIteration` (Cut 57): push the first per-iteration env
+    /// of a certified loop (a fresh copy of the capture context's head
+    /// slots); `step` indexes the running body's `names` payload.
+    pub enter_per_iteration: extern "C" fn(ctx: *mut c_void, step: u64) -> u64,
+    /// `Step::PerIteration` (Cut 57): replace the lexical env with a fresh
+    /// per-iteration env copied from the previous one (the loop exit's
+    /// `LeaveBlock` restores the loop env); `step` indexes the running
+    /// body's `names` payload.
+    pub per_iteration: extern "C" fn(ctx: *mut c_void, step: u64) -> u64,
 }
 
 /// The runtime's slow-path table, installed into every `JitHook`.
@@ -675,6 +712,15 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     dispatch_error,
     switch_disc,
     switch_test,
+    for_in_begin,
+    for_in_next,
+    for_of_begin,
+    for_of_next,
+    for_of_next_bind_local,
+    for_of_close,
+    for_of_close_all,
+    enter_per_iteration,
+    per_iteration,
 };
 
 /// The slack (in slots) reserved above a compiled body's working area on the
@@ -2611,6 +2657,232 @@ extern "C" fn switch_test(ctx: *mut c_void, case: u64, test: u64) -> u64 {
     } else {
         0
     }
+}
+
+// ----- Cut 57: for-in / for-of + per-iteration envs -----
+
+extern "C" fn for_in_begin(ctx: *mut c_void, value: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let rhs = Value::from_bits(value);
+    if crate::expr::is_nullish(&rhs) {
+        // spec ForInOfHeadEvaluation step 7.a: a nullish exprValue is a
+        // break completion — the loop is skipped, not an error. The
+        // empty-key state makes ForInNext pop straight to the done label.
+        let dummy = crux::object::JsObject::ordinary_object_create(None);
+        vm.for_in_stack.push((dummy, Vec::new(), 0));
+        return Value::Undefined.bits();
+    }
+    let obj = match crate::context::to_object(agent, &rhs) {
+        Ok(obj) => obj,
+        Err(error) => return slow_error(ctx, error),
+    };
+    let obj = match crate::context::as_object(&obj) {
+        Some(obj) => obj,
+        None => {
+            return slow_error(
+                ctx,
+                JsError::new(ErrorKind::TypeError, "for-in over a non-object".into()),
+            );
+        }
+    };
+    let keys = match crate::eval::for_in_key_levels(agent, &rhs) {
+        Ok(keys) => keys,
+        Err(error) => return slow_error(ctx, error),
+    };
+    vm.for_in_stack.push((obj, keys, 0));
+    Value::Undefined.bits()
+}
+
+extern "C" fn for_in_next(ctx: *mut c_void, stack: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let vm = unsafe { &mut *ctx.vm };
+    let Some((obj, keys, index)) = vm.for_in_stack.last_mut() else {
+        return slow_error(
+            ctx,
+            JsError::new(ErrorKind::SyntaxError, "ForInNext without a for-in".into()),
+        );
+    };
+    while *index < keys.len() {
+        let (level, key) = keys[*index];
+        *index += 1;
+        // A key deleted during enumeration is skipped (spec
+        // EnumerateObjectProperties step 5.a.v).
+        match crate::eval::key_enumerable_at_level(obj, level, &key) {
+            Ok(true) => {
+                // SAFETY: the machine code passes its live working-stack
+                // pointer with room for one slot.
+                unsafe { *(stack as *mut u64) = key.bits() };
+                return 1;
+            }
+            Ok(false) => {}
+            Err(error) => return slow_error(ctx, error),
+        }
+    }
+    vm.for_in_stack.pop();
+    0
+}
+
+extern "C" fn for_of_begin(ctx: *mut c_void, step: u64, value: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let Some(crate::ir::Step::ForOfBegin { top, end }) = step_at(ctx, step) else {
+        unreachable!("for_of_begin on a non-ForOfBegin step");
+    };
+    let rhs = Value::from_bits(value);
+    let entry = match crate::expr::for_of_begin(agent, &rhs) {
+        Ok(crate::expr::ForOfState::Generic(record)) => crate::ir::ForOfEntry::Generic(record),
+        Ok(crate::expr::ForOfState::FastArray(array)) => {
+            crate::ir::ForOfEntry::Fast { array, index: 0 }
+        }
+        Err(error) => return slow_error(ctx, error),
+    };
+    vm.for_of_stack.push(entry);
+    // The fixup-patched span drives `close_for_of_upto` on an external
+    // break/return/throw (mirroring the interpreter handler).
+    vm.for_of_boundaries.push((*top, *end));
+    Value::Undefined.bits()
+}
+
+/// The shared element write of the for-of protocol helpers: advance the
+/// innermost entry and either write the element at `stack[0]` (returning 1)
+/// or pop the entry and return 0 on exhaustion. A generic `next()` error
+/// propagates via `slow_error` with `for_of_stepping` left set (the error
+/// path then skips the iterator close).
+fn for_of_fetch(ctx: &mut JitCallContext, stack: u64) -> u64 {
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    match vm.for_of_advance(agent) {
+        Ok(crate::ir::ForOfAdvance::Element(value)) => {
+            // SAFETY: the machine code passes its live working-stack pointer
+            // with room for one slot.
+            unsafe { *(stack as *mut u64) = value.bits() };
+            1
+        }
+        Ok(crate::ir::ForOfAdvance::Done) => 0,
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn for_of_next(ctx: *mut c_void, stack: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    for_of_fetch(ctx, stack)
+}
+
+extern "C" fn for_of_next_bind_local(ctx: *mut c_void, slot: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    match vm.for_of_advance(agent) {
+        Ok(crate::ir::ForOfAdvance::Element(value)) => {
+            *vm.frame_get_mut(slot as usize) = value;
+            1
+        }
+        Ok(crate::ir::ForOfAdvance::Done) => 0,
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn for_of_close(ctx: *mut c_void) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    vm.for_of_boundaries.pop();
+    if let Some(crate::ir::ForOfEntry::Generic(iterator)) = vm.for_of_stack.pop()
+        && let Err(error) = crate::expr::iterator_close(agent, &iterator)
+    {
+        return slow_error(ctx, error);
+    }
+    Value::Undefined.bits()
+}
+
+extern "C" fn for_of_close_all(ctx: *mut c_void) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    // A generic `next()` error escapes with the iterator open (spec 14.7.6.2
+    // uses `?` on the next call): mirror the interpreter's Err-arm skip
+    // (`!covered && !for_of_stepping` — the flag stays set on the error
+    // path of `for_of_advance`).
+    if !vm.for_of_stepping {
+        vm.close_for_of_throw(agent);
+    }
+    Value::Undefined.bits()
+}
+
+/// Instantiate a fresh per-iteration env whose bindings copy `names` from
+/// `source`, hanging off `outer` (both env-creation steps share the copy;
+/// the caller decides the outer and whether the env joins the stack). The
+/// env is marked context-transparent so a certified body's closures resolve
+/// captures through the static context chain past it (the
+/// `EnterPerIteration`/`PerIteration` interpreter handlers do the same).
+fn per_iteration_env(
+    names: &[crux::JsString],
+    outer: crate::env::EnvRef,
+    source: crate::env::EnvRef,
+) -> Result<crate::env::EnvRef, JsError> {
+    let env = crate::env::new_declarative_environment(Some(outer));
+    for name in names {
+        let value = source.get_binding_value(name, false)?;
+        env.create_mutable_binding(name, false)?;
+        env.initialize_binding(name, value)?;
+    }
+    if let crate::env::EnvRecord::Declarative(declarative) = &*env {
+        declarative.mark_context_transparent();
+    }
+    Ok(env)
+}
+
+extern "C" fn enter_per_iteration(ctx: *mut c_void, step: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let vm = unsafe { &mut *ctx.vm };
+    let Some(crate::ir::Step::EnterPerIteration { names }) = step_at(ctx, step) else {
+        unreachable!("enter_per_iteration on a non-EnterPerIteration step");
+    };
+    // The first per-iteration env of a certified loop: fresh bindings
+    // copied from the capture context's head slots, pushed on the env stack
+    // so the loop's exit/break `LeaveBlock` pops it (later iterations
+    // re-use `PerIteration`, whose copies come from the previous env).
+    let source = vm.body_context.unwrap_or(vm.lexical_env);
+    let env = match per_iteration_env(names, vm.lexical_env, source) {
+        Ok(env) => env,
+        Err(error) => return slow_error(ctx, error),
+    };
+    vm.lexical_env = env;
+    vm.env_stack.push(env);
+    Value::Undefined.bits()
+}
+
+extern "C" fn per_iteration(ctx: *mut c_void, step: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let vm = unsafe { &mut *ctx.vm };
+    let Some(crate::ir::Step::PerIteration { names }) = step_at(ctx, step) else {
+        unreachable!("per_iteration on a non-PerIteration step");
+    };
+    // The per-iteration environment replaces the lexical environment
+    // without joining the stack; the loop's exit restores the loop env
+    // directly (spec 14.7.5.6 — the copies come from the previous env).
+    let last = vm.lexical_env;
+    let outer = match last.outer() {
+        Some(outer) => outer,
+        None => {
+            return slow_error(
+                ctx,
+                JsError::new(
+                    ErrorKind::ReferenceError,
+                    "No outer environment for per-iteration bindings".into(),
+                ),
+            );
+        }
+    };
+    let env = match per_iteration_env(names, outer, last) {
+        Ok(env) => env,
+        Err(error) => return slow_error(ctx, error),
+    };
+    vm.lexical_env = env;
+    Value::Undefined.bits()
 }
 
 extern "C" fn init_context(ctx: *mut c_void, index: u64, value: u64) -> u64 {

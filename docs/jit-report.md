@@ -70,8 +70,9 @@ run paths:
 | 27 | *(worktree)* | **String-literal lowering** (Cut 54): a plain string/bigint literal (`Push(Value::String(...))` — `compile_literal` emits a heap `Push`, only templates use `PushStr`) lowers via `push_const`; template quasis (`PushStr`) via `push_str`; the template flatten concat (`ConcatStr`/`ConcatStrConst`) via the `concat_strings`-adjacent helpers; and a register body's heap constant (`LeafOp::LoadConst`/`BinConst`, member `RegOperand::Const`) via `load_const` — a step/op/field-indexed helper reading the value back from the running body. Bodies with string literals — previously bailing wholesale — compile: a string-literal assignment loop runs 7ms vs 15ms interpreter for 2M. The step-index helpers read the RUNNING body's payload, so the steps are excluded from leaf-inlining (an inlined leaf's helpers would see the CALLER's `JitCallContext::body` — the fix that caught a 35-fixture crash in the dynamic-import cluster). |
 | 28 | *(worktree)* | **try/catch/finally + control-transfer dispatch** (Cut 55): the biggest remaining bail item. Certification (`FastScopeScan`) now accepts `try` — the try block/finalizer scan as blocks, the catch parameter as a flat frame slot (a simple uncaptured Ident; captured/destructuring params keep the body on the env path), the catch body one depth deeper so a try-block reference to the parameter bails. The steps lower: `EnterBlock`/`LeaveBlock` push/pop real block envs, `EnterTry` pushes the `TryFrame`, `Exit`/`Return`/`Break`/`Continue`/`Throw`/`FinallyEnd` run the interpreter's `control_transfer`/`throw_machinery` through new dispatch helpers that return a step target (the machine code branches over the body's static transfer-target set) or a completion sentinel, and `CatchBind` mirrors the interpreter handler plus writes the flat param slot. A helper's pending engine error in a try body routes through `dispatch_error` (the interpreter's Err arm) instead of terminating. Try/catch envs are marked context-transparent in certified bodies (like per-iteration envs) so closures created inside them still reach their capture context. Bodies with plain blocks, breaks, continues, and throws also compile now. |
 | 29 | *(worktree)* | **switch** (Cut 56): certification accepts `switch` — the discriminant and case tests scan at the outer depth (they run before the shared case-block's bindings initialize), the case consequents as one shared block scope. `SwitchDisc` stores the popped discriminant via a helper; `SwitchTest` strictly-equals each case test against it and the machine code jumps to the matched case block (a static target) on a match, falling through to the next test otherwise — no dispatch table, the `break` out of a switch rides the Cut 55 control dispatch. A switch case body with a DIRECT Annex B block function declaration stays on the env path (the compiler's block-scope copy machinery is only activated for `StmtKind::Block`, and the case bodies compile as bare statement lists — 2 annexB fixtures caught this). A hot switch loop compiles; nested switches and switch-in-try shapes work. |
+| 30 | *(worktree)* | **for-in / for-of + per-iteration envs** (Cut 57): the certified `ForOf*`/`ForIn*` steps lower — `ForInBegin`/`ForOfBegin` open the enumeration/iteration through the interpreter's shared machinery (`for_in_key_levels` / `for_of_begin`, which keeps the dense-array fast verdict); `ForInNext`/`ForOfNext`/`ForOfNextBindLocal` advance it (the fast path re-reads length + element per step via the generation-validated caches; a generic `next()` error sets `for_of_stepping` so the close machinery skips the iterator, spec 14.7.6.2's `?`); the element lands on the working stack (or the fused frame slot) and the machine code jumps to `back`/`done` with static conditional branches (the Cut 56 switch pattern, no dispatch table); `ForOfClose` pops the boundary + closes a generic iterator; `ForOfBindLocal`/`ForOfBindGlobal` bind the element inline / via the existing `set_global` helper. A captured lexical head emits the per-iteration envs: `EnterPerIteration` (first env, pushed) and `PerIteration` (fresh copy per later iteration, replacing without pushing) via step-index helpers — a `for (let i of a) { ar.push(() => i) }` body compiles. Three correctness closures the cut needed: a for-of body's `Return` routes through `return_control` (its `control_transfer` closes the iterator on the escape); a helper's engine error in a non-try for-of body closes the active iterators before the pending error surfaces (`for_of_close_all`, mirroring `run_inner`'s uncovered-error close but skipping when `for_of_stepping` — a `next()` error); and `throw_machinery`'s escaping-throw close is gated on `!for_of_stepping` (the JIT's pending-error dispatch routes such errors through it). For-in has no close (no iterator); `AsyncForOf*` stays bailed (async bodies never certify). |
 
-### Slow-path helper table (`JitSlowPaths`, 76 helpers)
+### Slow-path helper table (`JitSlowPaths`, 85 helpers)
 
 The JIT inlines the number/string fast paths (tag checks are ~2 instructions
 on NaN-boxed values); everything else calls a helper whose address is baked
@@ -104,8 +105,14 @@ abrupt transfers, returning a step target or a completion sentinel),
 `catch_bind` (the catch parameter binding), and `dispatch_error` (the
 pending-engine-error handler dispatch); the Cut 56 switch pair
 `switch_disc`/`switch_test` (the stored discriminant and the strict-
-equality case test). A body needing a `None` helper bails to the
-interpreter.
+equality case test); and the Cut 57 iterator set: `for_in_begin`/`for_in_next` (the for-in enumeration open + advance — the key lands at the passed working-stack pointer, the return is 1 = key / 0 = done),
+`for_of_begin`/`for_of_next`/`for_of_next_bind_local` (the for-of open +
+advance, sharing `Vm::for_of_advance` — the fused bind writes the frame
+slot directly), `for_of_close` (the boundary pop + generic close),
+`for_of_close_all` (the non-try engine-error close, mirroring `run_inner`
+and skipping when `for_of_stepping`), and `enter_per_iteration`/
+`per_iteration` (the certified loop's per-iteration envs, step-index
+helpers). A body needing a `None` helper bails to the interpreter.
 
 ## 3. Fast-path machinery
 
@@ -164,16 +171,21 @@ interpreter.
 | compound assign | 21.7ms | 3.1ms | **0.13** (was 0.77) |
 
 **Conformance** (full-area `--jit` sweeps): `language` **23721 pass / 0 fail /
-0 crash / 0 hang** (3 skip); `annexB` 1086 pass / 0 hang; `built-ins` 23212
-pass / 445 hang — *pre-existing* (baseline 447) slow RegExp property-escape
-fixtures, unrelated to the JIT. Clusters: `expressions/call` 92/92,
-`arrow-function` 343/343.
+0 crash / 0 hang** (3 skip); `annexB` 1086 pass / 0 hang; `built-ins` 23207
+pass / 450 hang — *pre-existing* (baseline 447± load wobble) slow RegExp
+property-escape / CharacterClassEscapes fixtures plus the known
+decodeURI/TypedArray/Temporal hang clusters, unrelated to the JIT (0
+fail / 0 crash). Clusters: `expressions/call` 92/92, `arrow-function`
+343/343.
 
-**Tests**: `cargo test --workspace` green (4466; jit crate 97 incl. the
+**Tests**: `cargo test --workspace` green (4466; jit crate 110 incl. the
 `installed_jit_*` e2e tests for member/slot callees, loop-with-calls, mid-run
 cell mutation, GC-stress rooting, global store-then-read, scope-shadow
-correctness, the Cut 55 try/catch/finally/block shapes, and the Cut 56
-switch/fall-through/nested/hot-loop shapes);
+correctness, the Cut 55 try/catch/finally/block shapes, the Cut 56
+switch/fall-through/nested/hot-loop shapes, and the Cut 57
+for-of fast/generic/hot-loop, for-in keying, holes + break/continue,
+break/return/next-error/body-error iterator closing, captured-head
+per-iteration envs (for-of AND for-in), and for-of-in-try shapes);
 `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 **The headline fix**: `tco-call-args.js` (a `getF()` closure per TCO step)
@@ -203,7 +215,12 @@ containing any of these fall back entirely:
   `CatchBind`/`FinallyEnd`) are now **compiled** (Cut 55), along with the
   abrupt transfers `Return` (in a try body), `Break`/`Continue`/`Throw` —
   see the implemented table.
-- **Iterator machinery**: all `ForIn*`, `ForOf*`, `AsyncForOf*`.
+- **Iterator machinery**: `AsyncForOf*` only — the certified `ForIn*`/
+  `ForOf*` steps and the per-iteration env creation
+  (`EnterPerIteration`/`PerIteration`) are now **compiled** (Cut 57); the
+  env-path head binds (`ForInBind`/`ForOfBind`) and restores
+  (`ForInRestore`/`ForOfRestore`) stay on the env path, and async for-of
+  never certifies.
 - **Suspension**: `Yield`/`Await`/`YieldStar*`/`AsyncYieldStar*`
   (generators/async).
 - **Control machinery**: class steps (`ClassBegin`/
@@ -269,10 +286,15 @@ containing any of these fall back entirely:
    (Cut 55 — certification now accepts `try`, the try/block/catch/finally
    steps and the `Return`/`Break`/`Continue`/`Throw` transfers lower through
    the control-dispatch helpers, and engine errors in a try body route
-   through the handler table), and **switch** (Cut 56 — the discriminant
+   through the handler table), **switch** (Cut 56 — the discriminant
    stores via `switch_disc`, each `SwitchTest` strictly-equals a case test
    and the machine code jumps to the matched case block; a case body with a
-   direct Annex B block function declaration stays on the env path) no
+   direct Annex B block function declaration stays on the env path), and
+   **for-in/for-of + per-iteration envs** (Cut 57 — the certified
+   `ForIn*`/`ForOf*` steps lower through the iterator helpers, the
+   do-while back edge jumps in machine code, and a captured lexical head's
+   `EnterPerIteration`/`PerIteration` envs compile; the env-path head binds
+   and restores, and async for-of, stay on the interpreter) no
    longer bail, so a
    spread self-tail-call compiles and jumps end to end (~430ms for 200K,
    down from the ~2s interpreter bail; the array-creation machinery is the

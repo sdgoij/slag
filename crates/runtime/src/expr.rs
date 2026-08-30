@@ -374,7 +374,7 @@ fn nullish_member_error(member: &MemberExpr) -> JsError {
     )
 }
 
-fn is_nullish(value: &Value) -> bool {
+pub(crate) fn is_nullish(value: &Value) -> bool {
     matches!(value.kind(), ValueKind::Undefined | ValueKind::Null)
 }
 
