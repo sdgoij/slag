@@ -523,6 +523,27 @@ pub struct JitSlowPaths {
         extern "C" fn(ctx: *mut c_void, object: u64, key: u64, step: u64) -> u64,
     /// `Step::ObjectSpread`: copy the source's own enumerable properties.
     pub object_spread: extern "C" fn(ctx: *mut c_void, object: u64, from: u64) -> u64,
+    /// `Step::PushStr`: push a string literal — the `JsString` payload is
+    /// read back from the running body at `step` and wrapped in a value.
+    pub push_str: extern "C" fn(ctx: *mut c_void, step: u64) -> u64,
+    /// `Step::ConcatStr`: ToString the top value and append its units to the
+    /// accumulator below it (the template-literal flatten concat).
+    pub concat_str: extern "C" fn(ctx: *mut c_void, value: u64, acc: u64) -> u64,
+    /// `Step::ConcatStrConst`: append a string-literal constant's units to
+    /// the accumulator; the `JsString` payload is read back at `step`.
+    pub concat_str_const: extern "C" fn(ctx: *mut c_void, acc: u64, step: u64) -> u64,
+    /// `Step::Push` with a heap constant (a plain string/bigint literal —
+    /// `compile_literal` emits `Push(Value::String(...))`, only templates use
+    /// `PushStr`): return the payload's bits (the step holds the strong ref,
+    /// mirroring the interpreter's `stack.push(*value)`).
+    pub push_const: extern "C" fn(ctx: *mut c_void, step: u64) -> u64,
+    /// A register body's heap constant (`LeafOp::LoadConst`/`BinConst` or a
+    /// member op's `RegOperand::Const`): read the value out of the running
+    /// body's register op at `(step, op)` and return its bits. `field`
+    /// selects the const-bearing field of the op (0 = the op's own Value,
+    /// 1 = `StoreMemberName.value`, 2 = `GetMemberComputed(.Local).key`,
+    /// 3/4 = `StoreMemberComputed.key/value`).
+    pub load_const: extern "C" fn(ctx: *mut c_void, step: u64, op: u64, field: u64) -> u64,
 }
 
 /// The runtime's slow-path table, installed into every `JitHook`.
@@ -586,6 +607,11 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     object_accessor_name,
     object_accessor_computed,
     object_spread,
+    push_str,
+    concat_str,
+    concat_str_const,
+    push_const,
+    load_const,
 };
 
 /// The slack (in slots) reserved above a compiled body's working area on the
@@ -2099,6 +2125,77 @@ extern "C" fn object_spread(ctx: *mut c_void, object: u64, from: u64) -> u64 {
     }
 }
 
+// ----- Cut 54: string literals and template concat -----
+
+extern "C" fn push_str(ctx: *mut c_void, step: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let Some(crate::ir::Step::PushStr(text)) = step_at(ctx, step) else {
+        unreachable!("push_str on a non-PushStr step");
+    };
+    Value::String(crux::Handle::new(text.clone())).bits()
+}
+
+extern "C" fn concat_str(ctx: *mut c_void, value: u64, acc: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let value = Value::from_bits(value);
+    let acc = Value::from_bits(acc);
+    let text = match crate::context::to_string(agent, &value) {
+        Ok(text) => text,
+        Err(error) => return slow_error(ctx, error),
+    };
+    let mut units = crate::ir::string_units_of(&acc);
+    units.extend_from_slice(text.as_slice());
+    Value::String(crux::Handle::new(crux::JsString::from_utf16(&units))).bits()
+}
+
+extern "C" fn concat_str_const(ctx: *mut c_void, acc: u64, step: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let acc = Value::from_bits(acc);
+    let Some(crate::ir::Step::ConcatStrConst(text)) = step_at(ctx, step) else {
+        unreachable!("concat_str_const on a non-ConcatStrConst step");
+    };
+    let mut units = crate::ir::string_units_of(&acc);
+    units.extend_from_slice(text.as_slice());
+    Value::String(crux::Handle::new(crux::JsString::from_utf16(&units))).bits()
+}
+
+extern "C" fn push_const(ctx: *mut c_void, step: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let Some(crate::ir::Step::Push(value)) = step_at(ctx, step) else {
+        unreachable!("push_const on a non-Push step");
+    };
+    value.bits()
+}
+
+extern "C" fn load_const(ctx: *mut c_void, step: u64, op: u64, field: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let Some(crate::ir::Step::RunRegBody { ops }) = step_at(ctx, step) else {
+        unreachable!("load_const on a non-RunRegBody step");
+    };
+    let Some(op) = ops.get(op as usize) else {
+        unreachable!("load_const op index");
+    };
+    let value = match (op, field) {
+        (crate::ir::LeafOp::LoadConst(value), 0)
+        | (crate::ir::LeafOp::BinConst { value, .. }, 0) => *value,
+        (crate::ir::LeafOp::StoreMemberName { value, .. }, 1) => reg_const(value),
+        (crate::ir::LeafOp::GetMemberComputed { key, .. }, 2)
+        | (crate::ir::LeafOp::GetMemberComputedLocal { key, .. }, 2) => reg_const(key),
+        (crate::ir::LeafOp::StoreMemberComputed { key, .. }, 3) => reg_const(key),
+        (crate::ir::LeafOp::StoreMemberComputed { value, .. }, 4) => reg_const(value),
+        _ => unreachable!("load_const on a const-free op/field"),
+    };
+    value.bits()
+}
+
+fn reg_const(operand: &crate::ir::RegOperand) -> Value {
+    match operand {
+        crate::ir::RegOperand::Const(value) => *value,
+        _ => unreachable!("load_const field is not a Const operand"),
+    }
+}
+
 extern "C" fn init_context(ctx: *mut c_void, index: u64, value: u64) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
     let vm = unsafe { &mut *ctx.vm };
@@ -2554,6 +2651,11 @@ mod tests {
         assert_ne!(JIT_SLOW_PATHS.object_accessor_name as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.object_accessor_computed as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.object_spread as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.push_str as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.concat_str as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.concat_str_const as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.push_const as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.load_const as usize, 0);
     }
 
     #[test]

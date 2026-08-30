@@ -9848,7 +9848,7 @@ pub(crate) fn nullish_error(what: &str) -> JsError {
 /// The UTF-16 units of a value converted to a string; used by the string
 /// concatenation steps, which must preserve lone surrogates (a lossy UTF-8
 /// round-trip would replace them with U+FFFD).
-fn string_units_of(value: &Value) -> Vec<u16> {
+pub(crate) fn string_units_of(value: &Value) -> Vec<u16> {
     match value.kind() {
         ValueKind::String(s) => s.as_slice().to_vec(),
         _ => crux::convert::to_string(value)
@@ -15789,8 +15789,41 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
                 // `function` (the caller's, when inlined); the strict
                 // unmapped object reads only the call's argument slice.
                 | Step::CreateArguments { mapped: Some(_), .. }
-        )
+        ) && !string_literal_step_reads_body(step)
     })
+}
+
+/// Cut 54: a step whose JIT lowering reads its payload back from the RUNNING
+/// body via `JitCallContext::body` (a step-index helper). An inlined leaf's
+/// helpers see the CALLER's body, so these must not inline — they run on the
+/// general path with their own Vm/context instead (where `ctx.body` is the
+/// callee's own). `ConcatStr` is safe (it takes both operands by value); the
+/// const forms carry their `JsString`/`Value` payload in the step.
+fn string_literal_step_reads_body(step: &Step) -> bool {
+    match step {
+        Step::PushStr(_) | Step::ConcatStrConst(_) => true,
+        Step::Push(value) => value_is_heap(value),
+        Step::RunRegBody { ops } => ops.iter().any(leaf_op_has_heap_const),
+        _ => false,
+    }
+}
+
+fn value_is_heap(value: &Value) -> bool {
+    matches!(value.kind(), ValueKind::String(_) | ValueKind::BigInt(_))
+}
+
+fn leaf_op_has_heap_const(op: &LeafOp) -> bool {
+    let operand =
+        |operand: &RegOperand| matches!(operand, RegOperand::Const(value) if value_is_heap(value));
+    match op {
+        LeafOp::LoadConst(value) | LeafOp::BinConst { value, .. } => value_is_heap(value),
+        LeafOp::StoreMemberName { value, .. } => operand(value),
+        LeafOp::StoreMemberComputed { key, value } => operand(key) || operand(value),
+        LeafOp::GetMemberComputed { key, .. } | LeafOp::GetMemberComputedLocal { key, .. } => {
+            operand(key)
+        }
+        _ => false,
+    }
 }
 
 /// One value on the lowering's shadow stack: a `Load*`/`Push` result. `Acc`

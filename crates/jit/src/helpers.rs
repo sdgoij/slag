@@ -80,6 +80,11 @@ pub enum Helper {
     ObjectAccessorName,
     ObjectAccessorComputed,
     ObjectSpread,
+    PushStr,
+    ConcatStr,
+    ConcatStrConst,
+    PushConst,
+    LoadConst,
 }
 
 impl Helper {
@@ -144,6 +149,11 @@ impl Helper {
             Helper::ObjectAccessorName => "object_accessor_name",
             Helper::ObjectAccessorComputed => "object_accessor_computed",
             Helper::ObjectSpread => "object_spread",
+            Helper::PushStr => "push_str",
+            Helper::ConcatStr => "concat_str",
+            Helper::ConcatStrConst => "concat_str_const",
+            Helper::PushConst => "push_const",
+            Helper::LoadConst => "load_const",
         }
     }
 
@@ -399,6 +409,19 @@ pub struct JitHelpers {
     pub object_accessor_computed:
         Option<extern "C" fn(vm: *mut c_void, object: u64, key: u64, step: u64) -> u64>,
     pub object_spread: Option<extern "C" fn(vm: *mut c_void, object: u64, from: u64) -> u64>,
+    /// String literal steps (Cut 54): `PushStr` pushes a literal (the
+    /// `JsString` payload is read back from the running body);
+    /// `ConcatStr`/`ConcatStrConst` run the template flatten concat.
+    pub push_str: Option<extern "C" fn(vm: *mut c_void, step: u64) -> u64>,
+    pub concat_str: Option<extern "C" fn(vm: *mut c_void, value: u64, acc: u64) -> u64>,
+    pub concat_str_const: Option<extern "C" fn(vm: *mut c_void, acc: u64, step: u64) -> u64>,
+    /// `Step::Push` with a heap constant (a plain string/bigint literal):
+    /// the payload is read back from the running body at `step`.
+    pub push_const: Option<extern "C" fn(vm: *mut c_void, step: u64) -> u64>,
+    /// A register body's heap constant (`LoadConst`/`BinConst`/member
+    /// `RegOperand::Const`): read the value from the running body's register
+    /// op at `(step, op)`, `field` selecting the const-bearing field.
+    pub load_const: Option<extern "C" fn(vm: *mut c_void, step: u64, op: u64, field: u64) -> u64>,
 }
 
 impl JitHelpers {
@@ -464,6 +487,11 @@ impl JitHelpers {
             object_accessor_name: None,
             object_accessor_computed: None,
             object_spread: None,
+            push_str: None,
+            concat_str: None,
+            concat_str_const: None,
+            push_const: None,
+            load_const: None,
         }
     }
 
@@ -533,6 +561,11 @@ impl JitHelpers {
                 self.object_accessor_computed.map(|f| f as usize as u64)
             }
             Helper::ObjectSpread => self.object_spread.map(|f| f as usize as u64),
+            Helper::PushStr => self.push_str.map(|f| f as usize as u64),
+            Helper::ConcatStr => self.concat_str.map(|f| f as usize as u64),
+            Helper::ConcatStrConst => self.concat_str_const.map(|f| f as usize as u64),
+            Helper::PushConst => self.push_const.map(|f| f as usize as u64),
+            Helper::LoadConst => self.load_const.map(|f| f as usize as u64),
         }
     }
 }
@@ -936,6 +969,29 @@ pub extern "C" fn test_object_accessor_computed(
 
 pub extern "C" fn test_object_spread(_vm: *mut c_void, object: u64, _from: u64) -> u64 {
     object
+}
+
+/// `push_str` double: returns 80 (the literal value the concat steps echo).
+pub extern "C" fn test_push_str(_vm: *mut c_void, _step: u64) -> u64 {
+    Value::Number(80.0).bits()
+}
+
+pub extern "C" fn test_concat_str(_vm: *mut c_void, _value: u64, acc: u64) -> u64 {
+    acc
+}
+
+pub extern "C" fn test_concat_str_const(_vm: *mut c_void, acc: u64, _step: u64) -> u64 {
+    acc
+}
+
+/// `push_const` double: returns 81 (the heap-constant payload value).
+pub extern "C" fn test_push_const(_vm: *mut c_void, _step: u64) -> u64 {
+    Value::Number(81.0).bits()
+}
+
+/// `load_const` double: returns 82 (the register body's heap constant).
+pub extern "C" fn test_load_const(_vm: *mut c_void, _step: u64, _op: u64, _field: u64) -> u64 {
+    Value::Number(82.0).bits()
 }
 
 /// Sums its numeric arguments — proves the `args` pointer/`argc` ABI the

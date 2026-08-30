@@ -193,6 +193,13 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
             Step::ObjectKeyToPropertyKey
             | Step::ObjectMethodName { .. }
             | Step::ObjectAccessorName { .. } => {}
+            // String literals (Cut 54): `PushStr` pushes the literal;
+            // `ConcatStr` pops the value + accumulator and pushes the
+            // concatenation; `ConcatStrConst` swaps the accumulator for the
+            // concatenation.
+            Step::PushStr(_) => depth += 1,
+            Step::ConcatStr => depth = depth.saturating_sub(2).saturating_add(1),
+            Step::ConcatStrConst(_) => {}
             // The fused slot call pops `argc` args (the callee is the
             // frame slot) and pushes the result.
             Step::CallFastSlot { argc, .. } => {
@@ -379,6 +386,7 @@ fn step_name(step: &Step) -> &'static str {
         | Step::ObjectAccessorName { .. }
         | Step::ObjectAccessorComputed { .. }
         | Step::ObjectSpread => "ObjectLiteral",
+        Step::PushStr(_) | Step::ConcatStr | Step::ConcatStrConst(_) => "StringLiteral",
         Step::ForOfNext { .. } | Step::ForInNext { .. } | Step::ForOfBegin { .. } => "ForOf/ForIn",
         Step::SwitchDisc | Step::SwitchTest { .. } => "Switch",
         Step::Break { .. } | Step::Continue { .. } => "Break/Continue",
@@ -1467,7 +1475,19 @@ impl<'a> Lowerer<'a> {
     fn emit_step(&mut self, index: usize, step: &Step) -> Result<(), Unsupported> {
         match step {
             Step::Push(value) => {
-                let bits = self.const_value(value)?;
+                let bits = match self.const_value(value) {
+                    Ok(bits) => bits,
+                    // Cut 54: a heap constant (a plain string/bigint
+                    // literal — `compile_literal` emits `Push(Value::String(
+                    // ...))`, only templates use `PushStr`): read the payload
+                    // back from the running body and push its bits (the step
+                    // holds the strong ref, mirroring the interpreter's
+                    // `stack.push(*value)`).
+                    Err(_) => {
+                        let step_imm = self.builder.ins().iconst(types::I64, index as i64);
+                        self.call_slow(self.sig_step, Helper::PushConst, &[step_imm])?
+                    }
+                };
                 self.push(bits);
                 self.fall_through(index);
             }
@@ -1724,8 +1744,8 @@ impl<'a> Lowerer<'a> {
                 let undef = self.builder.ins().iconst(types::I64, self.undef_bits);
                 self.builder.def_var(self.acc_var, undef);
                 let returns = matches!(ops.last(), Some(LeafOp::ReturnAcc));
-                for op in ops.iter() {
-                    self.emit_leaf_op(op)?;
+                for (op_index, op) in ops.iter().enumerate() {
+                    self.emit_leaf_op(index, op_index, op)?;
                 }
                 if returns {
                     // `ReturnAcc` already terminated the block.
@@ -2762,6 +2782,31 @@ impl<'a> Lowerer<'a> {
                 self.push(object);
                 self.fall_through(index);
             }
+            // String literals (Cut 54): `PushStr` reads the literal's
+            // `JsString` back from the running body and wraps it in a value;
+            // `ConcatStr`/`ConcatStrConst` run the interpreter's flatten
+            // template concat (the accumulator below the value).
+            Step::PushStr(_) => {
+                let step_imm = self.builder.ins().iconst(types::I64, index as i64);
+                let value = self.call_slow(self.sig_step, Helper::PushStr, &[step_imm])?;
+                self.push(value);
+                self.fall_through(index);
+            }
+            Step::ConcatStr => {
+                let value = self.pop();
+                let acc = self.pop();
+                let text = self.call_slow(self.sig_get_comp, Helper::ConcatStr, &[value, acc])?;
+                self.push(text);
+                self.fall_through(index);
+            }
+            Step::ConcatStrConst(_) => {
+                let acc = self.pop();
+                let step_imm = self.builder.ins().iconst(types::I64, index as i64);
+                let text =
+                    self.call_slow(self.sig_get_name, Helper::ConcatStrConst, &[acc, step_imm])?;
+                self.push(text);
+                self.fall_through(index);
+            }
             // Completion bookkeeping: `ResetCompletion`/`NormalizeCompletion`
             // (and the list scopes) only touch the completion register, but
             // `SetCompletion` POPS the statement's value — a no-op would
@@ -3190,7 +3235,12 @@ impl<'a> Lowerer<'a> {
 
     // ----- register body (LeafOp) lowering -----
 
-    fn emit_leaf_op(&mut self, op: &LeafOp) -> Result<(), Unsupported> {
+    fn emit_leaf_op(
+        &mut self,
+        step: usize,
+        op_index: usize,
+        op: &LeafOp,
+    ) -> Result<(), Unsupported> {
         match op {
             LeafOp::LoadReg { slot, tdz } => {
                 let bits = self.load_slot(*slot);
@@ -3221,7 +3271,7 @@ impl<'a> Lowerer<'a> {
                 self.builder.def_var(self.acc_var, bits);
             }
             LeafOp::LoadConst(value) => {
-                let bits = self.const_value(value)?;
+                let bits = self.const_bits(value, step, op_index, 0)?;
                 self.builder.def_var(self.acc_var, bits);
             }
             LeafOp::BinReg { op, slot, tdz } => {
@@ -3281,7 +3331,7 @@ impl<'a> Lowerer<'a> {
             }
             LeafOp::BinConst { op, value } => {
                 let left = self.builder.use_var(self.acc_var);
-                let right = self.const_value(value)?;
+                let right = self.const_bits(value, step, op_index, 0)?;
                 let res = self.emit_binary(*op, left, right)?;
                 self.builder.def_var(self.acc_var, res);
             }
@@ -3316,7 +3366,7 @@ impl<'a> Lowerer<'a> {
             }
             LeafOp::StoreMemberName { name, value } => {
                 let object = self.builder.use_var(self.acc_var);
-                let value = self.leaf_operand(value)?;
+                let value = self.leaf_operand(step, op_index, 1, value)?;
                 let name = self.builder.ins().iconst(types::I64, *name as i64);
                 self.call_slow(
                     self.sig_set_name,
@@ -3326,8 +3376,8 @@ impl<'a> Lowerer<'a> {
             }
             LeafOp::StoreMemberComputed { key, value } => {
                 let object = self.builder.use_var(self.acc_var);
-                let key = self.leaf_operand(key)?;
-                let value = self.leaf_operand(value)?;
+                let key = self.leaf_operand(step, op_index, 3, key)?;
+                let value = self.leaf_operand(step, op_index, 4, value)?;
                 self.call_slow(
                     self.sig_set_comp,
                     Helper::SetMemberComputed,
@@ -3341,7 +3391,7 @@ impl<'a> Lowerer<'a> {
             }
             LeafOp::GetMemberComputed { key } => {
                 let object = self.builder.use_var(self.acc_var);
-                let key = self.leaf_operand(key)?;
+                let key = self.leaf_operand(step, op_index, 2, key)?;
                 let res =
                     self.call_slow(self.sig_get_comp, Helper::GetMemberComputed, &[object, key])?;
                 self.builder.def_var(self.acc_var, res);
@@ -3367,7 +3417,7 @@ impl<'a> Lowerer<'a> {
                 if *tdz {
                     self.emit_tdz_check(object)?;
                 }
-                let key = self.leaf_operand(key)?;
+                let key = self.leaf_operand(step, op_index, 2, key)?;
                 let res =
                     self.call_slow(self.sig_get_comp, Helper::GetMemberComputed, &[object, key])?;
                 self.builder.def_var(self.acc_var, res);
@@ -3388,8 +3438,16 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Load a `RegOperand` (a member op's key/value): a frame slot (with its
-    /// `tdz` check), a constant, or the loop counter.
-    fn leaf_operand(&mut self, operand: &RegOperand) -> Result<ClifValue, Unsupported> {
+    /// `tdz` check), a constant, or the loop counter. `step`/`op_index`
+    /// locate the register op in the running body and `field` the
+    /// const-bearing field, for the heap-constant fallback (Cut 54).
+    fn leaf_operand(
+        &mut self,
+        step: usize,
+        op_index: usize,
+        field: u64,
+        operand: &RegOperand,
+    ) -> Result<ClifValue, Unsupported> {
         match operand {
             RegOperand::Reg { slot, tdz } => {
                 let bits = self.load_slot(*slot);
@@ -3398,7 +3456,7 @@ impl<'a> Lowerer<'a> {
                 }
                 Ok(bits)
             }
-            RegOperand::Const(value) => self.const_value(value),
+            RegOperand::Const(value) => self.const_bits(value, step, op_index, field),
             RegOperand::Counter => Ok(self.counter_bits()),
             RegOperand::Ctx { index } => {
                 // A captured binding as a member key/value: the depth-0
@@ -3414,6 +3472,33 @@ impl<'a> Lowerer<'a> {
                 self.call_slow(self.sig_get_name, Helper::LoadPerIter, &[zero, index_imm])
             }
             RegOperand::Acc | RegOperand::Spilled => Err(Unsupported::Leaf("member operand shape")),
+        }
+    }
+
+    /// Inline a constant's bits when it is a non-heap value, else read it
+    /// back from the running body's register op at `(step, op_index)` via the
+    /// `load_const` helper (`field` selects the const-bearing field). The
+    /// compiled body holds the strong ref, mirroring the register executor's
+    /// `RegOperand::Const(value) => Ok(*value)`.
+    fn const_bits(
+        &mut self,
+        value: &Value,
+        step: usize,
+        op_index: usize,
+        field: u64,
+    ) -> Result<ClifValue, Unsupported> {
+        match self.const_value(value) {
+            Ok(bits) => Ok(bits),
+            Err(_) => {
+                let step_imm = self.builder.ins().iconst(types::I64, step as i64);
+                let op_imm = self.builder.ins().iconst(types::I64, op_index as i64);
+                let field_imm = self.builder.ins().iconst(types::I64, field as i64);
+                self.call_slow(
+                    self.sig_set_name,
+                    Helper::LoadConst,
+                    &[step_imm, op_imm, field_imm],
+                )
+            }
         }
     }
 }

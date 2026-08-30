@@ -67,8 +67,9 @@ run paths:
 | 24 | *(worktree)* | **Array-literal lowering** (Cut 52): `ArrayBegin`/`ArrayElement`/`ArraySpread`/`ArrayHole`/`ArrayEnd` — the five array-literal steps — lower to helpers mirroring the interpreter's handlers: `array_begin` creates the array and opens an index on the Vm's array-index stack, the element/spread helpers define elements at that index, `array_end` pops it and sets `length`. The array rides the work stack between the steps (a heap object). `run_jit_leaf` now saves/restores the array-index stack (a leaf may build an array on the caller's Vm, and a throw mid-literal must not leak the entry). A spread self-tail-call (`f(...[n - 1])`), previously bailed by the array literal, now compiles and jumps: 200K iterations drop from ~2s (full interpreter bail) to ~430ms under `--jit`. |
 | 25 | *(worktree)* | **Dense-array fast spread** (Cut 52b): the spread helpers (`args_spread`, `array_spread`) reuse the for-of machinery's `for_of_begin` verdict — a plain Array with the stock `@@iterator` iterates via the generation-validated element cache (`Vm::array_length`/`array_element_get` with a full-Get fallback, mirroring `for_of_next`) instead of creating the iterator object and calling `next()` per element; the generic path uses `for_of_begin`'s record (the `@@iterator` getter fires exactly once). The spread self-tail-call drops to ~410ms and `[...x]`/`f(...x)` spreads of arrays speed up ~3x; the array-creation machinery (not the iteration) is now the floor. |
 | 26 | *(worktree)* | **Object-literal lowering** (Cut 53): all nine object-literal steps lower — `ObjectBegin` creates the plain object with the realm's `Object.prototype`; `ObjectInitName`/`ObjectInitComputed` define data properties (the `__proto__` setter special case and name inference preserved); `ObjectKeyToPropertyKey` converts a computed key before the value evaluates; `ObjectMethodName`/`ObjectMethodComputed`/`ObjectAccessorName`/`ObjectAccessorComputed` define methods/accessors through step-index helpers (the Cut 44 pattern — the function/param/body payload is read back from the running body, so method instantiation runs the shared `instantiate_method`/`instantiate_accessor` machinery); `ObjectSpread` copies a source's own enumerable properties. A body with an object literal compiles instead of bailing: a `{a: n, b: n+1}` loop runs 76ms vs 87ms interpreter for 200K; computed/spread/method shapes are machinery-bound (ToPropertyKey, copy-data-properties, function instantiation). |
+| 27 | *(worktree)* | **String-literal lowering** (Cut 54): a plain string/bigint literal (`Push(Value::String(...))` — `compile_literal` emits a heap `Push`, only templates use `PushStr`) lowers via `push_const`; template quasis (`PushStr`) via `push_str`; the template flatten concat (`ConcatStr`/`ConcatStrConst`) via the `concat_strings`-adjacent helpers; and a register body's heap constant (`LeafOp::LoadConst`/`BinConst`, member `RegOperand::Const`) via `load_const` — a step/op/field-indexed helper reading the value back from the running body. Bodies with string literals — previously bailing wholesale — compile: a string-literal assignment loop runs 7ms vs 15ms interpreter for 2M. The step-index helpers read the RUNNING body's payload, so the steps are excluded from leaf-inlining (an inlined leaf's helpers would see the CALLER's `JitCallContext::body` — the fix that caught a 35-fixture crash in the dynamic-import cluster). |
 
-### Slow-path helper table (`JitSlowPaths`, 58 helpers)
+### Slow-path helper table (`JitSlowPaths`, 63 helpers)
 
 The JIT inlines the number/string fast paths (tag checks are ~2 instructions
 on NaN-boxed values); everything else calls a helper whose address is baked
@@ -91,8 +92,10 @@ self-tail-call rebind, Cut 51), `array_begin`/`array_element`/`array_spread`/
 `object_begin`/`object_init_name`/`object_init_computed`/
 `object_key_to_property_key`/`object_method_name`/`object_method_computed`/
 `object_accessor_name`/`object_accessor_computed`/`object_spread` (the
-object-literal steps, Cut 53). A body needing a `None` helper bails to the
-interpreter.
+object-literal steps, Cut 53), `push_str`/`concat_str`/`concat_str_const`/
+`push_const` (string literals + template concat, Cut 54), and `load_const`
+(a register body's heap constant, Cut 54). A body needing a `None` helper
+bails to the interpreter.
 
 ## 3. Fast-path machinery
 
@@ -241,16 +244,18 @@ containing any of these fall back entirely:
    from the Vm's argument vector and jumps) self-tail-call forms run in
    machine code; the **vector call form** (Cut 49) is done, and **array
    literals** (Cut 52 — the five array steps lower, with a dense-array fast
-   spread in the spread helpers) and **object literals** (Cut 53 — all nine
-   steps lower, methods/accessors via step-index helpers) no longer bail, so
-   a spread self-tail-call compiles and jumps end to end (~430ms for 200K,
+   spread in the spread helpers), **object literals** (Cut 53 — all nine
+   steps lower, methods/accessors via step-index helpers), and **string
+   literals** (Cut 54 — `Push(Value::String)`/`PushStr`/the template
+   concat steps and register-body heap constants lower; the step-index
+   forms are excluded from leaf-inlining because an inlined leaf's helpers
+   would see the caller's `JitCallContext::body`) no longer bail, so a
+   spread self-tail-call compiles and jumps end to end (~430ms for 200K,
    down from the ~2s interpreter bail; the array-creation machinery is the
    remaining floor). A vector call to a certified LEAF still runs the general
    `call_inner` (no leaf-inline — a future slice could rebuild the fast-form
-   layout in machine code), a computed callee (`getF()(n-1)`) still pays the
-   per-iteration `tail_call` helper round-trip, and a body containing a
-   STRING literal (`PushStr`) still bails — the remaining literal shape
-   (alongside class machinery and the rest of the list).
+   layout in machine code), and a computed callee (`getF()(n-1)`) still pays
+   the per-iteration `tail_call` helper round-trip.
 8. **String concat**: the `concat_strings` helper is called per concat; very
    small strings could concat inline in registers.
 9. **Leaf-cache invalidation breadth**: any "disturbing" helper (a `valueOf`,

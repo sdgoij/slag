@@ -384,6 +384,11 @@ fn runtime_helpers() -> JitHelpers {
         object_accessor_name: Some(rt.object_accessor_name),
         object_accessor_computed: Some(rt.object_accessor_computed),
         object_spread: Some(rt.object_spread),
+        push_str: Some(rt.push_str),
+        concat_str: Some(rt.concat_str),
+        concat_str_const: Some(rt.concat_str_const),
+        push_const: Some(rt.push_const),
+        load_const: Some(rt.load_const),
     }
 }
 
@@ -525,6 +530,11 @@ mod tests {
             object_accessor_name: Some(helpers::test_object_accessor_name),
             object_accessor_computed: Some(helpers::test_object_accessor_computed),
             object_spread: Some(helpers::test_object_spread),
+            push_str: Some(helpers::test_push_str),
+            concat_str: Some(helpers::test_concat_str),
+            concat_str_const: Some(helpers::test_concat_str_const),
+            push_const: Some(helpers::test_push_const),
+            load_const: Some(helpers::test_load_const),
         }
     }
 
@@ -1006,6 +1016,27 @@ mod tests {
     }
 
     #[test]
+    fn string_literal_lowers_through_the_helpers() {
+        // Cut 54: the string literal steps lower to the helpers — `PushStr`
+        // returns the literal (the double returns 80), the concat steps echo
+        // the accumulator, and the body returns the value.
+        let engine = JitEngine::new().expect("native isa");
+        let body = make_body(
+            vec![
+                Step::PushStr(crux::JsString::from_utf8("a")),
+                Step::PushStr(crux::JsString::from_utf8("b")),
+                Step::ConcatStr,
+                Step::PushStr(crux::JsString::from_utf8("c")),
+                Step::ConcatStrConst(crux::JsString::from_utf8("d")),
+                Step::Return,
+            ],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(80.0).bits());
+    }
+
+    #[test]
     fn tail_call_self_check_mismatch_runs_the_helper() {
         // Cut 47: a `TailCallSelfCheck` whose resolved callee does NOT match
         // the running closure (`ctx.current_function` is 0) falls to the
@@ -1472,6 +1503,35 @@ mod tests {
                 .expect("runs")
         });
         assert_eq!(value.as_number(), Some(9.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_string_literal_body() {
+        // Cut 54: a body with string literals compiles — `s += 'x'` in a
+        // loop (the concat rides the binary Add's `concat_strings` helper).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "\"use strict\"; function f() { var s = ''; \
+                     for (var i = 0; i < 5000; i++) { s += 'x'; } return s.length; } f();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(5000.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_template_literal_body() {
+        // Cut 54: a template literal — `PushStr` + `ConcatStr` +
+        // `ConcatStrConst` — compiles.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script("function f(n) { return `a${n}b`.length; } f(7);")
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(3.0));
         assert!(compiled >= 1, "{compiled} bodies");
     }
 
