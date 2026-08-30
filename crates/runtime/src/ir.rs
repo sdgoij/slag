@@ -9986,7 +9986,7 @@ fn object_accessor(
     } else {
         Vec::new()
     };
-    let closure = crate::function::instantiate_accessor(agent, params, body.clone(), env, strict)?;
+    let closure = crate::function::instantiate_accessor(agent, params, body, env, strict)?;
     crate::function::make_method(agent, &closure, Value::Object(obj))?;
     let prefix = if get { Some("get") } else { Some("set") };
     crate::function::set_function_name(&closure, &crate::expr::property_key_display(&key), prefix)?;

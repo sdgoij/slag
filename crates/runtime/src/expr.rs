@@ -728,13 +728,8 @@ fn eval_object_literal(
                 // PropertyDefinition : get PropertyName ( ) { FunctionBody }
                 let key = eval_property_name(agent, key, strict)?;
                 let env = agent.running_context()?.lexical_environment;
-                let getter = crate::function::instantiate_accessor(
-                    agent,
-                    Vec::new(),
-                    body.clone(),
-                    env,
-                    strict,
-                )?;
+                let getter =
+                    crate::function::instantiate_accessor(agent, Vec::new(), body, env, strict)?;
                 crate::function::make_method(agent, &getter, Value::Object(object))?;
                 crate::function::set_function_name(
                     &getter,
@@ -770,7 +765,7 @@ fn eval_object_literal(
                         rest: false,
                         span: body.span,
                     }],
-                    body.clone(),
+                    body,
                     env,
                     strict,
                 )?;
@@ -1324,12 +1319,8 @@ pub(crate) fn apply_binary(
                 ));
             }
             if let Some(handler) = get_method(agent, right, "@@hasInstance")? {
-                let result = crate::function::call(
-                    agent,
-                    &handler,
-                    *right,
-                    std::slice::from_ref(left),
-                )?;
+                let result =
+                    crate::function::call(agent, &handler, *right, std::slice::from_ref(left))?;
                 return Ok(Value::Boolean(to_boolean(&result)));
             }
             if !is_callable(right) {
@@ -2019,12 +2010,7 @@ pub fn get_iterator(agent: &mut Agent, value: &Value) -> Result<IteratorRecord, 
     // spec 7.4.1-7.4.2), but a non-callable `next` only surfaces when it is
     // called: a `yield`/`await` may suspend between GetIterator and the first
     // step (spec 7.4.2 step 3 + 7.4.3).
-    let next = get_property(
-        agent,
-        &iterator,
-        &JsString::from_utf8("next"),
-        iterator,
-    )?;
+    let next = get_property(agent, &iterator, &JsString::from_utf8("next"), iterator)?;
     Ok(IteratorRecord { iterator, next })
 }
 
@@ -2079,9 +2065,7 @@ pub fn for_of_begin(agent: &mut Agent, value: &Value) -> Result<ForOfState, JsEr
         && let ValueKind::Object(object) = value.kind()
         && matches!(object.kind, crux::object::ObjectKind::Array)
         && object
-            .get_own_property_key(&PropertyKey::Symbol(
-                crux::symbol::well_known("iterator")
-            ))?
+            .get_own_property_key(&PropertyKey::Symbol(crux::symbol::well_known("iterator")))?
             .is_none()
         && let Some(ap_value) = realm.intrinsics.get("%Array.prototype%")
         && let ValueKind::Object(array_proto) = ap_value.kind()
@@ -2149,12 +2133,7 @@ pub fn for_of_begin(agent: &mut Agent, value: &Value) -> Result<ForOfState, JsEr
             "Iterator must be an object".into(),
         ));
     }
-    let next = get_property(
-        agent,
-        &iterator,
-        &JsString::from_utf8("next"),
-        iterator,
-    )?;
+    let next = get_property(agent, &iterator, &JsString::from_utf8("next"), iterator)?;
     // The stock values-iterator state: over a plain Array (a proxy whose
     // @@iterator resolves to the intrinsic would also create an entry — its
     // element reads must go through the traps, so it stays generic), at
@@ -2323,12 +2302,7 @@ pub fn iterator_step(
     if to_boolean(&done) {
         return Ok(None);
     }
-    let value = get_property(
-        agent,
-        &result,
-        &JsString::from_utf8("value"),
-        result,
-    )?;
+    let value = get_property(agent, &result, &JsString::from_utf8("value"), result)?;
     Ok(Some(value))
 }
 
@@ -2413,9 +2387,9 @@ pub fn get_method(
 ) -> Result<Option<Value>, JsError> {
     // The `@@name` notation (spec 6.1.6.3.5) names the well-known symbol
     // `name`; the registry keys by the short name.
-    let key = PropertyKey::Symbol(
-        crux::symbol::well_known(symbol_name.trim_start_matches("@@"))
-    );
+    let key = PropertyKey::Symbol(crux::symbol::well_known(
+        symbol_name.trim_start_matches("@@"),
+    ));
     let method = get_property_key(agent, value, &key, *value)?;
     match method.kind() {
         ValueKind::Undefined | ValueKind::Null => Ok(None),

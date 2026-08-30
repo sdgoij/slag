@@ -644,6 +644,48 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+/// The shared body `Rc<Block>` for an accessor site (a getter/setter — the
+/// `Block` the parse tree owns, so its node identity is stable across
+/// instantiations), mirroring `shared_function_body`: every accessor from
+/// the site shares one Block, so the compiled IR + JIT code compile once
+/// per site instead of per instantiation (an accessor created inside a loop
+/// would otherwise recompile per iteration, exactly like the Cut 43
+/// function/arrow trap). The key carries the node's span and source hash so
+/// raw node addresses reused after a parse is dropped cannot collide.
+pub fn shared_accessor_body(agent: &Agent, body: &Block) -> std::rc::Rc<Block> {
+    let realm = agent
+        .current_realm()
+        .map(|realm| crux::handle::Handle::as_ptr(realm) as usize)
+        .unwrap_or(0);
+    let source_key = capture_source(agent, body.span)
+        .map(|source| source_hash(&source))
+        .unwrap_or(0);
+    let key = (
+        body as *const Block as usize,
+        realm,
+        body.span.start as usize,
+        body.span.end as usize,
+        source_key,
+    );
+    ACCESSOR_BODY_CACHE.with(|cache| {
+        if let Some(block) = cache.borrow().get(&key) {
+            return block.clone();
+        }
+        let block = std::rc::Rc::new(body.clone());
+        cache.borrow_mut().insert(key, block.clone());
+        block
+    })
+}
+
+type AccessorBodyKey = (usize, usize, usize, usize, usize);
+
+type AccessorBodyCache = std::collections::HashMap<AccessorBodyKey, std::rc::Rc<Block>>;
+
+thread_local! {
+    static ACCESSOR_BODY_CACHE: std::cell::RefCell<AccessorBodyCache> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 /// Instantiate a method definition (object literal `m() {}` and class
 /// methods): an ordinary function with no `prototype` own property and no
 /// name until SetFunctionName; [[HomeObject]] is attached by `make_method`.
@@ -676,15 +718,19 @@ pub fn instantiate_method(
 pub fn instantiate_accessor(
     agent: &mut Agent,
     params: Vec<BindingElement>,
-    body: Block,
+    body: &Block,
     environment: EnvRef,
     enclosing_strict: bool,
 ) -> Result<Value, JsError> {
+    // Cut 48: the body `Rc` is shared per site (see `shared_accessor_body`),
+    // so the compiled IR + JIT code compile once per getter/setter site
+    // instead of per instantiation.
+    let body = shared_accessor_body(agent, body);
     register_function(
         agent,
         None,
         params,
-        std::rc::Rc::new(body),
+        body,
         environment,
         enclosing_strict,
         DefinitionKind::method(false, false),

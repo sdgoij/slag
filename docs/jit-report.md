@@ -186,11 +186,13 @@ containing any of these fall back entirely:
 
 **Correctness/soundness gaps (same shape as the fixed bug):**
 
-1. **`instantiate_accessor`** still builds a fresh `Rc<Block>` per
-   instantiation — an accessor created inside a loop would recompile IR + JIT
-   code per iteration, exactly like the function/arrow trap. Fix shape is
-   identical: share the block per site. (Accessors-in-loops are rare, hence
-   deferred.)
+1. ~~**`instantiate_accessor`**~~ — **done** (Cut 48): the accessor body
+   `Rc<Block>` is now shared per site (`shared_accessor_body`, mirroring the
+   Cut 43 function/arrow cache), so the compiled IR + JIT code compile once
+   per getter/setter site instead of per instantiation. Measured on an
+   accessor-in-a-loop with a per-iteration call: `--jit` 1100ms → ~82ms
+   (~13×) and the interpreter 120ms → ~80ms (the per-instantiation IR
+   recompile was hurting both paths).
 2. **Script/eval bodies** are not in the per-site compiled-body cache
    (`compile_statements`), so re-evaluating the same source recompiles. Lower
    priority (scripts aren't leaf callees, and repeat-eval-in-loop is uncommon).
@@ -208,7 +210,15 @@ containing any of these fall back entirely:
    step-index helpers; the remaining cost is the instantiation machinery
    itself (env + object allocation), which a future inline fast path for
    capture-free closures could cut.
-6. **Extend the bail list**: `try/catch/finally`, `switch`, `with`, `using`,
+6. **The instantiation machinery is the floor** (measured 2026-08-30): a
+   closure-creation loop measures ~7.8µs per closure (interp AND jit — the
+   cost is `register_function`'s object setup: `Function::new`, the
+   `prototype` object + name/length properties, the `ecma_functions` insert),
+   and a plain `{ a: 1 }` object literal ~17µs per literal — the JIT never
+   touches these. Cutting it needs a fast path in `register_function`/
+   object creation (share the params Vec per site, skip the intermediate
+   descriptors, pool the prototype object) — the report frontier.
+7. **Extend the bail list**: `try/catch/finally`, `switch`, `with`, `using`,
    iterators, generators/async, destructuring/spread, class machinery, mapped
    `arguments`, the vector call form (`ArgsBase`/`ArgsPush`/`ArgsSpread`) —
    each is a slice of lowering + helper work. Proper tail calls are **done**
@@ -218,17 +228,17 @@ containing any of these fall back entirely:
    identity check against the running closure (Cut 47) — only a computed
    callee (`getF()(n-1)`) still pays the per-iteration `tail_call` helper
    round-trip.
-7. **String concat**: the `concat_strings` helper is called per concat; very
+8. **String concat**: the `concat_strings` helper is called per concat; very
    small strings could concat inline in registers.
-8. **Leaf-cache invalidation breadth**: any "disturbing" helper (a `valueOf`,
+9. **Leaf-cache invalidation breadth**: any "disturbing" helper (a `valueOf`,
    a getter) bumps `leaf_epoch` and drops the per-site leaf verdict — a
    monomorphic hot call next to a `valueOf` re-probes every iteration.
 
 **Non-JIT engine work observed along the way:**
 
-9. **`built-ins` RegExp property-escape fixtures** (~445) are the slowest
+10. **`built-ins` RegExp property-escape fixtures** (~445) are the slowest
    cluster in the sweep — pre-existing RegExp compilation cost, independent of
    the JIT.
-10. **`--gc-stress` is superlinear** on 100K-closure fixtures (per-allocation
+11. **`--gc-stress` is superlinear** on 100K-closure fixtures (per-allocation
     collection × per-iteration allocations) — inherent to the mode, not a
     regression.

@@ -433,8 +433,7 @@ fn build_class(
             ClassElement::Get { name, body, .. } => {
                 let (private_id, key) =
                     element_key_with(agent, name, strict, precomputed_keys, computed_key_index)?;
-                let getter =
-                    instantiate_accessor(agent, Vec::new(), body.clone(), class_env, true)?;
+                let getter = instantiate_accessor(agent, Vec::new(), body, class_env, true)?;
                 set_private_environment(agent, &getter, &class_private_env)?;
                 make_method(agent, &getter, home)?;
                 set_function_name(&getter, &element_name_text(name, key.as_ref()), Some("get"))?;
@@ -472,7 +471,7 @@ fn build_class(
                         rest: false,
                         span: body.span,
                     }],
-                    body.clone(),
+                    body,
                     class_env,
                     true,
                 )?;
