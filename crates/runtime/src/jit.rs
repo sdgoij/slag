@@ -661,6 +661,48 @@ pub struct JitSlowPaths {
     /// `Step::Await` (Cut 58): like `yield_suspend`, with an `Await`
     /// suspension.
     pub await_suspend: extern "C" fn(ctx: *mut c_void, sp: u64, value: u64, ip: u64) -> u64,
+    /// `Step::DestructureBegin` (Cut 59): `GetIterator` on the value and
+    /// push the record (not-done) on the destructure stack.
+    pub destructure_begin: extern "C" fn(ctx: *mut c_void, value: u64) -> u64,
+    /// `Step::DestructureNext` (Cut 59): step the innermost destructure
+    /// iterator, returning the element bits (an exhausted iterator returns
+    /// `undefined` and marks itself done). A `next()` error leaves
+    /// `destructure_stepping` set so the close machinery skips it.
+    pub destructure_next: extern "C" fn(ctx: *mut c_void) -> u64,
+    /// `Step::DestructureRest` (Cut 59): collect the remaining values into a
+    /// fresh array and pop the iterator (no close), returning the array bits.
+    pub destructure_rest: extern "C" fn(ctx: *mut c_void) -> u64,
+    /// `Step::DestructureObjCoercible` (Cut 59): RequireObjectCoercible of an
+    /// object pattern's value, pushing it on the object stack with a fresh
+    /// excluded frame.
+    pub destructure_obj_coercible: extern "C" fn(ctx: *mut c_void, value: u64) -> u64,
+    /// `Step::DestructureObjKey` (Cut 59): the object pattern's constant key
+    /// (read from the step payload); returns the property value bits.
+    pub destructure_obj_key: extern "C" fn(ctx: *mut c_void, step: u64) -> u64,
+    /// `Step::DestructureObjKeyComputed` (Cut 59): convert the popped key,
+    /// record it in the exclusion set, and return the property value bits.
+    pub destructure_obj_key_computed: extern "C" fn(ctx: *mut c_void, key: u64) -> u64,
+    /// `Step::DestructureObjKeyStore` (Cut 59): push the converted key for
+    /// the later `DestructureObjKeyGet`.
+    pub destructure_obj_key_store: extern "C" fn(ctx: *mut c_void, key: u64) -> u64,
+    /// `Step::DestructureObjKeyGet` (Cut 59): pop the stored key, convert it,
+    /// record it in the exclusion set, and return the property value bits.
+    pub destructure_obj_key_get: extern "C" fn(ctx: *mut c_void) -> u64,
+    /// `Step::DestructureObjRest` (Cut 59): CopyDataProperties into a fresh
+    /// rest object (the exclusion set read from the step payload), returning
+    /// the rest object bits.
+    pub destructure_obj_rest: extern "C" fn(ctx: *mut c_void, step: u64) -> u64,
+    /// `Step::DestructureClose` (Cut 59): pop the innermost destructure
+    /// iterator and close it when it was not exhausted.
+    pub destructure_close: extern "C" fn(ctx: *mut c_void) -> u64,
+    /// `Step::DestructureObjEnd` (Cut 59): pop the object pattern's base and
+    /// its exclusion frame.
+    pub destructure_obj_end: extern "C" fn(ctx: *mut c_void) -> u64,
+    /// Cut 59: a compiled body's engine-error escape with a live destructure
+    /// — close all active not-done destructure iterators (mirroring
+    /// `run_inner`'s uncovered-error close, skipping when `destructure_stepping`)
+    /// and clear the object-pattern stacks.
+    pub destructure_close_all: extern "C" fn(ctx: *mut c_void) -> u64,
 }
 
 /// The runtime's slow-path table, installed into every `JitHook`.
@@ -753,6 +795,18 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     per_iteration,
     yield_suspend,
     await_suspend,
+    destructure_begin,
+    destructure_next,
+    destructure_rest,
+    destructure_obj_coercible,
+    destructure_obj_key,
+    destructure_obj_key_computed,
+    destructure_obj_key_store,
+    destructure_obj_key_get,
+    destructure_obj_rest,
+    destructure_close,
+    destructure_obj_end,
+    destructure_close_all,
 };
 
 /// The slack (in slots) reserved above a compiled body's working area on the
@@ -2654,6 +2708,16 @@ extern "C" fn dispatch_error(ctx: *mut c_void, ip: u64) -> u64 {
     // finally; an uncovered one re-sets the pending error and signals the
     // propagate sentinel so the machine code returns and the runtime
     // surfaces it). Mirrors `run_inner_impl`'s Err arm for a covered error.
+    // Cut 59: a step error while a destructuring pattern is in progress
+    // closes the not-done iterators first (regardless of coverage — the
+    // pattern's iterator is broken mid-pattern; a `next()` error skips via
+    // the flag), and a throwing `return` replaces the error (spec 7.4.11).
+    if !vm.destructure_stack.is_empty()
+        && !vm.destructure_stepping
+        && let Err(error) = vm.close_destructures_throw(agent)
+    {
+        ctx.error = Some(error);
+    }
     let error = ctx.error.take().expect("a pending JIT error is present");
     ctx.pending = false;
     let value = match crate::builtins::error::to_throwable(agent, &error) {
@@ -2876,6 +2940,317 @@ extern "C" fn await_suspend(ctx: *mut c_void, sp: u64, value: u64, ip: u64) -> u
     ctx.suspend_sp = sp;
     vm.ip = ip as usize;
     DISPATCH_SUSPEND
+}
+
+// ----- Cut 59: destructuring -----
+
+/// `Step::DestructureBegin` (Cut 59): GetIterator on the value and push the
+/// record (not-done) on the destructure stack (spec 13.15.5.2 step 3).
+extern "C" fn destructure_begin(ctx: *mut c_void, value: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let value = Value::from_bits(value);
+    match crate::expr::get_iterator(agent, &value) {
+        Ok(iterator) => {
+            vm.destructure_stack.push(iterator);
+            vm.destructure_done.push(false);
+            Value::Undefined.bits()
+        }
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+/// `Step::DestructureNext` (Cut 59): step the innermost destructure iterator,
+/// returning the element bits. An exhausted iterator returns `undefined` and
+/// marks itself done — a default initializer must run (and may suspend) even
+/// after exhaustion (spec 13.15.5.2 step 5.d). A `next()` error propagates
+/// with `destructure_stepping` left set (the error path then skips the
+/// close).
+extern "C" fn destructure_next(ctx: *mut c_void) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let Some(index) = vm.destructure_stack.len().checked_sub(1) else {
+        return slow_error(
+            ctx,
+            JsError::new(
+                ErrorKind::SyntaxError,
+                "DestructureNext without a destructure".into(),
+            ),
+        );
+    };
+    let iterator = vm.destructure_stack[index].clone();
+    vm.destructure_stepping = true;
+    match crate::expr::iterator_step(agent, &iterator) {
+        Ok(Some(value)) => {
+            vm.destructure_stepping = false;
+            value.bits()
+        }
+        Ok(None) => {
+            vm.destructure_stepping = false;
+            vm.destructure_done[index] = true;
+            Value::Undefined.bits()
+        }
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+/// `Step::DestructureRest` (Cut 59): collect the remaining values of the
+/// innermost destructure iterator into a fresh array, pop the iterator (no
+/// close), and return the array bits (spec 13.15.5.2 step 6). A `next()`
+/// error during the collection leaves the iterator open (the flag stays set
+/// on the error path).
+extern "C" fn destructure_rest(ctx: *mut c_void) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let Some(index) = vm.destructure_stack.len().checked_sub(1) else {
+        return slow_error(
+            ctx,
+            JsError::new(
+                ErrorKind::SyntaxError,
+                "DestructureRest without a destructure".into(),
+            ),
+        );
+    };
+    let iterator = vm.destructure_stack[index].clone();
+    vm.destructure_stepping = true;
+    let mut collected = Vec::new();
+    loop {
+        match crate::expr::iterator_step(agent, &iterator) {
+            Ok(Some(value)) => collected.push(value),
+            Ok(None) => break,
+            Err(error) => return slow_error(ctx, error),
+        }
+    }
+    vm.destructure_stepping = false;
+    vm.destructure_stack.pop();
+    vm.destructure_done.pop();
+    match crate::builtins::array::array_from_values(agent, &collected) {
+        Ok(value) => value.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+/// `Step::DestructureObjCoercible` (Cut 59): RequireObjectCoercible of an
+/// object pattern's value, pushing it on the object stack with a fresh
+/// exclusion frame (spec 13.15.5.6 step 2).
+extern "C" fn destructure_obj_coercible(ctx: *mut c_void, value: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let vm = unsafe { &mut *ctx.vm };
+    let value = Value::from_bits(value);
+    if matches!(value.kind(), ValueKind::Undefined | ValueKind::Null) {
+        return slow_error(
+            ctx,
+            JsError::new(
+                ErrorKind::TypeError,
+                "Cannot destructure null or undefined".into(),
+            ),
+        );
+    }
+    vm.destructure_obj_stack.push(value);
+    vm.destructure_excluded.push(Vec::new());
+    Value::Undefined.bits()
+}
+
+/// `Step::DestructureObjKey` (Cut 59): the object pattern's constant property
+/// key (read from the step payload); returns the property value bits.
+extern "C" fn destructure_obj_key(ctx: *mut c_void, step: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let Some(crate::ir::Step::DestructureObjKey { key }) = step_at(ctx, step) else {
+        return slow_error(
+            ctx,
+            JsError::new(
+                ErrorKind::SyntaxError,
+                "DestructureObjKey without a key".into(),
+            ),
+        );
+    };
+    let Some(object) = vm.destructure_obj_stack.last().cloned() else {
+        return slow_error(
+            ctx,
+            JsError::new(
+                ErrorKind::SyntaxError,
+                "DestructureObjKey without an object".into(),
+            ),
+        );
+    };
+    match crate::context::get_property_key(agent, &object, key, object) {
+        Ok(value) => value.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+/// `Step::DestructureObjKeyComputed` (Cut 59): convert the popped key, record
+/// it in the exclusion set, and return the property value bits.
+extern "C" fn destructure_obj_key_computed(ctx: *mut c_void, key: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let key = Value::from_bits(key);
+    let Some(object) = vm.destructure_obj_stack.last().cloned() else {
+        return slow_error(
+            ctx,
+            JsError::new(
+                ErrorKind::SyntaxError,
+                "DestructureObjKeyComputed without an object".into(),
+            ),
+        );
+    };
+    match crate::context::to_property_key(agent, &key) {
+        Ok(key) => {
+            if let Some(frame) = vm.destructure_excluded.last_mut() {
+                frame.push(key.clone());
+            }
+            match crate::context::get_property_key(agent, &object, &key, object) {
+                Ok(value) => value.bits(),
+                Err(error) => slow_error(ctx, error),
+            }
+        }
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+/// `Step::DestructureObjKeyStore` (Cut 59): push the converted computed key
+/// for the later `DestructureObjKeyGet` (the pattern's key evaluates before
+/// the assignment target's reference; the property read runs after it — spec
+/// 13.15.5.6).
+extern "C" fn destructure_obj_key_store(ctx: *mut c_void, key: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let vm = unsafe { &mut *ctx.vm };
+    vm.destructure_assign_keys.push(Value::from_bits(key));
+    Value::Undefined.bits()
+}
+
+/// `Step::DestructureObjKeyGet` (Cut 59): pop the stored computed key, convert
+/// it, record it in the exclusion set, and return the property value bits.
+extern "C" fn destructure_obj_key_get(ctx: *mut c_void) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let Some(key) = vm.destructure_assign_keys.pop() else {
+        return slow_error(
+            ctx,
+            JsError::new(
+                ErrorKind::SyntaxError,
+                "DestructureObjKeyGet without a stored key".into(),
+            ),
+        );
+    };
+    let Some(object) = vm.destructure_obj_stack.last().cloned() else {
+        return slow_error(
+            ctx,
+            JsError::new(
+                ErrorKind::SyntaxError,
+                "DestructureObjKeyGet without an object".into(),
+            ),
+        );
+    };
+    match crate::context::to_property_key(agent, &key) {
+        Ok(key) => {
+            if let Some(frame) = vm.destructure_excluded.last_mut() {
+                frame.push(key.clone());
+            }
+            match crate::context::get_property_key(agent, &object, &key, object) {
+                Ok(value) => value.bits(),
+                Err(error) => slow_error(ctx, error),
+            }
+        }
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+/// `Step::DestructureObjRest` (Cut 59): CopyDataProperties into a fresh rest
+/// object, excluding the pattern's static keys (read from the step payload)
+/// plus the runtime-computed ones (the exclusion stack), and return the rest
+/// object bits (spec 13.15.5.6 step 12).
+extern "C" fn destructure_obj_rest(ctx: *mut c_void, step: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let Some(crate::ir::Step::DestructureObjRest { excluded }) = step_at(ctx, step) else {
+        return slow_error(
+            ctx,
+            JsError::new(
+                ErrorKind::SyntaxError,
+                "DestructureObjRest without an exclusion set".into(),
+            ),
+        );
+    };
+    let Some(object) = vm.destructure_obj_stack.last().cloned() else {
+        return slow_error(
+            ctx,
+            JsError::new(
+                ErrorKind::SyntaxError,
+                "DestructureObjRest without an object".into(),
+            ),
+        );
+    };
+    let mut all = excluded.clone();
+    if let Some(frame) = vm.destructure_excluded.last() {
+        all.extend(frame.iter().cloned());
+    }
+    match crate::binding::rest_object(agent) {
+        Ok(rest) => {
+            match crate::binding::copy_data_properties_excluding(agent, &rest, &object, &all) {
+                Ok(()) => Value::Object(rest).bits(),
+                Err(error) => slow_error(ctx, error),
+            }
+        }
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+/// `Step::DestructureClose` (Cut 59): pop the innermost destructure iterator
+/// and close it when it was not exhausted. Pops BEFORE closing, so a throwing
+/// `return` reaches the error path with an empty destructure stack and is not
+/// closed a second time (spec 13.15.5.2 step 5 + 7.4.11).
+extern "C" fn destructure_close(ctx: *mut c_void) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let Some(index) = vm.destructure_stack.len().checked_sub(1) else {
+        return Value::Undefined.bits();
+    };
+    let done = vm.destructure_done.get(index).copied().unwrap_or(false);
+    let iterator = vm.destructure_stack.pop().unwrap();
+    vm.destructure_done.pop();
+    if !done && let Err(error) = crate::expr::iterator_close(agent, &iterator) {
+        return slow_error(ctx, error);
+    }
+    Value::Undefined.bits()
+}
+
+/// `Step::DestructureObjEnd` (Cut 59): pop the object pattern's base and its
+/// exclusion frame.
+extern "C" fn destructure_obj_end(ctx: *mut c_void) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let vm = unsafe { &mut *ctx.vm };
+    vm.destructure_obj_stack.pop();
+    vm.destructure_excluded.pop();
+    Value::Undefined.bits()
+}
+
+/// Cut 59: a compiled body's engine-error escape with a live destructure —
+/// close all active not-done destructure iterators (mirroring `run_inner`'s
+/// uncovered-error close, skipping when `destructure_stepping` — a `next()`
+/// error) and clear the object-pattern stacks. A throwing `return` replaces
+/// the pending error (spec 7.4.11). The caller is the machine code's error
+/// block (the pending byte is already set — a raw call).
+extern "C" fn destructure_close_all(ctx: *mut c_void) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    if !vm.destructure_stack.is_empty()
+        && !vm.destructure_stepping
+        && let Err(error) = vm.close_destructures_throw(agent)
+    {
+        ctx.error = Some(error);
+    }
+    Value::Undefined.bits()
 }
 
 /// Instantiate a fresh per-iteration env whose bindings copy `names` from
@@ -3505,6 +3880,15 @@ pub(crate) fn run_jit_resume(
         crate::ir::Resume::Throw(value) => (1, value, false),
         crate::ir::Resume::Return(value) => (2, value, false),
     };
+    // Cut 59: an abrupt resume of a `yield`/`await` inside a destructuring
+    // pattern closes its iterators (spec 13.15.5.2 step 5 + 7.4.11,
+    // mirroring `run_abrupt_inner` — a throwing `return` of a `return()`
+    // resume replaces the completion with the close error).
+    if kind == 1 {
+        vm.close_destructures_abrupt(agent, false)?;
+    } else if kind == 2 {
+        vm.close_destructures_abrupt(agent, true)?;
+    }
     let sp_offset = if push { saved + 1 } else { saved };
     if push {
         work[saved] = resume_value;

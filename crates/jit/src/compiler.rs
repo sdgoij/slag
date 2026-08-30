@@ -246,6 +246,23 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
             // Suspension (Cut 58): `Yield`/`Await` pop the value into the
             // suspension payload (the saved region is what's below).
             Step::Yield { .. } | Step::Await => depth = depth.saturating_sub(1),
+            // Destructuring (Cut 59): `DestructureBegin`/`DestructureObjCoercible`
+            // pop the value onto the Vm's pattern stacks; `DestructureNext`/
+            // `DestructureRest`/`DestructureObjKey`/`DestructureObjKeyGet`/
+            // `DestructureObjRest` push the element/key/rest value;
+            // `DestructureObjKeyComputed` swaps key for value; the close/end
+            // steps are net-neutral.
+            Step::DestructureBegin => depth = depth.saturating_sub(1),
+            Step::DestructureNext => depth += 1,
+            Step::DestructureUndef { .. } => {}
+            Step::DestructureRest => depth += 1,
+            Step::DestructureObjCoercible => depth = depth.saturating_sub(1),
+            Step::DestructureObjKey { .. } => depth += 1,
+            Step::DestructureObjKeyComputed => {}
+            Step::DestructureObjKeyStore => depth = depth.saturating_sub(1),
+            Step::DestructureObjKeyGet => depth += 1,
+            Step::DestructureObjRest { .. } => depth += 1,
+            Step::DestructureClose | Step::DestructureObjEnd => {}
             _ => {}
         }
         max = max.max(depth);
@@ -430,6 +447,7 @@ fn step_name(step: &Step) -> &'static str {
         | Step::AsyncYieldStarNext { .. }
         | Step::AsyncYieldStarInspect { .. }
         | Step::AsyncYieldStarResume { .. } => "YieldStar/AsyncYieldStar",
+        Step::Destructure { .. } | Step::DeclInit { .. } => "Destructure",
         Step::ImportCall { .. } | Step::ImportMeta => "Import",
         Step::ResolveVarIdent { .. } | Step::GetVarReferenceThis => "Reference machinery",
         Step::GetSuperName { .. } | Step::GetSuperBase => "Super",
@@ -470,6 +488,9 @@ fn step_targets(step: &Step) -> Vec<usize> {
         Step::SwitchTest { case } => vec![*case],
         Step::ForInNext { back, .. } | Step::ForOfNext { back, .. } => vec![*back],
         Step::ForOfNextBindLocal { back, .. } => vec![*back],
+        // Cut 59: a `DestructureUndef` default's jump target (always a
+        // forward label within the pattern, but a static branch either way).
+        Step::DestructureUndef { use_default } => vec![*use_default],
         // Cut 46: a self-tail-call jumps to the body's re-entry block, not
         // to a step block (see `Lowerer::reentry_block`).
         Step::TailCallSelf { .. }
@@ -533,6 +554,12 @@ struct Lowerer<'a> {
     /// iterators before the body returns (the callee Vm's stacks are
     /// discarded on the error surface).
     has_for_of: bool,
+    /// Cut 59: whether the body contains destructuring machinery (any
+    /// `Destructure*` step). A helper's engine error in such a body closes
+    /// the active destructure iterators first (mirroring `run_inner`'s
+    /// uncovered-error close, skipping a `next()` error) and `dispatch_error`
+    /// does the same regardless of coverage.
+    has_destructure: bool,
     /// Cut 58: whether the body contains a suspension step (`Yield`/
     /// `Await`). A suspension body gets an entry-forwarder block that
     /// dispatches the resume: a normal resume jumps to the continuation
@@ -615,6 +642,26 @@ impl<'a> Lowerer<'a> {
                 Step::ForOfBegin { .. } | Step::ForOfNext { .. } | Step::ForOfNextBindLocal { .. }
             )
         });
+        // Cut 59: the body's destructuring machinery (any primitive
+        // `Destructure*` step) — the error path must close the active
+        // destructure iterators before surfacing a pending engine error.
+        let has_destructure = body.steps.iter().any(|step| {
+            matches!(
+                step,
+                Step::DestructureBegin
+                    | Step::DestructureNext
+                    | Step::DestructureUndef { .. }
+                    | Step::DestructureRest
+                    | Step::DestructureObjCoercible
+                    | Step::DestructureObjKey { .. }
+                    | Step::DestructureObjKeyComputed
+                    | Step::DestructureObjKeyStore
+                    | Step::DestructureObjKeyGet
+                    | Step::DestructureObjRest { .. }
+                    | Step::DestructureClose
+                    | Step::DestructureObjEnd
+            )
+        });
         let has_suspension = body
             .steps
             .iter()
@@ -676,6 +723,7 @@ impl<'a> Lowerer<'a> {
             sig_entry,
             has_try,
             has_for_of,
+            has_destructure,
             has_suspension,
             suspension_targets,
             dispatch_targets,
@@ -1279,14 +1327,20 @@ impl<'a> Lowerer<'a> {
             let res = self.emit_raw_call(self.sig_bool, Helper::DispatchError, &[ip])?;
             self.bump_leaf_epoch();
             self.emit_dispatch(res);
-        } else if self.has_for_of {
-            // A helper error inside a for-of body escapes with the iterator
-            // open on this Vm (the callee's stacks are discarded when the
-            // error surfaces) — close the active iterators first, mirroring
-            // `run_inner`'s uncovered-error close. The raw call skips the
-            // pending check (the pending error is already set; the close
-            // swallows its own errors per spec 7.4.11).
-            self.emit_raw_call(self.sig_tdz, Helper::ForOfCloseAll, &[])?;
+        } else if self.has_for_of || self.has_destructure {
+            // A helper error inside a for-of/destructuring body escapes with
+            // the iterator(s) open on this Vm (the callee's stacks are
+            // discarded when the error surfaces) — close them first,
+            // mirroring `run_inner`'s uncovered-error close (the destructure
+            // close runs first, matching the interpreter's Err arm order).
+            // The raw calls skip the pending check (the pending error is
+            // already set; the closes swallow or replace per spec 7.4.11).
+            if self.has_destructure {
+                self.emit_raw_call(self.sig_tdz, Helper::DestructureCloseAll, &[])?;
+            }
+            if self.has_for_of {
+                self.emit_raw_call(self.sig_tdz, Helper::ForOfCloseAll, &[])?;
+            }
             let undef = self.builder.ins().iconst(types::I64, self.undef_bits);
             self.builder.ins().return_(&[undef]);
         } else {
@@ -3050,6 +3104,91 @@ impl<'a> Lowerer<'a> {
                 let res =
                     self.emit_raw_call(self.sig_rel, Helper::AwaitSuspend, &[sp, value, ip])?;
                 self.builder.ins().return_(&[res]);
+            }
+            // Destructuring (Cut 59): the primitive `Destructure*` steps
+            // drive the pattern's iterator / object machinery through helpers
+            // that mirror the interpreter handlers exactly (the shared Vm
+            // stacks they manage are the authoritative state). The element /
+            // key / rest values ride the working stack.
+            Step::DestructureBegin => {
+                let value = self.pop();
+                let _res = self.call_slow(self.sig_bool, Helper::DestructureBegin, &[value])?;
+                self.fall_through(index);
+            }
+            Step::DestructureNext => {
+                let res = self.call_slow(self.sig_tdz, Helper::DestructureNext, &[])?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::DestructureUndef { use_default } => {
+                // Pop the value; if it is undefined, consume it and jump to
+                // the default initializer (its own block — a static target);
+                // otherwise leave it on the stack and fall through. The
+                // consume happens in a dedicated block so the fall-through's
+                // sp is untouched.
+                let value = self.top();
+                let is_undef = self
+                    .builder
+                    .ins()
+                    .icmp_imm_u(IntCC::Equal, value, self.undef_bits);
+                let default_block = self.ensure_block(*use_default);
+                let next_block = self.ensure_block(index + 1);
+                let pop_block = self.builder.create_block();
+                self.builder
+                    .ins()
+                    .brif(is_undef, pop_block, &[], next_block, &[]);
+                self.builder.switch_to_block(pop_block);
+                self.pop();
+                self.builder.ins().jump(default_block, &[]);
+                self.builder.seal_block(pop_block);
+            }
+            Step::DestructureRest => {
+                let res = self.call_slow(self.sig_tdz, Helper::DestructureRest, &[])?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::DestructureObjCoercible => {
+                let value = self.pop();
+                let _res =
+                    self.call_slow(self.sig_bool, Helper::DestructureObjCoercible, &[value])?;
+                self.fall_through(index);
+            }
+            Step::DestructureObjKey { .. } => {
+                let step_imm = self.builder.ins().iconst(types::I64, index as i64);
+                let res = self.call_slow(self.sig_step, Helper::DestructureObjKey, &[step_imm])?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::DestructureObjKeyComputed => {
+                let key = self.pop();
+                let res =
+                    self.call_slow(self.sig_bool, Helper::DestructureObjKeyComputed, &[key])?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::DestructureObjKeyStore => {
+                let key = self.pop();
+                let _res = self.call_slow(self.sig_bool, Helper::DestructureObjKeyStore, &[key])?;
+                self.fall_through(index);
+            }
+            Step::DestructureObjKeyGet => {
+                let res = self.call_slow(self.sig_tdz, Helper::DestructureObjKeyGet, &[])?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::DestructureObjRest { .. } => {
+                let step_imm = self.builder.ins().iconst(types::I64, index as i64);
+                let res = self.call_slow(self.sig_step, Helper::DestructureObjRest, &[step_imm])?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::DestructureClose => {
+                let _res = self.call_slow(self.sig_tdz, Helper::DestructureClose, &[])?;
+                self.fall_through(index);
+            }
+            Step::DestructureObjEnd => {
+                let _res = self.call_slow(self.sig_tdz, Helper::DestructureObjEnd, &[])?;
+                self.fall_through(index);
             }
             Step::CatchBind { .. } => {
                 let step_imm = self.builder.ins().iconst(types::I64, index as i64);

@@ -72,8 +72,9 @@ run paths:
 | 29 | *(worktree)* | **switch** (Cut 56): certification accepts `switch` — the discriminant and case tests scan at the outer depth (they run before the shared case-block's bindings initialize), the case consequents as one shared block scope. `SwitchDisc` stores the popped discriminant via a helper; `SwitchTest` strictly-equals each case test against it and the machine code jumps to the matched case block (a static target) on a match, falling through to the next test otherwise — no dispatch table, the `break` out of a switch rides the Cut 55 control dispatch. A switch case body with a DIRECT Annex B block function declaration stays on the env path (the compiler's block-scope copy machinery is only activated for `StmtKind::Block`, and the case bodies compile as bare statement lists — 2 annexB fixtures caught this). A hot switch loop compiles; nested switches and switch-in-try shapes work. |
 | 30 | *(worktree)* | **for-in / for-of + per-iteration envs** (Cut 57): the certified `ForOf*`/`ForIn*` steps lower — `ForInBegin`/`ForOfBegin` open the enumeration/iteration through the interpreter's shared machinery (`for_in_key_levels` / `for_of_begin`, which keeps the dense-array fast verdict); `ForInNext`/`ForOfNext`/`ForOfNextBindLocal` advance it (the fast path re-reads length + element per step via the generation-validated caches; a generic `next()` error sets `for_of_stepping` so the close machinery skips the iterator, spec 14.7.6.2's `?`); the element lands on the working stack (or the fused frame slot) and the machine code jumps to `back`/`done` with static conditional branches (the Cut 56 switch pattern, no dispatch table); `ForOfClose` pops the boundary + closes a generic iterator; `ForOfBindLocal`/`ForOfBindGlobal` bind the element inline / via the existing `set_global` helper. A captured lexical head emits the per-iteration envs: `EnterPerIteration` (first env, pushed) and `PerIteration` (fresh copy per later iteration, replacing without pushing) via step-index helpers — a `for (let i of a) { ar.push(() => i) }` body compiles. Three correctness closures the cut needed: a for-of body's `Return` routes through `return_control` (its `control_transfer` closes the iterator on the escape); a helper's engine error in a non-try for-of body closes the active iterators before the pending error surfaces (`for_of_close_all`, mirroring `run_inner`'s uncovered-error close but skipping when `for_of_stepping` — a `next()` error); and `throw_machinery`'s escaping-throw close is gated on `!for_of_stepping` (the JIT's pending-error dispatch routes such errors through it). For-in has no close (no iterator); `AsyncForOf*` stays bailed (async bodies never certify). |
 | 31 | *(worktree)* | **Generator/async suspension** (Cut 58): a certified generator or async-function body compiles, with `Step::Yield`/`Step::Await` lowering to `yield_suspend`/`await_suspend` — helpers that record the suspension payload (value + delegate flag for `yield`, the awaited value for `await`), the machine code's working-stack pointer (`suspend_sp` — the depth `run_jit_body` saves into the new traced `Vm::jit_work`), and the continuation step (`vm.ip`), then signal `DISPATCH_SUSPEND` (`u64::MAX - 2`). A body with any suspension gets an entry dispatch on `ctx.resume_kind`: 0 (normal resume) compares `ctx.resume_ip` against the static `suspension_targets` and jumps to the continuation with the resume value pushed on the restored region; 1/2 (throw/return resume) route `ctx.resume_value` through `throw_control`/`return_control`. `resume_ip == 0` is the fresh-run sentinel. The drivers (`run_jit_body_loop`/`run_jit_resume_loop`) loop on `TailReplaced`, convert a completed value to the `Completed(Return)` outcome, and fall back to `vm.start`/`vm.run`/`vm.run_abrupt` (the abrupt-of-a-plain-`yield`/`await` decision mirrors `resume_body`). Resumable bodies are never leaves (a no-`await` async body must still route through `call_async_function` to return a Promise; a no-`yield` generator body through `call_generator`); the generator/async drivers install the capture context (`new_body_context`) into `vm.body_context` + `vm.lexical_env` + the saved ExecutionContext's `lexical_environment` so closures created mid-body capture it, and `setup_certified_frame` fills the frame from the saved call args/this. `yield*` and async generators (`AsyncYieldStar*`) stay bailed: certification rejects `delegate: true` and the combined async+generator kind. |
+| 32 | *(worktree)* | **Destructuring** (Cut 59): certification accepts destructuring declaration patterns (the scan walks the pattern's bound names into the frame/context slot layout, scanning defaults and computed keys as expressions) and destructuring-assignment targets whose elements are identifiers or nested patterns (member targets stay on the env path — they need the reference machinery). The compiler emits the primitive `Destructure*` steps for EVERY certified pattern — `DestructureBegin`/`DestructureNext`/`DestructureUndef`/`DestructureRest`/`DestructureClose` drive an array pattern's iterator through helpers mirroring the interpreter handlers (the element lands on the working stack; `DestructureUndef` is a static conditional jump to the fixup-patched default label, the Cut 56/57 branch pattern); `DestructureObjCoercible`/`DestructureObjKey`/`DestructureObjKeyComputed`/`DestructureObjKeyStore`/`DestructureObjKeyGet`/`DestructureObjRest`/`DestructureObjEnd` drive an object pattern's key reads, computed-key store/get pair, and rest copy (the static exclusion set read from the step payload). The certified binds are flat: a declaration element writes its slot/context via `InitLocal`/`InitContextSlot`, an assignment element via `StoreLocal`/`StoreContextSlot`/`StoreGlobal` (an undeclared assign target falls back to `AssignIdent` — it bails the body at JIT time, correct but slower). A for-loop head's destructuring (`for (var [...x] = iter; ;)`) compiles the same steps (the var/lexical head paths were the two sweep regressions this cut's certification exposed); a lexical pattern head whose name a body closure captures stays on the env path (per-iteration freshness covers only ident heads). Error handling mirrors `run_inner`'s Err arm: a step error in a destructure body closes the active not-done iterators (`destructure_close_all` on the non-try error path; `dispatch_error` closes before the handler-table routing) unless `destructure_stepping` (a `next()` error leaves the iterator open — the interpreter's exact behavior), and an abrupt `yield`/`await` resume inside a pattern closes them like `run_abrupt_inner`. The wholesale `Destructure`/`DeclInit` pattern binds (env machinery) and `SetFunctionName` (anonymous-function defaults) stay bailed. |
 
-### Slow-path helper table (`JitSlowPaths`, 87 helpers)
+### Slow-path helper table (`JitSlowPaths`, 99 helpers)
 
 The JIT inlines the number/string fast paths (tag checks are ~2 instructions
 on NaN-boxed values); everything else calls a helper whose address is baked
@@ -116,7 +117,19 @@ and skipping when `for_of_stepping`), and `enter_per_iteration`/
 helpers); and the Cut 58 suspension pair `yield_suspend`/`await_suspend`
 (the `Yield`/`Await` helpers that record the suspension — value, delegate
 flag, working-stack pointer, continuation step — and signal
-`DISPATCH_SUSPEND`). A body needing a `None` helper bails to the
+`DISPATCH_SUSPEND`); and the Cut 59 destructure set:
+`destructure_begin`/`destructure_next`/`destructure_rest`/
+`destructure_close` (an array pattern's iterator: open, step — returning
+the element bits with the exhausted-iterator `undefined`, collect-rest —
+pop without close, close — pop-before-close), `destructure_obj_coercible`/
+`destructure_obj_key`/`destructure_obj_key_computed`/
+`destructure_obj_key_store`/`destructure_obj_key_get`/`destructure_obj_rest`/
+`destructure_obj_end` (an object pattern's RequireObjectCoercible open, key
+reads — constant key via the step payload, computed via the popped value —
+the store/get computed-key pair, the rest copy with the merged exclusion
+set, and the close), and `destructure_close_all` (the engine-error close,
+mirroring `run_inner`'s uncovered-error close and skipping when
+`destructure_stepping`). A body needing a `None` helper bails to the
 interpreter.
 
 ## 3. Fast-path machinery
@@ -183,18 +196,22 @@ decodeURI/TypedArray/Temporal hang clusters, unrelated to the JIT (0
 fail / 0 crash). Clusters: `expressions/call` 92/92, `arrow-function`
 343/343.
 
-**Tests**: `cargo test --workspace` green (4487 passed, 3 ignored; jit crate 118 incl. the
+**Tests**: `cargo test --workspace` green (4495 passed, 3 ignored; jit crate 126 incl. the
 `installed_jit_*` e2e tests for member/slot callees, loop-with-calls, mid-run
 cell mutation, GC-stress rooting, global store-then-read, scope-shadow
 correctness, the Cut 55 try/catch/finally/block shapes, the Cut 56
 switch/fall-through/nested/hot-loop shapes, the Cut 57
 for-of fast/generic/hot-loop, for-in keying, holes + break/continue,
 break/return/next-error/body-error iterator closing, captured-head
-per-iteration envs (for-of AND for-in), for-of-in-try shapes, and the Cut 58
+per-iteration envs (for-of AND for-in), for-of-in-try shapes, the Cut 58
 async-await/await-in-fast-loop/async-rejection-catch/async-try-finally,
 generator-plain-yields/yield-in-fast-loop/generator-throw-catch,
 async-generator-interpreter-fallback, and async-method-returns-nested-
-async-function (the capture-env-fallback regression) shapes);
+async-function (the capture-env-fallback regression) shapes, and the Cut 59
+array/object declaration destructure (defaults, rest, nested, computed
+keys, captured names), assignment destructure, destructure-in-a-loop,
+iterator-close on completion, and the next-error-keeps-iterator-open
+shapes);
 `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 **The headline fix**: `tco-call-args.js` (a `getF()` closure per TCO step)
@@ -238,7 +255,14 @@ containing any of these fall back entirely:
 - **Control machinery**: class steps (`ClassBegin`/
   `ClassHeritage`/`ClassFinish`…), `RegExpLiteral`. `SwitchDisc`/`SwitchTest`
   are now **compiled** (Cut 56) — see the implemented table.
-- **Destructuring/spread**: `ObjectSpread`, `ArraySpread`, all `Destructure*`.
+- **Destructuring/spread**: the certified `Destructure*` steps are now
+  **compiled** (Cut 59) — see the implemented table. `ObjectSpread`/
+  `ArraySpread` (the literal-spread steps) were compiled in Cuts 52/53. The
+  env-path wholesale binds (`Destructure { pattern }`/`DeclInit { pattern }`)
+  stay on the env path (a certified body always compiles patterns to the
+  primitive steps with flat slot/context binds), as do destructuring-assign
+  targets with member elements (the reference machinery), `SetFunctionName`
+  (anonymous-function defaults), and `UsingInit`.
 - **Sloppy mapped arguments**: `CreateArguments { mapped: Some }`.
 - **Super machinery**: `SuperCall`, `GetSuperBase`, `GetSuperName`/
   `GetSuperComputed`/`AssignSuper*`, `DeleteSuper`, `UpdateSuper*`.
@@ -313,7 +337,11 @@ containing any of these fall back entirely:
    or routes a throw/return through the control machinery, the working
    region survives in the traced `Vm::jit_work`, and the drivers install
    the capture context + frame; `yield*` and async generators stay on the
-   interpreter) no
+   interpreter), and **destructuring** (Cut 59 — the certified primitive
+   `Destructure*` steps lower through the iterator/object helpers with flat
+   slot/context binds; a destructuring-assign target with member elements,
+   the env-path wholesale binds, `SetFunctionName`, and `UsingInit` stay
+   on the interpreter) no
    longer bail, so a
    spread self-tail-call compiles and jumps end to end (~430ms for 200K,
    down from the ~2s interpreter bail; the array-creation machinery is the

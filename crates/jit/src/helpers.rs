@@ -109,6 +109,18 @@ pub enum Helper {
     PerIteration,
     YieldSuspend,
     AwaitSuspend,
+    DestructureBegin,
+    DestructureNext,
+    DestructureRest,
+    DestructureObjCoercible,
+    DestructureObjKey,
+    DestructureObjKeyComputed,
+    DestructureObjKeyStore,
+    DestructureObjKeyGet,
+    DestructureObjRest,
+    DestructureClose,
+    DestructureObjEnd,
+    DestructureCloseAll,
 }
 
 impl Helper {
@@ -202,6 +214,18 @@ impl Helper {
             Helper::PerIteration => "per_iteration",
             Helper::YieldSuspend => "yield_suspend",
             Helper::AwaitSuspend => "await_suspend",
+            Helper::DestructureBegin => "destructure_begin",
+            Helper::DestructureNext => "destructure_next",
+            Helper::DestructureRest => "destructure_rest",
+            Helper::DestructureObjCoercible => "destructure_obj_coercible",
+            Helper::DestructureObjKey => "destructure_obj_key",
+            Helper::DestructureObjKeyComputed => "destructure_obj_key_computed",
+            Helper::DestructureObjKeyStore => "destructure_obj_key_store",
+            Helper::DestructureObjKeyGet => "destructure_obj_key_get",
+            Helper::DestructureObjRest => "destructure_obj_rest",
+            Helper::DestructureClose => "destructure_close",
+            Helper::DestructureObjEnd => "destructure_obj_end",
+            Helper::DestructureCloseAll => "destructure_close_all",
         }
     }
 
@@ -514,6 +538,25 @@ pub struct JitHelpers {
     pub yield_suspend:
         Option<extern "C" fn(vm: *mut c_void, sp: u64, value: u64, delegate: u64, ip: u64) -> u64>,
     pub await_suspend: Option<extern "C" fn(vm: *mut c_void, sp: u64, value: u64, ip: u64) -> u64>,
+    /// Destructuring steps (Cut 59): `DestructureBegin`/`DestructureNext`/
+    /// `DestructureRest`/`DestructureClose` drive an array pattern's iterator;
+    /// `DestructureObjCoercible` opens an object pattern (the key reads via
+    /// `DestructureObjKey`/`DestructureObjKeyComputed` and the store/get pair
+    /// `DestructureObjKeyStore`/`DestructureObjKeyGet`, the rest via
+    /// `DestructureObjRest`, the close via `DestructureObjEnd`);
+    /// `DestructureCloseAll` is the engine-error close.
+    pub destructure_begin: Option<extern "C" fn(vm: *mut c_void, value: u64) -> u64>,
+    pub destructure_next: Option<extern "C" fn(vm: *mut c_void) -> u64>,
+    pub destructure_rest: Option<extern "C" fn(vm: *mut c_void) -> u64>,
+    pub destructure_obj_coercible: Option<extern "C" fn(vm: *mut c_void, value: u64) -> u64>,
+    pub destructure_obj_key: Option<extern "C" fn(vm: *mut c_void, step: u64) -> u64>,
+    pub destructure_obj_key_computed: Option<extern "C" fn(vm: *mut c_void, key: u64) -> u64>,
+    pub destructure_obj_key_store: Option<extern "C" fn(vm: *mut c_void, key: u64) -> u64>,
+    pub destructure_obj_key_get: Option<extern "C" fn(vm: *mut c_void) -> u64>,
+    pub destructure_obj_rest: Option<extern "C" fn(vm: *mut c_void, step: u64) -> u64>,
+    pub destructure_close: Option<extern "C" fn(vm: *mut c_void) -> u64>,
+    pub destructure_obj_end: Option<extern "C" fn(vm: *mut c_void) -> u64>,
+    pub destructure_close_all: Option<extern "C" fn(vm: *mut c_void) -> u64>,
 }
 
 impl JitHelpers {
@@ -608,6 +651,18 @@ impl JitHelpers {
             per_iteration: None,
             yield_suspend: None,
             await_suspend: None,
+            destructure_begin: None,
+            destructure_next: None,
+            destructure_rest: None,
+            destructure_obj_coercible: None,
+            destructure_obj_key: None,
+            destructure_obj_key_computed: None,
+            destructure_obj_key_store: None,
+            destructure_obj_key_get: None,
+            destructure_obj_rest: None,
+            destructure_close: None,
+            destructure_obj_end: None,
+            destructure_close_all: None,
         }
     }
 
@@ -706,6 +761,24 @@ impl JitHelpers {
             Helper::PerIteration => self.per_iteration.map(|f| f as usize as u64),
             Helper::YieldSuspend => self.yield_suspend.map(|f| f as usize as u64),
             Helper::AwaitSuspend => self.await_suspend.map(|f| f as usize as u64),
+            Helper::DestructureBegin => self.destructure_begin.map(|f| f as usize as u64),
+            Helper::DestructureNext => self.destructure_next.map(|f| f as usize as u64),
+            Helper::DestructureRest => self.destructure_rest.map(|f| f as usize as u64),
+            Helper::DestructureObjCoercible => {
+                self.destructure_obj_coercible.map(|f| f as usize as u64)
+            }
+            Helper::DestructureObjKey => self.destructure_obj_key.map(|f| f as usize as u64),
+            Helper::DestructureObjKeyComputed => {
+                self.destructure_obj_key_computed.map(|f| f as usize as u64)
+            }
+            Helper::DestructureObjKeyStore => {
+                self.destructure_obj_key_store.map(|f| f as usize as u64)
+            }
+            Helper::DestructureObjKeyGet => self.destructure_obj_key_get.map(|f| f as usize as u64),
+            Helper::DestructureObjRest => self.destructure_obj_rest.map(|f| f as usize as u64),
+            Helper::DestructureClose => self.destructure_close.map(|f| f as usize as u64),
+            Helper::DestructureObjEnd => self.destructure_obj_end.map(|f| f as usize as u64),
+            Helper::DestructureCloseAll => self.destructure_close_all.map(|f| f as usize as u64),
         }
     }
 }
@@ -1243,6 +1316,58 @@ pub extern "C" fn test_yield_suspend(
 
 pub extern "C" fn test_await_suspend(_vm: *mut c_void, _sp: u64, _value: u64, _ip: u64) -> u64 {
     u64::MAX - 2
+}
+
+/// Cut 59 destructure doubles: `DestructureNext`/`DestructureRest`/
+/// `DestructureObjKeyGet` return a marker value the scaffolds push;
+/// `DestructureObjKey`/`DestructureObjRest` read their step payload through
+/// the same channel as the real helpers; the rest complete with `undefined`.
+pub extern "C" fn test_destructure_begin(_vm: *mut c_void, _value: u64) -> u64 {
+    Value::Undefined.bits()
+}
+
+pub extern "C" fn test_destructure_next(_vm: *mut c_void) -> u64 {
+    Value::Number(42.0).bits()
+}
+
+pub extern "C" fn test_destructure_rest(_vm: *mut c_void) -> u64 {
+    Value::Number(43.0).bits()
+}
+
+pub extern "C" fn test_destructure_obj_coercible(_vm: *mut c_void, _value: u64) -> u64 {
+    Value::Undefined.bits()
+}
+
+pub extern "C" fn test_destructure_obj_key(_vm: *mut c_void, _step: u64) -> u64 {
+    Value::Number(44.0).bits()
+}
+
+pub extern "C" fn test_destructure_obj_key_computed(_vm: *mut c_void, _key: u64) -> u64 {
+    Value::Number(45.0).bits()
+}
+
+pub extern "C" fn test_destructure_obj_key_store(_vm: *mut c_void, _key: u64) -> u64 {
+    Value::Undefined.bits()
+}
+
+pub extern "C" fn test_destructure_obj_key_get(_vm: *mut c_void) -> u64 {
+    Value::Number(46.0).bits()
+}
+
+pub extern "C" fn test_destructure_obj_rest(_vm: *mut c_void, _step: u64) -> u64 {
+    Value::Number(47.0).bits()
+}
+
+pub extern "C" fn test_destructure_close(_vm: *mut c_void) -> u64 {
+    Value::Undefined.bits()
+}
+
+pub extern "C" fn test_destructure_obj_end(_vm: *mut c_void) -> u64 {
+    Value::Undefined.bits()
+}
+
+pub extern "C" fn test_destructure_close_all(_vm: *mut c_void) -> u64 {
+    Value::Undefined.bits()
 }
 
 /// Sums its numeric arguments — proves the `args` pointer/`argc` ABI the

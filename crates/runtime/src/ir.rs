@@ -3782,7 +3782,7 @@ impl Vm {
     /// runs first and a throwing or non-object `return` becomes the new
     /// completion, so the remaining iterators close with the throw flavor
     /// (spec 7.4.11 steps 4-8); with a throw completion all closes swallow.
-    fn close_destructures_abrupt(
+    pub(crate) fn close_destructures_abrupt(
         &mut self,
         agent: &mut Agent,
         completion_is_return: bool,
@@ -3807,6 +3807,35 @@ impl Vm {
         self.destructure_assign_keys.clear();
         self.destructure_excluded.clear();
         match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Close every active destructure iterator when a step error escapes a
+    /// destructuring pattern (spec 13.15.5.2 step 5): the first throwing
+    /// `return` replaces the error (spec 7.4.11). The caller gates on
+    /// `!destructure_stepping` (a `next()` error leaves the iterator open).
+    /// Shared by `run_inner`'s Err arm and the JIT's error path (Cut 59);
+    /// also clears the object-pattern stacks.
+    pub(crate) fn close_destructures_throw(&mut self, agent: &mut Agent) -> Result<(), JsError> {
+        let mut close_error: Option<JsError> = None;
+        while let Some(index) = self.destructure_stack.len().checked_sub(1) {
+            let iterator = self.destructure_stack[index].clone();
+            let done = self.destructure_done.get(index).copied().unwrap_or(false);
+            if !done
+                && let Err(e) = crate::expr::iterator_close_throw(agent, &iterator)
+                && close_error.is_none()
+            {
+                close_error = Some(e);
+            }
+            self.destructure_stack.pop();
+            self.destructure_done.pop();
+        }
+        self.destructure_obj_stack.clear();
+        self.destructure_assign_keys.clear();
+        self.destructure_excluded.clear();
+        match close_error {
             Some(error) => Err(error),
             None => Ok(()),
         }
@@ -3944,30 +3973,14 @@ impl Vm {
                         // in progress closes the not-done iterators (spec
                         // 13.15.5.2 step 5): the first throwing `return` replaces
                         // the error (spec 7.4.11). The tree-walker's
-                        // array_assignment does the same on its error path.
+                        // array_assignment does the same on its error path. The
+                        // JIT's error path shares the close (Cut 59).
                         let mut error = error;
-                        if !self.destructure_stack.is_empty() && !self.destructure_stepping {
-                            let mut close_error: Option<JsError> = None;
-                            while let Some(index) = self.destructure_stack.len().checked_sub(1) {
-                                let iterator = self.destructure_stack[index].clone();
-                                let done =
-                                    self.destructure_done.get(index).copied().unwrap_or(false);
-                                if !done
-                                    && let Err(e) =
-                                        crate::expr::iterator_close_throw(agent, &iterator)
-                                    && close_error.is_none()
-                                {
-                                    close_error = Some(e);
-                                }
-                                self.destructure_stack.pop();
-                                self.destructure_done.pop();
-                            }
-                            self.destructure_obj_stack.clear();
-                            self.destructure_assign_keys.clear();
-                            self.destructure_excluded.clear();
-                            if let Some(e) = close_error {
-                                error = e;
-                            }
+                        if !self.destructure_stack.is_empty()
+                            && !self.destructure_stepping
+                            && let Err(e) = self.close_destructures_throw(agent)
+                        {
+                            error = e;
                         }
                         // An error escaping a for-of body or head closes the
                         // active iterators (spec 14.7.6.2: a head-binding error or
@@ -11293,6 +11306,71 @@ impl Compiler {
         }
     }
 
+    /// The flat slot write for a certified destructuring element (Cut 59):
+    /// the value on top of the stack initializes the declaration's binding
+    /// (a frame slot or capture-context slot — the certified scan allocated
+    /// every pattern name). The env fallback keeps the wholesale
+    /// `DeclInit`/`Destructure` (correct, but it bails the body at JIT time).
+    fn emit_certified_bind(&mut self, pattern: &BindingPattern, lexical: bool) {
+        let BindingPattern::Ident(name) = pattern else {
+            unreachable!("emit_certified_bind binds an identifier element")
+        };
+        match self.binding(*name) {
+            BindingLoc::Slot(slot) => self.emit(Step::InitLocal { slot }),
+            BindingLoc::Context(0, index) => self.emit(Step::InitContextSlot { index }),
+            BindingLoc::Global => self.emit(Step::StoreGlobal { name: *name }),
+            _ => {
+                self.emit(if lexical {
+                    Step::DeclInit {
+                        pattern: pattern.clone(),
+                    }
+                } else {
+                    Step::Destructure {
+                        pattern: pattern.clone(),
+                    }
+                });
+                self.emit(Step::Pop);
+            }
+        }
+    }
+
+    /// The flat store for a certified destructuring ASSIGNMENT element (Cut
+    /// 59): the value on top of the stack assigns the target binding — a
+    /// frame slot (`StoreLocal`), a captured binding (`StoreContextSlot`, the
+    /// const/TDZ checks), or a declared global. An undeclared name resolves
+    /// through the environment machinery (`AssignIdent` — it bails the body
+    /// at JIT time, correct but slower).
+    fn emit_certified_assign_store(&mut self, name: crux::AtomId) {
+        match self.binding(name) {
+            BindingLoc::Slot(slot) => self.emit(Step::StoreLocal { slot }),
+            BindingLoc::Context(depth, index) => {
+                if depth == 0
+                    && let Some((per_depth, per_index)) = self.per_iteration(name)
+                {
+                    self.emit(Step::StorePerIteration {
+                        depth: per_depth,
+                        index: per_index,
+                    });
+                } else {
+                    self.emit(Step::StoreContextSlot { depth, index });
+                }
+            }
+            BindingLoc::Global => self.emit(Step::StoreGlobal { name }),
+            BindingLoc::Acc => self.emit(Step::PopAcc),
+            BindingLoc::CapturedIteration(depth, index) => {
+                self.emit(Step::StorePerIteration { depth, index })
+            }
+            BindingLoc::Env => {
+                self.emit(Step::AssignIdent {
+                    name,
+                    op: AssignOp::Assign,
+                    set_name: false,
+                });
+                self.emit(Step::Pop);
+            }
+        }
+    }
+
     /// Whether a block contributes no environment — true when the block has
     /// no lexical declarations, or (certified bodies only) when every lexical
     /// declaration binds to a frame slot or the capture context: the scope
@@ -12176,9 +12254,17 @@ impl Compiler {
                             // after its binding.
                             self.emit(Step::SetFunctionName { name: *name });
                         }
-                        if self.binding_pattern_contains_suspension(&decl.pattern) {
+                        if self.binding_pattern_contains_suspension(&decl.pattern)
+                            || self.scope.is_some()
+                        {
                             // Defaults/computed keys with `yield`/`await`
-                            // compile inline so they can suspend.
+                            // compile inline so they can suspend; a certified
+                            // body (Cut 59) compiles EVERY pattern to the
+                            // primitive `Destructure*` steps with flat
+                            // slot/context binds (the wholesale
+                            // `DeclInit`/`Destructure` steps bind through the
+                            // environment machinery, which a certified body
+                            // never consults).
                             self.compile_destructure_binding(&decl.pattern, declaration)?;
                         } else if !declaration && matches!(decl.pattern, BindingPattern::Ident(_)) {
                             self.emit(Step::PutVarReference);
@@ -12199,12 +12285,19 @@ impl Compiler {
                         // (spec 14.2.1 step 4); the binding was created
                         // uninitialized by declaration instantiation. A
                         // slot-bound identifier writes the frame slot
-                        // directly (the frame started it in the TDZ).
+                        // directly (the frame started it in the TDZ); a
+                        // certified destructuring pattern (Cut 59) compiles
+                        // the primitive steps over the pushed `undefined`
+                        // (a no-init array/object pattern destructures it
+                        // and throws).
                         if let BindingPattern::Ident(name) = &decl.pattern
                             && let BindingLoc::Slot(slot) = self.binding(*name)
                         {
                             self.emit(Step::Push(Value::Undefined));
                             self.emit(Step::InitLocal { slot });
+                        } else if self.scope.is_some() {
+                            self.emit(Step::Push(Value::Undefined));
+                            self.compile_destructure_binding(&decl.pattern, declaration)?;
                         } else {
                             self.emit(Step::Push(Value::Undefined));
                             self.emit(Step::DeclInit {
@@ -12542,9 +12635,17 @@ impl Compiler {
                                 }
                             }
                             self.compile_expr(init)?;
-                            self.emit(Step::Destructure {
-                                pattern: decl.pattern.clone(),
-                            });
+                            if self.scope.is_some() {
+                                // Cut 59: a certified body's var-pattern head
+                                // compiles the primitive steps with flat
+                                // slot/context binds (the wholesale
+                                // `Destructure` binds through the env).
+                                self.compile_destructure_binding(&decl.pattern, false)?;
+                            } else {
+                                self.emit(Step::Destructure {
+                                    pattern: decl.pattern.clone(),
+                                });
+                            }
                         }
                     }
                 } else if *kind == VarDeclKind::Using || *kind == VarDeclKind::AwaitUsing {
@@ -12636,6 +12737,21 @@ impl Compiler {
                         has_loop_env = true;
                         self.per_iteration_heads.push(heads);
                         per_iteration.extend(names);
+                    } else if self.scope.is_some() {
+                        // Cut 59: a certified LEXICAL pattern head (the scan
+                        // rejects one whose names a body closure captures —
+                        // per-iteration freshness covers only ident heads)
+                        // compiles the primitive steps with flat binds; the
+                        // per-iteration envs are unobservable without
+                        // closures.
+                        for decl in decls {
+                            if let Some(init) = &decl.init {
+                                self.compile_expr(init)?;
+                            } else {
+                                self.emit(Step::Push(Value::Undefined));
+                            }
+                            self.compile_destructure_binding(&decl.pattern, true)?;
+                        }
                     } else {
                         self.emit(Step::EnterLoopEnv {
                             kind: *kind,
@@ -14239,8 +14355,13 @@ impl Compiler {
     ) -> Result<(), JsError> {
         if matches!(target.kind, ExprKind::Object(_) | ExprKind::Array(_)) {
             self.compile_expr(value)?;
-            if Self::destructure_needs_steps(target) {
+            if Self::destructure_needs_steps(target) || self.scope.is_some() {
                 // Keep a copy: the assignment expression's value is the RHS.
+                // A certified body (Cut 59) compiles EVERY pattern to the
+                // primitive `Destructure*` steps with flat slot/context
+                // stores (the wholesale `Destructure { pattern }` step binds
+                // through the environment machinery, which a certified body
+                // never consults).
                 self.emit(Step::Dup);
                 self.compile_destructure_assign(target)?;
             } else {
@@ -14454,9 +14575,14 @@ impl Compiler {
             // A default initializer compiles inline so it can suspend; a
             // nested pattern with suspension recurses step-wise; otherwise
             // the whole element binds in one step. The value is on top of
-            // the stack either way (spec 13.13.11 step 5.d).
+            // the stack either way (spec 13.13.11 step 5.d). A certified
+            // body (Cut 59) always compiles the primitive steps — the
+            // wholesale `DeclInit`/`Destructure` binds through the
+            // environment machinery, which a certified body never consults.
             let bind_element = |compiler: &mut Self| -> Result<(), JsError> {
-                if compiler.binding_pattern_contains_suspension(&element.pattern) {
+                if compiler.scope.is_some()
+                    || compiler.binding_pattern_contains_suspension(&element.pattern)
+                {
                     compiler.compile_destructure_binding(&element.pattern, lexical)
                 } else {
                     compiler.emit(if lexical {
@@ -14491,17 +14617,22 @@ impl Compiler {
             BindingPattern::Ident(_) => {
                 // A plain identifier with a suspension default cannot occur
                 // (the default belongs to the declaration's init, not the
-                // pattern); treat as a plain binding.
-                self.emit(if lexical {
-                    Step::DeclInit {
-                        pattern: pattern.clone(),
-                    }
+                // pattern); treat as a plain binding. A certified body's
+                // identifier element writes the flat slot directly (Cut 59).
+                if self.scope.is_some() {
+                    self.emit_certified_bind(pattern, lexical);
                 } else {
-                    Step::Destructure {
-                        pattern: pattern.clone(),
-                    }
-                });
-                self.emit(Step::Pop);
+                    self.emit(if lexical {
+                        Step::DeclInit {
+                            pattern: pattern.clone(),
+                        }
+                    } else {
+                        Step::Destructure {
+                            pattern: pattern.clone(),
+                        }
+                    });
+                    self.emit(Step::Pop);
+                }
             }
             BindingPattern::Array(elements) => {
                 self.emit(Step::DestructureBegin);
@@ -14722,29 +14853,23 @@ impl Compiler {
                     let after = self.new_label();
                     let set_name = crate::function::is_anonymous_function_definition(init);
                     self.emit_destructure_undef(use_default);
-                    self.emit(Step::AssignIdent {
-                        name: *id,
-                        op: AssignOp::Assign,
-                        set_name,
-                    });
-                    self.emit(Step::Pop);
+                    if set_name {
+                        // NamedEvaluation (spec 13.15.5.5): a default that
+                        // is an anonymous function definition names it after
+                        // the binding.
+                        self.emit(Step::SetFunctionName { name: *id });
+                    }
+                    self.emit_certified_assign_store(*id);
                     self.jump(after);
                     self.place(use_default);
                     self.compile_expr(init)?;
-                    self.emit(Step::AssignIdent {
-                        name: *id,
-                        op: AssignOp::Assign,
-                        set_name,
-                    });
-                    self.emit(Step::Pop);
+                    if set_name {
+                        self.emit(Step::SetFunctionName { name: *id });
+                    }
+                    self.emit_certified_assign_store(*id);
                     self.place(after);
                 } else {
-                    self.emit(Step::AssignIdent {
-                        name: *id,
-                        op: AssignOp::Assign,
-                        set_name: false,
-                    });
-                    self.emit(Step::Pop);
+                    self.emit_certified_assign_store(*id);
                 }
                 Ok(())
             }
@@ -17584,8 +17709,10 @@ impl FastScopeScan {
                 // A lexical for-head binding is scoped to the for statement
                 // itself (its head exprs and body): a reference at the same
                 // depth after the loop would leak the flat slot, so the
-                // scan rejects it (the body bails to the env path).
+                // scan rejects it (the body bails to the env path). Pattern
+                // heads (Cut 59) contribute every bound name.
                 let mut head_names = HashSet::new();
+                let mut pattern_head_captured = false;
                 if let Some(ForInit::VarDecl { kind, decls, .. }) = init
                     && *kind != VarDeclKind::Var
                 {
@@ -17593,6 +17720,22 @@ impl FastScopeScan {
                         if let BindingPattern::Ident(name) = decl.pattern {
                             head_names.insert(name);
                             self.for_head_lexicals.insert(name, depth);
+                        } else {
+                            // A captured lexical PATTERN head needs
+                            // per-iteration freshness, which the certified
+                            // machinery covers only for ident heads — stay on
+                            // the env path. The names still scope to the loop
+                            // (a reference after it would leak the flat slot).
+                            let mut names = Vec::new();
+                            crate::script::bound_names(&decl.pattern, &mut names);
+                            for name in names {
+                                let name = crux::intern_utf8(&name.to_string_lossy());
+                                if self.captured.contains(&name) {
+                                    pattern_head_captured = true;
+                                }
+                                head_names.insert(name);
+                                self.for_head_lexicals.insert(name, depth);
+                            }
                         }
                     }
                 }
@@ -17603,7 +17746,8 @@ impl FastScopeScan {
                     Some(ForInit::VarDecl { kind, decls }) => self.decls(kind, decls, depth),
                 };
                 self.open_loop_body_depths.push(depth + 1);
-                let result = init_ok
+                let result = !pattern_head_captured
+                    && init_ok
                     && test.as_ref().is_none_or(|t| self.expr(t, depth))
                     && update.as_ref().is_none_or(|u| self.expr(u, depth))
                     && self.stmt(body, depth + 1);
@@ -17960,54 +18104,8 @@ impl FastScopeScan {
     fn decls(&mut self, kind: &VarDeclKind, decls: &[VarDeclarator], depth: usize) -> bool {
         let lexical = *kind != VarDeclKind::Var;
         for decl in decls {
-            let BindingPattern::Ident(name) = decl.pattern else {
+            if !self.declare_pattern(&decl.pattern, lexical, *kind == VarDeclKind::Const, depth) {
                 return false;
-            };
-            if lexical {
-                // A lexical binding must be unique (the flat slot maps
-                // cannot tell two scopes apart) and referenced only within
-                // its scope; the per-iteration freshness of a `for`-head
-                // binding is unobservable without closures, which the scan
-                // rejects.
-                if self.slots.contains_key(&name) || self.context_slots.contains_key(&name) {
-                    return false;
-                }
-                self.declared_depth.insert(name, depth);
-                if *kind == VarDeclKind::Const {
-                    self.consts.insert(name);
-                }
-                // Cut 6 first slice: a same-block lexical makes a later
-                // block function declaration dead (the block env already
-                // binds the name).
-                if let Some(top) = self.block_names_stack.last_mut() {
-                    top.insert(name);
-                }
-                // A binding declared inside an open loop body is fresh per
-                // iteration (the body block re-creates each iteration): a
-                // closure capturing it must stay on the env path — the
-                // certified per-iteration machinery covers only the
-                // loop-head names.
-                if self
-                    .open_loop_body_depths
-                    .iter()
-                    .any(|&body_depth| depth >= body_depth)
-                {
-                    self.loop_body_lexicals.insert(name);
-                }
-            }
-            // A captured binding lives in the capture context; a `var`
-            // redeclaration reuses its existing slot/context binding.
-            if self.captured.contains(&name) && !self.context_slots.contains_key(&name) {
-                self.context_slots.insert(name, self.context_names.len());
-                self.context_names.push(name);
-                self.context_tdz.push(lexical);
-                self.context_const.push(*kind == VarDeclKind::Const);
-                self.context_param.push(None);
-            } else if !self.captured.contains(&name) && !self.slots.contains_key(&name) {
-                let slot = self.next_slot;
-                self.tdz.push(lexical);
-                self.next_slot += 1;
-                self.slots.insert(name, slot);
             }
             if let Some(init) = &decl.init
                 && !self.expr(init, depth)
@@ -18016,6 +18114,170 @@ impl FastScopeScan {
             }
         }
         true
+    }
+
+    /// Allocate every name a destructuring declaration pattern binds (Cut
+    /// 59): the frame/context slot layout and the lexical bookkeeping
+    /// (`declared_depth`, consts, block/loop-body scoping) apply per name
+    /// exactly as the `Ident`-pattern fast path does; defaults and computed
+    /// keys scan as expressions. The certified path compiles the pattern to
+    /// the primitive `Destructure*` steps with slot binds, so any pattern
+    /// shape (nested patterns, defaults, rest) certifies.
+    fn declare_pattern(
+        &mut self,
+        pattern: &BindingPattern,
+        lexical: bool,
+        is_const: bool,
+        depth: usize,
+    ) -> bool {
+        match pattern {
+            BindingPattern::Ident(name) => {
+                self.declare_pattern_name(*name, lexical, is_const, depth)
+            }
+            BindingPattern::Array(elements) => elements.iter().all(|element| match element {
+                ArrayBindingElement::Hole => true,
+                ArrayBindingElement::Element(element) | ArrayBindingElement::Rest(element) => {
+                    self.declare_pattern_element(element, lexical, is_const, depth)
+                }
+            }),
+            BindingPattern::Object(props) => props.iter().all(|prop| match prop {
+                syntax::ast::ObjectBindingProperty::Property { key, element, .. } => {
+                    let key_ok = match key {
+                        PropertyName::Computed(expr) => self.expr(expr, depth),
+                        _ => true,
+                    };
+                    key_ok && self.declare_pattern_element(element, lexical, is_const, depth)
+                }
+                syntax::ast::ObjectBindingProperty::Rest(element) => {
+                    self.declare_pattern_element(element, lexical, is_const, depth)
+                }
+            }),
+        }
+    }
+
+    fn declare_pattern_element(
+        &mut self,
+        element: &BindingElement,
+        lexical: bool,
+        is_const: bool,
+        depth: usize,
+    ) -> bool {
+        self.declare_pattern(&element.pattern, lexical, is_const, depth)
+            && element
+                .init
+                .as_ref()
+                .is_none_or(|init| self.expr(init, depth))
+    }
+
+    fn declare_pattern_name(
+        &mut self,
+        name: crux::AtomId,
+        lexical: bool,
+        is_const: bool,
+        depth: usize,
+    ) -> bool {
+        if lexical {
+            // A lexical binding must be unique (the flat slot maps
+            // cannot tell two scopes apart) and referenced only within
+            // its scope; the per-iteration freshness of a `for`-head
+            // binding is unobservable without closures, which the scan
+            // rejects.
+            if self.slots.contains_key(&name) || self.context_slots.contains_key(&name) {
+                return false;
+            }
+            self.declared_depth.insert(name, depth);
+            if is_const {
+                self.consts.insert(name);
+            }
+            // Cut 6 first slice: a same-block lexical makes a later
+            // block function declaration dead (the block env already
+            // binds the name).
+            if let Some(top) = self.block_names_stack.last_mut() {
+                top.insert(name);
+            }
+            // A binding declared inside an open loop body is fresh per
+            // iteration (the body block re-creates each iteration): a
+            // closure capturing it must stay on the env path — the
+            // certified per-iteration machinery covers only the
+            // loop-head names.
+            if self
+                .open_loop_body_depths
+                .iter()
+                .any(|&body_depth| depth >= body_depth)
+            {
+                self.loop_body_lexicals.insert(name);
+            }
+        }
+        // A captured binding lives in the capture context; a `var`
+        // redeclaration reuses its existing slot/context binding.
+        if self.captured.contains(&name) && !self.context_slots.contains_key(&name) {
+            self.context_slots.insert(name, self.context_names.len());
+            self.context_names.push(name);
+            self.context_tdz.push(lexical);
+            self.context_const.push(is_const);
+            self.context_param.push(None);
+        } else if !self.captured.contains(&name) && !self.slots.contains_key(&name) {
+            let slot = self.next_slot;
+            self.tdz.push(lexical);
+            self.next_slot += 1;
+            self.slots.insert(name, slot);
+        }
+        true
+    }
+
+    /// Whether a destructuring ASSIGNMENT target (`[a, b] = v`, `({x} = o)`)
+    /// certifies (Cut 59): every element target is an identifier (a
+    /// slot/context/global store) or a nested pattern; member targets need
+    /// the reference machinery and reject the body. Defaults and computed
+    /// keys scan as expressions.
+    fn destructure_assign_target(&mut self, target: &Expr, depth: usize) -> bool {
+        match &target.kind {
+            ExprKind::Array(array) => array.elements.iter().all(|element| match element {
+                ArrayElement::Hole => true,
+                ArrayElement::Expr(expr) | ArrayElement::Spread(expr) => {
+                    self.destructure_assign_element(expr, depth)
+                }
+            }),
+            ExprKind::Object(object) => object.props.iter().all(|prop| match prop {
+                ObjectProperty::Init { key, value, .. } => {
+                    let key_ok = match key {
+                        PropertyName::Computed(expr) => self.expr(expr, depth),
+                        _ => true,
+                    };
+                    key_ok && self.destructure_assign_element(value, depth)
+                }
+                ObjectProperty::Spread(value) => self.destructure_assign_element(value, depth),
+                _ => false,
+            }),
+            ExprKind::Paren(inner) => self.destructure_assign_target(inner, depth),
+            _ => false,
+        }
+    }
+
+    fn destructure_assign_element(&mut self, expr: &Expr, depth: usize) -> bool {
+        match &expr.kind {
+            ExprKind::Assign {
+                op: AssignOp::Assign,
+                target,
+                value,
+                ..
+            } => self.destructure_assign_leaf(target, depth) && self.expr(value, depth),
+            _ => self.destructure_assign_leaf(expr, depth),
+        }
+    }
+
+    fn destructure_assign_leaf(&mut self, expr: &Expr, depth: usize) -> bool {
+        match &expr.kind {
+            ExprKind::Ident(name) => {
+                // A `const` binding cannot be reassigned (the frame slot
+                // has no const enforcement).
+                !self.consts.contains(name) && self.expr(expr, depth)
+            }
+            ExprKind::Array(_) | ExprKind::Object(_) => self.destructure_assign_target(expr, depth),
+            ExprKind::Paren(inner) => self.destructure_assign_leaf(inner, depth),
+            // A member target needs the reference machinery.
+            _ => false,
+        }
     }
 
     fn expr(&mut self, expr: &Expr, depth: usize) -> bool {
@@ -18094,7 +18356,11 @@ impl FastScopeScan {
             }
             ExprKind::Assign { target, value, .. } => {
                 if matches!(target.kind, ExprKind::Object(_) | ExprKind::Array(_)) {
-                    return false;
+                    // Destructuring assignment (Cut 59): every element
+                    // target is an identifier (slot/context/global store) or
+                    // a nested pattern — member targets need the reference
+                    // machinery. Defaults and computed keys scan below.
+                    return self.destructure_assign_target(target, depth);
                 }
                 // A `const` binding cannot be reassigned (the frame slot
                 // has no const enforcement).

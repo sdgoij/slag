@@ -413,6 +413,18 @@ fn runtime_helpers() -> JitHelpers {
         per_iteration: Some(rt.per_iteration),
         yield_suspend: Some(rt.yield_suspend),
         await_suspend: Some(rt.await_suspend),
+        destructure_begin: Some(rt.destructure_begin),
+        destructure_next: Some(rt.destructure_next),
+        destructure_rest: Some(rt.destructure_rest),
+        destructure_obj_coercible: Some(rt.destructure_obj_coercible),
+        destructure_obj_key: Some(rt.destructure_obj_key),
+        destructure_obj_key_computed: Some(rt.destructure_obj_key_computed),
+        destructure_obj_key_store: Some(rt.destructure_obj_key_store),
+        destructure_obj_key_get: Some(rt.destructure_obj_key_get),
+        destructure_obj_rest: Some(rt.destructure_obj_rest),
+        destructure_close: Some(rt.destructure_close),
+        destructure_obj_end: Some(rt.destructure_obj_end),
+        destructure_close_all: Some(rt.destructure_close_all),
     }
 }
 
@@ -583,6 +595,18 @@ mod tests {
             per_iteration: Some(helpers::test_per_iteration),
             yield_suspend: Some(helpers::test_yield_suspend),
             await_suspend: Some(helpers::test_await_suspend),
+            destructure_begin: Some(helpers::test_destructure_begin),
+            destructure_next: Some(helpers::test_destructure_next),
+            destructure_rest: Some(helpers::test_destructure_rest),
+            destructure_obj_coercible: Some(helpers::test_destructure_obj_coercible),
+            destructure_obj_key: Some(helpers::test_destructure_obj_key),
+            destructure_obj_key_computed: Some(helpers::test_destructure_obj_key_computed),
+            destructure_obj_key_store: Some(helpers::test_destructure_obj_key_store),
+            destructure_obj_key_get: Some(helpers::test_destructure_obj_key_get),
+            destructure_obj_rest: Some(helpers::test_destructure_obj_rest),
+            destructure_close: Some(helpers::test_destructure_close),
+            destructure_obj_end: Some(helpers::test_destructure_obj_end),
+            destructure_close_all: Some(helpers::test_destructure_close_all),
         }
     }
 
@@ -2538,6 +2562,202 @@ mod tests {
             agent.run_script("result").expect("reads")
         });
         assert_eq!(value.as_number(), Some(7.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_array_destructure_declaration() {
+        // Cut 59: a certified body's `let [a, b] = ...` compiles the
+        // primitive `Destructure*` steps — the iterator opens via
+        // `destructure_begin`, each element via `destructure_next` (landing
+        // on the working stack, bound to the frame slots), the close via
+        // `destructure_close`.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f() { let [a, b] = [1, 2]; return a + b * 10; }\n\
+                     f();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(21.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_array_destructure_default_rest_and_generic() {
+        // Cut 59: defaults jump through the fixup-patched `DestructureUndef`
+        // target, rest collects through `destructure_rest`, and a GENERIC
+        // iterator (custom `[Symbol.iterator]`) exercises the same helpers
+        // as the dense-array fast path.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f() {\n\
+                     \x20 let [a, b = 5, ...rest] = [1, undefined, 3, 4];\n\
+                     \x20 let [x, y] = { [Symbol.iterator]: function* () { yield 7; yield 8; } };\n\
+                     \x20 return JSON.stringify([a, b, rest, x, y]);\n\
+                     }\n\
+                     f();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("[1,5,[3,4],7,8]".to_string())
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_object_destructure_declaration() {
+        // Cut 59: `let { x, y: { z } = {}, ...rest } = ...` — constant keys
+        // (`DestructureObjKey`), a nested pattern with a default, and the
+        // rest copy (`DestructureObjRest` — the static exclusion set read
+        // from the step payload).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f() {\n\
+                     \x20 let { x, y: { z } = {}, ...rest } = { x: 10, y: { z: 20 }, w: 30 };\n\
+                     \x20 return JSON.stringify([x, z, rest]);\n\
+                     }\n\
+                     f();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("[10,20,{\"w\":30}]".to_string())
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_destructure_assignment() {
+        // Cut 59: assignment destructuring (`[a, b] = v`, `({ p: a, q: b } =
+        // v)`) — the elements store to the existing frame slots through
+        // `emit_certified_assign_store`.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f() {\n\
+                     \x20 let a, b;\n\
+                     \x20 [a, b] = [7, 8];\n\
+                     \x20 ({ p: a, q: b } = { p: 9, q: 11 });\n\
+                     \x20 return a * 100 + b;\n\
+                     }\n\
+                     f();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(911.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_destructure_in_a_fast_loop() {
+        // Cut 59: destructuring inside a certified loop — the pattern steps
+        // run per iteration on the hot path.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f() {\n\
+                     \x20 var sum = 0;\n\
+                     \x20 for (var i = 0; i < 3; i++) { let [p, q] = [i, i + 1]; sum += p * 10 + q; }\n\
+                     \x20 return sum;\n\
+                     }\n\
+                     f();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(36.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_destructure_break_returns_close_the_iterator() {
+        // Cut 59: a `break`/`return`/throw ESCAPING a destructuring pattern
+        // is impossible (patterns are expressions), but an iterator-`return`
+        // must run on a normal `DestructureClose` and the error path must
+        // close a mid-pattern iterator. A throwing `next()` leaves it open
+        // (the `destructure_stepping` gate).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var closed = 0;\n\
+                     var next_calls = 0;\n\
+                     function it() {\n\
+                     \x20 var n = 0;\n\
+                     \x20 return {\n\
+                     \x20\x20 [Symbol.iterator]: function () { return this; },\n\
+                     \x20\x20 next: function () {\n\
+                     \x20\x20\x20 next_calls++;\n\
+                     \x20\x20\x20 if (n === 2) throw 'boom';\n\
+                     \x20\x20\x20 return { value: n++, done: false };\n\
+                     \x20\x20 },\n\
+                     \x20\x20 return: function () { closed++; return {}; }\n\
+                     \x20 };\n\
+                     }\n\
+                     var err = '';\n\
+                     try { let [a, b, c] = it(); } catch (e) { err = String(e); }\n\
+                     err + '|' + closed + '|' + next_calls;",
+                )
+                .expect("runs")
+        });
+        // The `next()` error at element 3 escapes with the iterator OPEN
+        // (the close machinery skips while `destructure_stepping`): the
+        // interpreter's pre-existing behavior, mirrored by the JIT.
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("boom|0|3".to_string())
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_destructure_closes_iterator_on_completion() {
+        // Cut 59: a pattern that consumes FEWER values than the iterator
+        // holds closes it on `DestructureClose` (spec 13.15.5.2 step 5) —
+        // the iterator's `return` method runs.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var closed = 0;\n\
+                     function it() {\n\
+                     \x20 var n = 0;\n\
+                     \x20 return {\n\
+                     \x20\x20 [Symbol.iterator]: function () { return this; },\n\
+                     \x20\x20 next: function () { return { value: n++, done: false }; },\n\
+                     \x20\x20 return: function () { closed++; return {}; }\n\
+                     \x20 };\n\
+                     }\n\
+                     let [a] = it();\n\
+                     closed;",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(1.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_destructure_captured_names() {
+        // Cut 59: a destructured binding captured by a closure — the names
+        // allocate capture-context slots and the pattern's `InitContextSlot`
+        // binds them.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f() {\n\
+                     \x20 let [a, b] = [3, 4];\n\
+                     \x20 return (function () { return a * 10 + b; })();\n\
+                     }\n\
+                     f();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(34.0));
         assert!(compiled >= 1, "{compiled} bodies");
     }
 
