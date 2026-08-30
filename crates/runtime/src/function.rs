@@ -9,7 +9,7 @@ use crux::function::Function;
 use crux::handle::Handle;
 use crux::heap::{GcAny, Trace};
 use crux::object::JsObject;
-use crux::property::PropertyDescriptor;
+use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
 use crux::value::{Value, ValueKind};
 use syntax::ast::{
@@ -297,29 +297,28 @@ fn set_function_properties(
     params: &[BindingElement],
     name: Option<&JsString>,
 ) -> Result<(), JsError> {
-    function.define_property(
-        &JsString::from_utf8("length"),
-        &PropertyDescriptor {
-            value: Some(Value::Number(function_length(params) as f64)),
-            writable: Some(false),
-            get: None,
-            set: None,
-            enumerable: Some(false),
-            configurable: Some(true),
-        },
-    )?;
+    // Cut 66: a fresh function object is ordinary, extensible, and has no
+    // own properties — the boilerplate appends skip the descriptor + validate
+    // machinery (`fresh_data_define_attrs` mirrors `validate_and_apply`'s
+    // fresh-insert result exactly: w/e/c data properties with the same
+    // map transition). The append cannot fail on the fresh object, so the
+    // `false` return (only for a non-ordinary/non-extensible receiver) is
+    // unreachable; the `Result` shape is kept for the error path symmetry.
+    function.object.fresh_data_define_attrs(
+        &PropertyKey::from_utf8("length"),
+        Value::Number(function_length(params) as f64),
+        false,
+        false,
+        true,
+    );
     let name = name.cloned().unwrap_or_else(|| JsString::from_utf8(""));
-    function.define_property(
-        &JsString::from_utf8("name"),
-        &PropertyDescriptor {
-            value: Some(Value::String(Handle::new(name))),
-            writable: Some(false),
-            get: None,
-            set: None,
-            enumerable: Some(false),
-            configurable: Some(true),
-        },
-    )?;
+    function.object.fresh_data_define_attrs(
+        &PropertyKey::from_utf8("name"),
+        Value::String(Handle::new(name)),
+        false,
+        false,
+        true,
+    );
     Ok(())
 }
 
@@ -420,30 +419,25 @@ fn make_constructor(
     // MakeConstructor (spec 10.2.5) only adds the `constructor` property when
     // it creates the prototype itself; a provided prototype (the generator
     // function's %Generator.prototype%-based object) has no own properties.
+    // Cut 66: both appends land on fresh ordinary objects (the prototype was
+    // just created; the function has only the length/name boilerplate), so
+    // the fast append applies (see `set_function_properties`).
     if add_constructor_property {
-        prototype.define_property(
-            &JsString::from_utf8("constructor"),
-            &PropertyDescriptor {
-                value: Some(function.self_value()),
-                writable: Some(true),
-                get: None,
-                set: None,
-                enumerable: Some(false),
-                configurable: Some(true),
-            },
-        )?;
+        prototype.fresh_data_define_attrs(
+            &PropertyKey::from_utf8("constructor"),
+            function.self_value(),
+            true,
+            false,
+            true,
+        );
     }
-    function.define_property(
-        &JsString::from_utf8("prototype"),
-        &PropertyDescriptor {
-            value: Some(Value::Object(prototype)),
-            writable: Some(writable),
-            get: None,
-            set: None,
-            enumerable: Some(false),
-            configurable: Some(false),
-        },
-    )?;
+    function.object.fresh_data_define_attrs(
+        &PropertyKey::from_utf8("prototype"),
+        Value::Object(prototype),
+        writable,
+        false,
+        false,
+    );
     Ok(())
 }
 
@@ -585,6 +579,24 @@ fn source_hash(source: &JsString) -> usize {
     hash
 }
 
+/// `source_hash` over the running context's source slice at `span`, WITHOUT
+/// allocating the `JsString` `capture_source` builds (Cut 66): the body-site
+/// caches (`shared_arrow_body`) recompute the key on every closure, and the
+/// slice allocation dominated the per-closure cost.
+fn source_hash_at(agent: &Agent, span: crux::Span) -> Option<usize> {
+    let source = agent.running_context().ok()?.source.as_ref()?;
+    let (start, end) = (span.start as usize, span.end as usize);
+    if start >= end || end > source.len() {
+        return None;
+    }
+    let mut hash: usize = 0xcbf2_9ce4_8422_2325;
+    for unit in &source.as_slice()[start..end] {
+        hash ^= *unit as usize;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Some(hash)
+}
+
 type FunctionBodyKey = (usize, usize, usize, usize, usize);
 
 type FunctionBodyCache = std::collections::HashMap<FunctionBodyKey, std::rc::Rc<Block>>;
@@ -640,9 +652,7 @@ pub fn shared_arrow_body(agent: &Agent, body: &syntax::ast::ArrowBody) -> std::r
         ArrowBody::Expr(expr) => (expr.as_ref() as *const Expr as usize, expr.span),
         ArrowBody::Block(block) => (block as *const Block as usize, block.span),
     };
-    let source_key = capture_source(agent, span)
-        .map(|source| source_hash(&source))
-        .unwrap_or(0);
+    let source_key = source_hash_at(agent, span).unwrap_or(0);
     let key = (
         node,
         realm,
@@ -983,17 +993,14 @@ fn register_function(
     // non-method functions).
     if !strict && !kind.is_method && !kind.is_async && !kind.is_generator {
         for name in ["caller", "arguments"] {
-            function.define_property(
-                &JsString::from_utf8(name),
-                &PropertyDescriptor {
-                    value: Some(Value::Undefined),
-                    writable: Some(false),
-                    get: None,
-                    set: None,
-                    enumerable: Some(false),
-                    configurable: Some(false),
-                },
-            )?;
+            // Cut 66: fresh-object fast append (see `set_function_properties`).
+            function.object.fresh_data_define_attrs(
+                &PropertyKey::from_utf8(name),
+                Value::Undefined,
+                false,
+                false,
+                false,
+            );
         }
     }
     // Plain async functions are never constructors and have no `prototype`;
@@ -1010,7 +1017,7 @@ fn register_function(
             let proto = agent
                 .current_realm()?
                 .intrinsics
-                .get(intrinsic)
+                .function_prototype(intrinsic)
                 .and_then(|value| crate::context::as_object(&value));
             JsObject::ordinary_object_create(proto)
         } else {
@@ -1019,13 +1026,16 @@ fn register_function(
             let proto = agent
                 .current_realm()?
                 .intrinsics
-                .get("%Object.prototype%")
+                .object_prototype()
                 .and_then(|value| crate::context::as_object(&value));
             JsObject::ordinary_object_create(proto)
         };
         make_constructor(&function, prototype, true, !kind.is_generator)?;
     }
-    set_function_prototype(agent, &function)?;
+    // Cut 66: the flags come from the caller's `kind` (no second
+    // `ecma_functions` lookup — the record was just inserted), and the
+    // intrinsic itself is cached per realm after the first resolution.
+    set_function_prototype(agent, &function, kind.is_generator, kind.is_async)?;
     Ok(Value::Function(function))
 }
 
@@ -1046,17 +1056,22 @@ pub(crate) fn capture_source(agent: &Agent, span: crux::Span) -> Option<JsString
 /// of the function's kind — %Function.prototype% for ordinary functions,
 /// %GeneratorFunction.prototype% / %AsyncFunction.prototype% /
 /// %AsyncGeneratorFunction.prototype% for the resumable kinds.
-fn set_function_prototype(agent: &Agent, function: &Handle<Function>) -> Result<(), JsError> {
-    let intrinsic = match agent.ecma_functions.get(&function.id()) {
-        Some(data) if data.is_generator && data.is_async => "%AsyncGeneratorFunction.prototype%",
-        Some(data) if data.is_generator => "%GeneratorFunction.prototype%",
-        Some(data) if data.is_async => "%AsyncFunction.prototype%",
-        _ => "%Function.prototype%",
+fn set_function_prototype(
+    agent: &Agent,
+    function: &Handle<Function>,
+    is_generator: bool,
+    is_async: bool,
+) -> Result<(), JsError> {
+    let intrinsic = match (is_generator, is_async) {
+        (true, true) => "%AsyncGeneratorFunction.prototype%",
+        (true, false) => "%GeneratorFunction.prototype%",
+        (false, true) => "%AsyncFunction.prototype%",
+        (false, false) => "%Function.prototype%",
     };
     let proto = agent
         .current_realm()?
         .intrinsics
-        .get(intrinsic)
+        .function_prototype(intrinsic)
         .and_then(|value| crate::context::as_object(&value));
     function.object.set_prototype_of(proto)?;
     Ok(())
@@ -1274,7 +1289,7 @@ pub fn instantiate_arrow(
     agent.ecma_functions.insert(function.id(), data);
     crate::ir::store_construct_patterns(agent, function.id(), this_writes);
     set_function_properties(&function, &params, None)?;
-    set_function_prototype(agent, &function)?;
+    set_function_prototype(agent, &function, false, is_async)?;
     Ok(Value::Function(function))
 }
 

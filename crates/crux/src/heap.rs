@@ -437,9 +437,12 @@ const fn align_up(n: usize, m: usize) -> usize {
 /// A fast non-cryptographic hasher for the box-address maps (GC-5): the
 /// addresses are word-aligned and not attacker-controlled, so SipHash's
 /// collision resistance is wasted cost on every collection's `by_addr`
-/// build and the precise dead set.
+/// build and the precise dead set. Cut 66: also the shape-transition maps
+/// (`Map::transitions`) and the agent's `ecma_functions` table — their keys
+/// (atom ids, function ids) are not attacker-controlled either, and the
+/// closure-creation path hashes them per property append / per insert.
 #[derive(Default)]
-struct FxHasher(u64);
+pub(crate) struct FxHasher(u64);
 
 impl std::hash::Hasher for FxHasher {
     fn write(&mut self, bytes: &[u8]) {

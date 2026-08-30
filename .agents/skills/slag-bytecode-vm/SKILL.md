@@ -763,6 +763,44 @@ shared body `Rc<Block>` — `shared_function_body`/`shared_arrow_body`/
 - The compiler/analyzer (`analyze_scope`) iterates `function.params` —
   unchanged via deref.
 
+## Closure instantiation is measured in the boilerplate (Cut 66)
+
+The per-closure cost of `register_function`/`instantiate_arrow` (the JIT's
+`create_function`/`create_arrow` helpers route through them) is dominated
+by the fresh-function setup, and the fast paths have traps:
+
+- **Use `JsObject::fresh_data_define_attrs(key, value, writable, enumerable,
+  configurable)` for the function/prototype boilerplate** (`length`/`name`/
+  `prototype`/`constructor`, restricted `caller`/`arguments`) — the
+  explicit-attributes sibling of `fresh_data_define`. It skips the descriptor
+  clone + ValidateAndApplyPropertyDescriptor table AND transitions the map
+  with the non-default attributes (the old `define_property` path did NOT
+  transition the map for non-all-true attributes, so the map read path
+  never served `fn.length` etc. — the new path does, keep the dual-write in
+  sync: a later set/define on the mapped key goes through
+  `sync_map_after_define`/`map_set` and updates the inline field). Call it
+  only on fresh ordinary objects with absent keys (a duplicate push would
+  double the vector entry).
+- **`shared_arrow_body`/`shared_function_body` recompute the cache key on
+  EVERY closure** — `capture_source` cloned the running source + built a
+  `JsString` slice per closure. Use `source_hash_at` (hashes the slice
+  in place, no allocation) when the caller only needs the key.
+- **`set_function_prototype` used to re-look-up `ecma_functions` by id** to
+  pick the intrinsic (a second HashMap hit per closure) and the intrinsics
+  table's `get` built a `JsString` per call. It now takes the
+  generator/async flags from the caller and reads a fixed per-realm cache
+  (`Intrinsics::function_prototype`) — when the intrinsic table grows, keep
+  the function-creation names on that cache (the array is indexed by
+  `function_prototype_index`).
+- **`Map::transitions` is Fx-hashed** — every shape fork (property append)
+  hashed the key with SipHash before. Don't reintroduce a slow hasher on a
+  per-append hot map; the keys (atom ids / symbol pointers) are not
+  attacker-controlled.
+- The residual floor is `ecma_functions` insert (identity-hashed already)
+  + the two per-closure object allocations; the JIT's per-closure FFI
+  overhead (~0.4µs) is the other half. A closure-creation loop measures
+  ~1.4µs/closure after this cut (~20% faster than before).
+
 ## Validation loop
 
 `cargo clippy --workspace --all-targets -- -D warnings` clean, then

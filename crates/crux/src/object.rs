@@ -2219,6 +2219,48 @@ impl JsObject {
         true
     }
 
+    /// Append a fresh data property with EXPLICIT attributes on an ordinary,
+    /// extensible object whose map does not yet describe the key (Cut 66:
+    /// the fresh function/prototype boilerplate — `length`/`name`/`prototype`/
+    /// `constructor` and the restricted `caller`/`arguments` carry non-default
+    /// writable/configurable flags, unlike `fresh_data_define`'s all-true
+    /// CreateDataProperty). The caller has verified the object is fresh and
+    /// the key absent, so the descriptor + ValidateAndApplyPropertyDescriptor
+    /// machinery is skipped exactly like the all-true form. Returns false when
+    /// the receiver is not an ordinary, extensible object.
+    pub fn fresh_data_define_attrs(
+        &self,
+        key: &PropertyKey,
+        value: Value,
+        writable: bool,
+        enumerable: bool,
+        configurable: bool,
+    ) -> bool {
+        if !matches!(self.kind, ObjectKind::Ordinary) || !self.extensible.get() {
+            return false;
+        }
+        let attrs = MapAttrs::new(writable, enumerable, configurable);
+        if self.map.get().is_some_and(|m| m.find(key).is_some())
+            || self.map_add_property_cell(key.clone(), attrs).is_some()
+        {
+            let _ = self.map_set(key, value);
+        }
+        let mut props = self.properties.borrow_mut();
+        let position = props.len();
+        props.push((
+            key.clone(),
+            Property::data(value, writable, enumerable, configurable),
+        ));
+        drop(props);
+        if self.property_index.borrow().is_some()
+            && let Some(index) = &mut *self.property_index.borrow_mut()
+        {
+            index.insert(key.clone(), position);
+        }
+        self.bump_generation();
+        true
+    }
+
     /// PrivateFieldAdd/PrivateMethodOrAccessorAdd storage (spec 10.2.10,
     /// 10.2.13): append a private element, rejecting a duplicate name.
     pub fn private_element_add(&self, element: PrivateElement) -> Result<(), JsError> {
@@ -3786,6 +3828,58 @@ mod tests {
             obj.map_get(&PropertyKey::from_utf8("y")),
             Some(Value::Number(2.0))
         );
+    }
+
+    #[test]
+    fn fresh_define_attrs_respects_explicit_attributes() {
+        // Cut 66: the explicit-attributes variant of `fresh_data_define` —
+        // the fresh function/prototype boilerplate (`length`/`name`/
+        // `prototype`/`constructor`) carries non-default writable/configurable
+        // flags, so the append must encode them in BOTH the map descriptor and
+        // the property vector, and the read paths must agree.
+        let obj = JsObject::ordinary_object_create(None);
+        assert!(obj.fresh_data_define_attrs(
+            &PropertyKey::from_utf8("length"),
+            Value::Number(1.0),
+            false,
+            false,
+            true,
+        ));
+        assert_eq!(
+            obj.map_get(&PropertyKey::from_utf8("length")),
+            Some(Value::Number(1.0))
+        );
+        let prop = obj.get_own_property(&key("length")).unwrap().unwrap();
+        assert_eq!(prop.writable(), Some(false));
+        assert!(!prop.enumerable);
+        assert!(prop.configurable);
+        // A non-writable own property rejects writes (sloppy set fails, no
+        // map-field desync: the map still serves the original value).
+        assert!(
+            !obj.set_key(&PropertyKey::from_utf8("length"), Value::Number(2.0), false)
+                .unwrap()
+        );
+        assert_eq!(
+            obj.map_get(&PropertyKey::from_utf8("length")),
+            Some(Value::Number(1.0))
+        );
+        // A configurable property is re-definable through the full machinery,
+        // which mirrors the new value into the inline field.
+        obj.define_property(
+            &key("length"),
+            &descriptor(
+                Some(Value::Number(3.0)),
+                Some(false),
+                Some(false),
+                Some(true),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            obj.map_get(&PropertyKey::from_utf8("length")),
+            Some(Value::Number(3.0))
+        );
+        assert_eq!(obj.get(&key("length")).unwrap(), Value::Number(3.0));
     }
 
     #[test]

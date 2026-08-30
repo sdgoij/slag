@@ -60,6 +60,29 @@ pub struct Intrinsics {
     /// literals (`ObjectBegin`) and constructor `this` fallbacks read it per
     /// object creation.
     object_prototype: RefCell<Option<Value>>,
+    /// Cut 66: the function-creation prototype intrinsics (%Function.prototype%
+    /// and the generator/async variants), resolved once per realm like
+    /// `object_prototype` — `set_function_prototype`/`make_constructor` read
+    /// them on every closure creation, and `Intrinsics::get` allocates a
+    /// JsString per call. A fixed array indexed by [`function_prototype_index`]
+    /// keeps the read a plain borrow + load (no hashing at all).
+    function_prototypes: RefCell<[Option<Value>; FN_PROTO_COUNT]>,
+}
+
+/// The number of cached function-creation prototype intrinsics.
+pub(crate) const FN_PROTO_COUNT: usize = 6;
+
+/// The slot index for a function-creation prototype intrinsic name.
+pub(crate) fn function_prototype_index(name: &str) -> usize {
+    match name {
+        "%Function.prototype%" => 0,
+        "%GeneratorFunction.prototype%" => 1,
+        "%AsyncFunction.prototype%" => 2,
+        "%AsyncGeneratorFunction.prototype%" => 3,
+        "%Generator.prototype%" => 4,
+        "%AsyncGenerator.prototype%" => 5,
+        _ => unreachable!("not a cached function-creation intrinsic: {name}"),
+    }
 }
 
 impl Trace for Intrinsics {
@@ -69,6 +92,14 @@ impl Trace for Intrinsics {
         // aborts the sweep instead of panicking.
         self.entries.trace(visit);
         self.object_prototype.trace(visit);
+        match self.function_prototypes.try_borrow() {
+            Ok(guard) => {
+                for slot in guard.iter() {
+                    slot.trace(visit);
+                }
+            }
+            Err(_) => crux::heap::note_aborted_trace(),
+        }
     }
 }
 
@@ -88,6 +119,21 @@ impl Intrinsics {
         }
         let value = self.get("%Object.prototype%")?;
         *self.object_prototype.borrow_mut() = Some(value);
+        Some(value)
+    }
+
+    /// A function-creation prototype intrinsic (%Function.prototype%,
+    /// %GeneratorFunction.prototype%, %AsyncFunction.prototype%,
+    /// %AsyncGeneratorFunction.prototype%, %Generator.prototype%,
+    /// %AsyncGenerator.prototype%), cached after the first resolution (see
+    /// the struct field).
+    pub fn function_prototype(&self, name: &'static str) -> Option<Value> {
+        let index = function_prototype_index(name);
+        if let Some(value) = self.function_prototypes.borrow()[index] {
+            return Some(value);
+        }
+        let value = self.get(name)?;
+        self.function_prototypes.borrow_mut()[index] = Some(value);
         Some(value)
     }
 

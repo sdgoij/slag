@@ -11,10 +11,12 @@
 //! handle; reads/writes stay through `SmallProps`.
 
 use std::cell::Cell;
+use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::handle::Handle;
-use crate::heap::{GcAny, Trace};
+use crate::heap::{FxHasher, GcAny, Trace};
 use crate::object::JsObject;
 use crate::property::PropertyKey;
 
@@ -60,8 +62,10 @@ pub struct Map {
     /// Prototype of objects described by this map.
     prototype: Option<Handle<JsObject>>,
     /// Transition tree: property name → child map created when that property
-    /// is added.
-    transitions: std::collections::HashMap<PropertyKey, Handle<Map>>,
+    /// is added. Fx-hashed (Cut 66): the closure-creation path forks the
+    /// function/prototype shapes per property append, and the keys are atom
+    /// ids / symbol pointers — not attacker-controlled.
+    transitions: HashMap<PropertyKey, Handle<Map>, BuildHasherDefault<FxHasher>>,
     /// Back-pointer to the parent map in the transition tree.
     back_pointer: Option<Handle<Map>>,
     /// Generation counter: bumped when this map's shape changes.
@@ -113,7 +117,7 @@ impl Map {
             id: MAP_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             descriptors: Vec::new(),
             prototype,
-            transitions: std::collections::HashMap::new(),
+            transitions: HashMap::default(),
             back_pointer,
             generation: Cell::new(0),
         })
