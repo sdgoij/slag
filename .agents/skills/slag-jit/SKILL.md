@@ -1,6 +1,6 @@
 ---
 name: slag-jit
-description: "Load when working on Slag's Cranelift JIT (crates/jit/src, crates/runtime/src/jit.rs, the JIT-visible parts of crates/runtime/src/ir.rs) — helper ABI registration, emit_step lowering, block sealing, dispatch sentinels, the leaf-call probe, the certified iterator machinery (for-of/for-in/AsyncForOf*), suspension (generator Yield / async Await, resume entry dispatch, jit_work save/restore), super property access, or destructuring (the Destructure* steps, flat slot/context binds, error-close gating). Traps: the four-file helper-table mirror, the pending-error ABI, the dispatch-target compare chain, the element-via-working-stack-pointer convention, the fixup-patched ForOfBegin boundary span, the iterator-close requirements for compiled for-of bodies, the sealed-block/back-edge rules, the for_of_advance shared-core contract, the resumable-body rules, and the destructure rules (never the wholesale env binds, the for-head pattern trap, the DestructureUndef fall-through sp, the destructure_stepping close gate)."
+description: "Load when working on Slag's Cranelift JIT (crates/jit/src, crates/runtime/src/jit.rs, the JIT-visible parts of crates/runtime/src/ir.rs) — helper ABI registration, emit_step lowering, block sealing, dispatch sentinels, the leaf-call probe, the certified iterator machinery (for-of/for-in/AsyncForOf*), suspension (generator Yield / async Await, resume entry dispatch, jit_work save/restore), super property access, new.target, or destructuring (the Destructure* steps, flat slot/context binds, error-close gating). Traps: the four-file helper-table mirror, the pending-error ABI, the dispatch-target compare chain, the element-via-working-stack-pointer convention, the fixup-patched ForOfBegin boundary span, the iterator-close requirements for compiled for-of bodies, the sealed-block/back-edge rules, the for_of_advance core contract, resumable-body rules, and the destructure rules (never the wholesale env binds, the for-head pattern trap, the DestructureUndef fall-through sp, the destructure_stepping close gate)."
 ---
 
 # Slag JIT traps
@@ -276,7 +276,41 @@ capturing `super` (lexical) never certify. Traps:
   prototype (an accessor on the base, or the base class's prototype
   property) — the interpreter tests model this (`proto = { x: 42 }`).
 
-## 13. Validation
+## 13. `new.target`, direct-eval CallFast, and heap constants (Cut 62)
+
+The final bail-row miscellany:
+
+- **`new.target` now certifies** in non-arrow bodies (the `FastScopeScan`
+  accepts the `new.target` MetaProperty; an arrow's `new.target` is
+  lexical — like `this` — and `import.meta` stays env-path). The
+  certified path has no FunctionEnv, so the `NewTarget` step reads the new
+  per-run `Vm::current_new_target`: the certified construct path sets it,
+  a normal call or driver run reads `undefined` (matching the
+  async/generator drivers' hardcoded-`undefined` FunctionEnv — async
+  functions/generators are not constructible here, so no constructed
+  case exists). `NewTarget` stays leaf-excluded DELIBERATELY: a leaf's
+  `new.target` differs from the caller's construct context (a regular
+  call inside a constructed function must read `undefined`, not the
+  caller's constructor) — don't lift the exclusion without giving the
+  leaf paths their own per-invocation value.
+- **A direct-eval `CallFast` site no longer bails**: `call_slow` gained a
+  `direct_eval` flag (a 6th arg — the four-file mirror: `JitSlowPaths`
+  field type, `Helper::CallSlow`'s `JitHelpers` field type, the
+  `sig_call_slow` import in `emit_call`, and the test double). The
+  compiler STILL never emits one (a direct eval always takes the vector
+  form — the fast form's eval handling is defense-in-depth), and eval
+  bodies never certify anyway, so this is pure completion of the step.
+- **Heap-value constants inline their bits**: `const_value` returns the
+  NaN-boxed pointer bits for a `String`/`BigInt` (a `Push` or the register
+  path's `LoadConst`/`BinConst`) instead of the `push_const`/`load_const`
+  helper fallback. Sound because the GC never moves boxes (`Gc` handles
+  are `Copy` — the weak-table compaction only clears entries) and the
+  value outlives the code: the step's `Push` holds it, the compiled body
+  is traced (the unbounded function-site cache, or the active-run tracer
+  while a script body runs), and the cache entry that frees the code also
+  drops the body.
+
+## 14. Validation
 
 `cargo clippy --workspace --all-targets -- -D warnings` clean, then
 `cargo test --workspace` green — then REBUILD the sweep

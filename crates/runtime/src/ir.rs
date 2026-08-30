@@ -2241,6 +2241,11 @@ pub struct Vm {
     /// resolved callee against this value to recognize a global-name
     /// self-tail-call at runtime (the name could have been reassigned).
     pub(crate) current_function: Option<Value>,
+    /// Cut 62: the `new.target` of the current certified run (the frame-slot
+    /// model creates no FunctionEnv to carry it). Set by the certified
+    /// construct path; `None` (a normal call or a fresh Vm) reads as
+    /// `undefined`.
+    pub(crate) current_new_target: Option<Value>,
     pub strict: bool,
     /// Whether the statement-completion register holds an empty completion
     /// (spec 6.2.2.3): no value-producing statement has run since the last
@@ -2333,6 +2338,7 @@ impl Trace for Vm {
         self.var_ref_stack.trace(visit);
         self.call_args.trace(visit);
         self.current_function.trace(visit);
+        self.current_new_target.trace(visit);
         // The leaf-path JIT runs' private buffers (pushed by `run_jit_leaf`
         // for the call's duration; empty otherwise).
         // SAFETY: each entry is a buffer `run_jit_leaf` holds alive for its
@@ -2484,6 +2490,7 @@ impl Vm {
             call_args: Vec::new(),
             tail_replaced: None,
             current_function: None,
+            current_new_target: None,
         }
     }
 
@@ -2543,6 +2550,7 @@ impl Vm {
         self.args_base_stack.clear();
         self.call_args.clear();
         self.current_function = None;
+        self.current_new_target = None;
     }
 
     /// GC-4: clear every frame slot so a Vm's stale values are never traced
@@ -4211,7 +4219,15 @@ impl Vm {
                     self.stack.push(value);
                 }
                 Step::NewTarget => {
-                    let value = get_new_target(agent)?;
+                    // Cut 62: the certified path's `new.target` is the
+                    // per-run `current_new_target` (the frame-slot model
+                    // creates no FunctionEnv to carry it); the env path
+                    // reads the running this-environment's binding.
+                    let value = if self.body_context.is_some() {
+                        self.current_new_target.unwrap_or(Value::Undefined)
+                    } else {
+                        get_new_target(agent)?
+                    };
                     self.stack.push(value);
                 }
                 Step::RegExpLiteral { pattern, flags } => {
@@ -18573,10 +18589,21 @@ impl FastScopeScan {
                 self.observes_super = true;
                 true
             }
+            ExprKind::MetaProperty { meta, property } => {
+                // Cut 62: `new.target` certifies in non-arrow bodies — the
+                // certified `NewTarget` step reads the per-run
+                // `current_new_target` (the frame-slot model has no
+                // FunctionEnv). An arrow's `new.target` is lexical (the
+                // enclosing function's — like `this`), so it bails here;
+                // `import.meta` (modules — never certified anyway) stays on
+                // the env path.
+                self.allow_this
+                    && crux::lookup(*meta) == JsString::from_utf8("new")
+                    && crux::lookup(*property) == JsString::from_utf8("target")
+            }
             ExprKind::Class(_)
             | ExprKind::PrivateIn { .. }
             | ExprKind::TaggedTemplate { .. }
-            | ExprKind::MetaProperty { .. }
             | ExprKind::ImportCall { .. } => false,
             // A generator/async body's suspension points (Cut 58): the
             // argument scans like any other expression. A `yield*`

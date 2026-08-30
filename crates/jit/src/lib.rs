@@ -1505,7 +1505,13 @@ mod tests {
     }
 
     #[test]
-    fn call_fast_direct_eval_bails() {
+    fn call_fast_direct_eval_lowers() {
+        // Cut 62: a `CallFast { direct_eval: true }` site now lowers — the
+        // slow path threads the flag through to `do_call_fast` (whose
+        // `fast_call_core` routes a real `%eval%` callee through
+        // `perform_eval` with the caller's environment intact). The
+        // compiler never emits one (a direct eval always takes the vector
+        // form), so the test proves the step compiles rather than bailing.
         let engine = JitEngine::new().expect("native isa");
         let body = make_body(
             vec![Step::CallFast {
@@ -1514,7 +1520,7 @@ mod tests {
             }],
             0,
         );
-        assert!(engine.compile(&body, &helpers_all()).is_none());
+        assert!(engine.compile(&body, &helpers_all()).is_some());
     }
 
     /// Run `f` with a fresh agent that has the JIT hook installed; returns
@@ -3922,6 +3928,74 @@ mod tests {
                 .expect("runs")
         });
         assert_eq!(value.as_number(), Some(42.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_new_target_normal_call_is_undefined() {
+        // Cut 62: `new.target` now certifies — a plain function's body
+        // compiles the `NewTarget` step (the general path; the step stays
+        // leaf-excluded). A normal call's per-run `current_new_target` is
+        // unset, so the read is `undefined`.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script("function f() { return new.target; } f() === undefined;")
+                .expect("runs")
+        });
+        assert_eq!(value.as_boolean(), Some(true));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_new_target_in_construct_is_the_constructor() {
+        // Cut 62: the certified construct path sets `current_new_target` —
+        // `new F()` (a base constructor with a certified body) reads its
+        // own `new.target`. The construct body runs via the certified
+        // construct path (interpreter), so the value assertion is the
+        // proof; the method body (`m`) compiles through the JIT.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function F() { this.t = new.target; }\n\
+                     class C { m() { return new.target; } }\n\
+                     (new F().t === F) && (new C().m() === undefined);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_boolean(), Some(true));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_heap_string_constant_in_a_loop() {
+        // Cut 62: a string literal (`Push(Value::String)`) now embeds its
+        // NaN-boxed pointer bits directly instead of a `push_const` helper
+        // call — the loop's `s += 'x'` concat stays exact across 10
+        // iterations (a stale/dangling constant would surface as a wrong
+        // length or a crash).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(n) { var s = ''; for (var i = 0; i < n; i++) { s += 'x'; } return s.length; }\n\
+                     f(10);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(10.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_heap_bigint_constant_leaf() {
+        // Cut 62: a bigint literal (`Push(Value::BigInt)`) embeds its bits
+        // too, and this body is a LEAF (Push + Return — the embedded
+        // constant rides the leaf path's private frame/working buffers).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script("function f() { return 10n; } f() === 10n;")
+                .expect("runs")
+        });
+        assert_eq!(value.as_boolean(), Some(true));
         assert!(compiled >= 1, "{compiled} bodies");
     }
 }

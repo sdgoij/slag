@@ -572,6 +572,11 @@ struct Lowerer<'a> {
     sig_set_name: SigRef,
     sig_set_comp: SigRef,
     sig_call: SigRef,
+    /// The `(vm, callee, this, argc, args_ptr, direct_eval) -> value`
+    /// signature of `call_slow` (Cut 62: a direct-eval `CallFast` site
+    /// passes the flag through; the compiler never emits one — direct eval
+    /// always takes the vector form — but the step is then fully lowered).
+    sig_call_slow: SigRef,
     sig_assign: SigRef,
     /// The `(vm, step_index) -> value` signature: the closure/RegExp helpers
     /// read their step's payload back out of the running body instead of
@@ -662,6 +667,7 @@ impl<'a> Lowerer<'a> {
         let sig_set_name = builder.import_signature(helper_sig(&[types::I64; 4], conv));
         let sig_set_comp = builder.import_signature(helper_sig(&[types::I64; 4], conv));
         let sig_call = builder.import_signature(helper_sig(&[types::I64; 5], conv));
+        let sig_call_slow = builder.import_signature(helper_sig(&[types::I64; 6], conv));
         let sig_assign = builder.import_signature(helper_sig(&[types::I64; 6], conv));
         let sig_step = builder.import_signature(helper_sig(&[types::I64; 2], conv));
         let sig_tail = builder.import_signature(helper_sig(&[types::I64; 6], conv));
@@ -753,6 +759,7 @@ impl<'a> Lowerer<'a> {
             sig_set_name,
             sig_set_comp,
             sig_call,
+            sig_call_slow,
             sig_assign,
             sig_step,
             sig_tail,
@@ -1543,6 +1550,7 @@ impl<'a> Lowerer<'a> {
     /// (this site, this callee, unchanged leaf-eligibility epoch) skips the
     /// probe helper entirely on repeat visits. `pre_call_sp` is the stack
     /// pointer the result replaces (the call's argument region base).
+    #[allow(clippy::too_many_arguments)]
     fn emit_call(
         &mut self,
         index: usize,
@@ -1551,6 +1559,7 @@ impl<'a> Lowerer<'a> {
         args_ptr: ClifValue,
         argc: usize,
         pre_call_sp: ClifValue,
+        direct_eval: bool,
     ) -> Result<(), Unsupported> {
         let argc_imm = self.builder.ins().iconst(types::I64, argc as i64);
         let ctx = self.vm();
@@ -1737,12 +1746,18 @@ impl<'a> Lowerer<'a> {
         let frame_bytes = self.builder.ins().imul_imm_s(frame_size_64, 8);
         let stack_ptr = self.builder.ins().iadd(frame_ptr, frame_bytes);
         self.emit_leaf_call_tail(probe, frame_ptr, stack_ptr, pre_call_sp, merge);
-        // The slow path: the interpreter's call machinery (unchanged).
+        // The slow path: the interpreter's call machinery (unchanged). The
+        // `direct_eval` flag rides along (Cut 62): a direct-eval callee
+        // must run `perform_eval` with the caller's environment intact.
         self.builder.switch_to_block(slow);
+        let direct_eval_imm = self
+            .builder
+            .ins()
+            .iconst(types::I64, i64::from(direct_eval));
         let res = self.call_slow(
-            self.sig_call,
+            self.sig_call_slow,
             Helper::CallSlow,
-            &[callee, this, argc_imm, args_ptr],
+            &[callee, this, argc_imm, args_ptr, direct_eval_imm],
         )?;
         self.builder.def_var(self.sp_var, pre_call_sp);
         self.push(res);
@@ -1863,7 +1878,15 @@ impl<'a> Lowerer<'a> {
                 .ins()
                 .iconst(types::I64, Value::Number(n).bits() as i64))
         } else {
-            Err(Unsupported::Const("heap value literal"))
+            // Cut 62: a heap constant (a string/bigint literal) embeds its
+            // NaN-boxed pointer bits directly. Sound because the box never
+            // moves (the GC's `Gc` handles are Copy — the weak-table
+            // compaction only clears entries) and the value stays alive for
+            // the code's lifetime: the step's `Push`/`LoadConst` holds it,
+            // the compiled body is traced (the function-site cache, or the
+            // active-run tracer while a script body runs), and the cache
+            // entry that frees the code also drops the body.
+            Ok(self.builder.ins().iconst(types::I64, value.bits() as i64))
         }
     }
 
@@ -1943,12 +1966,13 @@ impl<'a> Lowerer<'a> {
             Step::Push(value) => {
                 let bits = match self.const_value(value) {
                     Ok(bits) => bits,
-                    // Cut 54: a heap constant (a plain string/bigint
-                    // literal — `compile_literal` emits `Push(Value::String(
-                    // ...))`, only templates use `PushStr`): read the payload
-                    // back from the running body and push its bits (the step
-                    // holds the strong ref, mirroring the interpreter's
-                    // `stack.push(*value)`).
+                    // Cut 54: the step-index fallback reads the payload back
+                    // from the running body. Since Cut 62 `const_value`
+                    // embeds a heap constant's bits directly (a plain
+                    // string/bigint literal — `compile_literal` emits
+                    // `Push(Value::String(..))`, only templates use
+                    // `PushStr`), this arm is a safety net for any exotic
+                    // value a `Push` should never carry.
                     Err(_) => {
                         let step_imm = self.builder.ins().iconst(types::I64, index as i64);
                         self.call_slow(self.sig_step, Helper::PushConst, &[step_imm])?
@@ -2487,15 +2511,15 @@ impl<'a> Lowerer<'a> {
                 self.fall_through(index);
             }
             Step::CallFast { argc, direct_eval } => {
-                if *direct_eval {
-                    return Err(Unsupported::Step("CallFast direct eval"));
-                }
                 // `[..., this, callee, a1..aN]` on the JIT stack; the probe
                 // reads the callee by address, and the in-frame leaf path
                 // (when the callee is an inlineable leaf) replaces the whole
                 // region with the result. The slow path passes the argument
                 // region by pointer (the helper copies it out before running
-                // the interpreter's call machinery).
+                // the interpreter's call machinery). `direct_eval` (Cut 62:
+                // the compiler never emits a true flag — a direct eval
+                // always takes the vector form — but the slow path routes
+                // it correctly if one appears).
                 let sp = self.builder.use_var(self.sp_var);
                 let args_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64) * 8));
                 let callee_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64 + 1) * 8));
@@ -2512,7 +2536,15 @@ impl<'a> Lowerer<'a> {
                     this_ptr,
                     Offset32::new(0),
                 );
-                self.emit_call(index, callee, this, args_ptr, *argc as usize, this_ptr)?;
+                self.emit_call(
+                    index,
+                    callee,
+                    this,
+                    args_ptr,
+                    *argc as usize,
+                    this_ptr,
+                    *direct_eval,
+                )?;
             }
             Step::CallFastSlot { slot, argc } => {
                 // `[..., a1..aN]` — the fused slot call (`do_call_fast_slot`
@@ -2523,7 +2555,15 @@ impl<'a> Lowerer<'a> {
                 let args_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64) * 8));
                 let callee = self.load_slot(*slot);
                 let this = self.builder.ins().iconst(types::I64, self.undef_bits);
-                self.emit_call(index, callee, this, args_ptr, *argc as usize, args_ptr)?;
+                self.emit_call(
+                    index,
+                    callee,
+                    this,
+                    args_ptr,
+                    *argc as usize,
+                    args_ptr,
+                    false,
+                )?;
             }
             // Cut 49: the vector call form (≥3 args or a spread). The
             // arguments build in `Vm::args` through the helpers (the same

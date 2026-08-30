@@ -332,8 +332,14 @@ pub struct JitSlowPaths {
     /// The general `CallFast` (a body may contain calls — leaf bodies never
     /// do): `args` points at the JIT buffer's argument region (`argc`
     /// slots). Runs the interpreter's call machinery on the Vm's own stack.
-    pub call_slow:
-        extern "C" fn(ctx: *mut c_void, callee: u64, this: u64, argc: u64, args: *mut u64) -> u64,
+    pub call_slow: extern "C" fn(
+        ctx: *mut c_void,
+        callee: u64,
+        this: u64,
+        argc: u64,
+        args: *mut u64,
+        direct_eval: u64,
+    ) -> u64,
     /// Cut 37: the compiled leaf-call probe — validates the callee (a
     /// certified, environment-free, this-less leaf whose body has compiled
     /// machine code) and that the inline frame + working area fit above the
@@ -1103,6 +1109,7 @@ extern "C" fn call_slow(
     this: u64,
     argc: u64,
     args: *mut u64,
+    direct_eval: u64,
 ) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
     let argc = argc as usize;
@@ -1120,7 +1127,7 @@ extern "C" fn call_slow(
         // with `argc` slots.
         vm.stack.push(Value::from_bits(unsafe { *args.add(i) }));
     }
-    match vm.do_call_fast(agent, argc, false) {
+    match vm.do_call_fast(agent, argc, direct_eval != 0) {
         Ok(()) => {
             // `do_call_fast` replaced `[this, callee, args]` with the result.
             let result = match vm.stack.pop() {
@@ -1714,10 +1721,19 @@ extern "C" fn create_function_decl(ctx: *mut c_void, step: u64) -> u64 {
 extern "C" fn new_target(ctx: *mut c_void) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
     let agent = unsafe { &mut *ctx.agent };
-    match crate::context::get_new_target(agent) {
-        Ok(value) => value.bits(),
-        Err(error) => slow_error(ctx, error),
-    }
+    let vm = unsafe { &mut *ctx.vm };
+    // Cut 62: the certified path's `new.target` is the per-run Vm field
+    // (the frame-slot model has no FunctionEnv); the env path reads the
+    // running this-environment's binding.
+    let value = if vm.body_context.is_some() {
+        vm.current_new_target.unwrap_or(Value::Undefined)
+    } else {
+        match crate::context::get_new_target(agent) {
+            Ok(value) => value,
+            Err(error) => return slow_error(ctx, error),
+        }
+    };
+    value.bits()
 }
 
 extern "C" fn regexp_literal(ctx: *mut c_void, step: u64) -> u64 {

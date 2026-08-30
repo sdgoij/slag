@@ -329,9 +329,17 @@ pub struct JitHelpers {
         Option<extern "C" fn(vm: *mut c_void, object: u64, key: u64, value: u64) -> u64>,
     /// The general `CallFast` (a body may contain calls): `args` points at
     /// the JIT buffer's argument region (`argc` slots); returns the call's
-    /// result value.
+    /// result value. `direct_eval` (Cut 62) routes a direct-eval callee
+    /// through `perform_eval` with the caller's environment intact.
     pub call_slow: Option<
-        extern "C" fn(vm: *mut c_void, callee: u64, this: u64, argc: u64, args: *mut u64) -> u64,
+        extern "C" fn(
+            vm: *mut c_void,
+            callee: u64,
+            this: u64,
+            argc: u64,
+            args: *mut u64,
+            direct_eval: u64,
+        ) -> u64,
     >,
     /// The compiled leaf-call probe (Cut 37): validates the callee is an
     /// inlineable leaf and returns its JIT entry (0 = fall back to
@@ -1568,6 +1576,7 @@ pub(crate) extern "C" fn test_call_slow(
     _this: u64,
     argc: u64,
     args: *mut u64,
+    _direct_eval: u64,
 ) -> u64 {
     let mut sum = 0.0;
     for i in 0..argc {

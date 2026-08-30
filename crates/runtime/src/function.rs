@@ -2546,6 +2546,10 @@ fn ordinary_construct(
             // context-chain read lands on the right context.
             vm.body_context = Some(environment);
             vm.lexical_env = environment;
+            // Cut 62: the certified construct's `new.target` — the body's
+            // `Step::NewTarget` reads this field (the frame-slot model has
+            // no FunctionEnv to carry it).
+            vm.current_new_target = Some(*new_target);
             if let Some(scope) = &ir.scope {
                 vm.setup_frame(scope, args);
                 // Cut 3 continuation (unmapped arguments slice): the body's
