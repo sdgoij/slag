@@ -76,6 +76,7 @@ run paths:
 | 33 | *(worktree)* | **Arguments objects** (Cut 60): `Step::CreateArguments` — the last bail item's `mapped: Some` form — lowers via a step-index helper reading the `slot`/`mapped` payload: the sloppy MAPPED object (`create_mapped_arguments_object` — aliasing the simple params through the capture context `vm.lexical_env`, which the mapped-arguments certification slice already moved every param into; `arguments.callee` from the running context's `function`) and the strict UNMAPPED object (`create_unmapped_arguments_object` — reads only the call's argument slice). Both were previously bailed for non-leaf bodies (only the leaf path handled the unmapped form). `Step::TypeofTop` (a `typeof` VALUE operand — `typeof arguments.callee` and any member/computed `typeof`) lowers too: a pure helper returning the `typeof` string, whitelisted as leaf-eligibility-neutral; `TypeofIdent` (the unresolvable-reference form) stays env-path. BOTH `CreateArguments` forms stay leaf-excluded: the helper writes the body's `arguments` slot through `vm.frame`, but a JIT leaf runs on a PRIVATE frame buffer (`run_jit_leaf` builds its own) — a helper-written frame slot would target the caller's frame, and the strict unmapped form's `vm.call_args` is only filled by `setup_certified_frame` on the non-leaf path. That exclusion is the fix for the `--jit`-only failure clusters (Object/defineProperty, Object/create, arguments-object, Array.prototype.*, Date — strict `(function() { return arguments; })()` IIFEs returned `undefined` on the machine-code path). |
 | 34 | *(worktree)* | **Super property access** (Cut 61): certification now accepts `super` in non-arrow method/accessor bodies (`allow_super = allow_this && !is_class_constructor` — a body observing `super` also gets the `this` slot, the receiver); class constructors (`super()` + the this-before-super() TDZ) and arrows capturing `super` (lexical) stay env-path. The 12 super steps lower to helpers mirroring the interpreter handlers, branching the this binding / super base between the certified frame slot + home-object prototype and the env-path Function env: `GetSuperBase`/`ThisValue` (the base/receiver pair — `GetSuperBase` runs the this-binding check first, spec 13.3.7.1), `GetSuperName`/`GetSuperComputed`/`GetSuperComputedKeep` (reads through the base with the current this as receiver; the Keep converts the key once, writes it at the passed sp, and returns the value — `[base, key, base, key]` → `[base, key', value]`, the base surviving from the `GetSuperBase` capture), `AssignSuperName`/`AssignSuperComputed` (plain + compound writes), `UpdateSuperName`/`UpdateSuperComputed` (the `++`/`--` forms — interpreted but NOT emitted by the compiler: updates route through `ResolveSuperRef*` + `GetVarReference` + `UpdateVarReference`), `DeleteSuper` (the always-ReferenceError, spec 13.5.1.2 step 4.b — thrown before the key evaluates), and `ResolveSuperRefName`/`ResolveSuperRefComputed` (the logical-assign/update reference resolution — the reference records the base + this receiver). The base/receiver resolve through `current_function` (`certified_this` reads the `this_slot`, `certified_super_base` the home object's prototype — a static method's base is the superclass constructor); the async driver sets it for the whole run. ALL 12 steps are leaf-excluded — `GetSuperComputed` was MISSING from `steps_are_leaf`, and an inlined leaf would see the caller's this/home object (the sweep gap this cut closed). `SuperCall`/`GetVarReferenceThis`/bare `super(...)` stay bailed. |
 | 35 | *(worktree)* | **Misc close-out** (Cut 62): the last bail-list row — `new.target` now CERTIFIES (the `FastScopeScan` accepts the `new.target` MetaProperty in non-arrow bodies — an arrow's `new.target` is lexical and `import.meta` stays env-path) and reads the new per-run `Vm::current_new_target` on the certified path (the frame-slot model creates no FunctionEnv to carry it; the certified construct path sets it, a normal call/driver run reads `undefined` — matching the async/generator drivers' hardcoded `undefined` FunctionEnv). The `NewTarget` step keeps its deliberate leaf exclusion (a leaf's new.target differs from the caller's construct context) but now compiles in real bodies via the general path. A direct-eval `CallFast` site no longer bails: `call_slow` threads the `direct_eval` flag to `do_call_fast` (whose `fast_call_core` routes a real `%eval%` callee through `perform_eval` with the caller's environment intact) — the compiler still never emits one (direct eval always takes the vector form), so the lowering is defense-in-depth. Heap-value constants (a `Push(Value::String/BigInt)` and the register path's `LoadConst`) now EMBED their NaN-boxed pointer bits instead of a `push_const`/`load_const` helper call — sound because the GC never moves boxes (the `Gc` handles are Copy) and the value outlives the code: the step holds it, the compiled body is traced (the function-site cache, or the active-run tracer for a script body), and the cache entry that frees the code also drops the body. |
+| 36 | *(worktree)* | **Fused global/slot call lowering + certified-script JIT routing** (Cut 65): the last call-step bail rows — `CallFastGlobal` (a statically-known global-name callee at a stable cell), `CallFastSlotStore`, and `CallFastGlobalStore` (the fused `x = f(args)` stores) — now lower: the global-cell read feeds the existing leaf-probe call machinery, and a fused store materializes the arg slots (TDZ-checked in order) over the working region, calls, then TDZ-checks and stores the result to the target slot (`emit_call` gained an `emit_fall_through` so the store appends after its merge instead of bailing the body). A certified SCRIPT — previously always interpreted, since `eval_program` ran `vm.start` — now routes through `run_jit_body_loop`, so the top-level bench loops (`n = f(n)` fused global call-stores) execute in machine code with the leaf callees in-frame. Scripts complete through the interpreter's completion REGISTER (`vm.completion`/`completion_is_empty`), which the machine code now writes on the completion steps — `SetCompletion`, `ResetCompletion`, and the statement-position `FusedStoreLocal`/`FusedStoreGlobal` stores — via two offset constants (`runtime::jit::VM_COMPLETION_OFFSET`/`_IS_EMPTY_OFFSET`); the script path converts `run_jit_body_loop`'s fall-off-end `Return(undef)` marker back to the register's `Normal`/`Empty` completion (`Empty` ≡ `Normal(undefined)` at the top, so `NormalizeCompletion`/`ListBegin`/`ListEnd` stay no-ops — the register is unobservable mid-run in a certified body, and the interpreter's ListEnd-restore always lands on the value the JIT's never-reset register already holds). The compiled writes are null-guarded (the scaffold's bare-ctx test harness passes a null `vm`) and GC-safe (`Vm::trace` covers `completion`; the vm is an active-run root). |
 
 ### Slow-path helper table (`JitSlowPaths`, 113 helpers)
 
@@ -206,14 +207,14 @@ interpreter.
 | compound assign | 21.7ms | 3.1ms | **0.13** (was 0.77) |
 
 **Conformance** (full-area `--jit` sweeps): `language` **23721 pass / 0 fail /
-0 crash / 0 hang** (3 skip); `annexB` 1086 pass / 0 hang; `built-ins` 23207
-pass / 450 hang — *pre-existing* (baseline 447± load wobble) slow RegExp
+0 crash / 0 hang** (3 skip); `annexB` 1086 pass / 0 hang; `built-ins` 23215
+pass / 442 hang — *pre-existing* (baseline 447± load wobble) slow RegExp
 property-escape / CharacterClassEscapes fixtures plus the known
-decodeURI/TypedArray/Temporal hang clusters, unrelated to the JIT (0
+Temporal/TypedArray hang clusters, unrelated to the JIT (0
 fail / 0 crash). Clusters: `expressions/call` 92/92, `arrow-function`
 343/343.
 
-**Tests**: `cargo test --workspace` green (4501 passed, 3 ignored; jit crate 132 incl. the
+**Tests**: `cargo test --workspace` green (4518 passed, 3 ignored; jit crate 147 incl. the
 `installed_jit_*` e2e tests for member/slot callees, loop-with-calls, mid-run
 cell mutation, GC-stress rooting, global store-then-read, scope-shadow
 correctness, the Cut 55 try/catch/finally/block shapes, the Cut 56
@@ -235,7 +236,13 @@ regression) shapes, the Cut 61 super shapes (calls, computed read/call
 stack shapes, assign/compound, prefix/postfix updates, logical assign,
 async method, delete ReferenceError, static/inherited base, read-vs-call
 shapes), and the Cut 62 misc shapes (`new.target` normal-call/construct,
-heap string loop, heap bigint leaf, direct-eval `CallFast` lowering));
+heap string loop, heap bigint leaf, direct-eval `CallFast` lowering), and
+the Cut 65 fused-call + script-completion shapes (slot/global fused
+call-stores, a certified script's whole top-level loop in machine code,
+and an interpreter-match matrix of script completions — var-declaration
+empty, statement-position assignment, if with/without a value, trailing
+empty block restore, the Reset/Normalize interplay, and the fused
+call-store literal-arg vs counter-path shapes));
 `cargo clippy --workspace --all-targets -- -D warnings` clean. The Cut 63
 script/eval compiled-body cache is covered by a runtime test
 (`script_and_eval_bodies_cache_per_source`).
@@ -338,9 +345,15 @@ containing any of these fall back entirely:
 
 **Performance (the remaining benchmark rows and hot shapes):**
 
-4. **Inline direct leaf calls further** — `function calls` is 0.25 and the
-   leaf probe already caches verdicts, but a statically-known leaf callee at a
-   stable slot could skip the probe and `call_slow` round-trip entirely.
+4. ~~**Inline direct leaf calls further**~~ — **done** (Cut 65): the fused
+   global/slot call steps (`CallFastGlobal`, `CallFastSlotStore`,
+   `CallFastGlobalStore` — a statically-known leaf callee at a stable slot
+   or global cell, previously bailing the body) now lower through the
+   leaf-probe call machinery, and a certified script routes through the JIT
+   for the first time (`eval_program` runs `run_jit_body_loop`, which
+   required the compiled completion steps to write the interpreter's
+   completion register). The leaf probe still runs per call site — skipping
+   it for the statically-known case is future work.
 5. **Closure-creation lowering** (`Step::Closure`/`CreateFunction`/
    `CreateArrow`) — **done** (Cut 44): the creation step now compiles via
    step-index helpers; the remaining cost is the instantiation machinery

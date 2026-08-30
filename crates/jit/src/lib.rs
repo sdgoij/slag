@@ -3494,33 +3494,80 @@ mod tests {
     }
 
     #[test]
-    fn installed_jit_runs_a_fused_global_call_store() {
-        // `s = g(i)` inside a loop: the compiler fuses the arg loads, the
-        // global-callee call, and the store into one `CallFastGlobalStore`
-        // step, whose handler passes the caller-frame argument base. The
-        // enclosing body bails (the fused step is unsupported), so the
-        // interpreter runs it and the fused call site hands the certified
-        // callee's run to the JIT with the args materialized from the
-        // frame.
-        let (value, compiled) = with_jit_agent(|agent| {
-            agent
-                .run_script(
-                    "function g(x) { return x + 1; }\n\
-                     function f(n) { var s = 0; for (var i = 0; i < 100; i++) { s = g(i); } return s; }\n\
-                     f(100);",
-                )
-                .expect("runs")
-        });
-        assert_eq!(value.as_number(), Some(100.0));
-        assert!(compiled >= 1, "{compiled} bodies");
+    fn installed_jit_script_completion_matches_the_interpreter() {
+        // Cut 65: a certified script now runs through the JIT; its
+        // fall-off-end completion must match the interpreter's. The compiled
+        // completion steps write `vm.completion`/`completion_is_empty` (the
+        // register the interpreter's fall-off-end arm reads), and the script
+        // path converts the machine code's past-the-end value to that
+        // register's completion. Each case also asserts the script body (and
+        // its leaf callee) actually compiled.
+        let cases: &[(&str, Option<f64>, usize)] = &[
+            // The top-level bench shapes.
+            (
+                "var s = 0; for (var i = 0; i < 100; i++) { s += i; } s;",
+                Some(4950.0),
+                1,
+            ),
+            (
+                "function g(x) { return x + 1; } var t = 0; for (var i = 0; i < 100; i++) { t += g(i); } t;",
+                Some(5050.0),
+                2,
+            ),
+            (
+                "function g(x) { return x + 1; } var s = 0; for (var i = 0; i < 100; i++) { s = g(i); } s;",
+                Some(100.0),
+                2,
+            ),
+            // A var declaration produces no completion value.
+            ("var x = 1;", None, 1),
+            // A statement-position assignment carries its value
+            // (`FusedStoreLocal` sets the completion).
+            ("var x; x = 5;", Some(5.0), 1),
+            // Control statements: with and without a value.
+            ("if (true) { 3 }", Some(3.0), 1),
+            ("if (false) { 3 }", None, 1),
+            // A trailing block that ends empty restores the pre-block
+            // completion (`5; { var q = 1; }` completes 5, not undefined).
+            ("5; { var q = 1; }", Some(5.0), 1),
+            // ...but a control statement inside the block (ResetCompletion +
+            // NormalizeCompletion) turns the register empty, so the block's
+            // empty end does not restore 5.
+            ("5; { if (true) {} }", None, 1),
+            // The fused call-store only fires for plain slot args; a literal
+            // arg keeps the `FusedStoreLocal` tail, which sets the completion.
+            (
+                "function g(x) { return x + 1; } var s = 0; s = g(1);",
+                Some(2.0),
+                2,
+            ),
+            // In the counter path the loop body's `FusedStoreLocal` sets the
+            // completion on the last iteration (the last `s = g(i)` = 3).
+            (
+                "function g(x) { return x + 1; } var s = 0; for (var i = 0; i < 3; i++) { s = g(i); }",
+                Some(3.0),
+                2,
+            ),
+        ];
+        for (source, expected, min_compiled) in cases {
+            let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("runs"));
+            match expected {
+                Some(n) => assert_eq!(value.as_number(), Some(*n), "{source}"),
+                None => assert_eq!(value, Value::Undefined, "{source}"),
+            }
+            assert!(compiled >= *min_compiled, "{source}: {compiled} bodies");
+        }
     }
 
     #[test]
     fn installed_jit_runs_a_fused_slot_call_store() {
-        // The param-callee twin: `s = g(i)` fuses into `CallFastSlotStore`
-        // (the callee comes from the frame slot); the anonymous callee's
-        // body is a certified leaf, JIT-run from the fused call site's
-        // caller-frame argument base.
+        // Cut 65: the param-callee twin — `s = g(i)` fuses into
+        // `CallFastSlotStore` (the callee comes from the frame slot). The
+        // fused step now LOWERs: `f`'s body compiles (the arg slots
+        // materialize with their TDZ checks, the call runs through the leaf
+        // probe, the result stores to the target), so the loop runs in
+        // machine code with the anonymous callee's certified-leaf body
+        // in-frame.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
@@ -3530,7 +3577,49 @@ mod tests {
                 .expect("runs")
         });
         assert_eq!(value.as_number(), Some(100.0));
-        assert!(compiled >= 1, "{compiled} bodies");
+        assert!(compiled >= 2, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_fused_global_call_store() {
+        // Cut 65: a certified SCRIPT's `s = g(i)` fuses into
+        // `CallFastGlobalStore` (the never-assigned global `g` is the
+        // statically-known callee). The step now lowers — the top-level
+        // loop's arg loads, the global-cell callee read, the leaf-probe
+        // call, and the store all run in machine code (previously the
+        // script bailed to the interpreter).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function g(x) { return x + 1; }\n\
+                     var s = 0;\n\
+                     for (var i = 0; i < 100; i++) { s = g(i); }\n\
+                     s;",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(100.0));
+        assert!(compiled >= 2, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_fused_global_call() {
+        // Cut 65: the non-store form — a certified script's expression-
+        // position `g(i)` fuses into `CallFastGlobal` (callee from the
+        // global fast cell, `undefined` receiver). The whole loop runs in
+        // machine code.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function g(x) { return x + 1; }\n\
+                     var t = 0;\n\
+                     for (var i = 0; i < 100; i++) { t += g(i); }\n\
+                     t;",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(5050.0));
+        assert!(compiled >= 2, "{compiled} bodies");
     }
 
     #[test]

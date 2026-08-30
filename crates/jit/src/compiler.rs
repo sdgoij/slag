@@ -40,7 +40,10 @@ use runtime::ir::{
     CompiledBody, FastLoopVar, GLOBAL_CELLS, LeafOp, MEMBER_CELLS, MemberValueCell, RegOperand,
     ScopeInfo, Step, is_compound_assign,
 };
-use runtime::jit::{GlobalValueCell, JitCallContext, LeafCallSiteCache, LeafInlineInfo};
+use runtime::jit::{
+    GlobalValueCell, JitCallContext, LeafCallSiteCache, LeafInlineInfo,
+    VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET,
+};
 use syntax::ast::{AssignOp, BinaryOp, UpdateOp};
 use target_lexicon::PointerWidth;
 
@@ -226,8 +229,19 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
             Step::ConcatStrConst(_) => {}
             // The fused slot call pops `argc` args (the callee is the
             // frame slot) and pushes the result.
-            Step::CallFastSlot { argc, .. } => {
+            Step::CallFastSlot { argc, .. } | Step::CallFastGlobal { argc, .. } => {
                 depth = depth.saturating_sub(*argc as usize).saturating_add(1);
+            }
+            // The fused `x = f(args)` stores (Cut 65): the materialized arg
+            // slots transiently raise the depth; the call replaces them with
+            // the result and the store pops it (net 0).
+            Step::CallFastSlotStore { arg_slots, .. }
+            | Step::CallFastGlobalStore { arg_slots, .. } => {
+                depth += arg_slots.len();
+                depth = depth
+                    .saturating_sub(arg_slots.len())
+                    .saturating_add(1)
+                    .saturating_sub(1);
             }
             // A global read pushes the value; a global write consumes it.
             Step::LoadGlobal { .. } => depth += 1,
@@ -416,7 +430,10 @@ fn rel_cc(op: BinaryOp) -> Result<FloatCC, Unsupported> {
 fn step_name(step: &Step) -> &'static str {
     match step {
         Step::Call { .. } | Step::CallFast { .. } => "Call",
-        Step::CallFastGlobal { .. } | Step::CallFastSlot { .. } => "CallFastGlobal/Slot",
+        Step::CallFastGlobal { .. }
+        | Step::CallFastSlot { .. }
+        | Step::CallFastGlobalStore { .. }
+        | Step::CallFastSlotStore { .. } => "CallFastGlobal/Slot",
         Step::ArgsBase | Step::ArgsPush | Step::ArgsSpread => "ArgsVector",
         Step::TailCall { .. }
         | Step::TailCallFast { .. }
@@ -489,6 +506,13 @@ fn step_name(step: &Step) -> &'static str {
         | Step::ResolveSuperRefComputed => "Super",
         Step::LoadContextSlot { .. } | Step::StoreContextSlot { .. } => "Context slot",
         Step::InitContextSlot { .. } | Step::UpdateContextSlot { .. } => "Context slot",
+        Step::SetCompletion
+        | Step::ResetCompletion
+        | Step::NormalizeCompletion
+        | Step::ListBegin
+        | Step::ListEnd
+        | Step::SaveCompletion
+        | Step::RestoreCompletion => "Completion",
         Step::LoadPerIteration { .. }
         | Step::StorePerIteration { .. }
         | Step::UpdatePerIteration { .. } => "Per-iteration",
@@ -1331,6 +1355,54 @@ impl<'a> Lowerer<'a> {
         self.builder.use_var(self.vm_var)
     }
 
+    /// Load the running `Vm` pointer (the ctx's `vm` field) — the machine
+    /// code's handle for writing the interpreter's completion register.
+    fn vm_ptr(&mut self) -> ClifValue {
+        let ctx = self.vm();
+        self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, vm) as i32),
+        )
+    }
+
+    /// Write the interpreter's completion register (`Vm::completion` plus
+    /// `completion_is_empty`) from machine code — the script path's
+    /// fall-off-end completion reads it (`run_inner_inner`'s `None` arm), and
+    /// the interpreter's completion steps are the source of truth the compiled
+    /// code must mirror. Both fields are traced/reset with the Vm, so the
+    /// stored value stays rooted and the pool clears it between runs. The
+    /// write is skipped when the ctx's `vm` pointer is null — the scaffold's
+    /// bare-ctx test harness (which never dereferences it) calls the compiled
+    /// code with a null `vm`.
+    fn emit_completion_store(&mut self, value: ClifValue, is_empty: bool) {
+        let vm = self.vm_ptr();
+        let has_vm = self.builder.ins().icmp_imm_u(IntCC::NotEqual, vm, 0);
+        let has_vm_64 = self.bint(has_vm);
+        let store = self.builder.create_block();
+        let skip = self.builder.create_block();
+        self.builder.ins().brif(has_vm_64, store, &[], skip, &[]);
+        self.builder.switch_to_block(store);
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            value,
+            vm,
+            Offset32::new(VM_COMPLETION_OFFSET as i32),
+        );
+        let empty = self.builder.ins().iconst(types::I8, is_empty as i64);
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            empty,
+            vm,
+            Offset32::new(VM_COMPLETION_IS_EMPTY_OFFSET as i32),
+        );
+        self.builder.ins().jump(skip, &[]);
+        self.builder.seal_block(store);
+        self.builder.switch_to_block(skip);
+        self.builder.seal_block(skip);
+    }
+
     fn call_slow(
         &mut self,
         sig: SigRef,
@@ -1560,6 +1632,7 @@ impl<'a> Lowerer<'a> {
         argc: usize,
         pre_call_sp: ClifValue,
         direct_eval: bool,
+        emit_fall_through: bool,
     ) -> Result<(), Unsupported> {
         let argc_imm = self.builder.ins().iconst(types::I64, argc as i64);
         let ctx = self.vm();
@@ -1764,7 +1837,9 @@ impl<'a> Lowerer<'a> {
         self.builder.ins().jump(merge, &[]);
         self.builder.seal_block(merge);
         self.builder.switch_to_block(merge);
-        self.fall_through(index);
+        if emit_fall_through {
+            self.fall_through(index);
+        }
         Ok(())
     }
 
@@ -2018,6 +2093,12 @@ impl<'a> Lowerer<'a> {
                     self.emit_tdz_check(current)?;
                 }
                 self.store_slot(*slot, value);
+                // The interpreter's `FusedStoreLocal` also sets the statement
+                // completion (a statement-position `x = v`); `StoreLocal` does
+                // not — its result is popped by a following `SetCompletion`.
+                if matches!(step, Step::FusedStoreLocal { .. }) {
+                    self.emit_completion_store(value, false);
+                }
                 self.fall_through(index);
             }
             Step::InitLocal { slot } => {
@@ -2544,6 +2625,7 @@ impl<'a> Lowerer<'a> {
                     *argc as usize,
                     this_ptr,
                     *direct_eval,
+                    true,
                 )?;
             }
             Step::CallFastSlot { slot, argc } => {
@@ -2563,7 +2645,86 @@ impl<'a> Lowerer<'a> {
                     *argc as usize,
                     args_ptr,
                     false,
+                    true,
                 )?;
+            }
+            Step::CallFastGlobal {
+                name,
+                argc,
+                direct_eval,
+            } => {
+                // Cut 65: `[..., a1..aN]` — the fused global call
+                // (`do_call_fast_global` reads the callee from the global
+                // fast cell and passes `undefined` as `this`; the fuse
+                // guarantees the never-assigned global is stable). The
+                // machine-code cell read (`emit_global_read`) feeds the
+                // same leaf-probe machinery as the stack/slot forms.
+                let sp = self.builder.use_var(self.sp_var);
+                let args_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64) * 8));
+                let callee = self.emit_global_read(*name)?;
+                let this = self.builder.ins().iconst(types::I64, self.undef_bits);
+                self.emit_call(
+                    index,
+                    callee,
+                    this,
+                    args_ptr,
+                    *argc as usize,
+                    args_ptr,
+                    *direct_eval,
+                    true,
+                )?;
+            }
+            Step::CallFastSlotStore {
+                arg_slots,
+                store_slot,
+                ..
+            }
+            | Step::CallFastGlobalStore {
+                arg_slots,
+                store_slot,
+                ..
+            } => {
+                // Cut 65: the fused `x = f(args)` — materialize the arg
+                // slots onto the working stack (TDZ-checked in order, the
+                // `LoadLocal` semantics), run the slot/global-callee call
+                // over the region, and store the result to the target (the
+                // `FusedStoreLocal` TDZ check). The global form reads the
+                // callee from the fast cell; the slot form from the frame.
+                for &slot in arg_slots {
+                    let bits = self.load_slot(slot);
+                    if self.slot_is_lexical(slot) {
+                        self.emit_tdz_check(bits)?;
+                    }
+                    self.push(bits);
+                }
+                let sp = self.builder.use_var(self.sp_var);
+                let args_ptr = self
+                    .builder
+                    .ins()
+                    .iadd_imm_s(sp, -((arg_slots.len() as i64) * 8));
+                let callee = match step {
+                    Step::CallFastSlotStore { callee_slot, .. } => self.load_slot(*callee_slot),
+                    Step::CallFastGlobalStore { name, .. } => self.emit_global_read(*name)?,
+                    _ => unreachable!("the or-pattern matched a fused store"),
+                };
+                let this = self.builder.ins().iconst(types::I64, self.undef_bits);
+                self.emit_call(
+                    index,
+                    callee,
+                    this,
+                    args_ptr,
+                    arg_slots.len(),
+                    args_ptr,
+                    false,
+                    false,
+                )?;
+                let result = self.pop();
+                if self.slot_is_lexical(*store_slot) {
+                    let current = self.load_slot(*store_slot);
+                    self.emit_tdz_check(current)?;
+                }
+                self.store_slot(*store_slot, result);
+                self.fall_through(index);
             }
             // Cut 49: the vector call form (≥3 args or a spread). The
             // arguments build in `Vm::args` through the helpers (the same
@@ -2968,6 +3129,13 @@ impl<'a> Lowerer<'a> {
                 self.builder.ins().jump(merge, &[]);
                 self.builder.seal_block(merge);
                 self.builder.switch_to_block(merge);
+                // The interpreter's `FusedStoreGlobal` also sets the statement
+                // completion (a statement-position `x = v` on a declared
+                // global); `StoreGlobal` does not — its result is popped by a
+                // following `SetCompletion`.
+                if matches!(step, Step::FusedStoreGlobal { .. }) {
+                    self.emit_completion_store(value, false);
+                }
                 self.fall_through(index);
             }
             Step::LoadIdent { name } => {
@@ -3748,12 +3916,29 @@ impl<'a> Lowerer<'a> {
             // (and the list scopes) only touch the completion register, but
             // `SetCompletion` POPS the statement's value — a no-op would
             // leave the slot and drift the JIT stack one entry per
-            // expression statement (catastrophic in a loop).
+            // expression statement (catastrophic in a loop). Cut 65: a
+            // certified SCRIPT completes through the register at fall-off-end,
+            // so the write steps mirror the interpreter and store the real
+            // value/empty flag into `vm.completion`/`completion_is_empty`
+            // (functions never observe the register — their result comes from
+            // the machine-code return — so the stores are harmless there).
+            // `NormalizeCompletion` and the list scopes stay no-ops: in a
+            // certified body the register is unobservable mid-run, and at
+            // fall-off-end `Empty` and `Normal(undefined)` (what a normalize
+            // of an empty register produces) convert to the same top-level
+            // value, so skipping the normalize and the list save/restore
+            // cannot change the completed value.
             Step::SetCompletion => {
-                self.pop();
+                let value = self.pop();
+                self.emit_completion_store(value, false);
                 self.fall_through(index);
             }
-            Step::ResetCompletion | Step::NormalizeCompletion | Step::ListBegin | Step::ListEnd => {
+            Step::ResetCompletion => {
+                let undef = self.builder.ins().iconst(types::I64, self.undef_bits);
+                self.emit_completion_store(undef, true);
+                self.fall_through(index);
+            }
+            Step::NormalizeCompletion | Step::ListBegin | Step::ListEnd => {
                 self.fall_through(index);
             }
             _ => return Err(Unsupported::Step(step_name(step))),

@@ -1,6 +1,6 @@
 ---
 name: slag-jit
-description: "Load when working on Slag's Cranelift JIT (crates/jit/src, crates/runtime/src/jit.rs, the JIT-visible parts of crates/runtime/src/ir.rs) — helper ABI registration, emit_step lowering, block sealing, dispatch sentinels, the leaf-call probe, the certified iterator machinery (for-of/for-in/AsyncForOf*), suspension (generator Yield / async Await, resume entry dispatch, jit_work save/restore), super property access, new.target, or destructuring (the Destructure* steps, flat slot/context binds, error-close gating). Traps: the four-file helper-table mirror, the pending-error ABI, the dispatch-target compare chain, the element-via-working-stack-pointer convention, the fixup-patched ForOfBegin boundary span, the iterator-close requirements for compiled for-of bodies, the sealed-block/back-edge rules, the for_of_advance core contract, resumable-body rules, and the destructure rules (never the wholesale env binds, the for-head pattern trap, the DestructureUndef fall-through sp, the destructure_stepping close gate)."
+description: "Load when working on Slag's Cranelift JIT (crates/jit/src, crates/runtime/src/jit.rs, the JIT-visible parts of crates/runtime/src/ir.rs) — helper ABI registration, emit_step lowering, block sealing, dispatch sentinels, the leaf-call probe, the certified iterator machinery (for-of/for-in/AsyncForOf*), suspension (Yield/Await resume dispatch, jit_work save/restore), super property access, new.target, or destructuring (the Destructure* steps, flat slot/context binds). Traps: the four-file helper-table mirror, the pending-error ABI, the dispatch-target chain, the element-via-work-stack-pointer convention, the ForOfBegin boundary span, the iterator-close requirements for compiled for-of bodies, the sealed-block/back-edge rules, the for_of_advance core contract, resumable-body rules, the destructure rules (flat binds, for-head pattern trap, close gates), and the script completion-register writes (compiled completion steps must write vm.completion; eval_program converts the fall-off-end Return(undef))."
 ---
 
 # Slag JIT traps
@@ -310,7 +310,60 @@ The final bail-row miscellany:
   while a script body runs), and the cache entry that frees the code also
   drops the body.
 
-## 14. Validation
+## 14. Fused global/slot calls and the script completion register (Cut 65)
+
+`CallFastGlobal`, `CallFastSlotStore`, and `CallFastGlobalStore` lower now
+(`CallFastSlot` always did); a fused store materializes the arg slots
+(TDZ-checked in order) over the working region, calls through the leaf
+probe, then TDZ-checks + stores the result. `emit_call` gained an
+`emit_fall_through: bool` (9th arg, all call sites updated) because the
+store must append AFTER `emit_call`'s merge — emit_call seals and takes
+its merge block, so the caller must skip its internal `fall_through` and
+emit its own.
+
+**A certified SCRIPT routes through the JIT now** (`eval_program` calls
+`run_jit_body_loop` instead of `vm.start`; `run_jit_body_loop` falls back
+internally on `Interp`). This made the completion register observable, and
+it is the big trap:
+
+- The JIT previously treated the completion steps as no-ops because in a
+  certified FUNCTION the body result comes from the machine-code return.
+  A script completes by FALLING OFF THE END: `run_inner_inner`'s `None`
+  arm reads `vm.completion`/`vm.completion_is_empty`. The JIT never wrote
+  them, so every certified script failed with "Illegal control flow at
+  the top level" (the machine code's past-the-end `undef` came back as
+  `run_jit_body_loop`'s `Completed(Return(undef))`, which
+  `completion_to_result` rejects for a script).
+- Fix: the compiled `SetCompletion` (pop, write value + `is_empty=false`),
+  `ResetCompletion` (write undef + `is_empty=true`), and the
+  statement-position `FusedStoreLocal`/`FusedStoreGlobal` (split from
+  `StoreLocal`/`StoreGlobal`, which do NOT write — their result is popped
+  by a following `SetCompletion`) store straight into the Vm via the
+  `runtime::jit::VM_COMPLETION_OFFSET` / `_IS_EMPTY_OFFSET` constants
+  (the jit crate cannot name the `pub(crate)` `Vm` for `offset_of!`).
+  `eval_program` converts the JIT's fall-off-end `Return(_)` marker to
+  the register's `Normal`/`Empty` — scripts cannot contain `return`, so
+  every `Return` from that path is the marker.
+- `NormalizeCompletion`/`ListBegin`/`ListEnd` STAY no-ops. Justification:
+  the register is unobservable mid-run in a certified body (no eval/
+  with), and at fall-off-end `Empty` ≡ `Normal(undefined)` at the top
+  level; the interpreter's ListEnd-restore always lands on the value the
+  JIT's never-reset register already holds (the JIT never does the
+  ListBegin reset, and the control statements pair every
+  `NormalizeCompletion` with a preceding `ResetCompletion` that
+  re-syncs `is_empty`). Don't "fix" them without re-deriving this.
+- The compiled completion writes are NULL-GUARDED on `ctx.vm` (the
+  scaffold's bare-ctx `run` harness passes a null `vm` and must never be
+  dereferenced — the `compile_and_run_fast_counter_loop` crash), and
+  GC-safe (`Vm::trace` covers `completion`; the vm is an active-run root).
+- The fused call-store steps do NOT write the completion register — the
+  interpreter's `CallFastSlotStore`/`CallFastGlobalStore` arms don't
+  either. But note the fusion only fires for plain `LoadLocal` args: a
+  literal (`s = g(1)`) or the counter (`PushAcc` in the acc-path loop
+  body) keeps the `FusedStoreLocal` tail, which DOES write — that
+  difference is observable in a script's completion and is tested.
+
+## 15. Validation
 
 `cargo clippy --workspace --all-targets -- -D warnings` clean, then
 `cargo test --workspace` green — then REBUILD the sweep

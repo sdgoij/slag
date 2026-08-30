@@ -69,8 +69,40 @@ pub fn eval_program(
     if let Some(scope) = &body.scope {
         vm.setup_frame(scope, &[]);
     }
-    let completion = match vm.start(agent, &body) {
-        Ok(crate::ir::VmOutcome::Completed(completion)) => completion,
+    // Cut 65: a certified script runs through the JIT when the hook is
+    // installed — `run_jit_body_loop` compiles the body on first use and
+    // falls back to `vm.start` (the interpreter) inside for a body with no
+    // compiled code or an unsupported step. The top-level bench loops
+    // (`n = f(n)` fused global call-stores) previously ran interpreted;
+    // the machine code now executes them with the leaf callees in-frame.
+    let outcome = if body.scope.is_some() {
+        let mut body_rc = body.clone();
+        crate::jit::run_jit_body_loop(agent, &mut vm, &mut body_rc)
+    } else {
+        vm.start(agent, &body)
+    };
+    let completion = match outcome {
+        Ok(crate::ir::VmOutcome::Completed(completion)) => {
+            // Cut 65: a compiled script falls off the end with the machine
+            // code's past-the-end value (`undefined`) — `run_jit_body_loop`
+            // maps it to `Completion::Return` (the shape function bodies
+            // complete with). Scripts cannot contain `return`, so every
+            // `Return` from this path is that marker; the script's real
+            // completion is the register the compiled completion steps wrote
+            // (`vm.completion`/`completion_is_empty`), read exactly like the
+            // interpreter's fall-off-end arm (`run_inner_inner`'s `None`).
+            // The interpreter fallback (`vm.start`) never produces a `Return`.
+            match completion {
+                crate::flow::Completion::Return(_) => {
+                    if vm.completion_is_empty {
+                        crate::flow::Completion::Empty
+                    } else {
+                        crate::flow::Completion::Normal(vm.completion)
+                    }
+                }
+                other => other,
+            }
+        }
         Ok(crate::ir::VmOutcome::Suspended(_)) => {
             agent.return_vm(vm);
             return Err(JsError::new(

@@ -150,6 +150,14 @@ impl LeafCallSiteCache {
     }
 }
 
+/// Cut 65: the field offsets of the interpreter's completion register
+/// (`Vm::completion` / `Vm::completion_is_empty`) — the compiled script-path
+/// completion steps write the register directly (a certified script's
+/// fall-off-end completion reads it, and the jit crate cannot name the
+/// `pub(crate)` `Vm` to `offset_of!` its fields).
+pub const VM_COMPLETION_OFFSET: usize = std::mem::offset_of!(Vm, completion);
+pub const VM_COMPLETION_IS_EMPTY_OFFSET: usize = std::mem::offset_of!(Vm, completion_is_empty);
+
 /// The per-call context the Vm passes to a compiled body as its `ctx`
 /// argument. `pending` is offset 0 — the compiled code's error-check ABI.
 #[repr(C)]
