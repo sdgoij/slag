@@ -414,6 +414,20 @@ pub enum Step {
     TailCallSelf {
         argc: u8,
     },
+    /// Cut 47: a tail call to the enclosing function's own NAME in a body
+    /// that is NOT a named expression — a top-level or enclosing function
+    /// declaration (`function f(n) { return f(n - 1); }`), where the name
+    /// resolves through the global/outer env and could have been reassigned.
+    /// The callee/args sit on the stack exactly as for `TailCallFast`
+    /// (`[this, callee, a1..aN]`); the JIT compares the resolved callee
+    /// against the running closure (`JitCallContext::current_function`)
+    /// and jumps to the body's re-entry on a match (the self-recursive
+    /// chain runs in one machine-code invocation), else runs the general
+    /// `tail_call` helper. The interpreter routes it through the shared
+    /// `tail_call_shared` machinery, which handles both cases.
+    TailCallSelfCheck {
+        argc: u8,
+    },
     /// Tail form of `TaggedTemplate` (`return tag\`...\``).
     TailTaggedTemplate(syntax::ast::TemplateLiteral),
     SuperCall,
@@ -2195,6 +2209,13 @@ pub struct Vm {
     /// The Rc is also in `ecma_functions` (the callee is registered), so its
     /// literal `Value`s are already rooted and this field needs no tracing.
     pub(crate) tail_replaced: Option<std::rc::Rc<crate::ir::CompiledBody>>,
+    /// Cut 47: the closure whose body is running on this Vm, when it is an
+    /// ordinary ECMAScript function entered through `run_compiled_body`
+    /// (set at entry, and by `tail_prepare_ordinary` on a frame
+    /// replacement). The JIT's `TailCallSelfCheck` machine code compares the
+    /// resolved callee against this value to recognize a global-name
+    /// self-tail-call at runtime (the name could have been reassigned).
+    pub(crate) current_function: Option<Value>,
     pub strict: bool,
     /// Whether the statement-completion register holds an empty completion
     /// (spec 6.2.2.3): no value-producing statement has run since the last
@@ -2285,6 +2306,7 @@ impl Trace for Vm {
         }
         self.var_ref_stack.trace(visit);
         self.call_args.trace(visit);
+        self.current_function.trace(visit);
         // The leaf-path JIT runs' private buffers (pushed by `run_jit_leaf`
         // for the call's duration; empty otherwise).
         // SAFETY: each entry is a buffer `run_jit_leaf` holds alive for its
@@ -2434,6 +2456,7 @@ impl Vm {
             args_base_stack: Vec::new(),
             call_args: Vec::new(),
             tail_replaced: None,
+            current_function: None,
         }
     }
 
@@ -2491,6 +2514,7 @@ impl Vm {
         self.array_index_stack.clear();
         self.args_base_stack.clear();
         self.call_args.clear();
+        self.current_function = None;
     }
 
     /// GC-4: clear every frame slot so a Vm's stale values are never traced
@@ -4924,6 +4948,14 @@ impl Vm {
                     // lookup, no context swap, no frame realloc).
                     self.tail_call_self(agent, *argc as usize, body)?;
                     continue;
+                }
+                Step::TailCallSelfCheck { argc } => {
+                    // Cut 47: a global-name self-tail-call — the shared
+                    // machinery handles the callee either way (an identity
+                    // match frame-replaces, a reassigned name calls the
+                    // resolved callee); the JIT adds the identity check
+                    // before committing to the jump.
+                    return self.tail_call_fast(agent, *argc as usize, false, body);
                 }
                 Step::CallFastGlobal {
                     name,
@@ -8351,6 +8383,7 @@ impl Vm {
             // `run_compiled_body`.
             self.reset(body_env, strict);
             self.body_context = Some(body_env);
+            self.current_function = Some(Value::Function(*function));
             if scope.frame_size > 0 {
                 self.setup_frame(scope, args);
             }
@@ -8442,6 +8475,7 @@ impl Vm {
         // Vm with the context's lexical env after instantiation.
         let body_env = agent.running_context()?.lexical_environment;
         self.reset(body_env, strict);
+        self.current_function = Some(Value::Function(*function));
         self.ip = 0;
         Ok(Some(ir))
     }
@@ -8937,6 +8971,7 @@ impl Vm {
             leaf_call_cache: crate::jit::LeafCallSiteCache::empty(),
             body: std::rc::Rc::as_ptr(ir),
             tail: false,
+            current_function: 0,
         };
         let frame_ptr = buf.as_mut_ptr() as *mut std::os::raw::c_void;
         // SAFETY: `buf` has `frame_size + stack_usage + slack` slots.
@@ -15052,6 +15087,40 @@ impl Compiler {
                 return Ok(());
             }
         }
+        // Cut 47: the same shape in a body that is NOT a named expression —
+        // a top-level or enclosing function declaration whose own name
+        // resolves through the global/outer env, where it COULD have been
+        // reassigned. The receiver and callee are pushed and loaded normally
+        // (the machine code must see the resolved callee); the compiled step
+        // compares it against the running closure and jumps to the body's
+        // re-entry on a match, else runs the general `tail_call` helper.
+        if tail
+            && let ExprKind::Ident(name) = &callee.kind
+            && !self.named_expression
+            && self.function_name == Some(*name)
+            && self
+                .scope
+                .as_ref()
+                .is_some_and(|s| s.context_names.is_empty())
+            && self
+                .scope
+                .as_ref()
+                .is_some_and(|s| s.arguments_slot.is_none())
+            && matches!(self.binding(*name), BindingLoc::Env)
+            && !call.optional
+            && self.chain_depth == 0
+        {
+            self.emit(Step::Push(Value::Undefined));
+            self.compile_expr(&call.callee)?;
+            let saved = self.tail;
+            self.tail = false; // the arguments are never in tail position
+            let argc = self.compile_arguments(&call.args, true)?;
+            self.tail = saved;
+            if let Some(argc) = argc {
+                self.emit(Step::TailCallSelfCheck { argc: argc as u8 });
+                return Ok(());
+            }
+        }
         // Cut 35 slice 2/4: a plain named callee with an undefined receiver
         // fuses the receiver push and the callee load into the call step (2
         // fewer dispatches per call in a hot loop). Requires no `?.` on the
@@ -15469,6 +15538,7 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
                 | Step::TailCallFastGlobal { .. }
                 | Step::TailCallFastSlot { .. }
                 | Step::TailCallSelf { .. }
+                | Step::TailCallSelfCheck { .. }
                 | Step::TailTaggedTemplate(_)
                 | Step::Construct
                 | Step::SuperCall

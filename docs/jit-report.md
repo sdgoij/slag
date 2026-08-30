@@ -60,6 +60,7 @@ run paths:
 | 17 | *(worktree)* | **Closure creation + trivial context steps** — `CreateFunction`/`CreateArrow`/`FunctionDeclInit`, `NewTarget`, `RegExpLiteral` lower to step-index helpers that read the step's payload back out of the running body (`JitCallContext::body`) and run the interpreter's instantiation/evaluation machinery against the live lexical environment. A loop creating closures now runs entirely in machine code; the created closure's own body compiles separately. |
 | 18 | *(worktree)* | **Proper tail calls** — `TailCallFast`/`TailCallFastGlobal`/`TailCallFastSlot` (strict-mode TCO; the sloppy form stays a normal call per spec) lower to a `tail_call` helper that mirrors `tail_call_shared`: an ordinary certified callee replaces the current frame on the Vm (`JitCallContext::tail` + `Vm::tail_replaced`), anything else is a normal call whose result completes the body's return. `run_compiled_body` loops on the replaced body with the same Vm, so a 100K-deep TCO chain never grows the native stack. |
 | 19 | *(worktree)* | **Self-tail-call as a jump** — `TailCallSelf` (Cut 46): a tail call whose callee is the enclosing named function expression's own immutable self-binding compiles to an in-place frame rebind + jump back to the body's re-entry block, so the whole self-recursive tail chain runs in ONE machine-code invocation (no `tail_call` helper, no `run_compiled_body` round-trip). The compiler emits it only for certified capture-free, arguments-free bodies with the self-name resolving to the `Env` walk; the interpreter's `tail_call_self` rebinds the frame and re-enters the dispatch loop for the same shape. Measured ~3.3× faster than the round-trip path on a 1M-iteration chain (37ms vs ~120ms). |
+| 20 | *(worktree)* | **Global-name self-tail-call check** — `TailCallSelfCheck` (Cut 47): a tail call to the enclosing function's own NAME in a body that is not a named expression (`function f(n) { return f(n - 1); }`) — the name resolves through the global/outer env and could have been reassigned, so the machine code compares the resolved callee against the running closure (`Vm::current_function` captured into `JitCallContext::current_function`, exact bits) and jumps to the re-entry block on a match, else runs the `tail_call` helper. The interpreter routes it through the shared `tail_call_shared` machinery. The 1M global-name chain drops from ~120ms to ~38ms, matching the static form. |
 
 ### Slow-path helper table (`JitSlowPaths`, 38 helpers)
 
@@ -211,10 +212,12 @@ containing any of these fall back entirely:
    iterators, generators/async, destructuring/spread, class machinery, mapped
    `arguments`, the vector call form (`ArgsBase`/`ArgsPush`/`ArgsSpread`) —
    each is a slice of lowering + helper work. Proper tail calls are **done**
-   (Cut 45), and a NAMED function expression's direct self-tail-call now
-   jumps in machine code (Cut 46) — the remaining TCO chains (a global-name
-   recursion like `function f(n) { return f(n-1); }`, a computed callee)
-   still pay the per-iteration `tail_call` helper round-trip.
+   (Cut 45); a NAMED function expression's direct self-tail-call now
+   jumps in machine code (Cut 46) and a top-level/global-name self-recursion
+   (`function f(n) { return f(n-1); }`) jumps after an in-machine-code
+   identity check against the running closure (Cut 47) — only a computed
+   callee (`getF()(n-1)`) still pays the per-iteration `tail_call` helper
+   round-trip.
 7. **String concat**: the `concat_strings` helper is called per concat; very
    small strings could concat inline in registers.
 8. **Leaf-cache invalidation breadth**: any "disturbing" helper (a `valueOf`,

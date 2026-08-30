@@ -520,6 +520,7 @@ mod tests {
             leaf_call_cache: runtime::jit::LeafCallSiteCache::empty(),
             body: std::ptr::null(),
             tail: false,
+            current_function: 0,
         };
         // Safety: the buffers outlive the call; `vm` is never dereferenced by
         // the scaffold's test helpers.
@@ -853,6 +854,97 @@ mod tests {
             leaf_call_cache: runtime::jit::LeafCallSiteCache::empty(),
             body: std::ptr::null(),
             tail: false,
+            current_function: 0,
+        };
+        let result = unsafe {
+            compiled.call(
+                frame.as_mut_ptr(),
+                stack.as_mut_ptr(),
+                (&mut ctx as *mut runtime::jit::JitCallContext) as *mut std::os::raw::c_void,
+            )
+        };
+        assert!(!ctx.pending, "a test-double helper set the error flag");
+        assert_eq!(frame[1], 0xDEAD_BEEF_CAFE_F00D, "frame overrun");
+        assert_eq!(stack[64], 0xDEAD_BEEF_CAFE_F00D, "stack overrun");
+        assert_eq!(result, Value::Number(0.0).bits());
+    }
+
+    #[test]
+    fn tail_call_self_check_mismatch_runs_the_helper() {
+        // Cut 47: a `TailCallSelfCheck` whose resolved callee does NOT match
+        // the running closure (`ctx.current_function` is 0) falls to the
+        // `tail_call` helper — the test double returns 52.
+        let engine = JitEngine::new().expect("native isa");
+        let body = make_body(
+            vec![
+                Step::Push(Value::Undefined),
+                Step::Push(Value::Number(5.0)),
+                Step::Push(Value::Number(7.0)),
+                Step::TailCallSelfCheck { argc: 1 },
+            ],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(52.0).bits());
+    }
+
+    #[test]
+    fn tail_call_self_check_match_loops_in_machine_code() {
+        // Cut 47: when the resolved callee IS the running closure
+        // (`ctx.current_function`), the check takes the self path — rebind
+        // the frame with the new argument and jump back to the body's
+        // re-entry — so the whole self-recursive chain runs in ONE
+        // machine-code invocation. The body decrements slot 0 (a parameter)
+        // and tail-self-calls until 0, returning it: starting from 5, the
+        // loop runs five times and returns 0.
+        let engine = JitEngine::new().expect("native isa");
+        let mut body = make_body(
+            vec![
+                Step::JumpIfGtImm {
+                    slot: 0,
+                    imm: 0.0,
+                    target: 8,
+                },
+                Step::Push(Value::Undefined),
+                Step::Push(Value::Number(5.0)),
+                Step::LoadLocal { slot: 0 },
+                Step::Push(Value::Number(1.0)),
+                Step::Binary(syntax::ast::BinaryOp::Sub),
+                Step::TailCallSelfCheck { argc: 1 },
+                // Unreachable fall-through of the check (step 7).
+                Step::Push(Value::Undefined),
+                Step::LoadLocal { slot: 0 },
+                Step::Return,
+            ],
+            1,
+        );
+        body.scope = Some(ScopeInfo {
+            arity: 1,
+            ..scope(1)
+        });
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        // The frame is 2 slots (1 + canary); slot 0 starts at 5, and the
+        // "running closure" is the constant the body pushes as the callee.
+        let mut frame = vec![0u64; 2];
+        frame[0] = Value::Number(5.0).bits();
+        frame[1] = 0xDEAD_BEEF_CAFE_F00D;
+        let mut stack = vec![0u64; 65];
+        stack[64] = 0xDEAD_BEEF_CAFE_F00D;
+        let mut ctx = runtime::jit::JitCallContext {
+            pending: false,
+            error: None,
+            agent: std::ptr::null_mut(),
+            vm: std::ptr::null_mut(),
+            global_object: std::ptr::null_mut(),
+            global_value_cells: std::ptr::null_mut(),
+            member_value_cells: std::ptr::null_mut(),
+            clean_chain: false,
+            buf_end: std::ptr::null_mut(),
+            leaf_epoch: 0,
+            leaf_call_cache: runtime::jit::LeafCallSiteCache::empty(),
+            body: std::ptr::null(),
+            tail: false,
+            current_function: Value::Number(5.0).bits(),
         };
         let result = unsafe {
             compiled.call(
@@ -1139,9 +1231,11 @@ mod tests {
 
     #[test]
     fn installed_jit_runs_a_tail_call_chain() {
-        // Cut 45: a TCO-recursive body compiles; the tail call's frame
-        // replacement escapes to the runtime, which loops on the same Vm —
-        // the 100K-deep chain runs without growing the native stack.
+        // Cut 47: `function f(n) { return f(n - 1); }` — the callee resolves
+        // through the global env, so the machine code identity-checks it
+        // against the running closure (`ctx.current_function`) and jumps to
+        // the body's re-entry on a match: the 100K-deep chain runs in ONE
+        // machine-code invocation, no runtime round-trip.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
@@ -1153,6 +1247,28 @@ mod tests {
         });
         assert_eq!(value.as_number(), Some(0.0));
         assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_global_name_self_tail_call_rechecks_reassignment() {
+        // Cut 47: the checked self-tail-call must NOT jump when the name was
+        // reassigned — `f` is now `g`, so f's body tail-calls a different
+        // closure and the helper path runs. `original(3)` resolves through
+        // f→g→f→g to the replacement's base case (2); a wrongly-taken jump
+        // would return the original's (1).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "\"use strict\";\n\
+                     function f(n) { if (n === 0) { return 1; } return f(n - 1); }\n\
+                     var original = f;\n\
+                     f = function g(n) { if (n === 0) { return 2; } return original(n - 1); };\n\
+                     original(3);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(2.0));
+        assert!(compiled >= 2, "{compiled} bodies");
     }
 
     #[test]

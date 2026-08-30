@@ -1854,7 +1854,14 @@ fn ordinary_call(
         } else {
             Value::Undefined
         };
-        let result = run_compiled_body(agent, strict, ir, args, Some(this_value));
+        let result = run_compiled_body(
+            agent,
+            strict,
+            ir,
+            args,
+            Some(this_value),
+            Value::Function(*function),
+        );
         // A kind-only engine error escapes the body with the function's realm
         // context still current; surface it as that realm's error object now,
         // so a caller from another realm sees the right constructor (mirrors
@@ -1962,7 +1969,9 @@ fn ordinary_call(
             &function_env,
         )?;
         match ir {
-            Some(ir) => run_compiled_body(agent, strict, &ir, args, None),
+            Some(ir) => {
+                run_compiled_body(agent, strict, &ir, args, None, Value::Function(*function))
+            }
             None => evaluate_body(agent, &body, strict),
         }
     })();
@@ -2015,9 +2024,15 @@ fn run_compiled_body(
     ir: &std::rc::Rc<crate::ir::CompiledBody>,
     args: &[Value],
     this_value: Option<Value>,
+    function_value: Value,
 ) -> Result<Value, JsError> {
     let body_env = agent.running_context()?.lexical_environment;
     let mut vm = agent.take_vm(body_env, strict);
+    // Cut 47: the closure whose body is running — the JIT's
+    // `TailCallSelfCheck` compares the resolved callee against it to
+    // recognize a global-name self-tail-call. Updated by
+    // `tail_prepare_ordinary` when a tail call replaces the frame.
+    vm.current_function = Some(function_value);
     // Cut 45: the running body — reassigned when a compiled body's tail call
     // replaces the frame (the loop below re-enters with the new body).
     let mut ir = ir.clone();

@@ -13,7 +13,19 @@ step for a `return <call>` whose call is in tail position, and
 `CurrentBody`) instead of recursing — `tail_prepare_ordinary` pops the
 caller's execution context, pushes the callee's, and reuses THIS Vm via
 `self.reset(...)`. The non-ordinary/uncertified callee falls back to
-`call_inner` + `return_completion`. Two traps cost real debugging time:
+`call_inner` + `return_completion`. Two self-tail-call forms jump in the
+JIT instead of round-tripping (each needs a certified capture-free,
+arguments-free body — those re-create no per-call env, so the in-place
+frame rebind is exactly the frame replacement): `TailCallSelf` (Cut 46,
+a named function expression's immutable self-binding — statically the
+running body, no check) and `TailCallSelfCheck` (Cut 47, a top-level or
+enclosing declaration's own name — the name could be reassigned, so the
+machine code compares the resolved callee against
+`JitCallContext::current_function`, the exact bits of `Vm::current_function`
+set at entry by `run_compiled_body` and updated by `tail_prepare_ordinary`
+on a replacement). The interpreter routes `TailCallSelfCheck` through the
+shared `tail_call_fast` machinery (no check needed — the frame replacement
+is the general path). Two traps cost real debugging time:
 
 - **The slow-path env reset must use the RUNNING CONTEXT's lexical env,
   not `function_env`** (Set-method regression, `set-like-class-order`):

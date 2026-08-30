@@ -322,7 +322,8 @@ fn step_name(step: &Step) -> &'static str {
         | Step::TailCallFast { .. }
         | Step::TailCallFastGlobal { .. }
         | Step::TailCallFastSlot { .. }
-        | Step::TailCallSelf { .. } => "TailCall",
+        | Step::TailCallSelf { .. }
+        | Step::TailCallSelfCheck { .. } => "TailCall",
         Step::Throw => "Throw",
         Step::LoadIdent { .. } => "LoadIdent",
         Step::Unary(_) => "Unary",
@@ -377,7 +378,7 @@ fn step_targets(step: &Step) -> Vec<usize> {
         Step::ForOfNextBindLocal { back, .. } => vec![*back],
         // Cut 46: a self-tail-call jumps to the body's re-entry block, not
         // to a step block (see `Lowerer::reentry_block`).
-        Step::TailCallSelf { .. } => Vec::new(),
+        Step::TailCallSelf { .. } | Step::TailCallSelfCheck { .. } => Vec::new(),
         _ => Vec::new(),
     }
 }
@@ -582,10 +583,12 @@ impl<'a> Lowerer<'a> {
         // (the working-stack base, the loop counter, the accumulator) and
         // enters step 0. A fresh body run through either path starts from
         // exactly the entry state.
-        let has_self_tail_call = body
-            .steps
-            .iter()
-            .any(|step| matches!(step, Step::TailCallSelf { .. }));
+        let has_self_tail_call = body.steps.iter().any(|step| {
+            matches!(
+                step,
+                Step::TailCallSelf { .. } | Step::TailCallSelfCheck { .. }
+            )
+        });
         if has_self_tail_call {
             // The function's ENTRY block is the first block to receive an
             // instruction; it binds the parameters and falls into the
@@ -1262,6 +1265,35 @@ impl<'a> Lowerer<'a> {
         self.builder.def_var(self.sp_var, pre_call_sp);
         self.push(result);
         self.builder.ins().jump(merge, &[]);
+    }
+
+    /// Cut 46/47: rebind the frame for a self-tail-call re-entry — params
+    /// from the arguments at `[sp - argc*8, sp)`, missing params and the
+    /// var/lexical/`this` slots back to their entry state (tdz-aware) — then
+    /// jump to the body's re-entry block, which re-seeds the working-stack
+    /// base and the per-run variables. Shared by `TailCallSelf` (the static
+    /// self-binding form) and `TailCallSelfCheck`'s identity-match path.
+    fn emit_self_rebind(&mut self, scope: &ScopeInfo, argc: usize, sp: ClifValue) {
+        for slot in 0..scope.frame_size {
+            let value = if slot < scope.arity && slot < argc {
+                let ptr = self
+                    .builder
+                    .ins()
+                    .iadd_imm_s(sp, -(((argc - slot) as i64) * 8));
+                self.builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), ptr, Offset32::new(0))
+            } else if scope.tdz_store.get(slot).copied().unwrap_or(false) {
+                self.builder.ins().iconst(types::I64, self.uninit_bits)
+            } else {
+                self.builder.ins().iconst(types::I64, self.undef_bits)
+            };
+            self.store_slot(slot, value);
+        }
+        let entry = self
+            .reentry_block
+            .expect("a self-tail-call body always has a re-entry block");
+        self.builder.ins().jump(entry, &[]);
     }
 
     /// Cut 45: the shared tail-call tail — call the `tail_call` helper with
@@ -2015,29 +2047,69 @@ impl<'a> Lowerer<'a> {
                     .ok_or(Unsupported::Step("TailCallSelf without a certified scope"))?;
                 let argc = *argc as usize;
                 let sp = self.builder.use_var(self.sp_var);
-                for slot in 0..scope.frame_size {
-                    let value = if slot < scope.arity && slot < argc {
-                        let ptr = self
-                            .builder
-                            .ins()
-                            .iadd_imm_s(sp, -(((argc - slot) as i64) * 8));
-                        self.builder.ins().load(
-                            types::I64,
-                            MemFlagsData::new(),
-                            ptr,
-                            Offset32::new(0),
-                        )
-                    } else if scope.tdz_store.get(slot).copied().unwrap_or(false) {
-                        self.builder.ins().iconst(types::I64, self.uninit_bits)
-                    } else {
-                        self.builder.ins().iconst(types::I64, self.undef_bits)
-                    };
-                    self.store_slot(slot, value);
-                }
-                let entry = self
-                    .reentry_block
-                    .expect("a TailCallSelf body always has a re-entry block");
-                self.builder.ins().jump(entry, &[]);
+                self.emit_self_rebind(scope, argc, sp);
+            }
+            Step::TailCallSelfCheck { argc } => {
+                // Cut 47: a tail call to the enclosing function's own name in
+                // a body that is NOT a named expression (a declaration — the
+                // name resolves through the global/outer env and could have
+                // been reassigned). The callee/this/args sit on the stack as
+                // for `TailCallFast`; the machine code compares the resolved
+                // callee against the running closure (`ctx.current_function`,
+                // set at entry from the Vm's `current_function` and exact —
+                // the bits match iff the callee IS the running body). On a
+                // match the frame is rebound and the body re-enters its start
+                // (the whole self-recursive chain in one invocation);
+                // otherwise the general `tail_call` helper runs.
+                let scope = self.scope.ok_or(Unsupported::Step(
+                    "TailCallSelfCheck without a certified scope",
+                ))?;
+                let argc = *argc as usize;
+                let sp = self.builder.use_var(self.sp_var);
+                let args_ptr = self.builder.ins().iadd_imm_s(sp, -((argc as i64) * 8));
+                let callee_ptr = self
+                    .builder
+                    .ins()
+                    .iadd_imm_s(sp, -(((argc + 1) as i64) * 8));
+                let this_ptr = self
+                    .builder
+                    .ins()
+                    .iadd_imm_s(sp, -(((argc + 2) as i64) * 8));
+                let callee = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    callee_ptr,
+                    Offset32::new(0),
+                );
+                let this = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    this_ptr,
+                    Offset32::new(0),
+                );
+                let ctx = self.vm();
+                let current = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    ctx,
+                    Offset32::new(std::mem::offset_of!(JitCallContext, current_function) as i32),
+                );
+                let is_self = self.builder.ins().icmp(IntCC::Equal, callee, current);
+                let self_block = self.builder.create_block();
+                let helper_block = self.builder.create_block();
+                self.builder
+                    .ins()
+                    .brif(is_self, self_block, &[], helper_block, &[]);
+                // The self path: rebind the frame with the new arguments and
+                // re-enter the body's start.
+                self.builder.switch_to_block(self_block);
+                self.emit_self_rebind(scope, argc, sp);
+                self.builder.seal_block(self_block);
+                // The general path: the `tail_call` helper with the resolved
+                // callee (a reassigned name, or a cross-body call).
+                self.builder.switch_to_block(helper_block);
+                self.emit_tail_call(callee, this, argc, args_ptr, false)?;
+                self.builder.seal_block(helper_block);
             }
             Step::LoadGlobal { name } => {
                 let value = self.emit_global_read(*name)?;

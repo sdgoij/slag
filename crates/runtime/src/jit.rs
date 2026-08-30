@@ -207,6 +207,13 @@ pub struct JitCallContext {
     /// returns the placeholder value; `run_jit_body` signals the caller to
     /// loop on the new body instead of completing.
     pub tail: bool,
+    /// Cut 47: the running closure's NaN-boxed bits (the Vm's
+    /// `current_function`), for the compiled `TailCallSelfCheck` — the
+    /// machine code compares the resolved callee against it to recognize a
+    /// global-name self-tail-call at runtime (the name could have been
+    /// reassigned to a different closure). `0` when no function is running
+    /// (a body that can contain the check always runs with one).
+    pub current_function: u64,
 }
 
 /// A direct-mapped global-value cell the compiled `LoadGlobal`/`StoreGlobal`
@@ -1786,6 +1793,7 @@ pub(crate) fn run_jit_body(
         leaf_call_cache: LeafCallSiteCache::empty(),
         body: std::rc::Rc::as_ptr(ir),
         tail: false,
+        current_function: vm.current_function.map(|value| value.bits()).unwrap_or(0),
     };
     // Register the vm (its trace covers `vm.frame`, `vm.stack`, and any
     // nested leaf jit roots) plus the working area for the call's duration:
