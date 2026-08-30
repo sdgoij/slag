@@ -375,6 +375,15 @@ fn runtime_helpers() -> JitHelpers {
         array_spread: Some(rt.array_spread),
         array_hole: Some(rt.array_hole),
         array_end: Some(rt.array_end),
+        object_begin: Some(rt.object_begin),
+        object_init_name: Some(rt.object_init_name),
+        object_init_computed: Some(rt.object_init_computed),
+        object_key_to_property_key: Some(rt.object_key_to_property_key),
+        object_method_name: Some(rt.object_method_name),
+        object_method_computed: Some(rt.object_method_computed),
+        object_accessor_name: Some(rt.object_accessor_name),
+        object_accessor_computed: Some(rt.object_accessor_computed),
+        object_spread: Some(rt.object_spread),
     }
 }
 
@@ -507,6 +516,15 @@ mod tests {
             array_spread: Some(helpers::test_array_spread),
             array_hole: Some(helpers::test_array_hole),
             array_end: Some(helpers::test_array_end),
+            object_begin: Some(helpers::test_object_begin),
+            object_init_name: Some(helpers::test_object_init_name),
+            object_init_computed: Some(helpers::test_object_init_computed),
+            object_key_to_property_key: Some(helpers::test_object_key_to_property_key),
+            object_method_name: Some(helpers::test_object_method_name),
+            object_method_computed: Some(helpers::test_object_method_computed),
+            object_accessor_name: Some(helpers::test_object_accessor_name),
+            object_accessor_computed: Some(helpers::test_object_accessor_computed),
+            object_spread: Some(helpers::test_object_spread),
         }
     }
 
@@ -959,6 +977,35 @@ mod tests {
     }
 
     #[test]
+    fn object_literal_lowers_through_the_helpers() {
+        // Cut 53: the object literal steps lower to the helpers — `ObjectBegin`
+        // creates the object (the double returns 70), the init/key/spread
+        // steps echo it back, and the body returns the value.
+        let engine = JitEngine::new().expect("native isa");
+        let body = make_body(
+            vec![
+                Step::ObjectBegin,
+                Step::Push(Value::Number(1.0)),
+                Step::ObjectInitName {
+                    name: crux::intern_utf8("a"),
+                    set_name: false,
+                    shorthand: false,
+                },
+                Step::Push(Value::Number(2.0)),
+                Step::ObjectKeyToPropertyKey,
+                Step::Push(Value::Number(3.0)),
+                Step::ObjectInitComputed { set_name: false },
+                Step::Push(Value::Number(4.0)),
+                Step::ObjectSpread,
+                Step::Return,
+            ],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(70.0).bits());
+    }
+
+    #[test]
     fn tail_call_self_check_mismatch_runs_the_helper() {
         // Cut 47: a `TailCallSelfCheck` whose resolved callee does NOT match
         // the running closure (`ctx.current_function` is 0) falls to the
@@ -1394,6 +1441,38 @@ mod tests {
         });
         assert_eq!(value.as_number(), Some(6.0));
         assert!(compiled >= 2, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_an_object_literal_body() {
+        // Cut 53: an object-literal body compiles — plain, computed-key, and
+        // spread properties built in machine code.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f() { var k = 2; return { a: 1, [k]: 3, ...{ d: 4 } }; } \
+                     var o = f(); o.a + o[2] + o.d;",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(8.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_an_object_literal_with_methods() {
+        // Cut 53: method and accessor definitions compile too — the
+        // step-index helpers instantiate the functions from the running body.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f() { return { m() { return 4; }, get g() { return 5; } }; } \
+                     var o = f(); o.m() + o.g;",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(9.0));
+        assert!(compiled >= 1, "{compiled} bodies");
     }
 
     #[test]

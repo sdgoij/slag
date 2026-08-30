@@ -71,6 +71,15 @@ pub enum Helper {
     ArraySpread,
     ArrayHole,
     ArrayEnd,
+    ObjectBegin,
+    ObjectInitName,
+    ObjectInitComputed,
+    ObjectKeyToPropertyKey,
+    ObjectMethodName,
+    ObjectMethodComputed,
+    ObjectAccessorName,
+    ObjectAccessorComputed,
+    ObjectSpread,
 }
 
 impl Helper {
@@ -126,6 +135,15 @@ impl Helper {
             Helper::ArraySpread => "array_spread",
             Helper::ArrayHole => "array_hole",
             Helper::ArrayEnd => "array_end",
+            Helper::ObjectBegin => "object_begin",
+            Helper::ObjectInitName => "object_init_name",
+            Helper::ObjectInitComputed => "object_init_computed",
+            Helper::ObjectKeyToPropertyKey => "object_key_to_property_key",
+            Helper::ObjectMethodName => "object_method_name",
+            Helper::ObjectMethodComputed => "object_method_computed",
+            Helper::ObjectAccessorName => "object_accessor_name",
+            Helper::ObjectAccessorComputed => "object_accessor_computed",
+            Helper::ObjectSpread => "object_spread",
         }
     }
 
@@ -355,6 +373,32 @@ pub struct JitHelpers {
     pub array_spread: Option<extern "C" fn(vm: *mut c_void, array: u64, iterable: u64) -> u64>,
     pub array_hole: Option<extern "C" fn(vm: *mut c_void) -> u64>,
     pub array_end: Option<extern "C" fn(vm: *mut c_void, array: u64) -> u64>,
+    /// Object literal steps (Cut 53): `ObjectBegin` creates the plain
+    /// object; the init/method/accessor steps define the properties;
+    /// `ObjectKeyToPropertyKey` converts a computed key;
+    /// `ObjectSpread` copies a source's own enumerable properties.
+    pub object_begin: Option<extern "C" fn(vm: *mut c_void) -> u64>,
+    pub object_init_name: Option<
+        extern "C" fn(
+            vm: *mut c_void,
+            object: u64,
+            name: u64,
+            set_name: u64,
+            shorthand: u64,
+            value: u64,
+        ) -> u64,
+    >,
+    pub object_init_computed: Option<
+        extern "C" fn(vm: *mut c_void, object: u64, key: u64, set_name: u64, value: u64) -> u64,
+    >,
+    pub object_key_to_property_key: Option<extern "C" fn(vm: *mut c_void, key: u64) -> u64>,
+    pub object_method_name: Option<extern "C" fn(vm: *mut c_void, object: u64, step: u64) -> u64>,
+    pub object_method_computed:
+        Option<extern "C" fn(vm: *mut c_void, object: u64, key: u64, step: u64) -> u64>,
+    pub object_accessor_name: Option<extern "C" fn(vm: *mut c_void, object: u64, step: u64) -> u64>,
+    pub object_accessor_computed:
+        Option<extern "C" fn(vm: *mut c_void, object: u64, key: u64, step: u64) -> u64>,
+    pub object_spread: Option<extern "C" fn(vm: *mut c_void, object: u64, from: u64) -> u64>,
 }
 
 impl JitHelpers {
@@ -411,6 +455,15 @@ impl JitHelpers {
             array_spread: None,
             array_hole: None,
             array_end: None,
+            object_begin: None,
+            object_init_name: None,
+            object_init_computed: None,
+            object_key_to_property_key: None,
+            object_method_name: None,
+            object_method_computed: None,
+            object_accessor_name: None,
+            object_accessor_computed: None,
+            object_spread: None,
         }
     }
 
@@ -467,6 +520,19 @@ impl JitHelpers {
             Helper::ArraySpread => self.array_spread.map(|f| f as usize as u64),
             Helper::ArrayHole => self.array_hole.map(|f| f as usize as u64),
             Helper::ArrayEnd => self.array_end.map(|f| f as usize as u64),
+            Helper::ObjectBegin => self.object_begin.map(|f| f as usize as u64),
+            Helper::ObjectInitName => self.object_init_name.map(|f| f as usize as u64),
+            Helper::ObjectInitComputed => self.object_init_computed.map(|f| f as usize as u64),
+            Helper::ObjectKeyToPropertyKey => {
+                self.object_key_to_property_key.map(|f| f as usize as u64)
+            }
+            Helper::ObjectMethodName => self.object_method_name.map(|f| f as usize as u64),
+            Helper::ObjectMethodComputed => self.object_method_computed.map(|f| f as usize as u64),
+            Helper::ObjectAccessorName => self.object_accessor_name.map(|f| f as usize as u64),
+            Helper::ObjectAccessorComputed => {
+                self.object_accessor_computed.map(|f| f as usize as u64)
+            }
+            Helper::ObjectSpread => self.object_spread.map(|f| f as usize as u64),
         }
     }
 }
@@ -808,6 +874,68 @@ pub extern "C" fn test_array_hole(_vm: *mut c_void) -> u64 {
 
 pub extern "C" fn test_array_end(_vm: *mut c_void, array: u64) -> u64 {
     array
+}
+
+/// `object_begin` double: returns 70 (the object the property steps echo).
+pub extern "C" fn test_object_begin(_vm: *mut c_void) -> u64 {
+    Value::Number(70.0).bits()
+}
+
+/// The property-step doubles echo the object operand; the real definitions
+/// are exercised by the runtime's integration tests against a live object.
+pub extern "C" fn test_object_init_name(
+    _vm: *mut c_void,
+    object: u64,
+    _name: u64,
+    _set_name: u64,
+    _shorthand: u64,
+    _value: u64,
+) -> u64 {
+    object
+}
+
+pub extern "C" fn test_object_init_computed(
+    _vm: *mut c_void,
+    object: u64,
+    _key: u64,
+    _set_name: u64,
+    _value: u64,
+) -> u64 {
+    object
+}
+
+pub extern "C" fn test_object_key_to_property_key(_vm: *mut c_void, key: u64) -> u64 {
+    key
+}
+
+pub extern "C" fn test_object_method_name(_vm: *mut c_void, object: u64, _step: u64) -> u64 {
+    object
+}
+
+pub extern "C" fn test_object_method_computed(
+    _vm: *mut c_void,
+    object: u64,
+    _key: u64,
+    _step: u64,
+) -> u64 {
+    object
+}
+
+pub extern "C" fn test_object_accessor_name(_vm: *mut c_void, object: u64, _step: u64) -> u64 {
+    object
+}
+
+pub extern "C" fn test_object_accessor_computed(
+    _vm: *mut c_void,
+    object: u64,
+    _key: u64,
+    _step: u64,
+) -> u64 {
+    object
+}
+
+pub extern "C" fn test_object_spread(_vm: *mut c_void, object: u64, _from: u64) -> u64 {
+    object
 }
 
 /// Sums its numeric arguments — proves the `args` pointer/`argc` ABI the

@@ -180,6 +180,19 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
                 depth = depth.saturating_sub(2).saturating_add(1)
             }
             Step::ArrayHole | Step::ArrayEnd => {}
+            // Object literals (Cut 53): `ObjectBegin` pushes the object; an
+            // `Init` pops its value(s) + the object and pushes it back; the
+            // method/accessor/key/spread steps keep it net-neutral or pop
+            // the property's value.
+            Step::ObjectBegin => depth += 1,
+            Step::ObjectInitName { .. }
+            | Step::ObjectMethodComputed { .. }
+            | Step::ObjectAccessorComputed { .. }
+            | Step::ObjectSpread => depth = depth.saturating_sub(2).saturating_add(1),
+            Step::ObjectInitComputed { .. } => depth = depth.saturating_sub(3).saturating_add(1),
+            Step::ObjectKeyToPropertyKey
+            | Step::ObjectMethodName { .. }
+            | Step::ObjectAccessorName { .. } => {}
             // The fused slot call pops `argc` args (the callee is the
             // frame slot) and pushes the result.
             Step::CallFastSlot { argc, .. } => {
@@ -357,6 +370,15 @@ fn step_name(step: &Step) -> &'static str {
         | Step::ArraySpread
         | Step::ArrayHole
         | Step::ArrayEnd => "ArrayLiteral",
+        Step::ObjectBegin
+        | Step::ObjectInitName { .. }
+        | Step::ObjectInitComputed { .. }
+        | Step::ObjectKeyToPropertyKey
+        | Step::ObjectMethodName { .. }
+        | Step::ObjectMethodComputed { .. }
+        | Step::ObjectAccessorName { .. }
+        | Step::ObjectAccessorComputed { .. }
+        | Step::ObjectSpread => "ObjectLiteral",
         Step::ForOfNext { .. } | Step::ForInNext { .. } | Step::ForOfBegin { .. } => "ForOf/ForIn",
         Step::SwitchDisc | Step::SwitchTest { .. } => "Switch",
         Step::Break { .. } | Step::Continue { .. } => "Break/Continue",
@@ -2635,6 +2657,109 @@ impl<'a> Lowerer<'a> {
                 let array = self.pop();
                 let array = self.call_slow(self.sig_bool, Helper::ArrayEnd, &[array])?;
                 self.push(array);
+                self.fall_through(index);
+            }
+            // Object literals (Cut 53): one helper per step, mirroring the
+            // interpreter's handlers — `ObjectBegin` creates the plain
+            // object; the init/method/accessor steps define the properties
+            // with the object riding the work stack; `ObjectSpread` copies a
+            // source's own enumerable properties. The method/accessor steps
+            // pass their step index (the function/param/body payload is read
+            // back from the running body, the Cut 44 pattern).
+            Step::ObjectBegin => {
+                let object = self.call_slow(self.sig_tdz, Helper::ObjectBegin, &[])?;
+                self.push(object);
+                self.fall_through(index);
+            }
+            Step::ObjectInitName {
+                name,
+                set_name,
+                shorthand,
+            } => {
+                let value = self.pop();
+                let object = self.pop();
+                let name_imm = self.builder.ins().iconst(types::I64, *name as i64);
+                let set_imm = self.builder.ins().iconst(types::I64, i64::from(*set_name));
+                let short_imm = self.builder.ins().iconst(types::I64, i64::from(*shorthand));
+                let object = self.call_slow(
+                    self.sig_assign,
+                    Helper::ObjectInitName,
+                    &[object, name_imm, set_imm, short_imm, value],
+                )?;
+                self.push(object);
+                self.fall_through(index);
+            }
+            Step::ObjectInitComputed { set_name } => {
+                let value = self.pop();
+                let key = self.pop();
+                let object = self.pop();
+                let set_imm = self.builder.ins().iconst(types::I64, i64::from(*set_name));
+                let object = self.call_slow(
+                    self.sig_call,
+                    Helper::ObjectInitComputed,
+                    &[object, key, set_imm, value],
+                )?;
+                self.push(object);
+                self.fall_through(index);
+            }
+            Step::ObjectKeyToPropertyKey => {
+                let key = self.pop();
+                let key = self.call_slow(self.sig_bool, Helper::ObjectKeyToPropertyKey, &[key])?;
+                self.push(key);
+                self.fall_through(index);
+            }
+            Step::ObjectMethodName { .. } => {
+                let object = self.pop();
+                let step_imm = self.builder.ins().iconst(types::I64, index as i64);
+                let object = self.call_slow(
+                    self.sig_get_name,
+                    Helper::ObjectMethodName,
+                    &[object, step_imm],
+                )?;
+                self.push(object);
+                self.fall_through(index);
+            }
+            Step::ObjectMethodComputed { .. } => {
+                let key = self.pop();
+                let object = self.pop();
+                let step_imm = self.builder.ins().iconst(types::I64, index as i64);
+                let object = self.call_slow(
+                    self.sig_set_name,
+                    Helper::ObjectMethodComputed,
+                    &[object, key, step_imm],
+                )?;
+                self.push(object);
+                self.fall_through(index);
+            }
+            Step::ObjectAccessorName { .. } => {
+                let object = self.pop();
+                let step_imm = self.builder.ins().iconst(types::I64, index as i64);
+                let object = self.call_slow(
+                    self.sig_get_name,
+                    Helper::ObjectAccessorName,
+                    &[object, step_imm],
+                )?;
+                self.push(object);
+                self.fall_through(index);
+            }
+            Step::ObjectAccessorComputed { .. } => {
+                let key = self.pop();
+                let object = self.pop();
+                let step_imm = self.builder.ins().iconst(types::I64, index as i64);
+                let object = self.call_slow(
+                    self.sig_set_name,
+                    Helper::ObjectAccessorComputed,
+                    &[object, key, step_imm],
+                )?;
+                self.push(object);
+                self.fall_through(index);
+            }
+            Step::ObjectSpread => {
+                let from = self.pop();
+                let object = self.pop();
+                let object =
+                    self.call_slow(self.sig_get_comp, Helper::ObjectSpread, &[object, from])?;
+                self.push(object);
                 self.fall_through(index);
             }
             // Completion bookkeeping: `ResetCompletion`/`NormalizeCompletion`

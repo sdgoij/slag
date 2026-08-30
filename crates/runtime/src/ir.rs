@@ -9958,7 +9958,7 @@ pub(crate) fn array_set(array: &Value, key: &str, value: Value) -> Result<(), Js
 
 /// Object literal `Init` property definition (spec 13.2.5.5 step 4): the
 /// `__proto__` prototype-setter special case plus name inference.
-fn object_init(
+pub(crate) fn object_init(
     object: &Value,
     key: &PropertyName,
     value: Value,
@@ -10021,7 +10021,7 @@ fn object_init(
 /// A computed-key `Init` property definition (spec 13.2.5.5 step 4): a
 /// computed key is never the `__proto__` prototype setter, and SetFunctionName
 /// uses the key's display form (a symbol's bracketed description).
-fn object_init_key(
+pub(crate) fn object_init_key(
     obj: &crux::object::JsObject,
     key: PropertyKey,
     value: Value,
@@ -10035,7 +10035,7 @@ fn object_init_key(
 }
 
 /// MethodDefinition evaluation (spec 15.4.3) for the IR object literal steps.
-fn object_method(
+pub(crate) fn object_method(
     agent: &mut Agent,
     object: &Value,
     key: PropertyKey,
@@ -10055,7 +10055,7 @@ fn object_method(
 
 /// Accessor definition (get/set PropertyDefinition) for the IR steps.
 #[allow(clippy::too_many_arguments)]
-fn object_accessor(
+pub(crate) fn object_accessor(
     agent: &mut Agent,
     object: &Value,
     key: PropertyKey,

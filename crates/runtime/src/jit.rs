@@ -488,6 +488,41 @@ pub struct JitSlowPaths {
     /// `Step::ArrayEnd`: pop the index stack, set the array's `length`, and
     /// return the array.
     pub array_end: extern "C" fn(ctx: *mut c_void, array: u64) -> u64,
+    /// `Step::ObjectBegin`: create a plain object with the realm's
+    /// `Object.prototype` and return it (the machine code pushes it onto the
+    /// work stack for the property steps).
+    pub object_begin: extern "C" fn(ctx: *mut c_void) -> u64,
+    /// `Step::ObjectInitName`: define an own data property (with the
+    /// `__proto__` setter special case and name inference).
+    pub object_init_name: extern "C" fn(
+        ctx: *mut c_void,
+        object: u64,
+        name: u64,
+        set_name: u64,
+        shorthand: u64,
+        value: u64,
+    ) -> u64,
+    /// `Step::ObjectInitComputed`: define an own data property under a
+    /// computed (already-converted) key.
+    pub object_init_computed:
+        extern "C" fn(ctx: *mut c_void, object: u64, key: u64, set_name: u64, value: u64) -> u64,
+    /// `Step::ObjectKeyToPropertyKey`: ToPropertyKey the top value, returning
+    /// the converted String/Symbol value.
+    pub object_key_to_property_key: extern "C" fn(ctx: *mut c_void, key: u64) -> u64,
+    /// `Step::ObjectMethodName`/`ObjectMethodComputed`: define a method
+    /// (instantiate + make-method + name + define); the function payload is
+    /// read back from the running body at `step`.
+    pub object_method_name: extern "C" fn(ctx: *mut c_void, object: u64, step: u64) -> u64,
+    pub object_method_computed:
+        extern "C" fn(ctx: *mut c_void, object: u64, key: u64, step: u64) -> u64,
+    /// `Step::ObjectAccessorName`/`ObjectAccessorComputed`: define a get/set
+    /// accessor; the get/param/body payload is read back from the running
+    /// body at `step`.
+    pub object_accessor_name: extern "C" fn(ctx: *mut c_void, object: u64, step: u64) -> u64,
+    pub object_accessor_computed:
+        extern "C" fn(ctx: *mut c_void, object: u64, key: u64, step: u64) -> u64,
+    /// `Step::ObjectSpread`: copy the source's own enumerable properties.
+    pub object_spread: extern "C" fn(ctx: *mut c_void, object: u64, from: u64) -> u64,
 }
 
 /// The runtime's slow-path table, installed into every `JitHook`.
@@ -542,6 +577,15 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     array_spread,
     array_hole,
     array_end,
+    object_begin,
+    object_init_name,
+    object_init_computed,
+    object_key_to_property_key,
+    object_method_name,
+    object_method_computed,
+    object_accessor_name,
+    object_accessor_computed,
+    object_spread,
 };
 
 /// The slack (in slots) reserved above a compiled body's working area on the
@@ -1858,6 +1902,203 @@ extern "C" fn array_end(ctx: *mut c_void, array: u64) -> u64 {
     }
 }
 
+// ----- Cut 53: object literals -----
+//
+// One helper per step, mirroring the interpreter's handlers: `ObjectBegin`
+// creates the plain object (the realm's Object.prototype), the init/method/
+// accessor steps define the properties with the object riding the work
+// stack, `ObjectSpread` copies an iterable's own enumerable properties. The
+// method/accessor steps carry their function payloads in the running body
+// and read them back via the step index (the Cut 44 pattern).
+
+extern "C" fn object_begin(ctx: *mut c_void) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let proto = match agent
+        .current_realm()
+        .ok()
+        .and_then(|realm| realm.intrinsics.object_prototype())
+        .and_then(|value| crate::context::as_object(&value))
+    {
+        Some(proto) => proto,
+        None => {
+            return slow_error(
+                ctx,
+                JsError::new(ErrorKind::TypeError, "no realm Object.prototype".into()),
+            );
+        }
+    };
+    Value::Object(crux::object::JsObject::ordinary_object_create(Some(proto))).bits()
+}
+
+extern "C" fn object_init_name(
+    ctx: *mut c_void,
+    object: u64,
+    name: u64,
+    set_name: u64,
+    shorthand: u64,
+    value: u64,
+) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let object = Value::from_bits(object);
+    let value = Value::from_bits(value);
+    match crate::ir::object_init(
+        &object,
+        &syntax::ast::PropertyName::Ident(name as crux::AtomId),
+        value,
+        set_name != 0,
+        shorthand != 0,
+    ) {
+        Ok(()) => object.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn object_init_computed(
+    ctx: *mut c_void,
+    object: u64,
+    key: u64,
+    set_name: u64,
+    value: u64,
+) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let object = Value::from_bits(object);
+    let key = Value::from_bits(key);
+    let value = Value::from_bits(value);
+    let ValueKind::Object(obj) = object.kind() else {
+        return slow_error(
+            ctx,
+            JsError::new(ErrorKind::TypeError, "not an object".into()),
+        );
+    };
+    let key = match crate::context::to_property_key(agent, &key) {
+        Ok(key) => key,
+        Err(error) => return slow_error(ctx, error),
+    };
+    match crate::ir::object_init_key(&obj, key, value, set_name != 0) {
+        Ok(()) => object.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn object_key_to_property_key(ctx: *mut c_void, key: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let key = Value::from_bits(key);
+    match crate::context::to_property_key(agent, &key) {
+        Ok(crux::property::PropertyKey::String(id)) => {
+            Value::String(crux::Handle::new(crux::lookup(id))).bits()
+        }
+        Ok(crux::property::PropertyKey::Symbol(symbol)) => Value::Symbol(symbol).bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn object_method_name(ctx: *mut c_void, object: u64, step: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let object = Value::from_bits(object);
+    let Some(crate::ir::Step::ObjectMethodName { name, function }) = step_at(ctx, step) else {
+        unreachable!("object_method_name on a non-ObjectMethodName step");
+    };
+    let strict = unsafe { &*ctx.body }.strict;
+    match crate::ir::object_method(
+        agent,
+        &object,
+        crux::property::PropertyKey::String(*name),
+        function,
+        strict,
+    ) {
+        Ok(()) => object.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn object_method_computed(ctx: *mut c_void, object: u64, key: u64, step: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let object = Value::from_bits(object);
+    let key = Value::from_bits(key);
+    let Some(crate::ir::Step::ObjectMethodComputed { function }) = step_at(ctx, step) else {
+        unreachable!("object_method_computed on a non-ObjectMethodComputed step");
+    };
+    let strict = unsafe { &*ctx.body }.strict;
+    let key = match crate::context::to_property_key(agent, &key) {
+        Ok(key) => key,
+        Err(error) => return slow_error(ctx, error),
+    };
+    match crate::ir::object_method(agent, &object, key, function, strict) {
+        Ok(()) => object.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn object_accessor_name(ctx: *mut c_void, object: u64, step: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let object = Value::from_bits(object);
+    let Some(crate::ir::Step::ObjectAccessorName {
+        name,
+        get,
+        param,
+        body,
+    }) = step_at(ctx, step)
+    else {
+        unreachable!("object_accessor_name on a non-ObjectAccessorName step");
+    };
+    let strict = unsafe { &*ctx.body }.strict;
+    match crate::ir::object_accessor(
+        agent,
+        &object,
+        crux::property::PropertyKey::String(*name),
+        *get,
+        param.as_ref(),
+        body,
+        strict,
+    ) {
+        Ok(()) => object.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn object_accessor_computed(ctx: *mut c_void, object: u64, key: u64, step: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let object = Value::from_bits(object);
+    let key = Value::from_bits(key);
+    let Some(crate::ir::Step::ObjectAccessorComputed { get, param, body }) = step_at(ctx, step)
+    else {
+        unreachable!("object_accessor_computed on a non-ObjectAccessorComputed step");
+    };
+    let strict = unsafe { &*ctx.body }.strict;
+    let key = match crate::context::to_property_key(agent, &key) {
+        Ok(key) => key,
+        Err(error) => return slow_error(ctx, error),
+    };
+    match crate::ir::object_accessor(agent, &object, key, *get, param.as_ref(), body, strict) {
+        Ok(()) => object.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn object_spread(ctx: *mut c_void, object: u64, from: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let object = Value::from_bits(object);
+    let from = Value::from_bits(from);
+    let ValueKind::Object(obj) = object.kind() else {
+        return slow_error(
+            ctx,
+            JsError::new(ErrorKind::TypeError, "not an object".into()),
+        );
+    };
+    match crate::expr::copy_data_properties(agent, &obj, &from) {
+        Ok(()) => object.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
 extern "C" fn init_context(ctx: *mut c_void, index: u64, value: u64) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
     let vm = unsafe { &mut *ctx.vm };
@@ -2304,6 +2545,15 @@ mod tests {
         assert_ne!(JIT_SLOW_PATHS.array_spread as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.array_hole as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.array_end as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.object_begin as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.object_init_name as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.object_init_computed as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.object_key_to_property_key as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.object_method_name as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.object_method_computed as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.object_accessor_name as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.object_accessor_computed as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.object_spread as usize, 0);
     }
 
     #[test]
