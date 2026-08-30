@@ -271,6 +271,22 @@ pub struct Agent {
     /// the existing body-AST cache.
     pub(crate) compiled_bodies:
         std::collections::HashMap<usize, crate::function::CompiledBodyCacheEntry>,
+    /// Per-source compiled SCRIPT/EVAL bodies, keyed by the exact
+    /// source text + (strict, fast_script). `run_script`/`perform_eval`
+    /// re-parse the same source into a fresh AST each call, so without this
+    /// the `compile_statements` IR (and the JIT machine code via the
+    /// per-body `jit_info` fast pointer) recompiled on every re-evaluation —
+    /// an eval-in-a-loop recompiled per iteration. The key is exact (the
+    /// content-hashed `JsString`, not a source hash), the body is a pure
+    /// function of (source, strict, fast_script) — eval's per-call
+    /// declaration instantiation and env setup stay per-eval — and the
+    /// cache is traced like `compiled_bodies` so the literal `Value`s stay
+    /// rooted. Entries live for the agent's life (scripts/eval sites are
+    /// rare and small; consistent with the function caches).
+    pub(crate) script_bodies: std::collections::HashMap<
+        (crux::JsString, bool, bool),
+        std::rc::Rc<crate::ir::CompiledBody>,
+    >,
     /// The Promise Records keyed by promise-object identity (spec 27.2.1).
     pub promises: std::collections::HashMap<u64, RefCell<crate::promise::PromiseData>>,
     /// The resolving functions created by CreateResolvingFunctions, keyed by
@@ -686,6 +702,7 @@ impl Agent {
             module_eval_stack: Vec::new(),
             ecma_functions: std::collections::HashMap::default(),
             compiled_bodies: std::collections::HashMap::new(),
+            script_bodies: std::collections::HashMap::new(),
             promises: std::collections::HashMap::new(),
             promise_resolvers: std::collections::HashMap::new(),
             promise_compound: std::collections::HashMap::new(),
@@ -1064,6 +1081,12 @@ impl Agent {
         self.module_eval_stack.trace(visit);
         for entry in self.compiled_bodies.values() {
             entry.compiled.trace(visit);
+        }
+        // Cut 63: the script/eval compiled-body cache — the source KEY is a
+        // heap edge too (the value body is traced like `compiled_bodies`).
+        for (key, body) in &self.script_bodies {
+            key.0.trace(visit);
+            body.trace(visit);
         }
         self.ecma_functions.trace(visit);
         self.promises.trace(visit);

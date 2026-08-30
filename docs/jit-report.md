@@ -231,8 +231,14 @@ iterator-close on completion, and the next-error-keeps-iterator-open
 shapes, and the Cut 60 sloppy mapped arguments (index reads, aliasing both
 ways, `arguments.callee`, strict unmapped non-aliasing, captured params
 shared with a closure) and strict-unmapped-returned-object (leaf-frame
-regression) shapes);
-`cargo clippy --workspace --all-targets -- -D warnings` clean.
+regression) shapes, the Cut 61 super shapes (calls, computed read/call
+stack shapes, assign/compound, prefix/postfix updates, logical assign,
+async method, delete ReferenceError, static/inherited base, read-vs-call
+shapes), and the Cut 62 misc shapes (`new.target` normal-call/construct,
+heap string loop, heap bigint leaf, direct-eval `CallFast` lowering));
+`cargo clippy --workspace --all-targets -- -D warnings` clean. The Cut 63
+script/eval compiled-body cache is covered by a runtime test
+(`script_and_eval_bodies_cache_per_source`).
 
 **The headline fix**: `tco-call-args.js` (a `getF()` closure per TCO step)
 went **15.9s → 0.26s** under `--jit`. Root cause:
@@ -311,9 +317,17 @@ containing any of these fall back entirely:
    accessor-in-a-loop with a per-iteration call: `--jit` 1100ms → ~82ms
    (~13×) and the interpreter 120ms → ~80ms (the per-instantiation IR
    recompile was hurting both paths).
-2. **Script/eval bodies** are not in the per-site compiled-body cache
-   (`compile_statements`), so re-evaluating the same source recompiles. Lower
-   priority (scripts aren't leaf callees, and repeat-eval-in-loop is uncommon).
+2. ~~**Script/eval bodies**~~ — **done** (Cut 63): `eval_program` now
+   consults a per-agent `script_bodies` cache keyed by the exact source text
+   + (strict, fast_script) — re-evaluating the same source reuses the
+   compiled IR (the parse and the per-eval declaration instantiation still
+   run; the compile — and the JIT machine code via the shared per-body
+   `jit_info` fast pointer, should scripts ever JIT — do not repeat). Sound
+   because the eval parse context (`in_function`/`in_method`/private names)
+   only gates whether a source parses (early errors), never the AST it
+   produces, and a direct eval's caller-inherited strictness is part of the
+   key. Repeat-eval-in-loop (an `eval(src)` in a loop) no longer recompiles
+   per iteration.
 3. **`params.clone()` per closure instantiation** (both `register_function`
    callers and arrows) — minor per-instantiation allocation; could share the
    params `Vec` per site too.

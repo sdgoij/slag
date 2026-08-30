@@ -75,7 +75,7 @@ pub fn script_evaluation(
     let strict = script_is_strict(&script.source, &script.code);
     let result = (|| -> Result<Value, JsError> {
         global_declaration_instantiation(agent, &script.code, &global_env, strict)?;
-        crate::eval::eval_program(agent, &script.code, strict, true)
+        crate::eval::eval_program(agent, &script.code, strict, true, Some(&script.source))
     })();
 
     agent.execution_context_stack.pop();
@@ -830,7 +830,7 @@ pub fn perform_eval(
     agent.execution_context_stack.push(eval_context);
     let result = (|| -> Result<Value, JsError> {
         eval_declaration_instantiation(agent, &program, &variable_env, &lexical_env, strict_eval)?;
-        crate::eval::eval_program(agent, &program, strict_eval, false)
+        crate::eval::eval_program(agent, &program, strict_eval, false, Some(source))
     })();
     agent.execution_context_stack.pop();
     result
@@ -1455,6 +1455,65 @@ mod tests {
     #[test]
     fn empty_eval_returns_undefined() {
         assert_eq!(evaluated("").unwrap(), Value::Undefined);
+    }
+
+    #[test]
+    fn script_and_eval_bodies_cache_per_source() {
+        // Cut 63: re-evaluating the same source reuses the compiled body —
+        // `script_bodies` is keyed by the exact source + (strict,
+        // fast_script), so the same eval source evaluated twice (and a
+        // `run_script` of the same text) lands one entry, while a different
+        // source or a different strict/eval goal lands its own.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let source = JsString::from_utf8("var x = 1; x + 1");
+        assert_eq!(
+            perform_eval(&mut agent, &source, false, true).unwrap(),
+            Value::Number(2.0)
+        );
+        assert_eq!(
+            perform_eval(&mut agent, &source, false, true).unwrap(),
+            Value::Number(2.0)
+        );
+        assert_eq!(agent.script_bodies.len(), 1, "same eval source caches once");
+        // The same text through `run_script` is a different goal (fast_script
+        // = true) — a second entry, but the second run_script reuses it.
+        assert_eq!(
+            agent.run_script("var x = 1; x + 1").unwrap(),
+            Value::Number(2.0)
+        );
+        assert_eq!(
+            agent.run_script("var x = 1; x + 1").unwrap(),
+            Value::Number(2.0)
+        );
+        assert_eq!(
+            agent.script_bodies.len(),
+            2,
+            "script and eval goals are separate"
+        );
+        // A direct eval inheriting a STRICT caller compiles the same source
+        // under strictness — its own entry.
+        assert_eq!(
+            perform_eval(&mut agent, &source, true, true).unwrap(),
+            Value::Number(2.0)
+        );
+        assert_eq!(
+            agent.script_bodies.len(),
+            3,
+            "strictness is part of the key"
+        );
+        // A different source is a fresh entry.
+        assert_eq!(
+            perform_eval(
+                &mut agent,
+                &JsString::from_utf8("var y = 2; y * 2"),
+                false,
+                true
+            )
+            .unwrap(),
+            Value::Number(4.0)
+        );
+        assert_eq!(agent.script_bodies.len(), 4);
     }
 
     #[test]

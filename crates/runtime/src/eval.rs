@@ -29,14 +29,38 @@ use crate::script::bound_names;
 /// executes bytecode (the top-level path is compiled like any body).
 /// `fast_script` certifies top-level *script* evaluation for the
 /// script-level binding fast path; eval bodies pass `false` (they can see
-/// the caller's lexical environment).
+/// the caller's lexical environment). `source` (Cut 63) keys the per-agent
+/// compiled-body cache — re-evaluating the same source reuses the compiled
+/// IR (the parse still runs; the compile and the JIT machine code do not
+/// repeat). `None` compiles fresh (modules evaluate once).
 pub fn eval_program(
     agent: &mut Agent,
     program: &Program,
     strict: bool,
     fast_script: bool,
+    source: Option<&crux::JsString>,
 ) -> Result<Value, JsError> {
-    let body = crate::ir::compile_statements(&program.body, strict, fast_script)?;
+    let body = match source {
+        Some(source) => {
+            let key = (source.clone(), strict, fast_script);
+            if let Some(body) = agent.script_bodies.get(&key) {
+                body.clone()
+            } else {
+                let body = std::rc::Rc::new(crate::ir::compile_statements(
+                    &program.body,
+                    strict,
+                    fast_script,
+                )?);
+                agent.script_bodies.insert(key, body.clone());
+                body
+            }
+        }
+        None => std::rc::Rc::new(crate::ir::compile_statements(
+            &program.body,
+            strict,
+            fast_script,
+        )?),
+    };
     let env = agent.running_context()?.lexical_environment;
     let mut vm = agent.take_vm(env, strict);
     // Cut 16: a slotified script's declared vars live in the frame — the

@@ -718,6 +718,32 @@ bloat). Interleave base/new per pair and cancel the order; use a
 5M-iteration isolated timer (not the full bench) to amplify the signal
 above the load noise.
 
+## Script/eval compiled bodies cache per source (Cut 63)
+
+`run_script`/`perform_eval` re-parse the same source into a fresh AST every
+call, so `eval_program` now consults a per-agent `script_bodies` cache
+(`Agent::script_bodies`) keyed by the EXACT source `JsString` +
+`(strict, fast_script)` — the compiled IR (and, via the shared per-body
+`jit_info` fast pointer, the JIT machine code) no longer recompiles on
+re-evaluation. Traps if you extend it:
+
+- **The key is sound because the eval parse context only gates SUCCESS,
+  never the AST.** The `EvalContext` (`in_function`/`in_method`/private
+  names) decides whether `new.target`/`super`/`#x` parse (early errors)
+  — a source that parses produces the same `Program` in every context, so
+  the same compiled body is correct for all of them. The one flag that
+  DOES change the compile is a direct eval's caller-inherited strictness
+  (`strict_eval = strict_caller || script_is_strict(...)`) — it is part
+  of the key.
+- **The cache must be traced** (the bodies hold literal `Value`s) — the
+  source KEY is a heap edge too, so trace it manually like
+  `host_modules` (the generic HashMap trace visits values only).
+- **Certified scripts still never JIT** — `eval_program` runs through
+  `vm.start` (the pure interpreter); `run_jit_body` is only reached from
+  `run_compiled_body` (ordinary calls) and the generator/async drivers.
+  The cache's JIT benefit is latent: a shared body's `jit_info` would be
+  warm if scripts ever become JIT-eligible.
+
 ## Validation loop
 
 `cargo clippy --workspace --all-targets -- -D warnings` clean, then
