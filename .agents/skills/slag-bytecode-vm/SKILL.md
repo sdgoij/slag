@@ -744,6 +744,25 @@ re-evaluation. Traps if you extend it:
   The cache's JIT benefit is latent: a shared body's `jit_info` would be
   warm if scripts ever become JIT-eligible.
 
+## Function params are a shared site-level slice (Cut 64)
+
+`EcmaFunction.params` is `Rc<[BindingElement]>`, shared across every
+closure from the same declaration site via `shared_params` (keyed by the
+shared body `Rc<Block>` — `shared_function_body`/`shared_arrow_body`/
+`shared_accessor_body` are the canonical site identities). Traps:
+
+- **The slice is immutable by contract** — it is shared across closures, so
+  never mutate it (readers take `&[BindingElement]` via deref coercion;
+  `record.params.clone()` in `ordinary_call`/`tail_prepare_ordinary` is a
+  cheap Rc clone now, not a deep copy).
+- **Keying on the body pointer is sound because the body caches are
+  unbounded**: a shared `Rc<Block>` is never dropped, so its address is
+  never reused by a different site. The one non-cached block — the default
+  constructor's synthetic empty one — always has empty params, so a reused
+  address there would serve the same empty slice.
+- The compiler/analyzer (`analyze_scope`) iterates `function.params` —
+  unchanged via deref.
+
 ## Validation loop
 
 `cargo clippy --workspace --all-targets -- -D warnings` clean, then

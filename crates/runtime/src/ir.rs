@@ -4209,7 +4209,7 @@ impl Vm {
                     let value = crate::function::instantiate_arrow(
                         agent,
                         *is_async,
-                        params.clone(),
+                        params.as_slice(),
                         body,
                         env,
                         *strict,

@@ -1662,7 +1662,7 @@ extern "C" fn create_arrow(ctx: *mut c_void, step: u64) -> u64 {
     match crate::function::instantiate_arrow(
         agent,
         *is_async,
-        params.clone(),
+        params.as_slice(),
         body,
         env,
         *strict,

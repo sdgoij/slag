@@ -128,7 +128,12 @@ pub(crate) struct CompiledBodyCacheEntry {
 #[derive(Debug, Clone)]
 pub struct EcmaFunction {
     pub name: Option<JsString>,
-    pub params: Vec<BindingElement>,
+    /// Cut 64: the site's params, shared across every closure from the same
+    /// declaration site (`shared_params`, keyed by the shared body `Rc`)
+    /// — instantiating a closure in a loop no longer deep-clones the param
+    /// list (params are immutable; readers take `&[BindingElement]` via
+    /// deref coercion).
+    pub params: std::rc::Rc<[BindingElement]>,
     /// Shared so clones of the record (ordinary_call reads a copy) keep the
     /// same body AST nodes — the template-object cache keys sites by node
     /// identity within a parse.
@@ -510,10 +515,11 @@ pub fn instantiate_function_with_source(
 ) -> Result<Value, JsError> {
     let source = source.or_else(|| capture_source(agent, f.span));
     let body = shared_function_body(agent, f, source.as_ref());
+    let params = shared_params(&body, &f.params);
     let value = register_function(
         agent,
         default_binding_display_name(f.name.map(crux::lookup)),
-        f.params.clone(),
+        params,
         body,
         environment,
         enclosing_strict,
@@ -585,6 +591,37 @@ type FunctionBodyCache = std::collections::HashMap<FunctionBodyKey, std::rc::Rc<
 
 thread_local! {
     static FUNCTION_BODY_CACHE: std::cell::RefCell<FunctionBodyCache> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The site's shared params slice (Cut 64): every closure from the same
+/// declaration site shares one `Rc<[BindingElement]>` instead of cloning the
+/// param list per instantiation. The shared body `Rc<Block>` (from
+/// `shared_function_body`/`shared_arrow_body`/`shared_accessor_body`) is the
+/// canonical site identity, and the body caches are unbounded — the block
+/// is never dropped, so its pointer is never reused — making the pointer a
+/// sound key. The one non-cached block, the default constructor's synthetic
+/// empty one, always carries empty params, so a reused address (a dropped
+/// default-ctor block) would serve the same empty params.
+pub(crate) fn shared_params(
+    body: &std::rc::Rc<Block>,
+    params: &[BindingElement],
+) -> std::rc::Rc<[BindingElement]> {
+    let key = std::rc::Rc::as_ptr(body) as usize;
+    PARAMS_CACHE.with(|cache| {
+        if let Some(shared) = cache.borrow().get(&key) {
+            return shared.clone();
+        }
+        let shared: std::rc::Rc<[BindingElement]> = std::rc::Rc::from(params.to_vec());
+        cache.borrow_mut().insert(key, shared.clone());
+        shared
+    })
+}
+
+type ParamsCache = std::collections::HashMap<usize, std::rc::Rc<[BindingElement]>>;
+
+thread_local! {
+    static PARAMS_CACHE: std::cell::RefCell<ParamsCache> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
@@ -697,10 +734,11 @@ pub fn instantiate_method(
 ) -> Result<Value, JsError> {
     let source = capture_source(agent, f.span);
     let body = shared_function_body(agent, f, source.as_ref());
+    let params = shared_params(&body, &f.params);
     register_function(
         agent,
         None,
-        f.params.clone(),
+        params,
         body,
         environment,
         enclosing_strict,
@@ -726,6 +764,7 @@ pub fn instantiate_accessor(
     // so the compiled IR + JIT code compile once per getter/setter site
     // instead of per instantiation.
     let body = shared_accessor_body(agent, body);
+    let params = shared_params(&body, &params);
     register_function(
         agent,
         None,
@@ -746,7 +785,7 @@ pub fn instantiate_accessor(
 /// true (bare calls throw), and the class name as its eventual name.
 pub fn instantiate_class_constructor(
     agent: &mut Agent,
-    params: Vec<BindingElement>,
+    params: std::rc::Rc<[BindingElement]>,
     body: std::rc::Rc<Block>,
     environment: EnvRef,
     enclosing_strict: bool,
@@ -763,7 +802,7 @@ pub fn instantiate_default_derived_constructor(
 ) -> Result<Value, JsError> {
     instantiate_class_constructor_with(
         agent,
-        Vec::new(),
+        std::rc::Rc::from(Vec::<BindingElement>::new()),
         std::rc::Rc::new(Block {
             stmts: Vec::new(),
             span: crux::Span::new(0, 0),
@@ -776,7 +815,7 @@ pub fn instantiate_default_derived_constructor(
 
 fn instantiate_class_constructor_with(
     agent: &mut Agent,
-    params: Vec<BindingElement>,
+    params: std::rc::Rc<[BindingElement]>,
     body: std::rc::Rc<Block>,
     environment: EnvRef,
     enclosing_strict: bool,
@@ -853,7 +892,7 @@ fn shared_compiled_body(
 fn register_function(
     agent: &mut Agent,
     name: Option<JsString>,
-    params: Vec<BindingElement>,
+    params: std::rc::Rc<[BindingElement]>,
     body: std::rc::Rc<Block>,
     environment: EnvRef,
     enclosing_strict: bool,
@@ -1148,11 +1187,13 @@ pub fn instantiate_dynamic_function(
         .as_ref()
         .map(|source| body_is_strict(agent, &f.body, Some(source)))
         .unwrap_or(false);
+    let body = shared_function_body(agent, f, source.as_ref());
+    let params = shared_params(&body, &f.params);
     let value = register_function(
         agent,
         f.name.map(crux::lookup),
-        f.params.clone(),
-        shared_function_body(agent, f, source.as_ref()),
+        params,
+        body,
         environment,
         false,
         DefinitionKind::function(f.is_async, f.is_generator),
@@ -1175,7 +1216,7 @@ pub fn instantiate_dynamic_function(
 pub fn instantiate_arrow(
     agent: &mut Agent,
     is_async: bool,
-    params: Vec<BindingElement>,
+    params: &[BindingElement],
     body: &syntax::ast::ArrowBody,
     environment: EnvRef,
     enclosing_strict: bool,
@@ -1192,6 +1233,7 @@ pub fn instantiate_arrow(
     let private_environment = agent.running_context()?.private_environment;
     let strict = body_is_strict(agent, &block, None) || enclosing_strict;
     let class_field_initializer = agent.field_initializer_depth > 0;
+    let params = shared_params(&block, params);
     let mut data = EcmaFunction {
         name: None,
         params,
@@ -3231,6 +3273,38 @@ mod tests {
 
     fn number(value: f64) -> Value {
         Value::Number(value)
+    }
+
+    #[test]
+    fn closures_from_the_same_site_share_params() {
+        // Cut 64: two closures from the same declaration site share one
+        // params slice — `shared_params` keys the `Rc<[BindingElement]>` by
+        // the shared body `Rc<Block>`, so a closure-creation loop no longer
+        // deep-clones the param list per instantiation.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script(
+                "function make() { return function f(a, b) { return a + b; }; }\n\
+                 var f1 = make(); var f2 = make();",
+            )
+            .unwrap();
+        // The two closures from the `function f(a, b)` site share one body
+        // Rc (and one compiled body); every other record (make) is its own
+        // site. Find the sharing pair and assert the params Rc is shared
+        // too.
+        let records: Vec<&EcmaFunction> = agent.ecma_functions.values().collect();
+        let mut pairs = 0;
+        for i in 0..records.len() {
+            for j in (i + 1)..records.len() {
+                if std::rc::Rc::ptr_eq(&records[i].body, &records[j].body) {
+                    pairs += 1;
+                    assert!(std::rc::Rc::ptr_eq(&records[i].params, &records[j].params));
+                    assert_eq!(records[i].params.len(), 2);
+                }
+            }
+        }
+        assert_eq!(pairs, 1, "exactly the f1/f2 closures share a site");
     }
 
     fn object(props: &[(&str, f64)]) -> Value {

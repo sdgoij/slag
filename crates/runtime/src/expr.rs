@@ -63,7 +63,7 @@ pub fn eval_expr(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Value, 
             crate::function::instantiate_arrow(
                 agent,
                 *is_async,
-                params.clone(),
+                params.as_slice(),
                 body,
                 env,
                 strict,

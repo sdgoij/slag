@@ -328,9 +328,13 @@ containing any of these fall back entirely:
    produces, and a direct eval's caller-inherited strictness is part of the
    key. Repeat-eval-in-loop (an `eval(src)` in a loop) no longer recompiles
    per iteration.
-3. **`params.clone()` per closure instantiation** (both `register_function`
-   callers and arrows) — minor per-instantiation allocation; could share the
-   params `Vec` per site too.
+3. ~~**`params.clone()` per closure instantiation**~~ — **done** (Cut 64):
+   `EcmaFunction.params` is now a shared `Rc<[BindingElement]>`
+   (`shared_params`, keyed by the shared body `Rc<Block>` — the canonical
+   site identity), so instantiating a closure in a loop (and the uncertified
+   call/TCO paths that read the record) no longer deep-clones the param
+   list per closure/call. Readers take `&[BindingElement]` via deref
+   coercion unchanged.
 
 **Performance (the remaining benchmark rows and hot shapes):**
 

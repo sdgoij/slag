@@ -293,13 +293,9 @@ fn build_class(
     let ctor = match ctor_element {
         Some(function) => {
             let ctor_source = crate::function::capture_source(agent, function.span);
-            instantiate_class_constructor(
-                agent,
-                function.params.clone(),
-                crate::function::shared_function_body(agent, function, ctor_source.as_ref()),
-                class_env,
-                true,
-            )?
+            let body = crate::function::shared_function_body(agent, function, ctor_source.as_ref());
+            let params = crate::function::shared_params(&body, &function.params);
+            instantiate_class_constructor(agent, params, body, class_env, true)?
         }
         None => default_constructor(agent, super_constructor.is_some(), &class_env)?,
     };
@@ -669,7 +665,7 @@ fn default_constructor(
     } else {
         instantiate_class_constructor(
             agent,
-            Vec::new(),
+            std::rc::Rc::from(Vec::<BindingElement>::new()),
             std::rc::Rc::new(Block {
                 stmts: Vec::new(),
                 span: crux::Span::new(0, 0),
