@@ -62,8 +62,10 @@ run paths:
 | 19 | *(worktree)* | **Self-tail-call as a jump** — `TailCallSelf` (Cut 46): a tail call whose callee is the enclosing named function expression's own immutable self-binding compiles to an in-place frame rebind + jump back to the body's re-entry block, so the whole self-recursive tail chain runs in ONE machine-code invocation (no `tail_call` helper, no `run_compiled_body` round-trip). The compiler emits it only for certified capture-free, arguments-free bodies with the self-name resolving to the `Env` walk; the interpreter's `tail_call_self` rebinds the frame and re-enters the dispatch loop for the same shape. Measured ~3.3× faster than the round-trip path on a 1M-iteration chain (37ms vs ~120ms). |
 | 20 | *(worktree)* | **Global-name self-tail-call check** — `TailCallSelfCheck` (Cut 47): a tail call to the enclosing function's own NAME in a body that is not a named expression (`function f(n) { return f(n - 1); }`) — the name resolves through the global/outer env and could have been reassigned, so the machine code compares the resolved callee against the running closure (`Vm::current_function` captured into `JitCallContext::current_function`, exact bits) and jumps to the re-entry block on a match, else runs the `tail_call` helper. The interpreter routes it through the shared `tail_call_shared` machinery. The 1M global-name chain drops from ~120ms to ~38ms, matching the static form. |
 | 21 | *(worktree)* | **Vector call form** (Cut 49): `ArgsBase`/`ArgsPush`/`ArgsSpread` and the vector `Call`/`TailCall` steps — a ≥3-argument or spread call (which previously bailed the whole body to the interpreter) — lower to helpers that build the argument vector in `Vm::args` and run the interpreter's vector handlers (`do_call`/`tail_call`), bridging the work-buffer operands like `call_slow`. A 3-arg loop compiles for the first time; a ≥3-arg TCO chain runs with bounded stack. |
+| 22 | *(worktree)* | **Fast-argument cap raised to 8 + direct-eval vector routing** (Cut 50): `FAST_CALL_MAX_ARGS = 8` — plain calls with 3–8 args now take the fast `CallFast`/`TailCallFast` form (leaf-inline eligible) instead of the vector form; a direct `eval` ALWAYS takes the vector form (the fast form's JIT path bails on eval, and the vector handlers route it correctly). `call_vector` routes through `do_call_fast` (the same leaf-inline core as a `CallFast` site); `run_inline_leaf`'s argument buffer grew to `FAST_CALL_MAX_ARGS` with a Vec fallback for the (rare) vector-form count beyond it. A 1M 3-arg leaf call drops ~220ms → ~95ms under `--jit`. |
+| 23 | *(worktree)* | **Vector-form self-tail-call as a jump** (Cut 51): `TailCallSelfVector`/`TailCallSelfCheckVector` — a self-tail-call whose arguments took the vector form (a spread, or more than `FAST_CALL_MAX_ARGS` plain args) now rebinds the frame in place from the Vm's argument vector (`tail_call_self_vector` helper — no frame realloc, the JIT's frame pointer stays live) and jumps back to the body's re-entry block, the same single-invocation self-chain as the fast-form jump. The checked form compares the resolved callee against `current_function` first and falls back to the general vector `tail_call` helper on a mismatch. A 500K-deep 10-arg self-tail-call runs ~27ms under `--jit` (vs ~62ms interpreter; the pre-jump round-trip was ~10µs/iteration). |
 
-### Slow-path helper table (`JitSlowPaths`, 43 helpers)
+### Slow-path helper table (`JitSlowPaths`, 44 helpers)
 
 The JIT inlines the number/string fast paths (tag checks are ~2 instructions
 on NaN-boxed values); everything else calls a helper whose address is baked
@@ -80,7 +82,8 @@ into the machine code at compile time. The table: `binary_slow`,
 `create_function`/`create_arrow`/`create_function_decl`/`new_target`/
 `regexp_literal` (the step-index helpers), `tail_call` (proper tail calls),
 `args_base`/`args_push`/`args_spread`/`call_vector`/`tail_call_vector` (the
-vector call form, Cut 49). A body needing a `None` helper bails to the
+vector call form, Cut 49), `tail_call_self_vector` (the vector-form
+self-tail-call rebind, Cut 51). A body needing a `None` helper bails to the
 interpreter.
 
 ## 3. Fast-path machinery
@@ -166,10 +169,11 @@ containing any of these fall back entirely:
 
 - **Closure creation** (`CreateFunction`, `CreateArrow`, `FunctionDeclInit`),
   `NewTarget`, and `RegExpLiteral` are now **compiled** (Cut 44) — see the
-  implemented table. Same for **proper tail calls** (`TailCallFast` and the
-  fused global/slot forms, Cut 45); the vector form `TailCall` is unreachable
-  from the JIT (`ArgsBase`/`ArgsPush` still bail), and sloppy-mode `return
-  f(n-1)` compiles as a normal call (TCO is strict-only by spec).
+  implemented table. Same for **proper tail calls** (Cut 45, incl. the
+  fused global/slot forms and — Cut 49 — the vector form `TailCall`), with
+  the NFE (Cut 46), global-name-checked (Cut 47), and vector-form (Cut 51)
+  self-tail-calls jumping in machine code; sloppy-mode `return f(n-1)`
+  compiles as a normal call (TCO is strict-only by spec).
 - **Env machinery**: `EnterBlock`/`LeaveBlock`, `EnterWith`, `EnterTry`/
   `Exit`/`CatchBind`/`FinallyEnd`, `PerIteration`/`EnterLoopEnv`/
   `EnterPerIteration` (creation), `UsingInit`/`DeclInit`.
@@ -224,14 +228,16 @@ containing any of these fall back entirely:
 7. **Extend the bail list**: `try/catch/finally`, `switch`, `with`, `using`,
    iterators, generators/async, destructuring/spread, class machinery, mapped
    `arguments` — each is a slice of lowering + helper work. Proper tail calls
-   are **done** (Cut 45); the NAMED (Cut 46) and global-name (Cut 47)
-   self-tail-call forms jump in machine code; the **vector call form**
-   (≥3 args or a spread — `ArgsBase`/`ArgsPush`/`ArgsSpread` + the vector
-   `Call`/`TailCall`) is **done** (Cut 49), though a vector call to a
-   certified LEAF still runs the general `call_inner` (no leaf-inline — a
-   future slice could rebuild the fast-form layout in machine code). Only a
-   computed callee (`getF()(n-1)`) still pays the per-iteration `tail_call`
-   helper round-trip.
+   are **done** (Cut 45); the NAMED (Cut 46), global-name (Cut 47), and
+   **vector-form** (Cut 51 — a spread or >8 plain args now rebinds the frame
+   from the Vm's argument vector and jumps) self-tail-call forms run in
+   machine code; the **vector call form** (Cut 49) is done, though a vector
+   call to a certified LEAF still runs the general `call_inner` (no
+   leaf-inline — a future slice could rebuild the fast-form layout in machine
+   code). A computed callee (`getF()(n-1)`) still pays the per-iteration
+   `tail_call` helper round-trip, and a spread self-tail-call is still
+   interpreter-bound while the body contains an array literal (no
+   `ArrayBegin`/`ArrayEnd` lowering yet — the jump itself is ready).
 8. **String concat**: the `concat_strings` helper is called per concat; very
    small strings could concat inline in registers.
 9. **Leaf-cache invalidation breadth**: any "disturbing" helper (a `valueOf`,

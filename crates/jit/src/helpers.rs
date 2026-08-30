@@ -65,6 +65,7 @@ pub enum Helper {
     ArgsSpread,
     CallVector,
     TailCallVector,
+    TailCallSelfVector,
 }
 
 impl Helper {
@@ -114,6 +115,7 @@ impl Helper {
             Helper::ArgsSpread => "args_spread",
             Helper::CallVector => "call_vector",
             Helper::TailCallVector => "tail_call_vector",
+            Helper::TailCallSelfVector => "tail_call_self_vector",
         }
     }
 
@@ -330,6 +332,11 @@ pub struct JitHelpers {
         Option<extern "C" fn(vm: *mut c_void, this: u64, callee: u64, direct_eval: u64) -> u64>,
     pub tail_call_vector:
         Option<extern "C" fn(vm: *mut c_void, this: u64, callee: u64, direct_eval: u64) -> u64>,
+    /// Cut 51: the vector-form self-tail-call (`Step::TailCallSelfVector`,
+    /// and `TailCallSelfCheckVector`'s identity-match path): rebind the
+    /// frame in place from the Vm's argument vector; returns 1 when the
+    /// machine code should jump back to the body's re-entry.
+    pub tail_call_self_vector: Option<extern "C" fn(vm: *mut c_void) -> u64>,
 }
 
 impl JitHelpers {
@@ -380,6 +387,7 @@ impl JitHelpers {
             args_spread: None,
             call_vector: None,
             tail_call_vector: None,
+            tail_call_self_vector: None,
         }
     }
 
@@ -430,6 +438,7 @@ impl JitHelpers {
             Helper::ArgsSpread => self.args_spread.map(|f| f as usize as u64),
             Helper::CallVector => self.call_vector.map(|f| f as usize as u64),
             Helper::TailCallVector => self.tail_call_vector.map(|f| f as usize as u64),
+            Helper::TailCallSelfVector => self.tail_call_self_vector.map(|f| f as usize as u64),
         }
     }
 }
@@ -739,6 +748,14 @@ pub extern "C" fn test_tail_call_vector(
     _direct_eval: u64,
 ) -> u64 {
     Value::Number(54.0).bits()
+}
+
+/// Returns `1` (the success signal) — proves `tail_call_self_vector` was
+/// called with the right (ctx-only) ABI; the scaffold tests exercise the
+/// frame-rebind against a real Vm through the runtime's own integration
+/// tests instead (the rebind needs a live frame buffer).
+pub extern "C" fn test_tail_call_self_vector(_vm: *mut c_void) -> u64 {
+    1
 }
 
 /// Sums its numeric arguments — proves the `args` pointer/`argc` ABI the

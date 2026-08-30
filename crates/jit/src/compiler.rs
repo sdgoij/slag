@@ -331,7 +331,9 @@ fn step_name(step: &Step) -> &'static str {
         | Step::TailCallFastGlobal { .. }
         | Step::TailCallFastSlot { .. }
         | Step::TailCallSelf { .. }
-        | Step::TailCallSelfCheck { .. } => "TailCall",
+        | Step::TailCallSelfCheck { .. }
+        | Step::TailCallSelfVector
+        | Step::TailCallSelfCheckVector => "TailCall",
         Step::Throw => "Throw",
         Step::LoadIdent { .. } => "LoadIdent",
         Step::Unary(_) => "Unary",
@@ -386,7 +388,10 @@ fn step_targets(step: &Step) -> Vec<usize> {
         Step::ForOfNextBindLocal { back, .. } => vec![*back],
         // Cut 46: a self-tail-call jumps to the body's re-entry block, not
         // to a step block (see `Lowerer::reentry_block`).
-        Step::TailCallSelf { .. } | Step::TailCallSelfCheck { .. } => Vec::new(),
+        Step::TailCallSelf { .. }
+        | Step::TailCallSelfCheck { .. }
+        | Step::TailCallSelfVector
+        | Step::TailCallSelfCheckVector => Vec::new(),
         _ => Vec::new(),
     }
 }
@@ -594,7 +599,10 @@ impl<'a> Lowerer<'a> {
         let has_self_tail_call = body.steps.iter().any(|step| {
             matches!(
                 step,
-                Step::TailCallSelf { .. } | Step::TailCallSelfCheck { .. }
+                Step::TailCallSelf { .. }
+                    | Step::TailCallSelfCheck { .. }
+                    | Step::TailCallSelfVector
+                    | Step::TailCallSelfCheckVector
             )
         });
         if has_self_tail_call {
@@ -2171,6 +2179,102 @@ impl<'a> Lowerer<'a> {
                 // callee (a reassigned name, or a cross-body call).
                 self.builder.switch_to_block(helper_block);
                 self.emit_tail_call(callee, this, argc, args_ptr, false)?;
+                self.builder.seal_block(helper_block);
+            }
+            Step::TailCallSelfVector => {
+                // Cut 51: the vector-form self-tail-call — the arguments sit
+                // in the Vm's vector (the vector-build steps consumed their
+                // operands), no receiver/callee on the work stack. The
+                // helper pops the boundary, rebinds the frame in place from
+                // the argument vector, and returns 1; the machine code then
+                // jumps back to the body's re-entry block — the same
+                // single-invocation self-chain as the fast-form jump. On a
+                // helper error (0) the block terminates instead: the pending
+                // error surfaces when the JIT run returns, and the re-entry
+                // must NOT run again.
+                let ok = self.call_slow(self.sig_tdz, Helper::TailCallSelfVector, &[])?;
+                let entry = self.reentry_block.ok_or(Unsupported::Step(
+                    "TailCallSelfVector without a re-entry block",
+                ))?;
+                let ok_block = self.builder.create_block();
+                let err_block = self.builder.create_block();
+                let is_ok = self.builder.ins().icmp_imm_u(IntCC::NotEqual, ok, 0);
+                self.builder
+                    .ins()
+                    .brif(is_ok, ok_block, &[], err_block, &[]);
+                self.builder.switch_to_block(ok_block);
+                self.builder.ins().jump(entry, &[]);
+                self.builder.seal_block(ok_block);
+                self.builder.switch_to_block(err_block);
+                self.builder.ins().return_(&[ok]);
+                self.builder.seal_block(err_block);
+            }
+            Step::TailCallSelfCheckVector => {
+                // Cut 51: the vector-form checked self-tail-call — `[this,
+                // callee]` on the work stack, the arguments in the Vm's
+                // vector. The machine code compares the resolved callee
+                // against the running closure (`ctx.current_function`); on a
+                // match the frame is rebound from the vector and the body
+                // re-enters its start (the whole chain in one invocation);
+                // otherwise the general vector `tail_call` helper runs.
+                let sp = self.builder.use_var(self.sp_var);
+                let callee_ptr = self.builder.ins().iadd_imm_s(sp, -8);
+                let this_ptr = self.builder.ins().iadd_imm_s(sp, -16);
+                let callee = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    callee_ptr,
+                    Offset32::new(0),
+                );
+                let this = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    this_ptr,
+                    Offset32::new(0),
+                );
+                let ctx = self.vm();
+                let current = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    ctx,
+                    Offset32::new(std::mem::offset_of!(JitCallContext, current_function) as i32),
+                );
+                let is_self = self.builder.ins().icmp(IntCC::Equal, callee, current);
+                let self_block = self.builder.create_block();
+                let helper_block = self.builder.create_block();
+                self.builder
+                    .ins()
+                    .brif(is_self, self_block, &[], helper_block, &[]);
+                // The self path: rebind the frame from the argument vector
+                // and re-enter the body's start.
+                self.builder.switch_to_block(self_block);
+                let ok = self.call_slow(self.sig_tdz, Helper::TailCallSelfVector, &[])?;
+                let entry = self.reentry_block.ok_or(Unsupported::Step(
+                    "TailCallSelfCheckVector without a re-entry block",
+                ))?;
+                let ok_block = self.builder.create_block();
+                let err_block = self.builder.create_block();
+                let is_ok = self.builder.ins().icmp_imm_u(IntCC::NotEqual, ok, 0);
+                self.builder
+                    .ins()
+                    .brif(is_ok, ok_block, &[], err_block, &[]);
+                self.builder.switch_to_block(ok_block);
+                self.builder.ins().jump(entry, &[]);
+                self.builder.seal_block(ok_block);
+                self.builder.switch_to_block(err_block);
+                self.builder.ins().return_(&[ok]);
+                self.builder.seal_block(err_block);
+                self.builder.seal_block(self_block);
+                // The general path: the vector `tail_call` helper with the
+                // resolved callee (a reassigned name, or a cross-body call).
+                self.builder.switch_to_block(helper_block);
+                let zero = self.builder.ins().iconst(types::I64, 0);
+                let result = self.call_slow(
+                    self.sig_set_name,
+                    Helper::TailCallVector,
+                    &[this, callee, zero],
+                )?;
+                self.builder.ins().return_(&[result]);
                 self.builder.seal_block(helper_block);
             }
             Step::LoadGlobal { name } => {

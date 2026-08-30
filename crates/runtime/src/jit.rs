@@ -463,6 +463,15 @@ pub struct JitSlowPaths {
     /// arguments from the Vm's vector instead of the JIT buffer.
     pub tail_call_vector:
         extern "C" fn(ctx: *mut c_void, this: u64, callee: u64, direct_eval: u64) -> u64,
+    /// Cut 51: the vector-form self-tail-call (`Step::TailCallSelfVector`,
+    /// and `TailCallSelfCheckVector`'s identity-match path): pop the
+    /// argument boundary, split the Vm's argument vector, and rebind the
+    /// frame in place (params from the arguments, missing params and the
+    /// var/lexical/`this` slots back to their entry state). Returns 1 on
+    /// success — the machine code jumps back to the body's re-entry block —
+    /// and 0 with a pending error on failure (the block terminates instead
+    /// of re-entering).
+    pub tail_call_self_vector: extern "C" fn(ctx: *mut c_void) -> u64,
 }
 
 /// The runtime's slow-path table, installed into every `JitHook`.
@@ -511,6 +520,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     args_spread,
     call_vector,
     tail_call_vector,
+    tail_call_self_vector,
 };
 
 /// The slack (in slots) reserved above a compiled body's working area on the
@@ -1498,12 +1508,29 @@ extern "C" fn call_vector(ctx: *mut c_void, this: u64, callee: u64, direct_eval:
     let agent = unsafe { &mut *ctx.agent };
     let vm = unsafe { &mut *ctx.vm };
     let entry_len = vm.stack.len();
+    let base = match vm.args_base_stack.pop() {
+        Some(base) => base,
+        None => {
+            return slow_error(
+                ctx,
+                JsError::new(
+                    ErrorKind::SyntaxError,
+                    "Call without an argument boundary".into(),
+                ),
+            );
+        }
+    };
+    let args = vm.args.split_off(base);
+    let argc = args.len();
     vm.stack.push(Value::from_bits(this));
     vm.stack.push(Value::from_bits(callee));
-    // The arguments are already in `vm.args` (the vector-build steps); the
-    // vector `do_call` pops the boundary, runs the full call (eval check,
-    // callable check, `call_inner`), and pushes the result.
-    match vm.do_call(agent, direct_eval != 0) {
+    vm.stack.extend(args);
+    // The vector form now routes through the SAME fast-form core as a
+    // `CallFast` site: `do_call_fast`'s `fast_call_core` handles the
+    // certified-leaf inline run (JIT `run_jit_leaf` or the interpreter's
+    // `run_inline_leaf` on this Vm — no pool round-trip, no execution-
+    // context push), direct eval, the callable check, and the general call.
+    match vm.do_call_fast(agent, argc, direct_eval != 0) {
         Ok(()) => {
             let result = match vm.stack.pop() {
                 Some(value) => value,
@@ -1597,6 +1624,66 @@ extern "C" fn tail_call_vector(ctx: *mut c_void, this: u64, callee: u64, direct_
         },
         Err(error) => slow_error(ctx, error),
     }
+}
+
+extern "C" fn tail_call_self_vector(ctx: *mut c_void) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    // SAFETY: `ctx.body` points at the `Rc<CompiledBody>` the runtime holds
+    // for the duration of the compiled call (see `JitCallContext::body`).
+    let body = unsafe { &*ctx.body };
+    let Some(scope) = body.scope.as_ref() else {
+        return slow_error(
+            ctx,
+            JsError::new(
+                ErrorKind::TypeError,
+                "self-tail-call without a certified scope".into(),
+            ),
+        );
+    };
+    let base = match vm.args_base_stack.pop() {
+        Some(base) => base,
+        None => {
+            return slow_error(
+                ctx,
+                JsError::new(
+                    ErrorKind::SyntaxError,
+                    "TailCall without an argument boundary".into(),
+                ),
+            );
+        }
+    };
+    let args = vm.args.split_off(base);
+    let argc = args.len();
+    // GC-2: the argument copy is a local `Vec<Value>` the stack scan cannot
+    // see (mirror `tail_call_shared`'s suppression window).
+    let _stress = crate::ir::StressSuppress::new();
+    // Rebind the frame IN PLACE: the JIT's frame pointer stays live across
+    // the jump, so a `reset`/`setup_frame` (which can reallocate the buffer)
+    // is out — the machine code's re-entry block re-seeds the per-run
+    // variables instead, exactly like the fast-form self jump.
+    let frame = match &mut vm.frame {
+        crate::ir::Frame::Inline(buf) => buf.as_mut_ptr(),
+        crate::ir::Frame::Heap(vec) => vec.as_mut_ptr(),
+    };
+    // The parameter slots copy straight from the argument vector; the
+    // remaining slots go back to their entry state (tdz-aware).
+    let params = scope.arity.min(argc);
+    // SAFETY: `args` holds `argc` slots and the frame holds `frame_size`;
+    // the buffers are distinct allocations.
+    unsafe { std::ptr::copy_nonoverlapping(args.as_ptr(), frame, params) };
+    for slot in params..scope.frame_size {
+        let value = if scope.tdz_store.get(slot).copied().unwrap_or(false) {
+            Value::uninitialized()
+        } else {
+            Value::Undefined
+        };
+        // SAFETY: the frame buffer holds `frame_size` slots.
+        unsafe { *frame.add(slot) = value };
+    }
+    let _ = agent;
+    1
 }
 
 extern "C" fn init_context(ctx: *mut c_void, index: u64, value: u64) -> u64 {
@@ -2034,6 +2121,12 @@ mod tests {
         assert_ne!(JIT_SLOW_PATHS.new_target as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.regexp_literal as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.tail_call as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.args_base as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.args_push as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.args_spread as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.call_vector as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.tail_call_vector as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.tail_call_self_vector as usize, 0);
     }
 
     #[test]

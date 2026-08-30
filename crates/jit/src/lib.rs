@@ -369,6 +369,7 @@ fn runtime_helpers() -> JitHelpers {
         args_spread: Some(rt.args_spread),
         call_vector: Some(rt.call_vector),
         tail_call_vector: Some(rt.tail_call_vector),
+        tail_call_self_vector: Some(rt.tail_call_self_vector),
     }
 }
 
@@ -495,6 +496,7 @@ mod tests {
             args_spread: Some(helpers::test_args_spread),
             call_vector: Some(helpers::test_call_vector),
             tail_call_vector: Some(helpers::test_tail_call_vector),
+            tail_call_self_vector: Some(helpers::test_tail_call_self_vector),
         }
     }
 
@@ -1014,6 +1016,103 @@ mod tests {
     }
 
     #[test]
+    fn tail_call_self_vector_loops_in_machine_code() {
+        // Cut 51: a `TailCallSelfVector` (a spread/`> FAST_CALL_MAX_ARGS`
+        // argument self-call) rebinds the frame from the Vm's argument
+        // vector and jumps back to the body's re-entry — the whole
+        // self-recursive chain runs in ONE machine-code invocation. The body
+        // decrements slot 0 (a parameter, arity 1) into the argument vector
+        // and vector-self-calls until it is 0, then returns it: starting
+        // from 5, the loop runs five times with the back edge and returns 0.
+        // (The test double reports the success signal without touching the
+        // frame — the body's own decrement keeps the loop state, and the
+        // runtime-side integration verifies the real in-place rebind.)
+        let engine = JitEngine::new().expect("native isa");
+        let mut body = make_body(
+            vec![
+                Step::JumpIfGtImm {
+                    slot: 0,
+                    imm: 0.0,
+                    target: 10,
+                },
+                Step::LoadLocal { slot: 0 },
+                Step::Push(Value::Number(1.0)),
+                Step::Binary(syntax::ast::BinaryOp::Sub),
+                Step::StoreLocal { slot: 0 },
+                Step::ArgsBase,
+                Step::LoadLocal { slot: 0 },
+                Step::ArgsPush,
+                Step::TailCallSelfVector,
+                // Unreachable fall-through of the self-call (step 9).
+                Step::Push(Value::Undefined),
+                Step::LoadLocal { slot: 0 },
+                Step::Return,
+            ],
+            1,
+        );
+        body.scope = Some(ScopeInfo {
+            arity: 1,
+            ..scope(1)
+        });
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        // The frame is 2 slots (1 + canary); slot 0 starts at 5.
+        let mut frame = vec![0u64; 2];
+        frame[0] = Value::Number(5.0).bits();
+        frame[1] = 0xDEAD_BEEF_CAFE_F00D;
+        let mut stack = vec![0u64; 65];
+        stack[64] = 0xDEAD_BEEF_CAFE_F00D;
+        let mut ctx = runtime::jit::JitCallContext {
+            pending: false,
+            error: None,
+            agent: std::ptr::null_mut(),
+            vm: std::ptr::null_mut(),
+            global_object: std::ptr::null_mut(),
+            global_value_cells: std::ptr::null_mut(),
+            member_value_cells: std::ptr::null_mut(),
+            clean_chain: false,
+            buf_end: std::ptr::null_mut(),
+            leaf_epoch: 0,
+            leaf_call_cache: runtime::jit::LeafCallSiteCache::empty(),
+            body: std::ptr::null(),
+            tail: false,
+            current_function: 0,
+        };
+        let result = unsafe {
+            compiled.call(
+                frame.as_mut_ptr(),
+                stack.as_mut_ptr(),
+                (&mut ctx as *mut runtime::jit::JitCallContext) as *mut std::os::raw::c_void,
+            )
+        };
+        assert!(!ctx.pending, "a test-double helper set the error flag");
+        assert_eq!(frame[1], 0xDEAD_BEEF_CAFE_F00D, "frame overrun");
+        assert_eq!(stack[64], 0xDEAD_BEEF_CAFE_F00D, "stack overrun");
+        assert_eq!(result, Value::Number(0.0).bits());
+    }
+
+    #[test]
+    fn tail_call_self_check_vector_mismatch_runs_the_vector_helper() {
+        // Cut 51: a `TailCallSelfCheckVector` whose resolved callee does NOT
+        // match the running closure (`ctx.current_function` is 0) falls to
+        // the general vector `tail_call` helper — the test double returns
+        // 54.
+        let engine = JitEngine::new().expect("native isa");
+        let body = make_body(
+            vec![
+                Step::Push(Value::Undefined),
+                Step::Push(Value::Number(5.0)),
+                Step::ArgsBase,
+                Step::Push(Value::Number(7.0)),
+                Step::ArgsPush,
+                Step::TailCallSelfCheckVector,
+            ],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(54.0).bits());
+    }
+
+    #[test]
     fn compile_reports_the_stack_usage() {
         // `Push, Push, Binary, Return`: the depth peaks at 2 (two operands
         // live before the `Binary` consumes one).
@@ -1209,6 +1308,63 @@ mod tests {
         });
         assert_eq!(value.as_number(), Some(3.0));
         assert!(compiled >= 2, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_vector_self_tail_call() {
+        // Cut 51: a self-tail-call with 10 plain arguments (beyond the fast
+        // form's `FAST_CALL_MAX_ARGS` cap) compiles to the vector self-jump
+        // — the whole recursive chain runs in ONE machine-code invocation
+        // with a bounded native stack.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "\"use strict\"; (function f(n, a, b, c, d, e, g, h, i, j) { \
+                     return n ? f(n - 1, a, b, c, d, e, g, h, i, j) : \
+                     a + b + c + d + e + g + h + i + j; \
+                     }(50000, 1, 2, 3, 4, 5, 6, 7, 8, 9));",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(45.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_a_spread_self_tail_call() {
+        // Cut 51: a spread self-tail-call — the vector form via
+        // `ArgsSpread`. The array literal `[n - 1]` bails the JIT compile
+        // (no array-literal lowering yet), so this exercises the
+        // interpreter's `TailCallSelfVector` handler: the bounded-stack
+        // chain still completes correctly. The compiled vector self-jump is
+        // covered by the 10-arg form above (no array literal).
+        let (value, _compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "\"use strict\"; (function f(n) { return n ? f(...[n - 1]) : 0; }(50000));",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(0.0));
+    }
+
+    #[test]
+    fn installed_jit_runs_a_declared_vector_self_tail_call() {
+        // Cut 51: the checked vector form — a top-level declaration's own
+        // name, 10 plain arguments; the identity check takes the self jump
+        // and the whole chain runs in one machine-code invocation.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "\"use strict\"; function f(n, a, b, c, d, e, g, h, i, j) { \
+                     return n ? f(n - 1, a, b, c, d, e, g, h, i, j) : \
+                     a + b + c + d + e + g + h + i + j; \
+                     } f(50000, 1, 2, 3, 4, 5, 6, 7, 8, 9);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(45.0));
+        assert!(compiled >= 1, "{compiled} bodies");
     }
 
     #[test]

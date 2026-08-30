@@ -428,6 +428,19 @@ pub enum Step {
     TailCallSelfCheck {
         argc: u8,
     },
+    /// Cut 51: the vector-argument form of `TailCallSelf` (a spread, or
+    /// more plain arguments than `FAST_CALL_MAX_ARGS`): the named-expression
+    /// self-binding is statically the running body — the arguments sit in the
+    /// Vm's vector (`ArgsBase`/`ArgsPush`/`ArgsSpread`), no receiver/callee
+    /// pushes; the handler rebinds the frame and re-enters the body's entry
+    /// with no runtime round-trip.
+    TailCallSelfVector,
+    /// Cut 51: the vector-argument form of `TailCallSelfCheck`: the
+    /// receiver/callee sit on the stack as for the vector `TailCall`
+    /// (`[this, callee]`), the arguments in the Vm's vector; the JIT compares
+    /// the resolved callee against the running closure and jumps on a match,
+    /// else runs the general vector tail-call helper.
+    TailCallSelfCheckVector,
     /// Tail form of `TaggedTemplate` (`return tag\`...\``).
     TailTaggedTemplate(syntax::ast::TemplateLiteral),
     SuperCall,
@@ -4957,6 +4970,22 @@ impl Vm {
                     // before committing to the jump.
                     return self.tail_call_fast(agent, *argc as usize, false, body);
                 }
+                Step::TailCallSelfVector => {
+                    // Cut 51: the vector-form self-tail-call — the arguments
+                    // sit in the Vm's vector; rebind the frame in place and
+                    // re-enter the body's entry on this Vm (no callee
+                    // lookup, no context swap, no runtime round-trip).
+                    self.tail_call_self_vector(agent, body)?;
+                    continue;
+                }
+                Step::TailCallSelfCheckVector => {
+                    // Cut 51: the vector-form checked self-tail-call — the
+                    // shared vector machinery handles the callee either way
+                    // (an identity match frame-replaces, a reassigned name
+                    // calls the resolved callee); the JIT adds the identity
+                    // check before committing to the jump.
+                    return self.tail_call_vector(agent, false, body);
+                }
                 Step::CallFastGlobal {
                     name,
                     argc,
@@ -7210,10 +7239,8 @@ impl Vm {
 
     /// The `Step::Call` (vector-form) handler: the callee and receiver are on
     /// the stack, the arguments in the Vm's vector (`ArgsBase`/`ArgsPush`/
-    /// `ArgsSpread` built them). `pub(crate)` for the JIT's `call_vector`
-    /// slow-path helper (which bridges the JIT buffer operands onto the
-    /// stack, exactly like `call_slow` does for `do_call_fast`).
-    pub(crate) fn do_call(&mut self, agent: &mut Agent, direct_eval: bool) -> Result<(), JsError> {
+    /// `ArgsSpread` built them).
+    fn do_call(&mut self, agent: &mut Agent, direct_eval: bool) -> Result<(), JsError> {
         let callee = self.pop();
         let this = self.pop();
         let base = self.args_base_stack.pop().ok_or_else(|| {
@@ -8501,21 +8528,53 @@ impl Vm {
         argc: usize,
         body: &CompiledBody,
     ) -> Result<(), JsError> {
+        let n = self.stack.len();
+        let args: Vec<Value> = self.stack[n - argc..].to_vec();
+        self.tail_call_self_rebind(agent, body, &args)
+    }
+
+    /// Cut 51: the `TailCallSelfVector` handler — the same in-place rebind,
+    /// with the arguments read from the Vm's argument vector (the
+    /// `ArgsBase`/`ArgsPush`/`ArgsSpread` build) instead of the stack.
+    fn tail_call_self_vector(
+        &mut self,
+        agent: &mut Agent,
+        body: &CompiledBody,
+    ) -> Result<(), JsError> {
+        let base = self.args_base_stack.pop().ok_or_else(|| {
+            JsError::new(
+                ErrorKind::SyntaxError,
+                "TailCallSelfVector without an argument boundary".into(),
+            )
+        })?;
+        let args = self.args.split_off(base);
+        self.tail_call_self_rebind(agent, body, &args)
+    }
+
+    /// The shared self-tail-call rebind: reset the per-run state and set up
+    /// the body's frame from the new arguments, then re-enter the body's
+    /// entry (`ip == 0`) — exactly `tail_prepare_ordinary`'s certified
+    /// branch minus the callee lookup and the execution-context swap (a
+    /// capture-free self-call's context is identical to the running one).
+    fn tail_call_self_rebind(
+        &mut self,
+        agent: &mut Agent,
+        body: &CompiledBody,
+        args: &[Value],
+    ) -> Result<(), JsError> {
         let scope = body
             .scope
             .as_ref()
-            .expect("the compiler emits TailCallSelf only for certified bodies");
-        let n = self.stack.len();
-        let args: Vec<Value> = self.stack[n - argc..].to_vec();
+            .expect("the compiler emits the self-tail-call steps only for certified bodies");
         let env = agent.running_context()?.lexical_environment;
-        // GC-2: the argument copy is a local `Vec<Value>` the stack scan
-        // cannot see, and `setup_frame` may allocate the heap frame — mirror
+        // GC-2: the argument copy is a local the stack scan cannot see, and
+        // `setup_frame` may allocate the heap frame — mirror
         // `tail_call_shared`'s suppression window.
         let _stress = StressSuppress::new();
         self.reset(env, body.strict);
         self.body_context = Some(env);
         if scope.frame_size > 0 {
-            self.setup_frame(scope, &args);
+            self.setup_frame(scope, args);
         }
         self.ip = 0;
         Ok(())
@@ -8728,7 +8787,14 @@ impl Vm {
         } else {
             self.stack.len() - argc
         };
-        let mut args_buf = [Value::Undefined; 3];
+        // Cut 50: the leaf-inline argument copy. The fast `CallFast` form
+        // caps at `FAST_CALL_MAX_ARGS`, and the JIT's vector-form `call_vector`
+        // routes any count through `do_call_fast` too — so a count beyond the
+        // small stack buffer falls back to a function-scoped Vec (mirrors the
+        // construct path's Cow, minus the borrow-lifetime dance: the leaf run
+        // below borrows the chosen buffer, so both must outlive it).
+        let mut args_buf = [Value::Undefined; FAST_CALL_MAX_ARGS];
+        let args_owned: Vec<Value>;
         let completion = if let Some(ops) = ir.leaf_ops.as_deref() {
             // Cut 35 slice 23: at a fused call-store site, a register leaf
             // whose params are exactly the frame, all present, and never
@@ -8762,8 +8828,14 @@ impl Vm {
                 if let Some(base) = arg_base {
                     LeafFrame::Alias(base)
                 } else {
-                    args_buf[..argc].clone_from_slice(&self.stack[arg_start..n]);
-                    LeafFrame::Pushed(&args_buf[..argc])
+                    let args: &[Value] = if argc <= args_buf.len() {
+                        args_buf[..argc].clone_from_slice(&self.stack[arg_start..n]);
+                        &args_buf[..argc]
+                    } else {
+                        args_owned = self.stack[arg_start..n].to_vec();
+                        &args_owned[..]
+                    };
+                    LeafFrame::Pushed(args)
                 }
             };
             self.run_leaf_regs(agent, ops, &ir, environment, this_value, frame)?
@@ -8777,15 +8849,14 @@ impl Vm {
             }
             let n = self.stack.len();
             let arg_start = n - argc;
-            args_buf[..argc].clone_from_slice(&self.stack[arg_start..n]);
-            self.run_leaf_body(
-                agent,
-                &ir,
-                environment,
-                strict,
-                this_value,
-                &args_buf[..argc],
-            )?
+            let args: &[Value] = if argc <= args_buf.len() {
+                args_buf[..argc].clone_from_slice(&self.stack[arg_start..n]);
+                &args_buf[..argc]
+            } else {
+                args_owned = self.stack[arg_start..n].to_vec();
+                &args_owned[..]
+            };
+            self.run_leaf_body(agent, &ir, environment, strict, this_value, args)?
         };
         let result = Self::leaf_completion_result(completion)?;
         self.stack.truncate(pre_call - below);
@@ -10530,6 +10601,14 @@ enum Fixup {
     AsyncYieldStarResume(usize, usize, usize, usize),
 }
 
+/// Cut 50: the largest plain-argument count compiled as the fast
+/// `CallFast`/`TailCallFast` form (`[this, callee, a1..aN]` on the stack,
+/// no argument-vector machinery). More arguments — or any spread — take the
+/// vector form (`ArgsBase`/`ArgsPush`/`ArgsSpread` + the vector
+/// `Call`/`TailCall`). The `argc` field is `u8`, and the JIT's in-frame leaf
+/// probe handles any count that fits the working buffer.
+const FAST_CALL_MAX_ARGS: usize = 8;
+
 #[derive(Debug)]
 enum Scope {
     Loop {
@@ -11431,33 +11510,36 @@ impl Compiler {
         Ok(())
     }
 
-    /// The argument compilation + call step (fast 0-2 args or the vector
+    /// The argument compilation + call step (fast plain args or the vector
     /// form), shared by the guarded and unguarded call paths.
     fn compile_call_args(&mut self, args: &[Argument], direct_eval: bool) -> Result<(), JsError> {
         let tail = self.tail;
         self.tail = false; // arguments are never in tail position
-        let argc = self.compile_arguments(args, true)?;
+        // A direct eval ALWAYS takes the vector form (Cut 50): the fast
+        // form's JIT path does not handle eval, and the vector handlers do —
+        // so its arguments must be built in the VM's vector, not on the
+        // stack.
+        let argc = self.compile_arguments(args, !direct_eval)?;
         self.tail = tail;
-        // A direct eval in tail position stays a tail call: the flag is
+        // A direct eval stays a tail call when in tail position: the flag is
         // name-based (`eval` as the callee identifier — a shadowed `eval`
-        // function is still tail-called), and `tail_call_shared` routes a
-        // callee that really is %eval% through `perform_eval` with the
-        // caller's environment intact instead of frame-replacing.
-        match argc {
-            Some(argc) if tail => {
-                self.emit(Step::TailCallFast {
-                    argc: argc as u8,
-                    direct_eval,
-                });
-            }
-            None if tail => {
-                self.emit(Step::TailCall { direct_eval });
-            }
-            Some(argc) => self.emit(Step::CallFast {
-                argc: argc as u8,
-                direct_eval,
+        // function is still tail-called), and the vector-form handlers route
+        // a callee that really is %eval% through `perform_eval` with the
+        // caller's environment intact instead of frame-replacing. A direct
+        // eval ALWAYS takes the vector form (Cut 50): the fast form's JIT
+        // path does not handle eval, and the vector handlers do.
+        let fast = !direct_eval && argc.is_some();
+        match (fast, tail) {
+            (true, true) => self.emit(Step::TailCallFast {
+                argc: argc.unwrap() as u8,
+                direct_eval: false,
             }),
-            None => self.emit(Step::Call { direct_eval }),
+            (false, true) => self.emit(Step::TailCall { direct_eval }),
+            (true, false) => self.emit(Step::CallFast {
+                argc: argc.unwrap() as u8,
+                direct_eval: false,
+            }),
+            (false, false) => self.emit(Step::Call { direct_eval }),
         }
         Ok(())
     }
@@ -14875,7 +14957,7 @@ impl Compiler {
     }
 
     /// Compile call arguments. Returns the argument layout: `Some(argc)` when
-    /// the 0-2 plain (non-spread) arguments were pushed onto the value stack
+    /// the plain (non-spread) arguments were pushed onto the value stack
     /// (the `CallFast` form), `None` when they went into the VM's argument
     /// vector (`ArgsBase` + `ArgsPush`/`ArgsSpread`, the `Call`/`Construct`/
     /// `SuperCall` form). `allow_fast` is false when the consumer needs the
@@ -14885,7 +14967,10 @@ impl Compiler {
         args: &[Argument],
         allow_fast: bool,
     ) -> Result<Option<usize>, JsError> {
-        if allow_fast && args.len() <= 2 && args.iter().all(|a| matches!(a, Argument::Expr(_))) {
+        if allow_fast
+            && args.len() <= FAST_CALL_MAX_ARGS
+            && args.iter().all(|a| matches!(a, Argument::Expr(_)))
+        {
             for argument in args {
                 if let Argument::Expr(expr) = argument {
                     self.compile_expr(expr)?;
@@ -15085,12 +15170,21 @@ impl Compiler {
         {
             let saved = self.tail;
             self.tail = false; // the arguments are never in tail position
-            let argc = self.compile_arguments(&call.args, true)?;
-            self.tail = saved;
-            if let Some(argc) = argc {
-                self.emit(Step::TailCallSelf { argc: argc as u8 });
-                return Ok(());
+            match self.compile_arguments(&call.args, true)? {
+                Some(argc) => {
+                    self.tail = saved;
+                    self.emit(Step::TailCallSelf { argc: argc as u8 });
+                }
+                None => {
+                    // Cut 51: the vector form (a spread or more than
+                    // `FAST_CALL_MAX_ARGS` plain arguments) —
+                    // `compile_arguments` already built the argument vector;
+                    // the jump rebinds the frame from it.
+                    self.tail = saved;
+                    self.emit(Step::TailCallSelfVector);
+                }
             }
+            return Ok(());
         }
         // Cut 47: the same shape in a body that is NOT a named expression —
         // a top-level or enclosing function declaration whose own name
@@ -15119,12 +15213,20 @@ impl Compiler {
             self.compile_expr(&call.callee)?;
             let saved = self.tail;
             self.tail = false; // the arguments are never in tail position
-            let argc = self.compile_arguments(&call.args, true)?;
-            self.tail = saved;
-            if let Some(argc) = argc {
-                self.emit(Step::TailCallSelfCheck { argc: argc as u8 });
-                return Ok(());
+            match self.compile_arguments(&call.args, true)? {
+                Some(argc) => {
+                    self.tail = saved;
+                    self.emit(Step::TailCallSelfCheck { argc: argc as u8 });
+                }
+                None => {
+                    // Cut 51: the vector form — `compile_arguments` already
+                    // built the argument vector; the jump rebinds the frame
+                    // from it after the identity check.
+                    self.tail = saved;
+                    self.emit(Step::TailCallSelfCheckVector);
+                }
             }
+            return Ok(());
         }
         // Cut 35 slice 2/4: a plain named callee with an undefined receiver
         // fuses the receiver push and the callee load into the call step (2
@@ -15544,6 +15646,8 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
                 | Step::TailCallFastSlot { .. }
                 | Step::TailCallSelf { .. }
                 | Step::TailCallSelfCheck { .. }
+                | Step::TailCallSelfVector
+                | Step::TailCallSelfCheckVector
                 | Step::TailTaggedTemplate(_)
                 | Step::Construct
                 | Step::SuperCall
