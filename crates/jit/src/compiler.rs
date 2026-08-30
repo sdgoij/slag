@@ -171,6 +171,15 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
             Step::ArgsPush | Step::ArgsSpread => depth = depth.saturating_sub(1),
             Step::Call { .. } => depth = depth.saturating_sub(1),
             Step::TailCall { .. } => depth = depth.saturating_sub(2),
+            // Array literals (Cut 52): `ArrayBegin` pushes the array;
+            // `ArrayElement`/`ArraySpread` pop the element(s) + the array and
+            // push the array back; `ArrayHole`/`ArrayEnd` keep the array on
+            // the stack.
+            Step::ArrayBegin => depth += 1,
+            Step::ArrayElement | Step::ArraySpread => {
+                depth = depth.saturating_sub(2).saturating_add(1)
+            }
+            Step::ArrayHole | Step::ArrayEnd => {}
             // The fused slot call pops `argc` args (the callee is the
             // frame slot) and pushes the result.
             Step::CallFastSlot { argc, .. } => {
@@ -343,6 +352,11 @@ fn step_name(step: &Step) -> &'static str {
         Step::LoadGlobal { .. } | Step::StoreGlobal { .. } | Step::UpdateGlobal { .. } => {
             "Global fast path"
         }
+        Step::ArrayBegin
+        | Step::ArrayElement
+        | Step::ArraySpread
+        | Step::ArrayHole
+        | Step::ArrayEnd => "ArrayLiteral",
         Step::ForOfNext { .. } | Step::ForInNext { .. } | Step::ForOfBegin { .. } => "ForOf/ForIn",
         Step::SwitchDisc | Step::SwitchTest { .. } => "Switch",
         Step::Break { .. } | Step::Continue { .. } => "Break/Continue",
@@ -2583,6 +2597,44 @@ impl<'a> Lowerer<'a> {
                 let step_imm = self.builder.ins().iconst(types::I64, index as i64);
                 let res = self.call_slow(self.sig_step, Helper::RegExpLiteral, &[step_imm])?;
                 self.push(res);
+                self.fall_through(index);
+            }
+            // Array literals (Cut 52): one helper per step, mirroring the
+            // interpreter's handlers — `ArrayBegin` creates the array and
+            // opens an index on the Vm's array-index stack; the element/
+            // spread helpers define elements at that index; `ArrayEnd` pops
+            // it and sets `length`. The array rides the work stack between
+            // the steps (a heap object, so it cannot be a register value).
+            Step::ArrayBegin => {
+                let array = self.call_slow(self.sig_tdz, Helper::ArrayBegin, &[])?;
+                self.push(array);
+                self.fall_through(index);
+            }
+            Step::ArrayElement => {
+                let value = self.pop();
+                let array = self.pop();
+                let array =
+                    self.call_slow(self.sig_get_comp, Helper::ArrayElement, &[array, value])?;
+                self.push(array);
+                self.fall_through(index);
+            }
+            Step::ArrayHole => {
+                // Only the index moves — the array stays on the work stack.
+                self.call_slow(self.sig_tdz, Helper::ArrayHole, &[])?;
+                self.fall_through(index);
+            }
+            Step::ArraySpread => {
+                let iterable = self.pop();
+                let array = self.pop();
+                let array =
+                    self.call_slow(self.sig_get_comp, Helper::ArraySpread, &[array, iterable])?;
+                self.push(array);
+                self.fall_through(index);
+            }
+            Step::ArrayEnd => {
+                let array = self.pop();
+                let array = self.call_slow(self.sig_bool, Helper::ArrayEnd, &[array])?;
+                self.push(array);
                 self.fall_through(index);
             }
             // Completion bookkeeping: `ResetCompletion`/`NormalizeCompletion`

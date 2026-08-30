@@ -66,6 +66,11 @@ pub enum Helper {
     CallVector,
     TailCallVector,
     TailCallSelfVector,
+    ArrayBegin,
+    ArrayElement,
+    ArraySpread,
+    ArrayHole,
+    ArrayEnd,
 }
 
 impl Helper {
@@ -116,6 +121,11 @@ impl Helper {
             Helper::CallVector => "call_vector",
             Helper::TailCallVector => "tail_call_vector",
             Helper::TailCallSelfVector => "tail_call_self_vector",
+            Helper::ArrayBegin => "array_begin",
+            Helper::ArrayElement => "array_element",
+            Helper::ArraySpread => "array_spread",
+            Helper::ArrayHole => "array_hole",
+            Helper::ArrayEnd => "array_end",
         }
     }
 
@@ -337,6 +347,14 @@ pub struct JitHelpers {
     /// frame in place from the Vm's argument vector; returns 1 when the
     /// machine code should jump back to the body's re-entry.
     pub tail_call_self_vector: Option<extern "C" fn(vm: *mut c_void) -> u64>,
+    /// Array literal steps (Cut 52): `ArrayBegin` creates the array and
+    /// opens an index; `ArrayElement`/`ArraySpread` define elements;
+    /// `ArrayHole` skips an index; `ArrayEnd` closes it and sets `length`.
+    pub array_begin: Option<extern "C" fn(vm: *mut c_void) -> u64>,
+    pub array_element: Option<extern "C" fn(vm: *mut c_void, array: u64, value: u64) -> u64>,
+    pub array_spread: Option<extern "C" fn(vm: *mut c_void, array: u64, iterable: u64) -> u64>,
+    pub array_hole: Option<extern "C" fn(vm: *mut c_void) -> u64>,
+    pub array_end: Option<extern "C" fn(vm: *mut c_void, array: u64) -> u64>,
 }
 
 impl JitHelpers {
@@ -388,6 +406,11 @@ impl JitHelpers {
             call_vector: None,
             tail_call_vector: None,
             tail_call_self_vector: None,
+            array_begin: None,
+            array_element: None,
+            array_spread: None,
+            array_hole: None,
+            array_end: None,
         }
     }
 
@@ -439,6 +462,11 @@ impl JitHelpers {
             Helper::CallVector => self.call_vector.map(|f| f as usize as u64),
             Helper::TailCallVector => self.tail_call_vector.map(|f| f as usize as u64),
             Helper::TailCallSelfVector => self.tail_call_self_vector.map(|f| f as usize as u64),
+            Helper::ArrayBegin => self.array_begin.map(|f| f as usize as u64),
+            Helper::ArrayElement => self.array_element.map(|f| f as usize as u64),
+            Helper::ArraySpread => self.array_spread.map(|f| f as usize as u64),
+            Helper::ArrayHole => self.array_hole.map(|f| f as usize as u64),
+            Helper::ArrayEnd => self.array_end.map(|f| f as usize as u64),
         }
     }
 }
@@ -756,6 +784,30 @@ pub extern "C" fn test_tail_call_vector(
 /// tests instead (the rebind needs a live frame buffer).
 pub extern "C" fn test_tail_call_self_vector(_vm: *mut c_void) -> u64 {
     1
+}
+
+/// `array_begin` double: returns a fixed heap value (the array) the element
+/// helpers echo back, proving the ABI wiring.
+pub extern "C" fn test_array_begin(_vm: *mut c_void) -> u64 {
+    Value::Number(60.0).bits()
+}
+
+/// `array_element` double: echoes the array operand (the element write is
+/// exercised by the runtime's own integration tests against a real array).
+pub extern "C" fn test_array_element(_vm: *mut c_void, array: u64, _value: u64) -> u64 {
+    array
+}
+
+pub extern "C" fn test_array_spread(_vm: *mut c_void, array: u64, _iterable: u64) -> u64 {
+    array
+}
+
+pub extern "C" fn test_array_hole(_vm: *mut c_void) -> u64 {
+    0
+}
+
+pub extern "C" fn test_array_end(_vm: *mut c_void, array: u64) -> u64 {
+    array
 }
 
 /// Sums its numeric arguments — proves the `args` pointer/`argc` ABI the

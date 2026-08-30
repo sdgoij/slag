@@ -2264,7 +2264,7 @@ pub struct Vm {
     pub(crate) var_ref_stack: Vec<crate::context::Reference>,
     /// The next element index of each in-progress array literal (nested
     /// literals push in order); the length is set once at `ArrayEnd`.
-    array_index_stack: Vec<usize>,
+    pub(crate) array_index_stack: Vec<usize>,
     /// The argument-vector boundary of each in-progress call (nested calls
     /// push in order); the call step pops it and takes the appended slice.
     pub(crate) args_base_stack: Vec<usize>,
@@ -3306,7 +3306,11 @@ impl Vm {
     /// atom. `None` falls back to the full Get (which then re-resolves).
     /// The fronting value cache (Cut 35 slice 13) returns the element with
     /// no property-vector borrow when the array's generation matches.
-    fn array_element_get(agent: &mut Agent, object: &Value, index: u64) -> Option<Value> {
+    pub(crate) fn array_element_get(
+        agent: &mut Agent,
+        object: &Value,
+        index: u64,
+    ) -> Option<Value> {
         let ValueKind::Object(object) = object.kind() else {
             return None;
         };
@@ -3388,7 +3392,7 @@ impl Vm {
     /// The fronting length cache (Cut 35 slice 13) skips the borrow and
     /// number conversion when the array's generation matches. Defensively
     /// falls back to the generic read.
-    fn array_length(agent: &mut Agent, array: &Value) -> Result<u64, JsError> {
+    pub(crate) fn array_length(agent: &mut Agent, array: &Value) -> Result<u64, JsError> {
         let ValueKind::Object(obj) = array.kind() else {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -9059,6 +9063,12 @@ impl Vm {
         // allocate and trigger a collection, and a heap value only the
         // buffer references must survive until the JIT stores or returns it.
         self.jit_roots.push((buf.as_ptr() as usize, buf.len()));
+        // Cut 51: an array literal (`ArrayBegin` is leaf-eligible — a leaf
+        // may build an array) grows `array_index_stack` on the CALLER's Vm;
+        // the leaf's steps keep it balanced on the normal path, but a throw
+        // mid-literal must not leak the entry into the caller's next
+        // literal — mirror `run_leaf_body`'s length save/truncate.
+        let array_index_stack_len = self.array_index_stack.len();
         agent.jit_depth += 1;
         let result = unsafe {
             (entry)(
@@ -9075,6 +9085,7 @@ impl Vm {
         // a throwing slow path, so the pending error, when set, is the
         // call's only error.
         self.stack.truncate(pre_call - below);
+        self.array_index_stack.truncate(array_index_stack_len);
         if let Some(saved_env) = caller_body_context {
             self.body_context = Some(saved_env);
         }
@@ -9937,7 +9948,7 @@ pub(crate) fn is_eval_function(agent: &Agent, value: &Value) -> Result<bool, JsE
     Ok(realm.intrinsics.get("%eval%").as_ref() == Some(value))
 }
 
-fn array_set(array: &Value, key: &str, value: Value) -> Result<(), JsError> {
+pub(crate) fn array_set(array: &Value, key: &str, value: Value) -> Result<(), JsError> {
     let ValueKind::Object(obj) = array.kind() else {
         return Err(JsError::new(ErrorKind::TypeError, "not an object".into()));
     };

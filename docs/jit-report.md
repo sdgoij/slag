@@ -64,8 +64,10 @@ run paths:
 | 21 | *(worktree)* | **Vector call form** (Cut 49): `ArgsBase`/`ArgsPush`/`ArgsSpread` and the vector `Call`/`TailCall` steps — a ≥3-argument or spread call (which previously bailed the whole body to the interpreter) — lower to helpers that build the argument vector in `Vm::args` and run the interpreter's vector handlers (`do_call`/`tail_call`), bridging the work-buffer operands like `call_slow`. A 3-arg loop compiles for the first time; a ≥3-arg TCO chain runs with bounded stack. |
 | 22 | *(worktree)* | **Fast-argument cap raised to 8 + direct-eval vector routing** (Cut 50): `FAST_CALL_MAX_ARGS = 8` — plain calls with 3–8 args now take the fast `CallFast`/`TailCallFast` form (leaf-inline eligible) instead of the vector form; a direct `eval` ALWAYS takes the vector form (the fast form's JIT path bails on eval, and the vector handlers route it correctly). `call_vector` routes through `do_call_fast` (the same leaf-inline core as a `CallFast` site); `run_inline_leaf`'s argument buffer grew to `FAST_CALL_MAX_ARGS` with a Vec fallback for the (rare) vector-form count beyond it. A 1M 3-arg leaf call drops ~220ms → ~95ms under `--jit`. |
 | 23 | *(worktree)* | **Vector-form self-tail-call as a jump** (Cut 51): `TailCallSelfVector`/`TailCallSelfCheckVector` — a self-tail-call whose arguments took the vector form (a spread, or more than `FAST_CALL_MAX_ARGS` plain args) now rebinds the frame in place from the Vm's argument vector (`tail_call_self_vector` helper — no frame realloc, the JIT's frame pointer stays live) and jumps back to the body's re-entry block, the same single-invocation self-chain as the fast-form jump. The checked form compares the resolved callee against `current_function` first and falls back to the general vector `tail_call` helper on a mismatch. A 500K-deep 10-arg self-tail-call runs ~27ms under `--jit` (vs ~62ms interpreter; the pre-jump round-trip was ~10µs/iteration). |
+| 24 | *(worktree)* | **Array-literal lowering** (Cut 52): `ArrayBegin`/`ArrayElement`/`ArraySpread`/`ArrayHole`/`ArrayEnd` — the five array-literal steps — lower to helpers mirroring the interpreter's handlers: `array_begin` creates the array and opens an index on the Vm's array-index stack, the element/spread helpers define elements at that index, `array_end` pops it and sets `length`. The array rides the work stack between the steps (a heap object). `run_jit_leaf` now saves/restores the array-index stack (a leaf may build an array on the caller's Vm, and a throw mid-literal must not leak the entry). A spread self-tail-call (`f(...[n - 1])`), previously bailed by the array literal, now compiles and jumps: 200K iterations drop from ~2s (full interpreter bail) to ~430ms under `--jit`. |
+| 25 | *(worktree)* | **Dense-array fast spread** (Cut 52b): the spread helpers (`args_spread`, `array_spread`) reuse the for-of machinery's `for_of_begin` verdict — a plain Array with the stock `@@iterator` iterates via the generation-validated element cache (`Vm::array_length`/`array_element_get` with a full-Get fallback, mirroring `for_of_next`) instead of creating the iterator object and calling `next()` per element; the generic path uses `for_of_begin`'s record (the `@@iterator` getter fires exactly once). The spread self-tail-call drops to ~410ms and `[...x]`/`f(...x)` spreads of arrays speed up ~3x; the array-creation machinery (not the iteration) is now the floor. |
 
-### Slow-path helper table (`JitSlowPaths`, 44 helpers)
+### Slow-path helper table (`JitSlowPaths`, 49 helpers)
 
 The JIT inlines the number/string fast paths (tag checks are ~2 instructions
 on NaN-boxed values); everything else calls a helper whose address is baked
@@ -83,8 +85,9 @@ into the machine code at compile time. The table: `binary_slow`,
 `regexp_literal` (the step-index helpers), `tail_call` (proper tail calls),
 `args_base`/`args_push`/`args_spread`/`call_vector`/`tail_call_vector` (the
 vector call form, Cut 49), `tail_call_self_vector` (the vector-form
-self-tail-call rebind, Cut 51). A body needing a `None` helper bails to the
-interpreter.
+self-tail-call rebind, Cut 51), `array_begin`/`array_element`/`array_spread`/
+`array_hole`/`array_end` (the array-literal steps, Cut 52). A body needing a
+`None` helper bails to the interpreter.
 
 ## 3. Fast-path machinery
 
@@ -231,13 +234,16 @@ containing any of these fall back entirely:
    are **done** (Cut 45); the NAMED (Cut 46), global-name (Cut 47), and
    **vector-form** (Cut 51 — a spread or >8 plain args now rebinds the frame
    from the Vm's argument vector and jumps) self-tail-call forms run in
-   machine code; the **vector call form** (Cut 49) is done, though a vector
-   call to a certified LEAF still runs the general `call_inner` (no
+   machine code; the **vector call form** (Cut 49) is done, and **array
+   literals** (Cut 52 — the five array steps lower, with a dense-array fast
+   spread in the spread helpers) no longer bail, so a spread self-tail-call
+   compiles and jumps end to end (~430ms for 200K, down from the ~2s
+   interpreter bail; the array-creation machinery is the remaining floor).
+   A vector call to a certified LEAF still runs the general `call_inner` (no
    leaf-inline — a future slice could rebuild the fast-form layout in machine
-   code). A computed callee (`getF()(n-1)`) still pays the per-iteration
-   `tail_call` helper round-trip, and a spread self-tail-call is still
-   interpreter-bound while the body contains an array literal (no
-   `ArrayBegin`/`ArrayEnd` lowering yet — the jump itself is ready).
+   code), and a computed callee (`getF()(n-1)`) still pays the per-iteration
+   `tail_call` helper round-trip. Object literals (`ObjectBegin`/`Init`/
+   `End`) are the analogous next literal shape to lower.
 8. **String concat**: the `concat_strings` helper is called per concat; very
    small strings could concat inline in registers.
 9. **Leaf-cache invalidation breadth**: any "disturbing" helper (a `valueOf`,

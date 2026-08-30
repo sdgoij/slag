@@ -370,6 +370,11 @@ fn runtime_helpers() -> JitHelpers {
         call_vector: Some(rt.call_vector),
         tail_call_vector: Some(rt.tail_call_vector),
         tail_call_self_vector: Some(rt.tail_call_self_vector),
+        array_begin: Some(rt.array_begin),
+        array_element: Some(rt.array_element),
+        array_spread: Some(rt.array_spread),
+        array_hole: Some(rt.array_hole),
+        array_end: Some(rt.array_end),
     }
 }
 
@@ -497,6 +502,11 @@ mod tests {
             call_vector: Some(helpers::test_call_vector),
             tail_call_vector: Some(helpers::test_tail_call_vector),
             tail_call_self_vector: Some(helpers::test_tail_call_self_vector),
+            array_begin: Some(helpers::test_array_begin),
+            array_element: Some(helpers::test_array_element),
+            array_spread: Some(helpers::test_array_spread),
+            array_hole: Some(helpers::test_array_hole),
+            array_end: Some(helpers::test_array_end),
         }
     }
 
@@ -926,6 +936,29 @@ mod tests {
     }
 
     #[test]
+    fn array_literal_lowers_through_the_helpers() {
+        // Cut 52: the array literal steps lower to the helpers — `ArrayBegin`
+        // creates the array (the double returns 60), the element steps echo
+        // it back, `ArrayEnd` closes it, and the body returns the value.
+        let engine = JitEngine::new().expect("native isa");
+        let body = make_body(
+            vec![
+                Step::ArrayBegin,
+                Step::Push(Value::Number(1.0)),
+                Step::ArrayElement,
+                Step::ArrayHole,
+                Step::Push(Value::Number(2.0)),
+                Step::ArrayElement,
+                Step::ArrayEnd,
+                Step::Return,
+            ],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(60.0).bits());
+    }
+
+    #[test]
     fn tail_call_self_check_mismatch_runs_the_helper() {
         // Cut 47: a `TailCallSelfCheck` whose resolved callee does NOT match
         // the running closure (`ctx.current_function` is 0) falls to the
@@ -1332,13 +1365,12 @@ mod tests {
 
     #[test]
     fn installed_jit_runs_a_spread_self_tail_call() {
-        // Cut 51: a spread self-tail-call — the vector form via
-        // `ArgsSpread`. The array literal `[n - 1]` bails the JIT compile
-        // (no array-literal lowering yet), so this exercises the
-        // interpreter's `TailCallSelfVector` handler: the bounded-stack
-        // chain still completes correctly. The compiled vector self-jump is
-        // covered by the 10-arg form above (no array literal).
-        let (value, _compiled) = with_jit_agent(|agent| {
+        // Cut 52: a spread self-tail-call — the vector form via
+        // `ArgsSpread`, with the spread's array literal `[n - 1]` built in
+        // machine code (the array-literal steps lower). The whole recursive
+        // chain runs in ONE machine-code invocation with a bounded native
+        // stack.
+        let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
                     "\"use strict\"; (function f(n) { return n ? f(...[n - 1]) : 0; }(50000));",
@@ -1346,6 +1378,22 @@ mod tests {
                 .expect("runs")
         });
         assert_eq!(value.as_number(), Some(0.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_runs_an_array_literal_body() {
+        // Cut 52: an array-literal body compiles — `[1, 2, 3]` built in
+        // machine code, with holes and a spread.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f() { return [1, , 3]; } f().length + (function g() { return [1, ...[2, 3]].length; }());",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(6.0));
+        assert!(compiled >= 2, "{compiled} bodies");
     }
 
     #[test]

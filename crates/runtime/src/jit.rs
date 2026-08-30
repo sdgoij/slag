@@ -472,6 +472,22 @@ pub struct JitSlowPaths {
     /// and 0 with a pending error on failure (the block terminates instead
     /// of re-entering).
     pub tail_call_self_vector: extern "C" fn(ctx: *mut c_void) -> u64,
+    /// `Step::ArrayBegin`: create a fresh array, push 0 onto the Vm's
+    /// array-index stack, and return the array (the machine code pushes it
+    /// onto the work stack for the element steps).
+    pub array_begin: extern "C" fn(ctx: *mut c_void) -> u64,
+    /// `Step::ArrayElement`: define `value` at the current index (the
+    /// array-index stack top), bump the index, and return the array.
+    pub array_element: extern "C" fn(ctx: *mut c_void, array: u64, value: u64) -> u64,
+    /// `Step::ArraySpread`: define each iterable element at the current
+    /// index, bumping per element, and return the array.
+    pub array_spread: extern "C" fn(ctx: *mut c_void, array: u64, iterable: u64) -> u64,
+    /// `Step::ArrayHole`: bump the array-index stack top (a hole skips an
+    /// index; the array itself stays on the work stack, untouched).
+    pub array_hole: extern "C" fn(ctx: *mut c_void) -> u64,
+    /// `Step::ArrayEnd`: pop the index stack, set the array's `length`, and
+    /// return the array.
+    pub array_end: extern "C" fn(ctx: *mut c_void, array: u64) -> u64,
 }
 
 /// The runtime's slow-path table, installed into every `JitHook`.
@@ -521,6 +537,11 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     call_vector,
     tail_call_vector,
     tail_call_self_vector,
+    array_begin,
+    array_element,
+    array_spread,
+    array_hole,
+    array_end,
 };
 
 /// The slack (in slots) reserved above a compiled body's working area on the
@@ -1477,6 +1498,48 @@ extern "C" fn args_base(ctx: *mut c_void) -> u64 {
     0
 }
 
+/// Collect `iterable`'s elements (the spread protocol, spec 7.4), with the
+/// for-of machinery's dense-Array fast path: a plain Array with the stock
+/// `@@iterator` iterates via the generation-validated element cache instead
+/// of creating the iterator object and calling `next()` per element
+/// (observably identical — the stock iterator is empty and unobservable).
+/// Mirrors `for_of_next`'s element read: a cache miss (a hole or structural
+/// change) falls back to the full Get. The generic path is the existing
+/// `get_iterator`/`iterator_step` loop, unchanged.
+fn spread_elements(agent: &mut Agent, iterable: &Value) -> Result<Vec<Value>, JsError> {
+    match crate::expr::for_of_begin(agent, iterable)? {
+        crate::expr::ForOfState::FastArray(array) => {
+            let length = Vm::array_length(agent, &array)?;
+            let mut values = Vec::with_capacity(length as usize);
+            for index in 0..length {
+                let value = match Vm::array_element_get(agent, &array, index) {
+                    Some(value) => value,
+                    None => {
+                        let key = crux::property::PropertyKey::from_utf8(&index.to_string());
+                        crate::context::get_property_key(agent, &array, &key, array)?
+                    }
+                };
+                values.push(value);
+            }
+            Ok(values)
+        }
+        // The generic path: the full iterator protocol. The record comes
+        // from `for_of_begin` — the `@@iterator` method was fetched exactly
+        // once (re-fetching would fire a getter twice, an observable
+        // divergence).
+        crate::expr::ForOfState::Generic(record) => {
+            let mut values = Vec::new();
+            loop {
+                match crate::expr::iterator_step(agent, &record) {
+                    Ok(Some(value)) => values.push(value),
+                    Ok(None) => return Ok(values),
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+}
+
 extern "C" fn args_push(ctx: *mut c_void, value: u64) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
     let vm = unsafe { &mut *ctx.vm };
@@ -1489,18 +1552,13 @@ extern "C" fn args_spread(ctx: *mut c_void, iterable: u64) -> u64 {
     let agent = unsafe { &mut *ctx.agent };
     let vm = unsafe { &mut *ctx.vm };
     let iterable = Value::from_bits(iterable);
-    let iterator = match crate::expr::get_iterator(agent, &iterable) {
-        Ok(iterator) => iterator,
-        Err(error) => return slow_error(ctx, error),
-    };
-    loop {
-        match crate::expr::iterator_step(agent, &iterator) {
-            Ok(Some(value)) => vm.args.push(value),
-            Ok(None) => break,
-            Err(error) => return slow_error(ctx, error),
+    match spread_elements(agent, &iterable) {
+        Ok(values) => {
+            vm.args.extend(values);
+            0
         }
+        Err(error) => slow_error(ctx, error),
     }
-    0
 }
 
 extern "C" fn call_vector(ctx: *mut c_void, this: u64, callee: u64, direct_eval: u64) -> u64 {
@@ -1684,6 +1742,120 @@ extern "C" fn tail_call_self_vector(ctx: *mut c_void) -> u64 {
     }
     let _ = agent;
     1
+}
+
+extern "C" fn array_begin(ctx: *mut c_void) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    match crate::builtins::array::array_create(agent, 0.0) {
+        Ok(array) => {
+            vm.array_index_stack.push(0);
+            Value::Object(array).bits()
+        }
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn array_element(ctx: *mut c_void, array: u64, value: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let vm = unsafe { &mut *ctx.vm };
+    let array = Value::from_bits(array);
+    let value = Value::from_bits(value);
+    let index = match vm.array_index_stack.last_mut() {
+        Some(index) => *index,
+        None => {
+            return slow_error(
+                ctx,
+                JsError::new(
+                    ErrorKind::SyntaxError,
+                    "ArrayElement without an array".into(),
+                ),
+            );
+        }
+    };
+    if let Err(error) = crate::ir::array_set(&array, &index.to_string(), value) {
+        return slow_error(ctx, error);
+    }
+    *vm.array_index_stack.last_mut().expect("an array is open") = index + 1;
+    array.bits()
+}
+
+extern "C" fn array_spread(ctx: *mut c_void, array: u64, iterable: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let array = Value::from_bits(array);
+    let iterable = Value::from_bits(iterable);
+    let start = match vm.array_index_stack.last_mut() {
+        Some(index) => *index,
+        None => {
+            return slow_error(
+                ctx,
+                JsError::new(
+                    ErrorKind::SyntaxError,
+                    "ArraySpread without an array".into(),
+                ),
+            );
+        }
+    };
+    let values = match spread_elements(agent, &iterable) {
+        Ok(values) => values,
+        Err(error) => return slow_error(ctx, error),
+    };
+    let mut index = start;
+    for value in values {
+        if let Err(error) = crate::ir::array_set(&array, &index.to_string(), value) {
+            return slow_error(ctx, error);
+        }
+        index += 1;
+    }
+    *vm.array_index_stack.last_mut().expect("an array is open") = index;
+    array.bits()
+}
+
+extern "C" fn array_hole(ctx: *mut c_void) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let vm = unsafe { &mut *ctx.vm };
+    match vm.array_index_stack.last_mut() {
+        Some(index) => {
+            *index += 1;
+            0
+        }
+        None => slow_error(
+            ctx,
+            JsError::new(ErrorKind::SyntaxError, "ArrayHole without an array".into()),
+        ),
+    }
+}
+
+extern "C" fn array_end(ctx: *mut c_void, array: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let vm = unsafe { &mut *ctx.vm };
+    let array = Value::from_bits(array);
+    let length = match vm.array_index_stack.pop() {
+        Some(length) => length,
+        None => {
+            return slow_error(
+                ctx,
+                JsError::new(ErrorKind::SyntaxError, "ArrayEnd without an array".into()),
+            );
+        }
+    };
+    let ValueKind::Object(obj) = array.kind() else {
+        return slow_error(
+            ctx,
+            JsError::new(ErrorKind::TypeError, "not an object".into()),
+        );
+    };
+    match obj.set(
+        &crux::JsString::from_utf8("length"),
+        Value::Number(length as f64),
+        true,
+    ) {
+        Ok(_) => array.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
 }
 
 extern "C" fn init_context(ctx: *mut c_void, index: u64, value: u64) -> u64 {
@@ -2127,6 +2299,11 @@ mod tests {
         assert_ne!(JIT_SLOW_PATHS.call_vector as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.tail_call_vector as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.tail_call_self_vector as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.array_begin as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.array_element as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.array_spread as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.array_hole as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.array_end as usize, 0);
     }
 
     #[test]
