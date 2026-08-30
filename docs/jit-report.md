@@ -78,6 +78,7 @@ run paths:
 | 35 | *(worktree)* | **Misc close-out** (Cut 62): the last bail-list row — `new.target` now CERTIFIES (the `FastScopeScan` accepts the `new.target` MetaProperty in non-arrow bodies — an arrow's `new.target` is lexical and `import.meta` stays env-path) and reads the new per-run `Vm::current_new_target` on the certified path (the frame-slot model creates no FunctionEnv to carry it; the certified construct path sets it, a normal call/driver run reads `undefined` — matching the async/generator drivers' hardcoded `undefined` FunctionEnv). The `NewTarget` step keeps its deliberate leaf exclusion (a leaf's new.target differs from the caller's construct context) but now compiles in real bodies via the general path. A direct-eval `CallFast` site no longer bails: `call_slow` threads the `direct_eval` flag to `do_call_fast` (whose `fast_call_core` routes a real `%eval%` callee through `perform_eval` with the caller's environment intact) — the compiler still never emits one (direct eval always takes the vector form), so the lowering is defense-in-depth. Heap-value constants (a `Push(Value::String/BigInt)` and the register path's `LoadConst`) now EMBED their NaN-boxed pointer bits instead of a `push_const`/`load_const` helper call — sound because the GC never moves boxes (the `Gc` handles are Copy) and the value outlives the code: the step holds it, the compiled body is traced (the function-site cache, or the active-run tracer for a script body), and the cache entry that frees the code also drops the body. |
 | 36 | *(worktree)* | **Fused global/slot call lowering + certified-script JIT routing** (Cut 65): the last call-step bail rows — `CallFastGlobal` (a statically-known global-name callee at a stable cell), `CallFastSlotStore`, and `CallFastGlobalStore` (the fused `x = f(args)` stores) — now lower: the global-cell read feeds the existing leaf-probe call machinery, and a fused store materializes the arg slots (TDZ-checked in order) over the working region, calls, then TDZ-checks and stores the result to the target slot (`emit_call` gained an `emit_fall_through` so the store appends after its merge instead of bailing the body). A certified SCRIPT — previously always interpreted, since `eval_program` ran `vm.start` — now routes through `run_jit_body_loop`, so the top-level bench loops (`n = f(n)` fused global call-stores) execute in machine code with the leaf callees in-frame. Scripts complete through the interpreter's completion REGISTER (`vm.completion`/`completion_is_empty`), which the machine code now writes on the completion steps — `SetCompletion`, `ResetCompletion`, and the statement-position `FusedStoreLocal`/`FusedStoreGlobal` stores — via two offset constants (`runtime::jit::VM_COMPLETION_OFFSET`/`_IS_EMPTY_OFFSET`); the script path converts `run_jit_body_loop`'s fall-off-end `Return(undef)` marker back to the register's `Normal`/`Empty` completion (`Empty` ≡ `Normal(undefined)` at the top, so `NormalizeCompletion`/`ListBegin`/`ListEnd` stay no-ops — the register is unobservable mid-run in a certified body, and the interpreter's ListEnd-restore always lands on the value the JIT's never-reset register already holds). The compiled writes are null-guarded (the scaffold's bare-ctx test harness passes a null `vm`) and GC-safe (`Vm::trace` covers `completion`; the vm is an active-run root). |
 | 37 | *(worktree)* | **Instantiation-machinery fast path** (Cut 66): the per-closure function/prototype boilerplate and the lookups around it — `set_function_properties` (`length`/`name`), `make_constructor` (`constructor`/`prototype`), and the restricted `caller`/`arguments` now append through a new `JsObject::fresh_data_define_attrs` (an explicit-attributes sibling of `fresh_data_define`: the descriptor clone + ValidateAndApplyPropertyDescriptor table are skipped, and the map transition encodes the non-default writable/configurable flags so the map read path serves them); the function-creation prototype intrinsics (`%Function.prototype%` + the generator/async variants) are cached per realm in a fixed array (the table's `get` built a JsString per call); `set_function_prototype` reads the generator/async flags from the caller instead of a second `ecma_functions` lookup; the body-site cache keys hash the source slice without a `JsString` allocation (`source_hash_at` — `shared_arrow_body` recomputed the key — clone + slice alloc + hash — on every closure); and `Map::transitions` (the shape forks on every property append) uses the Fx hash instead of SipHash. A closure-creation loop measures ~20% faster (the 100K×2 recursive bench ~0.49s → ~0.38s); the `{ a: 1 }` literal is already on the `create_data_property` fast path (~0.3µs — the report's older ~17µs predates it). The `ecma_functions` insert and the per-closure object allocations stay the residual floor. |
+| 38 | *(worktree)* | **Inline small strings** (Cut 67): a `JsString` of at most 16 code units now stores its units INLINE in the box (`JsString::Small { len, units }`) — one arena allocation instead of the Vec + Arc + box the `Flat` path paid for tiny strings. `from_utf16`/`from_utf8` route small inputs to the inline form (larger ones keep the Arc-backed `Flat`), `concat`'s small path builds the inline form (the previous Vec + `Arc::from(Vec)` + `Flat` triple allocation is gone), and the leaf-merge branch accepts `Small` operands (a 17-128 unit leaf-leaf concat still merges to an Arc-backed `Flat`). The box is stable (the arena never moves boxes), so `as_slice`'s borrow of the inline units is valid while the owning handle is alive. Measured on the independent-small-concat shape (`s = x + x` with a 2-unit operand, 100K): ~0.033s → ~0.026s in BOTH the interpreter and the JIT (~20% — the JIT's `concat_strings` helper call and the interpreter's `apply_binary` share the concat); the rope append chain (`s += 'x'`) is unchanged (its ConsString node path was already a single allocation per append). |
 
 ### Slow-path helper table (`JitSlowPaths`, 113 helpers)
 
@@ -215,7 +216,7 @@ Temporal/TypedArray hang clusters, unrelated to the JIT (0
 fail / 0 crash). Clusters: `expressions/call` 92/92, `arrow-function`
 343/343.
 
-**Tests**: `cargo test --workspace` green (4519 passed, 3 ignored; jit crate 147 incl. the
+**Tests**: `cargo test --workspace` green (4520 passed, 3 ignored; jit crate 147 incl. the
 `installed_jit_*` e2e tests for member/slot callees, loop-with-calls, mid-run
 cell mutation, GC-stress rooting, global store-then-read, scope-shadow
 correctness, the Cut 55 try/catch/finally/block shapes, the Cut 56
@@ -247,7 +248,11 @@ call-store literal-arg vs counter-path shapes), and the Cut 66
 instantiation shapes (a crux test for `fresh_data_define_attrs` — explicit
 writable/enumerable/configurable flags encoded in both the map descriptor
 and the property vector, the map read path agreeing, a non-writable write
-rejected, and a configurable re-define mirroring into the inline field));
+rejected, and a configurable re-define mirroring into the inline field),
+and the Cut 67 small-string shapes (a crux test for the inline form — a
+small input routes to `Small`, `len`/`as_slice` read it, the 16-unit
+boundary spills to `Flat`, a small concat result is `Small`, a 17-unit
+concat result is `Flat`));
 `cargo clippy --workspace --all-targets -- -D warnings` clean. The Cut 63
 script/eval compiled-body cache is covered by a runtime test
 (`script_and_eval_bodies_cache_per_source`).
@@ -438,8 +443,16 @@ containing any of these fall back entirely:
    `call_inner` (no leaf-inline — a future slice could rebuild the fast-form
    layout in machine code), and a computed callee (`getF()(n-1)`) still pays
    the per-iteration `tail_call` helper round-trip.
-8. **String concat**: the `concat_strings` helper is called per concat; very
-   small strings could concat inline in registers.
+8. ~~**String concat**~~ — **done** (Cut 67): a string of at most 16 code
+   units now lives INLINE in the `JsString` box (`JsString::Small`), so a
+   small literal and a small concat result are a single arena allocation
+   instead of a Vec + an Arc + the box. `from_utf16`/`from_utf8` and
+   `concat`'s small path build the inline form; the concat's leaf-merge
+   branch accepts `Small` operands (17-128 units still merge to an
+   Arc-backed `Flat`). Measured on the independent-small-concat shape
+   (`s = x + x`, 100K): ~0.033s → ~0.026s in both the interpreter and the
+   JIT (~20%); the rope append chain (`s += 'x'`) is unchanged (its
+   ConsString node path was already one allocation).
 9. **Leaf-cache invalidation breadth**: any "disturbing" helper (a `valueOf`,
    a getter) bumps `leaf_epoch` and drops the per-site leaf verdict — a
    monomorphic hot call next to a `valueOf` re-probes every iteration.

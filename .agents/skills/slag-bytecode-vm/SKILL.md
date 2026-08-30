@@ -618,15 +618,32 @@ straggler and the bench's `s += 'x'` body needed it to see the win.
 
 **The string box IS the rope node (Cut 35 slice 30).** `JsString` is one
 enum — `Flat(Arc<[u16]>)` or `Rope { left/right:
-Option<Handle<JsString>>, len, depth, flat }` — so an append is a single
+`Option<Handle<JsString>>, len, depth, flat }` — so an append is a single
 allocation; the children are the operands' own `Handle`s (Rc bumps).
 That makes `JsString` `!Send` (the well-known-symbol table went
 `thread_local` — per-agent anyway) and its `Drop` must be iterative
 (`Option::take` + `Rc::try_unwrap` worklist — cloning the children
 instead silently recurses at dealloc and overflows the stack). Rope
-clones get fresh flat caches (no sharing). The 48-byte enum also trips
+clones get fresh flat caches (no sharing). The 56-byte enum also trips
 clippy's `large_enum_variant` on AST nodes embedding it (`ExportDecl`,
 `StaticElement`) — targeted allows with comments.
+
+**Small strings live INLINE in the box (Cut 67).** `JsString::Small { len,
+units: [u16; 16] }` holds ≤ 16 code units in the box — one arena
+allocation instead of a Vec + Arc + box for tiny strings (literals via
+`from_utf16`/`from_utf8`, concat results ≤ the threshold via `concat`'s
+small path). Traps: (1) `as_slice` on a `Small` borrows the BOX (not an
+Arc) — valid while the owning handle is alive because the arena never
+moves boxes, but never hold the slice across a path that could drop the
+last handle; (2) every JsString match (`Trace`, `len`, `as_slice`,
+`depth`, `flatten_into`, `Clone`) must cover the new variant — the enum
+is fully encapsulated in `crates/crux/src/string.rs`, so a new variant
+breaks only that file; (3) the concat leaf-merge branch (`len` 17-128)
+accepts `Small` operands alongside `Flat` — a `Small` + `Small` of total
+> 16 must not fall through to a ConsString node; (4) the JIT's
+`concat_strings` helper and the interpreter's `binary_inline` share the
+same `JsString::concat`, so a string-representation change shows up in
+both paths — measure both when A/B-ing.
 
 ## The JIT back edge cannot target the function's entry block
 

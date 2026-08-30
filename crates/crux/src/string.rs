@@ -26,6 +26,17 @@ use crate::heap::{GcAny, Trace};
 /// the cap appends, so arbitrarily long append chains stay linear.
 pub enum JsString {
     Flat(Arc<[u16]>),
+    /// Cut 67: a string of at most [`SMALL_STRING_CAP`] code units stored
+    /// INLINE in the box — one arena allocation instead of the Vec + Arc +
+    /// box the `Flat` path pays for tiny strings (the concat and literal
+    /// paths allocate them constantly). `as_slice` borrows the box, which is
+    /// stable (the arena never moves boxes), so the slice is valid while the
+    /// owning handle is alive. Clones copy the (≤ 32B) units rather than
+    /// sharing an Arc.
+    Small {
+        len: u8,
+        units: [u16; SMALL_STRING_CAP],
+    },
     /// Lean append-node for `s += char` patterns. Each node stores a left
     /// and right pointer — like V8's ConsString — but no buffer. This
     /// makes each append a lean Gc allocation (~48 bytes). The accumulated
@@ -68,10 +79,16 @@ enum FlattenLeaf<'a> {
 /// string is large enough that repeated copies would dominate.
 const CONCAT_FLAT_THRESHOLD: usize = 16;
 
+/// The inline-buffer capacity of the [`JsString::Small`] variant — the same
+/// 16 units as `CONCAT_FLAT_THRESHOLD`, so every flat concat result and every
+/// small literal fits the single-allocation form.
+pub const SMALL_STRING_CAP: usize = 16;
+
 impl Trace for JsString {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         match self {
             JsString::Flat(_) => {}
+            JsString::Small { .. } => {}
             JsString::ConsString { left, right, .. } => {
                 left.trace(visit);
                 right.trace(visit);
@@ -90,11 +107,35 @@ impl Trace for JsString {
 
 impl JsString {
     pub fn from_utf16(units: &[u16]) -> Self {
+        // Cut 67: a small input's units live inline in the box — one
+        // allocation instead of the Arc's own. Larger inputs keep the
+        // Arc-backed flat (shared across clones).
+        if units.len() <= SMALL_STRING_CAP {
+            let mut buf = [0u16; SMALL_STRING_CAP];
+            buf[..units.len()].copy_from_slice(units);
+            return JsString::Small {
+                len: units.len() as u8,
+                units: buf,
+            };
+        }
         JsString::Flat(units.into())
     }
 
     pub fn from_utf8(text: &str) -> Self {
-        JsString::Flat(text.encode_utf16().collect())
+        let units: Vec<u16> = text.encode_utf16().collect();
+        // Cut 67: small inputs copy into the inline box; larger ones keep the
+        // Vec-to-Arc buffer reuse (`Arc::from(Vec)` moves the buffer, it does
+        // not copy it).
+        if units.len() <= SMALL_STRING_CAP {
+            let mut buf = [0u16; SMALL_STRING_CAP];
+            buf[..units.len()].copy_from_slice(&units);
+            JsString::Small {
+                len: units.len() as u8,
+                units: buf,
+            }
+        } else {
+            JsString::Flat(units.into())
+        }
     }
 
     /// Concatenate without copying when the result is large enough: a rope
@@ -115,23 +156,31 @@ impl JsString {
         }
         let len = left.len() + right.len();
         if len <= CONCAT_FLAT_THRESHOLD {
-            let mut units = Vec::with_capacity(len);
-            units.extend_from_slice(left.as_slice());
-            units.extend_from_slice(right.as_slice());
-            return Handle::new(JsString::Flat(units.into()));
+            // Cut 67: the result fits the inline buffer — copy both operand
+            // slices into one `Small` box (a single allocation; the previous
+            // `Flat` path paid a Vec + an Arc + the box for tiny strings).
+            let mut buf = [0u16; SMALL_STRING_CAP];
+            let l = left.as_slice();
+            buf[..l.len()].copy_from_slice(l);
+            let r = right.as_slice();
+            buf[l.len()..len].copy_from_slice(r);
+            return Handle::new(JsString::Small {
+                len: len as u8,
+                units: buf,
+            });
         }
-        // Both Flat and small (≤ 128) → merge into Flat.
-        // Beyond that, use ConsString or Rope.
-        if let (JsString::Flat(left_units), JsString::Flat(right_units)) = (&**left, &**right) {
+        // Both leaf (Flat or Small) → merge into Flat (17-128 units), or a
+        // balanced Rope for two large Flats (Small operands cannot reach
+        // len > 128). The in-place Rope construction writes straight into
+        // the arena slot, skipping the stack-temp copy `Gc::new` pays for a
+        // large enum.
+        if left.is_leaf() && right.is_leaf() {
             if len <= 128 {
                 let mut units = Vec::with_capacity(len);
-                units.extend_from_slice(left_units);
-                units.extend_from_slice(right_units);
+                units.extend_from_slice(left.as_slice());
+                units.extend_from_slice(right.as_slice());
                 return Handle::new(JsString::Flat(units.into()));
             }
-            // Both Flat but large → create a balanced Rope (in place — the
-            // node's construction writes straight into the arena slot,
-            // skipping the stack-temp copy `Gc::new` pays for a large enum).
             return Handle::new_in_place(|ptr: *mut JsString| {
                 // SAFETY: `new_in_place` hands back the fresh slot; this
                 // closure writes every field before returning.
@@ -165,10 +214,16 @@ impl JsString {
         })
     }
 
+    /// Whether the string is a leaf (`Flat` or `Small`): `as_slice` returns
+    /// the units directly with no flatten cost.
+    fn is_leaf(&self) -> bool {
+        matches!(self, JsString::Flat(_) | JsString::Small { .. })
+    }
+
     /// The tree depth: 0 for a flat string, else the node's cached depth.
     fn depth(&self) -> u32 {
         match self {
-            JsString::Flat(_) => 0,
+            JsString::Flat(_) | JsString::Small { .. } => 0,
             JsString::ConsString { depth, .. } | JsString::Rope { depth, .. } => *depth,
         }
     }
@@ -177,6 +232,7 @@ impl JsString {
     pub fn len(&self) -> usize {
         match self {
             JsString::Flat(units) => units.len(),
+            JsString::Small { len, .. } => *len as usize,
             JsString::ConsString { len, .. } | JsString::Rope { len, .. } => *len,
         }
     }
@@ -188,6 +244,7 @@ impl JsString {
     pub fn as_slice(&self) -> &[u16] {
         match self {
             JsString::Flat(units) => units,
+            JsString::Small { len, units } => &units[..*len as usize],
             JsString::ConsString { flat, .. } | JsString::Rope { flat, .. } => {
                 flat.get_or_init(|| self.flatten()).as_ref()
             }
@@ -251,6 +308,9 @@ impl JsString {
             match item {
                 FlattenLeaf::String(string) => match string {
                     JsString::Flat(flat) => units.extend_from_slice(flat.as_ref()),
+                    JsString::Small { len, units: buf } => {
+                        units.extend_from_slice(&buf[..*len as usize])
+                    }
                     JsString::ConsString { left, right, .. } => {
                         // Push right first (so it's processed after left).
                         stack.push(FlattenLeaf::String(right));
@@ -274,6 +334,10 @@ impl Clone for JsString {
     fn clone(&self) -> Self {
         match self {
             JsString::Flat(units) => JsString::Flat(units.clone()),
+            JsString::Small { len, units } => JsString::Small {
+                len: *len,
+                units: *units,
+            },
             JsString::ConsString {
                 left,
                 right,
@@ -563,11 +627,51 @@ mod tests {
     }
 
     #[test]
+    fn small_strings_are_the_inline_form_and_read_correctly() {
+        // Cut 67: a small input's units live inline in the box — the read
+        // paths (`len`/`as_slice`) serve them from the box, and a concat
+        // whose result fits the inline buffer stays in the single-allocation
+        // form.
+        let s = JsString::from_utf8("hello");
+        assert!(matches!(s, JsString::Small { .. }));
+        assert_eq!(s.len(), 5);
+        assert_eq!(
+            s.as_slice(),
+            &"hello".encode_utf16().collect::<Vec<u16>>()[..]
+        );
+        // The boundary: 16 units fit, 17 spill to the Arc-backed `Flat`.
+        assert!(matches!(
+            JsString::from_utf16(&[0x61; 16]),
+            JsString::Small { .. }
+        ));
+        assert!(matches!(
+            JsString::from_utf16(&[0x61; 17]),
+            JsString::Flat(_)
+        ));
+        // A small concat result is Small too; a 17-unit result is Flat.
+        let a = Handle::new(JsString::from_utf8("abcdefgh"));
+        let b = Handle::new(JsString::from_utf8("ijklmnop"));
+        let s = JsString::concat(&a, &b);
+        assert!(matches!(*s, JsString::Small { .. }));
+        assert_eq!(s.len(), 16);
+        assert_eq!(
+            s.as_slice(),
+            &"abcdefghijklmnop".encode_utf16().collect::<Vec<u16>>()[..]
+        );
+        let c = Handle::new(JsString::from_utf8("q"));
+        let s = JsString::concat(&s, &c);
+        assert!(matches!(*s, JsString::Flat(_)));
+        assert_eq!(s.len(), 17);
+    }
+
+    #[test]
     fn concat_small_stays_flat_and_equals_the_units() {
         let a = Handle::new(JsString::from_utf8("ab"));
         let b = Handle::new(JsString::from_utf8("cd"));
         let s = JsString::concat(&a, &b);
-        assert!(matches!(*s, JsString::Flat(_)));
+        // Cut 67: a small result is the single-allocation `Small` form (a
+        // leaf, like `Flat`).
+        assert!(matches!(*s, JsString::Flat(_) | JsString::Small { .. }));
         assert_eq!(s.len(), 4);
         assert_eq!(
             s.as_slice(),
