@@ -425,6 +425,8 @@ fn runtime_helpers() -> JitHelpers {
         destructure_close: Some(rt.destructure_close),
         destructure_obj_end: Some(rt.destructure_obj_end),
         destructure_close_all: Some(rt.destructure_close_all),
+        create_arguments: Some(rt.create_arguments),
+        typeof_top: Some(rt.typeof_top),
     }
 }
 
@@ -607,6 +609,8 @@ mod tests {
             destructure_close: Some(helpers::test_destructure_close),
             destructure_obj_end: Some(helpers::test_destructure_obj_end),
             destructure_close_all: Some(helpers::test_destructure_close_all),
+            create_arguments: Some(helpers::test_create_arguments),
+            typeof_top: Some(helpers::test_typeof_top),
         }
     }
 
@@ -2758,6 +2762,144 @@ mod tests {
                 .expect("runs")
         });
         assert_eq!(value.as_number(), Some(34.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_strict_unmapped_arguments_returned_object() {
+        // Cut 60: a STRICT function created inside a strict script (the
+        // `enclosing_strict` forcing) returns its UNMAPPED arguments object.
+        // The unmapped form is leaf-eligible, and the JIT leaf runs on a
+        // PRIVATE frame buffer while the helper writes `vm.frame` — the
+        // regression: a strict `arguments`-returning body returned
+        // `undefined` under `--jit` (the Object/defineProperty and
+        // arguments-object fixture clusters). `CreateArguments` is now
+        // leaf-excluded, so the body runs `run_jit_body` where the frame
+        // matches.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "'use strict';\n\
+                     var r = (function () { return arguments; })(1, true, 'a');\n\
+                     JSON.stringify([r === undefined, typeof r, r.length, r[0], r[2]]);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("[false,\"object\",3,1,\"a\"]".to_string())
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_strict_unmapped_arguments_non_leaf_and_descriptor() {
+        // Cut 60: the strict unmapped object also works when the body is
+        // NOT a leaf (an array literal), and as an object-descriptor value
+        // (the `configurable: argObj` shape — ToBoolean of the object).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "'use strict';\n\
+                     function g() { var a = [1]; return arguments; }\n\
+                     var argObj = g(1, true, 'a');\n\
+                     var obj = {};\n\
+                     Object.defineProperty(obj, 'p', { configurable: argObj });\n\
+                     JSON.stringify([argObj.length, obj.hasOwnProperty('p'), delete obj.p]);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("[3,true,true]".to_string())
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_sloppy_mapped_arguments() {
+        // Cut 60: a sloppy body observing `arguments` gets the MAPPED object
+        // aliasing its simple params through the capture context — reading
+        // `arguments[i]` mirrors the param (and `length` is the argument
+        // count).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(a, b) { return a + '|' + arguments.length + '|' + arguments[0] + arguments[1]; }\n\
+                     f(1, 2);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("1|2|12".to_string())
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_mapped_arguments_alias_both_ways() {
+        // Cut 60: the mapped object's accessors and the body's own reads
+        // share the capture-context bindings — a write through `arguments`
+        // is seen by the param and vice versa.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(a) { arguments[0] = 5; return a; }\n\
+                     function g(a) { a = 7; return arguments[0]; }\n\
+                     f(1) + '|' + g(1);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("5|7".to_string())
+        );
+        assert!(compiled >= 2, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_arguments_callee_and_strict_unmapped() {
+        // Cut 60: `arguments.callee` resolves through the running context's
+        // function; a STRICT body gets the UNMAPPED object (a param write is
+        // not reflected).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f() { return typeof arguments.callee; }\n\
+                     function g(a) { 'use strict'; a = 9; return arguments[0]; }\n\
+                     f() + '|' + g(1);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("function|1".to_string())
+        );
+        assert!(compiled >= 2, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_mapped_arguments_with_captured_params() {
+        // Cut 60: a closure inside the body captures a param (context slot)
+        // while `arguments` aliases it — the mapped object and the closure
+        // observe the same capture-context binding.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(a) {\n\
+                     \x20 var g = function () { return a; };\n\
+                     \x20 arguments[0] = 11;\n\
+                     \x20 return g() + '|' + arguments[0];\n\
+                     }\n\
+                     f(1);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("11|11".to_string())
+        );
         assert!(compiled >= 1, "{compiled} bodies");
     }
 

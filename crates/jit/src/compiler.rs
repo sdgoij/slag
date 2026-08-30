@@ -448,6 +448,8 @@ fn step_name(step: &Step) -> &'static str {
         | Step::AsyncYieldStarInspect { .. }
         | Step::AsyncYieldStarResume { .. } => "YieldStar/AsyncYieldStar",
         Step::Destructure { .. } | Step::DeclInit { .. } => "Destructure",
+        Step::CreateArguments { .. } => "CreateArguments",
+        Step::TypeofTop => "TypeofTop",
         Step::ImportCall { .. } | Step::ImportMeta => "Import",
         Step::ResolveVarIdent { .. } | Step::GetVarReferenceThis => "Reference machinery",
         Step::GetSuperName { .. } | Step::GetSuperBase => "Super",
@@ -3188,6 +3190,25 @@ impl<'a> Lowerer<'a> {
             }
             Step::DestructureObjEnd => {
                 let _res = self.call_slow(self.sig_tdz, Helper::DestructureObjEnd, &[])?;
+                self.fall_through(index);
+            }
+            // Arguments object (Cut 60): `CreateArguments` builds the
+            // body's `arguments` object (sloppy mapped — aliasing the
+            // formals through the capture context — or strict unmapped) and
+            // stores it into the frame slot; a step-index helper reads the
+            // `slot`/`mapped` payload. Emitted once at body entry.
+            Step::CreateArguments { .. } => {
+                let step_imm = self.builder.ins().iconst(types::I64, index as i64);
+                let _res = self.call_slow(self.sig_step, Helper::CreateArguments, &[step_imm])?;
+                self.fall_through(index);
+            }
+            // `typeof` of a value operand (Cut 60): a pure helper — pops the
+            // value, pushes the `typeof` string. The unresolvable-reference
+            // form (`TypeofIdent`) stays env-path.
+            Step::TypeofTop => {
+                let value = self.pop();
+                let res = self.emit_raw_call(self.sig_bool, Helper::TypeofTop, &[value])?;
+                self.push(res);
                 self.fall_through(index);
             }
             Step::CatchBind { .. } => {

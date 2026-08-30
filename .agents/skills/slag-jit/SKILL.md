@@ -195,7 +195,44 @@ Certification accepts destructuring declaration patterns and assignment targets 
 - **`DestructureUndef`'s fall-through must leave the value on the stack** — use `top()` (read, no pop) + a dedicated pop-block on the DEFAULT path (which consumes the value and jumps to the fixup-patched label via `step_targets`); the fall-through block's sp is untouched, so its multi-predecessor shape (the `jump(after)` from the default path) stays SSA-valid. A pop-then-push in the next block breaks when the next block has two predecessors (the pushed value doesn't dominate it).
 - **The close gates mirror `run_inner`'s Err arm**: a step error in a destructure body closes the active not-done iterators (`destructure_close_all` on the non-try error path — a raw call; `dispatch_error` closes BEFORE the handler-table routing, regardless of coverage) UNLESS `destructure_stepping` — a `next()` error leaves the iterator open, including the leftover-stack-entry behavior when a try catches it (stay 1:1 with the interpreter). `DestructureClose` pops BEFORE closing (a throwing `return` must not re-close — bytecode-vm trap 4). The abrupt-resume path (`run_jit_resume`, kinds 1/2) closes via `close_destructures_abrupt` — a `yield`/`await` inside a pattern default can suspend mid-pattern.
 
-## 11. Validation
+## 11. Arguments objects and `typeof` (Cut 60)
+
+`Step::CreateArguments` — the last bail item's `mapped: Some` form — lowers
+via a step-index helper reading the `slot`/`mapped` payload. The mapped
+arguments machinery was ALREADY complete on the certification/compiler side
+(the "mapped arguments slice" moved every simple param into the capture
+context, and `compile_body` emits `CreateArguments` once at body entry) —
+only the JIT arm was missing. Traps:
+
+- **The mapped helper reads `vm.lexical_env` (the capture context) and the
+  running context's `function` (`callee`)** — both are available in a
+  certified run (`ordinary_call`/the drivers set `vm.lexical_env` to the
+  capture context; the pushed context's `function` is set when
+  `scope.arguments_slot.is_some() && !strict`).
+- **BOTH `CreateArguments` forms are leaf-excluded — the unmapped form was
+  NOT before the fix.** The helper writes the body's `arguments` slot
+  through `vm.frame_get_mut`, but a JIT leaf (`run_jit_leaf`) runs on a
+  PRIVATE frame buffer (`vm.frame` is the CALLER's) — a helper-written
+  frame slot would target the caller's frame, and the unmapped form's
+  `vm.call_args` is only filled by `setup_certified_frame` on the non-leaf
+  path. The `--jit` sweep caught this: strict
+  `(function () { return arguments; })()` IIFEs (strict via
+  `enclosing_strict` inside a strict script) returned `undefined` — the
+  Object/defineProperty, Object/create, arguments-object, Array.prototype.*,
+  and Date clusters. The interpreter leaf path was immune (`run_leaf_body`
+  sets `leaf_frame_base` so `frame_get_mut` addresses the leaf's own
+  region) — the JIT leaf is the only path with the mismatch. Any NEW
+  helper that writes a frame slot must be leaf-excluded for the same
+  reason; `for_of_next_bind_local` (for-of) and `function_decl_init` are
+  already excluded.
+- **`TypeofTop` (a `typeof` VALUE operand) is a bonus pair** — `typeof
+  arguments.callee` and any member/computed `typeof` need it (the
+  `TypeofIdent` unresolvable-reference form stays env-path). It is a pure
+  helper (`crux::value::type_of`) — whitelist it in
+  `disturbs_leaf_eligibility` and call it with `emit_raw_call` (it never
+  sets the pending byte).
+
+## 12. Validation
 
 `cargo clippy --workspace --all-targets -- -D warnings` clean, then
 `cargo test --workspace` green — then REBUILD the sweep

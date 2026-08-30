@@ -121,6 +121,8 @@ pub enum Helper {
     DestructureClose,
     DestructureObjEnd,
     DestructureCloseAll,
+    CreateArguments,
+    TypeofTop,
 }
 
 impl Helper {
@@ -226,6 +228,8 @@ impl Helper {
             Helper::DestructureClose => "destructure_close",
             Helper::DestructureObjEnd => "destructure_obj_end",
             Helper::DestructureCloseAll => "destructure_close_all",
+            Helper::CreateArguments => "create_arguments",
+            Helper::TypeofTop => "typeof_top",
         }
     }
 
@@ -256,6 +260,7 @@ impl Helper {
                 | Helper::LoadPerIter
                 | Helper::StorePerIter
                 | Helper::PopVarReference
+                | Helper::TypeofTop
         )
     }
 }
@@ -557,6 +562,14 @@ pub struct JitHelpers {
     pub destructure_close: Option<extern "C" fn(vm: *mut c_void) -> u64>,
     pub destructure_obj_end: Option<extern "C" fn(vm: *mut c_void) -> u64>,
     pub destructure_close_all: Option<extern "C" fn(vm: *mut c_void) -> u64>,
+    /// `Step::CreateArguments` (Cut 60): the body's `arguments` object —
+    /// sloppy mapped (aliasing the formals through the capture context) or
+    /// strict unmapped — stored into the frame slot; a step-index helper
+    /// reading the `slot`/`mapped` payload.
+    pub create_arguments: Option<extern "C" fn(vm: *mut c_void, step: u64) -> u64>,
+    /// `Step::TypeofTop` (Cut 60): the `typeof` string of a value operand;
+    /// never errors.
+    pub typeof_top: Option<extern "C" fn(vm: *mut c_void, value: u64) -> u64>,
 }
 
 impl JitHelpers {
@@ -663,6 +676,8 @@ impl JitHelpers {
             destructure_close: None,
             destructure_obj_end: None,
             destructure_close_all: None,
+            create_arguments: None,
+            typeof_top: None,
         }
     }
 
@@ -779,6 +794,8 @@ impl JitHelpers {
             Helper::DestructureClose => self.destructure_close.map(|f| f as usize as u64),
             Helper::DestructureObjEnd => self.destructure_obj_end.map(|f| f as usize as u64),
             Helper::DestructureCloseAll => self.destructure_close_all.map(|f| f as usize as u64),
+            Helper::CreateArguments => self.create_arguments.map(|f| f as usize as u64),
+            Helper::TypeofTop => self.typeof_top.map(|f| f as usize as u64),
         }
     }
 }
@@ -1368,6 +1385,14 @@ pub extern "C" fn test_destructure_obj_end(_vm: *mut c_void) -> u64 {
 
 pub extern "C" fn test_destructure_close_all(_vm: *mut c_void) -> u64 {
     Value::Undefined.bits()
+}
+
+pub extern "C" fn test_create_arguments(_vm: *mut c_void, _step: u64) -> u64 {
+    Value::Number(48.0).bits()
+}
+
+pub extern "C" fn test_typeof_top(_vm: *mut c_void, _value: u64) -> u64 {
+    Value::String(crux::Handle::new(crux::JsString::from_utf8("function"))).bits()
 }
 
 /// Sums its numeric arguments — proves the `args` pointer/`argc` ABI the

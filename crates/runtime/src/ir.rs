@@ -16018,10 +16018,14 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
                 | Step::ClassKeyToPropertyKey
                 | Step::ClassFinish { .. }
                 | Step::RegExpLiteral { .. }
-                // Sloppy mapped arguments reads the running context's
-                // `function` (the caller's, when inlined); the strict
-                // unmapped object reads only the call's argument slice.
-                | Step::CreateArguments { mapped: Some(_), .. }
+                // `CreateArguments` (Cut 60): the helper writes the body's
+                // `arguments` slot through `vm.frame`, but an inlined leaf's
+                // frame is a PRIVATE buffer (`run_jit_leaf` builds its own,
+                // separate from `vm.frame`) — a helper-written frame slot is
+                // wrong for a leaf. The mapped form additionally reads the
+                // running context's `function` (the caller's, when inlined).
+                // Both stay out of leaves.
+                | Step::CreateArguments { .. }
         ) && !string_literal_step_reads_body(step)
     })
 }

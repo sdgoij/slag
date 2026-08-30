@@ -703,6 +703,14 @@ pub struct JitSlowPaths {
     /// `run_inner`'s uncovered-error close, skipping when `destructure_stepping`)
     /// and clear the object-pattern stacks.
     pub destructure_close_all: extern "C" fn(ctx: *mut c_void) -> u64,
+    /// `Step::CreateArguments` (Cut 60): build the body's `arguments` object
+    /// (sloppy mapped — aliasing the formals through the capture context — or
+    /// strict unmapped) and store it into the frame slot; `step` indexes the
+    /// running body's `slot`/`mapped` payload.
+    pub create_arguments: extern "C" fn(ctx: *mut c_void, step: u64) -> u64,
+    /// `Step::TypeofTop` (Cut 60): compute the `typeof` string of the value
+    /// (pops it) and return it. Never errors.
+    pub typeof_top: extern "C" fn(ctx: *mut c_void, value: u64) -> u64,
 }
 
 /// The runtime's slow-path table, installed into every `JitHook`.
@@ -807,6 +815,8 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     destructure_close,
     destructure_obj_end,
     destructure_close_all,
+    create_arguments,
+    typeof_top,
 };
 
 /// The slack (in slots) reserved above a compiled body's working area on the
@@ -3251,6 +3261,66 @@ extern "C" fn destructure_close_all(ctx: *mut c_void) -> u64 {
         ctx.error = Some(error);
     }
     Value::Undefined.bits()
+}
+
+// ----- Cut 60: arguments objects -----
+
+/// `Step::CreateArguments` (Cut 60): build the body's `arguments` object
+/// from the call's arguments and store it into the frame slot. The sloppy
+/// mapped form aliases the formal parameters through the capture context
+/// (`vm.lexical_env` — the certified layout moved every param there) and
+/// reads the running context's `function` for `callee`; the strict unmapped
+/// form reads only the argument slice. Emitted once at body entry.
+extern "C" fn create_arguments(ctx: *mut c_void, step: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let Some(crate::ir::Step::CreateArguments { slot, mapped }) = step_at(ctx, step) else {
+        return slow_error(
+            ctx,
+            JsError::new(
+                ErrorKind::SyntaxError,
+                "CreateArguments without a slot".into(),
+            ),
+        );
+    };
+    let value = match mapped {
+        Some(formals) => {
+            let func = match agent.running_context() {
+                Ok(context) => context.function.unwrap_or(Value::Undefined),
+                Err(error) => return slow_error(ctx, error),
+            };
+            let formals: Vec<crux::JsString> = formals.iter().map(|id| crux::lookup(*id)).collect();
+            match crate::function::create_mapped_arguments_object(
+                agent,
+                func,
+                &vm.call_args,
+                &formals,
+                vm.lexical_env,
+            ) {
+                Ok(value) => value,
+                Err(error) => return slow_error(ctx, error),
+            }
+        }
+        None => match crate::function::create_unmapped_arguments_object(agent, &vm.call_args) {
+            Ok(value) => value,
+            Err(error) => return slow_error(ctx, error),
+        },
+    };
+    *vm.frame_get_mut(*slot) = value;
+    Value::Undefined.bits()
+}
+
+/// `Step::TypeofTop` (Cut 60): compute the `typeof` string of the popped
+/// value (spec 13.5.3.2 — a value operand; the unresolvable-reference form
+/// is `TypeofIdent`, which stays env-path). Never errors.
+extern "C" fn typeof_top(ctx: *mut c_void, value: u64) -> u64 {
+    let _ = ctx;
+    let value = Value::from_bits(value);
+    Value::String(crux::Handle::new(crux::JsString::from_utf8(
+        crux::value::type_of(&value),
+    )))
+    .bits()
 }
 
 /// Instantiate a fresh per-iteration env whose bindings copy `names` from
