@@ -29,9 +29,13 @@ pub mod harness {
 
     // GC-2 `--gc-stress` (collect after every allocation): set by the sweep
     // runner, applied to every fixture agent.
+    //
+    // The JIT is on by default (every certified body compiles through
+    // Cranelift); `test262-sweep --jitless` flips it off for an
+    // interpreter-only run.
     thread_local! {
         static GC_STRESS: Cell<bool> = const { Cell::new(false) };
-        static JIT: Cell<bool> = const { Cell::new(false) };
+        static JIT: Cell<bool> = const { Cell::new(true) };
     }
 
     /// Enable the per-allocation `--gc-stress` mode for subsequent fixture
@@ -40,9 +44,9 @@ pub mod harness {
         GC_STRESS.with(|stress| stress.set(enabled));
     }
 
-    /// Enable the Cranelift JIT for subsequent fixture agents (the
-    /// `test262-sweep --jit` gate: every certified body runs its compiled
-    /// machine code instead of the interpreter).
+    /// Set the Cranelift JIT mode for subsequent fixture agents. The JIT is
+    /// on by default — every certified body runs its compiled machine code
+    /// instead of the interpreter — and `test262-sweep --jitless` disables it.
     pub fn set_jit(enabled: bool) {
         JIT.with(|jit| jit.set(enabled));
     }
@@ -11310,13 +11314,8 @@ var $DONE = function (error) {
             *value,
         )
         .ok()?;
-        let name = runtime::context::get_property(
-            agent,
-            &ctor,
-            &JsString::from_utf8("name"),
-            ctor,
-        )
-        .ok()?;
+        let name = runtime::context::get_property(agent, &ctor, &JsString::from_utf8("name"), ctor)
+            .ok()?;
         match name.kind() {
             ValueKind::String(text) => Some(text.to_string_lossy()),
             _ => None,

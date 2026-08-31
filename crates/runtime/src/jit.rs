@@ -458,6 +458,15 @@ pub struct JitSlowPaths {
         old: u64,
         value: u64,
     ) -> u64,
+    /// The JIT's inline dense-array element write (`AssignMemberComputed`
+    /// with a plain `=`): returns 1 when the element was stored through
+    /// `array_element_write` (the object is a plain Array and the key a
+    /// canonical index Number), 0 when the machine code must fall back to
+    /// `assign_member_computed`. Never sets the pending byte — the checks
+    /// (Array kind, canonical index, chain walk) are exactly the fast path
+    /// of `assign_computed_plain`, so the slow path is correct on 0.
+    pub fast_array_element_write:
+        extern "C" fn(ctx: *mut c_void, object: u64, key: u64, value: u64) -> u64,
     /// The capture-context read (`LoadContextSlot`): `depth` is the static
     /// context-chain depth, `index` the binding's context slot. Returns the
     /// value (a TDZ marker throws the ReferenceError).
@@ -837,6 +846,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     update_ident,
     assign_member_name,
     assign_member_computed,
+    fast_array_element_write,
     set_member_slot,
     load_context,
     store_context,
@@ -1610,6 +1620,39 @@ extern "C" fn assign_member_computed(
             },
             Err(error) => slow_error(ctx, error),
         }
+    }
+}
+
+extern "C" fn fast_array_element_write(
+    _ctx: *mut c_void,
+    object: u64,
+    key: u64,
+    value: u64,
+) -> u64 {
+    // The JIT's inline dense-array store: mirror exactly the fast path of
+    // `assign_computed_plain` (the Array kind check, the canonical index
+    // Number check, then `array_element_write`). 1 = stored, 0 = fall back
+    // to the full `assign_member_computed` helper (which re-runs the checks
+    // and the [[Set]] machinery, including the nullish error). The helper
+    // never sets the pending byte: the chain walk bails on any link that
+    // is not a plain Ordinary/Array object, so no proxy trap or getter can
+    // run, and `array_element_write` on that shape cannot error.
+    let object = Value::from_bits(object);
+    let ValueKind::Object(obj) = object.kind() else {
+        return 0;
+    };
+    if !matches!(obj.kind, crux::object::ObjectKind::Array(_)) {
+        return 0;
+    }
+    let ValueKind::Number(number) = Value::from_bits(key).kind() else {
+        return 0;
+    };
+    if number.fract() != 0.0 || !(0.0..4294967295.0).contains(&number) {
+        return 0;
+    }
+    match obj.array_element_write(number as u64, Value::from_bits(value)) {
+        Ok(Some(())) => 1,
+        _ => 0,
     }
 }
 
@@ -4504,6 +4547,7 @@ mod tests {
         assert_ne!(JIT_SLOW_PATHS.update_ident as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.assign_member_name as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.assign_member_computed as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.fast_array_element_write as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.set_member_slot as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.load_context as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.store_context as usize, 0);

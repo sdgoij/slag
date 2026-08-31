@@ -503,6 +503,37 @@ pub fn intern_utf8(text: &str) -> AtomId {
     intern(&units)
 }
 
+// The atom for the canonical decimal string of an array index, memoized per
+// thread. The interner is a process-wide mutex and array hot loops (`a[i] =
+// v` filling a dense array, arguments objects) re-intern the same handful of
+// index strings over and over — each miss pays the lock. The interner is
+// append-only, so the index → atom mapping is stable and the memo can never
+// go stale.
+thread_local! {
+    static INDEX_ATOM_MEMO: std::cell::RefCell<std::collections::HashMap<u64, AtomId>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+// Bound the memo's memory (the distinct indices per program are usually a
+// few hundred; the property-escape fixtures' chunked `buildString` reuses
+// ~10k).
+const INDEX_ATOM_MEMO_CAP: usize = 65536;
+
+pub fn index_atom(index: u64) -> AtomId {
+    INDEX_ATOM_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if let Some(id) = memo.get(&index) {
+            return *id;
+        }
+        let id = intern_utf8(&index.to_string());
+        if memo.len() >= INDEX_ATOM_MEMO_CAP {
+            memo.clear();
+        }
+        memo.insert(index, id);
+        id
+    })
+}
+
 /// The canonical atom for `"__proto__"` (the object-literal prototype
 /// setter). Cached: the interner is a global (not thread-local), so the id
 /// is process-stable, and the object-literal hot path compares against it
@@ -534,6 +565,20 @@ pub fn lookup(id: AtomId) -> JsString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_atom_matches_intern_and_is_stable() {
+        // The memoized canonical-index atom must agree with the general
+        // interner (a numeric key on the array's map and a string key from
+        // elsewhere must collide) and stay stable across calls.
+        for index in [0u64, 1, 9, 10, 99, 999_999, 0xFFFF_FFFE, 1 << 40] {
+            let memoized = index_atom(index);
+            assert_eq!(memoized, index_atom(index));
+            assert_eq!(memoized, intern_utf8(&index.to_string()));
+        }
+        // The `length` key is not a canonical index string.
+        assert_ne!(index_atom(0), intern_utf8("length"));
+    }
 
     #[test]
     fn from_utf8_and_utf16_agree() {

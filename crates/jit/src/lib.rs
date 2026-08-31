@@ -346,6 +346,7 @@ fn runtime_helpers() -> JitHelpers {
         update_ident: Some(rt.update_ident),
         assign_member_name: Some(rt.assign_member_name),
         assign_member_computed: Some(rt.assign_member_computed),
+        fast_array_element_write: Some(rt.fast_array_element_write),
         set_member_slot: Some(rt.set_member_slot),
         load_context: Some(rt.load_context),
         store_context: Some(rt.store_context),
@@ -544,6 +545,7 @@ mod tests {
             update_ident: Some(helpers::test_update_ident),
             assign_member_name: Some(helpers::test_assign_member_name),
             assign_member_computed: Some(helpers::test_assign_member_computed),
+            fast_array_element_write: Some(helpers::test_fast_array_element_write),
             set_member_slot: Some(helpers::test_set_member_slot),
             load_context: Some(helpers::test_load_context),
             store_context: Some(helpers::test_store_context),
@@ -4133,6 +4135,120 @@ mod tests {
                 .expect("runs")
         });
         assert_eq!(value.as_boolean(), Some(true));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_dense_array_element_write_fast_path() {
+        // The inline dense-array store: `a[a.length] = i` in a compiled
+        // loop must route through `fast_array_element_write` (the counting
+        // wrapper proves the machine code called it ~n times) and store
+        // every element. The fallback shapes — a non-Array receiver or a
+        // non-canonical-index key — must still land through the full
+        // `assign_member_computed` helper.
+        static FAST_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_fast_write(
+            ctx: *mut c_void,
+            object: u64,
+            key: u64,
+            value: u64,
+        ) -> u64 {
+            FAST_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.fast_array_element_write)(ctx, object, key, value)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.fast_array_element_write = Some(counting_fast_write);
+
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent
+            .run_script(
+                "function fill(a, n) { for (var i = 0; i < n; i++) { a[a.length] = i; } return a.length; }\n\
+                 var a = [];\n\
+                 var len = fill(a, 1000);\n\
+                 var fallback = {};\n\
+                 fallback['x'] = 5;\n\
+                 var arr2 = [];\n\
+                 arr2['y'] = 7;\n\
+                 a[0] + a[999] + len + fallback.x + arr2.y;",
+            )
+            .expect("runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        // 0 + 999 + 1000 + 5 + 7 = 2011.
+        assert_eq!(value.as_number(), Some(2011.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+        let calls = FAST_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            calls >= 900,
+            "the compiled fill loop must take the inline store most of the time ({calls} fast calls)"
+        );
+    }
+
+    #[test]
+    fn installed_jit_dense_array_element_write_fallbacks() {
+        // The inline store's fallback shapes must route through the full
+        // `assign_member_computed` helper and land correctly: a non-Array
+        // receiver, a non-canonical-index key (a string key on an Array),
+        // and a compound computed assign (which never certifies — the
+        // `GetMemberComputedKeep` step has no JIT arm — so its
+        // `AssignMemberComputed { op }` with a compound stays on the helper
+        // by the emit's `!is_compound_assign` guard).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function fill(a, n) { for (var i = 0; i < n; i++) { a[a.length] = i; } return a; }\n\
+                     var a = fill([], 5);\n\
+                     var o = {};\n\
+                     o[0] = 9;\n\
+                     var b = [];\n\
+                     b['k'] = 3;\n\
+                     var c = [1];\n\
+                     c[0] += 4;\n\
+                     a[0] + a[4] + o[0] + b.k + c[0];",
+                )
+                .expect("runs")
+        });
+        // 0 + 4 + 9 + 3 + 5 = 21.
+        assert_eq!(value.as_number(), Some(21.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_dense_array_element_write_fallback_in_a_compiled_loop() {
+        // The inline store's FALLBACK (a non-Array receiver and a string-key
+        // Array store) inside a COMPILED loop: the step must leave the same
+        // single slot the fast path does. The pre-fix emit pushed the slow
+        // helper's result AND the value, so every fallback iteration drifted
+        // the working stack one slot deeper than `max_stack_usage` accounts —
+        // the writes ran past the pre-allocated buffer and corrupted the heap
+        // (the detached-buffer copyWithin cluster died with a 1-2 TB
+        // `JsString::from_utf8` allocation in `dispatch_error`). The
+        // top-level fallback test above misses this: straight-line scripts
+        // never compile, so its fallbacks ran interpreted.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(n) {\n\
+                       var o = {};\n\
+                       var b = [];\n\
+                       for (var i = 0; i < n; i++) { o[i] = i; b['x'] = i; }\n\
+                       return o[n - 1] + b.x;\n\
+                     }\n\
+                     f(1000);",
+                )
+                .expect("runs")
+        });
+        // 999 + 999 = 1998.
+        assert_eq!(value.as_number(), Some(1998.0));
         assert!(compiled >= 1, "{compiled} bodies");
     }
 

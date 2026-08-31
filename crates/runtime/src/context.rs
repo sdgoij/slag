@@ -655,7 +655,7 @@ pub fn get_property_key(
             // and the arguments mapping, both excluded here.
             if matches!(
                 obj.kind,
-                crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array
+                crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array(_)
             ) && let Some(property) = obj.get_own_property_key(key)?
                 && let crux::object::PropertyKind::Data { value, .. } = property.kind
             {

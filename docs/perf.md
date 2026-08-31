@@ -2189,6 +2189,81 @@ annexB 1,086/0/0, built-ins 23,812/0/154 + 447 hangs). The remaining
 string-concat gap vs node jitless (1.4ms → ~8.6x) is the loop machinery
 plus the allocation itself — the next lever is the arena/GC milestone.
 
+### Interpreter per-op floor (measured 2026-08-31)
+
+Profiling the sweep's slowest cluster (the RegExp property-escapes /
+CharacterClassEscapes fixtures, ~380-430 load-dependent "hangs") traced
+the cost to the interpreter's per-op speed, not to any single language
+feature: the vendored harness `buildString` (`test262/harness/
+regExpUtils.js`) fills a JS array in a loop and calls
+`String.fromCodePoint.apply`, and that body runs entirely interpreted
+(release build):
+
+| primitive | measured | mainstream reference (Node/V8, approx.) |
+|---|---|---|
+| bare `for` iteration (993k) | ~0.7 µs/iter (690 ms) | 1-10 ns |
+| array `push` | ~5.3 µs/op | ~10-50 ns |
+| indexed store `a[i] = v` | ~2.8 µs/op | ~5-20 ns |
+| `fromCodePoint.apply` chunk (10k) | ~0.6 ms | ~10-20 µs |
+
+These are ~100× off mainstream — a single bare loop iteration costs as
+much as a whole mainstream iteration plus 10-100 ops. The JIT is not the
+escape hatch here: it compiles only certified bodies (4-25× on the
+`--jit-bench` rows), and the array-store / member-write / `.apply` ops
+in `buildString` are outside the certified subset, so the function never
+leaves the interpreter (`--jit` changes nothing on these loops).
+`buildString` of a 2,162,560-unit string takes ~3.4 s at this floor —
+the fixtures straddle the sweep's 15 s budget and hang under load (the
+regexp engine itself measures 0-17 ms on them).
+
+The levers, in order of expected value: (1) **JIT certification for the
+`buildString` shape** — array element stores, member writes
+(`AssignMemberName`/`AssignMemberComputed`, register-path
+`StoreMember*`), and the `.apply` builtin call — which would run the
+fill loops at machine speed and clear the hang cluster entirely (details
+in `docs/jit-report.md` §6 and §7 item 12); (2) **the interpreter's
+core loop itself** (`ir.rs`/`run_inner`) — the 0.7 µs bare-loop floor is
+itself pathological, but even perfect array stores would only bring the
+fixtures to ~1 s at that floor, so the VM core is a real but secondary
+target. A `--bench`-style row for the bare-loop iteration cost would
+keep this floor visible.
+
+### CLI JIT default, detached-view length, and the typed-array JIT picture (measured 2026-09-01)
+
+Supersedes the "`--jit` changes nothing on these loops" claim in the floor
+section above: dense element stores (609ce62) and the `buildString` shape now
+certify (b61a0b5), so the JIT is a real escape hatch for that cluster
+(`--jit-bench` buildString rows: 191ms → 43ms).
+
+- **The CLI installs the JIT by default** (2026-09-01): `slag file.js` runs
+  certified bodies through Cranelift; `--no-jit` opts out; `--bench` still
+  measures the interpreter floor. Default vs `--no-jit` on the Node probes:
+  buildString shape 43ms vs 194ms (4.5x), buildString full 29ms vs 113ms
+  (3.9x).
+- **The numeric-index typed-array `length` fast path missed the
+  detached-buffer branch**: `typed_array_effective_length` returned the
+  pre-detach length after `transfer()` (the spec's length getter returns 0
+  for a detached view, 25.2.3.1). Fixed at the source — the function now
+  returns 0 for a detached buffer, which also fixes
+  `typed_array_own_property_keys` on detached views.
+- **The "JIT ignores typed-array loops" reading was a probe artifact**: a
+  `new Uint8Array(...)` inside the body emits `Step::Construct`, which the
+  JIT cannot lower, so the whole body bails to the interpreter. With the
+  array hoisted (passed in), the same loops compile: `view.length` loop
+  56ms → 18ms (3.1x), element-write loop 92ms → 54ms (1.7x). Native `fill`
+  stays ~700ms with or without the JIT — the builtin pays a per-element
+  `Vec` encode/decode allocation.
+
+Node v24.12.0 comparison (same machine, interleaved 7-rep medians):
+
+| probe | node | slag default (jit) | slag --no-jit | gap |
+|---|---|---|---|---|
+| buildString shape (3M appends) | 6ms | 42ms | 189ms | 7x |
+| buildString full (2.16M cps) | 13ms | 28ms | 110ms | 2.2x |
+| typed-array length read (800k) | ~1ms | 56ms | 56ms | ~56x |
+| typed-array element write (800k) | ~1ms | 90ms | 90ms | ~90x |
+| typed-array native `fill` (800k) | <1ms | 680ms | 680ms | ~680x |
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

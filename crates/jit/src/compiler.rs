@@ -1053,8 +1053,13 @@ impl<'a> Lowerer<'a> {
             self.emit_step(index, step)?;
         }
         // Past-the-end block: a body that falls off completes `Empty`, which
-        // leaf callers observe as `undefined`.
-        self.visit(n);
+        // leaf callers observe as `undefined`. An empty body's step-0 block
+        // already carries the seeded variables — re-visiting it would trip
+        // Cranelift's "fill your block before switching" debug assert (the
+        // block is no longer pristine but has no terminator yet).
+        if n > 0 {
+            self.visit(n);
+        }
         let undef = self.builder.ins().iconst(types::I64, self.undef_bits);
         self.builder.ins().return_(&[undef]);
         Ok(())
@@ -2683,13 +2688,56 @@ impl<'a> Lowerer<'a> {
                     Some(bits) => bits,
                     None => self.builder.ins().iconst(types::I64, self.undef_bits),
                 };
-                let res = self.call_slow(
-                    self.sig_assign,
-                    Helper::AssignMemberComputed,
-                    &[op_imm, object, key, old_imm, value],
-                )?;
-                self.push(res);
-                self.fall_through(index);
+                if !is_compound_assign(op) {
+                    // The inline dense-array store: a direct
+                    // `fast_array_element_write` call (a plain Array receiver
+                    // with a canonical index Number key) that never errors
+                    // and returns 1 on a stored element; any other shape
+                    // falls back to the full `assign_member_computed`
+                    // helper. The helper mirrors `assign_computed_plain`'s
+                    // fast path exactly, so the fallback re-runs the checks
+                    // and the [[Set]] machinery correctly. The raw call is
+                    // enough — the helper cannot set the pending byte (its
+                    // chain walk bails on anything but a plain
+                    // Ordinary/Array link, so no trap or getter runs).
+                    let fast = self.builder.create_block();
+                    let fallback = self.builder.create_block();
+                    let merge = self.builder.create_block();
+                    self.builder.ins().jump(fast, &[]);
+                    self.builder.switch_to_block(fast);
+                    let ok = self.emit_raw_call(
+                        self.sig_binary,
+                        Helper::FastArrayElementWrite,
+                        &[object, key, value],
+                    )?;
+                    let hit = self.builder.ins().icmp_imm_u(IntCC::Equal, ok, 1);
+                    self.builder.ins().brif(hit, merge, &[], fallback, &[]);
+                    self.builder.seal_block(fast);
+                    self.builder.switch_to_block(fallback);
+                    self.call_slow(
+                        self.sig_assign,
+                        Helper::AssignMemberComputed,
+                        &[op_imm, object, key, old_imm, value],
+                    )?;
+                    // The slow path's stored value is the RHS for a plain
+                    // `=` — the merge below pushes `value` for BOTH paths, so
+                    // the fallback must not push its result too (an extra
+                    // slot would leave the working stack one deeper than
+                    // `max_stack_usage` accounts and overrun the buffer).
+                    self.builder.ins().jump(merge, &[]);
+                    self.builder.seal_block(fallback);
+                    self.builder.switch_to_block(merge);
+                    self.push(value);
+                    self.fall_through(index);
+                } else {
+                    let res = self.call_slow(
+                        self.sig_assign,
+                        Helper::AssignMemberComputed,
+                        &[op_imm, object, key, old_imm, value],
+                    )?;
+                    self.push(res);
+                    self.fall_through(index);
+                }
             }
             Step::CallFast { argc, direct_eval } => {
                 // `[..., this, callee, a1..aN]` on the JIT stack; the probe

@@ -16,15 +16,21 @@
 //!   language | built-ins | annexB | all
 //!
 //! Options:
-//!   --jobs N             concurrent batches (default: available parallelism)
+//!   --fast               quick smoke: full-core jobs (the default) + a 5s recheck
+//!                       deadline (verdicts wobble on 5-15s fixtures under load)
+//!   --accurate           steadier verdicts: half-core jobs + a recheck deadline
+//!                       that matches --timeout
+//!   --jobs N             concurrent batches (default: full available parallelism)
 //!   --batch N            fixtures per batch (default: 32)
 //!   --timeout SECS       per-batch deadline (default: 15)
-//!   --recheck-timeout S  per-fixture hang-recheck deadline (default: 5)
+//!   --recheck-timeout S  per-fixture hang-recheck deadline (default: 15, same as --timeout:
+//!                       a fixture that fits its own batch budget is a pass, not a hang)
 //!   --sample N           at most N fixtures per top-level directory
 //!   --filter GLOB        only fixtures whose relative path matches (`*`, `?`)
 //!   --json               emit a JSON report instead of the text report
 //!   --gc-stress          collect after every allocation
-//!   --jit                run certified bodies through the Cranelift JIT
+//!   --jitless            run certified bodies in the interpreter instead of the
+//!                       Cranelift JIT (the JIT is on by default)
 //!   --worker             (internal) run the batch described on stdin
 
 use std::collections::BTreeMap;
@@ -39,6 +45,21 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--worker") {
         return worker_main();
+    }
+    if let Some(position) = args.iter().position(|a| a == "--single") {
+        let rest = &args[position + 1..];
+        let timeout = rest
+            .iter()
+            .position(|a| a == "--timeout")
+            .and_then(|i| rest.get(i + 1))
+            .and_then(|seconds| seconds.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(20));
+        return single_main(
+            rest.first().map(String::as_str).unwrap_or(""),
+            rest.get(1).map(String::as_str).unwrap_or(""),
+            timeout,
+        );
     }
     match run_parent(&args) {
         Ok(code) => ExitCode::from(code),
@@ -113,13 +134,54 @@ fn sanitize(detail: &str) -> String {
 
 // ---- worker mode ----
 
+/// `--single AREA PATH [--timeout SECS]`: run one fixture through the real
+/// harness (includes, prelude, `$262`) and print the verdict with the wall
+/// time — a fixture that finishes reports its elapsed time, one past the
+/// deadline reports HANG. The fast loop for "is this fixture slow or
+/// stuck?" questions.
+fn single_main(area_token: &str, relative: &str, timeout: Duration) -> ExitCode {
+    let Some(area) = parse_area(area_token) else {
+        eprintln!(
+            "test262-sweep: unknown area {area_token:?} (language | built-ins | annexB | intl402)"
+        );
+        return ExitCode::from(2);
+    };
+    let fixture = Fixture {
+        area,
+        relative: relative.to_string(),
+    };
+    let mut child = spawn_worker(std::slice::from_ref(&fixture), false, true);
+    let stdout = child.stdout.take().expect("worker stdout");
+    let reader = std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        reader
+            .lines()
+            .map_while(Result::ok)
+            .collect::<Vec<String>>()
+    });
+    let start = Instant::now();
+    let timed_out = !wait_for_child(&mut child, timeout);
+    let wall = start.elapsed().as_secs_f32();
+    let lines = reader.join().unwrap_or_default();
+    match lines.first().map(String::as_str) {
+        Some(line) if !timed_out => {
+            println!("{line} (wall {wall:.2}s)");
+            ExitCode::SUCCESS
+        }
+        _ => {
+            println!("HANG\t{relative}\t(wall {wall:.2}s, timeout {timeout:?})");
+            ExitCode::SUCCESS
+        }
+    }
+}
+
 fn worker_main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--gc-stress") {
         test262::harness::set_gc_stress(true);
     }
-    if args.iter().any(|a| a == "--jit") {
-        test262::harness::set_jit(true);
+    if args.iter().any(|a| a == "--jitless") {
+        test262::harness::set_jit(false);
     }
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -135,10 +197,26 @@ fn worker_main() -> ExitCode {
         let Some(area) = parse_area(area_token) else {
             continue;
         };
+        let start = Instant::now();
         let (status, detail) = match run_fixture(area, relative) {
             FixtureResult::Pass => ("PASS", String::new()),
             FixtureResult::Skip(reason) => ("SKIP", reason),
             FixtureResult::Fail(reason) => ("FAIL", reason),
+        };
+        let elapsed = start.elapsed().as_millis();
+        // Every worker line carries its wall time: PASS lines in the detail
+        // (the parent ignores it), FAIL/SKIP lines as a suffix — so a single
+        // fixture run reports how long it actually took (slow vs. stuck).
+        let detail = match status {
+            "PASS" => format!("{elapsed}ms"),
+            _ => {
+                let mut detail = detail;
+                if !detail.is_empty() {
+                    detail.push(' ');
+                }
+                detail.push_str(&format!("({elapsed}ms)"));
+                detail
+            }
         };
         println!("{status}\t{relative}\t{}", sanitize(&detail));
         let _ = stdout.lock().flush();
@@ -168,37 +246,69 @@ usage: test262-sweep [area] [options]
 area: language | built-ins | annexB | intl402 | all (default: all)
 
 options:
-  --jobs N             concurrent batches (default: available parallelism)
+  --fast               quick smoke: full-core jobs (the default) + 5s recheck deadline
+                       (verdicts wobble on 5-15s fixtures under load)
+  --accurate           steadier verdicts: half-core jobs + recheck matching the batch
+                       deadline
+  --jobs N             concurrent batches (default: full available parallelism)
   --batch N            fixtures per batch (default: 32)
   --timeout SECS       per-batch deadline (default: 15)
-  --recheck-timeout S  per-fixture hang-recheck deadline (default: 5)
+  --recheck-timeout S  per-fixture hang-recheck deadline (default: 15, matching --timeout)
   --sample N           at most N fixtures per top-level directory
   --filter GLOB        only fixtures whose relative path matches (* and ?)
   --list FILE          only the fixtures listed in FILE (one relative path per line)
   --gc-stress          collect after every allocation (GC-2 root-audit net)
-  --jit                run every certified body through the Cranelift JIT
+  --jitless            run every certified body through the interpreter (the JIT
+                       is on by default)
   --json               emit a JSON report instead of the text report
   --help, -h";
 
 fn parse_options(args: &[String]) -> Result<Options, String> {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     let mut options = Options {
-        jobs: std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4),
+        // Full-core parallelism by default (the fastest wall time; the
+        // recheck deadline below is what keeps the verdicts consistent — a
+        // fixture that finishes within its own 15s batch budget is a pass,
+        // not a hang, so a batch killed by the 32-fixture composition never
+        // misclassifies it). `--accurate` trades wall time for steadier
+        // per-fixture timing under reduced contention.
+        jobs: cores,
         batch: 32,
         timeout: Duration::from_secs(15),
-        recheck_timeout: Duration::from_secs(5),
+        // The recheck deadline matches the batch budget: a fixture that
+        // finishes within its own 15s deadline is a pass, not a hang — the
+        // old 5s recheck classified 5-15s fixtures (the slow RegExp
+        // property-escape fixtures) as hangs whenever their batch was
+        // killed, independent of any real problem.
+        recheck_timeout: Duration::from_secs(15),
         sample: None,
         filter: None,
         list: None,
         json: false,
         gc_stress: false,
-        jit: false,
+        // The JIT is the default; only `--jitless` turns it off.
+        jit: true,
         areas: vec![Area::Language, Area::Builtins, Area::AnnexB],
     };
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            "--fast" => {
+                // A quick smoke: full-core parallelism (the default) and a
+                // short recheck deadline, so a killed batch's fixtures are
+                // classified fast. Borderline fixtures (5-15s) can wobble
+                // between pass and hang under contention.
+                options.jobs = cores;
+                options.recheck_timeout = Duration::from_secs(5);
+            }
+            "--accurate" => {
+                // Steadier verdicts: half-core parallelism (less contention
+                // skew) and a recheck deadline that matches the batch budget.
+                options.jobs = (cores / 2).max(1);
+                options.recheck_timeout = options.timeout;
+            }
             "--jobs" => {
                 index += 1;
                 options.jobs = parse_usize(args, index, "--jobs")?;
@@ -238,7 +348,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
             }
             "--json" => options.json = true,
             "--gc-stress" => options.gc_stress = true,
-            "--jit" => options.jit = true,
+            "--jitless" => options.jit = false,
             "--help" | "-h" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -503,7 +613,7 @@ fn run_batch_inner(
     results
 }
 
-/// Re-run one fixture on its own with a short deadline; times out => Hang.
+/// Re-run one fixture on its own with the recheck deadline; times out => Hang.
 fn run_single(fixture: &Fixture, options: &Options) -> SweepResult {
     let mut child = spawn_worker(
         std::slice::from_ref(fixture),
@@ -568,8 +678,8 @@ fn spawn_worker(batch: &[Fixture], gc_stress: bool, jit: bool) -> Child {
     if gc_stress {
         command.arg("--gc-stress");
     }
-    if jit {
-        command.arg("--jit");
+    if !jit {
+        command.arg("--jitless");
     }
     let mut child = command.spawn().expect("spawn sweep worker");
     let mut stdin = child.stdin.take().expect("worker stdin");

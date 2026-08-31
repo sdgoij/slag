@@ -39,8 +39,8 @@ JavaScriptCore C-API bindings.
   [Cranelift](https://cranelift.dev): inline number/string fast paths,
   direct-mapped global/member value cells, and register-resident fast
   loops. `--jit-bench` times JIT vs interpreter, and the conformance
-  sweep runs the full corpus through the JIT (`--jit`). Design, status,
-  and remaining work: `docs/jit-report.md`.
+  sweep runs the full corpus through the JIT by default (`--jitless`
+  disables it). Design, status, and remaining work: `docs/jit-report.md`.
 - **Portable** — no third-party runtime dependencies beyond the Rust
   standard library (see `PLAN.md` §4.10), with one opt-in exception: the
   experimental JIT (`crates/jit`) pulls in Cranelift and `region` and is

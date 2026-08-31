@@ -132,7 +132,7 @@ impl std::fmt::Display for Error {
 /// A character-set predicate for `\d \w \s` and `\p{…}` classes that are not
 /// case-folded and not in `/v` set arithmetic (matched per character at match
 /// time instead of enumerated into ranges).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Predicate {
     Digits,
     Word,
@@ -300,6 +300,16 @@ pub struct Regex {
     pub named_group_order: Vec<Vec<u32>>,
     /// Whether any GroupName appears (drives the `groups` object).
     pub has_group_names: bool,
+    /// Whether the program contains no backreferences (computed once at
+    /// compile time): gates the repeat failure memo, see `engine`.
+    pub(crate) backref_free: bool,
+    /// The peeled atoms of repeats eligible for the exhausted memo (computed
+    /// once at compile time): no enclosing repeat has min >= 2.
+    pub(crate) memo_safe: std::collections::HashSet<usize>,
+    /// Leading-unit prefilter for the search loop, computed at compile time:
+    /// the UTF-16 units any match must start with (None = no skip, e.g. the
+    /// pattern can match empty). See `engine::search_prefilter`.
+    pub(crate) prefilter: Option<Vec<(u32, u32)>>,
 }
 
 /// The result of a successful `exec`: capture spans in code units.
@@ -325,20 +335,18 @@ impl Regex {
         engine::exec(self, input, start)
     }
 
+    /// Leftmost search that also reports the index the match started at (the
+    /// runtime's RegExpBuiltinExec loop needs it for lastIndex). Applies a
+    /// leading-char prefilter so positions where no match can start are
+    /// skipped without a full matcher attempt.
+    pub fn search_at(&self, input: &[u16], start: usize) -> Option<(usize, Match)> {
+        engine::search(self, input, start)
+    }
+
     /// Leftmost search: try `start`, advancing by one character on failure
     /// until a match is found or the input is exhausted.
     pub fn exec(&self, input: &[u16], start: usize) -> Option<Match> {
-        let mut index = start;
-        while index <= input.len() {
-            if let Some(m) = self.exec_at(input, index) {
-                return Some(m);
-            }
-            if index >= input.len() {
-                break;
-            }
-            index = self.advance_string_index(input, index);
-        }
-        None
+        self.search_at(input, start).map(|(_, m)| m)
     }
 
     /// spec 22.2.2.5 AdvanceStringIndex for empty-match handling.
@@ -915,6 +923,458 @@ mod tests {
                 v("v")
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn capture_repeat_fast_path_backtracks() {
+        // A capture-wrapped single atom takes the iterative fast path; the
+        // reported span must be the last iteration's, and backtracking must
+        // shrink it correctly (spec RepeatMatcher).
+        let re = compile(
+            "(a)+b".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f(""),
+        )
+        .unwrap();
+        let m = re
+            .exec(&"aaab".encode_utf16().collect::<Vec<u16>>(), 0)
+            .unwrap();
+        assert_eq!(m[0], Some((0, 4)));
+        assert_eq!(m[1], Some((2, 3)));
+        // Zero iterations leave the capture undefined.
+        let re = compile(
+            "(a)*b".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f(""),
+        )
+        .unwrap();
+        let m = re
+            .exec(&"b".encode_utf16().collect::<Vec<u16>>(), 0)
+            .unwrap();
+        assert_eq!(m[1], None);
+        // A nested pair of captures both track the last iteration.
+        let re = compile(
+            "((a))+".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f(""),
+        )
+        .unwrap();
+        let m = re
+            .exec(&"aaa".encode_utf16().collect::<Vec<u16>>(), 0)
+            .unwrap();
+        assert_eq!(m[1], Some((2, 3)));
+        assert_eq!(m[2], Some((2, 3)));
+    }
+
+    #[test]
+    fn capture_repeat_fast_path_does_not_overflow() {
+        // The capture-wrapped single atom must consume iteratively like the
+        // capture-free case (a multi-megabyte `(a)+` used to recurse once per
+        // character and overflow the stack).
+        let re = compile(
+            "(a)+".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f(""),
+        )
+        .unwrap();
+        let input = vec![b'a' as u16; 1_000_000];
+        let m = re.exec(&input, 0).unwrap();
+        assert_eq!(m[1], Some((999_999, 1_000_000)));
+    }
+
+    #[test]
+    fn search_prefilter_skips_and_hits() {
+        // The search loop's leading-char prefilter must never skip a real
+        // match, and must find matches after a run of skipped positions.
+        let re = compile("a*b".encode_utf16().collect::<Vec<u16>>().as_slice(), f("")).unwrap();
+        let m = re
+            .exec(&"xxb".encode_utf16().collect::<Vec<u16>>(), 0)
+            .unwrap();
+        assert_eq!(m[0], Some((2, 3)));
+        // `a?b`: first char may be `a` or `b` (the union prefilter).
+        let re = compile("a?b".encode_utf16().collect::<Vec<u16>>().as_slice(), f("")).unwrap();
+        let m = re
+            .exec(&"xb".encode_utf16().collect::<Vec<u16>>(), 0)
+            .unwrap();
+        assert_eq!(m[0], Some((1, 2)));
+        // Alternation union prefilter.
+        let re = compile(
+            "(foo|bar|baz)"
+                .encode_utf16()
+                .collect::<Vec<u16>>()
+                .as_slice(),
+            f(""),
+        )
+        .unwrap();
+        let m = re
+            .exec(&"xxbar".encode_utf16().collect::<Vec<u16>>(), 0)
+            .unwrap();
+        assert_eq!(m[0], Some((2, 5)));
+        // Anchored: the prefilter must not conflict with `^`.
+        let re = compile(
+            "^abc".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f(""),
+        )
+        .unwrap();
+        assert!(
+            re.exec(&"xxabc".encode_utf16().collect::<Vec<u16>>(), 0)
+                .is_none()
+        );
+        // A pattern that can match empty disables the prefilter entirely;
+        // the greedy `x*` still consumes the `x` before `$` succeeds.
+        let re = compile("x*$".encode_utf16().collect::<Vec<u16>>().as_slice(), f("")).unwrap();
+        let m = re
+            .exec(&"yx".encode_utf16().collect::<Vec<u16>>(), 0)
+            .unwrap();
+        assert_eq!(m[0], Some((1, 2)));
+    }
+
+    #[test]
+    fn search_prefilter_unicode_non_bmp() {
+        // A non-BMP first character must not be skipped by the unit-set
+        // mapping (high surrogate).
+        let re = compile(
+            "[\\u{10000}]b"
+                .encode_utf16()
+                .collect::<Vec<u16>>()
+                .as_slice(),
+            f("u"),
+        )
+        .unwrap();
+        let input: Vec<u16> = "x\u{10000}b".encode_utf16().collect();
+        let m = re.exec(&input, 0).unwrap();
+        assert_eq!(m[0], Some((1, 4)));
+    }
+
+    #[test]
+    fn predicate_prefilter_search() {
+        // `\d` and `\p{…}` classes now contribute their leading-char set to
+        // the prefilter, so a search skips positions that cannot start a
+        // match (behavioral check; the speedup is in the perf harness).
+        let re = compile(
+            "\\d{4}".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f(""),
+        )
+        .unwrap();
+        let mut input: Vec<u16> = vec![b'x' as u16; 100_000];
+        input.extend("1234".encode_utf16());
+        let m = re.exec(&input, 0).unwrap();
+        assert_eq!(m[0], Some((100_000, 100_004)));
+        // A full-space predicate (`\p{Any}`) must not produce a prefilter
+        // that skips everything.
+        let re = compile(
+            "\\p{Any}+".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f("u"),
+        )
+        .unwrap();
+        let m = re
+            .exec(&"ab".encode_utf16().collect::<Vec<u16>>(), 0)
+            .unwrap();
+        assert_eq!(m[0], Some((0, 2)));
+    }
+
+    #[test]
+    fn ignore_case_prefilter_never_skips_a_fold_class_member() {
+        // A folded literal's leading-char set is its full fold class, so the
+        // search must not skip a member the forward closure would miss:
+        // `/k/iu` matches U+212A KELVIN SIGN (which folds to `k`).
+        let re = compile("k".encode_utf16().collect::<Vec<u16>>().as_slice(), f("iu")).unwrap();
+        let mut input: Vec<u16> = vec![b'x' as u16; 100_000];
+        input.push(0x212A);
+        let m = re.exec(&input, 0).unwrap();
+        assert_eq!(m[0], Some((100_000, 100_001)));
+        // The classic fold pairs: `/ß/iu` matches ẞ and vice versa.
+        let re = compile(
+            "\u{DF}".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f("iu"),
+        )
+        .unwrap();
+        let mut input: Vec<u16> = vec![b'x' as u16; 1000];
+        input.push(0x1E9E);
+        let m = re.exec(&input, 0).unwrap();
+        assert_eq!(m[0], Some((1000, 1001)));
+        // Legacy mode folds through uppercase: `/é/i` matches É.
+        let re = compile(
+            "\u{E9}".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f("i"),
+        )
+        .unwrap();
+        let mut input: Vec<u16> = vec![b'x' as u16; 1000];
+        input.push(0xC9);
+        let m = re.exec(&input, 0).unwrap();
+        assert_eq!(m[0], Some((1000, 1001)));
+        // A non-BMP fold maps through the high surrogate.
+        let re = compile(
+            "\u{10428}".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f("iu"),
+        )
+        .unwrap();
+        let mut input: Vec<u16> = vec![b'x' as u16; 1000];
+        input.extend("\u{10400}".encode_utf16());
+        let m = re.exec(&input, 0).unwrap();
+        assert_eq!(m[0], Some((1000, 1002)));
+    }
+
+    #[test]
+    fn ignore_case_prefilter_skips_to_folded_match() {
+        // The folded literal now contributes its leading-char set, so a
+        // search skips positions that cannot start the match (behavioral
+        // check; the speedup is in the perf harness).
+        let re = compile(
+            "abcdefghij".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f("i"),
+        )
+        .unwrap();
+        let mut input: Vec<u16> = vec![b'x' as u16; 100_000];
+        input.extend("ABCDEFGHIJ".encode_utf16());
+        let m = re.exec(&input, 0).unwrap();
+        assert_eq!(m[0], Some((100_000, 100_010)));
+        // A folded class contributes too: `/[a-z]+/i` after a run of
+        // non-letters.
+        let re = compile(
+            "[a-z]+".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f("i"),
+        )
+        .unwrap();
+        let mut input: Vec<u16> = vec![b'0' as u16; 100_000];
+        input.extend("Abc".encode_utf16());
+        let m = re.exec(&input, 0).unwrap();
+        assert_eq!(m[0], Some((100_000, 100_003)));
+    }
+
+    #[test]
+    fn linear_sequence_repeat_fast_path() {
+        // `(ab)+` is a linear sequence of single atoms: it takes the
+        // iterative fast path, and the capture reports the last iteration's
+        // span.
+        let re = compile(
+            "(ab)+c".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f(""),
+        )
+        .unwrap();
+        let m = re
+            .exec(&"abababc".encode_utf16().collect::<Vec<u16>>(), 0)
+            .unwrap();
+        assert_eq!(m[0], Some((0, 7)));
+        assert_eq!(m[1], Some((4, 6)));
+        // Backtracking through the linear sequence still finds the match.
+        let re = compile(
+            "(ab)+b".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f(""),
+        )
+        .unwrap();
+        let m = re
+            .exec(&"ababb".encode_utf16().collect::<Vec<u16>>(), 0)
+            .unwrap();
+        assert_eq!(m[0], Some((0, 5)));
+        assert_eq!(m[1], Some((2, 4)));
+        // Non-capturing linear sequence.
+        let re = compile(
+            "(?:ab)+".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f(""),
+        )
+        .unwrap();
+        let m = re
+            .exec(&"abab".encode_utf16().collect::<Vec<u16>>(), 0)
+            .unwrap();
+        assert_eq!(m[0], Some((0, 4)));
+    }
+
+    #[test]
+    fn linear_sequence_repeat_does_not_overflow() {
+        // A multi-megabyte `(ab)+` must consume iteratively like `(a)+`.
+        let re = compile(
+            "(ab)+".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f(""),
+        )
+        .unwrap();
+        let input: Vec<u16> = "ab".repeat(500_000).encode_utf16().collect();
+        let m = re.exec(&input, 0).unwrap();
+        assert_eq!(m[1], Some((input.len() - 2, input.len())));
+    }
+
+    #[test]
+    fn branching_atom_repeat_does_not_overflow() {
+        // The explicit-stack engine iterates even branching repeats
+        // (`(a|b)+`, `(a?b)+` are not simple atoms and take the general
+        // path); a multi-megabyte input must not recurse per iteration.
+        let re = compile(
+            "(a|b)+".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f(""),
+        )
+        .unwrap();
+        let input: Vec<u16> = "ab".repeat(500_000).encode_utf16().collect();
+        let m = re.exec(&input, 0).unwrap();
+        // The last iteration matches the final `b`.
+        assert_eq!(m[1], Some((input.len() - 1, input.len())));
+        // A nested optional repeat is not simple either.
+        let re = compile(
+            "(a?b)+".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f(""),
+        )
+        .unwrap();
+        assert!(re.exec(&input, 0).is_some());
+    }
+
+    #[test]
+    fn nested_repeat_failure_is_memoized() {
+        // `(a+)+b` and `(?:a*)*b` are the classic exponential-backtracking
+        // patterns: every partition of the a-run into groups is explored.
+        // The failure memo turns them polynomial (the probe took ~12s at
+        // n=25; with the memo it is microseconds).
+        for pattern in ["(a+)+b", "(?:a*)*b"] {
+            let re = compile(
+                pattern.encode_utf16().collect::<Vec<u16>>().as_slice(),
+                f(""),
+            )
+            .unwrap();
+            let input: Vec<u16> = "a".repeat(25).encode_utf16().collect();
+            let start = std::time::Instant::now();
+            assert!(re.exec(&input, 0).is_none());
+            assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        }
+    }
+
+    #[test]
+    fn nested_repeat_memo_respects_soundness_gates() {
+        // The exhausted memo must stay off when an enclosing repeat has
+        // min >= 2: there the continuation depends on the enclosing repeat's
+        // iteration count, so a per-(atom, position) entry would hide the
+        // match here (g1=g2=g3="a", then b).
+        let re = compile(
+            "(a+){3,}b".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f(""),
+        )
+        .unwrap();
+        let m = re
+            .exec(&"aaab".encode_utf16().collect::<Vec<u16>>(), 0)
+            .unwrap();
+        assert_eq!(m[0], Some((0, 4)));
+        // A backreference anywhere also disables the exhausted memo (the
+        // continuation reads captures); the match must still be found.
+        let re = compile(
+            "((a+)+b)\\1"
+                .encode_utf16()
+                .collect::<Vec<u16>>()
+                .as_slice(),
+            f(""),
+        )
+        .unwrap();
+        let m = re
+            .exec(&"aaabaaab".encode_utf16().collect::<Vec<u16>>(), 0)
+            .unwrap();
+        assert_eq!(m[0], Some((0, 8)));
+    }
+
+    #[test]
+    fn nested_repeat_stop_choice_still_found() {
+        // `(a+)+a` on "aaa": the inner `a+` exhausts its shrink levels at
+        // some positions, but the match stops the enclosing repeat early;
+        // the recorded memo entries must not hide it.
+        let re = compile(
+            "(a+)+a".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f(""),
+        )
+        .unwrap();
+        let m = re
+            .exec(&"aaa".encode_utf16().collect::<Vec<u16>>(), 0)
+            .unwrap();
+        assert_eq!(m[0], Some((0, 3)));
+    }
+
+    #[test]
+    fn failure_memo_survives_search_loop_position_attempts() {
+        // The memo persists across `match_at` calls; positions that exhausted
+        // the repeat must not poison a later position where it matches.
+        let re = compile(
+            "(a+)+b".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f(""),
+        )
+        .unwrap();
+        let input: Vec<u16> = "aaaaaaaaaXaaab".encode_utf16().collect();
+        let m = re.exec(&input, 0).unwrap();
+        assert_eq!(m[0], Some((10, 14)));
+    }
+
+    #[test]
+    fn search_prefilter_never_visits_surrogate_halves() {
+        // The prefilter skip must advance code-point-aware under `/u` (the
+        // spec's AdvanceStringIndex): position 1 of a surrogate pair is
+        // never visited, so the lone low-surrogate literal must not match.
+        let re = compile(
+            "\\udf06".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f("u"),
+        )
+        .unwrap();
+        let input: Vec<u16> = vec![0xD834, 0xDF06];
+        assert!(re.exec(&input, 0).is_none());
+        // Without `/u`, every unit is a position: the low surrogate matches
+        // at index 1.
+        let re = compile(
+            "\\udf06".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f(""),
+        )
+        .unwrap();
+        let m = re.exec(&input, 0).unwrap();
+        assert_eq!(m[0], Some((1, 2)));
+    }
+
+    #[test]
+    fn lookbehind_capture_repeat_spans() {
+        // A capture repeat inside a lookbehind runs right-to-left; the span
+        // must still be recorded (start, end) with start < end.
+        let re = compile(
+            "(?<=(\\w){3})def"
+                .encode_utf16()
+                .collect::<Vec<u16>>()
+                .as_slice(),
+            f(""),
+        )
+        .unwrap();
+        let m = re
+            .exec(&"abcdef".encode_utf16().collect::<Vec<u16>>(), 0)
+            .unwrap();
+        assert_eq!(m[0], Some((3, 6)));
+        assert_eq!(m[1], Some((0, 1)));
+    }
+
+    #[test]
+    fn coalesced_repeats_match_like_originals() {
+        // Adjacent greedy capture-free repeats of the same atom collapse:
+        // `a*a*a*a*b` ≡ `a*b` (the pathological case becomes linear).
+        let re = compile(
+            "a*a*a*a*b".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f(""),
+        )
+        .unwrap();
+        let m = re
+            .exec(&"aaaaab".encode_utf16().collect::<Vec<u16>>(), 0)
+            .unwrap();
+        assert_eq!(m[0], Some((0, 6)));
+        assert!(
+            re.exec(&"aaaaac".encode_utf16().collect::<Vec<u16>>(), 0)
+                .is_none()
+        );
+        // `a{2}a{3}` ≡ `a{5}`.
+        let re = compile(
+            "a{2}a{3}".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f(""),
+        )
+        .unwrap();
+        let m = re
+            .exec(&"aaaaa".encode_utf16().collect::<Vec<u16>>(), 0)
+            .unwrap();
+        assert_eq!(m[0], Some((0, 5)));
+        assert!(
+            re.exec(&"aaaa".encode_utf16().collect::<Vec<u16>>(), 0)
+                .is_none()
+        );
+        // Lazy repeats keep their own semantics.
+        let re = compile(
+            "a*?a*?b".encode_utf16().collect::<Vec<u16>>().as_slice(),
+            f(""),
+        )
+        .unwrap();
+        assert!(
+            re.exec(&"aab".encode_utf16().collect::<Vec<u16>>(), 0)
+                .is_some()
         );
     }
 }

@@ -73,11 +73,15 @@ pub(crate) fn compile_pattern(pattern: &[u16], flags: Flags) -> Result<Regex, Er
         has_group_names,
         depth: 0,
     };
-    let program = parser.parse_disjunction()?;
+    let mut program = parser.parse_disjunction()?;
     if parser.pos != parser.atoms.len() {
         return Err(Error::syntax("Unmatched parentheses in regular expression"));
     }
+    coalesce_repeats(&mut program);
     Ok(Regex {
+        prefilter: crate::engine::search_prefilter(&program, flags.has_unicode()),
+        backref_free: crate::engine::is_backref_free(&program),
+        memo_safe: crate::engine::memo_safe_atoms(&program),
         program,
         flags,
         capturing_groups: parser.capturing_groups,
@@ -1667,6 +1671,72 @@ fn is_double_punctuator(atom: Atom) -> bool {
             | 0x60
             | 0x7E
     )
+}
+
+/// Normalize the AST so adjacent greedy, capture-free repeats of the same
+/// atom merge (`a*a*` → `a*`, `a{2}a{3}` → `a{5}`, `a*a*a*a*b` → `a*b`).
+/// The split between two identical greedy atoms is never observable — the
+/// continuation is tried at the same total lengths in the same order — so
+/// the merge preserves match results while removing the redundant
+/// backtracking states (the classic `a*a*a*a*b` catastrophic case collapses
+/// to linear). Lazy quantifiers and capture-owning atoms keep their
+/// per-repeat semantics and are left alone.
+fn coalesce_repeats(node: &mut Node) {
+    fn merge_seq(nodes: &mut Vec<Node>) {
+        for n in nodes.iter_mut() {
+            coalesce_repeats(n);
+        }
+        let mut i = 0;
+        while i + 1 < nodes.len() {
+            let merge = match (&nodes[i], &nodes[i + 1]) {
+                (
+                    Node::Repeat {
+                        node: a,
+                        min: min1,
+                        max: max1,
+                        greedy: true,
+                        owned_captures: owned1,
+                    },
+                    Node::Repeat {
+                        node: b,
+                        min: min2,
+                        max: max2,
+                        greedy: true,
+                        owned_captures: owned2,
+                    },
+                ) => {
+                    owned1.is_empty() && owned2.is_empty() && a == b && {
+                        let min = min1.saturating_add(*min2);
+                        let max = match (max1, max2) {
+                            (None, _) | (_, None) => None,
+                            (Some(x), Some(y)) => Some(x.saturating_add(*y)),
+                        };
+                        nodes[i] = Node::Repeat {
+                            node: a.clone(),
+                            min,
+                            max,
+                            greedy: true,
+                            owned_captures: Vec::new(),
+                        };
+                        true
+                    }
+                }
+                _ => false,
+            };
+            if merge {
+                nodes.remove(i + 1);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    match node {
+        Node::Sequence(nodes) => merge_seq(nodes),
+        Node::Alternate(alts) => alts.iter_mut().for_each(merge_seq),
+        Node::Capture { node, .. } | Node::Repeat { node, .. } => coalesce_repeats(node),
+        Node::Lookahead { node, .. } | Node::Lookbehind { node, .. } => coalesce_repeats(node),
+        _ => {}
+    }
 }
 
 fn assemble_class(

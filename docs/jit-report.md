@@ -330,6 +330,51 @@ containing any of these fall back entirely:
   (the compiler forces the vector form); the JIT lowers one anyway (Cut
   62). Heap-value constants inline their bits (Cut 62).
 
+**The `buildString` harness loops (the sweep's slowest cluster)** — the
+`RegExp/property-escapes/generated` + `CharacterClassEscapes` fixtures
+(previously 378-432 sweep "hangs") spend their time NOT in the regexp
+engine (the regex tests themselves measure 0-17 ms; the engine passes the
+cluster's 1500+ runnable fixtures) but in the vendored harness's
+`buildString` (`test262/harness/regExpUtils.js`), which fills a JS array
+in a loop and calls `String.fromCodePoint.apply`. The body DOES certify
+and compiles (`lookup_info` succeeds — the array store / member write /
+`.apply` steps all have JIT arms), but every op lowers to a slow-path
+helper call, so the machine code runs at interpreter speed (`--jit`
+changes nothing on these loops).
+
+The cost profile (release build, measured) had three layers; the first
+two are fixed (2026-08-31) and the whole cluster now passes clean:
+
+1. **The per-store interner lock** on the canonical index string
+   (`PropertyKey::from_utf8(&i.to_string())` → process-wide `Mutex`):
+   ~415 ns/op, 94% of the prototype-less store cost. Fixed by
+   `crux::string::index_atom` — a thread-local index → atom memo
+   (`PropertyKey::from_index`) — measured 8× on the crux append; the
+   fixtures' chunked `buildString` reuses ~10k indices, so every store
+   after the first chunk hits the memo lock-free.
+2. **The `arr.length = 0` reset was quadratic** — `array_set_length`
+   deleted per-element, and each `delete_key` is an O(n) scan + O(n)
+   remove + index-map null (the next lookup rebuilds it), so resetting a
+   10k-element array cost O(n²) per chunk. Fixed by a dense-truncation
+   fast path (one `SmallProps::truncate` when the own properties are
+   exactly `["0".."old_length-1", "length"]` and all elements are
+   configurable data). `buildString` of a 2,162,560-unit string:
+   ~3.4 s → ~0.65 s (~5×), and the fixtures 6.7 s → ~1.4 s.
+3. **Remaining**: the interpreter's per-step dispatch (~90 ns/step — the
+   buildString inner loop is ~13 steps) and the JIT's per-op `call_slow`
+   round-trips (§7 item 12). The store loop is now ~45% faster overall
+   (measured on the fixture's exact shape: 3M `codePoints[length++] =
+   codePoint` iterations, ~1670 ms → ~920 ms interpreted; the JIT inline
+   store adds a further edge under `--jit`), the whole `built-ins/RegExp`
+   cluster passes **1878/1879 with 0 fail / 0 crash** (batch-4 sweep; the
+   single residual hang, `RegExp/character-class-escape-non-whitespace.js`,
+   is a 65,536-iteration `\S+` replace loop — a REGEXP ENGINE cost, not
+   buildString), and the full 48,622-fixture sweep is **48130 pass / 0 fail /
+   0 crash / 334 hang** (down from 374 hangs: the batch-32 sweep's per-BATCH
+   15 s deadline still kills 32-fixture batches of ~1-2.5 s fixtures — each
+   fixture passes individually; the sweep runs interpreted by default,
+   `test262-sweep --jit` is opt-in).
+
 ## 7. TODO / next steps
 
 **Correctness/soundness gaps (same shape as the fixed bug):**
@@ -474,9 +519,15 @@ containing any of these fall back entirely:
 
 **Non-JIT engine work observed along the way:**
 
-10. **`built-ins` RegExp property-escape fixtures** (~445) are the slowest
-   cluster in the sweep — pre-existing RegExp compilation cost, independent of
-   the JIT.
+10. **`built-ins` RegExp property-escape fixtures** — **root cause identified**
+   (2026-08-31): the slowest cluster in the sweep is not RegExp cost (the
+   regex tests measure 0-17 ms; the engine passes the cluster's 1500+
+   runnable fixtures with 0 fail / 0 crash) but the vendored harness's
+   `buildString`, whose array-store / member-write / `.apply` body never
+   certifies and runs interpreted at ~100× mainstream speed — full
+   measurements in §6. The hang counts wobble with load (378-432); all
+   fixtures pass individually at idle. The fix is the certification work
+   in item 12.
 11. **`--gc-stress` is superlinear** on 100K-closure fixtures (per-allocation
     collection × per-iteration allocations) — inherent to the mode, not a
     regression.
@@ -491,6 +542,7 @@ they run interpreted until the count reaches the threshold, then compile
 on the next consult (the count is deliberately not cached in `jit_info`,
 so promotion is never blocked and the `1` sticky-unsupported mark is
 only written at/after the threshold). Loop bodies (`body_has_loop` — a
+loop bodies (`body_has_loop` — a
 back edge per `step_targets`, a `FastLoopHead`/`RunRegBody` step, or a
 `TailCallSelf*` step, whose interpreter TCO loop re-enters the body
 without re-consulting the JIT) and hot leaves under a compiled caller
@@ -499,3 +551,47 @@ without re-consulting the JIT) and hot leaves under a compiled caller
 benches are preserved. The consult count aggregates across the `Rc`
 clones of one declaration site. Remaining tuning: the K value (4/16/64),
 and a step-count floor for tiny loops.
+
+12. **Make the `buildString` shape fast (array stores + member writes)** —
+   the work that cleared the ~380-430 RegExp fixture hangs (§6). The body
+   already certifies; the bottleneck was per-op cost, and five slices
+   fixed it (measured on the fixture's store shape, 3M `codePoints[length++]
+   = codePoint` iterations with a 10k chunk reset: ~1670 ms → ~920 ms
+   interpreted, ~45%):
+   - the per-store interner lock on the canonical index string
+     (`crux::string::index_atom` — a thread-local index → atom memo,
+     `PropertyKey::from_index`, ~8× on the crux append);
+   - the quadratic `arr.length = 0` reset (`array_set_length`'s per-element
+     deletes with an O(n) scan/remove/index-map rebuild each → a
+     dense-truncation fast path);
+   - `SmallProps::truncate` DROPPED the heap Vec on every truncate-to-inline
+     (the fill-reset-fill pattern re-paid the 3→12k Vec growth per chunk),
+     and `SmallProps::push`'s spill allocated a fresh Vec each time —
+     truncate now keeps the heap's allocation (`clear()` instead of
+     `Vec::new()`) and the spill reuses it (measured ~220 ns/append →
+     ~55 ns);
+   - the reset's dense check re-parsed every key string through the
+     interner (`array_index_of` → `lookup` → lock + alloc per key, ~4×
+     slower) — it now compares the keys by ATOM against the memoized
+     `PropertyKey::from_index(i)`;
+   - the prototype-chain walk in `array_element_write` called
+     `get_own_property_key` per link, which re-parsed the index string for
+     the Array length fast path (~130 ns/append on a real
+     Array.prototype → Object.prototype chain — the earlier "~33 ns"
+     measurement was a prototype-less bench) — a parse-free
+     `has_own_index_property` (the Array length shortcut + an atom-compare
+     store lookup) drops the walk to ~50 ns.
+   Plus the JIT inline store (slice 3, the old item (b)): `AssignMemberComputed`
+   with a plain `=` now calls a direct `fast_array_element_write` helper
+   (Array kind + canonical index Number check, then `array_element_write`;
+   1 = stored, 0 = fall back to the full `assign_member_computed` helper;
+   never errors — the chain walk bails on anything but a plain
+   Ordinary/Array link, so no trap or getter can run). Measured ~2% on the
+   store loop under `--jit` (the call_slow wrapper was small; the crux
+   machinery was the cost), which is what the doc's earlier
+   "chain-clean cache not justified" note predicted — the walk fix above
+   was the higher-value piece. The residual fixture time is REGEXP ENGINE
+   cost (`\p{...}` class handling, the `\S` replace loops), not the
+   harness's array fills. Note the sweep runs interpreted by default, so
+   the crux slices matter for the default-sweep floor; the inline store
+   matters for the `--jit` mode.

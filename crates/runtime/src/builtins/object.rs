@@ -380,7 +380,7 @@ fn builtin_tag(agent: &mut Agent, object: &Value) -> Result<String, JsError> {
 fn is_array_for_to_string(value: &Value) -> Result<bool, JsError> {
     match value.kind() {
         ValueKind::Object(obj) => match &obj.kind {
-            crux::object::ObjectKind::Array => Ok(true),
+            crux::object::ObjectKind::Array(_) => Ok(true),
             crux::object::ObjectKind::Proxy(slots) => {
                 let Some(target) = slots.target.borrow().as_ref().cloned() else {
                     return Ok(false);
@@ -389,7 +389,7 @@ fn is_array_for_to_string(value: &Value) -> Result<bool, JsError> {
             }
             _ => Ok(false),
         },
-        ValueKind::Function(f) => Ok(matches!(f.object.kind, crux::object::ObjectKind::Array)),
+        ValueKind::Function(f) => Ok(matches!(f.object.kind, crux::object::ObjectKind::Array(_))),
         _ => Ok(false),
     }
 }
@@ -595,7 +595,7 @@ fn object_define_properties(
         let mut desc = crux::property::to_property_descriptor(&value)?;
         // ArraySetLength coerces an object [[Value]] through the agent
         // (spec 10.4.2.4 steps 3-4); crux cannot invoke user toString.
-        if matches!(target.kind, crux::object::ObjectKind::Array)
+        if matches!(target.kind, crux::object::ObjectKind::Array(_))
             && key == PropertyKey::from_utf8("length")
             && let Some(length_value) = &desc.value
             && matches!(
@@ -783,7 +783,7 @@ pub fn dispatch_call(
             // validation; crux cannot invoke user valueOf, so both coercions
             // run here through the agent (their side effects are observable,
             // define-own-prop-length-coercion-order.js).
-            if matches!(obj.kind, crux::object::ObjectKind::Array)
+            if matches!(obj.kind, crux::object::ObjectKind::Array(_))
                 && key == PropertyKey::from_utf8("length")
                 && let Some(value) = &desc.value
                 && matches!(value.kind(), ValueKind::Object(_) | ValueKind::Function(_))
@@ -1553,6 +1553,40 @@ mod tests {
         );
         // A non-writable property rejects writes in strict code.
         assert!(run("'use strict'; let o = {}; Object.defineProperty(o, 'x', { value: 1, writable: false }); o.x = 2").is_err());
+    }
+
+    #[test]
+    fn dense_array_length_redefine_with_configurable_true_throws() {
+        // The dense ArraySlots representation must not let a length redefine
+        // bypass the non-configurable length invariant (spec 10.4.2.4 step 8
+        // is OrdinaryDefineOwnProperty; test262
+        // redefine-length-with-various-values-and-configurable-true.js).
+        assert!(
+            run("let a = [1]; Object.defineProperty(a, 'length', { configurable: true })").is_err()
+        );
+        assert!(
+            run(
+                "let a = [1]; Object.defineProperty(a, 'length', { value: 1, configurable: true })"
+            )
+            .is_err()
+        );
+        assert!(
+            run(
+                "let a = [1]; Object.defineProperty(a, 'length', { value: 2, configurable: true })"
+            )
+            .is_err()
+        );
+        assert!(
+            run(
+                "let a = [1]; Object.defineProperty(a, 'length', { value: 0, configurable: true })"
+            )
+            .is_err()
+        );
+        // The compatible fast paths still work (value-only grows).
+        assert_eq!(
+            run("let a = [1]; a.length = 3; a.length").unwrap(),
+            Value::Number(3.0)
+        );
     }
 
     #[test]

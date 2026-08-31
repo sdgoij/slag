@@ -2960,7 +2960,7 @@ impl Vm {
             ValueKind::Object(object)
                 if matches!(
                     object.kind,
-                    crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array
+                    crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array(_)
                 ) =>
             {
                 // `kind()` already reconstructed the handle; move it out
@@ -2972,7 +2972,7 @@ impl Vm {
                 let object = &function.object;
                 if matches!(
                     object.kind,
-                    crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array
+                    crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array(_)
                 ) {
                     Some(*object)
                 } else {
@@ -3063,7 +3063,7 @@ impl Vm {
                 let proto = proto_handle.as_ref()?;
                 if !matches!(
                     proto.kind,
-                    crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array
+                    crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array(_)
                 ) {
                     return None;
                 }
@@ -3150,7 +3150,7 @@ impl Vm {
         };
         if !matches!(
             proto.kind,
-            crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array
+            crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array(_)
         ) {
             return false;
         }
@@ -3163,7 +3163,7 @@ impl Vm {
             }
             if !matches!(
                 current.kind,
-                crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array
+                crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array(_)
             ) {
                 return false;
             }
@@ -3208,7 +3208,7 @@ impl Vm {
             }
             if !matches!(
                 current.kind,
-                crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array
+                crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array(_)
             ) {
                 return None;
             }
@@ -3343,7 +3343,7 @@ impl Vm {
                 if let Ok(Some(proto)) = object.get_prototype_of()
                     && matches!(
                         proto.kind,
-                        crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array
+                        crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array(_)
                     )
                 {
                     let proto_index = Self::member_cell_index(proto.id(), name);
@@ -3371,8 +3371,27 @@ impl Vm {
         let ValueKind::Object(object) = object.kind() else {
             return None;
         };
-        if !matches!(object.kind, crux::object::ObjectKind::Array) {
+        if !matches!(object.kind, crux::object::ObjectKind::Array(_)) {
             return None;
+        }
+        // Dense fast path: the buffer is authoritative — the element is the
+        // slot (a hole reads absent, so the caller's full Get sees the
+        // chain). The value cell below stays valid because buffer writes
+        // bump the generation.
+        if let crux::object::ObjectKind::Array(slots) = &object.kind
+            && slots.dense.get()
+        {
+            let value = slots.elements.borrow().get(index as usize).and_then(|e| *e);
+            if let Some(value) = value {
+                let cache_index = Self::array_element_index(object.id(), index);
+                agent.array_element_value_cells[cache_index] = Some(ArrayElementValueCell {
+                    id: object.id(),
+                    index,
+                    generation: object.generation(),
+                    value,
+                });
+            }
+            return value;
         }
         let cache_index = Self::array_element_index(object.id(), index);
         if let Some(cell) = agent.array_element_value_cells[cache_index].as_ref()
@@ -3411,7 +3430,24 @@ impl Vm {
         let ValueKind::Object(object) = object.kind() else {
             return;
         };
-        if !matches!(object.kind, crux::object::ObjectKind::Array) {
+        if !matches!(object.kind, crux::object::ObjectKind::Array(_)) {
+            return;
+        }
+        // Dense: the value cell is the buffer slot directly (the generation
+        // catches a later write or spill); a hole caches nothing.
+        if let crux::object::ObjectKind::Array(slots) = &object.kind
+            && slots.dense.get()
+        {
+            let value = slots.elements.borrow().get(index as usize).and_then(|e| *e);
+            if let Some(value) = value {
+                let cache_index = Self::array_element_index(object.id(), index);
+                agent.array_element_value_cells[cache_index] = Some(ArrayElementValueCell {
+                    id: object.id(),
+                    index,
+                    generation: object.generation(),
+                    value,
+                });
+            }
             return;
         }
         // Array element keys are the canonical interned index strings, so
@@ -3462,6 +3498,19 @@ impl Vm {
             && cell.generation == obj.generation()
         {
             return Ok(cell.length);
+        }
+        // Dense: the cell is authoritative (the mirror is kept in sync, but
+        // the cell skips the borrow and number conversion).
+        if let crux::object::ObjectKind::Array(slots) = &obj.kind
+            && slots.dense.get()
+        {
+            let length = crux::convert::to_length(slots.length.get());
+            agent.array_length_cells[cache_index] = Some(ArrayLengthCell {
+                id: obj.id(),
+                generation: obj.generation(),
+                length,
+            });
+            return Ok(length);
         }
         let props = obj.properties.borrow();
         if let Some((_, property)) = props.first()
@@ -7181,13 +7230,23 @@ impl Vm {
             && number.fract() == 0.0
             && (0.0..4294967295.0).contains(&number)
             && let ValueKind::Object(object_ref) = object.kind()
-            && matches!(object_ref.kind, crux::object::ObjectKind::Array)
-            && object_ref
-                .array_element_write(number as u64, value)?
-                .is_some()
         {
-            self.stack.push(value);
-            return Ok(());
+            let index = number as u64;
+            if matches!(object_ref.kind, crux::object::ObjectKind::Array(_))
+                && object_ref.array_element_write(index, value)?.is_some()
+            {
+                self.stack.push(value);
+                return Ok(());
+            }
+            // A typed array writes the element by numeric index directly —
+            // no number→string→parse round trip (sequential indices were
+            // O(n²) in the interner memos).
+            if let crux::object::ObjectKind::IntegerIndexed(slots) = &object_ref.kind
+                && object_ref.typed_array_element_set(slots, index, value)?
+            {
+                self.stack.push(value);
+                return Ok(());
+            }
         }
         let key = crate::context::to_property_key(agent, &key)?;
         self.assign_member(
@@ -7215,6 +7274,17 @@ impl Vm {
         if is_nullish(&object) {
             return Err(nullish_error("Cannot read properties of null"));
         }
+        // A typed array's `length` is a prototype accessor; serving it from
+        // the slots skips the accessor invocation, which the fixture
+        // byte-copy loops read every iteration (~6.6µs per accessor call).
+        if name == Self::length_atom()
+            && let ValueKind::Object(object_ref) = object.kind()
+            && let crux::object::ObjectKind::IntegerIndexed(slots) = &object_ref.kind
+        {
+            return Ok(Value::Number(
+                crux::object::typed_array_effective_length(slots) as f64,
+            ));
+        }
         match Self::member_cell_get(agent, &object, name) {
             Some(value) => Ok(value),
             None => {
@@ -7224,6 +7294,15 @@ impl Vm {
                 Ok(value)
             }
         }
+    }
+
+    /// The interned "length" atom, cached once (the fixture byte-copy loops
+    /// read `view.length` every iteration, so the fast-path probe must not
+    /// re-intern per read).
+    fn length_atom() -> crux::AtomId {
+        use std::sync::OnceLock;
+        static LENGTH: OnceLock<crux::AtomId> = OnceLock::new();
+        *LENGTH.get_or_init(|| crux::string::intern_utf8("length"))
     }
 
     /// The shared computed member read (the `GetMemberComputed` step and
@@ -7253,6 +7332,16 @@ impl Vm {
             && let Some(value) = Self::array_element_get(agent, &object, index)
         {
             return Ok(value);
+        }
+        // A typed array reads the element by numeric index directly — no
+        // number→string→parse round trip (sequential indices were O(n²) in
+        // the interner memos). An invalid index reads *undefined* (spec
+        // 10.4.7.5), so the fast path covers every Number key.
+        if let Some(index) = numeric
+            && let ValueKind::Object(object_ref) = object.kind()
+            && let crux::object::ObjectKind::IntegerIndexed(slots) = &object_ref.kind
+        {
+            return object_ref.typed_array_element_get(slots, index);
         }
         let key = crate::context::to_property_key(agent, &key)?;
         let value = match &key {

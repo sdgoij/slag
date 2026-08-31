@@ -144,14 +144,28 @@ impl SmallProps {
         } else if self.len == INLINE_PROPS {
             // Spill: move the inline entries to the heap (the inline array
             // is left empty; the live entries are then contiguous there).
-            let mut heap = Vec::with_capacity(INLINE_PROPS + 1);
-            // SAFETY: all inline entries are initialized at `len == INLINE_PROPS`;
-            // `assume_init_read` moves each out of the array.
-            for i in 0..INLINE_PROPS {
-                heap.push(unsafe { self.inline[i].assume_init_read() });
+            // Reuse the heap's retained capacity when a `truncate` kept it
+            // (the chunked fill-reset-fill pattern would otherwise re-pay
+            // the Vec growth on every chunk); otherwise allocate fresh.
+            if self.heap.capacity() > INLINE_PROPS {
+                self.heap.clear();
+                // SAFETY: all inline entries are initialized at
+                // `len == INLINE_PROPS`; `assume_init_read` moves each out.
+                for i in 0..INLINE_PROPS {
+                    self.heap.push(unsafe { self.inline[i].assume_init_read() });
+                }
+                self.heap.push(entry);
+            } else {
+                let mut heap = Vec::with_capacity(INLINE_PROPS + 1);
+                // SAFETY: all inline entries are initialized at
+                // `len == INLINE_PROPS`; `assume_init_read` moves each out of
+                // the array.
+                for i in 0..INLINE_PROPS {
+                    heap.push(unsafe { self.inline[i].assume_init_read() });
+                }
+                heap.push(entry);
+                self.heap = heap;
             }
-            heap.push(entry);
-            self.heap = heap;
             self.len += 1;
         } else {
             self.heap.push(entry);
@@ -191,6 +205,44 @@ impl SmallProps {
             self.len -= 1;
             entry
         }
+    }
+
+    /// Drop the tail beyond `len`, preserving the prefix (mirrors
+    /// `Vec::truncate`). The heap holds every entry once the count spills
+    /// past the inline capacity (the slice invariants: live entries are in
+    /// `inline` exactly when `len <= INLINE_PROPS`), so truncating past the
+    /// inline region trims the heap, and truncating into it moves the
+    /// surviving prefix back into `inline` (like `remove`'s shrink-back).
+    pub fn truncate(&mut self, len: usize) {
+        if len >= self.len {
+            return;
+        }
+        if self.len > INLINE_PROPS {
+            if len <= INLINE_PROPS {
+                for i in 0..len {
+                    // SAFETY: the surviving entries live in the heap; clone
+                    // them into the inline array, then drop the heap.
+                    self.inline[i].write(self.heap[i].clone());
+                }
+                // Keep the heap's allocation: a truncated-to-inline array is
+                // refilled through `push`'s spill path, which reuses the
+                // retained capacity (the chunked `buildString` fill-reset
+                // pattern would otherwise re-pay the Vec growth per chunk).
+                self.heap.clear();
+            } else {
+                self.heap.truncate(len);
+            }
+        } else {
+            // The never-spilled case: the truncated tail lives in the inline
+            // array, which `Drop` only covers up to `len` — drop it here or
+            // the entries leak (a truncated Gc handle would also pin its
+            // target past the object's drop).
+            // SAFETY: entries [len, self.len) are initialized.
+            for i in len..self.len {
+                unsafe { self.inline[i].assume_init_drop() };
+            }
+        }
+        self.len = len;
     }
 }
 
@@ -360,8 +412,9 @@ impl Property {
 #[derive(Debug, Clone)]
 pub enum ObjectKind {
     Ordinary,
-    /// Array exotic (spec 10.4.2); `length` lives in `properties`.
-    Array,
+    /// Array exotic (spec 10.4.2); `length` lives in `properties` while
+    /// spilled, in the `ArraySlots` cell while dense.
+    Array(Handle<ArraySlots>),
     /// String exotic (spec 10.4.3): virtual code-unit index properties.
     String(Handle<JsString>),
     /// Arguments exotic (spec 10.4.4): mapped parameter bindings.
@@ -462,6 +515,40 @@ impl Trace for TypedArraySlots {
     }
 }
 
+/// The Array exotic's dense element storage (spec 10.4.2). While `dense`
+/// is set, elements `0..length-1` live in the `elements` buffer — the
+/// index IS the position, so a store is a Vec write with no key atom,
+/// `Property` struct, or lazy index-map entry — and `length` lives in the
+/// lock-free cell, mirrored in `properties[0]` so the generic paths stay
+/// coherent. The buffer is lazy: it holds `0..elements.len()` and is
+/// extended with `None` holes on demand, so `new Array(1e9)` sets the
+/// cell without allocating. Any operation the buffer cannot represent
+/// exactly (a non-w/e/c element descriptor, non-writable length,
+/// freeze/seal, a generic index-keyed access) spills: the elements are
+/// materialized into `properties` in index order and `dense` clears —
+/// the array then behaves exactly like the generic properties path, so
+/// the buffer is a fast path, never a second implementation.
+#[derive(Debug, Clone)]
+pub struct ArraySlots {
+    /// Dense elements: position == index; `None` is a hole (absent).
+    pub elements: RefCell<Vec<Option<Value>>>,
+    /// [[Length]] (a lock-free `Cell`, the `prototype` pattern).
+    pub length: Cell<f64>,
+    /// Whether the dense fast path is active; cleared by a spill.
+    pub dense: Cell<bool>,
+}
+
+/// The largest hole span the dense buffer will materialize before spilling:
+/// a write at `index` far past the buffer's end (e.g. `a[2^31] = v`) would
+/// otherwise allocate billions of `None` slots and hang the process.
+const DENSE_HOLE_SPILL_CAP: usize = 65536;
+
+impl Trace for ArraySlots {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.elements.trace(visit);
+    }
+}
+
 impl Trace for ModuleNamespaceSlots {
     fn trace(&self, _visit: &mut dyn FnMut(GcAny)) {
         // Exports are interned property keys (AtomId), not heap edges.
@@ -476,7 +563,8 @@ impl Trace for ObjectKind {
             ObjectKind::Proxy(slots) => slots.trace(visit),
             ObjectKind::IntegerIndexed(slots) => slots.trace(visit),
             ObjectKind::ModuleNamespace(slots) => slots.trace(visit),
-            // Ordinary, Array, IsHTMLDDA, External, and Host (deliberately Rc)
+            ObjectKind::Array(slots) => slots.trace(visit),
+            // Ordinary, IsHTMLDDA, External, and Host (deliberately Rc)
             // carry no GC heap edges.
             _ => {}
         }
@@ -487,7 +575,7 @@ impl ObjectKind {
     pub fn name(&self) -> &'static str {
         match self {
             ObjectKind::Ordinary => "Object",
-            ObjectKind::Array => "Array",
+            ObjectKind::Array(_) => "Array",
             ObjectKind::String(_) => "String",
             ObjectKind::Arguments(_) => "Arguments",
             ObjectKind::IsHTMLDDA => "HTMLDDA",
@@ -580,6 +668,17 @@ pub struct JsObject {
     /// so the JIT's inline global fast path can read it in place (via
     /// `offset_of!`) to validate its global-value cells.
     pub generation: Cell<u32>,
+    /// The write-side chain-verdict cache for `array_element_write`: (first
+    /// link id, generation, second link id, generation) — "the chain from
+    /// this Array is exactly these two Ordinary/Array links, neither
+    /// holding an index-keyed own property", so a missing-element store
+    /// skips the per-index prototype walk. The Array's own generation is
+    /// deliberately not part of the verdict: its own dense appends bump it
+    /// on every store, which would miss on the exact pattern the cache
+    /// exists for. The ids are raw (not handles): the links stay reachable
+    /// through the `prototype` cells while this object lives, so the cache
+    /// needs no trace edge (mirrors `prototype`).
+    store_chain_clean: Cell<Option<(u64, u32, u64, u32)>>,
     /// Own properties in insertion order (the [[OwnPropertyKeys]] string
     /// order for ordinary objects).
     pub properties: RefCell<SmallProps>,
@@ -707,6 +806,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
+            store_chain_clean: Cell::new(None),
             properties: RefCell::new(SmallProps::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
@@ -746,6 +846,10 @@ impl JsObject {
                 Cell::new(false),
             );
             std::ptr::write(std::ptr::addr_of_mut!((*this).generation), Cell::new(0));
+            std::ptr::write(
+                std::ptr::addr_of_mut!((*this).store_chain_clean),
+                Cell::new(None),
+            );
             std::ptr::write(
                 std::ptr::addr_of_mut!((*this).properties),
                 RefCell::new(SmallProps::new()),
@@ -950,6 +1054,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
+            store_chain_clean: Cell::new(None),
             properties: RefCell::new(SmallProps::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
@@ -975,13 +1080,18 @@ impl JsObject {
         }
         let array = Handle::new(Self {
             id: next_object_id(),
-            kind: ObjectKind::Array,
+            kind: ObjectKind::Array(Handle::new(ArraySlots {
+                elements: RefCell::new(Vec::new()),
+                length: Cell::new(length),
+                dense: Cell::new(true),
+            })),
             prototype: Cell::new(prototype),
             map: Cell::new(Some(canonical_empty_map(prototype))),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
+            store_chain_clean: Cell::new(None),
             properties: RefCell::new(SmallProps::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
@@ -990,15 +1100,13 @@ impl JsObject {
             boxed: Cell::new(None),
         });
         Self::link_self_handle(&array);
-        let length_desc = PropertyDescriptor {
-            value: Some(Value::Number(length)),
-            writable: Some(true),
-            get: None,
-            set: None,
-            enumerable: Some(false),
-            configurable: Some(false),
-        };
-        array.ordinary_define_own_property(&PropertyKey::from_utf8("length"), &length_desc)?;
+        // The dense `length` mirror: `properties[0]` holds the canonical
+        // length entry so the generic paths (which read the first entry as
+        // length) stay coherent while the cell is authoritative.
+        array.properties.borrow_mut().push((
+            PropertyKey::from_utf8("length"),
+            Property::data(Value::Number(length), true, false, false),
+        ));
         Ok(array)
     }
 
@@ -1018,6 +1126,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
+            store_chain_clean: Cell::new(None),
             properties: RefCell::new(SmallProps::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
@@ -1050,6 +1159,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
+            store_chain_clean: Cell::new(None),
             properties: RefCell::new(SmallProps::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
@@ -1076,6 +1186,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
+            store_chain_clean: Cell::new(None),
             properties: RefCell::new(SmallProps::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
@@ -1184,6 +1295,7 @@ impl JsObject {
             extensible: Cell::new(false),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
+            store_chain_clean: Cell::new(None),
             properties: RefCell::new(SmallProps::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
@@ -1237,6 +1349,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
+            store_chain_clean: Cell::new(None),
             properties: RefCell::new(SmallProps::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
@@ -1334,6 +1447,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
+            store_chain_clean: Cell::new(None),
             properties: RefCell::new(SmallProps::new()),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
@@ -1541,23 +1655,46 @@ impl JsObject {
     }
 
     fn ordinary_get_own_property(&self, key: &PropertyKey) -> Result<Option<Property>, JsError> {
-        // Array fast paths on the linear property store: `length` is always
-        // the first entry (created at ArrayCreate, never moved), and no own
-        // index property can exceed the current length (every index define
-        // bumps it), so an index at or beyond the length is absent without a
-        // scan. Both make sequential element fills O(1) instead of O(n²).
-        if matches!(self.kind, ObjectKind::Array) {
+        // Array fast paths: `length` is the cell while dense (the synthesized
+        // canonical property), the `properties[0]` mirror after a spill; a
+        // dense element at `index` is the buffer slot; no own index property
+        // can exceed the current length. Both make sequential element fills
+        // O(1) instead of O(n²).
+        if let ObjectKind::Array(slots) = &self.kind {
             if key == &PropertyKey::from_utf8("length") {
+                if slots.dense.get() {
+                    return Ok(Some(Property::data(
+                        Value::Number(slots.length.get()),
+                        true,
+                        false,
+                        false,
+                    )));
+                }
                 let props = self.properties.borrow();
                 return Ok(props.first().map(|(_, p)| p.clone()));
             }
-            if let Some(index) = array_index_of(key)
-                && let Some((_, length_prop)) = self.properties.borrow().first()
-                && let PropertyKind::Data { value, .. } = &length_prop.kind
-                && let Some(length) = value.as_number()
-                && (index as f64) >= length
-            {
-                return Ok(None);
+            if let Some(index) = array_index_of(key) {
+                let length = if slots.dense.get() {
+                    slots.length.get()
+                } else if let Some((_, length_prop)) = self.properties.borrow().first()
+                    && let PropertyKind::Data { value, .. } = &length_prop.kind
+                {
+                    value.as_number().unwrap_or(f64::NAN)
+                } else {
+                    f64::NAN
+                };
+                if (index as f64) >= length {
+                    return Ok(None);
+                }
+                if slots.dense.get() {
+                    // An in-range index is the buffer slot: a hole reads
+                    // absent, a value the canonical w/e/c element.
+                    let elements = slots.elements.borrow();
+                    return Ok(elements
+                        .get(index as usize)
+                        .and_then(|e| *e)
+                        .map(|value| Property::data(value, true, true, true)));
+                }
             }
         }
         Ok(self.ordinary_property_lookup(key))
@@ -1647,10 +1784,14 @@ impl JsObject {
     /// writable length. `Ok(None)` means the caller must fall back to the
     /// full `[[Set]]`.
     pub fn array_element_write(&self, index: u64, value: Value) -> Result<Option<()>, JsError> {
-        if !matches!(self.kind, ObjectKind::Array) {
+        let ObjectKind::Array(slots) = &self.kind else {
             return Ok(None);
+        };
+        if slots.dense.get() {
+            return self.array_element_write_dense(slots, index, value);
         }
-        let key = PropertyKey::from_utf8(&index.to_string());
+        // Spilled array: the generic properties path, unchanged.
+        let key = PropertyKey::from_index(index);
         let length = {
             let props = self.properties.borrow();
             let Some((_, length_property)) = props.first() else {
@@ -1697,19 +1838,14 @@ impl JsObject {
             return Ok(None);
         }
         // No own element (a hole fill or the dense append): the prototype
-        // chain must be clean and the array extensible.
+        // chain must be clean and the array extensible. The cached verdict
+        // covers only the chain, so the extensibility gate stays first (a
+        // non-extensible array falls back regardless of the chain).
         if !self.extensible.get() {
             return Ok(None);
         }
-        let mut probe = self.prototype.get();
-        while let Some(link) = probe {
-            if !matches!(link.kind, ObjectKind::Ordinary | ObjectKind::Array) {
-                return Ok(None);
-            }
-            if link.get_own_property_key(&key)?.is_some() {
-                return Ok(None);
-            }
-            probe = link.prototype.get();
+        if !self.store_chain_clean_hit() && !self.store_chain_walk(index) {
+            return Ok(None);
         }
         // Dense append (index == length): push the element and bump the
         // length in place, exactly like `array_define_own_property`'s fast
@@ -1749,6 +1885,289 @@ impl JsObject {
         } else {
             Ok(None)
         }
+    }
+
+    /// The dense-buffer element write: in-place update / hole fill / append
+    /// with no key atom, `Property` struct, or lazy index-map entry. The
+    /// semantics are the [[Set]] fast path's exactly: an existing own
+    /// writable element updates without a chain consult; a hole fill and the
+    /// append verify the chain is clean (Slice 1b) and the array extensible;
+    /// `index > length` falls back (the full [[Set]] grows via
+    /// `array_define_own_property`).
+    fn array_element_write_dense(
+        &self,
+        slots: &Handle<ArraySlots>,
+        index: u64,
+        value: Value,
+    ) -> Result<Option<()>, JsError> {
+        let length = slots.length.get();
+        if (index as f64) < length {
+            let mut elements = slots.elements.borrow_mut();
+            let hole = !matches!(elements.get(index as usize), Some(Some(_)));
+            if hole {
+                // A huge hole span (e.g. `a[2^31] = v` on a short array)
+                // must not materialize billions of slots: fall back, and
+                // `array_define_own_property` spills the buffer instead.
+                if index as usize > elements.len() + DENSE_HOLE_SPILL_CAP {
+                    return Ok(None);
+                }
+                drop(elements);
+                // A hole fill creates an own property: the chain walk and
+                // the extensibility gate run first.
+                if !self.extensible.get() {
+                    return Ok(None);
+                }
+                if !self.store_chain_clean_hit() && !self.store_chain_walk(index) {
+                    return Ok(None);
+                }
+                let mut elements = slots.elements.borrow_mut();
+                if elements.len() <= index as usize {
+                    elements.resize(index as usize + 1, None);
+                }
+                elements[index as usize] = Some(value);
+            } else {
+                elements[index as usize] = Some(value);
+            }
+            self.bump_generation();
+            return Ok(Some(()));
+        }
+        if (index as f64) > length {
+            return Ok(None);
+        }
+        // Dense append (index == length): the array must be extensible, the
+        // chain clean, and the growth within the array-index maximum (an
+        // index of 2^32-1 would push the length past its limit — the define
+        // machinery throws a RangeError there, so fall back).
+        if index > 0xFFFF_FFFE || !self.extensible.get() {
+            return Ok(None);
+        }
+        if !self.store_chain_clean_hit() && !self.store_chain_walk(index) {
+            return Ok(None);
+        }
+        slots.elements.borrow_mut().push(Some(value));
+        slots.length.set(length + 1.0);
+        self.write_length_mirror(length + 1.0);
+        self.bump_generation();
+        Ok(Some(()))
+    }
+
+    /// Keep `properties[0]` (the `length` mirror) in sync while dense: the
+    /// generic paths read it as today, so a stale mirror would surface
+    /// through them. All length changes while dense funnel through this and
+    /// `array_set_length`'s dense branches.
+    fn write_length_mirror(&self, length: f64) {
+        if let Some((_, length_prop)) = self.properties.borrow_mut().first_mut()
+            && let PropertyKind::Data { value: slot, .. } = &mut length_prop.kind
+        {
+            *slot = Value::Number(length);
+        }
+    }
+
+    /// Materialize the dense buffer into `properties` and drop dense mode:
+    /// the array then behaves exactly like the generic properties path, so
+    /// the buffer is a fast path, never a second implementation. Spills are
+    /// rare (a non-w/e/c element define, a non-writable length define) and
+    /// O(n); while dense the element attributes are always the canonical
+    /// w/e/c data, which is what the materialized entries restore.
+    fn spill_dense_array(&self, slots: &Handle<ArraySlots>) {
+        if !slots.dense.get() {
+            return;
+        }
+        let elements = std::mem::take(&mut *slots.elements.borrow_mut());
+        slots.dense.set(false);
+        let mut props = self.properties.borrow_mut();
+        // props holds `length` + string/symbol props; rebuild with the
+        // elements inserted in ascending index order after `length`.
+        let mut rebuilt = SmallProps::new();
+        let mut rest = props.iter();
+        if let Some((name, property)) = rest.next() {
+            rebuilt.push((name.clone(), property.clone()));
+        }
+        for (i, element) in elements.iter().enumerate() {
+            if let Some(value) = element {
+                rebuilt.push((
+                    PropertyKey::from_index(i as u64),
+                    Property::data(*value, true, true, true),
+                ));
+            }
+        }
+        for (name, property) in rest {
+            rebuilt.push((name.clone(), property.clone()));
+        }
+        *props = rebuilt;
+        *self.property_index.borrow_mut() = None;
+        self.bump_generation();
+    }
+
+    /// TypedArray element read by numeric index (no key-string parse): the
+    /// runtime's computed fast path for a Number key. An invalid index
+    /// (incl. a detached buffer) reads *undefined* without the chain (spec
+    /// 10.4.7.5), so the fast path covers every Number key on a typed array.
+    pub fn typed_array_element_get(
+        &self,
+        slots: &TypedArraySlots,
+        index: u64,
+    ) -> Result<Value, JsError> {
+        if typed_array_valid_index(slots, index as f64) {
+            let bytes = element_bytes(slots, index as f64)?;
+            crate::typed_array::decode_element(slots.element_type, &bytes, 0)
+        } else {
+            Ok(Value::Undefined)
+        }
+    }
+
+    /// TypedArray element write by numeric index (no key-string parse); the
+    /// receiver is the typed array itself (the runtime's computed fast
+    /// path). IntegerIndexedElementSet semantics: the value coerces before
+    /// the index check, and an invalid index on the live buffer reports
+    /// success (spec 10.4.7.6).
+    pub fn typed_array_element_set(
+        &self,
+        slots: &TypedArraySlots,
+        index: u64,
+        value: Value,
+    ) -> Result<bool, JsError> {
+        if slots.buffer.is_immutable() {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "TypedArray buffer is immutable".into(),
+            ));
+        }
+        let bytes = crate::typed_array::encode_element(slots.element_type, &value)?;
+        if typed_array_valid_index(slots, index as f64) {
+            write_element_bytes(slots, index as f64, &bytes)?;
+        }
+        Ok(true)
+    }
+
+    /// Parse-free own-property check for a canonical array index, used by
+    /// `array_element_write`'s prototype-chain walk. The generic
+    /// `get_own_property_key` re-parses the index string through the
+    /// interner (`lookup` misses the thread-local memo on every distinct
+    /// index), which dominated dense appends on chained arrays. For an
+    /// Ordinary/Array link the check is the Array length shortcut (no own
+    /// index property can exceed the length) plus an atom-compare store
+    /// lookup — `from_index` returns the same memoized canonical atom the
+    /// caller's key holds.
+    fn has_own_index_property(&self, index: u64) -> bool {
+        if let ObjectKind::Array(slots) = &self.kind {
+            let length = if slots.dense.get() {
+                slots.length.get()
+            } else if let Some((_, length_prop)) = self.properties.borrow().first()
+                && let PropertyKind::Data { value, .. } = &length_prop.kind
+            {
+                value.as_number().unwrap_or(f64::NAN)
+            } else {
+                f64::NAN
+            };
+            if (index as f64) >= length {
+                return false;
+            }
+            if slots.dense.get() {
+                return slots
+                    .elements
+                    .borrow()
+                    .get(index as usize)
+                    .is_some_and(|e| e.is_some());
+            }
+            return self
+                .ordinary_property_lookup(&PropertyKey::from_index(index))
+                .is_some();
+        }
+        self.ordinary_property_lookup(&PropertyKey::from_index(index))
+            .is_some()
+    }
+
+    /// Re-validate the cached "chain is clean for index stores" verdict
+    /// (see `store_chain_clean`): the chain from this Array is still
+    /// exactly the two recorded links — same ids, unchanged generations
+    /// (so neither gained an own index property) — and the second link's
+    /// prototype is still null (the chain did not grow). ~5 cell reads,
+    /// where the walk pays a property lookup per link.
+    fn store_chain_clean_hit(&self) -> bool {
+        let Some((first_id, first_gen, second_id, second_gen)) = self.store_chain_clean.get()
+        else {
+            return false;
+        };
+        let Some(first) = self.prototype.get() else {
+            return false;
+        };
+        if first.id() != first_id || first.generation() != first_gen {
+            return false;
+        }
+        let Some(second) = first.prototype.get() else {
+            return false;
+        };
+        if second.id() != second_id || second.generation() != second_gen {
+            return false;
+        }
+        second.prototype.get().is_none()
+    }
+
+    /// The per-index chain walk for `array_element_write` (semantics
+    /// unchanged): every link Ordinary/Array with no own index property at
+    /// `index`; `false` (the store falls back) on an exotic link or an own
+    /// index property. On a clean walk, caches the verdict when the chain
+    /// is exactly two links holding no index-keyed own property at all —
+    /// the verdict is then valid for every index, not just the one walked
+    /// (a link with an index-keyed prop at a different index would
+    /// otherwise slip past a later hit).
+    fn store_chain_walk(&self, index: u64) -> bool {
+        let mut links: [Option<Handle<JsObject>>; 2] = [None, None];
+        let mut count = 0usize;
+        let mut probe = self.prototype.get();
+        while let Some(link) = probe {
+            if !matches!(link.kind, ObjectKind::Ordinary | ObjectKind::Array(_)) {
+                return false;
+            }
+            if link.has_own_index_property(index) {
+                return false;
+            }
+            if count < links.len() {
+                links[count] = Some(link);
+            }
+            count += 1;
+            probe = link.prototype.get();
+        }
+        if count == links.len()
+            && let [Some(first), Some(second)] = links
+            && !first.has_index_keyed_own_property()
+            && !second.has_index_keyed_own_property()
+        {
+            self.store_chain_clean.set(Some((
+                first.id(),
+                first.generation(),
+                second.id(),
+                second.generation(),
+            )));
+        }
+        true
+    }
+
+    /// Whether any own property is keyed by a canonical array-index string
+    /// — `store_chain_walk`'s record gate, which extends the walk's
+    /// single-index check to every index. `true` when the store is too
+    /// large to scan cheaply: the caller then skips caching, and the walk
+    /// stays the (correct) fallback.
+    fn has_index_keyed_own_property(&self) -> bool {
+        // A dense Array's index properties live in the buffer, not props
+        // (the scan below would miss them and wrongly certify the chain).
+        if let ObjectKind::Array(slots) = &self.kind
+            && slots.dense.get()
+        {
+            return slots.elements.borrow().iter().any(|e| e.is_some());
+        }
+        const SCAN_CAP: usize = 64;
+        let props = self.properties.borrow();
+        if props.len() > SCAN_CAP {
+            return true;
+        }
+        props.iter().any(|(name, _)| {
+            matches!(
+                name,
+                PropertyKey::String(id) if canonical_index(&PropertyKey::String(*id)).is_some()
+            )
+        })
     }
 
     /// spec 7.3.12 HasOwnProperty.
@@ -1820,7 +2239,7 @@ impl JsObject {
         // Fast path: an own data property on a plain object — the receiver is
         // only meaningful to accessors and the arguments mapping, so skip
         // constructing it (and the exotic dispatch) entirely.
-        if matches!(self.kind, ObjectKind::Ordinary | ObjectKind::Array)
+        if matches!(self.kind, ObjectKind::Ordinary | ObjectKind::Array(_))
             && let Some(property) = self.get_own_property_key(key)?
             && let PropertyKind::Data { value, .. } = property.kind
         {
@@ -1877,8 +2296,9 @@ impl JsObject {
         // 10.1.9.3 steps 3-4). Array `length` is excluded: its define
         // intercept validates the new value (a non-uint32 length throws).
         // Anything else falls through to the full path.
-        if matches!(self.kind, ObjectKind::Ordinary | ObjectKind::Array)
-            && !(matches!(self.kind, ObjectKind::Array) && key == &PropertyKey::from_utf8("length"))
+        if matches!(self.kind, ObjectKind::Ordinary | ObjectKind::Array(_))
+            && !(matches!(self.kind, ObjectKind::Array(_))
+                && key == &PropertyKey::from_utf8("length"))
         {
             let mut props = self.properties.borrow_mut();
             let position = if props.len() >= 16 {
@@ -1938,8 +2358,9 @@ impl JsObject {
     /// scheme — see `set_global_slot`). A false return means the caller
     /// falls back to the full [[Set]].
     pub fn write_data_property(&self, key: &PropertyKey, value: Value) -> bool {
-        if !matches!(self.kind, ObjectKind::Ordinary | ObjectKind::Array)
-            || (matches!(self.kind, ObjectKind::Array) && key == &PropertyKey::from_utf8("length"))
+        if !matches!(self.kind, ObjectKind::Ordinary | ObjectKind::Array(_))
+            || (matches!(self.kind, ObjectKind::Array(_))
+                && key == &PropertyKey::from_utf8("length"))
         {
             return false;
         }
@@ -2072,7 +2493,7 @@ impl JsObject {
             ObjectKind::ModuleNamespace(slots) => {
                 return Self::namespace_define_own_property(slots, key, desc);
             }
-            ObjectKind::Array => return array_define_own_property(self, key, desc),
+            ObjectKind::Array(_) => return array_define_own_property(self, key, desc),
             ObjectKind::String(string) => {
                 if let Some(current) = string_get_own_property(string, key) {
                     return is_compatible_property_descriptor(
@@ -2322,6 +2743,19 @@ impl JsObject {
         match &self.kind {
             ObjectKind::Proxy(slots) => return crate::proxy::delete(slots, key),
             ObjectKind::IntegerIndexed(slots) => return typed_array_delete(self, slots, key),
+            // A dense index element is configurable (w/e/c): delete becomes
+            // a hole in the buffer. A non-index key falls through to the
+            // generic properties removal below.
+            ObjectKind::Array(slots) if slots.dense.get() => {
+                if let Some(index) = array_index_of(key) {
+                    let mut elements = slots.elements.borrow_mut();
+                    if let Some(slot) = elements.get_mut(index as usize) {
+                        *slot = None;
+                        self.bump_generation();
+                    }
+                    return Ok(true);
+                }
+            }
             // A module namespace never deletes an export or @@toStringTag
             // (non-configurable); deleting anything else succeeds (spec
             // 10.4.6.6).
@@ -2413,7 +2847,7 @@ impl JsObject {
                 keys.push(PropertyKey::Symbol(well_known("toStringTag")));
                 Ok(keys)
             }
-            ObjectKind::Array => Ok(array_own_property_keys(self)),
+            ObjectKind::Array(_) => Ok(array_own_property_keys(self)),
             ObjectKind::String(string) => Ok(string_own_property_keys(string, self)),
             ObjectKind::Host(ops) => match ops.own_property_keys(self) {
                 Some(result) => result,
@@ -2470,7 +2904,35 @@ fn ordinary_own_property_keys(obj: &JsObject) -> Vec<PropertyKey> {
 /// plus the array-index keys — only those actually present as own properties;
 /// holes are not own keys.
 fn array_own_property_keys(array: &JsObject) -> Vec<PropertyKey> {
-    ordinary_own_property_keys(array)
+    let ObjectKind::Array(slots) = &array.kind else {
+        return ordinary_own_property_keys(array);
+    };
+    if !slots.dense.get() {
+        return ordinary_own_property_keys(array);
+    }
+    // Dense: present buffer elements first (indices ascending, holes
+    // absent), then `length` + string props, then symbols — the ordinary
+    // [[OwnPropertyKeys]] order.
+    let mut keys = Vec::new();
+    let elements = slots.elements.borrow();
+    for (i, element) in elements.iter().enumerate() {
+        if element.is_some() {
+            keys.push(PropertyKey::from_index(i as u64));
+        }
+    }
+    drop(elements);
+    let props = array.properties.borrow();
+    let mut strings = Vec::new();
+    let mut symbols = Vec::new();
+    for (name, _) in props.iter() {
+        match name {
+            PropertyKey::String(_) => strings.push(name.clone()),
+            PropertyKey::Symbol(_) => symbols.push(name.clone()),
+        }
+    }
+    keys.extend(strings);
+    keys.extend(symbols);
+    keys
 }
 
 /// StringOwnPropertyKeys (spec 10.4.3.4): code-unit indices first, then own
@@ -2887,7 +3349,51 @@ fn array_define_own_property(
     if *key == PropertyKey::from_utf8("length") {
         return array_set_length(array, desc);
     }
-    if let Some(index) = array_index_of(key) {
+    let Some(index) = array_index_of(key) else {
+        return array.ordinary_define_own_property(key, desc);
+    };
+    // Dense: a canonical w/e/c data descriptor writes the buffer — an
+    // append, an in-place update, or a grow (a canonical define on a fresh
+    // index is exactly CreateDataProperty). Anything else spills and runs
+    // the generic index define below, which then sees the materialized
+    // elements.
+    if let ObjectKind::Array(slots) = &array.kind
+        && slots.dense.get()
+        && desc.value.is_some()
+        && desc.writable == Some(true)
+        && desc.enumerable == Some(true)
+        && desc.configurable == Some(true)
+        && !desc.is_accessor_descriptor()
+        && let Some(value) = desc.value
+    {
+        let length = slots.length.get();
+        if (index as f64) >= length && !array.extensible.get() {
+            return Ok(false);
+        }
+        // A huge hole span (e.g. `a[2^31] = v`) must not materialize
+        // billions of slots: spill, and the generic index define below
+        // grows the length through the properties path.
+        let elements_len = slots.elements.borrow().len();
+        if index as usize <= elements_len + DENSE_HOLE_SPILL_CAP {
+            let mut elements = slots.elements.borrow_mut();
+            if elements.len() <= index as usize {
+                elements.resize(index as usize + 1, None);
+            }
+            elements[index as usize] = Some(value);
+            if (index as f64) >= length {
+                slots.length.set(index as f64 + 1.0);
+                array.write_length_mirror(index as f64 + 1.0);
+            }
+            array.bump_generation();
+            return Ok(true);
+        }
+    }
+    if let ObjectKind::Array(slots) = &array.kind
+        && slots.dense.get()
+    {
+        array.spill_dense_array(slots);
+    }
+    {
         let length_desc = array
             .ordinary_get_own_property(&PropertyKey::from_utf8("length"))?
             .expect("arrays always have a length property");
@@ -2980,14 +3486,22 @@ fn array_define_own_property(
                 &new_length.to_descriptor(),
             )?;
         }
-        return Ok(true);
+        Ok(true)
     }
-    array.ordinary_define_own_property(key, desc)
 }
 
 /// ArraySetLength (spec 10.4.2.4).
 fn array_set_length(array: &JsObject, desc: &PropertyDescriptor) -> Result<bool, JsError> {
     let Some(value) = &desc.value else {
+        // A length define without a value only changes attributes; a
+        // non-writable request cannot be represented dense (dense length is
+        // always writable), so spill before the generic define applies it.
+        if let ObjectKind::Array(slots) = &array.kind
+            && slots.dense.get()
+            && desc.writable == Some(false)
+        {
+            array.spill_dense_array(slots);
+        }
         return array.ordinary_define_own_property(&PropertyKey::from_utf8("length"), desc);
     };
     let new_length = crate::convert::to_uint32(crate::convert::to_number(value)?);
@@ -3011,6 +3525,32 @@ fn array_set_length(array: &JsObject, desc: &PropertyDescriptor) -> Result<bool,
         .and_then(|v| v.as_number())
         .unwrap_or(f64::NAN);
     if (new_length as f64) >= old_length {
+        // Grow: for a dense array set the cell and mirror — the buffer
+        // stays short (reads past it are holes). A non-writable request
+        // spills so the generic define applies it. The fast path may only
+        // skip validation for a descriptor that is compatible with the
+        // canonical length (writable, non-enumerable, non-configurable) —
+        // a `configurable: true` / `enumerable: true` / accessor request
+        // must run the generic define, which throws (spec 10.4.2.4 step 8
+        // is OrdinaryDefineOwnProperty, so the non-configurable length
+        // invariant still applies).
+        if let ObjectKind::Array(slots) = &array.kind
+            && slots.dense.get()
+            && new_length_desc.writable != Some(false)
+            && new_length_desc.configurable != Some(true)
+            && new_length_desc.enumerable != Some(true)
+            && !new_length_desc.is_accessor_descriptor()
+        {
+            slots.length.set(new_length as f64);
+            array.write_length_mirror(new_length as f64);
+            array.bump_generation();
+            return Ok(true);
+        }
+        if let ObjectKind::Array(slots) = &array.kind
+            && slots.dense.get()
+        {
+            array.spill_dense_array(slots);
+        }
         return array
             .ordinary_define_own_property(&PropertyKey::from_utf8("length"), &new_length_desc);
     }
@@ -3024,6 +3564,26 @@ fn array_set_length(array: &JsObject, desc: &PropertyDescriptor) -> Result<bool,
             new_length_desc.writable = Some(true);
             false
         };
+    // Dense truncation: the buffer is authoritative, so truncate it, set
+    // the cell, and mirror `length` (the generic per-element deletes below
+    // would not see the buffer elements). A request that makes `length`
+    // non-writable cannot be represented dense — spill first.
+    if let ObjectKind::Array(slots) = &array.kind
+        && slots.dense.get()
+    {
+        if !new_writable {
+            array.spill_dense_array(slots);
+        } else if new_length_desc.configurable != Some(true)
+            && new_length_desc.enumerable != Some(true)
+            && !new_length_desc.is_accessor_descriptor()
+        {
+            slots.elements.borrow_mut().truncate(new_length as usize);
+            slots.length.set(new_length as f64);
+            array.write_length_mirror(new_length as f64);
+            array.bump_generation();
+            return Ok(true);
+        }
+    }
     if !array.ordinary_define_own_property(&PropertyKey::from_utf8("length"), &new_length_desc)? {
         return Ok(false);
     }
@@ -3035,9 +3595,61 @@ fn array_set_length(array: &JsObject, desc: &PropertyDescriptor) -> Result<bool,
         .filter_map(array_index_of)
         .filter(|index| *index >= new_length as u64)
         .collect();
+    // Dense truncation fast path: when the own properties are exactly
+    // `length` plus the dense range 0..old_length-1 (no holes, no extra
+    // props), all configurable data elements, the deleted indices are the
+    // store's tail — one truncate instead of per-element deletes (each an
+    // O(n) scan + remove + index-map rebuild, which made the fixture
+    // harness's repeated `arr.length = 0` resets quadratic).
+    // `own_property_keys` returns indices ascending first, then strings, so
+    // the dense shape is `["0".."old_length-1", "length"]`. The index keys
+    // are compared by ATOM against the memoized canonical index atoms
+    // (`PropertyKey::from_index`), not by re-parsing each key's string
+    // through the interner (`array_index_of`'s `lookup` — ~4x slower and
+    // lock-bound on the 10k-key resets).
+    let dense = keys.len() == old_length as usize + 1
+        && (0..old_length as u64).all(|i| keys[i as usize] == PropertyKey::from_index(i))
+        && keys.last() == Some(&PropertyKey::from_utf8("length"));
+    if dense {
+        let mut props = array.properties.borrow_mut();
+        if props
+            .iter()
+            .skip(1)
+            .all(|(_, p)| p.configurable && matches!(p.kind, PropertyKind::Data { .. }))
+        {
+            props.truncate(new_length as usize + 1);
+            if let Some((_, length_prop)) = props.first_mut()
+                && let PropertyKind::Data { value: slot, .. } = &mut length_prop.kind
+            {
+                *slot = Value::Number(new_length as f64);
+            }
+            drop(props);
+            *array.property_index.borrow_mut() = None;
+            array.bump_generation();
+            if !new_writable {
+                let writable_false = PropertyDescriptor {
+                    value: None,
+                    writable: Some(false),
+                    get: None,
+                    set: None,
+                    enumerable: None,
+                    configurable: None,
+                };
+                array.ordinary_define_own_property(
+                    &PropertyKey::from_utf8("length"),
+                    &writable_false,
+                )?;
+            }
+            return Ok(true);
+        }
+        // The dense shape check passed but not all elements are configurable
+        // data — fall through to the per-element deletes; the borrow must be
+        // released first (each delete re-enters the property store).
+        drop(props);
+    }
     to_delete.sort_unstable_by(|a, b| b.cmp(a));
     for index in to_delete {
-        let key = PropertyKey::from_utf8(&index.to_string());
+        let key = PropertyKey::from_index(index);
         if !array.delete_key(&key)? {
             new_length_desc.value = Some(Value::Number(index as f64 + 1.0));
             if !new_writable {
@@ -3173,8 +3785,13 @@ pub fn array_index_of(key: &PropertyKey) -> Option<u64> {
 /// view (resizable buffer without an explicit length) this tracks the buffer's
 /// current byte length; for a fixed-length view the elements are zero when the
 /// buffer has shrunk below the view's byte range and restored when it grows
-/// back (spec 25.2.2.1 steps 12-14 with resizable buffers).
+/// back (spec 25.2.2.1 steps 12-14 with resizable buffers). A detached view
+/// covers zero elements (spec 25.2.3.1: the length getter returns 0 when the
+/// buffer is detached).
 pub fn typed_array_effective_length(slots: &TypedArraySlots) -> usize {
+    if slots.buffer.is_detached() {
+        return 0;
+    }
     let element_size = slots.element_type.size();
     if slots.auto_length {
         slots.buffer.byte_length().saturating_sub(slots.byte_offset) / element_size
@@ -3634,6 +4251,48 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["d", "e", "x", "x", "x", "x"]
         );
+    }
+
+    #[test]
+    fn small_props_truncate_keeps_prefix_and_refills() {
+        // `SmallProps::truncate` (the `arr.length = N` dense shrink): the
+        // prefix survives, the tail is dropped in every storage region, and
+        // the retained heap capacity is reused by the spill on refill (the
+        // chunked `buildString` fill-reset-fill shape).
+        let mut props = SmallProps::new();
+        let data = |n: f64| Property::data(Value::Number(n), true, true, true);
+        let keys = |p: &SmallProps| {
+            p.iter()
+                .map(|(k, _)| k.display_string())
+                .collect::<Vec<_>>()
+        };
+        // Non-spilled truncate: the inline tail must be dropped (the stale
+        // slots are unreachable once `len` shrinks).
+        props.push((PropertyKey::from_utf8("a"), data(1.0)));
+        props.push((PropertyKey::from_utf8("b"), data(2.0)));
+        props.truncate(1);
+        assert_eq!(keys(&props), ["a"]);
+        // Refill through the inline path.
+        props.push((PropertyKey::from_utf8("c"), data(3.0)));
+        assert_eq!(keys(&props), ["a", "c"]);
+        // Spill, then truncate into the inline array (the buildString
+        // `codePoints.length = 0` reset): the heap tail is dropped and the
+        // prefix survives in `inline`.
+        for i in 0..4 {
+            props.push((PropertyKey::from_utf8(&format!("n{i}")), data(i as f64)));
+        }
+        assert_eq!(keys(&props), ["a", "c", "n0", "n1", "n2", "n3"]);
+        props.truncate(1);
+        assert_eq!(keys(&props), ["a"]);
+        // Refill across the spill boundary, reusing the retained capacity.
+        for i in 0..5 {
+            props.push((PropertyKey::from_utf8(&format!("m{i}")), data(i as f64)));
+        }
+        assert_eq!(props.len(), 6);
+        assert_eq!(props[0].0.display_string(), "a");
+        // Heap-only truncate: keeps the prefix, drops the tail.
+        props.truncate(3);
+        assert_eq!(keys(&props), ["a", "m0", "m1"]);
     }
 
     fn key(text: &str) -> JsString {
@@ -4364,6 +5023,430 @@ mod tests {
         assert!(!array.has_own_property(&key("3")).unwrap());
         assert!(!array.has_own_property(&key("4")).unwrap());
         assert_eq!(array.get(&key("2")).unwrap(), Value::Number(2.0));
+    }
+
+    #[test]
+    fn dense_buffer_hole_semantics_and_length_interplay() {
+        // The dense buffer (Item 2 Phase A): appends fill it, updates write
+        // in place, holes read undefined and are not own properties, a
+        // define at an index past the length grows it, and a length
+        // truncation drops the tail.
+        let array = JsObject::array_create(None, 0.0).unwrap();
+        for i in 0..5u64 {
+            assert!(
+                array
+                    .array_element_write(i, Value::Number(i as f64))
+                    .unwrap()
+                    .is_some(),
+                "a dense append must store the element"
+            );
+        }
+        assert_eq!(array.get(&key("length")).unwrap(), Value::Number(5.0));
+        // Update in place.
+        assert!(
+            array
+                .array_element_write(2, Value::Number(99.0))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(array.get(&key("2")).unwrap(), Value::Number(99.0));
+        // A hole and an out-of-range index read undefined, not own props.
+        assert_eq!(array.get(&key("5")).unwrap(), Value::Undefined);
+        assert!(!array.has_own_property(&key("5")).unwrap());
+        // Grow via a define (`a[7] = v` on length 5): length 8, hole at 6.
+        array
+            .create_data_property(&key("7"), Value::Number(7.0))
+            .unwrap();
+        assert_eq!(array.get(&key("length")).unwrap(), Value::Number(8.0));
+        assert_eq!(array.get(&key("6")).unwrap(), Value::Undefined);
+        assert_eq!(array.get(&key("7")).unwrap(), Value::Number(7.0));
+        // Truncation drops the tail.
+        assert!(
+            array
+                .set(&key("length"), Value::Number(3.0), false)
+                .unwrap()
+        );
+        assert_eq!(array.get(&key("length")).unwrap(), Value::Number(3.0));
+        assert_eq!(array.get(&key("2")).unwrap(), Value::Number(99.0));
+        assert_eq!(array.get(&key("7")).unwrap(), Value::Undefined);
+        assert!(!array.has_own_property(&key("7")).unwrap());
+    }
+
+    #[test]
+    fn dense_buffer_delete_is_a_hole_and_keys_omit_holes() {
+        let array = JsObject::array_create(None, 0.0).unwrap();
+        for i in 0..4u64 {
+            array
+                .array_element_write(i, Value::Number(i as f64))
+                .unwrap();
+        }
+        array.delete(&key("1")).unwrap();
+        assert!(!array.has_own_property(&key("1")).unwrap());
+        assert_eq!(array.get(&key("1")).unwrap(), Value::Undefined);
+        // [[OwnPropertyKeys]]: present indices ascending, then strings.
+        let names: Vec<String> = array
+            .own_property_keys()
+            .unwrap()
+            .iter()
+            .map(|k| k.display_string())
+            .collect();
+        assert_eq!(names, ["0", "2", "3", "length"]);
+        assert_eq!(array.get(&key("length")).unwrap(), Value::Number(4.0));
+    }
+
+    #[test]
+    fn dense_buffer_spills_on_non_canonical_element_define() {
+        // A non-writable element define cannot be represented dense: the
+        // buffer materializes into properties and the generic path applies
+        // the descriptor (the element is then non-writable).
+        let array = JsObject::array_create(None, 0.0).unwrap();
+        array.array_element_write(0, Value::Number(1.0)).unwrap();
+        let desc = PropertyDescriptor {
+            value: Some(Value::Number(1.0)),
+            writable: Some(false),
+            get: None,
+            set: None,
+            enumerable: Some(true),
+            configurable: Some(true),
+        };
+        assert!(array.define_property(&key("0"), &desc).unwrap());
+        assert!(
+            !array.set(&key("0"), Value::Number(9.0), false).unwrap(),
+            "a non-writable element must reject the in-place write"
+        );
+        assert_eq!(array.get(&key("0")).unwrap(), Value::Number(1.0));
+    }
+
+    #[test]
+    fn dense_buffer_grows_on_out_of_range_write() {
+        let array = JsObject::array_create(None, 2.0).unwrap();
+        assert_eq!(array.get(&key("length")).unwrap(), Value::Number(2.0));
+        assert!(array.set(&key("5"), Value::Number(5.0), false).unwrap());
+        assert_eq!(array.get(&key("length")).unwrap(), Value::Number(6.0));
+        assert_eq!(array.get(&key("5")).unwrap(), Value::Number(5.0));
+        assert_eq!(array.get(&key("3")).unwrap(), Value::Undefined);
+    }
+
+    #[test]
+    fn dense_buffer_freezing_array_spills() {
+        // Object.freeze defines every own property non-writable and
+        // non-configurable: the first element define spills, and the array
+        // stays frozen after.
+        let array = JsObject::array_create(None, 0.0).unwrap();
+        for i in 0..3u64 {
+            array
+                .array_element_write(i, Value::Number(i as f64))
+                .unwrap();
+        }
+        let keys = array.own_property_keys().unwrap();
+        for key in keys {
+            let desc = PropertyDescriptor {
+                value: None,
+                writable: Some(false),
+                get: None,
+                set: None,
+                enumerable: None,
+                configurable: Some(false),
+            };
+            array.define_property_key(&key, &desc).unwrap();
+        }
+        array.prevent_extensions().unwrap();
+        assert!(!array.set(&key("1"), Value::Number(9.0), false).unwrap());
+        assert_eq!(array.get(&key("1")).unwrap(), Value::Number(1.0));
+        assert!(!array.extensible.get());
+    }
+
+    #[test]
+    fn dense_length_reset_frees_elements_and_preserves_them() {
+        // The dense truncation fast path: `arr.length = 0` on a fully dense
+        // array drops every element (the fixture harness's chunked
+        // `buildString` reuses one array this way), and a refill sees a
+        // clean array.
+        let array = JsObject::array_create(None, 0.0).unwrap();
+        for i in 0..30u64 {
+            array
+                .array_element_write(i, Value::Number(i as f64))
+                .unwrap();
+        }
+        assert_eq!(array.get(&key("length")).unwrap(), Value::Number(30.0));
+        assert!(
+            array
+                .set(&key("length"), Value::Number(0.0), false)
+                .unwrap()
+        );
+        assert_eq!(array.get(&key("length")).unwrap(), Value::Number(0.0));
+        assert!(!array.has_own_property(&key("0")).unwrap());
+        assert!(!array.has_own_property(&key("29")).unwrap());
+        // Refill after the reset.
+        for i in 0..5u64 {
+            array
+                .array_element_write(i, Value::Number(i as f64))
+                .unwrap();
+        }
+        assert_eq!(array.get(&key("length")).unwrap(), Value::Number(5.0));
+        assert_eq!(array.get(&key("4")).unwrap(), Value::Number(4.0));
+        assert!(!array.has_own_property(&key("5")).unwrap());
+    }
+
+    #[test]
+    fn array_element_write_chain_walk_skips_clean_prototypes() {
+        // The parse-free chain walk: appending to an array whose prototype
+        // chain is clean (Array.prototype-like Array + Object.prototype-like
+        // Ordinary with own string props, no index props) stores every
+        // element, and a chain link WITH an own index property forces the
+        // fallback (Ok(None)) so the caller's [[Set]] machinery handles it.
+        let object_proto = JsObject::ordinary_object_create(None);
+        for i in 0..20u64 {
+            object_proto
+                .create_data_property(&key(&format!("p{i}")), Value::Number(i as f64))
+                .unwrap();
+        }
+        let array_proto = JsObject::array_create(Some(object_proto), 0.0).unwrap();
+        for i in 0..16u64 {
+            array_proto
+                .create_data_property(&key(&format!("m{i}")), Value::Undefined)
+                .unwrap();
+        }
+        let chained = JsObject::array_create(Some(array_proto), 0.0).unwrap();
+        for i in 0..5u64 {
+            assert!(
+                chained
+                    .array_element_write(i, Value::Number(i as f64))
+                    .unwrap()
+                    .is_some(),
+                "a clean chain must accept the dense append"
+            );
+        }
+        assert_eq!(chained.get(&key("length")).unwrap(), Value::Number(5.0));
+        assert_eq!(chained.get(&key("4")).unwrap(), Value::Number(4.0));
+        // A chain link with an own index property at `index` must fall back.
+        array_proto
+            .create_data_property(&key("0"), Value::Number(99.0))
+            .unwrap();
+        let fresh = JsObject::array_create(Some(array_proto), 0.0).unwrap();
+        assert_eq!(
+            fresh.array_element_write(0, Value::Number(1.0)).unwrap(),
+            None,
+            "an own index property on a chain link must fall back to [[Set]]"
+        );
+    }
+
+    #[test]
+    fn store_chain_clean_verdict_survives_the_arrays_own_appends() {
+        // The verdict cache (Slice 1b): a clean two-link chain (Array-like
+        // prototype → Ordinary prototype) records on the first store, and
+        // the array's own dense appends — which bump the array's generation
+        // — must not invalidate it, or the cache would miss on the exact
+        // pattern it exists for.
+        let object_proto = JsObject::ordinary_object_create(None);
+        object_proto
+            .create_data_property(&key("toString"), Value::Undefined)
+            .unwrap();
+        let array_proto = JsObject::array_create(Some(object_proto), 0.0).unwrap();
+        let array = JsObject::array_create(Some(array_proto), 0.0).unwrap();
+        assert!(
+            array
+                .array_element_write(0, Value::Number(1.0))
+                .unwrap()
+                .is_some(),
+            "a clean chain must accept the first append"
+        );
+        assert!(
+            array.store_chain_clean.get().is_some(),
+            "the clean two-link chain must be cached on the first store"
+        );
+        for i in 1..5u64 {
+            assert!(
+                array
+                    .array_element_write(i, Value::Number(i as f64))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert!(
+            array.store_chain_clean_hit(),
+            "the verdict must survive the array's own appends"
+        );
+        assert_eq!(array.get(&key("length")).unwrap(), Value::Number(5.0));
+    }
+
+    #[test]
+    fn store_chain_clean_string_prop_on_chain_revalidates() {
+        // A string prop on a chain link bumps its generation: the verdict
+        // misses once, the walk re-verifies (string keys are not indices),
+        // and the cache is repopulated — stores keep taking the fast path.
+        let object_proto = JsObject::ordinary_object_create(None);
+        let array_proto = JsObject::array_create(Some(object_proto), 0.0).unwrap();
+        let array = JsObject::array_create(Some(array_proto), 0.0).unwrap();
+        assert!(
+            array
+                .array_element_write(0, Value::Number(1.0))
+                .unwrap()
+                .is_some()
+        );
+        assert!(array.store_chain_clean.get().is_some());
+        array_proto
+            .create_data_property(&key("custom"), Value::Undefined)
+            .unwrap();
+        assert!(
+            !array.store_chain_clean_hit(),
+            "a chain mutation must invalidate the cached verdict"
+        );
+        assert!(
+            array
+                .array_element_write(1, Value::Number(2.0))
+                .unwrap()
+                .is_some(),
+            "a string prop on the chain must not fall the store back"
+        );
+        assert!(
+            array.store_chain_clean.get().is_some(),
+            "the clean verdict must re-record after the string prop"
+        );
+        assert!(array.store_chain_clean_hit());
+        assert!(
+            array
+                .array_element_write(2, Value::Number(3.0))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(array.get(&key("length")).unwrap(), Value::Number(3.0));
+    }
+
+    #[test]
+    fn store_chain_clean_index_prop_on_chain_link_falls_back() {
+        // An own index property on a chain link bumps the link's
+        // generation: the verdict misses, and the store at an index the
+        // link now owns falls back to [[Set]].
+        let object_proto = JsObject::ordinary_object_create(None);
+        let array_proto = JsObject::array_create(Some(object_proto), 0.0).unwrap();
+        let array = JsObject::array_create(Some(array_proto), 0.0).unwrap();
+        assert!(
+            array
+                .array_element_write(0, Value::Number(1.0))
+                .unwrap()
+                .is_some()
+        );
+        assert!(array.store_chain_clean.get().is_some());
+        array_proto
+            .create_data_property(&key("0"), Value::Number(99.0))
+            .unwrap();
+        assert!(!array.store_chain_clean_hit());
+        // Index 1 is past the polluted link's length (1), so the Array
+        // shortcut keeps the walk clean — the store succeeds, but the
+        // stale verdict can never hit again (the link's generation moved)
+        // and the walk re-runs (and declines to re-record) on every store.
+        assert!(
+            array
+                .array_element_write(1, Value::Number(2.0))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !array.store_chain_clean_hit(),
+            "the stale verdict must never hit while the chain holds an index-keyed prop"
+        );
+        // A fresh array appending at the polluted index falls back.
+        let fresh = JsObject::array_create(Some(array_proto), 0.0).unwrap();
+        assert_eq!(
+            fresh.array_element_write(0, Value::Number(1.0)).unwrap(),
+            None,
+            "an own index property on a chain link at the store index must fall back"
+        );
+    }
+
+    #[test]
+    fn store_chain_clean_index_keyed_prop_elsewhere_on_chain_disables_verdict() {
+        // The soundness gate: an index-keyed own prop on the Ordinary link
+        // at an index OTHER than the one walked must disable the verdict —
+        // a record at index 0 would otherwise wrongly cover the polluted
+        // index 5 on a later store (skipping the walk that must see it).
+        let object_proto = JsObject::ordinary_object_create(None);
+        object_proto
+            .create_data_property(&key("5"), Value::Number(99.0))
+            .unwrap();
+        let array_proto = JsObject::array_create(Some(object_proto), 0.0).unwrap();
+        let array = JsObject::array_create(Some(array_proto), 0.0).unwrap();
+        for i in 0..5u64 {
+            assert!(
+                array
+                    .array_element_write(i, Value::Number(i as f64))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(array.get(&key("length")).unwrap(), Value::Number(5.0));
+        assert!(
+            array.store_chain_clean.get().is_none(),
+            "an index-keyed prop anywhere on the chain must disable the verdict"
+        );
+        assert_eq!(
+            array.array_element_write(5, Value::Number(1.0)).unwrap(),
+            None,
+            "a chain link's own index property at the store index must fall back"
+        );
+    }
+
+    #[test]
+    fn store_chain_clean_longer_chain_and_exotic_link_never_cache() {
+        // A three-link chain is walked per store (the fixed-size verdict
+        // covers exactly two links); an exotic link (a String exotic here)
+        // falls back and never caches.
+        let object_proto = JsObject::ordinary_object_create(None);
+        let mid2 = JsObject::ordinary_object_create(Some(object_proto));
+        let mid1 = JsObject::ordinary_object_create(Some(mid2));
+        let array = JsObject::array_create(Some(mid1), 0.0).unwrap();
+        assert!(
+            array
+                .array_element_write(0, Value::Number(1.0))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            array.store_chain_clean.get().is_none(),
+            "a three-link chain is not cacheable"
+        );
+        let string_link =
+            JsObject::string_create(JsString::from_utf8("ab"), Some(object_proto)).unwrap();
+        let array2 = JsObject::array_create(Some(string_link), 0.0).unwrap();
+        assert_eq!(
+            array2.array_element_write(0, Value::Number(1.0)).unwrap(),
+            None,
+            "an exotic chain link must fall back to [[Set]]"
+        );
+        assert!(array2.store_chain_clean.get().is_none());
+    }
+
+    #[test]
+    fn dense_length_truncation_with_non_writable_descriptor() {
+        // The dense truncation fast path with an explicit `writable: false`
+        // in the length descriptor: the fast path's `!new_writable` branch
+        // re-enters OrdinaryDefineOwnProperty for `length` while the
+        // property-store guard is still held — a regression test for the
+        // double-borrow panic this used to cause (the guard must be
+        // released before the re-entry).
+        let array = JsObject::array_create(None, 0.0).unwrap();
+        for i in 0..30u64 {
+            array
+                .array_element_write(i, Value::Number(i as f64))
+                .unwrap();
+        }
+        let desc = PropertyDescriptor {
+            value: Some(Value::Number(0.0)),
+            writable: Some(false),
+            get: None,
+            set: None,
+            enumerable: None,
+            configurable: None,
+        };
+        let result = array
+            .define_property_key(&PropertyKey::from_utf8("length"), &desc)
+            .unwrap();
+        assert!(result);
+        assert_eq!(array.get(&key("length")).unwrap(), Value::Number(0.0));
+        assert!(!array.has_own_property(&key("0")).unwrap());
+        let length_desc = array.get_own_property(&key("length")).unwrap().unwrap();
+        assert_eq!(length_desc.writable(), Some(false));
     }
 
     #[test]

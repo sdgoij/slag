@@ -35,6 +35,12 @@ impl PropertyKey {
         Self::String(intern(units))
     }
 
+    /// The canonical decimal-string key for an array index, memoized (the
+    /// interner's global lock dominates dense element stores otherwise).
+    pub fn from_index(index: u64) -> Self {
+        Self::String(crate::string::index_atom(index))
+    }
+
     /// The key for a JsString property name.
     pub fn from_js_string(text: &JsString) -> Self {
         Self::String(intern(text.as_slice()))

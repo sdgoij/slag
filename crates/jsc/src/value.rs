@@ -67,7 +67,7 @@ pub unsafe extern "C" fn JSValueIsArray(_ctx: JSContextRef, value: JSValueRef) -
         };
         value
             .as_object()
-            .is_some_and(|object| matches!(object.kind, crux::object::ObjectKind::Array))
+            .is_some_and(|object| matches!(object.kind, crux::object::ObjectKind::Array(_)))
     })
 }
 
@@ -531,7 +531,7 @@ pub unsafe extern "C" fn JSValueGetLength(_ctx: JSContextRef, value: JSValueRef)
         // Arrays have a .length property; objects don't.
         if value.is_object()
             && let Some(obj) = value.as_object()
-            && matches!(obj.kind, crux::object::ObjectKind::Array)
+            && matches!(obj.kind, crux::object::ObjectKind::Array(_))
         {
             return 0; // Stub: real length from JS would go here.
         }

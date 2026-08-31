@@ -10,7 +10,9 @@
 //! `--bench` (run the micro-benchmark suite), `--jit-bench` (run the
 //! JIT-vs-interpreter comparison suite), `--print-bytecode` (print the
 //! compiled step stream), `--jit` (install the Cranelift JIT hook on every
-//! context), and the accepted-no-op knobs `--stack-size N`,
+//! context; on by default for script runs and the REPL, `--no-jit` disables
+//! it, and `--bench` always measures the interpreter), and the
+//! accepted-no-op knobs `--stack-size N`,
 //! `--max-old-space N`, `--harmony-*`.
 
 use std::io::{self, BufRead, Write};
@@ -33,6 +35,7 @@ struct Options {
     print_bytecode: bool,
     gc_stress: bool,
     jit: bool,
+    no_jit: bool,
     stack_size: Option<u64>,
     max_old_space: Option<u64>,
 }
@@ -64,6 +67,7 @@ fn parse(args: &[String]) -> Command {
             "--jit-bench" => options.jit_bench = true,
             "--print-bytecode" => options.print_bytecode = true,
             "--jit" => options.jit = true,
+            "--no-jit" => options.no_jit = true,
             "--stack-size" => {
                 index += 1;
                 options.stack_size = args.get(index).and_then(|value| value.parse().ok());
@@ -115,7 +119,8 @@ fn run(command: Command) -> Result<(), u8> {
             eprintln!("  --dump-ast, --dump-tokens");
             eprintln!("  --bench");
             eprintln!("  --jit-bench               JIT vs interpreter comparison");
-            eprintln!("  --jit                     install the Cranelift JIT hook");
+            eprintln!("  --jit                     install the Cranelift JIT hook (default)");
+            eprintln!("  --no-jit                  run without the JIT hook");
             eprintln!("  --print-bytecode");
             eprintln!("  --stack-size N            (no-op)");
             eprintln!("  --max-old-space N         (no-op)");
@@ -172,7 +177,7 @@ fn run_file_inner(file: &str, args: &[String], options: &Options, source: &str) 
     }
     let mut context = Context::new().map_err(report)?;
     context.set_gc_stress(options.gc_stress);
-    if options.jit {
+    if options.jit || !options.no_jit {
         jit::install(context.agent_mut()).map_err(report)?;
     }
     context.install_fs().map_err(report)?;
@@ -262,7 +267,7 @@ fn dump_bytecode(source: &str) -> Result<(), u8> {
 fn repl(options: &Options) -> Result<(), u8> {
     let mut context = Context::new().map_err(report)?;
     context.set_gc_stress(options.gc_stress);
-    if options.jit {
+    if options.jit || !options.no_jit {
         jit::install(context.agent_mut()).map_err(report)?;
     }
     println!("slag {VERSION} REPL (type .exit or Ctrl-D to quit)");
@@ -424,6 +429,14 @@ fn run_benchmarks(context: &mut Context) -> Result<(), u8> {
             "construct churn",
             "function C(x) { this.x = x; } var n = 0; for (var i = 0; i < 100_000; i++) { var o = new C(i); n += o.x; } n",
         ),
+        (
+            "buildString shape",
+            "var a = []; var l = 0; var c = 0; for (var i = 0; i < 3_000_000; i++) { a[l++] = i; if (l === 10000) { c++; a.length = l = 0; } } c",
+        ),
+        (
+            "buildString full",
+            "function buildString() { var lone = [0x2D, 0x58A, 0x5BE, 0x1400, 0x1806, 0x2053, 0x207B, 0x208B, 0x2212, 0x2E17, 0x2E1A, 0x2E40, 0x2E5D, 0x301C, 0x3030, 0x30A0, 0xFE58, 0xFE63, 0xFF0D, 0x10D6E, 0x10EAD]; var ranges = [[0xDC00, 0xDFFF], [0x0, 0x2C], [0x2E, 0x589], [0x58B, 0x5BD], [0x5BF, 0x13FF], [0x1401, 0x1805], [0x1807, 0x200F], [0x2016, 0x2052], [0x2054, 0x207A], [0x207C, 0x208A], [0x208C, 0x2211], [0x2213, 0x2E16], [0x2E18, 0x2E19], [0x2E1B, 0x2E39], [0x2E3C, 0x2E3F], [0x2E41, 0x2E5C], [0x2E5E, 0x301B], [0x301D, 0x302F], [0x3031, 0x309F], [0x30A1, 0xDBFF], [0xE000, 0xFE30], [0xFE33, 0xFE57], [0xFE59, 0xFE62], [0xFE64, 0xFF0C], [0xFF0E, 0x10D6D], [0x10D6F, 0x10EAC], [0x10EAE, 0x10FFFF]]; var CHUNK = 10000; var result = String.fromCodePoint.apply(null, lone); for (var i = 0; i < ranges.length; i++) { var start = ranges[i][0]; var end = ranges[i][1]; var codePoints = []; for (var length = 0, codePoint = start; codePoint <= end; codePoint++) { codePoints[length++] = codePoint; if (length === CHUNK) { result += String.fromCodePoint.apply(null, codePoints); codePoints.length = length = 0; } } result += String.fromCodePoint.apply(null, codePoints); } return result; } var s = buildString(); s.length",
+        ),
     ];
     println!("slag {VERSION} micro-benchmarks");
     for (name, source) in benchmarks {
@@ -475,6 +488,14 @@ fn run_jit_benchmarks() -> Result<(), u8> {
             "compound assign",
             "function bench(o, n) { var s = 0; for (var i = 0; i < n; i++) { o.x += 1; s += o.x; } return s; }\n\
              bench({ x: 0 }, 100_000);",
+        ),
+        (
+            "buildString shape",
+            "function bench() { var a = []; var l = 0; var c = 0; for (var i = 0; i < 3_000_000; i++) { a[l++] = i; if (l === 10000) { c++; a.length = l = 0; } } return c; } bench();",
+        ),
+        (
+            "buildString full",
+            "function bench() { var lone = [0x2D, 0x58A, 0x5BE, 0x1400, 0x1806, 0x2053, 0x207B, 0x208B, 0x2212, 0x2E17, 0x2E1A, 0x2E40, 0x2E5D, 0x301C, 0x3030, 0x30A0, 0xFE58, 0xFE63, 0xFF0D, 0x10D6E, 0x10EAD]; var ranges = [[0xDC00, 0xDFFF], [0x0, 0x2C], [0x2E, 0x589], [0x58B, 0x5BD], [0x5BF, 0x13FF], [0x1401, 0x1805], [0x1807, 0x200F], [0x2016, 0x2052], [0x2054, 0x207A], [0x207C, 0x208A], [0x208C, 0x2211], [0x2213, 0x2E16], [0x2E18, 0x2E19], [0x2E1B, 0x2E39], [0x2E3C, 0x2E3F], [0x2E41, 0x2E5C], [0x2E5E, 0x301B], [0x301D, 0x302F], [0x3031, 0x309F], [0x30A1, 0xDBFF], [0xE000, 0xFE30], [0xFE33, 0xFE57], [0xFE59, 0xFE62], [0xFE64, 0xFF0C], [0xFF0E, 0x10D6D], [0x10D6F, 0x10EAC], [0x10EAE, 0x10FFFF]]; var CHUNK = 10000; var result = String.fromCodePoint.apply(null, lone); for (var i = 0; i < ranges.length; i++) { var start = ranges[i][0]; var end = ranges[i][1]; var codePoints = []; for (var length = 0, codePoint = start; codePoint <= end; codePoint++) { codePoints[length++] = codePoint; if (length === CHUNK) { result += String.fromCodePoint.apply(null, codePoints); codePoints.length = length = 0; } } result += String.fromCodePoint.apply(null, codePoints); } return result.length; } bench();",
         ),
     ];
     println!("slag {VERSION} JIT vs interpreter micro-benchmarks");
@@ -573,6 +594,11 @@ mod tests {
             ..Options::default()
         };
         assert_eq!(parse(&["--jit".into()]), Command::Repl(options.clone()));
+        let options = Options {
+            no_jit: true,
+            ..Options::default()
+        };
+        assert_eq!(parse(&["--no-jit".into()]), Command::Repl(options.clone()));
         let options = Options {
             jit_bench: true,
             ..Options::default()

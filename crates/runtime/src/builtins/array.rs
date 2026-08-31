@@ -100,7 +100,7 @@ fn key(index: u64) -> JsString {
 pub fn is_array(value: &Value) -> bool {
     match value.kind() {
         ValueKind::Object(obj) => match &obj.kind {
-            ObjectKind::Array => true,
+            ObjectKind::Array(_) => true,
             ObjectKind::Proxy(slots) => slots
                 .target
                 .borrow()
@@ -109,7 +109,7 @@ pub fn is_array(value: &Value) -> bool {
                 .unwrap_or(false),
             _ => false,
         },
-        ValueKind::Function(function) => matches!(function.object.kind, ObjectKind::Array),
+        ValueKind::Function(function) => matches!(function.object.kind, ObjectKind::Array(_)),
         _ => false,
     }
 }
@@ -119,7 +119,7 @@ pub fn is_array(value: &Value) -> bool {
 pub fn is_array_or_throw(value: &Value) -> Result<bool, JsError> {
     match value.kind() {
         ValueKind::Object(obj) => match &obj.kind {
-            ObjectKind::Array => Ok(true),
+            ObjectKind::Array(_) => Ok(true),
             ObjectKind::Proxy(slots) => {
                 let Some(target) = slots.target.borrow().as_ref().cloned() else {
                     return Err(JsError::new(
@@ -131,7 +131,7 @@ pub fn is_array_or_throw(value: &Value) -> Result<bool, JsError> {
             }
             _ => Ok(false),
         },
-        ValueKind::Function(function) => Ok(matches!(function.object.kind, ObjectKind::Array)),
+        ValueKind::Function(function) => Ok(matches!(function.object.kind, ObjectKind::Array(_))),
         _ => Ok(false),
     }
 }
@@ -1191,7 +1191,7 @@ pub(crate) fn push(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Va
         // (chain-checked create, length bump included); anything else falls
         // back to the full `[[Set]]`.
         if let Some(array) = object.as_object()
-            && matches!(array.kind, crux::object::ObjectKind::Array)
+            && matches!(array.kind, crux::object::ObjectKind::Array(_))
             && array.array_element_write(length, *item)?.is_some()
         {
             length += 1;

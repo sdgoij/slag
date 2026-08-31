@@ -42,6 +42,7 @@ pub enum Helper {
     UpdateIdent,
     AssignMemberName,
     AssignMemberComputed,
+    FastArrayElementWrite,
     SetMemberSlot,
     LoadContext,
     StoreContext,
@@ -161,6 +162,7 @@ impl Helper {
             Helper::UpdateIdent => "update_ident",
             Helper::AssignMemberName => "assign_member_name",
             Helper::AssignMemberComputed => "assign_member_computed",
+            Helper::FastArrayElementWrite => "fast_array_element_write",
             Helper::SetMemberSlot => "set_member_slot",
             Helper::LoadContext => "load_context",
             Helper::StoreContext => "store_context",
@@ -394,6 +396,12 @@ pub struct JitHelpers {
     pub assign_member_computed: Option<
         extern "C" fn(vm: *mut c_void, op: u64, object: u64, key: u64, old: u64, value: u64) -> u64,
     >,
+    /// The JIT's inline dense-array element write: 1 when the element was
+    /// stored through `array_element_write` (plain Array + canonical index
+    /// Number key), 0 for the `assign_member_computed` fallback. Never
+    /// errors.
+    pub fast_array_element_write:
+        Option<extern "C" fn(vm: *mut c_void, object: u64, key: u64, value: u64) -> u64>,
     /// The capture-context read (`LoadContextSlot`): `depth` is the static
     /// context-chain depth, `index` the binding's context slot. Returns the
     /// value.
@@ -657,6 +665,7 @@ impl JitHelpers {
             update_ident: None,
             assign_member_name: None,
             assign_member_computed: None,
+            fast_array_element_write: None,
             set_member_slot: None,
             load_context: None,
             store_context: None,
@@ -777,6 +786,9 @@ impl JitHelpers {
             Helper::UpdateIdent => self.update_ident.map(|f| f as usize as u64),
             Helper::AssignMemberName => self.assign_member_name.map(|f| f as usize as u64),
             Helper::AssignMemberComputed => self.assign_member_computed.map(|f| f as usize as u64),
+            Helper::FastArrayElementWrite => {
+                self.fast_array_element_write.map(|f| f as usize as u64)
+            }
             Helper::SetMemberSlot => self.set_member_slot.map(|f| f as usize as u64),
             Helper::LoadContext => self.load_context.map(|f| f as usize as u64),
             Helper::StoreContext => self.store_context.map(|f| f as usize as u64),
@@ -1022,6 +1034,17 @@ pub extern "C" fn test_assign_member_computed(
         let old_num = Value::from_bits(old).as_number().unwrap_or(0.0);
         Value::Number(old_num + value_num).bits()
     }
+}
+
+/// Returns 1 — proves the dense-array fast write was called with the right
+/// ABI (the scaffold has no real array to store into).
+pub extern "C" fn test_fast_array_element_write(
+    _vm: *mut c_void,
+    _object: u64,
+    _key: u64,
+    _value: u64,
+) -> u64 {
+    1
 }
 
 /// Returns the stored value unchanged — proves `set_member_slot` was called
@@ -1627,6 +1650,7 @@ mod tests {
             Helper::UpdateIdent,
             Helper::AssignMemberName,
             Helper::AssignMemberComputed,
+            Helper::FastArrayElementWrite,
         ] {
             assert!(none.get(h).is_none(), "{} should be None", h.name());
         }
@@ -1647,6 +1671,10 @@ mod tests {
         assert_eq!(
             Helper::AssignMemberComputed.name(),
             "assign_member_computed"
+        );
+        assert_eq!(
+            Helper::FastArrayElementWrite.name(),
+            "fast_array_element_write"
         );
     }
 

@@ -2042,7 +2042,7 @@ pub fn for_of_begin(agent: &mut Agent, value: &Value) -> Result<ForOfState, JsEr
     // re-validates). The array generation covers an own @@iterator addition
     // and proto changes (Cut 22's mechanism bumps it).
     if let ValueKind::Object(object) = value.kind()
-        && matches!(object.kind, crux::object::ObjectKind::Array)
+        && matches!(object.kind, crux::object::ObjectKind::Array(_))
     {
         let index = object.id() as usize & (crate::ir::MEMBER_CELLS - 1);
         if let Some((cached_array, cached_generation, cached_proto)) =
@@ -2063,7 +2063,7 @@ pub fn for_of_begin(agent: &mut Agent, value: &Value) -> Result<ForOfState, JsEr
     // generic path below (get_method included), which is unchanged.
     if let Some(realm) = agent.current_realm().ok()
         && let ValueKind::Object(object) = value.kind()
-        && matches!(object.kind, crux::object::ObjectKind::Array)
+        && matches!(object.kind, crux::object::ObjectKind::Array(_))
         && object
             .get_own_property_key(&PropertyKey::Symbol(crux::symbol::well_known("iterator")))?
             .is_none()
@@ -2103,7 +2103,7 @@ pub fn for_of_begin(agent: &mut Agent, value: &Value) -> Result<ForOfState, JsEr
         && matches!(
             value.kind(),
             ValueKind::Object(ref object)
-                if matches!(object.kind, crux::object::ObjectKind::Array)
+                if matches!(object.kind, crux::object::ObjectKind::Array(_))
         )
         && realm
             .intrinsics
@@ -2138,24 +2138,21 @@ pub fn for_of_begin(agent: &mut Agent, value: &Value) -> Result<ForOfState, JsEr
     // @@iterator resolves to the intrinsic would also create an entry — its
     // element reads must go through the traps, so it stays generic), at
     // index 0, in the value kind, with the intrinsic `next`.
-    let stock = match iterator.kind() {
-        ValueKind::Object(object) => {
-            agent
-                .array_iter_data
-                .get(&object.id())
-                .cloned()
-                .filter(|(array, index, kind)| {
+    let stock =
+        match iterator.kind() {
+            ValueKind::Object(object) => agent.array_iter_data.get(&object.id()).cloned().filter(
+                |(array, index, kind)| {
                     *index == 0
                         && *kind == crate::builtins::array::ArrayIterationKind::Value as u32
                         && matches!(
                             array.kind(),
                             ValueKind::Object(ref array_object)
-                                if matches!(array_object.kind, crux::object::ObjectKind::Array)
+                                if matches!(array_object.kind, crux::object::ObjectKind::Array(_))
                         )
-                })
-        }
-        _ => None,
-    };
+                },
+            ),
+            _ => None,
+        };
     let intrinsic_next = agent
         .current_realm()
         .ok()

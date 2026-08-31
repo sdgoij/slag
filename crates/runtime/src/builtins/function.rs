@@ -57,9 +57,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     realm
         .intrinsics
         .define(FUNCTION_PROTO, function_proto_value);
-    realm
-        .intrinsics
-        .define(FUNCTION, function_ctor_value);
+    realm.intrinsics.define(FUNCTION, function_ctor_value);
 
     // 20.2.2 Function.prototype: non-writable and non-configurable.
     function_ctor.define_property(
@@ -434,8 +432,7 @@ fn bind(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         .intrinsics
         .get(FUNCTION_PROTO)
         .and_then(|value| as_object(&value));
-    let bound =
-        Function::bound_function_create(target, this_arg, bound_args.clone(), proto)?;
+    let bound = Function::bound_function_create(target, this_arg, bound_args.clone(), proto)?;
 
     // SetFunctionLength (spec steps 4-7): always an own `length`, computed
     // from the target's when it is a Number.
@@ -446,12 +443,8 @@ fn bind(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         _ => false,
     };
     if has_length {
-        let target_length = get_property_key(
-            agent,
-            &target,
-            &PropertyKey::from_utf8("length"),
-            target,
-        )?;
+        let target_length =
+            get_property_key(agent, &target, &PropertyKey::from_utf8("length"), target)?;
         if let ValueKind::Number(number) = target_length.kind() {
             let int = to_integer_or_infinity(number);
             length = if int == f64::INFINITY {
@@ -476,12 +469,7 @@ fn bind(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     )?;
 
     // SetFunctionName with the "bound " prefix (spec steps 8-10).
-    let target_name = get_property_key(
-        agent,
-        &target,
-        &PropertyKey::from_utf8("name"),
-        target,
-    )?;
+    let target_name = get_property_key(agent, &target, &PropertyKey::from_utf8("name"), target)?;
     let target_name = match target_name.kind() {
         ValueKind::String(text) => text.as_ref().clone(),
         _ => JsString::from_utf8(""),
@@ -524,12 +512,7 @@ fn create_list_from_array_like(agent: &mut Agent, value: &Value) -> Result<Vec<V
             "CreateListFromArrayLike called on non-object".into(),
         ));
     }
-    let length = get_property_key(
-        agent,
-        value,
-        &PropertyKey::from_utf8("length"),
-        *value,
-    )?;
+    let length = get_property_key(agent, value, &PropertyKey::from_utf8("length"), *value)?;
     let length = to_length(to_number(&length)?);
     // Fast path: a dense Array's elements are own data properties in the
     // linear property store, so per-index [[Get]] would be O(n²) (the
@@ -537,8 +520,26 @@ fn create_list_from_array_like(agent: &mut Agent, value: &Value) -> Result<Vec<V
     // on 10k-element arrays). Read the store once; any accessor or hole
     // falls back to the spec [[Get]] loop.
     if let ValueKind::Object(obj) = value.kind()
-        && matches!(obj.kind, crux::object::ObjectKind::Array)
+        && matches!(obj.kind, crux::object::ObjectKind::Array(_))
     {
+        // Dense: the elements are the buffer slots (index = position) — a
+        // direct read with no per-index [[Get]]. A hole (or a length past
+        // the buffer end) falls back to the [[Get]] loop below.
+        if let crux::object::ObjectKind::Array(slots) = &obj.kind
+            && slots.dense.get()
+        {
+            let elements = slots.elements.borrow();
+            let mut values = Vec::with_capacity(length as usize);
+            for index in 0..length {
+                match elements.get(index as usize).and_then(|e| *e) {
+                    Some(item) => values.push(item),
+                    None => break,
+                }
+            }
+            if values.len() == length as usize {
+                return Ok(values);
+            }
+        }
         let props = obj.properties.borrow();
         if (length as usize) <= props.len() {
             let mut values: Vec<Option<Value>> = vec![None; length as usize];
