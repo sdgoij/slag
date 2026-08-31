@@ -25,6 +25,8 @@
 
 ## Project Policies
 
+**NOTE**: Ensure skill descriptions are at most 1024 bytes; longer ones may consume more model-context tokens.
+
 See the following skills for full details:
 - **No stubs / real implementations**: `minix-c-to-rust` skill
 - **Testing requirements**: `minix-testing` skill

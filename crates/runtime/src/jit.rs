@@ -949,6 +949,14 @@ pub const MAX_JIT_DEPTH: usize = 128;
 /// certified bodies are far smaller, so the hot path avoids the allocation.
 pub(crate) const INLINE_JIT_BUF: usize = 64;
 
+/// Cut 69: the number of interpreted consultations a straight-line body
+/// (no loop) must receive before it is promoted to compiled code. The
+/// corpus's one-shot script/function bodies run once each, so they never
+/// amortize a Cranelift compile; loop bodies bypass the gate entirely
+/// (they run once with many internal iterations, so a pure count would
+/// never promote them). See `docs/jit-compile-threshold.md`.
+pub(crate) const JIT_COMPILE_THRESHOLD: u32 = 16;
+
 /// The `BinaryOp` variants in declaration order (a fieldless enum's
 /// discriminant is its index — guaranteed by the language).
 const BINARY_OPS: [BinaryOp; 22] = [
@@ -4077,6 +4085,19 @@ pub(crate) fn lookup_info(
     if known > 1 {
         known as *const JitCompiledInfo
     } else if known == 0 {
+        // Cut 69: a straight-line body (`has_loop` false) is run
+        // interpreted until it has been consulted `JIT_COMPILE_THRESHOLD`
+        // times. The count is deliberately NOT cached (`jit_info` stays 0),
+        // so every consult re-counts and promotion is never blocked; the
+        // `1` sticky-unsupported mark is never written here, so a genuinely
+        // unsupported body fails once (at or past the threshold) and
+        // sticks. A loop body compiles on the first consult — it runs once
+        // with many internal iterations, so a pure count would never
+        // promote it. `saturating_add` bounds the counter.
+        if ir.jit_calls.get() < JIT_COMPILE_THRESHOLD && !ir.has_loop {
+            ir.jit_calls.set(ir.jit_calls.get().saturating_add(1));
+            return std::ptr::null();
+        }
         // SAFETY: `hook.cache` is the installed cache and `ir` is alive for
         // the call.
         let ptr = unsafe {
@@ -4551,5 +4572,156 @@ mod tests {
             ASSIGN_OPS[AssignOp::NullishAssign as usize],
             AssignOp::NullishAssign
         );
+    }
+
+    /// A non-null info pointer (> 1 as usize — 1 is the sticky-unsupported
+    /// sentinel); never dereferenced by these tests.
+    const FAKE_INFO: usize = 0x1000;
+
+    /// Separate counters per test: the tests run in parallel threads, so a
+    /// shared static would leak one test's hook calls into the other's
+    /// assertions.
+    static FAKE_LOOKUP_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static FAKE_LOOP_LOOKUP_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// A fake cache lookup that always "compiles" (returns `FAKE_INFO`).
+    unsafe extern "C" fn fake_lookup(
+        _cache: *mut c_void,
+        _body: *const c_void,
+        _in_flight: bool,
+    ) -> *const c_void {
+        FAKE_LOOKUP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        FAKE_INFO as *const c_void
+    }
+
+    unsafe extern "C" fn fake_loop_lookup(
+        _cache: *mut c_void,
+        _body: *const c_void,
+        _in_flight: bool,
+    ) -> *const c_void {
+        FAKE_LOOP_LOOKUP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        FAKE_INFO as *const c_void
+    }
+
+    unsafe extern "C" fn fake_drop_cache(_cache: *mut c_void) {}
+
+    fn fake_lookup_calls() -> usize {
+        FAKE_LOOKUP_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn make_body(steps: Vec<crate::ir::Step>, has_loop: bool) -> std::rc::Rc<CompiledBody> {
+        std::rc::Rc::new(CompiledBody {
+            steps,
+            handlers: Vec::new(),
+            strict: false,
+            scope: None,
+            env_constant: true,
+            leaf: false,
+            leaf_needs_env: false,
+            leaf_uses_env: false,
+            leaf_ops: None,
+            script_globals: None,
+            jit_info: std::cell::Cell::new(0),
+            jit_calls: std::cell::Cell::new(0),
+            has_loop,
+        })
+    }
+
+    #[test]
+    fn lookup_info_gates_straight_line_bodies_below_the_threshold() {
+        // Cut 69: a straight-line body (`has_loop` false) is run
+        // interpreted until its consult count reaches the threshold —
+        // `lookup_info` returns null without consulting the hook, and the
+        // count is NOT cached (`jit_info` stays 0), so every consult
+        // re-counts. The (K+1)th consult compiles, and the set pointer then
+        // skips the hook.
+        FAKE_LOOKUP_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let hook = JitHook {
+            cache: std::ptr::null_mut(),
+            lookup: fake_lookup,
+            drop_cache: fake_drop_cache,
+            helpers: &JIT_SLOW_PATHS as *const JitSlowPaths,
+        };
+        let body = make_body(vec![crate::ir::Step::Push(Value::Undefined)], false);
+        for _ in 0..JIT_COMPILE_THRESHOLD {
+            assert!(lookup_info(hook, &body, false).is_null());
+        }
+        assert_eq!(body.jit_calls.get(), JIT_COMPILE_THRESHOLD);
+        assert_eq!(
+            body.jit_info.get(),
+            0,
+            "below-threshold misses are not cached"
+        );
+        assert_eq!(
+            fake_lookup_calls(),
+            0,
+            "the hook is not consulted below the threshold"
+        );
+        let ptr = lookup_info(hook, &body, false);
+        assert!(!ptr.is_null());
+        assert_eq!(fake_lookup_calls(), 1);
+        assert_eq!(body.jit_info.get(), FAKE_INFO);
+        // A set pointer is returned directly; the hook is not re-consulted.
+        let ptr2 = lookup_info(hook, &body, false);
+        assert_eq!(ptr, ptr2);
+        assert_eq!(fake_lookup_calls(), 1);
+    }
+
+    #[test]
+    fn lookup_info_compiles_loop_bodies_on_the_first_consult() {
+        // Cut 69: a loop body (`has_loop` true) bypasses the threshold — it
+        // runs once with many internal iterations, so a pure count would
+        // never promote it.
+        FAKE_LOOP_LOOKUP_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let hook = JitHook {
+            cache: std::ptr::null_mut(),
+            lookup: fake_loop_lookup,
+            drop_cache: fake_drop_cache,
+            helpers: &JIT_SLOW_PATHS as *const JitSlowPaths,
+        };
+        let body = make_body(vec![crate::ir::Step::Push(Value::Undefined)], true);
+        assert!(!lookup_info(hook, &body, false).is_null());
+        assert_eq!(
+            FAKE_LOOP_LOOKUP_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a loop body compiles on first use"
+        );
+        assert_eq!(
+            body.jit_calls.get(),
+            0,
+            "the threshold count is skipped for loops"
+        );
+    }
+
+    #[test]
+    fn body_has_loop_detects_back_edges_and_fused_loop_shapes() {
+        use crate::ir::Step;
+        // A forward jump is not a loop.
+        assert!(!crate::ir::body_has_loop(&[
+            Step::Push(Value::Undefined),
+            Step::Jump(1)
+        ]));
+        // A jump to an earlier step is a back edge.
+        assert!(crate::ir::body_has_loop(&[
+            Step::Push(Value::Undefined),
+            Step::Jump(0)
+        ]));
+        // The fused loop head and the register body are implicit loops.
+        assert!(crate::ir::body_has_loop(&[Step::FastLoopHead {
+            var: crate::ir::FastLoopVar::Counter,
+            op: BinaryOp::Add,
+            imm: 0.0,
+            inc: UpdateOp::Increment,
+            body_start: 0,
+            after: 0,
+        }]));
+        assert!(crate::ir::body_has_loop(&[Step::RunRegBody {
+            ops: Box::new([])
+        }]));
+        // A self-tail-call re-enters the body's own entry (the interpreter's
+        // TCO loop never re-consults the JIT), so it is a loop too.
+        assert!(crate::ir::body_has_loop(&[Step::TailCallSelf { argc: 1 }]));
     }
 }

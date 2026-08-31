@@ -516,6 +516,8 @@ mod tests {
             leaf_ops: None,
             script_globals: None,
             jit_info: std::cell::Cell::new(0),
+            jit_calls: std::cell::Cell::new(0),
+            has_loop: false,
         }
     }
 
@@ -1552,10 +1554,17 @@ mod tests {
     #[test]
     fn installed_jit_runs_a_member_callee() {
         // `return o.f(1) + 1` — a member callee (plain `CallFast`), no loop.
+        // Cut 69: both bodies are straight-line, so the call repeats 17×
+        // against the ONE hoisted callee site (the completion stays the
+        // last call's value).
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
-                    "function f(o) { return o.f(1) + 1; } f({ f: function (x) { return x + 1; } });",
+                    "function f(o) { return o.f(1) + 1; } \
+                     var o = { f: function (x) { return x + 1; } }; \
+                     f(o); f(o); f(o); f(o); f(o); f(o); \
+                     f(o); f(o); f(o); f(o); f(o); f(o); \
+                     f(o); f(o); f(o); f(o); f(o);",
                 )
                 .expect("runs")
         });
@@ -1604,11 +1613,19 @@ mod tests {
     #[test]
     fn installed_jit_runs_an_array_literal_body() {
         // Cut 52: an array-literal body compiles — `[1, 2, 3]` built in
-        // machine code, with holes and a spread.
+        // machine code, with holes and a spread. Cut 69: both bodies are
+        // straight-line, so the expression repeats 17× to cross the
+        // promotion threshold.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
-                    "function f() { return [1, , 3]; } f().length + (function g() { return [1, ...[2, 3]].length; }());",
+                    "function f() { return [1, , 3]; } \
+                     var g = function () { return [1, ...[2, 3]].length; }; \
+                     f().length + g(); f().length + g(); f().length + g(); f().length + g(); \
+                     f().length + g(); f().length + g(); f().length + g(); f().length + g(); \
+                     f().length + g(); f().length + g(); f().length + g(); f().length + g(); \
+                     f().length + g(); f().length + g(); f().length + g(); f().length + g(); \
+                     f().length + g();",
                 )
                 .expect("runs")
         });
@@ -1619,12 +1636,16 @@ mod tests {
     #[test]
     fn installed_jit_runs_an_object_literal_body() {
         // Cut 53: an object-literal body compiles — plain, computed-key, and
-        // spread properties built in machine code.
+        // spread properties built in machine code. Cut 69: `f` is
+        // straight-line, so the call repeats 17×.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
                     "function f() { var k = 2; return { a: 1, [k]: 3, ...{ d: 4 } }; } \
-                     var o = f(); o.a + o[2] + o.d;",
+                     var o = f(); var o = f(); var o = f(); var o = f(); var o = f(); var o = f(); \
+                     var o = f(); var o = f(); var o = f(); var o = f(); var o = f(); var o = f(); \
+                     var o = f(); var o = f(); var o = f(); var o = f(); var o = f(); \
+                     o.a + o[2] + o.d;",
                 )
                 .expect("runs")
         });
@@ -1636,11 +1657,17 @@ mod tests {
     fn installed_jit_runs_an_object_literal_with_methods() {
         // Cut 53: method and accessor definitions compile too — the
         // step-index helpers instantiate the functions from the running body.
+        // Cut 69: `f` itself is not certified (its object-literal body stays
+        // env-path); the METHOD bodies are straight-line, so the calls
+        // repeat 17× against the ONE hoisted object.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
                     "function f() { return { m() { return 4; }, get g() { return 5; } }; } \
-                     var o = f(); o.m() + o.g;",
+                     var o = f(); \
+                     o.m() + o.g; o.m() + o.g; o.m() + o.g; o.m() + o.g; o.m() + o.g; o.m() + o.g; \
+                     o.m() + o.g; o.m() + o.g; o.m() + o.g; o.m() + o.g; o.m() + o.g; o.m() + o.g; \
+                     o.m() + o.g; o.m() + o.g; o.m() + o.g; o.m() + o.g; o.m() + o.g;",
                 )
                 .expect("runs")
         });
@@ -1667,10 +1694,15 @@ mod tests {
     #[test]
     fn installed_jit_runs_a_template_literal_body() {
         // Cut 54: a template literal — `PushStr` + `ConcatStr` +
-        // `ConcatStrConst` — compiles.
+        // `ConcatStrConst` — compiles. Cut 69: `f` is straight-line, so the
+        // call repeats 17×.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
-                .run_script("function f(n) { return `a${n}b`.length; } f(7);")
+                .run_script(
+                    "function f(n) { return `a${n}b`.length; } \
+                     f(7); f(7); f(7); f(7); f(7); f(7); f(7); f(7); f(7); f(7); \
+                     f(7); f(7); f(7); f(7); f(7); f(7); f(7);",
+                )
                 .expect("runs")
         });
         assert_eq!(value.as_number(), Some(3.0));
@@ -1699,10 +1731,17 @@ mod tests {
     #[test]
     fn installed_jit_runs_a_slot_callee() {
         // `return g(x) + 1` — a param callee (fused `CallFastSlot`), no loop.
+        // Cut 69: both bodies are straight-line, so the call repeats 17×
+        // against the ONE hoisted callee site (the completion stays the
+        // last call's value).
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
-                    "function f(g, x) { return g(x) + 1; } f(function (x) { return x + 1; }, 41);",
+                    "function f(g, x) { return g(x) + 1; } \
+                     var g = function (x) { return x + 1; }; \
+                     f(g, 41); f(g, 41); f(g, 41); f(g, 41); f(g, 41); f(g, 41); \
+                     f(g, 41); f(g, 41); f(g, 41); f(g, 41); f(g, 41); f(g, 41); \
+                     f(g, 41); f(g, 41); f(g, 41); f(g, 41); f(g, 41);",
                 )
                 .expect("runs")
         });
@@ -1862,6 +1901,62 @@ mod tests {
     }
 
     #[test]
+    fn installed_jit_straight_line_body_stays_interpreted_below_the_threshold() {
+        // Cut 69: a straight-line body (`add`, no loop) is run interpreted
+        // until its consult count reaches `JIT_COMPILE_THRESHOLD`. Eight
+        // calls stay below the threshold, and the consulted-once script body
+        // is below it too — nothing compiles, and the behavior is identical.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function add(a, b) { return a + b; } \
+                     add(1, 2); add(1, 2); add(1, 2); add(1, 2); \
+                     add(1, 2); add(1, 2); add(1, 2); add(1, 2);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(3.0));
+        assert_eq!(compiled, 0, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_straight_line_body_promotes_at_the_threshold() {
+        // Cut 69: the 17th consult of a straight-line body crosses the
+        // threshold and compiles it — `add` runs its machine code on the
+        // last call (the script body, consulted once, stays interpreted).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function add(a, b) { return a + b; } \
+                     add(1, 2); add(1, 2); add(1, 2); add(1, 2); add(1, 2); add(1, 2); \
+                     add(1, 2); add(1, 2); add(1, 2); add(1, 2); add(1, 2); add(1, 2); \
+                     add(1, 2); add(1, 2); add(1, 2); add(1, 2); add(1, 2);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(3.0));
+        assert_eq!(compiled, 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_loop_body_compiles_on_the_first_consult() {
+        // Cut 69: a loop body (`sum`, has a back edge) bypasses the
+        // threshold — it runs once with many internal iterations, so a
+        // consult count would never promote it. It compiles on the first
+        // call, even though it is only ever called once.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function sum(n) { var s = 0; for (var i = 0; i <= n; i++) { s += i; } return s; } \
+                     sum(100);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(5050.0));
+        assert_eq!(compiled, 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_runs_a_loop_creating_closures() {
         // Cut 44: closure creation inside a loop no longer bails the body —
         // `CreateArrow`/`CreateFunction` lower to step-index helpers, so the
@@ -1910,7 +2005,9 @@ mod tests {
         // reassigned — `f` is now `g`, so f's body tail-calls a different
         // closure and the helper path runs. `original(3)` resolves through
         // f→g→f→g to the replacement's base case (2); a wrongly-taken jump
-        // would return the original's (1).
+        // would return the original's (1). Cut 69: f's body is a
+        // self-tail-call (a loop shape) and compiles on first use; g's
+        // tail call targets a different name, so g stays interpreted.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
@@ -1923,17 +2020,23 @@ mod tests {
                 .expect("runs")
         });
         assert_eq!(value.as_number(), Some(2.0));
-        assert!(compiled >= 2, "{compiled} bodies");
+        assert!(compiled >= 1, "{compiled} bodies");
     }
 
     #[test]
     fn installed_jit_runs_a_three_arg_call() {
         // Cut 49: a ≥3-argument call compiles through the vector form
         // (`ArgsBase`/`ArgsPush`/`Call`) — the certified script's call to
-        // `f(1, 2, 3)` no longer bails the body to the interpreter.
+        // `f(1, 2, 3)` no longer bails the body to the interpreter. Cut 69:
+        // `f` is straight-line, so the call repeats 17×.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
-                .run_script("function f(a, b, c) { return a + b + c; } f(1, 2, 3);")
+                .run_script(
+                    "function f(a, b, c) { return a + b + c; } \
+                     f(1, 2, 3); f(1, 2, 3); f(1, 2, 3); f(1, 2, 3); f(1, 2, 3); f(1, 2, 3); \
+                     f(1, 2, 3); f(1, 2, 3); f(1, 2, 3); f(1, 2, 3); f(1, 2, 3); f(1, 2, 3); \
+                     f(1, 2, 3); f(1, 2, 3); f(1, 2, 3); f(1, 2, 3); f(1, 2, 3);",
+                )
                 .expect("runs")
         });
         assert_eq!(value.as_number(), Some(6.0));
@@ -1943,9 +2046,17 @@ mod tests {
     #[test]
     fn installed_jit_runs_a_spread_call() {
         // Cut 49: `ArgsSpread` iterates the array into the argument vector.
+        // Cut 69: `f` is straight-line, so the call repeats 17×.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
-                .run_script("function f(a, b, c) { return a + b + c; } f(...[1, 2, 3]);")
+                .run_script(
+                    "function f(a, b, c) { return a + b + c; } \
+                     f(...[1, 2, 3]); f(...[1, 2, 3]); f(...[1, 2, 3]); f(...[1, 2, 3]); \
+                     f(...[1, 2, 3]); f(...[1, 2, 3]); f(...[1, 2, 3]); f(...[1, 2, 3]); \
+                     f(...[1, 2, 3]); f(...[1, 2, 3]); f(...[1, 2, 3]); f(...[1, 2, 3]); \
+                     f(...[1, 2, 3]); f(...[1, 2, 3]); f(...[1, 2, 3]); f(...[1, 2, 3]); \
+                     f(...[1, 2, 3]);",
+                )
                 .expect("runs")
         });
         assert_eq!(value.as_number(), Some(6.0));
@@ -1992,8 +2103,10 @@ mod tests {
     #[test]
     fn installed_jit_runs_a_tail_call_through_a_closure() {
         // The tco-call-args shape: `getF()(n - 1)` — closure creation plus a
-        // computed-callee tail call, both compiled now (`f` and `getF`'s
-        // body). `count` lands once at the base case.
+        // computed-callee tail call. Cut 69: the callee of a computed tail
+        // call is not statically the running body, so `f` is not a loop body
+        // and stays interpreted (consulted once); `getF` is consulted once
+        // per TCO step and promotes — `count` lands once at the base case.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
@@ -2005,7 +2118,7 @@ mod tests {
                 .expect("runs")
         });
         assert_eq!(value.as_number(), Some(1.0));
-        assert!(compiled >= 2, "{compiled} bodies");
+        assert!(compiled >= 1, "{compiled} bodies");
     }
 
     #[test]
@@ -2067,13 +2180,15 @@ mod tests {
         // Cut 55: a try/catch body compiles — a thrown value dispatches to
         // the catch block in machine code (via `throw_machinery`), the catch
         // parameter binds into its flat slot, and an engine error (a null
-        // member read) routes through the same pending-error dispatch.
+        // member read) routes through the same pending-error dispatch. Cut
+        // 69: `f` is straight-line, so the call repeats 17×.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
                     "function f() { try { throw 42; } catch (e) { return e * 2; } }\n\
                      function g() { try { var x = null; return x.y.z; } catch (e) { return e.name; } }\n\
-                     f();",
+                     f(); f(); f(); f(); f(); f(); f(); f(); f(); f(); f(); f(); \
+                     f(); f(); f(); f(); f();",
                 )
                 .expect("runs")
         });
@@ -2085,7 +2200,8 @@ mod tests {
     fn installed_jit_runs_a_try_finally_body() {
         // Cut 55: a return through a finally runs the finally, and a return
         // in the finally overrides the pending return; a break/continue
-        // through a finally routes via `control_transfer` too.
+        // through a finally routes via `control_transfer` too. Cut 69: `f`
+        // is straight-line, so the call repeats 17×.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
@@ -2094,7 +2210,8 @@ mod tests {
                      function g() { try { return 1; } finally { return 2; } }\n\
                      function h() { var out = ''; for (var i = 0; i < 3; i++) { \
                        try { if (i === 1) continue; out += i; } finally { out += 'f'; } } return out; }\n\
-                     f();",
+                     f(); f(); f(); f(); f(); f(); f(); f(); f(); f(); f(); f(); \
+                     f(); f(); f(); f(); f();",
                 )
                 .expect("runs")
         });
@@ -2125,7 +2242,9 @@ mod tests {
         // Cut 55: nested trys (an inner finally then an outer catch) and a
         // throw that escapes the JIT body into the caller's catch — the
         // escaping value round-trips through the pending error's attached
-        // value.
+        // value. Cut 69: `f` and `g` are straight-line, so the scenario
+        // repeats 17× (the precomputed result string is returned untouched;
+        // the script body itself is a loop, so it compiles too).
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
@@ -2135,7 +2254,10 @@ mod tests {
                      function g() { try { throw 'escaped'; } finally { log.push('g'); } }\n\
                      var caught = null;\n\
                      try { g(); } catch (e) { caught = e; }\n\
-                     f() + '|' + caught + '|' + log.join(',');",
+                     var result = f() + '|' + caught + '|' + log.join(',');\n\
+                     var i = 0;\n\
+                     while (i++ < 16) { try { g(); } catch (e) {} f(); }\n\
+                     result;",
                 )
                 .expect("runs")
         });
@@ -2150,12 +2272,14 @@ mod tests {
     fn installed_jit_runs_a_block_env_body() {
         // Cut 55: `EnterBlock`/`LeaveBlock` compile to env push/pop helpers
         // — a nested `let` block now JITs (the block env keeps the env
-        // stack balanced for the leaf-probe eligibility checks).
+        // stack balanced for the leaf-probe eligibility checks). Cut 69:
+        // `f` is straight-line, so the call repeats 17×.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
                     "function f() { { let x = 5; var y = x * 2; } return y; }\n\
-                     f();",
+                     f(); f(); f(); f(); f(); f(); f(); f(); f(); f(); f(); f(); \
+                     f(); f(); f(); f(); f();",
                 )
                 .expect("runs")
         });
@@ -2179,7 +2303,8 @@ mod tests {
                        default: out += 'd'; } return out; }\n\
                      function g(x) { switch (x) { case 1: return 'one'; default: return 'd'; } }\n\
                      function h(x, y) { switch (x) { case 1: switch (y) { case 10: return 'a'; } } return 'z'; }\n\
-                     f(1);",
+                     f(1); f(1); f(1); f(1); f(1); f(1); f(1); f(1); f(1); f(1); f(1); \
+                     f(1); f(1); f(1); f(1); f(1); f(1);",
                 )
                 .expect("runs")
         });
@@ -2537,12 +2662,16 @@ mod tests {
         // suspends the machine code (`DISPATCH_SUSPEND`), the driver
         // attaches the promise reactions, and the resume re-enters the
         // compiled body at the continuation with the awaited value pushed.
+        // Cut 69: the async body is consulted once per resume (below the
+        // promotion threshold for a 2-await body), so `f` repeats 17× via
+        // the script loop.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
                     "var result = 'pending';\n\
                      async function f(x) { var a = await x; var b = await (a + 1); return b * 2; }\n\
-                     f(10).then(function (v) { result = v; });",
+                     var i = 0;\n\
+                     while (i++ < 17) { f(10).then(function (v) { result = v; }); }",
                 )
                 .expect("runs");
             agent.run_jobs().expect("jobs");
@@ -2559,14 +2688,17 @@ mod tests {
         // Cut 58: a rejected `await` resumes with `Resume::Throw`, which the
         // machine code's entry routes through `throw_control` — the
         // machinery finds the body's catch (a static dispatch target) and
-        // the resumed segment runs the catch in machine code.
+        // the resumed segment runs the catch in machine code. Cut 69: the
+        // async body is consulted once per resume, so `f` repeats 17× via
+        // the script loop.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
                     "var result = 'pending';\n\
                      async function f() { var log = ''; try { await Promise.reject('boom'); } \
                        catch (e) { log += 'c' + e; } return log + 'done'; }\n\
-                     f().then(function (v) { result = v; });",
+                     var i = 0;\n\
+                     while (i++ < 17) { f().then(function (v) { result = v; }); }",
                 )
                 .expect("runs");
             agent.run_jobs().expect("jobs");
@@ -2583,14 +2715,18 @@ mod tests {
     fn installed_jit_async_function_with_a_finally_and_escaped_rejection() {
         // Cut 58: an `await` inside a try with a finally — the rejected
         // resume routes through the machinery (finally runs, then the throw
-        // escapes the body and rejects the promise).
+        // escapes the body and rejects the promise). Cut 69: the async body
+        // is consulted once per resume, so `f` repeats 17× via the script
+        // loop.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
                     "var result = 'pending';\n\
                      async function f() { var log = ''; try { await Promise.reject('x'); } \
                        finally { log += 'f'; } return log; }\n\
-                     f().then(function (v) { result = 'ok:' + v; }, function (e) { result = 'rej:' + e; });",
+                     var i = 0;\n\
+                     while (i++ < 17) { \
+                       f().then(function (v) { result = 'ok:' + v; }, function (e) { result = 'rej:' + e; }); }",
                 )
                 .expect("runs");
             agent.run_jobs().expect("jobs");
@@ -2607,14 +2743,20 @@ mod tests {
     fn installed_jit_runs_a_generator_with_plain_yields() {
         // Cut 58: a certified generator body compiles — each `yield`
         // suspends, `next()` resumes at the continuation, and the final
-        // `return` completes the iteration.
+        // `return` completes the iteration. Cut 69: a generator body is
+        // consulted once per resume, so the first generator's output drives
+        // the assertion while 5 more generators cross the promotion
+        // threshold (3 resumes each).
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
                     "function* g() { yield 1; yield 2; return 3; }\n\
-                     var out = ''; var it = g(); var r;\n\
-                     while (!(r = it.next()).done) { out += r.value + ','; }\n\
-                     out += r.value;",
+                     var out = '';\n\
+                     var first = g(); var r;\n\
+                     while (!(r = first.next()).done) { out += r.value + ','; }\n\
+                     out += r.value;\n\
+                     for (var j = 1; j < 6; j++) { var it = g(); var rr; while (!(rr = it.next()).done) { } }\n\
+                     out;",
                 )
                 .expect("runs")
         });
@@ -2653,7 +2795,10 @@ mod tests {
         // Cut 58: `it.throw(v)` at a plain `yield` resumes with
         // `Resume::Throw` — the machine code's entry routes it through
         // `throw_control`, and a body catch catches it; a second `throw`
-        // with no catch escapes and completes the generator.
+        // with no catch escapes and completes the generator. Cut 69: the
+        // body is resumed twice (below the promotion threshold), so it runs
+        // interpreted — the behavior is identical, and the compiled throw
+        // path is exercised by the sweep's loop-containing generators.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
@@ -2668,7 +2813,7 @@ mod tests {
             value.as_string().map(|s| s.to_string()),
             Some("1|false|cboomr|true".to_string())
         );
-        assert!(compiled >= 1, "{compiled} bodies");
+        assert_eq!(compiled, 0, "{compiled} bodies");
     }
 
     #[test]
@@ -2692,8 +2837,10 @@ mod tests {
             Some("12".to_string())
         );
         // The async generator body is not certified, so it never compiles;
-        // the `.then` callback (a plain body) does — proving the hook fired.
-        assert!(compiled >= 1, "{compiled} bodies");
+        // under Cut 69 the one-shot `.then` callback stays interpreted too
+        // (below the promotion threshold) — the async-generator machinery
+        // runs correctly either way.
+        assert_eq!(compiled, 0, "{compiled} bodies");
     }
 
     #[test]
@@ -2716,7 +2863,11 @@ mod tests {
             agent.run_script("result").expect("reads")
         });
         assert_eq!(value.as_number(), Some(7.0));
-        assert!(compiled >= 1, "{compiled} bodies");
+        // Cut 69: every body here is one-shot (the async method, the inner
+        // async function, and the `.then` callbacks), so all stay
+        // interpreted — the capture-through-[[Environment]] behavior is
+        // verified either way.
+        assert_eq!(compiled, 0, "{compiled} bodies");
     }
 
     #[test]
@@ -2725,12 +2876,14 @@ mod tests {
         // primitive `Destructure*` steps — the iterator opens via
         // `destructure_begin`, each element via `destructure_next` (landing
         // on the working stack, bound to the frame slots), the close via
-        // `destructure_close`.
+        // `destructure_close`. Cut 69: `f` is straight-line, so the call
+        // repeats 17×.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
                     "function f() { let [a, b] = [1, 2]; return a + b * 10; }\n\
-                     f();",
+                     f(); f(); f(); f(); f(); f(); f(); f(); f(); f(); f(); f(); \
+                     f(); f(); f(); f(); f();",
                 )
                 .expect("runs")
         });
@@ -2752,7 +2905,8 @@ mod tests {
                      \x20 let [x, y] = { [Symbol.iterator]: function* () { yield 7; yield 8; } };\n\
                      \x20 return JSON.stringify([a, b, rest, x, y]);\n\
                      }\n\
-                     f();",
+                     f(); f(); f(); f(); f(); f(); f(); f(); f(); f(); f(); \
+                     f(); f(); f(); f(); f(); f();",
                 )
                 .expect("runs")
         });
@@ -2776,7 +2930,8 @@ mod tests {
                      \x20 let { x, y: { z } = {}, ...rest } = { x: 10, y: { z: 20 }, w: 30 };\n\
                      \x20 return JSON.stringify([x, z, rest]);\n\
                      }\n\
-                     f();",
+                     f(); f(); f(); f(); f(); f(); f(); f(); f(); f(); f(); \
+                     f(); f(); f(); f(); f(); f();",
                 )
                 .expect("runs")
         });
@@ -2801,7 +2956,8 @@ mod tests {
                      \x20 ({ p: a, q: b } = { p: 9, q: 11 });\n\
                      \x20 return a * 100 + b;\n\
                      }\n\
-                     f();",
+                     f(); f(); f(); f(); f(); f(); f(); f(); f(); f(); f(); \
+                     f(); f(); f(); f(); f(); f();",
                 )
                 .expect("runs")
         });
@@ -2835,7 +2991,9 @@ mod tests {
         // is impossible (patterns are expressions), but an iterator-`return`
         // must run on a normal `DestructureClose` and the error path must
         // close a mid-pattern iterator. A throwing `next()` leaves it open
-        // (the `destructure_stepping` gate).
+        // (the `destructure_stepping` gate). Cut 69: the scenario lives in
+        // `run` (straight-line), which repeats 17× — the script resets the
+        // state per run, so the completion is the last run's output.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
@@ -2853,9 +3011,14 @@ mod tests {
                      \x20\x20 return: function () { closed++; return {}; }\n\
                      \x20 };\n\
                      }\n\
-                     var err = '';\n\
-                     try { let [a, b, c] = it(); } catch (e) { err = String(e); }\n\
-                     err + '|' + closed + '|' + next_calls;",
+                     function run() {\n\
+                     \x20 closed = 0; next_calls = 0;\n\
+                     \x20 var err = '';\n\
+                     \x20 try { let [a, b, c] = it(); } catch (e) { err = String(e); }\n\
+                     \x20 return err + '|' + closed + '|' + next_calls;\n\
+                     }\n\
+                     run(); run(); run(); run(); run(); run(); run(); run(); run(); \
+                     run(); run(); run(); run(); run(); run(); run(); run();",
                 )
                 .expect("runs")
         });
@@ -2866,14 +3029,16 @@ mod tests {
             value.as_string().map(|s| s.to_string()),
             Some("boom|0|3".to_string())
         );
-        assert!(compiled >= 1, "{compiled} bodies");
+        assert!(compiled >= 2, "{compiled} bodies");
     }
 
     #[test]
     fn installed_jit_destructure_closes_iterator_on_completion() {
         // Cut 59: a pattern that consumes FEWER values than the iterator
         // holds closes it on `DestructureClose` (spec 13.15.5.2 step 5) —
-        // the iterator's `return` method runs.
+        // the iterator's `return` method runs. Cut 69: the scenario lives
+        // in `run` (straight-line), which repeats 17× — `closed` is reset
+        // per run, so the completion is the last run's count.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
@@ -2886,20 +3051,21 @@ mod tests {
                      \x20\x20 return: function () { closed++; return {}; }\n\
                      \x20 };\n\
                      }\n\
-                     let [a] = it();\n\
-                     closed;",
+                     function run() { closed = 0; let [a] = it(); return closed; }\n\
+                     run(); run(); run(); run(); run(); run(); run(); run(); run(); \
+                     run(); run(); run(); run(); run(); run(); run(); run();",
                 )
                 .expect("runs")
         });
         assert_eq!(value.as_number(), Some(1.0));
-        assert!(compiled >= 1, "{compiled} bodies");
+        assert!(compiled >= 2, "{compiled} bodies");
     }
 
     #[test]
     fn installed_jit_destructure_captured_names() {
         // Cut 59: a destructured binding captured by a closure — the names
         // allocate capture-context slots and the pattern's `InitContextSlot`
-        // binds them.
+        // binds them. Cut 69: `f` is straight-line, so the call repeats 17×.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
@@ -2907,7 +3073,8 @@ mod tests {
                      \x20 let [a, b] = [3, 4];\n\
                      \x20 return (function () { return a * 10 + b; })();\n\
                      }\n\
-                     f();",
+                     f(); f(); f(); f(); f(); f(); f(); f(); f(); f(); f(); \
+                     f(); f(); f(); f(); f(); f();",
                 )
                 .expect("runs")
         });
@@ -2925,12 +3092,16 @@ mod tests {
         // `undefined` under `--jit` (the Object/defineProperty and
         // arguments-object fixture clusters). `CreateArguments` is now
         // leaf-excluded, so the body runs `run_jit_body` where the frame
-        // matches.
+        // matches. Cut 69: the one-shot IIFE repeats 17× via the script
+        // loop so it crosses the promotion threshold.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
                     "'use strict';\n\
-                     var r = (function () { return arguments; })(1, true, 'a');\n\
+                     var make = function () { return arguments; };\n\
+                     var r = make(1, true, 'a');\n\
+                     var i = 0;\n\
+                     while (i++ < 16) { make(1, true, 'a'); }\n\
                      JSON.stringify([r === undefined, typeof r, r.length, r[0], r[2]]);",
                 )
                 .expect("runs")
@@ -2953,6 +3124,8 @@ mod tests {
                     "'use strict';\n\
                      function g() { var a = [1]; return arguments; }\n\
                      var argObj = g(1, true, 'a');\n\
+                     var i = 0;\n\
+                     while (i++ < 16) { g(1, true, 'a'); }\n\
                      var obj = {};\n\
                      Object.defineProperty(obj, 'p', { configurable: argObj });\n\
                      JSON.stringify([argObj.length, obj.hasOwnProperty('p'), delete obj.p]);",
@@ -2971,12 +3144,13 @@ mod tests {
         // Cut 60: a sloppy body observing `arguments` gets the MAPPED object
         // aliasing its simple params through the capture context — reading
         // `arguments[i]` mirrors the param (and `length` is the argument
-        // count).
+        // count). Cut 69: `f` is straight-line, so the call repeats 17×.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
                     "function f(a, b) { return a + '|' + arguments.length + '|' + arguments[0] + arguments[1]; }\n\
-                     f(1, 2);",
+                     f(1, 2); f(1, 2); f(1, 2); f(1, 2); f(1, 2); f(1, 2); f(1, 2); f(1, 2); \
+                     f(1, 2); f(1, 2); f(1, 2); f(1, 2); f(1, 2); f(1, 2); f(1, 2); f(1, 2); f(1, 2);",
                 )
                 .expect("runs")
         });
@@ -2991,13 +3165,19 @@ mod tests {
     fn installed_jit_mapped_arguments_alias_both_ways() {
         // Cut 60: the mapped object's accessors and the body's own reads
         // share the capture-context bindings — a write through `arguments`
-        // is seen by the param and vice versa.
+        // is seen by the param and vice versa. Cut 69: both bodies are
+        // straight-line, so the expression repeats 17×.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
                     "function f(a) { arguments[0] = 5; return a; }\n\
                      function g(a) { a = 7; return arguments[0]; }\n\
-                     f(1) + '|' + g(1);",
+                     f(1) + '|' + g(1); f(1) + '|' + g(1); f(1) + '|' + g(1); \
+                     f(1) + '|' + g(1); f(1) + '|' + g(1); f(1) + '|' + g(1); \
+                     f(1) + '|' + g(1); f(1) + '|' + g(1); f(1) + '|' + g(1); \
+                     f(1) + '|' + g(1); f(1) + '|' + g(1); f(1) + '|' + g(1); \
+                     f(1) + '|' + g(1); f(1) + '|' + g(1); f(1) + '|' + g(1); \
+                     f(1) + '|' + g(1); f(1) + '|' + g(1);",
                 )
                 .expect("runs")
         });
@@ -3012,13 +3192,19 @@ mod tests {
     fn installed_jit_arguments_callee_and_strict_unmapped() {
         // Cut 60: `arguments.callee` resolves through the running context's
         // function; a STRICT body gets the UNMAPPED object (a param write is
-        // not reflected).
+        // not reflected). Cut 69: both bodies are straight-line, so the
+        // expression repeats 17×.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
                     "function f() { return typeof arguments.callee; }\n\
                      function g(a) { 'use strict'; a = 9; return arguments[0]; }\n\
-                     f() + '|' + g(1);",
+                     f() + '|' + g(1); f() + '|' + g(1); f() + '|' + g(1); \
+                     f() + '|' + g(1); f() + '|' + g(1); f() + '|' + g(1); \
+                     f() + '|' + g(1); f() + '|' + g(1); f() + '|' + g(1); \
+                     f() + '|' + g(1); f() + '|' + g(1); f() + '|' + g(1); \
+                     f() + '|' + g(1); f() + '|' + g(1); f() + '|' + g(1); \
+                     f() + '|' + g(1); f() + '|' + g(1);",
                 )
                 .expect("runs")
         });
@@ -3042,7 +3228,8 @@ mod tests {
                      \x20 arguments[0] = 11;\n\
                      \x20 return g() + '|' + arguments[0];\n\
                      }\n\
-                     f(1);",
+                     f(1); f(1); f(1); f(1); f(1); f(1); f(1); f(1); f(1); f(1); \
+                     f(1); f(1); f(1); f(1); f(1); f(1); f(1);",
                 )
                 .expect("runs")
         });
@@ -3198,7 +3385,9 @@ mod tests {
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
-                    "var x = 1; with ({ x: 2 }) { var f = function () { return x; }; } f();",
+                    "var x = 1; with ({ x: 2 }) { var f = function () { return x; }; } \
+                     f(); f(); f(); f(); f(); f(); f(); f(); f(); f(); f(); f(); \
+                     f(); f(); f(); f(); f();",
                 )
                 .expect("runs")
         });
@@ -3221,7 +3410,8 @@ mod tests {
             agent
                 .run_script(
                     "Object.defineProperty(globalThis, 'x', { value: 1, writable: true, configurable: true }); \
-                     function f() { return x; } f(); f();",
+                     function f() { return x; } f(); f(); f(); f(); f(); f(); f(); f(); f(); f(); \
+                     f(); f(); f(); f(); f(); f(); f();",
                 )
                 .expect("first script");
             agent.run_script("let x = 2; f();").expect("second script")
@@ -3500,10 +3690,17 @@ mod tests {
 
     #[test]
     fn installed_jit_runs_a_compound_member_assign() {
-        // `o.x += 1` through the real runtime machinery.
+        // `o.x += 1` through the real runtime machinery. Cut 69: `f` is
+        // straight-line, so the call repeats 17×.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
-                .run_script("function f(o) { o.x += 1; return o.x; } f({ x: 41 });")
+                .run_script(
+                    "function f(o) { o.x += 1; return o.x; } \
+                     f({ x: 41 }); f({ x: 41 }); f({ x: 41 }); f({ x: 41 }); f({ x: 41 }); \
+                     f({ x: 41 }); f({ x: 41 }); f({ x: 41 }); f({ x: 41 }); f({ x: 41 }); \
+                     f({ x: 41 }); f({ x: 41 }); f({ x: 41 }); f({ x: 41 }); f({ x: 41 }); \
+                     f({ x: 41 }); f({ x: 41 });",
+                )
                 .expect("runs")
         });
         assert_eq!(value.as_number(), Some(42.0));
@@ -3531,12 +3728,14 @@ mod tests {
         // context (`LoadContextSlot`/`StoreContextSlot`/`UpdateContextSlot`):
         // the JIT leaf path must build the leaf's own `body_context` from
         // the closure's environment, exactly like `run_leaf_body`, or the
-        // helpers would resolve the caller's env.
+        // helpers would resolve the caller's env. Cut 69: `f` is
+        // straight-line, so the call repeats 17×.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
                     "function make() { var x = 41; return function f() { return x + 1; }; }\n\
-                     var f = make(); f();",
+                     var f = make(); f(); f(); f(); f(); f(); f(); f(); f(); f(); \
+                     f(); f(); f(); f(); f(); f(); f(); f();",
                 )
                 .expect("runs")
         });
@@ -3544,12 +3743,18 @@ mod tests {
         assert!(compiled >= 1, "{compiled} bodies");
 
         // A captured write (`x = x + 41` reads then stores) and the fused
-        // update (`++x` reads, updates, stores, returns the new value).
+        // update (`++x` reads, updates, stores, returns the new value). Cut
+        // 69: `f` mutates its captured `x`, so the call must NOT repeat on
+        // one closure — each `make()()` is a fresh closure with a fresh `x`
+        // (the inner function's body is one shared site, so 17 calls cross
+        // the promotion threshold; each returns 43).
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
                     "function make() { var x = 1; return function f() { x = x + 41; return ++x; }; }\n\
-                     var f = make(); f();",
+                     make()(); make()(); make()(); make()(); make()(); make()(); \
+                     make()(); make()(); make()(); make()(); make()(); make()(); \
+                     make()(); make()(); make()(); make()(); make()();",
                 )
                 .expect("runs")
         });
@@ -3561,12 +3766,16 @@ mod tests {
     fn installed_jit_runs_a_per_iteration_body() {
         // A closure capturing a certified `for (let i...)` head reads the
         // fresh per-iteration binding (`LoadPerIteration`/`LeafOp::LoadPerIter`
-        // through the per-iteration env machinery).
+        // through the per-iteration env machinery). Cut 69: the captured
+        // closure is straight-line, so `make()()` repeats 17× (the
+        // completion stays the last call's value).
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
                     "function make() { var fns = []; for (let i = 0; i < 3; i++) { fns.push(function () { return i * 10; }); } return fns[2]; }\n\
-                     make()();",
+                     make()(); make()(); make()(); make()(); make()(); make()(); \
+                     make()(); make()(); make()(); make()(); make()(); make()(); \
+                     make()(); make()(); make()(); make()(); make()();",
                 )
                 .expect("runs")
         });
@@ -3578,7 +3787,9 @@ mod tests {
             agent
                 .run_script(
                     "function make() { var fns = []; for (let i = 0; i < 3; i++) { fns.push(function () { return ++i; }); } return fns[2]; }\n\
-                     make()();",
+                     make()(); make()(); make()(); make()(); make()(); make()(); \
+                     make()(); make()(); make()(); make()(); make()(); make()(); \
+                     make()(); make()(); make()(); make()(); make()();",
                 )
                 .expect("runs")
         });
@@ -3606,7 +3817,13 @@ mod tests {
 
         let (value, compiled) = with_jit_agent(|agent| {
             agent
-                .run_script("function g(o) { var v = o.x; o.x = 42; return v; } g({ x: 41 });")
+                .run_script(
+                    "function g(o) { var v = o.x; o.x = 42; return v; } \
+                     g({ x: 41 }); g({ x: 41 }); g({ x: 41 }); g({ x: 41 }); g({ x: 41 }); \
+                     g({ x: 41 }); g({ x: 41 }); g({ x: 41 }); g({ x: 41 }); g({ x: 41 }); \
+                     g({ x: 41 }); g({ x: 41 }); g({ x: 41 }); g({ x: 41 }); g({ x: 41 }); \
+                     g({ x: 41 }); g({ x: 41 });",
+                )
                 .expect("runs")
         });
         assert_eq!(value.as_number(), Some(41.0));
@@ -3623,7 +3840,11 @@ mod tests {
         // register's completion. Each case also asserts the script body (and
         // its leaf callee) actually compiled.
         let cases: &[(&str, Option<f64>, usize)] = &[
-            // The top-level bench shapes.
+            // The top-level bench shapes. The straight-line cases below run
+            // interpreted under Cut 69 (a consulted-once script body is
+            // below the promotion threshold), so their `min_compiled` is 0;
+            // the compiled completion register is exercised by the loop
+            // cases.
             (
                 "var s = 0; for (var i = 0; i < 100; i++) { s += i; } s;",
                 Some(4950.0),
@@ -3640,33 +3861,35 @@ mod tests {
                 2,
             ),
             // A var declaration produces no completion value.
-            ("var x = 1;", None, 1),
+            ("var x = 1;", None, 0),
             // A statement-position assignment carries its value
             // (`FusedStoreLocal` sets the completion).
-            ("var x; x = 5;", Some(5.0), 1),
+            ("var x; x = 5;", Some(5.0), 0),
             // Control statements: with and without a value.
-            ("if (true) { 3 }", Some(3.0), 1),
-            ("if (false) { 3 }", None, 1),
+            ("if (true) { 3 }", Some(3.0), 0),
+            ("if (false) { 3 }", None, 0),
             // A trailing block that ends empty restores the pre-block
             // completion (`5; { var q = 1; }` completes 5, not undefined).
-            ("5; { var q = 1; }", Some(5.0), 1),
+            ("5; { var q = 1; }", Some(5.0), 0),
             // ...but a control statement inside the block (ResetCompletion +
             // NormalizeCompletion) turns the register empty, so the block's
             // empty end does not restore 5.
-            ("5; { if (true) {} }", None, 1),
+            ("5; { if (true) {} }", None, 0),
             // The fused call-store only fires for plain slot args; a literal
             // arg keeps the `FusedStoreLocal` tail, which sets the completion.
             (
                 "function g(x) { return x + 1; } var s = 0; s = g(1);",
                 Some(2.0),
-                2,
+                0,
             ),
             // In the counter path the loop body's `FusedStoreLocal` sets the
             // completion on the last iteration (the last `s = g(i)` = 3).
+            // `g` is called 3 times — below the promotion threshold — so
+            // only the script body compiles.
             (
                 "function g(x) { return x + 1; } var s = 0; for (var i = 0; i < 3; i++) { s = g(i); }",
                 Some(3.0),
-                2,
+                1,
             ),
         ];
         for (source, expected, min_compiled) in cases {
@@ -3768,10 +3991,17 @@ mod tests {
         // certified construct path (`run_leaf_construct`) materializes the
         // construct args and hands the run to the JIT; the base-constructor
         // result rule (an object/function return wins, else `this`) lands
-        // the constructed object.
+        // the constructed object. Cut 69: `C` is straight-line, so the
+        // construct repeats 17×.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
-                .run_script("function C(x) { this.v = x; } new C(5).v")
+                .run_script(
+                    "function C(x) { this.v = x; } \
+                     new C(5).v; new C(5).v; new C(5).v; new C(5).v; new C(5).v; \
+                     new C(5).v; new C(5).v; new C(5).v; new C(5).v; new C(5).v; \
+                     new C(5).v; new C(5).v; new C(5).v; new C(5).v; new C(5).v; \
+                     new C(5).v; new C(5).v;",
+                )
                 .expect("runs")
         });
         assert_eq!(value.as_number(), Some(5.0));
@@ -3943,12 +4173,18 @@ mod tests {
     #[test]
     fn installed_jit_step_path_string_concat() {
         // Cut 41: the step path's `Binary(Add)` (a non-loop body) shares
-        // the string-string fast path.
+        // the string-string fast path. Cut 69: `f` is straight-line, so the
+        // comparison repeats 17×.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
-                    "function f(x) { var s = x + x + x; return s; }\n\
-                     f('ab') === 'ababab';",
+                    "function f(x) { var s = x + x + x; return s; } \
+                     f('ab') === 'ababab'; f('ab') === 'ababab'; f('ab') === 'ababab'; \
+                     f('ab') === 'ababab'; f('ab') === 'ababab'; f('ab') === 'ababab'; \
+                     f('ab') === 'ababab'; f('ab') === 'ababab'; f('ab') === 'ababab'; \
+                     f('ab') === 'ababab'; f('ab') === 'ababab'; f('ab') === 'ababab'; \
+                     f('ab') === 'ababab'; f('ab') === 'ababab'; f('ab') === 'ababab'; \
+                     f('ab') === 'ababab'; f('ab') === 'ababab';",
                 )
                 .expect("runs")
         });
@@ -3963,13 +4199,15 @@ mod tests {
         // this (the base method reads `this.v`), not the base object the
         // `GetSuperBase` capture left on the stack. The derived
         // constructor itself is env-path (bailed); the method bodies
-        // compile.
+        // compile. Cut 69: `m` is straight-line, so the call repeats 17×.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
                     "class A { m() { return this.v; } }\n\
                      class B extends A { constructor() { super(); this.v = 42; } m() { return super.m(); } }\n\
-                     new B().m();",
+                     new B().m(); new B().m(); new B().m(); new B().m(); new B().m(); new B().m(); \
+                     new B().m(); new B().m(); new B().m(); new B().m(); new B().m(); new B().m(); \
+                     new B().m(); new B().m(); new B().m(); new B().m(); new B().m();",
                 )
                 .expect("runs")
         });
@@ -3990,6 +4228,10 @@ mod tests {
                 .run_script(
                     "class A { constructor() { this._x = 40; } get x() { return this._x; } m() { return 41; } }\n\
                      class B extends A { m(k, j) { var a = super[k]; var b = super[j](); return a + b; } }\n\
+                     new B().m('x', 'm'); new B().m('x', 'm'); new B().m('x', 'm'); new B().m('x', 'm'); \
+                     new B().m('x', 'm'); new B().m('x', 'm'); new B().m('x', 'm'); new B().m('x', 'm'); \
+                     new B().m('x', 'm'); new B().m('x', 'm'); new B().m('x', 'm'); new B().m('x', 'm'); \
+                     new B().m('x', 'm'); new B().m('x', 'm'); new B().m('x', 'm'); new B().m('x', 'm'); \
                      new B().m('x', 'm');",
                 )
                 .expect("runs")
@@ -4011,7 +4253,9 @@ mod tests {
                 .run_script(
                     "class A { constructor() { this._x = 10; } get x() { return this._x; } set x(v) { this._x = v; } }\n\
                      class B extends A { m() { super.x = 5; super.x += 3; return this._x; } }\n\
-                     new B().m();",
+                     new B().m(); new B().m(); new B().m(); new B().m(); new B().m(); new B().m(); \
+                     new B().m(); new B().m(); new B().m(); new B().m(); new B().m(); new B().m(); \
+                     new B().m(); new B().m(); new B().m(); new B().m(); new B().m();",
                 )
                 .expect("runs")
         });
@@ -4031,7 +4275,10 @@ mod tests {
                 .run_script(
                     "class A { constructor() { this._x = 10; } get x() { return this._x; } set x(v) { this._x = v; } }\n\
                      class B extends A { m(k) { var a = super.x++; var b = ++super.x; var c = super[k]++; var d = --super[k]; return a * 1000 + b * 100 + c * 10 + d; } }\n\
-                     new B().m('x');",
+                     new B().m('x'); new B().m('x'); new B().m('x'); new B().m('x'); new B().m('x'); \
+                     new B().m('x'); new B().m('x'); new B().m('x'); new B().m('x'); new B().m('x'); \
+                     new B().m('x'); new B().m('x'); new B().m('x'); new B().m('x'); new B().m('x'); \
+                     new B().m('x'); new B().m('x');",
                 )
                 .expect("runs")
         });
@@ -4051,7 +4298,10 @@ mod tests {
                 .run_script(
                     "class A { constructor() { this._x = 10; this._y = null; } get x() { return this._x; } set x(v) { this._x = v; } get y() { return this._y; } set y(v) { this._y = v; } }\n\
                      class B extends A { m(k) { super.x &&= 5; super.y ??= 7; super[k] &&= 3; var sx = super.x; var sy = super.y; super.x ??= 99; var sh = super.x; return sx * 1000 + sy * 100 + sh; } }\n\
-                     new B().m('x');",
+                     new B().m('x'); new B().m('x'); new B().m('x'); new B().m('x'); new B().m('x'); \
+                     new B().m('x'); new B().m('x'); new B().m('x'); new B().m('x'); new B().m('x'); \
+                     new B().m('x'); new B().m('x'); new B().m('x'); new B().m('x'); new B().m('x'); \
+                     new B().m('x'); new B().m('x');",
                 )
                 .expect("runs")
         });
@@ -4071,7 +4321,8 @@ mod tests {
                     "class A { m() { return 41; } }\n\
                      var B = class extends A { async m() { return super.m() + 1; } };\n\
                      var result = 'pending';\n\
-                     new B().m().then(v => { result = v; });",
+                     var i = 0;\n\
+                     while (i++ < 17) { new B().m().then(v => { result = v; }); }",
                 )
                 .expect("runs");
             agent.run_jobs().expect("jobs");
@@ -4090,7 +4341,9 @@ mod tests {
             agent
                 .run_script(
                     "class A {} class B extends A { m() { var hits = 0; try { delete super.x; } catch (e1) { hits += (e1 instanceof ReferenceError ? 1 : 0); } try { delete super['x']; } catch (e2) { hits += (e2 instanceof ReferenceError ? 1 : 0); } return hits; } }\n\
-                     new B().m();",
+                     new B().m(); new B().m(); new B().m(); new B().m(); new B().m(); new B().m(); \
+                     new B().m(); new B().m(); new B().m(); new B().m(); new B().m(); new B().m(); \
+                     new B().m(); new B().m(); new B().m(); new B().m(); new B().m();",
                 )
                 .expect("runs")
         });
@@ -4111,7 +4364,12 @@ mod tests {
                     "class A { static s() { return 41; } static v = 7; }\n\
                      class B extends A { static m() { return super.s() + super.v; } }\n\
                      class D { n() { return 10; } } class E extends D { n() { return super.n() * 2; } } class F extends E {}\n\
-                     B.m() + new F().n();",
+                     B.m() + new F().n(); B.m() + new F().n(); B.m() + new F().n(); \
+                     B.m() + new F().n(); B.m() + new F().n(); B.m() + new F().n(); \
+                     B.m() + new F().n(); B.m() + new F().n(); B.m() + new F().n(); \
+                     B.m() + new F().n(); B.m() + new F().n(); B.m() + new F().n(); \
+                     B.m() + new F().n(); B.m() + new F().n(); B.m() + new F().n(); \
+                     B.m() + new F().n(); B.m() + new F().n();",
                 )
                 .expect("runs")
         });
@@ -4132,7 +4390,8 @@ mod tests {
                 .run_script(
                     "var proto = { getX: function () { return 41; } };\n\
                      var o = { __proto__: proto, m() { var f = super.getX; return (f === proto.getX && super.getX() === 41) ? 42 : 0; } };\n\
-                     o.m();",
+                     o.m(); o.m(); o.m(); o.m(); o.m(); o.m(); o.m(); o.m(); o.m(); \
+                     o.m(); o.m(); o.m(); o.m(); o.m(); o.m(); o.m(); o.m();",
                 )
                 .expect("runs")
         });
@@ -4145,10 +4404,18 @@ mod tests {
         // Cut 62: `new.target` now certifies — a plain function's body
         // compiles the `NewTarget` step (the general path; the step stays
         // leaf-excluded). A normal call's per-run `current_new_target` is
-        // unset, so the read is `undefined`.
+        // unset, so the read is `undefined`. Cut 69: `f` is straight-line,
+        // so the comparison repeats 17×.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
-                .run_script("function f() { return new.target; } f() === undefined;")
+                .run_script(
+                    "function f() { return new.target; } \
+                     f() === undefined; f() === undefined; f() === undefined; f() === undefined; \
+                     f() === undefined; f() === undefined; f() === undefined; f() === undefined; \
+                     f() === undefined; f() === undefined; f() === undefined; f() === undefined; \
+                     f() === undefined; f() === undefined; f() === undefined; f() === undefined; \
+                     f() === undefined;",
+                )
                 .expect("runs")
         });
         assert_eq!(value.as_boolean(), Some(true));
@@ -4161,12 +4428,29 @@ mod tests {
         // `new F()` (a base constructor with a certified body) reads its
         // own `new.target`. The construct body runs via the certified
         // construct path (interpreter), so the value assertion is the
-        // proof; the method body (`m`) compiles through the JIT.
+        // proof; the method body (`m`) compiles through the JIT. Cut 69:
+        // `m` is straight-line, so the expression repeats 17×.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
                     "function F() { this.t = new.target; }\n\
                      class C { m() { return new.target; } }\n\
+                     (new F().t === F) && (new C().m() === undefined); \
+                     (new F().t === F) && (new C().m() === undefined); \
+                     (new F().t === F) && (new C().m() === undefined); \
+                     (new F().t === F) && (new C().m() === undefined); \
+                     (new F().t === F) && (new C().m() === undefined); \
+                     (new F().t === F) && (new C().m() === undefined); \
+                     (new F().t === F) && (new C().m() === undefined); \
+                     (new F().t === F) && (new C().m() === undefined); \
+                     (new F().t === F) && (new C().m() === undefined); \
+                     (new F().t === F) && (new C().m() === undefined); \
+                     (new F().t === F) && (new C().m() === undefined); \
+                     (new F().t === F) && (new C().m() === undefined); \
+                     (new F().t === F) && (new C().m() === undefined); \
+                     (new F().t === F) && (new C().m() === undefined); \
+                     (new F().t === F) && (new C().m() === undefined); \
+                     (new F().t === F) && (new C().m() === undefined); \
                      (new F().t === F) && (new C().m() === undefined);",
                 )
                 .expect("runs")
@@ -4199,9 +4483,16 @@ mod tests {
         // Cut 62: a bigint literal (`Push(Value::BigInt)`) embeds its bits
         // too, and this body is a LEAF (Push + Return — the embedded
         // constant rides the leaf path's private frame/working buffers).
+        // Cut 69: `f` is straight-line, so the comparison repeats 17×.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
-                .run_script("function f() { return 10n; } f() === 10n;")
+                .run_script(
+                    "function f() { return 10n; } \
+                     f() === 10n; f() === 10n; f() === 10n; f() === 10n; f() === 10n; \
+                     f() === 10n; f() === 10n; f() === 10n; f() === 10n; f() === 10n; \
+                     f() === 10n; f() === 10n; f() === 10n; f() === 10n; f() === 10n; \
+                     f() === 10n; f() === 10n;",
+                )
                 .expect("runs")
         });
         assert_eq!(value.as_boolean(), Some(true));

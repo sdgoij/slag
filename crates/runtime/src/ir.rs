@@ -1339,6 +1339,19 @@ pub struct CompiledBody {
     /// set it on the first lookup so a hot call skips the cache
     /// consultation entirely.
     pub jit_info: std::cell::Cell<usize>,
+    /// Cut 69: the number of JIT consultations this body received while
+    /// below `crate::jit::JIT_COMPILE_THRESHOLD` (saturating). A
+    /// straight-line body (`has_loop` false) is run interpreted until the
+    /// count reaches the threshold, then compiles on the next consult; a
+    /// loop body compiles on the first consult. The count is shared across
+    /// every `Rc` clone of the body (the per-site closures of one body), so
+    /// the consult counts aggregate.
+    pub jit_calls: std::cell::Cell<u32>,
+    /// Cut 69: whether the body contains a loop (see [`body_has_loop`]).
+    /// Loop bodies compile on first JIT use — they run once with many
+    /// internal iterations, so a pure call-count threshold would never
+    /// promote them.
+    pub has_loop: bool,
 }
 
 impl Trace for CompiledBody {
@@ -16005,6 +16018,75 @@ fn labeled_continue_target(body: &Stmt) -> Option<(usize, usize)> {
     if is_loop { Some((usize::MAX, 0)) } else { None }
 }
 
+/// The jump targets of a step (Cut 69), mirroring
+/// `crates/jit/src/compiler.rs::step_targets` — the JIT compiler's
+/// back-edge detector. The runtime owns the [`Step`] enum, so the mirror
+/// lives here; keep the two in sync (a target added on one side but not
+/// the other skews the loop heuristic, never semantics).
+fn step_targets(step: &Step) -> Vec<usize> {
+    match step {
+        Step::Jump(t)
+        | Step::JumpIfFalse(t)
+        | Step::JumpIfTrue(t)
+        | Step::JumpIfFalseKeep(t)
+        | Step::JumpIfTrueKeep(t)
+        | Step::JumpIfNullishKeep(t)
+        | Step::JumpIfNotNullishKeep(t)
+        | Step::Break { target: t }
+        | Step::Continue { target: t } => vec![*t],
+        Step::JumpIfLtImm { target, .. }
+        | Step::JumpIfLeImm { target, .. }
+        | Step::JumpIfGtImm { target, .. }
+        | Step::JumpIfGeImm { target, .. }
+        | Step::JumpIfLtGlobalImm { target, .. }
+        | Step::JumpIfLeGlobalImm { target, .. }
+        | Step::JumpIfGtGlobalImm { target, .. }
+        | Step::JumpIfGeGlobalImm { target, .. } => vec![*target],
+        Step::FastLoopHead {
+            body_start, after, ..
+        } => vec![*body_start, *after],
+        Step::JumpIfChainShort(t) => vec![*t],
+        Step::Exit { after } => vec![*after],
+        Step::SwitchTest { case } => vec![*case],
+        Step::ForInNext { back, .. } | Step::ForOfNext { back, .. } => vec![*back],
+        Step::ForOfNextBindLocal { back, .. } => vec![*back],
+        Step::DestructureUndef { use_default } => vec![*use_default],
+        _ => Vec::new(),
+    }
+}
+
+/// Cut 69: whether the body contains a loop — a back edge (a step whose
+/// jump targets include a step index before its own, the exact rule
+/// [`step_targets`] feeds the JIT's `back_targets`), a fused/register
+/// loop step whose back edge is implicit ([`Step::FastLoopHead`]/
+/// [`Step::RunRegBody`]), or a self-tail-call step (the callee is
+/// statically the running body itself — the interpreter's TCO loop
+/// re-enters the body's entry without re-consulting the JIT, so a
+/// consult-count threshold could never promote a recursive chain). All
+/// of these run once with many internal iterations, so a pure count
+/// would never promote them; they compile on first JIT use.
+pub(crate) fn body_has_loop(steps: &[Step]) -> bool {
+    for (index, step) in steps.iter().enumerate() {
+        if matches!(
+            step,
+            Step::FastLoopHead { .. }
+                | Step::RunRegBody { .. }
+                | Step::TailCallSelf { .. }
+                | Step::TailCallSelfCheck { .. }
+                | Step::TailCallSelfVector
+                | Step::TailCallSelfCheckVector
+        ) {
+            return true;
+        }
+        for target in step_targets(step) {
+            if target < index {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Cut 25: whether `step` is safe to run on the CALLER's Vm (a certified
 /// body whose every step allows it is a *leaf* — see [`CompiledBody::leaf`]).
 /// Every step that re-enters the VM with a fresh frame (calls/constructs),
@@ -16700,6 +16782,7 @@ pub fn compile_body(
     } else {
         None
     };
+    let has_loop = body_has_loop(&compiler.steps);
     Ok((
         CompiledBody {
             steps: compiler.steps,
@@ -16713,6 +16796,8 @@ pub fn compile_body(
             leaf_ops,
             script_globals: None,
             jit_info: std::cell::Cell::new(0),
+            jit_calls: std::cell::Cell::new(0),
+            has_loop,
         },
         compiler.this_writes,
     ))
@@ -16772,6 +16857,7 @@ pub fn compile_statements(
         }
     }
     compiler.resolve();
+    let has_loop = body_has_loop(&compiler.steps);
     Ok(CompiledBody {
         steps: compiler.steps,
         handlers: compiler.handlers,
@@ -16786,6 +16872,8 @@ pub fn compile_statements(
         leaf_ops: None,
         script_globals: compiler.script_globals,
         jit_info: std::cell::Cell::new(0),
+        jit_calls: std::cell::Cell::new(0),
+        has_loop,
     })
 }
 

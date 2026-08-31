@@ -1,6 +1,6 @@
 ---
 name: slag-jit
-description: "Load when working on Slag's Cranelift JIT (crates/jit/src, crates/runtime/src/jit.rs, the JIT-visible parts of crates/runtime/src/ir.rs) — helper ABI registration, emit_step lowering, block sealing, dispatch sentinels, the leaf-call probe, the certified iterator machinery (for-of/for-in/AsyncForOf*), suspension (Yield/Await resume dispatch, jit_work save/restore), super property access, new.target, or destructuring (the Destructure* steps, flat slot/context binds). Traps: the four-file helper-table mirror, the pending-error ABI, the dispatch-target chain, the element-via-work-stack-pointer convention, the ForOfBegin boundary span, the iterator-close requirements for compiled for-of bodies, the sealed-block/back-edge rules, the for_of_advance core contract, resumable-body rules, the destructure rules (flat binds, for-head pattern trap, close gates), and the script completion-register writes (compiled completion steps must write vm.completion; eval_program converts the fall-off-end Return(undef))."
+description: "Load when working on Slag's Cranelift JIT (crates/jit/src, crates/runtime/src/jit.rs, JIT-visible crates/runtime/src/ir.rs) — helper ABI registration, emit_step lowering, block sealing, dispatch sentinels, leaf-call probe, certified iterators (for-of/for-in/AsyncForOf*), suspension (Yield/Await resume dispatch, jit_work), super access, new.target, or destructuring (Destructure* steps, flat binds). Traps: the four-file helper mirror, the pending-error ABI, the dispatch-target chain, the element-via-work-stack-pointer convention, the ForOfBegin boundary span, the compiled for-of close requirements, the sealed-block/back-edge rules, the for_of_advance core contract, resumable-body rules, the destructure rules (flat binds, for-head trap, close gates), the script completion-register writes (compiled steps write vm.completion; eval_program maps the fall-off-end Return(undef)), and the Cut 69 compile threshold (the lookup_info gate, body_has_loop↔step_targets sync, the call_slow→try_jit_leaf chain)."
 ---
 
 # Slag JIT traps
@@ -438,3 +438,76 @@ verdict when it is at rest. Traps:
   `leaf_call_probe` in a counting fn via
   `JitHelpers.leaf_call_probe` and assert the flat counts across a
   100K-iteration loop.
+
+## 17. The compile threshold (Cut 69) — the gate in `lookup_info`
+
+`lookup_info` (`runtime/src/jit.rs`) is the single choke point all four JIT
+decision sites call (`run_jit_body`, `run_jit_resume`, `run_jit_leaf` via
+`try_jit_leaf`, and `leaf_call_probe`). Since Cut 69 it gates
+STRAIGHT-LINE bodies behind a consult counter:
+
+```rust
+// in lookup_info, replacing the known==0 branch:
+if ir.jit_calls.get() < JIT_COMPILE_THRESHOLD && !ir.has_loop {
+    ir.jit_calls.set(ir.jit_calls.get().saturating_add(1));
+    return std::ptr::null();   // NOT cached: the next consult re-counts
+}
+let ptr = hook.lookup(...);    // compile
+```
+
+Traps that cost debugging time:
+
+- **The `body_has_loop` ↔ `step_targets` sync.** `body_has_loop`
+  (`runtime/src/ir.rs`, `pub(crate)`) mirrors the JIT compiler's
+  `step_targets` (compiler.rs): any step whose jump targets include an
+  index `< its own` is a back edge; PLUS the implicit-loop steps
+  `FastLoopHead`/`RunRegBody`. When you add a step with jump targets,
+  update BOTH `step_targets` (the compiler's back-target seeding) and the
+  ir.rs mirror — the runtime owns the `Step` enum, so the mirror lives
+  there. A skew only misclassifies the loop heuristic, never semantics.
+- **Self-tail-call steps are loops.** `TailCallSelf*` are in `body_has_loop`
+  even though their `step_targets` are empty: the interpreter's TCO loop
+  (`run_inner_impl` re-entering the body on `VmOutcome::TailCall`)
+  NEVER re-consults `lookup_info`, so a pure consult count could never
+  promote a recursive chain — the plan's "promotes after K calls"
+  premise is false for every TCO shape. The general tail-call steps
+  (`TailCall`/`TailCallFast*`) are NOT loops (a computed callee like
+  `getF()(n-1)` is not statically self-recursive), so a tco-call-args
+  style body stays interpreted — only its per-step closure (consulted per
+  iteration through the ordinary call) promotes.
+- **The `call_slow → try_jit_leaf → run_jit_leaf` promotion chain is
+  load-bearing.** A hot leaf under a compiled caller: the site's probe
+  caches a REJECTION (entry 0, below threshold), the machine code routes
+  to `call_slow` → `do_call_fast` → `fast_call_core` → `try_jit_leaf` →
+  `run_jit_leaf` → `lookup_info` — count++ per call. The counter reaches
+  K even though the site never re-probes, and after promotion the leaf's
+  machine code runs; the caller's site inlines on its NEXT fresh run.
+- **The count aggregates only across `Rc` clones of ONE declaration
+  site.** Function declarations and arrows share the compiled body per
+  site (Cut 43); a `function` expression VALUE does not — each
+  repetition in a test like `f({ f: function (x) { ... } }); f({ f: ...
+  });` is a DIFFERENT AST node, hence a fresh body whose count stays at
+  1. E2e tests that need a body promoted must call it against ONE
+  hoisted site (`var o = { f: fn }; f(o); ×17`), and a stateful closure
+  must be re-fresh per call (`make()(); ×17`, not `f(); f();` on one
+  closure).
+- **The threshold path never writes `jit_info == 1`.** The tri-state
+  (`0` unknown / `1` sticky-unsupported / `>1` compiled) is preserved:
+  below-threshold bodies stay at `0` (each consult re-counts), and the
+  sticky mark is only written at/after the threshold, so promotion is
+  never blocked. A body consulted ≥K times that the hook rejects still
+  sticks at `1`.
+- **Eviction stays correct**: a cleared `jit_info` re-consults with
+  `jit_calls ≥ K` (or `has_loop`), so it recompiles immediately.
+- **Straight-line scripts never compile** (consulted once per
+  `eval_program`), so the compiled completion-register path is only
+  exercised by LOOP scripts in e2e — the
+  `installed_jit_script_completion_matches_the_interpreter` table's
+  straight-line cases assert `min_compiled == 0` and verify behavior
+  parity only.
+- **One-shot async/generator bodies stay interpreted** (resumed once per
+  `yield`/`await` — a 2-await body gets 3 resumes), so the compiled
+  suspension path is exercised by loop-containing generators/async
+  bodies; the e2e tests that need a resumable body promoted drive it
+  ≥17 times (a script loop calling the async fn 17×, or 6 generator
+  instances).
