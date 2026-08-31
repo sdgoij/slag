@@ -41,8 +41,11 @@ use runtime::ir::{
     ScopeInfo, Step, is_compound_assign,
 };
 use runtime::jit::{
-    GlobalValueCell, JitCallContext, LeafCallSiteCache, LeafInlineInfo,
-    VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET,
+    AGENT_REALM_COUNT_OFFSET, GlobalValueCell, JitCallContext, LEAF_CALL_CACHE_ENTRIES,
+    LeafCallSiteCache, LeafInlineInfo, VM_ASYNC_FOR_OF_STACK_LEN_OFFSET,
+    VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET, VM_DESTRUCTURE_STACK_LEN_OFFSET,
+    VM_ENV_STACK_LEN_OFFSET, VM_FOR_IN_STACK_LEN_OFFSET, VM_FOR_OF_BOUNDARIES_LEN_OFFSET,
+    VM_FOR_OF_STACK_LEN_OFFSET, VM_PENDING_LEN_OFFSET, VM_TRY_STACK_LEN_OFFSET,
 };
 use syntax::ast::{AssignOp, BinaryOp, UpdateOp};
 use target_lexicon::PointerWidth;
@@ -343,6 +346,15 @@ fn helper_sig(params: &[Type], conv: CallConv) -> Signature {
 /// code loads the fields at these fixed offsets).
 fn leaf_inline_offset(field: usize) -> usize {
     std::mem::offset_of!(LeafCallSiteCache, leaf_inline) + field
+}
+
+/// The byte offset of the `leaf_call_cache` record for call-site step `index`
+/// inside `JitCallContext` (Cut 68: the direct-mapped set — the step index is
+/// a compile-time constant per call site, so the slot is a baked immediate).
+fn leaf_cache_entry_offset(index: usize) -> usize {
+    std::mem::offset_of!(JitCallContext, leaf_call_cache)
+        + (index ^ (index >> 2)) % LEAF_CALL_CACHE_ENTRIES
+            * std::mem::size_of::<LeafCallSiteCache>()
 }
 
 /// Lower `body` into `func`. `func`/`fctx` are consumed by the builder and
@@ -1622,6 +1634,63 @@ impl<'a> Lowerer<'a> {
     /// (this site, this callee, unchanged leaf-eligibility epoch) skips the
     /// probe helper entirely on repeat visits. `pre_call_sp` is the stack
     /// pointer the result replaces (the call's argument region base).
+    /// Cut 68: re-validate the leaf-eligibility state is AT REST — the
+    /// `Vm::can_inline_leaf` conditions plus the realm count, exactly what
+    /// `leaf_call_probe` checks. The compiled leaf-cache gate re-runs this
+    /// when the epoch is stale (a disturbing helper ran) instead of
+    /// re-probing: if the state never left at-rest, the cached verdict —
+    /// positive (the entry is a pure function of the unchanged callee) or
+    /// negative (the slow path is always correct) — is still valid and the
+    /// epoch is simply re-stamped.
+    fn emit_leaf_state_at_rest(&mut self) -> ClifValue {
+        let vm = self.vm_ptr();
+        let mut ok = self.builder.ins().iconst(types::I64, 1);
+        for offset in [
+            VM_TRY_STACK_LEN_OFFSET,
+            VM_PENDING_LEN_OFFSET,
+            VM_FOR_OF_STACK_LEN_OFFSET,
+            VM_FOR_OF_BOUNDARIES_LEN_OFFSET,
+            VM_FOR_IN_STACK_LEN_OFFSET,
+            VM_ASYNC_FOR_OF_STACK_LEN_OFFSET,
+            VM_DESTRUCTURE_STACK_LEN_OFFSET,
+        ] {
+            let len = self.builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                vm,
+                Offset32::new(offset as i32),
+            );
+            let empty = self.builder.ins().icmp_imm_u(IntCC::Equal, len, 0);
+            let empty_64 = self.bint(empty);
+            ok = self.builder.ins().band(ok, empty_64);
+        }
+        let env_len = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            vm,
+            Offset32::new(VM_ENV_STACK_LEN_OFFSET as i32),
+        );
+        let env_ok = self.builder.ins().icmp_imm_u(IntCC::Equal, env_len, 1);
+        let env_ok_64 = self.bint(env_ok);
+        ok = self.builder.ins().band(ok, env_ok_64);
+        let ctx = self.vm();
+        let agent = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, agent) as i32),
+        );
+        let realm = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            agent,
+            Offset32::new(AGENT_REALM_COUNT_OFFSET as i32),
+        );
+        let realm_ok = self.builder.ins().icmp_imm_u(IntCC::Equal, realm, 1);
+        let realm_ok_64 = self.bint(realm_ok);
+        self.builder.ins().band(ok, realm_ok_64)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn emit_call(
         &mut self,
@@ -1636,10 +1705,10 @@ impl<'a> Lowerer<'a> {
     ) -> Result<(), Unsupported> {
         let argc_imm = self.builder.ins().iconst(types::I64, argc as i64);
         let ctx = self.vm();
-        let cache = self.builder.ins().iadd_imm_s(
-            ctx,
-            std::mem::offset_of!(JitCallContext, leaf_call_cache) as i64,
-        );
+        let cache = self
+            .builder
+            .ins()
+            .iadd_imm_s(ctx, leaf_cache_entry_offset(index) as i64);
         // The cache-reuse gate: the record matches this call site, the
         // leaf-eligibility epoch is unchanged since the probe wrote it (no
         // JS-running helper ran), and the live callee's NaN-box identity
@@ -1691,9 +1760,9 @@ impl<'a> Lowerer<'a> {
             .builder
             .ins()
             .icmp(IntCC::Equal, payload, cached_payload);
-        let site_hit = self.builder.ins().band(site_ok, epoch_ok);
         let callee_hit = self.builder.ins().band(hi_ok, payload_ok);
-        let hit = self.builder.ins().band(site_hit, callee_hit);
+        let stable = self.builder.ins().band(site_ok, callee_hit);
+        let hit = self.builder.ins().band(stable, epoch_ok);
         let cached_entry = self.builder.ins().load(
             types::I64,
             MemFlagsData::new(),
@@ -1701,12 +1770,43 @@ impl<'a> Lowerer<'a> {
             Offset32::new(leaf_inline_offset(std::mem::offset_of!(LeafInlineInfo, entry)) as i32),
         );
         let hit_block = self.builder.create_block();
+        let stable_check = self.builder.create_block();
+        let stale_block = self.builder.create_block();
         let probe_block = self.builder.create_block();
         let slow = self.builder.create_block();
         let merge = self.builder.create_block();
         self.builder
             .ins()
-            .brif(hit, hit_block, &[], probe_block, &[]);
+            .brif(hit, hit_block, &[], stable_check, &[]);
+        // Cut 68: a miss is either a different site/callee (probe) or a stale
+        // epoch — a disturbing helper (a getter, a `valueOf`, a nested call)
+        // ran since the probe. If the eligibility state is STILL at rest (the
+        // helper didn't actually change any stack or the realm count), the
+        // cached verdict is still valid: re-stamp the epoch and reuse it
+        // instead of re-running the full probe every iteration (the
+        // monomorphic-hot-call-next-to-a-getter shape previously re-probed
+        // per iteration).
+        self.builder.switch_to_block(stable_check);
+        self.builder
+            .ins()
+            .brif(stable, stale_block, &[], probe_block, &[]);
+        self.builder.switch_to_block(stale_block);
+        let state_ok = self.emit_leaf_state_at_rest();
+        let restamp = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(state_ok, restamp, &[], probe_block, &[]);
+        self.builder.switch_to_block(restamp);
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            epoch,
+            cache,
+            Offset32::new(std::mem::offset_of!(LeafCallSiteCache, epoch) as i32),
+        );
+        self.builder.ins().jump(hit_block, &[]);
+        self.builder.seal_block(restamp);
+        self.builder.seal_block(stale_block);
+        self.builder.seal_block(stable_check);
         // A cache hit: a cached zero entry is a stable rejection (go straight
         // to `call_slow`); a nonzero entry reuses the verdict in-frame.
         self.builder.switch_to_block(hit_block);
@@ -1792,8 +1892,8 @@ impl<'a> Lowerer<'a> {
         let ctx = self.vm();
         let info = self.builder.ins().iadd_imm_s(
             ctx,
-            (std::mem::offset_of!(JitCallContext, leaf_call_cache)
-                + std::mem::offset_of!(LeafCallSiteCache, leaf_inline)) as i64,
+            (leaf_cache_entry_offset(index) + std::mem::offset_of!(LeafCallSiteCache, leaf_inline))
+                as i64,
         );
         let frame_size = self.builder.ins().load(
             types::I32,

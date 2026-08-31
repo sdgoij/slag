@@ -378,3 +378,63 @@ worktree). A JIT e2e test lives in `crates/jit/src/lib.rs`
 the compiled-body count); the `installed_jit_*` tests are the behavioral
 suite — new steps need one, including the iterator-close shapes
 (break/return close, `next()` error does not, body error does).
+
+## 16. Leaf-cache revalidation on a stale epoch (Cut 68)
+
+The per-call-site leaf verdict (`LeafCallSiteCache` in `JitCallContext`) is
+only trusted while `cache.epoch == ctx.leaf_epoch`. A "disturbing" helper
+(a getter, `valueOf`/`toString`, a nested call) bumps `leaf_epoch`, so the
+next visit misses. Before Cut 68 the miss ALWAYS re-probed — a monomorphic
+hot call next to a getter probed every iteration (100K probes per loop).
+Now the compiled gate re-validates the eligibility state and reuses the
+verdict when it is at rest. Traps:
+
+- **The epoch must gate separately from site/callee.** `hit = (site_ok &
+  callee_hit) & epoch_ok`; the re-validation runs only when the site AND
+  callee still match (`stable`) — a stale epoch on a DIFFERENT site/callee
+  must probe, never re-stamp. The re-stamp path (`stale_block` →
+  `emit_leaf_state_at_rest()` → ok? store `cache.epoch = live epoch` →
+  jump to the HIT block) reuses the cached verdict INCLUDING a cached
+  rejection (entry 0 → `call_slow`), which is always correct.
+- **`emit_leaf_state_at_rest` must mirror `leaf_call_probe`'s checks** —
+  all seven `Vm::can_inline_leaf` control stacks empty (`try_stack`,
+  `pending`, `for_of_stack`, `for_of_boundaries`, `for_in_stack`,
+  `async_for_of_stack`, `destructure_stack`), `env_stack.len() == 1`,
+  `realm_count == 1`. If it ever drifts from `can_inline_leaf`, the
+  revalidation can wrongly reuse a verdict across a real state change.
+- **The `Vec` len field is private** — `offset_of!(Vec, len)` won't
+  compile. The offsets are `pub const`s in `runtime/jit.rs` computed as
+  `2 * size_of::<usize>()` (the structural invariant: `Vec<T>` is
+  ptr + cap + len) for the private fields; `EnvStack.len` was made
+  `pub(crate)` so `offset_of!` works for it in the same crate. The jit
+  crate cannot name `pub(crate)` `Vm`/`EnvStack`, hence the constants.
+- **The `bint`/`band` borrow conflict**: `let empty_64 = self.bint(empty);
+  ok = self.builder.ins().band(ok, empty_64);` — passing the `bint`
+  result inline into `band` borrows `self.builder` twice and fails.
+  Always hoist the `bint` into a temp first.
+- **Two hot call sites thrash a single record — fixed with a set.**
+  `leaf_call_cache` is a direct-mapped `[LeafCallSiteCache;
+  LEAF_CALL_CACHE_ENTRIES]` (4) set, indexed by
+  `(index ^ (index >> 2)) % LEAF_CALL_CACHE_ENTRIES` on BOTH sides: the
+  compiler bakes the slot into `emit_call`'s cache-pointer immediate
+  (`leaf_cache_entry_offset(index)` — the step index is a compile-time
+  constant), and the probe writes `[site % slot]` with the same fold. The
+  xor-fold is load-bearing: fused call-store statements land call sites
+  4-8 steps apart, and the plain `index % 4` maps a spacing of 4 (or any
+  multiple) to ONE slot — the two-hot-sites e2e test's sites at 13 and 21
+  (8 apart) both fell in slot 1 and still thrashed at ~200K probes until
+  the fold was added. A collision is only a re-probe (the exact `site`
+  check still gates reuse) — never a correctness issue, and never a place
+  to "fix" by making the check looser. If you change the slot function,
+  change it in `leaf_cache_entry_offset` (compiler) AND `leaf_call_probe`
+  (runtime) together; the empty record's `site = u32::MAX` never matches
+  a real site, so a fresh ctx starts cold in every slot.
+- **The probe-count drop is the evidence, not wall time.** The getter's
+  own call cost dominates, so A/B wall-time deltas were noise (0.025 vs
+  0.024s); the defensible measurements are the probe counts 100K → 1
+  (stale-epoch revalidation) and ~200K → 2 (two hot sites) — the
+  `installed_jit_stale_epoch_leaf_cache_revalidates_at_rest` and
+  `installed_jit_two_hot_leaf_sites_each_cache_separately` e2e tests wrap
+  `leaf_call_probe` in a counting fn via
+  `JitHelpers.leaf_call_probe` and assert the flat counts across a
+  100K-iteration loop.

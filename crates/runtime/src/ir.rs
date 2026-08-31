@@ -1871,7 +1871,8 @@ pub(crate) enum ForOfAdvance {
 pub(crate) struct EnvStack {
     inline: [Option<EnvRef>; ENV_INLINE],
     heap: Vec<EnvRef>,
-    len: usize,
+    /// Cut 68: `pub(crate)` so the JIT's eligibility-state offsets can read it.
+    pub(crate) len: usize,
 }
 
 impl Trace for EnvStack {
@@ -9282,7 +9283,8 @@ impl Vm {
             buf_end: (buf.as_ptr() as usize + std::mem::size_of_val(buf))
                 as *mut std::os::raw::c_void,
             leaf_epoch: 0,
-            leaf_call_cache: crate::jit::LeafCallSiteCache::empty(),
+            leaf_call_cache: [crate::jit::LeafCallSiteCache::empty();
+                crate::jit::LEAF_CALL_CACHE_ENTRIES],
             body: std::rc::Rc::as_ptr(ir),
             tail: false,
             current_function: 0,

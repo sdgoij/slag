@@ -667,7 +667,8 @@ mod tests {
             clean_chain: false,
             buf_end: std::ptr::null_mut(),
             leaf_epoch: 0,
-            leaf_call_cache: runtime::jit::LeafCallSiteCache::empty(),
+            leaf_call_cache: [runtime::jit::LeafCallSiteCache::empty();
+                runtime::jit::LEAF_CALL_CACHE_ENTRIES],
             body: std::ptr::null(),
             tail: false,
             current_function: 0,
@@ -1012,7 +1013,8 @@ mod tests {
             clean_chain: false,
             buf_end: std::ptr::null_mut(),
             leaf_epoch: 0,
-            leaf_call_cache: runtime::jit::LeafCallSiteCache::empty(),
+            leaf_call_cache: [runtime::jit::LeafCallSiteCache::empty();
+                runtime::jit::LEAF_CALL_CACHE_ENTRIES],
             body: std::ptr::null(),
             tail: false,
             current_function: 0,
@@ -1226,7 +1228,8 @@ mod tests {
             clean_chain: false,
             buf_end: std::ptr::null_mut(),
             leaf_epoch: 0,
-            leaf_call_cache: runtime::jit::LeafCallSiteCache::empty(),
+            leaf_call_cache: [runtime::jit::LeafCallSiteCache::empty();
+                runtime::jit::LEAF_CALL_CACHE_ENTRIES],
             body: std::ptr::null(),
             tail: false,
             current_function: Value::Number(5.0).bits(),
@@ -1308,7 +1311,8 @@ mod tests {
             clean_chain: false,
             buf_end: std::ptr::null_mut(),
             leaf_epoch: 0,
-            leaf_call_cache: runtime::jit::LeafCallSiteCache::empty(),
+            leaf_call_cache: [runtime::jit::LeafCallSiteCache::empty();
+                runtime::jit::LEAF_CALL_CACHE_ENTRIES],
             body: std::ptr::null(),
             tail: false,
             current_function: 0,
@@ -1739,6 +1743,122 @@ mod tests {
         });
         assert_eq!(value.as_number(), Some(5050.0));
         assert!(compiled >= 2, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_stale_epoch_leaf_cache_revalidates_at_rest() {
+        // Cut 68: a monomorphic hot leaf call next to a disturbing helper
+        // (the `o.g` getter bumps the leaf-eligibility epoch on every
+        // iteration) must NOT re-probe every iteration. The counting probe
+        // wrapper proves it: the first visit warms the cache, and each later
+        // visit finds a stale epoch, re-validates that the eligibility state
+        // is still at rest, and reuses the cached verdict — the loop's `add`
+        // site probes exactly once (a per-iteration re-probe would count
+        // ~100K). The upper bound allows the script body's `run()` call site
+        // to probe once too, should the script ever compile; today it does
+        // not, so the total is 1.
+        static PROBE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_leaf_call_probe(
+            ctx: *mut c_void,
+            callee: u64,
+            args: *mut u64,
+            argc: u64,
+            site: u64,
+        ) -> u64 {
+            PROBE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.leaf_call_probe)(ctx, callee, args, argc, site)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.leaf_call_probe = Some(counting_leaf_call_probe);
+
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent
+            .run_script(
+                "var o = { get g() { return 1; } };\n\
+                 function add(a, b) { return a + b; }\n\
+                 function run() {\n\
+                   var s = 0;\n\
+                   for (var i = 0; i < 100000; i++) { s += add(o.g, 1); }\n\
+                   return s;\n\
+                 }\n\
+                 run();",
+            )
+            .expect("runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(value.as_number(), Some(200000.0));
+        assert!(compiled >= 2, "{compiled} bodies (run + add) must compile");
+        let probes = PROBE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            (1..=2).contains(&probes),
+            "the leaf sites must probe once each ({probes} total): a per-iteration re-probe would count ~100K"
+        );
+    }
+
+    #[test]
+    fn installed_jit_two_hot_leaf_sites_each_cache_separately() {
+        // Cut 68: TWO hot leaf call sites in one loop body used to alternate
+        // on the single `LeafCallSiteCache` record — every visit missed on
+        // `site` and re-probed (~200K probes for a 100K-iteration loop). The
+        // direct-mapped set (indexed by `site % LEAF_CALL_CACHE_ENTRIES`)
+        // gives each site its own record, so each warms once and the loop
+        // reuses both verdicts. The counting probe wrapper proves it: 2
+        // probes total (one per site), reused for the remaining ~200K
+        // visits (an upper bound of 3 allows the script body's `run()` site
+        // to probe once too, should the script ever compile).
+        static PROBE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_leaf_call_probe(
+            ctx: *mut c_void,
+            callee: u64,
+            args: *mut u64,
+            argc: u64,
+            site: u64,
+        ) -> u64 {
+            PROBE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.leaf_call_probe)(ctx, callee, args, argc, site)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.leaf_call_probe = Some(counting_leaf_call_probe);
+
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent
+            .run_script(
+                "function add(a, b) { return a + b; }\n\
+                 function run() {\n\
+                   var s = 0;\n\
+                   for (var i = 0; i < 100000; i++) { s += add(1, 1); s += add(2, 2); }\n\
+                   return s;\n\
+                 }\n\
+                 run();",
+            )
+            .expect("runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(value.as_number(), Some(600000.0));
+        assert!(compiled >= 2, "{compiled} bodies (run + add) must compile");
+        let probes = PROBE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            (2..=3).contains(&probes),
+            "each hot site must probe once ({probes} total): alternating single-record misses would count ~200K"
+        );
     }
 
     #[test]

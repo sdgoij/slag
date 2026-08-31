@@ -157,8 +157,16 @@ for-of/destructure state calls a leaf:
   `agent.running_context()` or `try_stack`/`pending`/`for_of_*`/
   `for_in_stack`/`destructure_*`/`env_stack` is exclusion.
 - **`can_inline_leaf` guards the call site, not the body**: the caller's
-  try/pending/for-of/for-in/destructure stacks must be empty and
-  `env_stack.len() == 1`. This is what makes the leaf's own
+  stacks must be EMPTY and the env chain at rest — `try_stack`, `pending`,
+  `for_of_stack`, `for_of_boundaries`, `for_in_stack`,
+  `async_for_of_stack`, and `destructure_stack` all empty, and
+  `env_stack.len() == 1` (the JIT's compiled re-validation, Cut 68,
+  mirrors this exact list plus `agent.realm_count == 1` — if you add a
+  stack to `can_inline_leaf`, update `emit_leaf_state_at_rest` in
+  `crates/jit/src/compiler.rs` and the `VM_*_LEN_OFFSET` constants in
+  `crates/runtime/src/jit.rs` in the same change, or a stale-epoch cache
+  re-stamp can wrongly reuse a verdict across a real state change). This
+  is what makes the leaf's own
   `Return`/`Throw`/`Break`/`Continue` safe — they route through
   `control_transfer`/`throw_machinery`, which walk the SHARED stacks with
   the LEAF's (empty) handler table; with caller frames present,

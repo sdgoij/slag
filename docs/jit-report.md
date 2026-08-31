@@ -79,6 +79,7 @@ run paths:
 | 36 | *(worktree)* | **Fused global/slot call lowering + certified-script JIT routing** (Cut 65): the last call-step bail rows — `CallFastGlobal` (a statically-known global-name callee at a stable cell), `CallFastSlotStore`, and `CallFastGlobalStore` (the fused `x = f(args)` stores) — now lower: the global-cell read feeds the existing leaf-probe call machinery, and a fused store materializes the arg slots (TDZ-checked in order) over the working region, calls, then TDZ-checks and stores the result to the target slot (`emit_call` gained an `emit_fall_through` so the store appends after its merge instead of bailing the body). A certified SCRIPT — previously always interpreted, since `eval_program` ran `vm.start` — now routes through `run_jit_body_loop`, so the top-level bench loops (`n = f(n)` fused global call-stores) execute in machine code with the leaf callees in-frame. Scripts complete through the interpreter's completion REGISTER (`vm.completion`/`completion_is_empty`), which the machine code now writes on the completion steps — `SetCompletion`, `ResetCompletion`, and the statement-position `FusedStoreLocal`/`FusedStoreGlobal` stores — via two offset constants (`runtime::jit::VM_COMPLETION_OFFSET`/`_IS_EMPTY_OFFSET`); the script path converts `run_jit_body_loop`'s fall-off-end `Return(undef)` marker back to the register's `Normal`/`Empty` completion (`Empty` ≡ `Normal(undefined)` at the top, so `NormalizeCompletion`/`ListBegin`/`ListEnd` stay no-ops — the register is unobservable mid-run in a certified body, and the interpreter's ListEnd-restore always lands on the value the JIT's never-reset register already holds). The compiled writes are null-guarded (the scaffold's bare-ctx test harness passes a null `vm`) and GC-safe (`Vm::trace` covers `completion`; the vm is an active-run root). |
 | 37 | *(worktree)* | **Instantiation-machinery fast path** (Cut 66): the per-closure function/prototype boilerplate and the lookups around it — `set_function_properties` (`length`/`name`), `make_constructor` (`constructor`/`prototype`), and the restricted `caller`/`arguments` now append through a new `JsObject::fresh_data_define_attrs` (an explicit-attributes sibling of `fresh_data_define`: the descriptor clone + ValidateAndApplyPropertyDescriptor table are skipped, and the map transition encodes the non-default writable/configurable flags so the map read path serves them); the function-creation prototype intrinsics (`%Function.prototype%` + the generator/async variants) are cached per realm in a fixed array (the table's `get` built a JsString per call); `set_function_prototype` reads the generator/async flags from the caller instead of a second `ecma_functions` lookup; the body-site cache keys hash the source slice without a `JsString` allocation (`source_hash_at` — `shared_arrow_body` recomputed the key — clone + slice alloc + hash — on every closure); and `Map::transitions` (the shape forks on every property append) uses the Fx hash instead of SipHash. A closure-creation loop measures ~20% faster (the 100K×2 recursive bench ~0.49s → ~0.38s); the `{ a: 1 }` literal is already on the `create_data_property` fast path (~0.3µs — the report's older ~17µs predates it). The `ecma_functions` insert and the per-closure object allocations stay the residual floor. |
 | 38 | *(worktree)* | **Inline small strings** (Cut 67): a `JsString` of at most 16 code units now stores its units INLINE in the box (`JsString::Small { len, units }`) — one arena allocation instead of the Vec + Arc + box the `Flat` path paid for tiny strings. `from_utf16`/`from_utf8` route small inputs to the inline form (larger ones keep the Arc-backed `Flat`), `concat`'s small path builds the inline form (the previous Vec + `Arc::from(Vec)` + `Flat` triple allocation is gone), and the leaf-merge branch accepts `Small` operands (a 17-128 unit leaf-leaf concat still merges to an Arc-backed `Flat`). The box is stable (the arena never moves boxes), so `as_slice`'s borrow of the inline units is valid while the owning handle is alive. Measured on the independent-small-concat shape (`s = x + x` with a 2-unit operand, 100K): ~0.033s → ~0.026s in BOTH the interpreter and the JIT (~20% — the JIT's `concat_strings` helper call and the interpreter's `apply_binary` share the concat); the rope append chain (`s += 'x'`) is unchanged (its ConsString node path was already a single allocation per append). |
+| 39 | *(worktree)* | **Leaf-cache revalidation on a stale epoch** (Cut 68): a compiled leaf-call site whose cached verdict misses on a stale leaf-eligibility epoch (a "disturbing" helper — a getter, `valueOf`/`toString`, a nested call — bumped `ctx.leaf_epoch` since the probe) now re-validates that the eligibility state is AT REST — all seven `Vm::can_inline_leaf` control stacks empty, `env_stack` length 1, realm count 1 (`emit_leaf_state_at_rest`) — and if so re-stamps the cache's epoch and reuses the cached verdict, instead of re-running `leaf_call_probe` every iteration (the monomorphic-hot-call-next-to-a-getter shape previously probed per iteration: the probe count drops 100K → 1 on the getter and bool-add benches). The revalidation is sound because the cached `LeafInlineInfo` is a pure function of the callee (identity-checked) and the at-rest state: a negative cached verdict → `call_slow` is always correct, and a positive one is correct when the state is at rest again. The gate stays strict: a stale epoch on a DIFFERENT site/callee still probes. The cache itself is now a direct-mapped set of `LEAF_CALL_CACHE_ENTRIES = 4` records (indexed by `(index ^ (index >> 2)) % 4` — the xor-fold breaks the `% 4` collision on call sites spaced 4-8 steps apart, which the fused call-store statements produce; a colliding pair is just a re-probe, the exact `site` check still gates every reuse), so two hot call sites each keep a warm verdict (the two-hot-sites bench's ~200K probes drop to 2). The compiled check reads the stack lengths through new `pub const` offsets (`runtime::jit`), using the structural invariant `len == 2 * size_of::<usize>()` for the private `Vec` len fields. |
 
 ### Slow-path helper table (`JitSlowPaths`, 113 helpers)
 
@@ -209,14 +210,14 @@ interpreter.
 | compound assign | 21.7ms | 3.1ms | **0.13** (was 0.77) |
 
 **Conformance** (full-area `--jit` sweeps): `language` **23721 pass / 0 fail /
-0 crash / 0 hang** (3 skip); `annexB` 1086 pass / 0 hang; `built-ins` 23215
-pass / 442 hang — *pre-existing* (baseline 447± load wobble) slow RegExp
+0 crash / 0 hang** (3 skip); `annexB` 1086 pass / 0 hang; `built-ins` 23231
+pass / 426 hang — *pre-existing* (baseline 447± load wobble) slow RegExp
 property-escape / CharacterClassEscapes fixtures plus the known
 Temporal/TypedArray hang clusters, unrelated to the JIT (0
 fail / 0 crash). Clusters: `expressions/call` 92/92, `arrow-function`
 343/343.
 
-**Tests**: `cargo test --workspace` green (4520 passed, 3 ignored; jit crate 147 incl. the
+**Tests**: `cargo test --workspace` green (4522 passed, 3 ignored; jit crate 149 incl. the
 `installed_jit_*` e2e tests for member/slot callees, loop-with-calls, mid-run
 cell mutation, GC-stress rooting, global store-then-read, scope-shadow
 correctness, the Cut 55 try/catch/finally/block shapes, the Cut 56
@@ -252,7 +253,12 @@ rejected, and a configurable re-define mirroring into the inline field),
 and the Cut 67 small-string shapes (a crux test for the inline form — a
 small input routes to `Small`, `len`/`as_slice` read it, the 16-unit
 boundary spills to `Flat`, a small concat result is `Small`, a 17-unit
-concat result is `Flat`));
+concat result is `Flat`), and the Cut 68 stale-epoch leaf-cache
+revalidation shape (a getter next to a hot leaf call in a 100K-iteration
+loop, with a counting probe wrapper proving the site probes once and
+re-stamps the epoch instead of re-probing per iteration), and the Cut 68
+two-hot-sites shape (two leaf call sites in a 100K loop, each warming its
+own direct-mapped record — 2 probes total));
 `cargo clippy --workspace --all-targets -- -D warnings` clean. The Cut 63
 script/eval compiled-body cache is covered by a runtime test
 (`script_and_eval_bodies_cache_per_source`).
@@ -453,9 +459,17 @@ containing any of these fall back entirely:
    (`s = x + x`, 100K): ~0.033s → ~0.026s in both the interpreter and the
    JIT (~20%); the rope append chain (`s += 'x'`) is unchanged (its
    ConsString node path was already one allocation).
-9. **Leaf-cache invalidation breadth**: any "disturbing" helper (a `valueOf`,
-   a getter) bumps `leaf_epoch` and drops the per-site leaf verdict — a
-   monomorphic hot call next to a `valueOf` re-probes every iteration.
+9. ~~**Leaf-cache invalidation breadth**~~ — **done** (Cut 68): a disturbing
+   helper (a `valueOf`, a getter) still bumps `leaf_epoch` and invalidates
+   the per-site leaf verdict, but the compiled call site now re-validates
+   the eligibility state on the stale epoch: if it is at rest (the
+   `can_inline_leaf` stacks + realm count), the site re-stamps the epoch
+   and reuses the cached verdict instead of re-probing — the probe count on
+   a monomorphic hot call next to a getter drops from ~100K to 1 per loop.
+   A stale epoch on a DIFFERENT site/callee still probes; two hot call
+   sites each cache separately in the direct-mapped `LeafCallSiteCache`
+   set (a record per `(index ^ (index >> 2)) % 4` slot — a colliding pair
+   just re-probes, since the exact `site` check still gates reuse).
 
 **Non-JIT engine work observed along the way:**
 

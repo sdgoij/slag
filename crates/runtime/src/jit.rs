@@ -35,7 +35,7 @@ use crate::agent::Agent;
 use crate::context::ReferenceBase;
 use crate::env::EnvRecord;
 use crate::ir::{
-    CompiledBody, MEMBER_CELLS, MemberValueCell, PropertyKeyName, Vm, member_reference,
+    CompiledBody, EnvStack, MEMBER_CELLS, MemberValueCell, PropertyKeyName, Vm, member_reference,
 };
 use crux::error::{ErrorKind, JsError};
 
@@ -150,6 +150,20 @@ impl LeafCallSiteCache {
     }
 }
 
+/// Cut 68: the number of direct-mapped `LeafCallSiteCache` records in
+/// `JitCallContext` — the compiled code and the probe both index the set by
+/// `slot(index) = (index ^ (index >> 2)) % LEAF_CALL_CACHE_ENTRIES`, so two
+/// hot leaf call sites that hash to different slots each keep a warm verdict
+/// (a single record made alternating sites re-probe every other visit). The
+/// step index is a compile-time constant per call site, so the machine code
+/// bakes the slot offset in as an immediate. The xor-fold matters: fused
+/// call-store statements land call sites 4-8 steps apart, and the plain
+/// `index % N` would map a spacing of `N` steps to ONE slot (the
+/// two-hot-sites bench's sites at 13 and 21 both fell in slot 1). A
+/// collision (same slot, different site) is just a re-probe — the exact
+/// `site` field check still gates every reuse.
+pub const LEAF_CALL_CACHE_ENTRIES: usize = 4;
+
 /// Cut 65: the field offsets of the interpreter's completion register
 /// (`Vm::completion` / `Vm::completion_is_empty`) — the compiled script-path
 /// completion steps write the register directly (a certified script's
@@ -157,6 +171,33 @@ impl LeafCallSiteCache {
 /// `pub(crate)` `Vm` to `offset_of!` its fields).
 pub const VM_COMPLETION_OFFSET: usize = std::mem::offset_of!(Vm, completion);
 pub const VM_COMPLETION_IS_EMPTY_OFFSET: usize = std::mem::offset_of!(Vm, completion_is_empty);
+
+/// The offset of a `Vec`'s length field: std's `Vec` is ptr + cap + len (the
+/// field is private, so `offset_of!` cannot name it; the layout is structural
+/// and stable for the whole Rust 1.x line).
+const VEC_LEN_OFFSET: usize = 2 * std::mem::size_of::<usize>();
+
+/// Cut 68: the leaf-eligibility state field offsets the compiled leaf-cache
+/// gate re-validates when the epoch is stale (a disturbing helper ran): the
+/// `Vm::can_inline_leaf` conditions plus the realm count — all plain `len`/
+/// `Cell` reads, so the machine code re-checks them at-rest and re-stamps the
+/// epoch instead of re-running the full `leaf_call_probe`. The jit crate
+/// cannot name the `pub(crate)` `Vm`/`Agent`/`EnvStack`, hence the constants.
+pub const VM_TRY_STACK_LEN_OFFSET: usize = std::mem::offset_of!(Vm, try_stack) + VEC_LEN_OFFSET;
+pub const VM_PENDING_LEN_OFFSET: usize = std::mem::offset_of!(Vm, pending) + VEC_LEN_OFFSET;
+pub const VM_FOR_OF_STACK_LEN_OFFSET: usize =
+    std::mem::offset_of!(Vm, for_of_stack) + VEC_LEN_OFFSET;
+pub const VM_FOR_OF_BOUNDARIES_LEN_OFFSET: usize =
+    std::mem::offset_of!(Vm, for_of_boundaries) + VEC_LEN_OFFSET;
+pub const VM_FOR_IN_STACK_LEN_OFFSET: usize =
+    std::mem::offset_of!(Vm, for_in_stack) + VEC_LEN_OFFSET;
+pub const VM_ASYNC_FOR_OF_STACK_LEN_OFFSET: usize =
+    std::mem::offset_of!(Vm, async_for_of_stack) + VEC_LEN_OFFSET;
+pub const VM_DESTRUCTURE_STACK_LEN_OFFSET: usize =
+    std::mem::offset_of!(Vm, destructure_stack) + VEC_LEN_OFFSET;
+pub const VM_ENV_STACK_LEN_OFFSET: usize =
+    std::mem::offset_of!(Vm, env_stack) + std::mem::offset_of!(EnvStack, len);
+pub const AGENT_REALM_COUNT_OFFSET: usize = std::mem::offset_of!(Agent, realm_count);
 
 /// The per-call context the Vm passes to a compiled body as its `ctx`
 /// argument. `pending` is offset 0 — the compiled code's error-check ABI.
@@ -203,8 +244,10 @@ pub struct JitCallContext {
     /// stacks or realm count the probe's eligibility checks, so a helper is
     /// the only way those can change mid-run.
     pub leaf_epoch: u32,
-    /// Cut 39: the per-call-site leaf-call cache (see `LeafCallSiteCache`).
-    pub leaf_call_cache: LeafCallSiteCache,
+    /// Cut 39: the per-call-site leaf-call cache (Cut 68: a direct-mapped
+    /// set of `LEAF_CALL_CACHE_ENTRIES` records, indexed by
+    /// `(index ^ (index >> 2)) % N` — see `LeafCallSiteCache`).
+    pub leaf_call_cache: [LeafCallSiteCache; LEAF_CALL_CACHE_ENTRIES],
     /// The compiled body whose machine code is running: the step-index
     /// helpers (`create_function`/`create_arrow`/`create_function_decl`/
     /// `regexp_literal`) read their step's payload (the AST and the
@@ -1171,12 +1214,16 @@ extern "C" fn leaf_call_probe(
     let ctx = unsafe { ctx_of(ctx) };
     let agent = unsafe { &mut *ctx.agent };
     let vm = unsafe { &mut *ctx.vm };
+    // SAFETY: the xor-fold modulo `LEAF_CALL_CACHE_ENTRIES` is always in
+    // bounds.
+    let cache_entry =
+        &mut ctx.leaf_call_cache[(site as usize ^ (site as usize >> 2)) % LEAF_CALL_CACHE_ENTRIES];
     // Record the cache identity up front, before any rejection: the compiled
     // code reuses this record only when its step index, the live leaf epoch,
     // and the callee's full NaN-box identity all match — so a cached zero
     // entry skips the probe for a stable rejection, and a stale record is
     // simply re-probed.
-    ctx.leaf_call_cache = LeafCallSiteCache {
+    *cache_entry = LeafCallSiteCache {
         site: site as u32,
         epoch: ctx.leaf_epoch,
         callee_hi: (callee >> 44) as u32,
@@ -1262,7 +1309,7 @@ extern "C" fn leaf_call_probe(
             unsafe { *frame.add(slot) = value };
         }
     }
-    ctx.leaf_call_cache.leaf_inline = LeafInlineInfo {
+    cache_entry.leaf_inline = LeafInlineInfo {
         entry: compiled.entry as u64,
         stack_usage: compiled.stack_usage as u64,
         frame_size: scope.frame_size as u32,
@@ -4150,7 +4197,7 @@ pub(crate) fn run_jit_body(
         clean_chain,
         buf_end: (work_ptr as usize + work_len * std::mem::size_of::<Value>()) as *mut c_void,
         leaf_epoch: 0,
-        leaf_call_cache: LeafCallSiteCache::empty(),
+        leaf_call_cache: [LeafCallSiteCache::empty(); LEAF_CALL_CACHE_ENTRIES],
         body: std::rc::Rc::as_ptr(ir),
         tail: false,
         current_function: vm.current_function.map(|value| value.bits()).unwrap_or(0),
@@ -4368,7 +4415,7 @@ pub(crate) fn run_jit_resume(
         clean_chain,
         buf_end: (work_ptr as usize + work_len * std::mem::size_of::<Value>()) as *mut c_void,
         leaf_epoch: 0,
-        leaf_call_cache: LeafCallSiteCache::empty(),
+        leaf_call_cache: [LeafCallSiteCache::empty(); LEAF_CALL_CACHE_ENTRIES],
         body: std::rc::Rc::as_ptr(ir),
         tail: false,
         current_function: vm.current_function.map(|value| value.bits()).unwrap_or(0),
