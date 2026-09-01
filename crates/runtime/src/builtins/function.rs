@@ -1056,6 +1056,79 @@ mod tests {
     }
 
     #[test]
+    fn certified_body_global_read_fast_path_stays_spec_exact() {
+        // The `LoadIdent` fast path (Cut 36 mirror): a certified body whose
+        // env chain is exactly the global env serves a warmed global-value
+        // cell instead of walking the env chain per read. The warm gate must
+        // stay spec-exact — accessor globals re-run their getter, top-level
+        // lexical declarations are never cached, enclosing locals shadow,
+        // and the global object's generation re-validates mutations.
+        assert_eq!(
+            value("var g = 1; var f = function () { return g; }; f()"),
+            Value::Number(1.0)
+        );
+        // A getter on the global runs on every read (never cached).
+        assert_eq!(
+            value(
+                "var n = 0; \
+                 Object.defineProperty(globalThis, 'gx', { get() { return ++n; }, configurable: true }); \
+                 var f = function () { var s = 0; for (var i = 0; i < 3; i++) { s += gx; } return s; }; \
+                 f() + n"
+            ),
+            Value::Number(9.0)
+        );
+        // A top-level `let` is a lexical declaration — never warmed.
+        assert_eq!(
+            value("let lv = 7; var f = function () { return lv; }; f()"),
+            Value::Number(7.0)
+        );
+        // An enclosing function's local shadows the same-named global (the
+        // body's env chain is not clean, so the fast path never fires).
+        assert_eq!(
+            value(
+                "var g = 1; \
+                 var f = function () { var g = 5; return function () { return g; }(); }; \
+                 f()"
+            ),
+            Value::Number(5.0)
+        );
+        // A mutation from another function between reads is observed (the
+        // store mirrors the cell).
+        assert_eq!(
+            value(
+                "var n = 10; \
+                 var bump = function () { n = 99; }; \
+                 var f = function () { var s = 0; for (var i = 0; i < 3; i++) { bump(); s += n; } return s; }; \
+                 f()"
+            ),
+            Value::Number(297.0)
+        );
+        // A body that writes the global it reads keeps the cell fresh.
+        assert_eq!(
+            value(
+                "var g = 0; \
+                 var f = function () { var s = 0; for (var i = 0; i < 3; i++) { g += 1; s += g; } return s; }; \
+                 f()"
+            ),
+            Value::Number(6.0)
+        );
+        // A catch param shadows the global (env-changing body — no probe).
+        assert_eq!(
+            value(
+                "var g = 1; \
+                 var f = function (x) { try { throw 5; } catch (g) { return g + x; } }; \
+                 f(1)"
+            ),
+            Value::Number(6.0)
+        );
+        // An inherited member reads through the global env, never the cell.
+        assert_eq!(
+            value("var f = function () { return typeof toString; }; f()"),
+            Value::String(Handle::new(JsString::from_utf8("function")))
+        );
+    }
+
+    #[test]
     fn function_values_work_as_prototypes_in_construct() {
         // OrdinaryCreateFromConstructor accepts a function-valued prototype:
         // new objects inherit through it to %Function.prototype%.

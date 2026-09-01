@@ -2413,7 +2413,6 @@ resolved function against the realm's cached intrinsic
 directly on the caller's Vm — the `this` argument, the
 `CreateListFromArrayLike` element reads (dense-array fast path included),
 and the leaf-inline `do_call_fast` run with no builtin dispatch, no
-per-call argument-vector `Vec` round-trip for the dense case, no
 `leaf_lookup` HashMap, and no pooled-Vm take/return. Any other resolved
 function falls back to the general call of that function exactly as
 `CallFast` would, so shadowing, the is-callable-before-argArray order
@@ -2428,7 +2427,46 @@ Measured on the `apply leaf call` row (200K, release, 3-run medians):
 remaining ~90-100ms is the per-call member read, the `CreateListFromArrayLike`
 length/element reads, and the leaf-inline frame setup (the leaf itself is
 ~85ns). The `call_apply` helper also means a compiled body containing a
-`.apply` call no longer bails out of the JIT.
+`.apply` call no longer bails out of the JIT. (The arg-list build still
+allocates a per-call `Vec` for the general path — the dense fast path
+avoids the per-element key/Get machinery, not the allocation; inlining
+the dense element pushes onto the stack is a listed follow-up.)
+
+### The interpreter's `LoadIdent` global fast path, mirroring the JIT's Cut 36 probe (measured 2026-09-01)
+
+The `--jit-bench` `global read` row (a 1M `s += g` loop inside a function)
+measured ~157ms interpreted — ~10x the same loop reading a local — while
+the JIT ran it in ~6.5ms. The gap: a function body reads a script-global
+through `Step::LoadIdent` (function bodies carry no `script_globals`, so
+`binding()` classifies globals as env-path), and the interpreter's
+`LoadIdent` handler walked the env chain + built a `PropertyKey` + ran the
+full `Get` per read (~133ns/read).
+
+- **The interpreter now mirrors the JIT's Cut 36 probe.** `Vm::run_inner`
+  computes `clean_chain` at entry — the running context's env IS the
+  global env record with no outer (the same gate `JitCallContext` bakes
+  in) — and the `LoadIdent` handler, gated on `body.env_constant &&
+  clean_chain` (an env-constant body adds no envs mid-run, so the entry
+  flag stays valid), serves the warmed global-value cell directly when
+  the captured name + the live global's id/generation match, else falls
+  back to the full resolve. The miss path warms the cell with the JIT's
+  exact `load_ident` gate (a Global-env binding with no top-level
+  `let`/`const`/`class`), so a hot loop's second read is a native load.
+- **The warm gate now records only own DATA properties** — a real bug fix
+  that also corrects the JIT's probe: `warm_global_cell` and
+  `load_global_value`'s fallback previously recorded the value cell even
+  when the binding was an accessor or inherited property, so the probe
+  served a stale first-read value forever (an accessor's getter ran once;
+  an inherited `Object.prototype` member could change without the global's
+  generation bumping). Both paths now skip recording when
+  `resolve_global_cell` finds no own-data slot.
+
+Measured: **`global read` interp 157.6ms → ~49ms (~3.2x)** — parity with
+reading a local in the same loop shape — with the JIT row unchanged
+(~6.4ms); no regressions on the other rows. The remaining ~49ms is the
+row's general step-loop floor (the `i < n` limit is a slot, not a
+literal, so the fused head does not apply) — part of the interpreter
+per-op floor lever.
 
 ## Deferred milestones
 

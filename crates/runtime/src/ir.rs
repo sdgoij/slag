@@ -2279,6 +2279,12 @@ pub struct Vm {
     /// further links) must not evaluate, and the chain is `undefined` (spec
     /// 13.4.3). Cleared when the outermost chain node finishes.
     pub chain_short: bool,
+    /// Cut 36 mirror: whether the running context's env chain is exactly the
+    /// global env (no intermediate envs), computed at run entry and valid
+    /// only while the body adds no envs mid-run (`CompiledBody::env_constant`
+    /// gates the `LoadIdent` fast path on it). Mirrors the JIT's
+    /// `JitCallContext::clean_chain`.
+    pub(crate) clean_chain: bool,
     /// The in-flight disposal of a scope's `using` resources at an
     /// async-disposal suspension: the VM suspends with `Suspension::Await`
     /// per async dispose, and `run_abrupt` resumes the driver.
@@ -2513,6 +2519,7 @@ impl Vm {
             env_stack: EnvStack::with_base(lexical_env),
             body_context: None,
             global: None,
+            clean_chain: false,
             completion: Value::Undefined,
             try_stack: Vec::new(),
             pending: Vec::new(),
@@ -2574,6 +2581,7 @@ impl Vm {
         self.env_stack.reset(lexical_env);
         self.body_context = None;
         self.global = None;
+        self.clean_chain = false;
         self.completion = Value::Undefined;
         self.try_stack.clear();
         self.pending.clear();
@@ -2828,15 +2836,37 @@ impl Vm {
     /// probe's miss path). Records only when the name is an own data
     /// property of the global object — the probe's fast path is exactly the
     /// declared-var read shape; an accessor or absent name stays on the
-    /// resolve path. The read already succeeded, so errors are swallowed
+    /// resolve path (an accessor can run code and an inherited property can
+    /// change without the global's generation bumping, so caching either
+    /// would go stale). The read already succeeded, so errors are swallowed
     /// (the cell is an optimization).
     pub(crate) fn warm_global_cell(&mut self, agent: &mut Agent, name: crux::AtomId, value: Value) {
         let Ok(global) = self.global_object(agent) else {
             return;
         };
         Self::resolve_global_cell(agent, name);
-        let slot = agent.global_cells[Self::global_cell_index(name)].map(|(_, slot)| slot);
-        Self::record_global_cell(agent, name, value, &global, slot);
+        let Some((_, slot)) = agent.global_cells[Self::global_cell_index(name)] else {
+            return;
+        };
+        Self::record_global_cell(agent, name, value, &global, Some(slot));
+    }
+
+    /// The Cut 36 `LoadIdent` fast path: read the warmed global-value cell
+    /// when its captured name and the live global's identity + generation
+    /// still match (the same probe the compiled `LoadIdent` runs). The cell
+    /// is only ever written by a resolve that landed on a global-object
+    /// binding, so a hit is exactly the value the env walk would produce;
+    /// `None` falls back to the full resolve.
+    fn try_global_cell_read(&mut self, agent: &mut Agent, name: crux::AtomId) -> Option<Value> {
+        let cell = agent.global_value_cells[Self::global_cell_index(name)];
+        if cell.name != name {
+            return None;
+        }
+        let global = self.global_object(agent).ok()?;
+        if cell.global_id != global.id() || cell.generation != global.generation() {
+            return None;
+        }
+        Some(cell.value)
     }
 
     /// Read a declared top-level `var` directly off the global object: the
@@ -2869,10 +2899,14 @@ impl Vm {
         Self::resolve_global_cell(agent, name);
         // The version read AFTER the value: a getter that mutated the global
         // during `get_value` bumps the generation, so the recorded cell is
-        // either current or never matched by the JIT's live check.
-        let global = self.global_object(agent)?;
-        let slot = agent.global_cells[Self::global_cell_index(name)].map(|(_, slot)| slot);
-        Self::record_global_cell(agent, name, value, &global, slot);
+        // either current or never matched by the JIT's live check. Record
+        // only an own data property (an accessor or inherited binding could
+        // change without the global's generation bumping — see
+        // `warm_global_cell`).
+        if let Some((_, slot)) = agent.global_cells[Self::global_cell_index(name)] {
+            let global = self.global_object(agent)?;
+            Self::record_global_cell(agent, name, value, &global, Some(slot));
+        }
         Ok(value)
     }
 
@@ -4038,6 +4072,21 @@ impl Vm {
     }
 
     fn run_inner(&mut self, agent: &mut Agent, body: &CompiledBody) -> Result<VmOutcome, JsError> {
+        // Cut 36 mirror: whether the running context's env chain is exactly
+        // the global env — a certified body's `LoadIdent` then resolves at
+        // the global env, so the read can serve the warmed global-value cell
+        // instead of walking the env chain per step (the `clean_chain` gate
+        // the JIT bakes into `JitCallContext`). Computed at run entry: only
+        // an `env_constant` body skips the per-step context sync, so the
+        // flag stays valid for the whole run there (the `LoadIdent` fast
+        // path gates on `body.env_constant`).
+        self.clean_chain = agent
+            .running_context()
+            .map(|context| {
+                let env = context.lexical_environment;
+                matches!(&*env, EnvRecord::Global(_)) && env.outer().is_none()
+            })
+            .unwrap_or(false);
         // GC-2: root this Vm and its compiled body for the run's duration —
         // a mid-execution stress collection must trace the active Vm
         // precisely (its heap-buffered stacks and the body's literal steps).
@@ -4192,9 +4241,35 @@ impl Vm {
             }
             match step {
                 Step::LoadIdent { name } => {
+                    // Cut 36 mirror: with a clean chain (the context env IS
+                    // the global env, and this env-constant body adds no envs
+                    // mid-run) the name resolves at the global env — serve the
+                    // warmed global-value cell directly, else fall back to the
+                    // full resolve (which warms the cell when the binding is a
+                    // global-object data property, so a hot loop's second read
+                    // hits the native load).
+                    if body.env_constant
+                        && self.clean_chain
+                        && let Some(value) = self.try_global_cell_read(agent, *name)
+                    {
+                        self.stack.push(value);
+                        continue;
+                    }
                     let reference =
                         crate::context::resolve_binding(agent, &crux::lookup(*name), self.strict)?;
                     let value = crate::context::get_value(agent, &reference)?;
+                    if body.env_constant
+                        && self.clean_chain
+                        && let crate::context::ReferenceBase::Environment(env) = &reference.base
+                        && let EnvRecord::Global(_) = &**env
+                        && !env.has_lexical_declaration(&crux::lookup(*name))
+                    {
+                        // The JIT's `load_ident` warm gate: a global-object
+                        // binding (var/function/undeclared), never a top-level
+                        // `let`/`const`/`class` (a declarative shadow would
+                        // not bump the global object's generation).
+                        self.warm_global_cell(agent, *name, value);
+                    }
                     self.stack.push(value);
                 }
                 Step::LoadLocal { slot } => {
