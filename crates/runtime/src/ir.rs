@@ -7277,9 +7277,14 @@ impl Vm {
         // A typed array's `length` is a prototype accessor; serving it from
         // the slots skips the accessor invocation, which the fixture
         // byte-copy loops read every iteration (~6.6µs per accessor call).
+        // An own `length` shadows the accessor (spec OrdinaryGet — a
+        // define-created own property wins), so the shortcut fires only when
+        // none exists: the check is a plain (usually empty) vector scan, no
+        // key-string parse.
         if name == Self::length_atom()
             && let ValueKind::Object(object_ref) = object.kind()
             && let crux::object::ObjectKind::IntegerIndexed(slots) = &object_ref.kind
+            && !object_ref.has_own_property_atom(name)
         {
             return Ok(Value::Number(
                 crux::object::typed_array_effective_length(slots) as f64,

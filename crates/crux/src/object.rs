@@ -21,7 +21,7 @@ use crate::map::canonical_empty_map;
 use crate::map::{Map, MapAttrs};
 use crate::ops::{same_value, same_value_zero};
 use crate::property::{PropertyDescriptor, PropertyKey};
-use crate::string::{JsString, lookup};
+use crate::string::{AtomId, JsString, lookup};
 use crate::symbol::well_known;
 use crate::value::{Value, ValueKind, is_callable};
 
@@ -2098,6 +2098,19 @@ impl JsObject {
         }
         self.ordinary_property_lookup(&PropertyKey::from_index(index))
             .is_some()
+    }
+
+    /// Whether `name` is an own property of this object: a plain scan of the
+    /// property vector — no key-string parse, no lazy-index build. The
+    /// typed-array `length` fast path uses this to detect an own `length`
+    /// shadowing the %TypedArray%.prototype accessor (spec OrdinaryGet, a
+    /// define-created own property must win over the slots length).
+    pub fn has_own_property_atom(&self, name: AtomId) -> bool {
+        let key = PropertyKey::String(name);
+        self.properties
+            .borrow()
+            .iter()
+            .any(|(stored, _)| stored == &key)
     }
 
     /// Re-validate the cached "chain is clean for index stores" verdict

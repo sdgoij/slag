@@ -3578,6 +3578,48 @@ mod tests {
     }
 
     #[test]
+    fn own_length_shadows_the_prototype_accessor() {
+        // An own `length` property (define-created) wins over the accessor
+        // (spec OrdinaryGet); the `get_member_name` slots shortcut must not
+        // fire while it exists. After the delete, the accessor serves again.
+        assert_eq!(
+            number(
+                "(function(){ var t = new Uint8Array(4); Object.defineProperty(t, 'length', { value: 1 }); return t.length; })()"
+            ),
+            1.0
+        );
+        assert_eq!(
+            number(
+                "(function(){ var t = new Uint8Array(4); Object.defineProperty(t, 'length', { value: 1, configurable: true }); delete t.length; return t.length; })()"
+            ),
+            4.0
+        );
+        // An own accessor `length` shadows too.
+        assert_eq!(
+            number(
+                "(function(){ var t = new Uint8Array(4); Object.defineProperty(t, 'length', { get: function(){ return 9; }, configurable: true }); return t.length; })()"
+            ),
+            9.0
+        );
+        // A re-define updates the shadowing value (the fast path stays off
+        // while the own property exists).
+        assert_eq!(
+            number(
+                "(function(){ var t = new Uint8Array(4); Object.defineProperty(t, 'length', { value: 2, configurable: true }); Object.defineProperty(t, 'length', { value: 3, configurable: true }); return t.length; })()"
+            ),
+            3.0
+        );
+        // Unrelated own properties do not disable the slots shortcut (the
+        // length value is the same either way, and the fast path stays hot).
+        assert_eq!(
+            number(
+                "(function(){ var t = new Uint8Array(4); Object.defineProperty(t, 'foo', { value: 1 }); return t.length; })()"
+            ),
+            4.0
+        );
+    }
+
+    #[test]
     fn fill_writes_elements_through_the_slots_fast_path() {
         // The fill builtin encodes the coerced value once and writes the
         // buffer directly (no per-element key string + re-encode). The
