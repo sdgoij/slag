@@ -5063,7 +5063,7 @@ mod tests {
         assert!(crate::ir::body_has_loop(&[Step::FastLoopHead {
             var: crate::ir::FastLoopVar::Counter,
             op: BinaryOp::Add,
-            imm: 0.0,
+            limit: crate::ir::RelLimit::Imm(0.0),
             inc: UpdateOp::Increment,
             body_start: 0,
             after: 0,

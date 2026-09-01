@@ -1129,6 +1129,81 @@ mod tests {
     }
 
     #[test]
+    fn fused_fast_binding_limit_loop_stays_spec_exact() {
+        // The fused relational loop test with a fast-binding limit (`i < n`
+        // where `n` is a frame slot): the head re-reads the limit every
+        // iteration (a body can mutate it), non-Number limits coerce through
+        // the general binary evaluator, and the TDZ checks match LoadLocal.
+        assert_eq!(
+            value(
+                "var f = function (n) { var s = 0; for (var i = 0; i < n; i++) { s += i; } return s; }; \
+                 f(5) + f(0) + f(-2)"
+            ),
+            Value::Number(10.0)
+        );
+        // A body that mutates the limit is observed (re-read each pass).
+        assert_eq!(
+            value(
+                "var f = function (n) { var s = 0; for (var i = 0; i < n; i++) { s += 1; if (s > 3) { n = 3; } } return s + '-' + n; }; \
+                 f(10)"
+            ),
+            Value::String(Handle::new(JsString::from_utf8("4-3")))
+        );
+        // A non-Number limit coerces (a string limit, and one that changes
+        // type mid-loop).
+        assert_eq!(
+            value(
+                "var f = function (n) { var s = 0; for (var i = 0; i < n; i++) { s += 1; } return s; }; \
+                 f('3')"
+            ),
+            Value::Number(3.0)
+        );
+        assert_eq!(
+            value(
+                "var f = function (n) { var s = 0; for (var i = 0; i < n; i++) { s += 1; if (i === 1) { n = '1'; } } return s; }; \
+                 f(5)"
+            ),
+            Value::Number(2.0)
+        );
+        // NaN and descending (`>=`/`--`) limits.
+        assert_eq!(
+            value(
+                "var f = function (n) { var s = 0; for (var i = 0; i < n; i++) { s += 1; } return s; }; f(NaN)"
+            ),
+            Value::Number(0.0)
+        );
+        assert_eq!(
+            value(
+                "var f = function (n) { var s = 0; for (var i = n; i >= 0; i--) { s += i; } return s; }; \
+                 f(5)"
+            ),
+            Value::Number(15.0)
+        );
+        // break/continue inside the fused loop.
+        assert_eq!(
+            value(
+                "var f = function (n) { var s = 0; for (var i = 0; i < n; i++) { if (i === 3) { break; } if (i === 1) { continue; } s += i; } return s; }; \
+                 f(10)"
+            ),
+            Value::Number(2.0)
+        );
+        // Nested fused loops.
+        assert_eq!(
+            value(
+                "var f = function (n) { var s = 0; for (var i = 0; i < n; i++) { for (var j = 0; j < n; j++) { s += i * j; } } return s; }; \
+                 f(4)"
+            ),
+            Value::Number(36.0)
+        );
+        // A global limit in a top-level script (the script path knows the
+        // declared globals).
+        assert_eq!(
+            value("var g = 4; var s = 0; for (var i = 0; i < g; i++) { s += i; } s"),
+            Value::Number(6.0)
+        );
+    }
+
+    #[test]
     fn function_values_work_as_prototypes_in_construct() {
         // OrdinaryCreateFromConstructor accepts a function-valued prototype:
         // new objects inherit through it to %Function.prototype%.

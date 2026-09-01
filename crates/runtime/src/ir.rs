@@ -749,6 +749,22 @@ pub enum Step {
         imm: f64,
         target: usize,
     },
+    /// The fused relational loop test with a fast-binding limit (`i < n`
+    /// where `n` is a frame slot or declared global — the general path
+    /// evaluates the limit every iteration, so the fused head re-reads it):
+    /// read the counter slot and the limit binding, apply the abstract
+    /// comparison, and jump to `target` when the test is false — exactly
+    /// what `LoadLocal; LoadLocal/LoadGlobal; Binary; JumpIfFalse`
+    /// computes. The literal-limit shapes use the `JumpIf*Imm` steps above;
+    /// this step covers the non-literal limit (emitted only for a
+    /// frame-slot counter, so the loop can never bail a new shape out of
+    /// the JIT).
+    JumpIfRelLimit {
+        op: BinaryOp,
+        slot: usize,
+        limit: RelLimit,
+        target: usize,
+    },
     // ----- top-level fast path (script-level bindings) -----
     /// Read a declared top-level `var`/function directly off the global
     /// object — the binding is guaranteed to exist (script instantiation
@@ -808,7 +824,7 @@ pub enum Step {
     FastLoopHead {
         var: FastLoopVar,
         op: BinaryOp,
-        imm: f64,
+        limit: RelLimit,
         inc: UpdateOp,
         /// Back to the body start when the test passes.
         body_start: usize,
@@ -2031,15 +2047,23 @@ pub enum FastLoopVar {
     Counter,
 }
 
-/// The shape of a fused canonical loop (Cut 15): the counter binding, the
-/// test operator + limit, and the update operator (`compile_fast_loop`'s
-/// result).
+/// The right operand of a fused relational loop test (the `LIMIT` of
+/// `for (i = 0; i < LIMIT; i++)`): a literal (the original `imm` shape), a
+/// frame slot, or a declared global. The general path evaluates the limit
+/// every iteration, so the fused head re-reads the binding each pass.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RelLimit {
+    Imm(f64),
+    Slot(usize),
+    Global(crux::AtomId),
+}
+
 struct FastLoopShape {
     var: FastLoopVar,
     loc: BindingLoc,
     name: crux::AtomId,
     op: BinaryOp,
-    imm: f64,
+    limit: RelLimit,
     inc: UpdateOp,
 }
 
@@ -2723,6 +2747,63 @@ impl Vm {
             return Ok(());
         }
         let right = Value::Number(imm);
+        let value = crate::expr::apply_binary(agent, op, &left, &right)?;
+        if !crux::convert::to_boolean(&value) {
+            self.ip = target;
+        }
+        Ok(())
+    }
+
+    /// The fused relational loop test with a fast-binding limit (Cut 15
+    /// extension): read the counter slot (TDZ-checked like `LoadLocal`),
+    /// read the limit binding, abstract-compare with the general binary
+    /// evaluator, and jump to `target` when the test is false — exactly
+    /// what `LoadLocal; LoadLocal/LoadGlobal; Binary; JumpIfFalse`
+    /// computes.
+    fn jump_if_rel_limit(
+        &mut self,
+        agent: &mut Agent,
+        op: BinaryOp,
+        slot: usize,
+        limit: RelLimit,
+        target: usize,
+    ) -> Result<(), JsError> {
+        let left = *self.frame_get(slot);
+        if left.is_uninitialized() {
+            return Err(JsError::new(
+                ErrorKind::ReferenceError,
+                "Cannot access a binding before initialization".into(),
+            ));
+        }
+        let right = match limit {
+            RelLimit::Imm(imm) => Value::Number(imm),
+            RelLimit::Slot(limit_slot) => {
+                let right = *self.frame_get(limit_slot);
+                if right.is_uninitialized() {
+                    return Err(JsError::new(
+                        ErrorKind::ReferenceError,
+                        "Cannot access a binding before initialization".into(),
+                    ));
+                }
+                right
+            }
+            RelLimit::Global(name) => self.load_global_value(agent, name)?,
+        };
+        if let (Some(num), Some(limit_num)) = (left.as_number(), right.as_number()) {
+            // JS relational semantics for two numbers: NaN comparisons are
+            // false, matching Rust's f64 comparisons.
+            let pass = match op {
+                BinaryOp::LessThan => num < limit_num,
+                BinaryOp::LessEqual => num <= limit_num,
+                BinaryOp::GreaterThan => num > limit_num,
+                BinaryOp::GreaterEqual => num >= limit_num,
+                _ => unreachable!("JumpIfRelLimit with a non-relational op"),
+            };
+            if !pass {
+                self.ip = target;
+            }
+            return Ok(());
+        }
         let value = crate::expr::apply_binary(agent, op, &left, &right)?;
         if !crux::convert::to_boolean(&value) {
             self.ip = target;
@@ -3661,22 +3742,29 @@ impl Vm {
         Ok(())
     }
 
-    /// The fused canonical loop's test `var <op> imm` (see `Step::FastLoop`):
-    /// a Number counter compares directly (JS relational semantics for two
-    /// numbers — NaN is false, matching Rust's f64 comparisons); a
-    /// non-number falls back to the general `apply_binary` boolean.
+    /// The fused canonical loop's test `var <op> LIMIT` (see `Step::FastLoop`):
+    /// a Number counter vs a Number limit compares directly (JS relational
+    /// semantics for two numbers — NaN is false, matching Rust's f64
+    /// comparisons); a non-number falls back to the general `apply_binary`
+    /// boolean. The limit is a literal, a frame slot, or a declared global —
+    /// the binding forms re-read the limit every iteration, matching the
+    /// general path's per-iteration evaluation.
     fn fast_loop_test(
         &mut self,
         agent: &mut Agent,
         var: FastLoopVar,
         op: BinaryOp,
-        imm: f64,
+        limit: RelLimit,
     ) -> Result<bool, JsError> {
         // The dedicated field holds the loop's Number counter (the acc-path
         // gates admit only Number inits/stores) — compare the raw f64
-        // directly (JS relational semantics for two numbers: NaN compares
-        // false, matching Rust's f64 comparisons).
-        if matches!(var, FastLoopVar::Counter) {
+        // directly against an immediate limit (JS relational semantics for
+        // two numbers: NaN compares false, matching Rust's f64
+        // comparisons); a binding limit goes through the shared value
+        // comparison below.
+        if matches!(var, FastLoopVar::Counter)
+            && let RelLimit::Imm(imm) = limit
+        {
             return Ok(match op {
                 BinaryOp::LessThan => self.loop_counter < imm,
                 BinaryOp::LessEqual => self.loop_counter <= imm,
@@ -3697,22 +3785,40 @@ impl Vm {
                 value
             }
             FastLoopVar::Global(name) => self.load_global_value(agent, name)?,
-            FastLoopVar::Counter => unreachable!("handled above"),
+            FastLoopVar::Counter => Value::Number(self.loop_counter),
         };
-        if let Some(num) = value.as_number() {
+        let right = match limit {
+            RelLimit::Imm(imm) => Value::Number(imm),
+            RelLimit::Slot(slot) => {
+                let right = *self.frame_get(slot);
+                if right.is_uninitialized() {
+                    return Err(JsError::new(
+                        ErrorKind::ReferenceError,
+                        "Cannot access a binding before initialization".into(),
+                    ));
+                }
+                right
+            }
+            // The warmed value cell first (the Cut 36 probe — a script
+            // global's own data value, re-validated by name + generation;
+            // `store_global_value` mirrors it, so a body that writes the
+            // limit is observed), else the full resolve.
+            RelLimit::Global(name) => match self.try_global_cell_read(agent, name) {
+                Some(value) => value,
+                None => self.load_global_value(agent, name)?,
+            },
+        };
+        if let (Some(num), Some(limit_num)) = (value.as_number(), right.as_number()) {
             return Ok(match op {
-                BinaryOp::LessThan => num < imm,
-                BinaryOp::LessEqual => num <= imm,
-                BinaryOp::GreaterThan => num > imm,
-                BinaryOp::GreaterEqual => num >= imm,
+                BinaryOp::LessThan => num < limit_num,
+                BinaryOp::LessEqual => num <= limit_num,
+                BinaryOp::GreaterThan => num > limit_num,
+                BinaryOp::GreaterEqual => num >= limit_num,
                 _ => unreachable!("FastLoop with a non-relational op"),
             });
         }
         Ok(crux::convert::to_boolean(&crate::expr::apply_binary(
-            agent,
-            op,
-            &value,
-            &Value::Number(imm),
+            agent, op, &value, &right,
         )?))
     }
 
@@ -6384,10 +6490,16 @@ impl Vm {
                 Step::JumpIfGeGlobalImm { name, imm, target } => {
                     self.jump_if_rel_global(agent, BinaryOp::GreaterEqual, *name, *imm, *target)?
                 }
+                Step::JumpIfRelLimit {
+                    op,
+                    slot,
+                    limit,
+                    target,
+                } => self.jump_if_rel_limit(agent, *op, *slot, *limit, *target)?,
                 Step::FastLoopHead {
                     var,
                     op,
-                    imm,
+                    limit,
                     inc,
                     body_start,
                     after,
@@ -6402,7 +6514,7 @@ impl Vm {
                     // jump back (or out) in one dispatch — the body dispatches
                     // inline in the main loop.
                     self.fast_loop_inc(agent, *var, *inc)?;
-                    if !self.fast_loop_test(agent, *var, *op, *imm)? {
+                    if !self.fast_loop_test(agent, *var, *op, *limit)? {
                         self.ip = *after;
                     } else {
                         self.ip = *body_start;
@@ -11159,6 +11271,13 @@ enum Fixup {
         name: crux::AtomId,
         imm: f64,
     },
+    /// The fused relational loop test with a fast-binding limit
+    /// (`Step::JumpIfRelLimit`): the step's `target` resolves at compile end;
+    /// op/slot/limit were fixed at emission.
+    JumpIfRelLimit {
+        index: usize,
+        label: usize,
+    },
     /// The fused canonical loop head's jump targets (Cut 15): both labels
     /// resolve at compile end like the jump fixups.
     FastLoopHead(usize, usize, usize),
@@ -11859,8 +11978,16 @@ impl Compiler {
     /// path (Cut 4): the fused `JumpIf*Imm` step replaces `LoadLocal;
     /// BinaryImm; JumpIfFalse` (and the `LoadGlobal` equivalent on the fast
     /// script). The comparison stays the general `apply_binary` semantics,
-    /// so a non-number value coerces exactly as before.
-    fn fused_rel_test(&self, test: &Expr) -> Option<(BinaryOp, BindingLoc, crux::AtomId, f64)> {
+    /// so a non-number value coerces exactly as before. The limit may be a
+    /// literal (the original `JumpIf*Imm` shape) or a fast binding (`i < n`
+    /// with `n` a frame slot / declared global — the fused test re-reads it
+    /// every iteration, matching the general path's per-iteration
+    /// evaluation); a non-fast limit (an env/context binding) keeps the
+    /// general test.
+    fn fused_rel_test(
+        &self,
+        test: &Expr,
+    ) -> Option<(BinaryOp, BindingLoc, crux::AtomId, RelLimit)> {
         if let ExprKind::Binary { op, left, right } = &test.kind
             && matches!(
                 op,
@@ -11870,18 +11997,30 @@ impl Compiler {
                     | BinaryOp::GreaterEqual
             )
             && let ExprKind::Ident(name) = &left.kind
-            && let ExprKind::Literal(syntax::ast::Literal::Number(n)) = &right.kind
         {
+            let limit = match &right.kind {
+                ExprKind::Literal(syntax::ast::Literal::Number(n)) => RelLimit::Imm(*n),
+                ExprKind::Ident(limit_name) => match self.binding(*limit_name) {
+                    BindingLoc::Slot(limit_slot) => RelLimit::Slot(limit_slot),
+                    BindingLoc::Global => RelLimit::Global(*limit_name),
+                    _ => return None,
+                },
+                _ => return None,
+            };
             match self.binding(*name) {
                 // A nested loop's test over an active accumulator counter or
                 // a captured binding must not fuse (there is no
                 // `JumpIf*AccImm`/`JumpIf*ContextImm` step); the general
-                // test reads them instead.
+                // test reads them instead. A non-literal limit also requires
+                // a frame-slot counter (the fused test reads the counter
+                // slot, and a global counter + binding limit would bail a
+                // new shape out of the JIT).
                 BindingLoc::Env
                 | BindingLoc::Acc
                 | BindingLoc::Context(_, _)
                 | BindingLoc::CapturedIteration(_, _) => None,
-                loc => Some((*op, loc, *name, *n)),
+                BindingLoc::Global if !matches!(limit, RelLimit::Imm(_)) => None,
+                loc => Some((*op, loc, *name, limit)),
             }
         } else {
             None
@@ -11912,19 +12051,20 @@ impl Compiler {
         }
     }
 
-    /// Emit a fused relational-imm loop test (Cut 4): the `JumpIf*Imm` step
-    /// with `target: 0`, patched to `target_label` at compile end.
+    /// Emit a fused relational loop test (Cut 4): the `JumpIf*Imm` step for a
+    /// literal limit, the `JumpIfRelLimit` step for a fast-binding limit —
+    /// both with `target: 0`, patched to `target_label` at compile end.
     fn emit_fused_rel_test(
         &mut self,
         op: BinaryOp,
         loc: BindingLoc,
         name: crux::AtomId,
-        imm: f64,
+        limit: RelLimit,
         target_label: usize,
     ) {
         let index = self.steps.len();
-        match loc {
-            BindingLoc::Slot(slot) => {
+        match (loc, limit) {
+            (BindingLoc::Slot(slot), RelLimit::Imm(imm)) => {
                 self.emit(Step::JumpIfLtImm {
                     slot,
                     imm,
@@ -11938,7 +12078,7 @@ impl Compiler {
                     imm,
                 });
             }
-            BindingLoc::Global => {
+            (BindingLoc::Global, RelLimit::Imm(imm)) => {
                 self.emit(Step::JumpIfLtGlobalImm {
                     name,
                     imm,
@@ -11952,11 +12092,29 @@ impl Compiler {
                     imm,
                 });
             }
-            BindingLoc::Acc => unreachable!("emit_fused_rel_test on the accumulator"),
-            BindingLoc::Context(_, _) | BindingLoc::CapturedIteration(_, _) => {
+            (BindingLoc::Slot(slot), limit) => {
+                // A frame-slot counter against a fast-binding limit (the
+                // `fused_rel_test` gate admits only this combo for a
+                // non-literal limit).
+                self.emit(Step::JumpIfRelLimit {
+                    op,
+                    slot,
+                    limit,
+                    target: 0,
+                });
+                self.fixups.push(Fixup::JumpIfRelLimit {
+                    index,
+                    label: target_label,
+                });
+            }
+            (BindingLoc::Acc, _) => unreachable!("emit_fused_rel_test on the accumulator"),
+            (BindingLoc::Context(_, _) | BindingLoc::CapturedIteration(_, _), _) => {
                 unreachable!("emit_fused_rel_test on a captured binding")
             }
-            BindingLoc::Env => unreachable!("emit_fused_rel_test on the environment path"),
+            (BindingLoc::Env, _) => unreachable!("emit_fused_rel_test on the environment path"),
+            (BindingLoc::Global, _) => {
+                unreachable!("a global counter fuses only a literal limit")
+            }
         }
     }
 
@@ -11975,7 +12133,7 @@ impl Compiler {
         let Some(update) = update else {
             return Ok(None);
         };
-        let Some((op, loc, name, imm)) = self.fused_rel_test(test) else {
+        let Some((op, loc, name, limit)) = self.fused_rel_test(test) else {
             return Ok(None);
         };
         let Some((inc_loc, inc_name, inc_op)) = self.fused_update(update) else {
@@ -11995,7 +12153,7 @@ impl Compiler {
             loc,
             name,
             op,
-            imm,
+            limit,
             inc: inc_op,
         }))
     }
@@ -12312,6 +12470,11 @@ impl Compiler {
                         BinaryOp::GreaterEqual => Step::JumpIfGeGlobalImm { name, imm, target },
                         _ => unreachable!("JumpIfRelGlobalImm fixup with a non-relational op"),
                     };
+                }
+                Fixup::JumpIfRelLimit { index, label } => {
+                    if let Step::JumpIfRelLimit { target, .. } = &mut self.steps[index] {
+                        *target = self.labels[&label];
+                    }
                 }
                 Fixup::FastLoopHead(index, body_label, after_label) => {
                     if let Step::FastLoopHead {
@@ -13260,7 +13423,7 @@ impl Compiler {
                         loc,
                         name,
                         op,
-                        imm,
+                        limit,
                         inc,
                     }) = self.compile_fast_loop(test, update)?
                 {
@@ -13285,7 +13448,7 @@ impl Compiler {
                         // before the initial test, so a zero-iteration loop
                         // still stores the init value back.
                         self.emit(Step::FastLoopBind { var });
-                        self.emit_fused_rel_test(op, loc, name, imm, end_label);
+                        self.emit_fused_rel_test(op, loc, name, limit, end_label);
                         let body_start = self.new_label();
                         self.place(body_start);
                         let saved = self.acc_binding.replace(name);
@@ -13313,7 +13476,7 @@ impl Compiler {
                         self.emit(Step::FastLoopHead {
                             var: FastLoopVar::Counter,
                             op,
-                            imm,
+                            limit,
                             inc,
                             body_start,
                             after: end_label,
@@ -13334,7 +13497,7 @@ impl Compiler {
                     // per-iteration head — increment, re-test, and the
                     // back-jump in one dispatch. The continue target is the
                     // head (a `continue` skips to the increment).
-                    self.emit_fused_rel_test(op, loc, name, imm, end_label);
+                    self.emit_fused_rel_test(op, loc, name, limit, end_label);
                     let body_start = self.new_label();
                     self.place(body_start);
                     self.compile_statement(body)?;
@@ -13343,7 +13506,7 @@ impl Compiler {
                     self.emit(Step::FastLoopHead {
                         var,
                         op,
-                        imm,
+                        limit,
                         inc,
                         body_start,
                         after: end_label,
@@ -16392,7 +16555,8 @@ fn step_targets(step: &Step) -> Vec<usize> {
         | Step::JumpIfLtGlobalImm { target, .. }
         | Step::JumpIfLeGlobalImm { target, .. }
         | Step::JumpIfGtGlobalImm { target, .. }
-        | Step::JumpIfGeGlobalImm { target, .. } => vec![*target],
+        | Step::JumpIfGeGlobalImm { target, .. }
+        | Step::JumpIfRelLimit { target, .. } => vec![*target],
         Step::FastLoopHead {
             body_start, after, ..
         } => vec![*body_start, *after],

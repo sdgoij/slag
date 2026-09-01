@@ -749,7 +749,7 @@ mod tests {
                 Step::FastLoopHead {
                     var: runtime::ir::FastLoopVar::Counter,
                     op: syntax::ast::BinaryOp::LessThan,
-                    imm: 1000.0,
+                    limit: runtime::ir::RelLimit::Imm(1000.0),
                     inc: syntax::ast::UpdateOp::Increment,
                     body_start: 7,
                     after: 12,
@@ -837,7 +837,7 @@ mod tests {
                 Step::FastLoopHead {
                     var: runtime::ir::FastLoopVar::Counter,
                     op: syntax::ast::BinaryOp::LessThan,
-                    imm: 10.0,
+                    limit: runtime::ir::RelLimit::Imm(10.0),
                     inc: syntax::ast::UpdateOp::Increment,
                     body_start: 5,
                     after: 7,

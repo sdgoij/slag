@@ -38,7 +38,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use crux::Value;
 use runtime::ir::{
     ApplyKind, CompiledBody, FastLoopVar, GLOBAL_CELLS, LeafOp, MEMBER_CELLS, MemberValueCell,
-    RegOperand, ScopeInfo, Step, is_compound_assign,
+    RegOperand, RelLimit, ScopeInfo, Step, is_compound_assign,
 };
 use runtime::jit::{
     AGENT_REALM_COUNT_OFFSET, GlobalValueCell, JitCallContext, LEAF_CALL_CACHE_ENTRIES,
@@ -532,6 +532,7 @@ fn step_name(step: &Step) -> &'static str {
         | Step::ListEnd
         | Step::SaveCompletion
         | Step::RestoreCompletion => "Completion",
+        Step::JumpIfRelLimit { .. } => "JumpIfRelLimit",
         Step::LoadPerIteration { .. }
         | Step::StorePerIteration { .. }
         | Step::UpdatePerIteration { .. } => "Per-iteration",
@@ -558,7 +559,8 @@ fn step_targets(step: &Step) -> Vec<usize> {
         | Step::JumpIfLtGlobalImm { target, .. }
         | Step::JumpIfLeGlobalImm { target, .. }
         | Step::JumpIfGtGlobalImm { target, .. }
-        | Step::JumpIfGeGlobalImm { target, .. } => vec![*target],
+        | Step::JumpIfGeGlobalImm { target, .. }
+        | Step::JumpIfRelLimit { target, .. } => vec![*target],
         Step::FastLoopHead {
             body_start, after, ..
         } => vec![*body_start, *after],
@@ -2439,6 +2441,42 @@ impl<'a> Lowerer<'a> {
             Step::JumpIfGeImm { slot, imm, target } => {
                 self.emit_rel_test_jump(*slot, *imm, BinaryOp::GreaterEqual, *target, index + 1)?
             }
+            Step::JumpIfRelLimit {
+                op,
+                slot,
+                limit,
+                target,
+            } => {
+                // The fused initial loop test with a fast-binding limit
+                // (`i < n` where `n` is a slot/global): runs once per loop,
+                // so the relational-slow helper is fine. The counter and the
+                // limit slots are TDZ-checked like `LoadLocal`.
+                let counter = self.load_slot(*slot);
+                if self.slot_is_lexical(*slot) {
+                    self.emit_tdz_check(counter)?;
+                }
+                let limit_bits = match limit {
+                    RelLimit::Imm(_) => {
+                        unreachable!("the literal limit uses the JumpIf*Imm steps")
+                    }
+                    RelLimit::Slot(limit_slot) => {
+                        let bits = self.load_slot(*limit_slot);
+                        if self.slot_is_lexical(*limit_slot) {
+                            self.emit_tdz_check(bits)?;
+                        }
+                        bits
+                    }
+                    RelLimit::Global(name) => self.emit_global_read(*name)?,
+                };
+                let op_imm = self.builder.ins().iconst(types::I64, *op as i64);
+                let test = self.call_slow(
+                    self.sig_rel,
+                    Helper::RelationalSlow,
+                    &[op_imm, counter, limit_bits],
+                )?;
+                let block = self.ensure_block(*target);
+                self.cond_jump(test, false, block, index + 1);
+            }
             Step::FastLoopBind { var } => {
                 self.emit_fast_loop_bind(*var)?;
                 self.fall_through(index);
@@ -2450,11 +2488,11 @@ impl<'a> Lowerer<'a> {
             Step::FastLoopHead {
                 var,
                 op,
-                imm,
+                limit,
                 inc,
                 body_start,
                 after,
-            } => self.emit_fast_loop_head(*var, *op, *imm, *inc, *body_start, *after)?,
+            } => self.emit_fast_loop_head(*var, *op, *limit, *inc, *body_start, *after)?,
             Step::RunRegBody { ops } => {
                 let entry_sp = self.builder.use_var(self.sp_var);
                 let undef = self.builder.ins().iconst(types::I64, self.undef_bits);
@@ -4378,12 +4416,15 @@ impl<'a> Lowerer<'a> {
     }
 
     /// The fused canonical loop's back edge: increment, re-test, branch back
-    /// to `body_start` (pass) or `after` (fail).
+    /// to `body_start` (pass) or `after` (fail). The limit is a literal, a
+    /// frame slot, or a declared global — the binding forms re-read it every
+    /// iteration, matching the general path's per-iteration evaluation (a
+    /// body can mutate the limit).
     fn emit_fast_loop_head(
         &mut self,
         var: FastLoopVar,
         op: BinaryOp,
-        imm: f64,
+        limit: RelLimit,
         inc: UpdateOp,
         body_start: usize,
         after: usize,
@@ -4400,12 +4441,23 @@ impl<'a> Lowerer<'a> {
                 };
                 self.inc_counter(delta);
                 let cur = self.builder.use_var(self.counter_var);
-                let cc = rel_cc(op)?;
-                let imm_num = self.builder.ins().f64const(imm);
-                let cmp = self.builder.ins().fcmp(cc, cur, imm_num);
-                let test = self.bint(cmp);
-                self.cond_jump(test, true, body_block, after);
-                Ok(())
+                match limit {
+                    RelLimit::Imm(imm) => {
+                        let cc = rel_cc(op)?;
+                        let imm_num = self.builder.ins().f64const(imm);
+                        let cmp = self.builder.ins().fcmp(cc, cur, imm_num);
+                        let test = self.bint(cmp);
+                        self.cond_jump(test, true, body_block, after);
+                        Ok(())
+                    }
+                    _ => {
+                        let limit_bits = self.emit_rel_limit_bits(limit)?;
+                        let counter_bits = self.counter_bits();
+                        let test = self.emit_rel_test2(op, counter_bits, limit_bits)?;
+                        self.cond_jump(test, true, body_block, after);
+                        Ok(())
+                    }
+                }
             }
             // A frame-slot counter may be a non-Number: `fast_loop_inc`'s
             // general path plus `fast_loop_test`'s relational fallback.
@@ -4428,18 +4480,29 @@ impl<'a> Lowerer<'a> {
                     .ins()
                     .bitcast(types::I64, MemFlagsData::new(), new_num);
                 let new_fast = self.canon(new_bits);
+                // The limit, read once per iteration (a body can mutate it):
+                // a constant for the literal shape, else the binding value
+                // and its number-ness for the fast-path gate.
+                let limit_bits = self.emit_rel_limit_bits(limit)?;
+                let limit_is_num = match limit {
+                    RelLimit::Imm(_) => self.builder.ins().iconst(types::I8, 1),
+                    _ => self.is_double(limit_bits),
+                };
+                let both = self.builder.ins().band(is_num, limit_is_num);
                 let cc = rel_cc(op)?;
-                let imm_num = self.builder.ins().f64const(imm);
-                let cmp = self.builder.ins().fcmp(cc, new_num, imm_num);
+                let limit_num =
+                    self.builder
+                        .ins()
+                        .bitcast(types::F64, MemFlagsData::new(), limit_bits);
+                let cmp = self.builder.ins().fcmp(cc, new_num, limit_num);
                 let test_fast = self.bint(cmp);
-                let imm_bits = self.const_value(&Value::Number(imm))?;
                 let new_var = self.builder.declare_var(types::I64);
                 let test_var = self.builder.declare_var(types::I64);
                 self.builder.def_var(new_var, new_fast);
                 self.builder.def_var(test_var, test_fast);
                 let merge = self.builder.create_block();
                 let slow = self.builder.create_block();
-                self.builder.ins().brif(is_num, merge, &[], slow, &[]);
+                self.builder.ins().brif(both, merge, &[], slow, &[]);
                 self.builder.switch_to_block(slow);
                 let inc_imm = self.builder.ins().iconst(types::I64, inc as i64);
                 let new_slow =
@@ -4448,7 +4511,7 @@ impl<'a> Lowerer<'a> {
                 let test_slow = self.call_slow(
                     self.sig_rel,
                     Helper::RelationalSlow,
-                    &[op_imm, new_slow, imm_bits],
+                    &[op_imm, new_slow, limit_bits],
                 )?;
                 self.builder.def_var(new_var, new_slow);
                 self.builder.def_var(test_var, test_slow);
@@ -4463,6 +4526,65 @@ impl<'a> Lowerer<'a> {
             }
             FastLoopVar::Global(_) => Err(Unsupported::Step("FastLoopHead Global")),
         }
+    }
+
+    /// The limit operand of a fused relational loop head/test: the value
+    /// bits of a frame slot or declared global (a literal is handled by the
+    /// `JumpIf*Imm`/imm head paths — this is only called for the binding
+    /// forms, except the Slot head's uniform path which also passes the
+    /// literal).
+    fn emit_rel_limit_bits(&mut self, limit: RelLimit) -> Result<ClifValue, Unsupported> {
+        match limit {
+            RelLimit::Imm(imm) => self.const_value(&Value::Number(imm)),
+            RelLimit::Slot(slot) => {
+                let bits = self.load_slot(slot);
+                if self.slot_is_lexical(slot) {
+                    self.emit_tdz_check(bits)?;
+                }
+                Ok(bits)
+            }
+            RelLimit::Global(name) => self.emit_global_read(name),
+        }
+    }
+
+    /// The JS relational test `left <op> right` as a 0/1 I64: the
+    /// both-number fast path inline, otherwise `relational_slow` (the
+    /// two-value sibling of `emit_rel_test`, which compares against a
+    /// constant).
+    fn emit_rel_test2(
+        &mut self,
+        op: BinaryOp,
+        left: ClifValue,
+        right: ClifValue,
+    ) -> Result<ClifValue, Unsupported> {
+        let cc = rel_cc(op)?;
+        let left_num = self.is_double(left);
+        let right_num = self.is_double(right);
+        let both = self.builder.ins().band(left_num, right_num);
+        let left_f = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), left);
+        let right_f = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), right);
+        let cmp = self.builder.ins().fcmp(cc, left_f, right_f);
+        let test_fast = self.bint(cmp);
+        let test_var = self.builder.declare_var(types::I64);
+        self.builder.def_var(test_var, test_fast);
+        let merge = self.builder.create_block();
+        let slow = self.builder.create_block();
+        self.builder.ins().brif(both, merge, &[], slow, &[]);
+        self.builder.switch_to_block(slow);
+        let op_imm = self.builder.ins().iconst(types::I64, op as i64);
+        let test_slow =
+            self.call_slow(self.sig_rel, Helper::RelationalSlow, &[op_imm, left, right])?;
+        self.builder.def_var(test_var, test_slow);
+        self.builder.ins().jump(merge, &[]);
+        self.builder.seal_block(merge);
+        self.builder.switch_to_block(merge);
+        Ok(self.builder.use_var(test_var))
     }
 
     /// `Inc`/`Dec`/`UpdateLocal`: read the slot, apply `++`/`--`, store, and
