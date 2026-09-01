@@ -112,6 +112,18 @@ both sides under similar load. For a clean comparison, rebuild both
 worktrees' sweep binaries first (the parent A/B worktree at
 `C:/Users/T/Desktop/jsrt-parent` is at `8c2f0cf`).
 
+### 6. `TypedArray/prototype/reduce/callbackfn-arguments-default-accumulator.js` flakes ~1-2%
+
+The Strict-mode run intermittently fails with `Expected SameValue(«43», «41») to be
+true` — `results[1][0]` reads iteration 1's `kValue` (43) instead of iteration 0's
+callback return (41). Passes in isolation, under `--gc-stress`, and in most full-area
+sweeps; reproduces only when the fixture runs in a batch worker process that already ran
+the 17 preceding `TypedArray/prototype/reduce/*` fixtures (16 BigInt + `callbackfn-
+arguments-custom-accumulator`) — prefix bisection: `lines[:17] + target` reproduces,
+shorter prefixes don't. Root cause unpinned (heap-state/timing dependent, consistent
+with a stale pointer in the strict-unmapped `arguments` path); documented in
+docs/conformance.md Open items. Re-run the fixture before triaging it as a regression.
+
 ## Relationship to the other skills
 
 - `slag-modules` — the module machinery: DFS evaluation waves, dynamic

@@ -2098,3 +2098,12 @@ ShadowRealm (64)).
   anything else that fails the sweep should be triaged into bug /
   host-dependent / missing-hook categories and either fixed or documented
   here.
+- Known flaky fixture: `TypedArray/prototype/reduce/callbackfn-arguments-default-accumulator.js`
+  (Strict) intermittently fails with `Expected SameValue(«43», «41») to be true` — the second
+  reduce callback's `arguments[0]` reads 43 (iteration 1's `kValue`) instead of 41 (iteration
+  0's callback return). ~1-2% flake: passes in isolation, under `--gc-stress`, and in most
+  full-area sweeps; reproduces only when the fixture runs in a batch worker process after the
+  17 preceding `TypedArray/prototype/reduce/*` fixtures (the 16 BigInt ones plus
+  `callbackfn-arguments-custom-accumulator`). Root cause unpinned — heap-state/timing
+  dependent, consistent with a stale-pointer / GC-compaction misread in the strict-unmapped
+  `arguments` path. Treat a lone failure here as a re-run, not a regression.
