@@ -336,7 +336,7 @@ pub(crate) fn rest_object(agent: &Agent) -> Result<crux::handle::Handle<JsObject
 /// (a String contributes its index properties).
 pub fn copy_data_properties_excluding(
     agent: &mut Agent,
-    to: &crux::object::JsObject,
+    to: &crux::handle::Handle<crux::object::JsObject>,
     from: &Value,
     excluded: &[PropertyKey],
 ) -> Result<(), JsError> {
@@ -346,24 +346,43 @@ pub fn copy_data_properties_excluding(
     let ValueKind::Object(from_obj) = crate::context::to_object(agent, from)?.kind() else {
         return Ok(());
     };
-    for key in from_obj.own_property_keys()? {
-        if excluded.contains(&key) {
-            continue;
-        }
-        let property = from_obj.get_own_property_key(&key)?;
-        if let Some(property) = property {
-            if !property.enumerable {
+    // The copy loop allocates (boxing a String source's index values, the
+    // destination's property appends), so a `--gc-stress` collection fires
+    // mid-loop. The source wrapper, the destination, and each copied value
+    // are native locals that can ride in a callee-saved register across the
+    // collection — the conservative stack scan sees only stack words (the
+    // register save slot holds the stale entry value), so an unrooted box is
+    // swept and the loop reads reused arena memory. Keep them precisely
+    // reachable through the KeepDuringJob set until the copy ends.
+    let root_len = agent.kept_during_job.borrow().len();
+    {
+        let mut kept = agent.kept_during_job.borrow_mut();
+        kept.push(Value::Object(from_obj));
+        kept.push(Value::Object(*to));
+    }
+    let result = (|| -> Result<(), JsError> {
+        for key in from_obj.own_property_keys()? {
+            if excluded.contains(&key) {
                 continue;
             }
-            // CopyDataProperties reads the value with Get after the
-            // enumerable check (spec 7.3.25 step 6.c.i-ii): for proxies this
-            // is what invokes the `get` trap, and the descriptor's data value
-            // would be a trap artifact.
-            let value = from_obj.get_key(&key)?;
-            to.create_data_property_key(&key, value)?;
+            let property = from_obj.get_own_property_key(&key)?;
+            if let Some(property) = property {
+                if !property.enumerable {
+                    continue;
+                }
+                // CopyDataProperties reads the value with Get after the
+                // enumerable check (spec 7.3.25 step 6.c.i-ii): for proxies this
+                // is what invokes the `get` trap, and the descriptor's data value
+                // would be a trap artifact.
+                let value = from_obj.get_key(&key)?;
+                agent.kept_during_job.borrow_mut().push(value);
+                to.create_data_property_key(&key, value)?;
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })();
+    agent.kept_during_job.borrow_mut().truncate(root_len);
+    result
 }
 
 /// DestructuringAssignmentEvaluation (spec 13.15.4): assign to the targets

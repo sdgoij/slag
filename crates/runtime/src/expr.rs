@@ -817,7 +817,7 @@ fn set_proto_or_throw(
 /// `Get`, so accessor and proxy traps run even when the key already exists.
 pub(crate) fn copy_data_properties(
     agent: &mut Agent,
-    to: &crux::object::JsObject,
+    to: &crux::handle::Handle<crux::object::JsObject>,
     from: &Value,
 ) -> Result<(), JsError> {
     if matches!(from.kind(), ValueKind::Null | ValueKind::Undefined) {
@@ -826,17 +826,34 @@ pub(crate) fn copy_data_properties(
     let ValueKind::Object(from_obj) = crate::context::to_object(agent, from)?.kind() else {
         return Ok(());
     };
-    for key in from_obj.own_property_keys()? {
-        let property = from_obj.get_own_property_key(&key)?;
-        if let Some(property) = property {
-            if !property.enumerable {
-                continue;
-            }
-            let value = from_obj.get_key(&key)?;
-            to.create_data_property_key(&key, value)?;
-        }
+    // Same root discipline as `copy_data_properties_excluding`: the copy
+    // allocates (String index boxes, destination appends), so a
+    // `--gc-stress` collection can fire while the source wrapper, the
+    // destination, and a copied value ride in callee-saved registers that
+    // the conservative stack scan cannot see. Keep them precisely reachable
+    // through the KeepDuringJob set until the copy ends.
+    let root_len = agent.kept_during_job.borrow().len();
+    {
+        let mut kept = agent.kept_during_job.borrow_mut();
+        kept.push(Value::Object(from_obj));
+        kept.push(Value::Object(*to));
     }
-    Ok(())
+    let result = (|| -> Result<(), JsError> {
+        for key in from_obj.own_property_keys()? {
+            let property = from_obj.get_own_property_key(&key)?;
+            if let Some(property) = property {
+                if !property.enumerable {
+                    continue;
+                }
+                let value = from_obj.get_key(&key)?;
+                agent.kept_during_job.borrow_mut().push(value);
+                to.create_data_property_key(&key, value)?;
+            }
+        }
+        Ok(())
+    })();
+    agent.kept_during_job.borrow_mut().truncate(root_len);
+    result
 }
 
 /// The property name, evaluating computed keys (spec 13.2.5.5).
