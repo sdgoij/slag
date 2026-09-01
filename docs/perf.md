@@ -2355,7 +2355,8 @@ The last call-step gap from `docs/jit-report.md` §7 item 7 — "a vector
 call to a certified LEAF still runs the general `call_inner`" — is closed,
 and `Function.prototype.apply`/`call` gained the same leaf fast path. New
 `--jit-bench` rows: `vector leaf call` (9-arg leaf, 200K) and
-`apply leaf call`.
+`apply leaf call`. (The `vector leaf call` row now uses 17 args — see the
+fast-argument cap note below.)
 
 - **The interpreter's vector-form call (`Step::Call` — the ≥9-arg or
   spread form) now leaf-inlines.** `do_call` rebuilt the fast-form layout
@@ -2449,6 +2450,21 @@ partially-filled arrays, re-entrant mutation, 10k-element arrays,
 array-likes, getters) plus the Function/prototype/apply+call fixture
 clusters clean under `--gc-stress --jitless`; full sweep (JIT default and
 `--jitless`) at 0 fail / 0 crash / 0 hang.
+
+**Fast-argument cap raised to 16** (2026-09-01): `FAST_CALL_MAX_ARGS` 8 →
+16 — plain calls with 9-16 arguments now take the fast `CallFast`/`TailCallFast`
+form (one step, the leaf-inline probe) instead of the vector form, whose
+JIT path ran 11 helper calls per iteration (`ArgsBase` + 9×`ArgsPush` +
+`Call`). The two `[Value; FAST_CALL_MAX_ARGS]` stack buffers
+(`do_call_apply`, `run_inline_leaf`) grow with the cap; a 17+-arg call or
+a spread still takes the vector form. Measured on the `vector leaf call`
+row's 9-arg shape (200K, release): **interp ~22.5ms → ~14ms, jit ~17.9ms
+→ ~2.4ms (7.4x)** — the 9-arg leaf now runs fully in machine code. The
+row was bumped to 17 args so the vector form stays benchmarked (interp
+~30ms, jit ~21ms). The vector-form JIT tests that used 10-arg calls
+switched to 17 to keep their coverage. Spec-exact: the new
+`wide_fast_form_calls_stay_spec_exact` test plus the full sweep (JIT
+default and `--jitless`) at 0 fail / 0 crash / 0 hang.
 
 ### The interpreter's `LoadIdent` global fast path, mirroring the JIT's Cut 36 probe (measured 2026-09-01)
 

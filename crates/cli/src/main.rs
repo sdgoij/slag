@@ -515,7 +515,7 @@ fn run_jit_benchmarks() -> Result<(), u8> {
         ),
         (
             "vector leaf call",
-            "function bench(f) { var s = 0; for (var i = 0; i < 200000; i++) { s += f(i, 2, 3, 4, 5, 6, 7, 8, 9); } return s; } bench(function (a, b, c, d, e, g, h, k, l) { return a + 1; });",
+            "function bench(f) { var s = 0; for (var i = 0; i < 200000; i++) { s += f(i, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17); } return s; } bench(function (a, b, c, d, e, g, h, k, l, m, n, o, p, q, r, t, u) { return a + 1; });",
         ),
         (
             "apply leaf call",

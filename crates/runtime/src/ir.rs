@@ -11390,8 +11390,11 @@ enum Fixup {
 /// no argument-vector machinery). More arguments — or any spread — take the
 /// vector form (`ArgsBase`/`ArgsPush`/`ArgsSpread` + the vector
 /// `Call`/`TailCall`). The `argc` field is `u8`, and the JIT's in-frame leaf
-/// probe handles any count that fits the working buffer.
-const FAST_CALL_MAX_ARGS: usize = 8;
+/// probe handles any count that fits the working buffer; the two `[Value;
+/// FAST_CALL_MAX_ARGS]` stack buffers (`do_call_apply`, `run_inline_leaf`)
+/// grow with it, so the cap is a stack-size tradeoff (16 is the common
+/// wider-arg leaf ceiling — a 9-arg call is the `--jit-bench` vector row).
+const FAST_CALL_MAX_ARGS: usize = 16;
 
 #[derive(Debug)]
 enum Scope {

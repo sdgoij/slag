@@ -1625,21 +1625,21 @@ mod tests {
 
     #[test]
     fn installed_jit_runs_a_vector_self_tail_call() {
-        // Cut 51: a self-tail-call with 10 plain arguments (beyond the fast
+        // Cut 51: a self-tail-call with 17 plain arguments (beyond the fast
         // form's `FAST_CALL_MAX_ARGS` cap) compiles to the vector self-jump
         // — the whole recursive chain runs in ONE machine-code invocation
         // with a bounded native stack.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
-                    "\"use strict\"; (function f(n, a, b, c, d, e, g, h, i, j) { \
-                     return n ? f(n - 1, a, b, c, d, e, g, h, i, j) : \
-                     a + b + c + d + e + g + h + i + j; \
-                     }(50000, 1, 2, 3, 4, 5, 6, 7, 8, 9));",
+                    "\"use strict\"; (function f(n, a, b, c, d, e, g, h, i, j, k, l, m, o, p, q, r, s) { \
+                     return n ? f(n - 1, a, b, c, d, e, g, h, i, j, k, l, m, o, p, q, r, s) : \
+                     a + b + c + d + e + g + h + i + j + k + l + m + o + p + q + r + s; \
+                     }(50000, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17));",
                 )
                 .expect("runs")
         });
-        assert_eq!(value.as_number(), Some(45.0));
+        assert_eq!(value.as_number(), Some(153.0));
         assert!(compiled >= 1, "{compiled} bodies");
     }
 
@@ -1763,19 +1763,19 @@ mod tests {
     #[test]
     fn installed_jit_runs_a_declared_vector_self_tail_call() {
         // Cut 51: the checked vector form — a top-level declaration's own
-        // name, 10 plain arguments; the identity check takes the self jump
+        // name, 17 plain arguments; the identity check takes the self jump
         // and the whole chain runs in one machine-code invocation.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
-                    "\"use strict\"; function f(n, a, b, c, d, e, g, h, i, j) { \
-                     return n ? f(n - 1, a, b, c, d, e, g, h, i, j) : \
-                     a + b + c + d + e + g + h + i + j; \
-                     } f(50000, 1, 2, 3, 4, 5, 6, 7, 8, 9);",
+                    "\"use strict\"; function f(n, a, b, c, d, e, g, h, i, j, k, l, m, o, p, q, r, s) { \
+                     return n ? f(n - 1, a, b, c, d, e, g, h, i, j, k, l, m, o, p, q, r, s) : \
+                     a + b + c + d + e + g + h + i + j + k + l + m + o + p + q + r + s; \
+                     } f(50000, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17);",
                 )
                 .expect("runs")
         });
-        assert_eq!(value.as_number(), Some(45.0));
+        assert_eq!(value.as_number(), Some(153.0));
         assert!(compiled >= 1, "{compiled} bodies");
     }
 
@@ -2116,19 +2116,20 @@ mod tests {
 
     #[test]
     fn installed_jit_runs_a_vector_tail_call_chain() {
-        // Cut 49: a ≥3-argument tail call compiles through the vector
-        // `TailCall` — the 100K-deep chain runs with bounded stack.
+        // Cut 49: a >`FAST_CALL_MAX_ARGS` tail call compiles through the
+        // vector `TailCall` — the 100K-deep chain runs with bounded stack.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
                     "\"use strict\";\n\
-                     function g(n, a, b, c) { if (n === 0) { return a + b + c; } \
-                       return g(n - 1, a + 1, b, c); }\n\
-                     g(100000, 0, 1, 2);",
+                     function g(n, a, b, c, d, e, h, k, m, o, p, q, r, s, t, u, v, w) { \
+                       if (n === 0) { return a + b + c + d + e + h + k + m + o + p + q + r + s + t + u + v + w; } \
+                       return g(n - 1, a + 1, b, c, d, e, h, k, m, o, p, q, r, s, t, u, v, w); }\
+                     g(100000, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);",
                 )
                 .expect("runs")
         });
-        assert_eq!(value.as_number(), Some(100003.0));
+        assert_eq!(value.as_number(), Some(100136.0));
         assert!(compiled >= 1, "{compiled} bodies");
     }
 

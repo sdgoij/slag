@@ -1136,6 +1136,51 @@ mod tests {
     }
 
     #[test]
+    fn wide_fast_form_calls_stay_spec_exact() {
+        // `FAST_CALL_MAX_ARGS` covers plain calls up to 16 arguments (the
+        // 9-arg `--jit-bench` vector row moved to the fast form): the fast
+        // `[this, callee, a1..aN]` layout passes every argument, a 17+-arg
+        // call still takes the vector form, and a spread stays vector.
+        assert_eq!(
+            value(
+                "var f = function (a, b, c, d, e, g, h, k, l) { return a + b + c + d + e + g + h + k + l; }; \
+                 f(1, 2, 3, 4, 5, 6, 7, 8, 9)"
+            ),
+            Value::Number(45.0)
+        );
+        assert_eq!(
+            value(
+                "var f = function (a, b, c, d, e, g, h, k, l, m, n, o, p, q, r, t) { \
+                   return a + b + c + d + e + g + h + k + l + m + n + o + p + q + r + t; }; \
+                 f(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)"
+            ),
+            Value::Number(136.0)
+        );
+        // The vector form above the cap.
+        assert_eq!(
+            value(
+                "var f = function (a, b, c, d, e, g, h, k, l, m, n, o, p, q, r, t, u) { \
+                   return a + b + c + d + e + g + h + k + l + m + n + o + p + q + r + t + u; }; \
+                 f(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)"
+            ),
+            Value::Number(153.0)
+        );
+        // Missing args stay undefined and the arguments object sees every
+        // fast-form argument.
+        assert_eq!(
+            value("var f = function (a, b, c) { return [a, b, c].join('|'); }; f(1)"),
+            Value::String(Handle::new(JsString::from_utf8("1||")))
+        );
+        assert_eq!(
+            value(
+                "var f = function () { return arguments.length; }; \
+                 f(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)"
+            ),
+            Value::Number(16.0)
+        );
+    }
+
+    #[test]
     fn certified_body_global_read_fast_path_stays_spec_exact() {
         // The `LoadIdent` fast path (Cut 36 mirror): a certified body whose
         // env chain is exactly the global env serves a warmed global-value
